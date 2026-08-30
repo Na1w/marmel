@@ -1,0 +1,32 @@
+# Rust build artifacts
+/target
+
+# Python bytecode caches
+__pycache__/
+*.pyc
+
+# Marmel workspace metadata
+.marmel/
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
+
+# Rust backup files
+**/*.rs.bk
+
+# Local config
+/.marmel.toml
+/config.toml
+
+# Editor / temp files
+*.swp
+*.tmp
+.marmennill_tmp/
+
+# Deep-Freeze crash-recovery checkpoint + journal (ephemeral, SPEC §3.4)
+.session_frozen.json
+.session_journal.json
+forced_phase.txt

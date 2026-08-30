@@ -1,0 +1,58 @@
+# marmel.toml
+backend_url = "http://192.168.50.151:11434/v1"
+auth_token = ""
+
+# Default model for Manager / Orchestrator
+model = "deepseek-v4-flash:cloud"
+
+temperature = 0.7
+top_p = 0.9
+max_context_tokens = 128000
+preserve_thinking = true
+ui_mode = "tui"
+
+[orchestration]
+max_recursion_depth = 3
+
+# Coder specialist — Lead Software Engineer (architecture, implementation, testing)
+[orchestration.specialists.coder]
+tools = ["delegate_task", "write_file", "replace", "read_file", "run_command", "grep_search", "glob"]
+model = "deepseek-v4-flash:cloud"
+# backend_url = "http://192.168.50.151:11434/v1"
+# auth_token = ""
+# enable_validator = false # Optional: set false to disable automated quality-assurance validation
+validator_model = "gemma4:cloud"
+# validator_backend_url = "http://192.168.50.151:11434/v1"
+# validator_auth_token = ""
+max_validator_iterations = 2
+
+# Debugger specialist — Systems Debugger (crash forensics, ABI/low-level diagnostics)
+[orchestration.specialists.debugger]
+tools = ["delegate_task", "write_file", "replace", "read_file", "run_command", "grep_search", "glob", "pty_spawn", "pty_write", "pty_read", "pty_close", "pty_list"]
+model = "deepseek-v4-flash:cloud"
+# backend_url = "http://192.168.50.151:11434/v1"
+# enable_validator = false
+validator_model = "gemma4:cloud"
+max_validator_iterations = 2
+
+# Researcher specialist — Information Retrieval & Ground Truth Fact-Checking
+[orchestration.specialists.researcher]
+tools = ["delegate_task", "read_file", "run_command", "grep_search", "glob"]
+model = "deepseek-v4-flash:cloud"
+# backend_url = "http://192.168.50.151:11434/v1"
+validator_model = "gemma4:cloud"
+max_validator_iterations = 2
+
+# Validator specialist — Independent Quality Assurance Auditor
+[orchestration.specialists.validator]
+tools = ["delegate_task", "write_file", "replace", "read_file", "run_command", "grep_search", "glob"]
+model = "gemma4:cloud"
+# backend_url = "http://192.168.50.151:11434/v1"
+# auth_token = ""
+
+# Generalist specialist — Supreme Polymath (dense reasoning & cross-domain analysis)
+[orchestration.specialists.generalist]
+tools = ["*"]
+model = "deepseek-v4-flash:cloud"
+# backend_url = "https://openrouter.ai/api/v1"
+# auth_token = "sk-or-..."

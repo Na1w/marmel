@@ -1,0 +1,91 @@
+# marmel.toml.example — copy to ./.marmel.toml or ~/.config/marmel/config.toml
+
+# Base URL of the OpenAI-compatible chat completions backend (no trailing slash).
+backend_url = "http://localhost:8000/v1"
+
+# Optional bearer token sent as `Authorization: Bearer <token>`.
+auth_token = ""
+
+# Model identifier to send in the chat request.
+model = "llama3.1-8b-instruct"
+
+# Sampling parameters.
+temperature = 0.7
+top_p = 0.9
+frequency_penalty = 0.0
+presence_penalty = 0.0
+
+# Token budget for the context window; compaction triggers at 90%.
+max_context_tokens = 8192
+
+# Preserve reasoning/thinking content in the transcript when enabled.
+preserve_thinking = true
+
+# Timeout (seconds) for a single run_command / PTY invocation.
+command_timeout_secs = 60
+
+# Number of semantically-identical consecutive turns that trigger cycle breaking.
+max_repetition_threshold = 3
+
+# Enable XML-rescue fallback when the model emits malformed tool calls.
+enable_xml_rescue = true
+
+# UI mode: "tui" (ratatui) or "raw" (plain streaming).
+ui_mode = "tui"
+
+# ---------------------------------------------------------------------------
+# Orchestration — Manager + Specialist Subagents (REQ-ORCH-001…005 / SPEC Part 5)
+# ---------------------------------------------------------------------------
+# The Manager (OrchestratorManager) owns planning, delegation, and synthesis. It
+# NEVER performs domain work itself: every unit of domain work is dispatched via
+# `delegate_task`.
+#
+# Each specialist can optionally configure a unique backend_url and auth_token
+# (e.g. routing code generation to a local GPU while delegating validation or
+# generalist tasks to remote cloud models). Unspecified fields fall back to the
+# top-level backend_url and auth_token.
+[orchestration]
+# Fractal delegation depth bound. The Manager is depth 0; each nested
+# `delegate_task` may descend at most this many levels (default 3).
+max_recursion_depth = 3
+
+# Per-specialist tool allowlists, backend endpoints, and model configurations.
+[orchestration.specialists.coder]
+tools = ["delegate_task", "write_file", "replace", "read_file", "run_command", "grep_search", "glob"]
+model = "deepseek-v4-flash:cloud"
+# Optional unique backend and token for coder:
+# backend_url = "http://localhost:11434/v1"
+# auth_token = ""
+# Optional: set false to disable automated quality-assurance validation
+# enable_validator = false
+# Optional unique validator settings for coder's quality assurance:
+validator_model = "gemma4:cloud"
+# validator_backend_url = "http://localhost:11434/v1"
+# validator_auth_token = ""
+max_validator_iterations = 2
+
+[orchestration.specialists.debugger]
+tools = ["delegate_task", "write_file", "replace", "read_file", "run_command", "grep_search", "glob", "pty_spawn", "pty_write", "pty_read", "pty_close", "pty_list"]
+model = "deepseek-v4-flash:cloud"
+# backend_url = "http://localhost:11434/v1"
+# enable_validator = false
+validator_model = "gemma4:cloud"
+max_validator_iterations = 2
+
+[orchestration.specialists.researcher]
+tools = ["delegate_task", "read_file", "run_command", "grep_search", "glob"]
+model = "deepseek-v4-flash:cloud"
+validator_model = "gemma4:cloud"
+max_validator_iterations = 2
+
+[orchestration.specialists.validator]
+tools = ["delegate_task", "write_file", "replace", "read_file", "run_command", "grep_search", "glob"]
+model = "gemma4:cloud"
+# backend_url = "http://localhost:11434/v1"
+# auth_token = ""
+
+[orchestration.specialists.generalist]
+tools = ["*"]
+model = "deepseek-v4-flash:cloud"
+# backend_url = "https://openrouter.ai/api/v1"
+# auth_token = "sk-or-..."

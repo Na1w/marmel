@@ -1,0 +1,383 @@
+//! JSON-RPC 2.0 MCP Client implementation for stdio and HTTP/SSE.
+
+use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
+
+/// Server configuration entry for an MCP server in marmel.toml.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpServerConfig {
+    /// Command to spawn the MCP server executable (for stdio transport).
+    pub command: Option<String>,
+    /// Command arguments.
+    pub args: Vec<String>,
+    /// Environment variables for the spawned process.
+    pub env: HashMap<String, String>,
+    /// Remote URL endpoint (for HTTP/SSE transport).
+    pub url: Option<String>,
+}
+
+/// Discovered MCP Tool definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpTool {
+    /// Original tool name reported by the MCP server.
+    pub name: String,
+    /// Human-readable description.
+    pub description: Option<String>,
+    /// JSON Schema for parameters.
+    pub input_schema: Value,
+    /// Which server provides this tool.
+    pub server_name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct JsonRpcRequest {
+    jsonrpc: &'static str,
+    id: u64,
+    method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct JsonRpcNotification {
+    jsonrpc: &'static str,
+    method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcResponse {
+    #[allow(dead_code)]
+    jsonrpc: Option<String>,
+    #[allow(dead_code)]
+    id: Option<Value>,
+    result: Option<Value>,
+    error: Option<JsonRpcError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcError {
+    code: i64,
+    message: String,
+    data: Option<Value>,
+}
+
+/// Active connection to an MCP server over stdio.
+pub struct StdioMcpConnection {
+    server_name: String,
+    child: Child,
+    stdin: tokio::process::ChildStdin,
+    stdout_reader: BufReader<tokio::process::ChildStdout>,
+    request_id: AtomicU64,
+}
+
+impl StdioMcpConnection {
+    pub async fn spawn(server_name: &str, cfg: &McpServerConfig) -> Result<Self> {
+        let cmd_str = cfg
+            .command
+            .as_ref()
+            .ok_or_else(|| anyhow!("missing `command` for stdio MCP server '{server_name}'"))?;
+
+        let mut cmd = Command::new(cmd_str);
+        cmd.args(&cfg.args);
+        for (k, v) in &cfg.env {
+            cmd.env(k, v);
+        }
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::inherit());
+
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("failed to spawn MCP server '{server_name}' ({cmd_str})"))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("failed to open stdin for '{server_name}'"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("failed to open stdout for '{server_name}'"))?;
+        let stdout_reader = BufReader::new(stdout);
+
+        let mut conn = Self {
+            server_name: server_name.to_string(),
+            child,
+            stdin,
+            stdout_reader,
+            request_id: AtomicU64::new(1),
+        };
+
+        conn.initialize().await?;
+        Ok(conn)
+    }
+
+    async fn send_request(&mut self, method: &str, params: Option<Value>) -> Result<Value> {
+        let id = self.request_id.fetch_add(1, Ordering::SeqCst);
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0",
+            id,
+            method: method.to_string(),
+            params,
+        };
+
+        let mut req_str = serde_json::to_string(&req)?;
+        req_str.push('\n');
+
+        self.stdin
+            .write_all(req_str.as_bytes())
+            .await
+            .with_context(|| format!("writing request to MCP server '{}'", self.server_name))?;
+        self.stdin.flush().await?;
+
+        let timeout_duration = std::time::Duration::from_secs(30);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read_fut = self.stdout_reader.read_line(&mut line);
+            let n = tokio::time::timeout(timeout_duration, read_fut)
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "timeout waiting for MCP server '{}' response (30s)",
+                        self.server_name
+                    )
+                })??;
+            if n == 0 {
+                return Err(anyhow!(
+                    "MCP server '{}' closed stdout stream",
+                    self.server_name
+                ));
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(trimmed) {
+                let id_matches = match &resp.id {
+                    Some(Value::Number(n)) => n.as_u64() == Some(id),
+                    Some(Value::String(s)) => s.parse::<u64>().ok() == Some(id),
+                    _ => false,
+                };
+                if !id_matches {
+                    continue;
+                }
+                if let Some(err) = resp.error {
+                    return Err(anyhow!(
+                        "MCP error ({}) from '{}': {} (data: {:?})",
+                        err.code,
+                        self.server_name,
+                        err.message,
+                        err.data
+                    ));
+                }
+                return Ok(resp.result.unwrap_or(Value::Null));
+            }
+        }
+    }
+
+    async fn send_notification(&mut self, method: &str, params: Option<Value>) -> Result<()> {
+        let notif = JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: method.to_string(),
+            params,
+        };
+        let mut notif_str = serde_json::to_string(&notif)?;
+        notif_str.push('\n');
+
+        self.stdin.write_all(notif_str.as_bytes()).await?;
+        self.stdin.flush().await?;
+        Ok(())
+    }
+
+    async fn initialize(&mut self) -> Result<()> {
+        let init_params = serde_json::json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {
+                "tools": {}
+            },
+            "clientInfo": {
+                "name": "marmel",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        });
+
+        let _result = self.send_request("initialize", Some(init_params)).await?;
+        self.send_notification("notifications/initialized", None)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_tools(&mut self) -> Result<Vec<McpTool>> {
+        let result = self.send_request("tools/list", None).await?;
+        let mut tools = Vec::new();
+        if let Some(tools_arr) = result.get("tools").and_then(Value::as_array) {
+            for t in tools_arr {
+                if let Some(name) = t.get("name").and_then(Value::as_str) {
+                    let description = t
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let input_schema = t
+                        .get("inputSchema")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+                    tools.push(McpTool {
+                        name: name.to_string(),
+                        description,
+                        input_schema,
+                        server_name: self.server_name.clone(),
+                    });
+                }
+            }
+        }
+        Ok(tools)
+    }
+
+    pub async fn call_tool(&mut self, name: &str, arguments: &Value) -> Result<String> {
+        let params = serde_json::json!({
+            "name": name,
+            "arguments": arguments
+        });
+
+        let result = self.send_request("tools/call", Some(params)).await?;
+
+        let mut output = String::new();
+        if let Some(content_arr) = result.get("content").and_then(Value::as_array) {
+            for item in content_arr {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    output.push_str(text);
+                } else {
+                    output.push_str(&item.to_string());
+                }
+                output.push('\n');
+            }
+        } else if let Some(text) = result.get("text").and_then(Value::as_str) {
+            output.push_str(text);
+        } else if !result.is_null() {
+            output.push_str(&result.to_string());
+        }
+
+        let is_error = result
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if is_error {
+            Err(anyhow!(output.trim().to_string()))
+        } else {
+            Ok(output.trim().to_string())
+        }
+    }
+
+    pub async fn shutdown(&mut self) -> Result<()> {
+        let _ = self.child.kill().await;
+        Ok(())
+    }
+}
+
+pub enum McpClient {
+    Stdio(Mutex<StdioMcpConnection>),
+}
+
+impl McpClient {
+    pub async fn list_tools(&self) -> Result<Vec<McpTool>> {
+        match self {
+            McpClient::Stdio(lock) => {
+                let mut conn = lock.lock().await;
+                conn.list_tools().await
+            }
+        }
+    }
+
+    pub async fn call_tool(&self, name: &str, arguments: &Value) -> Result<String> {
+        match self {
+            McpClient::Stdio(lock) => {
+                let mut conn = lock.lock().await;
+                conn.call_tool(name, arguments).await
+            }
+        }
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        match self {
+            McpClient::Stdio(lock) => {
+                let mut conn = lock.lock().await;
+                conn.shutdown().await
+            }
+        }
+    }
+}
+
+/// Global registry and lifecycle manager for all active MCP clients.
+#[derive(Default)]
+pub struct McpManager {
+    clients: HashMap<String, Arc<McpClient>>,
+    tools: HashMap<String, McpTool>,
+}
+
+impl McpManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Boot all configured MCP servers and discover their tools.
+    pub async fn boot(servers: &HashMap<String, McpServerConfig>) -> Result<Self> {
+        let mut manager = Self::new();
+        for (name, cfg) in servers {
+            if cfg.command.is_some() {
+                match StdioMcpConnection::spawn(name, cfg).await {
+                    Ok(conn) => {
+                        let client = Arc::new(McpClient::Stdio(Mutex::new(conn)));
+                        if let Ok(tools) = client.list_tools().await {
+                            for tool in tools {
+                                manager.tools.insert(tool.name.clone(), tool);
+                            }
+                        }
+                        manager.clients.insert(name.clone(), client);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to start MCP server '{name}': {e:#}");
+                    }
+                }
+            }
+        }
+        Ok(manager)
+    }
+
+    pub fn tools(&self) -> Vec<McpTool> {
+        self.tools.values().cloned().collect()
+    }
+
+    pub fn has_tool(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+    }
+
+    pub async fn call_tool(&self, name: &str, arguments: &Value) -> Result<String> {
+        let tool = self
+            .tools
+            .get(name)
+            .ok_or_else(|| anyhow!("unknown MCP tool '{name}'"))?;
+        let client = self
+            .clients
+            .get(&tool.server_name)
+            .ok_or_else(|| anyhow!("MCP server '{}' is not running", tool.server_name))?;
+        client.call_tool(name, arguments).await
+    }
+
+    pub async fn shutdown(&self) {
+        for client in self.clients.values() {
+            let _ = client.shutdown().await;
+        }
+    }
+}
