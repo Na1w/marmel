@@ -175,22 +175,10 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn temp_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "marmel_logrotate_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn test_rotate_log_over_threshold() {
-        let dir = temp_dir();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         let log = dir.join("marmel.log");
         fs::write(&log, "x".repeat(100)).unwrap();
 
@@ -205,12 +193,12 @@ mod tests {
             "x".repeat(100),
             "old contents moved to backup"
         );
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn test_rotate_log_under_threshold() {
-        let dir = temp_dir();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         let log = dir.join("marmel.log");
         fs::write(&log, "small").unwrap();
 
@@ -218,12 +206,12 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&log).unwrap(), "small");
         assert!(!dir.join("marmel.log.1").exists());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn test_rotate_log_shifts_backups() {
-        let dir = temp_dir();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         let log = dir.join("marmel.log");
         fs::write(&log, "current").unwrap();
         fs::write(dir.join("marmel.log.1"), "one").unwrap();
@@ -239,15 +227,14 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join("marmel.log.2")).unwrap(), "one");
         assert_eq!(fs::read_to_string(dir.join("marmel.log.3")).unwrap(), "two");
         assert!(!dir.join("marmel.log.4").exists());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn test_rotate_log_missing_file() {
-        let dir = temp_dir();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         let log = dir.join("does-not-exist.log");
         rotate_log(&log, 10, 3);
         assert!(!log.exists());
-        fs::remove_dir_all(&dir).unwrap();
     }
 }

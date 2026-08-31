@@ -133,25 +133,12 @@ pub fn rotate_log_file(path: &Path, max_bytes: u64, backups: u32) {
 mod tests {
     use super::*;
 
-    /// Create an isolated, unique temp workspace directory.
-    fn temp_workspace() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "marmel_workspace_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    }
-
     /// `Workspace::at` + `ensure_writable` creates the directory and validates
     /// write access; canonical paths resolve inside it.
     #[test]
     fn test_workspace_creates_and_validates() {
-        let dir = temp_workspace();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("isolated_workspace");
         assert!(!dir.exists());
         let ws = Workspace::at(&dir);
         ws.ensure_writable().unwrap();
@@ -171,8 +158,6 @@ mod tests {
             leftovers.is_empty(),
             "probe must be cleaned up: {leftovers:?}"
         );
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// `Workspace::new()` defaults to the canonical `.marmel` directory and
