@@ -73,10 +73,21 @@ pub struct PtySession {
 /// Build a sandboxed shell command, executing via Landlock on Linux, sh on macOS/Unix, or cmd on Windows.
 pub fn build_sandboxed_command(command: &str, cwd: &std::path::Path) -> CommandBuilder {
     if cfg!(target_os = "windows") {
-        let mut cmd = CommandBuilder::new("cmd");
-        cmd.args(["/C", command]);
-        cmd.cwd(cwd);
-        cmd
+        let trimmed = command.trim();
+        if trimmed.eq_ignore_ascii_case("cmd")
+            || trimmed.eq_ignore_ascii_case("cmd.exe")
+            || trimmed.eq_ignore_ascii_case("powershell")
+            || trimmed.eq_ignore_ascii_case("powershell.exe")
+        {
+            let mut cmd = CommandBuilder::new(trimmed);
+            cmd.cwd(cwd);
+            cmd
+        } else {
+            let mut cmd = CommandBuilder::new("cmd");
+            cmd.args(["/C", command]);
+            cmd.cwd(cwd);
+            cmd
+        }
     } else {
         let wrapped = format!(
             "stty -echo 2>/dev/null || true; ulimit -f {ULIMIT_FILE_BLOCKS} 2>/dev/null || ulimit -f {ULIMIT_FILE_BLOCKS_FALLBACK} 2>/dev/null; {command}"
@@ -352,6 +363,7 @@ impl PtyManager {
         })?;
 
         let pid = child.process_id();
+        drop(pair.slave);
         let writer = pair
             .master
             .take_writer()
