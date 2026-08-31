@@ -252,12 +252,13 @@ impl ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
                 name: "run_command".to_string(),
-                description: "Execute a command line inside a dedicated PTY with timeout and process-group isolation."
+                description: "Execute a command line inside a dedicated PTY with timeout and process-group isolation. For animations, TUIs, interactive programs, or servers, pass a short timeout_seconds (e.g. 3) to prevent indefinite blocking."
                     .to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "command": { "type": "string", "description": "The shell command to execute." }
+                        "command": { "type": "string", "description": "The shell command to execute." },
+                        "timeout_seconds": { "type": "integer", "description": "Optional timeout in seconds (default: 60, max: 300). Use a short timeout (e.g. 2-5) for GUI/TUI animations, interactive apps, or background servers." }
                     },
                     "required": ["command"]
                 }),

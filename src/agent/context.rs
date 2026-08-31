@@ -53,11 +53,6 @@ const COMPACTION_OVER_LIMIT_TARGET_RATIO: f64 = 0.80;
 pub const CONTEXT_LIMIT_EXCEEDED_MESSAGE: &str = "(SYSTEM: CONTEXT LIMIT EXCEEDED. Your context window overflowed. The proxy had to FORCIBLY compact your history by pruning older messages and tool results. You MUST immediately summarize your progress and invoke the 'rebirth' tool with your summary to reset your memory properly.)";
 
 /// BPE tokenizer singleton (cl100k_base).
-///
-/// tiktoken-rs 0.5's `cl100k_base_singleton()` returns a `&'static CoreBPE`
-/// that is `Send + Sync`. We cache it in a `OnceLock` so the pointer is fetched
-/// exactly once; subsequent `count_tokens` calls never re-enter the underlying
-/// mutex.
 fn bpe() -> &'static tiktoken_rs::CoreBPE {
     tiktoken_rs::cl100k_base_singleton()
 }

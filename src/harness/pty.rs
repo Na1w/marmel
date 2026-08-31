@@ -29,8 +29,8 @@ use serde_json::Value;
 use std::io::Read;
 use std::time::Duration;
 
-/// Default per-command timeout in seconds (REQ-TOOL-001: strict 300 s).
-pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
+/// Default per-command timeout in seconds (default 60 s, max 300 s).
+pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
 /// Hard file-size cap (`ulimit -f`) applied to every command, in 512-byte blocks.
 /// 4194304 blocks × 512 B = 2 GiB ceiling; this matches marmennill-cli's `ulimit -f`.
@@ -164,14 +164,19 @@ impl PtySession {
     }
 }
 
-/// Execute a shell command via `run_command`. Parses `{ command }`.
+/// Execute a shell command via `run_command`. Parses `{ command, timeout_seconds? }`.
 ///
-/// The timeout is strict: every PTY execution is capped at `DEFAULT_TIMEOUT_SECS`
-/// (300 s), matching marmennill-cli's local tool execution. A `timeout` argument is
-/// accepted for forward-compatibility but is clamped to the strict default.
+/// If `timeout_seconds` (or `timeout`) is provided, it is clamped to [1, 300] seconds.
+/// Otherwise `DEFAULT_TIMEOUT_SECS` (60 s) is used.
 pub fn run_command(args: &Value) -> Result<ToolResult, ToolError> {
     let command = crate::harness::fs::str_arg(args, "command", "run_command")?;
-    let output = run_command_pty(command, Duration::from_secs(DEFAULT_TIMEOUT_SECS))?;
+    let timeout_secs = args
+        .get("timeout_seconds")
+        .or_else(|| args.get("timeout"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_TIMEOUT_SECS)
+        .clamp(1, 300);
+    let output = run_command_pty(command, Duration::from_secs(timeout_secs))?;
     Ok(ToolResult::ok(output))
 }
 
@@ -228,7 +233,7 @@ pub fn run_command_pty(command: &str, timeout: Duration) -> Result<String, ToolE
 }
 
 // ---------------------------------------------------------------------------
-// Interactive Multi-Turn PTY Manager (Kvaser/Caesar Parity)
+// Interactive Multi-Turn PTY Manager
 // ---------------------------------------------------------------------------
 
 struct SharedBuffer {
@@ -735,16 +740,14 @@ mod tests {
         );
     }
 
-    /// The strict timeout preempts a hung command and reports it as killed.
     #[test]
-    fn test_harness_pty_timeout_kills_hung_command() {
-        // A command that sleeps far longer than the (short) test timeout.
-        let out = run_command_pty("sleep 30", Duration::from_millis(200))
-            .expect("timeout path returns Ok");
-        assert!(
-            out.contains("timed out after 0s and was killed"),
-            "unexpected timeout output: {out:?}"
-        );
+    fn test_run_command_parses_timeout_seconds_argument() {
+        let args = serde_json::json!({
+            "command": "sleep 10",
+            "timeout_seconds": 1
+        });
+        let res = run_command(&args).expect("executes with custom timeout");
+        assert!(res.content.contains("timed out after 1s and was killed"));
     }
 
     #[tokio::test]

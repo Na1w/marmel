@@ -95,6 +95,7 @@ impl Renderer for RawRenderer {
             Event::Done => {
                 let _ = writeln!(self.buffer, "[done]");
             }
+            Event::TokensIn(_) | Event::TokensOut(_) => {}
         }
         let _ = self.flush();
     }

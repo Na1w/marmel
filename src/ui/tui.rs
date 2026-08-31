@@ -86,8 +86,6 @@ pub struct TuiRenderer {
     frame_counter: u64,
     /// The status bar text. Defaults to `"Ready"`.
     status_line: String,
-    /// The session identifier shown in the status bar.
-    session_id: String,
     /// Which panel has focus (drives border color). Defaults to `Chat`.
     focused_panel: FocusedPanel,
     /// Vertical scroll offset of the chat panel.
@@ -160,6 +158,11 @@ pub struct TuiRenderer {
 
     active_agent: String,
     last_render: std::time::Instant,
+
+    /// Estimated total input (prompt) tokens across the session.
+    pub tokens_in: usize,
+    /// Estimated total output (completion) tokens across the session.
+    pub tokens_out: usize,
 }
 
 impl TuiRenderer {
@@ -175,7 +178,8 @@ impl TuiRenderer {
             confirm_abort: false,
             frame_counter: 0,
             status_line: "Ready".to_string(),
-            session_id: "local".to_string(),
+            tokens_in: 0,
+            tokens_out: 0,
             focused_panel: FocusedPanel::Chat,
             chat_scroll: 0,
             plan_scroll: 0,
@@ -818,7 +822,10 @@ impl TuiRenderer {
         }
         self.history_index = None;
         self.input_draft.clear();
-        self.status_line = "Starting new turn...".to_string();
+        let user_tokens = tiktoken_rs::cl100k_base_singleton()
+            .encode_ordinary(&line)
+            .len();
+        self.tokens_in = self.tokens_in.saturating_add(user_tokens);
         // Echo the user's line into the chat view.
         self.messages.push(format!("User: {trimmed}"));
         self.chat_auto_scroll = true;
@@ -1560,6 +1567,26 @@ impl TuiRenderer {
         frame.render_widget(subagent_block, area);
     }
 
+    fn format_count(n: usize) -> String {
+        if n >= 1_000_000 {
+            format!("{:.1}M", n as f64 / 1_000_000.0)
+        } else if n >= 1_000 {
+            format!("{:.1}k", n as f64 / 1_000.0)
+        } else {
+            format!("{n}")
+        }
+    }
+
+    fn format_token_counts(tokens_in: usize, tokens_out: usize) -> String {
+        let total = tokens_in.saturating_add(tokens_out);
+        format!(
+            "{} in / {} out ({} total)",
+            Self::format_count(tokens_in),
+            Self::format_count(tokens_out),
+            Self::format_count(total)
+        )
+    }
+
     fn render_status(&self, frame: &mut ratatui::Frame, area: Rect) {
         // F8: always surface the live running-subagent count, independent of
         // `status_line`, whenever any specialist is active.
@@ -1595,7 +1622,11 @@ impl TuiRenderer {
             status_str.push(' ');
             status_str.push_str(frames[idx]);
         }
-        let status_text = format!(" Session: {} | Status: {}", self.session_id, status_str);
+        let (global_in, global_out) = crate::llm::get_global_token_counts();
+        let tokens_in = self.tokens_in.max(global_in);
+        let tokens_out = self.tokens_out.max(global_out);
+        let tokens_str = Self::format_token_counts(tokens_in, tokens_out);
+        let status_text = format!(" Tokens: {} | Status: {}", tokens_str, status_str);
         let status_paragraph = Paragraph::new(status_text)
             .style(Style::default().bg(Color::DarkGray).fg(Color::White));
         frame.render_widget(status_paragraph, area);
@@ -1957,7 +1988,17 @@ impl Renderer for TuiRenderer {
 
     fn on_event(&mut self, event: &Event) {
         match event {
+            Event::TokensIn(count) => {
+                self.tokens_in = self.tokens_in.saturating_add(*count);
+            }
+            Event::TokensOut(count) => {
+                self.tokens_out = self.tokens_out.saturating_add(*count);
+            }
             Event::Message(text) => {
+                let tok_count = tiktoken_rs::cl100k_base_singleton()
+                    .encode_ordinary(text)
+                    .len();
+                self.tokens_out = self.tokens_out.saturating_add(tok_count);
                 self.current_content.push_str(text);
                 // Live-track content for the active subagent (t-c304): when a
                 // specialist is running, its final-answer text streams into the
@@ -1972,6 +2013,10 @@ impl Renderer for TuiRenderer {
                 }
             }
             Event::SteerResponse(text) => {
+                let tok_count = tiktoken_rs::cl100k_base_singleton()
+                    .encode_ordinary(text)
+                    .len();
+                self.tokens_out = self.tokens_out.saturating_add(tok_count);
                 // Stream steer arbitrator output as `Marmennill: ` yellow sentences.
                 self.steer_sentence_buffer.push_str(text);
                 let sentences = extract_complete_sentences(&mut self.steer_sentence_buffer);
@@ -1980,6 +2025,10 @@ impl Renderer for TuiRenderer {
                 }
             }
             Event::Thinking(text) => {
+                let tok_count = tiktoken_rs::cl100k_base_singleton()
+                    .encode_ordinary(text)
+                    .len();
+                self.tokens_out = self.tokens_out.saturating_add(tok_count);
                 self.current_thought.push_str(text);
                 // Live-track thinking for the active subagent (t-c304): when a
                 // specialist is running, its reasoning streams into the
@@ -1994,6 +2043,10 @@ impl Renderer for TuiRenderer {
                 }
             }
             Event::ToolCall(text) => {
+                let tok_count = tiktoken_rs::cl100k_base_singleton()
+                    .encode_ordinary(text)
+                    .len();
+                self.tokens_out = self.tokens_out.saturating_add(tok_count);
                 self.commit_turn_content();
                 self.messages.push(format!("[Tool Call] {text}"));
                 if self.chat_auto_scroll {
@@ -2916,5 +2969,35 @@ mod tests {
         // Delete backward
         r.delete_backward();
         assert_eq!(r.input_text, "hello Xwrld");
+    }
+
+    #[test]
+    fn test_token_counting_and_formatting_in_status_bar() {
+        assert_eq!(
+            TuiRenderer::format_token_counts(0, 0),
+            "0 in / 0 out (0 total)"
+        );
+        assert_eq!(
+            TuiRenderer::format_token_counts(450, 120),
+            "450 in / 120 out (570 total)"
+        );
+        assert_eq!(
+            TuiRenderer::format_token_counts(1500, 320),
+            "1.5k in / 320 out (1.8k total)"
+        );
+        assert_eq!(
+            TuiRenderer::format_token_counts(25400, 1200),
+            "25.4k in / 1.2k out (26.6k total)"
+        );
+        assert_eq!(
+            TuiRenderer::format_token_counts(1_200_000, 350_000),
+            "1.2M in / 350.0k out (1.6M total)"
+        );
+
+        let mut r = TuiRenderer::new();
+        r.on_event(&Event::TokensIn(1000));
+        r.on_event(&Event::Message("Hello world response".to_string()));
+        assert_eq!(r.tokens_in, 1000);
+        assert!(r.tokens_out > 0);
     }
 }

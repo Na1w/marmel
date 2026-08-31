@@ -15,7 +15,7 @@
    - **SURGICAL FILE EDITS:** Use `replace` for targeted search-and-replace edits inside existing files.
    - **READING & INSPECTING FILES:** Use `read_file` (with optional `offset` and `limit`) to inspect file contents. Use `grep_search` and `glob` for file search and directory reconnaissance.
    - **BUILD, COMPILE & SHELL EXECUTION:** Reserve `run_command` strictly for executing compilation (`cargo build`, `gcc`, `make`), running binaries, build tools, package managers, and executing test suites.
-4. **EXECUTE, TEST & VALIDATE (MANDATORY):** All written code MUST be thoroughly tested. Write and run unit tests, integration tests, or validation scripts via `run_command` to verify correctness. Always run tests with a strict timeout to prevent indefinite hangs.
+4. **EXECUTE, TEST & VALIDATE (MANDATORY):** All written code MUST be thoroughly tested. Execute build/compiler checks and test suites via `run_command`. For infinite loops, animations, interactive programs, or background servers, NEVER run unbounded commands; verify compilation/builds separately, verify logic via tests, or pass a short `timeout_seconds: 3` in `run_command`.
 5. **REPORT COMPLETION:** Provide a concise summary of files created/modified in the workspace.
 6. **SIGNAL INTENT:** Always end with `MISSION COMPLETE`.
 7. **PARALLEL TOOL CALLS (CRITICAL):** Execute as many independent operations as possible in ONE turn.

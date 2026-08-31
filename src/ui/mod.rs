@@ -49,6 +49,10 @@ pub enum Event {
     Delegation(DelegationEvent),
     /// The session has finished.
     Done,
+    /// Estimated input/prompt tokens added.
+    TokensIn(usize),
+    /// Estimated output/completion tokens added.
+    TokensOut(usize),
 }
 
 /// Abstraction over the interactive TUI and the headless raw mode.
@@ -176,6 +180,7 @@ pub async fn run_session(
                 ctx.append(Message::User { content: steer });
             }
 
+            renderer.on_event(&Event::TokensIn(ctx.token_count()));
             renderer.on_event(&Event::Status(format!("Running ({})", stream_cfg.model)));
             renderer.flush()?;
 

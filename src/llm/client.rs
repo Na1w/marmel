@@ -16,6 +16,41 @@ pub const MAX_ATTEMPTS: u32 = 3;
 /// Backoff base: sleep = `BACKOFF_BASE_MS × attempt`.
 pub const BACKOFF_BASE_MS: u64 = 1000;
 
+static GLOBAL_TOKENS_IN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GLOBAL_TOKENS_OUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn record_tokens_in(count: usize) {
+    GLOBAL_TOKENS_IN.fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn record_tokens_out(count: usize) {
+    GLOBAL_TOKENS_OUT.fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn get_global_token_counts() -> (usize, usize) {
+    (
+        GLOBAL_TOKENS_IN.load(std::sync::atomic::Ordering::Relaxed) as usize,
+        GLOBAL_TOKENS_OUT.load(std::sync::atomic::Ordering::Relaxed) as usize,
+    )
+}
+
+fn count_reply_tokens(
+    content: &str,
+    reasoning: &str,
+    tool_calls: &[crate::types::ToolCall],
+) -> usize {
+    let enc = tiktoken_rs::cl100k_base_singleton();
+    enc.encode_ordinary(content).len()
+        + enc.encode_ordinary(reasoning).len()
+        + tool_calls
+            .iter()
+            .map(|tc| {
+                1 + enc.encode_ordinary(&tc.function.name).len()
+                    + enc.encode_ordinary(&tc.function.arguments).len()
+            })
+            .sum::<usize>()
+}
+
 /// A single fully-assembled assistant reply chunk sequence.
 #[derive(Debug, Clone, Default)]
 pub struct StreamedReply {
@@ -140,6 +175,8 @@ impl ChatClient {
             req_body.model,
             req_body.messages.len()
         );
+        let prompt_tokens = crate::agent::context::count_tokens(&req_body.messages);
+        record_tokens_in(prompt_tokens);
         tracing::debug!(
             "LLM request body: {}",
             serde_json::to_string(&req_body).unwrap_or_default()
@@ -199,21 +236,28 @@ impl ChatClient {
                 on_delta,
             )? {
                 let tool_calls = map_to_tool_calls(tool_calls_map);
-                return Ok(StreamedReply {
+                let reply = StreamedReply {
                     content,
                     reasoning,
                     raw,
                     tool_calls,
-                });
+                };
+                let out_toks =
+                    count_reply_tokens(&reply.content, &reply.reasoning, &reply.tool_calls);
+                record_tokens_out(out_toks);
+                return Ok(reply);
             }
         } else {
             let tool_calls = map_to_tool_calls(tool_calls_map);
-            return Ok(StreamedReply {
+            let reply = StreamedReply {
                 content,
                 reasoning,
                 raw,
                 tool_calls,
-            });
+            };
+            let out_toks = count_reply_tokens(&reply.content, &reply.reasoning, &reply.tool_calls);
+            record_tokens_out(out_toks);
+            return Ok(reply);
         }
 
         let consume = async {
@@ -264,12 +308,15 @@ impl ChatClient {
             );
         }
 
-        Ok(StreamedReply {
+        let reply = StreamedReply {
             content,
             reasoning,
             raw,
             tool_calls,
-        })
+        };
+        let out_toks = count_reply_tokens(&reply.content, &reply.reasoning, &reply.tool_calls);
+        record_tokens_out(out_toks);
+        Ok(reply)
     }
 }
 
