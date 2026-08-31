@@ -56,6 +56,7 @@ impl Default for MonitoringConfig {
 /// A single per-specialist configuration entry from `[orchestration.specialists]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct SpecialistConfig {
     /// Source module path.
     pub module: String,
@@ -80,24 +81,6 @@ pub struct SpecialistConfig {
     pub enable_validator: Option<bool>,
     /// MCP servers whose tools this specialist is allowed to see.
     pub mcp_servers: Vec<String>,
-}
-
-impl Default for SpecialistConfig {
-    fn default() -> Self {
-        Self {
-            module: String::new(),
-            tools: Vec::new(),
-            model: None,
-            backend_url: None,
-            auth_token: None,
-            validator_model: None,
-            validator_backend_url: None,
-            validator_auth_token: None,
-            max_validator_iterations: None,
-            enable_validator: None,
-            mcp_servers: Vec::new(),
-        }
-    }
 }
 
 /// Resolved runtime configuration.
@@ -159,20 +142,20 @@ pub fn load(explicit_path: Option<&str>) -> Result<Config> {
         cfg = merge(cfg, toml::from_str::<PartialConfig>(&file)?);
     }
 
-    if cfg.auth_token.is_empty() {
-        if let Ok(token) = std::env::var("MARMEL_AUTH_TOKEN") {
-            cfg.auth_token = token;
-        }
+    if cfg.auth_token.is_empty()
+        && let Ok(token) = std::env::var("MARMEL_AUTH_TOKEN")
+    {
+        cfg.auth_token = token;
     }
-    if let Ok(url) = std::env::var("MARMEL_BACKEND_URL") {
-        if !url.trim().is_empty() {
-            cfg.backend_url = url;
-        }
+    if let Ok(url) = std::env::var("MARMEL_BACKEND_URL")
+        && !url.trim().is_empty()
+    {
+        cfg.backend_url = url;
     }
-    if let Ok(m) = std::env::var("MARMEL_MODEL") {
-        if !m.trim().is_empty() {
-            cfg.model = m;
-        }
+    if let Ok(m) = std::env::var("MARMEL_MODEL")
+        && !m.trim().is_empty()
+    {
+        cfg.model = m;
     }
 
     cfg.expand_paths();
@@ -252,30 +235,30 @@ struct PartialOrchestrationConfig {
 }
 
 fn merge(mut base: Config, partial: PartialConfig) -> Config {
-    if let Some(v) = partial.backend_url {
-        if !v.is_empty() {
-            base.backend_url = v;
-        }
+    if let Some(v) = partial.backend_url
+        && !v.is_empty()
+    {
+        base.backend_url = v;
     }
-    if let Some(v) = partial.auth_token {
-        if !v.is_empty() {
-            base.auth_token = v;
-        }
+    if let Some(v) = partial.auth_token
+        && !v.is_empty()
+    {
+        base.auth_token = v;
     }
-    if let Some(v) = partial.model {
-        if !v.is_empty() {
-            base.model = v;
-        }
+    if let Some(v) = partial.model
+        && !v.is_empty()
+    {
+        base.model = v;
     }
-    if let Some(v) = partial.ui_mode {
-        if !v.is_empty() {
-            base.ui_mode = v;
-        }
+    if let Some(v) = partial.ui_mode
+        && !v.is_empty()
+    {
+        base.ui_mode = v;
     }
-    if let Some(v) = partial.system_prompt_path {
-        if !v.as_os_str().is_empty() {
-            base.system_prompt_path = v;
-        }
+    if let Some(v) = partial.system_prompt_path
+        && !v.as_os_str().is_empty()
+    {
+        base.system_prompt_path = v;
     }
     if let Some(v) = partial.temperature {
         base.temperature = v;
@@ -324,10 +307,10 @@ fn merge(mut base: Config, partial: PartialConfig) -> Config {
         if let Some(d) = p_orch.max_recursion_depth {
             base.orchestration.max_recursion_depth = d;
         }
-        if let Some(m) = p_orch.manager_module {
-            if !m.is_empty() {
-                base.orchestration.manager_module = m;
-            }
+        if let Some(m) = p_orch.manager_module
+            && !m.is_empty()
+        {
+            base.orchestration.manager_module = m;
         }
         if !p_orch.specialists.is_empty() {
             base.orchestration.specialists.extend(p_orch.specialists);

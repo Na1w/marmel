@@ -511,7 +511,7 @@ impl TuiRenderer {
     /// F7: click within the input area places the cursor at the
     /// nearest grapheme boundary.
     fn click_to_cursor(&mut self, x: u16, area: Rect) {
-        let relative_x = x.saturating_sub(area.x as u16);
+        let relative_x = x.saturating_sub(area.x);
         let mut byte_offset = 0;
         let mut visual_x = 0;
         for grapheme in self.input_text.graphemes(true) {
@@ -690,10 +690,10 @@ impl TuiRenderer {
         if self.history_index.is_none() {
             self.input_draft = self.input_text.clone();
             self.history_index = Some(self.history.len() - 1);
-        } else if let Some(idx) = self.history_index {
-            if idx > 0 {
-                self.history_index = Some(idx - 1);
-            }
+        } else if let Some(idx) = self.history_index
+            && idx > 0
+        {
+            self.history_index = Some(idx - 1);
         }
         if let Some(idx) = self.history_index {
             self.input_text = self.history[idx].clone();
@@ -1287,7 +1287,7 @@ impl TuiRenderer {
                 height: area.height.saturating_sub(2),
             };
             let mut scrollbar_state =
-                ScrollbarState::new(max_scroll as usize).position(self.chat_scroll as usize);
+                ScrollbarState::new(max_scroll).position(self.chat_scroll as usize);
             frame.render_stateful_widget(
                 Scrollbar::new(ScrollbarOrientation::VerticalRight),
                 inner,
@@ -1538,7 +1538,7 @@ impl TuiRenderer {
                 height: details_area.height,
             };
             let mut scrollbar_state =
-                ScrollbarState::new(max_scroll as usize).position(self.subagent_scroll as usize);
+                ScrollbarState::new(max_scroll).position(self.subagent_scroll as usize);
             frame.render_stateful_widget(
                 Scrollbar::new(ScrollbarOrientation::VerticalRight),
                 inner,
@@ -1929,14 +1929,13 @@ impl Renderer for TuiRenderer {
                 // Live-track content for the active subagent (t-c304): when a
                 // specialist is running, its final-answer text streams into the
                 // subagent's `content` field so the Subagents panel shows it.
-                if self.active_agent != "Manager" {
-                    if let Some(sa) = self
+                if self.active_agent != "Manager"
+                    && let Some(sa) = self
                         .subagents
                         .iter_mut()
                         .find(|s| s.name == self.active_agent)
-                    {
-                        sa.content.push_str(text);
-                    }
+                {
+                    sa.content.push_str(text);
                 }
             }
             Event::SteerResponse(text) => {
@@ -1952,14 +1951,13 @@ impl Renderer for TuiRenderer {
                 // Live-track thinking for the active subagent (t-c304): when a
                 // specialist is running, its reasoning streams into the
                 // subagent's `thinking` field so the Subagents panel shows it.
-                if self.active_agent != "Manager" {
-                    if let Some(sa) = self
+                if self.active_agent != "Manager"
+                    && let Some(sa) = self
                         .subagents
                         .iter_mut()
                         .find(|s| s.name == self.active_agent)
-                    {
-                        sa.thinking.push_str(text);
-                    }
+                {
+                    sa.thinking.push_str(text);
                 }
             }
             Event::ToolCall(text) => {
@@ -2013,16 +2011,15 @@ impl Renderer for TuiRenderer {
                         break;
                     }
                 }
-                if !routed && self.active_agent != "Manager" {
-                    if let Some(sa) = self
+                if !routed
+                    && self.active_agent != "Manager"
+                    && let Some(sa) = self
                         .subagents
                         .iter_mut()
                         .find(|s| s.name == self.active_agent)
-                    {
-                        if sa.logs.last().map(String::as_str) != Some(text.as_str()) {
-                            sa.logs.push(text.clone());
-                        }
-                    }
+                    && sa.logs.last().map(String::as_str) != Some(text.as_str())
+                {
+                    sa.logs.push(text.clone());
                 }
             }
             Event::Delegation(de) => {

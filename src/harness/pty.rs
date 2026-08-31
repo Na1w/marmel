@@ -70,6 +70,41 @@ pub struct PtySession {
     pub pid: i32,
 }
 
+/// Build a sandboxed shell command, executing via Landlock on Linux, sh on macOS/Unix, or cmd on Windows.
+pub fn build_sandboxed_command(command: &str, cwd: &std::path::Path) -> CommandBuilder {
+    if cfg!(target_os = "windows") {
+        let mut cmd = CommandBuilder::new("cmd");
+        cmd.args(["/C", command]);
+        cmd.cwd(cwd);
+        cmd
+    } else {
+        let wrapped = format!(
+            "stty -echo 2>/dev/null || true; ulimit -f {ULIMIT_FILE_BLOCKS} 2>/dev/null || ulimit -f {ULIMIT_FILE_BLOCKS_FALLBACK} 2>/dev/null; {command}"
+        );
+
+        let is_marmel_binary = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
+            .is_some_and(|name| name == "marmel" || name == "marmel.exe");
+
+        if cfg!(target_os = "linux") && is_marmel_binary {
+            let exe = std::env::current_exe().unwrap();
+            let mut cmd = CommandBuilder::new(exe);
+            cmd.arg("--internal-sandbox-exec");
+            cmd.arg(cwd.to_string_lossy().as_ref());
+            cmd.arg(&wrapped);
+            cmd.cwd(cwd);
+            cmd
+        } else {
+            let mut cmd = CommandBuilder::new("sh");
+            cmd.arg("-c");
+            cmd.arg(&wrapped);
+            cmd.cwd(cwd);
+            cmd
+        }
+    }
+}
+
 impl PtySession {
     /// Wrap `command` in the REQ-TOOL-001 sandbox and spawn it into a PTY.
     pub fn spawn(command: &str) -> Result<Self, ToolError> {
@@ -81,15 +116,8 @@ impl PtySession {
             pixel_height: 0,
         })?;
 
-        let wrapped = format!(
-            "stty -echo; ulimit -f {ULIMIT_FILE_BLOCKS} 2>/dev/null || ulimit -f {ULIMIT_FILE_BLOCKS_FALLBACK} 2>/dev/null; {command}"
-        );
-        let mut cmd = CommandBuilder::new("sh");
-        if let Ok(cwd) = std::env::current_dir() {
-            cmd.cwd(cwd);
-        }
-        cmd.arg("-c");
-        cmd.arg(&wrapped);
+        let cur_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let cmd = build_sandboxed_command(command, &cur_dir);
         let child = pair.slave.spawn_command(cmd)?;
         // Release the slave side now that the child is spawned.
         drop(pair.slave);
@@ -303,19 +331,7 @@ impl PtyManager {
             })
             .map_err(|e| ToolError::Execution(anyhow::anyhow!("Failed to create PTY: {e}")))?;
 
-        let mut cmd = if cfg!(target_os = "windows") {
-            let mut c = CommandBuilder::new("cmd");
-            c.args(["/C", command_str]);
-            c
-        } else {
-            let mut c = CommandBuilder::new("sh");
-            let wrapped_cmd = format!(
-                "stty -echo 2>/dev/null || true; ulimit -f {ULIMIT_FILE_BLOCKS} 2>/dev/null || ulimit -f {ULIMIT_FILE_BLOCKS_FALLBACK} 2>/dev/null; {command_str}"
-            );
-            c.args(["-c", &wrapped_cmd]);
-            c
-        };
-        cmd.cwd(cwd);
+        let cmd = build_sandboxed_command(command_str, cwd);
 
         let child = pair.slave.spawn_command(cmd).map_err(|e| {
             ToolError::Execution(anyhow::anyhow!("Failed to spawn command in PTY: {e}"))
@@ -629,6 +645,11 @@ pub fn kill_process_group(pid: i32) -> Result<(), std::io::Error> {
     }
 }
 
+#[cfg(not(unix))]
+pub fn kill_process_group(_pid: i32) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,11 +671,11 @@ mod tests {
         // Poll until the background pid is recorded.
         let mut bg_pid: Option<i32> = None;
         for _ in 0..50 {
-            if let Ok(raw) = std::fs::read_to_string(&pidfile) {
-                if let Ok(p) = raw.trim().parse::<i32>() {
-                    bg_pid = Some(p);
-                    break;
-                }
+            if let Ok(raw) = std::fs::read_to_string(&pidfile)
+                && let Ok(p) = raw.trim().parse::<i32>()
+            {
+                bg_pid = Some(p);
+                break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }

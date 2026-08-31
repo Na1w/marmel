@@ -310,10 +310,8 @@ where
 
     if let Ok(decision) = serde_json::from_str::<SteerDecision>(json_text) {
         stats.record_steer_arbitration();
-        if !did_stream_response {
-            if let Some(ref resp) = decision.response {
-                on_delta(resp);
-            }
+        if !did_stream_response && let Some(ref resp) = decision.response {
+            on_delta(resp);
         }
         Some(decision)
     } else {
@@ -387,26 +385,14 @@ pub fn resolve_steer_outcome(
 pub async fn arbitrate_steer_stream_with_fallback<F>(
     client: &ChatClient,
     stats: &HarnessStats,
-    main_goal: &str,
-    plan_content: &str,
-    active_subtask: &str,
-    user_message: &str,
+    ctx: SteerContext<'_>,
     has_active_subtasks: bool,
     on_delta: F,
 ) -> SteerOutcome
 where
     F: FnMut(&str),
 {
-    let decision = arbitrate_steer_stream(
-        client,
-        stats,
-        main_goal,
-        plan_content,
-        active_subtask,
-        user_message,
-        on_delta,
-    )
-    .await;
+    let decision = arbitrate_steer_context_stream(client, stats, ctx, on_delta).await;
     resolve_steer_outcome(decision, has_active_subtasks)
 }
 
@@ -416,23 +402,10 @@ where
 pub async fn arbitrate_steer_with_fallback(
     client: &ChatClient,
     stats: &HarnessStats,
-    main_goal: &str,
-    plan_content: &str,
-    active_subtask: &str,
-    user_message: &str,
+    ctx: SteerContext<'_>,
     has_active_subtasks: bool,
 ) -> SteerOutcome {
-    arbitrate_steer_stream_with_fallback(
-        client,
-        stats,
-        main_goal,
-        plan_content,
-        active_subtask,
-        user_message,
-        has_active_subtasks,
-        |_| {},
-    )
-    .await
+    arbitrate_steer_stream_with_fallback(client, stats, ctx, has_active_subtasks, |_| {}).await
 }
 
 #[cfg(test)]

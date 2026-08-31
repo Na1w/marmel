@@ -315,6 +315,31 @@ Raw mode is pipe-friendly and streams labelled events to stdout:
 
 ---
 
+## Sandboxing & Cross-Platform Security Model
+
+Marmel implements a multi-tiered security model to ensure agent operations remain strictly confined to the project workspace across all major operating systems.
+
+### 1. Cross-Platform Path Confinement (Linux, macOS, Windows)
+
+All built-in file and search tools (`read_file`, `write_file`, `replace`, `grep_search`, `glob`) pass every target path through canonical workspace validation (`resolve_safe_path`):
+- **Workspace Confinement:** All operations are strictly restricted to the current workspace root directory and `/tmp`.
+- **Path Traversal Defense:** Escapes via `../` (e.g. `../../etc/passwd` or `../../.ssh/id_rsa`) and external absolute paths are intercepted in-process and rejected with `ToolError::Forbidden ("access denied: path escapes workspace root")`.
+- **Zero Dependencies:** Works identically on Linux, macOS, and Windows with zero external prerequisites.
+
+### 2. Linux Landlock LSM Process Isolation (Linux)
+
+For terminal command execution (`run_command` and interactive PTY sessions), Marmel leverages **Linux Landlock LSM** (Linux kernel $\ge 5.13$) for unprivileged kernel-enforced sandboxing:
+- **Workspace & Build Caches (Read/Write/Exec):** Full access is granted to the workspace root, `/tmp`, `~/.cargo`, and `~/.cache`. This allows package managers (`cargo build`, `cargo add`, `npm`, `pip`) to download, cache, and compile dependencies normally.
+- **System Toolchains (Read-Only + Exec):** System binaries and libraries (`/usr`, `/bin`, `/lib`, `/lib64`, `/etc`, `/dev`, `/proc`, `/sys`) and `~/.rustup` toolchains are strictly read-only.
+- **Sensitive Directories (Completely Blocked):** Critical directories such as `~/.ssh`, `~/.gnupg`, and other directories outside the workspace are blocked by the kernel.
+- **Inherited Sub-process Protection:** Landlock restrictions are applied via `--internal-sandbox-exec` right before the subshell starts, permanently confining bash, cargo, python, and any spawned sub-processes.
+
+### 3. macOS & Windows Compatibility
+
+On non-Linux systems (macOS and Windows), Landlock is conditionally bypassed while **Path Confinement**, working-directory encapsulation, and process-group cleanup remain 100% active.
+
+---
+
 ## Specialist Roles
 
 | Role | Focus | Tool allowlist |

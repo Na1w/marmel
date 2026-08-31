@@ -201,10 +201,10 @@ impl HttpSseConnection {
                 })?;
             match ev {
                 Some(Ok(event)) => {
-                    if let Ok(parsed) = serde_json::from_str::<JsonRpcResponse>(&event.data) {
-                        if parsed.id_matches(id) {
-                            return parsed.into_result(&self.server_name);
-                        }
+                    if let Ok(parsed) = serde_json::from_str::<JsonRpcResponse>(&event.data)
+                        && parsed.id_matches(id)
+                    {
+                        return parsed.into_result(&self.server_name);
                     }
                 }
                 Some(Err(e)) => {

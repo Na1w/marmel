@@ -37,10 +37,10 @@ pub fn set_status_sender(tx: tokio::sync::mpsc::UnboundedSender<String>) {
 
 /// Emit a status update to the active UI renderer.
 pub fn emit_status(msg: impl Into<String>) {
-    if let Ok(lock) = STATUS_SENDER.read() {
-        if let Some(tx) = lock.as_ref() {
-            let _ = tx.send(msg.into());
-        }
+    if let Ok(lock) = STATUS_SENDER.read()
+        && let Some(tx) = lock.as_ref()
+    {
+        let _ = tx.send(msg.into());
     }
 }
 
@@ -746,19 +746,19 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
     #[cfg(not(test))]
     {
         let plan = Plan::default();
-        if let Some(ref tid) = req.task_id {
-            if let Ok(Some(content)) = plan.read() {
-                let tid_lower = tid.to_ascii_lowercase();
-                let is_checked = content.lines().any(|line| {
-                    let lower = line.to_ascii_lowercase();
-                    lower.contains(&tid_lower) && (line.contains("[x]") || line.contains("[X]"))
-                });
-                if is_checked {
-                    tracing::warn!("Rejecting re-delegation of already completed task [{tid}]");
-                    return Ok(ToolResult::err(format!(
-                        "Task '{tid}' is already completed and checked off in the execution plan. Do not re-delegate completed tasks. Proceed with your final report synthesis."
-                    )));
-                }
+        if let Some(ref tid) = req.task_id
+            && let Ok(Some(content)) = plan.read()
+        {
+            let tid_lower = tid.to_ascii_lowercase();
+            let is_checked = content.lines().any(|line| {
+                let lower = line.to_ascii_lowercase();
+                lower.contains(&tid_lower) && (line.contains("[x]") || line.contains("[X]"))
+            });
+            if is_checked {
+                tracing::warn!("Rejecting re-delegation of already completed task [{tid}]");
+                return Ok(ToolResult::err(format!(
+                    "Task '{tid}' is already completed and checked off in the execution plan. Do not re-delegate completed tasks. Proceed with your final report synthesis."
+                )));
             }
         }
     }

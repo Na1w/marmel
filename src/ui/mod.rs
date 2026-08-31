@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// A specialist subagent shown in the bottom-right panel.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SubagentDetail {
     /// The specialist role id (e.g. `coder`, `researcher`).
     pub name: String,
@@ -28,21 +28,6 @@ pub struct SubagentDetail {
     pub content: String,
     /// Whether this subagent is currently running (between Started/Completed).
     pub is_active: bool,
-}
-
-impl Default for SubagentDetail {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            task_id: None,
-            prompt: String::new(),
-            started_at: None,
-            logs: Vec::new(),
-            thinking: String::new(),
-            content: String::new(),
-            is_active: false,
-        }
-    }
 }
 
 /// A single agent event dispatched to the active renderer.
@@ -120,15 +105,15 @@ pub async fn run_session(
     };
     ctx.set_goal(goal.clone());
 
-    if let Some(mgr) = manager.as_ref() {
-        if let Ok(Some(deliverable)) = mgr.recover_frozen().await {
-            let task_info = deliverable.task_id.as_deref().unwrap_or("recovered");
-            renderer.on_event(&Event::ToolResult(format!(
-                "[Recovered task {task_info}] {}",
-                deliverable.content
-            )));
-            renderer.flush()?;
-        }
+    if let Some(mgr) = manager.as_ref()
+        && let Ok(Some(deliverable)) = mgr.recover_frozen().await
+    {
+        let task_info = deliverable.task_id.as_deref().unwrap_or("recovered");
+        renderer.on_event(&Event::ToolResult(format!(
+            "[Recovered task {task_info}] {}",
+            deliverable.content
+        )));
+        renderer.flush()?;
     }
 
     let client = ChatClient::from_config(cfg);

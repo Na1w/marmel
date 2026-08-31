@@ -19,7 +19,7 @@ use std::collections::VecDeque;
 
 use crate::harness::HarnessStats;
 use crate::tool_names::{TOOL_GREP_SEARCH, TOOL_READ_FILE};
-use crate::types::{Message, ToolCall, ToolFunction};
+use crate::types::{Message, ToolCall};
 
 /// Buffer length (number of tool-call records) for the repetition detector.
 const TOOL_BUFFER_CAPACITY: usize = 50;
@@ -222,10 +222,10 @@ impl XMLToolRescue {
             scan_from = end;
         }
 
-        if !calls.is_empty() {
-            if let Some(stats) = &self.stats {
-                stats.record_xml_rescue();
-            }
+        if !calls.is_empty()
+            && let Some(stats) = &self.stats
+        {
+            stats.record_xml_rescue();
         }
         calls
     }
@@ -402,10 +402,7 @@ fn make_rescued_call(name: String, arguments: serde_json::Value) -> ToolCall {
         serde_json::Value::String(s) => s,
         other => other.to_string(),
     };
-    ToolCall {
-        id: format!("call_text_{}", uuid_v4()),
-        function: ToolFunction { name, arguments },
-    }
+    ToolCall::new(format!("call_text_{}", uuid_v4()), name, arguments)
 }
 
 /// Generate a UUID v4 string without external runtime deps beyond `uuid`.
@@ -527,7 +524,7 @@ impl ToolRepetitionDetector {
         // Walk back from the tail, requiring strict alternation: position at
         // even distance from the tail must equal `a`, odd distance must equal `b`.
         for i in (0..n - 1).rev() {
-            let expected = if (n - 1 - i) % 2 == 0 { a } else { b };
+            let expected = if (n - 1 - i).is_multiple_of(2) { a } else { b };
             if !all[i].semantically_eq(expected) {
                 // Alternation broke at distance d = n-1-i from the tail.
                 let d = n - 1 - i;
@@ -1259,18 +1256,10 @@ mod tests {
 
     #[test]
     fn test_monitor_prune_orphan_tool_messages() {
-        use crate::types::ToolFunction;
-
         let assistant = Message::Assistant {
             content: Some("calling".to_string()),
             reasoning_content: None,
-            tool_calls: vec![ToolCall {
-                id: "call_1".to_string(),
-                function: ToolFunction {
-                    name: "read_file".to_string(),
-                    arguments: r#"{"path":"a.rs"}"#.to_string(),
-                },
-            }],
+            tool_calls: vec![ToolCall::new("call_1", "read_file", r#"{"path":"a.rs"}"#)],
         };
         let orphan = Message::Tool {
             tool_call_id: "call_orphan".to_string(),
@@ -1305,26 +1294,12 @@ mod tests {
 
     #[test]
     fn test_monitor_prune_orphan_keeps_all_when_all_matched() {
-        use crate::types::ToolFunction;
-
         let assistant = Message::Assistant {
             content: Some("calling".to_string()),
             reasoning_content: None,
             tool_calls: vec![
-                ToolCall {
-                    id: "call_1".to_string(),
-                    function: ToolFunction {
-                        name: "read_file".to_string(),
-                        arguments: r#"{"path":"a.rs"}"#.to_string(),
-                    },
-                },
-                ToolCall {
-                    id: "call_2".to_string(),
-                    function: ToolFunction {
-                        name: "grep_search".to_string(),
-                        arguments: r#"{"pattern":"x"}"#.to_string(),
-                    },
-                },
+                ToolCall::new("call_1", "read_file", r#"{"path":"a.rs"}"#),
+                ToolCall::new("call_2", "grep_search", r#"{"pattern":"x"}"#),
             ],
         };
         let t1 = Message::Tool {

@@ -3,7 +3,7 @@
 
 use marmennill::agents::Agent;
 use marmennill::orchestrator::SpecialistRegistry;
-use marmennill::types::{Message, ToolCall, ToolDef, ToolFunction};
+use marmennill::types::{Message, ToolCall, ToolDef};
 
 #[test]
 fn test_specialist_tool_filtering_and_allowlists() {
@@ -79,13 +79,7 @@ fn test_subagent_history_message_sequence() {
     assert_eq!(msgs[1].role(), "user");
 
     // Turn 1: Model calls read_file
-    let tc1 = ToolCall {
-        id: "call_abc123".to_string(),
-        function: ToolFunction {
-            name: "read_file".to_string(),
-            arguments: r#"{"path":"src/main.rs"}"#.to_string(),
-        },
-    };
+    let tc1 = ToolCall::new("call_abc123", "read_file", r#"{"path":"src/main.rs"}"#);
     engine.append(Message::Assistant {
         content: Some("Checking existing main.rs".to_string()),
         reasoning_content: None,

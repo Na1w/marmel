@@ -15,6 +15,36 @@ struct CliArgs {
 }
 
 fn main() -> Result<()> {
+    let mut raw_args = std::env::args().skip(1);
+    if let Some(first) = raw_args.next()
+        && first == "--internal-sandbox-exec"
+    {
+        let cwd = raw_args.next().unwrap_or_else(|| ".".to_string());
+        let command = raw_args.next().unwrap_or_default();
+        let _ = harness::sandbox::apply_sandbox(std::path::Path::new(&cwd));
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .current_dir(&cwd)
+                .exec();
+            eprintln!("Failed to exec shell in sandbox: {err}");
+            std::process::exit(1);
+        }
+        #[cfg(not(unix))]
+        {
+            let mut child = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .current_dir(&cwd)
+                .spawn()?;
+            let status = child.wait()?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    }
+
     let args = parse_args();
     let cfg = config::load(args.config.as_deref())?;
 
@@ -26,10 +56,10 @@ fn main() -> Result<()> {
         .build()?;
 
     // Boot MCP servers if configured
-    if !cfg.mcp_servers.is_empty() {
-        if let Ok(mcp_mgr) = rt.block_on(mcp::McpManager::boot(&cfg.mcp_servers)) {
-            harness::set_mcp_manager(std::sync::Arc::new(mcp_mgr));
-        }
+    if !cfg.mcp_servers.is_empty()
+        && let Ok(mcp_mgr) = rt.block_on(mcp::McpManager::boot(&cfg.mcp_servers))
+    {
+        harness::set_mcp_manager(std::sync::Arc::new(mcp_mgr));
     }
 
     let manager = Some(boot_manager(&cfg));
@@ -90,33 +120,8 @@ fn parse_args() -> CliArgs {
 const DEFAULT_MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 const LOG_BACKUPS: u32 = 3;
 
-fn backup_path(path: &std::path::Path, n: u32) -> std::path::PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(format!(".{n}"));
-    std::path::PathBuf::from(name)
-}
-
 fn rotate_log(path: &std::path::Path, max_bytes: u64, backups: u32) {
-    let size = match std::fs::metadata(path) {
-        Ok(m) => m.len(),
-        Err(_) => return,
-    };
-    if size <= max_bytes {
-        return;
-    }
-
-    for i in (1..backups).rev() {
-        let src = backup_path(path, i);
-        let dst = backup_path(path, i + 1);
-        let _ = std::fs::rename(&src, &dst);
-    }
-
-    let _ = std::fs::rename(path, backup_path(path, 1));
-
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path);
+    harness::workspace::rotate_log_file(path, max_bytes, backups);
 }
 
 fn setup_panic_hook(use_raw: bool) {

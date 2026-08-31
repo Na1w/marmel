@@ -162,13 +162,13 @@ where
         } = &mut assistant
         {
             tool_calls.extend(reply.tool_calls);
-            if tool_calls.is_empty() {
-                if let Some(text) = content {
-                    let monitor = crate::harness::monitor::HarnessMonitor::with_new_stats();
-                    let rescued = monitor.rescue_xml(text);
-                    if !rescued.is_empty() {
-                        *tool_calls = rescued;
-                    }
+            if tool_calls.is_empty()
+                && let Some(text) = content
+            {
+                let monitor = crate::harness::monitor::HarnessMonitor::with_new_stats();
+                let rescued = monitor.rescue_xml(text);
+                if !rescued.is_empty() {
+                    *tool_calls = rescued;
                 }
             }
         }
@@ -270,13 +270,13 @@ where
         } = &mut assistant
         {
             tool_calls.extend(reply.tool_calls);
-            if tool_calls.is_empty() {
-                if let Some(text) = content {
-                    let monitor = crate::harness::monitor::HarnessMonitor::with_new_stats();
-                    let rescued = monitor.rescue_xml(text);
-                    if !rescued.is_empty() {
-                        *tool_calls = rescued;
-                    }
+            if tool_calls.is_empty()
+                && let Some(text) = content
+            {
+                let monitor = crate::harness::monitor::HarnessMonitor::with_new_stats();
+                let rescued = monitor.rescue_xml(text);
+                if !rescued.is_empty() {
+                    *tool_calls = rescued;
                 }
             }
         }

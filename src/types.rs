@@ -51,7 +51,31 @@ impl Message {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
+    #[serde(default = "default_tool_type")]
+    #[serde(rename = "type")]
+    pub kind: String,
     pub function: ToolFunction,
+}
+
+fn default_tool_type() -> String {
+    "function".to_string()
+}
+
+impl ToolCall {
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            kind: "function".to_string(),
+            function: ToolFunction {
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -444,7 +468,7 @@ impl ToolDef {
                     }
                     // Strip empty $defs / definitions
                     if (k == "$defs" || k == "definitions")
-                        && v.as_object().map_or(false, |o| o.is_empty())
+                        && v.as_object().is_some_and(|o| o.is_empty())
                     {
                         continue;
                     }
@@ -605,5 +629,22 @@ mod tests {
                 "required": ["path"]
             })
         );
+    }
+
+    #[test]
+    fn tool_call_serializes_with_type_function() {
+        let tc = ToolCall::new("call_123", "create_plan", r#"{"plan_markdown":"test"}"#);
+        let val = serde_json::to_value(&tc).unwrap();
+        assert_eq!(val["type"], "function");
+        assert_eq!(val["id"], "call_123");
+        assert_eq!(val["function"]["name"], "create_plan");
+    }
+
+    #[test]
+    fn tool_call_deserializes_missing_type_as_function() {
+        let json_str = r#"{"id":"call_456","function":{"name":"read_file","arguments":"{}"}}"#;
+        let tc: ToolCall = serde_json::from_str(json_str).unwrap();
+        assert_eq!(tc.kind, "function");
+        assert_eq!(tc.id, "call_456");
     }
 }

@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use super::*;
+
     use crate::mcp::McpTool;
     use crate::mcp::http::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
     use serde_json::{Value, json};
@@ -129,7 +129,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_call_tool_result_parsing() {
-        let server_name = "test-server";
+        let _server_name = "test-server";
 
         // Case 1: Standard content array
         let result1 = json!({

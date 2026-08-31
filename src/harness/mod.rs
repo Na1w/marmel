@@ -12,6 +12,7 @@ use std::sync::Arc;
 pub mod fs;
 pub mod monitor;
 pub mod pty;
+pub mod sandbox;
 pub mod search;
 pub mod workspace;
 
@@ -177,17 +178,16 @@ fn archive_plan() -> Result<ToolResult, ToolError> {
 
 /// The primary dispatcher entry point, shared by the Manager and specialists.
 pub fn dispatch(tool: &ToolInvocation) -> Result<ToolResult, ToolError> {
-    if let Some(mcp) = get_mcp_manager() {
-        if mcp.has_tool(&tool.name) {
-            let mcp_res = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(mcp.call_tool(&tool.name, &tool.arguments))
-            });
-            return match mcp_res {
-                Ok(content) => Ok(ToolResult::ok(content)),
-                Err(e) => Ok(ToolResult::err(format!("MCP tool error: {e}"))),
-            };
-        }
+    if let Some(mcp) = get_mcp_manager()
+        && mcp.has_tool(&tool.name)
+    {
+        let mcp_res = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(mcp.call_tool(&tool.name, &tool.arguments))
+        });
+        return match mcp_res {
+            Ok(content) => Ok(ToolResult::ok(content)),
+            Err(e) => Ok(ToolResult::err(format!("MCP tool error: {e}"))),
+        };
     }
 
     let res = match tool.name.as_str() {
@@ -313,16 +313,16 @@ pub fn dispatch_for(tool: &ToolInvocation, caller: ToolCaller) -> Result<ToolRes
 
 fn dispatch_manager(tool: &ToolInvocation) -> Result<ToolResult, ToolError> {
     let name = tool.name.as_str();
-    if let Some(mcp) = get_mcp_manager() {
-        if mcp.has_tool(name) {
-            let mcp_res = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(mcp.call_tool(name, &tool.arguments))
-            });
-            return match mcp_res {
-                Ok(content) => Ok(ToolResult::ok(content)),
-                Err(e) => Ok(ToolResult::err(format!("MCP tool error: {e}"))),
-            };
-        }
+    if let Some(mcp) = get_mcp_manager()
+        && mcp.has_tool(name)
+    {
+        let mcp_res = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(mcp.call_tool(name, &tool.arguments))
+        });
+        return match mcp_res {
+            Ok(content) => Ok(ToolResult::ok(content)),
+            Err(e) => Ok(ToolResult::err(format!("MCP tool error: {e}"))),
+        };
     }
 
     match name {
@@ -382,16 +382,16 @@ fn dispatch_specialist(
         });
     }
 
-    if let Some(mcp) = get_mcp_manager() {
-        if mcp.has_tool(name) {
-            let mcp_res = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(mcp.call_tool(name, &tool.arguments))
-            });
-            return match mcp_res {
-                Ok(content) => Ok(ToolResult::ok(content)),
-                Err(e) => Ok(ToolResult::err(format!("MCP tool error: {e}"))),
-            };
-        }
+    if let Some(mcp) = get_mcp_manager()
+        && mcp.has_tool(name)
+    {
+        let mcp_res = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(mcp.call_tool(name, &tool.arguments))
+        });
+        return match mcp_res {
+            Ok(content) => Ok(ToolResult::ok(content)),
+            Err(e) => Ok(ToolResult::err(format!("MCP tool error: {e}"))),
+        };
     }
 
     let registry = crate::orchestrator::SpecialistRegistry::canonical();
@@ -474,7 +474,7 @@ mod tests {
             "summary": "Completed initial refactoring steps."
         });
         let result = handle_rebirth(&mut engine, &args).unwrap();
-        assert_eq!(result.is_error, false);
+        assert!(!result.is_error);
         assert_eq!(engine.messages().len(), 4);
     }
 
@@ -489,7 +489,7 @@ mod tests {
             }),
         };
         let res = dispatch_for(&invocation, ToolCaller::Manager).unwrap();
-        assert_eq!(res.is_error, false);
+        assert!(!res.is_error);
         assert!(res.content.contains("MISSION COMPLETE"));
     }
 }

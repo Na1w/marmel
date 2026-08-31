@@ -134,6 +134,17 @@ impl ChatClient {
             req_body.model = self.model.clone();
         }
 
+        tracing::info!(
+            "Calling LLM backend at {} (model: {}, messages: {})",
+            url,
+            req_body.model,
+            req_body.messages.len()
+        );
+        tracing::debug!(
+            "LLM request body: {}",
+            serde_json::to_string(&req_body).unwrap_or_default()
+        );
+
         let mut builder = client.post(&url).json(&req_body);
         if !self.auth_token.is_empty() {
             builder = builder.bearer_auth(&self.auth_token);
@@ -147,7 +158,7 @@ impl ChatClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            tracing::warn!("LLM backend returned HTTP {status}: {body}");
+            tracing::error!("LLM backend returned HTTP {status}: {body}");
             return Err(ChatError::HttpStatus { status, body });
         }
 
@@ -239,6 +250,20 @@ impl ChatClient {
             .map_err(|_| ChatError::ReadTimeout)??;
 
         let tool_calls = map_to_tool_calls(tool_calls_map);
+        tracing::info!(
+            "LLM reply completed: {} content chars, {} tool calls",
+            content.len(),
+            tool_calls.len()
+        );
+        for tc in &tool_calls {
+            tracing::info!(
+                "Tool call parsed: {} (id: {}) args: {}",
+                tc.function.name,
+                tc.id,
+                tc.function.arguments
+            );
+        }
+
         Ok(StreamedReply {
             content,
             reasoning,
@@ -252,9 +277,9 @@ fn map_to_tool_calls(
     map: std::collections::BTreeMap<usize, (Option<String>, String, String)>,
 ) -> Vec<crate::types::ToolCall> {
     map.into_values()
-        .map(|(id, name, arguments)| crate::types::ToolCall {
-            id: id.unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4())),
-            function: crate::types::ToolFunction { name, arguments },
+        .map(|(id, name, arguments)| {
+            let call_id = id.unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
+            crate::types::ToolCall::new(call_id, name, arguments)
         })
         .collect()
 }

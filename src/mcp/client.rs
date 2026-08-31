@@ -249,7 +249,7 @@ impl StdioMcpConnection {
 }
 
 pub enum McpClient {
-    Stdio(Mutex<StdioMcpConnection>),
+    Stdio(Box<Mutex<StdioMcpConnection>>),
     HttpSse(Mutex<HttpSseConnection>),
     /// Test-only mock used to assert the routing chain without a live server.
     #[cfg(test)]
@@ -294,7 +294,7 @@ impl McpClient {
             }
             #[cfg(test)]
             McpClient::Mock(lock) => {
-                let mut conn = lock.lock().await;
+                let conn = lock.lock().await;
                 conn.called_names.lock().await.push(name.to_string());
                 Ok("mock-result".to_string())
             }
@@ -339,7 +339,7 @@ impl McpManager {
             if cfg.command.is_some() {
                 match StdioMcpConnection::spawn(name, cfg).await {
                     Ok(conn) => {
-                        let client = Arc::new(McpClient::Stdio(Mutex::new(conn)));
+                        let client = Arc::new(McpClient::Stdio(Box::new(Mutex::new(conn))));
                         if let Ok(tools) = client.list_tools().await {
                             for tool in tools {
                                 manager.tools.insert(tool.qualified_name(), tool);

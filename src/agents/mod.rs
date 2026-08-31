@@ -474,11 +474,11 @@ async fn run_specialist_live(
             tools.push(tool);
         }
     }
-    if let Some(mcp) = crate::harness::get_mcp_manager() {
-        if let Some(sc) = specialist_cfg {
-            for tool in mcp.tools_for_servers(&sc.mcp_servers) {
-                tools.push(crate::types::ToolDef::from_mcp(&tool));
-            }
+    if let Some(mcp) = crate::harness::get_mcp_manager()
+        && let Some(sc) = specialist_cfg
+    {
+        for tool in mcp.tools_for_servers(&sc.mcp_servers) {
+            tools.push(crate::types::ToolDef::from_mcp(&tool));
         }
     }
 

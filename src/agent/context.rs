@@ -555,20 +555,14 @@ impl ContextEngineFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ToolCall, ToolFunction};
+    use crate::types::ToolCall;
 
     /// Build an assistant message carrying one tool call with the given id.
     fn assistant_with_tool(id: &str) -> Message {
         Message::Assistant {
             content: Some("let me call a tool".to_string()),
             reasoning_content: None,
-            tool_calls: vec![ToolCall {
-                id: id.to_string(),
-                function: ToolFunction {
-                    name: "read_file".to_string(),
-                    arguments: "{\"path\":\"x\"}".to_string(),
-                },
-            }],
+            tool_calls: vec![ToolCall::new(id, "read_file", "{\"path\":\"x\"}")],
         }
     }
 

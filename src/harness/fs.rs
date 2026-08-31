@@ -31,6 +31,68 @@ pub fn map_path(path: &str) -> PathBuf {
     }
 }
 
+/// Resolve a path securely, ensuring it stays confined inside the workspace root.
+///
+/// Prevents path traversal attacks (e.g. `../../etc/passwd` or absolute escapes).
+pub fn resolve_safe_path(path: &str, tool: &str) -> Result<PathBuf, ToolError> {
+    let cur_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let canonical_root = cur_dir.canonicalize().unwrap_or_else(|_| cur_dir.clone());
+    let canonical_temp = std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir());
+
+    let raw_target = if path.starts_with(WORKSPACE_PREFIX) {
+        let relative = path.strip_prefix(WORKSPACE_PREFIX).unwrap_or(path);
+        let clean_relative = relative.strip_prefix('/').unwrap_or(relative);
+        canonical_root.join(clean_relative)
+    } else if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        canonical_root.join(path)
+    };
+
+    let canonical_target = if raw_target.exists() {
+        raw_target
+            .canonicalize()
+            .map_err(|e| ToolError::BadArguments {
+                tool: tool.to_string(),
+                detail: format!("failed to resolve path '{path}': {e}"),
+            })?
+    } else {
+        let mut cur = raw_target.clone();
+        let mut components = Vec::new();
+        while !cur.exists() {
+            if let Some(name) = cur.file_name() {
+                components.push(name.to_os_string());
+                if let Some(parent) = cur.parent() {
+                    cur = parent.to_path_buf();
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        let canonical_ancestor = cur.canonicalize().unwrap_or(cur);
+        let mut resolved = canonical_ancestor;
+        for part in components.into_iter().rev() {
+            resolved.push(part);
+        }
+        resolved
+    };
+
+    if !canonical_target.starts_with(&canonical_root)
+        && !canonical_target.starts_with(&canonical_temp)
+    {
+        return Err(ToolError::Forbidden {
+            tool: tool.to_string(),
+            caller: format!("access denied: path '{}' escapes workspace root", path),
+        });
+    }
+
+    Ok(canonical_target)
+}
+
 /// `read_file(path, offset, limit)` — reads a UTF-8 file window by *characters*.
 ///
 /// - `offset` is 0-based character index (default: 0).
@@ -41,7 +103,8 @@ pub fn read_file(args: &Value) -> Result<ToolResult, ToolError> {
     let offset = usize_arg(args, "offset", 0, TOOL_READ_FILE)?;
     let limit = usize_arg(args, "limit", 8000, TOOL_READ_FILE)?.min(8000);
 
-    let raw_bytes = std::fs::read(map_path(path)).map_err(anyhow::Error::from)?;
+    let safe_path = resolve_safe_path(path, TOOL_READ_FILE)?;
+    let raw_bytes = std::fs::read(&safe_path).map_err(anyhow::Error::from)?;
     let content = String::from_utf8_lossy(&raw_bytes);
     let total_chars = content.chars().count();
 
@@ -69,7 +132,8 @@ pub fn replace(args: &Value) -> Result<ToolResult, ToolError> {
     let old_str = str_arg(args, "old_str", TOOL_REPLACE)?;
     let new_str = str_arg(args, "new_str", TOOL_REPLACE)?;
 
-    let content = std::fs::read_to_string(map_path(path)).map_err(anyhow::Error::from)?;
+    let safe_path = resolve_safe_path(path, TOOL_REPLACE)?;
+    let content = std::fs::read_to_string(&safe_path).map_err(anyhow::Error::from)?;
     let count = content.matches(old_str).count();
 
     if count == 0 {
@@ -85,20 +149,20 @@ pub fn replace(args: &Value) -> Result<ToolResult, ToolError> {
 
     let new_content = content.replace(old_str, new_str);
     // Atomic single-match write: write to a temp file in the same dir, then rename.
-    let p = map_path(path);
-    let dir = p
+    let dir = safe_path
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let tmp = dir.join(format!(
         ".{}.tmp.{}",
-        p.file_name()
+        safe_path
+            .file_name()
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default(),
         std::process::id()
     ));
     std::fs::write(&tmp, new_content).map_err(anyhow::Error::from)?;
-    std::fs::rename(&tmp, &p).map_err(anyhow::Error::from)?;
+    std::fs::rename(&tmp, &safe_path).map_err(anyhow::Error::from)?;
     Ok(ToolResult::ok("replace applied"))
 }
 
@@ -108,15 +172,15 @@ pub fn replace(args: &Value) -> Result<ToolResult, ToolError> {
 pub fn write_file(args: &Value) -> Result<ToolResult, ToolError> {
     let path = str_arg(args, "path", TOOL_WRITE_FILE)?;
     let content = str_arg(args, "content", TOOL_WRITE_FILE)?;
-    let p = map_path(path);
-    if let Some(parent) = p.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(anyhow::Error::from)?;
-            // Ensure 0o755 permissions on the newly created parents.
-            set_dir_permissions_755(parent);
-        }
+    let safe_path = resolve_safe_path(path, TOOL_WRITE_FILE)?;
+    if let Some(parent) = safe_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(anyhow::Error::from)?;
+        // Ensure 0o755 permissions on the newly created parents.
+        set_dir_permissions_755(parent);
     }
-    std::fs::write(&p, content).map_err(anyhow::Error::from)?;
+    std::fs::write(&safe_path, content).map_err(anyhow::Error::from)?;
     Ok(ToolResult::ok(format!(
         "wrote {} bytes to {}",
         content.len(),
@@ -429,5 +493,30 @@ mod tests {
         assert!(r.content.starts_with(&expected_slice));
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_harness_path_confinement_sandbox() {
+        // Valid workspace path succeeds
+        let valid = resolve_safe_path("Cargo.toml", "read_file").unwrap();
+        assert!(valid.ends_with("Cargo.toml"));
+
+        // Path traversal escaping root fails with Forbidden
+        let escape_err = resolve_safe_path("../../../../../etc/passwd", "read_file").unwrap_err();
+        match escape_err {
+            ToolError::Forbidden { caller, .. } => {
+                assert!(caller.contains("escapes workspace root"));
+            }
+            other => panic!("expected ToolError::Forbidden, got {other:?}"),
+        }
+
+        // Absolute path outside workspace/temp fails with Forbidden
+        let abs_err = resolve_safe_path("/root/.ssh/id_rsa", "read_file").unwrap_err();
+        match abs_err {
+            ToolError::Forbidden { caller, .. } => {
+                assert!(caller.contains("escapes workspace root"));
+            }
+            other => panic!("expected ToolError::Forbidden, got {other:?}"),
+        }
     }
 }

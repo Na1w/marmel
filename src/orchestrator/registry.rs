@@ -163,12 +163,11 @@ impl SpecialistEntry {
             if ns == "*" || ns_bare == "*" {
                 return true;
             }
-            if let Some(p) = ns.strip_suffix('*') {
-                if tool.starts_with(p)
-                    || bare.starts_with(p.strip_prefix("terminal__").unwrap_or(p))
-                {
-                    return true;
-                }
+            if let Some(p) = ns.strip_suffix('*')
+                && (tool.starts_with(p)
+                    || bare.starts_with(p.strip_prefix("terminal__").unwrap_or(p)))
+            {
+                return true;
             }
             ns == tool || ns_bare == bare || ns == bare || ns_bare == tool
         })

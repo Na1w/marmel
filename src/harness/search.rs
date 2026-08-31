@@ -23,11 +23,8 @@ pub const GLOB_HARD_CAP: usize = 500;
 /// matches, hard-capped at 500.
 pub fn grep_search(args: &Value) -> Result<ToolResult, ToolError> {
     let pattern = str_arg(args, "pattern", "grep_search")?;
-    let root = args
-        .get("path")
-        .and_then(Value::as_str)
-        .unwrap_or(".")
-        .to_string();
+    let raw_root = args.get("path").and_then(Value::as_str).unwrap_or(".");
+    let safe_root = crate::harness::fs::resolve_safe_path(raw_root, "grep_search")?;
     let max_results = usize_arg(args, "max_results", 100, "grep_search")?.min(GREP_HARD_CAP);
 
     let re = Regex::new(pattern).map_err(|e| ToolError::BadArguments {
@@ -36,7 +33,11 @@ pub fn grep_search(args: &Value) -> Result<ToolResult, ToolError> {
     })?;
 
     let mut results = Vec::new();
-    for entry in WalkBuilder::new(&root).require_git(false).build().flatten() {
+    for entry in WalkBuilder::new(&safe_root)
+        .require_git(false)
+        .build()
+        .flatten()
+    {
         let path = entry.path();
         if !path.is_file() {
             continue;

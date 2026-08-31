@@ -98,6 +98,37 @@ impl Workspace {
     }
 }
 
+/// Helper to construct numbered backup paths: `marmel.log.1`, `marmel.log.2`, etc.
+pub fn backup_path(path: &Path, n: u32) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".{n}"));
+    PathBuf::from(name)
+}
+
+/// Rotate a log file if its size exceeds `max_bytes` (or unconditionally if `max_bytes == 0`).
+pub fn rotate_log_file(path: &Path, max_bytes: u64, backups: u32) {
+    let size = match std::fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(_) => return,
+    };
+    if max_bytes > 0 && size <= max_bytes {
+        return;
+    }
+
+    for i in (1..backups).rev() {
+        let src = backup_path(path, i);
+        let dst = backup_path(path, i + 1);
+        let _ = std::fs::rename(&src, &dst);
+    }
+
+    let _ = std::fs::rename(path, backup_path(path, 1));
+
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -186,6 +186,13 @@ impl Plan {
         let _guard = PLAN_MUTEX.lock().unwrap();
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("creating {}", self.dir.display()))?;
+
+        // Rotate session log on new plan creation so each plan gets a clean log history
+        let log_path = self.dir.join(crate::harness::workspace::LOG_FILE);
+        if log_path.exists() {
+            crate::harness::workspace::rotate_log_file(&log_path, 0, 5);
+        }
+
         let path = self.plan_path();
         std::fs::write(&path, plan_markdown)
             .with_context(|| format!("writing {}", path.display()))?;
