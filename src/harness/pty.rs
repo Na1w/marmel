@@ -783,9 +783,14 @@ mod tests {
             .expect("spawn session");
         assert!(init_out.is_empty() || !init_out.is_empty()); // Shell banner or prompt
 
+        #[cfg(unix)]
+        let (input, wait_ms) = ("echo hello_interactive_pty\n", 400);
+        #[cfg(windows)]
+        let (input, wait_ms) = ("echo hello_interactive_pty\r\n", 800);
+
         // Write a command
         let (out, alive) = mgr
-            .write(session_id, "echo hello_interactive_pty\n", 400)
+            .write(session_id, input, wait_ms)
             .await
             .expect("write to pty");
         assert!(alive, "session should be alive");

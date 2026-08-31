@@ -34,6 +34,7 @@ Marmel is a Rust-based CLI that connects to an OpenAI-compatible chat-completion
 - **Deep-Freeze crash recovery** — in-flight delegations are snapshotted and journaled so crashes can be recovered and rehydrated seamlessly.
 - **MCP (Model Context Protocol) client** — JSON-RPC 2.0 over stdio and SSE/HTTP, with tool discovery and execution.
 - **Two UI modes** — an interactive 3-panel Ratatui TUI (with subagent auto-focus, scroll clamping, and full horizontal cursor navigation) and a headless raw streaming mode.
+- **Live session token accounting** — global atomic tracking of cumulative input and output tokens across Manager turns, specialist subagents, validators, and arbitrators with auto-scaled metrics in the status bar.
 
 ---
 
@@ -278,6 +279,16 @@ The TUI is a 3-panel Ratatui interface: **Chat** / **Plan** / **Subagents**.
 | `/reset` | Clear the execution plan. |
 | `/abort` | Explicit abort. |
 
+**Live Status Bar:**
+
+The bottom status bar continuously reports session token metrics and active agent status:
+```text
+ Tokens: 1.5k in / 320 out (1.8k total) | Status: Running (gemma-4-12b) … [1 active: coder-t-001]
+```
+- **Tokens `in`:** Cumulative prompt tokens across all Manager and specialist subagent invocations.
+- **Tokens `out`:** Cumulative completion tokens (content, reasoning/thinking, and tool call payloads).
+- **Auto-scaled formatting:** Tokens are cleanly formatted as exact integers under $1\,000$, with `k` for thousands ($1.5\text{k}$), and `M` for millions ($1.2\text{M}$).
+
 ### Headless raw mode
 
 ```bash
@@ -422,7 +433,20 @@ cargo test
 - **Unit tests** are embedded in each module (`#[cfg(test)] mod tests`).
 - **Integration tests** live in `tests/` and use `wiremock` to mock the LLM backend.
 
-Coverage areas include: config parsing, orchestration (delegation, check-off, recursion depth, Deep-Freeze recovery), agent loop (turn phases, tool classification, steer/abort, repetition detection, XML rescue), context engine (compaction, rebirth, token counting), harness (replace uniqueness, paginated read, grep gitignore, glob sorting, PTY process-group kill), LLM (thinking demuxer, request construction), role gating, and UI session.
+Coverage areas include: config parsing, orchestration (delegation, check-off, recursion depth, Deep-Freeze recovery), agent loop (turn phases, tool classification, steer/abort, repetition detection, XML rescue), context engine (compaction, rebirth, token counting), harness (replace uniqueness, paginated read, grep gitignore, glob sorting, cross-platform PTY lifecycle), LLM (thinking demuxer, request construction), role gating, and UI session.
+
+### Multi-Platform CI / CD
+
+Marmel is continuously built and tested across all supported target platforms via GitHub Actions (`.github/workflows/ci.yml`):
+- 🐧 **Linux** (`x86_64-unknown-linux-gnu`)
+- 🍏 **macOS** (`aarch64-apple-darwin`)
+- 🪟 **Windows** (`x86_64-pc-windows-msvc`)
+
+Every commit and pull request runs:
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features` (212 unit & integration tests)
+- `cargo build --release` (optimized binary verification)
 
 ---
 
