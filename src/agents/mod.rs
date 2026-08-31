@@ -475,8 +475,10 @@ async fn run_specialist_live(
         }
     }
     if let Some(mcp) = crate::harness::get_mcp_manager() {
-        for tool in mcp.tools() {
-            tools.push(crate::types::ToolDef::from_mcp(&tool));
+        if let Some(sc) = specialist_cfg {
+            for tool in mcp.tools_for_servers(&sc.mcp_servers) {
+                tools.push(crate::types::ToolDef::from_mcp(&tool));
+            }
         }
     }
 
@@ -888,7 +890,12 @@ async fn run_automated_validation(
         }
     }
     if let Some(mcp) = crate::harness::get_mcp_manager() {
-        for tool in mcp.tools() {
+        let servers = validator_cfg
+            .map(|vc| vc.mcp_servers.clone())
+            .filter(|s| !s.is_empty())
+            .or_else(|| specialist_cfg.map(|sc| sc.mcp_servers.clone()))
+            .unwrap_or_default();
+        for tool in mcp.tools_for_servers(&servers) {
             tools.push(crate::types::ToolDef::from_mcp(&tool));
         }
     }

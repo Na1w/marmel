@@ -11,6 +11,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
+use super::http::{
+    HttpSseConnection, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+};
+
 /// Server configuration entry for an MCP server in marmel.toml.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -38,38 +42,12 @@ pub struct McpTool {
     pub server_name: String,
 }
 
-#[derive(Debug, Serialize)]
-struct JsonRpcRequest {
-    jsonrpc: &'static str,
-    id: u64,
-    method: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    params: Option<Value>,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonRpcNotification {
-    jsonrpc: &'static str,
-    method: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    params: Option<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct JsonRpcResponse {
-    #[allow(dead_code)]
-    jsonrpc: Option<String>,
-    #[allow(dead_code)]
-    id: Option<Value>,
-    result: Option<Value>,
-    error: Option<JsonRpcError>,
-}
-
-#[derive(Debug, Deserialize)]
-struct JsonRpcError {
-    code: i64,
-    message: String,
-    data: Option<Value>,
+impl McpTool {
+    /// Fully-qualified name combining the server name and the raw tool name,
+    /// guaranteeing uniqueness across servers that expose identically-named tools.
+    pub fn qualified_name(&self) -> String {
+        format!("{}__{}", self.server_name, self.name)
+    }
 }
 
 /// Active connection to an MCP server over stdio.
@@ -165,24 +143,10 @@ impl StdioMcpConnection {
                 continue;
             }
             if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(trimmed) {
-                let id_matches = match &resp.id {
-                    Some(Value::Number(n)) => n.as_u64() == Some(id),
-                    Some(Value::String(s)) => s.parse::<u64>().ok() == Some(id),
-                    _ => false,
-                };
-                if !id_matches {
+                if !resp.id_matches(id) {
                     continue;
                 }
-                if let Some(err) = resp.error {
-                    return Err(anyhow!(
-                        "MCP error ({}) from '{}': {} (data: {:?})",
-                        err.code,
-                        self.server_name,
-                        err.message,
-                        err.data
-                    ));
-                }
-                return Ok(resp.result.unwrap_or(Value::Null));
+                return resp.into_result(&self.server_name);
             }
         }
     }
@@ -288,6 +252,17 @@ impl StdioMcpConnection {
 
 pub enum McpClient {
     Stdio(Mutex<StdioMcpConnection>),
+    HttpSse(Mutex<HttpSseConnection>),
+    /// Test-only mock used to assert the routing chain without a live server.
+    #[cfg(test)]
+    Mock(Mutex<MockMcpConnection>),
+}
+
+/// Test-only mock connection that records the tool names dispatched to it.
+#[cfg(test)]
+pub struct MockMcpConnection {
+    /// Names passed to `call_tool`, in call order.
+    pub called_names: Arc<Mutex<Vec<String>>>,
 }
 
 impl McpClient {
@@ -296,6 +271,15 @@ impl McpClient {
             McpClient::Stdio(lock) => {
                 let mut conn = lock.lock().await;
                 conn.list_tools().await
+            }
+            McpClient::HttpSse(lock) => {
+                let mut conn = lock.lock().await;
+                conn.list_tools().await
+            }
+            #[cfg(test)]
+            McpClient::Mock(lock) => {
+                let _conn = lock.lock().await;
+                Ok(Vec::new())
             }
         }
     }
@@ -306,6 +290,16 @@ impl McpClient {
                 let mut conn = lock.lock().await;
                 conn.call_tool(name, arguments).await
             }
+            McpClient::HttpSse(lock) => {
+                let mut conn = lock.lock().await;
+                conn.call_tool(name, arguments).await
+            }
+            #[cfg(test)]
+            McpClient::Mock(lock) => {
+                let mut conn = lock.lock().await;
+                conn.called_names.lock().await.push(name.to_string());
+                Ok("mock-result".to_string())
+            }
         }
     }
 
@@ -314,6 +308,15 @@ impl McpClient {
             McpClient::Stdio(lock) => {
                 let mut conn = lock.lock().await;
                 conn.shutdown().await
+            }
+            McpClient::HttpSse(lock) => {
+                let mut conn = lock.lock().await;
+                conn.shutdown().await
+            }
+            #[cfg(test)]
+            McpClient::Mock(lock) => {
+                let _conn = lock.lock().await;
+                Ok(())
             }
         }
     }
@@ -341,13 +344,32 @@ impl McpManager {
                         let client = Arc::new(McpClient::Stdio(Mutex::new(conn)));
                         if let Ok(tools) = client.list_tools().await {
                             for tool in tools {
-                                manager.tools.insert(tool.name.clone(), tool);
+                                manager
+                                    .tools
+                                    .insert(tool.qualified_name(), tool);
                             }
                         }
                         manager.clients.insert(name.clone(), client);
                     }
                     Err(e) => {
                         tracing::warn!("Failed to start MCP server '{name}': {e:#}");
+                    }
+                }
+            } else if cfg.url.is_some() {
+                match HttpSseConnection::connect(name, cfg).await {
+                    Ok(conn) => {
+                        let client = Arc::new(McpClient::HttpSse(Mutex::new(conn)));
+                        if let Ok(tools) = client.list_tools().await {
+                            for tool in tools {
+                                manager
+                                    .tools
+                                    .insert(tool.qualified_name(), tool);
+                            }
+                        }
+                        manager.clients.insert(name.clone(), client);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to connect to MCP server '{name}': {e:#}");
                     }
                 }
             }
@@ -357,6 +379,19 @@ impl McpManager {
 
     pub fn tools(&self) -> Vec<McpTool> {
         self.tools.values().cloned().collect()
+    }
+
+    /// Returns only the tools whose `server_name` is contained in `servers`.
+    /// If `servers` is empty, returns an empty Vec.
+    pub fn tools_for_servers(&self, servers: &[String]) -> Vec<McpTool> {
+        if servers.is_empty() {
+            return Vec::new();
+        }
+        self.tools
+            .values()
+            .filter(|tool| servers.iter().any(|s| s == &tool.server_name))
+            .cloned()
+            .collect()
     }
 
     pub fn has_tool(&self, name: &str) -> bool {
@@ -372,7 +407,7 @@ impl McpManager {
             .clients
             .get(&tool.server_name)
             .ok_or_else(|| anyhow!("MCP server '{}' is not running", tool.server_name))?;
-        client.call_tool(name, arguments).await
+        client.call_tool(&tool.name, arguments).await
     }
 
     pub async fn shutdown(&self) {
@@ -381,3 +416,110 @@ impl McpManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_tool(server_name: &str, name: &str) -> McpTool {
+        McpTool {
+            name: name.to_string(),
+            description: Some(format!("{name} from {server_name}")),
+            input_schema: json!({"type": "object"}),
+            server_name: server_name.to_string(),
+        }
+    }
+
+    #[test]
+    fn qualified_name_joins_server_and_tool() {
+        let tool = sample_tool("alpha", "get_weather");
+        assert_eq!(tool.qualified_name(), "alpha__get_weather");
+    }
+
+    #[test]
+    fn qualified_name_disambiguates_colliding_tool_names() {
+        let a = sample_tool("alpha", "get_weather");
+        let b = sample_tool("beta", "get_weather");
+        assert_ne!(a.qualified_name(), b.qualified_name());
+        assert_eq!(a.qualified_name(), "alpha__get_weather");
+        assert_eq!(b.qualified_name(), "beta__get_weather");
+    }
+
+    #[tokio::test]
+    async fn routing_chain_resolves_qualified_and_dispatches_raw() {
+        let called_names = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mock = Arc::new(McpClient::Mock(Mutex::new(MockMcpConnection {
+            called_names: called_names.clone(),
+        })));
+
+        let mut manager = McpManager::new();
+        // Two servers exposing the same raw tool name must not collide.
+        let tool_alpha = sample_tool("alpha", "get_weather");
+        let tool_beta = sample_tool("beta", "get_weather");
+        manager
+            .tools
+            .insert(tool_alpha.qualified_name(), tool_alpha);
+        manager.tools.insert(tool_beta.qualified_name(), tool_beta);
+        manager.clients.insert("alpha".to_string(), mock.clone());
+        manager.clients.insert("beta".to_string(), mock.clone());
+
+        // has_tool matches the qualified name.
+        assert!(manager.has_tool("alpha__get_weather"));
+        assert!(manager.has_tool("beta__get_weather"));
+        // The raw name alone is no longer a valid key.
+        assert!(!manager.has_tool("get_weather"));
+
+        // call_tool resolves the qualified name and dispatches the RAW name.
+        let result = manager
+            .call_tool("alpha__get_weather", &json!({"city": "Oslo"}))
+            .await
+            .expect("call should succeed");
+        assert_eq!(result, "mock-result");
+
+        let names = called_names.lock().await.clone();
+        assert_eq!(names, vec!["get_weather".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn call_tool_unknown_qualified_name_errors() {
+        let manager = McpManager::new();
+        let err = manager
+            .call_tool("nope__missing", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown MCP tool"));
+    }
+
+    #[test]
+    fn tools_for_servers_filters_by_server_name() {
+        let mut manager = McpManager::new();
+        manager
+            .tools
+            .insert("alpha__a".to_string(), sample_tool("alpha", "a"));
+        manager
+            .tools
+            .insert("alpha__b".to_string(), sample_tool("alpha", "b"));
+        manager
+            .tools
+            .insert("beta__c".to_string(), sample_tool("beta", "c"));
+
+        let alpha_only = manager.tools_for_servers(&["alpha".to_string()]);
+        assert_eq!(alpha_only.len(), 2);
+        assert!(alpha_only.iter().all(|t| t.server_name == "alpha"));
+
+        let alpha_and_beta = manager.tools_for_servers(&[
+            "alpha".to_string(),
+            "beta".to_string(),
+        ]);
+        assert_eq!(alpha_and_beta.len(), 3);
+
+        let none = manager.tools_for_servers(&["gamma".to_string()]);
+        assert!(none.is_empty());
+
+        // Empty input list yields an empty result.
+        let empty = manager.tools_for_servers(&[]);
+        assert!(empty.is_empty());
+    }
+}
+

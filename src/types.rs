@@ -435,7 +435,7 @@ impl ToolDef {
         ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
-                name: tool.name.clone(),
+                name: tool.qualified_name(),
                 description: tool.description.clone().unwrap_or_default(),
                 parameters: tool.input_schema.clone(),
             },
@@ -502,3 +502,35 @@ pub struct ChunkToolFunction {
     pub name: Option<String>,
     pub arguments: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::McpTool;
+
+    fn sample_tool(server_name: &str, name: &str) -> McpTool {
+        McpTool {
+            name: name.to_string(),
+            description: Some(format!("{name} from {server_name}")),
+            input_schema: serde_json::json!({"type": "object"}),
+            server_name: server_name.to_string(),
+        }
+    }
+
+    #[test]
+    fn from_mcp_uses_qualified_name() {
+        let tool = sample_tool("alpha", "get_weather");
+        let def = ToolDef::from_mcp(&tool);
+        assert_eq!(def.function.name, "alpha__get_weather");
+    }
+
+    #[test]
+    fn from_mcp_preserves_description_and_schema() {
+        let tool = sample_tool("alpha", "get_weather");
+        let def = ToolDef::from_mcp(&tool);
+        assert_eq!(def.function.description, "get_weather from alpha");
+        assert_eq!(def.function.parameters, serde_json::json!({"type": "object"}));
+        assert_eq!(def.kind, "function");
+    }
+}
+

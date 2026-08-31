@@ -18,6 +18,8 @@ pub struct OrchestrationConfig {
     pub manager_module: String,
     /// Specialists table: role id -> { module, tools: [...] }.
     pub specialists: BTreeMap<String, SpecialistConfig>,
+    /// MCP servers whose tools the orchestrator is allowed to see.
+    pub mcp_servers: Vec<String>,
 }
 
 impl OrchestrationConfig {
@@ -76,6 +78,8 @@ pub struct SpecialistConfig {
     /// Whether automated validation is enabled for this specialist (default: true).
     #[serde(alias = "auto_validate", alias = "enable_validation")]
     pub enable_validator: Option<bool>,
+    /// MCP servers whose tools this specialist is allowed to see.
+    pub mcp_servers: Vec<String>,
 }
 
 impl Default for SpecialistConfig {
@@ -91,6 +95,7 @@ impl Default for SpecialistConfig {
             validator_auth_token: None,
             max_validator_iterations: None,
             enable_validator: None,
+            mcp_servers: Vec::new(),
         }
     }
 }
@@ -241,6 +246,8 @@ struct PartialOrchestrationConfig {
     pub max_recursion_depth: Option<usize>,
     pub manager_module: Option<String>,
     #[serde(default)]
+    pub mcp_servers: Vec<String>,
+    #[serde(default)]
     pub specialists: HashMap<String, SpecialistConfig>,
 }
 
@@ -324,6 +331,9 @@ fn merge(mut base: Config, partial: PartialConfig) -> Config {
         }
         if !p_orch.specialists.is_empty() {
             base.orchestration.specialists.extend(p_orch.specialists);
+        }
+        if !p_orch.mcp_servers.is_empty() {
+            base.orchestration.mcp_servers = p_orch.mcp_servers;
         }
     }
 
@@ -458,5 +468,54 @@ mod tests {
         let cfg = merge(Config::default(), partial);
         assert!(cfg.mcp_servers.contains_key("fs"));
         assert_eq!(cfg.mcp_servers["fs"].command.as_deref(), Some("npx"));
+    }
+
+    #[test]
+    fn test_mcp_servers_remote_url_parse_and_merge() {
+        let toml_str = r#"
+            [mcp_servers.remote]
+            url = "https://example.com/mcp"
+        "#;
+        let partial: PartialConfig = toml::from_str(toml_str).expect("parses");
+        let cfg = merge(Config::default(), partial);
+        assert!(cfg.mcp_servers.contains_key("remote"));
+        assert_eq!(
+            cfg.mcp_servers["remote"].url.as_deref(),
+            Some("https://example.com/mcp")
+        );
+        assert!(cfg.mcp_servers["remote"].command.is_none());
+    }
+
+    #[test]
+    fn specialist_mcp_servers_parse() {
+        let toml_str = r#"
+            [orchestration.specialists.coder]
+            module = "src/agents/coder.rs"
+            mcp_servers = ["fs", "db"]
+        "#;
+        let partial: PartialConfig = toml::from_str(toml_str).expect("parses");
+        let cfg = merge(Config::default(), partial);
+
+        let coder = cfg
+            .orchestration
+            .specialists
+            .get("coder")
+            .expect("coder present");
+        assert_eq!(coder.mcp_servers, vec!["fs".to_string(), "db".to_string()]);
+    }
+
+    #[test]
+    fn orchestration_mcp_servers_parse() {
+        let toml_str = r#"
+            [orchestration]
+            mcp_servers = ["fs"]
+        "#;
+        let partial: PartialConfig = toml::from_str(toml_str).expect("parses");
+        let cfg = merge(Config::default(), partial);
+
+        assert_eq!(
+            cfg.orchestration.mcp_servers,
+            vec!["fs".to_string()]
+        );
     }
 }

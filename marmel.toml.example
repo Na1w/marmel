@@ -89,3 +89,35 @@ tools = ["*"]
 model = "deepseek-v4-flash:cloud"
 # backend_url = "https://openrouter.ai/api/v1"
 # auth_token = "sk-or-..."
+
+# ---------------------------------------------------------------------------
+# External MCP servers (Model Context Protocol)
+# ---------------------------------------------------------------------------
+# Each entry under `[mcp_servers.<name>]` registers an external MCP server that
+# marmel can connect to. A server must use exactly ONE transport:
+#
+#   * stdio  — spawn a local executable via `command` (+ optional `args`).
+#   * remote — reach an HTTP/SSE endpoint via `url`.
+#
+# A server may NOT set both `command` and `url`; pick the transport that matches
+# the server you are integrating.
+#
+# `env` is optional and only applies to stdio servers: it sets environment
+# variables for the spawned process (e.g. API keys the server needs).
+#
+# Discovered MCP tools are exposed to agents with a `<server_name>__<tool_name>`
+# prefix (e.g. a tool `read_file` from server `filesystem` appears as
+# `filesystem__read_file`). This prefix prevents name collisions when multiple
+# servers expose tools with the same name. The prefix is stripped automatically
+# before the call is sent to the MCP server, so the server always receives the
+# original unprefixed tool name.
+
+# Example 1 — local stdio server (spawns `npx`).
+[mcp_servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+# env = { SOME_API_KEY = "..." }
+
+# Example 2 — remote/external HTTP/SSE server (reached over the network).
+[mcp_servers.remote]
+url = "https://example.com/mcp"

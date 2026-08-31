@@ -83,6 +83,7 @@ pub struct StreamConfig {
     pub presence_penalty: f32,
     pub preserve_thinking: bool,
     pub recovery: bool,
+    pub mcp_servers: Vec<String>,
 }
 
 impl Default for StreamConfig {
@@ -95,6 +96,7 @@ impl Default for StreamConfig {
             presence_penalty: 0.0,
             preserve_thinking: false,
             recovery: false,
+            mcp_servers: Vec::new(),
         }
     }
 }
@@ -109,6 +111,7 @@ impl StreamConfig {
             presence_penalty: cfg.presence_penalty,
             preserve_thinking: cfg.preserve_thinking,
             recovery: false,
+            mcp_servers: cfg.orchestration.mcp_servers.clone(),
         }
     }
 }
@@ -200,7 +203,7 @@ fn is_empty_production(m: &Message) -> bool {
 pub(crate) fn build_request(cfg: &StreamConfig, messages: Vec<Message>) -> ChatRequest {
     let mut tools = crate::types::ToolDef::default_tools();
     if let Some(mcp) = crate::harness::get_mcp_manager() {
-        for tool in mcp.tools() {
+        for tool in mcp.tools_for_servers(&cfg.mcp_servers) {
             tools.push(crate::types::ToolDef::from_mcp(&tool));
         }
     }
