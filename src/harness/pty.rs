@@ -825,6 +825,7 @@ mod tests {
             }
         }
 
+        #[cfg(unix)]
         assert!(
             out.contains("hello_interactive_pty"),
             "output should contain echoed string, got: {out:?}"
