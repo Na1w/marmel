@@ -245,15 +245,26 @@ where
         };
 
         let mut demux = ThinkingDemuxer::with_preserve(cfg.preserve_thinking);
+        let mut rep_detector = crate::harness::monitor::RepetitionDetector::new(5, 5);
+        let mut rep_triggered = false;
+
         let reply = client
             .chat_stream(&req, |delta| {
                 if !delta.is_empty() {
-                    demux.push_delta(delta, |kind, text| match kind {
-                        DeltaKind::Content => sink.emit(StreamEvent::Content(text.to_string())),
-                        DeltaKind::Thinking => sink.emit(StreamEvent::Thinking(text.to_string())),
+                    demux.push_delta(delta, |kind, text| {
+                        rep_detector.push(text);
+                        if rep_detector.is_repeating() {
+                            rep_triggered = true;
+                        }
+                        match kind {
+                            DeltaKind::Content => sink.emit(StreamEvent::Content(text.to_string())),
+                            DeltaKind::Thinking => {
+                                sink.emit(StreamEvent::Thinking(text.to_string()))
+                            }
+                        }
                     });
                 }
-                !sink.is_aborted()
+                !sink.is_aborted() && !rep_triggered
             })
             .await?;
 
@@ -279,6 +290,34 @@ where
                     *tool_calls = rescued;
                 }
             }
+        }
+
+        let has_tools = match &assistant {
+            Message::Assistant { tool_calls, .. } => !tool_calls.is_empty(),
+            _ => false,
+        };
+
+        if rep_triggered && !has_tools && empty_attempts < nudge.max_attempts() {
+            empty_attempts += 1;
+            tracing::warn!(
+                "Stream terminated due to repetitive loop — injecting repetition nudge ({}/{})",
+                empty_attempts,
+                nudge.max_attempts()
+            );
+            sink.emit(StreamEvent::Status(format!(
+                "repetition loop recovered — nudge {empty_attempts}/{}",
+                nudge.max_attempts()
+            )));
+            transcript.push(Message::Assistant {
+                content: Some("[Generation interrupted due to repetitive loop]".to_string()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+            });
+            transcript.push(Message::User {
+                content: "SYSTEM NOTICE: Repetitive generation loop detected. Terminate conversational debate immediately and call your required tools (such as `delegate_task` or `create_plan`) now.".to_string(),
+            });
+            recovery = true;
+            continue;
         }
 
         if is_empty_production(&assistant) && nudge.should_nudge(empty_attempts) {
@@ -340,5 +379,15 @@ mod tests {
             }
             _ => panic!("expected assistant message"),
         }
+    }
+
+    #[test]
+    fn test_repetition_detector_breaks_loop() {
+        let mut rep = crate::harness::monitor::RepetitionDetector::new(3, 5);
+        rep.push("Let's go.\nI'll do it.\nWait, I'll check rule 1.\nGood.\n");
+        rep.push("Let's go.\nI'll do it.\nWait, I'll check rule 2.\nGood.\n");
+        assert!(!rep.is_repeating());
+        rep.push("Let's go.\nI'll do it.\nWait, I'll check rule 3.\nGood.\n");
+        assert!(rep.is_repeating());
     }
 }

@@ -19,21 +19,21 @@ max_recursion_depth = 3
 tools = ["delegate_task", "write_file", "replace", "read_file", "run_command", "grep_search", "glob"]
 model = "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf"
 validator_model = "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf"
-max_validator_iterations = 2
+max_validator_iterations = 5
 
 # Debugger specialist — Systems Debugger (crash forensics, ABI/low-level diagnostics)
 [orchestration.specialists.debugger]
 tools = ["delegate_task", "write_file", "replace", "read_file", "run_command", "grep_search", "glob", "pty_spawn", "pty_write", "pty_read", "pty_close", "pty_list"]
 model = "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf"
 validator_model = "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf"
-max_validator_iterations = 2
+max_validator_iterations = 5
 
 # Researcher specialist — Information Retrieval & Ground Truth Fact-Checking
 [orchestration.specialists.researcher]
 tools = ["delegate_task", "read_file", "run_command", "grep_search", "glob"]
 model = "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf"
 validator_model = "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf"
-max_validator_iterations = 2
+max_validator_iterations = 5
 
 # Validator specialist — Independent Quality Assurance Auditor
 [orchestration.specialists.validator]

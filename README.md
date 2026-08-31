@@ -24,16 +24,16 @@ Marmel is a Rust-based CLI that connects to an OpenAI-compatible chat-completion
 ## Features
 
 - **Fractal Manager + Specialist orchestration** — a Manager decomposes a goal into a disk-backed execution plan and delegates each atomic task to a domain specialist. The Manager never performs domain work itself; it only plans, delegates, and synthesizes.
-- **Disk-backed execution plan** — the plan lives at `.marmel/execution_plan.md` in `- [ ] [t-xxx]` checkbox format, auto-checked-off on completion and archived when done.
+- **Disk-backed execution plan & auto-resume** — the plan lives at `.marmel/execution_plan.md` in `- [ ] [t-xxx]` checkbox format, auto-checked-off on completion, auto-resumed on session restart, and archived when done.
 - **Five specialist roles** with per-role tool allowlists — `coder`, `researcher`, `debugger`, `validator`, and `generalist`.
-- **Automated validation loop** — specialist deliverables are automatically audited by a Validator subagent; rejected work is fed back for revision (up to a configurable number of iterations).
-- **Resilience harness** — XML tool-call rescue, semantic repetition detection, text repetition breaking, and empty-production nudging keep loops productive.
+- **Automated validation loop** — specialist deliverables are automatically audited by a Validator subagent; rejected work is fed back for revision (up to 5 iterations by default).
+- **Multi-tier resilience harness** — XML tool-call rescue, semantic tool repetition detection, and text loop breaking (consecutive lines, line bigrams, word 4-grams) with live SSE stream interruption and automatic retry.
 - **Context engine** — `cl100k_base` BPE token counting, KV-cache prefix preservation, automatic compaction, and forced `rebirth` collapse.
 - **LLM streaming client** — SSE streaming with retry/backoff, watchdog timeouts, and `[thinking]` tag demuxing.
-- **Steer Arbitrator** — real-time user steering mid-flight (respond, abort, queue, forward, approve/reject plan, or delegate).
-- **Deep-Freeze crash recovery** — in-flight delegations are snapshotted and journaled so a crash can be recovered or failed properly.
-- **MCP (Model Context Protocol) client** — JSON-RPC 2.0 over stdio, with tool discovery and execution.
-- **Two UI modes** — an interactive 3-panel Ratatui TUI and a headless raw streaming mode.
+- **Steer Arbitrator** — real-time user steering mid-flight (respond, abort, queue, forward, approve/reject plan, or delegate) with human-readable duration formatting (minutes and seconds).
+- **Deep-Freeze crash recovery** — in-flight delegations are snapshotted and journaled so crashes can be recovered and rehydrated seamlessly.
+- **MCP (Model Context Protocol) client** — JSON-RPC 2.0 over stdio and SSE/HTTP, with tool discovery and execution.
+- **Two UI modes** — an interactive 3-panel Ratatui TUI (with subagent auto-focus, scroll clamping, and full horizontal cursor navigation) and a headless raw streaming mode.
 
 ---
 
@@ -224,7 +224,7 @@ mcp_servers = ["fs"]
 model = "deepseek-coder-v2"
 backend_url = "http://localhost:11434/v1"
 validator_model = "gemma4:cloud"
-max_validator_iterations = 2
+max_validator_iterations = 5
 
 # Researcher gets docs search MCP tools
 [orchestration.specialists.researcher]
@@ -384,13 +384,17 @@ Each agent turn walks: `PrepareTurn → CallBackend → StreamResponse → Proce
 
 ### Validation loop
 
-Specialist deliverables are automatically audited by a Validator subagent. Rejected work is fed back to the specialist for revision, up to `max_validator_iterations` (default 2).
+Specialist deliverables are automatically audited by a Validator subagent. Rejected work is fed back to the specialist for revision, up to `max_validator_iterations` (default 5).
 
 ### Resilience
 
 - **XML tool-call rescue** — recovers plain-text XML tool calls into structured JSON.
-- **Semantic repetition detection** — blocks/cuts alternating-cycle loops.
-- **Text repetition breaker** — rolling 1000-char buffer.
+- **Semantic tool repetition & cycle gate** — blocks identical repeated calls and cuts alternating tool cycles.
+- **Multi-tier text repetition breaker** — rolling 1000-char buffer tracking:
+  - $\ge 3$ identical consecutive lines.
+  - $\ge 3$ repeated line bigrams.
+  - $\ge 3$ repeated word 4-gram phrases across sentences.
+- **Live stream interruption & auto-recovery** — cuts SSE generation mid-flight on loop detection, purges toxic history, and retries with increased `frequency_penalty`.
 - **Empty-production nudge** — up to 3 attempts.
 - **One-turn recovery** — adjusts `enable_thinking`, `frequency_penalty`, and `temperature` on failure.
 
@@ -401,9 +405,11 @@ Specialist deliverables are automatically audited by a Validator subagent. Rejec
 - Automatic compaction at >90% budget targeting 70%.
 - Forced `rebirth` collapse to exactly 4 messages.
 
-### Deep-Freeze crash recovery
+### Deep-Freeze crash recovery & plan resumption
 
-In-flight delegations are snapshotted to `.marmel/.session_frozen.json` before running. On restart, `recover_frozen()` rehydrates the identical worker or fails the task properly. An append-only crash journal is maintained at `.marmel/.session_journal.json`.
+- **In-flight checkpointing:** Active delegations are snapshotted to `.marmel/.session_frozen.json` with an append-only journal at `.marmel/.session_journal.json`.
+- **Startup rehydration:** On boot, `recover_frozen()` runs immediately to complete or fail interrupted tasks.
+- **Plan persistence:** If `.marmel/execution_plan.md` exists on disk with pending tasks, the Manager automatically resumes execution from the next unchecked item.
 
 ---
 

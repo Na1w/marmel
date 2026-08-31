@@ -658,12 +658,19 @@ impl TuiRenderer {
         if is_active {
             self.show_subagent_panel = true;
         }
-        match self.subagents.iter_mut().find(|s| s.name == name) {
-            Some(existing) => {
+        let target_idx = match self
+            .subagents
+            .iter_mut()
+            .enumerate()
+            .find(|(_, s)| s.name == name)
+        {
+            Some((idx, existing)) => {
                 existing.is_active = is_active;
                 existing.logs.push(log.to_string());
+                idx
             }
             None => {
+                let idx = self.subagents.len();
                 self.subagents.push(SubagentDetail {
                     name: name.to_string(),
                     task_id: None,
@@ -678,7 +685,11 @@ impl TuiRenderer {
                     content: String::new(),
                     is_active,
                 });
+                idx
             }
+        };
+        if is_active {
+            self.selected_subagent_idx = target_idx;
         }
     }
 
@@ -1390,7 +1401,7 @@ impl TuiRenderer {
 
         let inner_area = subagent_block.inner(area);
         let list_len = (self.subagents.len() as u16)
-            .clamp(1, 5)
+            .clamp(1, 3)
             .min(inner_area.height.saturating_sub(3).max(1));
         let subagent_chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1596,14 +1607,26 @@ impl TuiRenderer {
             .border_style(Style::default().fg(Color::Cyan));
 
         let max_text_width = area.width.saturating_sub(2) as usize;
-        let text_len = self.input_text.chars().count();
-        let (visible_text, cursor_pos_x) = if text_len <= max_text_width {
-            (self.input_text.clone(), area.x + 1 + text_len as u16)
+        let cursor_char_idx = self.input_text[..self.cursor.min(self.input_text.len())]
+            .chars()
+            .count();
+
+        // Calculate a sliding window (scroll_offset) that keeps the cursor visible
+        let scroll_offset = if cursor_char_idx < max_text_width {
+            0
         } else {
-            let skip = text_len - max_text_width;
-            let visible: String = self.input_text.chars().skip(skip).collect();
-            (visible, area.x + 1 + max_text_width as u16)
+            cursor_char_idx + 1 - max_text_width
         };
+
+        let visible_text: String = self
+            .input_text
+            .chars()
+            .skip(scroll_offset)
+            .take(max_text_width)
+            .collect();
+
+        let visible_cursor_offset = cursor_char_idx.saturating_sub(scroll_offset) as u16;
+        let cursor_pos_x = area.x + 1 + visible_cursor_offset;
 
         let input_paragraph = Paragraph::new(visible_text.as_str()).block(input_block);
         frame.render_widget(input_paragraph, area);
@@ -1918,6 +1941,16 @@ impl Renderer for TuiRenderer {
         let stdout = io::stdout();
         let backend = CrosstermBackend::new(stdout);
         self.terminal = Some(Terminal::new(backend)?);
+
+        let plan = crate::agent::phase::Plan::default();
+        if let Ok(Some(content)) = plan.read()
+            && !content.trim().is_empty()
+        {
+            self.plan_content = content;
+            self.show_plan_panel = true;
+            self.had_active_plan = true;
+        }
+
         self.flush()?;
         Ok(())
     }
@@ -2152,10 +2185,15 @@ impl Renderer for TuiRenderer {
     fn set_subagents(&mut self, subagents: Vec<SubagentDetail>) {
         // Adopt the session-loop's authoritative list, preserving any live
         // thinking/content already streamed into the local entries (t-c304).
+        let mut activated_name = None;
         for incoming in &subagents {
             match self.subagents.iter_mut().find(|s| s.name == incoming.name) {
                 Some(existing) => {
+                    let was_inactive = !existing.is_active;
                     existing.is_active = incoming.is_active;
+                    if was_inactive && incoming.is_active {
+                        activated_name = Some(incoming.name.clone());
+                    }
                     existing.logs = incoming.logs.clone();
                     // Keep locally-streamed thinking/content if the incoming
                     // entry has none yet (the loop only folds lifecycle events).
@@ -2166,7 +2204,12 @@ impl Renderer for TuiRenderer {
                         existing.content = incoming.content.clone();
                     }
                 }
-                None => self.subagents.push(incoming.clone()),
+                None => {
+                    if incoming.is_active {
+                        activated_name = Some(incoming.name.clone());
+                    }
+                    self.subagents.push(incoming.clone());
+                }
             }
         }
         // Drop entries that are no longer present in the authoritative list.
@@ -2175,7 +2218,11 @@ impl Renderer for TuiRenderer {
         if self.subagents.iter().any(|s| s.is_active) {
             self.show_subagent_panel = true;
         }
-        if self.selected_subagent_idx >= self.subagents.len() {
+        if let Some(name) = activated_name
+            && let Some(idx) = self.subagents.iter().position(|s| s.name == name)
+        {
+            self.selected_subagent_idx = idx;
+        } else if self.selected_subagent_idx >= self.subagents.len() {
             self.selected_subagent_idx = self.subagents.len().saturating_sub(1);
         }
     }
@@ -2824,5 +2871,50 @@ mod tests {
 
         assert!(r.subagent_autoscroll);
         assert_eq!(r.subagent_scroll, n.saturating_sub(h) as u16);
+    }
+
+    #[test]
+    fn test_subagents_auto_focuses_latest_activated_agent() {
+        let mut r = TuiRenderer::new();
+        r.upsert_subagent("coder-t-001", true, "started t-001");
+        assert_eq!(r.selected_subagent_idx, 0);
+
+        r.upsert_subagent("coder-t-002", true, "started t-002");
+        assert_eq!(r.selected_subagent_idx, 1);
+
+        r.upsert_subagent("researcher-t-003", true, "started t-003");
+        assert_eq!(r.selected_subagent_idx, 2);
+
+        // Completion should not shift focus away from currently selected
+        r.upsert_subagent("coder-t-001", false, "completed t-001");
+        assert_eq!(r.selected_subagent_idx, 2);
+    }
+
+    #[test]
+    fn test_input_cursor_stepping_left_and_right() {
+        let mut r = TuiRenderer::new();
+        r.focused_panel = FocusedPanel::Chat;
+        r.input_text = "hello world".to_string();
+        r.cursor = "hello world".len();
+
+        // Step left 5 times
+        for _ in 0..5 {
+            r.cursor_left();
+        }
+        assert_eq!(r.cursor, "hello ".len());
+
+        // Insert character at cursor
+        r.insert_char('X');
+        assert_eq!(r.input_text, "hello Xworld");
+        assert_eq!(r.cursor, "hello X".len());
+
+        // Step right 2 times
+        r.cursor_right();
+        r.cursor_right();
+        assert_eq!(r.cursor, "hello Xwo".len());
+
+        // Delete backward
+        r.delete_backward();
+        assert_eq!(r.input_text, "hello Xwrld");
     }
 }

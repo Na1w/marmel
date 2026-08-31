@@ -536,7 +536,20 @@ async fn run_specialist_live(
         };
         engine.append(assistant_msg);
 
+        let is_repeating = monitor.feed_text(&reply.content);
+
         if tool_calls.is_empty() {
+            if is_repeating && nudge_count < 3 {
+                nudge_count += 1;
+                tracing::warn!(
+                    "{agent_tag}: repetitive generation loop detected in specialist output — injecting corrective nudge"
+                );
+                engine.append(crate::types::Message::User {
+                    content: "SYSTEM NOTICE: Repetitive generation loop detected. Terminate conversational debate immediately and call your required tools (such as `read_file`, `write_file`, `run_command`, etc.) to perform the required work, or conclude with 'MISSION COMPLETE'.".to_string(),
+                });
+                continue;
+            }
+
             let upper = reply.content.to_ascii_uppercase();
             let is_terminal = upper.contains("MISSION COMPLETE")
                 || upper.contains("FAILED")
@@ -623,7 +636,7 @@ async fn run_specialist_live(
         .unwrap_or(true);
     let max_val_iterations = specialist_cfg
         .and_then(|sc| sc.max_validator_iterations)
-        .unwrap_or(2);
+        .unwrap_or(5);
 
     let mut validation_passed =
         !auto_validate_enabled || max_val_iterations == 0 || agent == Agent::Validator;

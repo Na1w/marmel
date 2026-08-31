@@ -78,6 +78,20 @@ pub async fn run_session(
     let mut ctx = ContextEngine::new(cfg.max_context_tokens);
     ctx.set_system_prompt(system);
 
+    if let Some(mgr) = manager.as_ref()
+        && let Ok(Some(deliverable)) = mgr.recover_frozen().await
+    {
+        let task_info = deliverable.task_id.as_deref().unwrap_or("recovered");
+        renderer.on_event(&Event::ToolResult(format!(
+            "[Recovered task {task_info}] {}",
+            deliverable.content
+        )));
+        renderer.flush()?;
+    }
+
+    let plan = crate::agent::phase::Plan::default();
+    let has_pending_plan = !plan.pending_tasks().is_empty();
+
     let goal = match initial {
         Some(g) => g,
         None => loop {
@@ -92,8 +106,11 @@ pub async fn run_session(
                         handle_reset_command(&plan, &mut *renderer, &mut ctx);
                         continue;
                     }
-                    if !line.trim().is_empty() {
-                        break line;
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        break trimmed.to_string();
+                    } else if has_pending_plan {
+                        break "Continue executing the active execution plan.".to_string();
                     }
                 }
                 None => {
@@ -104,17 +121,6 @@ pub async fn run_session(
         },
     };
     ctx.set_goal(goal.clone());
-
-    if let Some(mgr) = manager.as_ref()
-        && let Ok(Some(deliverable)) = mgr.recover_frozen().await
-    {
-        let task_info = deliverable.task_id.as_deref().unwrap_or("recovered");
-        renderer.on_event(&Event::ToolResult(format!(
-            "[Recovered task {task_info}] {}",
-            deliverable.content
-        )));
-        renderer.flush()?;
-    }
 
     let client = ChatClient::from_config(cfg);
     let harness_stats = Arc::new(crate::harness::HarnessStats::new());
@@ -818,9 +824,19 @@ impl StreamSink for RendererSink<'_> {
 fn load_system_prompt(_cfg: &Config) -> Result<String> {
     let content = include_str!("../../prompts/system.md");
     let cwd = std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string());
-    Ok(format!(
+    let mut prompt = format!(
         "{content}\n\n## Workspace & Environment\n- Current Working Directory: `{cwd}`\n- All tool executions, relative file paths, commands, and search operations resolve against this workspace directory.\n"
-    ))
+    );
+    let plan = crate::agent::phase::Plan::default();
+    if let Ok(Some(plan_content)) = plan.read()
+        && !plan_content.trim().is_empty()
+    {
+        prompt.push_str(&format!(
+            "\n## Active Execution Plan (`.marmel/execution_plan.md`)\nThere is an existing execution plan already active on disk:\n```markdown\n{}\n```\nDo NOT call `create_plan` unless you explicitly intend to overwrite the plan. Proceed directly with `delegate_task` to execute any remaining unchecked `- [ ] [t-xxx]` tasks.\n",
+            plan_content.trim()
+        ));
+    }
+    Ok(prompt)
 }
 
 pub fn chunk_utf8(s: &str, max: usize) -> Vec<&str> {

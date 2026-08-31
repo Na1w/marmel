@@ -62,7 +62,7 @@ model = "deepseek-v4-flash:cloud"
 validator_model = "gemma4:cloud"
 # validator_backend_url = "http://localhost:11434/v1"
 # validator_auth_token = ""
-max_validator_iterations = 2
+max_validator_iterations = 5
 
 [orchestration.specialists.debugger]
 tools = ["delegate_task", "write_file", "replace", "read_file", "run_command", "grep_search", "glob", "pty_spawn", "pty_write", "pty_read", "pty_close", "pty_list"]
@@ -70,13 +70,13 @@ model = "deepseek-v4-flash:cloud"
 # backend_url = "http://localhost:11434/v1"
 # enable_validator = false
 validator_model = "gemma4:cloud"
-max_validator_iterations = 2
+max_validator_iterations = 5
 
 [orchestration.specialists.researcher]
 tools = ["delegate_task", "read_file", "run_command", "grep_search", "glob"]
 model = "deepseek-v4-flash:cloud"
 validator_model = "gemma4:cloud"
-max_validator_iterations = 2
+max_validator_iterations = 5
 
 [orchestration.specialists.validator]
 tools = ["delegate_task", "write_file", "replace", "read_file", "run_command", "grep_search", "glob"]

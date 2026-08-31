@@ -112,6 +112,17 @@ pub fn has_active_workers() -> bool {
     !map.is_empty()
 }
 
+/// Helper to format elapsed durations into human-readable minutes and seconds (e.g. "2m 15s" or "45s").
+pub fn format_duration_human(secs: u64) -> String {
+    let mins = secs / 60;
+    let rem_secs = secs % 60;
+    if mins == 0 {
+        format!("{rem_secs}s")
+    } else {
+        format!("{mins}m {rem_secs}s")
+    }
+}
+
 /// Formats all currently active subagent workers with their tool call ID, prompt, and running time.
 pub fn get_active_subtasks_str() -> String {
     let Ok(map) = ACTIVE_WORKERS.read() else {
@@ -123,10 +134,11 @@ pub fn get_active_subtasks_str() -> String {
     let mut out = String::new();
     for (id, info) in map.iter() {
         let elapsed_secs = info.started_at.elapsed().as_secs();
+        let duration_str = format_duration_human(elapsed_secs);
         let task_id_str = info.task_id.as_deref().unwrap_or(id);
         out.push_str(&format!(
-            "- Tool Call ID: {}\n  Subagent: {}\n  Task Prompt: {}\n  Running For: {} seconds\n\n",
-            task_id_str, info.agent_name, info.prompt, elapsed_secs
+            "- Tool Call ID: {}\n  Subagent: {}\n  Task Prompt: {}\n  Running For: {} ({elapsed_secs} total seconds)\n\n",
+            task_id_str, info.agent_name, info.prompt, duration_str
         ));
     }
     out
@@ -201,7 +213,7 @@ pub fn generate_plan_progress_summary(plan_content: &str) -> String {
             };
 
             if let Some((_k, info)) = matched_active {
-                let running_time = format!("{}s", info.started_at.elapsed().as_secs());
+                let running_time = format_duration_human(info.started_at.elapsed().as_secs());
                 in_progress_tasks.push(format!(
                     "{} (Assigned to: {}, Running: {})",
                     clean_line, info.agent_name, running_time
@@ -859,6 +871,15 @@ mod tests {
             Plan::at(dir.path()),
             Arc::new(HarnessStats::new()),
         )
+    }
+
+    #[test]
+    fn test_format_duration_human_minutes_and_seconds() {
+        assert_eq!(format_duration_human(0), "0s");
+        assert_eq!(format_duration_human(45), "45s");
+        assert_eq!(format_duration_human(60), "1m 0s");
+        assert_eq!(format_duration_human(135), "2m 15s");
+        assert_eq!(format_duration_human(3665), "61m 5s");
     }
 
     /// REQ-ORCH-003: a delegated IsolatedContext contains ONLY the specialist's
