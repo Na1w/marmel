@@ -222,9 +222,8 @@ pub fn run_command_pty(command: &str, timeout: Duration) -> Result<String, ToolE
     let output = match rx.recv_timeout(timeout) {
         Ok(o) => o,
         Err(_) => {
-            // Timed out: kill the whole process group, then drain any leftovers.
+            // Timed out: kill the whole process group.
             let _ = session.teardown();
-            let _ = session.read_output();
             return Ok(format!(
                 "[command timed out after {}s and was killed]",
                 timeout.as_secs()

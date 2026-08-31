@@ -1267,11 +1267,16 @@ mod tests {
         // grants it, so the abort-mid-flight contract is exercised (REQ-ORCH-002).
         let mut loop_ = AgentLoop::new(plan).with_caller(ToolCaller::Specialist(Agent::Coder));
         loop_.track_pty_pid(999_999);
+        #[cfg(unix)]
+        let cmd = "sleep 2";
+        #[cfg(windows)]
+        let cmd = "ping -n 3 127.0.0.1";
+
         // Queue a slow write tool annotated with t-001. It sleeps long enough for
         // the abort to be raised mid-flight and caught after dispatch returns.
         loop_.enqueue_tools(vec![serde_json::json!({
             "name": "run_command",
-            "arguments": { "command": "sleep 2", "task_id": "t-001" }
+            "arguments": { "command": cmd, "timeout_seconds": 2, "task_id": "t-001" }
         })]);
         // Arm the abort flag from a separate OS thread after a short delay,
         // simulating a mid-flight `Signal::Abort` raised by the UI/backend layer
