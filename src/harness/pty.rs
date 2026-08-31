@@ -122,10 +122,20 @@ impl PtySession {
         // Release the slave side now that the child is spawned.
         drop(pair.slave);
 
+        #[cfg(unix)]
         let pid = child
             .process_id()
             .map(|p| p as i32)
             .or_else(|| pair.master.process_group_leader())
+            .ok_or_else(|| ToolError::BadArguments {
+                tool: "run_command".into(),
+                detail: "could not obtain child process id".into(),
+            })?;
+
+        #[cfg(not(unix))]
+        let pid = child
+            .process_id()
+            .map(|p| p as i32)
             .ok_or_else(|| ToolError::BadArguments {
                 tool: "run_command".into(),
                 detail: "could not obtain child process id".into(),
@@ -662,6 +672,7 @@ mod tests {
     /// REQ-TOOL-001: Spawning a background sleep loop and tearing down the PTY
     /// leaves zero orphan processes — the backgrounded child dies with the group.
     #[test]
+    #[cfg(unix)]
     fn test_harness_pty_process_group_kill() {
         let dir = std::env::temp_dir().join(format!("marmel_pty_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -742,8 +753,13 @@ mod tests {
 
     #[test]
     fn test_run_command_parses_timeout_seconds_argument() {
+        #[cfg(unix)]
+        let cmd = "sleep 10";
+        #[cfg(windows)]
+        let cmd = "ping -n 10 127.0.0.1";
+
         let args = serde_json::json!({
-            "command": "sleep 10",
+            "command": cmd,
             "timeout_seconds": 1
         });
         let res = run_command(&args).expect("executes with custom timeout");
@@ -756,9 +772,14 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let session_id = "test-session-1";
 
+        #[cfg(unix)]
+        let shell = "sh";
+        #[cfg(windows)]
+        let shell = "cmd.exe";
+
         // Spawn a shell
         let init_out = mgr
-            .spawn(session_id, "sh", &cwd, 24, 80)
+            .spawn(session_id, shell, &cwd, 24, 80)
             .await
             .expect("spawn session");
         assert!(init_out.is_empty() || !init_out.is_empty()); // Shell banner or prompt

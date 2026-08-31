@@ -9,6 +9,7 @@ use super::{Event, Renderer, chunk_utf8};
 use crate::config::Config;
 use crate::orchestrator::OrchestratorManager;
 use anyhow::Result;
+#[cfg(unix)]
 use std::io::IsTerminal;
 use std::io::Write;
 use std::sync::Arc;
