@@ -430,14 +430,47 @@ impl ToolDef {
         }
     }
 
-    /// Build a tool definition dynamically from an MCP tool.
+    /// Minify and sanitize a JSON Schema by removing non-semantic metadata keys
+    /// (`$schema`, `title`, `$id`, empty `$defs`/`definitions`) that bloat LLM tool definitions
+    /// and degrade KV cache efficiency on local and small models.
+    pub fn minify_json_schema(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut cleaned = serde_json::Map::new();
+                for (k, v) in map {
+                    // Strip unnecessary schema metadata
+                    if k == "$schema" || k == "$id" || k == "title" {
+                        continue;
+                    }
+                    // Strip empty $defs / definitions
+                    if (k == "$defs" || k == "definitions")
+                        && v.as_object().map_or(false, |o| o.is_empty())
+                    {
+                        continue;
+                    }
+                    cleaned.insert(k.clone(), Self::minify_json_schema(v));
+                }
+                if cleaned.is_empty() {
+                    serde_json::json!({"type": "object"})
+                } else {
+                    serde_json::Value::Object(cleaned)
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                serde_json::Value::Array(arr.iter().map(Self::minify_json_schema).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Build a tool definition dynamically from an MCP tool, applying schema minification.
     pub fn from_mcp(tool: &crate::mcp::McpTool) -> ToolDef {
         ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
-                name: tool.name.clone(),
+                name: tool.qualified_name(),
                 description: tool.description.clone().unwrap_or_default(),
-                parameters: tool.input_schema.clone(),
+                parameters: Self::minify_json_schema(&tool.input_schema),
             },
         }
     }
@@ -501,4 +534,76 @@ pub struct ChunkToolCall {
 pub struct ChunkToolFunction {
     pub name: Option<String>,
     pub arguments: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::McpTool;
+
+    fn sample_tool(server_name: &str, name: &str) -> McpTool {
+        McpTool {
+            name: name.to_string(),
+            description: Some(format!("{name} from {server_name}")),
+            input_schema: serde_json::json!({"type": "object"}),
+            server_name: server_name.to_string(),
+        }
+    }
+
+    #[test]
+    fn from_mcp_uses_qualified_name() {
+        let tool = sample_tool("alpha", "get_weather");
+        let def = ToolDef::from_mcp(&tool);
+        assert_eq!(def.function.name, "alpha__get_weather");
+    }
+
+    #[test]
+    fn from_mcp_preserves_description_and_schema() {
+        let tool = sample_tool("alpha", "get_weather");
+        let def = ToolDef::from_mcp(&tool);
+        assert_eq!(def.function.description, "get_weather from alpha");
+        assert_eq!(
+            def.function.parameters,
+            serde_json::json!({"type": "object"})
+        );
+        assert_eq!(def.kind, "function");
+    }
+
+    #[test]
+    fn from_mcp_minifies_schema_metadata() {
+        let tool = McpTool {
+            name: "read_file".to_string(),
+            description: Some("Reads a file".to_string()),
+            input_schema: serde_json::json!({
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "title": "ReadFileArgs",
+                "$id": "https://example.com/read_file.json",
+                "$defs": {},
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "title": "Path",
+                        "type": "string",
+                        "description": "File path"
+                    }
+                },
+                "required": ["path"]
+            }),
+            server_name: "fs".to_string(),
+        };
+        let def = ToolDef::from_mcp(&tool);
+        assert_eq!(
+            def.function.parameters,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path"
+                    }
+                },
+                "required": ["path"]
+            })
+        );
+    }
 }

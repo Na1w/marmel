@@ -208,8 +208,19 @@ where
     };
 
     let user_prompt = format!(
-        "Main Session Goal: \"{}\"\nOrchestrator Status: {}\n\nPending Approval Request:\n{}\n\nExecution Plan Progress Breakdown:\n{}\n\nActive Execution Plan (Full Text):\n{}\n\nAvailable Specialist Agents:\n{}\n\nSteering Conversation History:\n{}\n\nNew User Instruction: \"{}\"\n\nActive Subtasks:\n{}\n\nPlease output your decision JSON.",
+        "Available Specialist Agents:\n{}\n\nMain Session Goal: \"{}\"\n\nActive Execution Plan (Full Text):\n{}\n\nExecution Plan Progress Breakdown:\n{}\n\nOrchestrator Status: {}\n\nPending Approval Request:\n{}\n\nActive Subtasks:\n{}\n\nSteering Conversation History:\n{}\n\nNew User Instruction: \"{}\"\n\nPlease output your decision JSON.",
+        available_agents,
         ctx.main_goal,
+        if ctx.plan_content.is_empty() {
+            "None"
+        } else {
+            ctx.plan_content
+        },
+        if ctx.plan_progress.is_empty() {
+            "None"
+        } else {
+            ctx.plan_progress
+        },
         if ctx.orchestrator_status.is_empty() {
             "Active"
         } else {
@@ -220,28 +231,17 @@ where
         } else {
             ctx.pending_approval
         },
-        if ctx.plan_progress.is_empty() {
+        if ctx.active_subtasks.is_empty() {
             "None"
         } else {
-            ctx.plan_progress
+            ctx.active_subtasks
         },
-        if ctx.plan_content.is_empty() {
-            "None"
-        } else {
-            ctx.plan_content
-        },
-        available_agents,
         if ctx.steering_history.is_empty() {
             "None"
         } else {
             ctx.steering_history
         },
         ctx.user_message,
-        if ctx.active_subtasks.is_empty() {
-            "None"
-        } else {
-            ctx.active_subtasks
-        },
     );
 
     let req = ChatRequest {

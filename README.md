@@ -174,15 +174,70 @@ Applied after file config, before defaults:
 | `ui_mode` | `"tui"` | `"tui"` (Ratatui) or `"raw"` (plain streaming). |
 | `system_prompt_path` | `prompts/system.md` | Path to the Manager system prompt. |
 | `[monitoring]` | — | Resilience harness thresholds (`enabled`, `repetition_threshold`, `min_pattern_len`). |
-| `[orchestration]` | — | `max_recursion_depth` (default 3), `manager_module`, `specialists` table. |
-| `[orchestration.specialists.<role>]` | — | Per-specialist `tools`, `model`, `backend_url`, `auth_token`, `validator_model`, `validator_backend_url`, `validator_auth_token`, `max_validator_iterations`, `enable_validator`. |
-| `[mcp_servers.<name>]` | — | MCP server config (`command`, `args`, `env`, `url`). |
+| `[orchestration]` | — | `max_recursion_depth` (default 3), `manager_module`, `mcp_servers`, `specialists` table. |
+| `[orchestration.specialists.<role>]` | — | Per-specialist `tools`, `model`, `backend_url`, `auth_token`, `mcp_servers`, `validator_model`, `validator_backend_url`, `validator_auth_token`, `max_validator_iterations`, `enable_validator`. |
+| `[mcp_servers.<name>]` | — | External MCP server registration (`command`, `args`, `env`, `url`). |
 
-**Per-specialist model routing:** each specialist can use a different backend/model (e.g. route `coder` to a local GPU, `validator` to a cloud model). Unspecified fields fall back to the top-level `backend_url` / `auth_token` / `model`.
+### Specialist Configuration & MCP Routing
 
-### Example configuration
+Marmel enforces strict context boundaries and Role-Based Access Control (RBAC). Both built-in tools and external MCP servers can be granted selectively per specialist.
 
-See marmel.toml
+- **Orchestrator Manager:** Performs planning, delegation, and result synthesis.
+- **Specialists (`coder`, `debugger`, `researcher`, `validator`, `generalist`):** Execute domain tasks with isolated context and scoped toolsets.
+- **Model routing:** Each specialist can route to different LLM backends/models (e.g. `coder` on local GPU, `researcher` on cloud).
+- **Scoped MCP servers:** Each specialist only receives the tool schemas for its configured `mcp_servers`. Tools from external servers are namespaced as `<server_name>__<tool_name>` to eliminate collisions.
+
+### Example configuration (`marmel.toml`)
+
+```toml
+backend_url = "http://localhost:8000/v1"
+model = "llama3.1-8b-instruct"
+max_context_tokens = 8192
+ui_mode = "tui"
+
+# ---------------------------------------------------------------------------
+# External MCP Servers (Model Context Protocol)
+# ---------------------------------------------------------------------------
+
+# Local stdio MCP server
+[mcp_servers.fs]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+
+# Remote HTTP/SSE MCP server
+[mcp_servers.docs_search]
+url = "https://mcp.example.com/search"
+
+# ---------------------------------------------------------------------------
+# Orchestration & Specialist Access Control
+# ---------------------------------------------------------------------------
+
+[orchestration]
+max_recursion_depth = 3
+# Manager can access high-level docs search MCP
+mcp_servers = ["docs_search"]
+
+# Coder gets filesystem MCP tools and local GPU model
+[orchestration.specialists.coder]
+tools = ["delegate_task", "write_file", "replace", "read_file", "run_command", "grep_search", "glob"]
+mcp_servers = ["fs"]
+model = "deepseek-coder-v2"
+backend_url = "http://localhost:11434/v1"
+validator_model = "gemma4:cloud"
+max_validator_iterations = 2
+
+# Researcher gets docs search MCP tools
+[orchestration.specialists.researcher]
+tools = ["delegate_task", "read_file", "run_command", "grep_search", "glob"]
+mcp_servers = ["docs_search"]
+model = "deepseek-v4-flash:cloud"
+
+# Debugger with terminal PTY access (no external MCP tools needed)
+[orchestration.specialists.debugger]
+tools = ["delegate_task", "write_file", "replace", "read_file", "run_command", "grep_search", "glob", "pty_spawn", "pty_write", "pty_read", "pty_close", "pty_list"]
+mcp_servers = []
+model = "deepseek-v4-flash:cloud"
+```
 
 ---
 
