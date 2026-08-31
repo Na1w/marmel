@@ -59,8 +59,7 @@ pub const CONTEXT_LIMIT_EXCEEDED_MESSAGE: &str = "(SYSTEM: CONTEXT LIMIT EXCEEDE
 /// exactly once; subsequent `count_tokens` calls never re-enter the underlying
 /// mutex.
 fn bpe() -> &'static tiktoken_rs::CoreBPE {
-    static BPE: std::sync::OnceLock<tiktoken_rs::CoreBPE> = std::sync::OnceLock::new();
-    BPE.get_or_init(|| tiktoken_rs::cl100k_base_singleton().lock().clone())
+    tiktoken_rs::cl100k_base_singleton()
 }
 
 /// Count the total BPE tokens in a message transcript.

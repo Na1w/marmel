@@ -85,7 +85,7 @@ Marmel is a Rust-based CLI that connects to an OpenAI-compatible chat-completion
 
 ### Prerequisites
 
-- **Rust toolchain 1.94+** (edition 2024).
+- **Rust toolchain 1.98+** (edition 2024).
 - An **OpenAI-compatible chat-completions backend** reachable over HTTP (e.g. Ollama at `http://localhost:11434/v1`, vLLM, OpenRouter, or a local GPU server).
 
 ### Build
@@ -432,21 +432,21 @@ Coverage areas include: config parsing, orchestration (delegation, check-off, re
 
 | Crate | Version | Purpose |
 |---|---|---|
-| `tokio` | 1.43 (full) | Async runtime. |
+| `tokio` | 1.44 (full) | Async runtime. |
 | `futures` / `futures-util` | 0.3.31 | Async streams / combinators. |
 | `async-trait` | 0.1.86 | Async trait support. |
-| `reqwest` | 0.12 (json, stream) | HTTP client for LLM backend. |
+| `reqwest` | 0.13 (json, stream) | HTTP client for LLM backend. |
 | `eventsource-stream` | 0.2 | SSE event parsing. |
 | `serde` / `serde_json` | 1.0 | Serialization. |
-| `toml` | 0.8 | Config parsing. |
-| `ratatui` | 0.29 | TUI rendering. |
-| `crossterm` | 0.28 (event-stream) | Terminal handling. |
-| `portable-pty` | 0.8 | PTY creation for command execution. |
-| `tiktoken-rs` | 0.5 | BPE token counting (cl100k_base). |
+| `toml` | 1.1 | Config parsing. |
+| `ratatui` | 0.30 | TUI rendering. |
+| `crossterm` | 0.29 (event-stream) | Terminal handling. |
+| `portable-pty` | 0.9 | PTY creation for command execution. |
+| `tiktoken-rs` | 0.12 | BPE token counting (cl100k_base). |
 | `regex` | 1.11 | Regex search / parsing. |
 | `ignore` | 0.4 | Gitignore-aware file walking. |
 | `unicode-width` | 0.2 | Terminal width calculation. |
-| `unicode-segmentation` | 1.12 | Grapheme segmentation. |
+| `unicode-segmentation` | 1.13 | Grapheme segmentation. |
 | `uuid` | 1.25 (v4) | UUID generation. |
 | `anyhow` | 1.0 | Error handling. |
 | `thiserror` | 2.0 | Error types. |
@@ -477,5 +477,5 @@ MIT
 - **Name:** `marmennill`
 - **Binary / CLI:** `marmel`
 - **Version:** `0.1.0`
-- **Language:** Rust (edition 2024, `rust-version = "1.94"`)
+- **Language:** Rust (edition 2024, `rust-version = "1.98"`)
 - **Repository:** `https://github.com/Na1w/marmel.git` (branch `main`)
