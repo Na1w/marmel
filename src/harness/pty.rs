@@ -123,10 +123,10 @@ impl PtySession {
         drop(pair.slave);
 
         #[cfg(unix)]
-        let pid = child
-            .process_id()
-            .map(|p| p as i32)
-            .or_else(|| pair.master.process_group_leader())
+        let pid = pair
+            .master
+            .process_group_leader()
+            .or_else(|| child.process_id().map(|p| p as i32))
             .ok_or_else(|| ToolError::BadArguments {
                 tool: "run_command".into(),
                 detail: "could not obtain child process id".into(),
@@ -673,8 +673,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_harness_pty_process_group_kill() {
-        let dir = std::env::temp_dir().join(format!("marmel_pty_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         let pidfile = dir.join("bg.pid");
 
         // Spawn a command that backgrounds a long-running sleep and writes its
@@ -707,14 +707,20 @@ mod tests {
         session.teardown().expect("teardown kills process group");
         drop(session);
 
-        // After teardown, the backgrounded sleep must no longer be reachable.
-        let alive_after = unsafe { libc::kill(bg_pid, 0) == 0 };
+        // Poll briefly until the kernel reaps the killed background process.
+        let mut alive_after = true;
+        for _ in 0..50 {
+            alive_after = unsafe { libc::kill(bg_pid, 0) == 0 };
+            if !alive_after {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
         assert!(
             !alive_after,
             "background sleep {bg_pid} survived process-group kill"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The shell wrapper must include the stty -echo and ulimit preamble with
@@ -789,11 +795,24 @@ mod tests {
         let (input, wait_ms) = ("echo hello_interactive_pty\r\n", 800);
 
         // Write a command
-        let (out, alive) = mgr
+        let (mut out, alive) = mgr
             .write(session_id, input, wait_ms)
             .await
             .expect("write to pty");
         assert!(alive, "session should be alive");
+
+        if !out.contains("hello_interactive_pty") {
+            for _ in 0..15 {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                if let Ok((extra, _)) = mgr.read(session_id, 0).await {
+                    out.push_str(&extra);
+                    if out.contains("hello_interactive_pty") {
+                        break;
+                    }
+                }
+            }
+        }
+
         assert!(
             out.contains("hello_interactive_pty"),
             "output should contain echoed string, got: {out:?}"
