@@ -1200,14 +1200,24 @@ impl TuiRenderer {
             let mut in_think = false;
             for raw_line in msg.lines() {
                 let line = raw_line.replace('\t', "    ");
-                if line.starts_with(" thinking") || line.starts_with("<think>") {
+                let trimmed = line.trim();
+                if line.starts_with(" thinking")
+                    || line.starts_with("<think>")
+                    || line.starts_with("<thought>")
+                    || trimmed == "<think>"
+                    || trimmed == "<thought>"
+                {
                     in_think = true;
                     if !self.show_thought {
                         continue;
                     }
                 }
                 if in_think {
-                    let is_end = line.starts_with(" response") || line.starts_with("</think>");
+                    let is_end = line.starts_with(" response")
+                        || line.starts_with("</think>")
+                        || line.starts_with("</thought>")
+                        || trimmed == "</think>"
+                        || trimmed == "</thought>";
                     if is_end {
                         in_think = false;
                     }
@@ -1223,6 +1233,8 @@ impl TuiRenderer {
                     || line.starts_with(" response")
                     || line.starts_with("<think>")
                     || line.starts_with("</think>")
+                    || line.starts_with("<thought>")
+                    || line.starts_with("</thought>")
                 {
                     chat_lines.push(Line::from(Span::styled(
                         line,
@@ -1236,10 +1248,10 @@ impl TuiRenderer {
                         Style::default().fg(Color::Magenta),
                     )));
                 } else {
-                    // Orchestrator content: LIGHT GRAY
+                    // Orchestrator / Model content: WHITE
                     chat_lines.push(Line::from(Span::styled(
                         line,
-                        Style::default().fg(Color::Gray),
+                        Style::default().fg(Color::White),
                     )));
                 }
             }
@@ -1258,13 +1270,13 @@ impl TuiRenderer {
             chat_lines.push(Line::from(Span::styled("</think>", think_style)));
         }
 
-        // Streaming content (Orchestrator output - LIGHT GRAY).
+        // Streaming content (Orchestrator output - WHITE).
         if !self.current_content.is_empty() {
             for line in self.current_content.lines() {
                 let line = line.replace('\t', "    ");
                 chat_lines.push(Line::from(Span::styled(
                     line,
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(Color::White),
                 )));
             }
         }
@@ -1748,8 +1760,8 @@ fn message_style(msg: &str) -> (Style, bool) {
             true,
         )
     } else {
-        // Orchestrator content defaults to light gray text.
-        (Style::default().fg(Color::Gray), false)
+        // Orchestrator / Model content defaults to white text.
+        (Style::default().fg(Color::White), false)
     }
 }
 
@@ -1759,14 +1771,24 @@ fn count_single_message_lines(msg: &str, width: usize, show_thought: bool) -> us
     let mut n = 0;
     let mut in_think = false;
     for line in msg.lines() {
-        if line.starts_with(" thinking") || line.starts_with("<think>") {
+        let trimmed = line.trim();
+        if line.starts_with(" thinking")
+            || line.starts_with("<think>")
+            || line.starts_with("<thought>")
+            || trimmed == "<think>"
+            || trimmed == "<thought>"
+        {
             in_think = true;
             if !show_thought {
                 continue;
             }
         }
         if in_think {
-            let is_end = line.starts_with(" response") || line.starts_with("</think>");
+            let is_end = line.starts_with(" response")
+                || line.starts_with("</think>")
+                || line.starts_with("</thought>")
+                || trimmed == "</think>"
+                || trimmed == "</thought>";
             if is_end {
                 in_think = false;
             }
@@ -2834,10 +2856,10 @@ mod tests {
     }
 
     #[test]
-    fn test_orchestrator_content_is_gray_and_steer_is_yellow() {
-        let (gray_style, special_gray) = message_style("Orchestrator answer");
-        assert!(!special_gray);
-        assert_eq!(gray_style.fg, Some(Color::Gray));
+    fn test_orchestrator_content_is_white_and_steer_is_yellow() {
+        let (white_style, special_white) = message_style("Orchestrator answer");
+        assert!(!special_white);
+        assert_eq!(white_style.fg, Some(Color::White));
 
         let (yellow_style, special_yellow) =
             message_style("Marmennill: Direct answer from arbitrator");
@@ -2863,6 +2885,78 @@ mod tests {
             r.messages
                 .iter()
                 .any(|m| m.starts_with("Marmennill: Direct reply from arbitrator."))
+        );
+    }
+
+    #[test]
+    fn test_chat_renders_white_content_and_gates_thought() {
+        let mut r = TuiRenderer::new();
+        assert!(!r.show_thought); // Default is false (OFF)
+
+        r.messages
+            .push("<think>\nsecret thoughts\n</think>\nVisible answer to user".to_string());
+        r.current_thought = "streaming thoughts".to_string();
+        r.current_content = "streaming visible answer".to_string();
+
+        let backend = ratatui::backend::TestBackend::new(80, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        // 1. When show_thought is false: thoughts must NOT appear in chat
+        terminal
+            .draw(|frame| {
+                let area = ratatui::layout::Rect::new(0, 0, 80, 10);
+                r.render_chat(frame, area);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut lines = Vec::new();
+        for y in 0..10 {
+            let line: String = (0..80)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect();
+            lines.push(line);
+        }
+        let text_off = lines.join("\n");
+        assert!(
+            !text_off.contains("secret thoughts"),
+            "secret thoughts should be hidden when show_thought=false"
+        );
+        assert!(
+            !text_off.contains("streaming thoughts"),
+            "streaming thoughts should be hidden when show_thought=false"
+        );
+        assert!(text_off.contains("Visible answer to user"));
+        assert!(text_off.contains("streaming visible answer"));
+
+        // 2. Toggle thought ON via /thought
+        r.input_text = "/thought".to_string();
+        r.submit();
+        assert!(r.show_thought);
+
+        terminal
+            .draw(|frame| {
+                let area = ratatui::layout::Rect::new(0, 0, 80, 10);
+                r.render_chat(frame, area);
+            })
+            .unwrap();
+
+        let buffer2 = terminal.backend().buffer();
+        let mut lines2 = Vec::new();
+        for y in 0..10 {
+            let line: String = (0..80)
+                .map(|x| buffer2[(x, y)].symbol().to_string())
+                .collect();
+            lines2.push(line);
+        }
+        let text_on = lines2.join("\n");
+        assert!(
+            text_on.contains("secret thoughts"),
+            "thoughts should be shown when show_thought=true"
+        );
+        assert!(
+            text_on.contains("streaming thoughts"),
+            "streaming thoughts should be shown when show_thought=true"
         );
     }
 
