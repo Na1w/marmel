@@ -185,6 +185,15 @@ pub trait Specialist: Send + Sync + fmt::Debug {
     fn tool_namespaces(&self) -> &[&'static str];
 
     async fn run(&self, ctx: &IsolatedContext) -> Deliverable {
+        if crate::orchestrator::is_aborted() {
+            return Deliverable {
+                marker: MissionMarker::Failed {
+                    reason: "aborted".to_string(),
+                },
+                content: "Task aborted by user instruction.\n\nFAILED (aborted)".to_string(),
+                task_id: ctx.task_id.clone(),
+            };
+        }
         let content = run_specialist_llm(self.name(), ctx).await;
         let marker = MissionMarker::parse(&content).unwrap_or_else(|| MissionMarker::Failed {
             reason: "no terminal marker".to_string(),
@@ -192,7 +201,7 @@ pub trait Specialist: Send + Sync + fmt::Debug {
         Deliverable {
             marker,
             content,
-            task_id: None,
+            task_id: ctx.task_id.clone(),
         }
     }
 
@@ -499,6 +508,10 @@ async fn run_specialist_live(
     );
 
     for _turn in 0..100 {
+        if crate::orchestrator::is_aborted() {
+            tracing::warn!("{agent_tag}: aborted by cancellation signal");
+            return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
+        }
         crate::orchestrator::update_active_worker_context(&_active_guard.0, engine.token_count());
         crate::orchestrator::emit_status(format!(
             "{agent_tag}: thinking / calling model ({specialist_model})..."
@@ -515,7 +528,19 @@ async fn run_specialist_live(
             frequency_penalty: Some(cfg.frequency_penalty),
         };
 
-        let reply = client.chat(&req).await?;
+        let mut abort_rx = crate::orchestrator::subscribe_abort();
+        let reply = if *abort_rx.borrow() {
+            tracing::warn!("{agent_tag}: aborted before LLM request");
+            return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
+        } else {
+            tokio::select! {
+                res = client.chat(&req) => res?,
+                _ = abort_rx.wait_for(|&aborted| aborted) => {
+                    tracing::warn!("{agent_tag}: aborted during LLM call");
+                    return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
+                }
+            }
+        };
         update_revision(&mut final_content, &reply.content);
 
         let mut tool_calls = reply.tool_calls.clone();
@@ -566,6 +591,13 @@ async fn run_specialist_live(
         }
 
         for tc in tool_calls {
+            if crate::orchestrator::is_aborted() {
+                tracing::warn!(
+                    "{agent_tag}: aborted before executing tool {}",
+                    tc.function.name
+                );
+                return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
+            }
             let args_val = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
                 .unwrap_or_else(|_| serde_json::Value::String(tc.function.arguments.clone()));
             let preview = format_tool_args_preview(&tc.function.name, &args_val);

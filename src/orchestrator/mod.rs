@@ -28,6 +28,34 @@ pub use steer::{
 static STATUS_SENDER: std::sync::RwLock<Option<tokio::sync::mpsc::UnboundedSender<String>>> =
     std::sync::RwLock::new(None);
 
+static ABORT_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ABORT_WATCH: std::sync::LazyLock<(
+    tokio::sync::watch::Sender<bool>,
+    tokio::sync::watch::Receiver<bool>,
+)> = std::sync::LazyLock::new(|| tokio::sync::watch::channel(false));
+
+/// Request cancellation / abort across all active workers and specialists.
+pub fn request_abort() {
+    ABORT_FLAG.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = ABORT_WATCH.0.send(true);
+}
+
+/// Reset the abort state for a new turn or execution.
+pub fn clear_abort() {
+    ABORT_FLAG.store(false, std::sync::atomic::Ordering::SeqCst);
+    let _ = ABORT_WATCH.0.send(false);
+}
+
+/// Check whether an abort was requested.
+pub fn is_aborted() -> bool {
+    ABORT_FLAG.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Subscribe to abort watch notifications.
+pub fn subscribe_abort() -> tokio::sync::watch::Receiver<bool> {
+    ABORT_WATCH.1.clone()
+}
+
 /// Register an unbounded channel to receive real-time status updates across all agents and specialists.
 pub fn set_status_sender(tx: tokio::sync::mpsc::UnboundedSender<String>) {
     if let Ok(mut lock) = STATUS_SENDER.write() {
@@ -611,8 +639,18 @@ impl OrchestratorManager {
         );
 
         // 5. Build the worker and run to completion (synchronous-from-Manager).
-        let worker = self.registry.worker(entry.agent);
-        let deliverable = worker.run(&ctx).await;
+        let deliverable = if is_aborted() {
+            Deliverable {
+                marker: MissionMarker::Failed {
+                    reason: "aborted".to_string(),
+                },
+                content: "Task aborted by user instruction.\n\nFAILED (aborted)".to_string(),
+                task_id: req.task_id.clone(),
+            }
+        } else {
+            let worker = self.registry.worker(entry.agent);
+            worker.run(&ctx).await
+        };
 
         // 6. Deep-Freeze: the delegation terminated (cleanly). Release the
         //    frozen checkpoint so a later recovery does not re-resume a task

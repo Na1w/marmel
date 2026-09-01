@@ -2421,6 +2421,7 @@ impl Renderer for TuiRenderer {
 
     fn clear_abort(&mut self) {
         self.aborted = false;
+        self.confirm_abort = false;
     }
 
     fn shutdown(&mut self) {

@@ -80,6 +80,8 @@ pub async fn run_session(
     initial: Option<String>,
     manager: Option<Arc<OrchestratorManager>>,
 ) -> Result<()> {
+    crate::orchestrator::clear_abort();
+    renderer.clear_abort();
     renderer.init()?;
 
     let system = load_system_prompt(cfg)?;
@@ -135,6 +137,7 @@ pub async fn run_session(
     let mut keep_going = true;
     let stream_cfg = StreamConfig::from_config(cfg);
     let mut steer_queue = Vec::<String>::new();
+    let mut steer_abort_requested = false;
     let mut subagents = Vec::<SubagentDetail>::new();
     let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (steer_arb_tx, mut steer_arb_rx) = tokio::sync::mpsc::unbounded_channel::<SteerArbEvent>();
@@ -145,7 +148,12 @@ pub async fn run_session(
             renderer.on_event(&Event::Status(msg));
         }
 
-        drain_steer_arbitration_events(&mut steer_arb_rx, &mut *renderer, &mut steer_queue);
+        drain_steer_arbitration_events(
+            &mut steer_arb_rx,
+            &mut *renderer,
+            &mut steer_queue,
+            &mut steer_abort_requested,
+        );
         drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
 
         if let Some(steer) = renderer.poll_input() {
@@ -177,7 +185,12 @@ pub async fn run_session(
             while let Ok(msg) = status_rx.try_recv() {
                 renderer.on_event(&Event::Status(msg));
             }
-            drain_steer_arbitration_events(&mut steer_arb_rx, &mut *renderer, &mut steer_queue);
+            drain_steer_arbitration_events(
+                &mut steer_arb_rx,
+                &mut *renderer,
+                &mut steer_queue,
+                &mut steer_abort_requested,
+            );
             drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
             renderer.flush()?;
 
@@ -192,6 +205,7 @@ pub async fn run_session(
             let mut bridge = RendererSink {
                 renderer: &mut *renderer,
                 steer_queue: &mut steer_queue,
+                steer_abort_requested: &mut steer_abort_requested,
                 arb_tx: &steer_arb_tx,
                 arb_rx: &mut steer_arb_rx,
                 client: &client,
@@ -242,7 +256,7 @@ pub async fn run_session(
             if tool_calls.is_empty() {
                 let current_plan = manager.as_ref().map(|m| m.plan.clone()).unwrap_or_default();
                 let pending = current_plan.pending_tasks();
-                if !pending.is_empty() && nudge_count < 5 {
+                if !steer_abort_requested && !pending.is_empty() && nudge_count < 5 {
                     nudge_count += 1;
                     let pending_str = pending.join(", ");
                     renderer.on_event(&Event::Status(format!(
@@ -348,6 +362,7 @@ pub async fn run_session(
                             &mut steer_arb_rx,
                             &mut *renderer,
                             &mut steer_queue,
+                            &mut steer_abort_requested,
                         );
                         drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
                         if renderer.aborted() {
@@ -379,6 +394,7 @@ pub async fn run_session(
                                     &mut steer_arb_rx,
                                     &mut *renderer,
                                     &mut steer_queue,
+                                    &mut steer_abort_requested,
                                 );
                                 drain_delegation_events(
                                     manager.as_deref(),
@@ -506,6 +522,7 @@ pub async fn run_session(
                             &mut steer_arb_rx,
                             &mut *renderer,
                             &mut steer_queue,
+                            &mut steer_abort_requested,
                         );
                         drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
                         if renderer.aborted() {
@@ -528,6 +545,7 @@ pub async fn run_session(
                                     &mut steer_arb_rx,
                                     &mut *renderer,
                                     &mut steer_queue,
+                                    &mut steer_abort_requested,
                                 );
                                 drain_delegation_events(
                                     manager.as_deref(),
@@ -596,11 +614,24 @@ pub async fn run_session(
             }
         }
 
-        drain_steer_arbitration_events(&mut steer_arb_rx, &mut *renderer, &mut steer_queue);
-        if renderer.aborted() {
-            if !steer_queue.is_empty() {
-                // Steer arbitrator requested AbortImmediately -> clear abort flag and start next turn immediately
+        drain_steer_arbitration_events(
+            &mut steer_arb_rx,
+            &mut *renderer,
+            &mut steer_queue,
+            &mut steer_abort_requested,
+        );
+        if steer_abort_requested || renderer.aborted() {
+            if steer_abort_requested {
+                // Steer arbitrator requested AbortImmediately / RejectPlan -> clear abort flag, reset subagents, and start next turn immediately
+                steer_abort_requested = false;
                 renderer.clear_abort();
+                crate::orchestrator::clear_abort();
+                for s in subagents.iter_mut() {
+                    if s.is_active {
+                        s.is_active = false;
+                        s.logs.push("[aborted by user]".to_string());
+                    }
+                }
                 for steer in steer_queue.drain(..) {
                     ctx.append(Message::User { content: steer });
                 }
@@ -754,6 +785,7 @@ fn drain_steer_arbitration_events(
     arb_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SteerArbEvent>,
     renderer: &mut dyn Renderer,
     steer_queue: &mut Vec<String>,
+    steer_abort_requested: &mut bool,
 ) {
     while let Ok(ev) = arb_rx.try_recv() {
         match ev {
@@ -770,7 +802,9 @@ fn drain_steer_arbitration_events(
                         let _ = renderer.flush();
                     }
                     Some("AbortImmediately") => {
+                        crate::orchestrator::request_abort();
                         renderer.request_abort();
+                        *steer_abort_requested = true;
                         steer_queue.push(user_msg);
                     }
                     Some("ForwardToWorker") => {
@@ -783,7 +817,9 @@ fn drain_steer_arbitration_events(
                         steer_queue.push("User approved plan.".to_string());
                     }
                     Some("RejectPlan") => {
+                        crate::orchestrator::request_abort();
                         renderer.request_abort();
+                        *steer_abort_requested = true;
                         steer_queue.push(format!("User rejected plan: {user_msg}"));
                     }
                     _ => {
@@ -802,6 +838,7 @@ fn drain_steer_arbitration_events(
 struct RendererSink<'a> {
     renderer: &'a mut dyn Renderer,
     steer_queue: &'a mut Vec<String>,
+    steer_abort_requested: &'a mut bool,
     arb_tx: &'a tokio::sync::mpsc::UnboundedSender<SteerArbEvent>,
     arb_rx: &'a mut tokio::sync::mpsc::UnboundedReceiver<SteerArbEvent>,
     client: &'a ChatClient,
@@ -822,7 +859,12 @@ impl StreamSink for RendererSink<'_> {
 
     fn is_aborted(&mut self) -> bool {
         let _ = self.renderer.flush();
-        drain_steer_arbitration_events(self.arb_rx, self.renderer, self.steer_queue);
+        drain_steer_arbitration_events(
+            self.arb_rx,
+            self.renderer,
+            self.steer_queue,
+            self.steer_abort_requested,
+        );
         if let Some(input) = self.renderer.poll_input() {
             if is_abort_command(&input) {
                 self.renderer.request_abort();

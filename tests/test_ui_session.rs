@@ -51,6 +51,9 @@ struct ScriptedRenderer {
     /// Lines returned by `read_input()`, consumed in order.
     read_script: Vec<String>,
     read_cursor: usize,
+    /// Lines returned by `poll_input()`, consumed in order.
+    poll_script: Vec<String>,
+    poll_cursor: usize,
     /// Whether an abort was requested (via `/abort`).
     aborted: bool,
 }
@@ -60,6 +63,18 @@ impl ScriptedRenderer {
         Self {
             read_script,
             read_cursor: 0,
+            poll_script: Vec::new(),
+            poll_cursor: 0,
+            aborted: false,
+        }
+    }
+
+    fn with_poll(read_script: Vec<String>, poll_script: Vec<String>) -> Self {
+        Self {
+            read_script,
+            read_cursor: 0,
+            poll_script,
+            poll_cursor: 0,
             aborted: false,
         }
     }
@@ -73,9 +88,15 @@ impl Renderer for ScriptedRenderer {
     fn flush(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
-    /// Non-blocking: returns `None` (the user has not typed at the poll instant).
+    /// Non-blocking: returns scripted poll lines or `None`.
     fn poll_input(&mut self) -> Option<String> {
-        None
+        if self.poll_cursor < self.poll_script.len() {
+            let line = self.poll_script[self.poll_cursor].clone();
+            self.poll_cursor += 1;
+            if line.is_empty() { None } else { Some(line) }
+        } else {
+            None
+        }
     }
     /// Blocking: returns the next scripted line, or `None` when exhausted.
     fn read_input(&mut self) -> Option<String> {
@@ -88,6 +109,9 @@ impl Renderer for ScriptedRenderer {
     }
     fn aborted(&self) -> bool {
         self.aborted
+    }
+    fn clear_abort(&mut self) {
+        self.aborted = false;
     }
     fn shutdown(&mut self) {}
 }
@@ -240,4 +264,89 @@ async fn test_ui_run_session_auto_nudges_when_plan_incomplete_capped_at_5() {
         backend_calls, 6,
         "expected 1 initial turn + 5 auto-nudge retries = 6 backend calls, but got {backend_calls}"
     );
+}
+
+fn tool_call_sse(id: &str, name: &str, args: &str) -> String {
+    format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        serde_json::json!({
+            "id": "chatcmpl-1",
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": args
+                        }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        })
+    )
+}
+
+/// Verify that when mid-flight steering arbitration decides `AbortImmediately`,
+/// the session aborts the current turn, clears the abort flag, injects the steering
+/// redirection into context, and stays alive for the subsequent turn instead of exiting.
+#[tokio::test]
+async fn test_ui_session_steer_abort_redirection_resets_abort_and_continues() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let assistant_turns = Arc::new(AtomicUsize::new(0));
+    let arbitrator_calls = Arc::new(AtomicUsize::new(0));
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let assistant_turns = assistant_turns.clone();
+            let arbitrator_calls = arbitrator_calls.clone();
+            move |req: &wiremock::Request| {
+                let body_str = String::from_utf8_lossy(&req.body);
+                if body_str.contains("Steer Arbitrator") || body_str.contains("Arbitrate the user")
+                {
+                    arbitrator_calls.fetch_add(1, Ordering::SeqCst);
+                    let body =
+                        completion_sse(r#"{"decision": "AbortImmediately", "response": null}"#);
+                    ResponseTemplate::new(200).set_body_string(body)
+                } else {
+                    let n = assistant_turns.fetch_add(1, Ordering::SeqCst);
+                    let body = if n == 0 {
+                        tool_call_sse("call_1", "read_file", r#"{"path": "Cargo.toml"}"#)
+                    } else {
+                        completion_sse("Second turn response redirected to user instruction.")
+                    };
+                    ResponseTemplate::new(200).set_body_string(body)
+                }
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let cfg = config_for_backend(&server.uri());
+
+    // Scripted input:
+    // Initial goal: "start long task"
+    // Mid-flight poll input: "" (before turn 1), then "stop and list files instead" during tool execution
+    // After turn 2: "/abort" to finish
+    let mut renderer = ScriptedRenderer::with_poll(
+        vec!["start long task".to_string(), "/abort".to_string()],
+        vec![String::new(), "stop and list files instead".to_string()],
+    );
+
+    marmennill::ui::run_session(&cfg, &mut renderer, None, None)
+        .await
+        .expect("run_session should complete without error");
+
+    let total_assistant_turns = assistant_turns.load(Ordering::SeqCst);
+    assert!(
+        total_assistant_turns >= 2,
+        "expected at least 2 assistant turns (turn 1 aborted + turn 2 redirection), but got {total_assistant_turns}"
+    );
+
+    assert!(renderer.aborted(), "session should end via final /abort");
 }
