@@ -145,9 +145,19 @@ pub enum ToolError {
 }
 
 fn write_plan(md: &str) -> Result<ToolResult, ToolError> {
-    crate::agent::phase::Plan::default()
-        .create(md)
-        .map(|_| ToolResult::ok("plan written to .marmel/execution_plan.md"))
+    let plan = crate::agent::phase::Plan::default();
+    plan.create(md)
+        .map(|_| {
+            let pending = plan.pending_tasks();
+            let pending_str = if pending.is_empty() {
+                "none".to_string()
+            } else {
+                pending.join(", ")
+            };
+            ToolResult::ok(format!(
+                "Execution plan written to .marmel/execution_plan.md.\nRecognized pending tasks: [{pending_str}].\nPhase is now EXECUTING. You must proceed immediately to emit `delegate_task` tool calls for the first pending task(s). Do NOT call create_plan again unless you explicitly intend to overwrite the plan."
+            ))
+        })
         .map_err(ToolError::Execution)
 }
 

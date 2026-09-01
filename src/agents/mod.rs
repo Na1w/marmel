@@ -184,8 +184,12 @@ pub trait Specialist: Send + Sync + fmt::Debug {
     fn name(&self) -> Agent;
     fn tool_namespaces(&self) -> &[&'static str];
 
-    async fn run(&self, ctx: &IsolatedContext) -> Deliverable {
-        if crate::orchestrator::is_aborted() {
+    async fn run(
+        &self,
+        ctx: &IsolatedContext,
+        token: &tokio_util::sync::CancellationToken,
+    ) -> Deliverable {
+        if token.is_cancelled() {
             return Deliverable {
                 marker: MissionMarker::Failed {
                     reason: "aborted".to_string(),
@@ -194,7 +198,7 @@ pub trait Specialist: Send + Sync + fmt::Debug {
                 task_id: ctx.task_id.clone(),
             };
         }
-        let content = run_specialist_llm(self.name(), ctx).await;
+        let content = run_specialist_llm(self.name(), ctx, token).await;
         let marker = MissionMarker::parse(&content).unwrap_or_else(|| MissionMarker::Failed {
             reason: "no terminal marker".to_string(),
         });
@@ -210,7 +214,11 @@ pub trait Specialist: Send + Sync + fmt::Debug {
     }
 }
 
-pub(crate) async fn run_specialist_llm(agent: Agent, ctx: &IsolatedContext) -> String {
+pub(crate) async fn run_specialist_llm(
+    agent: Agent,
+    ctx: &IsolatedContext,
+    token: &tokio_util::sync::CancellationToken,
+) -> String {
     let snippet_block = if ctx.snippets.is_empty() {
         "(none)".to_string()
     } else {
@@ -233,13 +241,13 @@ pub(crate) async fn run_specialist_llm(agent: Agent, ctx: &IsolatedContext) -> S
 
     #[cfg(test)]
     {
-        let _ = agent;
+        let _ = (agent, token);
         canned
     }
 
     #[cfg(not(test))]
     {
-        if let Some(res) = try_run_specialist_live(agent, ctx).await {
+        if let Some(res) = try_run_specialist_live(agent, ctx, token).await {
             return res;
         }
         canned
@@ -247,7 +255,11 @@ pub(crate) async fn run_specialist_llm(agent: Agent, ctx: &IsolatedContext) -> S
 }
 
 #[cfg(not(test))]
-async fn try_run_specialist_live(agent: Agent, ctx: &IsolatedContext) -> Option<String> {
+async fn try_run_specialist_live(
+    agent: Agent,
+    ctx: &IsolatedContext,
+    token: &tokio_util::sync::CancellationToken,
+) -> Option<String> {
     if tokio::runtime::Handle::try_current().is_err() {
         return None;
     }
@@ -274,7 +286,9 @@ async fn try_run_specialist_live(agent: Agent, ctx: &IsolatedContext) -> Option<
         .and_then(|sc| sc.model.as_ref())
         .unwrap_or(&cfg.model);
     let client = crate::llm::ChatClient::new_with_token(backend_url, model, auth_token);
-    let res = run_specialist_live(&client, agent, ctx, &cfg).await.ok()?;
+    let res = run_specialist_live(&client, agent, ctx, &cfg, token)
+        .await
+        .ok()?;
     (!res.trim().is_empty()).then_some(res)
 }
 
@@ -446,6 +460,7 @@ async fn run_specialist_live(
     agent: Agent,
     ctx: &IsolatedContext,
     cfg: &crate::config::Config,
+    token: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<String> {
     let env_block = crate::prompts::format_environment_block();
 
@@ -508,7 +523,7 @@ async fn run_specialist_live(
     );
 
     for _turn in 0..100 {
-        if crate::orchestrator::is_aborted() {
+        if token.is_cancelled() {
             tracing::warn!("{agent_tag}: aborted by cancellation signal");
             return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
         }
@@ -528,17 +543,11 @@ async fn run_specialist_live(
             frequency_penalty: Some(cfg.frequency_penalty),
         };
 
-        let mut abort_rx = crate::orchestrator::subscribe_abort();
-        let reply = if *abort_rx.borrow() {
-            tracing::warn!("{agent_tag}: aborted before LLM request");
-            return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
-        } else {
-            tokio::select! {
-                res = client.chat(&req) => res?,
-                _ = abort_rx.wait_for(|&aborted| aborted) => {
-                    tracing::warn!("{agent_tag}: aborted during LLM call");
-                    return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
-                }
+        let reply = tokio::select! {
+            res = client.chat(&req) => res?,
+            _ = token.cancelled() => {
+                tracing::warn!("{agent_tag}: aborted during LLM call");
+                return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
             }
         };
         update_revision(&mut final_content, &reply.content);
@@ -591,7 +600,7 @@ async fn run_specialist_live(
         }
 
         for tc in tool_calls {
-            if crate::orchestrator::is_aborted() {
+            if token.is_cancelled() {
                 tracing::warn!(
                     "{agent_tag}: aborted before executing tool {}",
                     tc.function.name
@@ -689,13 +698,18 @@ async fn run_specialist_live(
         && !final_content.is_empty()
     {
         for val_iter in 0..max_val_iterations {
+            if token.is_cancelled() {
+                tracing::warn!("{agent_tag}: aborted before validation pass");
+                return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
+            }
             crate::orchestrator::emit_status(format!(
                 "validator-{agent_tag}: testing deliverable (pass {}/{})...",
                 val_iter + 1,
                 max_val_iterations
             ));
             if let Ok((approved, critique)) =
-                run_automated_validation(client, agent, &ctx.brief, &final_content, cfg).await
+                run_automated_validation(client, agent, &ctx.brief, &final_content, cfg, token)
+                    .await
             {
                 if approved {
                     let feedback = if critique.trim().is_empty() {
@@ -741,6 +755,12 @@ async fn run_specialist_live(
 
                     let mut latest_revision = String::new();
                     for rev_turn in 0..25 {
+                        if token.is_cancelled() {
+                            tracing::warn!("{agent_tag}: aborted during revision");
+                            return Ok(
+                                "Task aborted by user instruction.\n\nFAILED (aborted)".to_string()
+                            );
+                        }
                         crate::orchestrator::emit_status(format!(
                             "{agent_tag}: revising code per validator critique (step {}/25)...",
                             rev_turn + 1
@@ -757,13 +777,19 @@ async fn run_specialist_live(
                             frequency_penalty: Some(cfg.frequency_penalty),
                         };
 
-                        let reply = match client.chat(&req).await {
-                            Ok(r) => r,
-                            Err(e) => {
-                                tracing::error!(
-                                    "{agent_tag}: LLM chat call error on revision step {rev_turn}: {e:?}"
-                                );
-                                break;
+                        let reply = tokio::select! {
+                            res = client.chat(&req) => match res {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    tracing::error!(
+                                        "{agent_tag}: LLM chat call error on revision step {rev_turn}: {e:?}"
+                                    );
+                                    break;
+                                }
+                            },
+                            _ = token.cancelled() => {
+                                tracing::warn!("{agent_tag}: aborted during LLM revision call");
+                                return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
                             }
                         };
                         if !reply.content.is_empty() {
@@ -891,6 +917,7 @@ async fn run_automated_validation(
     task_brief: &str,
     deliverable: &str,
     cfg: &crate::config::Config,
+    token: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<(bool, String)> {
     let validator_prompt = match agent {
         Agent::Coder => crate::agents::validator::VALIDATOR_CODER_ROLE_PROMPT,
@@ -967,6 +994,13 @@ async fn run_automated_validation(
         mon_cfg,
     );
     for _turn in 0..50 {
+        if token.is_cancelled() {
+            tracing::warn!("validator-{agent}: aborted by cancellation token");
+            return Ok((
+                false,
+                "Validation aborted by cancellation signal.".to_string(),
+            ));
+        }
         crate::orchestrator::update_active_worker_context(&_active_guard.0, engine.token_count());
         let req = crate::types::ChatRequest {
             model: validator_model.clone(),
@@ -980,11 +1014,17 @@ async fn run_automated_validation(
             frequency_penalty: Some(cfg.frequency_penalty),
         };
 
-        let reply = match val_client.chat(&req).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("validator-{agent} LLM chat call error on turn {_turn}: {e:?}");
-                break;
+        let reply = tokio::select! {
+            res = val_client.chat(&req) => match res {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("validator-{agent} LLM chat call error on turn {_turn}: {e:?}");
+                    break;
+                }
+            },
+            _ = token.cancelled() => {
+                tracing::warn!("validator-{agent}: aborted during LLM call");
+                return Ok((false, "Validation aborted by cancellation signal.".to_string()));
             }
         };
 

@@ -158,6 +158,7 @@ pub struct TuiRenderer {
 
     active_agent: String,
     last_render: std::time::Instant,
+    waiting_for_token_since: Option<std::time::Instant>,
 
     /// Estimated total input (prompt) tokens across the session.
     pub tokens_in: usize,
@@ -227,6 +228,7 @@ impl TuiRenderer {
 
             active_agent: "Manager".to_string(),
             last_render: std::time::Instant::now(),
+            waiting_for_token_since: None,
         }
     }
 
@@ -1719,6 +1721,10 @@ impl TuiRenderer {
         ]
         .iter()
         .any(|k| status_str.contains(k));
+        if let Some(start) = self.waiting_for_token_since {
+            let elapsed = start.elapsed().as_secs_f32();
+            status_str.push_str(&format!(" ({:.1}s)", elapsed));
+        }
         if active_phase {
             let frames = ["…", "..", "."];
             let idx = (self.frame_counter % frames.len() as u64) as usize;
@@ -2165,6 +2171,7 @@ impl Renderer for TuiRenderer {
                 self.tokens_out = self.tokens_out.saturating_add(*count);
             }
             Event::Message(text) => {
+                self.waiting_for_token_since = None;
                 let tok_count = tiktoken_rs::cl100k_base_singleton()
                     .encode_ordinary(text)
                     .len();
@@ -2190,6 +2197,7 @@ impl Renderer for TuiRenderer {
                 }
             }
             Event::SteerResponse(text) => {
+                self.waiting_for_token_since = None;
                 let tok_count = tiktoken_rs::cl100k_base_singleton()
                     .encode_ordinary(text)
                     .len();
@@ -2208,6 +2216,7 @@ impl Renderer for TuiRenderer {
                 }
             }
             Event::Thinking(text) => {
+                self.waiting_for_token_since = None;
                 let tok_count = tiktoken_rs::cl100k_base_singleton()
                     .encode_ordinary(text)
                     .len();
@@ -2233,6 +2242,7 @@ impl Renderer for TuiRenderer {
                 }
             }
             Event::ToolCall(text) => {
+                self.waiting_for_token_since = None;
                 let tok_count = tiktoken_rs::cl100k_base_singleton()
                     .encode_ordinary(text)
                     .len();
@@ -2247,6 +2257,7 @@ impl Renderer for TuiRenderer {
                 }
             }
             Event::ToolResult(text) => {
+                self.waiting_for_token_since = None;
                 self.messages.push(format!("[Tool Result] {text}"));
                 if self.chat_auto_scroll {
                     let w = self.chat_width.get();
@@ -2257,6 +2268,17 @@ impl Renderer for TuiRenderer {
             }
             Event::Status(text) => {
                 self.status_line = text.lines().next().unwrap_or("").to_string();
+                let is_waiting = self.status_line.contains("Running")
+                    || self.status_line.contains("thinking")
+                    || self.status_line.contains("calling backend")
+                    || self.status_line.contains("Arbitrating");
+                if is_waiting {
+                    if self.waiting_for_token_since.is_none() {
+                        self.waiting_for_token_since = Some(std::time::Instant::now());
+                    }
+                } else if self.status_line.contains("Ready") {
+                    self.waiting_for_token_since = None;
+                }
                 if text.starts_with("[CLI]")
                     || text.starts_with("[Validator] APPROVED")
                     || text.starts_with("System Error")
@@ -2405,7 +2427,8 @@ impl Renderer for TuiRenderer {
             if let Ok(line) = self.rx.try_recv() {
                 return Some(line);
             }
-            if handled {
+            if handled || self.last_render.elapsed() >= Duration::from_millis(50) {
+                self.last_render = std::time::Instant::now();
                 let _ = self.flush();
             }
         }
@@ -3431,6 +3454,39 @@ mod tests {
             content.contains("Ctx: 14.5k"),
             "expected 'Ctx: 14.5k' in status bar, got: {content}"
         );
+    }
+
+    #[test]
+    fn test_waiting_for_token_elapsed_time_in_status_bar() {
+        let mut r = TuiRenderer::new();
+        r.on_event(&Event::Status("Running (test-model)".to_string()));
+        assert!(r.waiting_for_token_since.is_some());
+
+        let backend = ratatui::backend::TestBackend::new(100, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = ratatui::layout::Rect::new(0, 9, 100, 1);
+                r.render_status(frame, area);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = (0..100)
+            .map(|x| buffer[(x, 9)].symbol().to_string())
+            .collect();
+        assert!(
+            content.contains("Running (test-model)"),
+            "expected 'Running (test-model)' in status bar, got: {content}"
+        );
+        assert!(
+            content.contains("s)"),
+            "expected elapsed seconds counter '(X.Xs)' in status bar, got: {content}"
+        );
+
+        // First token arrives -> timer clears
+        r.on_event(&Event::Message("token 1".to_string()));
+        assert!(r.waiting_for_token_since.is_none());
     }
 
     #[test]

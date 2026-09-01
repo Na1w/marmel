@@ -28,34 +28,6 @@ pub use steer::{
 static STATUS_SENDER: std::sync::RwLock<Option<tokio::sync::mpsc::UnboundedSender<String>>> =
     std::sync::RwLock::new(None);
 
-static ABORT_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static ABORT_WATCH: std::sync::LazyLock<(
-    tokio::sync::watch::Sender<bool>,
-    tokio::sync::watch::Receiver<bool>,
-)> = std::sync::LazyLock::new(|| tokio::sync::watch::channel(false));
-
-/// Request cancellation / abort across all active workers and specialists.
-pub fn request_abort() {
-    ABORT_FLAG.store(true, std::sync::atomic::Ordering::SeqCst);
-    let _ = ABORT_WATCH.0.send(true);
-}
-
-/// Reset the abort state for a new turn or execution.
-pub fn clear_abort() {
-    ABORT_FLAG.store(false, std::sync::atomic::Ordering::SeqCst);
-    let _ = ABORT_WATCH.0.send(false);
-}
-
-/// Check whether an abort was requested.
-pub fn is_aborted() -> bool {
-    ABORT_FLAG.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-/// Subscribe to abort watch notifications.
-pub fn subscribe_abort() -> tokio::sync::watch::Receiver<bool> {
-    ABORT_WATCH.1.clone()
-}
-
 /// Register an unbounded channel to receive real-time status updates across all agents and specialists.
 pub fn set_status_sender(tx: tokio::sync::mpsc::UnboundedSender<String>) {
     if let Ok(mut lock) = STATUS_SENDER.write() {
@@ -95,12 +67,11 @@ pub struct ActiveWorkerGuard(pub String);
 
 impl Drop for ActiveWorkerGuard {
     fn drop(&mut self) {
-        if let Ok(mut map) = ACTIVE_WORKERS.write() {
-            if let Some(info) = map.remove(&self.0)
-                && let Ok(mut last_map) = WORKER_CONTEXT_TOKENS.write()
-            {
-                last_map.insert(self.0.clone(), info.context_tokens);
-            }
+        if let Ok(mut map) = ACTIVE_WORKERS.write()
+            && let Some(info) = map.remove(&self.0)
+            && let Ok(mut last_map) = WORKER_CONTEXT_TOKENS.write()
+        {
+            last_map.insert(self.0.clone(), info.context_tokens);
         }
     }
 }
@@ -518,6 +489,8 @@ pub struct OrchestratorManager {
     /// `Arc<OrchestratorManager>`) be drained concurrently by the UI without a
     /// `&mut` borrow, so `delegate` stays `&self`.
     pub delegation_events: Arc<std::sync::Mutex<Vec<DelegationEvent>>>,
+    /// Cancellation token for this manager and its subagent worker hierarchy.
+    pub cancellation_token: tokio_util::sync::CancellationToken,
 }
 
 impl OrchestratorManager {
@@ -555,7 +528,24 @@ impl OrchestratorManager {
             depth: RecursionDepth::root(),
             journal,
             delegation_events: Arc::new(std::sync::Mutex::new(Vec::new())),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    /// Request cancellation across this manager and all its child workers.
+    pub fn cancel(&self) {
+        self.cancellation_token.cancel();
+    }
+
+    /// Check whether this manager has been cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation_token.is_cancelled()
+    }
+
+    /// Set a custom cancellation token (e.g. from session loop).
+    pub fn with_cancellation_token(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancellation_token = token;
+        self
     }
 
     /// Enforce the Manager-Never-Does-Domain-Work invariant.
@@ -639,7 +629,7 @@ impl OrchestratorManager {
         );
 
         // 5. Build the worker and run to completion (synchronous-from-Manager).
-        let deliverable = if is_aborted() {
+        let deliverable = if self.cancellation_token.is_cancelled() {
             Deliverable {
                 marker: MissionMarker::Failed {
                     reason: "aborted".to_string(),
@@ -649,7 +639,8 @@ impl OrchestratorManager {
             }
         } else {
             let worker = self.registry.worker(entry.agent);
-            worker.run(&ctx).await
+            let child_token = self.cancellation_token.child_token();
+            worker.run(&ctx, &child_token).await
         };
 
         // 6. Deep-Freeze: the delegation terminated (cleanly). Release the
@@ -711,7 +702,8 @@ impl OrchestratorManager {
         // session (SPEC §3.4). Rehydrate with the identical worker_id.
         let ctx = IsolatedContext::from_request(self.role_prompt_for(entry.agent), &snap.sub_req);
         let worker = self.registry.worker(entry.agent);
-        let deliverable = worker.run(&ctx).await;
+        let child_token = self.cancellation_token.child_token();
+        let deliverable = worker.run(&ctx, &child_token).await;
 
         // The frozen delegation resolved: release the checkpoint so it is not
         // resumed again on a subsequent boot.
@@ -899,7 +891,7 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
     );
 
     let deliverable = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(manager.delegate(req)))
+        handle.block_on(manager.delegate(req))
     } else {
         futures::executor::block_on(manager.delegate(req))
     }

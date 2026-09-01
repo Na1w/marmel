@@ -80,7 +80,6 @@ pub async fn run_session(
     initial: Option<String>,
     manager: Option<Arc<OrchestratorManager>>,
 ) -> Result<()> {
-    crate::orchestrator::clear_abort();
     renderer.clear_abort();
     renderer.init()?;
 
@@ -265,7 +264,7 @@ pub async fn run_session(
                     renderer.flush()?;
                     ctx.append(Message::User {
                         content: format!(
-                            "(SYSTEM NOTICE: The execution plan is NOT complete. Remaining tasks: [{pending_str}]. You must continue issuing tool calls to fulfill the remaining tasks. Do NOT stop or summarize to the user until all tasks are complete.)"
+                            "(SYSTEM NOTICE: The execution plan is active on disk with pending tasks: [{pending_str}]. You are in the EXECUTING phase. You must call `delegate_task` to dispatch these pending tasks to specialists. Do NOT call `create_plan` again, and do NOT output conversational filler until all tasks are marked [x].)"
                         ),
                     });
                     continue;
@@ -622,10 +621,9 @@ pub async fn run_session(
         );
         if steer_abort_requested || renderer.aborted() {
             if steer_abort_requested {
-                // Steer arbitrator requested AbortImmediately / RejectPlan -> clear abort flag, reset subagents, and start next turn immediately
+                // Steer arbitrator requested AbortImmediately / RejectPlan -> reset abort state, reset subagents, and start next turn immediately
                 steer_abort_requested = false;
                 renderer.clear_abort();
-                crate::orchestrator::clear_abort();
                 for s in subagents.iter_mut() {
                     if s.is_active {
                         s.is_active = false;
@@ -802,7 +800,6 @@ fn drain_steer_arbitration_events(
                         let _ = renderer.flush();
                     }
                     Some("AbortImmediately") => {
-                        crate::orchestrator::request_abort();
                         renderer.request_abort();
                         *steer_abort_requested = true;
                         steer_queue.push(user_msg);
@@ -817,7 +814,6 @@ fn drain_steer_arbitration_events(
                         steer_queue.push("User approved plan.".to_string());
                     }
                     Some("RejectPlan") => {
-                        crate::orchestrator::request_abort();
                         renderer.request_abort();
                         *steer_abort_requested = true;
                         steer_queue.push(format!("User rejected plan: {user_msg}"));

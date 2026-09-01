@@ -35,22 +35,17 @@ use marmennill::orchestrator::{
 };
 use std::sync::Arc;
 
-static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Create a fresh temp dir and set the process cwd to it (so no `marmel.toml`
 /// is found and the worker falls back to its deterministic canned deliverable
 /// instead of attempting a live LLM call).
-fn setup() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
-    let guard = TEST_LOCK.lock().unwrap();
-    marmennill::orchestrator::clear_abort();
+fn setup() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     std::env::set_current_dir(tmp.path()).expect("set cwd to temp dir");
-    (tmp, guard)
+    tmp
 }
 
 /// Build a manager rooted at a fresh temp plan dir for tests.
 fn test_manager(dir: &tempfile::TempDir) -> OrchestratorManager {
-    marmennill::orchestrator::clear_abort();
     OrchestratorManager::new(
         ChatClient::new("http://localhost:9999/v1", "test-model"),
         Plan::at(dir.path()),
@@ -85,7 +80,7 @@ fn req(
 /// unconditional gate at tools_manager.rs:914).
 #[tokio::test]
 async fn test_depth_gate_rejects_at_bound_regardless_of_grant() {
-    let (tmp, _guard) = setup();
+    let tmp = setup();
     let mut m = test_manager(&tmp);
     m.orchestration.max_recursion_depth = 3;
     // Place the manager at the max depth (0→1→2→3 is allowed; depth 3 + 1 is not).
@@ -108,7 +103,7 @@ async fn test_depth_gate_rejects_at_bound_regardless_of_grant() {
 /// (parity with caesar, which returns before spawning a worker on rejection).
 #[tokio::test]
 async fn test_depth_gate_rejection_emits_no_started_event() {
-    let (tmp, _guard) = setup();
+    let tmp = setup();
     let mut m = test_manager(&tmp);
     m.orchestration.max_recursion_depth = 1;
     m.depth = RecursionDepth(1); // at the bound
@@ -128,7 +123,7 @@ async fn test_depth_gate_rejection_emits_no_started_event() {
 /// A delegation within the bound succeeds and emits Started + Completed.
 #[tokio::test]
 async fn test_depth_gate_allows_within_bound() {
-    let (tmp, _guard) = setup();
+    let tmp = setup();
     let mut m = test_manager(&tmp);
     m.orchestration.max_recursion_depth = 3;
     // Root depth 0; a single delegation (0→1) is within the bound.
@@ -147,7 +142,7 @@ async fn test_depth_gate_allows_within_bound() {
 /// the worker runs and clears it on clean termination (SPEC §3.4).
 #[tokio::test]
 async fn test_deep_freeze_snapshots_and_clears() {
-    let (tmp, _guard) = setup();
+    let tmp = setup();
     let m = test_manager(&tmp);
     assert!(!m.journal.is_frozen());
     let d = m
@@ -173,7 +168,7 @@ async fn test_deep_freeze_snapshots_and_clears() {
 /// worker_id and preserved sub_req.
 #[tokio::test]
 async fn test_deep_freeze_recover_rehydrates() {
-    let (tmp, _guard) = setup();
+    let tmp = setup();
     let m = test_manager(&tmp);
     let r = req(
         Agent::Generalist,
@@ -205,7 +200,7 @@ async fn test_deep_freeze_recover_rehydrates() {
 /// With nothing frozen, `recover_frozen()` is a clean no-op.
 #[tokio::test]
 async fn test_deep_freeze_recover_none_when_clean() {
-    let (tmp, _guard) = setup();
+    let tmp = setup();
     let m = test_manager(&tmp);
     assert!(!m.journal.is_frozen());
     let res = m.recover_frozen().await.expect("no error on clean boot");
@@ -220,7 +215,7 @@ async fn test_deep_freeze_recover_none_when_clean() {
 /// event for the specialist + task.
 #[tokio::test]
 async fn test_delegation_events_started_then_completed() {
-    let (tmp, _guard) = setup();
+    let tmp = setup();
     let m = test_manager(&tmp);
     let _ = m
         .delegate(req(
@@ -250,7 +245,7 @@ async fn test_delegation_events_started_then_completed() {
 /// `MISSION COMPLETE (t-xxx)` flips the plan line `[ ]` → `[x]`.
 #[tokio::test]
 async fn test_check_off_complete_flips() {
-    let (tmp, _guard) = setup();
+    let tmp = setup();
     let m = test_manager(&tmp);
     m.create_plan("- [ ] [t-101] Build the parser.\n- [ ] [t-102] Test the parser.\n")
         .expect("plan written");
@@ -274,7 +269,7 @@ async fn test_check_off_complete_flips() {
 /// line on `MISSION COMPLETE` and leaves a non-Complete task pending.
 #[tokio::test]
 async fn test_check_off_failed_leaves_unchecked() {
-    let (tmp, _guard) = setup();
+    let tmp = setup();
     let m = test_manager(&tmp);
     m.create_plan("- [ ] [t-200] Do the thing.\n").unwrap();
     // A FAILED deliverable bound to t-200 must leave it pending.
@@ -299,8 +294,6 @@ async fn test_check_off_failed_leaves_unchecked() {
 /// ToolError (the snake_case enum rejects it), never a panic.
 #[test]
 fn test_handler_rejects_unknown_agent() {
-    let _guard = TEST_LOCK.lock().unwrap();
-    marmennill::orchestrator::clear_abort();
     let args = serde_json::json!({
         "agent_name": "planner",
         "prompt": "Nope.",
@@ -313,8 +306,6 @@ fn test_handler_rejects_unknown_agent() {
 /// A blank prompt is rejected (one task per call; the brief must stand alone).
 #[test]
 fn test_handler_rejects_empty_prompt() {
-    let _guard = TEST_LOCK.lock().unwrap();
-    marmennill::orchestrator::clear_abort();
     let args = serde_json::json!({
         "agent_name": "coder",
         "prompt": "   ",
@@ -328,8 +319,6 @@ fn test_handler_rejects_empty_prompt() {
 /// (task-id)` terminal marker.
 #[test]
 fn test_handler_full_signature_success() {
-    let _guard = TEST_LOCK.lock().unwrap();
-    marmennill::orchestrator::clear_abort();
     let args = serde_json::json!({
         "agent_name": "coder",
         "prompt": "Implement the widget parser.",
@@ -350,22 +339,17 @@ fn test_handler_full_signature_success() {
 
 #[tokio::test]
 async fn test_orchestrator_abort_signal_lifecycle_and_cancellation() {
-    let (tmp, _guard) = setup();
+    let tmp = setup();
     let m = test_manager(&tmp);
 
-    // Initial state: not aborted
-    marmennill::orchestrator::clear_abort();
-    assert!(!marmennill::orchestrator::is_aborted());
+    // Initial state: not cancelled
+    assert!(!m.is_cancelled());
 
-    let mut rx = marmennill::orchestrator::subscribe_abort();
-    assert!(!*rx.borrow());
+    // Request abort / cancellation
+    m.cancel();
+    assert!(m.is_cancelled());
 
-    // Request abort
-    marmennill::orchestrator::request_abort();
-    assert!(marmennill::orchestrator::is_aborted());
-    assert!(*rx.borrow_and_update());
-
-    // When aborted, delegate() immediately returns a Failed deliverable without executing
+    // When cancelled, delegate() immediately returns a Failed deliverable without executing
     let d = m
         .delegate(req(Agent::Coder, "write parser", Some("t-99"), false))
         .await
@@ -373,13 +357,10 @@ async fn test_orchestrator_abort_signal_lifecycle_and_cancellation() {
     assert!(matches!(d.marker, MissionMarker::Failed { .. }));
     assert!(d.content.contains("aborted"));
 
-    // Reset abort state
-    marmennill::orchestrator::clear_abort();
-    assert!(!marmennill::orchestrator::is_aborted());
-    assert!(!*rx.borrow_and_update());
-
-    // Clean execution succeeds after clear_abort
-    let d2 = m
+    // Clean fresh manager succeeds
+    let m2 = test_manager(&tmp);
+    assert!(!m2.is_cancelled());
+    let d2 = m2
         .delegate(req(Agent::Coder, "write parser", Some("t-99"), false))
         .await
         .expect("returns deliverable");

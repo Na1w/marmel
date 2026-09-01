@@ -36,7 +36,7 @@ The ONLY permitted uses of your own tools are:
 4. final user synthesis
 
 ## Planning & Dispatching Protocol (REQ-PLAN-003 / REQ-ORCH-001)
-- **PLAN CREATION:** For tasks requiring code, research, multi-part reviews, or debugging, call `create_plan` FIRST to write `.marmel/execution_plan.md` with explicit `- [ ] [t-xxx]` tasks before emitting `delegate_task` calls.
+- **PLAN CREATION:** For tasks requiring code, research, multi-part reviews, or debugging, call `create_plan` ONCE to write `.marmel/execution_plan.md` with explicit `- [ ] [t-xxx]` tasks. Once `create_plan` succeeds, you transition immediately to the EXECUTING phase and must proceed to `delegate_task`. Do NOT call `create_plan` a second time unless explicitly asked to recreate the plan.
 - **PARALLEL-FRIENDLY PLANNING:** Structure the execution plan into clear phases with decoupled, independent tasks so they can run concurrently (aim for **2 to 4 parallel tasks per phase as standard**).
 - In the **Conversational** phase (no plan on disk): interact with the user and call `create_plan` to initiate execution.
 - In the **Executing** phase (plan on disk): emit `delegate_task` calls directly for pending plan items.

@@ -187,10 +187,21 @@ impl ChatClient {
             builder = builder.bearer_auth(&self.auth_token);
         }
 
-        let resp = builder
-            .send()
-            .await
-            .map_err(|e| ChatError::Transport(e.to_string()))?;
+        let send_fut = builder.send();
+        tokio::pin!(send_fut);
+        let resp = loop {
+            if !on_delta("") {
+                return Ok(StreamedReply::default());
+            }
+            match tokio::time::timeout(Duration::from_millis(50), &mut send_fut).await {
+                Ok(res) => break res.map_err(|e| ChatError::Transport(e.to_string()))?,
+                Err(_) => {
+                    if !on_delta("") {
+                        return Ok(StreamedReply::default());
+                    }
+                }
+            }
+        };
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
