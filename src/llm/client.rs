@@ -276,8 +276,6 @@ impl ChatClient {
                 raw,
                 tool_calls,
             };
-            let out_toks = count_reply_tokens(&reply.content, &reply.reasoning, &reply.tool_calls);
-            record_tokens_out(out_toks);
             return Ok(reply);
         }
 
@@ -386,6 +384,7 @@ where
             if let Some(r) = choice.delta.reasoning_content
                 && !r.is_empty()
             {
+                record_tokens_out(1);
                 reasoning.push_str(&r);
                 raw.push_str(&r);
                 if !*in_reasoning {
@@ -401,6 +400,7 @@ where
             if let Some(c) = choice.delta.content
                 && !c.is_empty()
             {
+                record_tokens_out(1);
                 if *in_reasoning {
                     *in_reasoning = false;
                     if !on_delta("</think>") {
@@ -415,6 +415,7 @@ where
             }
             if let Some(tcs) = choice.delta.tool_calls {
                 for tc in tcs {
+                    record_tokens_out(1);
                     let entry = tool_calls_map
                         .entry(tc.index)
                         .or_insert_with(|| (None, String::new(), String::new()));
@@ -429,6 +430,9 @@ where
                             entry.2.push_str(&args);
                         }
                     }
+                }
+                if !on_delta("") {
+                    return Ok(true);
                 }
             }
         }

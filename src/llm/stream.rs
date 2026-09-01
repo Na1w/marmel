@@ -201,7 +201,7 @@ fn is_empty_production(m: &Message) -> bool {
 }
 
 pub(crate) fn build_request(cfg: &StreamConfig, messages: Vec<Message>) -> ChatRequest {
-    let mut tools = crate::types::ToolDef::default_tools();
+    let mut tools = crate::types::ToolDef::manager_tools();
     if let Some(mcp) = crate::harness::get_mcp_manager() {
         for tool in mcp.tools_for_servers(&cfg.mcp_servers) {
             tools.push(crate::types::ToolDef::from_mcp(&tool));

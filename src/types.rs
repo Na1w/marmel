@@ -521,6 +521,19 @@ impl ToolDef {
             Self::leave_verdict(),
         ]
     }
+
+    pub fn manager_tools() -> Vec<ToolDef> {
+        let roles = &["coder", "researcher", "debugger", "validator", "generalist"];
+        vec![
+            Self::delegate_task(roles),
+            Self::create_plan(),
+            Self::archive_current_plan(),
+            Self::read_file(),
+            Self::grep_search(),
+            Self::glob(),
+            Self::rebirth(),
+        ]
+    }
 }
 
 /// A single streaming chunk from the SSE response.
