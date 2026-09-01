@@ -163,6 +163,8 @@ pub struct TuiRenderer {
     pub tokens_in: usize,
     /// Estimated total output (completion) tokens across the session.
     pub tokens_out: usize,
+    /// Context window size (tokens) of the orchestrator/main turn.
+    pub orchestrator_context_tokens: usize,
 }
 
 impl TuiRenderer {
@@ -180,6 +182,7 @@ impl TuiRenderer {
             status_line: "Ready".to_string(),
             tokens_in: 0,
             tokens_out: 0,
+            orchestrator_context_tokens: 0,
             focused_panel: FocusedPanel::Chat,
             chat_scroll: 0,
             plan_scroll: 0,
@@ -688,6 +691,7 @@ impl TuiRenderer {
                     thinking: String::new(),
                     content: String::new(),
                     is_active,
+                    context_tokens: 0,
                 });
                 idx
             }
@@ -1356,8 +1360,18 @@ impl TuiRenderer {
         let total_plan_lines = wrapped_lines(plan, plan_w.max(1));
         self.plan_max_scroll = total_plan_lines.saturating_sub(plan_h) as u16;
         let scroll_y = if self.plan_auto_scroll {
-            self.plan_scroll = self.plan_max_scroll;
-            self.plan_max_scroll
+            let target_scroll = if let Some(first_pending_visual) =
+                visual_line_offset_of_first_pending(plan, plan_w.max(1))
+            {
+                // Position the first pending task comfortably in view (leaving 1 line of context above if possible)
+                let desired = first_pending_visual.saturating_sub(1);
+                (desired as u16).min(self.plan_max_scroll)
+            } else {
+                // If all tasks are completed or no pending tasks, scroll to bottom to show completed progress
+                self.plan_max_scroll
+            };
+            self.plan_scroll = target_scroll;
+            target_scroll
         } else {
             self.plan_scroll.min(self.plan_max_scroll)
         };
@@ -1430,10 +1444,26 @@ impl TuiRenderer {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let status = if sa.is_active {
-                Span::styled(" (Active)", Style::default().fg(Color::LightGreen))
+            let ctx_tokens = if sa.is_active {
+                crate::orchestrator::get_active_worker_tokens(&sa.name).unwrap_or(sa.context_tokens)
             } else {
-                Span::styled(" (Idle)", Style::default().fg(Color::DarkGray))
+                sa.context_tokens
+            };
+            let ctx_info = if ctx_tokens > 0 {
+                format!(", {} ctx", Self::format_count(ctx_tokens))
+            } else {
+                String::new()
+            };
+            let status = if sa.is_active {
+                Span::styled(
+                    format!(" (Active{ctx_info})"),
+                    Style::default().fg(Color::LightGreen),
+                )
+            } else {
+                Span::styled(
+                    format!(" (Idle{ctx_info})"),
+                    Style::default().fg(Color::DarkGray),
+                )
             };
             list_lines.push(Line::from(vec![
                 Span::raw(prefix),
@@ -1626,15 +1656,15 @@ impl TuiRenderer {
         let tokens_in = self.tokens_in.max(global_in);
         let tokens_out = self.tokens_out.max(global_out);
         let tokens_str = Self::format_token_counts(tokens_in, tokens_out);
-        let status_text =
-            if let Some(ctx_str) = crate::orchestrator::get_active_specialist_context_str() {
-                format!(
-                    " Ctx: {} | Tokens: {} | Status: {}",
-                    ctx_str, tokens_str, status_str
-                )
-            } else {
-                format!(" Tokens: {} | Status: {}", tokens_str, status_str)
-            };
+        let status_text = if self.orchestrator_context_tokens > 0 {
+            let ctx_str = Self::format_count(self.orchestrator_context_tokens);
+            format!(
+                " Ctx: {} | Tokens: {} | Status: {}",
+                ctx_str, tokens_str, status_str
+            )
+        } else {
+            format!(" Tokens: {} | Status: {}", tokens_str, status_str)
+        };
         let status_paragraph = Paragraph::new(status_text)
             .style(Style::default().bg(Color::DarkGray).fg(Color::White));
         frame.render_widget(status_paragraph, area);
@@ -1874,6 +1904,24 @@ fn wrapped_lines(text: &str, width: usize) -> usize {
     total_lines
 }
 
+/// Compute the visual (wrapped) line offset of the first uncompleted task checkbox (`- [ ]`)
+/// in the execution plan text. Returns `None` if no uncompleted task is present.
+fn visual_line_offset_of_first_pending(text: &str, width: usize) -> Option<usize> {
+    static UNCHECKED_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = UNCHECKED_RE.get_or_init(|| {
+        regex::Regex::new(r"^\s*(?:[-*]|\d+\.)?\s*(\[\s*\]|\(\s*\))")
+            .expect("valid unchecked regex")
+    });
+    let mut visual_offset = 0;
+    for raw_line in text.lines() {
+        if re.is_match(raw_line) {
+            return Some(visual_offset);
+        }
+        visual_offset += wrapped_lines(raw_line, width).max(1);
+    }
+    None
+}
+
 /// Compute a centered rectangle of `percent_x`% width and `percent_y`% height
 /// within `r` (reference §9.1).
 #[allow(dead_code)]
@@ -1997,6 +2045,7 @@ impl Renderer for TuiRenderer {
     fn on_event(&mut self, event: &Event) {
         match event {
             Event::TokensIn(count) => {
+                self.orchestrator_context_tokens = *count;
                 self.tokens_in = self.tokens_in.saturating_add(*count);
             }
             Event::TokensOut(count) => {
@@ -2545,6 +2594,7 @@ mod tests {
             thinking: "think".to_string(),
             content: "out".to_string(),
             is_active: true,
+            context_tokens: 0,
         });
         // 1 (header) + 2 ([Thinking], " thinking") + 1 (think) + 1 (" response")
         // + 1 ([Output]) + 1 (out) + 1 ([Logs]) + 1 (- log1) = 9
@@ -2616,6 +2666,7 @@ mod tests {
             thinking: String::new(),
             content: String::new(),
             is_active: true,
+            context_tokens: 0,
         });
 
         r.focused_panel = FocusedPanel::Chat;
@@ -2706,6 +2757,7 @@ mod tests {
             thinking: "local think".to_string(),
             content: "local content".to_string(),
             is_active: true,
+            context_tokens: 0,
         });
 
         // Authoritative list from the loop (no thinking/content, just lifecycle).
@@ -2718,6 +2770,7 @@ mod tests {
             thinking: String::new(),
             content: String::new(),
             is_active: true,
+            context_tokens: 0,
         }];
         r.set_subagents(authoritative);
 
@@ -2737,6 +2790,7 @@ mod tests {
             thinking: String::new(),
             content: String::new(),
             is_active: false,
+            context_tokens: 0,
         });
         r.set_subagents(vec![SubagentDetail {
             name: "coder".to_string(),
@@ -2747,6 +2801,7 @@ mod tests {
             thinking: String::new(),
             content: String::new(),
             is_active: false,
+            context_tokens: 0,
         }]);
         assert_eq!(r.subagents.len(), 1);
         assert_eq!(r.subagents[0].name, "coder");
@@ -2816,6 +2871,49 @@ mod tests {
     }
 
     #[test]
+    fn test_visual_line_offset_of_first_pending() {
+        let plan = "# Plan\n## Phase 1\n- [x] [t-001] Done 1\n- [x] [t-002] Done 2\n## Phase 2\n- [ ] [t-003] Next task\n- [ ] [t-004] Later task\n";
+        let offset = visual_line_offset_of_first_pending(plan, 80);
+        // Line 0: # Plan
+        // Line 1: ## Phase 1
+        // Line 2: - [x] [t-001] Done 1
+        // Line 3: - [x] [t-002] Done 2
+        // Line 4: ## Phase 2
+        // Line 5: - [ ] [t-003] Next task (first unchecked)
+        assert_eq!(offset, Some(5));
+
+        let completed_plan = "# Plan\n- [x] Done 1\n- [x] Done 2\n";
+        assert_eq!(
+            visual_line_offset_of_first_pending(completed_plan, 80),
+            None
+        );
+    }
+
+    #[test]
+    fn test_plan_auto_scrolls_to_first_pending_task() {
+        let mut r = TuiRenderer::new();
+        let plan_text = "# Plan\n## Phase 1\n- [x] Task 1\n- [x] Task 2\n- [x] Task 3\n- [x] Task 4\n- [x] Task 5\n- [x] Task 6\n- [x] Task 7\n- [x] Task 8\n## Phase 2\n- [ ] Task 9\n- [ ] Task 10\n";
+        r.plan_content = plan_text.to_string();
+        r.show_plan_panel = true;
+        r.plan_auto_scroll = true;
+
+        let backend = ratatui::backend::TestBackend::new(80, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = ratatui::layout::Rect::new(0, 0, 80, 8);
+                r.render_plan(frame, area, plan_text, false);
+            })
+            .unwrap();
+
+        // Area height is 8, inner height is 6.
+        // Task 9 is at visual offset 11. Desired scroll is 11 - 1 = 10.
+        // Total lines is 13, max scroll is 13 - 6 = 7.
+        // Scroll should be min(10, 7) = 7.
+        assert_eq!(r.plan_scroll, 7);
+    }
+
+    #[test]
     fn test_subagent_scrolling_and_focus() {
         let mut r = TuiRenderer::new();
         r.focused_panel = FocusedPanel::Subagents;
@@ -2833,6 +2931,7 @@ mod tests {
             thinking: "think line 1\nthink line 2\nthink line 3".to_string(),
             content: "output line 1\noutput line 2".to_string(),
             is_active: true,
+            context_tokens: 0,
         });
 
         r.subagent_width.set(40);
@@ -2897,6 +2996,7 @@ mod tests {
             thinking: "think".to_string(),
             content: "output".to_string(),
             is_active: true,
+            context_tokens: 0,
         });
         r.subagents.push(SubagentDetail {
             name: "coder-2".to_string(),
@@ -2912,6 +3012,7 @@ mod tests {
             thinking: "think 2".to_string(),
             content: "output 2".to_string(),
             is_active: true,
+            context_tokens: 0,
         });
 
         r.subagent_width.set(40);
@@ -3006,6 +3107,102 @@ mod tests {
         r.on_event(&Event::TokensIn(1000));
         r.on_event(&Event::Message("Hello world response".to_string()));
         assert_eq!(r.tokens_in, 1000);
+        assert_eq!(r.orchestrator_context_tokens, 1000);
         assert!(r.tokens_out > 0);
+    }
+
+    #[test]
+    fn test_orchestrator_context_tokens_in_status_bar() {
+        let mut r = TuiRenderer::new();
+        r.on_event(&Event::TokensIn(14500));
+        assert_eq!(r.orchestrator_context_tokens, 14500);
+
+        let backend = ratatui::backend::TestBackend::new(100, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = ratatui::layout::Rect::new(0, 9, 100, 1);
+                r.render_status(frame, area);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = (0..100)
+            .map(|x| buffer[(x, 9)].symbol().to_string())
+            .collect();
+        assert!(
+            content.contains("Ctx: 14.5k"),
+            "expected 'Ctx: 14.5k' in status bar, got: {content}"
+        );
+    }
+
+    #[test]
+    fn test_subagent_context_tokens_rendering_in_list() {
+        let mut r = TuiRenderer::new();
+        r.show_subagent_panel = true;
+        r.subagents.push(SubagentDetail {
+            name: "coder-t-1".to_string(),
+            task_id: Some("t-1".to_string()),
+            prompt: String::new(),
+            started_at: None,
+            logs: vec![],
+            thinking: String::new(),
+            content: String::new(),
+            is_active: true,
+            context_tokens: 3500,
+        });
+        r.subagents.push(SubagentDetail {
+            name: "researcher-t-2".to_string(),
+            task_id: Some("t-2".to_string()),
+            prompt: String::new(),
+            started_at: None,
+            logs: vec![],
+            thinking: String::new(),
+            content: String::new(),
+            is_active: false,
+            context_tokens: 1200,
+        });
+        r.subagents.push(SubagentDetail {
+            name: "validator".to_string(),
+            task_id: None,
+            prompt: String::new(),
+            started_at: None,
+            logs: vec![],
+            thinking: String::new(),
+            content: String::new(),
+            is_active: true,
+            context_tokens: 0,
+        });
+
+        let backend = ratatui::backend::TestBackend::new(100, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = ratatui::layout::Rect::new(0, 0, 100, 20);
+                r.render_subagents(frame, area);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut lines = Vec::new();
+        for y in 0..20 {
+            let line: String = (0..100)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect();
+            lines.push(line);
+        }
+        let full_text = lines.join("\n");
+        assert!(
+            full_text.contains("coder-t-1 (Active, 3.5k ctx)"),
+            "expected 'coder-t-1 (Active, 3.5k ctx)' in subagents panel, got:\n{full_text}"
+        );
+        assert!(
+            full_text.contains("researcher-t-2 (Idle, 1.2k ctx)"),
+            "expected 'researcher-t-2 (Idle, 1.2k ctx)' in subagents panel, got:\n{full_text}"
+        );
+        assert!(
+            full_text.contains("validator (Active)"),
+            "expected 'validator (Active)' with no ctx string when 0, got:\n{full_text}"
+        );
     }
 }

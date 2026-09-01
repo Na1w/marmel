@@ -28,6 +28,8 @@ pub struct SubagentDetail {
     pub content: String,
     /// Whether this subagent is currently running (between Started/Completed).
     pub is_active: bool,
+    /// The context tokens used by this subagent.
+    pub context_tokens: usize,
 }
 
 /// A single agent event dispatched to the active renderer.
@@ -235,10 +237,7 @@ pub async fn run_session(
             }
 
             if tool_calls.is_empty() {
-                let current_plan = manager
-                    .as_ref()
-                    .map(|m| m.plan.clone())
-                    .unwrap_or_else(crate::agent::phase::Plan::default);
+                let current_plan = manager.as_ref().map(|m| m.plan.clone()).unwrap_or_default();
                 let pending = current_plan.pending_tasks();
                 if !pending.is_empty() && nudge_count < 5 {
                     nudge_count += 1;
@@ -586,10 +585,7 @@ pub async fn run_session(
                 }
             }
 
-            let current_plan = manager
-                .as_ref()
-                .map(|m| m.plan.clone())
-                .unwrap_or_else(crate::agent::phase::Plan::default);
+            let current_plan = manager.as_ref().map(|m| m.plan.clone()).unwrap_or_default();
             if current_plan.is_complete() {
                 ctx.append(Message::User {
                     content: "(SYSTEM NOTICE: All execution plan tasks are now COMPLETE [x]. Do NOT execute any more tools or re-delegate. Deliver your comprehensive final answer/synthesis to the user now.)".to_string(),
@@ -961,8 +957,12 @@ fn update_subagent_lifecycle(
     } else {
         format!("completed task {task_str}")
     };
+    let active_tokens = crate::orchestrator::get_active_worker_tokens(&name).unwrap_or(0);
     if let Some(existing) = subagents.iter_mut().find(|s| s.name == name) {
         existing.is_active = started;
+        if active_tokens > 0 {
+            existing.context_tokens = active_tokens;
+        }
         if started {
             existing.task_id = task;
             if let Some(p) = prompt {
@@ -987,6 +987,7 @@ fn update_subagent_lifecycle(
             thinking: String::new(),
             content: String::new(),
             is_active: started,
+            context_tokens: active_tokens,
         });
     }
 }

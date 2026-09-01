@@ -108,11 +108,17 @@ pub fn register_active_worker(
 
 /// Update the active specialist worker's context token count.
 pub fn update_active_worker_context(key: &str, tokens: usize) {
-    if let Ok(mut map) = ACTIVE_WORKERS.write() {
-        if let Some(info) = map.get_mut(key) {
-            info.context_tokens = tokens;
-        }
+    if let Ok(mut map) = ACTIVE_WORKERS.write()
+        && let Some(info) = map.get_mut(key)
+    {
+        info.context_tokens = tokens;
     }
+}
+
+/// Get the context token count for an active specialist worker by its key (e.g. `coder-t-001`).
+pub fn get_active_worker_tokens(key: &str) -> Option<usize> {
+    let map = ACTIVE_WORKERS.read().ok()?;
+    map.get(key).map(|w| w.context_tokens)
 }
 
 /// Format the active specialist context tokens for display in the status bar.
