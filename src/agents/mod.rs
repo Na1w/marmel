@@ -535,7 +535,7 @@ async fn run_specialist_live(
             model: specialist_model.clone(),
             messages: engine.messages().to_vec(),
             tools: Some(tools.clone()),
-            stream: Some(false),
+            stream: Some(true),
             enable_thinking: None,
             temperature: Some(cfg.temperature),
             top_p: Some(cfg.top_p),
@@ -543,8 +543,22 @@ async fn run_specialist_live(
             frequency_penalty: Some(cfg.frequency_penalty),
         };
 
+        let mut in_think = false;
         let reply = tokio::select! {
-            res = client.chat(&req) => res?,
+            res = client.chat_stream(&req, |chunk| {
+                if chunk == "<think>" {
+                    in_think = true;
+                    crate::orchestrator::emit_event(crate::ui::Event::Thinking(chunk.to_string()));
+                } else if chunk == "</think>" {
+                    in_think = false;
+                    crate::orchestrator::emit_event(crate::ui::Event::Thinking(chunk.to_string()));
+                } else if in_think {
+                    crate::orchestrator::emit_event(crate::ui::Event::Thinking(chunk.to_string()));
+                } else if !chunk.is_empty() {
+                    crate::orchestrator::emit_event(crate::ui::Event::Message(chunk.to_string()));
+                }
+                true
+            }) => res?,
             _ = token.cancelled() => {
                 tracing::warn!("{agent_tag}: aborted during LLM call");
                 return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
@@ -769,7 +783,7 @@ async fn run_specialist_live(
                             model: specialist_model.clone(),
                             messages: engine.messages().to_vec(),
                             tools: Some(tools.clone()),
-                            stream: Some(false),
+                            stream: Some(true),
                             enable_thinking: None,
                             temperature: Some(cfg.temperature),
                             top_p: Some(cfg.top_p),
@@ -777,8 +791,22 @@ async fn run_specialist_live(
                             frequency_penalty: Some(cfg.frequency_penalty),
                         };
 
+                        let mut in_think = false;
                         let reply = tokio::select! {
-                            res = client.chat(&req) => match res {
+                            res = client.chat_stream(&req, |chunk| {
+                                if chunk == "<think>" {
+                                    in_think = true;
+                                    crate::orchestrator::emit_event(crate::ui::Event::Thinking(chunk.to_string()));
+                                } else if chunk == "</think>" {
+                                    in_think = false;
+                                    crate::orchestrator::emit_event(crate::ui::Event::Thinking(chunk.to_string()));
+                                } else if in_think {
+                                    crate::orchestrator::emit_event(crate::ui::Event::Thinking(chunk.to_string()));
+                                } else if !chunk.is_empty() {
+                                    crate::orchestrator::emit_event(crate::ui::Event::Message(chunk.to_string()));
+                                }
+                                true
+                            }) => match res {
                                 Ok(r) => r,
                                 Err(e) => {
                                     tracing::error!(
@@ -1002,11 +1030,15 @@ async fn run_automated_validation(
             ));
         }
         crate::orchestrator::update_active_worker_context(&_active_guard.0, engine.token_count());
+        crate::orchestrator::emit_status(format!(
+            "validator-{agent}: evaluating test & inspection output (turn {}/50)...",
+            _turn + 1
+        ));
         let req = crate::types::ChatRequest {
             model: validator_model.clone(),
             messages: engine.messages().to_vec(),
             tools: Some(tools.clone()),
-            stream: Some(false),
+            stream: Some(true),
             enable_thinking: None,
             temperature: Some(0.0),
             top_p: Some(cfg.top_p),
@@ -1014,8 +1046,22 @@ async fn run_automated_validation(
             frequency_penalty: Some(cfg.frequency_penalty),
         };
 
+        let mut in_think = false;
         let reply = tokio::select! {
-            res = val_client.chat(&req) => match res {
+            res = val_client.chat_stream(&req, |chunk| {
+                if chunk == "<think>" {
+                    in_think = true;
+                    crate::orchestrator::emit_event(crate::ui::Event::Thinking(chunk.to_string()));
+                } else if chunk == "</think>" {
+                    in_think = false;
+                    crate::orchestrator::emit_event(crate::ui::Event::Thinking(chunk.to_string()));
+                } else if in_think {
+                    crate::orchestrator::emit_event(crate::ui::Event::Thinking(chunk.to_string()));
+                } else if !chunk.is_empty() {
+                    crate::orchestrator::emit_event(crate::ui::Event::Message(chunk.to_string()));
+                }
+                true
+            }) => match res {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!("validator-{agent} LLM chat call error on turn {_turn}: {e:?}");

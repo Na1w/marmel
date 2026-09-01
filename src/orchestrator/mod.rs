@@ -28,9 +28,20 @@ pub use steer::{
 static STATUS_SENDER: std::sync::RwLock<Option<tokio::sync::mpsc::UnboundedSender<String>>> =
     std::sync::RwLock::new(None);
 
+static EVENT_SENDER: std::sync::RwLock<
+    Option<tokio::sync::mpsc::UnboundedSender<crate::ui::Event>>,
+> = std::sync::RwLock::new(None);
+
 /// Register an unbounded channel to receive real-time status updates across all agents and specialists.
 pub fn set_status_sender(tx: tokio::sync::mpsc::UnboundedSender<String>) {
     if let Ok(mut lock) = STATUS_SENDER.write() {
+        *lock = Some(tx);
+    }
+}
+
+/// Register an unbounded channel to receive real-time UI events across all agents and specialists.
+pub fn set_event_sender(tx: tokio::sync::mpsc::UnboundedSender<crate::ui::Event>) {
+    if let Ok(mut lock) = EVENT_SENDER.write() {
         *lock = Some(tx);
     }
 }
@@ -41,6 +52,15 @@ pub fn emit_status(msg: impl Into<String>) {
         && let Some(tx) = lock.as_ref()
     {
         let _ = tx.send(msg.into());
+    }
+}
+
+/// Emit a UI event directly to the active UI renderer.
+pub fn emit_event(ev: crate::ui::Event) {
+    if let Ok(lock) = EVENT_SENDER.read()
+        && let Some(tx) = lock.as_ref()
+    {
+        let _ = tx.send(ev);
     }
 }
 

@@ -2176,21 +2176,18 @@ impl Renderer for TuiRenderer {
                     .encode_ordinary(text)
                     .len();
                 self.tokens_out = self.tokens_out.saturating_add(tok_count);
-                self.current_content.push_str(text);
-                if self.chat_auto_scroll {
-                    let w = self.chat_width.get();
-                    let n = self.estimated_chat_lines(w);
-                    let h = self.chat_height.get();
-                    self.chat_scroll = n.saturating_sub(h) as u16;
-                }
-                // Live-track content for the active subagent (t-c304): when a
-                // specialist is running, its final-answer text streams into the
-                // subagent's `content` field so the Subagents panel shows it.
-                if self.active_agent != "Manager"
-                    && let Some(sa) = self
-                        .subagents
-                        .iter_mut()
-                        .find(|s| s.name == self.active_agent)
+                if self.active_agent == "Manager" {
+                    self.current_content.push_str(text);
+                    if self.chat_auto_scroll {
+                        let w = self.chat_width.get();
+                        let n = self.estimated_chat_lines(w);
+                        let h = self.chat_height.get();
+                        self.chat_scroll = n.saturating_sub(h) as u16;
+                    }
+                } else if let Some(sa) = self
+                    .subagents
+                    .iter_mut()
+                    .find(|s| s.name == self.active_agent)
                 {
                     sa.content.push_str(text);
                     sa.last_activity_at = Some(std::time::Instant::now());
@@ -2221,21 +2218,18 @@ impl Renderer for TuiRenderer {
                     .encode_ordinary(text)
                     .len();
                 self.tokens_out = self.tokens_out.saturating_add(tok_count);
-                self.current_thought.push_str(text);
-                if self.chat_auto_scroll {
-                    let w = self.chat_width.get();
-                    let n = self.estimated_chat_lines(w);
-                    let h = self.chat_height.get();
-                    self.chat_scroll = n.saturating_sub(h) as u16;
-                }
-                // Live-track thinking for the active subagent (t-c304): when a
-                // specialist is running, its reasoning streams into the
-                // subagent's `thinking` field so the Subagents panel shows it.
-                if self.active_agent != "Manager"
-                    && let Some(sa) = self
-                        .subagents
-                        .iter_mut()
-                        .find(|s| s.name == self.active_agent)
+                if self.active_agent == "Manager" {
+                    self.current_thought.push_str(text);
+                    if self.chat_auto_scroll {
+                        let w = self.chat_width.get();
+                        let n = self.estimated_chat_lines(w);
+                        let h = self.chat_height.get();
+                        self.chat_scroll = n.saturating_sub(h) as u16;
+                    }
+                } else if let Some(sa) = self
+                    .subagents
+                    .iter_mut()
+                    .find(|s| s.name == self.active_agent)
                 {
                     sa.thinking.push_str(text);
                     sa.last_activity_at = Some(std::time::Instant::now());
@@ -2258,6 +2252,7 @@ impl Renderer for TuiRenderer {
             }
             Event::ToolResult(text) => {
                 self.waiting_for_token_since = None;
+                self.commit_turn_content();
                 self.messages.push(format!("[Tool Result] {text}"));
                 if self.chat_auto_scroll {
                     let w = self.chat_width.get();
@@ -2267,6 +2262,10 @@ impl Renderer for TuiRenderer {
                 }
             }
             Event::Status(text) => {
+                if !self.steer_sentence_buffer.trim().is_empty() {
+                    let remaining = std::mem::take(&mut self.steer_sentence_buffer);
+                    self.append_steer_sentence(remaining.trim());
+                }
                 self.status_line = text.lines().next().unwrap_or("").to_string();
                 let is_waiting = self.status_line.contains("Running")
                     || self.status_line.contains("thinking")

@@ -8,10 +8,12 @@ use std::time::Duration;
 use thiserror::Error;
 
 /// First SSE event must arrive within this window or the request fails.
-pub const INITIAL_RESPONSE_WATCHDOG_SECS: u64 = 60;
+pub const INITIAL_RESPONSE_WATCHDOG_SECS: u64 = 180;
+/// Maximum silent pause allowed between stream chunks once streaming has started.
+pub const INTER_CHUNK_WATCHDOG_SECS: u64 = 60;
 /// Upper bound on the entire streaming read.
 pub const OVERALL_READ_TIMEOUT_SECS: u64 = 1800;
-/// Maximum total attempts (initial + up to 2 retries for 503/429).
+/// Maximum total attempts (initial + up to 2 retries for 503/429/timeouts).
 pub const MAX_ATTEMPTS: u32 = 3;
 /// Backoff base: sleep = `BACKOFF_BASE_MS × attempt`.
 pub const BACKOFF_BASE_MS: u64 = 1000;
@@ -74,6 +76,8 @@ pub(crate) enum ChatError {
     HttpStatus { status: u16, body: String },
     #[error("first event did not arrive within {INITIAL_RESPONSE_WATCHDOG_SECS}s")]
     InitialTimeout,
+    #[error("stream stalled: no tokens received for {INTER_CHUNK_WATCHDOG_SECS}s")]
+    StallTimeout,
     #[error("stream exceeded {OVERALL_READ_TIMEOUT_SECS}s read timeout")]
     ReadTimeout,
     #[error("SSE stream error: {0}")]
@@ -87,9 +91,10 @@ impl ChatError {
         matches!(
             self,
             ChatError::HttpStatus {
-                status: 503 | 429,
+                status: 503 | 429 | 502 | 504,
                 ..
-            }
+            } | ChatError::InitialTimeout
+                | ChatError::StallTimeout
         )
     }
 }
@@ -277,12 +282,17 @@ impl ChatClient {
         }
 
         let consume = async {
+            let mut last_chunk_at = std::time::Instant::now();
             loop {
                 if !on_delta("") {
                     break;
                 }
+                if last_chunk_at.elapsed() >= Duration::from_secs(INTER_CHUNK_WATCHDOG_SECS) {
+                    return Err(ChatError::StallTimeout);
+                }
                 match tokio::time::timeout(Duration::from_millis(50), stream.next()).await {
                     Ok(Some(ev)) => {
+                        last_chunk_at = std::time::Instant::now();
                         let ev = ev.map_err(|e| ChatError::Stream(e.to_string()))?;
                         if consume_event(
                             &ev,

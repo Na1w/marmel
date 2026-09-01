@@ -139,12 +139,17 @@ pub async fn run_session(
     let mut steer_abort_requested = false;
     let mut subagents = Vec::<SubagentDetail>::new();
     let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let (steer_arb_tx, mut steer_arb_rx) = tokio::sync::mpsc::unbounded_channel::<SteerArbEvent>();
     crate::orchestrator::set_status_sender(status_tx);
+    crate::orchestrator::set_event_sender(event_tx);
 
     while keep_going && !renderer.aborted() {
         while let Ok(msg) = status_rx.try_recv() {
             renderer.on_event(&Event::Status(msg));
+        }
+        while let Ok(ev) = event_rx.try_recv() {
+            renderer.on_event(&ev);
         }
 
         drain_steer_arbitration_events(
@@ -327,7 +332,7 @@ pub async fn run_session(
                             },
                         ));
                     } else {
-                        renderer.on_event(&Event::ToolCall(format!("{}({})", name, args_str)));
+                        renderer.on_event(&Event::ToolCall(format_tool_call_display(&name, &args_val)));
                     }
 
                     let invocation = crate::harness::ToolInvocation {
@@ -355,6 +360,10 @@ pub async fn run_session(
                     let res = loop {
                         while let Ok(msg) = status_rx.try_recv() {
                             renderer.on_event(&Event::Status(msg));
+                            let _ = renderer.flush();
+                        }
+                        while let Ok(ev) = event_rx.try_recv() {
+                            renderer.on_event(&ev);
                             let _ = renderer.flush();
                         }
                         drain_steer_arbitration_events(
@@ -387,6 +396,10 @@ pub async fn run_session(
                             Err(_) => {
                                 while let Ok(msg) = status_rx.try_recv() {
                                     renderer.on_event(&Event::Status(msg));
+                                    let _ = renderer.flush();
+                                }
+                                while let Ok(ev) = event_rx.try_recv() {
+                                    renderer.on_event(&ev);
                                     let _ = renderer.flush();
                                 }
                                 drain_steer_arbitration_events(
@@ -494,7 +507,7 @@ pub async fn run_session(
                             },
                         ));
                     } else {
-                        renderer.on_event(&Event::ToolCall(format!("{}({})", name, args_str)));
+                        renderer.on_event(&Event::ToolCall(format_tool_call_display(&name, &args_val)));
                     }
                     renderer.flush()?;
 
@@ -515,6 +528,10 @@ pub async fn run_session(
                     let result = loop {
                         while let Ok(msg) = status_rx.try_recv() {
                             renderer.on_event(&Event::Status(msg));
+                            let _ = renderer.flush();
+                        }
+                        while let Ok(ev) = event_rx.try_recv() {
+                            renderer.on_event(&ev);
                             let _ = renderer.flush();
                         }
                         drain_steer_arbitration_events(
@@ -538,6 +555,10 @@ pub async fn run_session(
                             Err(_) => {
                                 while let Ok(msg) = status_rx.try_recv() {
                                     renderer.on_event(&Event::Status(msg));
+                                    let _ = renderer.flush();
+                                }
+                                while let Ok(ev) = event_rx.try_recv() {
+                                    renderer.on_event(&ev);
                                     let _ = renderer.flush();
                                 }
                                 drain_steer_arbitration_events(
@@ -903,6 +924,73 @@ fn load_system_prompt(_cfg: &Config) -> Result<String> {
         ));
     }
     Ok(prompt)
+}
+
+fn format_tool_call_display(name: &str, args_val: &serde_json::Value) -> String {
+    match name {
+        "create_plan" => {
+            let len = args_val
+                .get("plan_markdown")
+                .and_then(serde_json::Value::as_str)
+                .map_or(0, str::len);
+            format!("create_plan(plan_markdown: {len} chars)")
+        }
+        "delegate_task" => {
+            let agent = args_val
+                .get("agent_name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("specialist");
+            let task_id = args_val
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if task_id.is_empty() {
+                format!("delegate_task(agent: {agent})")
+            } else {
+                format!("delegate_task(agent: {agent}, task_id: {task_id})")
+            }
+        }
+        "write_file" | "read_file" | "replace" => {
+            let path = args_val
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            format!("{name}(path: {path})")
+        }
+        "run_command" => {
+            let cmd = args_val
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if cmd.len() > 60 {
+                format!("run_command({}…)", &cmd[..57])
+            } else {
+                format!("run_command({cmd})")
+            }
+        }
+        "grep_search" => {
+            let query = args_val
+                .get("query")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            format!("grep_search(query: {query})")
+        }
+        "glob" => {
+            let pattern = args_val
+                .get("pattern")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            format!("glob(pattern: {pattern})")
+        }
+        _ => {
+            let s = args_val.to_string();
+            if s.len() > 60 {
+                format!("{name}({}…)", &s[..57])
+            } else {
+                format!("{name}({s})")
+            }
+        }
+    }
 }
 
 pub fn chunk_utf8(s: &str, max: usize) -> Vec<&str> {
