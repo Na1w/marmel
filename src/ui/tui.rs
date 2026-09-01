@@ -1338,11 +1338,7 @@ impl TuiRenderer {
             }
         }
 
-        let max_p_scroll = (chat_lines.len()).saturating_sub(chat_h) as u16;
-        let paragraph_scroll = self
-            .chat_scroll
-            .saturating_sub(lines_before_start as u16)
-            .min(max_p_scroll);
+        let paragraph_scroll = self.chat_scroll.saturating_sub(lines_before_start as u16);
         let chat_paragraph = Paragraph::new(chat_lines)
             .block(chat_block)
             .wrap(Wrap { trim: false })
@@ -3017,6 +3013,75 @@ mod tests {
             text_on.contains("streaming thoughts"),
             "streaming thoughts should be shown when show_thought=true"
         );
+    }
+
+    #[test]
+    fn test_chat_scrolling_renders_windowed_view() {
+        let mut r = TuiRenderer::new();
+        r.focused_panel = FocusedPanel::Chat;
+        for i in 0..50 {
+            r.messages.push(format!("Message line {i}"));
+        }
+
+        r.chat_width.set(80);
+        r.chat_height.set(8); // inner area height of 80x10 bordered box
+
+        let total_lines = r.estimated_chat_lines(80);
+        assert_eq!(total_lines, 50);
+
+        // Scroll to bottom
+        r.scroll_to_bottom();
+        assert_eq!(r.chat_scroll, 42); // 50 - 8
+
+        let backend = ratatui::backend::TestBackend::new(80, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        // 1. Render bottom view
+        terminal
+            .draw(|frame| {
+                let area = ratatui::layout::Rect::new(0, 0, 80, 10);
+                r.render_chat(frame, area);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut bottom_text = String::new();
+        for y in 0..10 {
+            let line: String = (0..80)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect();
+            bottom_text.push_str(&line);
+            bottom_text.push('\n');
+        }
+        assert!(bottom_text.contains("Message line 49"));
+        assert!(!bottom_text.contains("Message line 0"));
+
+        // 2. Scroll up to top
+        r.scroll_to_top();
+        assert_eq!(r.chat_scroll, 0);
+
+        terminal
+            .draw(|frame| {
+                let area = ratatui::layout::Rect::new(0, 0, 80, 10);
+                r.render_chat(frame, area);
+            })
+            .unwrap();
+
+        let buffer2 = terminal.backend().buffer();
+        let mut top_text = String::new();
+        for y in 0..10 {
+            let line: String = (0..80)
+                .map(|x| buffer2[(x, y)].symbol().to_string())
+                .collect();
+            top_text.push_str(&line);
+            top_text.push('\n');
+        }
+        assert!(top_text.contains("Message line 0"));
+        assert!(!top_text.contains("Message line 49"));
+
+        // 3. Scroll down by 5 lines
+        r.scroll_down(5);
+        assert_eq!(r.chat_scroll, 5);
     }
 
     #[test]
