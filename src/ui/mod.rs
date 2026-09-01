@@ -163,6 +163,7 @@ pub async fn run_session(
         }
 
         let mut turn_count = 0;
+        let mut nudge_count = 0;
         loop {
             turn_count += 1;
             if turn_count > crate::agent::r#loop::MAX_TURNS || renderer.aborted() {
@@ -234,8 +235,29 @@ pub async fn run_session(
             }
 
             if tool_calls.is_empty() {
+                let current_plan = manager
+                    .as_ref()
+                    .map(|m| m.plan.clone())
+                    .unwrap_or_else(crate::agent::phase::Plan::default);
+                let pending = current_plan.pending_tasks();
+                if !pending.is_empty() && nudge_count < 5 {
+                    nudge_count += 1;
+                    let pending_str = pending.join(", ");
+                    renderer.on_event(&Event::Status(format!(
+                        "Auto-nudge ({nudge_count}/5): Plan incomplete (pending: {pending_str})"
+                    )));
+                    renderer.flush()?;
+                    ctx.append(Message::User {
+                        content: format!(
+                            "(SYSTEM NOTICE: The execution plan is NOT complete. Remaining tasks: [{pending_str}]. You must continue issuing tool calls to fulfill the remaining tasks. Do NOT stop or summarize to the user until all tasks are complete.)"
+                        ),
+                    });
+                    continue;
+                }
                 break;
             }
+
+            nudge_count = 0;
 
             let all_parallel = tool_calls.iter().all(|c| {
                 matches!(
@@ -564,7 +586,11 @@ pub async fn run_session(
                 }
             }
 
-            if crate::agent::phase::Plan::default().is_complete() {
+            let current_plan = manager
+                .as_ref()
+                .map(|m| m.plan.clone())
+                .unwrap_or_else(crate::agent::phase::Plan::default);
+            if current_plan.is_complete() {
                 ctx.append(Message::User {
                     content: "(SYSTEM NOTICE: All execution plan tasks are now COMPLETE [x]. Do NOT execute any more tools or re-delegate. Deliver your comprehensive final answer/synthesis to the user now.)".to_string(),
                 });

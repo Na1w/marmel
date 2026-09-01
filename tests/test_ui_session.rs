@@ -189,3 +189,55 @@ async fn test_ui_run_session_continues_after_first_turn() {
          silent keep_going=false path triggered by a non-blocking poll_input()==None"
     );
 }
+
+/// Verify that when an active execution plan is incomplete, the session
+/// automatically nudges the model (up to 5 times) to continue emitting tool calls,
+/// and respects the 5-retry safeguard.
+#[tokio::test]
+async fn test_ui_run_session_auto_nudges_when_plan_incomplete_capped_at_5() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let calls = calls.clone();
+            move |_req: &wiremock::Request| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                // Return plain text without tool calls
+                let body = completion_sse("I am thinking about the task.");
+                ResponseTemplate::new(200).set_body_string(body)
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let cfg = config_for_backend(&server.uri());
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan = marmennill::agent::phase::Plan::at(tmp.path());
+    plan.create("# Plan\n- [ ] [t-001] incomplete task\n")
+        .expect("plan created");
+
+    let manager = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::new(&cfg.backend_url, "test-model"),
+        plan,
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    let mut renderer = ScriptedRenderer::new(vec!["start".to_string(), "/abort".to_string()]);
+
+    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(manager))
+        .await
+        .expect("run_session should complete");
+
+    let backend_calls = calls.load(Ordering::SeqCst);
+    // 1 initial turn + 5 auto-nudges before hitting the 5-retry safeguard and yielding to read_input
+    assert_eq!(
+        backend_calls, 6,
+        "expected 1 initial turn + 5 auto-nudge retries = 6 backend calls, but got {backend_calls}"
+    );
+}
