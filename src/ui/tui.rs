@@ -1201,25 +1201,26 @@ impl TuiRenderer {
             for raw_line in msg.lines() {
                 let line = raw_line.replace('\t', "    ");
                 let trimmed = line.trim();
-                if line.starts_with(" thinking")
+                let is_open_tag = line.starts_with(" thinking")
                     || line.starts_with("<think>")
                     || line.starts_with("<thought>")
                     || trimmed == "<think>"
                     || trimmed == "<thought>"
-                {
+                    || trimmed == "thinking";
+                if is_open_tag {
                     in_think = true;
-                    if !self.show_thought {
-                        continue;
-                    }
+                    continue;
                 }
                 if in_think {
                     let is_end = line.starts_with(" response")
                         || line.starts_with("</think>")
                         || line.starts_with("</thought>")
                         || trimmed == "</think>"
-                        || trimmed == "</thought>";
+                        || trimmed == "</thought>"
+                        || trimmed == "response";
                     if is_end {
                         in_think = false;
+                        continue;
                     }
                     if !self.show_thought {
                         continue;
@@ -1228,14 +1229,7 @@ impl TuiRenderer {
 
                 if has_special_style {
                     chat_lines.push(Line::from(Span::styled(line, msg_style)));
-                } else if in_think
-                    || line.starts_with(" thinking")
-                    || line.starts_with(" response")
-                    || line.starts_with("<think>")
-                    || line.starts_with("</think>")
-                    || line.starts_with("<thought>")
-                    || line.starts_with("</thought>")
-                {
+                } else if in_think {
                     chat_lines.push(Line::from(Span::styled(
                         line,
                         Style::default()
@@ -1262,22 +1256,65 @@ impl TuiRenderer {
             let think_style = Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC);
-            chat_lines.push(Line::from(Span::styled("<think>", think_style)));
             for line in self.current_thought.lines() {
                 let line = line.replace('\t', "    ");
+                let trimmed = line.trim();
+                if trimmed == "<think>"
+                    || trimmed == "</think>"
+                    || trimmed == "<thought>"
+                    || trimmed == "</thought>"
+                {
+                    continue;
+                }
                 chat_lines.push(Line::from(Span::styled(line, think_style)));
             }
-            chat_lines.push(Line::from(Span::styled("</think>", think_style)));
         }
 
         // Streaming content (Orchestrator output - WHITE).
         if !self.current_content.is_empty() {
-            for line in self.current_content.lines() {
-                let line = line.replace('\t', "    ");
-                chat_lines.push(Line::from(Span::styled(
-                    line,
-                    Style::default().fg(Color::White),
-                )));
+            let mut in_think = false;
+            for raw_line in self.current_content.lines() {
+                let line = raw_line.replace('\t', "    ");
+                let trimmed = line.trim();
+                let is_open_tag = line.starts_with(" thinking")
+                    || line.starts_with("<think>")
+                    || line.starts_with("<thought>")
+                    || trimmed == "<think>"
+                    || trimmed == "<thought>"
+                    || trimmed == "thinking";
+                if is_open_tag {
+                    in_think = true;
+                    continue;
+                }
+                if in_think {
+                    let is_end = line.starts_with(" response")
+                        || line.starts_with("</think>")
+                        || line.starts_with("</thought>")
+                        || trimmed == "</think>"
+                        || trimmed == "</thought>"
+                        || trimmed == "response";
+                    if is_end {
+                        in_think = false;
+                        continue;
+                    }
+                    if !self.show_thought {
+                        continue;
+                    }
+                }
+
+                if in_think {
+                    chat_lines.push(Line::from(Span::styled(
+                        line,
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    )));
+                } else {
+                    chat_lines.push(Line::from(Span::styled(
+                        line,
+                        Style::default().fg(Color::White),
+                    )));
+                }
             }
         }
 
@@ -1772,25 +1809,26 @@ fn count_single_message_lines(msg: &str, width: usize, show_thought: bool) -> us
     let mut in_think = false;
     for line in msg.lines() {
         let trimmed = line.trim();
-        if line.starts_with(" thinking")
+        let is_open_tag = line.starts_with(" thinking")
             || line.starts_with("<think>")
             || line.starts_with("<thought>")
             || trimmed == "<think>"
             || trimmed == "<thought>"
-        {
+            || trimmed == "thinking";
+        if is_open_tag {
             in_think = true;
-            if !show_thought {
-                continue;
-            }
+            continue;
         }
         if in_think {
             let is_end = line.starts_with(" response")
                 || line.starts_with("</think>")
                 || line.starts_with("</thought>")
                 || trimmed == "</think>"
-                || trimmed == "</thought>";
+                || trimmed == "</thought>"
+                || trimmed == "response";
             if is_end {
                 in_think = false;
+                continue;
             }
             if !show_thought {
                 continue;
@@ -2548,8 +2586,8 @@ mod tests {
         let msg = "User: hi\n thinking\nsecret\n response\nvisible";
         // show_thought = false → think block excluded: "User: hi" + "visible".
         assert_eq!(count_single_message_lines(msg, 80, false), 2);
-        // show_thought = true → think block included: all 5 lines.
-        assert_eq!(count_single_message_lines(msg, 80, true), 5);
+        // show_thought = true → think block included without raw tag lines: "User: hi" + "secret" + "visible".
+        assert_eq!(count_single_message_lines(msg, 80, true), 3);
     }
 
     #[test]
