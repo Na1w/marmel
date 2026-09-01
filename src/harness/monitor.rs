@@ -621,6 +621,10 @@ impl RepetitionDetector {
         let last_start = n - pat_len;
         // Reference pattern = final `pat_len` characters.
         let last: Vec<char> = self.buffer.range(last_start..n).copied().collect();
+        // Ignore pure whitespace or formatting dividers (e.g. `---`, `   `)
+        if !last.iter().any(|c| c.is_alphanumeric()) {
+            return false;
+        }
         for group in 1..self.threshold {
             let start = last_start - (group * pat_len);
             for (i, ch) in self.buffer.range(start..start + pat_len).enumerate() {
@@ -633,9 +637,9 @@ impl RepetitionDetector {
     }
 
     /// Check whether the tail of lines forms a degenerate loop:
-    /// 1. The exact same line repeated consecutively >= 3 times at the tail.
-    /// 2. A 2-line sequence (bigram) repeated >= 3 times in the buffer.
-    /// 3. Any non-trivial line appearing >= threshold (>= 4) times in the buffer.
+    /// 1. The exact same line repeated consecutively >= threshold times at the tail.
+    /// 2. A 2-line sequence (bigram) repeated >= threshold times in the buffer.
+    /// 3. Any non-trivial line appearing >= threshold times in the buffer.
     fn line_or_phrase_repeats(&self) -> bool {
         let text: String = self.buffer.iter().collect();
         let lines: Vec<&str> = text
@@ -645,42 +649,62 @@ impl RepetitionDetector {
             .collect();
 
         let n = lines.len();
-        if n >= 3 {
-            // 1. Consecutive identical line repeats at the tail (>= 3 times)
-            if lines[n - 1] == lines[n - 2]
-                && lines[n - 2] == lines[n - 3]
-                && lines[n - 1].len() >= 4
+        let th = self.threshold.max(3);
+        if n >= th {
+            // 1. Consecutive identical line repeats at the tail (>= th times)
+            let last = lines[n - 1];
+            if last.len() >= 8
+                && last.chars().any(|c| c.is_alphanumeric())
+                && !is_markdown_divider(last)
             {
-                return true;
+                let mut consecutive = 1;
+                for i in 2..=th {
+                    if lines[n - i] == last {
+                        consecutive += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if consecutive >= th {
+                    return true;
+                }
             }
 
-            // 2. 2-line sequence (bigram) repeated >= 3 times in the buffer
+            // 2. 2-line sequence (bigram) repeated >= th times in the buffer
             let mut bigrams = std::collections::HashMap::<(&str, &str), usize>::new();
             for w in lines.windows(2) {
-                if w[0].len() >= 4 && w[1].len() >= 4 {
+                if w[0].len() >= 6
+                    && w[1].len() >= 6
+                    && (w[0].chars().any(|c| c.is_alphanumeric())
+                        || w[1].chars().any(|c| c.is_alphanumeric()))
+                    && !is_markdown_divider(w[0])
+                    && !is_markdown_divider(w[1])
+                {
                     let cnt = bigrams.entry((w[0], w[1])).or_insert(0);
                     *cnt += 1;
-                    if *cnt >= 3 {
+                    if *cnt >= th {
                         return true;
                     }
                 }
             }
 
-            // 3. Any single non-trivial line appearing >= threshold times
+            // 3. Any single non-trivial line appearing >= th times
             let mut counts = std::collections::HashMap::<&str, usize>::new();
             for &l in &lines {
-                if l.len() >= 6 {
+                if l.len() >= 10
+                    && l.chars().any(|c| c.is_alphanumeric())
+                    && !is_markdown_divider(l)
+                {
                     let cnt = counts.entry(l).or_insert(0);
                     *cnt += 1;
-                    if *cnt >= self.threshold.max(4) {
+                    if *cnt >= th {
                         return true;
                     }
                 }
             }
         }
 
-        // 4. Word 4-gram sequence repeated >= 3 times in the buffer
-        // Catches repeating phrases even when in a single line or with varying endings.
+        // 4. Word 4-gram sequence repeated >= th times in the buffer
         let words: Vec<&str> = text
             .split_whitespace()
             .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
@@ -692,10 +716,10 @@ impl RepetitionDetector {
                 std::collections::HashMap::<(&str, &str, &str, &str), usize>::new();
             for w in words.windows(4) {
                 let total_len = w[0].len() + w[1].len() + w[2].len() + w[3].len();
-                if total_len >= 10 {
+                if total_len >= 12 {
                     let cnt = word_ngrams.entry((w[0], w[1], w[2], w[3])).or_insert(0);
                     *cnt += 1;
-                    if *cnt >= 3 {
+                    if *cnt >= th {
                         return true;
                     }
                 }
@@ -704,6 +728,16 @@ impl RepetitionDetector {
 
         false
     }
+}
+
+fn is_markdown_divider(s: &str) -> bool {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed
+        .chars()
+        .all(|c| c == '-' || c == '=' || c == '*' || c == '`' || c == '#' || c == '_')
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,12 +1143,13 @@ mod tests {
 
     #[test]
     fn test_monitor_line_repetition_detector() {
-        let mut det = RepetitionDetector::new(5, 5);
+        let mut det = RepetitionDetector::new(4, 5);
         det.push("Let's go.\nI'll do it.\nWait, I'll check rule 1.\nGood.\n");
         det.push("Let's go.\nI'll do it.\nWait, I'll check rule 2.\nGood.\n");
-        assert!(!det.is_repeating()); // only 2 repeats
         det.push("Let's go.\nI'll do it.\nWait, I'll check rule 3.\nGood.\n");
-        assert!(det.is_repeating(), "3rd repetition of bigrams must trigger");
+        assert!(!det.is_repeating()); // 3 repeats does not trigger (needs 4)
+        det.push("Let's go.\nI'll do it.\nWait, I'll check rule 4.\nGood.\n");
+        assert!(det.is_repeating(), "4th repetition of bigrams must trigger");
     }
 
     #[test]
@@ -1132,29 +1167,31 @@ mod tests {
 
     #[test]
     fn test_monitor_consecutive_identical_line_spam() {
-        let mut det = RepetitionDetector::new(5, 5);
+        let mut det = RepetitionDetector::new(4, 5);
         det.push("Compiling project...\n");
         det.push("thinking about rules\n");
         det.push("thinking about rules\n");
-        assert!(!det.is_repeating()); // only 2 consecutive repeats
+        det.push("thinking about rules\n");
+        assert!(!det.is_repeating()); // 3 consecutive repeats does not trigger
         det.push("thinking about rules\n");
         assert!(
             det.is_repeating(),
-            "3 consecutive identical lines must trigger repetition break"
+            "4 consecutive identical lines must trigger repetition break"
         );
     }
 
     #[test]
     fn test_monitor_word_ngram_phrase_repetition_single_line() {
-        let mut det = RepetitionDetector::new(5, 5);
+        let mut det = RepetitionDetector::new(4, 5);
         // Single continuous string without newlines, with varying rule endings
         det.push("I'll do it. Wait, I'll check the rule A. Good. Let's go. ");
         det.push("I'll do it. Wait, I'll check the rule B. Good. Let's go. ");
-        assert!(!det.is_repeating());
         det.push("I'll do it. Wait, I'll check the rule C. Good. Let's go. ");
+        assert!(!det.is_repeating()); // 3 repeats does not trigger
+        det.push("I'll do it. Wait, I'll check the rule D. Good. Let's go. ");
         assert!(
             det.is_repeating(),
-            "word 4-gram (e.g. 'wait ill check the') repeating 3 times must trigger"
+            "word 4-gram (e.g. 'wait ill check the') repeating 4 times must trigger"
         );
     }
 
