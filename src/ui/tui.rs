@@ -665,6 +665,7 @@ impl TuiRenderer {
         if is_active {
             self.show_subagent_panel = true;
         }
+        let now = std::time::Instant::now();
         let target_idx = match self
             .subagents
             .iter_mut()
@@ -673,6 +674,7 @@ impl TuiRenderer {
         {
             Some((idx, existing)) => {
                 existing.is_active = is_active;
+                existing.last_activity_at = Some(now);
                 existing.logs.push(log.to_string());
                 idx
             }
@@ -682,11 +684,8 @@ impl TuiRenderer {
                     name: name.to_string(),
                     task_id: None,
                     prompt: String::new(),
-                    started_at: if is_active {
-                        Some(std::time::Instant::now())
-                    } else {
-                        None
-                    },
+                    started_at: if is_active { Some(now) } else { None },
+                    last_activity_at: Some(now),
                     logs: vec![log.to_string()],
                     thinking: String::new(),
                     content: String::new(),
@@ -1454,14 +1453,24 @@ impl TuiRenderer {
             } else {
                 String::new()
             };
+            let elapsed_str = if let Some(last) = sa.last_activity_at.or(sa.started_at) {
+                let secs = last.elapsed().as_secs();
+                if secs >= 60 {
+                    format!(", {}m {}s ago", secs / 60, secs % 60)
+                } else {
+                    format!(", {}s ago", secs)
+                }
+            } else {
+                String::new()
+            };
             let status = if sa.is_active {
                 Span::styled(
-                    format!(" (Active{ctx_info})"),
+                    format!(" (Active{ctx_info}{elapsed_str})"),
                     Style::default().fg(Color::LightGreen),
                 )
             } else {
                 Span::styled(
-                    format!(" (Idle{ctx_info})"),
+                    format!(" (Idle{ctx_info}{elapsed_str})"),
                     Style::default().fg(Color::DarkGray),
                 )
             };
@@ -2067,6 +2076,7 @@ impl Renderer for TuiRenderer {
                         .find(|s| s.name == self.active_agent)
                 {
                     sa.content.push_str(text);
+                    sa.last_activity_at = Some(std::time::Instant::now());
                 }
             }
             Event::SteerResponse(text) => {
@@ -2097,6 +2107,7 @@ impl Renderer for TuiRenderer {
                         .find(|s| s.name == self.active_agent)
                 {
                     sa.thinking.push_str(text);
+                    sa.last_activity_at = Some(std::time::Instant::now());
                 }
             }
             Event::ToolCall(text) => {
@@ -2150,6 +2161,7 @@ impl Renderer for TuiRenderer {
                         if sa.logs.last().map(String::as_str) != Some(text.as_str()) {
                             sa.logs.push(text.clone());
                         }
+                        sa.last_activity_at = Some(std::time::Instant::now());
                         routed = true;
                         break;
                     }
@@ -2160,9 +2172,11 @@ impl Renderer for TuiRenderer {
                         .subagents
                         .iter_mut()
                         .find(|s| s.name == self.active_agent)
-                    && sa.logs.last().map(String::as_str) != Some(text.as_str())
                 {
-                    sa.logs.push(text.clone());
+                    if sa.logs.last().map(String::as_str) != Some(text.as_str()) {
+                        sa.logs.push(text.clone());
+                    }
+                    sa.last_activity_at = Some(std::time::Instant::now());
                 }
             }
             Event::Delegation(de) => {
@@ -2305,6 +2319,12 @@ impl Renderer for TuiRenderer {
                         activated_name = Some(incoming.name.clone());
                     }
                     existing.logs = incoming.logs.clone();
+                    if incoming.last_activity_at.is_some() {
+                        existing.last_activity_at = incoming.last_activity_at;
+                    }
+                    if incoming.context_tokens > 0 {
+                        existing.context_tokens = incoming.context_tokens;
+                    }
                     // Keep locally-streamed thinking/content if the incoming
                     // entry has none yet (the loop only folds lifecycle events).
                     if !incoming.thinking.is_empty() {
@@ -2590,6 +2610,7 @@ mod tests {
             task_id: None,
             prompt: String::new(),
             started_at: None,
+            last_activity_at: None,
             logs: vec!["log1".to_string()],
             thinking: "think".to_string(),
             content: "out".to_string(),
@@ -2662,6 +2683,7 @@ mod tests {
             task_id: None,
             prompt: String::new(),
             started_at: None,
+            last_activity_at: None,
             logs: vec![],
             thinking: String::new(),
             content: String::new(),
@@ -2753,6 +2775,7 @@ mod tests {
             task_id: None,
             prompt: String::new(),
             started_at: None,
+            last_activity_at: None,
             logs: vec!["started task t-1".to_string()],
             thinking: "local think".to_string(),
             content: "local content".to_string(),
@@ -2766,6 +2789,7 @@ mod tests {
             task_id: None,
             prompt: String::new(),
             started_at: None,
+            last_activity_at: None,
             logs: vec!["started task t-1".to_string()],
             thinking: String::new(),
             content: String::new(),
@@ -2786,6 +2810,7 @@ mod tests {
             task_id: None,
             prompt: String::new(),
             started_at: None,
+            last_activity_at: None,
             logs: vec![],
             thinking: String::new(),
             content: String::new(),
@@ -2797,6 +2822,7 @@ mod tests {
             task_id: None,
             prompt: String::new(),
             started_at: None,
+            last_activity_at: None,
             logs: vec![],
             thinking: String::new(),
             content: String::new(),
@@ -2922,6 +2948,7 @@ mod tests {
             task_id: None,
             prompt: String::new(),
             started_at: None,
+            last_activity_at: None,
             logs: vec![
                 "log1".to_string(),
                 "log2".to_string(),
@@ -2988,6 +3015,7 @@ mod tests {
             task_id: None,
             prompt: String::new(),
             started_at: None,
+            last_activity_at: None,
             logs: vec![
                 "line 1".to_string(),
                 "line 2".to_string(),
@@ -3003,6 +3031,7 @@ mod tests {
             task_id: None,
             prompt: String::new(),
             started_at: None,
+            last_activity_at: None,
             logs: vec![
                 "a".to_string(),
                 "b".to_string(),
@@ -3145,6 +3174,7 @@ mod tests {
             task_id: Some("t-1".to_string()),
             prompt: String::new(),
             started_at: None,
+            last_activity_at: None,
             logs: vec![],
             thinking: String::new(),
             content: String::new(),
@@ -3156,6 +3186,7 @@ mod tests {
             task_id: Some("t-2".to_string()),
             prompt: String::new(),
             started_at: None,
+            last_activity_at: None,
             logs: vec![],
             thinking: String::new(),
             content: String::new(),
@@ -3167,6 +3198,7 @@ mod tests {
             task_id: None,
             prompt: String::new(),
             started_at: None,
+            last_activity_at: None,
             logs: vec![],
             thinking: String::new(),
             content: String::new(),
@@ -3203,6 +3235,64 @@ mod tests {
         assert!(
             full_text.contains("validator (Active)"),
             "expected 'validator (Active)' with no ctx string when 0, got:\n{full_text}"
+        );
+    }
+
+    #[test]
+    fn test_subagent_time_counter_rendering_in_list() {
+        let mut r = TuiRenderer::new();
+        r.show_subagent_panel = true;
+        let now = std::time::Instant::now();
+        r.subagents.push(SubagentDetail {
+            name: "coder-t-1".to_string(),
+            task_id: Some("t-1".to_string()),
+            prompt: String::new(),
+            started_at: Some(now - Duration::from_secs(5)),
+            last_activity_at: Some(now - Duration::from_secs(5)),
+            logs: vec![],
+            thinking: String::new(),
+            content: String::new(),
+            is_active: true,
+            context_tokens: 3500,
+        });
+        r.subagents.push(SubagentDetail {
+            name: "researcher-t-2".to_string(),
+            task_id: Some("t-2".to_string()),
+            prompt: String::new(),
+            started_at: None,
+            last_activity_at: Some(now - Duration::from_secs(85)),
+            logs: vec![],
+            thinking: String::new(),
+            content: String::new(),
+            is_active: false,
+            context_tokens: 1200,
+        });
+
+        let backend = ratatui::backend::TestBackend::new(100, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = ratatui::layout::Rect::new(0, 0, 100, 20);
+                r.render_subagents(frame, area);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut lines = Vec::new();
+        for y in 0..20 {
+            let line: String = (0..100)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect();
+            lines.push(line);
+        }
+        let full_text = lines.join("\n");
+        assert!(
+            full_text.contains("coder-t-1 (Active, 3.5k ctx, 5s ago)"),
+            "expected 'coder-t-1 (Active, 3.5k ctx, 5s ago)' in subagents panel, got:\n{full_text}"
+        );
+        assert!(
+            full_text.contains("researcher-t-2 (Idle, 1.2k ctx, 1m 25s ago)"),
+            "expected 'researcher-t-2 (Idle, 1.2k ctx, 1m 25s ago)' in subagents panel, got:\n{full_text}"
         );
     }
 }

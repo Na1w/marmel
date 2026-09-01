@@ -20,6 +20,8 @@ pub struct SubagentDetail {
     pub task_id: Option<String>,
     pub prompt: String,
     pub started_at: Option<std::time::Instant>,
+    /// Instant of the most recent activity (streaming chunk, log, status, or lifecycle).
+    pub last_activity_at: Option<std::time::Instant>,
     /// Ordered log lines for this subagent (status / tool activity).
     pub logs: Vec<String>,
     /// Streaming "thinking" block for this subagent.
@@ -958,8 +960,10 @@ fn update_subagent_lifecycle(
         format!("completed task {task_str}")
     };
     let active_tokens = crate::orchestrator::get_active_worker_tokens(&name).unwrap_or(0);
+    let now = std::time::Instant::now();
     if let Some(existing) = subagents.iter_mut().find(|s| s.name == name) {
         existing.is_active = started;
+        existing.last_activity_at = Some(now);
         if active_tokens > 0 {
             existing.context_tokens = active_tokens;
         }
@@ -968,7 +972,7 @@ fn update_subagent_lifecycle(
             if let Some(p) = prompt {
                 existing.prompt = p;
             }
-            existing.started_at = Some(std::time::Instant::now());
+            existing.started_at = Some(now);
         } else {
             existing.started_at = None;
         }
@@ -978,11 +982,8 @@ fn update_subagent_lifecycle(
             name,
             task_id: task,
             prompt: prompt.unwrap_or_default(),
-            started_at: if started {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            },
+            started_at: if started { Some(now) } else { None },
+            last_activity_at: Some(now),
             logs: vec![log_entry],
             thinking: String::new(),
             content: String::new(),
