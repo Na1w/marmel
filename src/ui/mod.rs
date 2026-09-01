@@ -332,7 +332,8 @@ pub async fn run_session(
                             },
                         ));
                     } else {
-                        renderer.on_event(&Event::ToolCall(format_tool_call_display(&name, &args_val)));
+                        renderer
+                            .on_event(&Event::ToolCall(format_tool_call_display(&name, &args_val)));
                     }
 
                     let invocation = crate::harness::ToolInvocation {
@@ -507,7 +508,8 @@ pub async fn run_session(
                             },
                         ));
                     } else {
-                        renderer.on_event(&Event::ToolCall(format_tool_call_display(&name, &args_val)));
+                        renderer
+                            .on_event(&Event::ToolCall(format_tool_call_display(&name, &args_val)));
                     }
                     renderer.flush()?;
 
