@@ -206,6 +206,7 @@ impl ChatClient {
         let mut raw = String::new();
         let mut tool_calls_map =
             std::collections::BTreeMap::<usize, (Option<String>, String, String)>::new();
+        let mut in_reasoning = false;
 
         let first_start = std::time::Instant::now();
         let first = loop {
@@ -233,8 +234,12 @@ impl ChatClient {
                 &mut reasoning,
                 &mut raw,
                 &mut tool_calls_map,
+                &mut in_reasoning,
                 on_delta,
             )? {
+                if in_reasoning {
+                    let _ = on_delta("</think>");
+                }
                 let tool_calls = map_to_tool_calls(tool_calls_map);
                 let reply = StreamedReply {
                     content,
@@ -274,6 +279,7 @@ impl ChatClient {
                             &mut reasoning,
                             &mut raw,
                             &mut tool_calls_map,
+                            &mut in_reasoning,
                             on_delta,
                         )? {
                             break;
@@ -286,6 +292,10 @@ impl ChatClient {
                         }
                     }
                 }
+            }
+            if in_reasoning {
+                in_reasoning = false;
+                let _ = on_delta("</think>");
             }
             Ok::<(), ChatError>(())
         };
@@ -337,27 +347,48 @@ fn consume_event<F>(
     reasoning: &mut String,
     raw: &mut String,
     tool_calls_map: &mut std::collections::BTreeMap<usize, (Option<String>, String, String)>,
+    in_reasoning: &mut bool,
     on_delta: &mut F,
 ) -> Result<bool, ChatError>
 where
     F: FnMut(&str) -> bool,
 {
     if ev.data.trim() == "[DONE]" {
+        if *in_reasoning {
+            *in_reasoning = false;
+            let _ = on_delta("</think>");
+        }
         return Ok(true);
     }
     if let Ok(chunk) = serde_json::from_str::<ChatChunk>(&ev.data) {
         for choice in chunk.choices {
-            if let Some(c) = choice.delta.content {
-                content.push_str(&c);
-                raw.push_str(&c);
-                if !on_delta(&c) {
+            if let Some(r) = choice.delta.reasoning_content
+                && !r.is_empty()
+            {
+                reasoning.push_str(&r);
+                raw.push_str(&r);
+                if !*in_reasoning {
+                    *in_reasoning = true;
+                    if !on_delta("<think>") {
+                        return Ok(true);
+                    }
+                }
+                if !on_delta(&r) {
                     return Ok(true);
                 }
             }
-            if let Some(r) = choice.delta.reasoning_content {
-                reasoning.push_str(&r);
-                raw.push_str(&r);
-                if !on_delta(&r) {
+            if let Some(c) = choice.delta.content
+                && !c.is_empty()
+            {
+                if *in_reasoning {
+                    *in_reasoning = false;
+                    if !on_delta("</think>") {
+                        return Ok(true);
+                    }
+                }
+                content.push_str(&c);
+                raw.push_str(&c);
+                if !on_delta(&c) {
                     return Ok(true);
                 }
             }

@@ -51,8 +51,11 @@ pub struct ThinkingDemuxer {
     preserve_thinking: bool,
 }
 
-const OPEN_TAG: &str = "[thinking]";
-const CLOSE_TAG: &str = "[/thinking]";
+const TAG_PAIRS: &[(&str, &str)] = &[
+    ("<think>", "</think>"),
+    ("[thinking]", "[/thinking]"),
+    ("<thought>", "</thought>"),
+];
 
 impl ThinkingDemuxer {
     pub fn new() -> Self {
@@ -67,7 +70,7 @@ impl ThinkingDemuxer {
         }
     }
 
-    /// Push a raw delta and classify it. Content inside a `[thinking]` block is
+    /// Push a raw delta and classify it. Content inside a thinking block is
     /// routed to the thinking channel; everything else to the payload channel.
     /// Tags are consumed as state and stripped unless `preserve_thinking` is set.
     pub fn push(&mut self, delta: &str) -> DeltaKind {
@@ -88,13 +91,20 @@ impl ThinkingDemuxer {
 
         let mut kind = self.current_kind();
         loop {
-            let tag = if self.in_thinking {
-                CLOSE_TAG
+            let found = if self.in_thinking {
+                TAG_PAIRS
+                    .iter()
+                    .filter_map(|(_, close)| self.pending.find(close).map(|idx| (idx, *close)))
+                    .min_by_key(|(idx, _)| *idx)
             } else {
-                OPEN_TAG
+                TAG_PAIRS
+                    .iter()
+                    .filter_map(|(open, _)| self.pending.find(open).map(|idx| (idx, *open)))
+                    .min_by_key(|(idx, _)| *idx)
             };
-            match self.pending.find(tag) {
-                Some(idx) => {
+
+            match found {
+                Some((idx, tag)) => {
                     // Commit content before the tag into the current channel.
                     let pre = self.pending[..idx].to_string();
                     if !pre.is_empty() {
@@ -113,9 +123,18 @@ impl ThinkingDemuxer {
                     self.pending = self.pending[idx + tag.len()..].to_string();
                 }
                 None => {
-                    // No complete tag: check whether the tail is a partial tag
-                    // prefix that may continue in the next delta. If so, hold it.
-                    if let Some(split) = partial_prefix_split(&self.pending, tag) {
+                    let candidate_tags: Vec<&str> = if self.in_thinking {
+                        TAG_PAIRS.iter().map(|(_, c)| *c).collect()
+                    } else {
+                        TAG_PAIRS.iter().map(|(o, _)| *o).collect()
+                    };
+
+                    let min_split = candidate_tags
+                        .iter()
+                        .filter_map(|t| partial_prefix_split(&self.pending, t))
+                        .min();
+
+                    if let Some(split) = min_split {
                         let committed = self.pending[..split].to_string();
                         if !committed.is_empty() {
                             self.append(&committed, self.in_thinking);
@@ -465,11 +484,25 @@ mod tests {
     fn test_partial_prefix_split_multibyte() {
         // String ending with multi-byte emoji followed by partial tag prefix.
         let buf = "Hello 🔍[thin";
-        assert_eq!(partial_prefix_split(buf, OPEN_TAG), Some("Hello 🔍".len()));
+        assert_eq!(
+            partial_prefix_split(buf, "[thinking]"),
+            Some("Hello 🔍".len())
+        );
 
         // String ending directly with multi-byte emoji (no tag prefix).
         let buf_emoji = "Hello 🔍";
-        assert_eq!(partial_prefix_split(buf_emoji, OPEN_TAG), None);
+        assert_eq!(partial_prefix_split(buf_emoji, "[thinking]"), None);
+    }
+
+    #[test]
+    fn test_llm_stream_think_tags_demux() {
+        let raw = "<think>\nI should report this honestly.\n</think>\nVisible message to user";
+        let mut d = ThinkingDemuxer::new();
+        for ch in raw.chars() {
+            d.push(&ch.to_string());
+        }
+        assert_eq!(d.content(), "\nVisible message to user");
+        assert_eq!(d.thinking(), "\nI should report this honestly.\n");
     }
 
     #[test]
