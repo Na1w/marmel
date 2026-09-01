@@ -1626,7 +1626,15 @@ impl TuiRenderer {
         let tokens_in = self.tokens_in.max(global_in);
         let tokens_out = self.tokens_out.max(global_out);
         let tokens_str = Self::format_token_counts(tokens_in, tokens_out);
-        let status_text = format!(" Tokens: {} | Status: {}", tokens_str, status_str);
+        let status_text =
+            if let Some(ctx_str) = crate::orchestrator::get_active_specialist_context_str() {
+                format!(
+                    " Ctx: {} | Tokens: {} | Status: {}",
+                    ctx_str, tokens_str, status_str
+                )
+            } else {
+                format!(" Tokens: {} | Status: {}", tokens_str, status_str)
+            };
         let status_paragraph = Paragraph::new(status_text)
             .style(Style::default().bg(Color::DarkGray).fg(Color::White));
         frame.render_widget(status_paragraph, area);

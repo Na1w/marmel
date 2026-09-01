@@ -499,6 +499,7 @@ async fn run_specialist_live(
     );
 
     for _turn in 0..100 {
+        crate::orchestrator::update_active_worker_context(&_active_guard.0, engine.token_count());
         crate::orchestrator::emit_status(format!(
             "{agent_tag}: thinking / calling model ({specialist_model})..."
         ));
@@ -913,6 +914,12 @@ async fn run_automated_validation(
         }
     }
 
+    let _active_guard = crate::orchestrator::register_active_worker(
+        None,
+        format!("validator-{agent}"),
+        format!("Auditing {agent} deliverable"),
+    );
+
     let default_mon = crate::config::MonitoringConfig::default();
     let mon_cfg = cfg.monitoring.as_ref().unwrap_or(&default_mon);
     let mut monitor = crate::harness::monitor::HarnessMonitor::new_with_config(
@@ -920,6 +927,7 @@ async fn run_automated_validation(
         mon_cfg,
     );
     for _turn in 0..50 {
+        crate::orchestrator::update_active_worker_context(&_active_guard.0, engine.token_count());
         let req = crate::types::ChatRequest {
             model: validator_model.clone(),
             messages: engine.messages().to_vec(),

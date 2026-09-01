@@ -51,6 +51,7 @@ pub struct ActiveWorkerInfo {
     pub agent_name: String,
     pub prompt: String,
     pub started_at: std::time::Instant,
+    pub context_tokens: usize,
 }
 
 static ACTIVE_WORKERS: std::sync::LazyLock<
@@ -98,10 +99,53 @@ pub fn register_active_worker(
                 agent_name,
                 prompt,
                 started_at: std::time::Instant::now(),
+                context_tokens: 0,
             },
         );
     }
     ActiveWorkerGuard(key)
+}
+
+/// Update the active specialist worker's context token count.
+pub fn update_active_worker_context(key: &str, tokens: usize) {
+    if let Ok(mut map) = ACTIVE_WORKERS.write() {
+        if let Some(info) = map.get_mut(key) {
+            info.context_tokens = tokens;
+        }
+    }
+}
+
+/// Format the active specialist context tokens for display in the status bar.
+/// Returns None if no specialist workers are active or context is 0.
+pub fn get_active_specialist_context_str() -> Option<String> {
+    let map = ACTIVE_WORKERS.read().ok()?;
+    if map.is_empty() {
+        return None;
+    }
+    let entries: Vec<String> = map
+        .values()
+        .filter(|w| w.context_tokens > 0)
+        .map(|w| {
+            let count_str = if w.context_tokens >= 1_000_000 {
+                format!("{:.1}M", w.context_tokens as f64 / 1_000_000.0)
+            } else if w.context_tokens >= 1_000 {
+                format!("{:.1}k", w.context_tokens as f64 / 1_000.0)
+            } else {
+                format!("{}", w.context_tokens)
+            };
+            if let Some(ref tid) = w.task_id {
+                format!("{}-{}: {}", w.agent_name, tid, count_str)
+            } else {
+                format!("{}: {}", w.agent_name, count_str)
+            }
+        })
+        .collect();
+
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries.join(", "))
+    }
 }
 
 /// Returns true if there are currently any active background specialist workers.
@@ -1410,5 +1454,20 @@ mod tests {
             DelegationEvent::Started { agent: Agent::Coder, task: Some(t) } if t == "t-77"));
         assert!(matches!(&events[1],
             DelegationEvent::Completed { agent: Agent::Coder, task: Some(t) } if t == "t-77"));
+    }
+
+    #[test]
+    fn test_active_specialist_context_formatting() {
+        assert!(get_active_specialist_context_str().is_none());
+        let guard = register_active_worker(
+            Some("t-123".to_string()),
+            "coder".to_string(),
+            "Do coding".to_string(),
+        );
+        update_active_worker_context(&guard.0, 3450);
+        let formatted = get_active_specialist_context_str();
+        assert_eq!(formatted.as_deref(), Some("coder-t-123: 3.5k"));
+        drop(guard);
+        assert!(get_active_specialist_context_str().is_none());
     }
 }
