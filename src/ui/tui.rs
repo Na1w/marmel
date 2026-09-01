@@ -743,8 +743,11 @@ impl TuiRenderer {
         self.steer_sentence_buffer.clear();
 
         let mut msg_accum = String::new();
-        if !self.current_thought.is_empty() {
-            msg_accum.push_str(&format!("<think>\n{}\n</think>\n", self.current_thought));
+        if !self.current_thought.trim().is_empty() {
+            msg_accum.push_str(&format!(
+                "<think>\n{}\n</think>\n",
+                self.current_thought.trim()
+            ));
             self.current_thought.clear();
         }
         if !self.current_content.is_empty() {
@@ -1204,6 +1207,20 @@ impl TuiRenderer {
                     in_think = true;
                     if trimmed.contains("</think>") || trimmed.contains("</thought>") {
                         in_think = false;
+                        if !self.show_thought {
+                            continue;
+                        }
+                        let cleaned = strip_think_tags(&line);
+                        if cleaned.trim().is_empty() {
+                            continue;
+                        }
+                        chat_lines.push(Line::from(Span::styled(
+                            cleaned,
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        )));
+                        continue;
                     }
                     if !self.show_thought || trimmed == "<think>" || trimmed == "<thought>" {
                         continue;
@@ -1211,13 +1228,34 @@ impl TuiRenderer {
                 } else if in_think {
                     if trimmed.contains("</think>") || trimmed.contains("</thought>") {
                         in_think = false;
+                        if !self.show_thought {
+                            continue;
+                        }
+                        let cleaned = strip_think_tags(&line);
+                        if cleaned.trim().is_empty() {
+                            continue;
+                        }
+                        chat_lines.push(Line::from(Span::styled(
+                            cleaned,
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        )));
                         continue;
                     }
                     if !self.show_thought {
                         continue;
                     }
                 }
-                if trimmed == "</think>" || trimmed == "</thought>" {
+                if trimmed == "</think>"
+                    || trimmed == "</thought>"
+                    || trimmed == "<think></think>"
+                    || trimmed == "<thought></thought>"
+                {
+                    continue;
+                }
+                let cleaned = strip_think_tags(&line);
+                if cleaned.trim().is_empty() && !line.trim().is_empty() {
                     continue;
                 }
 
@@ -1225,7 +1263,7 @@ impl TuiRenderer {
                     chat_lines.push(Line::from(Span::styled(line, msg_style)));
                 } else if in_think {
                     chat_lines.push(Line::from(Span::styled(
-                        line,
+                        cleaned,
                         Style::default()
                             .fg(Color::DarkGray)
                             .add_modifier(Modifier::ITALIC),
@@ -1238,7 +1276,7 @@ impl TuiRenderer {
                 } else {
                     // Orchestrator / Model content: WHITE
                     chat_lines.push(Line::from(Span::styled(
-                        line,
+                        cleaned,
                         Style::default().fg(Color::White),
                     )));
                 }
@@ -1257,10 +1295,16 @@ impl TuiRenderer {
                     || trimmed == "</think>"
                     || trimmed == "<thought>"
                     || trimmed == "</thought>"
+                    || trimmed == "<think></think>"
+                    || trimmed == "<thought></thought>"
                 {
                     continue;
                 }
-                chat_lines.push(Line::from(Span::styled(line, think_style)));
+                let cleaned = strip_think_tags(&line);
+                if cleaned.trim().is_empty() && !line.trim().is_empty() {
+                    continue;
+                }
+                chat_lines.push(Line::from(Span::styled(cleaned, think_style)));
             }
         }
 
@@ -1268,8 +1312,22 @@ impl TuiRenderer {
         if !self.current_content.is_empty() {
             for raw_line in self.current_content.lines() {
                 let line = raw_line.replace('\t', "    ");
+                let trimmed = line.trim();
+                if trimmed == "<think>"
+                    || trimmed == "</think>"
+                    || trimmed == "<thought>"
+                    || trimmed == "</thought>"
+                    || trimmed == "<think></think>"
+                    || trimmed == "<thought></thought>"
+                {
+                    continue;
+                }
+                let cleaned = strip_think_tags(&line);
+                if cleaned.trim().is_empty() && !line.trim().is_empty() {
+                    continue;
+                }
                 chat_lines.push(Line::from(Span::styled(
-                    line,
+                    cleaned,
                     Style::default().fg(Color::White),
                 )));
             }
@@ -1759,6 +1817,14 @@ fn message_style(msg: &str) -> (Style, bool) {
     }
 }
 
+/// Strip XML thinking tags from a rendered line.
+fn strip_think_tags(line: &str) -> String {
+    line.replace("<think>", "")
+        .replace("</think>", "")
+        .replace("<thought>", "")
+        .replace("</thought>", "")
+}
+
 /// Count the wrapped lines a single message occupies at `width`, excluding
 /// think-block lines when `show_thought` is `false` (reference §11.2).
 fn count_single_message_lines(msg: &str, width: usize, show_thought: bool) -> usize {
@@ -1770,6 +1836,15 @@ fn count_single_message_lines(msg: &str, width: usize, show_thought: bool) -> us
             in_think = true;
             if trimmed.contains("</think>") || trimmed.contains("</thought>") {
                 in_think = false;
+                if !show_thought {
+                    continue;
+                }
+                let cleaned = strip_think_tags(line);
+                if cleaned.trim().is_empty() {
+                    continue;
+                }
+                n += wrapped_lines(&cleaned, width);
+                continue;
             }
             if !show_thought || trimmed == "<think>" || trimmed == "<thought>" {
                 continue;
@@ -1777,20 +1852,36 @@ fn count_single_message_lines(msg: &str, width: usize, show_thought: bool) -> us
         } else if in_think {
             if trimmed.contains("</think>") || trimmed.contains("</thought>") {
                 in_think = false;
+                if !show_thought {
+                    continue;
+                }
+                let cleaned = strip_think_tags(line);
+                if cleaned.trim().is_empty() {
+                    continue;
+                }
+                n += wrapped_lines(&cleaned, width);
                 continue;
             }
             if !show_thought {
                 continue;
             }
         }
-        if trimmed == "</think>" || trimmed == "</thought>" {
+        if trimmed == "</think>"
+            || trimmed == "</thought>"
+            || trimmed == "<think></think>"
+            || trimmed == "<thought></thought>"
+        {
+            continue;
+        }
+        let cleaned = strip_think_tags(line);
+        if cleaned.trim().is_empty() && !line.trim().is_empty() {
             continue;
         }
 
         if line.is_empty() {
             n += 1;
         } else {
-            n += wrapped_lines(line, width);
+            n += wrapped_lines(&cleaned, width);
         }
     }
     n
@@ -2967,6 +3058,10 @@ mod tests {
             text_on.contains("streaming thoughts"),
             "streaming thoughts should be shown when show_thought=true"
         );
+        assert!(!text_off.contains("<think>"));
+        assert!(!text_off.contains("</think>"));
+        assert!(!text_on.contains("<think>"));
+        assert!(!text_on.contains("</think>"));
     }
 
     #[test]
