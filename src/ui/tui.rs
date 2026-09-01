@@ -947,11 +947,10 @@ impl TuiRenderer {
         self.ensure_message_cache(width);
         let mut n = self.cached_total_message_lines.get();
         if self.show_thought && !self.current_thought.is_empty() {
-            n += wrapped_lines(&self.current_thought, width);
-            n += 2; // " thinking" + " response" markers
+            n += count_single_message_lines(&self.current_thought, width, self.show_thought);
         }
         if !self.current_content.is_empty() {
-            n += wrapped_lines(&self.current_content, width);
+            n += count_single_message_lines(&self.current_content, width, self.show_thought);
         }
         if !self.steer_sentence_buffer.is_empty() {
             let prefix = if self
@@ -1339,7 +1338,11 @@ impl TuiRenderer {
             }
         }
 
-        let paragraph_scroll = self.chat_scroll.saturating_sub(lines_before_start as u16);
+        let max_p_scroll = (chat_lines.len()).saturating_sub(chat_h) as u16;
+        let paragraph_scroll = self
+            .chat_scroll
+            .saturating_sub(lines_before_start as u16)
+            .min(max_p_scroll);
         let chat_paragraph = Paragraph::new(chat_lines)
             .block(chat_block)
             .wrap(Wrap { trim: false })
@@ -2126,6 +2129,12 @@ impl Renderer for TuiRenderer {
                     .len();
                 self.tokens_out = self.tokens_out.saturating_add(tok_count);
                 self.current_content.push_str(text);
+                if self.chat_auto_scroll {
+                    let w = self.chat_width.get();
+                    let n = self.estimated_chat_lines(w);
+                    let h = self.chat_height.get();
+                    self.chat_scroll = n.saturating_sub(h) as u16;
+                }
                 // Live-track content for the active subagent (t-c304): when a
                 // specialist is running, its final-answer text streams into the
                 // subagent's `content` field so the Subagents panel shows it.
@@ -2150,6 +2159,12 @@ impl Renderer for TuiRenderer {
                 for s in sentences {
                     self.append_steer_sentence(&s);
                 }
+                if self.chat_auto_scroll {
+                    let w = self.chat_width.get();
+                    let n = self.estimated_chat_lines(w);
+                    let h = self.chat_height.get();
+                    self.chat_scroll = n.saturating_sub(h) as u16;
+                }
             }
             Event::Thinking(text) => {
                 let tok_count = tiktoken_rs::cl100k_base_singleton()
@@ -2157,6 +2172,12 @@ impl Renderer for TuiRenderer {
                     .len();
                 self.tokens_out = self.tokens_out.saturating_add(tok_count);
                 self.current_thought.push_str(text);
+                if self.chat_auto_scroll {
+                    let w = self.chat_width.get();
+                    let n = self.estimated_chat_lines(w);
+                    let h = self.chat_height.get();
+                    self.chat_scroll = n.saturating_sub(h) as u16;
+                }
                 // Live-track thinking for the active subagent (t-c304): when a
                 // specialist is running, its reasoning streams into the
                 // subagent's `thinking` field so the Subagents panel shows it.
@@ -2658,8 +2679,8 @@ mod tests {
         r.current_thought = "thinking text".to_string();
 
         let n = r.estimated_chat_lines(80);
-        // 1 (message) + 1 (content) + 1 (thought) + 2 (markers) = 5
-        assert_eq!(n, 5);
+        // 1 (message) + 1 (content) + 1 (thought) = 3 (markers are not rendered)
+        assert_eq!(n, 3);
     }
 
     #[test]
