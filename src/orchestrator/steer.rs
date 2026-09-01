@@ -207,9 +207,12 @@ where
         ctx.available_agents
     };
 
+    let env_block = crate::prompts::format_environment_block();
+
     let user_prompt = format!(
-        "Available Specialist Agents:\n{}\n\nMain Session Goal: \"{}\"\n\nActive Execution Plan (Full Text):\n{}\n\nExecution Plan Progress Breakdown:\n{}\n\nOrchestrator Status: {}\n\nPending Approval Request:\n{}\n\nActive Subtasks:\n{}\n\nSteering Conversation History:\n{}\n\nNew User Instruction: \"{}\"\n\nPlease output your decision JSON.",
+        "Available Specialist Agents:\n{}\n\n{}\n\nMain Session Goal: \"{}\"\n\nActive Execution Plan (Full Text):\n{}\n\nExecution Plan Progress Breakdown:\n{}\n\nOrchestrator Status: {}\n\nPending Approval Request:\n{}\n\nActive Subtasks:\n{}\n\nSteering Conversation History:\n{}\n\nNew User Instruction: \"{}\"\n\nPlease output your decision JSON.",
         available_agents,
+        env_block,
         ctx.main_goal,
         if ctx.plan_content.is_empty() {
             "None"

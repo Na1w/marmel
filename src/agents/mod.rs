@@ -438,11 +438,11 @@ async fn run_specialist_live(
     ctx: &IsolatedContext,
     cfg: &crate::config::Config,
 ) -> anyhow::Result<String> {
-    let cwd = std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string());
+    let env_block = crate::prompts::format_environment_block();
 
     let enhanced_system_prompt = format!(
-        "{}\n\n## Environment & Workspace\n- Current Working Directory (CWD): `{cwd}`\n- All relative paths and file operations resolve against this workspace directory.\n- Tools available: `write_file`, `replace`, `read_file`, `run_command`, `grep_search`, `glob`.\n- You MUST save files and execute real work to complete the task.",
-        ctx.role_system_prompt
+        "{}\n\n{}\n- Tools available: `write_file`, `replace`, `read_file`, `run_command`, `grep_search`, `glob`.\n- You MUST save files and execute real work to complete the task.",
+        ctx.role_system_prompt, env_block
     );
 
     let mut engine = crate::agent::ContextEngineFactory::new(cfg.max_context_tokens)

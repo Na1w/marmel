@@ -852,10 +852,8 @@ impl StreamSink for RendererSink<'_> {
 
 fn load_system_prompt(_cfg: &Config) -> Result<String> {
     let content = include_str!("../../prompts/system.md");
-    let cwd = std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string());
-    let mut prompt = format!(
-        "{content}\n\n## Workspace & Environment\n- Current Working Directory: `{cwd}`\n- All tool executions, relative file paths, commands, and search operations resolve against this workspace directory.\n"
-    );
+    let env_block = crate::prompts::format_environment_block();
+    let mut prompt = format!("{content}\n\n{env_block}\n");
     let plan = crate::agent::phase::Plan::default();
     if let Ok(Some(plan_content)) = plan.read()
         && !plan_content.trim().is_empty()
