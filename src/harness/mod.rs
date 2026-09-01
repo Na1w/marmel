@@ -300,18 +300,29 @@ pub fn apply_tool_output_length_limit(mut result: ToolResult) -> ToolResult {
 }
 
 pub fn dispatch_for(tool: &ToolInvocation, caller: ToolCaller) -> Result<ToolResult, ToolError> {
+    dispatch_for_with_engine(tool, caller, None)
+}
+
+pub fn dispatch_for_with_engine(
+    tool: &ToolInvocation,
+    caller: ToolCaller,
+    engine: Option<&mut crate::agent::ContextEngine>,
+) -> Result<ToolResult, ToolError> {
     let res = if caller == ToolCaller::Manager {
-        dispatch_manager(tool)
+        dispatch_manager(tool, engine)
     } else {
         let ToolCaller::Specialist(agent) = caller else {
             unreachable!("non-Manager caller is a specialist");
         };
-        dispatch_specialist(tool, agent)
+        dispatch_specialist(tool, agent, engine)
     };
     res.map(apply_tool_output_length_limit)
 }
 
-fn dispatch_manager(tool: &ToolInvocation) -> Result<ToolResult, ToolError> {
+fn dispatch_manager(
+    tool: &ToolInvocation,
+    engine: Option<&mut crate::agent::ContextEngine>,
+) -> Result<ToolResult, ToolError> {
     let name = tool.name.as_str();
     if let Some(mcp) = get_mcp_manager()
         && mcp.has_tool(name)
@@ -339,10 +350,17 @@ fn dispatch_manager(tool: &ToolInvocation) -> Result<ToolResult, ToolError> {
             )),
         },
         TOOL_ARCHIVE_PLAN => archive_plan(),
-        TOOL_REBIRTH => Err(ToolError::BadArguments {
-            tool: TOOL_REBIRTH.to_string(),
-            detail: "rebirth requires a live ContextEngine; use dispatch_with_engine".to_string(),
-        }),
+        TOOL_REBIRTH => {
+            if let Some(eng) = engine {
+                handle_rebirth(eng, &tool.arguments)
+            } else {
+                Err(ToolError::BadArguments {
+                    tool: TOOL_REBIRTH.to_string(),
+                    detail: "rebirth requires a live ContextEngine; use dispatch_with_engine"
+                        .to_string(),
+                })
+            }
+        }
         TOOL_READ_FILE => fs::read_file(&tool.arguments),
         TOOL_GREP_SEARCH => search::grep_search(&tool.arguments),
         TOOL_GLOB => search::glob(&tool.arguments),
@@ -373,6 +391,7 @@ fn normalize_tool_name(name: &str) -> String {
 fn dispatch_specialist(
     tool: &ToolInvocation,
     agent: crate::agents::Agent,
+    engine: Option<&mut crate::agent::ContextEngine>,
 ) -> Result<ToolResult, ToolError> {
     let name = tool.name.as_str();
     if name == TOOL_CREATE_PLAN {
@@ -439,10 +458,17 @@ fn dispatch_specialist(
                 "Verdict recorded via leave_verdict: {verdict} with comments: {comments}"
             )))
         }
-        TOOL_REBIRTH => Err(ToolError::BadArguments {
-            tool: TOOL_REBIRTH.to_string(),
-            detail: "rebirth requires a live ContextEngine; use dispatch_with_engine".to_string(),
-        }),
+        TOOL_REBIRTH => {
+            if let Some(eng) = engine {
+                handle_rebirth(eng, &tool.arguments)
+            } else {
+                Err(ToolError::BadArguments {
+                    tool: TOOL_REBIRTH.to_string(),
+                    detail: "rebirth requires a live ContextEngine; use dispatch_with_engine"
+                        .to_string(),
+                })
+            }
+        }
         other => Err(ToolError::UnknownTool(other.to_string())),
     }
 }

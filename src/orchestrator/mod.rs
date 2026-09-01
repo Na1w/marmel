@@ -58,13 +58,21 @@ static ACTIVE_WORKERS: std::sync::LazyLock<
     std::sync::RwLock<std::collections::BTreeMap<String, ActiveWorkerInfo>>,
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::BTreeMap::new()));
 
+static WORKER_CONTEXT_TOKENS: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::BTreeMap<String, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::BTreeMap::new()));
+
 /// RAII guard that automatically unregisters an active worker on drop.
 pub struct ActiveWorkerGuard(pub String);
 
 impl Drop for ActiveWorkerGuard {
     fn drop(&mut self) {
         if let Ok(mut map) = ACTIVE_WORKERS.write() {
-            map.remove(&self.0);
+            if let Some(info) = map.remove(&self.0)
+                && let Ok(mut last_map) = WORKER_CONTEXT_TOKENS.write()
+            {
+                last_map.insert(self.0.clone(), info.context_tokens);
+            }
         }
     }
 }
@@ -92,6 +100,11 @@ pub fn register_active_worker(
     };
 
     if let Ok(mut map) = ACTIVE_WORKERS.write() {
+        let initial_tokens = WORKER_CONTEXT_TOKENS
+            .read()
+            .ok()
+            .and_then(|m| m.get(&key).copied())
+            .unwrap_or(0);
         map.insert(
             key.clone(),
             ActiveWorkerInfo {
@@ -99,7 +112,7 @@ pub fn register_active_worker(
                 agent_name,
                 prompt,
                 started_at: std::time::Instant::now(),
-                context_tokens: 0,
+                context_tokens: initial_tokens,
             },
         );
     }
@@ -113,12 +126,24 @@ pub fn update_active_worker_context(key: &str, tokens: usize) {
     {
         info.context_tokens = tokens;
     }
+    if let Ok(mut last_map) = WORKER_CONTEXT_TOKENS.write() {
+        last_map.insert(key.to_string(), tokens);
+    }
 }
 
 /// Get the context token count for an active specialist worker by its key (e.g. `coder-t-001`).
 pub fn get_active_worker_tokens(key: &str) -> Option<usize> {
-    let map = ACTIVE_WORKERS.read().ok()?;
-    map.get(key).map(|w| w.context_tokens)
+    if let Ok(map) = ACTIVE_WORKERS.read()
+        && let Some(w) = map.get(key)
+    {
+        return Some(w.context_tokens);
+    }
+    if let Ok(map) = WORKER_CONTEXT_TOKENS.read()
+        && let Some(&tokens) = map.get(key)
+    {
+        return Some(tokens);
+    }
+    None
 }
 
 /// Format the active specialist context tokens for display in the status bar.
@@ -1473,7 +1498,26 @@ mod tests {
         update_active_worker_context(&guard.0, 3450);
         let formatted = get_active_specialist_context_str();
         assert_eq!(formatted.as_deref(), Some("coder-t-123: 3.5k"));
+        assert_eq!(get_active_worker_tokens("coder-t-123"), Some(3450));
         drop(guard);
         assert!(get_active_specialist_context_str().is_none());
+        // Last known tokens are preserved after drop for Idle subagent rendering
+        assert_eq!(get_active_worker_tokens("coder-t-123"), Some(3450));
+    }
+
+    #[test]
+    fn test_active_worker_context_tokens_rebirth_reduction() {
+        let guard = register_active_worker(
+            Some("t-456".to_string()),
+            "coder".to_string(),
+            "Do large work".to_string(),
+        );
+        // Before rebirth: large context
+        update_active_worker_context(&guard.0, 8500);
+        assert_eq!(get_active_worker_tokens("coder-t-456"), Some(8500));
+
+        // After rebirth or compaction: context count drops
+        update_active_worker_context(&guard.0, 450);
+        assert_eq!(get_active_worker_tokens("coder-t-456"), Some(450));
     }
 }

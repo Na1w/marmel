@@ -231,6 +231,7 @@ pub async fn run_session(
 
             if ctx.should_compact() {
                 ctx.compact();
+                renderer.on_event(&Event::TokensIn(ctx.token_count()));
                 renderer.on_event(&Event::Status("context compacted".to_string()));
             }
 

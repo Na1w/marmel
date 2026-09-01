@@ -605,9 +605,10 @@ async fn run_specialist_live(
                         name: tc.function.name.clone(),
                         arguments: args_val,
                     };
-                    let tool_res = crate::harness::dispatch_for(
+                    let tool_res = crate::harness::dispatch_for_with_engine(
                         &invocation,
                         crate::harness::ToolCaller::Specialist(agent),
+                        Some(&mut engine),
                     );
                     match tool_res {
                         Ok(r) => {
@@ -629,6 +630,13 @@ async fn run_specialist_live(
                 tool_call_id: tc.id,
                 content,
             });
+            if engine.should_compact() {
+                engine.compact();
+            }
+            crate::orchestrator::update_active_worker_context(
+                &_active_guard.0,
+                engine.token_count(),
+            );
         }
     }
 
@@ -1050,9 +1058,10 @@ async fn run_automated_validation(
                         name: tc.function.name.clone(),
                         arguments: args_val,
                     };
-                    let tool_res = crate::harness::dispatch_for(
+                    let tool_res = crate::harness::dispatch_for_with_engine(
                         &invocation,
                         crate::harness::ToolCaller::Specialist(Agent::Validator),
+                        Some(&mut engine),
                     );
                     match tool_res {
                         Ok(r) => {
@@ -1077,6 +1086,13 @@ async fn run_automated_validation(
                 tool_call_id: tc.id,
                 content,
             });
+            if engine.should_compact() {
+                engine.compact();
+            }
+            crate::orchestrator::update_active_worker_context(
+                &_active_guard.0,
+                engine.token_count(),
+            );
         }
     }
 
