@@ -103,14 +103,14 @@ impl MissionMarker {
                 reason: text.to_string(),
             });
         }
-        if upper.contains("MISSION COMPLETE") {
-            let task_id = find_task_id(text).map(|t| t.to_string());
-            return Some(MissionMarker::Complete { task_id });
-        }
         if upper.contains("FAILED") {
             return Some(MissionMarker::Failed {
                 reason: text.to_string(),
             });
+        }
+        if upper.contains("MISSION COMPLETE") {
+            let task_id = find_task_id(text).map(|t| t.to_string());
+            return Some(MissionMarker::Complete { task_id });
         }
         None
     }
@@ -421,15 +421,24 @@ pub(crate) fn assemble_final_deliverable(
     validator_critique: Option<&str>,
     final_content: &str,
 ) -> String {
+    let upper = final_content.to_ascii_uppercase();
+    let has_complete = upper.contains("MISSION COMPLETE");
+    let has_failed = upper.contains("FAILED");
+    let has_replan = upper.contains("REPLAN REQUIRED");
+
     if validation_passed {
-        let mut content = final_content.to_string();
-        if !content.contains("MISSION COMPLETE")
-            && !content.contains("FAILED")
-            && !content.contains("REPLAN REQUIRED")
-        {
-            content.push_str("\n\nMISSION COMPLETE");
+        if has_complete || has_failed || has_replan {
+            return final_content.to_string();
         }
-        return content;
+        // If neither was explicitly signaled, do NOT fabricate MISSION COMPLETE.
+        // It must stay unchecked in the execution plan.
+        let mut res = final_content.to_string();
+        if res.trim().is_empty() {
+            res = "Specialist terminated without deliverable.\n\nFAILED (incomplete)".to_string();
+        } else {
+            res.push_str("\n\nFAILED (task concluded without explicit completion)");
+        }
+        return res;
     }
 
     let mut rejected = String::new();
@@ -1253,8 +1262,12 @@ mod tests {
 
     #[test]
     fn test_assemble_final_deliverable() {
-        let approved = assemble_final_deliverable(true, None, "Code completed.");
-        assert!(approved.contains("MISSION COMPLETE"));
+        let complete = assemble_final_deliverable(true, None, "Code completed. MISSION COMPLETE");
+        assert!(complete.contains("MISSION COMPLETE"));
+
+        let incomplete = assemble_final_deliverable(true, None, "Code partially written.");
+        assert!(!incomplete.contains("MISSION COMPLETE"));
+        assert!(incomplete.contains("FAILED"));
 
         let rejected = assemble_final_deliverable(
             false,
