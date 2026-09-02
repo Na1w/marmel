@@ -321,6 +321,33 @@ where
             _ => false,
         };
 
+        if budget_exceeded && !has_tools && empty_attempts < nudge.max_attempts() {
+            empty_attempts += 1;
+            tracing::warn!(
+                "Stream terminated due to output token budget ({max_tokens}) — injecting budget recovery nudge ({}/{})",
+                empty_attempts,
+                nudge.max_attempts()
+            );
+            sink.emit(StreamEvent::Status(format!(
+                "output budget reached ({max_tokens} tokens) — nudge {empty_attempts}/{}",
+                nudge.max_attempts()
+            )));
+            transcript.push(Message::Assistant {
+                content: Some(format!(
+                    "[Generation truncated: exceeded {max_tokens} token single-turn limit]"
+                )),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+            });
+            transcript.push(Message::User {
+                content: format!(
+                    "SYSTEM NOTICE: Your response exceeded the single-turn output budget limit ({max_tokens} tokens) and was truncated. Please be concise and execute your necessary tools (such as `delegate_task` or `create_plan`) now."
+                ),
+            });
+            recovery = true;
+            continue;
+        }
+
         if rep_triggered && !has_tools && empty_attempts < nudge.max_attempts() {
             empty_attempts += 1;
             tracing::warn!(

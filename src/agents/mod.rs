@@ -631,6 +631,19 @@ async fn run_specialist_live(
         let is_repeating = monitor.feed_text(&reply.content);
 
         if tool_calls.is_empty() {
+            if budget_exceeded && nudge_count < 3 {
+                nudge_count += 1;
+                tracing::warn!(
+                    "{agent_tag}: output budget exceeded — injecting corrective nudge ({nudge_count}/3)"
+                );
+                engine.append(crate::types::Message::User {
+                    content: format!(
+                        "SYSTEM NOTICE: Your response exceeded the single-turn output budget limit ({max_tokens} tokens) and was truncated. Please be concise, call your required tools (such as `read_file`, `write_file`, `replace`, `run_command`, etc.) to perform the work, or conclude with 'MISSION COMPLETE'."
+                    ),
+                });
+                continue;
+            }
+
             if is_repeating && nudge_count < 3 {
                 nudge_count += 1;
                 tracing::warn!(
@@ -925,6 +938,17 @@ async fn run_specialist_live(
                         engine.append(assistant_msg);
 
                         if tool_calls.is_empty() {
+                            if budget_exceeded && rev_turn + 1 < 25 {
+                                tracing::warn!(
+                                    "{agent_tag}: output budget exceeded during revision — injecting corrective nudge"
+                                );
+                                engine.append(crate::types::Message::User {
+                                    content: format!(
+                                        "SYSTEM NOTICE: Your revision response exceeded the single-turn output budget limit ({max_tokens} tokens) and was truncated. Please be concise and call your required tools (such as `write_file`, `replace`, `run_command`, etc.) to apply the necessary fixes."
+                                    ),
+                                });
+                                continue;
+                            }
                             break;
                         }
 
