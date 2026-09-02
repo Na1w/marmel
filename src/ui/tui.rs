@@ -989,7 +989,7 @@ impl TuiRenderer {
                 }
                 n += 1; // " response"
             }
-            if !sa.content.is_empty() {
+            if self.show_thought && !sa.content.is_empty() {
                 n += 1; // "[Output]"
                 for line in sa.content.lines() {
                     n += if line.is_empty() {
@@ -1612,7 +1612,7 @@ impl TuiRenderer {
                 detail_lines.push(Line::styled(" response", think_style));
             }
 
-            if !sa.content.is_empty() {
+            if self.show_thought && !sa.content.is_empty() {
                 detail_lines.push(Line::styled(
                     "[Output]",
                     Style::default()
@@ -2242,23 +2242,38 @@ impl Renderer for TuiRenderer {
                     .len();
                 self.tokens_out = self.tokens_out.saturating_add(tok_count);
                 self.commit_turn_content();
-                self.messages.push(format!("[Tool Call] {text}"));
-                if self.chat_auto_scroll {
-                    let w = self.chat_width.get();
-                    let n = self.estimated_chat_lines(w);
-                    let h = self.chat_height.get();
-                    self.chat_scroll = n.saturating_sub(h) as u16;
+                if self.active_agent != "Manager"
+                    && let Some(sa) = self
+                        .subagents
+                        .iter_mut()
+                        .find(|s| s.name == self.active_agent)
+                {
+                    let log_entry = text.clone();
+                    if sa.logs.last().map(String::as_str) != Some(log_entry.as_str()) {
+                        sa.logs.push(log_entry);
+                    }
+                    sa.last_activity_at = Some(std::time::Instant::now());
+                } else {
+                    self.messages.push(format!("[Tool Call] {text}"));
+                    if self.chat_auto_scroll {
+                        let w = self.chat_width.get();
+                        let n = self.estimated_chat_lines(w);
+                        let h = self.chat_height.get();
+                        self.chat_scroll = n.saturating_sub(h) as u16;
+                    }
                 }
             }
             Event::ToolResult(text) => {
                 self.waiting_for_token_since = None;
                 self.commit_turn_content();
-                self.messages.push(format!("[Tool Result] {text}"));
-                if self.chat_auto_scroll {
-                    let w = self.chat_width.get();
-                    let n = self.estimated_chat_lines(w);
-                    let h = self.chat_height.get();
-                    self.chat_scroll = n.saturating_sub(h) as u16;
+                if self.active_agent == "Manager" {
+                    self.messages.push(format!("[Tool Result] {text}"));
+                    if self.chat_auto_scroll {
+                        let w = self.chat_width.get();
+                        let n = self.estimated_chat_lines(w);
+                        let h = self.chat_height.get();
+                        self.chat_scroll = n.saturating_sub(h) as u16;
+                    }
                 }
             }
             Event::Status(text) => {
@@ -2301,8 +2316,17 @@ impl Renderer for TuiRenderer {
                         || text.starts_with(&format!("{} ", sa.name))
                         || text.contains(&format!("for {}", sa.name))
                     {
-                        if sa.logs.last().map(String::as_str) != Some(text.as_str()) {
-                            sa.logs.push(text.clone());
+                        let clean = if let Some(stripped) =
+                            text.strip_prefix(&format!("{}: ", sa.name))
+                        {
+                            stripped.to_string()
+                        } else if let Some(stripped) = text.strip_prefix(&format!("{}:", sa.name)) {
+                            stripped.trim_start().to_string()
+                        } else {
+                            text.clone()
+                        };
+                        if sa.logs.last().map(String::as_str) != Some(clean.as_str()) {
+                            sa.logs.push(clean);
                         }
                         sa.last_activity_at = Some(std::time::Instant::now());
                         routed = true;
@@ -2316,8 +2340,16 @@ impl Renderer for TuiRenderer {
                         .iter_mut()
                         .find(|s| s.name == self.active_agent)
                 {
-                    if sa.logs.last().map(String::as_str) != Some(text.as_str()) {
-                        sa.logs.push(text.clone());
+                    let clean = if let Some(stripped) = text.strip_prefix(&format!("{}: ", sa.name))
+                    {
+                        stripped.to_string()
+                    } else if let Some(stripped) = text.strip_prefix(&format!("{}:", sa.name)) {
+                        stripped.trim_start().to_string()
+                    } else {
+                        text.clone()
+                    };
+                    if sa.logs.last().map(String::as_str) != Some(clean.as_str()) {
+                        sa.logs.push(clean);
                     }
                     sa.last_activity_at = Some(std::time::Instant::now());
                 }
@@ -2762,8 +2794,8 @@ mod tests {
             is_active: true,
             context_tokens: 0,
         });
-        // Default (show_thought = false): 1 (header) + 1 ([Output]) + 1 (out) + 1 ([Logs]) + 1 (- log1) = 5
-        assert_eq!(r.estimated_subagent_lines(80), 5);
+        // Default (show_thought = false): 1 (header) + 1 ([Logs]) + 1 (- log1) = 3
+        assert_eq!(r.estimated_subagent_lines(80), 3);
         // When show_thought = true: 1 (header) + 2 ([Thinking], " thinking") + 1 (think) + 1 (" response")
         // + 1 ([Output]) + 1 (out) + 1 ([Logs]) + 1 (- log1) = 9
         r.show_thought = true;
@@ -3135,8 +3167,16 @@ mod tests {
             !text_off.contains("secret subagent thoughts"),
             "subagent thoughts should be hidden when show_thought=false"
         );
-        assert!(text_off.contains("[Output]"));
-        assert!(text_off.contains("deliverable code"));
+        assert!(
+            !text_off.contains("[Output]"),
+            "subagent [Output] should be hidden when show_thought=false"
+        );
+        assert!(
+            !text_off.contains("deliverable code"),
+            "subagent output content should be hidden when show_thought=false"
+        );
+        assert!(text_off.contains("[Logs]"));
+        assert!(text_off.contains("log step"));
 
         // 2. Toggle thought ON via /thought
         r.input_text = "/thought".to_string();
@@ -3166,6 +3206,54 @@ mod tests {
         assert!(
             text_on.contains("secret subagent thoughts"),
             "subagent thoughts should be shown when show_thought=true"
+        );
+        assert!(
+            text_on.contains("[Output]"),
+            "subagent [Output] should be shown when show_thought=true"
+        );
+        assert!(
+            text_on.contains("deliverable code"),
+            "subagent output content should be shown when show_thought=true"
+        );
+    }
+
+    #[test]
+    fn test_subagent_tool_calls_logged_with_arguments_and_stripped_prefix() {
+        let mut r = TuiRenderer::new();
+        r.subagents.push(SubagentDetail {
+            name: "coder-t-001".to_string(),
+            task_id: Some("t-001".to_string()),
+            prompt: "build raytracer".to_string(),
+            started_at: None,
+            last_activity_at: None,
+            logs: vec![],
+            thinking: String::new(),
+            content: String::new(),
+            is_active: true,
+            context_tokens: 0,
+        });
+        r.active_agent = "coder-t-001".to_string();
+
+        // Status event with agent prefix should have prefix stripped
+        r.on_event(&Event::Status(
+            "coder-t-001: write_file(src/scene.rs)".to_string(),
+        ));
+        assert_eq!(
+            r.subagents[0].logs.last().unwrap(),
+            "write_file(src/scene.rs)"
+        );
+
+        // ToolCall event during specialist execution should route directly to subagent logs
+        r.on_event(&Event::ToolCall("run_command(cargo test)".to_string()));
+        assert_eq!(
+            r.subagents[0].logs.last().unwrap(),
+            "run_command(cargo test)"
+        );
+        // And not pollute the main chat
+        assert!(
+            !r.messages
+                .iter()
+                .any(|m| m.contains("run_command(cargo test)"))
         );
     }
 
@@ -3333,6 +3421,7 @@ mod tests {
             context_tokens: 0,
         });
 
+        r.show_thought = true;
         r.subagent_width.set(40);
         r.subagent_height.set(5);
 

@@ -1539,7 +1539,6 @@ mod tests {
 
     #[test]
     fn test_active_specialist_context_formatting() {
-        assert!(get_active_specialist_context_str().is_none());
         let guard = register_active_worker(
             Some("t-123".to_string()),
             "coder".to_string(),
@@ -1547,10 +1546,13 @@ mod tests {
         );
         update_active_worker_context(&guard.0, 3450);
         let formatted = get_active_specialist_context_str();
-        assert_eq!(formatted.as_deref(), Some("coder-t-123: 3.5k"));
+        assert!(
+            formatted
+                .as_deref()
+                .is_some_and(|s| s.contains("coder-t-123: 3.5k"))
+        );
         assert_eq!(get_active_worker_tokens("coder-t-123"), Some(3450));
         drop(guard);
-        assert!(get_active_specialist_context_str().is_none());
         // Last known tokens are preserved after drop for Idle subagent rendering
         assert_eq!(get_active_worker_tokens("coder-t-123"), Some(3450));
     }

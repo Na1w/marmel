@@ -16,7 +16,6 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-#[cfg(not(test))]
 use crate::tool_names::{
     TOOL_DELEGATE_TASK, TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_LEAVE_VERDICT, TOOL_READ_FILE,
     TOOL_REPLACE, TOOL_RUN_COMMAND, TOOL_WRITE_FILE,
@@ -292,15 +291,10 @@ async fn try_run_specialist_live(
     (!res.trim().is_empty()).then_some(res)
 }
 
-#[cfg(not(test))]
-fn format_tool_args_preview(tool: &str, args: &serde_json::Value) -> String {
+#[allow(dead_code)]
+pub(crate) fn format_tool_args_preview(tool: &str, args: &serde_json::Value) -> String {
     match tool {
-        TOOL_READ_FILE | TOOL_WRITE_FILE => args
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        TOOL_REPLACE => args
+        TOOL_READ_FILE | TOOL_WRITE_FILE | TOOL_REPLACE => args
             .get("path")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
@@ -310,8 +304,8 @@ fn format_tool_args_preview(tool: &str, args: &serde_json::Value) -> String {
                 .get("command")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
-            if cmd.len() > 35 {
-                format!("{}...", &cmd[..32])
+            if cmd.len() > 40 {
+                format!("{}…", &cmd[..37])
             } else {
                 cmd.to_string()
             }
@@ -329,7 +323,7 @@ fn format_tool_args_preview(tool: &str, args: &serde_json::Value) -> String {
         _ => {
             let s = args.to_string();
             if s.len() > 30 {
-                format!("{}...", &s[..27])
+                format!("{}…", &s[..27])
             } else {
                 s
             }
@@ -337,8 +331,8 @@ fn format_tool_args_preview(tool: &str, args: &serde_json::Value) -> String {
     }
 }
 
-#[cfg(not(test))]
-fn format_tool_args_full(tool: &str, args: &serde_json::Value) -> String {
+#[allow(dead_code)]
+pub(crate) fn format_tool_args_full(tool: &str, args: &serde_json::Value) -> String {
     match tool {
         TOOL_READ_FILE | TOOL_WRITE_FILE | TOOL_REPLACE => {
             if let Some(path) = args.get("path").and_then(serde_json::Value::as_str) {

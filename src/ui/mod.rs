@@ -961,7 +961,11 @@ fn format_tool_call_display(name: &str, args_val: &serde_json::Value) -> String 
                 .get("path")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
-            format!("{name}(path: {path})")
+            if path.is_empty() {
+                format!("{name}()")
+            } else {
+                format!("{name}({path})")
+            }
         }
         "run_command" => {
             let cmd = args_val
@@ -979,14 +983,18 @@ fn format_tool_call_display(name: &str, args_val: &serde_json::Value) -> String 
                 .get("query")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
-            format!("grep_search(query: {query})")
+            if let Some(path) = args_val.get("path").and_then(serde_json::Value::as_str) {
+                format!("grep_search({query} in {path})")
+            } else {
+                format!("grep_search({query})")
+            }
         }
         "glob" => {
             let pattern = args_val
                 .get("pattern")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
-            format!("glob(pattern: {pattern})")
+            format!("glob({pattern})")
         }
         _ => {
             let s = args_val.to_string();
