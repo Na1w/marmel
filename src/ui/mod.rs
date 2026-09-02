@@ -216,28 +216,32 @@ pub async fn run_session(
                 goal: &goal,
                 subagents: &subagents,
             };
-            let assistant =
-                match chat_client_turn(&client, ctx.messages().to_vec(), &stream_cfg, &mut bridge)
-                    .await
-                {
-                    Ok(m) => m,
-                    Err(e) => {
-                        let category = classify_llm_error(&e);
-                        tracing::warn!(
-                            error = %format!("{e:#}"),
-                            category = %category,
-                            "LLM turn failed"
-                        );
-                        renderer.on_event(&Event::Message(format!(
+            let assistant = match chat_client_turn(
+                &client,
+                ctx.messages().to_vec(),
+                &stream_cfg,
+                &mut bridge,
+            )
+            .await
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    let category = classify_llm_error(&e);
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        category = %category,
+                        "LLM turn failed"
+                    );
+                    renderer.on_event(&Event::Message(format!(
                             "\n[Error] LLM backend call failed ({category}): {e:#}\n(Check that your LLM server is running at {} for model `{}`)",
                             client.backend_url(),
                             stream_cfg.model
                         )));
-                        renderer.on_event(&Event::Status(format!("LLM error: {category} (Ready)")));
-                        renderer.flush()?;
-                        break;
-                    }
-                };
+                    renderer.on_event(&Event::Status(format!("LLM error: {category} (Ready)")));
+                    renderer.flush()?;
+                    break;
+                }
+            };
 
             if renderer.aborted() {
                 break;
