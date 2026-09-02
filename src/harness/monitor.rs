@@ -287,13 +287,74 @@ fn parse_tool_call_block(block: &str) -> Option<ToolCall> {
     }
 
     // Pattern 2: `<tool_call function="read_file">{"path": ...}</tool_call>`
+    // or `<tool_call function="write_file" path="foo.md"># Content...</tool_call>`
     if let Some((name, body)) = try_function_attr(block) {
         let args_json = extract_inner_text(body);
-        let arguments = if let Ok(v) = serde_json::from_str::<serde_json::Value>(args_json.trim()) {
-            v
-        } else {
-            serde_json::Value::String(args_json.trim().to_string())
+        let parsed = serde_json::from_str::<serde_json::Value>(args_json.trim());
+        let mut map = match parsed {
+            Ok(serde_json::Value::Object(m)) => m,
+            _ => {
+                let mut m = serde_json::Map::new();
+                let inner = args_json.trim();
+                if !inner.is_empty() {
+                    if name == "write_file" || name == "replace" {
+                        m.insert(
+                            "content".to_string(),
+                            serde_json::Value::String(inner.to_string()),
+                        );
+                    } else if name == "read_file" {
+                        m.insert(
+                            "path".to_string(),
+                            serde_json::Value::String(inner.to_string()),
+                        );
+                    } else if name == "run_command" {
+                        m.insert(
+                            "command".to_string(),
+                            serde_json::Value::String(inner.to_string()),
+                        );
+                    } else if name == "grep_search" {
+                        m.insert(
+                            "query".to_string(),
+                            serde_json::Value::String(inner.to_string()),
+                        );
+                    } else if name == "glob" {
+                        m.insert(
+                            "pattern".to_string(),
+                            serde_json::Value::String(inner.to_string()),
+                        );
+                    }
+                }
+                m
+            }
         };
+
+        // Extract opening tag attributes like path="...", file="...", command="...", query="...", pattern="..."
+        for attr in &[
+            "path",
+            "file",
+            "file_path",
+            "filepath",
+            "filename",
+            "command",
+            "query",
+            "pattern",
+            "doc",
+            "destination",
+            "dest",
+            "target",
+        ] {
+            if let Some(val) = extract_attribute(block, attr) {
+                map.entry((*attr).to_string())
+                    .or_insert_with(|| serde_json::Value::String(val));
+            }
+        }
+
+        let arguments = if map.is_empty() {
+            serde_json::Value::String(args_json.trim().to_string())
+        } else {
+            serde_json::Value::Object(map)
+        };
+
         return Some(make_rescued_call(name, arguments));
     }
 

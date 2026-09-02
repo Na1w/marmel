@@ -68,6 +68,7 @@ pub struct ChatClient {
     backend_url: String,
     auth_token: String,
     model: String,
+    initial_timeout_secs: u64,
 }
 
 #[derive(Debug, Error)]
@@ -108,6 +109,7 @@ impl ChatClient {
             backend_url: cfg.backend_url.clone(),
             auth_token: cfg.auth_token.clone(),
             model: cfg.model.clone(),
+            initial_timeout_secs: INITIAL_RESPONSE_WATCHDOG_SECS,
         }
     }
 
@@ -116,6 +118,7 @@ impl ChatClient {
             backend_url: backend_url.into(),
             auth_token: String::new(),
             model: model.into(),
+            initial_timeout_secs: INITIAL_RESPONSE_WATCHDOG_SECS,
         }
     }
 
@@ -128,7 +131,13 @@ impl ChatClient {
             backend_url: backend_url.into(),
             auth_token: auth_token.into(),
             model: model.into(),
+            initial_timeout_secs: INITIAL_RESPONSE_WATCHDOG_SECS,
         }
+    }
+
+    pub fn with_initial_timeout_secs(mut self, secs: u64) -> Self {
+        self.initial_timeout_secs = secs;
+        self
     }
 
     pub fn backend_url(&self) -> &str {
@@ -209,11 +218,15 @@ impl ChatClient {
             builder = builder.bearer_auth(&self.auth_token);
         }
 
+        let first_start = std::time::Instant::now();
         let send_fut = builder.send();
         tokio::pin!(send_fut);
         let resp = loop {
             if !on_delta("") {
                 return Ok(StreamedReply::default());
+            }
+            if first_start.elapsed() >= Duration::from_secs(self.initial_timeout_secs) {
+                return Err(ChatError::InitialTimeout);
             }
             match tokio::time::timeout(Duration::from_millis(50), &mut send_fut).await {
                 Ok(res) => break res.map_err(|e| ChatError::Transport(e.to_string()))?,
@@ -241,12 +254,11 @@ impl ChatClient {
             std::collections::BTreeMap::<usize, (Option<String>, String, String)>::new();
         let mut in_reasoning = false;
 
-        let first_start = std::time::Instant::now();
         let first = loop {
             if !on_delta("") {
                 return Ok(StreamedReply::default());
             }
-            if first_start.elapsed() >= Duration::from_secs(INITIAL_RESPONSE_WATCHDOG_SECS) {
+            if first_start.elapsed() >= Duration::from_secs(self.initial_timeout_secs) {
                 return Err(ChatError::InitialTimeout);
             }
             match tokio::time::timeout(Duration::from_millis(50), stream.next()).await {
@@ -540,5 +552,75 @@ mod tests {
         let client = ChatClient::new(server.uri(), "test-model".to_string());
         let err = client.chat(&request()).await.unwrap_err();
         assert!(err.to_string().contains("503"));
+    }
+
+    #[tokio::test]
+    async fn test_llm_prefill_delay_triggers_initial_timeout_and_retries() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with({
+                let calls = calls.clone();
+                move |_req: &Request| {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    if n < 2 {
+                        // Stalled prompt pre-fill: delay 1.5s (exceeding initial_timeout_secs of 1s)
+                        ResponseTemplate::new(200)
+                            .set_delay(Duration::from_millis(1500))
+                            .set_body_string(sse_body("delayed"))
+                    } else {
+                        // Quick success on retry 3
+                        ResponseTemplate::new(200).set_body_string(sse_body("recovered"))
+                    }
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let client =
+            ChatClient::new(server.uri(), "test-model".to_string()).with_initial_timeout_secs(1);
+        let reply = client.chat(&request()).await.unwrap();
+
+        assert_eq!(reply.content, "recovered");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_llm_on_delta_abort_during_prefill() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(1000))
+                    .set_body_string(sse_body("never seen")),
+            )
+            .mount(&server)
+            .await;
+
+        let client =
+            ChatClient::new(server.uri(), "test-model".to_string()).with_initial_timeout_secs(10);
+
+        let mut check_count = 0;
+        let reply = client
+            .chat_stream(&request(), |_delta| {
+                check_count += 1;
+                // Abort immediately on the 2nd polling tick (100ms in)
+                check_count < 2
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(reply.content, "");
+        assert!(check_count >= 2);
     }
 }

@@ -551,7 +551,7 @@ async fn run_specialist_live(
                 } else if !chunk.is_empty() {
                     crate::orchestrator::emit_event(crate::ui::Event::Message(chunk.to_string()));
                 }
-                true
+                !token.is_cancelled()
             }) => res?,
             _ = token.cancelled() => {
                 tracing::warn!("{agent_tag}: aborted during LLM call");

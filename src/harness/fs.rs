@@ -209,8 +209,16 @@ pub(crate) fn str_arg<'a>(args: &'a Value, key: &str, tool: &str) -> Result<&'a 
                 .or_else(|| args.get("filepath"))
                 .or_else(|| args.get("file"))
                 .or_else(|| args.get("filename"))
+                .or_else(|| args.get("file_name"))
                 .or_else(|| args.get("target"))
                 .or_else(|| args.get("target_file"))
+                .or_else(|| args.get("dest"))
+                .or_else(|| args.get("destination"))
+                .or_else(|| args.get("output_file"))
+                .or_else(|| args.get("output_path"))
+                .or_else(|| args.get("name"))
+                .or_else(|| args.get("doc"))
+                .or_else(|| args.get("path_to_file"))
                 .and_then(Value::as_str)
             {
                 return Ok(v);
@@ -223,6 +231,10 @@ pub(crate) fn str_arg<'a>(args: &'a Value, key: &str, tool: &str) -> Result<&'a 
                 .or_else(|| args.get("code"))
                 .or_else(|| args.get("body"))
                 .or_else(|| args.get("file_content"))
+                .or_else(|| args.get("filecontent"))
+                .or_else(|| args.get("data"))
+                .or_else(|| args.get("source"))
+                .or_else(|| args.get("raw"))
                 .and_then(Value::as_str)
             {
                 return Ok(v);
