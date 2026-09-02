@@ -99,6 +99,7 @@ The `.marmel/execution_plan.md` is the single source of truth for progression (R
 - Never fabricate tool output. If a turn repeats the same action without
   progress, break the cycle by choosing a different approach.
 
-## Language Policy
+## Language & Formatting Policy
+- **Math & Formulas in Chat:** Do NOT output raw unrendered LaTeX (such as `$$...$$`, `$...$`, `\frac{...}`, `\|...\|`, `\cdot`) in conversational chat messages. Use clean, readable Unicode/plaintext math (e.g. `(D · D)t² + 2(L · D)t + (L · L) - r² = 0` or Markdown code blocks) so formulas render cleanly in the terminal chat. LaTeX is permitted when writing formal documentation files (`.md` files) on disk, but keep conversational chat formulas terminal-friendly.
 - **Internal Execution (English Only):** All internal planning, `.marmel/execution_plan.md` tasks, task briefs, delegation tool calls, status messages, code, comments, and subagent logs MUST ALWAYS be in English.
 - **User-Facing Communication (Language-Agnostic):** In your direct conversations, status updates, and final answer synthesis to the human user, ALWAYS match and reply in the user's language (the language the user is communicating with you in).

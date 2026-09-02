@@ -1256,13 +1256,16 @@ impl TuiRenderer {
                 {
                     continue;
                 }
-                let cleaned = strip_think_tags(&line);
+                let cleaned = format_terminal_math(&strip_think_tags(&line));
                 if cleaned.trim().is_empty() && !line.trim().is_empty() {
                     continue;
                 }
 
                 if has_special_style {
-                    chat_lines.push(Line::from(Span::styled(line, msg_style)));
+                    chat_lines.push(Line::from(Span::styled(
+                        format_terminal_math(&line),
+                        msg_style,
+                    )));
                 } else if in_think {
                     chat_lines.push(Line::from(Span::styled(
                         cleaned,
@@ -1302,7 +1305,7 @@ impl TuiRenderer {
                 {
                     continue;
                 }
-                let cleaned = strip_think_tags(&line);
+                let cleaned = format_terminal_math(&strip_think_tags(&line));
                 if cleaned.trim().is_empty() && !line.trim().is_empty() {
                     continue;
                 }
@@ -1324,7 +1327,7 @@ impl TuiRenderer {
                 {
                     continue;
                 }
-                let cleaned = strip_think_tags(&line);
+                let cleaned = format_terminal_math(&strip_think_tags(&line));
                 if cleaned.trim().is_empty() && !line.trim().is_empty() {
                     continue;
                 }
@@ -1607,6 +1610,7 @@ impl TuiRenderer {
                     .add_modifier(Modifier::ITALIC);
                 detail_lines.push(Line::styled(" thinking", think_style));
                 for line in sa.thinking.lines() {
+                    let line = format_terminal_math(line);
                     detail_lines.push(Line::styled(line, think_style));
                 }
                 detail_lines.push(Line::styled(" response", think_style));
@@ -1620,6 +1624,7 @@ impl TuiRenderer {
                         .add_modifier(Modifier::BOLD),
                 ));
                 for line in sa.content.lines() {
+                    let line = format_terminal_math(line);
                     detail_lines.push(Line::raw(line));
                 }
             }
@@ -1831,6 +1836,193 @@ fn strip_think_tags(line: &str) -> String {
         .replace("</thought>", "")
 }
 
+/// Format LaTeX math expressions ($$...$$, $...$, and common math symbols)
+/// into clean, readable terminal Unicode text.
+pub(crate) fn format_terminal_math(text: &str) -> String {
+    let mut s = text.to_string();
+    if !s.contains('$') && !s.contains('\\') && !s.contains('^') && !s.contains('_') {
+        return s;
+    }
+
+    // Replace display math $$...$$
+    while let Some(start) = s.find("$$") {
+        if let Some(end_rel) = s[start + 2..].find("$$") {
+            let end = start + 2 + end_rel;
+            let inner = &s[start + 2..end];
+            let formatted = format_math_expr(inner.trim());
+            s.replace_range(start..end + 2, &format!("  {formatted}"));
+        } else {
+            let inner = &s[start + 2..];
+            let formatted = format_math_expr(inner.trim());
+            s.replace_range(start.., &format!("  {formatted}"));
+            break;
+        }
+    }
+
+    // Replace inline math $...$
+    let mut i = 0;
+    while i < s.len() {
+        if let Some(start_rel) = s[i..].find('$') {
+            let start = i + start_rel;
+            if start + 1 < s.len() && s.as_bytes()[start + 1] == b'$' {
+                i = start + 2;
+                continue;
+            }
+            if let Some(end_rel) = s[start + 1..].find('$') {
+                let end = start + 1 + end_rel;
+                let inner = &s[start + 1..end];
+                if !inner.trim().is_empty()
+                    && !inner
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c == '.' || c == ',')
+                {
+                    let formatted = format_math_expr(inner);
+                    s.replace_range(start..end + 1, &formatted);
+                    i = start + formatted.len();
+                    continue;
+                }
+                i = end + 1;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    format_math_expr(&s)
+}
+
+fn format_math_expr(expr: &str) -> String {
+    let mut out = expr
+        .replace(r"\|", "|")
+        .replace(r"\cdot", "·")
+        .replace(r"\times", "×")
+        .replace(r"\pm", "±")
+        .replace(r"\mp", "∓")
+        .replace(r"\leq", "≤")
+        .replace(r"\le", "≤")
+        .replace(r"\geq", "≥")
+        .replace(r"\ge", "≥")
+        .replace(r"\neq", "≠")
+        .replace(r"\ne", "≠")
+        .replace(r"\approx", "≈")
+        .replace(r"\to", "→")
+        .replace(r"\rightarrow", "→")
+        .replace(r"\leftarrow", "←")
+        .replace(r"\dots", "…")
+        .replace(r"\cdots", "…")
+        .replace(r"\quad", "  ")
+        .replace(r"\qquad", "    ")
+        .replace(r"\alpha", "α")
+        .replace(r"\beta", "β")
+        .replace(r"\gamma", "γ")
+        .replace(r"\theta", "θ")
+        .replace(r"\lambda", "λ")
+        .replace(r"\mu", "μ")
+        .replace(r"\pi", "π")
+        .replace(r"\sigma", "σ")
+        .replace(r"\omega", "ω")
+        .replace(r"\Delta", "Δ")
+        .replace(r"\sum", "∑")
+        .replace(r"\prod", "∏")
+        .replace(r"\int", "∫")
+        .replace(r"\infty", "∞");
+
+    // Replace superscripts
+    out = out
+        .replace("^2", "²")
+        .replace("^3", "³")
+        .replace("^0", "⁰")
+        .replace("^1", "¹")
+        .replace("^4", "⁴")
+        .replace("^5", "⁵")
+        .replace("^6", "⁶")
+        .replace("^7", "⁷")
+        .replace("^8", "⁸")
+        .replace("^9", "⁹")
+        .replace("^{+}", "⁺")
+        .replace("^{-}", "⁻")
+        .replace("^{2}", "²")
+        .replace("^{3}", "³")
+        .replace("^{0}", "⁰")
+        .replace("^{1}", "¹")
+        .replace("^{n}", "ⁿ")
+        .replace("^{t}", "ᵗ")
+        .replace("^{T}", "ᵀ")
+        .replace("^n", "ⁿ")
+        .replace("^t", "ᵗ")
+        .replace("^T", "ᵀ");
+
+    // Replace subscripts
+    out = out
+        .replace("_{0}", "₀")
+        .replace("_{1}", "₁")
+        .replace("_{2}", "₂")
+        .replace("_{3}", "₃")
+        .replace("_{4}", "₄")
+        .replace("_{5}", "₅")
+        .replace("_{6}", "₆")
+        .replace("_{7}", "₇")
+        .replace("_{8}", "₈")
+        .replace("_{9}", "₉")
+        .replace("_{i}", "ᵢ")
+        .replace("_{n}", "ₙ")
+        .replace("_{x}", "ₓ")
+        .replace("_{y}", "ᵧ")
+        .replace("_{z}", "₂")
+        .replace("_0", "₀")
+        .replace("_1", "₁")
+        .replace("_2", "₂")
+        .replace("_3", "₃")
+        .replace("_4", "₄")
+        .replace("_5", "₅")
+        .replace("_6", "₆")
+        .replace("_7", "₇")
+        .replace("_8", "₈")
+        .replace("_9", "₉")
+        .replace("_i", "ᵢ")
+        .replace("_n", "ₙ")
+        .replace("_x", "ₓ")
+        .replace("_y", "ᵧ");
+
+    while let Some(start) = out.find(r"\text{") {
+        if let Some(end_rel) = out[start + 6..].find('}') {
+            let end = start + 6 + end_rel;
+            let inner = out[start + 6..end].to_string();
+            out.replace_range(start..end + 1, &inner);
+        } else {
+            break;
+        }
+    }
+
+    while let Some(start) = out.find(r"\sqrt{") {
+        if let Some(end_rel) = out[start + 6..].find('}') {
+            let end = start + 6 + end_rel;
+            let inner = out[start + 6..end].to_string();
+            out.replace_range(start..end + 1, &format!("√({inner})"));
+        } else {
+            break;
+        }
+    }
+
+    while let Some(start) = out.find(r"\frac{") {
+        if let Some(mid_rel) = out[start + 6..].find("}{") {
+            let mid = start + 6 + mid_rel;
+            if let Some(end_rel) = out[mid + 2..].find('}') {
+                let end = mid + 2 + end_rel;
+                let num = out[start + 6..mid].to_string();
+                let den = out[mid + 2..end].to_string();
+                out.replace_range(start..end + 1, &format!("({num})/({den})"));
+                continue;
+            }
+        }
+        break;
+    }
+
+    out
+}
+
 /// Count the wrapped lines a single message occupies at `width`, excluding
 /// think-block lines when `show_thought` is `false` (reference §11.2).
 fn count_single_message_lines(msg: &str, width: usize, show_thought: bool) -> usize {
@@ -1845,7 +2037,7 @@ fn count_single_message_lines(msg: &str, width: usize, show_thought: bool) -> us
                 if !show_thought {
                     continue;
                 }
-                let cleaned = strip_think_tags(line);
+                let cleaned = format_terminal_math(&strip_think_tags(line));
                 if cleaned.trim().is_empty() {
                     continue;
                 }
@@ -1861,7 +2053,7 @@ fn count_single_message_lines(msg: &str, width: usize, show_thought: bool) -> us
                 if !show_thought {
                     continue;
                 }
-                let cleaned = strip_think_tags(line);
+                let cleaned = format_terminal_math(&strip_think_tags(line));
                 if cleaned.trim().is_empty() {
                     continue;
                 }
@@ -1879,7 +2071,7 @@ fn count_single_message_lines(msg: &str, width: usize, show_thought: bool) -> us
         {
             continue;
         }
-        let cleaned = strip_think_tags(line);
+        let cleaned = format_terminal_math(&strip_think_tags(line));
         if cleaned.trim().is_empty() && !line.trim().is_empty() {
             continue;
         }
@@ -3788,5 +3980,27 @@ mod tests {
             full_text.contains("researcher-t-2 (Idle, 1.2k ctx, 1m 25s ago)"),
             "expected 'researcher-t-2 (Idle, 1.2k ctx, 1m 25s ago)' in subagents panel, got:\n{full_text}"
         );
+    }
+
+    #[test]
+    fn test_format_terminal_math() {
+        let raw = r#"$$\|(O + tD) - C\|^2 = r^2$$
+Let $L = O - C$. The equation becomes:
+$$(L + tD) \cdot (L + tD) = r^2$$
+$$(D \cdot D)t^2 + 2(L \cdot D)t + (L \cdot L) - r^2 = 0$$
+
+This is a quadratic equation in the form $at^2 + bt + c = 0$ where:
+- $a = D \cdot D$
+- $b = 2(L \cdot D)$
+- $c = (L \cdot L) - r^2$"#;
+
+        let formatted = format_terminal_math(raw);
+        assert!(!formatted.contains("$$"));
+        assert!(!formatted.contains(r"\cdot"));
+        assert!(!formatted.contains(r"\|"));
+        assert!(formatted.contains("·"));
+        assert!(formatted.contains("²"));
+        assert!(formatted.contains("(D · D)t² + 2(L · D)t + (L · L) - r² = 0"));
+        assert!(formatted.contains("at² + bt + c = 0"));
     }
 }
