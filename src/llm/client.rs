@@ -95,6 +95,9 @@ impl ChatError {
                 ..
             } | ChatError::InitialTimeout
                 | ChatError::StallTimeout
+                | ChatError::Transport(_)
+                | ChatError::Stream(_)
+                | ChatError::ReadTimeout
         )
     }
 }
@@ -128,6 +131,14 @@ impl ChatClient {
         }
     }
 
+    pub fn backend_url(&self) -> &str {
+        &self.backend_url
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     pub async fn chat(&self, req: &ChatRequest) -> Result<StreamedReply> {
         self.chat_stream(req, |_| true).await
     }
@@ -143,9 +154,15 @@ impl ChatClient {
                 Ok(reply) => return Ok(reply),
                 Err(e) if e.is_retryable() && attempt < MAX_ATTEMPTS => {
                     let ms = BACKOFF_BASE_MS * attempt as u64;
+                    tracing::warn!(
+                        "LLM backend call attempt {attempt}/{MAX_ATTEMPTS} failed ({e}), retrying in {ms}ms..."
+                    );
                     tokio::time::sleep(Duration::from_millis(ms)).await;
                 }
-                Err(e) => return Err(anyhow::anyhow!("{e}")),
+                Err(e) => {
+                    tracing::error!("LLM backend call failed after {attempt} attempts: {e}");
+                    return Err(anyhow::anyhow!("{e}"));
+                }
             }
         }
     }

@@ -133,7 +133,6 @@ pub async fn run_session(
 
     let client = ChatClient::from_config(cfg);
     let harness_stats = Arc::new(crate::harness::HarnessStats::new());
-    let mut keep_going = true;
     let stream_cfg = StreamConfig::from_config(cfg);
     let mut steer_queue = Vec::<String>::new();
     let mut steer_abort_requested = false;
@@ -144,7 +143,7 @@ pub async fn run_session(
     crate::orchestrator::set_status_sender(status_tx);
     crate::orchestrator::set_event_sender(event_tx);
 
-    while keep_going && !renderer.aborted() {
+    while !renderer.aborted() {
         while let Ok(msg) = status_rx.try_recv() {
             renderer.on_event(&Event::Status(msg));
         }
@@ -227,10 +226,15 @@ pub async fn run_session(
                         tracing::warn!(
                             error = %format!("{e:#}"),
                             category = %category,
-                            "LLM turn failed -> terminate session"
+                            "LLM turn failed"
                         );
-                        renderer.on_event(&Event::Status(format!("LLM error ({category}): {e:#}")));
-                        keep_going = false;
+                        renderer.on_event(&Event::Message(format!(
+                            "\n[Error] LLM backend call failed ({category}): {e:#}\n(Check that your LLM server is running at {} for model `{}`)",
+                            client.backend_url(),
+                            stream_cfg.model
+                        )));
+                        renderer.on_event(&Event::Status(format!("LLM error: {category} (Ready)")));
+                        renderer.flush()?;
                         break;
                     }
                 };
@@ -664,10 +668,6 @@ pub async fn run_session(
             } else {
                 break;
             }
-        }
-
-        if !keep_going {
-            break;
         }
 
         // If user queued instructions during execution, start next turn immediately without blocking at read_input
