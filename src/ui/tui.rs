@@ -1183,86 +1183,48 @@ impl TuiRenderer {
             let mut in_think = false;
             for raw_line in msg.lines() {
                 let line = raw_line.replace('\t', "    ");
-                let trimmed = line.trim();
-                if trimmed.starts_with("<think>") || trimmed.starts_with("<thought>") {
-                    in_think = true;
-                    if trimmed.contains("</think>") || trimmed.contains("</thought>") {
-                        in_think = false;
-                        if !self.show_thought {
-                            continue;
+                let segments = parse_line_segments(&line, &mut in_think);
+                for seg in segments {
+                    match seg {
+                        LineSegment::Thought(t) => {
+                            if !self.show_thought {
+                                continue;
+                            }
+                            let cleaned = format_terminal_math(t.trim());
+                            if cleaned.is_empty() {
+                                continue;
+                            }
+                            chat_lines.push(Line::from(Span::styled(
+                                cleaned,
+                                Style::default()
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(Modifier::ITALIC),
+                            )));
                         }
-                        let cleaned = strip_think_tags(&line);
-                        if cleaned.trim().is_empty() {
-                            continue;
+                        LineSegment::Content(c) => {
+                            let trimmed = c.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            let cleaned = format_terminal_math(trimmed);
+                            if has_special_style {
+                                chat_lines.push(Line::from(Span::styled(cleaned, msg_style)));
+                            } else if trimmed.starts_with("[Tool Call] ")
+                                || trimmed.starts_with("[Tool Result] ")
+                            {
+                                chat_lines.push(Line::from(Span::styled(
+                                    cleaned,
+                                    Style::default().fg(Color::Magenta),
+                                )));
+                            } else {
+                                // Orchestrator / Model content: WHITE
+                                chat_lines.push(Line::from(Span::styled(
+                                    cleaned,
+                                    Style::default().fg(Color::White),
+                                )));
+                            }
                         }
-                        chat_lines.push(Line::from(Span::styled(
-                            cleaned,
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::ITALIC),
-                        )));
-                        continue;
                     }
-                    if !self.show_thought || trimmed == "<think>" || trimmed == "<thought>" {
-                        continue;
-                    }
-                } else if in_think {
-                    if trimmed.contains("</think>") || trimmed.contains("</thought>") {
-                        in_think = false;
-                        if !self.show_thought {
-                            continue;
-                        }
-                        let cleaned = strip_think_tags(&line);
-                        if cleaned.trim().is_empty() {
-                            continue;
-                        }
-                        chat_lines.push(Line::from(Span::styled(
-                            cleaned,
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::ITALIC),
-                        )));
-                        continue;
-                    }
-                    if !self.show_thought {
-                        continue;
-                    }
-                }
-                if trimmed == "</think>"
-                    || trimmed == "</thought>"
-                    || trimmed == "<think></think>"
-                    || trimmed == "<thought></thought>"
-                {
-                    continue;
-                }
-                let cleaned = format_terminal_math(&strip_think_tags(&line));
-                if cleaned.trim().is_empty() && !line.trim().is_empty() {
-                    continue;
-                }
-
-                if has_special_style {
-                    chat_lines.push(Line::from(Span::styled(
-                        format_terminal_math(&line),
-                        msg_style,
-                    )));
-                } else if in_think {
-                    chat_lines.push(Line::from(Span::styled(
-                        cleaned,
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    )));
-                } else if line.starts_with("[Tool Call] ") || line.starts_with("[Tool Result] ") {
-                    chat_lines.push(Line::from(Span::styled(
-                        line,
-                        Style::default().fg(Color::Magenta),
-                    )));
-                } else {
-                    // Orchestrator / Model content: WHITE
-                    chat_lines.push(Line::from(Span::styled(
-                        cleaned,
-                        Style::default().fg(Color::White),
-                    )));
                 }
             }
         }
@@ -1806,6 +1768,65 @@ fn message_style(msg: &str) -> (Style, bool) {
     }
 }
 
+/// Segment of a rendered line representing either reasoning thought or visible content.
+#[derive(Debug, PartialEq, Eq)]
+enum LineSegment<'a> {
+    Thought(&'a str),
+    Content(&'a str),
+}
+
+/// Parse segments of a line according to the running `in_think` state, tracking transitions across `<think>` and `</think>` tags.
+fn parse_line_segments<'a>(line: &'a str, in_think: &mut bool) -> Vec<LineSegment<'a>> {
+    let mut segments = Vec::new();
+    let mut cursor = 0;
+    while cursor < line.len() {
+        if *in_think {
+            // Looking for close tag: </think> or </thought>
+            let close_tag = [("</think>", 8), ("</thought>", 10)]
+                .iter()
+                .filter_map(|(tag, len)| line[cursor..].find(tag).map(|idx| (cursor + idx, *len)))
+                .min_by_key(|(idx, _)| *idx);
+
+            if let Some((idx, len)) = close_tag {
+                let thought_part = &line[cursor..idx];
+                if !thought_part.is_empty() {
+                    segments.push(LineSegment::Thought(thought_part));
+                }
+                *in_think = false;
+                cursor = idx + len;
+            } else {
+                let thought_part = &line[cursor..];
+                if !thought_part.is_empty() {
+                    segments.push(LineSegment::Thought(thought_part));
+                }
+                break;
+            }
+        } else {
+            // Looking for open tag: <think> or <thought>
+            let open_tag = [("<think>", 7), ("<thought>", 9)]
+                .iter()
+                .filter_map(|(tag, len)| line[cursor..].find(tag).map(|idx| (cursor + idx, *len)))
+                .min_by_key(|(idx, _)| *idx);
+
+            if let Some((idx, len)) = open_tag {
+                let content_part = &line[cursor..idx];
+                if !content_part.is_empty() {
+                    segments.push(LineSegment::Content(content_part));
+                }
+                *in_think = true;
+                cursor = idx + len;
+            } else {
+                let content_part = &line[cursor..];
+                if !content_part.is_empty() {
+                    segments.push(LineSegment::Content(content_part));
+                }
+                break;
+            }
+        }
+    }
+    segments
+}
+
 /// Strip XML thinking tags from a rendered line.
 fn strip_think_tags(line: &str) -> String {
     line.replace("<think>", "")
@@ -2007,57 +2028,25 @@ fn count_single_message_lines(msg: &str, width: usize, show_thought: bool) -> us
     let mut n = 0;
     let mut in_think = false;
     for line in msg.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("<think>") || trimmed.starts_with("<thought>") {
-            in_think = true;
-            if trimmed.contains("</think>") || trimmed.contains("</thought>") {
-                in_think = false;
-                if !show_thought {
-                    continue;
+        let segments = parse_line_segments(line, &mut in_think);
+        for seg in segments {
+            match seg {
+                LineSegment::Thought(t) => {
+                    if !show_thought {
+                        continue;
+                    }
+                    let cleaned = format_terminal_math(t.trim());
+                    if !cleaned.is_empty() {
+                        n += wrapped_lines(&cleaned, width);
+                    }
                 }
-                let cleaned = format_terminal_math(&strip_think_tags(line));
-                if cleaned.trim().is_empty() {
-                    continue;
+                LineSegment::Content(c) => {
+                    let cleaned = format_terminal_math(c.trim());
+                    if !cleaned.is_empty() {
+                        n += wrapped_lines(&cleaned, width);
+                    }
                 }
-                n += wrapped_lines(&cleaned, width);
-                continue;
             }
-            if !show_thought || trimmed == "<think>" || trimmed == "<thought>" {
-                continue;
-            }
-        } else if in_think {
-            if trimmed.contains("</think>") || trimmed.contains("</thought>") {
-                in_think = false;
-                if !show_thought {
-                    continue;
-                }
-                let cleaned = format_terminal_math(&strip_think_tags(line));
-                if cleaned.trim().is_empty() {
-                    continue;
-                }
-                n += wrapped_lines(&cleaned, width);
-                continue;
-            }
-            if !show_thought {
-                continue;
-            }
-        }
-        if trimmed == "</think>"
-            || trimmed == "</thought>"
-            || trimmed == "<think></think>"
-            || trimmed == "<thought></thought>"
-        {
-            continue;
-        }
-        let cleaned = format_terminal_math(&strip_think_tags(line));
-        if cleaned.trim().is_empty() && !line.trim().is_empty() {
-            continue;
-        }
-
-        if line.is_empty() {
-            n += 1;
-        } else {
-            n += wrapped_lines(&cleaned, width);
         }
     }
     n

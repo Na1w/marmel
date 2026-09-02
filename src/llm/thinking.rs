@@ -112,10 +112,9 @@ impl ThinkingDemuxer {
                         emit(self.current_kind(), &pre);
                     }
 
-                    // Handle the tag itself.
+                    // Handle the tag itself (preserve in payload if configured, but do not emit raw tag to stream sink).
                     if self.preserve_thinking {
                         self.content.push_str(tag);
-                        emit(DeltaKind::Content, tag);
                     }
                     self.in_thinking = !self.in_thinking;
                     kind = self.current_kind();

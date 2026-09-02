@@ -11,6 +11,11 @@ max_context_tokens = 128000
 preserve_thinking = true
 ui_mode = "tui"
 
+[monitoring]
+enabled = true
+repetition_threshold = 5
+min_pattern_len = 7
+
 [orchestration]
 max_recursion_depth = 3
 

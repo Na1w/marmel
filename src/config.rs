@@ -125,7 +125,7 @@ impl Default for Config {
             system_prompt_path: PathBuf::from("prompts/system.md"),
             preserve_thinking: true,
             command_timeout_secs: 60,
-            max_repetition_threshold: 3,
+            max_repetition_threshold: 5,
             enable_xml_rescue: true,
             ui_mode: "tui".to_string(),
             debug: false,

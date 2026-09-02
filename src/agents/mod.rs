@@ -546,22 +546,29 @@ async fn run_specialist_live(
             frequency_penalty: Some(cfg.frequency_penalty),
         };
 
-        let mut in_think = false;
+        let mut demux = crate::llm::ThinkingDemuxer::new();
         let reply = tokio::select! {
             res = client.chat_stream(&req, |chunk| {
-                if chunk == "<think>" {
-                    in_think = true;
-                    crate::orchestrator::emit_event(crate::ui::Event::Thinking(chunk.to_string()));
-                } else if chunk == "</think>" {
-                    in_think = false;
-                    crate::orchestrator::emit_event(crate::ui::Event::Thinking(chunk.to_string()));
-                } else if in_think {
-                    crate::orchestrator::emit_event(crate::ui::Event::Thinking(chunk.to_string()));
-                } else if !chunk.is_empty() {
-                    crate::orchestrator::emit_event(crate::ui::Event::Message(chunk.to_string()));
-                }
+                demux.push_delta(chunk, |kind, text| match kind {
+                    crate::llm::DeltaKind::Content => {
+                        crate::orchestrator::emit_event(crate::ui::Event::Message(text.to_string()));
+                    }
+                    crate::llm::DeltaKind::Thinking => {
+                        crate::orchestrator::emit_event(crate::ui::Event::Thinking(text.to_string()));
+                    }
+                });
                 !token.is_cancelled()
-            }) => res?,
+            }) => {
+                demux.finish_delta(|kind, text| match kind {
+                    crate::llm::DeltaKind::Content => {
+                        crate::orchestrator::emit_event(crate::ui::Event::Message(text.to_string()));
+                    }
+                    crate::llm::DeltaKind::Thinking => {
+                        crate::orchestrator::emit_event(crate::ui::Event::Thinking(text.to_string()));
+                    }
+                });
+                res?
+            },
             _ = token.cancelled() => {
                 tracing::warn!("{agent_tag}: aborted during LLM call");
                 return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
@@ -794,23 +801,30 @@ async fn run_specialist_live(
                             frequency_penalty: Some(cfg.frequency_penalty),
                         };
 
-                        let mut in_think = false;
+                        let mut demux = crate::llm::ThinkingDemuxer::new();
                         let reply = tokio::select! {
                             res = client.chat_stream(&req, |chunk| {
-                                if chunk == "<think>" {
-                                    in_think = true;
-                                    crate::orchestrator::emit_event(crate::ui::Event::Thinking(chunk.to_string()));
-                                } else if chunk == "</think>" {
-                                    in_think = false;
-                                    crate::orchestrator::emit_event(crate::ui::Event::Thinking(chunk.to_string()));
-                                } else if in_think {
-                                    crate::orchestrator::emit_event(crate::ui::Event::Thinking(chunk.to_string()));
-                                } else if !chunk.is_empty() {
-                                    crate::orchestrator::emit_event(crate::ui::Event::Message(chunk.to_string()));
-                                }
+                                demux.push_delta(chunk, |kind, text| match kind {
+                                    crate::llm::DeltaKind::Content => {
+                                        crate::orchestrator::emit_event(crate::ui::Event::Message(text.to_string()));
+                                    }
+                                    crate::llm::DeltaKind::Thinking => {
+                                        crate::orchestrator::emit_event(crate::ui::Event::Thinking(text.to_string()));
+                                    }
+                                });
                                 true
                             }) => match res {
-                                Ok(r) => r,
+                                Ok(r) => {
+                                    demux.finish_delta(|kind, text| match kind {
+                                        crate::llm::DeltaKind::Content => {
+                                            crate::orchestrator::emit_event(crate::ui::Event::Message(text.to_string()));
+                                        }
+                                        crate::llm::DeltaKind::Thinking => {
+                                            crate::orchestrator::emit_event(crate::ui::Event::Thinking(text.to_string()));
+                                        }
+                                    });
+                                    r
+                                }
                                 Err(e) => {
                                     tracing::error!(
                                         "{agent_tag}: LLM chat call error on revision step {rev_turn}: {e:?}"
@@ -1049,23 +1063,30 @@ async fn run_automated_validation(
             frequency_penalty: Some(cfg.frequency_penalty),
         };
 
-        let mut in_think = false;
+        let mut demux = crate::llm::ThinkingDemuxer::new();
         let reply = tokio::select! {
             res = val_client.chat_stream(&req, |chunk| {
-                if chunk == "<think>" {
-                    in_think = true;
-                    crate::orchestrator::emit_event(crate::ui::Event::Thinking(chunk.to_string()));
-                } else if chunk == "</think>" {
-                    in_think = false;
-                    crate::orchestrator::emit_event(crate::ui::Event::Thinking(chunk.to_string()));
-                } else if in_think {
-                    crate::orchestrator::emit_event(crate::ui::Event::Thinking(chunk.to_string()));
-                } else if !chunk.is_empty() {
-                    crate::orchestrator::emit_event(crate::ui::Event::Message(chunk.to_string()));
-                }
+                demux.push_delta(chunk, |kind, text| match kind {
+                    crate::llm::DeltaKind::Content => {
+                        crate::orchestrator::emit_event(crate::ui::Event::Message(text.to_string()));
+                    }
+                    crate::llm::DeltaKind::Thinking => {
+                        crate::orchestrator::emit_event(crate::ui::Event::Thinking(text.to_string()));
+                    }
+                });
                 true
             }) => match res {
-                Ok(r) => r,
+                Ok(r) => {
+                    demux.finish_delta(|kind, text| match kind {
+                        crate::llm::DeltaKind::Content => {
+                            crate::orchestrator::emit_event(crate::ui::Event::Message(text.to_string()));
+                        }
+                        crate::llm::DeltaKind::Thinking => {
+                            crate::orchestrator::emit_event(crate::ui::Event::Thinking(text.to_string()));
+                        }
+                    });
+                    r
+                }
                 Err(e) => {
                     tracing::error!("validator-{agent} LLM chat call error on turn {_turn}: {e:?}");
                     break;

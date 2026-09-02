@@ -25,13 +25,19 @@ preserve_thinking = true
 command_timeout_secs = 60
 
 # Number of semantically-identical consecutive turns that trigger cycle breaking.
-max_repetition_threshold = 3
+max_repetition_threshold = 5
 
 # Enable XML-rescue fallback when the model emits malformed tool calls.
 enable_xml_rescue = true
 
 # UI mode: "tui" (ratatui) or "raw" (plain streaming).
 ui_mode = "tui"
+
+# Monitoring & resilience harness (repetition detection & loop breaking)
+[monitoring]
+enabled = true
+repetition_threshold = 5
+min_pattern_len = 5
 
 # ---------------------------------------------------------------------------
 # Orchestration — Manager + Specialist Subagents (REQ-ORCH-001…005 / SPEC Part 5)

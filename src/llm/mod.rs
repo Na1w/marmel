@@ -12,5 +12,5 @@ pub use stream::{
     NullSink, StreamConfig, StreamEvent, StreamSink, VecSink, chat_client_turn, drive_streamed_turn,
 };
 pub use thinking::{
-    NudgePolicy, RecoveryAdjustment, ThinkingDemuxer, apply_recovery, demux_stream,
+    DeltaKind, NudgePolicy, RecoveryAdjustment, ThinkingDemuxer, apply_recovery, demux_stream,
 };
