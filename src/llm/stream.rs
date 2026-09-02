@@ -102,7 +102,7 @@ impl Default for StreamConfig {
             mcp_servers: Vec::new(),
             repetition_threshold: 5,
             min_pattern_len: 5,
-            max_stream_tokens: 8192,
+            max_stream_tokens: 32768,
         }
     }
 }
