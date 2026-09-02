@@ -32,6 +32,40 @@ static EVENT_SENDER: std::sync::RwLock<
     Option<tokio::sync::mpsc::UnboundedSender<crate::ui::Event>>,
 > = std::sync::RwLock::new(None);
 
+static GLOBAL_CANCELLATION_TOKEN: std::sync::LazyLock<
+    std::sync::RwLock<tokio_util::sync::CancellationToken>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(tokio_util::sync::CancellationToken::new()));
+
+/// Get the current session-wide cancellation token.
+pub fn global_cancellation_token() -> tokio_util::sync::CancellationToken {
+    GLOBAL_CANCELLATION_TOKEN
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or_default()
+}
+
+/// Cancel all active subagents, workers, LLM streams, and operations across the entire process.
+pub fn cancel_all() {
+    if let Ok(guard) = GLOBAL_CANCELLATION_TOKEN.read() {
+        guard.cancel();
+    }
+}
+
+/// Returns true if a global cancellation / abort signal has been requested.
+pub fn is_globally_cancelled() -> bool {
+    GLOBAL_CANCELLATION_TOKEN
+        .read()
+        .map(|guard| guard.is_cancelled())
+        .unwrap_or(false)
+}
+
+/// Reset the global cancellation token for a fresh turn / prompt cycle.
+pub fn reset_cancellation() {
+    if let Ok(mut guard) = GLOBAL_CANCELLATION_TOKEN.write() {
+        *guard = tokio_util::sync::CancellationToken::new();
+    }
+}
+
 /// Register an unbounded channel to receive real-time status updates across all agents and specialists.
 pub fn set_status_sender(tx: tokio::sync::mpsc::UnboundedSender<String>) {
     if let Ok(mut lock) = STATUS_SENDER.write() {
@@ -539,6 +573,7 @@ impl OrchestratorManager {
         orchestration: OrchestrationConfig,
     ) -> Self {
         let journal = CrashJournal::new(plan.dir());
+        let cancellation_token = global_cancellation_token().child_token();
         Self {
             client,
             plan,
@@ -548,7 +583,7 @@ impl OrchestratorManager {
             depth: RecursionDepth::root(),
             journal,
             delegation_events: Arc::new(std::sync::Mutex::new(Vec::new())),
-            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            cancellation_token,
         }
     }
 
@@ -842,8 +877,8 @@ impl OrchestratorManager {
     /// via `crate::harness::pty::kill_process_group`; it is not counted as a
     /// resilience-repetition intervention.
     pub fn abort(&mut self) {
-        // Abort is a user-initiated halt, not a harness repetition intervention.
-        // (PTY process-group teardown is handled by REQ-LOOP-004; no counter.)
+        self.cancellation_token.cancel();
+        cancel_all();
     }
 }
 

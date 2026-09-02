@@ -251,16 +251,21 @@ impl TuiRenderer {
                     match key.code {
                         KeyCode::Enter => self.submit(),
                         KeyCode::Esc => {
-                            // F11/F5: Esc dismisses confirm-abort; else if focus
-                            // is not Chat, move focus to Chat; else arm the
-                            // confirm-abort state (first press warns, second aborts).
+                            // Esc arms confirm-abort (or aborts if already armed or focus switched).
                             if self.confirm_abort {
                                 self.aborted = true;
                                 self.confirm_abort = false;
+                                self.status_line = "Aborted by user.".to_string();
+                                crate::orchestrator::cancel_all();
                             } else if self.focused_panel != FocusedPanel::Chat {
                                 self.focused_panel = FocusedPanel::Chat;
+                                self.confirm_abort = true;
+                                self.status_line =
+                                    "Abort armed. Press ESC again to abort.".to_string();
                             } else {
                                 self.confirm_abort = true;
+                                self.status_line =
+                                    "Abort armed. Press ESC again to abort.".to_string();
                             }
                         }
                         KeyCode::Tab => self.cycle_focus(),
@@ -340,18 +345,26 @@ impl TuiRenderer {
                         KeyCode::Char(c) => {
                             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                             if ctrl && (c == 'c' || c == 'C') {
-                                // F5: Ctrl+C arms/triggers confirm-abort.
+                                // Ctrl+C arms/triggers confirm-abort.
                                 if self.confirm_abort {
                                     self.aborted = true;
                                     self.confirm_abort = false;
+                                    self.status_line = "Aborted by user.".to_string();
+                                    crate::orchestrator::cancel_all();
                                 } else {
                                     self.confirm_abort = true;
+                                    self.status_line =
+                                        "Abort armed. Press Ctrl+C or ESC again to abort."
+                                            .to_string();
                                 }
                             } else if ctrl && (c == 'd' || c == 'D') {
-                                // Ctrl+D is treated as abort (reference §13).
+                                // Ctrl+D is treated as abort.
                                 self.aborted = true;
                                 self.confirm_abort = false;
+                                self.status_line = "Aborted by user.".to_string();
+                                crate::orchestrator::cancel_all();
                             } else if ctrl && (c == 'p' || c == 'P') {
+                                self.confirm_abort = false;
                                 // F12: single Ctrl+P handler (toggle plan panel).
                                 self.show_plan_panel = !self.show_plan_panel;
                                 if !self.show_plan_panel && self.focused_panel == FocusedPanel::Plan
@@ -359,6 +372,7 @@ impl TuiRenderer {
                                     self.focused_panel = FocusedPanel::Chat;
                                 }
                             } else if ctrl && (c == 'a' || c == 'A') {
+                                self.confirm_abort = false;
                                 // F12: single Ctrl+A handler (toggle subagents).
                                 self.toggle_subagent_panel();
                                 if !self.show_subagent_panel
@@ -367,6 +381,7 @@ impl TuiRenderer {
                                     self.focused_panel = FocusedPanel::Chat;
                                 }
                             } else if !c.is_control() {
+                                self.confirm_abort = false;
                                 // F1: insert the character at the cursor.
                                 self.insert_char(c);
                             }
@@ -1680,17 +1695,31 @@ impl TuiRenderer {
         let tokens_in = self.tokens_in.max(global_in);
         let tokens_out = self.tokens_out.max(global_out);
         let tokens_str = Self::format_token_counts(tokens_in, tokens_out);
-        let status_text = if self.orchestrator_context_tokens > 0 {
-            let ctx_str = Self::format_count(self.orchestrator_context_tokens);
-            format!(
-                " Ctx: {} | Tokens: {} | Status: {}",
-                ctx_str, tokens_str, status_str
+        let (status_text, status_style) = if self.confirm_abort {
+            (
+                " ⚠ [ABORT ARMED] Press ESC or Ctrl+C again to abort | Any other key to cancel "
+                    .to_string(),
+                Style::default()
+                    .bg(Color::Red)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             )
         } else {
-            format!(" Tokens: {} | Status: {}", tokens_str, status_str)
+            let status_text = if self.orchestrator_context_tokens > 0 {
+                let ctx_str = Self::format_count(self.orchestrator_context_tokens);
+                format!(
+                    " Ctx: {} | Tokens: {} | Status: {}",
+                    ctx_str, tokens_str, status_str
+                )
+            } else {
+                format!(" Tokens: {} | Status: {}", tokens_str, status_str)
+            };
+            (
+                status_text,
+                Style::default().bg(Color::DarkGray).fg(Color::White),
+            )
         };
-        let status_paragraph = Paragraph::new(status_text)
-            .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+        let status_paragraph = Paragraph::new(status_text).style(status_style);
         frame.render_widget(status_paragraph, area);
     }
 
@@ -2626,6 +2655,9 @@ impl Renderer for TuiRenderer {
 
     fn request_abort(&mut self) {
         self.aborted = true;
+        self.confirm_abort = false;
+        self.status_line = "Aborted by user.".to_string();
+        crate::orchestrator::cancel_all();
     }
 
     fn aborted(&self) -> bool {
@@ -2635,6 +2667,7 @@ impl Renderer for TuiRenderer {
     fn clear_abort(&mut self) {
         self.aborted = false;
         self.confirm_abort = false;
+        crate::orchestrator::reset_cancellation();
     }
 
     fn shutdown(&mut self) {

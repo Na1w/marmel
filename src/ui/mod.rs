@@ -383,6 +383,7 @@ pub async fn run_session(
                         );
                         drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
                         if renderer.aborted() {
+                            crate::orchestrator::cancel_all();
                             break (
                                 String::new(),
                                 None,
@@ -552,6 +553,7 @@ pub async fn run_session(
                         );
                         drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
                         if renderer.aborted() {
+                            crate::orchestrator::cancel_all();
                             break Err(crate::harness::ToolError::Execution(anyhow::anyhow!(
                                 "aborted"
                             )));

@@ -547,17 +547,30 @@ async fn run_specialist_live(
         };
 
         let mut demux = crate::llm::ThinkingDemuxer::new();
+        let mut rep_detector = crate::harness::monitor::RepetitionDetector::new(
+            mon_cfg.repetition_threshold,
+            mon_cfg.min_pattern_len,
+        );
+        let mut rep_triggered = false;
         let reply = tokio::select! {
             res = client.chat_stream(&req, |chunk| {
                 demux.push_delta(chunk, |kind, text| match kind {
                     crate::llm::DeltaKind::Content => {
+                        rep_detector.push(text);
+                        if rep_detector.is_repeating() {
+                            rep_triggered = true;
+                        }
                         crate::orchestrator::emit_event(crate::ui::Event::Message(text.to_string()));
                     }
                     crate::llm::DeltaKind::Thinking => {
+                        rep_detector.push(text);
+                        if rep_detector.is_repeating() {
+                            rep_triggered = true;
+                        }
                         crate::orchestrator::emit_event(crate::ui::Event::Thinking(text.to_string()));
                     }
                 });
-                !token.is_cancelled()
+                !token.is_cancelled() && !rep_triggered && !crate::orchestrator::is_globally_cancelled()
             }) => {
                 demux.finish_delta(|kind, text| match kind {
                     crate::llm::DeltaKind::Content => {
@@ -802,17 +815,30 @@ async fn run_specialist_live(
                         };
 
                         let mut demux = crate::llm::ThinkingDemuxer::new();
+                        let mut rep_detector = crate::harness::monitor::RepetitionDetector::new(
+                            mon_cfg.repetition_threshold,
+                            mon_cfg.min_pattern_len,
+                        );
+                        let mut rep_triggered = false;
                         let reply = tokio::select! {
                             res = client.chat_stream(&req, |chunk| {
                                 demux.push_delta(chunk, |kind, text| match kind {
                                     crate::llm::DeltaKind::Content => {
+                                        rep_detector.push(text);
+                                        if rep_detector.is_repeating() {
+                                            rep_triggered = true;
+                                        }
                                         crate::orchestrator::emit_event(crate::ui::Event::Message(text.to_string()));
                                     }
                                     crate::llm::DeltaKind::Thinking => {
+                                        rep_detector.push(text);
+                                        if rep_detector.is_repeating() {
+                                            rep_triggered = true;
+                                        }
                                         crate::orchestrator::emit_event(crate::ui::Event::Thinking(text.to_string()));
                                     }
                                 });
-                                true
+                                !token.is_cancelled() && !rep_triggered && !crate::orchestrator::is_globally_cancelled()
                             }) => match res {
                                 Ok(r) => {
                                     demux.finish_delta(|kind, text| match kind {
@@ -1064,17 +1090,30 @@ async fn run_automated_validation(
         };
 
         let mut demux = crate::llm::ThinkingDemuxer::new();
+        let mut rep_detector = crate::harness::monitor::RepetitionDetector::new(
+            mon_cfg.repetition_threshold,
+            mon_cfg.min_pattern_len,
+        );
+        let mut rep_triggered = false;
         let reply = tokio::select! {
             res = val_client.chat_stream(&req, |chunk| {
                 demux.push_delta(chunk, |kind, text| match kind {
                     crate::llm::DeltaKind::Content => {
+                        rep_detector.push(text);
+                        if rep_detector.is_repeating() {
+                            rep_triggered = true;
+                        }
                         crate::orchestrator::emit_event(crate::ui::Event::Message(text.to_string()));
                     }
                     crate::llm::DeltaKind::Thinking => {
+                        rep_detector.push(text);
+                        if rep_detector.is_repeating() {
+                            rep_triggered = true;
+                        }
                         crate::orchestrator::emit_event(crate::ui::Event::Thinking(text.to_string()));
                     }
                 });
-                true
+                !token.is_cancelled() && !rep_triggered && !crate::orchestrator::is_globally_cancelled()
             }) => match res {
                 Ok(r) => {
                     demux.finish_delta(|kind, text| match kind {

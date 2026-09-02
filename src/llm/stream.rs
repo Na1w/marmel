@@ -264,7 +264,9 @@ where
                         }
                     });
                 }
-                !sink.is_aborted() && !rep_triggered
+                !sink.is_aborted()
+                    && !rep_triggered
+                    && !crate::orchestrator::is_globally_cancelled()
             })
             .await?;
 
