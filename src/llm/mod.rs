@@ -5,7 +5,9 @@ pub mod client;
 pub mod stream;
 pub mod thinking;
 
-pub use client::{ChatClient, get_global_token_counts, record_tokens_in, record_tokens_out};
+pub use client::{
+    ChatClient, StreamedReply, get_global_token_counts, record_tokens_in, record_tokens_out,
+};
 pub use stream::{
     NullSink, StreamConfig, StreamEvent, StreamSink, VecSink, chat_client_turn, drive_streamed_turn,
 };

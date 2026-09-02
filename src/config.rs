@@ -101,6 +101,8 @@ pub struct Config {
     pub max_repetition_threshold: usize,
     pub enable_xml_rescue: bool,
     pub ui_mode: String,
+    /// Detailed debug logging to debug.log.
+    pub debug: bool,
     /// Resilience harness thresholds.
     pub monitoring: Option<MonitoringConfig>,
     /// Orchestration block.
@@ -126,6 +128,7 @@ impl Default for Config {
             max_repetition_threshold: 3,
             enable_xml_rescue: true,
             ui_mode: "tui".to_string(),
+            debug: false,
             monitoring: Some(MonitoringConfig::default()),
             orchestration: OrchestrationConfig::default_depth(),
             mcp_servers: HashMap::new(),

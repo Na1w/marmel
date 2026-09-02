@@ -10,6 +10,8 @@ struct CliArgs {
     config: Option<String>,
     /// Force raw (non-TUI) output mode.
     raw: bool,
+    /// Detailed debug logging to debug.log.
+    debug: bool,
     /// Optional initial prompt to start the session.
     prompt: Option<String>,
 }
@@ -46,7 +48,19 @@ fn main() -> Result<()> {
     }
 
     let args = parse_args();
-    let cfg = config::load(args.config.as_deref())?;
+    let mut cfg = config::load(args.config.as_deref())?;
+    if args.debug {
+        cfg.debug = true;
+    }
+
+    if cfg.debug {
+        let ws = harness::workspace::Workspace::new();
+        let debug_log_path = ws
+            .as_ref()
+            .map(|w| w.root().join("debug.log"))
+            .unwrap_or_else(|_| std::path::PathBuf::from("debug.log"));
+        marmennill::debug_log::init(Some(debug_log_path));
+    }
 
     let use_raw = args.raw || cfg.ui_mode == "raw" || !stdout_is_terminal();
     setup_panic_hook(use_raw);
@@ -94,11 +108,13 @@ fn parse_args() -> CliArgs {
                 }
             }
             "--raw" => args.raw = true,
+            "--debug" => args.debug = true,
             "-h" | "--help" => {
                 println!(
                     "marmel — autonomous agentic coding assistant\n\n\
-                     USAGE:\n    marmel [--config <path>] [--raw] [PROMPT]\n\n\
+                     USAGE:\n    marmel [--config <path>] [--raw] [--debug] [PROMPT]\n\n\
                      FLAGS:\n    --raw            force headless stdout (pipe-friendly) mode\n\
+                     --debug          log all incoming and outgoing LLM and tool traffic to debug.log\n\
                      --config <path>  override the config file path\n\
                      -h, --help       print this help\n\n\
                      ARGS:\n    PROMPT           optional initial prompt to start the session"

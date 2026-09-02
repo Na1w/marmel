@@ -212,6 +212,8 @@ impl ChatClient {
             "LLM request body: {}",
             serde_json::to_string(&req_body).unwrap_or_default()
         );
+        crate::debug_log::log_llm_request(&url, &req_body.model, &req_body);
+        let req_start = std::time::Instant::now();
 
         let mut builder = client.post(&url).json(&req_body);
         if !self.auth_token.is_empty() {
@@ -226,10 +228,29 @@ impl ChatClient {
                 return Ok(StreamedReply::default());
             }
             if first_start.elapsed() >= Duration::from_secs(self.initial_timeout_secs) {
+                let elapsed = req_start.elapsed().as_millis();
+                crate::debug_log::log_llm_error(
+                    &url,
+                    &req_body.model,
+                    elapsed,
+                    "initial timeout waiting for first response",
+                );
                 return Err(ChatError::InitialTimeout);
             }
             match tokio::time::timeout(Duration::from_millis(50), &mut send_fut).await {
-                Ok(res) => break res.map_err(|e| ChatError::Transport(e.to_string()))?,
+                Ok(res) => match res {
+                    Ok(r) => break r,
+                    Err(e) => {
+                        let elapsed = req_start.elapsed().as_millis();
+                        crate::debug_log::log_llm_error(
+                            &url,
+                            &req_body.model,
+                            elapsed,
+                            &e.to_string(),
+                        );
+                        return Err(ChatError::Transport(e.to_string()));
+                    }
+                },
                 Err(_) => {
                     if !on_delta("") {
                         return Ok(StreamedReply::default());
@@ -241,7 +262,14 @@ impl ChatClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
+            let elapsed = req_start.elapsed().as_millis();
             tracing::error!("LLM backend returned HTTP {status}: {body}");
+            crate::debug_log::log_llm_error(
+                &url,
+                &req_body.model,
+                elapsed,
+                &format!("HTTP {status}: {body}"),
+            );
             return Err(ChatError::HttpStatus { status, body });
         }
 
@@ -295,6 +323,8 @@ impl ChatClient {
                 let out_toks =
                     count_reply_tokens(&reply.content, &reply.reasoning, &reply.tool_calls);
                 record_tokens_out(out_toks);
+                let elapsed = req_start.elapsed().as_millis();
+                crate::debug_log::log_llm_response(&url, &req_body.model, 200, elapsed, &reply);
                 return Ok(reply);
             }
         } else {
@@ -305,6 +335,8 @@ impl ChatClient {
                 raw,
                 tool_calls,
             };
+            let elapsed = req_start.elapsed().as_millis();
+            crate::debug_log::log_llm_response(&url, &req_body.model, 200, elapsed, &reply);
             return Ok(reply);
         }
 
@@ -374,6 +406,8 @@ impl ChatClient {
         };
         let out_toks = count_reply_tokens(&reply.content, &reply.reasoning, &reply.tool_calls);
         record_tokens_out(out_toks);
+        let elapsed = req_start.elapsed().as_millis();
+        crate::debug_log::log_llm_response(&url, &req_body.model, 200, elapsed, &reply);
         Ok(reply)
     }
 }

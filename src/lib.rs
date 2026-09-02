@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod agents;
 pub mod config;
+pub mod debug_log;
 pub mod harness;
 pub mod llm;
 pub mod mcp;

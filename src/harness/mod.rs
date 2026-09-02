@@ -318,6 +318,13 @@ pub fn dispatch_for_with_engine(
     caller: ToolCaller,
     engine: Option<&mut crate::agent::ContextEngine>,
 ) -> Result<ToolResult, ToolError> {
+    let caller_str = match caller {
+        ToolCaller::Manager => "Manager".to_string(),
+        ToolCaller::Specialist(a) => format!("Specialist({a:?})"),
+    };
+    crate::debug_log::log_tool_invocation(&caller_str, &tool.name, &tool.arguments);
+    let start = std::time::Instant::now();
+
     let res = if caller == ToolCaller::Manager {
         dispatch_manager(tool, engine)
     } else {
@@ -326,6 +333,25 @@ pub fn dispatch_for_with_engine(
         };
         dispatch_specialist(tool, agent, engine)
     };
+
+    let elapsed = start.elapsed().as_millis();
+    match &res {
+        Ok(r) => crate::debug_log::log_tool_result(
+            &caller_str,
+            &tool.name,
+            elapsed,
+            &r.content,
+            r.is_error,
+        ),
+        Err(e) => crate::debug_log::log_tool_result(
+            &caller_str,
+            &tool.name,
+            elapsed,
+            &e.to_string(),
+            true,
+        ),
+    }
+
     res.map(apply_tool_output_length_limit)
 }
 
