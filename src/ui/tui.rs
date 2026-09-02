@@ -758,7 +758,12 @@ impl TuiRenderer {
         }
         if !msg_accum.trim().is_empty() {
             self.messages.push(msg_accum);
-            self.invalidate_last_message_cache();
+            if self.chat_auto_scroll {
+                let w = self.chat_width.get();
+                let n = self.estimated_chat_lines(w);
+                let h = self.chat_height.get();
+                self.chat_scroll = n.saturating_sub(h) as u16;
+            }
         }
     }
 
@@ -1172,34 +1177,8 @@ impl TuiRenderer {
         self.chat_width.set(chat_w);
         self.chat_height.set(chat_h);
 
-        // Ensure the per-message line cache is up to date (reference §11.3).
-        self.ensure_message_cache(chat_w);
-        let cached_lines = self.cached_message_lines.borrow();
-
-        // Windowing: only render messages around the viewport to keep
-        // rendering O(1) relative to total history (reference §4.5).
-        let scroll_y = self.chat_scroll as usize;
-        let target_start_line = scroll_y.saturating_sub(chat_h);
-
-        let mut start_msg_idx = 0;
-        let mut lines_before_start = 0;
-        let mut current_cum_lines = 0;
-
-        for (idx, &lines_cnt) in cached_lines.iter().enumerate() {
-            if current_cum_lines + lines_cnt > target_start_line {
-                start_msg_idx = idx;
-                lines_before_start = current_cum_lines;
-                break;
-            }
-            current_cum_lines += lines_cnt;
-        }
-        // Release the shared borrow before any later call that may take a
-        // mutable borrow of `cached_message_lines` (e.g. `estimated_chat_lines`
-        // -> `ensure_message_cache` for the scrollbar at the end of this fn).
-        drop(cached_lines);
-
         let mut chat_lines = Vec::new();
-        for msg in self.messages.iter().skip(start_msg_idx) {
+        for msg in &self.messages {
             let (msg_style, has_special_style) = message_style(msg);
             let mut in_think = false;
             for raw_line in msg.lines() {
@@ -1359,11 +1338,10 @@ impl TuiRenderer {
             }
         }
 
-        let paragraph_scroll = self.chat_scroll.saturating_sub(lines_before_start as u16);
         let chat_paragraph = Paragraph::new(chat_lines)
             .block(chat_block)
             .wrap(Wrap { trim: false })
-            .scroll((paragraph_scroll, 0));
+            .scroll((self.chat_scroll, 0));
         frame.render_widget(chat_paragraph, area);
 
         // F4: vertical scrollbar on the chat pane.
