@@ -285,6 +285,8 @@ impl ContextEngine {
     /// reached, older turns are dropped. Any `role:"tool"` messages that
     /// outlive their assistant tool call are pruned.
     pub fn compact(&mut self) {
+        let initial_tokens = self.token_count();
+        let initial_msgs = self.messages.len();
         let target = compaction_target(self.max_context_tokens);
 
         // Always pin the first two messages.
@@ -308,6 +310,12 @@ impl ContextEngine {
 
         // Eliminate orphaned tool messages introduced by the pruning above.
         self.messages = prune_orphan_tool_messages(kept);
+
+        let final_tokens = self.token_count();
+        let final_msgs = self.messages.len();
+        tracing::info!(
+            "Context compaction executed (automatic): {initial_tokens} tokens ({initial_msgs} msgs) -> {final_tokens} tokens ({final_msgs} msgs, target budget: {target})"
+        );
 
         if let Some(stats) = &self.stats {
             stats.record_compaction();
@@ -343,6 +351,8 @@ impl ContextEngine {
             return false;
         }
         self.compaction_retry_count += 1;
+        let initial_tokens = self.token_count();
+        let initial_msgs = self.messages.len();
 
         let compacted = if self.compaction_retry_count == 1 && self.token_count() > limit {
             // Retry 1 over the hard limit: compact_context targets 80% of limit.
@@ -360,6 +370,12 @@ impl ContextEngine {
         };
 
         if compacted {
+            let final_tokens = self.token_count();
+            let final_msgs = self.messages.len();
+            tracing::info!(
+                "Context compaction executed (forced/retry {}): {initial_tokens} tokens ({initial_msgs} msgs) -> {final_tokens} tokens ({final_msgs} msgs, limit: {limit})",
+                self.compaction_retry_count
+            );
             if let Some(stats) = &self.stats {
                 stats.record_compaction();
             }
@@ -444,6 +460,8 @@ impl ContextEngine {
     /// The `session_rebirths` counter in the attached [`HarnessStats`] is
     /// incremented, and the slow-prefill cooling tracker is reset.
     pub fn perform_rebirth(&mut self, summary: &str) {
+        let initial_tokens = self.token_count();
+        let initial_msgs = self.messages.len();
         let system = match self.messages.first() {
             Some(Message::System { content }) => content.clone(),
             _ => String::new(),
@@ -469,6 +487,12 @@ impl ContextEngine {
                 content: checkpoint,
             },
         ];
+
+        let final_tokens = self.token_count();
+        let final_msgs = self.messages.len();
+        tracing::info!(
+            "Context compaction executed (rebirth): {initial_tokens} tokens ({initial_msgs} msgs) -> {final_tokens} tokens ({final_msgs} msgs), summary: {summary}"
+        );
 
         if let Some(stats) = &self.stats {
             stats.record_rebirth();

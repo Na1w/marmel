@@ -978,7 +978,7 @@ impl TuiRenderer {
     fn estimated_subagent_lines(&self, width: usize) -> usize {
         if let Some(sa) = self.subagents.get(self.selected_subagent_idx) {
             let mut n = 1; // "=== Details for ... ==="
-            if !sa.thinking.is_empty() {
+            if self.show_thought && !sa.thinking.is_empty() {
                 n += 2; // "[Thinking]", " thinking"
                 for line in sa.thinking.lines() {
                     n += if line.is_empty() {
@@ -1595,7 +1595,7 @@ impl TuiRenderer {
                     .add_modifier(Modifier::BOLD),
             ));
 
-            if !sa.thinking.is_empty() {
+            if self.show_thought && !sa.thinking.is_empty() {
                 detail_lines.push(Line::styled(
                     "[Thinking]",
                     Style::default()
@@ -2762,8 +2762,11 @@ mod tests {
             is_active: true,
             context_tokens: 0,
         });
-        // 1 (header) + 2 ([Thinking], " thinking") + 1 (think) + 1 (" response")
+        // Default (show_thought = false): 1 (header) + 1 ([Output]) + 1 (out) + 1 ([Logs]) + 1 (- log1) = 5
+        assert_eq!(r.estimated_subagent_lines(80), 5);
+        // When show_thought = true: 1 (header) + 2 ([Thinking], " thinking") + 1 (think) + 1 (" response")
         // + 1 ([Output]) + 1 (out) + 1 ([Logs]) + 1 (- log1) = 9
+        r.show_thought = true;
         assert_eq!(r.estimated_subagent_lines(80), 9);
     }
 
@@ -3085,6 +3088,85 @@ mod tests {
         assert!(!text_off.contains("</think>"));
         assert!(!text_on.contains("<think>"));
         assert!(!text_on.contains("</think>"));
+    }
+
+    #[test]
+    fn test_subagent_thinking_visibility_controlled_by_show_thought() {
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut r = TuiRenderer::new();
+        r.subagents.push(SubagentDetail {
+            name: "coder".to_string(),
+            task_id: Some("t-001".to_string()),
+            prompt: "task brief".to_string(),
+            started_at: None,
+            last_activity_at: None,
+            logs: vec!["log step".to_string()],
+            thinking: "secret subagent thoughts".to_string(),
+            content: "deliverable code".to_string(),
+            is_active: true,
+            context_tokens: 0,
+        });
+
+        // 1. By default, show_thought is false -> [Thinking] must not appear
+        assert!(!r.show_thought);
+        terminal
+            .draw(|frame| {
+                let area = ratatui::layout::Rect::new(0, 0, 80, 20);
+                r.render_subagents(frame, area);
+            })
+            .unwrap();
+
+        let buffer1 = terminal.backend().buffer();
+        let mut lines1 = Vec::new();
+        for y in 0..20 {
+            let line: String = (0..80)
+                .map(|x| buffer1[(x, y)].symbol().to_string())
+                .collect();
+            lines1.push(line);
+        }
+        let text_off = lines1.join("\n");
+        assert!(
+            !text_off.contains("[Thinking]"),
+            "subagent [Thinking] should be hidden when show_thought=false"
+        );
+        assert!(
+            !text_off.contains("secret subagent thoughts"),
+            "subagent thoughts should be hidden when show_thought=false"
+        );
+        assert!(text_off.contains("[Output]"));
+        assert!(text_off.contains("deliverable code"));
+
+        // 2. Toggle thought ON via /thought
+        r.input_text = "/thought".to_string();
+        r.submit();
+        assert!(r.show_thought);
+
+        terminal
+            .draw(|frame| {
+                let area = ratatui::layout::Rect::new(0, 0, 80, 20);
+                r.render_subagents(frame, area);
+            })
+            .unwrap();
+
+        let buffer2 = terminal.backend().buffer();
+        let mut lines2 = Vec::new();
+        for y in 0..20 {
+            let line: String = (0..80)
+                .map(|x| buffer2[(x, y)].symbol().to_string())
+                .collect();
+            lines2.push(line);
+        }
+        let text_on = lines2.join("\n");
+        assert!(
+            text_on.contains("[Thinking]"),
+            "subagent [Thinking] should be shown when show_thought=true"
+        );
+        assert!(
+            text_on.contains("secret subagent thoughts"),
+            "subagent thoughts should be shown when show_thought=true"
+        );
     }
 
     #[test]
