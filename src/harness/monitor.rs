@@ -1306,6 +1306,7 @@ mod tests {
             enabled: true,
             repetition_threshold: 3,
             min_pattern_len: 5,
+            ..Default::default()
         };
         let mut mon =
             HarnessMonitor::new_with_config(std::sync::Arc::new(HarnessStats::new()), &cfg);
@@ -1390,6 +1391,7 @@ mod tests {
             enabled: true,
             repetition_threshold: 4,
             min_pattern_len: 5,
+            ..Default::default()
         };
         let mut mon =
             HarnessMonitor::new_with_config(std::sync::Arc::new(HarnessStats::new()), &cfg);
@@ -1417,6 +1419,7 @@ mod tests {
             enabled: true,
             repetition_threshold: 2,
             min_pattern_len: 5,
+            ..Default::default()
         };
         let mut mon =
             HarnessMonitor::new_with_config(std::sync::Arc::new(HarnessStats::new()), &cfg);
@@ -1441,6 +1444,7 @@ mod tests {
             enabled: true,
             repetition_threshold: 5,
             min_pattern_len: 7,
+            ..Default::default()
         };
         let mut mon =
             HarnessMonitor::new_with_config(std::sync::Arc::new(HarnessStats::new()), &cfg);

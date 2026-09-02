@@ -84,6 +84,9 @@ pub struct StreamConfig {
     pub preserve_thinking: bool,
     pub recovery: bool,
     pub mcp_servers: Vec<String>,
+    pub repetition_threshold: usize,
+    pub min_pattern_len: usize,
+    pub max_stream_tokens: usize,
 }
 
 impl Default for StreamConfig {
@@ -97,12 +100,17 @@ impl Default for StreamConfig {
             preserve_thinking: false,
             recovery: false,
             mcp_servers: Vec::new(),
+            repetition_threshold: 5,
+            min_pattern_len: 5,
+            max_stream_tokens: 8192,
         }
     }
 }
 
 impl StreamConfig {
     pub fn from_config(cfg: &crate::config::Config) -> Self {
+        let default_mon = crate::config::MonitoringConfig::default();
+        let mon = cfg.monitoring.as_ref().unwrap_or(&default_mon);
         Self {
             model: cfg.model.clone(),
             temperature: cfg.temperature,
@@ -112,6 +120,9 @@ impl StreamConfig {
             preserve_thinking: cfg.preserve_thinking,
             recovery: false,
             mcp_servers: cfg.orchestration.mcp_servers.clone(),
+            repetition_threshold: mon.repetition_threshold,
+            min_pattern_len: mon.min_pattern_len,
+            max_stream_tokens: mon.max_stream_tokens,
         }
     }
 }
@@ -244,13 +255,23 @@ where
             req
         };
 
+        let max_tokens = cfg.max_stream_tokens.max(256);
+        let mut tokens_count = 0usize;
         let mut demux = ThinkingDemuxer::with_preserve(cfg.preserve_thinking);
-        let mut rep_detector = crate::harness::monitor::RepetitionDetector::new(5, 5);
+        let mut rep_detector = crate::harness::monitor::RepetitionDetector::new(
+            cfg.repetition_threshold,
+            cfg.min_pattern_len,
+        );
         let mut rep_triggered = false;
+        let mut budget_exceeded = false;
 
         let reply = client
             .chat_stream(&req, |delta| {
                 if !delta.is_empty() {
+                    tokens_count += 1;
+                    if tokens_count > max_tokens {
+                        budget_exceeded = true;
+                    }
                     demux.push_delta(delta, |kind, text| {
                         rep_detector.push(text);
                         if rep_detector.is_repeating() {
@@ -266,6 +287,7 @@ where
                 }
                 !sink.is_aborted()
                     && !rep_triggered
+                    && !budget_exceeded
                     && !crate::orchestrator::is_globally_cancelled()
             })
             .await?;

@@ -11,8 +11,8 @@ use thiserror::Error;
 pub const INITIAL_RESPONSE_WATCHDOG_SECS: u64 = 180;
 /// Maximum silent pause allowed between stream chunks once streaming has started.
 pub const INTER_CHUNK_WATCHDOG_SECS: u64 = 60;
-/// Upper bound on the entire streaming read.
-pub const OVERALL_READ_TIMEOUT_SECS: u64 = 1800;
+/// Upper bound on the entire streaming read (5 minutes safety watchdog).
+pub const OVERALL_READ_TIMEOUT_SECS: u64 = 300;
 /// Maximum total attempts (initial + up to 2 retries for 503/429/timeouts).
 pub const MAX_ATTEMPTS: u32 = 3;
 /// Backoff base: sleep = `BACKOFF_BASE_MS × attempt`.

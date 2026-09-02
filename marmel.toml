@@ -15,6 +15,7 @@ ui_mode = "tui"
 enabled = true
 repetition_threshold = 5
 min_pattern_len = 7
+max_stream_tokens = 8192
 
 [orchestration]
 max_recursion_depth = 3

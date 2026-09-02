@@ -48,6 +48,11 @@ pub fn is_enabled() -> bool {
     DEBUG_LOG_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Explicitly enable or disable debug logging.
+pub fn set_enabled(enabled: bool) {
+    DEBUG_LOG_ENABLED.store(enabled, Ordering::SeqCst);
+}
+
 /// Returns the path to the active debug log file, if enabled.
 pub fn debug_log_path() -> Option<&'static Path> {
     DEBUG_LOG_PATH.get().map(|p| p.as_path())
@@ -210,5 +215,6 @@ mod tests {
         assert!(content.contains(">>> [TOOL INVOCATION]"));
         assert!(content.contains("delegate_task"));
         assert!(content.contains("<<< [TOOL RESULT: OK]"));
+        set_enabled(false);
     }
 }

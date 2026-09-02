@@ -546,6 +546,9 @@ async fn run_specialist_live(
             frequency_penalty: Some(cfg.frequency_penalty),
         };
 
+        let max_tokens = mon_cfg.max_stream_tokens.max(256);
+        let mut tokens_count = 0usize;
+        let mut budget_exceeded = false;
         let mut demux = crate::llm::ThinkingDemuxer::new();
         let mut rep_detector = crate::harness::monitor::RepetitionDetector::new(
             mon_cfg.repetition_threshold,
@@ -554,6 +557,12 @@ async fn run_specialist_live(
         let mut rep_triggered = false;
         let reply = tokio::select! {
             res = client.chat_stream(&req, |chunk| {
+                if !chunk.is_empty() {
+                    tokens_count += 1;
+                    if tokens_count > max_tokens {
+                        budget_exceeded = true;
+                    }
+                }
                 demux.push_delta(chunk, |kind, text| match kind {
                     crate::llm::DeltaKind::Content => {
                         rep_detector.push(text);
@@ -570,7 +579,10 @@ async fn run_specialist_live(
                         crate::orchestrator::emit_event(crate::ui::Event::Thinking(text.to_string()));
                     }
                 });
-                !token.is_cancelled() && !rep_triggered && !crate::orchestrator::is_globally_cancelled()
+                !token.is_cancelled()
+                    && !rep_triggered
+                    && !budget_exceeded
+                    && !crate::orchestrator::is_globally_cancelled()
             }) => {
                 demux.finish_delta(|kind, text| match kind {
                     crate::llm::DeltaKind::Content => {
@@ -580,6 +592,14 @@ async fn run_specialist_live(
                         crate::orchestrator::emit_event(crate::ui::Event::Thinking(text.to_string()));
                     }
                 });
+                if budget_exceeded {
+                    tracing::warn!(
+                        "{agent_tag}: maximum single-turn output budget of {max_tokens} tokens exceeded — cutting stream"
+                    );
+                    crate::orchestrator::emit_status(format!(
+                        "{agent_tag}: single-turn output budget ({max_tokens} tokens) reached"
+                    ));
+                }
                 res?
             },
             _ = token.cancelled() => {
@@ -814,6 +834,9 @@ async fn run_specialist_live(
                             frequency_penalty: Some(cfg.frequency_penalty),
                         };
 
+                        let max_tokens = mon_cfg.max_stream_tokens.max(256);
+                        let mut tokens_count = 0usize;
+                        let mut budget_exceeded = false;
                         let mut demux = crate::llm::ThinkingDemuxer::new();
                         let mut rep_detector = crate::harness::monitor::RepetitionDetector::new(
                             mon_cfg.repetition_threshold,
@@ -822,6 +845,12 @@ async fn run_specialist_live(
                         let mut rep_triggered = false;
                         let reply = tokio::select! {
                             res = client.chat_stream(&req, |chunk| {
+                                if !chunk.is_empty() {
+                                    tokens_count += 1;
+                                    if tokens_count > max_tokens {
+                                        budget_exceeded = true;
+                                    }
+                                }
                                 demux.push_delta(chunk, |kind, text| match kind {
                                     crate::llm::DeltaKind::Content => {
                                         rep_detector.push(text);
@@ -838,7 +867,10 @@ async fn run_specialist_live(
                                         crate::orchestrator::emit_event(crate::ui::Event::Thinking(text.to_string()));
                                     }
                                 });
-                                !token.is_cancelled() && !rep_triggered && !crate::orchestrator::is_globally_cancelled()
+                                !token.is_cancelled()
+                                    && !rep_triggered
+                                    && !budget_exceeded
+                                    && !crate::orchestrator::is_globally_cancelled()
                             }) => match res {
                                 Ok(r) => {
                                     demux.finish_delta(|kind, text| match kind {
@@ -849,6 +881,11 @@ async fn run_specialist_live(
                                             crate::orchestrator::emit_event(crate::ui::Event::Thinking(text.to_string()));
                                         }
                                     });
+                                    if budget_exceeded {
+                                        tracing::warn!(
+                                            "{agent_tag}: maximum single-turn output budget of {max_tokens} tokens exceeded during revision"
+                                        );
+                                    }
                                     r
                                 }
                                 Err(e) => {
@@ -1089,6 +1126,9 @@ async fn run_automated_validation(
             frequency_penalty: Some(cfg.frequency_penalty),
         };
 
+        let max_tokens = mon_cfg.max_stream_tokens.max(256);
+        let mut tokens_count = 0usize;
+        let mut budget_exceeded = false;
         let mut demux = crate::llm::ThinkingDemuxer::new();
         let mut rep_detector = crate::harness::monitor::RepetitionDetector::new(
             mon_cfg.repetition_threshold,
@@ -1097,6 +1137,12 @@ async fn run_automated_validation(
         let mut rep_triggered = false;
         let reply = tokio::select! {
             res = val_client.chat_stream(&req, |chunk| {
+                if !chunk.is_empty() {
+                    tokens_count += 1;
+                    if tokens_count > max_tokens {
+                        budget_exceeded = true;
+                    }
+                }
                 demux.push_delta(chunk, |kind, text| match kind {
                     crate::llm::DeltaKind::Content => {
                         rep_detector.push(text);
@@ -1113,7 +1159,10 @@ async fn run_automated_validation(
                         crate::orchestrator::emit_event(crate::ui::Event::Thinking(text.to_string()));
                     }
                 });
-                !token.is_cancelled() && !rep_triggered && !crate::orchestrator::is_globally_cancelled()
+                !token.is_cancelled()
+                    && !rep_triggered
+                    && !budget_exceeded
+                    && !crate::orchestrator::is_globally_cancelled()
             }) => match res {
                 Ok(r) => {
                     demux.finish_delta(|kind, text| match kind {
@@ -1124,6 +1173,11 @@ async fn run_automated_validation(
                             crate::orchestrator::emit_event(crate::ui::Event::Thinking(text.to_string()));
                         }
                     });
+                    if budget_exceeded {
+                        tracing::warn!(
+                            "validator-{agent}: maximum single-turn output budget of {max_tokens} tokens exceeded"
+                        );
+                    }
                     r
                 }
                 Err(e) => {

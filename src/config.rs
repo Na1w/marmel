@@ -41,6 +41,8 @@ pub struct MonitoringConfig {
     pub repetition_threshold: usize,
     /// Minimum pattern length (in characters) for text-repetition detection.
     pub min_pattern_len: usize,
+    /// Maximum output tokens per single streaming turn before cutting off runaway generation.
+    pub max_stream_tokens: usize,
 }
 
 impl Default for MonitoringConfig {
@@ -49,6 +51,7 @@ impl Default for MonitoringConfig {
             enabled: true,
             repetition_threshold: 5,
             min_pattern_len: 5,
+            max_stream_tokens: 8192,
         }
     }
 }

@@ -37,7 +37,8 @@ ui_mode = "tui"
 [monitoring]
 enabled = true
 repetition_threshold = 5
-min_pattern_len = 5
+min_pattern_len = 7
+max_stream_tokens = 8192
 
 # ---------------------------------------------------------------------------
 # Orchestration — Manager + Specialist Subagents (REQ-ORCH-001…005 / SPEC Part 5)
