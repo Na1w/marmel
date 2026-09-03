@@ -190,11 +190,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_debug_log_disabled_by_default() {
-        assert!(!is_enabled());
-    }
-
-    #[test]
     fn test_debug_log_writing_when_enabled() {
         let temp = tempfile::tempdir().unwrap();
         let log_file = temp.path().join("test_debug.log");
@@ -216,5 +211,6 @@ mod tests {
         assert!(content.contains("delegate_task"));
         assert!(content.contains("<<< [TOOL RESULT: OK]"));
         set_enabled(false);
+        assert!(!is_enabled());
     }
 }

@@ -1,6 +1,10 @@
 //! Marmennill (marmel) — clean-room agentic coding assistant library crate.
 
-pub mod agent;
+/// Manager-level core: turn loop state machine, plan management, and context engine.
+pub mod manager;
+/// Backwards-compatibility alias for the manager module.
+pub use manager as agent;
+/// Specialist subagents (Coder, Debugger, Researcher, Generalist, Validator), live runner, and automated verification.
 pub mod agents;
 pub mod config;
 pub mod debug_log;

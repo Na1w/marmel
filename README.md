@@ -405,6 +405,7 @@ Specialist deliverables are automatically audited by a Validator subagent. Rejec
   - $\ge 3$ identical consecutive lines.
   - $\ge 3$ repeated line bigrams.
   - $\ge 3$ repeated word 4-gram phrases across sentences.
+- **Multi-turn thought repetition breaker** — detects repetitive reasoning loops across turns in specialist output, purges conversational chatter, and injects targeted corrective nudges.
 - **Live stream interruption & auto-recovery** — cuts SSE generation mid-flight on loop detection, purges toxic history, and retries with increased `frequency_penalty`.
 - **Empty-production nudge** — up to 3 attempts.
 - **One-turn recovery** — adjusts `enable_thinking`, `frequency_penalty`, and `temperature` on failure.
@@ -430,7 +431,7 @@ Specialist deliverables are automatically audited by a Validator subagent. Rejec
 cargo test
 ```
 
-- **Unit tests** are embedded in each module (`#[cfg(test)] mod tests`).
+- **Unit tests** are organized into dedicated companion test modules (`*_tests.rs`) and inline test blocks.
 - **Integration tests** live in `tests/` and use `wiremock` to mock the LLM backend.
 
 Coverage areas include: config parsing, orchestration (delegation, check-off, recursion depth, Deep-Freeze recovery), agent loop (turn phases, tool classification, steer/abort, repetition detection, XML rescue), context engine (compaction, rebirth, token counting), harness (replace uniqueness, paginated read, grep gitignore, glob sorting, cross-platform PTY lifecycle), LLM (thinking demuxer, request construction), role gating, and UI session.
@@ -445,7 +446,7 @@ Marmel is continuously built and tested across all supported target platforms vi
 Every commit and pull request runs:
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo test --all-targets --all-features` (212 unit & integration tests)
+- `cargo test --all-targets --all-features` (262 unit & integration tests)
 - `cargo build --release` (optimized binary verification)
 
 ---
@@ -500,6 +501,6 @@ MIT
 
 - **Name:** `marmennill`
 - **Binary / CLI:** `marmel`
-- **Version:** `0.1.0`
+- **Version:** `0.5.0`
 - **Language:** Rust (edition 2024, `rust-version = "1.98"`)
 - **Repository:** `https://github.com/Na1w/marmel.git` (branch `main`)

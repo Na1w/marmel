@@ -18,6 +18,46 @@ pub mod workspace;
 
 static MCP_MANAGER: std::sync::RwLock<Option<Arc<crate::mcp::McpManager>>> =
     std::sync::RwLock::new(None);
+static WORKSPACE_ROOT: std::sync::RwLock<Option<std::path::PathBuf>> = std::sync::RwLock::new(None);
+
+tokio::task_local! {
+    static SCOPED_WORKSPACE_ROOT: std::path::PathBuf;
+}
+
+/// Run an async future scoped to a specific workspace root (ideal for isolated tests & sub-workspaces).
+pub async fn with_workspace_root<F, R>(root: impl Into<std::path::PathBuf>, f: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    let p = root.into();
+    let abs = p.canonicalize().unwrap_or(p);
+    SCOPED_WORKSPACE_ROOT.scope(abs, f).await
+}
+
+/// Explicitly configure the global workspace root directory.
+pub fn set_workspace_root(root: impl Into<std::path::PathBuf>) {
+    let p = root.into();
+    let abs = p.canonicalize().unwrap_or(p);
+    if let Ok(mut lock) = WORKSPACE_ROOT.write() {
+        *lock = Some(abs);
+    }
+}
+
+/// Retrieve the active workspace root directory (task-local if set, or global fallback).
+pub fn get_workspace_root() -> std::path::PathBuf {
+    if let Ok(scoped) = SCOPED_WORKSPACE_ROOT.try_with(|p| p.clone()) {
+        return scoped;
+    }
+    if let Ok(lock) = WORKSPACE_ROOT.read()
+        && let Some(ref p) = *lock
+    {
+        return p.clone();
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let canonical = cwd.canonicalize().unwrap_or(cwd);
+    set_workspace_root(&canonical);
+    canonical
+}
 
 /// Register the global MCP manager for tool dispatch.
 pub fn set_mcp_manager(manager: Arc<crate::mcp::McpManager>) {
