@@ -350,3 +350,80 @@ async fn test_ui_session_steer_abort_redirection_resets_abort_and_continues() {
 
     assert!(renderer.aborted(), "session should end via final /abort");
 }
+
+/// Verify that when user inputs a question mid-stream during LLM generation,
+/// the active stream pauses immediately, the steer arbitrator answers with RespondDirectly,
+/// and the stream seamlessly resumes with assistant prefix continuation, delivering the full answer.
+#[tokio::test]
+async fn test_ui_session_stream_pause_and_resume_on_user_question() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let assistant_requests = Arc::new(AtomicUsize::new(0));
+    let arbitrator_calls = Arc::new(AtomicUsize::new(0));
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let assistant_requests = assistant_requests.clone();
+            let arbitrator_calls = arbitrator_calls.clone();
+            move |req: &wiremock::Request| {
+                let body_str = String::from_utf8_lossy(&req.body);
+                if body_str.contains("Steer Arbitrator") || body_str.contains("Arbitrate the user")
+                {
+                    arbitrator_calls.fetch_add(1, Ordering::SeqCst);
+                    let body = completion_sse(
+                        r#"{"decision": "RespondDirectly", "response": "I am currently analyzing your project files."}"#,
+                    );
+                    ResponseTemplate::new(200).set_body_string(body)
+                } else {
+                    let n = assistant_requests.fetch_add(1, Ordering::SeqCst);
+                    let body = if n == 0 {
+                        // Part 1 before pause
+                        completion_sse("First part of generation...")
+                    } else {
+                        // Part 2 continuation after resume
+                        completion_sse(" and second part after resume.")
+                    };
+                    ResponseTemplate::new(200).set_body_string(body)
+                }
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let cfg = config_for_backend(&server.uri());
+
+    // Scripted input:
+    // Initial goal: "start generation task"
+    // Mid-flight poll input: "what are you doing?"
+    // After turn: "/abort" to finish session
+    let mut renderer = ScriptedRenderer::with_poll(
+        vec!["start generation task".to_string(), "/abort".to_string()],
+        vec![
+            String::new(),
+            String::new(),
+            String::new(),
+            "what are you doing?".to_string(),
+        ],
+    );
+
+    marmennill::ui::run_session(&cfg, &mut renderer, None, None)
+        .await
+        .expect("run_session should complete without error");
+
+    let arb = arbitrator_calls.load(Ordering::SeqCst);
+    assert_eq!(
+        arb, 1,
+        "steer arbitrator should have been invoked exactly once"
+    );
+
+    let reqs = assistant_requests.load(Ordering::SeqCst);
+    assert_eq!(
+        reqs, 2,
+        "expected initial stream + continuation stream = 2 assistant requests"
+    );
+
+    assert!(renderer.aborted(), "session should end via final /abort");
+}

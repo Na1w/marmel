@@ -335,6 +335,48 @@ pub fn log_custom(tag: &str, message: &str) {
     log_raw(&entry);
 }
 
+/// Log a stream pause event triggered by mid-flight user steering.
+pub fn log_stream_pause(model: &str, user_input: &str, tokens_so_far: usize) {
+    if !is_enabled() {
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = format!(
+        "\n{}\n[{now}] ||| [STREAM PAUSE] model: {model} (tokens so far: {tokens_so_far})\nUser instruction: {user_input}\n{}\n",
+        "~".repeat(80),
+        "~".repeat(80)
+    );
+    log_raw(&entry);
+}
+
+/// Log a stream resume event after steering arbitration.
+pub fn log_stream_resume(model: &str, partial_chars: usize) {
+    if !is_enabled() {
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = format!(
+        "\n{}\n[{now}] ||| [STREAM RESUME] model: {model} (resuming from {partial_chars} chars prefix)\n{}\n",
+        "~".repeat(80),
+        "~".repeat(80)
+    );
+    log_raw(&entry);
+}
+
+/// Log a stream abort event after steering arbitration.
+pub fn log_stream_abort(model: &str, reason: &str) {
+    if !is_enabled() {
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = format!(
+        "\n{}\n[{now}] ||| [STREAM ABORT] model: {model} (reason: {reason})\n{}\n",
+        "~".repeat(80),
+        "~".repeat(80)
+    );
+    log_raw(&entry);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
