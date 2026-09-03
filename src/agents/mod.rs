@@ -238,23 +238,13 @@ pub(crate) async fn run_specialist_llm(
         snippet_block = snippet_block,
     );
 
-    #[cfg(test)]
-    {
-        let _ = (agent, token);
-        canned
+    if let Some(res) = try_run_specialist_live(agent, ctx, token).await {
+        return res;
     }
-
-    #[cfg(not(test))]
-    {
-        if let Some(res) = try_run_specialist_live(agent, ctx, token).await {
-            return res;
-        }
-        canned
-    }
+    canned
 }
 
-#[cfg(not(test))]
-async fn try_run_specialist_live(
+pub(crate) async fn try_run_specialist_live(
     agent: Agent,
     ctx: &IsolatedContext,
     token: &tokio_util::sync::CancellationToken,
@@ -457,8 +447,7 @@ pub(crate) fn assemble_final_deliverable(
     rejected
 }
 
-#[cfg(not(test))]
-async fn run_specialist_live(
+pub async fn run_specialist_live(
     client: &crate::llm::ChatClient,
     agent: Agent,
     ctx: &IsolatedContext,
@@ -1066,8 +1055,7 @@ async fn run_specialist_live(
     }
 }
 
-#[cfg(not(test))]
-async fn run_automated_validation(
+pub(crate) async fn run_automated_validation(
     _client: &crate::llm::ChatClient,
     agent: Agent,
     task_brief: &str,
