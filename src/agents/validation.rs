@@ -210,6 +210,8 @@ pub(crate) async fn run_automated_validation(
                     "Deliverable rejected by validator without detailed comments.".to_string()
                 };
 
+                crate::debug_log::log_validation_verdict(agent.as_str(), approved, &critique);
+
                 tracing::info!(
                     "Validator recorded verdict for {agent} via leave_verdict: approved={}, critique:\n{}",
                     approved,

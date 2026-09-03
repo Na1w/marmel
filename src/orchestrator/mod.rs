@@ -250,6 +250,7 @@ impl OrchestratorManager {
 
     /// Create (or overwrite) the on-disk execution plan via `create_plan`.
     pub fn create_plan(&self, plan_markdown: &str) -> Result<()> {
+        crate::debug_log::log_plan_update("create_plan", plan_markdown);
         self.plan.create(plan_markdown)
     }
 
@@ -291,6 +292,13 @@ impl OrchestratorManager {
                 task: req.task_id.clone(),
             });
         }
+        crate::debug_log::log_delegation_start(
+            entry.agent.as_str(),
+            req.task_id.as_deref(),
+            &req.prompt,
+            req.snippets.len(),
+        );
+        let start_time = std::time::Instant::now();
 
         // 3. Deep-Freeze: snapshot this in-flight delegation to the Crash
         //    Journal BEFORE the worker runs (SPEC §3.4). If the process dies
@@ -330,6 +338,16 @@ impl OrchestratorManager {
             let child_token = self.cancellation_token.child_token();
             worker.run(&ctx, &child_token).await
         };
+
+        let elapsed_ms = start_time.elapsed().as_millis();
+        let marker_str = format!("{:?}", deliverable.marker);
+        crate::debug_log::log_delegation_finish(
+            entry.agent.as_str(),
+            req.task_id.as_deref(),
+            &marker_str,
+            elapsed_ms,
+            &deliverable.content,
+        );
 
         // 6. Deep-Freeze: the delegation terminated (cleanly). Release the
         //    frozen checkpoint so a later recovery does not re-resume a task
@@ -422,7 +440,12 @@ impl OrchestratorManager {
             // the task off, regardless of what tokens appear in the content body.
             if matches!(d.marker, MissionMarker::Complete { .. }) {
                 // Second gate: the *content* must still carry the terminal marker.
-                let _ = self.plan.check_plan_on_marker(Some(t), &d.content);
+                if let Ok(true) = self.plan.check_plan_on_marker(Some(t), &d.content) {
+                    crate::debug_log::log_plan_update(
+                        "check_off",
+                        &format!("Task [{t}] marked completed [x] on disk"),
+                    );
+                }
             }
             let mut d = d;
             d.task_id = Some(t.clone());

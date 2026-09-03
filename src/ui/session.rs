@@ -23,6 +23,7 @@ pub async fn run_session(
 ) -> Result<()> {
     renderer.clear_abort();
     renderer.init()?;
+    crate::debug_log::log_session_start(cfg, &cfg.ui_mode);
 
     let system = load_system_prompt(cfg)?;
     let mut ctx = ContextEngine::new(cfg.max_context_tokens);
@@ -43,24 +44,32 @@ pub async fn run_session(
     let has_pending_plan = !plan.pending_tasks().is_empty();
 
     let goal = match initial {
-        Some(g) => g,
+        Some(g) => {
+            crate::debug_log::log_user_input("initial_argument", &g);
+            g
+        }
         None => loop {
             match renderer.read_input() {
                 Some(line) => {
                     if is_abort_command(&line) {
+                        crate::debug_log::log_user_input("command", &line);
                         renderer.shutdown();
                         return Ok(());
                     }
                     if is_reset_command(&line) {
+                        crate::debug_log::log_user_input("command", &line);
                         let plan = crate::agent::phase::Plan::default();
                         handle_reset_command(&plan, &mut *renderer, &mut ctx);
                         continue;
                     }
                     let trimmed = line.trim();
                     if !trimmed.is_empty() {
+                        crate::debug_log::log_user_input("interactive_goal", trimmed);
                         break trimmed.to_string();
                     } else if has_pending_plan {
-                        break "Continue executing the active execution plan.".to_string();
+                        let resume_msg = "Continue executing the active execution plan.";
+                        crate::debug_log::log_user_input("resume_plan", resume_msg);
+                        break resume_msg.to_string();
                     }
                 }
                 None => {
@@ -102,15 +111,18 @@ pub async fn run_session(
 
         if let Some(steer) = renderer.poll_input() {
             if is_abort_command(&steer) {
+                crate::debug_log::log_user_input("command", &steer);
                 renderer.request_abort();
                 break;
             }
             if is_reset_command(&steer) {
+                crate::debug_log::log_user_input("command", &steer);
                 let plan = crate::agent::phase::Plan::default();
                 handle_reset_command(&plan, &mut *renderer, &mut ctx);
                 continue;
             }
             if !steer.trim().is_empty() {
+                crate::debug_log::log_user_input("midflight_steer", &steer);
                 steer_queue.push(steer);
             }
         }
@@ -189,7 +201,18 @@ pub async fn run_session(
             }
 
             let tool_calls = match &assistant {
-                Message::Assistant { tool_calls, .. } => tool_calls.clone(),
+                Message::Assistant {
+                    tool_calls,
+                    content,
+                    ..
+                } => {
+                    if tool_calls.is_empty()
+                        && let Some(text) = content
+                    {
+                        crate::debug_log::log_user_output("assistant_reply", text);
+                    }
+                    tool_calls.clone()
+                }
                 _ => Vec::new(),
             };
 
@@ -628,15 +651,18 @@ pub async fn run_session(
         match renderer.read_input() {
             Some(line) => {
                 if is_abort_command(&line) {
+                    crate::debug_log::log_user_input("command", &line);
                     renderer.request_abort();
                     break;
                 }
                 if is_reset_command(&line) {
+                    crate::debug_log::log_user_input("command", &line);
                     let plan = crate::agent::phase::Plan::default();
                     handle_reset_command(&plan, &mut *renderer, &mut ctx);
                     continue;
                 }
                 if !line.trim().is_empty() {
+                    crate::debug_log::log_user_input("interactive_input", &line);
                     ctx.append(Message::User { content: line });
                 }
             }
