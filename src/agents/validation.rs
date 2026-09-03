@@ -137,29 +137,51 @@ pub(crate) async fn run_automated_validation(
         };
 
         let max_tokens = mon_cfg.max_stream_tokens.max(256);
-        let mut stream_handler =
-            crate::llm::TurnStreamHandler::new(max_tokens, &mut rep_detector, token);
-        let reply = tokio::select! {
-            res = val_client.chat_stream(&req, |chunk| stream_handler.on_chunk(chunk)) => match res {
-                Ok(r) => {
-                    stream_handler.finish();
-                    if stream_handler.budget_exceeded {
-                        tracing::warn!(
-                            "validator-{agent}: maximum single-turn output budget of {max_tokens} tokens exceeded"
-                        );
-                    }
-                    r
+        let mut sink = crate::orchestrator::PreemptibleStreamSink::register(
+            format!("validator-{agent}"),
+            &validator_model,
+        );
+        let stream_out = crate::llm::chat_stream_resumable(
+            &val_client,
+            &req,
+            &mut sink,
+            max_tokens,
+            &mut rep_detector,
+            false,
+            Some(token),
+        )
+        .await;
+
+        let out = match stream_out {
+            Ok(o) => o,
+            Err(e) => {
+                if token.is_cancelled() {
+                    tracing::warn!("validator-{agent}: aborted during LLM call");
+                    return Ok((
+                        false,
+                        "Validation aborted by cancellation signal.".to_string(),
+                    ));
                 }
-                Err(e) => {
-                    tracing::error!("validator-{agent} LLM chat call error on turn {_turn}: {e:?}");
-                    break;
-                }
-            },
-            _ = token.cancelled() => {
-                tracing::warn!("validator-{agent}: aborted during LLM call");
-                return Ok((false, "Validation aborted by cancellation signal.".to_string()));
+                tracing::error!("validator-{agent} LLM chat call error on turn {_turn}: {e:?}");
+                break;
             }
         };
+
+        if out.was_aborted_by_steer || token.is_cancelled() {
+            tracing::warn!("validator-{agent}: aborted during LLM call");
+            return Ok((
+                false,
+                "Validation aborted by cancellation signal.".to_string(),
+            ));
+        }
+
+        let reply = out.reply;
+        let budget_exceeded = out.budget_exceeded;
+        if budget_exceeded {
+            tracing::warn!(
+                "validator-{agent}: maximum single-turn output budget of {max_tokens} tokens exceeded"
+            );
+        }
 
         let mut tool_calls = reply.tool_calls.clone();
         if tool_calls.is_empty() && cfg.enable_xml_rescue {

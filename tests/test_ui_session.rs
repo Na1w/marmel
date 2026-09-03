@@ -427,3 +427,134 @@ async fn test_ui_session_stream_pause_and_resume_on_user_question() {
 
     assert!(renderer.aborted(), "session should end via final /abort");
 }
+
+/// Verify that a running specialist stream on a shared model can be preempted
+/// by the Steer Arbitrator, yielding its GPU/model slot, and subsequently
+/// resumed seamlessly via Assistant Prefill continuation.
+#[tokio::test]
+async fn test_specialist_stream_preemption_and_resumption_on_shared_model() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (first_chunk_sent_tx, first_chunk_sent_rx) = tokio::sync::oneshot::channel();
+    let (preempt_done_tx, preempt_done_rx) = tokio::sync::oneshot::channel();
+
+    // Spawn mock streaming server
+    tokio::spawn(async move {
+        // First connection: initial specialist stream
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf).await;
+
+        let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+        stream.write_all(headers.as_bytes()).await.unwrap();
+
+        // Send chunk 1
+        let chunk1_data =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Specialist part 1...\"}}]}\n\n";
+        let chunk1 = format!("{:x}\r\n{}\r\n", chunk1_data.len(), chunk1_data);
+        stream.write_all(chunk1.as_bytes()).await.unwrap();
+
+        // Give client time to read and parse chunk 1
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        // Notify test that first chunk was sent
+        let _ = first_chunk_sent_tx.send(());
+
+        // Wait until steer preemption has been registered
+        let _ = preempt_done_rx.await;
+
+        // Send chunk 2 to trigger poll_control inside on_chunk_with_sink
+        let chunk2_data = "data: {\"choices\":[{\"delta\":{\"content\":\" (cutting)\"}}]}\n\n";
+        let chunk2 = format!("{:x}\r\n{}\r\n", chunk2_data.len(), chunk2_data);
+        let _ = stream.write_all(chunk2.as_bytes()).await;
+
+        // Client drops stream when paused.
+        // Second connection: continuation stream after resume
+        if let Ok((mut stream2, _)) = listener.accept().await {
+            let mut buf2 = [0u8; 1024];
+            let _ = stream2.read(&mut buf2).await;
+            let headers2 = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            stream2.write_all(headers2.as_bytes()).await.unwrap();
+
+            let chunk_cont_data = "data: {\"choices\":[{\"delta\":{\"content\":\" and specialist part 2 completed.\"}}]}\n\n";
+            let chunk_cont = format!("{:x}\r\n{}\r\n", chunk_cont_data.len(), chunk_cont_data);
+            stream2.write_all(chunk_cont.as_bytes()).await.unwrap();
+
+            let done_data = "data: [DONE]\n\n";
+            let done_chunk = format!("{:x}\r\n{}\r\n0\r\n\r\n", done_data.len(), done_data);
+            stream2.write_all(done_chunk.as_bytes()).await.unwrap();
+        }
+    });
+
+    let client = marmennill::llm::ChatClient::new(format!("http://{addr}/v1"), "shared-model");
+    let req = marmennill::types::ChatRequest {
+        model: "shared-model".to_string(),
+        messages: vec![marmennill::types::Message::User {
+            content: "write code".to_string(),
+        }],
+        temperature: None,
+        top_p: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        stream: Some(true),
+        enable_thinking: None,
+        tools: None,
+    };
+
+    let mut rep_detector = marmennill::harness::monitor::RepetitionDetector::new(3, 5);
+    let mut sink =
+        marmennill::orchestrator::PreemptibleStreamSink::register("coder", "shared-model");
+
+    // Spawn specialist stream in background
+    let specialist_task = tokio::spawn(async move {
+        marmennill::llm::chat_stream_resumable(
+            &client,
+            &req,
+            &mut sink,
+            512,
+            &mut rep_detector,
+            false,
+            None,
+        )
+        .await
+    });
+
+    // Wait until specialist received first chunk
+    first_chunk_sent_rx.await.unwrap();
+
+    // Now preempt the active stream for the Steer Arbitrator
+    let preempt_fut =
+        marmennill::orchestrator::preempt_conflicting_stream("shared-model", "what is happening?");
+
+    // Unblock the mock server to deliver chunk 2 so the client polls control and pauses
+    let _ = preempt_done_tx.send(());
+
+    let handle = preempt_fut.await;
+    assert!(
+        matches!(handle, marmennill::orchestrator::PreemptHandle::Active(_)),
+        "expected an active preempt handle for conflicting shared-model stream"
+    );
+
+    // Arbitrator finishes and grants resumption
+    handle.complete_all(marmennill::llm::PauseAction::Resume);
+
+    let stream_out = specialist_task
+        .await
+        .expect("specialist task join")
+        .expect("stream resumable result");
+
+    assert!(
+        stream_out.reply.content.contains("Specialist part 1..."),
+        "result should contain pre-pause content"
+    );
+    assert!(
+        stream_out
+            .reply
+            .content
+            .contains("and specialist part 2 completed."),
+        "result should contain post-resumption content"
+    );
+}

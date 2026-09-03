@@ -13,9 +13,14 @@
 pub mod bus;
 pub mod freeze;
 pub mod plan_summary;
+pub mod preemption;
 pub mod registry;
 pub mod steer;
 pub mod workers;
+
+pub use preemption::{
+    PreemptHandle, PreemptibleStreamSink, models_conflict, preempt_conflicting_stream,
+};
 
 use crate::agent::phase::Plan;
 pub use crate::agents::{

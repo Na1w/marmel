@@ -490,6 +490,129 @@ pub(crate) fn build_fallback_continuation_request(
     req
 }
 
+/// Output from a resumable streaming LLM turn.
+#[derive(Debug, Clone)]
+pub struct ResumableStreamOutput {
+    pub reply: StreamedReply,
+    pub budget_exceeded: bool,
+    pub rep_triggered: bool,
+    pub was_aborted_by_steer: bool,
+}
+
+/// Drives a resumable streaming chat call against `client`, supporting mid-flight pause,
+/// steering arbitration, and continuation prefill.
+pub async fn chat_stream_resumable<S>(
+    client: &ChatClient,
+    req: &ChatRequest,
+    sink: &mut S,
+    max_tokens: usize,
+    rep_detector: &mut crate::harness::monitor::RepetitionDetector,
+    preserve_thinking: bool,
+    cancellation_token: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<ResumableStreamOutput>
+where
+    S: StreamSink + ?Sized,
+{
+    let mut stream_handler = TurnStreamHandler::with_cancellation(
+        max_tokens,
+        rep_detector,
+        cancellation_token,
+        preserve_thinking,
+    );
+
+    let mut current_req = req.clone();
+    let base_messages = req.messages.clone();
+    let mut all_tool_calls = Vec::new();
+    let mut was_aborted_by_steer = false;
+
+    loop {
+        let reply_res = client
+            .chat_stream(&current_req, |delta| {
+                stream_handler.on_chunk_with_sink(delta, sink)
+            })
+            .await;
+
+        let reply = match reply_res {
+            Ok(r) => r,
+            Err(e) => {
+                if current_req.messages.len() > base_messages.len() {
+                    let fallback_req = build_fallback_continuation_request(
+                        &current_req,
+                        &base_messages,
+                        stream_handler.demux.content(),
+                    );
+                    match client
+                        .chat_stream(&fallback_req, |delta| {
+                            stream_handler.on_chunk_with_sink(delta, sink)
+                        })
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => return Err(e),
+                    }
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+
+        all_tool_calls.extend(reply.tool_calls);
+
+        if let Some(user_input) = stream_handler.take_pause_request() {
+            crate::debug_log::log_stream_pause(
+                &current_req.model,
+                &user_input,
+                stream_handler.tokens_count,
+            );
+            match sink.on_pause(&user_input).await {
+                PauseAction::Resume => {
+                    crate::debug_log::log_stream_resume(
+                        &current_req.model,
+                        stream_handler.demux.content().len(),
+                    );
+                    current_req = build_continuation_request(
+                        &current_req,
+                        &base_messages,
+                        stream_handler.demux.content(),
+                        stream_handler.demux.thinking(),
+                    );
+                    continue;
+                }
+                PauseAction::Abort => {
+                    crate::debug_log::log_stream_abort(
+                        &current_req.model,
+                        "aborted by steer arbitrator during pause",
+                    );
+                    was_aborted_by_steer = true;
+                    break;
+                }
+            }
+        }
+
+        break;
+    }
+
+    stream_handler.finish_with_sink(sink);
+
+    let budget_exceeded = stream_handler.budget_exceeded;
+    let rep_triggered = stream_handler.rep_triggered;
+
+    let final_content = stream_handler.demux.content().to_string();
+    let final_thinking = stream_handler.demux.thinking().to_string();
+
+    Ok(ResumableStreamOutput {
+        reply: StreamedReply {
+            content: final_content,
+            reasoning: final_thinking,
+            raw: String::new(),
+            tool_calls: all_tool_calls,
+        },
+        budget_exceeded,
+        rep_triggered,
+        was_aborted_by_steer,
+    })
+}
+
 pub async fn chat_client_turn<S>(
     client: &ChatClient,
     messages: Vec<Message>,
@@ -518,102 +641,48 @@ where
             cfg.repetition_threshold,
             cfg.min_pattern_len,
         );
-        let mut stream_handler =
-            TurnStreamHandler::for_sink(max_tokens, &mut rep_detector, cfg.preserve_thinking);
 
-        let mut current_req = req.clone();
-        let base_messages = req.messages.clone();
-        let mut all_tool_calls = Vec::new();
-        let mut was_aborted_by_steer = false;
+        let out = chat_stream_resumable(
+            client,
+            &req,
+            sink,
+            max_tokens,
+            &mut rep_detector,
+            cfg.preserve_thinking,
+            None,
+        )
+        .await?;
 
-        loop {
-            let reply_res = client
-                .chat_stream(&current_req, |delta| {
-                    stream_handler.on_chunk_with_sink(delta, sink)
-                })
-                .await;
+        let budget_exceeded = out.budget_exceeded;
+        let rep_triggered = out.rep_triggered;
+        let was_aborted_by_steer = out.was_aborted_by_steer;
 
-            let reply = match reply_res {
-                Ok(r) => r,
-                Err(e) => {
-                    if current_req.messages.len() > base_messages.len() {
-                        let fallback_req = build_fallback_continuation_request(
-                            &current_req,
-                            &base_messages,
-                            stream_handler.demux.content(),
-                        );
-                        match client
-                            .chat_stream(&fallback_req, |delta| {
-                                stream_handler.on_chunk_with_sink(delta, sink)
-                            })
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(_) => return Err(e),
-                        }
-                    } else {
-                        return Err(e);
-                    }
-                }
-            };
+        let mut assistant = Message::Assistant {
+            content: if out.reply.content.is_empty() {
+                None
+            } else {
+                Some(out.reply.content.clone())
+            },
+            reasoning_content: if out.reply.reasoning.is_empty() {
+                None
+            } else {
+                Some(out.reply.reasoning.clone())
+            },
+            tool_calls: out.reply.tool_calls.clone(),
+        };
 
-            all_tool_calls.extend(reply.tool_calls);
-
-            if let Some(user_input) = stream_handler.take_pause_request() {
-                crate::debug_log::log_stream_pause(
-                    &current_req.model,
-                    &user_input,
-                    stream_handler.tokens_count,
-                );
-                match sink.on_pause(&user_input).await {
-                    PauseAction::Resume => {
-                        crate::debug_log::log_stream_resume(
-                            &current_req.model,
-                            stream_handler.demux.content().len(),
-                        );
-                        current_req = build_continuation_request(
-                            &current_req,
-                            &base_messages,
-                            stream_handler.demux.content(),
-                            stream_handler.demux.thinking(),
-                        );
-                        continue;
-                    }
-                    PauseAction::Abort => {
-                        crate::debug_log::log_stream_abort(
-                            &current_req.model,
-                            "aborted by steer arbitrator during pause",
-                        );
-                        was_aborted_by_steer = true;
-                        break;
-                    }
-                }
-            }
-
-            break;
-        }
-
-        stream_handler.finish_with_sink(sink);
-
-        let budget_exceeded = stream_handler.budget_exceeded;
-        let rep_triggered = stream_handler.rep_triggered;
-
-        let mut assistant = stream_handler.into_message();
         if let Message::Assistant {
             tool_calls,
             content,
             ..
         } = &mut assistant
+            && tool_calls.is_empty()
+            && let Some(text) = content
         {
-            tool_calls.extend(all_tool_calls);
-            if tool_calls.is_empty()
-                && let Some(text) = content
-            {
-                let monitor = crate::harness::monitor::HarnessMonitor::with_new_stats();
-                let rescued = monitor.rescue_xml(text);
-                if !rescued.is_empty() {
-                    *tool_calls = rescued;
-                }
+            let monitor = crate::harness::monitor::HarnessMonitor::with_new_stats();
+            let rescued = monitor.rescue_xml(text);
+            if !rescued.is_empty() {
+                *tool_calls = rescued;
             }
         }
 

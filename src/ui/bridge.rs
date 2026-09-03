@@ -57,6 +57,9 @@ pub(crate) fn spawn_steer_arbitration(
             user_message: &msg,
             active_subtasks: &active_subtasks_str,
         };
+        let preempt_handle =
+            crate::orchestrator::preempt_conflicting_stream(client.model(), &msg).await;
+
         let decision = crate::orchestrator::steer::arbitrate_steer_context_stream(
             &client,
             &stats,
@@ -66,6 +69,17 @@ pub(crate) fn spawn_steer_arbitration(
             },
         )
         .await;
+
+        let is_global_abort = matches!(
+            decision.as_ref().map(|d| d.decision.as_str()),
+            Some("AbortImmediately") | Some("RejectPlan")
+        );
+
+        if is_global_abort {
+            preempt_handle.complete_all(PauseAction::Abort);
+        } else {
+            preempt_handle.complete_with_subtask_decision(decision.as_ref());
+        }
 
         let _ = tx.send(SteerArbEvent::Finished {
             decision,

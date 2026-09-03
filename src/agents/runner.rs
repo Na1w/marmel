@@ -330,28 +330,46 @@ pub async fn run_specialist_live(
         };
 
         let max_tokens = mon_cfg.max_stream_tokens.max(256);
-        let mut stream_handler =
-            crate::llm::TurnStreamHandler::new(max_tokens, &mut rep_detector, token);
-        let reply = tokio::select! {
-            res = client.chat_stream(&req, |chunk| stream_handler.on_chunk(chunk)) => {
-                stream_handler.finish();
-                if stream_handler.budget_exceeded {
-                    tracing::warn!(
-                        "{agent_tag}: maximum single-turn output budget of {max_tokens} tokens exceeded — cutting stream"
-                    );
-                    crate::orchestrator::emit_status(format!(
-                        "{agent_tag}: single-turn output budget ({max_tokens} tokens) reached"
-                    ));
+        let mut sink =
+            crate::orchestrator::PreemptibleStreamSink::register(&agent_tag, &specialist_model);
+        let stream_out = crate::llm::chat_stream_resumable(
+            client,
+            &req,
+            &mut sink,
+            max_tokens,
+            &mut rep_detector,
+            false,
+            Some(token),
+        )
+        .await;
+
+        let out = match stream_out {
+            Ok(o) => o,
+            Err(e) => {
+                if token.is_cancelled() {
+                    tracing::warn!("{agent_tag}: aborted during LLM call");
+                    return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
                 }
-                res?
-            },
-            _ = token.cancelled() => {
-                tracing::warn!("{agent_tag}: aborted during LLM call");
-                return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
+                return Err(e);
             }
         };
-        let budget_exceeded = stream_handler.budget_exceeded;
-        let rep_triggered = stream_handler.rep_triggered;
+
+        if out.was_aborted_by_steer || token.is_cancelled() {
+            tracing::warn!("{agent_tag}: aborted during LLM call");
+            return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
+        }
+
+        let reply = out.reply;
+        let budget_exceeded = out.budget_exceeded;
+        let rep_triggered = out.rep_triggered;
+        if budget_exceeded {
+            tracing::warn!(
+                "{agent_tag}: maximum single-turn output budget of {max_tokens} tokens exceeded — cutting stream"
+            );
+            crate::orchestrator::emit_status(format!(
+                "{agent_tag}: single-turn output budget ({max_tokens} tokens) reached"
+            ));
+        }
         update_revision(&mut final_content, &reply.content);
 
         let mut tool_calls = reply.tool_calls.clone();
@@ -653,36 +671,53 @@ pub async fn run_specialist_live(
                         };
 
                         let max_tokens = mon_cfg.max_stream_tokens.max(256);
-                        let mut stream_handler = crate::llm::TurnStreamHandler::new(
+                        let mut sink = crate::orchestrator::PreemptibleStreamSink::register(
+                            &agent_tag,
+                            &specialist_model,
+                        );
+                        let stream_out = crate::llm::chat_stream_resumable(
+                            client,
+                            &req,
+                            &mut sink,
                             max_tokens,
                             &mut rev_rep_detector,
-                            token,
-                        );
-                        let reply = tokio::select! {
-                            res = client.chat_stream(&req, |chunk| stream_handler.on_chunk(chunk)) => match res {
-                                Ok(r) => {
-                                    stream_handler.finish();
-                                    if stream_handler.budget_exceeded {
-                                        tracing::warn!(
-                                            "{agent_tag}: maximum single-turn output budget of {max_tokens} tokens exceeded during revision"
-                                        );
-                                    }
-                                    r
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        "{agent_tag}: LLM chat call error on revision step {rev_turn}: {e:?}"
+                            false,
+                            Some(token),
+                        )
+                        .await;
+
+                        let out = match stream_out {
+                            Ok(o) => o,
+                            Err(e) => {
+                                if token.is_cancelled() {
+                                    tracing::warn!("{agent_tag}: aborted during LLM revision call");
+                                    return Ok(
+                                        "Task aborted by user instruction.\n\nFAILED (aborted)"
+                                            .to_string(),
                                     );
-                                    break;
                                 }
-                            },
-                            _ = token.cancelled() => {
-                                tracing::warn!("{agent_tag}: aborted during LLM revision call");
-                                return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
+                                tracing::error!(
+                                    "{agent_tag}: LLM chat call error on revision step {rev_turn}: {e:?}"
+                                );
+                                break;
                             }
                         };
-                        let budget_exceeded = stream_handler.budget_exceeded;
-                        let rep_triggered = stream_handler.rep_triggered;
+
+                        if out.was_aborted_by_steer || token.is_cancelled() {
+                            tracing::warn!("{agent_tag}: aborted during LLM revision call");
+                            return Ok(
+                                "Task aborted by user instruction.\n\nFAILED (aborted)".to_string()
+                            );
+                        }
+
+                        let reply = out.reply;
+                        let budget_exceeded = out.budget_exceeded;
+                        let rep_triggered = out.rep_triggered;
+                        if budget_exceeded {
+                            tracing::warn!(
+                                "{agent_tag}: maximum single-turn output budget of {max_tokens} tokens exceeded during revision"
+                            );
+                        }
                         if !reply.content.is_empty() {
                             latest_revision = reply.content.clone();
                         }
