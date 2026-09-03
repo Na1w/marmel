@@ -824,6 +824,7 @@ async fn run_specialist_live(
                     });
 
                     let mut latest_revision = String::new();
+                    let mut rev_nudge_count = 0usize;
                     for rev_turn in 0..25 {
                         if token.is_cancelled() {
                             tracing::warn!("{agent_tag}: aborted during revision");
@@ -927,7 +928,7 @@ async fn run_specialist_live(
                         }
 
                         let assistant_msg = crate::types::Message::Assistant {
-                            content: Some(reply.content),
+                            content: Some(reply.content.clone()),
                             reasoning_content: if reply.reasoning.is_empty() {
                                 None
                             } else {
@@ -938,7 +939,8 @@ async fn run_specialist_live(
                         engine.append(assistant_msg);
 
                         if tool_calls.is_empty() {
-                            if budget_exceeded && rev_turn + 1 < 25 {
+                            if budget_exceeded && rev_nudge_count < 3 {
+                                rev_nudge_count += 1;
                                 tracing::warn!(
                                     "{agent_tag}: output budget exceeded during revision — injecting corrective nudge"
                                 );
@@ -949,8 +951,22 @@ async fn run_specialist_live(
                                 });
                                 continue;
                             }
+
+                            let upper = reply.content.to_ascii_uppercase();
+                            let is_terminal = upper.contains("MISSION COMPLETE")
+                                || upper.contains("FAILED")
+                                || upper.contains("REPLAN REQUIRED");
+                            if !is_terminal && rev_nudge_count < 3 {
+                                rev_nudge_count += 1;
+                                engine.append(crate::types::Message::User {
+                                    content: "SYSTEM NOTICE: You did not call any tools to address the validator critique or output MISSION COMPLETE. Please use your tools (such as `read_file`, `write_file`, `replace`, `run_command`, etc.) to apply the necessary fixes, verify with tests, and conclude with 'MISSION COMPLETE'.".to_string(),
+                                });
+                                continue;
+                            }
                             break;
                         }
+
+                        rev_nudge_count = 0;
 
                         for tc in tool_calls {
                             let args_val =
@@ -991,9 +1007,10 @@ async fn run_specialist_live(
                                         name: tc.function.name.clone(),
                                         arguments: args_val,
                                     };
-                                    let tool_res = crate::harness::dispatch_for(
+                                    let tool_res = crate::harness::dispatch_for_with_engine(
                                         &invocation,
                                         crate::harness::ToolCaller::Specialist(agent),
+                                        Some(&mut engine),
                                     );
                                     match tool_res {
                                         Ok(r) => {
@@ -1018,6 +1035,13 @@ async fn run_specialist_live(
                                 tool_call_id: tc.id,
                                 content,
                             });
+                            if engine.should_compact() {
+                                engine.compact();
+                            }
+                            crate::orchestrator::update_active_worker_context(
+                                &_active_guard.0,
+                                engine.token_count(),
+                            );
                         }
                     }
                     if !latest_revision.is_empty() {
