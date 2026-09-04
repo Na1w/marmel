@@ -222,6 +222,23 @@ pub(crate) fn str_arg<'a>(args: &'a Value, key: &str, tool: &str) -> Result<&'a 
             {
                 return Ok(v);
             }
+            // Heuristic fallback for write_file if LLM put "saved to `path`" in content
+            if tool == TOOL_WRITE_FILE
+                && let Some(content) = args.get("content").and_then(Value::as_str)
+                && let Some(idx) = content.find("saved to `")
+            {
+                let sub = &content[idx + 10..];
+                if let Some(end) = sub.find('`') {
+                    let candidate = sub[..end].trim();
+                    if !candidate.is_empty() && (candidate.contains('/') || candidate.contains('.'))
+                    {
+                        tracing::info!(
+                            "write_file: inferred missing `path` ('{candidate}') from content text"
+                        );
+                        return Ok(candidate);
+                    }
+                }
+            }
         }
         "content" => {
             if let Some(v) = args
@@ -288,7 +305,12 @@ pub(crate) fn str_arg<'a>(args: &'a Value, key: &str, tool: &str) -> Result<&'a 
     }
     Err(ToolError::BadArguments {
         tool: tool.into(),
-        detail: format!("missing string field `{key}`"),
+        detail: match key {
+            "path" if tool == TOOL_WRITE_FILE => {
+                "missing string field `path`. Specify the target file path in the tool arguments, e.g. {\"path\": \"docs/report.md\", \"content\": \"...\"}".to_string()
+            }
+            _ => format!("missing string field `{key}`"),
+        },
     })
 }
 

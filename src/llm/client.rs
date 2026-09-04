@@ -385,8 +385,9 @@ impl ChatClient {
 
         let tool_calls = map_to_tool_calls(tool_calls_map);
         tracing::info!(
-            "LLM reply completed: {} content chars, {} tool calls",
+            "LLM reply completed: {} content chars, {} reasoning chars, {} tool calls",
             content.len(),
+            reasoning.len(),
             tool_calls.len()
         );
         for tc in &tool_calls {

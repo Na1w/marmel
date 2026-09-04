@@ -69,10 +69,11 @@ pub(crate) async fn try_run_specialist_live(
         .and_then(|sc| sc.model.as_ref())
         .unwrap_or(&cfg.model);
     let client = crate::llm::ChatClient::new_with_token(backend_url, model, auth_token);
-    let res = run_specialist_live(&client, agent, ctx, &cfg, token)
-        .await
-        .ok()?;
-    (!res.trim().is_empty()).then_some(res)
+    let res = match run_specialist_live(&client, agent, ctx, &cfg, token).await {
+        Ok(s) => s,
+        Err(e) => format!("Specialist execution failed: {e}\n\nFAILED"),
+    };
+    Some(res)
 }
 
 pub(crate) fn format_tool_args_preview(tool: &str, args: &serde_json::Value) -> String {
@@ -380,8 +381,13 @@ pub async fn run_specialist_live(
             }
         }
 
+        let assistant_content = if reply.content.is_empty() && !reply.reasoning.is_empty() {
+            Some("[Thinking completed without content or tool calls]".to_string())
+        } else {
+            Some(reply.content.clone())
+        };
         let assistant_msg = crate::types::Message::Assistant {
-            content: Some(reply.content.clone()),
+            content: assistant_content,
             reasoning_content: if reply.reasoning.is_empty() {
                 None
             } else {
@@ -455,9 +461,14 @@ pub async fn run_specialist_live(
             if !is_terminal {
                 if nudge_count < 2 {
                     nudge_count += 1;
-                    engine.append(crate::types::Message::User {
-                        content: "SYSTEM NOTICE: You did not call any tools or output MISSION COMPLETE. Do not output conversational prose. Immediately use your tools (such as `read_file`, `write_file`, `replace`, `run_command`, etc.) to perform the required work, create/update any requested files in the workspace, and conclude with 'MISSION COMPLETE'.".to_string(),
-                    });
+                    let nudge_msg = if reply.content.trim().is_empty()
+                        && !reply.reasoning.is_empty()
+                    {
+                        "SYSTEM NOTICE: Your thoughts completed but you produced 0 output text and 0 tool calls. Do not remain silent in thoughts. You MUST execute your required tools (such as `read_file`, `write_file`, `replace`, `run_command`, etc.) to write files to disk and perform the task, or conclude with 'MISSION COMPLETE'.".to_string()
+                    } else {
+                        "SYSTEM NOTICE: You did not call any tools or output MISSION COMPLETE. Do not output conversational prose. Immediately use your tools (such as `read_file`, `write_file`, `replace`, `run_command`, etc.) to perform the required work, create/update any requested files in the workspace, and conclude with 'MISSION COMPLETE'.".to_string()
+                    };
+                    engine.append(crate::types::Message::User { content: nudge_msg });
                     continue;
                 } else {
                     tracing::warn!(
@@ -923,6 +934,10 @@ pub async fn run_specialist_live(
         );
         Ok(assembled)
     } else {
-        Ok(String::new())
+        Ok(assemble_final_deliverable(
+            false,
+            Some("Specialist produced no output deliverable or tool executions"),
+            &final_content,
+        ))
     }
 }

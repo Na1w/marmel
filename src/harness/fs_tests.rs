@@ -215,3 +215,31 @@ fn test_harness_path_confinement_sandbox() {
         other => panic!("expected ToolError::Forbidden, got {other:?}"),
     }
 }
+
+#[test]
+fn test_harness_write_file_path_inference_and_error() {
+    let dir = temp_dir();
+    let target = dir.join("test_inferred.md");
+
+    // 1. When path is omitted but content mentions `saved to \`path\``
+    let args_inferred = serde_json::json!({
+        "content": format!("# Report\n\nsaved to `{}`\nDone.", target.to_string_lossy()),
+    });
+    let res = write_file(&args_inferred).expect("inferred path write succeeds");
+    assert!(!res.is_error);
+    assert!(target.exists());
+
+    // 2. When path is completely missing and no heuristic matches
+    let args_missing = serde_json::json!({
+        "content": "Just content with no file hint",
+    });
+    let err = write_file(&args_missing).expect_err("missing path should fail");
+    match err {
+        ToolError::BadArguments { detail, .. } => {
+            assert!(detail.contains("Specify the target file path"));
+        }
+        other => panic!("expected BadArguments, got {other:?}"),
+    }
+
+    fs::remove_dir_all(&dir).unwrap();
+}
