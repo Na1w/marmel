@@ -28,10 +28,12 @@ Marmel is a Rust-based CLI that connects to an OpenAI-compatible chat-completion
 - **Five specialist roles** with per-role tool allowlists — `coder`, `researcher`, `debugger`, `validator`, and `generalist`.
 - **Automated validation loop** — specialist deliverables are automatically audited by a Validator subagent; rejected work is fed back for revision (up to 5 iterations by default).
 - **Multi-tier resilience harness** — XML tool-call rescue, semantic tool repetition detection, and text loop breaking (consecutive lines, line bigrams, word 4-grams) with live SSE stream interruption and automatic retry.
-- **Context engine** — `cl100k_base` BPE token counting, KV-cache prefix preservation, automatic compaction, and forced `rebirth` collapse.
+- **Context engine with proactive rebirth & compaction** — `cl100k_base` BPE token counting, KV-cache prefix preservation, proactive rebirth advisory at 80% budget with state preservation instructions (offsets, files, data), forced compaction at 90%, and universal `rebirth` tool availability across all agents and validators.
+- **Stream preemption & cooperative pause/resume** — mid-flight user steering and queries can pause/preempt active specialist LLM streams on shared local backends without losing state, servicing arbitration before resuming.
+- **Extended prefill watchdog** — 300s (5-minute) timeout window accommodating slow prefill on long-context local models (e.g. Gemma 4, Llama 3, DeepSeek) without premature aborts.
 - **LLM streaming client** — SSE streaming with retry/backoff, watchdog timeouts, and `[thinking]` tag demuxing.
 - **Steer Arbitrator** — real-time user steering mid-flight (respond, abort, queue, forward, approve/reject plan, or delegate) with human-readable duration formatting (minutes and seconds).
-- **Deep-Freeze crash recovery** — in-flight delegations are snapshotted and journaled so crashes can be recovered and rehydrated seamlessly.
+- **Deep-Freeze crash recovery & full UI rehydration** — in-flight delegations are snapshotted and journaled; sessions resume seamlessly with full restoration of chat history, execution plans, and past specialist subagent deliverables in the TUI Agent pane.
 - **MCP (Model Context Protocol) client** — JSON-RPC 2.0 over stdio and SSE/HTTP, with tool discovery and execution.
 - **Two UI modes** — an interactive 3-panel Ratatui TUI (with subagent auto-focus, scroll clamping, and full horizontal cursor navigation) and a headless raw streaming mode.
 - **Live session token accounting** — global atomic tracking of cumulative input and output tokens across Manager turns, specialist subagents, validators, and arbitrators with auto-scaled metrics in the status bar.
@@ -410,18 +412,29 @@ Specialist deliverables are automatically audited by a Validator subagent. Rejec
 - **Empty-production nudge** — up to 3 attempts.
 - **One-turn recovery** — adjusts `enable_thinking`, `frequency_penalty`, and `temperature` on failure.
 
+### Stream preemption & interactive pause/resume
+
+When running against local models on resource-constrained backends (such as a single GPU running Ollama or vLLM), concurrent generation can cause latency or memory contention. Marmel solves this with **cooperative stream preemption and pause/resume**:
+- Mid-flight steering commands and user queries pause the active specialist stream cleanly without discarding progress.
+- The Steer Arbitrator handles the user interaction immediately (answering questions, redirecting the plan, or queueing instructions).
+- Once the steering turn completes, the specialist stream resumes smoothly from its last checkpoint.
+
 ### Context engine
 
 - `cl100k_base` BPE token counting via `tiktoken-rs`.
 - KV-cache prefix preservation (system prompt locked at `messages[0]`, goal at `[1]`).
-- Automatic compaction at >90% budget targeting 70%.
-- Forced `rebirth` collapse to exactly 4 messages.
+- **Proactive rebirth advisory at 80%:** Generates an advisory notification instructing the model to invoke `rebirth` with summarized continuation state (active file paths, exact read line numbers or byte offsets, intermediate data) before forced compaction occurs.
+- **Universal rebirth availability:** The `rebirth` tool is available to all roles, including the Validator, enabling clean state resets across the entire hierarchy.
+- **Forced compaction at 90%:** Escalates from 70% to 50% target ratios on compaction retries, pruning orphaned tool calls while strictly pinning system and goal messages.
+- **Slow-prefill watchdog (300s):** Provides a 5-minute timeout window accommodating slow prefill on long-context local models (e.g. Gemma 4, DeepSeek, Llama 3) without premature aborts.
 
-### Deep-Freeze crash recovery & plan resumption
+### Deep-Freeze crash recovery & full UI rehydration
 
 - **In-flight checkpointing:** Active delegations are snapshotted to `.marmel/.session_frozen.json` with an append-only journal at `.marmel/.session_journal.json`.
-- **Startup rehydration:** On boot, `recover_frozen()` runs immediately to complete or fail interrupted tasks.
+- **Startup recovery:** On boot, `recover_frozen()` runs immediately to complete or fail interrupted tasks.
 - **Plan persistence:** If `.marmel/execution_plan.md` exists on disk with pending tasks, the Manager automatically resumes execution from the next unchecked item.
+- **Full Agent Pane Rehydration:** Reconstitutes historical specialist subagents, deliverables, task briefs, and execution logs from `.marmel/transcript.json`, `.session_journal.json`, and the execution plan into the TUI Specialist Subagents pane, automatically making it visible upon resumption.
+- **Clean Chat History:** Rehydrated chat logs summarize past delegations concisely (`[Tool Result] MISSION COMPLETE (...)`), keeping verbose deliverables accessible in the Subagents pane rather than cluttering the chat stream.
 
 ---
 
@@ -446,7 +459,7 @@ Marmel is continuously built and tested across all supported target platforms vi
 Every commit and pull request runs:
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo test --all-targets --all-features` (262 unit & integration tests)
+- `cargo test --all-targets --all-features` (280+ unit & integration tests)
 - `cargo build --release` (optimized binary verification)
 
 ---
