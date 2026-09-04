@@ -41,7 +41,7 @@ pub const SLOW_PREFILL_THRESHOLD_SECS: u64 = 300;
 const MIN_TURNS_AFTER_REBIRTH: u64 = 5;
 
 /// The exact `SYSTEM: CONTEXT BUDGET ADVISORY` message injected when context reaches 80% of budget.
-pub const REBIRTH_ADVISORY_MESSAGE: &str = "(SYSTEM: CONTEXT BUDGET ADVISORY. You have reached 80% of your context budget. You should summarize your progress, key findings, and immediate next steps, then invoke the 'rebirth' tool with your summary before forced context compaction occurs.)";
+pub const REBIRTH_ADVISORY_MESSAGE: &str = "(SYSTEM: CONTEXT BUDGET ADVISORY. You have reached 80% of your context budget. You should summarize your progress, key findings, and immediate next steps, then invoke the 'rebirth' tool with your summary before forced context compaction occurs. IMPORTANT: To prevent repeating work, your summary MUST preserve all vital operational state—such as active file paths, exact line numbers or byte offsets reached (e.g. in read_file), intermediate discoveries, and precise next steps so you resume seamlessly without starting over from the beginning.)";
 
 /// Compaction retry cap: compaction is attempted at most twice (`< 2`),
 /// mirroring caesar's `compaction_retry_count < 2` gate (orchestrator.rs:982).
@@ -55,7 +55,7 @@ const COMPACTION_RETRY2_RATIO: f64 = 0.50;
 const COMPACTION_OVER_LIMIT_TARGET_RATIO: f64 = 0.80;
 /// The exact `SYSTEM: CONTEXT LIMIT EXCEEDED` user-message injection emitted
 /// after a successful forced compaction (caesar orchestrator.rs:1002).
-pub const CONTEXT_LIMIT_EXCEEDED_MESSAGE: &str = "(SYSTEM: CONTEXT LIMIT EXCEEDED. Your context window overflowed. The proxy had to FORCIBLY compact your history by pruning older messages and tool results. You MUST immediately summarize your progress and invoke the 'rebirth' tool with your summary to reset your memory properly.)";
+pub const CONTEXT_LIMIT_EXCEEDED_MESSAGE: &str = "(SYSTEM: CONTEXT LIMIT EXCEEDED. Your context window overflowed. The proxy had to FORCIBLY compact your history by pruning older messages and tool results. You MUST immediately summarize your progress and invoke the 'rebirth' tool with your summary to reset your memory properly. IMPORTANT: In your summary, preserve all vital continuation state—including files inspected, current read offsets/line numbers, intermediate data, and immediate next steps—to avoid restarting already completed work.)";
 
 /// BPE tokenizer singleton (cl100k_base).
 fn bpe() -> &'static tiktoken_rs::CoreBPE {

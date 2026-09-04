@@ -68,7 +68,7 @@ pub(crate) async fn run_automated_validation(
          Instructions:\n\
          1. Inspect the workspace, verify files, compile, and run tests as needed using available tools.\n\
          2. When your verification is complete, you MUST call the `leave_verdict` tool with `verdict` ('APPROVED' or 'REJECTED') and detailed `comments`.\n\
-         3. If advised or when context usage is high (>= 80%), call the `rebirth` tool with your intermediate findings to preserve context.",
+         3. If advised or when context usage is high (>= 80%), call the `rebirth` tool with your intermediate findings, tested files, and current offsets/line numbers to preserve continuity without restarting.",
         task_brief, deliverable
     );
 

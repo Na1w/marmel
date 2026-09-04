@@ -309,12 +309,15 @@ impl ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
                 name: "rebirth".to_string(),
-                description: "Compact conversation history into a structured checkpoint summary to preserve context budget."
+                description: "Compact conversation history into a structured checkpoint summary to preserve context budget. CRITICAL: Your summary MUST record all pertinent state in detail so you can seamlessly continue without starting over—including active file paths, exact line numbers or byte offsets reached (e.g. when reading files with offset/limit in `read_file`), intermediate discoveries, variables, and immediate next actions."
                     .to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "summary": { "type": "string", "description": "Structured summary of accomplishments and current state." }
+                        "summary": {
+                            "type": "string",
+                            "description": "Comprehensive structured checkpoint. Record all accomplishments, intermediate findings, and vital operational state (e.g. active file paths, exact line numbers or byte offsets reached when reading/analyzing files, and immediate next steps so execution resumes without restarting from scratch)."
+                        }
                     },
                     "required": ["summary"]
                 }),

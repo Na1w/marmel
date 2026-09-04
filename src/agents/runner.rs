@@ -250,7 +250,7 @@ pub async fn run_specialist_live(
     let env_block = crate::prompts::format_environment_block();
 
     let enhanced_system_prompt = format!(
-        "{}\n\n{}\n- Tools available: `write_file`, `replace`, `read_file`, `run_command`, `grep_search`, `glob`, `rebirth`.\n- You MUST save files and execute real work to complete the task.",
+        "{}\n\n{}\n- Tools available: `write_file`, `replace`, `read_file`, `run_command`, `grep_search`, `glob`, `rebirth`.\n- You MUST save files and execute real work to complete the task.\n- Context Preservation: If context usage is high (>= 80%) or advised, call `rebirth` with a detailed summary capturing all pertinent state (including active file paths, current read offsets or line numbers reached in `read_file`, intermediate findings, and next actions) so work resumes seamlessly without starting over.",
         ctx.role_system_prompt, env_block
     );
 

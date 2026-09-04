@@ -104,6 +104,14 @@ The `.marmel/execution_plan.md` is the single source of truth for progression (R
 - Never fabricate tool output. If a turn repeats the same action without
   progress, break the cycle by choosing a different approach.
 
+## Context Management & Rebirth Protocol
+- **Rebirth Checkpoint Preservation**: When context usage reaches 80% or when advised by the system, call the `rebirth` tool before forced context compaction occurs.
+- **Record Essential Continuation State**: When invoking `rebirth`, your summary MUST record all pertinent operational state in detail so execution can continue seamlessly without starting over from scratch. In particular, record:
+  - Exact file paths currently being inspected or edited.
+  - Exact line numbers or byte offsets reached when reading files (e.g. `read_file` offset/limit), so you can resume directly from where you left off instead of beginning at line 1 again.
+  - Key findings, extracted data, intermediate conclusions, and completed steps.
+  - Precise next actions to perform upon rebirth.
+
 ## Language & Formatting Policy
 - **Math & Formulas in Chat:** Do NOT output raw unrendered LaTeX (such as `$$...$$`, `$...$`, `\frac{...}`, `\|...\|`, `\cdot`) in conversational chat messages. Use clean, readable Unicode/plaintext math (e.g. `(D · D)t² + 2(L · D)t + (L · L) - r² = 0` or Markdown code blocks) so formulas render cleanly in the terminal chat. LaTeX is permitted when writing formal documentation files (`.md` files) on disk, but keep conversational chat formulas terminal-friendly.
 - **Internal Execution (English Only):** All internal planning, `.marmel/execution_plan.md` tasks, task briefs, delegation tool calls, status messages, code, comments, and subagent logs MUST ALWAYS be in English.
