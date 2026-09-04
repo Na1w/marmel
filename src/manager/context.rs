@@ -29,14 +29,19 @@ use crate::types::Message;
 /// (REQ-CORE-004).
 pub const REBIRTH_CHECKPOINT_PREFIX: &str = "(SYSTEM: REBIRTH CHECKPOINT. The previous turn-by-turn history has been compacted. Summarized progress: ";
 
+/// Rebirth advisory trigger ratio (80% of budget).
+pub const REBIRTH_ADVISORY_TRIGGER_RATIO: f64 = 0.80;
 /// Compaction trigger ratio (90% of budget).
-const COMPACTION_TRIGGER_RATIO: f64 = 0.90;
+pub const COMPACTION_TRIGGER_RATIO: f64 = 0.90;
 /// Compaction target ratio (70% of budget).
-const COMPACTION_TARGET_RATIO: f64 = 0.70;
+pub const COMPACTION_TARGET_RATIO: f64 = 0.70;
 /// Slow-prefill threshold in seconds (REQ-CORE-005).
 pub const SLOW_PREFILL_THRESHOLD_SECS: u64 = 300;
 /// Minimum recovery turns before a slow-prefill warning is emitted.
 const MIN_TURNS_AFTER_REBIRTH: u64 = 5;
+
+/// The exact `SYSTEM: CONTEXT BUDGET ADVISORY` message injected when context reaches 80% of budget.
+pub const REBIRTH_ADVISORY_MESSAGE: &str = "(SYSTEM: CONTEXT BUDGET ADVISORY. You have reached 80% of your context budget. You should summarize your progress, key findings, and immediate next steps, then invoke the 'rebirth' tool with your summary before forced context compaction occurs.)";
 
 /// Compaction retry cap: compaction is attempted at most twice (`< 2`),
 /// mirroring caesar's `compaction_retry_count < 2` gate (orchestrator.rs:982).
@@ -92,6 +97,11 @@ fn message_tokens(enc: &tiktoken_rs::CoreBPE, m: &Message) -> usize {
         }
         Message::Tool { content, .. } => enc.encode_ordinary(content).len(),
     }
+}
+
+/// The token count above which a rebirth advisory should be emitted (80% of the budget).
+pub fn rebirth_advisory_threshold(max_context_tokens: usize) -> usize {
+    (max_context_tokens as f64 * REBIRTH_ADVISORY_TRIGGER_RATIO).round() as usize
 }
 
 /// The token count above which compaction is triggered (90% of the budget).
@@ -211,6 +221,8 @@ pub struct ContextEngine {
     /// `compaction_retry_count < 2` gate. Reset to 0 on a successful backend
     /// response.
     compaction_retry_count: u32,
+    /// Whether a rebirth advisory has already been emitted for the current context window.
+    rebirth_advisory_emitted: bool,
 }
 
 impl ContextEngine {
@@ -221,6 +233,7 @@ impl ContextEngine {
             stats: None,
             prefill: SlowPrefillTracker::new(),
             compaction_retry_count: 0,
+            rebirth_advisory_emitted: false,
         }
     }
 
@@ -290,6 +303,31 @@ impl ContextEngine {
         self.token_count() > compaction_threshold(self.max_context_tokens)
     }
 
+    /// Whether a rebirth advisory should be emitted right now (> 80% of budget and not yet emitted).
+    pub fn should_advise_rebirth(&self) -> bool {
+        !self.rebirth_advisory_emitted
+            && self.token_count() > rebirth_advisory_threshold(self.max_context_tokens)
+    }
+
+    /// Inject the `SYSTEM: CONTEXT BUDGET ADVISORY` user message instructing the
+    /// agent to summarize and invoke `rebirth`.
+    pub fn inject_rebirth_advisory(&mut self) {
+        self.rebirth_advisory_emitted = true;
+        self.messages.push(Message::User {
+            content: REBIRTH_ADVISORY_MESSAGE.to_string(),
+        });
+    }
+
+    /// Reset the rebirth advisory emitted flag.
+    pub fn reset_rebirth_advisory(&mut self) {
+        self.rebirth_advisory_emitted = false;
+    }
+
+    /// Whether a rebirth advisory has already been emitted for this context generation.
+    pub fn rebirth_advisory_emitted(&self) -> bool {
+        self.rebirth_advisory_emitted
+    }
+
     /// Compact the transcript down to ~70% of the budget (REQ-CORE-003).
     ///
     /// Always keeps `messages[0]` (System) and `messages[1]` (Goal). The most
@@ -328,6 +366,10 @@ impl ContextEngine {
         tracing::info!(
             "Context compaction executed (automatic): {initial_tokens} tokens ({initial_msgs} msgs) -> {final_tokens} tokens ({final_msgs} msgs, target budget: {target})"
         );
+
+        if self.token_count() <= rebirth_advisory_threshold(self.max_context_tokens) {
+            self.rebirth_advisory_emitted = false;
+        }
 
         if let Some(stats) = &self.stats {
             stats.record_compaction();
@@ -390,6 +432,9 @@ impl ContextEngine {
             );
             if let Some(stats) = &self.stats {
                 stats.record_compaction();
+            }
+            if self.token_count() <= rebirth_advisory_threshold(self.max_context_tokens) {
+                self.rebirth_advisory_emitted = false;
             }
             self.inject_context_limit_exceeded();
         }
@@ -506,6 +551,7 @@ impl ContextEngine {
             "Context compaction executed (rebirth): {initial_tokens} tokens ({initial_msgs} msgs) -> {final_tokens} tokens ({final_msgs} msgs), summary: {summary}"
         );
 
+        self.rebirth_advisory_emitted = false;
         if let Some(stats) = &self.stats {
             stats.record_rebirth();
         }

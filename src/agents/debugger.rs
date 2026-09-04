@@ -38,6 +38,7 @@ impl Specialist for Debugger {
             "pty_list",
             "pty__*",
             "pty_*",
+            "rebirth",
         ]
     }
 }
@@ -51,6 +52,7 @@ mod tests {
         let d = Debugger;
         assert_eq!(d.name(), Agent::Debugger);
         assert!(d.tool_namespaces().contains(&"run_command"));
+        assert!(d.tool_namespaces().contains(&"rebirth"));
         assert!(!d.may_recurse());
     }
 }

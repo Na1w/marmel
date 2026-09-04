@@ -32,6 +32,7 @@ impl Specialist for Researcher {
             "run_command",
             "grep_search",
             "glob",
+            "rebirth",
         ]
     }
 }
@@ -45,6 +46,7 @@ mod tests {
         let r = Researcher;
         assert_eq!(r.name(), Agent::Researcher);
         assert!(r.tool_namespaces().contains(&"read_file"));
+        assert!(r.tool_namespaces().contains(&"rebirth"));
         assert!(!r.may_recurse());
     }
 }

@@ -246,7 +246,7 @@ pub async fn run_specialist_live(
     let env_block = crate::prompts::format_environment_block();
 
     let enhanced_system_prompt = format!(
-        "{}\n\n{}\n- Tools available: `write_file`, `replace`, `read_file`, `run_command`, `grep_search`, `glob`.\n- You MUST save files and execute real work to complete the task.",
+        "{}\n\n{}\n- Tools available: `write_file`, `replace`, `read_file`, `run_command`, `grep_search`, `glob`, `rebirth`.\n- You MUST save files and execute real work to complete the task.",
         ctx.role_system_prompt, env_block
     );
 
@@ -538,12 +538,18 @@ pub async fn run_specialist_live(
                     }
                 }
             };
-            engine.append(crate::types::Message::Tool {
-                tool_call_id: tc.id,
-                content,
-            });
+            let is_rebirth = tc.function.name == crate::tool_names::TOOL_REBIRTH;
+            let execution_succeeded = !content.starts_with("ERROR:");
+            if !is_rebirth || !execution_succeeded {
+                engine.append(crate::types::Message::Tool {
+                    tool_call_id: tc.id,
+                    content,
+                });
+            }
             if engine.should_compact() {
                 engine.compact();
+            } else if engine.should_advise_rebirth() {
+                engine.inject_rebirth_advisory();
             }
             crate::orchestrator::update_active_worker_context(
                 &_active_guard.0,
@@ -880,12 +886,18 @@ pub async fn run_specialist_live(
                                     }
                                 }
                             };
-                            engine.append(crate::types::Message::Tool {
-                                tool_call_id: tc.id,
-                                content,
-                            });
+                            let is_rebirth = tc.function.name == crate::tool_names::TOOL_REBIRTH;
+                            let execution_succeeded = !content.starts_with("ERROR:");
+                            if !is_rebirth || !execution_succeeded {
+                                engine.append(crate::types::Message::Tool {
+                                    tool_call_id: tc.id,
+                                    content,
+                                });
+                            }
                             if engine.should_compact() {
                                 engine.compact();
+                            } else if engine.should_advise_rebirth() {
+                                engine.inject_rebirth_advisory();
                             }
                             crate::orchestrator::update_active_worker_context(
                                 &_active_guard.0,

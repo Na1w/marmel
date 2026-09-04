@@ -154,6 +154,17 @@ pub async fn run_session(
                 ctx.append(Message::User { content: steer });
             }
 
+            if ctx.should_compact() {
+                ctx.compact();
+                renderer.on_event(&Event::TokensIn(ctx.token_count()));
+                renderer.on_event(&Event::Status("context compacted".to_string()));
+            } else if ctx.should_advise_rebirth() {
+                ctx.inject_rebirth_advisory();
+                renderer.on_event(&Event::Status(
+                    "context advisory: rebirth recommended (>= 80% budget)".to_string(),
+                ));
+            }
+
             renderer.on_event(&Event::TokensIn(ctx.token_count()));
             renderer.on_event(&Event::Status(format!("Running ({})", stream_cfg.model)));
             renderer.flush()?;
@@ -223,6 +234,11 @@ pub async fn run_session(
                 ctx.compact();
                 renderer.on_event(&Event::TokensIn(ctx.token_count()));
                 renderer.on_event(&Event::Status("context compacted".to_string()));
+            } else if ctx.should_advise_rebirth() {
+                ctx.inject_rebirth_advisory();
+                renderer.on_event(&Event::Status(
+                    "context advisory: rebirth recommended (>= 80% budget)".to_string(),
+                ));
             }
 
             for steer in steer_queue.drain(..) {
@@ -487,6 +503,31 @@ pub async fn run_session(
                     renderer.flush()?;
 
                     drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
+
+                    if name == crate::tool_names::TOOL_REBIRTH {
+                        renderer
+                            .on_event(&Event::ToolCall(format_tool_call_display(&name, &args_val)));
+                        renderer.flush()?;
+                        let res = crate::harness::handle_rebirth(&mut ctx, &args_val);
+                        match res {
+                            Ok(r) => {
+                                renderer.on_event(&Event::ToolResult(r.content));
+                                renderer.on_event(&Event::TokensIn(ctx.token_count()));
+                                renderer.on_event(&Event::Status(
+                                    "rebirth checkpoint applied".to_string(),
+                                ));
+                            }
+                            Err(e) => {
+                                renderer.on_event(&Event::ToolResult(format!("ERROR: {e}")));
+                                ctx.append(Message::Tool {
+                                    tool_call_id: call.id,
+                                    content: format!("ERROR: {e}"),
+                                });
+                            }
+                        }
+                        renderer.flush()?;
+                        continue;
+                    }
 
                     let invocation = crate::harness::ToolInvocation {
                         name: name.clone(),

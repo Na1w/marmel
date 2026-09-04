@@ -620,3 +620,114 @@ fn test_slow_prefill_fast_prefill_resets_consecutive_count() {
         "second consecutive slow after reset must emit"
     );
 }
+
+#[test]
+fn test_rebirth_advisory_at_80_percent_and_compaction_at_90_percent() {
+    let budget = 300;
+    let mut engine = ContextEngine::new(budget);
+    engine.set_system_prompt("You are a helpful coding assistant.".to_string());
+    engine.set_goal("Refactor parser.".to_string());
+
+    let advisory_thresh = rebirth_advisory_threshold(budget); // 240
+    let compact_thresh = compaction_threshold(budget); // 270
+
+    assert!(!engine.should_advise_rebirth());
+    assert!(!engine.should_compact());
+
+    // Fill until token count is between 80% (240) and 90% (270).
+    while engine.token_count() <= advisory_thresh {
+        engine.append(Message::User {
+            content: "Step in the plan with some text to consume tokens.".to_string(),
+        });
+        engine.append(Message::Assistant {
+            content: Some("Working on this step now.".to_string()),
+            reasoning_content: None,
+            tool_calls: vec![],
+        });
+    }
+
+    assert!(engine.token_count() > advisory_thresh);
+    if engine.token_count() <= compact_thresh {
+        assert!(
+            engine.should_advise_rebirth(),
+            "should advise rebirth at > 80%"
+        );
+        assert!(!engine.should_compact(), "should not compact yet at <= 90%");
+
+        engine.inject_rebirth_advisory();
+        assert!(engine.rebirth_advisory_emitted());
+        assert!(
+            !engine.should_advise_rebirth(),
+            "should not advise repeatedly"
+        );
+        assert_eq!(
+            engine.messages().last().unwrap().content().unwrap(),
+            REBIRTH_ADVISORY_MESSAGE
+        );
+    }
+
+    // Now fill further until token count exceeds 90%
+    while engine.token_count() <= compact_thresh {
+        engine.append(Message::User {
+            content: "Additional instruction with more words to push tokens over 90% threshold."
+                .to_string(),
+        });
+        engine.append(Message::Assistant {
+            content: Some("Understood, proceeding further.".to_string()),
+            reasoning_content: None,
+            tool_calls: vec![],
+        });
+    }
+
+    assert!(
+        engine.should_compact(),
+        "should trigger compaction above 90%"
+    );
+    engine.compact();
+    assert!(!engine.should_compact(), "should be compacted back down");
+    assert!(
+        engine.token_count() <= compaction_target(budget),
+        "compact targets 70% budget"
+    );
+    assert!(
+        !engine.rebirth_advisory_emitted(),
+        "advisory emitted flag should reset after compaction back below 80%"
+    );
+}
+
+#[test]
+fn test_rebirth_advisory_reset_on_perform_rebirth() {
+    let budget = 300;
+    let mut engine = ContextEngine::new(budget);
+    engine.set_system_prompt("System prompt.".to_string());
+    engine.set_goal("User goal.".to_string());
+
+    let advisory_thresh = rebirth_advisory_threshold(budget);
+    while engine.token_count() <= advisory_thresh {
+        engine.append(Message::User {
+            content: "More work to consume tokens.".to_string(),
+        });
+        engine.append(Message::Assistant {
+            content: Some("Response to work.".to_string()),
+            reasoning_content: None,
+            tool_calls: vec![],
+        });
+    }
+
+    assert!(engine.token_count() > advisory_thresh);
+    assert!(engine.should_advise_rebirth());
+    engine.inject_rebirth_advisory();
+    assert!(engine.rebirth_advisory_emitted());
+
+    // Agent executes rebirth
+    engine.perform_rebirth("Finished preliminary tasks, ready for next phase.");
+    assert_eq!(engine.messages().len(), 4);
+    assert!(
+        !engine.rebirth_advisory_emitted(),
+        "rebirth resets advisory emitted flag"
+    );
+    assert!(
+        !engine.should_advise_rebirth(),
+        "collapsed context is well below 80%"
+    );
+}

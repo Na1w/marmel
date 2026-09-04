@@ -32,6 +32,7 @@ impl Specialist for Coder {
             "run_command",
             "grep_search",
             "glob",
+            "rebirth",
         ]
     }
 
@@ -51,6 +52,7 @@ mod tests {
         let c = Coder;
         assert_eq!(c.name(), Agent::Coder);
         assert!(c.tool_namespaces().contains(&"write_file"));
+        assert!(c.tool_namespaces().contains(&"rebirth"));
         assert!(c.may_recurse());
     }
 }

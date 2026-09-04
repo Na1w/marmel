@@ -7,8 +7,8 @@ use futures_util::StreamExt;
 use std::time::Duration;
 use thiserror::Error;
 
-/// First SSE event must arrive within this window or the request fails.
-pub const INITIAL_RESPONSE_WATCHDOG_SECS: u64 = 180;
+/// First SSE event must arrive within this window or the request fails (5 minutes for long prefill).
+pub const INITIAL_RESPONSE_WATCHDOG_SECS: u64 = 300;
 /// Maximum silent pause allowed between stream chunks once streaming has started.
 pub const INTER_CHUNK_WATCHDOG_SECS: u64 = 60;
 /// Upper bound on the entire streaming read (20 minutes safety watchdog for up to 32k tokens).

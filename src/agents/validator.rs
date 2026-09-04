@@ -44,6 +44,7 @@ impl Specialist for Validator {
             "grep_search",
             "glob",
             "leave_verdict",
+            "rebirth",
         ]
     }
 }
@@ -58,6 +59,7 @@ mod tests {
         assert_eq!(v.name(), Agent::Validator);
         assert!(v.tool_namespaces().contains(&"read_file"));
         assert!(v.tool_namespaces().contains(&"run_command"));
+        assert!(v.tool_namespaces().contains(&"rebirth"));
         assert!(!v.may_recurse());
     }
 }

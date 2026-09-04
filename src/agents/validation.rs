@@ -67,7 +67,8 @@ pub(crate) async fn run_automated_validation(
         "Task Brief:\n{}\n\nSpecialist Deliverable:\n{}\n\n\
          Instructions:\n\
          1. Inspect the workspace, verify files, compile, and run tests as needed using available tools.\n\
-         2. When your verification is complete, you MUST call the `leave_verdict` tool with `verdict` ('APPROVED' or 'REJECTED') and detailed `comments`.",
+         2. When your verification is complete, you MUST call the `leave_verdict` tool with `verdict` ('APPROVED' or 'REJECTED') and detailed `comments`.\n\
+         3. If advised or when context usage is high (>= 80%), call the `rebirth` tool with your intermediate findings to preserve context.",
         task_brief, deliverable
     );
 
@@ -311,12 +312,18 @@ pub(crate) async fn run_automated_validation(
                     }
                 }
             };
-            engine.append(crate::types::Message::Tool {
-                tool_call_id: tc.id,
-                content,
-            });
+            let is_rebirth = tc.function.name == crate::tool_names::TOOL_REBIRTH;
+            let execution_succeeded = !content.starts_with("ERROR:");
+            if !is_rebirth || !execution_succeeded {
+                engine.append(crate::types::Message::Tool {
+                    tool_call_id: tc.id,
+                    content,
+                });
+            }
             if engine.should_compact() {
                 engine.compact();
+            } else if engine.should_advise_rebirth() {
+                engine.inject_rebirth_advisory();
             }
             crate::orchestrator::update_active_worker_context(
                 &_active_guard.0,
