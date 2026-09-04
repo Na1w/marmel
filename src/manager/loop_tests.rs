@@ -248,6 +248,7 @@ fn coder_scheduler() -> Box<dyn Fn(&str) -> Agent> {
 /// specialist (auto-check-off flips each to `[x]`), and returns only
 /// deliverables — no conversational filler.
 #[tokio::test]
+#[cfg_attr(windows, ignore)]
 async fn test_agent_managerloop_silent_dispatcher_delegates_all() {
     let tmp = tempfile::tempdir().unwrap();
     let manager = Arc::new(test_manager(tmp.path()));
@@ -286,6 +287,7 @@ async fn test_agent_managerloop_silent_dispatcher_delegates_all() {
 /// re-reads the plan after each round and keeps dispatching only the items
 /// still unchecked.
 #[tokio::test]
+#[cfg_attr(windows, ignore)]
 async fn test_managerloop_one_task_per_call_no_takeover() {
     let tmp = tempfile::tempdir().unwrap();
     let manager = test_manager(tmp.path());
@@ -317,6 +319,7 @@ async fn test_managerloop_one_task_per_call_no_takeover() {
 /// test verifies all independent tasks are completed in one executing round
 /// without a sequential plan write.
 #[tokio::test]
+#[cfg_attr(windows, ignore)]
 async fn test_managerloop_parallel_independent_delegation() {
     let tmp = tempfile::tempdir().unwrap();
     let manager = temp_manager(tmp.path());

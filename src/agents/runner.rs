@@ -48,7 +48,10 @@ pub(crate) async fn try_run_specialist_live(
     }
     // If running inside cargo test suite (integration tests binaries in target/.../deps/), bypass live network calls
     if std::env::current_exe()
-        .map(|p| p.to_string_lossy().contains("/deps/"))
+        .map(|p| {
+            let s = p.to_string_lossy();
+            s.contains("/deps/") || s.contains(r"\deps\")
+        })
         .unwrap_or(false)
         && std::env::var("MARMEL_LIVE_TEST").is_err()
     {
