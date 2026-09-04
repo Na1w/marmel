@@ -56,6 +56,8 @@ struct ScriptedRenderer {
     poll_cursor: usize,
     /// Whether an abort was requested (via `/abort`).
     aborted: bool,
+    rehydrated: Vec<marmennill::types::Message>,
+    events: Vec<Event>,
 }
 
 impl ScriptedRenderer {
@@ -66,6 +68,8 @@ impl ScriptedRenderer {
             poll_script: Vec::new(),
             poll_cursor: 0,
             aborted: false,
+            rehydrated: Vec::new(),
+            events: Vec::new(),
         }
     }
 
@@ -76,6 +80,8 @@ impl ScriptedRenderer {
             poll_script,
             poll_cursor: 0,
             aborted: false,
+            rehydrated: Vec::new(),
+            events: Vec::new(),
         }
     }
 }
@@ -84,7 +90,12 @@ impl Renderer for ScriptedRenderer {
     fn init(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
-    fn on_event(&mut self, _event: &Event) {}
+    fn on_event(&mut self, event: &Event) {
+        self.events.push(event.clone());
+    }
+    fn rehydrate_messages(&mut self, messages: &[marmennill::types::Message]) {
+        self.rehydrated = messages.to_vec();
+    }
     fn flush(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -274,6 +285,7 @@ fn tool_call_sse(id: &str, name: &str, args: &str) -> String {
             "choices": [{
                 "delta": {
                     "tool_calls": [{
+                        "index": 0,
                         "id": id,
                         "type": "function",
                         "function": {
@@ -557,4 +569,209 @@ async fn test_specialist_stream_preemption_and_resumption_on_shared_model() {
             .contains("and specialist part 2 completed."),
         "result should contain post-resumption content"
     );
+}
+
+#[tokio::test]
+async fn test_ui_session_rehydrates_transcript_and_resumes_plan() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let turn_counter = Arc::new(AtomicUsize::new(0));
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let tc = turn_counter.clone();
+            move |req: &wiremock::Request| {
+                let n = tc.fetch_add(1, Ordering::SeqCst);
+                let body = String::from_utf8_lossy(&req.body);
+                if n == 0 {
+                    // Turn 1 of session 1: assistant emits a tool call
+                    ResponseTemplate::new(200).set_body_string(tool_call_sse(
+                        "call-glob-1",
+                        "glob",
+                        r#"{"pattern": "Cargo.toml"}"#,
+                    ))
+                } else if n == 1 {
+                    // Turn 1 part 2 of session 1: assistant finishes turn after tool result
+                    ResponseTemplate::new(200)
+                        .set_body_string(completion_sse("Found Cargo.toml, proceeding."))
+                } else {
+                    // Resumed session (session 2):
+                    // Verify that the prompt payload contains the EXECUTING phase notice and pending task t-102
+                    assert!(
+                        body.contains("t-102"),
+                        "resumed session must contain pending task t-102 in context"
+                    );
+                    assert!(
+                        body.contains("EXECUTING"),
+                        "resumed session must contain EXECUTING phase notice"
+                    );
+                    assert!(
+                        body.contains("Do NOT call `create_plan` again"),
+                        "resumed session must prohibit calling create_plan"
+                    );
+                    ResponseTemplate::new(200)
+                        .set_body_string(completion_sse("Resumed turn reply."))
+                }
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = marmennill::agent::phase::Plan::at(tmp.path());
+    plan.create("# Execution Plan: Test Rehydration\n\n- [x] [t-101] First task\n- [ ] [t-102] Second task\n")
+        .unwrap();
+
+    let cfg = Config {
+        backend_url: format!("{}/v1", server.uri()),
+        system_prompt_path: PathBuf::from("prompts/system.md"),
+        ui_mode: "tui".to_string(),
+        ..Config::default()
+    };
+
+    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::from_config(&cfg),
+        plan.clone(),
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    // Run session 1: user gives initial goal, does 1 turn with tool execution, then aborts
+    let mut renderer1 = ScriptedRenderer::new(vec!["/abort".to_string()]);
+    marmennill::ui::run_session(
+        &cfg,
+        &mut renderer1,
+        Some("Build feature X".to_string()),
+        Some(mgr.clone()),
+    )
+    .await
+    .expect("session 1 succeeds");
+
+    assert!(
+        plan.transcript_path().exists(),
+        "session transcript should be saved to disk"
+    );
+
+    // Run session 2: restarted with no initial argument, user presses Enter to resume
+    let mut renderer2 = ScriptedRenderer::new(vec!["".to_string(), "/abort".to_string()]);
+    marmennill::ui::run_session(&cfg, &mut renderer2, None, Some(mgr))
+        .await
+        .expect("session 2 succeeds");
+
+    // Verify that session 2 rehydrated past transcript messages
+    assert!(
+        !renderer2.rehydrated.is_empty(),
+        "renderer2 should have received rehydrated messages from session 1"
+    );
+    // Verify that the rehydrated transcript contains the tool call from session 1
+    assert!(
+        renderer2.rehydrated.iter().any(|m| matches!(m, marmennill::types::Message::Tool { content, .. } if content.contains("Cargo.toml"))),
+        "rehydrated messages should include tool result from session 1"
+    );
+    assert!(turn_counter.load(Ordering::SeqCst) >= 3);
+}
+
+#[tokio::test]
+async fn test_ui_session_recovers_frozen_and_injects_deliverable() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let req_counter = Arc::new(AtomicUsize::new(0));
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let rc = req_counter.clone();
+            move |req: &wiremock::Request| {
+                let n = rc.fetch_add(1, Ordering::SeqCst);
+                let body = String::from_utf8_lossy(&req.body);
+                if n == 0 {
+                    // Specialist worker running to complete the frozen task
+                    ResponseTemplate::new(200).set_body_string(completion_sse(
+                        "Recovered work completed.\n\nMISSION COMPLETE (t-801)",
+                    ))
+                } else {
+                    // Manager turn 1: verify that context received the recovered deliverable!
+                    assert!(
+                        body.contains("t-801"),
+                        "manager turn should contain the recovered task id t-801"
+                    );
+                    assert!(
+                        body.contains("Recovered work completed"),
+                        "manager turn should contain the recovered deliverable text"
+                    );
+                    ResponseTemplate::new(200)
+                        .set_body_string(completion_sse("Synthesis after recovery."))
+                }
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = marmennill::agent::phase::Plan::at(tmp.path());
+    plan.create("# Execution Plan: Crash Recovery\n\n- [ ] [t-801] Interrupted task\n- [ ] [t-802] Next task\n")
+        .unwrap();
+
+    let cfg = Config {
+        backend_url: format!("{}/v1", server.uri()),
+        system_prompt_path: PathBuf::from("prompts/system.md"),
+        ui_mode: "tui".to_string(),
+        ..Config::default()
+    };
+
+    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::from_config(&cfg),
+        plan.clone(),
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    // Simulate an interrupted task by manually creating a freeze snapshot
+    let frozen_req = marmennill::orchestrator::DelegationRequest {
+        agent_name: marmennill::agents::Agent::Generalist,
+        prompt: "Complete the interrupted task.".to_string(),
+        snippets: vec![],
+        task_id: Some("t-801".to_string()),
+        image_urls: None,
+        audio_urls: None,
+        recursion_granted: false,
+    };
+    let wid = mgr
+        .journal
+        .snapshot(marmennill::agents::Agent::Generalist, &frozen_req)
+        .unwrap();
+    assert!(mgr.journal.is_frozen());
+
+    // Boot run_session — should detect frozen task, recover it, check it off, and inject deliverable
+    let mut renderer = ScriptedRenderer::new(vec!["".to_string(), "/abort".to_string()]);
+    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr.clone()))
+        .await
+        .expect("recovery session succeeds");
+
+    // Frozen state must be cleared
+    assert!(
+        !mgr.journal.is_frozen(),
+        "frozen checkpoint must be cleared after recovery"
+    );
+
+    // Task t-801 must be checked off in plan
+    let plan_text = plan.read().unwrap().unwrap();
+    assert!(
+        plan_text.contains("- [x] [t-801]"),
+        "task t-801 should be checked off in plan after recovery"
+    );
+
+    // Renderer must have received the recovered task ToolResult event
+    assert!(
+        renderer
+            .events
+            .iter()
+            .any(|ev| matches!(ev, Event::ToolResult(r) if r.contains("[Recovered task t-801]"))),
+        "renderer should have received ToolResult for recovered task"
+    );
+
+    let _ = wid;
 }

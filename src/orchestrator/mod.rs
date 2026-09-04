@@ -418,7 +418,8 @@ impl OrchestratorManager {
 
         // The frozen delegation resolved: release the checkpoint so it is not
         // resumed again on a subsequent boot.
-        let _ = self.journal.clear(&snap.worker_id, true);
+        let clean = !matches!(deliverable.marker, MissionMarker::Failed { .. });
+        let _ = self.journal.clear(&snap.worker_id, clean);
         Ok(Some(self.apply_check_off(
             deliverable,
             snap.sub_req.task_id.clone(),

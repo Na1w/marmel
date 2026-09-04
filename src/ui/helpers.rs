@@ -36,11 +36,13 @@ pub fn format_active_subtasks(subagents: &[SubagentDetail]) -> String {
 pub fn format_plan_progress_summary(plan_content: &str) -> String {
     crate::orchestrator::generate_plan_progress_summary(plan_content)
 }
-pub(crate) fn load_system_prompt(_cfg: &Config) -> Result<String> {
+pub(crate) fn load_system_prompt_with_plan(
+    _cfg: &Config,
+    plan: &crate::agent::phase::Plan,
+) -> Result<String> {
     let content = include_str!("../../prompts/system.md");
     let env_block = crate::prompts::format_environment_block();
     let mut prompt = format!("{content}\n\n{env_block}\n");
-    let plan = crate::agent::phase::Plan::default();
     if let Ok(Some(plan_content)) = plan.read()
         && !plan_content.trim().is_empty()
     {
@@ -50,6 +52,11 @@ pub(crate) fn load_system_prompt(_cfg: &Config) -> Result<String> {
         ));
     }
     Ok(prompt)
+}
+
+#[allow(dead_code)]
+pub(crate) fn load_system_prompt(cfg: &Config) -> Result<String> {
+    load_system_prompt_with_plan(cfg, &crate::agent::phase::Plan::default())
 }
 
 pub(crate) fn format_tool_call_display(name: &str, args_val: &serde_json::Value) -> String {
@@ -173,6 +180,10 @@ pub(crate) fn handle_reset_command(
     ctx: &mut ContextEngine,
 ) {
     let _ = plan.clear();
+    let transcript = plan.transcript_path();
+    if transcript.exists() {
+        let _ = std::fs::remove_file(&transcript);
+    }
     renderer.on_event(&Event::Message(
         "Execution plan has been cleared and reset by user.".to_string(),
     ));

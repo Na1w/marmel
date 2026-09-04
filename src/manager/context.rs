@@ -567,6 +567,39 @@ impl ContextEngine {
     pub fn prefill_tracker_mut(&mut self) -> &mut SlowPrefillTracker {
         &mut self.prefill
     }
+
+    /// Save the full message transcript to disk as JSON.
+    pub fn save_transcript(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(&self.messages)?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// Load the message transcript from disk if it exists and contains at least 2 messages (system + goal).
+    pub fn load_transcript(&mut self, path: &std::path::Path) -> anyhow::Result<bool> {
+        if !path.exists() {
+            return Ok(false);
+        }
+        let data = std::fs::read_to_string(path)?;
+        let msgs: Vec<Message> = match serde_json::from_str(&data) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to deserialize session transcript from {}: {e}",
+                    path.display()
+                );
+                return Ok(false);
+            }
+        };
+        if msgs.len() < 2 {
+            return Ok(false);
+        }
+        self.messages = msgs;
+        Ok(true)
+    }
 }
 
 /// Per-agent [`ContextEngine`] factory.

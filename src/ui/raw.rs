@@ -138,4 +138,38 @@ impl Renderer for RawRenderer {
     fn shutdown(&mut self) {
         let _ = self.flush();
     }
+
+    fn rehydrate_messages(&mut self, messages: &[crate::types::Message]) {
+        for msg in messages.iter().skip(1) {
+            match msg {
+                crate::types::Message::User { content } => {
+                    if !content.starts_with("(SYSTEM NOTICE:") && !content.starts_with("(SYSTEM:") {
+                        self.push_line("user", content);
+                    }
+                }
+                crate::types::Message::Assistant {
+                    content,
+                    tool_calls,
+                    ..
+                } => {
+                    for call in tool_calls {
+                        self.push_line(
+                            "tool",
+                            &format!("{}({})", call.function.name, call.function.arguments),
+                        );
+                    }
+                    if let Some(c) = content
+                        && !c.trim().is_empty()
+                    {
+                        self.push_line("assistant", c);
+                    }
+                }
+                crate::types::Message::Tool { content, .. } => {
+                    self.push_line("tool-result", content);
+                }
+                _ => {}
+            }
+        }
+        let _ = self.flush();
+    }
 }

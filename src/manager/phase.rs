@@ -36,6 +36,8 @@ pub const MARMEL_DIR: &str = ".marmel";
 pub const PLAN_FILE: &str = "execution_plan.md";
 /// Phase-override file name inside the marmel directory.
 pub const FORCED_PHASE_FILE: &str = "forced_phase.txt";
+/// Session transcript file name inside the marmel directory.
+pub const TRANSCRIPT_FILE: &str = ".session_transcript.json";
 
 /// High-level mission phases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +182,11 @@ impl Plan {
         self.dir.join(FORCED_PHASE_FILE)
     }
 
+    /// The absolute path of the session transcript file.
+    pub fn transcript_path(&self) -> PathBuf {
+        self.dir.join(TRANSCRIPT_FILE)
+    }
+
     /// REQ-PLAN-001: write the initial execution plan to `.marmel/execution_plan.md`,
     /// creating the directory if it does not exist.
     pub fn create(&self, plan_markdown: &str) -> Result<()> {
@@ -248,6 +255,14 @@ impl Plan {
                 forced.display()
             );
             let _ = std::fs::remove_file(&forced);
+        }
+        let transcript = self.transcript_path();
+        if transcript.exists() {
+            tracing::warn!(
+                "Plan::clear: deleting transcript file at {}",
+                transcript.display()
+            );
+            let _ = std::fs::remove_file(&transcript);
         }
         tracing::warn!("Execution plan CLEARED from disk (all plan files deleted).");
         Ok(())
@@ -325,6 +340,10 @@ impl Plan {
         let latest = self.dir.join("execution_plan_archive.md");
         let _ = std::fs::write(&latest, &content);
         let _ = std::fs::remove_file(&path);
+        let transcript = self.transcript_path();
+        if transcript.exists() {
+            let _ = std::fs::remove_file(&transcript);
+        }
         tracing::warn!(
             "Execution plan completed and ARCHIVED to {} (active plan file {} removed from disk)",
             dest.display(),

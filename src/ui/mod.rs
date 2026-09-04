@@ -71,6 +71,7 @@ pub trait Renderer: Send {
     fn clear_abort(&mut self) {}
     fn shutdown(&mut self);
     fn set_subagents(&mut self, _subagents: Vec<SubagentDetail>) {}
+    fn rehydrate_messages(&mut self, _messages: &[crate::types::Message]) {}
 }
 
 pub fn restore() {

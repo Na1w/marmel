@@ -605,6 +605,53 @@ impl Renderer for TuiRenderer {
             self.selected_subagent_idx = self.subagents.len().saturating_sub(1);
         }
     }
+
+    fn rehydrate_messages(&mut self, messages: &[crate::types::Message]) {
+        self.commit_turn_content();
+        for msg in messages.iter().skip(1) {
+            match msg {
+                crate::types::Message::User { content } => {
+                    if !content.starts_with("(SYSTEM NOTICE:") && !content.starts_with("(SYSTEM:") {
+                        self.messages.push(format!("User: {content}"));
+                    }
+                }
+                crate::types::Message::Assistant {
+                    content,
+                    tool_calls,
+                    ..
+                } => {
+                    for call in tool_calls {
+                        let args_val =
+                            serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                                .unwrap_or_else(|_| {
+                                    serde_json::Value::String(call.function.arguments.clone())
+                                });
+                        self.messages.push(format!(
+                            "[Tool Call] {}",
+                            crate::ui::helpers::format_tool_call_display(
+                                &call.function.name,
+                                &args_val
+                            )
+                        ));
+                    }
+                    if let Some(c) = content
+                        && !c.trim().is_empty()
+                    {
+                        self.messages.push(c.clone());
+                    }
+                }
+                crate::types::Message::Tool { content, .. } => {
+                    self.messages.push(format!("[Tool Result] {content}"));
+                }
+                _ => {}
+            }
+        }
+        let w = self.chat_width.get();
+        let n = self.estimated_chat_lines(w);
+        let h = self.chat_height.get();
+        self.chat_scroll = n.saturating_sub(h) as u16;
+        let _ = self.flush();
+    }
 }
 
 /// Leave the alternate screen (best-effort, from the panic hook).
