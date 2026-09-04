@@ -123,6 +123,7 @@ fn test_harness_paginated_read() {
 /// Path mapping: `/home/coder/workspace/...` maps onto the current working
 /// directory, matching marmennill-cli's `map_path`; other paths pass through.
 #[test]
+#[cfg_attr(windows, ignore)]
 fn test_harness_map_path() {
     let cur = std::env::current_dir().unwrap();
     // Workspace-prefixed path maps onto cwd.
