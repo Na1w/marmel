@@ -56,6 +56,8 @@ struct ScriptedRenderer {
     poll_cursor: usize,
     /// Whether an abort was requested (via `/abort`).
     aborted: bool,
+    rehydrated: Vec<marmennill::types::Message>,
+    events: Vec<Event>,
 }
 
 impl ScriptedRenderer {
@@ -66,6 +68,8 @@ impl ScriptedRenderer {
             poll_script: Vec::new(),
             poll_cursor: 0,
             aborted: false,
+            rehydrated: Vec::new(),
+            events: Vec::new(),
         }
     }
 
@@ -76,6 +80,8 @@ impl ScriptedRenderer {
             poll_script,
             poll_cursor: 0,
             aborted: false,
+            rehydrated: Vec::new(),
+            events: Vec::new(),
         }
     }
 }
@@ -84,7 +90,12 @@ impl Renderer for ScriptedRenderer {
     fn init(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
-    fn on_event(&mut self, _event: &Event) {}
+    fn on_event(&mut self, event: &Event) {
+        self.events.push(event.clone());
+    }
+    fn rehydrate_messages(&mut self, messages: &[marmennill::types::Message]) {
+        self.rehydrated = messages.to_vec();
+    }
     fn flush(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -274,6 +285,7 @@ fn tool_call_sse(id: &str, name: &str, args: &str) -> String {
             "choices": [{
                 "delta": {
                     "tool_calls": [{
+                        "index": 0,
                         "id": id,
                         "type": "function",
                         "function": {
@@ -349,4 +361,417 @@ async fn test_ui_session_steer_abort_redirection_resets_abort_and_continues() {
     );
 
     assert!(renderer.aborted(), "session should end via final /abort");
+}
+
+/// Verify that when user inputs a question mid-stream during LLM generation,
+/// the active stream pauses immediately, the steer arbitrator answers with RespondDirectly,
+/// and the stream seamlessly resumes with assistant prefix continuation, delivering the full answer.
+#[tokio::test]
+async fn test_ui_session_stream_pause_and_resume_on_user_question() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let assistant_requests = Arc::new(AtomicUsize::new(0));
+    let arbitrator_calls = Arc::new(AtomicUsize::new(0));
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let assistant_requests = assistant_requests.clone();
+            let arbitrator_calls = arbitrator_calls.clone();
+            move |req: &wiremock::Request| {
+                let body_str = String::from_utf8_lossy(&req.body);
+                if body_str.contains("Steer Arbitrator") || body_str.contains("Arbitrate the user")
+                {
+                    arbitrator_calls.fetch_add(1, Ordering::SeqCst);
+                    let body = completion_sse(
+                        r#"{"decision": "RespondDirectly", "response": "I am currently analyzing your project files."}"#,
+                    );
+                    ResponseTemplate::new(200).set_body_string(body)
+                } else {
+                    let n = assistant_requests.fetch_add(1, Ordering::SeqCst);
+                    let body = if n == 0 {
+                        // Part 1 before pause
+                        completion_sse("First part of generation...")
+                    } else {
+                        // Part 2 continuation after resume
+                        completion_sse(" and second part after resume.")
+                    };
+                    ResponseTemplate::new(200).set_body_string(body)
+                }
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let cfg = config_for_backend(&server.uri());
+
+    // Scripted input:
+    // Initial goal: "start generation task"
+    // Mid-flight poll input: "what are you doing?"
+    // After turn: "/abort" to finish session
+    let mut renderer = ScriptedRenderer::with_poll(
+        vec!["start generation task".to_string(), "/abort".to_string()],
+        vec![
+            String::new(),
+            String::new(),
+            String::new(),
+            "what are you doing?".to_string(),
+        ],
+    );
+
+    marmennill::ui::run_session(&cfg, &mut renderer, None, None)
+        .await
+        .expect("run_session should complete without error");
+
+    let arb = arbitrator_calls.load(Ordering::SeqCst);
+    assert_eq!(
+        arb, 1,
+        "steer arbitrator should have been invoked exactly once"
+    );
+
+    let reqs = assistant_requests.load(Ordering::SeqCst);
+    assert_eq!(
+        reqs, 2,
+        "expected initial stream + continuation stream = 2 assistant requests"
+    );
+
+    assert!(renderer.aborted(), "session should end via final /abort");
+}
+
+/// Verify that a running specialist stream on a shared model can be preempted
+/// by the Steer Arbitrator, yielding its GPU/model slot, and subsequently
+/// resumed seamlessly via Assistant Prefill continuation.
+#[tokio::test]
+async fn test_specialist_stream_preemption_and_resumption_on_shared_model() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (first_chunk_sent_tx, first_chunk_sent_rx) = tokio::sync::oneshot::channel();
+    let (preempt_done_tx, preempt_done_rx) = tokio::sync::oneshot::channel();
+
+    // Spawn mock streaming server
+    tokio::spawn(async move {
+        // First connection: initial specialist stream
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf).await;
+
+        let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+        stream.write_all(headers.as_bytes()).await.unwrap();
+
+        // Send chunk 1
+        let chunk1_data =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Specialist part 1...\"}}]}\n\n";
+        let chunk1 = format!("{:x}\r\n{}\r\n", chunk1_data.len(), chunk1_data);
+        stream.write_all(chunk1.as_bytes()).await.unwrap();
+
+        // Give client time to read and parse chunk 1
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        // Notify test that first chunk was sent
+        let _ = first_chunk_sent_tx.send(());
+
+        // Wait until steer preemption has been registered
+        let _ = preempt_done_rx.await;
+
+        // Send chunk 2 to trigger poll_control inside on_chunk_with_sink
+        let chunk2_data = "data: {\"choices\":[{\"delta\":{\"content\":\" (cutting)\"}}]}\n\n";
+        let chunk2 = format!("{:x}\r\n{}\r\n", chunk2_data.len(), chunk2_data);
+        let _ = stream.write_all(chunk2.as_bytes()).await;
+
+        // Client drops stream when paused.
+        // Second connection: continuation stream after resume
+        if let Ok((mut stream2, _)) = listener.accept().await {
+            let mut buf2 = [0u8; 1024];
+            let _ = stream2.read(&mut buf2).await;
+            let headers2 = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            stream2.write_all(headers2.as_bytes()).await.unwrap();
+
+            let chunk_cont_data = "data: {\"choices\":[{\"delta\":{\"content\":\" and specialist part 2 completed.\"}}]}\n\n";
+            let chunk_cont = format!("{:x}\r\n{}\r\n", chunk_cont_data.len(), chunk_cont_data);
+            stream2.write_all(chunk_cont.as_bytes()).await.unwrap();
+
+            let done_data = "data: [DONE]\n\n";
+            let done_chunk = format!("{:x}\r\n{}\r\n0\r\n\r\n", done_data.len(), done_data);
+            stream2.write_all(done_chunk.as_bytes()).await.unwrap();
+        }
+    });
+
+    let client = marmennill::llm::ChatClient::new(format!("http://{addr}/v1"), "shared-model");
+    let req = marmennill::types::ChatRequest {
+        model: "shared-model".to_string(),
+        messages: vec![marmennill::types::Message::User {
+            content: "write code".to_string(),
+        }],
+        temperature: None,
+        top_p: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        stream: Some(true),
+        enable_thinking: None,
+        tools: None,
+    };
+
+    let mut rep_detector = marmennill::harness::monitor::RepetitionDetector::new(3, 5);
+    let mut sink =
+        marmennill::orchestrator::PreemptibleStreamSink::register("coder", "shared-model");
+
+    // Spawn specialist stream in background
+    let specialist_task = tokio::spawn(async move {
+        marmennill::llm::chat_stream_resumable(
+            &client,
+            &req,
+            &mut sink,
+            512,
+            &mut rep_detector,
+            false,
+            None,
+        )
+        .await
+    });
+
+    // Wait until specialist received first chunk
+    first_chunk_sent_rx.await.unwrap();
+
+    // Now preempt the active stream for the Steer Arbitrator
+    let preempt_fut =
+        marmennill::orchestrator::preempt_conflicting_stream("shared-model", "what is happening?");
+
+    // Unblock the mock server to deliver chunk 2 so the client polls control and pauses
+    let _ = preempt_done_tx.send(());
+
+    let handle = preempt_fut.await;
+    assert!(
+        matches!(handle, marmennill::orchestrator::PreemptHandle::Active(_)),
+        "expected an active preempt handle for conflicting shared-model stream"
+    );
+
+    // Arbitrator finishes and grants resumption
+    handle.complete_all(marmennill::llm::PauseAction::Resume);
+
+    let stream_out = specialist_task
+        .await
+        .expect("specialist task join")
+        .expect("stream resumable result");
+
+    assert!(
+        stream_out.reply.content.contains("Specialist part 1..."),
+        "result should contain pre-pause content"
+    );
+    assert!(
+        stream_out
+            .reply
+            .content
+            .contains("and specialist part 2 completed."),
+        "result should contain post-resumption content"
+    );
+}
+
+#[tokio::test]
+async fn test_ui_session_rehydrates_transcript_and_resumes_plan() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let turn_counter = Arc::new(AtomicUsize::new(0));
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let tc = turn_counter.clone();
+            move |req: &wiremock::Request| {
+                let n = tc.fetch_add(1, Ordering::SeqCst);
+                let body = String::from_utf8_lossy(&req.body);
+                if n == 0 {
+                    // Turn 1 of session 1: assistant emits a tool call
+                    ResponseTemplate::new(200).set_body_string(tool_call_sse(
+                        "call-glob-1",
+                        "glob",
+                        r#"{"pattern": "Cargo.toml"}"#,
+                    ))
+                } else if n == 1 {
+                    // Turn 1 part 2 of session 1: assistant finishes turn after tool result
+                    ResponseTemplate::new(200)
+                        .set_body_string(completion_sse("Found Cargo.toml, proceeding."))
+                } else {
+                    // Resumed session (session 2):
+                    // Verify that the prompt payload contains the EXECUTING phase notice and pending task t-102
+                    assert!(
+                        body.contains("t-102"),
+                        "resumed session must contain pending task t-102 in context"
+                    );
+                    assert!(
+                        body.contains("EXECUTING"),
+                        "resumed session must contain EXECUTING phase notice"
+                    );
+                    assert!(
+                        body.contains("Do NOT call `create_plan` again"),
+                        "resumed session must prohibit calling create_plan"
+                    );
+                    ResponseTemplate::new(200)
+                        .set_body_string(completion_sse("Resumed turn reply."))
+                }
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = marmennill::agent::phase::Plan::at(tmp.path());
+    plan.create("# Execution Plan: Test Rehydration\n\n- [x] [t-101] First task\n- [ ] [t-102] Second task\n")
+        .unwrap();
+
+    let cfg = Config {
+        backend_url: format!("{}/v1", server.uri()),
+        system_prompt_path: PathBuf::from("prompts/system.md"),
+        ui_mode: "tui".to_string(),
+        ..Config::default()
+    };
+
+    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::from_config(&cfg),
+        plan.clone(),
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    // Run session 1: user gives initial goal, does 1 turn with tool execution, then aborts
+    let mut renderer1 = ScriptedRenderer::new(vec!["/abort".to_string()]);
+    marmennill::ui::run_session(
+        &cfg,
+        &mut renderer1,
+        Some("Build feature X".to_string()),
+        Some(mgr.clone()),
+    )
+    .await
+    .expect("session 1 succeeds");
+
+    assert!(
+        plan.transcript_path().exists(),
+        "session transcript should be saved to disk"
+    );
+
+    // Run session 2: restarted with no initial argument, user presses Enter to resume
+    let mut renderer2 = ScriptedRenderer::new(vec!["".to_string(), "/abort".to_string()]);
+    marmennill::ui::run_session(&cfg, &mut renderer2, None, Some(mgr))
+        .await
+        .expect("session 2 succeeds");
+
+    // Verify that session 2 rehydrated past transcript messages
+    assert!(
+        !renderer2.rehydrated.is_empty(),
+        "renderer2 should have received rehydrated messages from session 1"
+    );
+    // Verify that the rehydrated transcript contains the tool call from session 1
+    assert!(
+        renderer2.rehydrated.iter().any(|m| matches!(m, marmennill::types::Message::Tool { content, .. } if content.contains("Cargo.toml"))),
+        "rehydrated messages should include tool result from session 1"
+    );
+    assert!(turn_counter.load(Ordering::SeqCst) >= 3);
+}
+
+#[tokio::test]
+async fn test_ui_session_recovers_frozen_and_injects_deliverable() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let req_counter = Arc::new(AtomicUsize::new(0));
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let rc = req_counter.clone();
+            move |req: &wiremock::Request| {
+                let n = rc.fetch_add(1, Ordering::SeqCst);
+                let body = String::from_utf8_lossy(&req.body);
+                if n == 0 {
+                    // Specialist worker running to complete the frozen task
+                    ResponseTemplate::new(200).set_body_string(completion_sse(
+                        "Recovered work completed.\n\nMISSION COMPLETE (t-801)",
+                    ))
+                } else {
+                    // Manager turn 1: verify that context received the recovered deliverable!
+                    assert!(
+                        body.contains("t-801"),
+                        "manager turn should contain the recovered task id t-801"
+                    );
+                    assert!(
+                        body.contains("Recovered work completed"),
+                        "manager turn should contain the recovered deliverable text"
+                    );
+                    ResponseTemplate::new(200)
+                        .set_body_string(completion_sse("Synthesis after recovery."))
+                }
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = marmennill::agent::phase::Plan::at(tmp.path());
+    plan.create("# Execution Plan: Crash Recovery\n\n- [ ] [t-801] Interrupted task\n- [ ] [t-802] Next task\n")
+        .unwrap();
+
+    let cfg = Config {
+        backend_url: format!("{}/v1", server.uri()),
+        system_prompt_path: PathBuf::from("prompts/system.md"),
+        ui_mode: "tui".to_string(),
+        ..Config::default()
+    };
+
+    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::from_config(&cfg),
+        plan.clone(),
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    // Simulate an interrupted task by manually creating a freeze snapshot
+    let frozen_req = marmennill::orchestrator::DelegationRequest {
+        agent_name: marmennill::agents::Agent::Generalist,
+        prompt: "Complete the interrupted task.".to_string(),
+        snippets: vec![],
+        task_id: Some("t-801".to_string()),
+        image_urls: None,
+        audio_urls: None,
+        recursion_granted: false,
+    };
+    let wid = mgr
+        .journal
+        .snapshot(marmennill::agents::Agent::Generalist, &frozen_req)
+        .unwrap();
+    assert!(mgr.journal.is_frozen());
+
+    // Boot run_session — should detect frozen task, recover it, check it off, and inject deliverable
+    let mut renderer = ScriptedRenderer::new(vec!["".to_string(), "/abort".to_string()]);
+    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr.clone()))
+        .await
+        .expect("recovery session succeeds");
+
+    // Frozen state must be cleared
+    assert!(
+        !mgr.journal.is_frozen(),
+        "frozen checkpoint must be cleared after recovery"
+    );
+
+    // Task t-801 must be checked off in plan
+    let plan_text = plan.read().unwrap().unwrap();
+    assert!(
+        plan_text.contains("- [x] [t-801]"),
+        "task t-801 should be checked off in plan after recovery"
+    );
+
+    // Renderer must have received the recovered task ToolResult event
+    assert!(
+        renderer
+            .events
+            .iter()
+            .any(|ev| matches!(ev, Event::ToolResult(r) if r.contains("[Recovered task t-801]"))),
+        "renderer should have received ToolResult for recovered task"
+    );
+
+    let _ = wid;
 }

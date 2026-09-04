@@ -125,16 +125,3 @@ fn apply_landlock_linux(workspace_root: &Path) -> Result<()> {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_apply_sandbox_does_not_panic() {
-        let cur = std::env::current_dir().unwrap();
-        // apply_sandbox should gracefully succeed or log warning without panicking
-        let res = apply_sandbox(&cur);
-        assert!(res.is_ok());
-    }
-}

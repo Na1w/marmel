@@ -108,6 +108,9 @@ impl StdioMcpConnection {
             params,
         };
 
+        crate::debug_log::log_mcp_request(&self.server_name, method, req.params.as_ref());
+        let start_time = std::time::Instant::now();
+
         let mut req_str = serde_json::to_string(&req)?;
         req_str.push('\n');
 
@@ -131,10 +134,15 @@ impl StdioMcpConnection {
                     )
                 })??;
             if n == 0 {
-                return Err(anyhow!(
-                    "MCP server '{}' closed stdout stream",
-                    self.server_name
-                ));
+                let err_msg = format!("MCP server '{}' closed stdout stream", self.server_name);
+                crate::debug_log::log_mcp_response(
+                    &self.server_name,
+                    method,
+                    start_time.elapsed().as_millis(),
+                    &err_msg,
+                    true,
+                );
+                return Err(anyhow!(err_msg));
             }
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -144,7 +152,20 @@ impl StdioMcpConnection {
                 if !resp.id_matches(id) {
                     continue;
                 }
-                return resp.into_result(&self.server_name);
+                let res = resp.into_result(&self.server_name);
+                let elapsed_ms = start_time.elapsed().as_millis();
+                let res_str = match &res {
+                    Ok(v) => serde_json::to_string(v).unwrap_or_else(|_| v.to_string()),
+                    Err(e) => e.to_string(),
+                };
+                crate::debug_log::log_mcp_response(
+                    &self.server_name,
+                    method,
+                    elapsed_ms,
+                    &res_str,
+                    res.is_err(),
+                );
+                return res;
             }
         }
     }

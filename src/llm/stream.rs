@@ -20,8 +20,29 @@ pub enum StreamEvent {
     Status(String),
 }
 
+/// Control signal polled from a `StreamSink` on delta boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamControl {
+    /// Continue streaming chunks.
+    Continue,
+    /// Abort the stream completely.
+    Abort,
+    /// Pause the active stream immediately to handle mid-flight user steering.
+    Pause { user_input: String },
+}
+
+/// Action to take after handling a paused stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseAction {
+    /// Resume the interrupted stream from where it was paused.
+    Resume,
+    /// Abort the turn and do not resume.
+    Abort,
+}
+
 /// The shared stream sink that both Manager and specialist turns write demuxed events into.
-pub trait StreamSink {
+#[async_trait::async_trait]
+pub trait StreamSink: Send {
     /// Deliver one demuxed stream event to the channel.
     fn emit(&mut self, event: StreamEvent);
 
@@ -29,12 +50,29 @@ pub trait StreamSink {
     fn is_aborted(&mut self) -> bool {
         false
     }
+
+    /// Query stream control state on delta boundaries.
+    fn poll_control(&mut self) -> StreamControl {
+        if self.is_aborted() {
+            StreamControl::Abort
+        } else {
+            StreamControl::Continue
+        }
+    }
+
+    /// Callback invoked when a stream was paused due to `StreamControl::Pause`.
+    /// Returns whether to resume the stream or abort.
+    async fn on_pause(&mut self, user_input: &str) -> PauseAction {
+        let _ = user_input;
+        PauseAction::Resume
+    }
 }
 
 /// A sink that discards every event.
 #[derive(Debug, Default, Clone)]
 pub struct NullSink;
 
+#[async_trait::async_trait]
 impl StreamSink for NullSink {
     fn emit(&mut self, _event: StreamEvent) {}
 }
@@ -67,6 +105,7 @@ impl VecSink {
     }
 }
 
+#[async_trait::async_trait]
 impl StreamSink for VecSink {
     fn emit(&mut self, event: StreamEvent) {
         self.events.push(event);
@@ -124,6 +163,179 @@ impl StreamConfig {
             min_pattern_len: mon.min_pattern_len,
             max_stream_tokens: mon.max_stream_tokens,
         }
+    }
+}
+
+/// Target destination for demuxed stream events.
+/// Target destination for demuxed stream events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamTarget {
+    /// Emit events to the orchestrator event bus (used by specialists and validators).
+    OrchestratorEvents,
+    /// Emit events to a StreamSink (used by chat_client_turn).
+    Sink,
+}
+
+/// Helper that manages token budget capping, thinking demuxing, repetition detection,
+/// and cancellation checking for a single streaming turn.
+pub struct TurnStreamHandler<'a> {
+    pub max_tokens: usize,
+    pub tokens_count: usize,
+    pub budget_exceeded: bool,
+    pub rep_triggered: bool,
+    pub demux: ThinkingDemuxer,
+    pub rep_detector: &'a mut crate::harness::monitor::RepetitionDetector,
+    pub cancellation_token: Option<&'a tokio_util::sync::CancellationToken>,
+    pub pause_requested: Option<String>,
+}
+
+impl<'a> TurnStreamHandler<'a> {
+    /// Create a stream handler targeting orchestrator events with a cancellation token.
+    pub fn new(
+        max_tokens: usize,
+        rep_detector: &'a mut crate::harness::monitor::RepetitionDetector,
+        cancellation_token: &'a tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self::with_cancellation(max_tokens, rep_detector, Some(cancellation_token), false)
+    }
+
+    /// Create a stream handler for a StreamSink.
+    pub fn for_sink(
+        max_tokens: usize,
+        rep_detector: &'a mut crate::harness::monitor::RepetitionDetector,
+        preserve_thinking: bool,
+    ) -> Self {
+        Self::with_cancellation(max_tokens, rep_detector, None, preserve_thinking)
+    }
+
+    /// Create a stream handler with explicit cancellation and configuration.
+    pub fn with_cancellation(
+        max_tokens: usize,
+        rep_detector: &'a mut crate::harness::monitor::RepetitionDetector,
+        cancellation_token: Option<&'a tokio_util::sync::CancellationToken>,
+        preserve_thinking: bool,
+    ) -> Self {
+        Self {
+            max_tokens: max_tokens.max(256),
+            tokens_count: 0,
+            budget_exceeded: false,
+            rep_triggered: false,
+            demux: ThinkingDemuxer::with_preserve(preserve_thinking),
+            rep_detector,
+            cancellation_token,
+            pause_requested: None,
+        }
+    }
+
+    /// Take any pending pause request triggered by mid-flight user steering.
+    pub fn take_pause_request(&mut self) -> Option<String> {
+        self.pause_requested.take()
+    }
+
+    /// Process an incoming chunk delta targeting orchestrator events. Returns true to continue streaming, false to cut stream.
+    pub fn on_chunk(&mut self, chunk: &str) -> bool {
+        if !chunk.is_empty() {
+            self.tokens_count += 1;
+            if self.tokens_count > self.max_tokens {
+                self.budget_exceeded = true;
+            }
+        }
+        let rep_det = &mut *self.rep_detector;
+        let rep_trig = &mut self.rep_triggered;
+        self.demux.push_delta(chunk, |kind, text| {
+            rep_det.push(text);
+            if rep_det.is_repeating() {
+                *rep_trig = true;
+            }
+            match kind {
+                DeltaKind::Content => {
+                    crate::orchestrator::emit_event(crate::ui::Event::Message(text.to_string()));
+                }
+                DeltaKind::Thinking => {
+                    crate::orchestrator::emit_event(crate::ui::Event::Thinking(text.to_string()));
+                }
+            }
+        });
+
+        let cancelled = self
+            .cancellation_token
+            .map(|t| t.is_cancelled())
+            .unwrap_or(false);
+
+        !cancelled
+            && !self.rep_triggered
+            && !self.budget_exceeded
+            && !crate::orchestrator::is_globally_cancelled()
+    }
+
+    /// Process an incoming chunk delta delivering events to `sink`. Returns true to continue streaming, false to cut stream.
+    pub fn on_chunk_with_sink<S: StreamSink + ?Sized>(
+        &mut self,
+        chunk: &str,
+        sink: &mut S,
+    ) -> bool {
+        if !chunk.is_empty() {
+            self.tokens_count += 1;
+            if self.tokens_count > self.max_tokens {
+                self.budget_exceeded = true;
+            }
+        }
+        let rep_det = &mut *self.rep_detector;
+        let rep_trig = &mut self.rep_triggered;
+        self.demux.push_delta(chunk, |kind, text| {
+            rep_det.push(text);
+            if rep_det.is_repeating() {
+                *rep_trig = true;
+            }
+            match kind {
+                DeltaKind::Content => sink.emit(StreamEvent::Content(text.to_string())),
+                DeltaKind::Thinking => sink.emit(StreamEvent::Thinking(text.to_string())),
+            }
+        });
+
+        match sink.poll_control() {
+            StreamControl::Abort => return false,
+            StreamControl::Pause { user_input } => {
+                self.pause_requested = Some(user_input);
+                return false;
+            }
+            StreamControl::Continue => {}
+        }
+
+        let cancelled = self
+            .cancellation_token
+            .map(|t| t.is_cancelled())
+            .unwrap_or(false);
+
+        !cancelled
+            && !self.rep_triggered
+            && !self.budget_exceeded
+            && !crate::orchestrator::is_globally_cancelled()
+    }
+
+    /// Flushes any pending thinking/content deltas to orchestrator events.
+    pub fn finish(&mut self) {
+        self.demux.finish_delta(|kind, text| match kind {
+            DeltaKind::Content => {
+                crate::orchestrator::emit_event(crate::ui::Event::Message(text.to_string()));
+            }
+            DeltaKind::Thinking => {
+                crate::orchestrator::emit_event(crate::ui::Event::Thinking(text.to_string()));
+            }
+        });
+    }
+
+    /// Flushes any pending thinking/content deltas to `sink`.
+    pub fn finish_with_sink<S: StreamSink + ?Sized>(&mut self, sink: &mut S) {
+        self.demux.finish_delta(|kind, text| match kind {
+            DeltaKind::Content => sink.emit(StreamEvent::Content(text.to_string())),
+            DeltaKind::Thinking => sink.emit(StreamEvent::Thinking(text.to_string())),
+        });
+    }
+
+    /// Consumes the handler and produces the demuxed assistant Message.
+    pub fn into_message(self) -> Message {
+        self.demux.into_message()
     }
 }
 
@@ -232,6 +444,175 @@ pub(crate) fn build_request(cfg: &StreamConfig, messages: Vec<Message>) -> ChatR
     }
 }
 
+pub(crate) fn build_continuation_request(
+    original_req: &ChatRequest,
+    base_messages: &[Message],
+    accumulated_content: &str,
+    accumulated_thinking: &str,
+) -> ChatRequest {
+    let mut req = original_req.clone();
+    let mut messages = base_messages.to_vec();
+    if !accumulated_content.is_empty() || !accumulated_thinking.is_empty() {
+        messages.push(Message::Assistant {
+            content: if accumulated_content.is_empty() {
+                None
+            } else {
+                Some(accumulated_content.to_string())
+            },
+            reasoning_content: if accumulated_thinking.is_empty() {
+                None
+            } else {
+                Some(accumulated_thinking.to_string())
+            },
+            tool_calls: Vec::new(),
+        });
+    }
+    req.messages = messages;
+    req
+}
+
+pub(crate) fn build_fallback_continuation_request(
+    original_req: &ChatRequest,
+    base_messages: &[Message],
+    accumulated_content: &str,
+) -> ChatRequest {
+    let mut req = original_req.clone();
+    let mut messages = base_messages.to_vec();
+    messages.push(Message::Assistant {
+        content: Some(accumulated_content.to_string()),
+        reasoning_content: None,
+        tool_calls: Vec::new(),
+    });
+    messages.push(Message::User {
+        content: "(System continuation notice: continue generating your response directly from where you were interrupted. Do not repeat anything.)".to_string(),
+    });
+    req.messages = messages;
+    req
+}
+
+/// Output from a resumable streaming LLM turn.
+#[derive(Debug, Clone)]
+pub struct ResumableStreamOutput {
+    pub reply: StreamedReply,
+    pub budget_exceeded: bool,
+    pub rep_triggered: bool,
+    pub was_aborted_by_steer: bool,
+}
+
+/// Drives a resumable streaming chat call against `client`, supporting mid-flight pause,
+/// steering arbitration, and continuation prefill.
+pub async fn chat_stream_resumable<S>(
+    client: &ChatClient,
+    req: &ChatRequest,
+    sink: &mut S,
+    max_tokens: usize,
+    rep_detector: &mut crate::harness::monitor::RepetitionDetector,
+    preserve_thinking: bool,
+    cancellation_token: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<ResumableStreamOutput>
+where
+    S: StreamSink + ?Sized,
+{
+    let mut stream_handler = TurnStreamHandler::with_cancellation(
+        max_tokens,
+        rep_detector,
+        cancellation_token,
+        preserve_thinking,
+    );
+
+    let mut current_req = req.clone();
+    let base_messages = req.messages.clone();
+    let mut all_tool_calls = Vec::new();
+    let mut was_aborted_by_steer = false;
+
+    loop {
+        let reply_res = client
+            .chat_stream(&current_req, |delta| {
+                stream_handler.on_chunk_with_sink(delta, sink)
+            })
+            .await;
+
+        let reply = match reply_res {
+            Ok(r) => r,
+            Err(e) => {
+                if current_req.messages.len() > base_messages.len() {
+                    let fallback_req = build_fallback_continuation_request(
+                        &current_req,
+                        &base_messages,
+                        stream_handler.demux.content(),
+                    );
+                    match client
+                        .chat_stream(&fallback_req, |delta| {
+                            stream_handler.on_chunk_with_sink(delta, sink)
+                        })
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => return Err(e),
+                    }
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+
+        all_tool_calls.extend(reply.tool_calls);
+
+        if let Some(user_input) = stream_handler.take_pause_request() {
+            crate::debug_log::log_stream_pause(
+                &current_req.model,
+                &user_input,
+                stream_handler.tokens_count,
+            );
+            match sink.on_pause(&user_input).await {
+                PauseAction::Resume => {
+                    crate::debug_log::log_stream_resume(
+                        &current_req.model,
+                        stream_handler.demux.content().len(),
+                    );
+                    current_req = build_continuation_request(
+                        &current_req,
+                        &base_messages,
+                        stream_handler.demux.content(),
+                        stream_handler.demux.thinking(),
+                    );
+                    continue;
+                }
+                PauseAction::Abort => {
+                    crate::debug_log::log_stream_abort(
+                        &current_req.model,
+                        "aborted by steer arbitrator during pause",
+                    );
+                    was_aborted_by_steer = true;
+                    break;
+                }
+            }
+        }
+
+        break;
+    }
+
+    stream_handler.finish_with_sink(sink);
+
+    let budget_exceeded = stream_handler.budget_exceeded;
+    let rep_triggered = stream_handler.rep_triggered;
+
+    let final_content = stream_handler.demux.content().to_string();
+    let final_thinking = stream_handler.demux.thinking().to_string();
+
+    Ok(ResumableStreamOutput {
+        reply: StreamedReply {
+            content: final_content,
+            reasoning: final_thinking,
+            raw: String::new(),
+            tool_calls: all_tool_calls,
+        },
+        budget_exceeded,
+        rep_triggered,
+        was_aborted_by_steer,
+    })
+}
+
 pub async fn chat_client_turn<S>(
     client: &ChatClient,
     messages: Vec<Message>,
@@ -239,7 +620,7 @@ pub async fn chat_client_turn<S>(
     sink: &mut S,
 ) -> Result<Message>
 where
-    S: StreamSink + ?Sized,
+    S: StreamSink,
 {
     let mut transcript = messages;
     let nudge = NudgePolicy::default();
@@ -256,64 +637,57 @@ where
         };
 
         let max_tokens = cfg.max_stream_tokens.max(256);
-        let mut tokens_count = 0usize;
-        let mut demux = ThinkingDemuxer::with_preserve(cfg.preserve_thinking);
         let mut rep_detector = crate::harness::monitor::RepetitionDetector::new(
             cfg.repetition_threshold,
             cfg.min_pattern_len,
         );
-        let mut rep_triggered = false;
-        let mut budget_exceeded = false;
 
-        let reply = client
-            .chat_stream(&req, |delta| {
-                if !delta.is_empty() {
-                    tokens_count += 1;
-                    if tokens_count > max_tokens {
-                        budget_exceeded = true;
-                    }
-                    demux.push_delta(delta, |kind, text| {
-                        rep_detector.push(text);
-                        if rep_detector.is_repeating() {
-                            rep_triggered = true;
-                        }
-                        match kind {
-                            DeltaKind::Content => sink.emit(StreamEvent::Content(text.to_string())),
-                            DeltaKind::Thinking => {
-                                sink.emit(StreamEvent::Thinking(text.to_string()))
-                            }
-                        }
-                    });
-                }
-                !sink.is_aborted()
-                    && !rep_triggered
-                    && !budget_exceeded
-                    && !crate::orchestrator::is_globally_cancelled()
-            })
-            .await?;
+        let out = chat_stream_resumable(
+            client,
+            &req,
+            sink,
+            max_tokens,
+            &mut rep_detector,
+            cfg.preserve_thinking,
+            None,
+        )
+        .await?;
 
-        demux.finish_delta(|kind, text| match kind {
-            DeltaKind::Content => sink.emit(StreamEvent::Content(text.to_string())),
-            DeltaKind::Thinking => sink.emit(StreamEvent::Thinking(text.to_string())),
-        });
+        let budget_exceeded = out.budget_exceeded;
+        let rep_triggered = out.rep_triggered;
+        let was_aborted_by_steer = out.was_aborted_by_steer;
 
-        let mut assistant = demux.into_message();
+        let mut assistant = Message::Assistant {
+            content: if out.reply.content.is_empty() {
+                None
+            } else {
+                Some(out.reply.content.clone())
+            },
+            reasoning_content: if out.reply.reasoning.is_empty() {
+                None
+            } else {
+                Some(out.reply.reasoning.clone())
+            },
+            tool_calls: out.reply.tool_calls.clone(),
+        };
+
         if let Message::Assistant {
             tool_calls,
             content,
             ..
         } = &mut assistant
+            && tool_calls.is_empty()
+            && let Some(text) = content
         {
-            tool_calls.extend(reply.tool_calls);
-            if tool_calls.is_empty()
-                && let Some(text) = content
-            {
-                let monitor = crate::harness::monitor::HarnessMonitor::with_new_stats();
-                let rescued = monitor.rescue_xml(text);
-                if !rescued.is_empty() {
-                    *tool_calls = rescued;
-                }
+            let monitor = crate::harness::monitor::HarnessMonitor::with_new_stats();
+            let rescued = monitor.rescue_xml(text);
+            if !rescued.is_empty() {
+                *tool_calls = rescued;
             }
+        }
+
+        if was_aborted_by_steer {
+            return Ok(assistant);
         }
 
         let has_tools = match &assistant {
@@ -388,57 +762,5 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_llm_stream_channel_demuxes_thinking() {
-        let messages = vec![Message::User {
-            content: "hi".to_string(),
-        }];
-        let cfg = StreamConfig::default();
-        let mut sink = VecSink::default();
-
-        let raw_payload = "[thinking]Let me reason[/thinking]Hello world!";
-        let msg = drive_streamed_turn(
-            |_req| async move {
-                Ok(StreamedReply {
-                    content: "Hello world!".to_string(),
-                    reasoning: "Let me reason".to_string(),
-                    raw: raw_payload.to_string(),
-                    tool_calls: vec![],
-                })
-            },
-            messages,
-            &cfg,
-            &mut sink,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(sink.thinking(), "Let me reason");
-        assert_eq!(sink.content(), "Hello world!");
-
-        match msg {
-            Message::Assistant {
-                content,
-                reasoning_content,
-                ..
-            } => {
-                assert_eq!(content.as_deref(), Some("Hello world!"));
-                assert_eq!(reasoning_content.as_deref(), Some("Let me reason"));
-            }
-            _ => panic!("expected assistant message"),
-        }
-    }
-
-    #[test]
-    fn test_repetition_detector_breaks_loop() {
-        let mut rep = crate::harness::monitor::RepetitionDetector::new(3, 5);
-        rep.push("Let's go.\nI'll do it.\nWait, I'll check rule 1.\nGood.\n");
-        rep.push("Let's go.\nI'll do it.\nWait, I'll check rule 2.\nGood.\n");
-        assert!(!rep.is_repeating());
-        rep.push("Let's go.\nI'll do it.\nWait, I'll check rule 3.\nGood.\n");
-        assert!(rep.is_repeating());
-    }
-}
+#[path = "stream_tests.rs"]
+mod tests;

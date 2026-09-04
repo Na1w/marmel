@@ -47,6 +47,7 @@ impl SpecialistRegistry {
                 "run_command",
                 "grep_search",
                 "glob",
+                "rebirth",
             ],
             None,
         );
@@ -61,6 +62,7 @@ impl SpecialistRegistry {
                 "run_command",
                 "grep_search",
                 "glob",
+                "rebirth",
             ],
             None,
         );
@@ -82,6 +84,7 @@ impl SpecialistRegistry {
                 "pty_list",
                 "pty__*",
                 "pty_*",
+                "rebirth",
             ],
             None,
         );
@@ -97,6 +100,7 @@ impl SpecialistRegistry {
                 "grep_search",
                 "glob",
                 "leave_verdict",
+                "rebirth",
             ],
             None,
         );

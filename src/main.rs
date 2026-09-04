@@ -48,6 +48,9 @@ fn main() -> Result<()> {
     }
 
     let args = parse_args();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    harness::set_workspace_root(&cwd);
+
     let mut cfg = config::load(args.config.as_deref())?;
     if args.debug {
         cfg.debug = true;

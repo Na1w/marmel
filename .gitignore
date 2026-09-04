@@ -30,3 +30,4 @@ __pycache__/
 .session_frozen.json
 .session_journal.json
 forced_phase.txt
+.idea/

@@ -138,3 +138,54 @@ fn specialist_delegate_task_allowed_by_allowlist() {
         "Researcher must be permitted delegate_task via its allowlist"
     );
 }
+
+/// Rebirth is permitted to ALL agents, including all specialists and validator.
+#[test]
+fn all_specialists_and_validator_permitted_rebirth() {
+    let factory = marmennill::agent::ContextEngineFactory::new(1000);
+    let roles = [
+        Agent::Coder,
+        Agent::Researcher,
+        Agent::Debugger,
+        Agent::Validator,
+        Agent::Generalist,
+    ];
+
+    for role in roles {
+        let mut engine = factory.specialist_context(
+            format!("Role prompt for {role}"),
+            format!("Task brief for {role}"),
+        );
+        engine.append(marmennill::types::Message::User {
+            content: "Do work".to_string(),
+        });
+        engine.append(marmennill::types::Message::Assistant {
+            content: Some("Working on it".to_string()),
+            reasoning_content: None,
+            tool_calls: vec![],
+        });
+
+        let tool = ToolInvocation {
+            name: "rebirth".to_string(),
+            arguments: serde_json::json!({
+                "summary": format!("Progress summary for {role}")
+            }),
+        };
+
+        let res = marmennill::harness::dispatch_for_with_engine(
+            &tool,
+            ToolCaller::Specialist(role),
+            Some(&mut engine),
+        );
+        assert!(
+            res.is_ok(),
+            "{role} must be permitted to call rebirth, got error: {:?}",
+            res.err()
+        );
+        assert_eq!(
+            engine.messages().len(),
+            4,
+            "Rebirth must collapse {role} context to exactly 4 messages"
+        );
+    }
+}

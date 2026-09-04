@@ -175,6 +175,156 @@ pub fn log_tool_result(
     log_raw(&entry);
 }
 
+/// Log session startup with configuration and environment details.
+pub fn log_session_start(cfg: &crate::config::Config, mode: &str) {
+    if !is_enabled() {
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = format!(
+        "\n{}\n[{now}] === [SESSION START] mode: {mode} (PID: {}) ===\nBackend: {}\nModel: {}\nContext tokens: {}\nSpecialists: {:?}\nMCP servers: {:?}\n{}\n",
+        "=".repeat(80),
+        std::process::id(),
+        cfg.backend_url,
+        cfg.model,
+        cfg.max_context_tokens,
+        cfg.orchestration.specialists.keys().collect::<Vec<_>>(),
+        cfg.mcp_servers,
+        "=".repeat(80),
+    );
+    log_raw(&entry);
+}
+
+/// Log user input entering marmel (initial prompt, interactive input, steering, commands).
+pub fn log_user_input(source: &str, text: &str) {
+    if !is_enabled() {
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = format!(
+        "\n{}\n[{now}] >>> [USER INPUT] (source: {source})\n{text}\n{}\n",
+        "#".repeat(80),
+        "#".repeat(80)
+    );
+    log_raw(&entry);
+}
+
+/// Log user output exiting marmel towards the user (assistant replies, summary).
+pub fn log_user_output(channel: &str, text: &str) {
+    if !is_enabled() {
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = format!(
+        "\n{}\n[{now}] <<< [USER OUTPUT] (channel: {channel})\n{text}\n{}\n",
+        "#".repeat(80),
+        "#".repeat(80)
+    );
+    log_raw(&entry);
+}
+
+/// Log a subagent delegation dispatch from Manager to Specialist.
+pub fn log_delegation_start(
+    agent: &str,
+    task_id: Option<&str>,
+    prompt: &str,
+    snippets_count: usize,
+) {
+    if !is_enabled() {
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let tid = task_id.unwrap_or("(none)");
+    let entry = format!(
+        "\n{}\n[{now}] >>> [DELEGATION START] Agent: {agent} | Task ID: {tid} | Snippets: {snippets_count}\nPrompt:\n{prompt}\n{}\n",
+        "*".repeat(80),
+        "*".repeat(80)
+    );
+    log_raw(&entry);
+}
+
+/// Log a subagent delegation completion from Specialist back to Manager.
+pub fn log_delegation_finish(
+    agent: &str,
+    task_id: Option<&str>,
+    marker: &str,
+    elapsed_ms: u128,
+    deliverable: &str,
+) {
+    if !is_enabled() {
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let tid = task_id.unwrap_or("(none)");
+    let entry = format!(
+        "\n{}\n[{now}] <<< [DELEGATION FINISH] Agent: {agent} | Task ID: {tid} | Marker: {marker} (elapsed: {elapsed_ms}ms)\nDeliverable:\n{deliverable}\n{}\n",
+        "*".repeat(80),
+        "*".repeat(80)
+    );
+    log_raw(&entry);
+}
+
+/// Log a validator inspection verdict and feedback comments.
+pub fn log_validation_verdict(agent: &str, approved: bool, critique: &str) {
+    if !is_enabled() {
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let verdict_str = if approved { "APPROVED" } else { "REJECTED" };
+    let entry = format!(
+        "\n{}\n[{now}] <<< [VALIDATION VERDICT: {verdict_str}] Target Agent: {agent}\nCritique:\n{critique}\n{}\n",
+        "^".repeat(80),
+        "^".repeat(80)
+    );
+    log_raw(&entry);
+}
+
+/// Log an execution plan lifecycle event (creation, checkoff, archival).
+pub fn log_plan_update(action: &str, details: &str) {
+    if !is_enabled() {
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = format!(
+        "\n{}\n[{now}] === [PLAN UPDATE: {action}] ===\n{details}\n{}\n",
+        "~".repeat(80),
+        "~".repeat(80)
+    );
+    log_raw(&entry);
+}
+
+/// Log an outgoing JSON-RPC request to an MCP server.
+pub fn log_mcp_request(server: &str, method: &str, params: Option<&serde_json::Value>) {
+    if !is_enabled() {
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let params_str = params
+        .map(|p| serde_json::to_string_pretty(p).unwrap_or_else(|_| p.to_string()))
+        .unwrap_or_else(|| "null".to_string());
+    let entry = format!(
+        "\n{}\n[{now}] >>> [MCP REQUEST] Server: {server} | Method: {method}\nParams:\n{params_str}\n{}\n",
+        ":".repeat(80),
+        ":".repeat(80)
+    );
+    log_raw(&entry);
+}
+
+/// Log an incoming JSON-RPC response from an MCP server.
+pub fn log_mcp_response(server: &str, method: &str, elapsed_ms: u128, result: &str, is_err: bool) {
+    if !is_enabled() {
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let status_str = if is_err { "ERROR" } else { "OK" };
+    let entry = format!(
+        "\n{}\n[{now}] <<< [MCP RESPONSE: {status_str}] Server: {server} | Method: {method} (elapsed: {elapsed_ms}ms)\nResult:\n{result}\n{}\n",
+        ":".repeat(80),
+        ":".repeat(80)
+    );
+    log_raw(&entry);
+}
+
 /// Log an arbitrary custom debug entry.
 pub fn log_custom(tag: &str, message: &str) {
     if !is_enabled() {
@@ -185,14 +335,51 @@ pub fn log_custom(tag: &str, message: &str) {
     log_raw(&entry);
 }
 
+/// Log a stream pause event triggered by mid-flight user steering.
+pub fn log_stream_pause(model: &str, user_input: &str, tokens_so_far: usize) {
+    if !is_enabled() {
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = format!(
+        "\n{}\n[{now}] ||| [STREAM PAUSE] model: {model} (tokens so far: {tokens_so_far})\nUser instruction: {user_input}\n{}\n",
+        "~".repeat(80),
+        "~".repeat(80)
+    );
+    log_raw(&entry);
+}
+
+/// Log a stream resume event after steering arbitration.
+pub fn log_stream_resume(model: &str, partial_chars: usize) {
+    if !is_enabled() {
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = format!(
+        "\n{}\n[{now}] ||| [STREAM RESUME] model: {model} (resuming from {partial_chars} chars prefix)\n{}\n",
+        "~".repeat(80),
+        "~".repeat(80)
+    );
+    log_raw(&entry);
+}
+
+/// Log a stream abort event after steering arbitration.
+pub fn log_stream_abort(model: &str, reason: &str) {
+    if !is_enabled() {
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = format!(
+        "\n{}\n[{now}] ||| [STREAM ABORT] model: {model} (reason: {reason})\n{}\n",
+        "~".repeat(80),
+        "~".repeat(80)
+    );
+    log_raw(&entry);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_debug_log_disabled_by_default() {
-        assert!(!is_enabled());
-    }
 
     #[test]
     fn test_debug_log_writing_when_enabled() {
@@ -202,6 +389,14 @@ mod tests {
         assert!(is_enabled());
 
         log_custom("TEST", "Hello debug log");
+        log_user_input("cli_prompt", "build the widget");
+        log_user_output("assistant_reply", "widget built successfully");
+        log_delegation_start("coder", Some("t-01"), "write code", 2);
+        log_delegation_finish("coder", Some("t-01"), "Complete", 150, "MISSION COMPLETE");
+        log_validation_verdict("coder", true, "Looks good");
+        log_plan_update("check_off", "t-01 marked [x]");
+        log_mcp_request("git", "tools/list", None);
+        log_mcp_response("git", "tools/list", 25, "[]", false);
         log_tool_invocation(
             "Manager",
             "delegate_task",
@@ -212,9 +407,18 @@ mod tests {
         let content = std::fs::read_to_string(&log_file).unwrap();
         assert!(content.contains("=== MARMEL DEBUG LOG STARTED"));
         assert!(content.contains("[TEST] Hello debug log"));
+        assert!(content.contains(">>> [USER INPUT]"));
+        assert!(content.contains("<<< [USER OUTPUT]"));
+        assert!(content.contains(">>> [DELEGATION START]"));
+        assert!(content.contains("<<< [DELEGATION FINISH]"));
+        assert!(content.contains("<<< [VALIDATION VERDICT: APPROVED]"));
+        assert!(content.contains("=== [PLAN UPDATE: check_off]"));
+        assert!(content.contains(">>> [MCP REQUEST]"));
+        assert!(content.contains("<<< [MCP RESPONSE: OK]"));
         assert!(content.contains(">>> [TOOL INVOCATION]"));
         assert!(content.contains("delegate_task"));
         assert!(content.contains("<<< [TOOL RESULT: OK]"));
         set_enabled(false);
+        assert!(!is_enabled());
     }
 }

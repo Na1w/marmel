@@ -27,6 +27,7 @@ fn test_specialist_tool_filtering_and_allowlists() {
     assert!(researcher_tools.contains(&"grep_search".to_string()));
     assert!(researcher_tools.contains(&"glob".to_string()));
     assert!(researcher_tools.contains(&"delegate_task".to_string()));
+    assert!(researcher_tools.contains(&"rebirth".to_string()));
     // Researcher must not have validator or manager tools
     assert!(!researcher_tools.contains(&"leave_verdict".to_string()));
     assert!(!researcher_tools.contains(&"create_plan".to_string()));
@@ -43,6 +44,7 @@ fn test_specialist_tool_filtering_and_allowlists() {
     assert!(coder_tools.contains(&"write_file".to_string()));
     assert!(coder_tools.contains(&"replace".to_string()));
     assert!(coder_tools.contains(&"read_file".to_string()));
+    assert!(coder_tools.contains(&"rebirth".to_string()));
     assert!(!coder_tools.contains(&"leave_verdict".to_string()));
     assert!(!coder_tools.contains(&"create_plan".to_string()));
 
@@ -61,6 +63,7 @@ fn test_specialist_tool_filtering_and_allowlists() {
     assert!(val_tools.contains(&"run_command".to_string()));
     assert!(val_tools.contains(&"grep_search".to_string()));
     assert!(val_tools.contains(&"glob".to_string()));
+    assert!(val_tools.contains(&"rebirth".to_string()));
     assert!(!val_tools.contains(&"create_plan".to_string()));
     assert!(!val_tools.contains(&"archive_current_plan".to_string()));
 }

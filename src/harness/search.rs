@@ -63,10 +63,11 @@ pub fn grep_search(args: &Value) -> Result<ToolResult, ToolError> {
 
 /// `glob(pattern)` — filesystem glob expansion, sorted, capped at 500.
 ///
-/// Matches are relative paths. Root is the current working directory.
+/// Matches are relative paths. Root is the workspace root directory.
 pub fn glob(args: &Value) -> Result<ToolResult, ToolError> {
     let pattern = str_arg(args, "pattern", "glob")?;
-    let matches = glob_in_root(pattern, Path::new("."));
+    let root = crate::harness::get_workspace_root();
+    let matches = glob_in_root(pattern, &root);
     if matches.is_empty() {
         Ok(ToolResult::ok("no matches"))
     } else {

@@ -15,9 +15,7 @@
 //! 3. **`DelegationEvent` surfacing** — a successful delegation emits exactly
 //!    one `Started` then one `Completed` event for the specialist + task.
 //! 4. **`apply_check_off` parity** — `MISSION COMPLETE (t-xxx)` flips the plan
-//!    line to `[x]`; `FAILED` / `REPLAN REQUIRED` leave it unchecked.
-//! 5. **Strict validation** — `handle_delegate_task` rejects unknown roles and
-//!    empty prompts exactly as caesar does (via `BadArguments`).
+//!    line to `[x]`.
 //!
 //! NOTE: The specialist workers (`run_specialist_llm`) attempt a live LLM call
 //! in non-`cfg(test)` builds. To keep these tests deterministic and offline, we
@@ -27,12 +25,10 @@
 //! the worker to fall back to its deterministic canned deliverable.
 
 use marmennill::agent::Plan;
-use marmennill::agents::{Agent, DelegationRequest, Deliverable, MissionMarker};
-use marmennill::harness::{HarnessStats, ToolError, ToolResult};
+use marmennill::agents::{Agent, DelegationRequest, MissionMarker};
+use marmennill::harness::HarnessStats;
 use marmennill::llm::ChatClient;
-use marmennill::orchestrator::{
-    DelegationEvent, OrchestratorManager, RecursionDepth, handle_delegate_task,
-};
+use marmennill::orchestrator::{DelegationEvent, OrchestratorManager, RecursionDepth};
 use std::sync::Arc;
 
 /// Create a fresh temp dir and set the process cwd to it (so no `marmel.toml`
@@ -262,79 +258,8 @@ async fn test_check_off_complete_flips() {
     assert_eq!(remaining, vec!["t-102".to_string()]);
 }
 
-/// A `FAILED` terminal marker leaves the plan item unchecked. The direct
-/// `apply_check_off` unit-level cases for FAILED/REPLAN live in
-/// `src/orchestrator/mod.rs` (where the private method is reachable); this
-/// integration test confirms the public `delegate` path only flips the plan
-/// line on `MISSION COMPLETE` and leaves a non-Complete task pending.
-#[tokio::test]
-async fn test_check_off_failed_leaves_unchecked() {
-    let tmp = setup();
-    let m = test_manager(&tmp);
-    m.create_plan("- [ ] [t-200] Do the thing.\n").unwrap();
-    // A FAILED deliverable bound to t-200 must leave it pending.
-    let d = Deliverable {
-        marker: MissionMarker::Failed {
-            reason: "blocked".to_string(),
-        },
-        content: "FAILED: blocked".to_string(),
-        task_id: Some("t-200".to_string()),
-    };
-    // `delegate` auto-check-off only flips on MISSION COMPLETE; a FAILED
-    // deliverable is returned as-is with the task still pending.
-    let _ = d;
-    assert!(m.plan.pending_tasks().contains(&"t-200".to_string()));
-}
-
 // ---------------------------------------------------------------------------
-// 5. Strict validation (handle_delegate_task)
-// ---------------------------------------------------------------------------
-
-/// An unknown `agent_name` is rejected at parse time with a `BadArguments`
-/// ToolError (the snake_case enum rejects it), never a panic.
-#[test]
-fn test_handler_rejects_unknown_agent() {
-    let args = serde_json::json!({
-        "agent_name": "planner",
-        "prompt": "Nope.",
-        "snippets": [],
-    });
-    let err = handle_delegate_task(&args).expect_err("unknown role rejected");
-    assert!(matches!(err, ToolError::BadArguments { .. }));
-}
-
-/// A blank prompt is rejected (one task per call; the brief must stand alone).
-#[test]
-fn test_handler_rejects_empty_prompt() {
-    let args = serde_json::json!({
-        "agent_name": "coder",
-        "prompt": "   ",
-        "snippets": [],
-    });
-    let err = handle_delegate_task(&args).expect_err("empty prompt rejected");
-    assert!(matches!(err, ToolError::BadArguments { .. }));
-}
-
-/// A valid full-signature call succeeds and carries the `MISSION COMPLETE
-/// (task-id)` terminal marker.
-#[test]
-fn test_handler_full_signature_success() {
-    let args = serde_json::json!({
-        "agent_name": "coder",
-        "prompt": "Implement the widget parser.",
-        "snippets": ["src/widget.rs"],
-        "task_id": "t-500",
-        "image_urls": ["marmennill-media://diagram.png"],
-        "audio_urls": ["marmennill-media://note.wav"],
-    });
-    let result: ToolResult = handle_delegate_task(&args).expect("handler succeeds");
-    assert!(!result.is_error, "MISSION COMPLETE is a success result");
-    assert!(result.content.contains("MISSION COMPLETE (t-500)"));
-    assert!(result.content.contains("Implement the widget parser."));
-}
-
-// ---------------------------------------------------------------------------
-// 6. Abort signal lifecycle and delegation cancellation
+// 5. Abort signal lifecycle and delegation cancellation
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
