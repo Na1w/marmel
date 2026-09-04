@@ -574,6 +574,12 @@ impl Renderer for TuiRenderer {
                     if incoming.context_tokens > 0 {
                         existing.context_tokens = incoming.context_tokens;
                     }
+                    if existing.prompt.is_empty() && !incoming.prompt.is_empty() {
+                        existing.prompt = incoming.prompt.clone();
+                    }
+                    if existing.task_id.is_none() && incoming.task_id.is_some() {
+                        existing.task_id = incoming.task_id.clone();
+                    }
                     // Keep locally-streamed thinking/content if the incoming
                     // entry has none yet (the loop only folds lifecycle events).
                     if !incoming.thinking.is_empty() {
@@ -606,8 +612,27 @@ impl Renderer for TuiRenderer {
         }
     }
 
+    fn rehydrate_subagents(&mut self, subagents: &[SubagentDetail]) {
+        self.set_subagents(subagents.to_vec());
+        if !self.subagents.is_empty() {
+            self.show_subagent_panel = true;
+            self.selected_subagent_idx = self.subagents.len().saturating_sub(1);
+        }
+    }
+
     fn rehydrate_messages(&mut self, messages: &[crate::types::Message]) {
         self.commit_turn_content();
+        let delegated_call_ids: std::collections::HashSet<&str> = messages
+            .iter()
+            .filter_map(|m| match m {
+                crate::types::Message::Assistant { tool_calls, .. } => Some(tool_calls),
+                _ => None,
+            })
+            .flatten()
+            .filter(|call| call.function.name == "delegate_task")
+            .map(|call| call.id.as_str())
+            .collect();
+
         for msg in messages.iter().skip(1) {
             match msg {
                 crate::types::Message::User { content } => {
@@ -640,8 +665,24 @@ impl Renderer for TuiRenderer {
                         self.messages.push(c.clone());
                     }
                 }
-                crate::types::Message::Tool { content, .. } => {
-                    self.messages.push(format!("[Tool Result] {content}"));
+                crate::types::Message::Tool {
+                    tool_call_id,
+                    content,
+                } => {
+                    if delegated_call_ids.contains(tool_call_id.as_str()) {
+                        let summary = if let Some(first_line) = content.lines().next() {
+                            if first_line.starts_with("MISSION COMPLETE") {
+                                first_line.to_string()
+                            } else {
+                                "Task completed".to_string()
+                            }
+                        } else {
+                            "Task completed".to_string()
+                        };
+                        self.messages.push(format!("[Tool Result] {summary}"));
+                    } else {
+                        self.messages.push(format!("[Tool Result] {content}"));
+                    }
                 }
                 _ => {}
             }

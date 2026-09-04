@@ -1238,3 +1238,101 @@ This is a quadratic equation in the form $at^2 + bt + c = 0$ where:
     assert!(formatted.contains("(D · D)t² + 2(L · D)t + (L · L) - r² = 0"));
     assert!(formatted.contains("at² + bt + c = 0"));
 }
+
+#[test]
+fn test_rehydrate_subagents_enables_panel_and_selects_latest() {
+    let mut r = TuiRenderer::new();
+    assert!(!r.show_subagent_panel);
+    assert_eq!(r.subagents.len(), 0);
+
+    let subagents = vec![
+        SubagentDetail {
+            name: "coder-t-001".to_string(),
+            task_id: Some("t-001".to_string()),
+            prompt: "task 1".to_string(),
+            started_at: None,
+            last_activity_at: None,
+            logs: vec![
+                "started task t-001".to_string(),
+                "completed task t-001".to_string(),
+            ],
+            thinking: String::new(),
+            content: "output 1".to_string(),
+            is_active: false,
+            context_tokens: 100,
+        },
+        SubagentDetail {
+            name: "researcher-t-002".to_string(),
+            task_id: Some("t-002".to_string()),
+            prompt: "task 2".to_string(),
+            started_at: None,
+            last_activity_at: None,
+            logs: vec![
+                "started task t-002".to_string(),
+                "completed task t-002".to_string(),
+            ],
+            thinking: String::new(),
+            content: "output 2".to_string(),
+            is_active: false,
+            context_tokens: 200,
+        },
+    ];
+
+    r.rehydrate_subagents(&subagents);
+
+    assert!(
+        r.show_subagent_panel,
+        "Subagents panel must be visible after rehydration"
+    );
+    assert_eq!(r.subagents.len(), 2);
+    assert_eq!(r.selected_subagent_idx, 1, "Should select latest subagent");
+    assert_eq!(r.subagents[0].name, "coder-t-001");
+    assert_eq!(r.subagents[1].name, "researcher-t-002");
+}
+
+#[test]
+fn test_rehydrate_messages_summarizes_delegation_results() {
+    let mut r = TuiRenderer::new();
+    let messages = vec![
+        crate::types::Message::System {
+            content: "system".to_string(),
+        },
+        crate::types::Message::User {
+            content: "goal".to_string(),
+        },
+        crate::types::Message::Assistant {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![crate::types::ToolCall::new(
+                "call-del-1",
+                "delegate_task",
+                r#"{"agent_name": "coder", "task_id": "t-001", "prompt": "build feature"}"#,
+            )],
+        },
+        crate::types::Message::Tool {
+            tool_call_id: "call-del-1".to_string(),
+            content: "MISSION COMPLETE (t-001):\nline 1\nline 2\nline 3\n... 2000 lines ..."
+                .to_string(),
+        },
+    ];
+
+    r.rehydrate_messages(&messages);
+
+    assert!(
+        r.messages
+            .iter()
+            .any(|m| m.contains("[Tool Call] delegate_task(agent: coder, task_id: t-001)"))
+    );
+    // Should NOT dump the multi-line deliverable into chat
+    assert!(
+        !r.messages
+            .iter()
+            .any(|m| m.contains("line 1") || m.contains("2000 lines"))
+    );
+    // Should contain the summarized mission marker
+    assert!(
+        r.messages
+            .iter()
+            .any(|m| m == "[Tool Result] MISSION COMPLETE (t-001):")
+    );
+}

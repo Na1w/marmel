@@ -140,6 +140,17 @@ impl Renderer for RawRenderer {
     }
 
     fn rehydrate_messages(&mut self, messages: &[crate::types::Message]) {
+        let delegated_call_ids: std::collections::HashSet<&str> = messages
+            .iter()
+            .filter_map(|m| match m {
+                crate::types::Message::Assistant { tool_calls, .. } => Some(tool_calls),
+                _ => None,
+            })
+            .flatten()
+            .filter(|call| call.function.name == "delegate_task")
+            .map(|call| call.id.as_str())
+            .collect();
+
         for msg in messages.iter().skip(1) {
             match msg {
                 crate::types::Message::User { content } => {
@@ -164,8 +175,24 @@ impl Renderer for RawRenderer {
                         self.push_line("assistant", c);
                     }
                 }
-                crate::types::Message::Tool { content, .. } => {
-                    self.push_line("tool-result", content);
+                crate::types::Message::Tool {
+                    tool_call_id,
+                    content,
+                } => {
+                    if delegated_call_ids.contains(tool_call_id.as_str()) {
+                        let summary = if let Some(first_line) = content.lines().next() {
+                            if first_line.starts_with("MISSION COMPLETE") {
+                                first_line.to_string()
+                            } else {
+                                "Task completed".to_string()
+                            }
+                        } else {
+                            "Task completed".to_string()
+                        };
+                        self.push_line("tool-result", &summary);
+                    } else {
+                        self.push_line("tool-result", content);
+                    }
                 }
                 _ => {}
             }

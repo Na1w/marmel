@@ -57,6 +57,7 @@ struct ScriptedRenderer {
     /// Whether an abort was requested (via `/abort`).
     aborted: bool,
     rehydrated: Vec<marmennill::types::Message>,
+    subagents: Vec<marmennill::ui::SubagentDetail>,
     events: Vec<Event>,
 }
 
@@ -69,6 +70,7 @@ impl ScriptedRenderer {
             poll_cursor: 0,
             aborted: false,
             rehydrated: Vec::new(),
+            subagents: Vec::new(),
             events: Vec::new(),
         }
     }
@@ -81,6 +83,7 @@ impl ScriptedRenderer {
             poll_cursor: 0,
             aborted: false,
             rehydrated: Vec::new(),
+            subagents: Vec::new(),
             events: Vec::new(),
         }
     }
@@ -95,6 +98,12 @@ impl Renderer for ScriptedRenderer {
     }
     fn rehydrate_messages(&mut self, messages: &[marmennill::types::Message]) {
         self.rehydrated = messages.to_vec();
+    }
+    fn set_subagents(&mut self, subagents: Vec<marmennill::ui::SubagentDetail>) {
+        self.subagents = subagents;
+    }
+    fn rehydrate_subagents(&mut self, subagents: &[marmennill::ui::SubagentDetail]) {
+        self.subagents = subagents.to_vec();
     }
     fn flush(&mut self) -> anyhow::Result<()> {
         Ok(())
@@ -774,4 +783,100 @@ async fn test_ui_session_recovers_frozen_and_injects_deliverable() {
     );
 
     let _ = wid;
+}
+
+#[tokio::test]
+async fn test_ui_session_rehydrates_subagents_and_populates_agent_pane() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let turn_counter = Arc::new(AtomicUsize::new(0));
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let tc = turn_counter.clone();
+            move |req: &wiremock::Request| {
+                let n = tc.fetch_add(1, Ordering::SeqCst);
+                let _body = String::from_utf8_lossy(&req.body);
+                if n == 0 {
+                    // Turn 1 of session 1: manager delegates task t-901 to coder
+                    ResponseTemplate::new(200).set_body_string(tool_call_sse(
+                        "call-del-901",
+                        "delegate_task",
+                        r#"{"agent_name": "coder", "task_id": "t-901", "prompt": "build feature A"}"#,
+                    ))
+                } else if n == 1 {
+                    // Turn 1 part 2 of session 1: manager finishes turn after delegation result
+                    ResponseTemplate::new(200)
+                        .set_body_string(completion_sse("Finished delegating t-901."))
+                } else {
+                    // Resumed turn
+                    ResponseTemplate::new(200)
+                        .set_body_string(completion_sse("Resumed turn reply."))
+                }
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = marmennill::agent::phase::Plan::at(tmp.path());
+    plan.create("# Execution Plan\n\n- [ ] [t-901] First task\n- [ ] [t-902] Second task\n")
+        .unwrap();
+
+    let cfg = Config {
+        backend_url: format!("{}/v1", server.uri()),
+        system_prompt_path: PathBuf::from("prompts/system.md"),
+        ui_mode: "tui".to_string(),
+        ..Config::default()
+    };
+
+    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::from_config(&cfg),
+        plan.clone(),
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    // Run session 1: user gives initial goal, manager delegates t-901, finishes turn, then aborts
+    let mut renderer1 = ScriptedRenderer::new(vec!["/abort".to_string()]);
+    marmennill::ui::run_session(
+        &cfg,
+        &mut renderer1,
+        Some("Build feature set".to_string()),
+        Some(mgr.clone()),
+    )
+    .await
+    .expect("session 1 succeeds");
+
+    assert!(plan.transcript_path().exists());
+
+    // Run session 2 (rehydration): restarted with no initial argument, user presses Enter to resume
+    let mut renderer2 = ScriptedRenderer::new(vec!["".to_string(), "/abort".to_string()]);
+    marmennill::ui::run_session(&cfg, &mut renderer2, None, Some(mgr))
+        .await
+        .expect("session 2 succeeds");
+
+    // Verify that session 2 rehydrated subagent list for the Agent pane
+    assert!(
+        !renderer2.subagents.is_empty(),
+        "renderer2 should have rehydrated subagents list for agent pane"
+    );
+    let sa = renderer2
+        .subagents
+        .iter()
+        .find(|s| s.task_id.as_deref() == Some("t-901"))
+        .expect("coder-t-901 should be present in rehydrated subagents");
+    assert_eq!(sa.name, "coder-t-901");
+    assert_eq!(sa.prompt, "build feature A");
+    assert!(!sa.is_active);
+    assert!(
+        sa.logs.iter().any(|l| l.contains("started task t-901")),
+        "logs should record task start"
+    );
+    assert!(
+        sa.logs.iter().any(|l| l.contains("completed task t-901")),
+        "logs should record task completion"
+    );
 }

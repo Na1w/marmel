@@ -291,3 +291,347 @@ pub(crate) fn drain_delegation_events(
         renderer.set_subagents(subagents.clone());
     }
 }
+
+/// Rehydrate the list of specialist subagents from historical session artifacts:
+/// 1. Messages in the transcript (`delegate_task` tool calls and matching `tool` results).
+/// 2. Crash journal entries in `.session_journal.json`.
+/// 3. Recovered deliverable from deep-freeze checkpoint (if any).
+/// 4. Completed tasks in the on-disk execution plan.
+pub fn rehydrate_subagents(
+    messages: &[Message],
+    journal: Option<&crate::orchestrator::freeze::CrashJournal>,
+    recovered_deliverable: Option<&(String, String)>,
+    plan: Option<&crate::agent::phase::Plan>,
+) -> Vec<SubagentDetail> {
+    let mut subagents = Vec::<SubagentDetail>::new();
+
+    // 1. Rehydrate from messages in transcript: look for delegate_task tool calls and results
+    for msg in messages {
+        if let Message::Assistant { tool_calls, .. } = msg {
+            for call in tool_calls {
+                if call.function.name == "delegate_task" {
+                    let args_val =
+                        serde_json::from_str::<serde_json::Value>(&call.function.arguments).ok();
+                    let agent_name = args_val
+                        .as_ref()
+                        .and_then(|v| v.get("agent_name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("specialist");
+                    let task_id = args_val
+                        .as_ref()
+                        .and_then(|v| v.get("task_id"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let prompt = args_val
+                        .as_ref()
+                        .and_then(|v| v.get("prompt"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    let name = match &task_id {
+                        Some(tid) if !tid.trim().is_empty() => format!("{agent_name}-{tid}"),
+                        _ => agent_name.to_string(),
+                    };
+
+                    // Find matching tool result
+                    let matching_tool = messages.iter().find_map(|m| match m {
+                        Message::Tool {
+                            tool_call_id,
+                            content,
+                        } if tool_call_id == &call.id => Some(content.clone()),
+                        _ => None,
+                    });
+
+                    let task_str = task_id.as_deref().unwrap_or("");
+                    let mut logs = vec![format!("started task {task_str}")];
+                    let content = if let Some(c) = matching_tool {
+                        logs.push(format!("completed task {task_str}"));
+                        c
+                    } else if let Some((rec_task, rec_content)) = recovered_deliverable {
+                        if task_id.as_deref() == Some(rec_task) || name.ends_with(rec_task) {
+                            logs.push(format!("completed task {task_str}"));
+                            rec_content.clone()
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
+
+                    let context_tokens = if !content.is_empty() {
+                        tiktoken_rs::cl100k_base_singleton()
+                            .encode_ordinary(&content)
+                            .len()
+                    } else {
+                        0
+                    };
+
+                    if let Some(existing) = subagents.iter_mut().find(|s| s.name == name) {
+                        if existing.content.is_empty() && !content.is_empty() {
+                            existing.content = content;
+                            existing.context_tokens = context_tokens;
+                        }
+                        if existing.prompt.is_empty() && !prompt.is_empty() {
+                            existing.prompt = prompt;
+                        }
+                        if existing.task_id.is_none() && task_id.is_some() {
+                            existing.task_id = task_id;
+                        }
+                        for log in logs {
+                            if !existing.logs.contains(&log) {
+                                existing.logs.push(log);
+                            }
+                        }
+                    } else {
+                        subagents.push(SubagentDetail {
+                            name,
+                            task_id,
+                            prompt,
+                            started_at: None,
+                            last_activity_at: None,
+                            logs,
+                            thinking: String::new(),
+                            content,
+                            is_active: false,
+                            context_tokens,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Incorporate crash journal events (if any delegation was logged)
+    if let Some(j) = journal
+        && let Ok(entries) = j.journal()
+    {
+        for entry in entries {
+            let name = match &entry.task_id {
+                Some(tid) if !tid.trim().is_empty() => {
+                    format!("{}-{tid}", entry.agent.as_str())
+                }
+                _ => entry.agent.as_str().to_string(),
+            };
+            let task_str = entry.task_id.as_deref().unwrap_or("");
+            let log_entry = match entry.kind {
+                crate::orchestrator::freeze::JournalEventKind::Resolved => {
+                    format!("completed task {task_str}")
+                }
+                crate::orchestrator::freeze::JournalEventKind::Failed => {
+                    format!("failed task {task_str}")
+                }
+                crate::orchestrator::freeze::JournalEventKind::Frozen => {
+                    format!("started task {task_str}")
+                }
+            };
+            if let Some(existing) = subagents.iter_mut().find(|s| s.name == name) {
+                if !existing.logs.contains(&log_entry) {
+                    existing.logs.push(log_entry);
+                }
+            } else {
+                let mut logs = vec![format!("started task {task_str}")];
+                if entry.kind != crate::orchestrator::freeze::JournalEventKind::Frozen {
+                    logs.push(log_entry);
+                }
+                subagents.push(SubagentDetail {
+                    name,
+                    task_id: entry.task_id,
+                    prompt: String::new(),
+                    started_at: None,
+                    last_activity_at: None,
+                    logs,
+                    thinking: String::new(),
+                    content: String::new(),
+                    is_active: false,
+                    context_tokens: 0,
+                });
+            }
+        }
+    }
+
+    // 3. Fold in recovered_deliverable if not already present
+    if let Some((rec_task, rec_content)) = recovered_deliverable {
+        let matched = subagents
+            .iter_mut()
+            .find(|s| s.task_id.as_deref() == Some(rec_task) || s.name.ends_with(rec_task));
+        if let Some(existing) = matched {
+            if existing.content.is_empty() {
+                existing.content = rec_content.clone();
+                existing.context_tokens = tiktoken_rs::cl100k_base_singleton()
+                    .encode_ordinary(rec_content)
+                    .len();
+            }
+            let completed_log = format!("completed task {rec_task}");
+            if !existing.logs.contains(&completed_log) {
+                existing.logs.push(completed_log);
+            }
+        } else {
+            let name = format!("specialist-{rec_task}");
+            let context_tokens = tiktoken_rs::cl100k_base_singleton()
+                .encode_ordinary(rec_content)
+                .len();
+            subagents.push(SubagentDetail {
+                name,
+                task_id: Some(rec_task.clone()),
+                prompt: String::new(),
+                started_at: None,
+                last_activity_at: None,
+                logs: vec![
+                    format!("started task {rec_task}"),
+                    format!("completed task {rec_task}"),
+                ],
+                thinking: String::new(),
+                content: rec_content.clone(),
+                is_active: false,
+                context_tokens,
+            });
+        }
+    }
+
+    // 4. Check off tasks from execution plan that might have completed
+    if let Some(p) = plan {
+        let all = p.all_tasks();
+        let pending = p.pending_tasks();
+        let completed: Vec<String> = all.into_iter().filter(|t| !pending.contains(t)).collect();
+        let plan_content = p.read().ok().flatten().unwrap_or_default();
+
+        for tid in completed {
+            if !subagents
+                .iter()
+                .any(|s| s.task_id.as_deref() == Some(&tid) || s.name.ends_with(&tid))
+            {
+                // Detect role if specified on the task line, e.g. (coder)
+                let matching_line = plan_content
+                    .lines()
+                    .find(|line| line.contains(&tid))
+                    .unwrap_or("");
+                let role = if matching_line.contains("(coder)") {
+                    "coder"
+                } else if matching_line.contains("(researcher)") {
+                    "researcher"
+                } else if matching_line.contains("(validator)") {
+                    "validator"
+                } else if matching_line.contains("(debugger)") {
+                    "debugger"
+                } else {
+                    "specialist"
+                };
+                subagents.push(SubagentDetail {
+                    name: format!("{role}-{tid}"),
+                    task_id: Some(tid.clone()),
+                    prompt: String::new(),
+                    started_at: None,
+                    last_activity_at: None,
+                    logs: vec![
+                        format!("started task {tid}"),
+                        format!("completed task {tid}"),
+                    ],
+                    thinking: String::new(),
+                    content: String::new(),
+                    is_active: false,
+                    context_tokens: 0,
+                });
+            }
+        }
+    }
+
+    subagents
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Message, ToolCall};
+
+    #[test]
+    fn test_rehydrate_subagents_from_messages() {
+        let messages = vec![
+            Message::System {
+                content: "sys".to_string(),
+            },
+            Message::User {
+                content: "goal".to_string(),
+            },
+            Message::Assistant {
+                content: Some("I will delegate task 1".to_string()),
+                reasoning_content: None,
+                tool_calls: vec![ToolCall::new(
+                    "call_1",
+                    "delegate_task",
+                    serde_json::json!({
+                        "agent_name": "coder",
+                        "task_id": "t-001",
+                        "prompt": "write scene.rs"
+                    })
+                    .to_string(),
+                )],
+            },
+            Message::Tool {
+                tool_call_id: "call_1".to_string(),
+                content: "MISSION COMPLETE (t-001):\nwrote scene.rs successfully".to_string(),
+            },
+        ];
+
+        let subagents = rehydrate_subagents(&messages, None, None, None);
+        assert_eq!(subagents.len(), 1);
+        let s = &subagents[0];
+        assert_eq!(s.name, "coder-t-001");
+        assert_eq!(s.task_id.as_deref(), Some("t-001"));
+        assert_eq!(s.prompt, "write scene.rs");
+        assert_eq!(
+            s.content,
+            "MISSION COMPLETE (t-001):\nwrote scene.rs successfully"
+        );
+        assert!(!s.is_active);
+        assert_eq!(s.logs, vec!["started task t-001", "completed task t-001"]);
+    }
+
+    #[test]
+    fn test_rehydrate_subagents_with_recovered_deliverable() {
+        let messages = vec![
+            Message::System {
+                content: "sys".to_string(),
+            },
+            Message::User {
+                content: "goal".to_string(),
+            },
+            Message::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![ToolCall::new(
+                    "call_frozen",
+                    "delegate_task",
+                    serde_json::json!({
+                        "agent_name": "researcher",
+                        "task_id": "t-002",
+                        "prompt": "study docs"
+                    })
+                    .to_string(),
+                )],
+            },
+        ];
+
+        let recovered = ("t-002".to_string(), "recovered report".to_string());
+        let subagents = rehydrate_subagents(&messages, None, Some(&recovered), None);
+        assert_eq!(subagents.len(), 1);
+        let s = &subagents[0];
+        assert_eq!(s.name, "researcher-t-002");
+        assert_eq!(s.content, "recovered report");
+        assert!(s.logs.contains(&"completed task t-002".to_string()));
+    }
+
+    #[test]
+    fn test_rehydrate_subagents_from_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = crate::agent::phase::Plan::at(tmp.path());
+        plan.create("# Plan\n\n- [x] [t-001] Setup project (coder)\n- [ ] [t-002] Write tests\n")
+            .unwrap();
+
+        let subagents = rehydrate_subagents(&[], None, None, Some(&plan));
+        assert_eq!(subagents.len(), 1);
+        assert_eq!(subagents[0].name, "coder-t-001");
+        assert_eq!(subagents[0].task_id.as_deref(), Some("t-001"));
+        assert!(!subagents[0].is_active);
+    }
+}

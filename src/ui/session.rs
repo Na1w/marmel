@@ -4,7 +4,7 @@ use super::bridge::{
     RendererSink, SteerArbEvent, drain_steer_arbitration_events, spawn_steer_arbitration,
 };
 use super::helpers::*;
-use super::{Event, Renderer, SubagentDetail};
+use super::{Event, Renderer};
 use crate::config::Config;
 use crate::llm::{ChatClient, StreamConfig, chat_client_turn};
 use crate::manager::context::ContextEngine;
@@ -123,7 +123,7 @@ pub async fn run_session(
         let _ = renderer.flush();
     }
 
-    if let Some((task_info, content)) = recovered_deliverable {
+    if let Some((task_info, content)) = recovered_deliverable.as_ref() {
         ctx.append(Message::User {
             content: format!(
                 "(SYSTEM NOTICE: A previous interrupted task [{task_info}] was recovered successfully from checkpoint:\n{content}\nUse this deliverable to proceed with subsequent pending plan tasks.)"
@@ -148,7 +148,17 @@ pub async fn run_session(
 
     let mut steer_queue = Vec::<String>::new();
     let mut steer_abort_requested = false;
-    let mut subagents = Vec::<SubagentDetail>::new();
+    let mut subagents = rehydrate_subagents(
+        ctx.messages(),
+        manager.as_ref().map(|m| &m.journal),
+        recovered_deliverable.as_ref(),
+        Some(&plan),
+    );
+
+    if !subagents.is_empty() {
+        renderer.rehydrate_subagents(&subagents);
+        let _ = renderer.flush();
+    }
 
     let goal = match initial {
         Some(g) => {
