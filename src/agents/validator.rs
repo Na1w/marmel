@@ -1,16 +1,16 @@
 //! Specialist: **Validator** — Independent Quality Auditor.
 //!
-//! Domain (REQ-ORCH-002): verifies accuracy/logic/fact-checking; runs test
-//! suites, linters, checks deliverables; issues formal verdicts. Rejects
+//! Domain (REQ-ORCH-002): verifies accuracy/logic/fact-checking; inspects
+//! deliverables and source files; issues formal verdicts. Rejects
 //! incomplete work with actionable feedback; never inflates pass status.
 //!
-//! Allowed tool namespaces: `delegate_task`, `terminal__*`, `kiwix__*`,
-//! `gedcom__*`, `memory__*`, `leave_verdict`.
+//! Allowed tool namespaces: `delegate_task`, `read_file`, `grep_search`,
+//! `glob`, `pty_*`, `leave_verdict`, `rebirth`.
 
 use crate::agents::{Agent, Specialist};
 use async_trait::async_trait;
 
-/// Independent Quality Auditor — verification, test suites, formal verdicts.
+/// Independent Quality Auditor — verification, inspection, formal verdicts.
 #[derive(Debug, Default)]
 pub struct Validator;
 
@@ -38,9 +38,15 @@ impl Specialist for Validator {
         &[
             "delegate_task",
             "read_file",
-            "run_command",
             "grep_search",
             "glob",
+            "pty_spawn",
+            "pty_write",
+            "pty_read",
+            "pty_close",
+            "pty_list",
+            "pty__*",
+            "pty_*",
             "leave_verdict",
             "rebirth",
         ]
@@ -56,9 +62,11 @@ mod tests {
         let v = Validator;
         assert_eq!(v.name(), Agent::Validator);
         assert!(v.tool_namespaces().contains(&"read_file"));
-        assert!(v.tool_namespaces().contains(&"run_command"));
+        assert!(!v.tool_namespaces().contains(&"run_command"));
         assert!(v.tool_namespaces().contains(&"grep_search"));
         assert!(v.tool_namespaces().contains(&"glob"));
+        assert!(v.tool_namespaces().contains(&"pty_spawn"));
+        assert!(v.tool_namespaces().contains(&"pty_read"));
         assert!(v.tool_namespaces().contains(&"leave_verdict"));
         assert!(v.tool_namespaces().contains(&"rebirth"));
         assert!(!v.tool_namespaces().contains(&"write_file"));

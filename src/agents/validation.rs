@@ -66,10 +66,10 @@ pub(crate) async fn run_automated_validation(
     let brief = format!(
         "Task Brief:\n{}\n\nSpecialist Deliverable:\n{}\n\n\
          Instructions:\n\
-         1. Inspect the workspace, verify files, compile, and run tests as needed using available tools.\n\
-         2. You are an auditor: do NOT modify any files yourself. Solely analyze, inspect, test, and provide feedback.\n\
+         1. Inspect the workspace and examine files using available inspection tools (`read_file`, `grep_search`, `glob`) or interactive terminal sessions (`pty_*`).\n\
+         2. You are an auditor: you cannot execute direct shell commands (`run_command`) or modify files (`write_file`, `replace`). Solely analyze, inspect, and provide feedback.\n\
          3. When your verification is complete, you MUST call the `leave_verdict` tool with `verdict` ('APPROVED' or 'REJECTED') and detailed `comments`.\n\
-         4. If advised or when context usage is high (>= 80%), call the `rebirth` tool with your intermediate findings, tested files, and current offsets/line numbers to preserve continuity without restarting.",
+         4. If advised or when context usage is high (>= 80%), call the `rebirth` tool with your intermediate findings, inspected files, and current offsets/line numbers to preserve continuity without restarting.",
         task_brief, deliverable
     );
 
