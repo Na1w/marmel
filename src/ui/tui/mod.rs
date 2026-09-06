@@ -119,6 +119,7 @@ pub struct TuiRenderer {
     pub(crate) chat_auto_scroll: bool,
     pub(crate) plan_max_scroll: u16,
     pub(crate) plan_auto_scroll: bool,
+    pub(crate) active_plan_task: Option<String>,
 
     pub(crate) chat_area: Rect,
     pub(crate) plan_area: Rect,
@@ -193,6 +194,7 @@ impl TuiRenderer {
             chat_auto_scroll: true,
             plan_max_scroll: 0,
             plan_auto_scroll: false,
+            active_plan_task: None,
 
             chat_area: Rect::default(),
             plan_area: Rect::default(),
@@ -442,10 +444,20 @@ impl Renderer for TuiRenderer {
                         };
                         self.active_agent = name.clone();
                         let t = task.as_deref().unwrap_or("(no task id)");
+                        if let Some(tid) = task
+                            && !tid.trim().is_empty()
+                        {
+                            self.active_plan_task = Some(tid.clone());
+                            self.plan_auto_scroll = true;
+                            self.show_plan_panel = true;
+                        }
                         // Fold into the local subagent list so the panel stays
                         // live even before the session loop pushes the
                         // authoritative list (t-c304).
                         self.upsert_subagent(&name, true, &format!("started task {t}"));
+                        if let Some(s) = self.subagents.iter_mut().find(|s| s.name == name) {
+                            s.task_id = task.clone();
+                        }
                         self.status_line = format!("Delegating to specialist {name} for {t}");
                     }
                     crate::orchestrator::DelegationEvent::Completed { agent, task } => {
@@ -455,6 +467,13 @@ impl Renderer for TuiRenderer {
                         };
                         let t = task.as_deref().unwrap_or("(no task id)");
                         self.upsert_subagent(&name, false, &format!("completed task {t}"));
+                        if self.active_plan_task.as_deref() == task.as_deref() {
+                            self.active_plan_task = self
+                                .subagents
+                                .iter()
+                                .find(|s| s.is_active && s.task_id.is_some() && s.name != name)
+                                .and_then(|s| s.task_id.clone());
+                        }
                         let remaining_active: Vec<&str> = self
                             .subagents
                             .iter()

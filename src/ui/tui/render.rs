@@ -487,12 +487,35 @@ impl TuiRenderer {
             .border_style(Style::default().fg(plan_border_color))
             .title(" Execution Plan ");
 
+        let target_task = self.active_plan_task.as_deref().or_else(|| {
+            self.subagents
+                .iter()
+                .find(|s| s.is_active && s.task_id.is_some())
+                .and_then(|s| s.task_id.as_deref())
+        });
+
         let mut plan_lines = Vec::new();
         for raw_line in plan.lines() {
             let line = raw_line.replace('\t', "    ");
+            let is_active_task = if let Some(tid) = target_task {
+                let clean_tid = tid
+                    .trim_matches(|c| {
+                        c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\''
+                    })
+                    .trim()
+                    .to_lowercase();
+                !clean_tid.is_empty() && line.to_lowercase().contains(&clean_tid)
+            } else {
+                false
+            };
+
             let style = if line.starts_with("# ") || line.starts_with("## ") {
                 Style::default()
                     .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_active_task && (line.contains("[ ]") || line.contains("( )")) {
+                Style::default()
+                    .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
             } else if line.contains("[x]") || line.contains("[X]") {
                 Style::default().fg(Color::Green)
@@ -512,7 +535,13 @@ impl TuiRenderer {
         let total_plan_lines = wrapped_lines(plan, plan_w.max(1));
         self.plan_max_scroll = total_plan_lines.saturating_sub(plan_h) as u16;
         let scroll_y = if self.plan_auto_scroll {
-            let target_scroll = if let Some(first_pending_visual) =
+            let target_scroll = if let Some(task_id) = target_task
+                && let Some(task_visual) = visual_line_offset_of_task(plan, task_id, plan_w.max(1))
+            {
+                // Position the active started task comfortably in view (leaving 1 line of context above if possible)
+                let desired = task_visual.saturating_sub(1);
+                (desired as u16).min(self.plan_max_scroll)
+            } else if let Some(first_pending_visual) =
                 visual_line_offset_of_first_pending(plan, plan_w.max(1))
             {
                 // Position the first pending task comfortably in view (leaving 1 line of context above if possible)

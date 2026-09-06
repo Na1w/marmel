@@ -478,6 +478,58 @@ pub fn visual_line_offset_of_first_pending(text: &str, width: usize) -> Option<u
     None
 }
 
+/// Compute the visual (wrapped) line offset of a specific task in the execution plan text (e.g. `t-001`).
+/// Returns `None` if the task ID is not found.
+pub fn visual_line_offset_of_task(text: &str, task_id: &str, width: usize) -> Option<usize> {
+    let clean_tid = task_id
+        .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
+        .trim();
+    if clean_tid.is_empty() {
+        return None;
+    }
+    let tid_lower = clean_tid.to_lowercase();
+    let mut visual_offset = 0;
+    let mut candidate_offset = None;
+
+    for raw_line in text.lines() {
+        let line_lower = raw_line.to_lowercase();
+        if let Some(pos) = line_lower.find(&tid_lower) {
+            let before = if pos == 0 {
+                None
+            } else {
+                line_lower[..pos].chars().last()
+            };
+            let after_pos = pos + tid_lower.len();
+            let after = line_lower[after_pos..].chars().next();
+
+            let before_ok = before
+                .map(|c| !c.is_alphanumeric() && c != '-' && c != '_')
+                .unwrap_or(true);
+            let after_ok = after
+                .map(|c| !c.is_alphanumeric() && c != '-' && c != '_')
+                .unwrap_or(true);
+
+            if before_ok && after_ok {
+                // If this line has a checkbox, it's definitively the task checklist item
+                if raw_line.contains("[ ]")
+                    || raw_line.contains("[x]")
+                    || raw_line.contains("[X]")
+                    || raw_line.contains("( )")
+                    || raw_line.contains("(x)")
+                    || raw_line.contains("(X)")
+                {
+                    return Some(visual_offset);
+                }
+                if candidate_offset.is_none() {
+                    candidate_offset = Some(visual_offset);
+                }
+            }
+        }
+        visual_offset += wrapped_lines(raw_line, width).max(1);
+    }
+    candidate_offset
+}
+
 /// Compute a centered rectangle of `percent_x`% width and `percent_y`% height
 /// within `r` (reference §9.1).
 #[allow(dead_code)]

@@ -827,6 +827,47 @@ fn test_plan_auto_scrolls_to_first_pending_task() {
 }
 
 #[test]
+fn test_visual_line_offset_of_task() {
+    let plan = "# Plan\n## Phase 1\n- [x] [t-001] First\n- [x] [t-002] Second\n- [ ] [t-003] Third\n- [ ] [t-004] Fourth\n";
+    assert_eq!(visual_line_offset_of_task(plan, "t-001", 80), Some(2));
+    assert_eq!(visual_line_offset_of_task(plan, "t-002", 80), Some(3));
+    assert_eq!(visual_line_offset_of_task(plan, "t-003", 80), Some(4));
+    assert_eq!(visual_line_offset_of_task(plan, "t-004", 80), Some(5));
+    assert_eq!(visual_line_offset_of_task(plan, "t-999", 80), None);
+}
+
+#[test]
+fn test_plan_auto_scrolls_to_started_task() {
+    let mut r = TuiRenderer::new();
+    let plan_text = "# Plan\n## Phase 1\n- [x] [t-001] Task 1\n- [x] [t-002] Task 2\n- [x] [t-003] Task 3\n- [ ] [t-004] Task 4\n- [ ] [t-005] Task 5\n- [ ] [t-006] Task 6\n- [ ] [t-007] Task 7\n- [ ] [t-008] Task 8\n- [ ] [t-009] Task 9\n- [ ] [t-010] Task 10\n";
+    r.plan_content = plan_text.to_string();
+
+    // Start task t-008
+    r.on_event(&crate::ui::Event::Delegation(
+        crate::orchestrator::DelegationEvent::Started {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-008".to_string()),
+        },
+    ));
+
+    assert_eq!(r.active_plan_task.as_deref(), Some("t-008"));
+    assert!(r.plan_auto_scroll);
+    assert!(r.show_plan_panel);
+
+    let backend = ratatui::backend::TestBackend::new(80, 6);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 0, 80, 6);
+            r.render_plan(frame, area, plan_text, false);
+        })
+        .unwrap();
+
+    // Line offset of t-008 is 9, leaving 1 line of context above -> desired scroll is 8
+    assert_eq!(r.plan_scroll, 8);
+}
+
+#[test]
 fn test_subagent_scrolling_and_focus() {
     let mut r = TuiRenderer::new();
     r.focused_panel = FocusedPanel::Subagents;
