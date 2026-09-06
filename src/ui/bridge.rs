@@ -19,6 +19,10 @@ pub(crate) enum SteerArbEvent {
         task_id: String,
         deliverable: crate::agents::Deliverable,
     },
+    SynthesizedAnswer {
+        user_msg: String,
+        answer: String,
+    },
     Finished {
         decision: Option<crate::orchestrator::SteerDecision>,
         user_msg: String,
@@ -96,6 +100,7 @@ pub(crate) fn spawn_steer_arbitration(
 
         if let Some(ref d) = decision {
             let tasks = crate::orchestrator::steer::extract_tasks_to_delegate(d, &msg);
+            let mut completed_deliverables = Vec::new();
             for (agent, task_id, prompt) in tasks {
                 let _ = tx.send(SteerArbEvent::DelegationStarted {
                     agent,
@@ -122,9 +127,31 @@ pub(crate) fn spawn_steer_arbitration(
                 };
                 let _ = tx.send(SteerArbEvent::DelegationCompleted {
                     agent,
-                    task_id,
-                    deliverable,
+                    task_id: task_id.clone(),
+                    deliverable: deliverable.clone(),
                 });
+                completed_deliverables.push((agent, task_id, deliverable));
+            }
+
+            if !completed_deliverables.is_empty() {
+                let delta_tx = tx.clone();
+                let _ = delta_tx.send(SteerArbEvent::Delta("\n".to_string()));
+                let synth_res = crate::orchestrator::steer::synthesize_steer_subtask_response(
+                    &client,
+                    &stats,
+                    &msg,
+                    &completed_deliverables,
+                    move |delta| {
+                        let _ = delta_tx.send(SteerArbEvent::Delta(delta.to_string()));
+                    },
+                )
+                .await;
+                if let Ok(synthesized) = synth_res {
+                    let _ = tx.send(SteerArbEvent::SynthesizedAnswer {
+                        user_msg: msg.clone(),
+                        answer: synthesized,
+                    });
+                }
             }
         }
 
@@ -171,6 +198,7 @@ pub(crate) fn drain_steer_arbitration_events(
                         Some(prompt),
                         true,
                     );
+                    renderer.set_subagents(sub.clone());
                 }
                 let _ = renderer.flush();
             }
@@ -204,6 +232,7 @@ pub(crate) fn drain_steer_arbitration_events(
                         None,
                         false,
                     );
+                    renderer.set_subagents(sub.clone());
                 }
                 steer_queue.push(format!(
                     "(User steering resulted in subtask '{task_id}' executed by specialist '{}'. Deliverable:\n{})",
@@ -211,6 +240,11 @@ pub(crate) fn drain_steer_arbitration_events(
                     deliverable.content
                 ));
                 let _ = renderer.flush();
+            }
+            SteerArbEvent::SynthesizedAnswer { user_msg, answer } => {
+                steer_queue.push(format!(
+                    "(User steering inquiry: '{user_msg}'. Arbitrator answered user directly: {answer})"
+                ));
             }
             SteerArbEvent::Finished { decision, user_msg } => {
                 let has_delegations = decision

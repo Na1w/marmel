@@ -61,9 +61,18 @@ pub struct JournalEvent {
     pub task_id: Option<String>,
 }
 
-/// File-backed Crash Journal. No shared mutable state — every operation
-/// (re)reads/writes the on-disk files, so it is safe to share `&self` across
-/// the async delegation path.
+static JOURNAL_MUTEX: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum RawFrozen {
+    Single(FreezeSnapshot),
+    List(Vec<FreezeSnapshot>),
+}
+
+/// File-backed Crash Journal. Thread-safe snapshotting and recovery for concurrent
+/// delegations sharing the `.marmel/` directory.
 #[derive(Debug, Clone)]
 pub struct CrashJournal {
     dir: PathBuf,
@@ -91,15 +100,18 @@ impl CrashJournal {
     }
 
     /// REQ-ORCH-003 (persistence): snapshot an in-flight delegation before the
-    /// worker runs. Generates a fresh `worker_id`, writes `.session_frozen.json`
+    /// worker runs. Generates a fresh `worker_id`, records it in `.session_frozen.json`
     /// and appends a `frozen` journal record. Returns the worker_id.
     pub fn snapshot(&self, agent: Agent, req: &DelegationRequest) -> anyhow::Result<String> {
+        let _guard = JOURNAL_MUTEX.lock().unwrap();
         let worker_id = Uuid::new_v4().to_string();
-        self.write_frozen(FreezeSnapshot {
+        let mut list = self.read_frozen_list()?;
+        list.push(FreezeSnapshot {
             worker_id: worker_id.clone(),
             agent_name: agent,
             sub_req: req.clone(),
-        })?;
+        });
+        self.write_frozen_list(&list)?;
         self.append(JournalEvent {
             ts: Self::now(),
             kind: JournalEventKind::Frozen,
@@ -113,16 +125,15 @@ impl CrashJournal {
     /// REQ-ORCH-003 (persistence): the current pending (frozen) snapshot, or
     /// `None` when no delegation is frozen. This is the rehydration source.
     pub fn frozen(&self) -> anyhow::Result<Option<FreezeSnapshot>> {
-        let path = self.frozen_path();
-        if !path.exists() {
-            return Ok(None);
-        }
-        let raw = std::fs::read_to_string(&path)?;
-        if raw.trim().is_empty() {
-            return Ok(None);
-        }
-        let snap: FreezeSnapshot = serde_json::from_str(&raw)?;
-        Ok(Some(snap))
+        let _guard = JOURNAL_MUTEX.lock().unwrap();
+        let list = self.read_frozen_list()?;
+        Ok(list.into_iter().next())
+    }
+
+    /// All in-flight pending snapshots.
+    pub fn frozen_all(&self) -> anyhow::Result<Vec<FreezeSnapshot>> {
+        let _guard = JOURNAL_MUTEX.lock().unwrap();
+        self.read_frozen_list()
     }
 
     /// Clear the frozen checkpoint once a delegation terminates (cleanly or
@@ -131,21 +142,20 @@ impl CrashJournal {
     /// freeze). Appends a `Resolved`/`Failed` journal event preserving the
     /// frozen delegation's agent and task identity for audit.
     pub fn clear(&self, worker_id: &str, resolved: bool) -> anyhow::Result<()> {
+        let _guard = JOURNAL_MUTEX.lock().unwrap();
         let kind = if resolved {
             JournalEventKind::Resolved
         } else {
             JournalEventKind::Failed
         };
-        // Capture the frozen record's agent + task before removing it so the
-        // journal event is accurate.
-        let (agent, task_id) = match self.frozen()? {
-            Some(snap) if snap.worker_id == worker_id => {
-                let agent = snap.agent_name;
-                let task_id = snap.sub_req.task_id;
-                let _ = std::fs::remove_file(self.frozen_path());
-                (agent, task_id)
-            }
-            _ => (Agent::Coder, None), // no-op guard: nothing owned by us frozen
+        let mut list = self.read_frozen_list()?;
+        let (agent, task_id) = if let Some(idx) = list.iter().position(|s| s.worker_id == worker_id)
+        {
+            let snap = list.remove(idx);
+            self.write_frozen_list(&list)?;
+            (snap.agent_name, snap.sub_req.task_id)
+        } else {
+            (Agent::Coder, None) // no-op guard: nothing owned by us frozen
         };
         self.append(JournalEvent {
             ts: Self::now(),
@@ -159,6 +169,7 @@ impl CrashJournal {
 
     /// The pending Crash Journal entries (audit/recovery diagnostics).
     pub fn journal(&self) -> anyhow::Result<Vec<JournalEvent>> {
+        let _guard = JOURNAL_MUTEX.lock().unwrap();
         let path = self.journal_path();
         if !path.exists() {
             return Ok(Vec::new());
@@ -172,7 +183,10 @@ impl CrashJournal {
 
     /// Whether a frozen snapshot exists (used by the recovery bootstrap).
     pub fn is_frozen(&self) -> bool {
-        self.frozen().map(|o| o.is_some()).unwrap_or(false)
+        let _guard = JOURNAL_MUTEX.lock().unwrap();
+        self.read_frozen_list()
+            .map(|l| !l.is_empty())
+            .unwrap_or(false)
     }
 
     /// Current UTC timestamp (RFC 3339) for journal records.
@@ -180,10 +194,39 @@ impl CrashJournal {
         chrono::Utc::now().to_rfc3339()
     }
 
-    fn write_frozen(&self, snap: FreezeSnapshot) -> anyhow::Result<()> {
+    fn read_frozen_list(&self) -> anyhow::Result<Vec<FreezeSnapshot>> {
+        let path = self.frozen_path();
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let raw = std::fs::read_to_string(&path)?;
+        if raw.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        match serde_json::from_str::<RawFrozen>(&raw) {
+            Ok(RawFrozen::Single(snap)) => Ok(vec![snap]),
+            Ok(RawFrozen::List(list)) => Ok(list),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to parse frozen snapshot file {}: {e}",
+                    path.display()
+                );
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    fn write_frozen_list(&self, list: &[FreezeSnapshot]) -> anyhow::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
-        let json = serde_json::to_string_pretty(&snap)?;
-        std::fs::write(self.frozen_path(), json)?;
+        if list.is_empty() {
+            let _ = std::fs::remove_file(self.frozen_path());
+        } else if list.len() == 1 {
+            let json = serde_json::to_string_pretty(&list[0])?;
+            std::fs::write(self.frozen_path(), json)?;
+        } else {
+            let json = serde_json::to_string_pretty(list)?;
+            std::fs::write(self.frozen_path(), json)?;
+        }
         Ok(())
     }
 
@@ -282,5 +325,35 @@ mod tests {
         // Distinct directories are distinct journals.
         assert!(ja.is_frozen());
         assert!(!jb.is_frozen());
+    }
+
+    #[test]
+    fn test_freeze_multiple_concurrent_snapshots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let j = CrashJournal::new(tmp.path());
+
+        let wid1 = j.snapshot(Agent::Coder, &sample_req()).unwrap();
+        let mut req2 = sample_req();
+        req2.task_id = Some("t-102".to_string());
+        req2.prompt = "Write integration tests.".to_string();
+        let wid2 = j.snapshot(Agent::Generalist, &req2).unwrap();
+
+        assert!(j.is_frozen());
+        let all = j.frozen_all().unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|s| s.worker_id == wid1));
+        assert!(all.iter().any(|s| s.worker_id == wid2));
+
+        // Clear wid1; wid2 should remain.
+        j.clear(&wid1, true).unwrap();
+        assert!(j.is_frozen());
+        let all = j.frozen_all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].worker_id, wid2);
+
+        // Clear wid2; now nothing is frozen.
+        j.clear(&wid2, true).unwrap();
+        assert!(!j.is_frozen());
+        assert!(j.frozen().unwrap().is_none());
     }
 }

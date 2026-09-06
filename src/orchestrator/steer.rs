@@ -505,6 +505,85 @@ pub async fn execute_steer_subtask(
     manager.delegate(req).await
 }
 
+/// Synthesize a direct response to the user's inquiry after delegated steering subtasks complete.
+pub async fn synthesize_steer_subtask_response<F>(
+    client: &ChatClient,
+    _stats: &HarnessStats,
+    user_msg: &str,
+    deliverables: &[(Agent, String, Deliverable)],
+    mut on_delta: F,
+) -> Result<String, anyhow::Error>
+where
+    F: FnMut(&str) + Send,
+{
+    let mut findings = String::new();
+    for (agent, task_id, deliverable) in deliverables {
+        findings.push_str(&format!(
+            "### Specialist [{}] (Subtask: {}):\n{}\n\n",
+            agent.as_str(),
+            task_id,
+            deliverable.content
+        ));
+    }
+
+    let system_prompt = "\
+You are Marmel's Steer Arbitrator. The user asked a question or sent an inquiry mid-flight while the session was executing.
+You delegated specialist subtask(s) to inspect the workspace, run diagnostics, or research the answer.
+The specialist findings and deliverables are provided below.
+
+Your task: Formulate a direct, helpful, and concise answer to the user in the EXACT SAME LANGUAGE as the user's message.
+- Answer the user's inquiry directly using the specialist findings.
+- Be factual, surgical, and clear. Zero filler, no conversational boilerplate or meta-disclaimers.";
+
+    let user_prompt = format!(
+        "User Message/Question:\n\"{}\"\n\nSpecialist Findings:\n{}\nPlease answer the user's question directly based on the findings above.",
+        user_msg, findings
+    );
+
+    let req = ChatRequest {
+        model: String::new(),
+        messages: vec![
+            Message::System {
+                content: system_prompt.to_string(),
+            },
+            Message::User {
+                content: user_prompt,
+            },
+        ],
+        temperature: Some(0.0),
+        top_p: Some(0.9),
+        frequency_penalty: None,
+        presence_penalty: None,
+        stream: Some(true),
+        enable_thinking: Some(false),
+        tools: None,
+    };
+
+    let mut full_response = String::new();
+    let reply = match tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        client.chat_stream(&req, |chunk| {
+            full_response.push_str(chunk);
+            on_delta(chunk);
+            true
+        }),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return Err(e),
+        Err(e) => return Err(e.into()),
+    };
+
+    let final_text = if !full_response.trim().is_empty() {
+        full_response.trim().to_string()
+    } else {
+        reply.content.trim().to_string()
+    };
+
+    Ok(final_text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,5 +823,49 @@ mod tests {
         ));
         assert_eq!(d.task_id.as_deref(), Some("steer-test-1"));
         assert!(d.content.contains("Inspect git status"));
+    }
+
+    #[tokio::test]
+    async fn test_synthesize_steer_subtask_response_streams_answer() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"De 3 testerna som misslyckas är i modul foo.\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ChatClient::new_with_token(&server.uri(), "mock", "tok");
+        let stats = HarnessStats::new();
+        let deliverable = Deliverable {
+            marker: crate::agents::MissionMarker::Complete {
+                task_id: Some("steer-test-1".to_string()),
+            },
+            content: "Found 3 failing tests in module foo".to_string(),
+            task_id: Some("steer-test-1".to_string()),
+        };
+        let deliverables = vec![(Agent::Researcher, "steer-test-1".to_string(), deliverable)];
+        let mut streamed = Vec::new();
+        let res = synthesize_steer_subtask_response(
+            &client,
+            &stats,
+            "Vilka tester misslyckas?",
+            &deliverables,
+            |delta| streamed.push(delta.to_string()),
+        )
+        .await;
+        assert!(res.is_ok());
+        let final_text = res.unwrap();
+        assert_eq!(final_text, "De 3 testerna som misslyckas är i modul foo.");
+        assert_eq!(
+            streamed.join(""),
+            "De 3 testerna som misslyckas är i modul foo."
+        );
     }
 }

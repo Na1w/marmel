@@ -92,6 +92,10 @@ impl Renderer for RawRenderer {
                     let t = task.as_deref().unwrap_or("(no task id)");
                     self.push_line("delegation", &format!("DONE    {agent} on {t}"));
                 }
+                crate::orchestrator::DelegationEvent::Failed { agent, task } => {
+                    let t = task.as_deref().unwrap_or("(no task id)");
+                    self.push_line("delegation", &format!("FAILED  {agent} on {t}"));
+                }
             },
             Event::Done => {
                 let _ = writeln!(self.buffer, "[done]");

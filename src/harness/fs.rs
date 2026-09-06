@@ -92,15 +92,21 @@ pub fn resolve_safe_path(path: &str, tool: &str) -> Result<PathBuf, ToolError> {
     Ok(canonical_target)
 }
 
+pub const READ_FILE_MIN_LIMIT: usize = 2000;
+pub const READ_FILE_MAX_LIMIT: usize = 8000;
+pub const READ_FILE_DEFAULT_LIMIT: usize = 4000;
+
 /// `read_file(path, offset, limit)` — reads a UTF-8 file window by *characters*.
 ///
 /// - `offset` is 0-based character index (default: 0).
-/// - `limit` is character count (default: 8000, max: 8000).
+/// - `limit` is character count (default: 4000, min: 2000, max: 8000). Values
+///   below 2000 are clamped to 2000 to prevent models getting trapped in micro-pagination loops.
 /// - Returns sliced text with pagination footer if more characters remain.
 pub fn read_file(args: &Value) -> Result<ToolResult, ToolError> {
     let path = str_arg(args, "path", TOOL_READ_FILE)?;
     let offset = usize_arg(args, "offset", 0, TOOL_READ_FILE)?;
-    let limit = usize_arg(args, "limit", 8000, TOOL_READ_FILE)?.min(8000);
+    let limit = usize_arg(args, "limit", READ_FILE_DEFAULT_LIMIT, TOOL_READ_FILE)?
+        .clamp(READ_FILE_MIN_LIMIT, READ_FILE_MAX_LIMIT);
 
     let safe_path = resolve_safe_path(path, TOOL_READ_FILE)?;
     let raw_bytes = std::fs::read(&safe_path).map_err(anyhow::Error::from)?;

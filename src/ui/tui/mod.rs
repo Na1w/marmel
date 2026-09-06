@@ -538,6 +538,58 @@ impl Renderer for TuiRenderer {
                             self.status_line = format!("{name} finished task {t}");
                         }
                     }
+                    crate::orchestrator::DelegationEvent::Failed { agent, task } => {
+                        let name = match task {
+                            Some(t) if !t.trim().is_empty() => format!("{agent}-{t}"),
+                            _ => format!("{agent}"),
+                        };
+                        let t = task.as_deref().unwrap_or("(no task id)");
+                        self.upsert_subagent(&name, false, &format!("failed task {t}"));
+                        self.plan_mtime = None;
+                        self.last_plan_check = std::time::Instant::now()
+                            .checked_sub(std::time::Duration::from_secs(1))
+                            .unwrap_or_else(std::time::Instant::now);
+
+                        let failed_msg = match task {
+                            Some(tid) if !tid.trim().is_empty() => {
+                                let clean = tid.trim().trim_matches(|c| {
+                                    c == '[' || c == ']' || c == '"' || c == '\''
+                                });
+                                format!("[{clean}] failed.")
+                            }
+                            _ => format!("[{agent}] failed."),
+                        };
+                        self.messages.push(failed_msg);
+                        if self.chat_auto_scroll {
+                            let w = self.chat_width.get();
+                            let n = self.estimated_chat_lines(w);
+                            let h = self.chat_height.get();
+                            self.chat_scroll = n.saturating_sub(h) as u16;
+                        }
+                        if self.active_plan_task.as_deref() == task.as_deref() {
+                            self.active_plan_task = self
+                                .subagents
+                                .iter()
+                                .find(|s| s.is_active && s.task_id.is_some() && s.name != name)
+                                .and_then(|s| s.task_id.clone());
+                        }
+                        let remaining_active: Vec<&str> = self
+                            .subagents
+                            .iter()
+                            .filter(|s| s.is_active && s.name != name)
+                            .map(|s| s.name.as_str())
+                            .collect();
+                        if !remaining_active.is_empty() {
+                            self.active_agent = remaining_active[0].to_string();
+                            self.status_line = format!(
+                                "{name} failed {t}. Active: {}",
+                                remaining_active.join(", ")
+                            );
+                        } else {
+                            self.active_agent = "Manager".to_string();
+                            self.status_line = format!("{name} failed task {t}");
+                        }
+                    }
                 };
             }
             Event::Done => {
@@ -677,8 +729,32 @@ impl Renderer for TuiRenderer {
         // Drop entries that are no longer present in the authoritative list.
         self.subagents
             .retain(|s| subagents.iter().any(|i| i.name == s.name));
-        if self.subagents.iter().any(|s| s.is_active) {
+        let any_active = self.subagents.iter().any(|s| s.is_active);
+        if any_active {
             self.show_subagent_panel = true;
+            let active_names: Vec<&str> = self
+                .subagents
+                .iter()
+                .filter(|s| s.is_active)
+                .map(|s| s.name.as_str())
+                .collect();
+            if !self
+                .subagents
+                .iter()
+                .any(|s| s.name == self.active_agent && s.is_active)
+            {
+                self.active_agent = active_names[0].to_string();
+            }
+        } else {
+            if self.active_agent != "Manager" {
+                self.active_agent = "Manager".to_string();
+            }
+            if self.status_line.contains("Active:")
+                || self.status_line.starts_with("Delegating to specialist")
+            {
+                self.status_line = "Ready".to_string();
+            }
+            self.active_plan_task = None;
         }
         if let Some(name) = activated_name
             && let Some(idx) = self.subagents.iter().position(|s| s.name == name)

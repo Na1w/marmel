@@ -1451,6 +1451,11 @@ fn test_status_bar_displays_right_aligned_elapsed_time() {
 #[test]
 fn test_status_bar_prefers_plan_start_time() {
     let _lock = PLAN_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let plan = crate::agent::phase::Plan::default();
+    let backup = plan.read().ok().flatten();
+    if backup.is_some() {
+        let _ = plan.clear();
+    }
     let r = TuiRenderer::new();
     defer_clear_plan();
 
@@ -1463,6 +1468,9 @@ fn test_status_bar_prefers_plan_start_time() {
 
     // Clean up afterwards
     defer_clear_plan();
+    if let Some(content) = backup {
+        let _ = plan.create(&content);
+    }
 }
 
 fn defer_clear_plan() {

@@ -200,7 +200,7 @@ impl ToolDef {
                     "properties": {
                         "path": { "type": "string", "description": "Relative path to the file." },
                         "offset": { "type": "integer", "description": "Starting character index (0-based, default: 0)." },
-                        "limit": { "type": "integer", "description": "Maximum number of characters to read (default: 8000, max: 8000)." }
+                        "limit": { "type": "integer", "description": "Maximum number of characters to read (default: 4000, min: 2000, max: 8000). Values below 2000 are clamped to 2000." }
                     },
                     "required": ["path"]
                 }),

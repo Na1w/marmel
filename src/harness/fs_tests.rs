@@ -193,6 +193,60 @@ fn test_harness_read_file_multibyte_safety() {
 }
 
 #[test]
+fn test_harness_read_file_limit_clamping() {
+    let dir = temp_dir();
+    let path = dir.join("large_file.txt");
+    let content = "a".repeat(10_000);
+    fs::write(&path, &content).unwrap();
+
+    // 1. limit below 2000 (e.g. 50) is clamped to 2000
+    let args_low = serde_json::json!({
+        "path": path.to_string_lossy(),
+        "offset": 0,
+        "limit": 50,
+    });
+    let r_low = read_file(&args_low).unwrap();
+    assert!(!r_low.is_error);
+    assert!(
+        r_low
+            .content
+            .contains("[Showing characters 0-2000 of 10000. Use offset=2000 to read next chunk]"),
+        "limit below 2000 must be clamped to 2000"
+    );
+
+    // 2. limit above 8000 (e.g. 15000) is clamped to 8000
+    let args_high = serde_json::json!({
+        "path": path.to_string_lossy(),
+        "offset": 0,
+        "limit": 15000,
+    });
+    let r_high = read_file(&args_high).unwrap();
+    assert!(!r_high.is_error);
+    assert!(
+        r_high
+            .content
+            .contains("[Showing characters 0-8000 of 10000. Use offset=8000 to read next chunk]"),
+        "limit above 8000 must be clamped to 8000"
+    );
+
+    // 3. limit omitted defaults to 4000
+    let args_default = serde_json::json!({
+        "path": path.to_string_lossy(),
+        "offset": 0,
+    });
+    let r_def = read_file(&args_default).unwrap();
+    assert!(!r_def.is_error);
+    assert!(
+        r_def
+            .content
+            .contains("[Showing characters 0-4000 of 10000. Use offset=4000 to read next chunk]"),
+        "omitted limit must default to 4000"
+    );
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn test_harness_path_confinement_sandbox() {
     // Valid workspace path succeeds
     let valid = resolve_safe_path("Cargo.toml", "read_file").unwrap();

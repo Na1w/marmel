@@ -406,9 +406,9 @@ pub async fn run_session(
 
             nudge_count = 0;
 
-            let all_parallel = tool_calls
-                .iter()
-                .all(|c| crate::manager::is_read_tool(&c.function.name));
+            let all_parallel = tool_calls.iter().all(|c| {
+                c.function.name == "delegate_task" || crate::manager::is_read_tool(&c.function.name)
+            });
 
             if all_parallel && tool_calls.len() > 1 {
                 let mut handles = Vec::new();
@@ -431,7 +431,19 @@ pub async fn run_session(
                         args_val
                             .get("task_id")
                             .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
+                            .map(|s| {
+                                s.trim_matches(|c| {
+                                    c == '['
+                                        || c == ']'
+                                        || c == '('
+                                        || c == ')'
+                                        || c == '"'
+                                        || c == '\''
+                                })
+                                .trim()
+                                .to_string()
+                            })
+                            .filter(|s| !s.is_empty())
                     } else {
                         None
                     };
@@ -449,6 +461,7 @@ pub async fn run_session(
                             Some(task_prompt),
                             true,
                         );
+                        renderer.set_subagents(subagents.clone());
                         renderer.on_event(&Event::Delegation(
                             crate::orchestrator::DelegationEvent::Started {
                                 agent,
@@ -570,11 +583,9 @@ pub async fn run_session(
                     if let Some(ag) = agent {
                         update_subagent_lifecycle(&mut subagents, ag, task.clone(), None, false);
                         if is_error {
-                            let clean_tid =
-                                task.as_deref().unwrap_or("task").trim().trim_matches(|c| {
-                                    c == '[' || c == ']' || c == '"' || c == '\''
-                                });
-                            renderer.on_event(&Event::Status(format!("[{clean_tid}] failed.")));
+                            renderer.on_event(&Event::Delegation(
+                                crate::orchestrator::DelegationEvent::Failed { agent: ag, task },
+                            ));
                         } else {
                             if let Some(ref tid) = task {
                                 let plan = crate::agent::phase::Plan::default();
@@ -584,6 +595,7 @@ pub async fn run_session(
                                 crate::orchestrator::DelegationEvent::Completed { agent: ag, task },
                             ));
                         }
+                        renderer.set_subagents(subagents.clone());
                     } else {
                         renderer.on_event(&Event::ToolResult(result_content.clone()));
                     }
@@ -622,7 +634,19 @@ pub async fn run_session(
                         args_obj
                             .and_then(|o| o.get("task_id"))
                             .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
+                            .map(|s| {
+                                s.trim_matches(|c| {
+                                    c == '['
+                                        || c == ']'
+                                        || c == '('
+                                        || c == ')'
+                                        || c == '"'
+                                        || c == '\''
+                                })
+                                .trim()
+                                .to_string()
+                            })
+                            .filter(|s| !s.is_empty())
                     } else {
                         None
                     };
@@ -640,6 +664,7 @@ pub async fn run_session(
                             Some(task_prompt),
                             true,
                         );
+                        renderer.set_subagents(subagents.clone());
                         renderer.on_event(&Event::Delegation(
                             crate::orchestrator::DelegationEvent::Started {
                                 agent,
@@ -777,12 +802,12 @@ pub async fn run_session(
                             false,
                         );
                         if is_error {
-                            let clean_tid = delegated_task
-                                .as_deref()
-                                .unwrap_or("task")
-                                .trim()
-                                .trim_matches(|c| c == '[' || c == ']' || c == '"' || c == '\'');
-                            renderer.on_event(&Event::Status(format!("[{clean_tid}] failed.")));
+                            renderer.on_event(&Event::Delegation(
+                                crate::orchestrator::DelegationEvent::Failed {
+                                    agent,
+                                    task: delegated_task,
+                                },
+                            ));
                         } else {
                             if let Some(ref tid) = delegated_task {
                                 let plan = crate::agent::phase::Plan::default();
@@ -795,6 +820,7 @@ pub async fn run_session(
                                 },
                             ));
                         }
+                        renderer.set_subagents(subagents.clone());
                     } else {
                         renderer.on_event(&Event::ToolResult(result_content.clone()));
                     }
@@ -837,6 +863,7 @@ pub async fn run_session(
                         s.logs.push("[aborted by user]".to_string());
                     }
                 }
+                renderer.set_subagents(subagents.clone());
                 for steer in steer_queue.drain(..) {
                     ctx.append(Message::User { content: steer });
                 }

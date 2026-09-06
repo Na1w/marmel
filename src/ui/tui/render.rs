@@ -856,7 +856,11 @@ impl TuiRenderer {
             .map(|s| s.name.as_str())
             .collect();
         let mut status_str = self.status_line.clone();
-        if !active_agents.is_empty() {
+        if active_agents.is_empty() {
+            if let Some((prefix, _)) = status_str.split_once(". Active: ") {
+                status_str = prefix.to_string();
+            }
+        } else {
             let count_suffix = format!(
                 " [{} active: {}]",
                 active_agents.len(),

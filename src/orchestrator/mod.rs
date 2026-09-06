@@ -116,6 +116,8 @@ pub enum DelegationEvent {
     Started { agent: Agent, task: Option<String> },
     /// A specialist has returned its deliverable.
     Completed { agent: Agent, task: Option<String> },
+    /// A specialist failed to complete its task.
+    Failed { agent: Agent, task: Option<String> },
 }
 
 /// A depth counter passed down a delegation chain. The Manager is depth 0; each

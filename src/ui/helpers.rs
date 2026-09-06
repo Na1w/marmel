@@ -287,7 +287,8 @@ pub(crate) fn drain_delegation_events(
                 update_subagent_lifecycle(subagents, *agent, task.clone(), None, true);
                 changed = true;
             }
-            DelegationEvent::Completed { agent, task } => {
+            DelegationEvent::Completed { agent, task }
+            | DelegationEvent::Failed { agent, task } => {
                 update_subagent_lifecycle(subagents, *agent, task.clone(), None, false);
                 changed = true;
             }

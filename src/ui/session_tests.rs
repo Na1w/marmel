@@ -53,8 +53,17 @@ async fn test_ui_run_session_raw_single_turn() {
 
     let cfg = config_for_backend(&server.uri());
 
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan = crate::agent::phase::Plan::at(tmp.path());
+    let stats = Arc::new(crate::harness::HarnessStats::new());
+    let manager = Arc::new(OrchestratorManager::new(
+        ChatClient::new(&server.uri(), "marmel-manager"),
+        plan,
+        stats,
+    ));
+
     let mut renderer = RawRenderer::new();
-    run_session(&cfg, &mut renderer, Some("goal".to_string()), None)
+    run_session(&cfg, &mut renderer, Some("goal".to_string()), Some(manager))
         .await
         .expect("run_session should complete without error");
 
@@ -121,12 +130,21 @@ async fn test_ui_run_session_executes_tool_calls() {
 
     let cfg = config_for_backend(&server.uri());
 
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan = crate::agent::phase::Plan::at(tmp.path());
+    let stats = Arc::new(crate::harness::HarnessStats::new());
+    let manager = Arc::new(OrchestratorManager::new(
+        ChatClient::new(&server.uri(), "marmel-manager"),
+        plan,
+        stats,
+    ));
+
     let mut renderer = RawRenderer::new();
     run_session(
         &cfg,
         &mut renderer,
         Some("analysera projektet".to_string()),
-        None,
+        Some(manager),
     )
     .await
     .expect("run_session should complete");
@@ -309,4 +327,106 @@ async fn test_renderer_sink_handles_reset_command() {
         }),
         "ContextEngine must receive reset system notice"
     );
+}
+
+fn multiple_tool_calls_sse(calls: &[(&str, &str, &str)]) -> String {
+    let tool_calls_json: Vec<_> = calls
+        .iter()
+        .enumerate()
+        .map(|(idx, (id, name, args))| {
+            serde_json::json!({
+                "index": idx,
+                "id": id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": args
+                }
+            })
+        })
+        .collect();
+
+    format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        serde_json::json!({
+            "id": "chatcmpl-1",
+            "choices": [{
+                "delta": {
+                    "content": null,
+                    "tool_calls": tool_calls_json
+                },
+                "finish_reason": null
+            }]
+        })
+    )
+}
+
+#[tokio::test]
+async fn test_ui_run_session_executes_parallel_delegations() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let calls = calls.clone();
+            move |_req: &wiremock::Request| {
+                let call_idx = calls.fetch_add(1, Ordering::SeqCst);
+                if call_idx == 0 {
+                    ResponseTemplate::new(200).set_body_string(multiple_tool_calls_sse(&[
+                        (
+                            "call-del-1",
+                            "delegate_task",
+                            r#"{"agent_name": "coder", "prompt": "task 1", "task_id": "t-001"}"#,
+                        ),
+                        (
+                            "call-del-2",
+                            "delegate_task",
+                            r#"{"agent_name": "generalist", "prompt": "task 2", "task_id": "t-002"}"#,
+                        ),
+                    ]))
+                } else {
+                    ResponseTemplate::new(200).set_body_string(completion_sse("All tasks completed."))
+                }
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let cfg = config_for_backend(&server.uri());
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan = crate::agent::phase::Plan::at(tmp.path());
+    let stats = Arc::new(crate::harness::HarnessStats::new());
+    let manager = Arc::new(OrchestratorManager::new(
+        ChatClient::new(&server.uri(), "marmel-manager"),
+        plan,
+        stats,
+    ));
+
+    let mut renderer = RecordingRenderer::new();
+    run_session(
+        &cfg,
+        &mut renderer,
+        Some("kör parallella uppgifter".to_string()),
+        Some(manager),
+    )
+    .await
+    .expect("run_session should complete");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    let started_t1 = renderer.delegation_events.iter().any(|ev| match ev {
+        DelegationEvent::Started { task, .. } => task.as_deref() == Some("t-001"),
+        _ => false,
+    });
+    let started_t2 = renderer.delegation_events.iter().any(|ev| match ev {
+        DelegationEvent::Started { task, .. } => task.as_deref() == Some("t-002"),
+        _ => false,
+    });
+    assert!(started_t1, "task t-001 should be started");
+    assert!(started_t2, "task t-002 should be started");
 }
