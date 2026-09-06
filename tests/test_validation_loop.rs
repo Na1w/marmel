@@ -473,3 +473,107 @@ async fn test_specialist_revision_recovers_after_repetition_nudge_and_succeeds()
         assert!(!result.contains("FAILED"));
     }).await;
 }
+
+#[tokio::test]
+async fn test_specialist_approved_without_explicit_mission_complete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+
+    marmennill::harness::with_workspace_root(tmp_path.clone(), async move {
+        let server = MockServer::start().await;
+        let call_counter = Arc::new(AtomicUsize::new(0));
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with({
+                let counter = call_counter.clone();
+                move |_req: &wiremock::Request| {
+                    let call_idx = counter.fetch_add(1, Ordering::SeqCst);
+                    let body = match call_idx {
+                        // Turn 0: Specialist creates src/math.rs
+                        0 => {
+                            let args = serde_json::json!({
+                                "path": "src/math.rs",
+                                "content": "pub fn add(a: i32, b: i32) -> i32 { a + b }"
+                            }).to_string();
+                            tool_call_sse("call_write_math", "write_file", &args)
+                        }
+                        // Turn 1: Specialist concludes without explicit MISSION COMPLETE
+                        1 => text_sse("I have implemented the add function in src/math.rs with 0 failed tests."),
+                        // Turn 2: Validator approves
+                        2 => {
+                            let args = serde_json::json!({
+                                "verdict": "APPROVED",
+                                "comments": "Function verified and correctly implemented."
+                            }).to_string();
+                            tool_call_sse("call_val_math", "leave_verdict", &args)
+                        }
+                        _ => text_sse("Unexpected call"),
+                    };
+                    ResponseTemplate::new(200).set_body_string(body)
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let backend_url = format!("{}/v1", server.uri());
+        let specialist_cfg = marmennill::config::SpecialistConfig {
+            module: "src/agents/coder.rs".to_string(),
+            tools: vec![
+                "write_file".to_string(),
+                "read_file".to_string(),
+                "run_command".to_string(),
+            ],
+            enable_validator: Some(true),
+            max_validator_iterations: Some(3),
+            ..Default::default()
+        };
+        let mut cfg = Config {
+            backend_url: backend_url.clone(),
+            model: "test-model".to_string(),
+            enable_xml_rescue: true,
+            ..Default::default()
+        };
+        cfg.orchestration
+            .specialists
+            .insert("coder".to_string(), specialist_cfg);
+
+        let client = ChatClient::new(&backend_url, "test-model");
+        let ctx = IsolatedContext {
+            role_system_prompt: "You are the Coder specialist.".to_string(),
+            brief: "Implement math add function.".to_string(),
+            snippets: vec![],
+            task_id: Some("t-005".to_string()),
+            image_urls: vec![],
+            audio_urls: vec![],
+        };
+        let token = CancellationToken::new();
+
+        let result = run_specialist_live(&client, Agent::Coder, &ctx, &cfg, &token)
+            .await
+            .expect("specialist live run should complete");
+
+        // Verify file was written
+        assert!(tmp_path.join("src/math.rs").exists());
+
+        // Verify deliverable is approved with MISSION COMPLETE and NOT marked as FAILED
+        assert!(
+            result.contains("MISSION COMPLETE"),
+            "Deliverable should contain MISSION COMPLETE: {result}"
+        );
+        assert!(
+            !result.contains("FAILED"),
+            "Deliverable should not contain FAILED: {result}"
+        );
+
+        let marker = marmennill::agents::MissionMarker::parse(&result);
+        assert_eq!(
+            marker,
+            Some(marmennill::agents::MissionMarker::Complete {
+                task_id: Some("t-005".to_string())
+            }),
+            "Marker must be Complete: {result}"
+        );
+    }).await;
+}
+

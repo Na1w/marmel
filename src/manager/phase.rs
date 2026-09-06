@@ -112,6 +112,17 @@ pub enum MissionMarker {
     Replan { reason: String },
 }
 
+fn contains_failed_marker(upper: &str) -> bool {
+    if !upper.contains("FAILED") {
+        return false;
+    }
+    let sanitized = upper
+        .replace("0 FAILED", "")
+        .replace("0 TESTS FAILED", "")
+        .replace("0 TEST FAILED", "");
+    sanitized.contains("FAILED")
+}
+
 impl MissionMarker {
     /// Parse the terminal marker out of a subagent's final text
     /// (REQ-ORCH-005). Matched case-insensitively anywhere in the deliverable.
@@ -130,7 +141,7 @@ impl MissionMarker {
                 task_id: find_task_id(text),
             });
         }
-        if upper.contains("FAILED") {
+        if contains_failed_marker(&upper) {
             return Some(MissionMarker::Failed {
                 reason: text.to_string(),
             });

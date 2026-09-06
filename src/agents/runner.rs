@@ -206,21 +206,27 @@ pub(crate) fn assemble_final_deliverable(
     validation_passed: bool,
     validator_critique: Option<&str>,
     final_content: &str,
+    task_id: Option<&str>,
 ) -> String {
     let upper = final_content.to_ascii_uppercase();
     let has_complete = upper.contains("MISSION COMPLETE");
-    let has_failed = upper.contains("FAILED");
     let has_replan = upper.contains("REPLAN REQUIRED");
 
     if validation_passed {
-        if has_complete || has_failed || has_replan {
+        if has_replan {
+            return final_content.to_string();
+        }
+        if final_content.trim().is_empty() {
+            return "Specialist terminated without deliverable.\n\nFAILED (incomplete)".to_string();
+        }
+        if has_complete {
             return final_content.to_string();
         }
         let mut res = final_content.to_string();
-        if res.trim().is_empty() {
-            res = "Specialist terminated without deliverable.\n\nFAILED (incomplete)".to_string();
+        if let Some(tid) = task_id.filter(|t| !t.trim().is_empty()) {
+            res.push_str(&format!("\n\nMISSION COMPLETE ({tid})"));
         } else {
-            res.push_str("\n\nFAILED (task concluded without explicit completion)");
+            res.push_str("\n\nMISSION COMPLETE");
         }
         return res;
     }
@@ -606,6 +612,7 @@ pub async fn run_specialist_live(
             false,
             Some("Specialist generated conversational text without executing any tools."),
             &final_content,
+            ctx.task_id.as_deref(),
         ));
     }
 
@@ -654,6 +661,7 @@ pub async fn run_specialist_live(
                         feedback
                     );
                     validation_passed = true;
+                    validator_critique = None;
                     break;
                 } else {
                     let feedback = if critique.trim().is_empty() {
@@ -954,6 +962,7 @@ pub async fn run_specialist_live(
             validation_passed,
             validator_critique.as_deref(),
             &final_content,
+            ctx.task_id.as_deref(),
         );
         Ok(assembled)
     } else {
@@ -961,6 +970,7 @@ pub async fn run_specialist_live(
             false,
             Some("Specialist produced no output deliverable or tool executions"),
             &final_content,
+            ctx.task_id.as_deref(),
         ))
     }
 }
