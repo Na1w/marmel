@@ -317,8 +317,10 @@ pub async fn run_specialist_live(
         mon_cfg.min_pattern_len,
     );
     let mut tools_executed_count = 0usize;
+    let mut _turn = 0usize;
 
-    for _turn in 0..100 {
+    loop {
+        _turn += 1;
         if token.is_cancelled() {
             tracing::warn!("{agent_tag}: aborted by cancellation signal");
             return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
@@ -694,7 +696,9 @@ pub async fn run_specialist_live(
                         mon_cfg.repetition_threshold,
                         mon_cfg.min_pattern_len,
                     );
-                    for rev_turn in 0..25 {
+                    let mut rev_turn = 0usize;
+                    loop {
+                        rev_turn += 1;
                         if token.is_cancelled() {
                             tracing::warn!("{agent_tag}: aborted during revision");
                             return Ok(
@@ -702,8 +706,7 @@ pub async fn run_specialist_live(
                             );
                         }
                         crate::orchestrator::emit_status(format!(
-                            "{agent_tag}: revising code per validator critique (step {}/25)...",
-                            rev_turn + 1
+                            "{agent_tag}: revising code per validator critique (turn {rev_turn})...",
                         ));
                         let req = crate::types::ChatRequest {
                             model: specialist_model.clone(),

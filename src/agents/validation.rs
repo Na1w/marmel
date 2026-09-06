@@ -113,7 +113,9 @@ pub(crate) async fn run_automated_validation(
         mon_cfg.min_pattern_len,
     );
     let mut verdict_nudge_count = 0usize;
-    for _turn in 0..50 {
+    let mut _turn = 0usize;
+    loop {
+        _turn += 1;
         if token.is_cancelled() {
             tracing::warn!("validator-{agent}: aborted by cancellation token");
             return Ok((
@@ -123,8 +125,7 @@ pub(crate) async fn run_automated_validation(
         }
         crate::orchestrator::update_active_worker_context(&_active_guard.0, engine.token_count());
         crate::orchestrator::emit_status(format!(
-            "validator-{agent}: evaluating test & inspection output (turn {}/50)...",
-            _turn + 1
+            "validator-{agent}: evaluating test & inspection output (turn {_turn})...",
         ));
         let req = crate::types::ChatRequest {
             model: validator_model.clone(),
