@@ -319,6 +319,18 @@ pub async fn run_specialist_live(
     let mut tools_executed_count = 0usize;
     let mut _turn = 0usize;
 
+    let auto_validate_enabled = specialist_cfg
+        .and_then(|sc| sc.enable_validator)
+        .unwrap_or(true);
+    let max_val_iterations = specialist_cfg
+        .and_then(|sc| sc.max_validator_iterations)
+        .unwrap_or(5);
+
+    let mut validation_passed =
+        !auto_validate_enabled || max_val_iterations == 0 || agent == Agent::Validator;
+    let mut validator_critique: Option<String> = None;
+    let mut val_iter = 0usize;
+
     loop {
         _turn += 1;
         if token.is_cancelled() {
@@ -488,7 +500,110 @@ pub async fn run_specialist_live(
                     break;
                 }
             }
-            break;
+
+            let has_terminal_marker = upper.contains("MISSION COMPLETE")
+                || upper.contains("FAILED")
+                || upper.contains("REPLAN REQUIRED");
+
+            if tools_executed_count == 0 && !has_terminal_marker {
+                tracing::warn!(
+                    "{agent_tag}: specialist produced no tool executions or terminal marker — failing deliverable without validation"
+                );
+                return Ok(assemble_final_deliverable(
+                    false,
+                    Some("Specialist generated conversational text without executing any tools."),
+                    &final_content,
+                    ctx.task_id.as_deref(),
+                ));
+            }
+
+            if auto_validate_enabled
+                && agent != Agent::Validator
+                && !final_content.is_empty()
+                && (tools_executed_count > 0 || has_terminal_marker)
+                && !upper.contains("REPLAN REQUIRED")
+            {
+                if val_iter < max_val_iterations {
+                    val_iter += 1;
+                    if token.is_cancelled() {
+                        tracing::warn!("{agent_tag}: aborted before validation pass");
+                        return Ok(
+                            "Task aborted by user instruction.\n\nFAILED (aborted)".to_string()
+                        );
+                    }
+                    crate::orchestrator::emit_status(format!(
+                        "validator-{agent_tag}: testing deliverable (pass {val_iter}/{max_val_iterations})..."
+                    ));
+                    match run_automated_validation(
+                        client,
+                        agent,
+                        &ctx.brief,
+                        &final_content,
+                        cfg,
+                        token,
+                    )
+                    .await
+                    {
+                        Ok((approved, critique)) => {
+                            if approved {
+                                let feedback = if critique.trim().is_empty() {
+                                    "All verification checks passed.".to_string()
+                                } else {
+                                    critique.clone()
+                                };
+                                crate::orchestrator::emit_status(format!(
+                                    "[Validator] APPROVED deliverable for {agent_tag}:\n{feedback}"
+                                ));
+                                tracing::info!(
+                                    "Automated validator APPROVED specialist deliverable for {}: {}",
+                                    agent_tag,
+                                    feedback
+                                );
+                                validation_passed = true;
+                                validator_critique = None;
+                                break;
+                            } else {
+                                let feedback = if critique.trim().is_empty() {
+                                    "Deliverable failed verification checks.".to_string()
+                                } else {
+                                    critique.clone()
+                                };
+                                validator_critique = Some(feedback.clone());
+                                crate::orchestrator::emit_status(format!(
+                                    "[Validator] REJECTED deliverable for {agent_tag} (pass {val_iter}/{max_val_iterations}):\n{feedback}"
+                                ));
+                                tracing::warn!(
+                                    "Automated validator REJECTED specialist deliverable for {}: {}",
+                                    agent_tag,
+                                    feedback
+                                );
+                                let feedback_msg = format!(
+                                    "Validation feedback: The validator tested your changes and found issues:\n{}\n\n\
+                                     Please address all validator critique points, verify your work with available tools, and conclude with 'MISSION COMPLETE'.",
+                                    feedback
+                                );
+                                engine.append(crate::types::Message::User {
+                                    content: feedback_msg,
+                                });
+                                nudge_count = 0;
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Automated validator encountered error: {e}");
+                            break;
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "{agent_tag}: maximum validator iterations ({max_val_iterations}) reached without approval"
+                    );
+                    validation_passed = false;
+                    break;
+                }
+            } else {
+                break;
+            }
         }
 
         for tc in tool_calls {
@@ -565,6 +680,7 @@ pub async fn run_specialist_live(
                     match tool_res {
                         Ok(r) => {
                             tools_executed_count += 1;
+                            nudge_count = 0;
                             tracing::info!(
                                 "{agent_tag} tool {} completed with {} chars output",
                                 tc.function.name,
@@ -615,348 +731,6 @@ pub async fn run_specialist_live(
             &final_content,
             ctx.task_id.as_deref(),
         ));
-    }
-
-    let auto_validate_enabled = specialist_cfg
-        .and_then(|sc| sc.enable_validator)
-        .unwrap_or(true);
-    let max_val_iterations = specialist_cfg
-        .and_then(|sc| sc.max_validator_iterations)
-        .unwrap_or(5);
-
-    let mut validation_passed =
-        !auto_validate_enabled || max_val_iterations == 0 || agent == Agent::Validator;
-    let mut validator_critique: Option<String> = None;
-
-    if auto_validate_enabled
-        && max_val_iterations > 0
-        && agent != Agent::Validator
-        && !final_content.is_empty()
-    {
-        for val_iter in 0..max_val_iterations {
-            if token.is_cancelled() {
-                tracing::warn!("{agent_tag}: aborted before validation pass");
-                return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
-            }
-            crate::orchestrator::emit_status(format!(
-                "validator-{agent_tag}: testing deliverable (pass {}/{})...",
-                val_iter + 1,
-                max_val_iterations
-            ));
-            if let Ok((approved, critique)) =
-                run_automated_validation(client, agent, &ctx.brief, &final_content, cfg, token)
-                    .await
-            {
-                if approved {
-                    let feedback = if critique.trim().is_empty() {
-                        "All verification checks passed.".to_string()
-                    } else {
-                        critique.clone()
-                    };
-                    crate::orchestrator::emit_status(format!(
-                        "[Validator] APPROVED deliverable for {agent_tag}:\n{feedback}"
-                    ));
-                    tracing::info!(
-                        "Automated validator APPROVED specialist deliverable for {}: {}",
-                        agent_tag,
-                        feedback
-                    );
-                    validation_passed = true;
-                    validator_critique = None;
-                    break;
-                } else {
-                    let feedback = if critique.trim().is_empty() {
-                        "Deliverable failed verification checks.".to_string()
-                    } else {
-                        critique.clone()
-                    };
-                    validator_critique = Some(feedback.clone());
-                    crate::orchestrator::emit_status(format!(
-                        "[Validator] REJECTED deliverable for {agent_tag} (pass {}/{}):\n{feedback}",
-                        val_iter + 1,
-                        max_val_iterations
-                    ));
-                    tracing::warn!(
-                        "Automated validator REJECTED specialist deliverable for {}: {}",
-                        agent_tag,
-                        feedback
-                    );
-                    let feedback_msg = format!(
-                        "Validation feedback: The validator tested your changes and found issues:\n{}\n\n\
-                         Please address all validator critique points, verify your work with available tools, and conclude with 'MISSION COMPLETE'.",
-                        feedback
-                    );
-                    engine.append(crate::types::Message::User {
-                        content: feedback_msg,
-                    });
-
-                    let mut latest_revision = String::new();
-                    let mut rev_nudge_count = 0usize;
-                    let mut rev_rep_detector = crate::harness::monitor::RepetitionDetector::new(
-                        mon_cfg.repetition_threshold,
-                        mon_cfg.min_pattern_len,
-                    );
-                    let mut rev_turn = 0usize;
-                    loop {
-                        rev_turn += 1;
-                        if token.is_cancelled() {
-                            tracing::warn!("{agent_tag}: aborted during revision");
-                            return Ok(
-                                "Task aborted by user instruction.\n\nFAILED (aborted)".to_string()
-                            );
-                        }
-                        crate::orchestrator::emit_status(format!(
-                            "{agent_tag}: revising code per validator critique (turn {rev_turn})...",
-                        ));
-                        let req = crate::types::ChatRequest {
-                            model: specialist_model.clone(),
-                            messages: engine.messages().to_vec(),
-                            tools: Some(tools.clone()),
-                            stream: Some(true),
-                            enable_thinking: None,
-                            temperature: Some(cfg.temperature),
-                            top_p: Some(cfg.top_p),
-                            presence_penalty: Some(cfg.presence_penalty),
-                            frequency_penalty: Some(cfg.frequency_penalty),
-                        };
-
-                        let max_tokens = mon_cfg.max_stream_tokens.max(256);
-                        let mut sink = crate::orchestrator::PreemptibleStreamSink::register(
-                            &agent_tag,
-                            &specialist_model,
-                        );
-                        let stream_out = crate::llm::chat_stream_resumable(
-                            client,
-                            &req,
-                            &mut sink,
-                            max_tokens,
-                            &mut rev_rep_detector,
-                            false,
-                            Some(token),
-                        )
-                        .await;
-
-                        let out = match stream_out {
-                            Ok(o) => o,
-                            Err(e) => {
-                                if token.is_cancelled() {
-                                    tracing::warn!("{agent_tag}: aborted during LLM revision call");
-                                    return Ok(
-                                        "Task aborted by user instruction.\n\nFAILED (aborted)"
-                                            .to_string(),
-                                    );
-                                }
-                                tracing::error!(
-                                    "{agent_tag}: LLM chat call error on revision step {rev_turn}: {e:?}"
-                                );
-                                break;
-                            }
-                        };
-
-                        if out.was_aborted_by_steer || token.is_cancelled() {
-                            tracing::warn!("{agent_tag}: aborted during LLM revision call");
-                            return Ok(
-                                "Task aborted by user instruction.\n\nFAILED (aborted)".to_string()
-                            );
-                        }
-
-                        let reply = out.reply;
-                        let budget_exceeded = out.budget_exceeded;
-                        let rep_triggered = out.rep_triggered;
-                        if budget_exceeded {
-                            tracing::warn!(
-                                "{agent_tag}: maximum single-turn output budget of {max_tokens} tokens exceeded during revision"
-                            );
-                        }
-                        if !reply.content.is_empty() {
-                            latest_revision = reply.content.clone();
-                        }
-
-                        let mut tool_calls = reply.tool_calls.clone();
-                        if tool_calls.is_empty() && cfg.enable_xml_rescue {
-                            let monitor = crate::harness::monitor::HarnessMonitor::with_new_stats();
-                            let rescued = monitor.rescue_xml(&reply.content);
-                            if !rescued.is_empty() {
-                                tool_calls = rescued;
-                            }
-                        }
-
-                        let assistant_msg = crate::types::Message::Assistant {
-                            content: Some(reply.content.clone()),
-                            reasoning_content: if reply.reasoning.is_empty() {
-                                None
-                            } else {
-                                Some(reply.reasoning.clone())
-                            },
-                            tool_calls: tool_calls.clone(),
-                        };
-                        engine.append(assistant_msg);
-
-                        let full_rev_text = if reply.reasoning.is_empty() {
-                            reply.content.clone()
-                        } else {
-                            format!("{}\n{}", reply.reasoning, reply.content)
-                        };
-                        let is_repeating = rep_triggered || monitor.feed_text(&full_rev_text);
-
-                        if tool_calls.is_empty() {
-                            if budget_exceeded && rev_nudge_count < 2 {
-                                rev_nudge_count += 1;
-                                tracing::warn!(
-                                    "{agent_tag}: output budget exceeded during revision — injecting corrective nudge"
-                                );
-                                engine.append(crate::types::Message::User {
-                                    content: format!(
-                                        "SYSTEM NOTICE: Your revision response exceeded the single-turn output budget limit ({max_tokens} tokens) and was truncated. Please be concise and call your required tools (such as `write_file`, `replace`, `run_command`, etc.) to apply the necessary fixes."
-                                    ),
-                                });
-                                continue;
-                            }
-
-                            if is_repeating {
-                                if rev_nudge_count < 2 {
-                                    rev_nudge_count += 1;
-                                    tracing::warn!(
-                                        "{agent_tag}: repetitive generation loop detected during revision — injecting corrective nudge ({rev_nudge_count}/2)"
-                                    );
-                                    engine.replace_last(crate::types::Message::Assistant {
-                                        content: Some(
-                                            "[Generation interrupted due to repetitive loop]"
-                                                .to_string(),
-                                        ),
-                                        reasoning_content: None,
-                                        tool_calls: Vec::new(),
-                                    });
-                                    rev_rep_detector =
-                                        crate::harness::monitor::RepetitionDetector::new(
-                                            mon_cfg.repetition_threshold,
-                                            mon_cfg.min_pattern_len,
-                                        );
-                                    engine.append(crate::types::Message::User {
-                                        content: "SYSTEM NOTICE: Repetitive generation loop detected in your revision output. Terminate conversational debate immediately and invoke your required tools to apply the necessary fixes, or conclude with 'MISSION COMPLETE'.".to_string(),
-                                    });
-                                    continue;
-                                } else {
-                                    tracing::warn!(
-                                        "{agent_tag}: repetitive generation loop persisted during revision — breaking revision loop"
-                                    );
-                                    break;
-                                }
-                            }
-
-                            let upper = reply.content.to_ascii_uppercase();
-                            let is_terminal = upper.contains("MISSION COMPLETE")
-                                || upper.contains("FAILED")
-                                || upper.contains("REPLAN REQUIRED");
-                            if !is_terminal {
-                                if rev_nudge_count < 2 {
-                                    rev_nudge_count += 1;
-                                    engine.append(crate::types::Message::User {
-                                        content: "SYSTEM NOTICE: You did not call any tools to address the validator critique or output MISSION COMPLETE. Do not output conversational prose. Please use your tools (such as `read_file`, `write_file`, `replace`, `run_command`, etc.) to apply the necessary fixes, verify with tests, and conclude with 'MISSION COMPLETE'.".to_string(),
-                                    });
-                                    continue;
-                                } else {
-                                    tracing::warn!(
-                                        "{agent_tag}: specialist produced no tool calls during revision after {rev_nudge_count} nudges — terminating revision"
-                                    );
-                                    break;
-                                }
-                            }
-                            break;
-                        }
-
-                        rev_nudge_count = 0;
-
-                        for tc in tool_calls {
-                            let args_val =
-                                serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
-                                    .unwrap_or_else(|_| {
-                                        serde_json::Value::String(tc.function.arguments.clone())
-                                    });
-                            let desc = format_tool_args_preview(&tc.function.name, &args_val);
-                            crate::orchestrator::emit_status(format!(
-                                "{agent_tag}: running {}({desc})",
-                                tc.function.name
-                            ));
-                            let full_args = format_tool_args_full(&tc.function.name, &args_val);
-                            tracing::info!(
-                                "{agent_tag} (revision) invoking tool: {}({})",
-                                tc.function.name,
-                                full_args
-                            );
-
-                            let intervention = monitor.observe_tool(&tc.function.name, &args_val);
-                            let content = match intervention {
-                                crate::harness::monitor::Intervention::Block
-                                | crate::harness::monitor::Intervention::Cut => {
-                                    let err_msg = monitor.intervention_error(intervention).unwrap_or_else(|| {
-                                        format!(
-                                            "ERROR: Tool repetition detected for '{}'. Do not repeat identical calls — proceed with your task or save deliverables with write_file.",
-                                            tc.function.name
-                                        )
-                                    });
-                                    tracing::warn!(
-                                        "{agent_tag} (revision) tool {} blocked by repetition detector",
-                                        tc.function.name
-                                    );
-                                    err_msg
-                                }
-                                crate::harness::monitor::Intervention::None => {
-                                    let invocation = crate::harness::ToolInvocation {
-                                        name: tc.function.name.clone(),
-                                        arguments: args_val,
-                                    };
-                                    let tool_res = crate::harness::dispatch_for_with_engine(
-                                        &invocation,
-                                        crate::harness::ToolCaller::Specialist(agent),
-                                        Some(&mut engine),
-                                    );
-                                    match tool_res {
-                                        Ok(r) => {
-                                            tracing::info!(
-                                                "{agent_tag} (revision) tool {} completed with {} chars",
-                                                tc.function.name,
-                                                r.content.len()
-                                            );
-                                            r.content
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "{agent_tag} (revision) tool {} error: {e}",
-                                                tc.function.name
-                                            );
-                                            format!("ERROR: {e}")
-                                        }
-                                    }
-                                }
-                            };
-                            let is_rebirth = tc.function.name == crate::tool_names::TOOL_REBIRTH;
-                            let execution_succeeded = !content.starts_with("ERROR:");
-                            if !is_rebirth || !execution_succeeded {
-                                engine.append(crate::types::Message::Tool {
-                                    tool_call_id: tc.id,
-                                    content,
-                                });
-                            }
-                            if engine.should_compact() {
-                                engine.compact();
-                            } else if engine.should_advise_rebirth() {
-                                engine.inject_rebirth_advisory();
-                            }
-                            crate::orchestrator::update_active_worker_context(
-                                &_active_guard.0,
-                                engine.token_count(),
-                            );
-                        }
-                    }
-                    if !latest_revision.is_empty() {
-                        final_content = latest_revision;
-                    }
-                }
-            } else {
-                break;
-            }
-        }
     }
 
     if !final_content.is_empty() {
