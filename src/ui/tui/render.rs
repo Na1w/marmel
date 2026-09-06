@@ -775,9 +775,26 @@ impl TuiRenderer {
             detail_lines.push(Line::raw("No subagents active or selected."));
         }
 
-        self.subagent_width
-            .set(details_area.width.saturating_sub(1) as usize);
-        self.subagent_height.set(details_area.height as usize);
+        let details_w = details_area.width.saturating_sub(1) as usize;
+        let details_h = details_area.height as usize;
+        self.subagent_width.set(details_w);
+        self.subagent_height.set(details_h);
+
+        let mut total_detail_lines = 0;
+        for line in &detail_lines {
+            let line_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
+            if line_len == 0 {
+                total_detail_lines += 1;
+            } else {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                total_detail_lines += wrapped_lines(&text, details_w).max(1);
+            }
+        }
+
+        let max_scroll = total_detail_lines.saturating_sub(details_h);
+        if self.subagent_autoscroll || (self.subagent_scroll as usize) > max_scroll {
+            self.subagent_scroll = max_scroll as u16;
+        }
 
         let detail_paragraph = Paragraph::new(detail_lines)
             .wrap(Wrap { trim: false })
@@ -785,10 +802,6 @@ impl TuiRenderer {
         frame.render_widget(detail_paragraph, details_area);
 
         // F4: vertical scrollbar on the subagent-details pane.
-        let w = self.subagent_width.get();
-        let total = self.estimated_subagent_lines(w);
-        let h = self.subagent_height.get();
-        let max_scroll = total.saturating_sub(h);
         if max_scroll > 0 {
             let inner = Rect {
                 x: details_area.x,
