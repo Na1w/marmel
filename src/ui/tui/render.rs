@@ -145,42 +145,53 @@ impl TuiRenderer {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     ) -> Result<()> {
-        // Refresh the plan content from disk (live check-off updates).
+        // Refresh the plan content from disk (live check-off updates), cached to avoid synchronous disk I/O on every frame.
         let plan_path = std::path::Path::new(crate::agent::phase::MARMEL_DIR)
             .join(crate::agent::phase::PLAN_FILE);
-        let (plan, is_archived, has_active_plan) = if plan_path.exists() {
-            let content = std::fs::read_to_string(&plan_path)
-                .unwrap_or_else(|_| "Error reading execution plan.".to_string());
-            let active = !content.trim().is_empty();
-            (content, false, active)
-        } else {
-            let archive = std::path::Path::new(crate::agent::phase::MARMEL_DIR)
-                .join("execution_plan_archive.md");
-            if archive.exists() {
-                (
-                    format!(
-                        "[Plan completed & archived to .marmel/archive/]\n\n{}",
-                        std::fs::read_to_string(archive).unwrap_or_default()
-                    ),
-                    true,
-                    false,
-                )
-            } else {
-                (
-                    "No active execution plan on disk.".to_string(),
-                    false,
-                    false,
-                )
-            }
-        };
-        self.plan_content = plan.clone();
+        let archive_path = std::path::Path::new(crate::agent::phase::MARMEL_DIR)
+            .join("execution_plan_archive.md");
 
-        // Auto-open plan panel when a plan appears; keep it visible so user can always see plan progress.
-        if (has_active_plan || is_archived) && !self.had_active_plan {
-            self.show_plan_panel = true;
-            self.plan_scroll = 0;
-            self.plan_auto_scroll = true;
-            self.had_active_plan = true;
+        if self.last_plan_check.elapsed() >= std::time::Duration::from_millis(250) || self.plan_content.is_empty() {
+            self.last_plan_check = std::time::Instant::now();
+            let current_plan_mtime = std::fs::metadata(&plan_path).ok().and_then(|m| m.modified().ok());
+            let current_archive_mtime = std::fs::metadata(&archive_path).ok().and_then(|m| m.modified().ok());
+
+            if current_plan_mtime != self.plan_mtime || current_archive_mtime != self.archive_mtime || self.plan_content.is_empty() {
+                self.plan_mtime = current_plan_mtime;
+                self.archive_mtime = current_archive_mtime;
+
+                let (plan, is_archived, has_active_plan) = if current_plan_mtime.is_some() {
+                    let content = std::fs::read_to_string(&plan_path)
+                        .unwrap_or_else(|_| "Error reading execution plan.".to_string());
+                    let active = !content.trim().is_empty();
+                    (content, false, active)
+                } else if current_archive_mtime.is_some() {
+                    (
+                        format!(
+                            "[Plan completed & archived to .marmel/archive/]\n\n{}",
+                            std::fs::read_to_string(&archive_path).unwrap_or_default()
+                        ),
+                        true,
+                        false,
+                    )
+                } else {
+                    (
+                        "No active execution plan on disk.".to_string(),
+                        false,
+                        false,
+                    )
+                };
+                self.plan_content = plan;
+                self.plan_is_archived = is_archived;
+
+                // Auto-open plan panel when a plan appears; keep it visible so user can always see plan progress.
+                if (has_active_plan || is_archived) && !self.had_active_plan {
+                    self.show_plan_panel = true;
+                    self.plan_scroll = 0;
+                    self.plan_auto_scroll = true;
+                }
+                self.had_active_plan = has_active_plan || is_archived;
+            }
         }
 
         // Auto-scroll targets (reference §11.5 / §11.6).
@@ -268,6 +279,8 @@ impl TuiRenderer {
 
             self.render_chat(frame, chat_area);
             if let Some(p) = plan_rect {
+                let plan = self.plan_content.clone();
+                let is_archived = self.plan_is_archived;
                 self.render_plan(frame, p, &plan, is_archived);
             }
             if let Some(s) = subagent_rect {

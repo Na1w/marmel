@@ -175,7 +175,7 @@ pub async fn run_session(
                     }
                     if is_reset_command(&line) {
                         crate::debug_log::log_user_input("command", &line);
-                        handle_reset_command(&plan, &mut *renderer, &mut ctx);
+                        handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
                         continue;
                     }
                     let trimmed = line.trim();
@@ -256,7 +256,7 @@ pub async fn run_session(
             }
             if is_reset_command(&steer) {
                 crate::debug_log::log_user_input("command", &steer);
-                handle_reset_command(&plan, &mut *renderer, &mut ctx);
+                handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
                 continue;
             }
             if !steer.trim().is_empty() {
@@ -307,6 +307,7 @@ pub async fn run_session(
             renderer.on_event(&Event::Status(format!("Running ({})", stream_cfg.model)));
             renderer.flush()?;
 
+            let msgs = ctx.messages().to_vec();
             let mut bridge = RendererSink {
                 renderer: &mut *renderer,
                 steer_queue: &mut steer_queue,
@@ -317,10 +318,12 @@ pub async fn run_session(
                 stats: harness_stats.clone(),
                 goal: &goal,
                 subagents: &subagents,
+                plan: Some(&plan),
+                ctx: Some(&mut ctx),
             };
             let assistant = match chat_client_turn(
                 &client,
-                ctx.messages().to_vec(),
+                msgs,
                 &stream_cfg,
                 &mut bridge,
             )
@@ -408,12 +411,9 @@ pub async fn run_session(
 
             nudge_count = 0;
 
-            let all_parallel = tool_calls.iter().all(|c| {
-                matches!(
-                    c.function.name.as_str(),
-                    "delegate_task" | "read_file" | "grep_search" | "glob"
-                )
-            });
+            let all_parallel = tool_calls
+                .iter()
+                .all(|c| crate::manager::is_read_tool(&c.function.name));
 
             if all_parallel && tool_calls.len() > 1 {
                 let mut handles = Vec::new();
@@ -548,7 +548,7 @@ pub async fn run_session(
                                     if is_abort_command(&input) {
                                         renderer.request_abort();
                                     } else if is_reset_command(&input) {
-                                        handle_reset_command(&plan, &mut *renderer, &mut ctx);
+                                        handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
                                     } else if !input.trim().is_empty() {
                                         spawn_steer_arbitration(
                                             &client,
@@ -736,7 +736,7 @@ pub async fn run_session(
                                     if is_abort_command(&input) {
                                         renderer.request_abort();
                                     } else if is_reset_command(&input) {
-                                        handle_reset_command(&plan, &mut *renderer, &mut ctx);
+                                        handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
                                     } else if !input.trim().is_empty() {
                                         spawn_steer_arbitration(
                                             &client,
@@ -844,7 +844,7 @@ pub async fn run_session(
                 }
                 if is_reset_command(&line) {
                     crate::debug_log::log_user_input("command", &line);
-                    handle_reset_command(&plan, &mut *renderer, &mut ctx);
+                    handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
                     continue;
                 }
                 if !line.trim().is_empty() {

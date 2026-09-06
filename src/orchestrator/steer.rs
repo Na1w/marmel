@@ -95,7 +95,9 @@ impl StreamingResponseExtractor {
                 let rest = &self.buffer[pos + "\"response\"".len()..];
                 if let Some(colon_pos) = rest.find(':') {
                     let after_colon = &rest[colon_pos + 1..];
-                    if let Some(quote_pos) = after_colon.find('"') {
+                    let trimmed = after_colon.trim_start();
+                    if trimmed.starts_with('"') {
+                        let quote_pos = after_colon.find('"').unwrap();
                         self.in_response_field = true;
                         let content_after_quote = &after_colon[quote_pos + 1..];
                         let chars: Vec<char> = content_after_quote.chars().collect();
@@ -107,6 +109,12 @@ impl StreamingResponseExtractor {
                             }
                         }
                         return (output, just_finished);
+                    } else if trimmed.starts_with("null")
+                        || (!trimmed.is_empty() && !trimmed.starts_with('"') && !trimmed.starts_with('n'))
+                    {
+                        self.finished = true;
+                        self.buffer.clear();
+                        return (String::new(), false);
                     }
                 }
             }
@@ -560,5 +568,14 @@ mod tests {
         let (out, finished) = extractor.push_chunk(chunk);
         assert_eq!(out, "\"Citat\" och \\backslashes\\ samt \t tabb och A");
         assert!(finished);
+    }
+
+    #[test]
+    fn test_streaming_response_extractor_null_response_field() {
+        let mut extractor = StreamingResponseExtractor::new();
+        let chunk = "{\"decision\": \"QueueAndContinue\", \"response\": null, \"subtasks\": [\"task1\"]}";
+        let (out, _finished) = extractor.push_chunk(chunk);
+        assert_eq!(out, "");
+        assert!(!extractor.in_response_field);
     }
 }

@@ -139,6 +139,20 @@ impl Default for Config {
     }
 }
 
+static ACTIVE_CONFIG: std::sync::RwLock<Option<Config>> = std::sync::RwLock::new(None);
+
+/// Set the globally active configuration.
+pub fn set_active(cfg: Config) {
+    if let Ok(mut lock) = ACTIVE_CONFIG.write() {
+        *lock = Some(cfg);
+    }
+}
+
+/// Retrieve a clone of the globally active configuration, if set.
+pub fn get_active() -> Option<Config> {
+    ACTIVE_CONFIG.read().ok().and_then(|lock| lock.clone())
+}
+
 /// Config lookup order: CLI --config > ./.marmel.toml > ~/.config/marmel/config.toml > env vars > defaults.
 pub fn load(explicit_path: Option<&str>) -> Result<Config> {
     let mut cfg = Config::default();
@@ -503,5 +517,17 @@ mod tests {
         let cfg = merge(Config::default(), partial);
 
         assert_eq!(cfg.orchestration.mcp_servers, vec!["fs".to_string()]);
+    }
+
+    #[test]
+    fn test_set_and_get_active_config() {
+        let mut custom = Config::default();
+        custom.model = "test-custom-model-123".to_string();
+        custom.backend_url = "http://custom:1234/v1".to_string();
+        set_active(custom.clone());
+
+        let retrieved = get_active().expect("active config should be present");
+        assert_eq!(retrieved.model, "test-custom-model-123");
+        assert_eq!(retrieved.backend_url, "http://custom:1234/v1");
     }
 }

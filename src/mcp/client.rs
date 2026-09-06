@@ -71,11 +71,23 @@ impl StdioMcpConnection {
         }
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::inherit());
+        cmd.stderr(Stdio::piped());
 
         let mut child = cmd
             .spawn()
             .with_context(|| format!("failed to spawn MCP server '{server_name}' ({cmd_str})"))?;
+
+        let stderr = child.stderr.take();
+        if let Some(stderr) = stderr {
+            let s_name = server_name.to_string();
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut reader = tokio::io::BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    tracing::debug!(target: "mcp", "[{s_name}] {line}");
+                }
+            });
+        }
 
         let stdin = child
             .stdin

@@ -55,6 +55,7 @@ fn main() -> Result<()> {
     if args.debug {
         cfg.debug = true;
     }
+    config::set_active(cfg.clone());
 
     if cfg.debug {
         let ws = harness::workspace::Workspace::new();

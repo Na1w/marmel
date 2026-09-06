@@ -177,7 +177,7 @@ pub(crate) fn is_reset_command(line: &str) -> bool {
 pub(crate) fn handle_reset_command(
     plan: &crate::agent::phase::Plan,
     renderer: &mut dyn Renderer,
-    ctx: &mut ContextEngine,
+    mut ctx: Option<&mut ContextEngine>,
 ) {
     let _ = plan.clear();
     let transcript = plan.transcript_path();
@@ -189,10 +189,12 @@ pub(crate) fn handle_reset_command(
     ));
     renderer.on_event(&Event::Status("Execution plan reset".to_string()));
     let _ = renderer.flush();
-    ctx.append(Message::User {
-        content: "[System] User executed /reset. The execution plan has been removed from disk. Return to Conversational phase."
-            .to_string(),
-    });
+    if let Some(ref mut ctx) = ctx {
+        ctx.append(Message::User {
+            content: "[System] User executed /reset. The execution plan has been removed from disk. Return to Conversational phase."
+                .to_string(),
+        });
+    }
 }
 
 pub(crate) fn classify_llm_error(e: &anyhow::Error) -> &'static str {

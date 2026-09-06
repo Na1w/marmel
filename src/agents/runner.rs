@@ -57,7 +57,8 @@ pub(crate) async fn try_run_specialist_live(
     {
         return None;
     }
-    let cfg = crate::config::load(None).ok()?;
+    let cfg = crate::config::get_active()
+        .or_else(|| crate::config::load(None).ok())?;
     let specialist_cfg = cfg.orchestration.specialists.get(agent.as_str());
     let backend_url = specialist_cfg
         .and_then(|sc| sc.backend_url.as_ref())
@@ -530,11 +531,30 @@ pub async fn run_specialist_live(
                         name: tc.function.name.clone(),
                         arguments: args_val,
                     };
-                    let tool_res = crate::harness::dispatch_for_with_engine(
-                        &invocation,
-                        crate::harness::ToolCaller::Specialist(agent),
-                        Some(&mut engine),
-                    );
+                    let caller = crate::harness::ToolCaller::Specialist(agent);
+                    let tool_res = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                            tokio::task::block_in_place(|| {
+                                crate::harness::dispatch_for_with_engine(
+                                    &invocation,
+                                    caller,
+                                    Some(&mut engine),
+                                )
+                            })
+                        } else {
+                            crate::harness::dispatch_for_with_engine(
+                                &invocation,
+                                caller,
+                                Some(&mut engine),
+                            )
+                        }
+                    } else {
+                        crate::harness::dispatch_for_with_engine(
+                            &invocation,
+                            caller,
+                            Some(&mut engine),
+                        )
+                    };
                     match tool_res {
                         Ok(r) => {
                             tools_executed_count += 1;

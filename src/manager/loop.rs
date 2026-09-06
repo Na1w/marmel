@@ -33,8 +33,7 @@ use crate::harness::monitor::{HarnessMonitor, Intervention};
 use crate::harness::{HarnessStats, ToolCaller, ToolInvocation, ToolResult, dispatch_for};
 use crate::orchestrator::{MAX_EXECUTING_ROUNDS, OrchestratorManager, brief_for_task};
 use crate::tool_names::{
-    TOOL_DELEGATE_TASK, TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_READ_FILE, TOOL_REPLACE,
-    TOOL_RUN_COMMAND, TOOL_WRITE_FILE,
+    TOOL_DELEGATE_TASK, TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_READ_FILE,
 };
 use crate::types::{Message, ToolCall};
 
@@ -130,21 +129,16 @@ fn extract_task_id(_name: &str, args: &serde_json::Value) -> Option<String> {
 
 /// Returns `true` for read-only tools eligible for parallel execution
 /// (REQ-LOOP-003).
-fn is_read_tool(name: &str) -> bool {
+pub fn is_read_tool(name: &str) -> bool {
     matches!(name, TOOL_READ_FILE | TOOL_GREP_SEARCH | TOOL_GLOB)
 }
 
 /// Returns `true` for writing/executing tools that must run sequentially.
 ///
-/// `delegate_task` is included as a **sequential** (blocking, synchronous-from-
-/// Manager) tool per REQ-ORCH-005: it mutates the plan/workspace and returns a
-/// deliverable, so it must NOT be parallelized with reads (REQ-LOOP-003,
-/// t-or01 §2.3).
-fn is_write_tool(name: &str) -> bool {
-    matches!(
-        name,
-        TOOL_DELEGATE_TASK | TOOL_WRITE_FILE | TOOL_REPLACE | TOOL_RUN_COMMAND
-    )
+/// Any tool that is not a read-only parallel tool must run sequentially
+/// (REQ-LOOP-003, REQ-ORCH-005), including plan tools, rebirth, PTY tools, and MCP tools.
+pub fn is_write_tool(name: &str) -> bool {
+    !is_read_tool(name)
 }
 
 /// The turn state machine. Each `run_turn` walks through the strict phase

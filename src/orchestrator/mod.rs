@@ -600,15 +600,20 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
     // 3. Route through a Manager rooted at the shared `.marmel` plan dir.
     //    The build URL/model are unused by the deterministic Phase-O
     //    `run_specialist_llm` driver, so a placeholder client is fine.
+    let cfg = crate::config::get_active()
+        .or_else(|| crate::config::load(None).ok())
+        .unwrap_or_default();
     let stats = Arc::new(HarnessStats::new());
     let manager = OrchestratorManager::new(
-        ChatClient::new("http://127.0.0.1:11434/v1", "marmel-manager"),
+        ChatClient::new_with_token(&cfg.backend_url, &cfg.model, &cfg.auth_token),
         Plan::default(),
         stats,
     );
 
     let deliverable = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.block_on(manager.delegate(req))
+        std::thread::scope(|s| {
+            s.spawn(|| handle.block_on(manager.delegate(req))).join().unwrap()
+        })
     } else {
         futures::executor::block_on(manager.delegate(req))
     }

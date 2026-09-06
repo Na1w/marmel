@@ -128,6 +128,10 @@ pub struct TuiRenderer {
     pub(crate) active_agent: String,
     pub(crate) last_render: std::time::Instant,
     pub(crate) waiting_for_token_since: Option<std::time::Instant>,
+    pub(crate) last_plan_check: std::time::Instant,
+    pub(crate) plan_mtime: Option<std::time::SystemTime>,
+    pub(crate) archive_mtime: Option<std::time::SystemTime>,
+    pub(crate) plan_is_archived: bool,
 
     /// Estimated total input (prompt) tokens across the session.
     pub tokens_in: usize,
@@ -198,6 +202,12 @@ impl TuiRenderer {
             active_agent: "Manager".to_string(),
             last_render: std::time::Instant::now(),
             waiting_for_token_since: None,
+            last_plan_check: std::time::Instant::now()
+                .checked_sub(Duration::from_secs(10))
+                .unwrap_or_else(std::time::Instant::now),
+            plan_mtime: None,
+            archive_mtime: None,
+            plan_is_archived: false,
         }
     }
 }

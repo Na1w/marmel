@@ -151,6 +151,8 @@ pub(crate) struct RendererSink<'a> {
     pub(crate) stats: Arc<crate::harness::HarnessStats>,
     pub(crate) goal: &'a str,
     pub(crate) subagents: &'a [SubagentDetail],
+    pub(crate) plan: Option<&'a crate::agent::phase::Plan>,
+    pub(crate) ctx: Option<&'a mut crate::manager::context::ContextEngine>,
 }
 
 #[async_trait::async_trait]
@@ -183,14 +185,10 @@ impl StreamSink for RendererSink<'_> {
                 return StreamControl::Abort;
             } else if is_reset_command(&input) {
                 crate::debug_log::log_user_input("command", &input);
-                let plan = crate::agent::phase::Plan::default();
-                let _ = plan.clear();
-                self.renderer.on_event(&Event::Message(
-                    "Execution plan has been cleared and reset by user.".to_string(),
-                ));
-                self.renderer
-                    .on_event(&Event::Status("Execution plan reset".to_string()));
-                let _ = self.renderer.flush();
+                let default_plan = crate::agent::phase::Plan::default();
+                let plan = self.plan.unwrap_or(&default_plan);
+                let ctx = self.ctx.as_deref_mut();
+                crate::ui::helpers::handle_reset_command(plan, self.renderer, ctx);
             } else if !input.trim().is_empty() {
                 crate::debug_log::log_user_input("midflight_steer", &input);
                 return StreamControl::Pause { user_input: input };

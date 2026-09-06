@@ -288,11 +288,30 @@ pub(crate) async fn run_automated_validation(
                         name: tc.function.name.clone(),
                         arguments: args_val,
                     };
-                    let tool_res = crate::harness::dispatch_for_with_engine(
-                        &invocation,
-                        crate::harness::ToolCaller::Specialist(Agent::Validator),
-                        Some(&mut engine),
-                    );
+                    let caller = crate::harness::ToolCaller::Specialist(Agent::Validator);
+                    let tool_res = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                            tokio::task::block_in_place(|| {
+                                crate::harness::dispatch_for_with_engine(
+                                    &invocation,
+                                    caller,
+                                    Some(&mut engine),
+                                )
+                            })
+                        } else {
+                            crate::harness::dispatch_for_with_engine(
+                                &invocation,
+                                caller,
+                                Some(&mut engine),
+                            )
+                        }
+                    } else {
+                        crate::harness::dispatch_for_with_engine(
+                            &invocation,
+                            caller,
+                            Some(&mut engine),
+                        )
+                    };
                     match tool_res {
                         Ok(r) => {
                             tracing::info!(

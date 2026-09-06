@@ -28,7 +28,9 @@ use marmennill::agent::Plan;
 use marmennill::agents::{Agent, DelegationRequest, MissionMarker};
 use marmennill::harness::HarnessStats;
 use marmennill::llm::ChatClient;
-use marmennill::orchestrator::{DelegationEvent, OrchestratorManager, RecursionDepth};
+use marmennill::orchestrator::{
+    handle_delegate_task, DelegationEvent, OrchestratorManager, RecursionDepth,
+};
 use std::sync::Arc;
 
 /// Create a fresh temp dir and set the process cwd to it (so no `marmel.toml`
@@ -290,4 +292,18 @@ async fn test_orchestrator_abort_signal_lifecycle_and_cancellation() {
         .await
         .expect("returns deliverable");
     assert!(matches!(d2.marker, MissionMarker::Complete { .. }));
+}
+
+#[tokio::test]
+async fn test_handle_delegate_task_synchronous_inside_async_context() {
+    let _tmp = setup();
+
+    let args = serde_json::json!({
+        "agent_name": "coder",
+        "prompt": "Inspect the code.",
+        "task_id": "t-async-1",
+    });
+
+    let res = handle_delegate_task(&args);
+    assert!(res.is_ok(), "handle_delegate_task must not panic in async context");
 }

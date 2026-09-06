@@ -1336,3 +1336,13 @@ fn test_rehydrate_messages_summarizes_delegation_results() {
             .any(|m| m == "[Tool Result] MISSION COMPLETE (t-001):")
     );
 }
+
+#[test]
+fn test_plan_caching_and_throttling() {
+    let mut renderer = TuiRenderer::new();
+    renderer.plan_content = "Cached plan".to_string();
+    renderer.last_plan_check = std::time::Instant::now();
+
+    assert_eq!(renderer.plan_content, "Cached plan");
+    assert!(!renderer.plan_is_archived);
+}

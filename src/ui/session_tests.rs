@@ -1,8 +1,10 @@
 use super::helpers::*;
 use super::*;
 use crate::config::Config;
+use crate::llm::ChatClient;
 use crate::manager::context::ContextEngine;
 use crate::orchestrator::OrchestratorManager;
+use crate::types::Message;
 use crate::ui::raw::RawRenderer;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -137,6 +139,7 @@ struct RecordingRenderer {
     subagents: Vec<SubagentDetail>,
     delegation_events: Vec<DelegationEvent>,
     events: Vec<Event>,
+    input_queue: std::collections::VecDeque<String>,
 }
 
 impl RecordingRenderer {
@@ -145,6 +148,7 @@ impl RecordingRenderer {
             subagents: Vec::new(),
             delegation_events: Vec::new(),
             events: Vec::new(),
+            input_queue: std::collections::VecDeque::new(),
         }
     }
 }
@@ -163,7 +167,7 @@ impl Renderer for RecordingRenderer {
         Ok(())
     }
     fn poll_input(&mut self) -> Option<String> {
-        None
+        self.input_queue.pop_front()
     }
     fn read_input(&mut self) -> Option<String> {
         None
@@ -240,7 +244,7 @@ fn test_handle_reset_command_clears_plan_and_notifies() {
     ctx.set_system_prompt("sys".to_string());
     ctx.set_goal("goal".to_string());
 
-    handle_reset_command(&plan, &mut renderer, &mut ctx);
+    handle_reset_command(&plan, &mut renderer, Some(&mut ctx));
 
     assert!(!plan.exists());
     assert!(
@@ -254,5 +258,55 @@ fn test_handle_reset_command_clears_plan_and_notifies() {
             .events
             .iter()
             .any(|ev| matches!(ev, Event::Status(s) if s.contains("reset")))
+    );
+}
+
+#[tokio::test]
+async fn test_renderer_sink_handles_reset_command() {
+    use crate::llm::StreamSink;
+    use crate::ui::bridge::RendererSink;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan = crate::agent::phase::Plan::at(tmp.path());
+    plan.create("# Plan\n- [ ] [t-1] test\n").unwrap();
+    assert!(plan.exists());
+
+    let mut renderer = RecordingRenderer::new();
+    renderer.input_queue.push_back("/reset".to_string());
+
+    let mut steer_queue = Vec::new();
+    let mut steer_abort_requested = false;
+    let (arb_tx, _arb_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_arb_tx2, mut arb_rx) = tokio::sync::mpsc::unbounded_channel();
+    let client = ChatClient::new("http://localhost:11434/v1", "test".to_string());
+    let stats = Arc::new(crate::harness::HarnessStats::new());
+    let mut ctx = ContextEngine::new(4096);
+
+    let mut sink = RendererSink {
+        renderer: &mut renderer,
+        steer_queue: &mut steer_queue,
+        steer_abort_requested: &mut steer_abort_requested,
+        arb_tx: &arb_tx,
+        arb_rx: &mut arb_rx,
+        client: &client,
+        stats,
+        goal: "goal",
+        subagents: &[],
+        plan: Some(&plan),
+        ctx: Some(&mut ctx),
+    };
+
+    let ctrl = sink.poll_control();
+    assert!(matches!(ctrl, crate::llm::StreamControl::Continue));
+    assert!(
+        !plan.exists(),
+        "Plan must be cleared after /reset in RendererSink"
+    );
+    assert!(
+        ctx.messages().iter().any(|m| match m {
+            Message::User { content } => content.contains("User executed /reset"),
+            _ => false,
+        }),
+        "ContextEngine must receive reset system notice"
     );
 }
