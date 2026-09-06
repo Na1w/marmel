@@ -43,6 +43,8 @@ pub(crate) fn spawn_steer_arbitration(
         .unwrap_or_default();
     let active_subtasks_str = format_active_subtasks(subagents);
     let plan_progress_str = format_plan_progress_summary(&plan_content);
+    let has_active =
+        crate::orchestrator::has_active_workers() || subagents.iter().any(|s| s.is_active);
     let tx = arb_tx.clone();
     let msg = user_msg.clone();
 
@@ -55,7 +57,7 @@ pub(crate) fn spawn_steer_arbitration(
         let delta_tx = tx.clone();
         let ctx = crate::orchestrator::steer::SteerContext {
             main_goal: &goal,
-            orchestrator_status: if active_subtasks_str == "None" {
+            orchestrator_status: if !has_active {
                 "Active (planning/turn)"
             } else {
                 "Active (subagents executing)"
@@ -343,9 +345,11 @@ impl StreamSink for RendererSink<'_> {
         let active_subtasks_str = format_active_subtasks(self.subagents);
         let plan_progress_str = format_plan_progress_summary(&plan_content);
 
+        let has_active =
+            crate::orchestrator::has_active_workers() || self.subagents.iter().any(|s| s.is_active);
         let ctx = crate::orchestrator::steer::SteerContext {
             main_goal: self.goal,
-            orchestrator_status: if active_subtasks_str == "None" {
+            orchestrator_status: if !has_active {
                 "Active (planning/turn)"
             } else {
                 "Active (subagents executing)"

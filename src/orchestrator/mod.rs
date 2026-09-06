@@ -45,9 +45,10 @@ pub use steer::{
     execute_steer_subtask, extract_tasks_to_delegate, resolve_steer_outcome,
 };
 pub use workers::{
-    ActiveWorkerGuard, ActiveWorkerInfo, format_duration_human, get_active_specialist_context_str,
-    get_active_subtasks_str, get_active_worker_tokens, has_active_workers, register_active_worker,
-    update_active_worker_context,
+    ActiveWorkerGuard, ActiveWorkerInfo, CompletedWorkerInfo, format_duration_human,
+    get_active_specialist_context_str, get_active_subtasks_str, get_active_worker_tokens,
+    has_active_workers, register_active_worker, set_active_worker_status,
+    update_active_worker_context, update_active_worker_progress,
 };
 
 /// Default fractal recursion bound (REQ-ORCH-001).

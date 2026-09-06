@@ -335,8 +335,15 @@ pub async fn run_specialist_live(
         _turn += 1;
         if token.is_cancelled() {
             tracing::warn!("{agent_tag}: aborted by cancellation signal");
+            crate::orchestrator::set_active_worker_status(&_active_guard.0, "Aborted");
             return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
         }
+        crate::orchestrator::update_active_worker_progress(
+            &_active_guard.0,
+            _turn,
+            val_iter,
+            validator_critique.clone(),
+        );
         crate::orchestrator::update_active_worker_context(&_active_guard.0, engine.token_count());
         crate::orchestrator::emit_status(format!(
             "{agent_tag}: thinking / calling model ({specialist_model})..."
@@ -560,7 +567,17 @@ pub async fn run_specialist_live(
                                     feedback
                                 );
                                 validation_passed = true;
-                                validator_critique = None;
+                                validator_critique = Some(feedback.clone());
+                                crate::orchestrator::update_active_worker_progress(
+                                    &_active_guard.0,
+                                    _turn,
+                                    val_iter,
+                                    Some(feedback),
+                                );
+                                crate::orchestrator::set_active_worker_status(
+                                    &_active_guard.0,
+                                    "Approved",
+                                );
                                 break;
                             } else {
                                 let feedback = if critique.trim().is_empty() {
@@ -576,6 +593,18 @@ pub async fn run_specialist_live(
                                     "Automated validator REJECTED specialist deliverable for {}: {}",
                                     agent_tag,
                                     feedback
+                                );
+                                crate::orchestrator::update_active_worker_progress(
+                                    &_active_guard.0,
+                                    _turn,
+                                    val_iter,
+                                    Some(feedback.clone()),
+                                );
+                                crate::orchestrator::set_active_worker_status(
+                                    &_active_guard.0,
+                                    &format!(
+                                        "Revising (rejected pass {val_iter}/{max_val_iterations})"
+                                    ),
                                 );
                                 let feedback_msg = format!(
                                     "Validation feedback: The validator tested your changes and found issues:\n{}\n\n\
@@ -599,6 +628,10 @@ pub async fn run_specialist_live(
                         "{agent_tag}: maximum validator iterations ({max_val_iterations}) reached without approval"
                     );
                     validation_passed = false;
+                    crate::orchestrator::set_active_worker_status(
+                        &_active_guard.0,
+                        "Failed (max validator iterations exceeded)",
+                    );
                     break;
                 }
             } else {
@@ -725,12 +758,24 @@ pub async fn run_specialist_live(
         tracing::warn!(
             "{agent_tag}: specialist produced no tool executions or terminal marker — failing deliverable without validation"
         );
+        crate::orchestrator::set_active_worker_status(
+            &_active_guard.0,
+            "Failed (no tools executed)",
+        );
         return Ok(assemble_final_deliverable(
             false,
             Some("Specialist generated conversational text without executing any tools."),
             &final_content,
             ctx.task_id.as_deref(),
         ));
+    }
+
+    if validation_passed {
+        crate::orchestrator::set_active_worker_status(&_active_guard.0, "Approved");
+    } else if validator_critique.is_some() {
+        crate::orchestrator::set_active_worker_status(&_active_guard.0, "Rejected");
+    } else {
+        crate::orchestrator::set_active_worker_status(&_active_guard.0, "Completed");
     }
 
     if !final_content.is_empty() {

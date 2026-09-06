@@ -12,6 +12,24 @@ pub struct ActiveWorkerInfo {
     pub prompt: String,
     pub started_at: Instant,
     pub context_tokens: usize,
+    pub implementation_turns: usize,
+    pub validation_rounds: usize,
+    pub latest_validator_feedback: Option<String>,
+    pub status: String,
+}
+
+/// Information about a recently completed specialist task.
+#[derive(Debug, Clone)]
+pub struct CompletedWorkerInfo {
+    pub task_id: Option<String>,
+    pub agent_name: String,
+    pub prompt: String,
+    pub started_at: Instant,
+    pub duration: std::time::Duration,
+    pub implementation_turns: usize,
+    pub validation_rounds: usize,
+    pub latest_validator_feedback: Option<String>,
+    pub status: String,
 }
 
 static ACTIVE_WORKERS: LazyLock<RwLock<BTreeMap<String, ActiveWorkerInfo>>> =
@@ -20,16 +38,38 @@ static ACTIVE_WORKERS: LazyLock<RwLock<BTreeMap<String, ActiveWorkerInfo>>> =
 static WORKER_CONTEXT_TOKENS: LazyLock<RwLock<BTreeMap<String, usize>>> =
     LazyLock::new(|| RwLock::new(BTreeMap::new()));
 
-/// RAII guard that automatically unregisters an active worker on drop.
+static RECENT_COMPLETED_WORKERS: LazyLock<RwLock<Vec<CompletedWorkerInfo>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
+
+/// RAII guard that automatically unregisters an active worker on drop and moves it to recently completed.
 pub struct ActiveWorkerGuard(pub String);
 
 impl Drop for ActiveWorkerGuard {
     fn drop(&mut self) {
         if let Ok(mut map) = ACTIVE_WORKERS.write()
             && let Some(info) = map.remove(&self.0)
-            && let Ok(mut last_map) = WORKER_CONTEXT_TOKENS.write()
         {
-            last_map.insert(self.0.clone(), info.context_tokens);
+            if let Ok(mut last_map) = WORKER_CONTEXT_TOKENS.write() {
+                last_map.insert(self.0.clone(), info.context_tokens);
+            }
+            if let Ok(mut completed) = RECENT_COMPLETED_WORKERS.write() {
+                let duration = info.started_at.elapsed();
+                completed.push(CompletedWorkerInfo {
+                    task_id: info.task_id,
+                    agent_name: info.agent_name,
+                    prompt: info.prompt,
+                    started_at: info.started_at,
+                    duration,
+                    implementation_turns: info.implementation_turns,
+                    validation_rounds: info.validation_rounds,
+                    latest_validator_feedback: info.latest_validator_feedback,
+                    status: info.status,
+                });
+                if completed.len() > 10 {
+                    let remove_count = completed.len() - 10;
+                    completed.drain(0..remove_count);
+                }
+            }
         }
     }
 }
@@ -64,6 +104,10 @@ pub fn register_active_worker(
                 prompt,
                 started_at: Instant::now(),
                 context_tokens: initial_tokens,
+                implementation_turns: 0,
+                validation_rounds: 0,
+                latest_validator_feedback: None,
+                status: "In Progress".to_string(),
             },
         );
     }
@@ -79,6 +123,33 @@ pub fn update_active_worker_context(key: &str, tokens: usize) {
     }
     if let Ok(mut last_map) = WORKER_CONTEXT_TOKENS.write() {
         last_map.insert(key.to_string(), tokens);
+    }
+}
+
+/// Update the active specialist worker's implementation turn, validation rounds, and latest validator critique/feedback.
+pub fn update_active_worker_progress(
+    key: &str,
+    turns: usize,
+    val_rounds: usize,
+    feedback: Option<String>,
+) {
+    if let Ok(mut map) = ACTIVE_WORKERS.write()
+        && let Some(info) = map.get_mut(key)
+    {
+        info.implementation_turns = turns;
+        info.validation_rounds = val_rounds;
+        if let Some(fb) = feedback {
+            info.latest_validator_feedback = Some(fb);
+        }
+    }
+}
+
+/// Set the descriptive status of an active specialist worker (e.g. "Approved", "Revising", "Failed", "Aborted").
+pub fn set_active_worker_status(key: &str, status: &str) {
+    if let Ok(mut map) = ACTIVE_WORKERS.write()
+        && let Some(info) = map.get_mut(key)
+    {
+        info.status = status.to_string();
     }
 }
 
@@ -149,24 +220,82 @@ pub fn format_duration_human(secs: u64) -> String {
     }
 }
 
-/// Formats all currently active subagent workers with their tool call ID, prompt, and running time.
+/// Formats all currently active and recently completed subagent workers with their tool call ID, prompt, running time,
+/// implementation turns, validation rounds, and latest validator feedback.
 pub fn get_active_subtasks_str() -> String {
-    let Ok(map) = ACTIVE_WORKERS.read() else {
-        return "None".to_string();
-    };
-    if map.is_empty() {
+    let active_map = ACTIVE_WORKERS.read().ok();
+    let completed_list = RECENT_COMPLETED_WORKERS.read().ok();
+
+    let has_active = active_map.as_ref().map(|m| !m.is_empty()).unwrap_or(false);
+    let has_completed = completed_list
+        .as_ref()
+        .map(|c| !c.is_empty())
+        .unwrap_or(false);
+
+    if !has_active && !has_completed {
         return "None".to_string();
     }
+
     let mut out = String::new();
-    for (id, info) in map.iter() {
-        let elapsed_secs = info.started_at.elapsed().as_secs();
-        let duration_str = format_duration_human(elapsed_secs);
-        let task_id_str = info.task_id.as_deref().unwrap_or(id);
-        out.push_str(&format!(
-            "- Tool Call ID: {}\n  Subagent: {}\n  Task Prompt: {}\n  Running For: {} ({elapsed_secs} total seconds)\n\n",
-            task_id_str, info.agent_name, info.prompt, duration_str
-        ));
+    if let Some(map) = active_map
+        && !map.is_empty()
+    {
+        out.push_str("Active Background Subagents:\n");
+        for (id, info) in map.iter() {
+            let elapsed_secs = info.started_at.elapsed().as_secs();
+            let duration_str = format_duration_human(elapsed_secs);
+            let task_id_str = info.task_id.as_deref().unwrap_or(id);
+            out.push_str(&format!(
+                "- Tool Call ID: {}\n  Subagent: {}\n  Status: {}\n  Task Prompt: {}\n  Running For: {} ({elapsed_secs} total seconds)\n  Implementation Turns: {}\n  Validation Rounds: {}\n",
+                task_id_str, info.agent_name, info.status, info.prompt, duration_str, info.implementation_turns, info.validation_rounds
+            ));
+            if let Some(ref fb) = info.latest_validator_feedback {
+                let trimmed = fb.trim();
+                let summary = if trimmed.len() > 300 {
+                    format!("{}...", &trimmed[..297])
+                } else {
+                    trimmed.to_string()
+                };
+                out.push_str(&format!(
+                    "  Latest Validator Feedback: \"{}\"\n",
+                    summary.replace('\n', " ")
+                ));
+            } else {
+                out.push_str("  Latest Validator Feedback: None\n");
+            }
+            out.push('\n');
+        }
     }
+
+    if let Some(completed) = completed_list
+        && !completed.is_empty()
+    {
+        out.push_str("Recently Completed Subagents:\n");
+        for info in completed.iter().rev() {
+            let duration_str = format_duration_human(info.duration.as_secs());
+            let task_id_str = info.task_id.as_deref().unwrap_or(&info.agent_name);
+            out.push_str(&format!(
+                "- Tool Call ID: {}\n  Subagent: {}\n  Status: {}\n  Task Prompt: {}\n  Duration: {}\n  Implementation Turns: {}\n  Validation Rounds: {}\n",
+                task_id_str, info.agent_name, info.status, info.prompt, duration_str, info.implementation_turns, info.validation_rounds
+            ));
+            if let Some(ref fb) = info.latest_validator_feedback {
+                let trimmed = fb.trim();
+                let summary = if trimmed.len() > 300 {
+                    format!("{}...", &trimmed[..297])
+                } else {
+                    trimmed.to_string()
+                };
+                out.push_str(&format!(
+                    "  Latest Validator Feedback: \"{}\"\n",
+                    summary.replace('\n', " ")
+                ));
+            } else {
+                out.push_str("  Latest Validator Feedback: None\n");
+            }
+            out.push('\n');
+        }
+    }
+
     out
 }
 
@@ -181,4 +310,39 @@ pub fn get_active_subtask_by_id(task_id: &str) -> Option<(String, String)> {
     })?;
     let running_time = format_duration_human(info.started_at.elapsed().as_secs());
     Some((info.agent_name.clone(), running_time))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_worker_progress_and_completed_history() {
+        let guard = register_active_worker(
+            Some("task-test-1".to_string()),
+            "coder".to_string(),
+            "Write parser tests".to_string(),
+        );
+
+        update_active_worker_progress(&guard.0, 3, 1, Some("Missing edge case".to_string()));
+        set_active_worker_status(&guard.0, "Revising");
+
+        let status_str = get_active_subtasks_str();
+        assert!(status_str.contains("Active Background Subagents:"));
+        assert!(status_str.contains("Implementation Turns: 3"));
+        assert!(status_str.contains("Validation Rounds: 1"));
+        assert!(status_str.contains("Missing edge case"));
+        assert!(status_str.contains("Status: Revising"));
+
+        set_active_worker_status(&guard.0, "Approved");
+        update_active_worker_progress(&guard.0, 4, 2, Some("All checks passed".to_string()));
+        drop(guard);
+
+        let completed_str = get_active_subtasks_str();
+        assert!(completed_str.contains("Recently Completed Subagents:"));
+        assert!(completed_str.contains("Implementation Turns: 4"));
+        assert!(completed_str.contains("Validation Rounds: 2"));
+        assert!(completed_str.contains("Status: Approved"));
+        assert!(completed_str.contains("All checks passed"));
+    }
 }
