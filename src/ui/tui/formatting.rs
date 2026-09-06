@@ -40,6 +40,13 @@ pub fn message_style(msg: &str) -> (Style, bool) {
                 .add_modifier(Modifier::BOLD),
             true,
         )
+    } else if first.starts_with('[') && first.ends_with("completed.") {
+        (
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+            true,
+        )
     } else {
         // Orchestrator / Model content defaults to white text.
         (Style::default().fg(Color::White), false)
@@ -55,6 +62,13 @@ pub enum LineSegment<'a> {
 
 /// Parse segments of a line according to the running `in_think` state, tracking transitions across `<think>` and `</think>` tags.
 pub fn parse_line_segments<'a>(line: &'a str, in_think: &mut bool) -> Vec<LineSegment<'a>> {
+    if line.is_empty() {
+        return if *in_think {
+            vec![LineSegment::Thought("")]
+        } else {
+            vec![LineSegment::Content("")]
+        };
+    }
     let mut segments = Vec::new();
     let mut cursor = 0;
     while cursor < line.len() {
@@ -313,15 +327,27 @@ pub fn count_single_message_lines(msg: &str, width: usize, show_thought: bool) -
                     if !show_thought {
                         continue;
                     }
-                    let cleaned = format_terminal_math(t.trim());
-                    if !cleaned.is_empty() {
-                        n += wrapped_lines(&cleaned, width);
+                    if t.trim().is_empty() {
+                        n += 1;
+                    } else {
+                        let cleaned = format_terminal_math(t.trim());
+                        n += if cleaned.is_empty() {
+                            1
+                        } else {
+                            wrapped_lines(&cleaned, width)
+                        };
                     }
                 }
                 LineSegment::Content(c) => {
-                    let cleaned = format_terminal_math(c.trim());
-                    if !cleaned.is_empty() {
-                        n += wrapped_lines(&cleaned, width);
+                    if c.trim().is_empty() {
+                        n += 1;
+                    } else {
+                        let cleaned = format_terminal_math(c.trim());
+                        n += if cleaned.is_empty() {
+                            1
+                        } else {
+                            wrapped_lines(&cleaned, width)
+                        };
                     }
                 }
             }
@@ -476,6 +502,58 @@ pub fn visual_line_offset_of_first_pending(text: &str, width: usize) -> Option<u
         visual_offset += wrapped_lines(raw_line, width).max(1);
     }
     None
+}
+
+/// Compute the visual (wrapped) line offset of a specific task in the execution plan text (e.g. `t-001`).
+/// Returns `None` if the task ID is not found.
+pub fn visual_line_offset_of_task(text: &str, task_id: &str, width: usize) -> Option<usize> {
+    let clean_tid = task_id
+        .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
+        .trim();
+    if clean_tid.is_empty() {
+        return None;
+    }
+    let tid_lower = clean_tid.to_lowercase();
+    let mut visual_offset = 0;
+    let mut candidate_offset = None;
+
+    for raw_line in text.lines() {
+        let line_lower = raw_line.to_lowercase();
+        if let Some(pos) = line_lower.find(&tid_lower) {
+            let before = if pos == 0 {
+                None
+            } else {
+                line_lower[..pos].chars().last()
+            };
+            let after_pos = pos + tid_lower.len();
+            let after = line_lower[after_pos..].chars().next();
+
+            let before_ok = before
+                .map(|c| !c.is_alphanumeric() && c != '-' && c != '_')
+                .unwrap_or(true);
+            let after_ok = after
+                .map(|c| !c.is_alphanumeric() && c != '-' && c != '_')
+                .unwrap_or(true);
+
+            if before_ok && after_ok {
+                // If this line has a checkbox, it's definitively the task checklist item
+                if raw_line.contains("[ ]")
+                    || raw_line.contains("[x]")
+                    || raw_line.contains("[X]")
+                    || raw_line.contains("( )")
+                    || raw_line.contains("(x)")
+                    || raw_line.contains("(X)")
+                {
+                    return Some(visual_offset);
+                }
+                if candidate_offset.is_none() {
+                    candidate_offset = Some(visual_offset);
+                }
+            }
+        }
+        visual_offset += wrapped_lines(raw_line, width).max(1);
+    }
+    candidate_offset
 }
 
 /// Compute a centered rectangle of `percent_x`% width and `percent_y`% height

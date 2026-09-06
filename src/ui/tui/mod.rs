@@ -119,6 +119,7 @@ pub struct TuiRenderer {
     pub(crate) chat_auto_scroll: bool,
     pub(crate) plan_max_scroll: u16,
     pub(crate) plan_auto_scroll: bool,
+    pub(crate) active_plan_task: Option<String>,
 
     pub(crate) chat_area: Rect,
     pub(crate) plan_area: Rect,
@@ -128,6 +129,12 @@ pub struct TuiRenderer {
     pub(crate) active_agent: String,
     pub(crate) last_render: std::time::Instant,
     pub(crate) waiting_for_token_since: Option<std::time::Instant>,
+    pub(crate) last_plan_check: std::time::Instant,
+    pub(crate) plan_mtime: Option<std::time::SystemTime>,
+    pub(crate) archive_mtime: Option<std::time::SystemTime>,
+    pub(crate) plan_is_archived: bool,
+    #[allow(dead_code)]
+    pub(crate) session_start: std::time::Instant,
 
     /// Estimated total input (prompt) tokens across the session.
     pub tokens_in: usize,
@@ -189,6 +196,7 @@ impl TuiRenderer {
             chat_auto_scroll: true,
             plan_max_scroll: 0,
             plan_auto_scroll: false,
+            active_plan_task: None,
 
             chat_area: Rect::default(),
             plan_area: Rect::default(),
@@ -198,6 +206,37 @@ impl TuiRenderer {
             active_agent: "Manager".to_string(),
             last_render: std::time::Instant::now(),
             waiting_for_token_since: None,
+            last_plan_check: std::time::Instant::now()
+                .checked_sub(Duration::from_secs(10))
+                .unwrap_or_else(std::time::Instant::now),
+            plan_mtime: None,
+            archive_mtime: None,
+            plan_is_archived: false,
+            session_start: std::time::Instant::now(),
+        }
+    }
+
+    /// Total duration spent working on an execution plan.
+    /// Only counts when actively working on a plan; freezes as soon as the plan is completed / archived.
+    pub(crate) fn total_project_elapsed(&self) -> Option<std::time::Duration> {
+        let (inst, _) = crate::manager::phase::get_plan_start_time()?;
+        if let Some(comp) = crate::manager::phase::get_plan_completed_time() {
+            Some(comp.duration_since(inst))
+        } else if self.plan_is_archived {
+            crate::manager::phase::record_plan_completed();
+            Some(inst.elapsed())
+        } else {
+            let plan = crate::agent::phase::Plan::default();
+            if plan.is_complete() {
+                crate::manager::phase::record_plan_completed();
+                if let Some(comp) = crate::manager::phase::get_plan_completed_time() {
+                    Some(comp.duration_since(inst))
+                } else {
+                    Some(inst.elapsed())
+                }
+            } else {
+                Some(inst.elapsed())
+            }
         }
     }
 }
@@ -362,7 +401,6 @@ impl Renderer for TuiRenderer {
                     self.waiting_for_token_since = None;
                 }
                 if text.starts_with("[CLI]")
-                    || text.starts_with("[Validator] APPROVED")
                     || text.starts_with("System Error")
                     || text.starts_with("LLM error")
                 {
@@ -432,10 +470,20 @@ impl Renderer for TuiRenderer {
                         };
                         self.active_agent = name.clone();
                         let t = task.as_deref().unwrap_or("(no task id)");
+                        if let Some(tid) = task
+                            && !tid.trim().is_empty()
+                        {
+                            self.active_plan_task = Some(tid.clone());
+                            self.plan_auto_scroll = true;
+                            self.show_plan_panel = true;
+                        }
                         // Fold into the local subagent list so the panel stays
                         // live even before the session loop pushes the
                         // authoritative list (t-c304).
                         self.upsert_subagent(&name, true, &format!("started task {t}"));
+                        if let Some(s) = self.subagents.iter_mut().find(|s| s.name == name) {
+                            s.task_id = task.clone();
+                        }
                         self.status_line = format!("Delegating to specialist {name} for {t}");
                     }
                     crate::orchestrator::DelegationEvent::Completed { agent, task } => {
@@ -445,6 +493,34 @@ impl Renderer for TuiRenderer {
                         };
                         let t = task.as_deref().unwrap_or("(no task id)");
                         self.upsert_subagent(&name, false, &format!("completed task {t}"));
+                        self.plan_mtime = None;
+                        self.last_plan_check = std::time::Instant::now()
+                            .checked_sub(std::time::Duration::from_secs(1))
+                            .unwrap_or_else(std::time::Instant::now);
+
+                        let completed_msg = match task {
+                            Some(tid) if !tid.trim().is_empty() => {
+                                let clean = tid.trim().trim_matches(|c| {
+                                    c == '[' || c == ']' || c == '"' || c == '\''
+                                });
+                                format!("[{clean}] completed.")
+                            }
+                            _ => format!("[{agent}] completed."),
+                        };
+                        self.messages.push(completed_msg);
+                        if self.chat_auto_scroll {
+                            let w = self.chat_width.get();
+                            let n = self.estimated_chat_lines(w);
+                            let h = self.chat_height.get();
+                            self.chat_scroll = n.saturating_sub(h) as u16;
+                        }
+                        if self.active_plan_task.as_deref() == task.as_deref() {
+                            self.active_plan_task = self
+                                .subagents
+                                .iter()
+                                .find(|s| s.is_active && s.task_id.is_some() && s.name != name)
+                                .and_then(|s| s.task_id.clone());
+                        }
                         let remaining_active: Vec<&str> = self
                             .subagents
                             .iter()
@@ -514,6 +590,7 @@ impl Renderer for TuiRenderer {
     }
 
     fn read_input(&mut self) -> Option<String> {
+        self.commit_turn_content();
         self.status_line = "Ready".to_string();
         let _ = self.flush();
         loop {

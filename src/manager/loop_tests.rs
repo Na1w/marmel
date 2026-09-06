@@ -54,6 +54,39 @@ fn test_agent_tool_classification() {
     // Manager), never parallelized with reads.
     assert!(is_write_tool("delegate_task"));
     assert!(!is_read_tool("delegate_task"));
+
+    // Verify unclassified / domain / MCP / plan tools are sequential and not dropped
+    for tool_name in &[
+        "create_plan",
+        "archive_current_plan",
+        "rebirth",
+        "leave_verdict",
+        "pty_spawn",
+        "pty_write",
+        "pty_read",
+        "pty_close",
+        "pty_list",
+        "mcp__custom_server__tool",
+    ] {
+        assert!(is_write_tool(tool_name));
+        assert!(!is_read_tool(tool_name));
+    }
+}
+
+/// Verify that non-read tools outside the basic set (e.g. create_plan, MCP) are executed
+/// sequentially rather than silently dropped.
+#[tokio::test]
+async fn test_unclassified_tools_not_dropped() {
+    let (dir, plan) = test_plan();
+    let mut loop_ = AgentLoop::new(plan).with_caller(ToolCaller::Specialist(Agent::Validator));
+    // `leave_verdict` is outside the basic read/write set and was previously dropped by AgentLoop.
+    loop_.enqueue_tools(vec![serde_json::json!({
+        "name": "leave_verdict",
+        "arguments": { "verdict": "APPROVED", "comments": "LGTM" }
+    })]);
+    let outcome = loop_.run_turn().await.unwrap();
+    assert_eq!(outcome, TurnOutcome::Continue);
+    fs::remove_dir_all(&dir).unwrap();
 }
 
 /// REQ-LOOP-004: steer signals are drained and injected as user messages;

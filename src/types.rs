@@ -147,7 +147,7 @@ impl ToolDef {
                         },
                         "task_id": {
                             "type": "string",
-                            "description": "Optional execution_plan.md task id (e.g. t-042) enabling automatic check-off on success."
+                            "description": "Mandatory execution_plan.md task id (e.g. 't-001') that this delegation satisfies, enabling automatic check-off on success."
                         },
                         "image_urls": {
                             "type": "array",
@@ -160,7 +160,7 @@ impl ToolDef {
                             "description": "Optional audio references for audio specialists."
                         }
                     },
-                    "required": ["agent_name", "prompt"]
+                    "required": ["agent_name", "prompt", "task_id"]
                 }),
             },
         }

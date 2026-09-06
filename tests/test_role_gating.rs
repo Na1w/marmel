@@ -102,6 +102,64 @@ fn specialist_permitted_allowlisted_terminal_tool() {
     );
 }
 
+/// Validator is an auditor and must be forbidden from file-modification and execution tools (write_file, replace, run_command).
+#[tokio::test(flavor = "multi_thread")]
+async fn validator_forbidden_from_file_modification_and_execution_tools() {
+    let tool_write = ToolInvocation {
+        name: "write_file".to_string(),
+        arguments: serde_json::json!({
+            "path": "test.txt",
+            "content": "modified"
+        }),
+    };
+    match dispatch_for(&tool_write, ToolCaller::Specialist(Agent::Validator)) {
+        Err(ToolError::Forbidden { tool: t, caller }) => {
+            assert_eq!(t, "write_file");
+            assert_eq!(caller, "validator");
+        }
+        other => panic!("Validator must be forbidden from write_file, got {other:?}"),
+    }
+
+    let tool_replace = ToolInvocation {
+        name: "replace".to_string(),
+        arguments: serde_json::json!({
+            "path": "test.txt",
+            "old": "a",
+            "new": "b"
+        }),
+    };
+    match dispatch_for(&tool_replace, ToolCaller::Specialist(Agent::Validator)) {
+        Err(ToolError::Forbidden { tool: t, caller }) => {
+            assert_eq!(t, "replace");
+            assert_eq!(caller, "validator");
+        }
+        other => panic!("Validator must be forbidden from replace, got {other:?}"),
+    }
+
+    let tool_run = ToolInvocation {
+        name: "run_command".to_string(),
+        arguments: serde_json::json!({
+            "command": "cargo test"
+        }),
+    };
+    match dispatch_for(&tool_run, ToolCaller::Specialist(Agent::Validator)) {
+        Err(ToolError::Forbidden { tool: t, caller }) => {
+            assert_eq!(t, "run_command");
+            assert_eq!(caller, "validator");
+        }
+        other => panic!("Validator must be forbidden from run_command, got {other:?}"),
+    }
+
+    let tool_pty = ToolInvocation {
+        name: "pty_list".to_string(),
+        arguments: serde_json::json!({}),
+    };
+    assert!(
+        dispatch_for(&tool_pty, ToolCaller::Specialist(Agent::Validator)).is_ok(),
+        "Validator must be permitted pty_list"
+    );
+}
+
 /// REQ-ORCH-001: `create_plan` is Manager-only. Even DeepBrain (allowlist `*`)
 /// must be forbidden from authoring the plan.
 #[test]

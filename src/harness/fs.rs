@@ -2,8 +2,8 @@
 //!
 //! REQ-TOOL-002: `replace` only writes when the target string occurs exactly
 //! once — 0 or ≥2 matches return an error without touching the file.
-//! REQ-TOOL-003: `read_file` is line-paginated with `{line_num} | {content}`
-//! rows and a `[Showing lines X-Y of Z...]` footer.
+//! REQ-TOOL-003: `read_file` is character-paginated with `offset` and `limit`
+//! parameters and a `[Showing characters X-Y of Z...]` footer.
 //! REQ-TOOL-004: `write_file` auto-creates parent directories with mode 0o755.
 //!
 //! Path mapping: every path argument is passed through `map_path`, which maps

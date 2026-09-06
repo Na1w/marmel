@@ -12,6 +12,7 @@ use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use std::io;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 impl TuiRenderer {
     /// Ensure the per-message wrapped-line cache is up to date for `width`
@@ -145,42 +146,62 @@ impl TuiRenderer {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     ) -> Result<()> {
-        // Refresh the plan content from disk (live check-off updates).
+        // Refresh the plan content from disk (live check-off updates), cached to avoid synchronous disk I/O on every frame.
         let plan_path = std::path::Path::new(crate::agent::phase::MARMEL_DIR)
             .join(crate::agent::phase::PLAN_FILE);
-        let (plan, is_archived, has_active_plan) = if plan_path.exists() {
-            let content = std::fs::read_to_string(&plan_path)
-                .unwrap_or_else(|_| "Error reading execution plan.".to_string());
-            let active = !content.trim().is_empty();
-            (content, false, active)
-        } else {
-            let archive = std::path::Path::new(crate::agent::phase::MARMEL_DIR)
-                .join("execution_plan_archive.md");
-            if archive.exists() {
-                (
-                    format!(
-                        "[Plan completed & archived to .marmel/archive/]\n\n{}",
-                        std::fs::read_to_string(archive).unwrap_or_default()
-                    ),
-                    true,
-                    false,
-                )
-            } else {
-                (
-                    "No active execution plan on disk.".to_string(),
-                    false,
-                    false,
-                )
-            }
-        };
-        self.plan_content = plan.clone();
+        let archive_path =
+            std::path::Path::new(crate::agent::phase::MARMEL_DIR).join("execution_plan_archive.md");
 
-        // Auto-open plan panel when a plan appears; keep it visible so user can always see plan progress.
-        if (has_active_plan || is_archived) && !self.had_active_plan {
-            self.show_plan_panel = true;
-            self.plan_scroll = 0;
-            self.plan_auto_scroll = true;
-            self.had_active_plan = true;
+        if self.last_plan_check.elapsed() >= std::time::Duration::from_millis(250)
+            || self.plan_content.is_empty()
+        {
+            self.last_plan_check = std::time::Instant::now();
+            let current_plan_mtime = std::fs::metadata(&plan_path)
+                .ok()
+                .and_then(|m| m.modified().ok());
+            let current_archive_mtime = std::fs::metadata(&archive_path)
+                .ok()
+                .and_then(|m| m.modified().ok());
+
+            if current_plan_mtime != self.plan_mtime
+                || current_archive_mtime != self.archive_mtime
+                || self.plan_content.is_empty()
+            {
+                self.plan_mtime = current_plan_mtime;
+                self.archive_mtime = current_archive_mtime;
+
+                let (plan, is_archived, has_active_plan) = if current_plan_mtime.is_some() {
+                    let content = std::fs::read_to_string(&plan_path)
+                        .unwrap_or_else(|_| "Error reading execution plan.".to_string());
+                    let active = !content.trim().is_empty();
+                    (content, false, active)
+                } else if current_archive_mtime.is_some() {
+                    (
+                        format!(
+                            "[Plan completed & archived to .marmel/archive/]\n\n{}",
+                            std::fs::read_to_string(&archive_path).unwrap_or_default()
+                        ),
+                        true,
+                        false,
+                    )
+                } else {
+                    (
+                        "No active execution plan on disk.".to_string(),
+                        false,
+                        false,
+                    )
+                };
+                self.plan_content = plan;
+                self.plan_is_archived = is_archived;
+
+                // Auto-open plan panel when a plan appears; keep it visible so user can always see plan progress.
+                if (has_active_plan || is_archived) && !self.had_active_plan {
+                    self.show_plan_panel = true;
+                    self.plan_scroll = 0;
+                    self.plan_auto_scroll = true;
+                }
+                self.had_active_plan = has_active_plan || is_archived;
+            }
         }
 
         // Auto-scroll targets (reference §11.5 / §11.6).
@@ -268,6 +289,8 @@ impl TuiRenderer {
 
             self.render_chat(frame, chat_area);
             if let Some(p) = plan_rect {
+                let plan = self.plan_content.clone();
+                let is_archived = self.plan_is_archived;
                 self.render_plan(frame, p, &plan, is_archived);
             }
             if let Some(s) = subagent_rect {
@@ -312,10 +335,12 @@ impl TuiRenderer {
                             if !self.show_thought {
                                 continue;
                             }
-                            let cleaned = format_terminal_math(t.trim());
-                            if cleaned.is_empty() {
+                            let trimmed = t.trim();
+                            if trimmed.is_empty() {
+                                chat_lines.push(Line::from(""));
                                 continue;
                             }
+                            let cleaned = format_terminal_math(trimmed);
                             chat_lines.push(Line::from(Span::styled(
                                 cleaned,
                                 Style::default()
@@ -326,6 +351,7 @@ impl TuiRenderer {
                         LineSegment::Content(c) => {
                             let trimmed = c.trim();
                             if trimmed.is_empty() {
+                                chat_lines.push(Line::from(""));
                                 continue;
                             }
                             let cleaned = format_terminal_math(trimmed);
@@ -422,6 +448,22 @@ impl TuiRenderer {
             }
         }
 
+        let mut total_chat_lines = 0;
+        for line in &chat_lines {
+            let line_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
+            if line_len == 0 {
+                total_chat_lines += 1;
+            } else {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                total_chat_lines += wrapped_lines(&text, chat_w).max(1);
+            }
+        }
+
+        let max_scroll = total_chat_lines.saturating_sub(chat_h);
+        if self.chat_auto_scroll || (self.chat_scroll as usize) > max_scroll {
+            self.chat_scroll = max_scroll as u16;
+        }
+
         let chat_paragraph = Paragraph::new(chat_lines)
             .block(chat_block)
             .wrap(Wrap { trim: false })
@@ -429,8 +471,6 @@ impl TuiRenderer {
         frame.render_widget(chat_paragraph, area);
 
         // F4: vertical scrollbar on the chat pane.
-        let total = self.estimated_chat_lines(chat_w);
-        let max_scroll = total.saturating_sub(chat_h);
         if max_scroll > 0 {
             let inner = Rect {
                 x: area.x + 1,
@@ -465,12 +505,35 @@ impl TuiRenderer {
             .border_style(Style::default().fg(plan_border_color))
             .title(" Execution Plan ");
 
+        let target_task = self.active_plan_task.as_deref().or_else(|| {
+            self.subagents
+                .iter()
+                .find(|s| s.is_active && s.task_id.is_some())
+                .and_then(|s| s.task_id.as_deref())
+        });
+
         let mut plan_lines = Vec::new();
         for raw_line in plan.lines() {
             let line = raw_line.replace('\t', "    ");
+            let is_active_task = if let Some(tid) = target_task {
+                let clean_tid = tid
+                    .trim_matches(|c| {
+                        c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\''
+                    })
+                    .trim()
+                    .to_lowercase();
+                !clean_tid.is_empty() && line.to_lowercase().contains(&clean_tid)
+            } else {
+                false
+            };
+
             let style = if line.starts_with("# ") || line.starts_with("## ") {
                 Style::default()
                     .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_active_task && (line.contains("[ ]") || line.contains("( )")) {
+                Style::default()
+                    .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
             } else if line.contains("[x]") || line.contains("[X]") {
                 Style::default().fg(Color::Green)
@@ -490,7 +553,13 @@ impl TuiRenderer {
         let total_plan_lines = wrapped_lines(plan, plan_w.max(1));
         self.plan_max_scroll = total_plan_lines.saturating_sub(plan_h) as u16;
         let scroll_y = if self.plan_auto_scroll {
-            let target_scroll = if let Some(first_pending_visual) =
+            let target_scroll = if let Some(task_id) = target_task
+                && let Some(task_visual) = visual_line_offset_of_task(plan, task_id, plan_w.max(1))
+            {
+                // Position the active started task comfortably in view (leaving 1 line of context above if possible)
+                let desired = task_visual.saturating_sub(1);
+                (desired as u16).min(self.plan_max_scroll)
+            } else if let Some(first_pending_visual) =
                 visual_line_offset_of_first_pending(plan, plan_w.max(1))
             {
                 // Position the first pending task comfortably in view (leaving 1 line of context above if possible)
@@ -584,12 +653,17 @@ impl TuiRenderer {
             } else {
                 String::new()
             };
-            let elapsed_str = if let Some(last) = sa.last_activity_at.or(sa.started_at) {
-                let secs = last.elapsed().as_secs();
-                if secs >= 60 {
-                    format!(", {}m {}s ago", secs / 60, secs % 60)
+            let total_secs = if sa.is_active {
+                (sa.worked_duration + sa.started_at.map(|st| st.elapsed()).unwrap_or_default())
+                    .as_secs()
+            } else {
+                sa.worked_duration.as_secs()
+            };
+            let elapsed_str = if total_secs > 0 {
+                if total_secs >= 60 {
+                    format!(", {}m {}s", total_secs / 60, total_secs % 60)
                 } else {
-                    format!(", {}s ago", secs)
+                    format!(", {}s", total_secs)
                 }
             } else {
                 String::new()
@@ -706,9 +780,26 @@ impl TuiRenderer {
             detail_lines.push(Line::raw("No subagents active or selected."));
         }
 
-        self.subagent_width
-            .set(details_area.width.saturating_sub(1) as usize);
-        self.subagent_height.set(details_area.height as usize);
+        let details_w = details_area.width.saturating_sub(1) as usize;
+        let details_h = details_area.height as usize;
+        self.subagent_width.set(details_w);
+        self.subagent_height.set(details_h);
+
+        let mut total_detail_lines = 0;
+        for line in &detail_lines {
+            let line_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
+            if line_len == 0 {
+                total_detail_lines += 1;
+            } else {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                total_detail_lines += wrapped_lines(&text, details_w).max(1);
+            }
+        }
+
+        let max_scroll = total_detail_lines.saturating_sub(details_h);
+        if self.subagent_autoscroll || (self.subagent_scroll as usize) > max_scroll {
+            self.subagent_scroll = max_scroll as u16;
+        }
 
         let detail_paragraph = Paragraph::new(detail_lines)
             .wrap(Wrap { trim: false })
@@ -716,10 +807,6 @@ impl TuiRenderer {
         frame.render_widget(detail_paragraph, details_area);
 
         // F4: vertical scrollbar on the subagent-details pane.
-        let w = self.subagent_width.get();
-        let total = self.estimated_subagent_lines(w);
-        let h = self.subagent_height.get();
-        let max_scroll = total.saturating_sub(h);
         if max_scroll > 0 {
             let inner = Rect {
                 x: details_area.x,
@@ -812,7 +899,7 @@ impl TuiRenderer {
                     .add_modifier(Modifier::BOLD),
             )
         } else {
-            let status_text = if self.orchestrator_context_tokens > 0 {
+            let left_text = if self.orchestrator_context_tokens > 0 {
                 let ctx_str = Self::format_count(self.orchestrator_context_tokens);
                 format!(
                     " Ctx: {} | Tokens: {} | Status: {}",
@@ -821,6 +908,41 @@ impl TuiRenderer {
             } else {
                 format!(" Tokens: {} | Status: {}", tokens_str, status_str)
             };
+
+            let right_text = if let Some(dur) = self.total_project_elapsed() {
+                format!(
+                    "Elapsed: {} ",
+                    crate::orchestrator::workers::format_duration_human(dur.as_secs())
+                )
+            } else {
+                String::new()
+            };
+
+            let total_width = area.width as usize;
+            let left_w = UnicodeWidthStr::width(left_text.as_str());
+            let right_w = UnicodeWidthStr::width(right_text.as_str());
+
+            let status_text = if total_width > left_w + right_w {
+                let padding = total_width - left_w - right_w;
+                format!("{}{:width$}{}", left_text, "", right_text, width = padding)
+            } else if total_width > right_w {
+                let avail_left = total_width - right_w;
+                let mut truncated = String::new();
+                let mut cur_w = 0;
+                for ch in left_text.chars() {
+                    let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if cur_w + ch_w > avail_left {
+                        break;
+                    }
+                    truncated.push(ch);
+                    cur_w += ch_w;
+                }
+                let padding = avail_left - cur_w;
+                format!("{}{:width$}{}", truncated, "", right_text, width = padding)
+            } else {
+                left_text
+            };
+
             (
                 status_text,
                 Style::default().bg(Color::DarkGray).fg(Color::White),

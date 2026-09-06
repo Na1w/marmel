@@ -60,10 +60,14 @@ fn test_specialist_tool_filtering_and_allowlists() {
 
     assert!(val_tools.contains(&"leave_verdict".to_string()));
     assert!(val_tools.contains(&"read_file".to_string()));
-    assert!(val_tools.contains(&"run_command".to_string()));
+    assert!(!val_tools.contains(&"run_command".to_string()));
     assert!(val_tools.contains(&"grep_search".to_string()));
     assert!(val_tools.contains(&"glob".to_string()));
+    assert!(val_tools.contains(&"pty_spawn".to_string()));
+    assert!(val_tools.contains(&"pty_read".to_string()));
     assert!(val_tools.contains(&"rebirth".to_string()));
+    assert!(!val_tools.contains(&"write_file".to_string()));
+    assert!(!val_tools.contains(&"replace".to_string()));
     assert!(!val_tools.contains(&"create_plan".to_string()));
     assert!(!val_tools.contains(&"archive_current_plan".to_string()));
 }

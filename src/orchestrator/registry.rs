@@ -93,12 +93,16 @@ impl SpecialistRegistry {
             "src/agents/validator.rs",
             &[
                 "delegate_task",
-                "write_file",
-                "replace",
                 "read_file",
-                "run_command",
                 "grep_search",
                 "glob",
+                "pty_spawn",
+                "pty_write",
+                "pty_read",
+                "pty_close",
+                "pty_list",
+                "pty__*",
+                "pty_*",
                 "leave_verdict",
                 "rebirth",
             ],
@@ -242,6 +246,11 @@ mod tests {
         // Validator allowlist checks.
         let validator = reg.resolve(Agent::Validator).unwrap();
         assert!(validator.allows("read_file"));
+        assert!(validator.allows("pty_spawn"));
+        assert!(validator.allows("pty_read"));
+        assert!(!validator.allows("run_command"));
+        assert!(!validator.allows("write_file"));
+        assert!(!validator.allows("replace"));
         assert!(!validator.allows("bogus_tool"));
     }
 

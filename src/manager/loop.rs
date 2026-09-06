@@ -32,10 +32,7 @@ use crate::agents::{Agent, DelegationRequest, Deliverable};
 use crate::harness::monitor::{HarnessMonitor, Intervention};
 use crate::harness::{HarnessStats, ToolCaller, ToolInvocation, ToolResult, dispatch_for};
 use crate::orchestrator::{MAX_EXECUTING_ROUNDS, OrchestratorManager, brief_for_task};
-use crate::tool_names::{
-    TOOL_DELEGATE_TASK, TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_READ_FILE, TOOL_REPLACE,
-    TOOL_RUN_COMMAND, TOOL_WRITE_FILE,
-};
+use crate::tool_names::{TOOL_DELEGATE_TASK, TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_READ_FILE};
 use crate::types::{Message, ToolCall};
 
 use super::phase::Plan;
@@ -114,37 +111,39 @@ struct PendingTool {
 /// Compiled exactly once via `OnceLock` (CODE_REVIEW Point 2).
 static TASK_ID_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
 
-/// Extract an optional `[t-xxx]` task id from a tool's arguments JSON string.
+/// Extract an optional task id from a tool's arguments JSON string.
 fn extract_task_id(_name: &str, args: &serde_json::Value) -> Option<String> {
     // A `task_id` may be embedded in the JSON arguments (plan annotation).
     let candidate = args.get("task_id").and_then(|v| v.as_str());
     if let Some(c) = candidate {
-        return Some(c.to_string());
+        let clean = c
+            .trim()
+            .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
+            .trim();
+        if !clean.is_empty() {
+            return Some(clean.to_string());
+        }
     }
-    // Fall back to scanning the raw argument text for `[t-xxx]`.
+    // Fall back to scanning the raw argument text for `(t-xxx)` or `[t-xxx]`.
     let raw = args.to_string();
-    let re = TASK_ID_RE
-        .get_or_init(|| regex::Regex::new(r"\[(t-[A-Za-z0-9_-]+)\]").expect("valid task regex"));
+    let re = TASK_ID_RE.get_or_init(|| {
+        regex::Regex::new(r"\(?\[?(t-[A-Za-z0-9_-]+)\]?\)?").expect("valid task regex")
+    });
     re.captures(&raw).map(|m| m[1].to_string())
 }
 
 /// Returns `true` for read-only tools eligible for parallel execution
 /// (REQ-LOOP-003).
-fn is_read_tool(name: &str) -> bool {
+pub fn is_read_tool(name: &str) -> bool {
     matches!(name, TOOL_READ_FILE | TOOL_GREP_SEARCH | TOOL_GLOB)
 }
 
 /// Returns `true` for writing/executing tools that must run sequentially.
 ///
-/// `delegate_task` is included as a **sequential** (blocking, synchronous-from-
-/// Manager) tool per REQ-ORCH-005: it mutates the plan/workspace and returns a
-/// deliverable, so it must NOT be parallelized with reads (REQ-LOOP-003,
-/// t-or01 §2.3).
-fn is_write_tool(name: &str) -> bool {
-    matches!(
-        name,
-        TOOL_DELEGATE_TASK | TOOL_WRITE_FILE | TOOL_REPLACE | TOOL_RUN_COMMAND
-    )
+/// Any tool that is not a read-only parallel tool must run sequentially
+/// (REQ-LOOP-003, REQ-ORCH-005), including plan tools, rebirth, PTY tools, and MCP tools.
+pub fn is_write_tool(name: &str) -> bool {
+    !is_read_tool(name)
 }
 
 /// The turn state machine. Each `run_turn` walks through the strict phase

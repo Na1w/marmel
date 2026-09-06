@@ -686,6 +686,11 @@ impl RepetitionDetector {
         if !last.iter().any(|c| c.is_alphanumeric()) {
             return false;
         }
+        let last_str: String = last.iter().collect();
+        // If the pattern is short (< 16 chars) and is a code token or syntax construct, ignore it
+        if pat_len < 16 && is_code_pattern(&last_str) {
+            return false;
+        }
         for group in 1..self.threshold {
             let start = last_start - (group * pat_len);
             for (i, ch) in self.buffer.range(start..start + pat_len).enumerate() {
@@ -700,7 +705,7 @@ impl RepetitionDetector {
     /// Check whether the tail of lines forms a degenerate loop:
     /// 1. The exact same line repeated consecutively >= threshold times at the tail.
     /// 2. A 2-line sequence (bigram) repeated >= threshold times in the buffer.
-    /// 3. Any non-trivial line appearing >= threshold times in the buffer.
+    /// 3. Any non-trivial conversational line appearing >= threshold times in the buffer.
     fn line_or_phrase_repeats(&self) -> bool {
         let text: String = self.buffer.iter().collect();
         let lines: Vec<&str> = text
@@ -726,7 +731,9 @@ impl RepetitionDetector {
                         break;
                     }
                 }
-                if consecutive >= th {
+                // Code data (such as repeated rows in matrix initialization) requires a much higher spam limit
+                let limit = if is_code_line(last) { th * 3 } else { th };
+                if consecutive >= limit {
                     return true;
                 }
             }
@@ -734,6 +741,10 @@ impl RepetitionDetector {
             // 2. 2-line sequence (bigram) repeated >= th times in the buffer
             let mut bigrams = std::collections::HashMap::<(&str, &str), usize>::new();
             for w in lines.windows(2) {
+                // Ignore code bigrams like `return Ok(());\n}` or `#[test]\nfn ...`
+                if is_code_line(w[0]) || is_code_line(w[1]) {
+                    continue;
+                }
                 if w[0].len() >= 6
                     && w[1].len() >= 6
                     && (w[0].chars().any(|c| c.is_alphanumeric())
@@ -749,10 +760,15 @@ impl RepetitionDetector {
                 }
             }
 
-            // 3. Any single non-trivial line appearing >= th times
+            // 3. Any single non-trivial conversational line appearing >= th times
             let mut counts = std::collections::HashMap::<&str, usize>::new();
             for &l in &lines {
-                if l.len() >= 10
+                // Ignore code lines: code repeating throughout a file (e.g. return Ok(())) is normal
+                if is_code_line(l) {
+                    continue;
+                }
+                // Must be a substantial natural language thought or sentence (>= 25 chars)
+                if l.len() >= 25
                     && l.chars().any(|c| c.is_alphanumeric())
                     && !is_markdown_divider(l)
                 {
@@ -776,6 +792,14 @@ impl RepetitionDetector {
             let mut word_ngrams =
                 std::collections::HashMap::<(&str, &str, &str, &str), usize>::new();
             for w in words.windows(4) {
+                // Ignore n-grams with code keywords (e.g. `assert eq`, `pub fn`, `let mut`)
+                if is_code_word(w[0])
+                    || is_code_word(w[1])
+                    || is_code_word(w[2])
+                    || is_code_word(w[3])
+                {
+                    continue;
+                }
                 let total_len = w[0].len() + w[1].len() + w[2].len() + w[3].len();
                 if total_len >= 12 {
                     let cnt = word_ngrams.entry((w[0], w[1], w[2], w[3])).or_insert(0);
@@ -789,6 +813,234 @@ impl RepetitionDetector {
 
         false
     }
+}
+
+fn is_code_pattern(s: &str) -> bool {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Delimiters common in programming syntax, array literals, and struct initializers
+    if trimmed.contains(',')
+        || trimmed.contains(';')
+        || trimmed.contains('(')
+        || trimmed.contains(')')
+        || trimmed.contains('[')
+        || trimmed.contains(']')
+        || trimmed.contains('{')
+        || trimmed.contains('}')
+        || trimmed.contains("->")
+        || trimmed.contains("::")
+        || trimmed.contains("=>")
+        || trimmed.contains('=')
+        || trimmed.contains("0x")
+    {
+        return true;
+    }
+    // Common primitive literals or numeric sequences
+    matches!(
+        trimmed,
+        "true" | "false" | "null" | "None" | "Some" | "Ok" | "Err" | "nil" | "undefined"
+    ) || trimmed
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == '.' || c == '_')
+}
+
+fn is_code_line(s: &str) -> bool {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // Markdown code block delimiters
+    if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+        return true;
+    }
+
+    // Comments, attributes, macros, preprocessor directives
+    if trimmed.starts_with("//")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with('#')
+        || trimmed.starts_with('@')
+    {
+        return true;
+    }
+
+    // Typical code line terminators and structural brackets
+    if trimmed.ends_with(';')
+        || trimmed.ends_with('{')
+        || trimmed.ends_with('}')
+        || trimmed.ends_with(',')
+        || trimmed.ends_with(')')
+        || trimmed.ends_with(']')
+        || trimmed.ends_with(':')
+        || trimmed.ends_with('\\')
+    {
+        return true;
+    }
+
+    // Contains code operators / punctuation
+    if trimmed.contains("::")
+        || trimmed.contains("->")
+        || trimmed.contains("=>")
+        || trimmed.contains("==")
+        || trimmed.contains("!=")
+        || trimmed.contains("<=")
+        || trimmed.contains(">=")
+        || trimmed.contains("+=")
+        || trimmed.contains("-=")
+        || trimmed.contains("*=")
+        || trimmed.contains("&&")
+        || trimmed.contains("||")
+        || trimmed.contains("()")
+        || trimmed.contains("[]")
+        || trimmed.contains("{}")
+        || trimmed.contains("println!")
+        || trimmed.contains("assert!")
+        || trimmed.contains("assert_eq!")
+    {
+        return true;
+    }
+
+    // Leading programming language keyword
+    let first_word = trimmed
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .next()
+        .unwrap_or("");
+    matches!(
+        first_word,
+        "fn" | "pub"
+            | "let"
+            | "mut"
+            | "const"
+            | "static"
+            | "struct"
+            | "enum"
+            | "impl"
+            | "trait"
+            | "type"
+            | "use"
+            | "mod"
+            | "return"
+            | "if"
+            | "else"
+            | "match"
+            | "for"
+            | "while"
+            | "loop"
+            | "break"
+            | "continue"
+            | "def"
+            | "class"
+            | "import"
+            | "from"
+            | "var"
+            | "val"
+            | "function"
+            | "export"
+            | "public"
+            | "private"
+            | "protected"
+            | "case"
+            | "default"
+            | "switch"
+            | "try"
+            | "catch"
+            | "finally"
+            | "throw"
+            | "async"
+            | "await"
+            | "package"
+            | "include"
+            | "SELECT"
+            | "INSERT"
+            | "UPDATE"
+            | "DELETE"
+            | "WHERE"
+            | "FROM"
+            | "CREATE"
+    )
+}
+
+fn is_code_word(w: &str) -> bool {
+    let lower = w.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "fn" | "pub"
+            | "let"
+            | "mut"
+            | "const"
+            | "static"
+            | "struct"
+            | "enum"
+            | "impl"
+            | "trait"
+            | "type"
+            | "use"
+            | "mod"
+            | "return"
+            | "if"
+            | "else"
+            | "match"
+            | "for"
+            | "while"
+            | "loop"
+            | "break"
+            | "continue"
+            | "def"
+            | "class"
+            | "import"
+            | "from"
+            | "var"
+            | "val"
+            | "function"
+            | "export"
+            | "public"
+            | "private"
+            | "protected"
+            | "case"
+            | "default"
+            | "switch"
+            | "try"
+            | "catch"
+            | "finally"
+            | "throw"
+            | "async"
+            | "await"
+            | "self"
+            | "super"
+            | "crate"
+            | "true"
+            | "false"
+            | "none"
+            | "some"
+            | "ok"
+            | "err"
+            | "nil"
+            | "null"
+            | "int"
+            | "i32"
+            | "i64"
+            | "u32"
+            | "u64"
+            | "usize"
+            | "isize"
+            | "str"
+            | "string"
+            | "vec"
+            | "bool"
+            | "void"
+            | "char"
+            | "float"
+            | "double"
+            | "assert"
+            | "asserteq"
+            | "println"
+            | "printf"
+            | "stdout"
+            | "stderr"
+    )
 }
 
 fn is_markdown_divider(s: &str) -> bool {

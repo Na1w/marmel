@@ -42,12 +42,13 @@ use std::sync::Arc;
 pub use steer::{
     SteerDecision, SteerOutcome, SteerSubtaskDecision, StreamingResponseExtractor, arbitrate_steer,
     arbitrate_steer_stream, arbitrate_steer_stream_with_fallback, arbitrate_steer_with_fallback,
-    resolve_steer_outcome,
+    execute_steer_subtask, extract_tasks_to_delegate, resolve_steer_outcome,
 };
 pub use workers::{
-    ActiveWorkerGuard, ActiveWorkerInfo, format_duration_human, get_active_specialist_context_str,
-    get_active_subtasks_str, get_active_worker_tokens, has_active_workers, register_active_worker,
-    update_active_worker_context,
+    ActiveWorkerGuard, ActiveWorkerInfo, CompletedWorkerInfo, format_duration_human,
+    get_active_specialist_context_str, get_active_subtasks_str, get_active_worker_tokens,
+    has_active_workers, register_active_worker, set_active_worker_status,
+    update_active_worker_context, update_active_worker_progress,
 };
 
 /// Default fractal recursion bound (REQ-ORCH-001).
@@ -441,24 +442,20 @@ impl OrchestratorManager {
     /// check-off still works when the subagent omits the parenthesized id.
     fn apply_check_off(&self, d: Deliverable, task_id: Option<String>) -> Deliverable {
         let tid = d.task_id.clone().or(task_id);
-        if let Some(t) = &tid {
-            // Only a genuine Complete marker (not Failed/Replan) may ever check
-            // the task off, regardless of what tokens appear in the content body.
-            if matches!(d.marker, MissionMarker::Complete { .. }) {
-                // Second gate: the *content* must still carry the terminal marker.
-                if let Ok(true) = self.plan.check_plan_on_marker(Some(t), &d.content) {
-                    crate::debug_log::log_plan_update(
-                        "check_off",
-                        &format!("Task [{t}] marked completed [x] on disk"),
-                    );
-                }
+        if matches!(d.marker, MissionMarker::Complete { .. }) {
+            // Second gate: the *content* must still carry the terminal marker.
+            if let Ok(true) = self.plan.check_plan_on_marker(tid.as_deref(), &d.content)
+                && let Some(t) = &tid
+            {
+                crate::debug_log::log_plan_update(
+                    "check_off",
+                    &format!("Task [{t}] marked completed [x] on disk"),
+                );
             }
-            let mut d = d;
-            d.task_id = Some(t.clone());
-            d
-        } else {
-            d
         }
+        let mut d = d;
+        d.task_id = tid;
+        d
     }
 
     /// REQ-ORCH-001: resolve the role system prompt for a specialist. Reads the
@@ -576,7 +573,28 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
         });
     }
 
-    // 2b. Guard: reject re-delegation of tasks already checked off in the plan.
+    // 2b. task_id is mandatory (REQ-ORCH-005): must identify which execution plan item is being delegated.
+    let raw_task_id = req.task_id.as_deref().unwrap_or("").trim();
+    if raw_task_id.is_empty() {
+        return Err(ToolError::BadArguments {
+            tool: TOOL_DELEGATE_TASK.to_string(),
+            detail: "`task_id` is mandatory: you must specify the execution_plan.md task id (e.g. 't-001') to delegate work".to_string(),
+        });
+    }
+    let clean_task_id = raw_task_id
+        .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
+        .trim()
+        .to_string();
+    if clean_task_id.is_empty() {
+        return Err(ToolError::BadArguments {
+            tool: TOOL_DELEGATE_TASK.to_string(),
+            detail: "`task_id` cannot be empty".to_string(),
+        });
+    }
+    let mut req = req;
+    req.task_id = Some(clean_task_id);
+
+    // 2c. Guard: reject re-delegation of tasks already checked off in the plan.
     #[cfg(not(test))]
     {
         let plan = Plan::default();
@@ -600,15 +618,22 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
     // 3. Route through a Manager rooted at the shared `.marmel` plan dir.
     //    The build URL/model are unused by the deterministic Phase-O
     //    `run_specialist_llm` driver, so a placeholder client is fine.
+    let cfg = crate::config::get_active()
+        .or_else(|| crate::config::load(None).ok())
+        .unwrap_or_default();
     let stats = Arc::new(HarnessStats::new());
     let manager = OrchestratorManager::new(
-        ChatClient::new("http://127.0.0.1:11434/v1", "marmel-manager"),
+        ChatClient::new_with_token(&cfg.backend_url, &cfg.model, &cfg.auth_token),
         Plan::default(),
         stats,
     );
 
     let deliverable = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.block_on(manager.delegate(req))
+        std::thread::scope(|s| {
+            s.spawn(|| handle.block_on(manager.delegate(req)))
+                .join()
+                .unwrap()
+        })
     } else {
         futures::executor::block_on(manager.delegate(req))
     }

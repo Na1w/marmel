@@ -150,3 +150,43 @@ async fn test_llm_on_delta_abort_during_prefill() {
     assert_eq!(reply.content, "");
     assert!(check_count >= 2);
 }
+
+#[test]
+fn test_consume_event_does_not_double_count_tokens() {
+    let before = get_global_token_counts().1;
+
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut raw = String::new();
+    let mut tool_calls_map = std::collections::BTreeMap::new();
+    let mut in_reasoning = false;
+
+    let ev = eventsource_stream::Event {
+        event: "message".to_string(),
+        data: serde_json::json!({
+            "choices": [{
+                "delta": { "content": "hello world from streaming chunk" }
+            }]
+        })
+        .to_string(),
+        id: String::new(),
+        retry: None,
+    };
+
+    consume_event(
+        &ev,
+        &mut content,
+        &mut reasoning,
+        &mut raw,
+        &mut tool_calls_map,
+        &mut in_reasoning,
+        &mut |_| true,
+    )
+    .unwrap();
+
+    let after = get_global_token_counts().1;
+    assert_eq!(
+        before, after,
+        "consume_event must not increment token counter on chunks"
+    );
+}

@@ -175,7 +175,7 @@ pub async fn run_session(
                     }
                     if is_reset_command(&line) {
                         crate::debug_log::log_user_input("command", &line);
-                        handle_reset_command(&plan, &mut *renderer, &mut ctx);
+                        handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
                         continue;
                     }
                     let trimmed = line.trim();
@@ -245,6 +245,7 @@ pub async fn run_session(
             &mut *renderer,
             &mut steer_queue,
             &mut steer_abort_requested,
+            Some(&mut subagents),
         );
         drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
 
@@ -256,7 +257,7 @@ pub async fn run_session(
             }
             if is_reset_command(&steer) {
                 crate::debug_log::log_user_input("command", &steer);
-                handle_reset_command(&plan, &mut *renderer, &mut ctx);
+                handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
                 continue;
             }
             if !steer.trim().is_empty() {
@@ -284,6 +285,7 @@ pub async fn run_session(
                 &mut *renderer,
                 &mut steer_queue,
                 &mut steer_abort_requested,
+                Some(&mut subagents),
             );
             drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
             renderer.flush()?;
@@ -307,6 +309,7 @@ pub async fn run_session(
             renderer.on_event(&Event::Status(format!("Running ({})", stream_cfg.model)));
             renderer.flush()?;
 
+            let msgs = ctx.messages().to_vec();
             let mut bridge = RendererSink {
                 renderer: &mut *renderer,
                 steer_queue: &mut steer_queue,
@@ -317,15 +320,10 @@ pub async fn run_session(
                 stats: harness_stats.clone(),
                 goal: &goal,
                 subagents: &subagents,
+                plan: Some(&plan),
+                ctx: Some(&mut ctx),
             };
-            let assistant = match chat_client_turn(
-                &client,
-                ctx.messages().to_vec(),
-                &stream_cfg,
-                &mut bridge,
-            )
-            .await
-            {
+            let assistant = match chat_client_turn(&client, msgs, &stream_cfg, &mut bridge).await {
                 Ok(m) => m,
                 Err(e) => {
                     let category = classify_llm_error(&e);
@@ -408,12 +406,9 @@ pub async fn run_session(
 
             nudge_count = 0;
 
-            let all_parallel = tool_calls.iter().all(|c| {
-                matches!(
-                    c.function.name.as_str(),
-                    "delegate_task" | "read_file" | "grep_search" | "glob"
-                )
-            });
+            let all_parallel = tool_calls
+                .iter()
+                .all(|c| crate::manager::is_read_tool(&c.function.name));
 
             if all_parallel && tool_calls.len() > 1 {
                 let mut handles = Vec::new();
@@ -501,6 +496,7 @@ pub async fn run_session(
                             &mut *renderer,
                             &mut steer_queue,
                             &mut steer_abort_requested,
+                            Some(&mut subagents),
                         );
                         drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
                         if renderer.aborted() {
@@ -538,6 +534,7 @@ pub async fn run_session(
                                     &mut *renderer,
                                     &mut steer_queue,
                                     &mut steer_abort_requested,
+                                    Some(&mut subagents),
                                 );
                                 drain_delegation_events(
                                     manager.as_deref(),
@@ -548,7 +545,7 @@ pub async fn run_session(
                                     if is_abort_command(&input) {
                                         renderer.request_abort();
                                     } else if is_reset_command(&input) {
-                                        handle_reset_command(&plan, &mut *renderer, &mut ctx);
+                                        handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
                                     } else if !input.trim().is_empty() {
                                         spawn_steer_arbitration(
                                             &client,
@@ -566,15 +563,27 @@ pub async fn run_session(
                     };
 
                     let (call_id, agent, task, tool_res) = res;
-                    let result_content = match tool_res {
-                        Ok(r) => r.content,
-                        Err(e) => format!("ERROR: {e}"),
+                    let (result_content, is_error) = match tool_res {
+                        Ok(r) => (r.content, r.is_error),
+                        Err(e) => (format!("ERROR: {e}"), true),
                     };
                     if let Some(ag) = agent {
                         update_subagent_lifecycle(&mut subagents, ag, task.clone(), None, false);
-                        renderer.on_event(&Event::Delegation(
-                            crate::orchestrator::DelegationEvent::Completed { agent: ag, task },
-                        ));
+                        if is_error {
+                            let clean_tid =
+                                task.as_deref().unwrap_or("task").trim().trim_matches(|c| {
+                                    c == '[' || c == ']' || c == '"' || c == '\''
+                                });
+                            renderer.on_event(&Event::Status(format!("[{clean_tid}] failed.")));
+                        } else {
+                            if let Some(ref tid) = task {
+                                let plan = crate::agent::phase::Plan::default();
+                                let _ = plan.check_off(tid);
+                            }
+                            renderer.on_event(&Event::Delegation(
+                                crate::orchestrator::DelegationEvent::Completed { agent: ag, task },
+                            ));
+                        }
                     } else {
                         renderer.on_event(&Event::ToolResult(result_content.clone()));
                     }
@@ -698,6 +707,7 @@ pub async fn run_session(
                             &mut *renderer,
                             &mut steer_queue,
                             &mut steer_abort_requested,
+                            Some(&mut subagents),
                         );
                         drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
                         if renderer.aborted() {
@@ -726,6 +736,7 @@ pub async fn run_session(
                                     &mut *renderer,
                                     &mut steer_queue,
                                     &mut steer_abort_requested,
+                                    Some(&mut subagents),
                                 );
                                 drain_delegation_events(
                                     manager.as_deref(),
@@ -736,7 +747,7 @@ pub async fn run_session(
                                     if is_abort_command(&input) {
                                         renderer.request_abort();
                                     } else if is_reset_command(&input) {
-                                        handle_reset_command(&plan, &mut *renderer, &mut ctx);
+                                        handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
                                     } else if !input.trim().is_empty() {
                                         spawn_steer_arbitration(
                                             &client,
@@ -753,9 +764,9 @@ pub async fn run_session(
                         }
                     };
 
-                    let result_content = match result {
-                        Ok(res) => res.content,
-                        Err(e) => format!("ERROR: {e}"),
+                    let (result_content, is_error) = match result {
+                        Ok(res) => (res.content, res.is_error),
+                        Err(e) => (format!("ERROR: {e}"), true),
                     };
                     if let Some(agent) = delegated_agent {
                         update_subagent_lifecycle(
@@ -765,12 +776,25 @@ pub async fn run_session(
                             None,
                             false,
                         );
-                        renderer.on_event(&Event::Delegation(
-                            crate::orchestrator::DelegationEvent::Completed {
-                                agent,
-                                task: delegated_task,
-                            },
-                        ));
+                        if is_error {
+                            let clean_tid = delegated_task
+                                .as_deref()
+                                .unwrap_or("task")
+                                .trim()
+                                .trim_matches(|c| c == '[' || c == ']' || c == '"' || c == '\'');
+                            renderer.on_event(&Event::Status(format!("[{clean_tid}] failed.")));
+                        } else {
+                            if let Some(ref tid) = delegated_task {
+                                let plan = crate::agent::phase::Plan::default();
+                                let _ = plan.check_off(tid);
+                            }
+                            renderer.on_event(&Event::Delegation(
+                                crate::orchestrator::DelegationEvent::Completed {
+                                    agent,
+                                    task: delegated_task,
+                                },
+                            ));
+                        }
                     } else {
                         renderer.on_event(&Event::ToolResult(result_content.clone()));
                     }
@@ -800,6 +824,7 @@ pub async fn run_session(
             &mut *renderer,
             &mut steer_queue,
             &mut steer_abort_requested,
+            Some(&mut subagents),
         );
         if steer_abort_requested || renderer.aborted() {
             if steer_abort_requested {
@@ -844,7 +869,7 @@ pub async fn run_session(
                 }
                 if is_reset_command(&line) {
                     crate::debug_log::log_user_input("command", &line);
-                    handle_reset_command(&plan, &mut *renderer, &mut ctx);
+                    handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
                     continue;
                 }
                 if !line.trim().is_empty() {

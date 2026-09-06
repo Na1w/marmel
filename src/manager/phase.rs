@@ -79,6 +79,76 @@ pub fn output_is_success(output: &str) -> bool {
 static PLAN_MUTEX: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
+type PlanStartTime = (std::time::Instant, chrono::DateTime<chrono::Local>);
+
+static PLAN_STARTED_AT: std::sync::LazyLock<std::sync::RwLock<Option<PlanStartTime>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+
+static PLAN_COMPLETED_AT: std::sync::LazyLock<std::sync::RwLock<Option<std::time::Instant>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+
+/// Record that an execution plan started right now.
+pub fn record_plan_start() {
+    record_plan_start_at(std::time::Instant::now());
+}
+
+/// Record that an execution plan started at a specific instant.
+pub fn record_plan_start_at(inst: std::time::Instant) {
+    if let Ok(mut g) = PLAN_STARTED_AT.write() {
+        *g = Some((inst, chrono::Local::now()));
+    }
+    if let Ok(mut g) = PLAN_COMPLETED_AT.write() {
+        *g = None;
+    }
+}
+
+/// Record that an execution plan completed all tasks right now.
+pub fn record_plan_completed() {
+    if let Ok(mut g) = PLAN_COMPLETED_AT.write()
+        && g.is_none()
+    {
+        *g = Some(std::time::Instant::now());
+    }
+}
+
+/// Retrieve the instant when the plan was completed, if finished.
+pub fn get_plan_completed_time() -> Option<std::time::Instant> {
+    PLAN_COMPLETED_AT.read().ok().and_then(|g| *g)
+}
+
+/// Clear the recorded plan start time upon completion / archive.
+pub fn clear_plan_start() {
+    if let Ok(mut g) = PLAN_STARTED_AT.write() {
+        *g = None;
+    }
+    if let Ok(mut g) = PLAN_COMPLETED_AT.write() {
+        *g = None;
+    }
+}
+
+/// Retrieve the start time of the active execution plan, falling back to disk metadata if needed.
+pub fn get_plan_start_time() -> Option<(std::time::Instant, chrono::DateTime<chrono::Local>)> {
+    if let Ok(g) = PLAN_STARTED_AT.read()
+        && let Some((inst, wall)) = *g
+    {
+        return Some((inst, wall));
+    }
+    let plan_path = std::path::Path::new(MARMEL_DIR).join(PLAN_FILE);
+    if let Ok(meta) = std::fs::metadata(&plan_path)
+        && let Ok(mod_time) = meta.created().or_else(|_| meta.modified())
+    {
+        let wall: chrono::DateTime<chrono::Local> = mod_time.into();
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(mod_time)
+            .unwrap_or_default();
+        let inst = std::time::Instant::now()
+            .checked_sub(elapsed)
+            .unwrap_or_else(std::time::Instant::now);
+        return Some((inst, wall));
+    }
+    None
+}
+
 /// Regex matching a `(t-xxx)` / `[t-xxx]` task-id token. Compiled exactly once
 /// via `OnceLock` (CODE_REVIEW Point 2).
 static TASK_ID_RE: OnceLock<Regex> = OnceLock::new();
@@ -112,6 +182,17 @@ pub enum MissionMarker {
     Replan { reason: String },
 }
 
+fn contains_failed_marker(upper: &str) -> bool {
+    if !upper.contains("FAILED") {
+        return false;
+    }
+    let sanitized = upper
+        .replace("0 FAILED", "")
+        .replace("0 TESTS FAILED", "")
+        .replace("0 TEST FAILED", "");
+    sanitized.contains("FAILED")
+}
+
 impl MissionMarker {
     /// Parse the terminal marker out of a subagent's final text
     /// (REQ-ORCH-005). Matched case-insensitively anywhere in the deliverable.
@@ -130,7 +211,7 @@ impl MissionMarker {
                 task_id: find_task_id(text),
             });
         }
-        if upper.contains("FAILED") {
+        if contains_failed_marker(&upper) {
             return Some(MissionMarker::Failed {
                 reason: text.to_string(),
             });
@@ -197,6 +278,7 @@ impl Plan {
         let path = self.plan_path();
         std::fs::write(&path, plan_markdown)
             .with_context(|| format!("writing {}", path.display()))?;
+        record_plan_start();
         tracing::info!(
             "Execution plan created at {} ({} chars):\n{}",
             path.display(),
@@ -344,6 +426,7 @@ impl Plan {
         if transcript.exists() {
             let _ = std::fs::remove_file(&transcript);
         }
+        clear_plan_start();
         tracing::warn!(
             "Execution plan completed and ARCHIVED to {} (active plan file {} removed from disk)",
             dest.display(),
@@ -365,7 +448,11 @@ impl Plan {
             tracing::warn!("check_off({task_id}): no active plan file on disk");
             return Ok(false);
         };
-        let tid_lower = task_id.to_ascii_lowercase();
+        let clean_tid = task_id
+            .trim()
+            .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
+            .trim();
+        let tid_lower = clean_tid.to_ascii_lowercase();
         let mut flipped = false;
         let re_box = Regex::new(r"\[\s*\]").expect("box regex");
         let updated = content
@@ -398,6 +485,7 @@ impl Plan {
             // caller explicitly archives. This is a best-effort snapshot; a
             // failure here must not fail the check-off itself.
             if complete {
+                record_plan_completed();
                 let _ = self.write_completed_snapshot(&updated);
             }
         } else {
@@ -469,13 +557,22 @@ impl Plan {
         // Resolve the task id: the explicit override takes precedence, falling
         // back to the marker's own `(t-xxx)` token. Own the id so no borrow is
         // held past the local `marker`.
-        let tid = task_id.map(str::to_string).or_else(|| {
-            if let MissionMarker::Complete { task_id } = &marker {
-                task_id.clone()
-            } else {
-                None
-            }
-        });
+        let tid = task_id
+            .map(|t| {
+                t.trim()
+                    .trim_matches(|c| {
+                        c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\''
+                    })
+                    .trim()
+                    .to_string()
+            })
+            .or_else(|| {
+                if let MissionMarker::Complete { task_id } = &marker {
+                    task_id.clone()
+                } else {
+                    None
+                }
+            });
         let Some(tid) = tid else {
             tracing::warn!("check_plan_on_marker: No task_id resolved from marker {marker:?}");
             return Ok(false);

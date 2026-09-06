@@ -225,6 +225,7 @@ fn estimated_subagent_lines_counts_sections() {
         task_id: None,
         prompt: String::new(),
         started_at: None,
+        worked_duration: std::time::Duration::ZERO,
         last_activity_at: None,
         logs: vec!["log1".to_string()],
         thinking: "think".to_string(),
@@ -301,6 +302,7 @@ fn cycle_focus_obeys_panel_visibility() {
         task_id: None,
         prompt: String::new(),
         started_at: None,
+        worked_duration: std::time::Duration::ZERO,
         last_activity_at: None,
         logs: vec![],
         thinking: String::new(),
@@ -393,6 +395,7 @@ fn set_subagents_adopts_authoritative_list() {
         task_id: None,
         prompt: String::new(),
         started_at: None,
+        worked_duration: std::time::Duration::ZERO,
         last_activity_at: None,
         logs: vec!["started task t-1".to_string()],
         thinking: "local think".to_string(),
@@ -407,6 +410,7 @@ fn set_subagents_adopts_authoritative_list() {
         task_id: None,
         prompt: String::new(),
         started_at: None,
+        worked_duration: std::time::Duration::ZERO,
         last_activity_at: None,
         logs: vec!["started task t-1".to_string()],
         thinking: String::new(),
@@ -428,6 +432,7 @@ fn set_subagents_adopts_authoritative_list() {
         task_id: None,
         prompt: String::new(),
         started_at: None,
+        worked_duration: std::time::Duration::ZERO,
         last_activity_at: None,
         logs: vec![],
         thinking: String::new(),
@@ -440,6 +445,7 @@ fn set_subagents_adopts_authoritative_list() {
         task_id: None,
         prompt: String::new(),
         started_at: None,
+        worked_duration: std::time::Duration::ZERO,
         last_activity_at: None,
         logs: vec![],
         thinking: String::new(),
@@ -570,6 +576,7 @@ fn test_subagent_thinking_visibility_controlled_by_show_thought() {
         task_id: Some("t-001".to_string()),
         prompt: "task brief".to_string(),
         started_at: None,
+        worked_duration: std::time::Duration::ZERO,
         last_activity_at: None,
         logs: vec!["log step".to_string()],
         thinking: "secret subagent thoughts".to_string(),
@@ -668,6 +675,7 @@ fn test_subagent_tool_calls_logged_with_arguments_and_stripped_prefix() {
         content: String::new(),
         is_active: true,
         context_tokens: 0,
+        worked_duration: Duration::ZERO,
     });
     r.active_agent = "coder-t-001".to_string();
 
@@ -827,6 +835,47 @@ fn test_plan_auto_scrolls_to_first_pending_task() {
 }
 
 #[test]
+fn test_visual_line_offset_of_task() {
+    let plan = "# Plan\n## Phase 1\n- [x] [t-001] First\n- [x] [t-002] Second\n- [ ] [t-003] Third\n- [ ] [t-004] Fourth\n";
+    assert_eq!(visual_line_offset_of_task(plan, "t-001", 80), Some(2));
+    assert_eq!(visual_line_offset_of_task(plan, "t-002", 80), Some(3));
+    assert_eq!(visual_line_offset_of_task(plan, "t-003", 80), Some(4));
+    assert_eq!(visual_line_offset_of_task(plan, "t-004", 80), Some(5));
+    assert_eq!(visual_line_offset_of_task(plan, "t-999", 80), None);
+}
+
+#[test]
+fn test_plan_auto_scrolls_to_started_task() {
+    let mut r = TuiRenderer::new();
+    let plan_text = "# Plan\n## Phase 1\n- [x] [t-001] Task 1\n- [x] [t-002] Task 2\n- [x] [t-003] Task 3\n- [ ] [t-004] Task 4\n- [ ] [t-005] Task 5\n- [ ] [t-006] Task 6\n- [ ] [t-007] Task 7\n- [ ] [t-008] Task 8\n- [ ] [t-009] Task 9\n- [ ] [t-010] Task 10\n";
+    r.plan_content = plan_text.to_string();
+
+    // Start task t-008
+    r.on_event(&crate::ui::Event::Delegation(
+        crate::orchestrator::DelegationEvent::Started {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-008".to_string()),
+        },
+    ));
+
+    assert_eq!(r.active_plan_task.as_deref(), Some("t-008"));
+    assert!(r.plan_auto_scroll);
+    assert!(r.show_plan_panel);
+
+    let backend = ratatui::backend::TestBackend::new(80, 6);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 0, 80, 6);
+            r.render_plan(frame, area, plan_text, false);
+        })
+        .unwrap();
+
+    // Line offset of t-008 is 9, leaving 1 line of context above -> desired scroll is 8
+    assert_eq!(r.plan_scroll, 8);
+}
+
+#[test]
 fn test_subagent_scrolling_and_focus() {
     let mut r = TuiRenderer::new();
     r.focused_panel = FocusedPanel::Subagents;
@@ -846,6 +895,7 @@ fn test_subagent_scrolling_and_focus() {
         content: "output line 1\noutput line 2".to_string(),
         is_active: true,
         context_tokens: 0,
+        worked_duration: Duration::ZERO,
     });
 
     r.show_thought = true;
@@ -913,6 +963,7 @@ fn test_subagent_switch_scrolls_to_bottom_and_autoscrolls() {
         content: "output".to_string(),
         is_active: true,
         context_tokens: 0,
+        worked_duration: Duration::ZERO,
     });
     r.subagents.push(SubagentDetail {
         name: "coder-2".to_string(),
@@ -930,6 +981,7 @@ fn test_subagent_switch_scrolls_to_bottom_and_autoscrolls() {
         content: "output 2".to_string(),
         is_active: true,
         context_tokens: 0,
+        worked_duration: Duration::ZERO,
     });
 
     r.subagent_width.set(40);
@@ -1101,6 +1153,7 @@ fn test_subagent_context_tokens_rendering_in_list() {
         content: String::new(),
         is_active: true,
         context_tokens: 3500,
+        worked_duration: Duration::ZERO,
     });
     r.subagents.push(SubagentDetail {
         name: "researcher-t-2".to_string(),
@@ -1113,6 +1166,7 @@ fn test_subagent_context_tokens_rendering_in_list() {
         content: String::new(),
         is_active: false,
         context_tokens: 1200,
+        worked_duration: Duration::ZERO,
     });
     r.subagents.push(SubagentDetail {
         name: "validator".to_string(),
@@ -1125,6 +1179,7 @@ fn test_subagent_context_tokens_rendering_in_list() {
         content: String::new(),
         is_active: true,
         context_tokens: 0,
+        worked_duration: Duration::ZERO,
     });
 
     let backend = ratatui::backend::TestBackend::new(100, 20);
@@ -1175,6 +1230,7 @@ fn test_subagent_time_counter_rendering_in_list() {
         content: String::new(),
         is_active: true,
         context_tokens: 3500,
+        worked_duration: Duration::ZERO,
     });
     r.subagents.push(SubagentDetail {
         name: "researcher-t-2".to_string(),
@@ -1187,6 +1243,7 @@ fn test_subagent_time_counter_rendering_in_list() {
         content: String::new(),
         is_active: false,
         context_tokens: 1200,
+        worked_duration: Duration::from_secs(85),
     });
 
     let backend = ratatui::backend::TestBackend::new(100, 20);
@@ -1208,12 +1265,12 @@ fn test_subagent_time_counter_rendering_in_list() {
     }
     let full_text = lines.join("\n");
     assert!(
-        full_text.contains("coder-t-1 (Active, 3.5k ctx, 5s ago)"),
-        "expected 'coder-t-1 (Active, 3.5k ctx, 5s ago)' in subagents panel, got:\n{full_text}"
+        full_text.contains("coder-t-1 (Active, 3.5k ctx, 5s)"),
+        "expected 'coder-t-1 (Active, 3.5k ctx, 5s)' in subagents panel, got:\n{full_text}"
     );
     assert!(
-        full_text.contains("researcher-t-2 (Idle, 1.2k ctx, 1m 25s ago)"),
-        "expected 'researcher-t-2 (Idle, 1.2k ctx, 1m 25s ago)' in subagents panel, got:\n{full_text}"
+        full_text.contains("researcher-t-2 (Idle, 1.2k ctx, 1m 25s)"),
+        "expected 'researcher-t-2 (Idle, 1.2k ctx, 1m 25s)' in subagents panel, got:\n{full_text}"
     );
 }
 
@@ -1260,6 +1317,7 @@ fn test_rehydrate_subagents_enables_panel_and_selects_latest() {
             content: "output 1".to_string(),
             is_active: false,
             context_tokens: 100,
+            worked_duration: Duration::ZERO,
         },
         SubagentDetail {
             name: "researcher-t-002".to_string(),
@@ -1275,6 +1333,7 @@ fn test_rehydrate_subagents_enables_panel_and_selects_latest() {
             content: "output 2".to_string(),
             is_active: false,
             context_tokens: 200,
+            worked_duration: Duration::ZERO,
         },
     ];
 
@@ -1334,5 +1393,158 @@ fn test_rehydrate_messages_summarizes_delegation_results() {
         r.messages
             .iter()
             .any(|m| m == "[Tool Result] MISSION COMPLETE (t-001):")
+    );
+}
+
+#[test]
+fn test_plan_caching_and_throttling() {
+    let mut renderer = TuiRenderer::new();
+    renderer.plan_content = "Cached plan".to_string();
+    renderer.last_plan_check = std::time::Instant::now();
+
+    assert_eq!(renderer.plan_content, "Cached plan");
+    assert!(!renderer.plan_is_archived);
+}
+
+static PLAN_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn test_status_bar_displays_right_aligned_elapsed_time() {
+    let _lock = PLAN_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let r = TuiRenderer::new();
+    crate::manager::phase::record_plan_start_at(
+        std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(135))
+            .unwrap(),
+    );
+
+    let backend = ratatui::backend::TestBackend::new(100, 5);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 4, 100, 1);
+            r.render_status(frame, area);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let content: String = (0..100)
+        .map(|x| buffer[(x, 4)].symbol().to_string())
+        .collect();
+
+    defer_clear_plan();
+
+    assert!(
+        content.contains("Tokens:"),
+        "expected 'Tokens:' on the left, got: {content}"
+    );
+    assert!(
+        content.contains("Elapsed: 2m 15s"),
+        "expected 'Elapsed: 2m 15s' in status bar, got: {content}"
+    );
+    assert!(
+        content.ends_with("Elapsed: 2m 15s "),
+        "expected elapsed time to be right-aligned at the edge of the status bar, got: '{content}'"
+    );
+}
+
+#[test]
+fn test_status_bar_prefers_plan_start_time() {
+    let _lock = PLAN_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let r = TuiRenderer::new();
+    defer_clear_plan();
+
+    // No plan start yet -> None (only counts when actively working on a plan)
+    assert!(r.total_project_elapsed().is_none());
+
+    // Now record plan start
+    crate::manager::phase::record_plan_start();
+    assert!(r.total_project_elapsed().is_some());
+
+    // Clean up afterwards
+    defer_clear_plan();
+}
+
+fn defer_clear_plan() {
+    crate::manager::phase::clear_plan_start();
+}
+
+#[test]
+fn test_delegation_completed_emits_task_id_completed_in_chat() {
+    let mut r = TuiRenderer::new();
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Started {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-007".to_string()),
+        },
+    ));
+
+    // Validator approval status should NOT dump into chat
+    r.on_event(&Event::Status(
+        "[Validator] APPROVED deliverable for coder-t-007:\nAll checks passed.".to_string(),
+    ));
+    assert!(
+        !r.messages
+            .iter()
+            .any(|m| m.contains("[Validator] APPROVED")),
+        "validator approval must not be pushed into chat messages"
+    );
+    // But it should be present in subagent logs
+    assert!(
+        r.subagents[0]
+            .logs
+            .iter()
+            .any(|l| l.contains("[Validator] APPROVED deliverable for coder-t-007")),
+        "validator approval should be recorded in subagent logs"
+    );
+
+    // Delegation completion pushes "[t-007] completed." to chat
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Completed {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-007".to_string()),
+        },
+    ));
+
+    assert_eq!(
+        r.messages.last().map(String::as_str),
+        Some("[t-007] completed.")
+    );
+
+    // Style verification
+    let (style, special) = message_style("[t-007] completed.");
+    assert!(special);
+    assert_eq!(style.fg, Some(ratatui::style::Color::Green));
+    assert!(style.add_modifier.contains(ratatui::style::Modifier::BOLD));
+}
+
+#[test]
+fn test_chat_auto_scroll_shows_final_lines_of_multiline_markdown_response() {
+    let mut r = TuiRenderer::new();
+    let text = "## Summary\n\nParagraph 1.\n\nParagraph 2.\n\n### Section 1\nLine 1\nLine 2\n\n### Section 2\n- Item 1\n- Item 2\n\n### Section 3\n- Item 3\n- Item 4\n\n### Final Section\nBottom line 1\nBottom line 2\n";
+    r.on_event(&Event::Message(text.to_string()));
+
+    let backend = ratatui::backend::TestBackend::new(80, 10);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 0, 80, 10);
+            r.render_chat(frame, area);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let mut rendered = String::new();
+    for y in 0..10 {
+        let line: String = (0..80)
+            .map(|x| buffer[(x, y)].symbol().to_string())
+            .collect();
+        rendered.push_str(&line);
+        rendered.push('\n');
+    }
+
+    assert!(
+        rendered.contains("Bottom line 2"),
+        "expected bottom line to be visible in chat viewport, got:\n{rendered}"
     );
 }

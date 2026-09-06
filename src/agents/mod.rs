@@ -95,6 +95,17 @@ fn find_task_id(text: &str) -> Option<&str> {
     re.captures(text).map(|c| c.get(1).unwrap().as_str())
 }
 
+fn contains_failed_marker(upper: &str) -> bool {
+    if !upper.contains("FAILED") {
+        return false;
+    }
+    let sanitized = upper
+        .replace("0 FAILED", "")
+        .replace("0 TESTS FAILED", "")
+        .replace("0 TEST FAILED", "");
+    sanitized.contains("FAILED")
+}
+
 impl MissionMarker {
     pub fn parse(text: &str) -> Option<MissionMarker> {
         let upper = text.to_ascii_uppercase();
@@ -103,14 +114,14 @@ impl MissionMarker {
                 reason: text.to_string(),
             });
         }
-        if upper.contains("FAILED") {
-            return Some(MissionMarker::Failed {
-                reason: text.to_string(),
-            });
-        }
         if upper.contains("MISSION COMPLETE") {
             let task_id = find_task_id(text).map(|t| t.to_string());
             return Some(MissionMarker::Complete { task_id });
+        }
+        if contains_failed_marker(&upper) {
+            return Some(MissionMarker::Failed {
+                reason: text.to_string(),
+            });
         }
         None
     }
@@ -250,18 +261,75 @@ mod tests {
     }
 
     #[test]
+    fn test_mission_marker_parse_precedence_and_benign_failed() {
+        // MISSION COMPLETE takes precedence over words like "failed" in narrative
+        let narrative =
+            "Previous build failed with syntax error. Fixed now.\n\nMISSION COMPLETE (t-001)";
+        assert_eq!(
+            MissionMarker::parse(narrative),
+            Some(MissionMarker::Complete {
+                task_id: Some("t-001".to_string())
+            })
+        );
+
+        // Test outputs containing "0 failed" must not be parsed as Failed
+        let test_output =
+            "test result: ok. 15 passed; 0 failed; 0 ignored\n\nMISSION COMPLETE (t-002)";
+        assert_eq!(
+            MissionMarker::parse(test_output),
+            Some(MissionMarker::Complete {
+                task_id: Some("t-002".to_string())
+            })
+        );
+
+        // 0 failed without MISSION COMPLETE should not be parsed as Failed
+        let benign = "test result: ok. 15 passed; 0 failed; 0 ignored";
+        assert_eq!(MissionMarker::parse(benign), None);
+
+        // Actual failure without MISSION COMPLETE is parsed as Failed
+        let failed = "Compilation error: FAILED to compile src/main.rs";
+        assert!(matches!(
+            MissionMarker::parse(failed),
+            Some(MissionMarker::Failed { .. })
+        ));
+    }
+
+    #[test]
     fn test_assemble_final_deliverable() {
-        let complete = assemble_final_deliverable(true, None, "Code completed. MISSION COMPLETE");
+        let complete = assemble_final_deliverable(
+            true,
+            None,
+            "Code completed. MISSION COMPLETE",
+            Some("t-001"),
+        );
         assert!(complete.contains("MISSION COMPLETE"));
 
-        let incomplete = assemble_final_deliverable(true, None, "Code partially written.");
-        assert!(!incomplete.contains("MISSION COMPLETE"));
-        assert!(incomplete.contains("FAILED"));
+        // When validation passed without explicit MISSION COMPLETE, deliverable is approved and concluded with MISSION COMPLETE
+        let approved_implicit = assemble_final_deliverable(
+            true,
+            None,
+            "Implemented feature and verified tests pass.",
+            Some("t-002"),
+        );
+        assert!(approved_implicit.contains("MISSION COMPLETE (t-002)"));
+        assert!(!approved_implicit.contains("FAILED"));
 
+        // When validation passed but specialist explicitly requested replan, keep replan
+        let replan = assemble_final_deliverable(
+            true,
+            None,
+            "REPLAN REQUIRED: need different database schema",
+            Some("t-003"),
+        );
+        assert!(replan.contains("REPLAN REQUIRED"));
+        assert!(!replan.contains("MISSION COMPLETE"));
+
+        // When validation failed (rejected), revoke MISSION COMPLETE and append FAILED
         let rejected = assemble_final_deliverable(
             false,
             Some("Syntax error in line 10"),
             "Code done. MISSION COMPLETE",
+            Some("t-004"),
         );
         assert!(rejected.contains("VALIDATOR REJECTION: Syntax error in line 10"));
         assert!(!rejected.contains("MISSION COMPLETE"));

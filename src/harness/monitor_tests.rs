@@ -240,6 +240,22 @@ fn test_monitor_bigram_no_false_positives_on_diverse_code() {
 }
 
 #[test]
+fn test_monitor_no_false_positives_on_realistic_large_code_file() {
+    let mut det = RepetitionDetector::new(5, 5);
+    // Write 10 unit tests and functions that share identical boilerplates like return Ok(()),
+    // #[tokio::test], assert!(result.is_ok()), and repeated array rows.
+    for i in 0..10 {
+        det.push(&format!(
+            "#[tokio::test]\nasync fn test_case_{i}() {{\n    let arr = [0, 0, 0, 0, 0, 0];\n    let res = calculate({i});\n    assert!(res.is_ok());\n    return Ok(());\n}}\n"
+        ));
+    }
+    assert!(
+        !det.is_repeating(),
+        "realistic Rust file with 10 unit tests must not trigger false positive repetition"
+    );
+}
+
+#[test]
 fn test_monitor_consecutive_identical_line_spam() {
     let mut det = RepetitionDetector::new(4, 5);
     det.push("Compiling project...\n");

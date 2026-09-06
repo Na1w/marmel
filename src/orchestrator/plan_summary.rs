@@ -82,12 +82,23 @@ pub fn generate_plan_progress_summary(plan_content: &str) -> String {
 
     let completion_pct = (completed_tasks.len() as f64 / total_tasks as f64 * 100.0).round() as u64;
 
-    let mut summary = format!(
+    let mut summary = String::new();
+    if let Some((inst, wall)) = crate::manager::phase::get_plan_start_time() {
+        let elapsed_secs = inst.elapsed().as_secs();
+        let elapsed_str = super::workers::format_duration_human(elapsed_secs);
+        let wall_str = wall.format("%H:%M:%S");
+        summary.push_str(&format!(
+            "Plan Started At: {} (running for {}, {} total seconds)\n",
+            wall_str, elapsed_str, elapsed_secs
+        ));
+    }
+
+    summary.push_str(&format!(
         "Overall Progress: {}/{} tasks completed ({}%)\n\n",
         completed_tasks.len(),
         total_tasks,
         completion_pct
-    );
+    ));
 
     if !completed_tasks.is_empty() {
         summary.push_str(&format!(
@@ -125,4 +136,22 @@ pub fn generate_plan_progress_summary(plan_content: &str) -> String {
     }
 
     summary.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_plan_progress_summary_includes_plan_start_time() {
+        crate::manager::phase::record_plan_start();
+        let plan =
+            "- [ ] [t-summary-unique-101] First task\n- [x] [t-summary-unique-102] Second task\n";
+        let summary = generate_plan_progress_summary(plan);
+        assert!(summary.contains("Plan Started At:"));
+        assert!(summary.contains("Overall Progress: 1/2 tasks completed (50%)"));
+        assert!(summary.contains("### Completed Steps (1/2):"));
+        assert!(summary.contains("### Pending Steps (1/2):"));
+        crate::manager::phase::clear_plan_start();
+    }
 }
