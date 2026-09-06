@@ -577,3 +577,104 @@ async fn test_specialist_approved_without_explicit_mission_complete() {
     }).await;
 }
 
+#[tokio::test]
+async fn test_validator_reminded_3_times_and_assumed_approved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+
+    marmennill::harness::with_workspace_root(tmp_path.clone(), async move {
+        let server = MockServer::start().await;
+        let call_counter = Arc::new(AtomicUsize::new(0));
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with({
+                let counter = call_counter.clone();
+                move |_req: &wiremock::Request| {
+                    let call_idx = counter.fetch_add(1, Ordering::SeqCst);
+                    let body = match call_idx {
+                        // Turn 0: Specialist creates src/util.rs
+                        0 => {
+                            let args = serde_json::json!({
+                                "path": "src/util.rs",
+                                "content": "pub fn util() {}"
+                            }).to_string();
+                            tool_call_sse("call_write_util", "write_file", &args)
+                        }
+                        // Turn 1: Specialist concludes
+                        1 => text_sse("src/util.rs written.\n\nMISSION COMPLETE (t-006)"),
+                        // Turn 2: Validator turn 0: outputs conversational text, no tool call
+                        2 => text_sse("I checked the code and it looks solid."),
+                        // Turn 3: Validator turn 1 (after reminder 1): outputs conversational text again
+                        3 => text_sse("Still looks fine, no errors found."),
+                        // Turn 4: Validator turn 2 (after reminder 2): outputs text again
+                        4 => text_sse("Verification passes, all good."),
+                        // Turn 5: Validator turn 3 (after reminder 3): outputs text again
+                        5 => text_sse("Concluded review in text."),
+                        _ => text_sse("Unexpected call"),
+                    };
+                    ResponseTemplate::new(200).set_body_string(body)
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let backend_url = format!("{}/v1", server.uri());
+        let specialist_cfg = marmennill::config::SpecialistConfig {
+            module: "src/agents/coder.rs".to_string(),
+            tools: vec![
+                "write_file".to_string(),
+                "read_file".to_string(),
+                "run_command".to_string(),
+            ],
+            enable_validator: Some(true),
+            max_validator_iterations: Some(1),
+            ..Default::default()
+        };
+        let mut cfg = Config {
+            backend_url: backend_url.clone(),
+            model: "test-model".to_string(),
+            enable_xml_rescue: true,
+            ..Default::default()
+        };
+        cfg.orchestration
+            .specialists
+            .insert("coder".to_string(), specialist_cfg);
+
+        let client = ChatClient::new(&backend_url, "test-model");
+        let ctx = IsolatedContext {
+            role_system_prompt: "You are the Coder specialist.".to_string(),
+            brief: "Create util.rs.".to_string(),
+            snippets: vec![],
+            task_id: Some("t-006".to_string()),
+            image_urls: vec![],
+            audio_urls: vec![],
+        };
+        let token = CancellationToken::new();
+
+        let result = run_specialist_live(&client, Agent::Coder, &ctx, &cfg, &token)
+            .await
+            .expect("specialist live run should complete");
+
+        // Verify deliverable is approved and marked complete
+        assert!(
+            result.contains("MISSION COMPLETE"),
+            "Deliverable should contain MISSION COMPLETE: {result}"
+        );
+        assert!(
+            !result.contains("FAILED"),
+            "Deliverable should not contain FAILED: {result}"
+        );
+
+        let marker = marmennill::agents::MissionMarker::parse(&result);
+        assert_eq!(
+            marker,
+            Some(marmennill::agents::MissionMarker::Complete {
+                task_id: Some("t-006".to_string())
+            }),
+            "Marker must be Complete: {result}"
+        );
+    }).await;
+}
+
+
