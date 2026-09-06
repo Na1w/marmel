@@ -245,6 +245,7 @@ pub async fn run_session(
             &mut *renderer,
             &mut steer_queue,
             &mut steer_abort_requested,
+            Some(&mut subagents),
         );
         drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
 
@@ -284,6 +285,7 @@ pub async fn run_session(
                 &mut *renderer,
                 &mut steer_queue,
                 &mut steer_abort_requested,
+                Some(&mut subagents),
             );
             drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
             renderer.flush()?;
@@ -501,6 +503,7 @@ pub async fn run_session(
                             &mut *renderer,
                             &mut steer_queue,
                             &mut steer_abort_requested,
+                            Some(&mut subagents),
                         );
                         drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
                         if renderer.aborted() {
@@ -538,6 +541,7 @@ pub async fn run_session(
                                     &mut *renderer,
                                     &mut steer_queue,
                                     &mut steer_abort_requested,
+                                    Some(&mut subagents),
                                 );
                                 drain_delegation_events(
                                     manager.as_deref(),
@@ -698,6 +702,7 @@ pub async fn run_session(
                             &mut *renderer,
                             &mut steer_queue,
                             &mut steer_abort_requested,
+                            Some(&mut subagents),
                         );
                         drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
                         if renderer.aborted() {
@@ -726,6 +731,7 @@ pub async fn run_session(
                                     &mut *renderer,
                                     &mut steer_queue,
                                     &mut steer_abort_requested,
+                                    Some(&mut subagents),
                                 );
                                 drain_delegation_events(
                                     manager.as_deref(),
@@ -800,6 +806,7 @@ pub async fn run_session(
             &mut *renderer,
             &mut steer_queue,
             &mut steer_abort_requested,
+            Some(&mut subagents),
         );
         if steer_abort_requested || renderer.aborted() {
             if steer_abort_requested {

@@ -14,10 +14,14 @@
 //! `QueueAndContinue`) while keeping the JSON shape fully compatible with the
 //! caesar `SteerDecisionResponse` (including `tier`, `model`, and `subtasks`).
 
+use crate::agent::phase::Plan;
+use crate::agents::{Agent, DelegationRequest, Deliverable};
 use crate::harness::HarnessStats;
 use crate::llm::ChatClient;
+use crate::orchestrator::OrchestratorManager;
 use crate::types::{ChatRequest, Message};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 pub const STEER_ARBITRATOR_SYSTEM_PROMPT: &str = include_str!("../../prompts/steer_arbitrator.md");
 
@@ -419,6 +423,90 @@ pub async fn arbitrate_steer_with_fallback(
     arbitrate_steer_stream_with_fallback(client, stats, ctx, has_active_subtasks, |_| {}).await
 }
 
+/// Helper to extract all subtasks that should be delegated from a SteerDecision.
+pub fn extract_tasks_to_delegate(
+    decision: &SteerDecision,
+    user_msg: &str,
+) -> Vec<(Agent, String, String)> {
+    let mut tasks = Vec::new();
+    let has_explicit_subtask_delegations = decision
+        .subtasks
+        .iter()
+        .any(|s| s.action.eq_ignore_ascii_case("DelegateTask"));
+
+    if has_explicit_subtask_delegations {
+        let mut idx = 1;
+        for s in &decision.subtasks {
+            if s.action.eq_ignore_ascii_case("DelegateTask") {
+                let agent = s
+                    .agent_name
+                    .as_deref()
+                    .and_then(Agent::from_str)
+                    .unwrap_or(Agent::Coder);
+                let tid = if !s.tool_call_id.trim().is_empty() {
+                    s.tool_call_id.clone()
+                } else {
+                    format!("steer-task-{idx}")
+                };
+                idx += 1;
+                let prompt = s
+                    .prompt
+                    .as_deref()
+                    .filter(|p| !p.trim().is_empty())
+                    .unwrap_or(user_msg);
+                tasks.push((agent, tid, prompt.to_string()));
+            }
+        }
+    } else if decision.decision.eq_ignore_ascii_case("DelegateTask") {
+        let agent = decision
+            .subtasks
+            .iter()
+            .find_map(|s| s.agent_name.as_deref().and_then(Agent::from_str))
+            .unwrap_or(Agent::Coder);
+        let tid = decision
+            .subtasks
+            .first()
+            .filter(|s| !s.tool_call_id.trim().is_empty())
+            .map(|s| s.tool_call_id.clone())
+            .unwrap_or_else(|| "steer-task-1".to_string());
+        let prompt = decision
+            .subtasks
+            .first()
+            .and_then(|s| s.prompt.as_deref())
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or(user_msg);
+        tasks.push((agent, tid, prompt.to_string()));
+    }
+    tasks
+}
+
+/// Execute an ad-hoc delegated subtask triggered by steering arbitration.
+pub async fn execute_steer_subtask(
+    client: &ChatClient,
+    stats: Arc<HarnessStats>,
+    agent: Agent,
+    task_id: Option<String>,
+    prompt: &str,
+) -> Result<Deliverable, anyhow::Error> {
+    let plan = Plan::default();
+    let mut manager = OrchestratorManager::new(
+        client.clone(),
+        plan,
+        stats,
+    );
+    manager.cancellation_token = crate::orchestrator::bus::global_cancellation_token();
+    let req = DelegationRequest {
+        agent_name: agent,
+        prompt: prompt.to_string(),
+        snippets: Vec::new(),
+        task_id,
+        image_urls: None,
+        audio_urls: None,
+        recursion_granted: false,
+    };
+    manager.delegate(req).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,5 +665,82 @@ mod tests {
         let (out, _finished) = extractor.push_chunk(chunk);
         assert_eq!(out, "");
         assert!(!extractor.in_response_field);
+    }
+
+    #[test]
+    fn test_extract_tasks_to_delegate_explicit_subtasks() {
+        let json = r#"{
+            "decision": "DelegateTask",
+            "response": "I will run the tests and check files.",
+            "subtasks": [
+                {
+                    "tool_call_id": "steer-task-1",
+                    "action": "DelegateTask",
+                    "agent_name": "coder",
+                    "prompt": "Run cargo test"
+                },
+                {
+                    "tool_call_id": "steer-task-2",
+                    "action": "DelegateTask",
+                    "agent_name": "researcher",
+                    "prompt": "Search codebase for foo"
+                }
+            ]
+        }"#;
+        let d: SteerDecision = serde_json::from_str(json).unwrap();
+        let tasks = extract_tasks_to_delegate(&d, "check things");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].0, Agent::Coder);
+        assert_eq!(tasks[0].1, "steer-task-1");
+        assert_eq!(tasks[0].2, "Run cargo test");
+        assert_eq!(tasks[1].0, Agent::Researcher);
+        assert_eq!(tasks[1].1, "steer-task-2");
+        assert_eq!(tasks[1].2, "Search codebase for foo");
+    }
+
+    #[test]
+    fn test_extract_tasks_to_delegate_toplevel_fallback() {
+        let json = r#"{
+            "decision": "DelegateTask",
+            "response": "Starting coder task directly.",
+            "subtasks": []
+        }"#;
+        let d: SteerDecision = serde_json::from_str(json).unwrap();
+        let tasks = extract_tasks_to_delegate(&d, "run cargo check");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].0, Agent::Coder);
+        assert_eq!(tasks[0].1, "steer-task-1");
+        assert_eq!(tasks[0].2, "run cargo check");
+    }
+
+    #[test]
+    fn test_extract_tasks_to_delegate_no_tasks() {
+        let json = r#"{
+            "decision": "RespondDirectly",
+            "response": "Currently on step 1.",
+            "subtasks": []
+        }"#;
+        let d: SteerDecision = serde_json::from_str(json).unwrap();
+        let tasks = extract_tasks_to_delegate(&d, "status?");
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_execute_steer_subtask_runs_specialist() {
+        let client = ChatClient::new_with_token("http://127.0.0.1:11434", "mock", "tok");
+        let stats = Arc::new(HarnessStats::new());
+        let res = execute_steer_subtask(
+            &client,
+            stats,
+            Agent::Coder,
+            Some("steer-test-1".to_string()),
+            "Inspect git status",
+        )
+        .await;
+        assert!(res.is_ok());
+        let d = res.unwrap();
+        assert!(matches!(d.marker, crate::agents::MissionMarker::Complete { .. }));
+        assert_eq!(d.task_id.as_deref(), Some("steer-test-1"));
+        assert!(d.content.contains("Inspect git status"));
     }
 }

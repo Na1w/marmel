@@ -40,9 +40,10 @@ pub use plan_summary::generate_plan_progress_summary;
 pub use registry::SpecialistRegistry;
 use std::sync::Arc;
 pub use steer::{
-    SteerDecision, SteerOutcome, SteerSubtaskDecision, StreamingResponseExtractor, arbitrate_steer,
-    arbitrate_steer_stream, arbitrate_steer_stream_with_fallback, arbitrate_steer_with_fallback,
-    resolve_steer_outcome,
+    arbitrate_steer, arbitrate_steer_stream, arbitrate_steer_stream_with_fallback,
+    arbitrate_steer_with_fallback, execute_steer_subtask, extract_tasks_to_delegate,
+    resolve_steer_outcome, SteerDecision, SteerOutcome, SteerSubtaskDecision,
+    StreamingResponseExtractor,
 };
 pub use workers::{
     ActiveWorkerGuard, ActiveWorkerInfo, format_duration_human, get_active_specialist_context_str,
@@ -443,13 +444,13 @@ impl OrchestratorManager {
         let tid = d.task_id.clone().or(task_id);
         if matches!(d.marker, MissionMarker::Complete { .. }) {
             // Second gate: the *content* must still carry the terminal marker.
-            if let Ok(true) = self.plan.check_plan_on_marker(tid.as_deref(), &d.content) {
-                if let Some(t) = &tid {
-                    crate::debug_log::log_plan_update(
-                        "check_off",
-                        &format!("Task [{t}] marked completed [x] on disk"),
-                    );
-                }
+            if let Ok(true) = self.plan.check_plan_on_marker(tid.as_deref(), &d.content)
+                && let Some(t) = &tid
+            {
+                crate::debug_log::log_plan_update(
+                    "check_off",
+                    &format!("Task [{t}] marked completed [x] on disk"),
+                );
             }
         }
         let mut d = d;
