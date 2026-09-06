@@ -62,6 +62,13 @@ pub enum LineSegment<'a> {
 
 /// Parse segments of a line according to the running `in_think` state, tracking transitions across `<think>` and `</think>` tags.
 pub fn parse_line_segments<'a>(line: &'a str, in_think: &mut bool) -> Vec<LineSegment<'a>> {
+    if line.is_empty() {
+        return if *in_think {
+            vec![LineSegment::Thought("")]
+        } else {
+            vec![LineSegment::Content("")]
+        };
+    }
     let mut segments = Vec::new();
     let mut cursor = 0;
     while cursor < line.len() {
@@ -320,15 +327,27 @@ pub fn count_single_message_lines(msg: &str, width: usize, show_thought: bool) -
                     if !show_thought {
                         continue;
                     }
-                    let cleaned = format_terminal_math(t.trim());
-                    if !cleaned.is_empty() {
-                        n += wrapped_lines(&cleaned, width);
+                    if t.trim().is_empty() {
+                        n += 1;
+                    } else {
+                        let cleaned = format_terminal_math(t.trim());
+                        n += if cleaned.is_empty() {
+                            1
+                        } else {
+                            wrapped_lines(&cleaned, width)
+                        };
                     }
                 }
                 LineSegment::Content(c) => {
-                    let cleaned = format_terminal_math(c.trim());
-                    if !cleaned.is_empty() {
-                        n += wrapped_lines(&cleaned, width);
+                    if c.trim().is_empty() {
+                        n += 1;
+                    } else {
+                        let cleaned = format_terminal_math(c.trim());
+                        n += if cleaned.is_empty() {
+                            1
+                        } else {
+                            wrapped_lines(&cleaned, width)
+                        };
                     }
                 }
             }

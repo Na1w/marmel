@@ -574,6 +574,7 @@ impl Renderer for TuiRenderer {
     }
 
     fn read_input(&mut self) -> Option<String> {
+        self.commit_turn_content();
         self.status_line = "Ready".to_string();
         let _ = self.flush();
         loop {

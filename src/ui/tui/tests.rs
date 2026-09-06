@@ -1495,3 +1495,34 @@ fn test_delegation_completed_emits_task_id_completed_in_chat() {
     );
 }
 
+#[test]
+fn test_chat_auto_scroll_shows_final_lines_of_multiline_markdown_response() {
+    let mut r = TuiRenderer::new();
+    let text = "## Summary\n\nParagraph 1.\n\nParagraph 2.\n\n### Section 1\nLine 1\nLine 2\n\n### Section 2\n- Item 1\n- Item 2\n\n### Section 3\n- Item 3\n- Item 4\n\n### Final Section\nBottom line 1\nBottom line 2\n";
+    r.on_event(&Event::Message(text.to_string()));
+
+    let backend = ratatui::backend::TestBackend::new(80, 10);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 0, 80, 10);
+            r.render_chat(frame, area);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let mut rendered = String::new();
+    for y in 0..10 {
+        let line: String = (0..80)
+            .map(|x| buffer[(x, y)].symbol().to_string())
+            .collect();
+        rendered.push_str(&line);
+        rendered.push('\n');
+    }
+
+    assert!(
+        rendered.contains("Bottom line 2"),
+        "expected bottom line to be visible in chat viewport, got:\n{rendered}"
+    );
+}
+

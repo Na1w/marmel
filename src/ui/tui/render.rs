@@ -335,10 +335,12 @@ impl TuiRenderer {
                             if !self.show_thought {
                                 continue;
                             }
-                            let cleaned = format_terminal_math(t.trim());
-                            if cleaned.is_empty() {
+                            let trimmed = t.trim();
+                            if trimmed.is_empty() {
+                                chat_lines.push(Line::from(""));
                                 continue;
                             }
+                            let cleaned = format_terminal_math(trimmed);
                             chat_lines.push(Line::from(Span::styled(
                                 cleaned,
                                 Style::default()
@@ -349,6 +351,7 @@ impl TuiRenderer {
                         LineSegment::Content(c) => {
                             let trimmed = c.trim();
                             if trimmed.is_empty() {
+                                chat_lines.push(Line::from(""));
                                 continue;
                             }
                             let cleaned = format_terminal_math(trimmed);
@@ -445,6 +448,22 @@ impl TuiRenderer {
             }
         }
 
+        let mut total_chat_lines = 0;
+        for line in &chat_lines {
+            let line_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
+            if line_len == 0 {
+                total_chat_lines += 1;
+            } else {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                total_chat_lines += wrapped_lines(&text, chat_w).max(1);
+            }
+        }
+
+        let max_scroll = total_chat_lines.saturating_sub(chat_h);
+        if self.chat_auto_scroll || (self.chat_scroll as usize) > max_scroll {
+            self.chat_scroll = max_scroll as u16;
+        }
+
         let chat_paragraph = Paragraph::new(chat_lines)
             .block(chat_block)
             .wrap(Wrap { trim: false })
@@ -452,8 +471,6 @@ impl TuiRenderer {
         frame.render_widget(chat_paragraph, area);
 
         // F4: vertical scrollbar on the chat pane.
-        let total = self.estimated_chat_lines(chat_w);
-        let max_scroll = total.saturating_sub(chat_h);
         if max_scroll > 0 {
             let inner = Rect {
                 x: area.x + 1,
