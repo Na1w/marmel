@@ -45,13 +45,8 @@ pub fn spawn_steer_arbitration(
     let client = client.clone();
     let stats = stats.clone();
     let goal = goal.to_string();
-    let plan_content = crate::agent::phase::Plan::default()
-        .read()
-        .unwrap_or(None)
-        .unwrap_or_default();
     let active_subtasks_str = format_active_subtasks(subagents);
-    let plan_progress_str = format_plan_progress_summary(&plan_content);
-    let has_active =
+    let initial_has_active =
         crate::orchestrator::has_active_workers() || subagents.iter().any(|s| s.is_active);
     let tx = arb_tx.clone();
     let msg = user_msg.clone();
@@ -62,75 +57,123 @@ pub fn spawn_steer_arbitration(
     let _ = renderer.flush();
 
     tokio::spawn(async move {
-        let delta_tx = tx.clone();
-        let history_str = steering_history
-            .as_ref()
-            .and_then(|h| h.read().ok())
-            .map(|h| crate::orchestrator::format_steering_history(&h))
-            .unwrap_or_else(|| "None".to_string());
-
-        let ctx = crate::orchestrator::steer::SteerContext {
-            main_goal: &goal,
-            orchestrator_status: if !has_active {
-                "Active (planning/turn)"
-            } else {
-                "Active (subagents executing)"
-            },
-            pending_approval: "None",
-            plan_progress: &plan_progress_str,
-            plan_content: &plan_content,
-            available_agents: "",
-            steering_history: &history_str,
-            user_message: &msg,
-            active_subtasks: &active_subtasks_str,
-        };
-        let preempt_handle =
-            crate::orchestrator::preempt_conflicting_stream(client.model(), &msg).await;
-
-        let decision = crate::orchestrator::steer::arbitrate_steer_context_stream(
-            &client,
-            &stats,
-            ctx,
-            move |delta| {
-                let _ = delta_tx.send(SteerArbEvent::Delta(delta.to_string()));
-            },
-        )
-        .await;
-
-        let is_global_abort = matches!(
-            decision.as_ref().map(|d| d.decision.as_str()),
-            Some("AbortImmediately") | Some("RejectPlan")
-        );
-
-        if is_global_abort {
-            preempt_handle.complete_all(PauseAction::Abort);
-        } else {
-            preempt_handle.complete_with_subtask_decision(decision.as_ref());
-        }
-
+        let mut loop_count = 0;
+        let mut decision = None;
         let mut synthesized_answer_opt = None;
 
-        if let Some(ref d) = decision {
-            if d.decision.eq_ignore_ascii_case("Sleep") {
+        while loop_count < 5 {
+            loop_count += 1;
+            let delta_tx = tx.clone();
+            let history_str = steering_history
+                .as_ref()
+                .and_then(|h| h.read().ok())
+                .map(|h| crate::orchestrator::format_steering_history(&h))
+                .unwrap_or_else(|| "None".to_string());
+
+            let plan_content = crate::agent::phase::Plan::default()
+                .read()
+                .unwrap_or(None)
+                .unwrap_or_default();
+            let plan_progress_str = format_plan_progress_summary(&plan_content);
+            let active_subtasks_str = if loop_count == 1 {
+                active_subtasks_str.clone()
+            } else {
+                crate::orchestrator::get_active_subtasks_str()
+            };
+            let has_active = if loop_count == 1 {
+                initial_has_active
+            } else {
+                crate::orchestrator::has_active_workers()
+            };
+
+            let effective_msg = if loop_count == 1 {
+                msg.clone()
+            } else {
+                format!(
+                    "{msg} (SYSTEM NOTICE: You already slept as requested and have now woken up to re-evaluate. Inspect the updated Active Subtasks and Plan Progress above and deliver your direct factual response or action now.)"
+                )
+            };
+
+            let ctx = crate::orchestrator::steer::SteerContext {
+                main_goal: &goal,
+                orchestrator_status: if !has_active {
+                    "Active (planning/turn)"
+                } else {
+                    "Active (subagents executing)"
+                },
+                pending_approval: "None",
+                plan_progress: &plan_progress_str,
+                plan_content: &plan_content,
+                available_agents: "",
+                steering_history: &history_str,
+                user_message: &effective_msg,
+                active_subtasks: &active_subtasks_str,
+            };
+            let preempt_handle =
+                crate::orchestrator::preempt_conflicting_stream(client.model(), &effective_msg)
+                    .await;
+
+            let cur_decision = crate::orchestrator::steer::arbitrate_steer_context_stream(
+                &client,
+                &stats,
+                ctx,
+                move |delta| {
+                    let _ = delta_tx.send(SteerArbEvent::Delta(delta.to_string()));
+                },
+            )
+            .await;
+
+            let is_global_abort = matches!(
+                cur_decision.as_ref().map(|d| d.decision.as_str()),
+                Some("AbortImmediately") | Some("RejectPlan")
+            );
+
+            if is_global_abort {
+                preempt_handle.complete_all(PauseAction::Abort);
+            } else {
+                preempt_handle.complete_with_subtask_decision(cur_decision.as_ref());
+            }
+
+            decision = cur_decision;
+
+            if let Some(ref d) = decision
+                && d.decision.eq_ignore_ascii_case("Sleep")
+            {
                 let sleep_secs = d.sleep_seconds.unwrap_or(5).min(300);
                 let _ = tx.send(SteerArbEvent::Delta(format!(
                     "\n[Steering Arbitrator sleeping for {sleep_secs}s...]\n"
                 )));
+                if let Some(ref hist_lock) = steering_history
+                    && let Ok(mut hist) = hist_lock.write()
+                {
+                    let note = d.response.as_deref().unwrap_or("Slept");
+                    hist.push((msg.clone(), format!("{note} (slept for {sleep_secs}s)")));
+                }
                 let cancel = crate::orchestrator::bus::global_cancellation_token();
-                tokio::select! {
+                let was_cancelled = tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)) => {
                         let _ = tx.send(SteerArbEvent::Delta(format!(
-                            "[Steering Arbitrator woke up after {sleep_secs}s]\n"
+                            "[Steering Arbitrator woke up after {sleep_secs}s — re-evaluating status...]\n\n"
                         )));
+                        false
                     }
                     _ = cancel.cancelled() => {
                         let _ = tx.send(SteerArbEvent::Delta(
                             "[Steering Arbitrator sleep cancelled]\n".to_string()
                         ));
+                        true
                     }
+                };
+                if was_cancelled {
+                    break;
                 }
+                continue;
             }
 
+            break;
+        }
+
+        if let Some(ref d) = decision {
             let tasks = crate::orchestrator::steer::extract_tasks_to_delegate(d, &msg);
             let mut completed_deliverables = Vec::new();
             for (agent, task_id, prompt) in tasks {
@@ -421,67 +464,131 @@ impl StreamSink for RendererSink<'_> {
     }
 
     async fn on_pause(&mut self, user_msg: &str) -> PauseAction {
-        self.renderer.on_event(&Event::Status(
-            "Stream paused — evaluating steering instruction...".to_string(),
-        ));
-        let _ = self.renderer.flush();
+        let mut loop_count = 0;
+        let mut decision = None;
 
-        let plan_content = crate::agent::phase::Plan::default()
-            .read()
-            .unwrap_or(None)
-            .unwrap_or_default();
-        let active_subtasks_str = format_active_subtasks(self.subagents);
-        let plan_progress_str = format_plan_progress_summary(&plan_content);
+        while loop_count < 5 {
+            loop_count += 1;
+            self.renderer.on_event(&Event::Status(
+                "Stream paused — evaluating steering instruction...".to_string(),
+            ));
+            let _ = self.renderer.flush();
 
-        let has_active =
-            crate::orchestrator::has_active_workers() || self.subagents.iter().any(|s| s.is_active);
-        let history_str = self
-            .steering_history
-            .as_ref()
-            .and_then(|h| h.read().ok())
-            .map(|h| crate::orchestrator::format_steering_history(&h))
-            .unwrap_or_else(|| "None".to_string());
-
-        let ctx = crate::orchestrator::steer::SteerContext {
-            main_goal: self.goal,
-            orchestrator_status: if !has_active {
-                "Active (planning/turn)"
+            let plan_content = crate::agent::phase::Plan::default()
+                .read()
+                .unwrap_or(None)
+                .unwrap_or_default();
+            let active_subtasks_str = if loop_count == 1 {
+                format_active_subtasks(self.subagents)
             } else {
-                "Active (subagents executing)"
-            },
-            pending_approval: "None",
-            plan_progress: &plan_progress_str,
-            plan_content: &plan_content,
-            available_agents: "",
-            steering_history: &history_str,
-            user_message: user_msg,
-            active_subtasks: &active_subtasks_str,
-        };
+                crate::orchestrator::get_active_subtasks_str()
+            };
+            let plan_progress_str = format_plan_progress_summary(&plan_content);
 
-        let preempt_handle =
-            crate::orchestrator::preempt_conflicting_stream(self.client.model(), user_msg).await;
+            let has_active = crate::orchestrator::has_active_workers()
+                || self.subagents.iter().any(|s| s.is_active);
+            let history_str = self
+                .steering_history
+                .as_ref()
+                .and_then(|h| h.read().ok())
+                .map(|h| crate::orchestrator::format_steering_history(&h))
+                .unwrap_or_else(|| "None".to_string());
 
-        let renderer = &mut *self.renderer;
-        let decision = crate::orchestrator::steer::arbitrate_steer_context_stream(
-            self.client,
-            &self.stats,
-            ctx,
-            |delta| {
-                renderer.on_event(&Event::SteerResponse(delta.to_string()));
-                let _ = renderer.flush();
-            },
-        )
-        .await;
+            let effective_msg = if loop_count == 1 {
+                user_msg.to_string()
+            } else {
+                format!(
+                    "{user_msg} (SYSTEM NOTICE: You already slept as requested and have now woken up to re-evaluate. Inspect the updated Active Subtasks and Plan Progress above and deliver your direct factual response or action now.)"
+                )
+            };
 
-        let is_global_abort = matches!(
-            decision.as_ref().map(|d| d.decision.as_str()),
-            Some("AbortImmediately") | Some("RejectPlan")
-        );
+            let ctx = crate::orchestrator::steer::SteerContext {
+                main_goal: self.goal,
+                orchestrator_status: if !has_active {
+                    "Active (planning/turn)"
+                } else {
+                    "Active (subagents executing)"
+                },
+                pending_approval: "None",
+                plan_progress: &plan_progress_str,
+                plan_content: &plan_content,
+                available_agents: "",
+                steering_history: &history_str,
+                user_message: &effective_msg,
+                active_subtasks: &active_subtasks_str,
+            };
 
-        if is_global_abort {
-            preempt_handle.complete_all(PauseAction::Abort);
-        } else {
-            preempt_handle.complete_with_subtask_decision(decision.as_ref());
+            let preempt_handle = crate::orchestrator::preempt_conflicting_stream(
+                self.client.model(),
+                &effective_msg,
+            )
+            .await;
+
+            let renderer = &mut *self.renderer;
+            let cur_decision = crate::orchestrator::steer::arbitrate_steer_context_stream(
+                self.client,
+                &self.stats,
+                ctx,
+                |delta| {
+                    renderer.on_event(&Event::SteerResponse(delta.to_string()));
+                    let _ = renderer.flush();
+                },
+            )
+            .await;
+
+            let is_global_abort = matches!(
+                cur_decision.as_ref().map(|d| d.decision.as_str()),
+                Some("AbortImmediately") | Some("RejectPlan")
+            );
+
+            if is_global_abort {
+                preempt_handle.complete_all(PauseAction::Abort);
+            } else {
+                preempt_handle.complete_with_subtask_decision(cur_decision.as_ref());
+            }
+
+            decision = cur_decision;
+
+            if let Some(ref d) = decision
+                && d.decision.eq_ignore_ascii_case("Sleep")
+            {
+                let sleep_secs = d.sleep_seconds.unwrap_or(5).min(300);
+                self.renderer.on_event(&Event::Status(format!(
+                    "Steering arbitrator sleeping for {sleep_secs}s..."
+                )));
+                let _ = self.renderer.flush();
+                if let Some(ref hist_lock) = self.steering_history
+                    && let Ok(mut hist) = hist_lock.write()
+                {
+                    let note = d.response.as_deref().unwrap_or("Slept");
+                    hist.push((
+                        user_msg.to_string(),
+                        format!("{note} (slept for {sleep_secs}s)"),
+                    ));
+                }
+                let cancel = crate::orchestrator::bus::global_cancellation_token();
+                let was_cancelled = tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)) => {
+                        self.renderer.on_event(&Event::Status(format!(
+                            "Steering arbitrator woke up after {sleep_secs}s — re-evaluating status..."
+                        )));
+                        false
+                    }
+                    _ = cancel.cancelled() => {
+                        self.renderer.on_event(&Event::Status(
+                            "Steering arbitrator sleep cancelled".to_string(),
+                        ));
+                        true
+                    }
+                };
+                let _ = self.renderer.flush();
+                if was_cancelled {
+                    return PauseAction::Resume;
+                }
+                continue;
+            }
+
+            break;
         }
 
         let recorded_resp = if let Some(ref d) = decision {

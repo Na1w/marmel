@@ -1075,3 +1075,88 @@ async fn test_stream_preemption_on_synchronous_bridge() {
     assert_eq!(bridge_action, PauseAction::Resume);
     assert_eq!(specialist_action, PauseAction::Resume);
 }
+
+#[tokio::test]
+async fn test_steering_arbitrator_sleep_re_invokes_after_delay() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let req_counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = Arc::clone(&req_counter);
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_: &Request| {
+            let count = counter_clone.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                // Call 1: Arbitrator decides to Sleep for 1 second
+                ResponseTemplate::new(200).set_body_string(
+                    "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"Sleep\\\", \\\"sleep_seconds\\\": 1, \\\"response\\\": \\\"Väntar 1s på tester...\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+                )
+            } else {
+                // Call 2: After waking up from sleep, Arbitrator is re-invoked and responds directly!
+                ResponseTemplate::new(200).set_body_string(
+                    "data: {\"id\":\"c2\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"RespondDirectly\\\", \\\"response\\\": \\\"Tester har nu slutförts utan fel.\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+                )
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let client =
+        marmennill::llm::ChatClient::new(format!("{}/v1", server.uri()), "test".to_string());
+    let stats = Arc::new(marmennill::harness::HarnessStats::new());
+    let (arb_tx, mut arb_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut renderer = ScriptedRenderer::new(vec![]);
+    let steering_history = Arc::new(std::sync::RwLock::new(Vec::<(String, String)>::new()));
+
+    marmennill::ui::bridge::spawn_steer_arbitration(
+        &client,
+        stats.clone(),
+        "run tests",
+        &[],
+        "Vänta på tester och rapportera".to_string(),
+        &arb_tx,
+        &mut renderer,
+        Some(Arc::clone(&steering_history)),
+    );
+
+    let mut finished_decision = None;
+    let mut received_deltas = Vec::new();
+
+    while let Some(event) = arb_rx.recv().await {
+        match event {
+            marmennill::ui::bridge::SteerArbEvent::Delta(d) => received_deltas.push(d),
+            marmennill::ui::bridge::SteerArbEvent::Finished { decision, .. } => {
+                finished_decision = decision;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // Verify that the arbitrator was called twice: once for Sleep, and once re-invoked after waking up!
+    assert_eq!(req_counter.load(Ordering::SeqCst), 2);
+
+    // Verify deltas include sleep and wake-up notifications
+    let all_deltas = received_deltas.join("");
+    assert!(all_deltas.contains("sleeping for 1s"));
+    assert!(all_deltas.contains("woke up after 1s"));
+
+    // Verify the final decision was RespondDirectly with the re-evaluated answer
+    let dec = finished_decision.expect("must have finished decision");
+    assert_eq!(dec.decision, "RespondDirectly");
+    assert_eq!(
+        dec.response.as_deref(),
+        Some("Tester har nu slutförts utan fel.")
+    );
+
+    // Verify conversation history recorded the progression
+    let hist = steering_history.read().unwrap();
+    assert_eq!(hist.len(), 2);
+    assert!(hist[0].1.contains("slept for 1s"));
+    assert!(hist[1].1.contains("Tester har nu slutförts utan fel."));
+}
