@@ -40,6 +40,13 @@ pub fn message_style(msg: &str) -> (Style, bool) {
                 .add_modifier(Modifier::BOLD),
             true,
         )
+    } else if first.starts_with('[') && first.ends_with("completed.") {
+        (
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+            true,
+        )
     } else {
         // Orchestrator / Model content defaults to white text.
         (Style::default().fg(Color::White), false)

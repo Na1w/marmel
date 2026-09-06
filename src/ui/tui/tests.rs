@@ -1443,3 +1443,55 @@ fn test_status_bar_prefers_plan_start_time() {
 fn defer_clear_plan() {
     crate::manager::phase::clear_plan_start();
 }
+
+#[test]
+fn test_delegation_completed_emits_task_id_completed_in_chat() {
+    let mut r = TuiRenderer::new();
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Started {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-007".to_string()),
+        },
+    ));
+
+    // Validator approval status should NOT dump into chat
+    r.on_event(&Event::Status(
+        "[Validator] APPROVED deliverable for coder-t-007:\nAll checks passed.".to_string(),
+    ));
+    assert!(
+        !r.messages.iter().any(|m| m.contains("[Validator] APPROVED")),
+        "validator approval must not be pushed into chat messages"
+    );
+    // But it should be present in subagent logs
+    assert!(
+        r.subagents[0]
+            .logs
+            .iter()
+            .any(|l| l.contains("[Validator] APPROVED deliverable for coder-t-007")),
+        "validator approval should be recorded in subagent logs"
+    );
+
+    // Delegation completion pushes "[t-007] completed." to chat
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Completed {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-007".to_string()),
+        },
+    ));
+
+    assert_eq!(
+        r.messages.last().map(String::as_str),
+        Some("[t-007] completed.")
+    );
+
+    // Style verification
+    let (style, special) = message_style("[t-007] completed.");
+    assert!(special);
+    assert_eq!(style.fg, Some(ratatui::style::Color::Green));
+    assert!(
+        style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD)
+    );
+}
+

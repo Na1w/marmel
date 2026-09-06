@@ -387,7 +387,6 @@ impl Renderer for TuiRenderer {
                     self.waiting_for_token_since = None;
                 }
                 if text.starts_with("[CLI]")
-                    || text.starts_with("[Validator] APPROVED")
                     || text.starts_with("System Error")
                     || text.starts_with("LLM error")
                 {
@@ -480,6 +479,25 @@ impl Renderer for TuiRenderer {
                         };
                         let t = task.as_deref().unwrap_or("(no task id)");
                         self.upsert_subagent(&name, false, &format!("completed task {t}"));
+
+                        let completed_msg = match task {
+                            Some(tid) if !tid.trim().is_empty() => {
+                                let clean = tid
+                                    .trim()
+                                    .trim_matches(|c| {
+                                        c == '[' || c == ']' || c == '"' || c == '\''
+                                    });
+                                format!("[{clean}] completed.")
+                            }
+                            _ => format!("[{agent}] completed."),
+                        };
+                        self.messages.push(completed_msg);
+                        if self.chat_auto_scroll {
+                            let w = self.chat_width.get();
+                            let n = self.estimated_chat_lines(w);
+                            let h = self.chat_height.get();
+                            self.chat_scroll = n.saturating_sub(h) as u16;
+                        }
                         if self.active_plan_task.as_deref() == task.as_deref() {
                             self.active_plan_task = self
                                 .subagents
