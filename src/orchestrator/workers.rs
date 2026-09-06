@@ -11,6 +11,7 @@ pub struct ActiveWorkerInfo {
     pub agent_name: String,
     pub prompt: String,
     pub started_at: Instant,
+    pub started_wall: chrono::DateTime<chrono::Local>,
     pub context_tokens: usize,
     pub implementation_turns: usize,
     pub validation_rounds: usize,
@@ -25,6 +26,9 @@ pub struct CompletedWorkerInfo {
     pub agent_name: String,
     pub prompt: String,
     pub started_at: Instant,
+    pub started_wall: chrono::DateTime<chrono::Local>,
+    pub completed_at: Instant,
+    pub completed_wall: chrono::DateTime<chrono::Local>,
     pub duration: std::time::Duration,
     pub implementation_turns: usize,
     pub validation_rounds: usize,
@@ -59,6 +63,9 @@ impl Drop for ActiveWorkerGuard {
                     agent_name: info.agent_name,
                     prompt: info.prompt,
                     started_at: info.started_at,
+                    started_wall: info.started_wall,
+                    completed_at: Instant::now(),
+                    completed_wall: chrono::Local::now(),
                     duration,
                     implementation_turns: info.implementation_turns,
                     validation_rounds: info.validation_rounds,
@@ -103,6 +110,7 @@ pub fn register_active_worker(
                 agent_name,
                 prompt,
                 started_at: Instant::now(),
+                started_wall: chrono::Local::now(),
                 context_tokens: initial_tokens,
                 implementation_turns: 0,
                 validation_rounds: 0,
@@ -245,9 +253,10 @@ pub fn get_active_subtasks_str() -> String {
             let elapsed_secs = info.started_at.elapsed().as_secs();
             let duration_str = format_duration_human(elapsed_secs);
             let task_id_str = info.task_id.as_deref().unwrap_or(id);
+            let start_wall_str = info.started_wall.format("%H:%M:%S");
             out.push_str(&format!(
-                "- Tool Call ID: {}\n  Subagent: {}\n  Status: {}\n  Task Prompt: {}\n  Running For: {} ({elapsed_secs} total seconds)\n  Implementation Turns: {}\n  Validation Rounds: {}\n",
-                task_id_str, info.agent_name, info.status, info.prompt, duration_str, info.implementation_turns, info.validation_rounds
+                "- Tool Call ID: {}\n  Subagent: {}\n  Status: {}\n  Task Prompt: {}\n  Started At: {} (running for {}, {elapsed_secs} total seconds)\n  Implementation Turns: {}\n  Validation Rounds: {}\n",
+                task_id_str, info.agent_name, info.status, info.prompt, start_wall_str, duration_str, info.implementation_turns, info.validation_rounds
             ));
             if let Some(ref fb) = info.latest_validator_feedback {
                 let trimmed = fb.trim();
@@ -274,9 +283,11 @@ pub fn get_active_subtasks_str() -> String {
         for info in completed.iter().rev() {
             let duration_str = format_duration_human(info.duration.as_secs());
             let task_id_str = info.task_id.as_deref().unwrap_or(&info.agent_name);
+            let start_wall_str = info.started_wall.format("%H:%M:%S");
+            let finish_wall_str = info.completed_wall.format("%H:%M:%S");
             out.push_str(&format!(
-                "- Tool Call ID: {}\n  Subagent: {}\n  Status: {}\n  Task Prompt: {}\n  Duration: {}\n  Implementation Turns: {}\n  Validation Rounds: {}\n",
-                task_id_str, info.agent_name, info.status, info.prompt, duration_str, info.implementation_turns, info.validation_rounds
+                "- Tool Call ID: {}\n  Subagent: {}\n  Status: {}\n  Task Prompt: {}\n  Started At: {}\n  Finished At: {} (total duration: {})\n  Implementation Turns: {}\n  Validation Rounds: {}\n",
+                task_id_str, info.agent_name, info.status, info.prompt, start_wall_str, finish_wall_str, duration_str, info.implementation_turns, info.validation_rounds
             ));
             if let Some(ref fb) = info.latest_validator_feedback {
                 let trimmed = fb.trim();
@@ -333,6 +344,7 @@ mod tests {
         assert!(status_str.contains("Validation Rounds: 1"));
         assert!(status_str.contains("Missing edge case"));
         assert!(status_str.contains("Status: Revising"));
+        assert!(status_str.contains("Started At:"));
 
         set_active_worker_status(&guard.0, "Approved");
         update_active_worker_progress(&guard.0, 4, 2, Some("All checks passed".to_string()));
@@ -344,5 +356,7 @@ mod tests {
         assert!(completed_str.contains("Validation Rounds: 2"));
         assert!(completed_str.contains("Status: Approved"));
         assert!(completed_str.contains("All checks passed"));
+        assert!(completed_str.contains("Started At:"));
+        assert!(completed_str.contains("Finished At:"));
     }
 }
