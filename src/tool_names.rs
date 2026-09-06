@@ -40,6 +40,8 @@ pub const TOOL_PTY_CLOSE: &str = "pty_close";
 pub const TOOL_PTY_LIST: &str = "pty_list";
 /// `leave_verdict` — submit a formal validation verdict (APPROVED / REJECTED) with comments.
 pub const TOOL_LEAVE_VERDICT: &str = "leave_verdict";
+/// `sleep` — pause execution for a specified duration in seconds.
+pub const TOOL_SLEEP: &str = "sleep";
 
 /// `terminal__read_file` — caesar-style namespaced variant of `read_file`.
 pub const TERMINAL_READ_FILE: &str = "terminal__read_file";
@@ -55,3 +57,5 @@ pub const TERMINAL_GREP_SEARCH: &str = "terminal__grep_search";
 pub const TERMINAL_GLOB: &str = "terminal__glob";
 /// `terminal__list_directory` — caesar-style namespaced variant of `list_directory`.
 pub const TERMINAL_LIST_DIRECTORY: &str = "terminal__list_directory";
+/// `terminal__sleep` — caesar-style namespaced variant of `sleep`.
+pub const TERMINAL_SLEEP: &str = "terminal__sleep";

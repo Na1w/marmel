@@ -39,6 +39,8 @@ impl Specialist for Debugger {
             "pty__*",
             "pty_*",
             "rebirth",
+            "sleep",
+            "terminal__sleep",
         ]
     }
 }

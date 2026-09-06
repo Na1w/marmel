@@ -82,11 +82,15 @@ fn main() -> Result<()> {
 
     let manager = Some(boot_manager(&cfg));
 
-    if use_raw {
+    let res = if use_raw {
         rt.block_on(ui::raw::run(&cfg, args.prompt, manager))
     } else {
         rt.block_on(ui::tui::run(&cfg, args.prompt, manager))
-    }
+    };
+
+    orchestrator::cancel_all();
+    rt.shutdown_timeout(std::time::Duration::from_millis(300));
+    res
 }
 
 fn boot_manager(cfg: &config::Config) -> std::sync::Arc<orchestrator::OrchestratorManager> {

@@ -247,3 +247,40 @@ fn all_specialists_and_validator_permitted_rebirth() {
         );
     }
 }
+
+/// Sleep is permitted to ALL callers, including Manager and all specialists.
+#[test]
+fn all_agents_permitted_sleep() {
+    let sleep_tool = ToolInvocation {
+        name: "sleep".to_string(),
+        arguments: serde_json::json!({
+            "seconds": 1,
+            "reason": "testing role gating"
+        }),
+    };
+
+    // 1. Manager must be permitted sleep
+    let mgr_res = marmennill::harness::dispatch_for(&sleep_tool, ToolCaller::Manager);
+    assert!(
+        mgr_res.is_ok(),
+        "Manager must be permitted sleep, got: {:?}",
+        mgr_res.err()
+    );
+
+    // 2. All specialists must be permitted sleep
+    let roles = [
+        Agent::Coder,
+        Agent::Researcher,
+        Agent::Debugger,
+        Agent::Validator,
+        Agent::Generalist,
+    ];
+    for role in roles {
+        let res = marmennill::harness::dispatch_for(&sleep_tool, ToolCaller::Specialist(role));
+        assert!(
+            res.is_ok(),
+            "{role} must be permitted to call sleep, got error: {:?}",
+            res.err()
+        );
+    }
+}

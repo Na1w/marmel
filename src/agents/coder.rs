@@ -33,6 +33,8 @@ impl Specialist for Coder {
             "grep_search",
             "glob",
             "rebirth",
+            "sleep",
+            "terminal__sleep",
         ]
     }
 

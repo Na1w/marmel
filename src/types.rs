@@ -458,6 +458,31 @@ impl ToolDef {
         }
     }
 
+    pub fn sleep() -> ToolDef {
+        ToolDef {
+            kind: "function".to_string(),
+            function: ToolFunctionDef {
+                name: "sleep".to_string(),
+                description: "Pause execution for a specified number of seconds before being invoked again. Useful when waiting for background builds, tests, or external processes to finish."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "seconds": {
+                            "type": "integer",
+                            "description": "Number of seconds to sleep (e.g. 5, 10, 30)."
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Optional short explanation of what is being waited for."
+                        }
+                    },
+                    "required": ["seconds"]
+                }),
+            },
+        }
+    }
+
     /// Minify and sanitize a JSON Schema by removing non-semantic metadata keys
     /// (`$schema`, `title`, `$id`, empty `$defs`/`definitions`) that bloat LLM tool definitions
     /// and degrade KV cache efficiency on local and small models.
@@ -522,6 +547,7 @@ impl ToolDef {
             Self::pty_list(),
             Self::rebirth(),
             Self::leave_verdict(),
+            Self::sleep(),
         ]
     }
 
@@ -535,6 +561,7 @@ impl ToolDef {
             Self::grep_search(),
             Self::glob(),
             Self::rebirth(),
+            Self::sleep(),
         ]
     }
 }

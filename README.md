@@ -30,9 +30,10 @@ Marmel is a Rust-based CLI that connects to an OpenAI-compatible chat-completion
 - **Multi-tier resilience harness** — XML tool-call rescue, semantic tool repetition detection, and text loop breaking (consecutive lines, line bigrams, word 4-grams) with live SSE stream interruption and automatic retry.
 - **Context engine with proactive rebirth & compaction** — `cl100k_base` BPE token counting, KV-cache prefix preservation, proactive rebirth advisory at 80% budget with state preservation instructions (offsets, files, data), forced compaction at 90%, and universal `rebirth` tool availability across all agents and validators.
 - **Stream preemption & cooperative pause/resume** — mid-flight user steering and queries can pause/preempt active specialist LLM streams on shared local backends without losing state, servicing arbitration before resuming.
+- **Interactive Steer Arbitrator & multi-turn history** — real-time user steering mid-flight (respond, abort, queue, forward, approve/reject plan, delegate, or sleep) with multi-turn conversation memory, immediate stream preemption, and human-readable duration formatting (minutes and seconds).
+- **Agent sleep tool (`sleep`)** — universal sleep tool enabling specialists and the Steer Arbitrator to pause for $N$ seconds (with clean cancellation checks and cooperative runtime yielding) before retrying or checking status.
 - **Extended prefill watchdog** — 300s (5-minute) timeout window accommodating slow prefill on long-context local models (e.g. Gemma 4, Llama 3, DeepSeek) without premature aborts.
 - **LLM streaming client** — SSE streaming with retry/backoff, watchdog timeouts, and `[thinking]` tag demuxing.
-- **Steer Arbitrator** — real-time user steering mid-flight (respond, abort, queue, forward, approve/reject plan, or delegate) with human-readable duration formatting (minutes and seconds).
 - **Deep-Freeze crash recovery & full UI rehydration** — in-flight delegations are snapshotted and journaled; sessions resume seamlessly with full restoration of chat history, execution plans, and past specialist subagent deliverables in the TUI Agent pane.
 - **MCP (Model Context Protocol) client** — JSON-RPC 2.0 over stdio and SSE/HTTP, with tool discovery and execution.
 - **Two UI modes** — an interactive 3-panel Ratatui TUI (with subagent auto-focus, scroll clamping, and full horizontal cursor navigation) and a headless raw streaming mode.
@@ -62,7 +63,7 @@ Marmel is a Rust-based CLI that connects to an OpenAI-compatible chat-completion
               │  read_file · write_file · replace · run_command        │
               │  grep_search · glob · pty_* · delegate_task            │
               │  create_plan · archive_current_plan · rebirth          │
-              │  leave_verdict                                         │
+              │  leave_verdict · sleep                                 │
               └───────┬─────────────────────┬─────────────────┬────────┘
                       │                     │                 │
               ┌───────▼───────┐     ┌────────▼────────┐  ┌─────▼──────────┐
@@ -357,11 +358,11 @@ On non-Linux systems (macOS and Windows), Landlock is conditionally bypassed whi
 
 | Role | Focus | Tool allowlist |
 |---|---|---|
-| **Coder** | Software engineering, implementation, tests. | Read/write/run tools, search, delegation. |
-| **Researcher** | Information retrieval, fact-checking, documentation. | Read/search tools, delegation. |
-| **Debugger** | Crash forensics, low-level diagnostics, interactive PTY GDB/LLDB. | Read/run/PTY tools, search, delegation. |
-| **Validator** | Independent QA auditor; issues `leave_verdict` (APPROVED/REJECTED). | Read/search tools, verdict. |
-| **Generalist** | Cross-domain polymath with universal `"*"` tool access. | All tools. |
+| **Coder** | Software engineering, implementation, tests. | Read/write/run tools, search, delegation, sleep. |
+| **Researcher** | Information retrieval, fact-checking, documentation. | Read/search tools, delegation, sleep. |
+| **Debugger** | Crash forensics, low-level diagnostics, interactive PTY GDB/LLDB. | Read/run/PTY tools, search, delegation, sleep. |
+| **Validator** | Independent QA auditor; issues `leave_verdict` (APPROVED/REJECTED). | Read/search tools, verdict, sleep. |
+| **Generalist** | Cross-domain polymath with universal `"*"` tool access. | All tools (including sleep). |
 
 Each specialist runs in an **isolated context** — it sees only its role prompt, the task brief, and bounded snippets, never the Manager's full transcript.
 
@@ -415,9 +416,17 @@ Specialist deliverables are automatically audited by a Validator subagent. Rejec
 ### Stream preemption & interactive pause/resume
 
 When running against local models on resource-constrained backends (such as a single GPU running Ollama or vLLM), concurrent generation can cause latency or memory contention. Marmel solves this with **cooperative stream preemption and pause/resume**:
-- Mid-flight steering commands and user queries pause the active specialist stream cleanly without discarding progress.
-- The Steer Arbitrator handles the user interaction immediately (answering questions, redirecting the plan, or queueing instructions).
-- Once the steering turn completes, the specialist stream resumes smoothly from its last checkpoint.
+- Mid-flight steering commands and user queries immediately preempt active specialist streams on the shared backend via `preempt_conflicting_stream`, avoiding GPU memory contention and ensuring instant arbitrator responsiveness.
+- The Steer Arbitrator handles the user interaction immediately: answering status questions, queueing instructions, updating or rejecting plans, delegating subtasks, or sleeping.
+- **Continuous Multi-Turn Steering History:** The arbitrator tracks past user questions and arbitrator responses across turns in `steering_history`, enabling context-aware follow-up discussions without losing context.
+- Once the steering turn completes, preempted specialist streams resume smoothly from their last checkpoint.
+
+### Sleep tool & periodic agent pausing
+
+Marmel equips all agents and the Steer Arbitrator with a dedicated `sleep` tool (`sleep(seconds, reason)`):
+- **Universal availability:** Available to `coder`, `researcher`, `debugger`, `validator`, `generalist`, and the Steer Arbitrator (`Sleep` decision with `sleep_seconds`).
+- **Cooperative execution:** Executes via Tokio runtime-aware sleep with periodic cancellation token checks, ensuring immediate responsiveness if the user aborts or interrupts.
+- **Polling & stabilization:** Enables agents to pause execution cleanly when waiting for external services, build steps, asynchronous processes, or cooldown periods without burning LLM inference tokens in tight loops.
 
 ### Context engine
 

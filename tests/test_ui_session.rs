@@ -210,7 +210,7 @@ async fn test_ui_run_session_continues_after_first_turn() {
     let plan = marmennill::agent::Plan::at(tmp.path());
     let stats = std::sync::Arc::new(marmennill::harness::HarnessStats::new());
     let manager = std::sync::Arc::new(marmennill::orchestrator::OrchestratorManager::new(
-        marmennill::llm::ChatClient::new(&server.uri(), "marmel-manager"),
+        marmennill::llm::ChatClient::new(server.uri(), "marmel-manager"),
         plan,
         stats,
     ));
@@ -442,7 +442,7 @@ async fn test_ui_session_stream_pause_and_resume_on_user_question() {
     let plan = marmennill::agent::Plan::at(tmp.path());
     let stats = std::sync::Arc::new(marmennill::harness::HarnessStats::new());
     let manager = std::sync::Arc::new(marmennill::orchestrator::OrchestratorManager::new(
-        marmennill::llm::ChatClient::new(&server.uri(), "marmel-manager"),
+        marmennill::llm::ChatClient::new(server.uri(), "marmel-manager"),
         plan,
         stats,
     ));
@@ -896,4 +896,182 @@ async fn test_ui_session_rehydrates_subagents_and_populates_agent_pane() {
         sa.logs.iter().any(|l| l.contains("completed task t-901")),
         "logs should record task completion"
     );
+}
+
+#[tokio::test]
+async fn test_steering_conversation_history_accumulates_and_passes_to_arbitrator() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let received_bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let rb = received_bodies.clone();
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&req.body).to_string();
+            rb.lock().unwrap().push(body.clone());
+            if body.contains("Hur många är kvar?") {
+                ResponseTemplate::new(200).set_body_string(
+                    "data: {\"id\":\"c2\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"RespondDirectly\\\", \\\"response\\\": \\\"Det är 2 tester kvar.\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+                )
+            } else {
+                ResponseTemplate::new(200).set_body_string(
+                    "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"RespondDirectly\\\", \\\"response\\\": \\\"Kör tester just nu.\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+                )
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let client =
+        marmennill::llm::ChatClient::new(format!("{}/v1", server.uri()), "test".to_string());
+    let stats = Arc::new(marmennill::harness::HarnessStats::new());
+    let (arb_tx, mut arb_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut renderer = ScriptedRenderer::new(vec![]);
+    let steering_history = Arc::new(std::sync::RwLock::new(Vec::<(String, String)>::new()));
+
+    // Turn 1: user asks "Vad gör du nu?"
+    marmennill::ui::bridge::spawn_steer_arbitration(
+        &client,
+        stats.clone(),
+        "build system",
+        &[],
+        "Vad gör du nu?".to_string(),
+        &arb_tx,
+        &mut renderer,
+        Some(Arc::clone(&steering_history)),
+    );
+
+    // Wait for first arbitration to finish
+    loop {
+        if let Some(event) = arb_rx.recv().await
+            && matches!(
+                event,
+                marmennill::ui::bridge::SteerArbEvent::Finished { .. }
+            )
+        {
+            break;
+        }
+    }
+
+    // Verify history now contains turn 1
+    {
+        let hist = steering_history.read().unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].0, "Vad gör du nu?");
+        assert!(hist[0].1.contains("Kör tester just nu."));
+    }
+
+    // Turn 2: user asks "Hur många är kvar?"
+    marmennill::ui::bridge::spawn_steer_arbitration(
+        &client,
+        stats.clone(),
+        "build system",
+        &[],
+        "Hur många är kvar?".to_string(),
+        &arb_tx,
+        &mut renderer,
+        Some(Arc::clone(&steering_history)),
+    );
+
+    // Wait for second arbitration to finish
+    loop {
+        if let Some(event) = arb_rx.recv().await
+            && matches!(
+                event,
+                marmennill::ui::bridge::SteerArbEvent::Finished { .. }
+            )
+        {
+            break;
+        }
+    }
+
+    // Verify history now contains turn 1 AND turn 2
+    {
+        let hist = steering_history.read().unwrap();
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[1].0, "Hur många är kvar?");
+        assert!(hist[1].1.contains("Det är 2 tester kvar."));
+    }
+
+    // Verify that the second request payload sent to the mock server actually contained the history!
+    let bodies = received_bodies.lock().unwrap();
+    assert!(bodies.len() >= 2);
+    let second_req = &bodies[1];
+    assert!(
+        second_req.contains("Vad gör du nu?") && second_req.contains("Kör tester just nu."),
+        "Second request must contain the accumulated conversation history, got: {second_req}"
+    );
+}
+
+#[tokio::test]
+async fn test_stream_preemption_on_synchronous_bridge() {
+    use marmennill::llm::{PauseAction, StreamControl, StreamSink};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"RespondDirectly\\\", \\\"response\\\": \\\"Pausing and answering.\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+        ))
+        .mount(&server)
+        .await;
+
+    let client = marmennill::llm::ChatClient::new(
+        format!("{}/v1", server.uri()),
+        "test-shared-model".to_string(),
+    );
+    let stats = Arc::new(marmennill::harness::HarnessStats::new());
+
+    // Register an active specialist stream using the same model
+    let mut specialist_sink =
+        marmennill::orchestrator::PreemptibleStreamSink::register("coder", "test-shared-model");
+
+    let mut renderer = ScriptedRenderer::new(vec![]);
+    let mut steer_queue = Vec::new();
+    let mut steer_abort = false;
+    let (arb_tx, _arb_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_arb_tx2, mut arb_rx2) = tokio::sync::mpsc::unbounded_channel();
+    let steering_history = Arc::new(std::sync::RwLock::new(Vec::new()));
+
+    let mut bridge = marmennill::ui::bridge::RendererSink {
+        renderer: &mut renderer,
+        steer_queue: &mut steer_queue,
+        steer_abort_requested: &mut steer_abort,
+        arb_tx: &arb_tx,
+        arb_rx: &mut arb_rx2,
+        client: &client,
+        stats,
+        goal: "test goal",
+        subagents: &[],
+        plan: None,
+        ctx: None,
+        steering_history: Some(steering_history),
+    };
+
+    // Run on_pause concurrently with specialist stream yielding its slot
+    let pause_fut = bridge.on_pause("What is the status?");
+    let specialist_fut = async {
+        // Specialist polls control, sees pause signal, and awaits on_pause action
+        let mut attempts = 0;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if matches!(specialist_sink.poll_control(), StreamControl::Pause { .. }) {
+                break;
+            }
+            attempts += 1;
+            if attempts > 50 {
+                panic!("Specialist did not receive Pause signal in time");
+            }
+        }
+        specialist_sink.on_pause("").await
+    };
+
+    let (bridge_action, specialist_action) = tokio::join!(pause_fut, specialist_fut);
+    assert_eq!(bridge_action, PauseAction::Resume);
+    assert_eq!(specialist_action, PauseAction::Resume);
 }

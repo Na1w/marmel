@@ -34,6 +34,7 @@ pub async fn run_session(
     let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let (steer_arb_tx, mut steer_arb_rx) = tokio::sync::mpsc::unbounded_channel::<SteerArbEvent>();
+    let steering_history = Arc::new(std::sync::RwLock::new(Vec::<(String, String)>::new()));
     crate::orchestrator::set_status_sender(status_tx);
     crate::orchestrator::set_event_sender(event_tx);
 
@@ -322,6 +323,7 @@ pub async fn run_session(
                 subagents: &subagents,
                 plan: Some(&plan),
                 ctx: Some(&mut ctx),
+                steering_history: Some(Arc::clone(&steering_history)),
             };
             let assistant = match chat_client_turn(&client, msgs, &stream_cfg, &mut bridge).await {
                 Ok(m) => m,
@@ -514,6 +516,8 @@ pub async fn run_session(
                         drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
                         if renderer.aborted() {
                             crate::orchestrator::cancel_all();
+                            let _ =
+                                tokio::time::timeout(Duration::from_millis(100), &mut handle).await;
                             break (
                                 String::new(),
                                 None,
@@ -568,6 +572,7 @@ pub async fn run_session(
                                             input,
                                             &steer_arb_tx,
                                             &mut *renderer,
+                                            Some(Arc::clone(&steering_history)),
                                         );
                                     }
                                 }
@@ -737,6 +742,8 @@ pub async fn run_session(
                         drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
                         if renderer.aborted() {
                             crate::orchestrator::cancel_all();
+                            let _ =
+                                tokio::time::timeout(Duration::from_millis(100), &mut handle).await;
                             break Err(crate::harness::ToolError::Execution(anyhow::anyhow!(
                                 "aborted"
                             )));
@@ -782,6 +789,7 @@ pub async fn run_session(
                                             input,
                                             &steer_arb_tx,
                                             &mut *renderer,
+                                            Some(Arc::clone(&steering_history)),
                                         );
                                     }
                                 }

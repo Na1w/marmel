@@ -1,6 +1,6 @@
 //! User-facing rendering and interactive session loop.
 
-pub(crate) mod bridge;
+pub mod bridge;
 pub(crate) mod helpers;
 pub mod raw;
 pub mod session;

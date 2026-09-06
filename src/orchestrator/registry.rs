@@ -48,6 +48,8 @@ impl SpecialistRegistry {
                 "grep_search",
                 "glob",
                 "rebirth",
+                "sleep",
+                "terminal__sleep",
             ],
             None,
         );
@@ -63,6 +65,8 @@ impl SpecialistRegistry {
                 "grep_search",
                 "glob",
                 "rebirth",
+                "sleep",
+                "terminal__sleep",
             ],
             None,
         );
@@ -85,6 +89,8 @@ impl SpecialistRegistry {
                 "pty__*",
                 "pty_*",
                 "rebirth",
+                "sleep",
+                "terminal__sleep",
             ],
             None,
         );
@@ -105,6 +111,8 @@ impl SpecialistRegistry {
                 "pty_*",
                 "leave_verdict",
                 "rebirth",
+                "sleep",
+                "terminal__sleep",
             ],
             None,
         );

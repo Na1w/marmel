@@ -57,7 +57,7 @@ async fn test_ui_run_session_raw_single_turn() {
     let plan = crate::agent::phase::Plan::at(tmp.path());
     let stats = Arc::new(crate::harness::HarnessStats::new());
     let manager = Arc::new(OrchestratorManager::new(
-        ChatClient::new(&server.uri(), "marmel-manager"),
+        ChatClient::new(server.uri(), "marmel-manager"),
         plan,
         stats,
     ));
@@ -134,7 +134,7 @@ async fn test_ui_run_session_executes_tool_calls() {
     let plan = crate::agent::phase::Plan::at(tmp.path());
     let stats = Arc::new(crate::harness::HarnessStats::new());
     let manager = Arc::new(OrchestratorManager::new(
-        ChatClient::new(&server.uri(), "marmel-manager"),
+        ChatClient::new(server.uri(), "marmel-manager"),
         plan,
         stats,
     ));
@@ -312,6 +312,7 @@ async fn test_renderer_sink_handles_reset_command() {
         subagents: &[],
         plan: Some(&plan),
         ctx: Some(&mut ctx),
+        steering_history: None,
     };
 
     let ctrl = sink.poll_control();
@@ -402,7 +403,7 @@ async fn test_ui_run_session_executes_parallel_delegations() {
     let plan = crate::agent::phase::Plan::at(tmp.path());
     let stats = Arc::new(crate::harness::HarnessStats::new());
     let manager = Arc::new(OrchestratorManager::new(
-        ChatClient::new(&server.uri(), "marmel-manager"),
+        ChatClient::new(server.uri(), "marmel-manager"),
         plan,
         stats,
     ));

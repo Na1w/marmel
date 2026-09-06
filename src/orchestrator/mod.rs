@@ -42,7 +42,8 @@ use std::sync::Arc;
 pub use steer::{
     SteerDecision, SteerOutcome, SteerSubtaskDecision, StreamingResponseExtractor, arbitrate_steer,
     arbitrate_steer_stream, arbitrate_steer_stream_with_fallback, arbitrate_steer_with_fallback,
-    execute_steer_subtask, extract_tasks_to_delegate, resolve_steer_outcome,
+    execute_steer_subtask, extract_tasks_to_delegate, format_steering_history,
+    resolve_steer_outcome,
 };
 pub use workers::{
     ActiveWorkerGuard, ActiveWorkerInfo, CompletedWorkerInfo, format_duration_human,
@@ -631,11 +632,42 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
     );
 
     let deliverable = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        std::thread::scope(|s| {
-            s.spawn(|| handle.block_on(manager.delegate(req)))
-                .join()
-                .unwrap()
-        })
+        let join_res = std::thread::scope(|s| {
+            s.spawn(|| {
+                if crate::orchestrator::is_globally_cancelled() {
+                    return Ok(Deliverable {
+                        marker: MissionMarker::Failed {
+                            reason: "aborted".to_string(),
+                        },
+                        content: "Task aborted by user instruction.\n\nFAILED (aborted)".to_string(),
+                        task_id: req.task_id.clone(),
+                    });
+                }
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle.block_on(manager.delegate(req))
+                }))
+                .unwrap_or_else(|_| {
+                    Ok(Deliverable {
+                        marker: MissionMarker::Failed {
+                            reason: "task interrupted or runtime shutting down".to_string(),
+                        },
+                        content: "Task execution interrupted or runtime shutting down.\n\nFAILED (aborted)".to_string(),
+                        task_id: None,
+                    })
+                })
+            })
+            .join()
+        });
+        match join_res {
+            Ok(res) => res,
+            Err(_) => Ok(Deliverable {
+                marker: MissionMarker::Failed {
+                    reason: "task thread interrupted or runtime shutting down".to_string(),
+                },
+                content: "Task execution thread interrupted or runtime shutting down.\n\nFAILED (aborted)".to_string(),
+                task_id: None,
+            }),
+        }
     } else {
         futures::executor::block_on(manager.delegate(req))
     }

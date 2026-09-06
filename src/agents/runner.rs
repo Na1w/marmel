@@ -4,7 +4,7 @@ use crate::agents::validation::run_automated_validation;
 use crate::agents::{Agent, IsolatedContext};
 use crate::tool_names::{
     TOOL_DELEGATE_TASK, TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_LEAVE_VERDICT, TOOL_READ_FILE,
-    TOOL_REPLACE, TOOL_RUN_COMMAND, TOOL_WRITE_FILE,
+    TOOL_REPLACE, TOOL_RUN_COMMAND, TOOL_SLEEP, TOOL_WRITE_FILE,
 };
 
 pub(crate) async fn run_specialist_llm(
@@ -107,6 +107,18 @@ pub(crate) fn format_tool_args_preview(tool: &str, args: &serde_json::Value) -> 
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .to_string(),
+        TOOL_SLEEP => {
+            let secs = args
+                .get("seconds")
+                .or_else(|| args.get("duration"))
+                .or_else(|| args.get("duration_seconds"))
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                })
+                .unwrap_or(5);
+            format!("{secs}s")
+        }
         _ => {
             let s = args.to_string();
             if s.len() > 30 {
@@ -185,6 +197,26 @@ pub(crate) fn format_tool_args_full(tool: &str, args: &serde_json::Value) -> Str
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
             format!("verdict={v}, comments=\"{c}\"")
+        }
+        TOOL_SLEEP => {
+            let secs = args
+                .get("seconds")
+                .or_else(|| args.get("duration"))
+                .or_else(|| args.get("duration_seconds"))
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                })
+                .unwrap_or(5);
+            let reason = args
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if reason.is_empty() {
+                format!("seconds={secs}")
+            } else {
+                format!("seconds={secs}, reason=\"{reason}\"")
+            }
         }
         _ => args.to_string(),
     }

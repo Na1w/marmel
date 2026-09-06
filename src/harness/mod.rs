@@ -2,10 +2,10 @@
 
 use crate::tool_names::{
     TERMINAL_GLOB, TERMINAL_GREP_SEARCH, TERMINAL_LIST_DIRECTORY, TERMINAL_READ_FILE,
-    TERMINAL_REPLACE, TERMINAL_RUN_COMMAND, TERMINAL_WRITE_FILE, TOOL_ARCHIVE_PLAN,
+    TERMINAL_REPLACE, TERMINAL_RUN_COMMAND, TERMINAL_SLEEP, TERMINAL_WRITE_FILE, TOOL_ARCHIVE_PLAN,
     TOOL_CREATE_PLAN, TOOL_DELEGATE_TASK, TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_LEAVE_VERDICT,
     TOOL_PTY_CLOSE, TOOL_PTY_LIST, TOOL_PTY_READ, TOOL_PTY_SPAWN, TOOL_PTY_WRITE, TOOL_READ_FILE,
-    TOOL_REBIRTH, TOOL_REPLACE, TOOL_RUN_COMMAND, TOOL_WRITE_FILE,
+    TOOL_REBIRTH, TOOL_REPLACE, TOOL_RUN_COMMAND, TOOL_SLEEP, TOOL_WRITE_FILE,
 };
 use std::sync::Arc;
 
@@ -226,6 +226,88 @@ fn archive_plan() -> Result<ToolResult, ToolError> {
     }
 }
 
+fn handle_sleep(args: &serde_json::Value) -> Result<ToolResult, ToolError> {
+    let secs = args
+        .get("seconds")
+        .or_else(|| args.get("duration"))
+        .or_else(|| args.get("duration_seconds"))
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| {
+                    v.as_i64()
+                        .and_then(|i| if i > 0 { Some(i as u64) } else { None })
+                })
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .unwrap_or(5);
+    let max_sleep = 300; // Cap at 5 minutes
+    let actual_secs = secs.clamp(1, max_sleep);
+    let reason = args
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let reason_clause = if reason.is_empty() {
+        String::new()
+    } else {
+        format!(" ({reason})")
+    };
+
+    let cancel = crate::orchestrator::bus::global_cancellation_token();
+    if cancel.is_cancelled() {
+        return Ok(ToolResult::err("Sleep cancelled before starting."));
+    }
+
+    let completed = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(actual_secs)) => true,
+                        _ = cancel.cancelled() => false,
+                    }
+                })
+            }),
+            _ => {
+                let start = std::time::Instant::now();
+                let dur = std::time::Duration::from_secs(actual_secs);
+                let mut done = false;
+                while start.elapsed() < dur {
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if start.elapsed() >= dur && !cancel.is_cancelled() {
+                    done = true;
+                }
+                done
+            }
+        }
+    } else {
+        let start = std::time::Instant::now();
+        let dur = std::time::Duration::from_secs(actual_secs);
+        let mut done = false;
+        while start.elapsed() < dur {
+            if cancel.is_cancelled() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if start.elapsed() >= dur && !cancel.is_cancelled() {
+            done = true;
+        }
+        done
+    };
+
+    if completed {
+        Ok(ToolResult::ok(format!(
+            "Slept for {actual_secs} seconds{reason_clause}."
+        )))
+    } else {
+        Ok(ToolResult::err("Sleep interrupted by cancellation signal."))
+    }
+}
+
 /// The primary dispatcher entry point, shared by the Manager and specialists.
 pub fn dispatch(tool: &ToolInvocation) -> Result<ToolResult, ToolError> {
     if let Some(mcp) = get_mcp_manager()
@@ -275,6 +357,7 @@ pub fn dispatch(tool: &ToolInvocation) -> Result<ToolResult, ToolError> {
             }
         }
         TOOL_ARCHIVE_PLAN => archive_plan(),
+        TOOL_SLEEP | TERMINAL_SLEEP | "wait" => handle_sleep(&tool.arguments),
         TOOL_REBIRTH => Err(ToolError::BadArguments {
             tool: TOOL_REBIRTH.to_string(),
             detail: "rebirth requires a live ContextEngine; use dispatch_with_engine".to_string(),
@@ -440,6 +523,7 @@ fn dispatch_manager(
         TOOL_READ_FILE => fs::read_file(&tool.arguments),
         TOOL_GREP_SEARCH => search::grep_search(&tool.arguments),
         TOOL_GLOB => search::glob(&tool.arguments),
+        TOOL_SLEEP | TERMINAL_SLEEP | "wait" => handle_sleep(&tool.arguments),
         other => Err(ToolError::Forbidden {
             tool: other.to_string(),
             caller: "Manager".to_string(),
@@ -459,6 +543,7 @@ fn normalize_tool_name(name: &str) -> String {
         }
         TOOL_GREP_SEARCH | "grep" | "search" => TERMINAL_GREP_SEARCH.to_string(),
         TOOL_GLOB | "find_files" | "glob_search" => TERMINAL_GLOB.to_string(),
+        TOOL_SLEEP | TERMINAL_SLEEP | "wait" => TERMINAL_SLEEP.to_string(),
         "list_directory" | "ls" | "list_files" => TERMINAL_LIST_DIRECTORY.to_string(),
         other => other.to_string(),
     }
@@ -534,6 +619,7 @@ fn dispatch_specialist(
                 "Verdict recorded via leave_verdict: {verdict} with comments: {comments}"
             )))
         }
+        TOOL_SLEEP | TERMINAL_SLEEP | "wait" => handle_sleep(&tool.arguments),
         TOOL_REBIRTH => {
             if let Some(eng) = engine {
                 handle_rebirth(eng, &tool.arguments)

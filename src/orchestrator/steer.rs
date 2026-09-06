@@ -29,7 +29,7 @@ pub const STEER_ARBITRATOR_SYSTEM_PROMPT: &str = include_str!("../../prompts/ste
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteerSubtaskDecision {
     pub tool_call_id: String,
-    /// `"ForwardNotice"` | `"Cancel"` | `"DelegateTask"`.
+    /// `"ForwardNotice"` | `"Cancel"` | `"DelegateTask"` | `"Sleep"`.
     pub action: String,
     #[serde(default)]
     pub message: Option<String>,
@@ -37,13 +37,15 @@ pub struct SteerSubtaskDecision {
     pub agent_name: Option<String>,
     #[serde(default)]
     pub prompt: Option<String>,
+    #[serde(default)]
+    pub sleep_seconds: Option<u64>,
 }
 
 /// The steer decision JSON, matching caesar `SteerDecisionResponse`.
 ///
 /// `decision` is one of `RespondDirectly`, `AbortImmediately`,
 /// `QueueAndContinue`, `ForwardToWorker`, `ApprovePlan`, `RejectPlan`,
-/// `DelegateTask`, `SwitchTier`, `SwitchModel`.
+/// `DelegateTask`, `Sleep`, `SwitchTier`, `SwitchModel`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteerDecision {
     pub decision: String,
@@ -54,6 +56,8 @@ pub struct SteerDecision {
     pub model: Option<String>,
     #[serde(default)]
     pub subtasks: Vec<SteerSubtaskDecision>,
+    #[serde(default)]
+    pub sleep_seconds: Option<u64>,
 }
 
 /// Outcome of a steer arbitration, including the unavailable-arbitrator
@@ -277,7 +281,7 @@ where
         presence_penalty: None,
         stream: Some(true),
         enable_thinking: Some(false),
-        tools: None,
+        tools: Some(vec![crate::types::ToolDef::sleep()]),
     };
 
     let mut extractor = StreamingResponseExtractor::new();
@@ -325,7 +329,50 @@ where
         &raw
     };
 
-    if let Ok(decision) = serde_json::from_str::<SteerDecision>(json_text) {
+    let parsed_decision = if let Ok(mut decision) = serde_json::from_str::<SteerDecision>(json_text)
+    {
+        if decision.decision.eq_ignore_ascii_case("Sleep") && decision.sleep_seconds.is_none() {
+            decision.sleep_seconds = Some(5);
+        }
+        Some(decision)
+    } else if let Some(tc) = reply
+        .tool_calls
+        .iter()
+        .find(|tc| tc.function.name == "sleep" || tc.function.name == "terminal__sleep")
+    {
+        let args: serde_json::Value =
+            serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+        let secs = args
+            .get("seconds")
+            .or_else(|| args.get("duration"))
+            .or_else(|| args.get("duration_seconds"))
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+            .unwrap_or(5);
+        let reason = args
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let resp = if reason.is_empty() {
+            format!("Sleeping for {secs} seconds...")
+        } else {
+            format!("Sleeping for {secs} seconds ({reason})...")
+        };
+        Some(SteerDecision {
+            decision: "Sleep".to_string(),
+            response: Some(resp),
+            tier: None,
+            model: None,
+            subtasks: Vec::new(),
+            sleep_seconds: Some(secs),
+        })
+    } else {
+        None
+    };
+
+    if let Some(decision) = parsed_decision {
         stats.record_steer_arbitration();
         if !did_stream_response && let Some(ref resp) = decision.response {
             on_delta(resp);
@@ -333,6 +380,21 @@ where
         Some(decision)
     } else {
         None
+    }
+}
+
+/// Format the accumulated steering conversation history into a readable transcript for SteerContext.
+pub fn format_steering_history(history: &[(String, String)]) -> String {
+    if history.is_empty() {
+        "None".to_string()
+    } else {
+        history
+            .iter()
+            .map(|(user, resp)| {
+                format!("User: \"{}\"\nArbitrator: \"{}\"", user.trim(), resp.trim())
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 }
 
@@ -595,6 +657,7 @@ mod tests {
             tier: None,
             model: None,
             subtasks: Vec::new(),
+            sleep_seconds: None,
         }
     }
 
@@ -841,7 +904,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = ChatClient::new_with_token(&server.uri(), "mock", "tok");
+        let client = ChatClient::new_with_token(server.uri(), "mock", "tok");
         let stats = HarnessStats::new();
         let deliverable = Deliverable {
             marker: crate::agents::MissionMarker::Complete {
@@ -867,5 +930,94 @@ mod tests {
             streamed.join(""),
             "De 3 testerna som misslyckas är i modul foo."
         );
+    }
+
+    #[test]
+    fn test_sleep_decision_json() {
+        let json = r#"{
+            "decision": "Sleep",
+            "response": "Väntar 10 sekunder...",
+            "sleep_seconds": 10
+        }"#;
+        let d: SteerDecision = serde_json::from_str(json).unwrap();
+        assert_eq!(d.decision, "Sleep");
+        assert_eq!(d.response.as_deref(), Some("Väntar 10 sekunder..."));
+        assert_eq!(d.sleep_seconds, Some(10));
+    }
+
+    #[test]
+    fn test_subtask_sleep_json() {
+        let json = r#"{
+            "decision": "ForwardToWorker",
+            "response": "Beordrar codern att vila",
+            "subtasks": [
+                {
+                    "tool_call_id": "coder-1",
+                    "action": "Sleep",
+                    "sleep_seconds": 15
+                }
+            ]
+        }"#;
+        let d: SteerDecision = serde_json::from_str(json).unwrap();
+        assert_eq!(d.subtasks.len(), 1);
+        assert_eq!(d.subtasks[0].action, "Sleep");
+        assert_eq!(d.subtasks[0].sleep_seconds, Some(15));
+    }
+
+    #[test]
+    fn test_format_steering_history() {
+        assert_eq!(format_steering_history(&[]), "None");
+
+        let history = vec![
+            (
+                "Vad gör den nu?".to_string(),
+                "Codern kör just nu testerna.".to_string(),
+            ),
+            (
+                "Hur många tester är det?".to_string(),
+                "Totalt körs 12 tester.".to_string(),
+            ),
+        ];
+        let formatted = format_steering_history(&history);
+        assert!(formatted.contains("User: \"Vad gör den nu?\""));
+        assert!(formatted.contains("Arbitrator: \"Codern kör just nu testerna.\""));
+        assert!(formatted.contains("User: \"Hur många tester är det?\""));
+        assert!(formatted.contains("Arbitrator: \"Totalt körs 12 tester.\""));
+    }
+
+    #[tokio::test]
+    async fn test_arbitrate_steer_context_stream_parses_sleep_tool_call() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Mock SSE response returning a sleep tool call instead of raw JSON
+        let tool_call_chunk = "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_sleep_1\",\"type\":\"function\",\"function\":{\"name\":\"sleep\",\"arguments\":\"{\\\"seconds\\\": 7, \\\"reason\\\": \\\"wait for build\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(tool_call_chunk))
+            .mount(&server)
+            .await;
+
+        let client = ChatClient::new_with_token(server.uri(), "mock", "tok");
+        let stats = HarnessStats::new();
+        let ctx = SteerContext {
+            main_goal: "test goal",
+            orchestrator_status: "Active",
+            pending_approval: "None",
+            plan_progress: "None",
+            plan_content: "None",
+            available_agents: "",
+            steering_history: "None",
+            user_message: "vänta 7 sekunder",
+            active_subtasks: "None",
+        };
+
+        let decision = arbitrate_steer_context_stream(&client, &stats, ctx, |_| {}).await;
+        assert!(decision.is_some());
+        let d = decision.unwrap();
+        assert_eq!(d.decision, "Sleep");
+        assert_eq!(d.sleep_seconds, Some(7));
+        assert!(d.response.as_ref().unwrap().contains("7"));
     }
 }

@@ -7,7 +7,7 @@ use super::{Event, Renderer, SubagentDetail};
 use crate::llm::{ChatClient, PauseAction, StreamControl, StreamEvent, StreamSink};
 use std::sync::Arc;
 
-pub(crate) enum SteerArbEvent {
+pub enum SteerArbEvent {
     Delta(String),
     DelegationStarted {
         agent: crate::agents::Agent,
@@ -29,7 +29,10 @@ pub(crate) enum SteerArbEvent {
     },
 }
 
-pub(crate) fn spawn_steer_arbitration(
+pub type SharedSteeringHistory = Arc<std::sync::RwLock<Vec<(String, String)>>>;
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_steer_arbitration(
     client: &ChatClient,
     stats: Arc<crate::harness::HarnessStats>,
     goal: &str,
@@ -37,6 +40,7 @@ pub(crate) fn spawn_steer_arbitration(
     user_msg: String,
     arb_tx: &tokio::sync::mpsc::UnboundedSender<SteerArbEvent>,
     renderer: &mut dyn Renderer,
+    steering_history: Option<SharedSteeringHistory>,
 ) {
     let client = client.clone();
     let stats = stats.clone();
@@ -59,6 +63,12 @@ pub(crate) fn spawn_steer_arbitration(
 
     tokio::spawn(async move {
         let delta_tx = tx.clone();
+        let history_str = steering_history
+            .as_ref()
+            .and_then(|h| h.read().ok())
+            .map(|h| crate::orchestrator::format_steering_history(&h))
+            .unwrap_or_else(|| "None".to_string());
+
         let ctx = crate::orchestrator::steer::SteerContext {
             main_goal: &goal,
             orchestrator_status: if !has_active {
@@ -70,7 +80,7 @@ pub(crate) fn spawn_steer_arbitration(
             plan_progress: &plan_progress_str,
             plan_content: &plan_content,
             available_agents: "",
-            steering_history: "None",
+            steering_history: &history_str,
             user_message: &msg,
             active_subtasks: &active_subtasks_str,
         };
@@ -98,7 +108,29 @@ pub(crate) fn spawn_steer_arbitration(
             preempt_handle.complete_with_subtask_decision(decision.as_ref());
         }
 
+        let mut synthesized_answer_opt = None;
+
         if let Some(ref d) = decision {
+            if d.decision.eq_ignore_ascii_case("Sleep") {
+                let sleep_secs = d.sleep_seconds.unwrap_or(5).min(300);
+                let _ = tx.send(SteerArbEvent::Delta(format!(
+                    "\n[Steering Arbitrator sleeping for {sleep_secs}s...]\n"
+                )));
+                let cancel = crate::orchestrator::bus::global_cancellation_token();
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)) => {
+                        let _ = tx.send(SteerArbEvent::Delta(format!(
+                            "[Steering Arbitrator woke up after {sleep_secs}s]\n"
+                        )));
+                    }
+                    _ = cancel.cancelled() => {
+                        let _ = tx.send(SteerArbEvent::Delta(
+                            "[Steering Arbitrator sleep cancelled]\n".to_string()
+                        ));
+                    }
+                }
+            }
+
             let tasks = crate::orchestrator::steer::extract_tasks_to_delegate(d, &msg);
             let mut completed_deliverables = Vec::new();
             for (agent, task_id, prompt) in tasks {
@@ -147,12 +179,33 @@ pub(crate) fn spawn_steer_arbitration(
                 )
                 .await;
                 if let Ok(synthesized) = synth_res {
+                    synthesized_answer_opt = Some(synthesized.clone());
                     let _ = tx.send(SteerArbEvent::SynthesizedAnswer {
                         user_msg: msg.clone(),
                         answer: synthesized,
                     });
                 }
             }
+        }
+
+        let recorded_resp = if let Some(ref synth) = synthesized_answer_opt {
+            synth.clone()
+        } else if let Some(ref d) = decision {
+            if let Some(ref r) = d.response {
+                r.clone()
+            } else if d.decision.eq_ignore_ascii_case("Sleep") {
+                format!("Slept for {}s", d.sleep_seconds.unwrap_or(5))
+            } else {
+                format!("Decision: {}", d.decision)
+            }
+        } else {
+            "No decision".to_string()
+        };
+
+        if let Some(ref hist_lock) = steering_history
+            && let Ok(mut hist) = hist_lock.write()
+        {
+            hist.push((msg.clone(), recorded_resp));
         }
 
         let _ = tx.send(SteerArbEvent::Finished {
@@ -304,19 +357,20 @@ pub(crate) fn drain_steer_arbitration_events(
     }
 }
 
-pub(crate) struct RendererSink<'a> {
-    pub(crate) renderer: &'a mut dyn Renderer,
-    pub(crate) steer_queue: &'a mut Vec<String>,
-    pub(crate) steer_abort_requested: &'a mut bool,
+pub struct RendererSink<'a> {
+    pub renderer: &'a mut dyn Renderer,
+    pub steer_queue: &'a mut Vec<String>,
+    pub steer_abort_requested: &'a mut bool,
     #[allow(dead_code)]
-    pub(crate) arb_tx: &'a tokio::sync::mpsc::UnboundedSender<SteerArbEvent>,
-    pub(crate) arb_rx: &'a mut tokio::sync::mpsc::UnboundedReceiver<SteerArbEvent>,
-    pub(crate) client: &'a ChatClient,
-    pub(crate) stats: Arc<crate::harness::HarnessStats>,
-    pub(crate) goal: &'a str,
-    pub(crate) subagents: &'a [SubagentDetail],
-    pub(crate) plan: Option<&'a crate::agent::phase::Plan>,
-    pub(crate) ctx: Option<&'a mut crate::manager::context::ContextEngine>,
+    pub arb_tx: &'a tokio::sync::mpsc::UnboundedSender<SteerArbEvent>,
+    pub arb_rx: &'a mut tokio::sync::mpsc::UnboundedReceiver<SteerArbEvent>,
+    pub client: &'a ChatClient,
+    pub stats: Arc<crate::harness::HarnessStats>,
+    pub goal: &'a str,
+    pub subagents: &'a [SubagentDetail],
+    pub plan: Option<&'a crate::agent::phase::Plan>,
+    pub ctx: Option<&'a mut crate::manager::context::ContextEngine>,
+    pub steering_history: Option<SharedSteeringHistory>,
 }
 
 #[async_trait::async_trait]
@@ -381,6 +435,13 @@ impl StreamSink for RendererSink<'_> {
 
         let has_active =
             crate::orchestrator::has_active_workers() || self.subagents.iter().any(|s| s.is_active);
+        let history_str = self
+            .steering_history
+            .as_ref()
+            .and_then(|h| h.read().ok())
+            .map(|h| crate::orchestrator::format_steering_history(&h))
+            .unwrap_or_else(|| "None".to_string());
+
         let ctx = crate::orchestrator::steer::SteerContext {
             main_goal: self.goal,
             orchestrator_status: if !has_active {
@@ -392,10 +453,13 @@ impl StreamSink for RendererSink<'_> {
             plan_progress: &plan_progress_str,
             plan_content: &plan_content,
             available_agents: "",
-            steering_history: "None",
+            steering_history: &history_str,
             user_message: user_msg,
             active_subtasks: &active_subtasks_str,
         };
+
+        let preempt_handle =
+            crate::orchestrator::preempt_conflicting_stream(self.client.model(), user_msg).await;
 
         let renderer = &mut *self.renderer;
         let decision = crate::orchestrator::steer::arbitrate_steer_context_stream(
@@ -408,6 +472,35 @@ impl StreamSink for RendererSink<'_> {
             },
         )
         .await;
+
+        let is_global_abort = matches!(
+            decision.as_ref().map(|d| d.decision.as_str()),
+            Some("AbortImmediately") | Some("RejectPlan")
+        );
+
+        if is_global_abort {
+            preempt_handle.complete_all(PauseAction::Abort);
+        } else {
+            preempt_handle.complete_with_subtask_decision(decision.as_ref());
+        }
+
+        let recorded_resp = if let Some(ref d) = decision {
+            if let Some(ref r) = d.response {
+                r.clone()
+            } else if d.decision.eq_ignore_ascii_case("Sleep") {
+                format!("Slept for {}s", d.sleep_seconds.unwrap_or(5))
+            } else {
+                format!("Decision: {}", d.decision)
+            }
+        } else {
+            "No decision".to_string()
+        };
+
+        if let Some(ref hist_lock) = self.steering_history
+            && let Ok(mut hist) = hist_lock.write()
+        {
+            hist.push((user_msg.to_string(), recorded_resp));
+        }
 
         let tasks = decision
             .as_ref()
@@ -525,6 +618,32 @@ impl StreamSink for RendererSink<'_> {
                     let _ = self.renderer.flush();
                     PauseAction::Resume
                 }
+                Some("Sleep") => {
+                    let sleep_secs = decision
+                        .as_ref()
+                        .and_then(|d| d.sleep_seconds)
+                        .unwrap_or(5)
+                        .min(300);
+                    self.renderer.on_event(&Event::Status(format!(
+                        "Steering arbitrator sleeping for {sleep_secs}s..."
+                    )));
+                    let _ = self.renderer.flush();
+                    let cancel = crate::orchestrator::bus::global_cancellation_token();
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)) => {
+                            self.renderer.on_event(&Event::Status(format!(
+                                "Steering arbitrator woke up after {sleep_secs}s — resuming stream..."
+                            )));
+                        }
+                        _ = cancel.cancelled() => {
+                            self.renderer.on_event(&Event::Status(
+                                "Steering arbitrator sleep cancelled".to_string(),
+                            ));
+                        }
+                    }
+                    let _ = self.renderer.flush();
+                    PauseAction::Resume
+                }
                 _ => {
                     self.steer_queue.push(user_msg.to_string());
                     self.renderer.on_event(&Event::Status(
@@ -615,7 +734,9 @@ mod tests {
                     message: None,
                     agent_name: Some("coder".to_string()),
                     prompt: Some("Check files".to_string()),
+                    sleep_seconds: None,
                 }],
+                sleep_seconds: None,
             }),
             user_msg: "check files".to_string(),
         })

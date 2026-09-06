@@ -303,7 +303,9 @@ mod tests {
                 message: None,
                 agent_name: Some("coder".to_string()),
                 prompt: None,
+                sleep_seconds: None,
             }],
+            sleep_seconds: None,
         };
 
         handle.complete_with_subtask_decision(Some(&decision));

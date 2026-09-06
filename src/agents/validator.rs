@@ -49,6 +49,8 @@ impl Specialist for Validator {
             "pty_*",
             "leave_verdict",
             "rebirth",
+            "sleep",
+            "terminal__sleep",
         ]
     }
 }
