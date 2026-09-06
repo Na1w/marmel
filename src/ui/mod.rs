@@ -20,6 +20,8 @@ pub struct SubagentDetail {
     pub task_id: Option<String>,
     pub prompt: String,
     pub started_at: Option<std::time::Instant>,
+    /// Accumulated duration this subagent has actively spent working.
+    pub worked_duration: std::time::Duration,
     /// Instant of the most recent activity (streaming chunk, log, status, or lifecycle).
     pub last_activity_at: Option<std::time::Instant>,
     /// Ordered log lines for this subagent (status / tool activity).

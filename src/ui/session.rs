@@ -563,15 +563,27 @@ pub async fn run_session(
                     };
 
                     let (call_id, agent, task, tool_res) = res;
-                    let result_content = match tool_res {
-                        Ok(r) => r.content,
-                        Err(e) => format!("ERROR: {e}"),
+                    let (result_content, is_error) = match tool_res {
+                        Ok(r) => (r.content, r.is_error),
+                        Err(e) => (format!("ERROR: {e}"), true),
                     };
                     if let Some(ag) = agent {
                         update_subagent_lifecycle(&mut subagents, ag, task.clone(), None, false);
-                        renderer.on_event(&Event::Delegation(
-                            crate::orchestrator::DelegationEvent::Completed { agent: ag, task },
-                        ));
+                        if is_error {
+                            let clean_tid =
+                                task.as_deref().unwrap_or("task").trim().trim_matches(|c| {
+                                    c == '[' || c == ']' || c == '"' || c == '\''
+                                });
+                            renderer.on_event(&Event::Status(format!("[{clean_tid}] failed.")));
+                        } else {
+                            if let Some(ref tid) = task {
+                                let plan = crate::agent::phase::Plan::default();
+                                let _ = plan.check_off(tid);
+                            }
+                            renderer.on_event(&Event::Delegation(
+                                crate::orchestrator::DelegationEvent::Completed { agent: ag, task },
+                            ));
+                        }
                     } else {
                         renderer.on_event(&Event::ToolResult(result_content.clone()));
                     }
@@ -752,9 +764,9 @@ pub async fn run_session(
                         }
                     };
 
-                    let result_content = match result {
-                        Ok(res) => res.content,
-                        Err(e) => format!("ERROR: {e}"),
+                    let (result_content, is_error) = match result {
+                        Ok(res) => (res.content, res.is_error),
+                        Err(e) => (format!("ERROR: {e}"), true),
                     };
                     if let Some(agent) = delegated_agent {
                         update_subagent_lifecycle(
@@ -764,12 +776,25 @@ pub async fn run_session(
                             None,
                             false,
                         );
-                        renderer.on_event(&Event::Delegation(
-                            crate::orchestrator::DelegationEvent::Completed {
-                                agent,
-                                task: delegated_task,
-                            },
-                        ));
+                        if is_error {
+                            let clean_tid = delegated_task
+                                .as_deref()
+                                .unwrap_or("task")
+                                .trim()
+                                .trim_matches(|c| c == '[' || c == ']' || c == '"' || c == '\'');
+                            renderer.on_event(&Event::Status(format!("[{clean_tid}] failed.")));
+                        } else {
+                            if let Some(ref tid) = delegated_task {
+                                let plan = crate::agent::phase::Plan::default();
+                                let _ = plan.check_off(tid);
+                            }
+                            renderer.on_event(&Event::Delegation(
+                                crate::orchestrator::DelegationEvent::Completed {
+                                    agent,
+                                    task: delegated_task,
+                                },
+                            ));
+                        }
                     } else {
                         renderer.on_event(&Event::ToolResult(result_content.clone()));
                     }

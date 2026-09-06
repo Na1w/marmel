@@ -218,13 +218,12 @@ pub(crate) fn assemble_final_deliverable(
         if final_content.trim().is_empty() {
             return "Specialist terminated without deliverable.\n\nFAILED (incomplete)".to_string();
         }
-        if has_complete {
-            return final_content.to_string();
-        }
         let mut res = final_content.to_string();
         if let Some(tid) = task_id.filter(|t| !t.trim().is_empty()) {
-            res.push_str(&format!("\n\nMISSION COMPLETE ({tid})"));
-        } else {
+            if !res.contains(&format!("MISSION COMPLETE ({tid})")) {
+                res.push_str(&format!("\n\nMISSION COMPLETE ({tid})"));
+            }
+        } else if !has_complete {
             res.push_str("\n\nMISSION COMPLETE");
         }
         return res;
@@ -524,6 +523,16 @@ pub async fn run_specialist_live(
                 ));
             }
 
+            if final_content.trim().is_empty() {
+                if !reply.reasoning.trim().is_empty() {
+                    final_content = reply.reasoning.clone();
+                } else if tools_executed_count > 0 {
+                    final_content = format!(
+                        "Specialist executed {tools_executed_count} tool operations to complete the task."
+                    );
+                }
+            }
+
             if auto_validate_enabled
                 && agent != Agent::Validator
                 && !final_content.is_empty()
@@ -783,6 +792,17 @@ pub async fn run_specialist_live(
             validation_passed,
             validator_critique.as_deref(),
             &final_content,
+            ctx.task_id.as_deref(),
+        );
+        Ok(assembled)
+    } else if tools_executed_count > 0 {
+        let synth = format!(
+            "Specialist executed {tools_executed_count} tool operations to complete the task."
+        );
+        let assembled = assemble_final_deliverable(
+            validation_passed,
+            validator_critique.as_deref(),
+            &synth,
             ctx.task_id.as_deref(),
         );
         Ok(assembled)

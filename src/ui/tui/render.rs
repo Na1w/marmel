@@ -653,12 +653,17 @@ impl TuiRenderer {
             } else {
                 String::new()
             };
-            let elapsed_str = if let Some(last) = sa.last_activity_at.or(sa.started_at) {
-                let secs = last.elapsed().as_secs();
-                if secs >= 60 {
-                    format!(", {}m {}s ago", secs / 60, secs % 60)
+            let total_secs = if sa.is_active {
+                (sa.worked_duration + sa.started_at.map(|st| st.elapsed()).unwrap_or_default())
+                    .as_secs()
+            } else {
+                sa.worked_duration.as_secs()
+            };
+            let elapsed_str = if total_secs > 0 {
+                if total_secs >= 60 {
+                    format!(", {}m {}s", total_secs / 60, total_secs % 60)
                 } else {
-                    format!(", {}s ago", secs)
+                    format!(", {}s", total_secs)
                 }
             } else {
                 String::new()
@@ -904,11 +909,14 @@ impl TuiRenderer {
                 format!(" Tokens: {} | Status: {}", tokens_str, status_str)
             };
 
-            let elapsed_secs = self.total_project_elapsed().as_secs();
-            let right_text = format!(
-                "Elapsed: {} ",
-                crate::orchestrator::workers::format_duration_human(elapsed_secs)
-            );
+            let right_text = if let Some(dur) = self.total_project_elapsed() {
+                format!(
+                    "Elapsed: {} ",
+                    crate::orchestrator::workers::format_duration_human(dur.as_secs())
+                )
+            } else {
+                String::new()
+            };
 
             let total_width = area.width as usize;
             let left_w = UnicodeWidthStr::width(left_text.as_str());

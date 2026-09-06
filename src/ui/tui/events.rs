@@ -468,6 +468,13 @@ impl TuiRenderer {
             .find(|(_, s)| s.name == name)
         {
             Some((idx, existing)) => {
+                if existing.is_active && !is_active {
+                    if let Some(st) = existing.started_at.take() {
+                        existing.worked_duration += st.elapsed();
+                    }
+                } else if !existing.is_active && is_active {
+                    existing.started_at = Some(now);
+                }
                 existing.is_active = is_active;
                 existing.last_activity_at = Some(now);
                 existing.logs.push(log.to_string());
@@ -480,6 +487,7 @@ impl TuiRenderer {
                     task_id: None,
                     prompt: String::new(),
                     started_at: if is_active { Some(now) } else { None },
+                    worked_duration: std::time::Duration::ZERO,
                     last_activity_at: Some(now),
                     logs: vec![log.to_string()],
                     thinking: String::new(),

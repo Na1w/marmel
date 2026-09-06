@@ -521,9 +521,11 @@ mod tests {
 
     #[test]
     fn test_set_and_get_active_config() {
-        let mut custom = Config::default();
-        custom.model = "test-custom-model-123".to_string();
-        custom.backend_url = "http://custom:1234/v1".to_string();
+        let custom = Config {
+            model: "test-custom-model-123".to_string(),
+            backend_url: "http://custom:1234/v1".to_string(),
+            ..Default::default()
+        };
         set_active(custom.clone());
 
         let retrieved = get_active().expect("active config should be present");

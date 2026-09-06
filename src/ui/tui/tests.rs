@@ -225,6 +225,7 @@ fn estimated_subagent_lines_counts_sections() {
         task_id: None,
         prompt: String::new(),
         started_at: None,
+        worked_duration: std::time::Duration::ZERO,
         last_activity_at: None,
         logs: vec!["log1".to_string()],
         thinking: "think".to_string(),
@@ -301,6 +302,7 @@ fn cycle_focus_obeys_panel_visibility() {
         task_id: None,
         prompt: String::new(),
         started_at: None,
+        worked_duration: std::time::Duration::ZERO,
         last_activity_at: None,
         logs: vec![],
         thinking: String::new(),
@@ -393,6 +395,7 @@ fn set_subagents_adopts_authoritative_list() {
         task_id: None,
         prompt: String::new(),
         started_at: None,
+        worked_duration: std::time::Duration::ZERO,
         last_activity_at: None,
         logs: vec!["started task t-1".to_string()],
         thinking: "local think".to_string(),
@@ -407,6 +410,7 @@ fn set_subagents_adopts_authoritative_list() {
         task_id: None,
         prompt: String::new(),
         started_at: None,
+        worked_duration: std::time::Duration::ZERO,
         last_activity_at: None,
         logs: vec!["started task t-1".to_string()],
         thinking: String::new(),
@@ -428,6 +432,7 @@ fn set_subagents_adopts_authoritative_list() {
         task_id: None,
         prompt: String::new(),
         started_at: None,
+        worked_duration: std::time::Duration::ZERO,
         last_activity_at: None,
         logs: vec![],
         thinking: String::new(),
@@ -440,6 +445,7 @@ fn set_subagents_adopts_authoritative_list() {
         task_id: None,
         prompt: String::new(),
         started_at: None,
+        worked_duration: std::time::Duration::ZERO,
         last_activity_at: None,
         logs: vec![],
         thinking: String::new(),
@@ -570,6 +576,7 @@ fn test_subagent_thinking_visibility_controlled_by_show_thought() {
         task_id: Some("t-001".to_string()),
         prompt: "task brief".to_string(),
         started_at: None,
+        worked_duration: std::time::Duration::ZERO,
         last_activity_at: None,
         logs: vec!["log step".to_string()],
         thinking: "secret subagent thoughts".to_string(),
@@ -668,6 +675,7 @@ fn test_subagent_tool_calls_logged_with_arguments_and_stripped_prefix() {
         content: String::new(),
         is_active: true,
         context_tokens: 0,
+        worked_duration: Duration::ZERO,
     });
     r.active_agent = "coder-t-001".to_string();
 
@@ -887,6 +895,7 @@ fn test_subagent_scrolling_and_focus() {
         content: "output line 1\noutput line 2".to_string(),
         is_active: true,
         context_tokens: 0,
+        worked_duration: Duration::ZERO,
     });
 
     r.show_thought = true;
@@ -954,6 +963,7 @@ fn test_subagent_switch_scrolls_to_bottom_and_autoscrolls() {
         content: "output".to_string(),
         is_active: true,
         context_tokens: 0,
+        worked_duration: Duration::ZERO,
     });
     r.subagents.push(SubagentDetail {
         name: "coder-2".to_string(),
@@ -971,6 +981,7 @@ fn test_subagent_switch_scrolls_to_bottom_and_autoscrolls() {
         content: "output 2".to_string(),
         is_active: true,
         context_tokens: 0,
+        worked_duration: Duration::ZERO,
     });
 
     r.subagent_width.set(40);
@@ -1142,6 +1153,7 @@ fn test_subagent_context_tokens_rendering_in_list() {
         content: String::new(),
         is_active: true,
         context_tokens: 3500,
+        worked_duration: Duration::ZERO,
     });
     r.subagents.push(SubagentDetail {
         name: "researcher-t-2".to_string(),
@@ -1154,6 +1166,7 @@ fn test_subagent_context_tokens_rendering_in_list() {
         content: String::new(),
         is_active: false,
         context_tokens: 1200,
+        worked_duration: Duration::ZERO,
     });
     r.subagents.push(SubagentDetail {
         name: "validator".to_string(),
@@ -1166,6 +1179,7 @@ fn test_subagent_context_tokens_rendering_in_list() {
         content: String::new(),
         is_active: true,
         context_tokens: 0,
+        worked_duration: Duration::ZERO,
     });
 
     let backend = ratatui::backend::TestBackend::new(100, 20);
@@ -1216,6 +1230,7 @@ fn test_subagent_time_counter_rendering_in_list() {
         content: String::new(),
         is_active: true,
         context_tokens: 3500,
+        worked_duration: Duration::ZERO,
     });
     r.subagents.push(SubagentDetail {
         name: "researcher-t-2".to_string(),
@@ -1228,6 +1243,7 @@ fn test_subagent_time_counter_rendering_in_list() {
         content: String::new(),
         is_active: false,
         context_tokens: 1200,
+        worked_duration: Duration::from_secs(85),
     });
 
     let backend = ratatui::backend::TestBackend::new(100, 20);
@@ -1249,12 +1265,12 @@ fn test_subagent_time_counter_rendering_in_list() {
     }
     let full_text = lines.join("\n");
     assert!(
-        full_text.contains("coder-t-1 (Active, 3.5k ctx, 5s ago)"),
-        "expected 'coder-t-1 (Active, 3.5k ctx, 5s ago)' in subagents panel, got:\n{full_text}"
+        full_text.contains("coder-t-1 (Active, 3.5k ctx, 5s)"),
+        "expected 'coder-t-1 (Active, 3.5k ctx, 5s)' in subagents panel, got:\n{full_text}"
     );
     assert!(
-        full_text.contains("researcher-t-2 (Idle, 1.2k ctx, 1m 25s ago)"),
-        "expected 'researcher-t-2 (Idle, 1.2k ctx, 1m 25s ago)' in subagents panel, got:\n{full_text}"
+        full_text.contains("researcher-t-2 (Idle, 1.2k ctx, 1m 25s)"),
+        "expected 'researcher-t-2 (Idle, 1.2k ctx, 1m 25s)' in subagents panel, got:\n{full_text}"
     );
 }
 
@@ -1301,6 +1317,7 @@ fn test_rehydrate_subagents_enables_panel_and_selects_latest() {
             content: "output 1".to_string(),
             is_active: false,
             context_tokens: 100,
+            worked_duration: Duration::ZERO,
         },
         SubagentDetail {
             name: "researcher-t-002".to_string(),
@@ -1316,6 +1333,7 @@ fn test_rehydrate_subagents_enables_panel_and_selects_latest() {
             content: "output 2".to_string(),
             is_active: false,
             context_tokens: 200,
+            worked_duration: Duration::ZERO,
         },
     ];
 
@@ -1388,12 +1406,17 @@ fn test_plan_caching_and_throttling() {
     assert!(!renderer.plan_is_archived);
 }
 
+static PLAN_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn test_status_bar_displays_right_aligned_elapsed_time() {
-    let mut r = TuiRenderer::new();
-    r.session_start = std::time::Instant::now()
-        .checked_sub(std::time::Duration::from_secs(135))
-        .unwrap();
+    let _lock = PLAN_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let r = TuiRenderer::new();
+    crate::manager::phase::record_plan_start_at(
+        std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(135))
+            .unwrap(),
+    );
 
     let backend = ratatui::backend::TestBackend::new(100, 5);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1408,6 +1431,8 @@ fn test_status_bar_displays_right_aligned_elapsed_time() {
     let content: String = (0..100)
         .map(|x| buffer[(x, 4)].symbol().to_string())
         .collect();
+
+    defer_clear_plan();
 
     assert!(
         content.contains("Tokens:"),
@@ -1425,17 +1450,17 @@ fn test_status_bar_displays_right_aligned_elapsed_time() {
 
 #[test]
 fn test_status_bar_prefers_plan_start_time() {
-    let mut r = TuiRenderer::new();
-    // Simulate session start 30 seconds ago
-    r.session_start = std::time::Instant::now()
-        .checked_sub(std::time::Duration::from_secs(30))
-        .unwrap();
+    let _lock = PLAN_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let r = TuiRenderer::new();
+    defer_clear_plan();
 
-    // No plan start yet -> elapsed is ~30s
-    assert!(r.total_project_elapsed().as_secs() >= 30);
+    // No plan start yet -> None (only counts when actively working on a plan)
+    assert!(r.total_project_elapsed().is_none());
 
     // Now record plan start
     crate::manager::phase::record_plan_start();
+    assert!(r.total_project_elapsed().is_some());
+
     // Clean up afterwards
     defer_clear_plan();
 }
@@ -1459,7 +1484,9 @@ fn test_delegation_completed_emits_task_id_completed_in_chat() {
         "[Validator] APPROVED deliverable for coder-t-007:\nAll checks passed.".to_string(),
     ));
     assert!(
-        !r.messages.iter().any(|m| m.contains("[Validator] APPROVED")),
+        !r.messages
+            .iter()
+            .any(|m| m.contains("[Validator] APPROVED")),
         "validator approval must not be pushed into chat messages"
     );
     // But it should be present in subagent logs
@@ -1488,11 +1515,7 @@ fn test_delegation_completed_emits_task_id_completed_in_chat() {
     let (style, special) = message_style("[t-007] completed.");
     assert!(special);
     assert_eq!(style.fg, Some(ratatui::style::Color::Green));
-    assert!(
-        style
-            .add_modifier
-            .contains(ratatui::style::Modifier::BOLD)
-    );
+    assert!(style.add_modifier.contains(ratatui::style::Modifier::BOLD));
 }
 
 #[test]
@@ -1525,4 +1548,3 @@ fn test_chat_auto_scroll_shows_final_lines_of_multiline_markdown_response() {
         "expected bottom line to be visible in chat viewport, got:\n{rendered}"
     );
 }
-

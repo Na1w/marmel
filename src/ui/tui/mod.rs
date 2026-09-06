@@ -133,6 +133,7 @@ pub struct TuiRenderer {
     pub(crate) plan_mtime: Option<std::time::SystemTime>,
     pub(crate) archive_mtime: Option<std::time::SystemTime>,
     pub(crate) plan_is_archived: bool,
+    #[allow(dead_code)]
     pub(crate) session_start: std::time::Instant,
 
     /// Estimated total input (prompt) tokens across the session.
@@ -215,14 +216,27 @@ impl TuiRenderer {
         }
     }
 
-    /// Total duration spent working on the project as a whole.
-    /// Prefers the plan start time (if an execution plan exists/is active)
-    /// combined with session duration, falling back to the current TUI session duration.
-    pub(crate) fn total_project_elapsed(&self) -> std::time::Duration {
-        if let Some((inst, _)) = crate::manager::phase::get_plan_start_time() {
-            inst.elapsed().max(self.session_start.elapsed())
+    /// Total duration spent working on an execution plan.
+    /// Only counts when actively working on a plan; freezes as soon as the plan is completed / archived.
+    pub(crate) fn total_project_elapsed(&self) -> Option<std::time::Duration> {
+        let (inst, _) = crate::manager::phase::get_plan_start_time()?;
+        if let Some(comp) = crate::manager::phase::get_plan_completed_time() {
+            Some(comp.duration_since(inst))
+        } else if self.plan_is_archived {
+            crate::manager::phase::record_plan_completed();
+            Some(inst.elapsed())
         } else {
-            self.session_start.elapsed()
+            let plan = crate::agent::phase::Plan::default();
+            if plan.is_complete() {
+                crate::manager::phase::record_plan_completed();
+                if let Some(comp) = crate::manager::phase::get_plan_completed_time() {
+                    Some(comp.duration_since(inst))
+                } else {
+                    Some(inst.elapsed())
+                }
+            } else {
+                Some(inst.elapsed())
+            }
         }
     }
 }
@@ -479,14 +493,16 @@ impl Renderer for TuiRenderer {
                         };
                         let t = task.as_deref().unwrap_or("(no task id)");
                         self.upsert_subagent(&name, false, &format!("completed task {t}"));
+                        self.plan_mtime = None;
+                        self.last_plan_check = std::time::Instant::now()
+                            .checked_sub(std::time::Duration::from_secs(1))
+                            .unwrap_or_else(std::time::Instant::now);
 
                         let completed_msg = match task {
                             Some(tid) if !tid.trim().is_empty() => {
-                                let clean = tid
-                                    .trim()
-                                    .trim_matches(|c| {
-                                        c == '[' || c == ']' || c == '"' || c == '\''
-                                    });
+                                let clean = tid.trim().trim_matches(|c| {
+                                    c == '[' || c == ']' || c == '"' || c == '\''
+                                });
                                 format!("[{clean}] completed.")
                             }
                             _ => format!("[{agent}] completed."),

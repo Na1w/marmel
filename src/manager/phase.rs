@@ -84,16 +84,44 @@ type PlanStartTime = (std::time::Instant, chrono::DateTime<chrono::Local>);
 static PLAN_STARTED_AT: std::sync::LazyLock<std::sync::RwLock<Option<PlanStartTime>>> =
     std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
 
+static PLAN_COMPLETED_AT: std::sync::LazyLock<std::sync::RwLock<Option<std::time::Instant>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+
 /// Record that an execution plan started right now.
 pub fn record_plan_start() {
+    record_plan_start_at(std::time::Instant::now());
+}
+
+/// Record that an execution plan started at a specific instant.
+pub fn record_plan_start_at(inst: std::time::Instant) {
     if let Ok(mut g) = PLAN_STARTED_AT.write() {
-        *g = Some((std::time::Instant::now(), chrono::Local::now()));
+        *g = Some((inst, chrono::Local::now()));
     }
+    if let Ok(mut g) = PLAN_COMPLETED_AT.write() {
+        *g = None;
+    }
+}
+
+/// Record that an execution plan completed all tasks right now.
+pub fn record_plan_completed() {
+    if let Ok(mut g) = PLAN_COMPLETED_AT.write()
+        && g.is_none()
+    {
+        *g = Some(std::time::Instant::now());
+    }
+}
+
+/// Retrieve the instant when the plan was completed, if finished.
+pub fn get_plan_completed_time() -> Option<std::time::Instant> {
+    PLAN_COMPLETED_AT.read().ok().and_then(|g| *g)
 }
 
 /// Clear the recorded plan start time upon completion / archive.
 pub fn clear_plan_start() {
     if let Ok(mut g) = PLAN_STARTED_AT.write() {
+        *g = None;
+    }
+    if let Ok(mut g) = PLAN_COMPLETED_AT.write() {
         *g = None;
     }
 }
@@ -457,6 +485,7 @@ impl Plan {
             // caller explicitly archives. This is a best-effort snapshot; a
             // failure here must not fail the check-off itself.
             if complete {
+                record_plan_completed();
                 let _ = self.write_completed_snapshot(&updated);
             }
         } else {

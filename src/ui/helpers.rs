@@ -233,6 +233,13 @@ pub(crate) fn update_subagent_lifecycle(
     let active_tokens = crate::orchestrator::get_active_worker_tokens(&name).unwrap_or(0);
     let now = std::time::Instant::now();
     if let Some(existing) = subagents.iter_mut().find(|s| s.name == name) {
+        if existing.is_active && !started {
+            if let Some(st) = existing.started_at.take() {
+                existing.worked_duration += st.elapsed();
+            }
+        } else if !existing.is_active && started {
+            existing.started_at = Some(now);
+        }
         existing.is_active = started;
         existing.last_activity_at = Some(now);
         if active_tokens > 0 {
@@ -243,9 +250,6 @@ pub(crate) fn update_subagent_lifecycle(
             if let Some(p) = prompt {
                 existing.prompt = p;
             }
-            existing.started_at = Some(now);
-        } else {
-            existing.started_at = None;
         }
         existing.logs.push(log_entry);
     } else {
@@ -254,6 +258,7 @@ pub(crate) fn update_subagent_lifecycle(
             task_id: task,
             prompt: prompt.unwrap_or_default(),
             started_at: if started { Some(now) } else { None },
+            worked_duration: std::time::Duration::ZERO,
             last_activity_at: Some(now),
             logs: vec![log_entry],
             thinking: String::new(),
@@ -391,6 +396,7 @@ pub fn rehydrate_subagents(
                             task_id,
                             prompt,
                             started_at: None,
+                            worked_duration: std::time::Duration::ZERO,
                             last_activity_at: None,
                             logs,
                             thinking: String::new(),
@@ -441,6 +447,7 @@ pub fn rehydrate_subagents(
                     task_id: entry.task_id,
                     prompt: String::new(),
                     started_at: None,
+                    worked_duration: std::time::Duration::ZERO,
                     last_activity_at: None,
                     logs,
                     thinking: String::new(),
@@ -478,6 +485,7 @@ pub fn rehydrate_subagents(
                 task_id: Some(rec_task.clone()),
                 prompt: String::new(),
                 started_at: None,
+                worked_duration: std::time::Duration::ZERO,
                 last_activity_at: None,
                 logs: vec![
                     format!("started task {rec_task}"),
@@ -524,6 +532,7 @@ pub fn rehydrate_subagents(
                     task_id: Some(tid.clone()),
                     prompt: String::new(),
                     started_at: None,
+                    worked_duration: std::time::Duration::ZERO,
                     last_activity_at: None,
                     logs: vec![
                         format!("started task {tid}"),
