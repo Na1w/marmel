@@ -113,17 +113,23 @@ struct PendingTool {
 /// Compiled exactly once via `OnceLock` (CODE_REVIEW Point 2).
 static TASK_ID_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
 
-/// Extract an optional `[t-xxx]` task id from a tool's arguments JSON string.
+/// Extract an optional task id from a tool's arguments JSON string.
 fn extract_task_id(_name: &str, args: &serde_json::Value) -> Option<String> {
     // A `task_id` may be embedded in the JSON arguments (plan annotation).
     let candidate = args.get("task_id").and_then(|v| v.as_str());
     if let Some(c) = candidate {
-        return Some(c.to_string());
+        let clean = c
+            .trim()
+            .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
+            .trim();
+        if !clean.is_empty() {
+            return Some(clean.to_string());
+        }
     }
-    // Fall back to scanning the raw argument text for `[t-xxx]`.
+    // Fall back to scanning the raw argument text for `(t-xxx)` or `[t-xxx]`.
     let raw = args.to_string();
     let re = TASK_ID_RE
-        .get_or_init(|| regex::Regex::new(r"\[(t-[A-Za-z0-9_-]+)\]").expect("valid task regex"));
+        .get_or_init(|| regex::Regex::new(r"\(?\[?(t-[A-Za-z0-9_-]+)\]?\)?").expect("valid task regex"));
     re.captures(&raw).map(|m| m[1].to_string())
 }
 

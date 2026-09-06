@@ -376,7 +376,11 @@ impl Plan {
             tracing::warn!("check_off({task_id}): no active plan file on disk");
             return Ok(false);
         };
-        let tid_lower = task_id.to_ascii_lowercase();
+        let clean_tid = task_id
+            .trim()
+            .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
+            .trim();
+        let tid_lower = clean_tid.to_ascii_lowercase();
         let mut flipped = false;
         let re_box = Regex::new(r"\[\s*\]").expect("box regex");
         let updated = content
@@ -480,7 +484,12 @@ impl Plan {
         // Resolve the task id: the explicit override takes precedence, falling
         // back to the marker's own `(t-xxx)` token. Own the id so no borrow is
         // held past the local `marker`.
-        let tid = task_id.map(str::to_string).or_else(|| {
+        let tid = task_id.map(|t| {
+            t.trim()
+                .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
+                .trim()
+                .to_string()
+        }).or_else(|| {
             if let MissionMarker::Complete { task_id } = &marker {
                 task_id.clone()
             } else {

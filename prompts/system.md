@@ -57,9 +57,7 @@ The `.marmel/execution_plan.md` is the single source of truth for progression (R
   domain work, with a self-contained brief in English.
 - **agent_name** must match the subtask's domain: `coder`, `researcher`,
   `debugger`, `validator`, or `generalist` (REQ-ORCH-002 selection rule).
-- **task_id binding** — when the work maps to an `.marmel/execution_plan.md`
-  line `- [ ] [t-xxx]`, pass `task_id: "t-xxx"` so a successful deliverable
-  auto-checks-off that line.
+- **task_id binding (MANDATORY)** — you MUST pass `task_id: "t-xxx"` corresponding to the execution plan line `- [ ] [t-xxx]`. `task_id` is required for automatic check-off on completion. Do not omit `task_id`.
 - **snippets** — pass only a bounded list of relevant excerpts or file paths;
   the specialist sees ONLY the brief + snippets (isolated context, REQ-ORCH-003),
   never your full conversation history.

@@ -464,9 +464,32 @@ fn test_handler_rejects_empty_prompt() {
     let args = serde_json::json!({
         "agent_name": "coder",
         "prompt": "   ",
+        "task_id": "t-001",
         "snippets": [],
     });
     let err = handle_delegate_task(&args).expect_err("empty prompt rejected");
+    assert!(matches!(err, ToolError::BadArguments { .. }));
+}
+
+#[test]
+fn test_handler_rejects_missing_or_empty_task_id() {
+    // Missing task_id
+    let args_missing = serde_json::json!({
+        "agent_name": "coder",
+        "prompt": "Implement widget.",
+        "snippets": [],
+    });
+    let err = handle_delegate_task(&args_missing).expect_err("missing task_id rejected");
+    assert!(matches!(err, ToolError::BadArguments { .. }));
+
+    // Empty task_id
+    let args_empty = serde_json::json!({
+        "agent_name": "coder",
+        "prompt": "Implement widget.",
+        "task_id": "   ",
+        "snippets": [],
+    });
+    let err = handle_delegate_task(&args_empty).expect_err("empty task_id rejected");
     assert!(matches!(err, ToolError::BadArguments { .. }));
 }
 

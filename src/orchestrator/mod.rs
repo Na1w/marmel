@@ -441,24 +441,20 @@ impl OrchestratorManager {
     /// check-off still works when the subagent omits the parenthesized id.
     fn apply_check_off(&self, d: Deliverable, task_id: Option<String>) -> Deliverable {
         let tid = d.task_id.clone().or(task_id);
-        if let Some(t) = &tid {
-            // Only a genuine Complete marker (not Failed/Replan) may ever check
-            // the task off, regardless of what tokens appear in the content body.
-            if matches!(d.marker, MissionMarker::Complete { .. }) {
-                // Second gate: the *content* must still carry the terminal marker.
-                if let Ok(true) = self.plan.check_plan_on_marker(Some(t), &d.content) {
+        if matches!(d.marker, MissionMarker::Complete { .. }) {
+            // Second gate: the *content* must still carry the terminal marker.
+            if let Ok(true) = self.plan.check_plan_on_marker(tid.as_deref(), &d.content) {
+                if let Some(t) = &tid {
                     crate::debug_log::log_plan_update(
                         "check_off",
                         &format!("Task [{t}] marked completed [x] on disk"),
                     );
                 }
             }
-            let mut d = d;
-            d.task_id = Some(t.clone());
-            d
-        } else {
-            d
         }
+        let mut d = d;
+        d.task_id = tid;
+        d
     }
 
     /// REQ-ORCH-001: resolve the role system prompt for a specialist. Reads the
@@ -576,7 +572,28 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
         });
     }
 
-    // 2b. Guard: reject re-delegation of tasks already checked off in the plan.
+    // 2b. task_id is mandatory (REQ-ORCH-005): must identify which execution plan item is being delegated.
+    let raw_task_id = req.task_id.as_deref().unwrap_or("").trim();
+    if raw_task_id.is_empty() {
+        return Err(ToolError::BadArguments {
+            tool: TOOL_DELEGATE_TASK.to_string(),
+            detail: "`task_id` is mandatory: you must specify the execution_plan.md task id (e.g. 't-001') to delegate work".to_string(),
+        });
+    }
+    let clean_task_id = raw_task_id
+        .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
+        .trim()
+        .to_string();
+    if clean_task_id.is_empty() {
+        return Err(ToolError::BadArguments {
+            tool: TOOL_DELEGATE_TASK.to_string(),
+            detail: "`task_id` cannot be empty".to_string(),
+        });
+    }
+    let mut req = req;
+    req.task_id = Some(clean_task_id);
+
+    // 2c. Guard: reject re-delegation of tasks already checked off in the plan.
     #[cfg(not(test))]
     {
         let plan = Plan::default();
