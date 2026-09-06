@@ -57,8 +57,7 @@ pub(crate) async fn try_run_specialist_live(
     {
         return None;
     }
-    let cfg = crate::config::get_active()
-        .or_else(|| crate::config::load(None).ok())?;
+    let cfg = crate::config::get_active().or_else(|| crate::config::load(None).ok())?;
     let specialist_cfg = cfg.orchestration.specialists.get(agent.as_str());
     let backend_url = specialist_cfg
         .and_then(|sc| sc.backend_url.as_ref())

@@ -263,7 +263,8 @@ mod tests {
     #[test]
     fn test_mission_marker_parse_precedence_and_benign_failed() {
         // MISSION COMPLETE takes precedence over words like "failed" in narrative
-        let narrative = "Previous build failed with syntax error. Fixed now.\n\nMISSION COMPLETE (t-001)";
+        let narrative =
+            "Previous build failed with syntax error. Fixed now.\n\nMISSION COMPLETE (t-001)";
         assert_eq!(
             MissionMarker::parse(narrative),
             Some(MissionMarker::Complete {
@@ -272,7 +273,8 @@ mod tests {
         );
 
         // Test outputs containing "0 failed" must not be parsed as Failed
-        let test_output = "test result: ok. 15 passed; 0 failed; 0 ignored\n\nMISSION COMPLETE (t-002)";
+        let test_output =
+            "test result: ok. 15 passed; 0 failed; 0 ignored\n\nMISSION COMPLETE (t-002)";
         assert_eq!(
             MissionMarker::parse(test_output),
             Some(MissionMarker::Complete {

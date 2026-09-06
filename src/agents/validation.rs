@@ -366,7 +366,9 @@ pub(crate) async fn run_automated_validation(
     }
 
     // If the loop finished all turns without an explicit leave_verdict tool call, assume approved:
-    tracing::info!("Validator for {agent} completed turns without calling leave_verdict; assuming approved.");
+    tracing::info!(
+        "Validator for {agent} completed turns without calling leave_verdict; assuming approved."
+    );
     Ok((
         true,
         "Validator completed turns without calling leave_verdict; assumed approved.".to_string(),

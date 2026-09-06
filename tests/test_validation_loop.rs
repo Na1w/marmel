@@ -598,7 +598,8 @@ async fn test_validator_reminded_3_times_and_assumed_approved() {
                             let args = serde_json::json!({
                                 "path": "src/util.rs",
                                 "content": "pub fn util() {}"
-                            }).to_string();
+                            })
+                            .to_string();
                             tool_call_sse("call_write_util", "write_file", &args)
                         }
                         // Turn 1: Specialist concludes
@@ -674,7 +675,6 @@ async fn test_validator_reminded_3_times_and_assumed_approved() {
             }),
             "Marker must be Complete: {result}"
         );
-    }).await;
+    })
+    .await;
 }
-
-

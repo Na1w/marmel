@@ -114,7 +114,9 @@ impl StreamingResponseExtractor {
                         }
                         return (output, just_finished);
                     } else if trimmed.starts_with("null")
-                        || (!trimmed.is_empty() && !trimmed.starts_with('"') && !trimmed.starts_with('n'))
+                        || (!trimmed.is_empty()
+                            && !trimmed.starts_with('"')
+                            && !trimmed.starts_with('n'))
                     {
                         self.finished = true;
                         self.buffer.clear();
@@ -489,11 +491,7 @@ pub async fn execute_steer_subtask(
     prompt: &str,
 ) -> Result<Deliverable, anyhow::Error> {
     let plan = Plan::default();
-    let mut manager = OrchestratorManager::new(
-        client.clone(),
-        plan,
-        stats,
-    );
+    let mut manager = OrchestratorManager::new(client.clone(), plan, stats);
     manager.cancellation_token = crate::orchestrator::bus::global_cancellation_token();
     let req = DelegationRequest {
         agent_name: agent,
@@ -661,7 +659,8 @@ mod tests {
     #[test]
     fn test_streaming_response_extractor_null_response_field() {
         let mut extractor = StreamingResponseExtractor::new();
-        let chunk = "{\"decision\": \"QueueAndContinue\", \"response\": null, \"subtasks\": [\"task1\"]}";
+        let chunk =
+            "{\"decision\": \"QueueAndContinue\", \"response\": null, \"subtasks\": [\"task1\"]}";
         let (out, _finished) = extractor.push_chunk(chunk);
         assert_eq!(out, "");
         assert!(!extractor.in_response_field);
@@ -739,7 +738,10 @@ mod tests {
         .await;
         assert!(res.is_ok());
         let d = res.unwrap();
-        assert!(matches!(d.marker, crate::agents::MissionMarker::Complete { .. }));
+        assert!(matches!(
+            d.marker,
+            crate::agents::MissionMarker::Complete { .. }
+        ));
         assert_eq!(d.task_id.as_deref(), Some("steer-test-1"));
         assert!(d.content.contains("Inspect git status"));
     }

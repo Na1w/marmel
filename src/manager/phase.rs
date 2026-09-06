@@ -484,18 +484,22 @@ impl Plan {
         // Resolve the task id: the explicit override takes precedence, falling
         // back to the marker's own `(t-xxx)` token. Own the id so no borrow is
         // held past the local `marker`.
-        let tid = task_id.map(|t| {
-            t.trim()
-                .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
-                .trim()
-                .to_string()
-        }).or_else(|| {
-            if let MissionMarker::Complete { task_id } = &marker {
-                task_id.clone()
-            } else {
-                None
-            }
-        });
+        let tid = task_id
+            .map(|t| {
+                t.trim()
+                    .trim_matches(|c| {
+                        c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\''
+                    })
+                    .trim()
+                    .to_string()
+            })
+            .or_else(|| {
+                if let MissionMarker::Complete { task_id } = &marker {
+                    task_id.clone()
+                } else {
+                    None
+                }
+            });
         let Some(tid) = tid else {
             tracing::warn!("check_plan_on_marker: No task_id resolved from marker {marker:?}");
             return Ok(false);

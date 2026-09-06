@@ -323,14 +323,7 @@ pub async fn run_session(
                 plan: Some(&plan),
                 ctx: Some(&mut ctx),
             };
-            let assistant = match chat_client_turn(
-                &client,
-                msgs,
-                &stream_cfg,
-                &mut bridge,
-            )
-            .await
-            {
+            let assistant = match chat_client_turn(&client, msgs, &stream_cfg, &mut bridge).await {
                 Ok(m) => m,
                 Err(e) => {
                     let category = classify_llm_error(&e);

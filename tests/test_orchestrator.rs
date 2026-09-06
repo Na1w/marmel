@@ -29,7 +29,7 @@ use marmennill::agents::{Agent, DelegationRequest, MissionMarker};
 use marmennill::harness::HarnessStats;
 use marmennill::llm::ChatClient;
 use marmennill::orchestrator::{
-    handle_delegate_task, DelegationEvent, OrchestratorManager, RecursionDepth,
+    DelegationEvent, OrchestratorManager, RecursionDepth, handle_delegate_task,
 };
 use std::sync::Arc;
 
@@ -305,5 +305,8 @@ async fn test_handle_delegate_task_synchronous_inside_async_context() {
     });
 
     let res = handle_delegate_task(&args);
-    assert!(res.is_ok(), "handle_delegate_task must not panic in async context");
+    assert!(
+        res.is_ok(),
+        "handle_delegate_task must not panic in async context"
+    );
 }

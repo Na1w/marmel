@@ -335,8 +335,7 @@ impl ChatClient {
                 raw,
                 tool_calls,
             };
-            let out_toks =
-                count_reply_tokens(&reply.content, &reply.reasoning, &reply.tool_calls);
+            let out_toks = count_reply_tokens(&reply.content, &reply.reasoning, &reply.tool_calls);
             record_tokens_out(out_toks);
             let elapsed = req_start.elapsed().as_millis();
             crate::debug_log::log_llm_response(&url, &req_body.model, 200, elapsed, &reply);

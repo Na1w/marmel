@@ -40,10 +40,9 @@ pub use plan_summary::generate_plan_progress_summary;
 pub use registry::SpecialistRegistry;
 use std::sync::Arc;
 pub use steer::{
-    arbitrate_steer, arbitrate_steer_stream, arbitrate_steer_stream_with_fallback,
-    arbitrate_steer_with_fallback, execute_steer_subtask, extract_tasks_to_delegate,
-    resolve_steer_outcome, SteerDecision, SteerOutcome, SteerSubtaskDecision,
-    StreamingResponseExtractor,
+    SteerDecision, SteerOutcome, SteerSubtaskDecision, StreamingResponseExtractor, arbitrate_steer,
+    arbitrate_steer_stream, arbitrate_steer_stream_with_fallback, arbitrate_steer_with_fallback,
+    execute_steer_subtask, extract_tasks_to_delegate, resolve_steer_outcome,
 };
 pub use workers::{
     ActiveWorkerGuard, ActiveWorkerInfo, format_duration_human, get_active_specialist_context_str,
@@ -630,7 +629,9 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
 
     let deliverable = if let Ok(handle) = tokio::runtime::Handle::try_current() {
         std::thread::scope(|s| {
-            s.spawn(|| handle.block_on(manager.delegate(req))).join().unwrap()
+            s.spawn(|| handle.block_on(manager.delegate(req)))
+                .join()
+                .unwrap()
         })
     } else {
         futures::executor::block_on(manager.delegate(req))

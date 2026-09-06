@@ -148,15 +148,24 @@ impl TuiRenderer {
         // Refresh the plan content from disk (live check-off updates), cached to avoid synchronous disk I/O on every frame.
         let plan_path = std::path::Path::new(crate::agent::phase::MARMEL_DIR)
             .join(crate::agent::phase::PLAN_FILE);
-        let archive_path = std::path::Path::new(crate::agent::phase::MARMEL_DIR)
-            .join("execution_plan_archive.md");
+        let archive_path =
+            std::path::Path::new(crate::agent::phase::MARMEL_DIR).join("execution_plan_archive.md");
 
-        if self.last_plan_check.elapsed() >= std::time::Duration::from_millis(250) || self.plan_content.is_empty() {
+        if self.last_plan_check.elapsed() >= std::time::Duration::from_millis(250)
+            || self.plan_content.is_empty()
+        {
             self.last_plan_check = std::time::Instant::now();
-            let current_plan_mtime = std::fs::metadata(&plan_path).ok().and_then(|m| m.modified().ok());
-            let current_archive_mtime = std::fs::metadata(&archive_path).ok().and_then(|m| m.modified().ok());
+            let current_plan_mtime = std::fs::metadata(&plan_path)
+                .ok()
+                .and_then(|m| m.modified().ok());
+            let current_archive_mtime = std::fs::metadata(&archive_path)
+                .ok()
+                .and_then(|m| m.modified().ok());
 
-            if current_plan_mtime != self.plan_mtime || current_archive_mtime != self.archive_mtime || self.plan_content.is_empty() {
+            if current_plan_mtime != self.plan_mtime
+                || current_archive_mtime != self.archive_mtime
+                || self.plan_content.is_empty()
+            {
                 self.plan_mtime = current_plan_mtime;
                 self.archive_mtime = current_archive_mtime;
 

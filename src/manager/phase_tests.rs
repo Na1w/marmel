@@ -188,12 +188,15 @@ fn test_mission_marker_parse() {
     assert!(matches!(m, MissionMarker::Replan { .. }));
 
     // MISSION COMPLETE wins over earlier mentions of failed.
-    let m = MissionMarker::parse("Previous attempt failed with error. MISSION COMPLETE (t-008)").unwrap();
+    let m = MissionMarker::parse("Previous attempt failed with error. MISSION COMPLETE (t-008)")
+        .unwrap();
     assert!(m.is_complete());
 
     // Benign test counters like "0 failed" must not be parsed as Failed.
     assert!(MissionMarker::parse("test result: ok. 10 passed; 0 failed").is_none());
-    let m = MissionMarker::parse("test result: ok. 10 passed; 0 failed\n\nMISSION COMPLETE (t-009)").unwrap();
+    let m =
+        MissionMarker::parse("test result: ok. 10 passed; 0 failed\n\nMISSION COMPLETE (t-009)")
+            .unwrap();
     assert!(m.is_complete());
 
     // No marker -> None (never auto-check).

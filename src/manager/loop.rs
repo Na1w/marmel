@@ -32,9 +32,7 @@ use crate::agents::{Agent, DelegationRequest, Deliverable};
 use crate::harness::monitor::{HarnessMonitor, Intervention};
 use crate::harness::{HarnessStats, ToolCaller, ToolInvocation, ToolResult, dispatch_for};
 use crate::orchestrator::{MAX_EXECUTING_ROUNDS, OrchestratorManager, brief_for_task};
-use crate::tool_names::{
-    TOOL_DELEGATE_TASK, TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_READ_FILE,
-};
+use crate::tool_names::{TOOL_DELEGATE_TASK, TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_READ_FILE};
 use crate::types::{Message, ToolCall};
 
 use super::phase::Plan;
@@ -128,8 +126,9 @@ fn extract_task_id(_name: &str, args: &serde_json::Value) -> Option<String> {
     }
     // Fall back to scanning the raw argument text for `(t-xxx)` or `[t-xxx]`.
     let raw = args.to_string();
-    let re = TASK_ID_RE
-        .get_or_init(|| regex::Regex::new(r"\(?\[?(t-[A-Za-z0-9_-]+)\]?\)?").expect("valid task regex"));
+    let re = TASK_ID_RE.get_or_init(|| {
+        regex::Regex::new(r"\(?\[?(t-[A-Za-z0-9_-]+)\]?\)?").expect("valid task regex")
+    });
     re.captures(&raw).map(|m| m[1].to_string())
 }
 

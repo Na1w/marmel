@@ -241,8 +241,9 @@ pub(crate) fn drain_steer_arbitration_events(
                         }
                         Some("ForwardToWorker") => {
                             steer_queue.push(user_msg);
-                            renderer
-                                .on_event(&Event::Status("Notice forwarded to specialist".to_string()));
+                            renderer.on_event(&Event::Status(
+                                "Notice forwarded to specialist".to_string(),
+                            ));
                             let _ = renderer.flush();
                         }
                         Some("ApprovePlan") => {
