@@ -1387,3 +1387,59 @@ fn test_plan_caching_and_throttling() {
     assert_eq!(renderer.plan_content, "Cached plan");
     assert!(!renderer.plan_is_archived);
 }
+
+#[test]
+fn test_status_bar_displays_right_aligned_elapsed_time() {
+    let mut r = TuiRenderer::new();
+    r.session_start = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(135))
+        .unwrap();
+
+    let backend = ratatui::backend::TestBackend::new(100, 5);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 4, 100, 1);
+            r.render_status(frame, area);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let content: String = (0..100)
+        .map(|x| buffer[(x, 4)].symbol().to_string())
+        .collect();
+
+    assert!(
+        content.contains("Tokens:"),
+        "expected 'Tokens:' on the left, got: {content}"
+    );
+    assert!(
+        content.contains("Elapsed: 2m 15s"),
+        "expected 'Elapsed: 2m 15s' in status bar, got: {content}"
+    );
+    assert!(
+        content.ends_with("Elapsed: 2m 15s "),
+        "expected elapsed time to be right-aligned at the edge of the status bar, got: '{content}'"
+    );
+}
+
+#[test]
+fn test_status_bar_prefers_plan_start_time() {
+    let mut r = TuiRenderer::new();
+    // Simulate session start 30 seconds ago
+    r.session_start = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(30))
+        .unwrap();
+
+    // No plan start yet -> elapsed is ~30s
+    assert!(r.total_project_elapsed().as_secs() >= 30);
+
+    // Now record plan start
+    crate::manager::phase::record_plan_start();
+    // Clean up afterwards
+    defer_clear_plan();
+}
+
+fn defer_clear_plan() {
+    crate::manager::phase::clear_plan_start();
+}

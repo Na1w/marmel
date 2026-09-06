@@ -12,6 +12,7 @@ use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use std::io;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 impl TuiRenderer {
     /// Ensure the per-message wrapped-line cache is up to date for `width`
@@ -863,7 +864,7 @@ impl TuiRenderer {
                     .add_modifier(Modifier::BOLD),
             )
         } else {
-            let status_text = if self.orchestrator_context_tokens > 0 {
+            let left_text = if self.orchestrator_context_tokens > 0 {
                 let ctx_str = Self::format_count(self.orchestrator_context_tokens);
                 format!(
                     " Ctx: {} | Tokens: {} | Status: {}",
@@ -872,6 +873,38 @@ impl TuiRenderer {
             } else {
                 format!(" Tokens: {} | Status: {}", tokens_str, status_str)
             };
+
+            let elapsed_secs = self.total_project_elapsed().as_secs();
+            let right_text = format!(
+                "Elapsed: {} ",
+                crate::orchestrator::workers::format_duration_human(elapsed_secs)
+            );
+
+            let total_width = area.width as usize;
+            let left_w = UnicodeWidthStr::width(left_text.as_str());
+            let right_w = UnicodeWidthStr::width(right_text.as_str());
+
+            let status_text = if total_width > left_w + right_w {
+                let padding = total_width - left_w - right_w;
+                format!("{}{:width$}{}", left_text, "", right_text, width = padding)
+            } else if total_width > right_w {
+                let avail_left = total_width - right_w;
+                let mut truncated = String::new();
+                let mut cur_w = 0;
+                for ch in left_text.chars() {
+                    let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if cur_w + ch_w > avail_left {
+                        break;
+                    }
+                    truncated.push(ch);
+                    cur_w += ch_w;
+                }
+                let padding = avail_left - cur_w;
+                format!("{}{:width$}{}", truncated, "", right_text, width = padding)
+            } else {
+                left_text
+            };
+
             (
                 status_text,
                 Style::default().bg(Color::DarkGray).fg(Color::White),

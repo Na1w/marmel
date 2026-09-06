@@ -133,6 +133,7 @@ pub struct TuiRenderer {
     pub(crate) plan_mtime: Option<std::time::SystemTime>,
     pub(crate) archive_mtime: Option<std::time::SystemTime>,
     pub(crate) plan_is_archived: bool,
+    pub(crate) session_start: std::time::Instant,
 
     /// Estimated total input (prompt) tokens across the session.
     pub tokens_in: usize,
@@ -210,6 +211,18 @@ impl TuiRenderer {
             plan_mtime: None,
             archive_mtime: None,
             plan_is_archived: false,
+            session_start: std::time::Instant::now(),
+        }
+    }
+
+    /// Total duration spent working on the project as a whole.
+    /// Prefers the plan start time (if an execution plan exists/is active)
+    /// combined with session duration, falling back to the current TUI session duration.
+    pub(crate) fn total_project_elapsed(&self) -> std::time::Duration {
+        if let Some((inst, _)) = crate::manager::phase::get_plan_start_time() {
+            inst.elapsed().max(self.session_start.elapsed())
+        } else {
+            self.session_start.elapsed()
         }
     }
 }
