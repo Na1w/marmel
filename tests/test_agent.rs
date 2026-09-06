@@ -64,6 +64,8 @@ fn test_specialist_tool_filtering_and_allowlists() {
     assert!(val_tools.contains(&"grep_search".to_string()));
     assert!(val_tools.contains(&"glob".to_string()));
     assert!(val_tools.contains(&"rebirth".to_string()));
+    assert!(!val_tools.contains(&"write_file".to_string()));
+    assert!(!val_tools.contains(&"replace".to_string()));
     assert!(!val_tools.contains(&"create_plan".to_string()));
     assert!(!val_tools.contains(&"archive_current_plan".to_string()));
 }

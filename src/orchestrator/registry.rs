@@ -93,8 +93,6 @@ impl SpecialistRegistry {
             "src/agents/validator.rs",
             &[
                 "delegate_task",
-                "write_file",
-                "replace",
                 "read_file",
                 "run_command",
                 "grep_search",

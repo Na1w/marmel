@@ -37,8 +37,6 @@ impl Specialist for Validator {
     fn tool_namespaces(&self) -> &[&'static str] {
         &[
             "delegate_task",
-            "write_file",
-            "replace",
             "read_file",
             "run_command",
             "grep_search",
@@ -59,7 +57,12 @@ mod tests {
         assert_eq!(v.name(), Agent::Validator);
         assert!(v.tool_namespaces().contains(&"read_file"));
         assert!(v.tool_namespaces().contains(&"run_command"));
+        assert!(v.tool_namespaces().contains(&"grep_search"));
+        assert!(v.tool_namespaces().contains(&"glob"));
+        assert!(v.tool_namespaces().contains(&"leave_verdict"));
         assert!(v.tool_namespaces().contains(&"rebirth"));
+        assert!(!v.tool_namespaces().contains(&"write_file"));
+        assert!(!v.tool_namespaces().contains(&"replace"));
         assert!(!v.may_recurse());
     }
 }

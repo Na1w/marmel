@@ -102,6 +102,41 @@ fn specialist_permitted_allowlisted_terminal_tool() {
     );
 }
 
+/// Validator is an auditor and must be forbidden from file-modification tools (write_file, replace).
+#[test]
+fn validator_forbidden_from_file_modification_tools() {
+    let tool_write = ToolInvocation {
+        name: "write_file".to_string(),
+        arguments: serde_json::json!({
+            "path": "test.txt",
+            "content": "modified"
+        }),
+    };
+    match dispatch_for(&tool_write, ToolCaller::Specialist(Agent::Validator)) {
+        Err(ToolError::Forbidden { tool: t, caller }) => {
+            assert_eq!(t, "write_file");
+            assert_eq!(caller, "validator");
+        }
+        other => panic!("Validator must be forbidden from write_file, got {other:?}"),
+    }
+
+    let tool_replace = ToolInvocation {
+        name: "replace".to_string(),
+        arguments: serde_json::json!({
+            "path": "test.txt",
+            "old": "a",
+            "new": "b"
+        }),
+    };
+    match dispatch_for(&tool_replace, ToolCaller::Specialist(Agent::Validator)) {
+        Err(ToolError::Forbidden { tool: t, caller }) => {
+            assert_eq!(t, "replace");
+            assert_eq!(caller, "validator");
+        }
+        other => panic!("Validator must be forbidden from replace, got {other:?}"),
+    }
+}
+
 /// REQ-ORCH-001: `create_plan` is Manager-only. Even DeepBrain (allowlist `*`)
 /// must be forbidden from authoring the plan.
 #[test]
