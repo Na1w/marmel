@@ -1,0 +1,25 @@
+[package]
+name = "mcp-deep-research"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Model Context Protocol (MCP) server for SearchWala Deep Research and Ketch documentation lookup"
+
+[[bin]]
+name = "mcp-deep-research"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.44", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.13", features = ["json"] }
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3.17"

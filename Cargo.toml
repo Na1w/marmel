@@ -56,3 +56,9 @@ landlock = "0.4"
 [dev-dependencies]
 tempfile = "3.17"
 wiremock = "0.6"
+
+[workspace]
+members = [
+    ".",
+    "crates/mcp-deep-research",
+]
