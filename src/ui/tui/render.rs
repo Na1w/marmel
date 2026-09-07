@@ -103,22 +103,16 @@ impl TuiRenderer {
     pub(crate) fn estimated_subagent_lines(&self, width: usize) -> usize {
         if let Some(sa) = self.subagents.get(self.selected_subagent_idx) {
             let mut n = 1; // "=== Details for ... ==="
-            if !sa.thinking.is_empty() {
-                if self.show_thought {
-                    n += 2; // "[Thinking]", " thinking"
-                    for line in sa.thinking.lines() {
-                        n += if line.is_empty() {
-                            1
-                        } else {
-                            wrapped_lines(line, width)
-                        };
-                    }
-                    n += 1; // " response"
-                } else {
-                    n += 1; // "[Thinking: ~X tokens / Y chars (Ctrl+T or /thought to view)]"
+            if !sa.thinking.is_empty() && self.show_thought {
+                n += 2; // "[Thinking]", " thinking"
+                for line in sa.thinking.lines() {
+                    n += if line.is_empty() {
+                        1
+                    } else {
+                        wrapped_lines(line, width)
+                    };
                 }
-            } else if sa.is_active && sa.content.is_empty() {
-                n += 1; // "[Status: Active - waiting for model response...]"
+                n += 1; // " response"
             }
             if !sa.content.is_empty() {
                 n += 1; // "[Output]"
@@ -723,16 +717,40 @@ impl TuiRenderer {
         let separator = Block::default()
             .borders(Borders::TOP)
             .border_style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(separator, subagent_chunks[1]);
 
-        // Subagent details (reference §6.4).
-        let details_area = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(2)])
-            .split(subagent_chunks[1])[1];
+        // Subagent details and bottom status bar.
+        let sa_opt = self.subagents.get(self.selected_subagent_idx);
+        let show_status_bar = if let Some(sa) = sa_opt {
+            sa.is_active || !sa.thinking.is_empty()
+        } else {
+            false
+        };
+
+        let (details_area, status_area_opt) = if show_status_bar && subagent_chunks[1].height >= 4 {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1), // Top separator border
+                    Constraint::Min(2),    // Scrollable details area
+                    Constraint::Length(1), // Bottom subagent status bar
+                ])
+                .split(subagent_chunks[1]);
+            frame.render_widget(separator, chunks[0]);
+            (chunks[1], Some(chunks[2]))
+        } else {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1), // Top separator border
+                    Constraint::Min(2),    // Scrollable details area
+                ])
+                .split(subagent_chunks[1]);
+            frame.render_widget(separator, chunks[0]);
+            (chunks[1], None)
+        };
 
         let mut detail_lines = Vec::new();
-        if let Some(sa) = self.subagents.get(self.selected_subagent_idx) {
+        if let Some(sa) = sa_opt {
             detail_lines.push(Line::styled(
                 format!("=== Details for {} ===", sa.name),
                 Style::default()
@@ -740,44 +758,22 @@ impl TuiRenderer {
                     .add_modifier(Modifier::BOLD),
             ));
 
-            if !sa.thinking.is_empty() {
-                if self.show_thought {
-                    detail_lines.push(Line::styled(
-                        "[Thinking]",
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                    let think_style = Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC);
-                    detail_lines.push(Line::styled(" thinking", think_style));
-                    for line in sa.thinking.lines() {
-                        let line = format_terminal_math(line);
-                        detail_lines.push(Line::styled(line, think_style));
-                    }
-                    detail_lines.push(Line::styled(" response", think_style));
-                } else {
-                    let chars = sa.thinking.len();
-                    let tok_count = chars.div_ceil(4);
-                    detail_lines.push(Line::styled(
-                        format!(
-                            "[Thinking: ~{} tokens / {} chars (Ctrl+T or /thought to view)]",
-                            Self::format_count(tok_count),
-                            Self::format_count(chars)
-                        ),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    ));
-                }
-            } else if sa.is_active && sa.content.is_empty() {
+            if !sa.thinking.is_empty() && self.show_thought {
                 detail_lines.push(Line::styled(
-                    "[Status: Active - waiting for model response...]",
+                    "[Thinking]",
                     Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC),
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
                 ));
+                let think_style = Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC);
+                detail_lines.push(Line::styled(" thinking", think_style));
+                for line in sa.thinking.lines() {
+                    let line = format_terminal_math(line);
+                    detail_lines.push(Line::styled(line, think_style));
+                }
+                detail_lines.push(Line::styled(" response", think_style));
             }
 
             if !sa.content.is_empty() {
@@ -833,6 +829,70 @@ impl TuiRenderer {
             .wrap(Wrap { trim: false })
             .scroll((self.subagent_scroll, 0));
         frame.render_widget(detail_paragraph, details_area);
+
+        // Subagent bottom status bar (rendered like main UI status bar).
+        if let (Some(status_area), Some(sa)) = (status_area_opt, sa_opt) {
+            let frames = ["…", "..", "."];
+            let idx = (self.frame_counter % frames.len() as u64) as usize;
+            let dots = if sa.is_active { frames[idx] } else { "" };
+
+            let (bar_text, bar_style) = if !sa.thinking.is_empty()
+                && (sa.content.is_empty() || !self.show_thought)
+            {
+                let chars = sa.thinking.len();
+                let tok_count = chars.div_ceil(4);
+                let text = format!(
+                    " [Thinking: ~{} tokens / {} chars] {}",
+                    Self::format_count(tok_count),
+                    Self::format_count(chars),
+                    dots
+                );
+                (
+                    text,
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else if sa.is_active && sa.content.is_empty() {
+                let text = format!(" [Status: Active - waiting for model response...] {}", dots);
+                (text, Style::default().bg(Color::DarkGray).fg(Color::Cyan))
+            } else if sa.is_active {
+                let text = if !sa.thinking.is_empty() {
+                    let tok_count = sa.thinking.len().div_ceil(4);
+                    format!(
+                        " [Status: Active - streaming output... | Thinking: ~{} tokens] {}",
+                        Self::format_count(tok_count),
+                        dots
+                    )
+                } else {
+                    format!(" [Status: Active - streaming output...] {}", dots)
+                };
+                (text, Style::default().bg(Color::DarkGray).fg(Color::Green))
+            } else if !sa.thinking.is_empty() {
+                let chars = sa.thinking.len();
+                let tok_count = chars.div_ceil(4);
+                let text = format!(
+                    " [Thinking: ~{} tokens / {} chars]",
+                    Self::format_count(tok_count),
+                    Self::format_count(chars)
+                );
+                (
+                    text,
+                    Style::default().bg(Color::DarkGray).fg(Color::DarkGray),
+                )
+            } else {
+                (
+                    " [Status: Idle]".to_string(),
+                    Style::default().bg(Color::DarkGray).fg(Color::DarkGray),
+                )
+            };
+
+            let status_p = Paragraph::new(bar_text)
+                .style(bar_style)
+                .alignment(ratatui::layout::Alignment::Left);
+            frame.render_widget(status_p, status_area);
+        }
 
         // F4: vertical scrollbar on the subagent-details pane.
         if max_scroll > 0 {

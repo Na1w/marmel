@@ -233,8 +233,9 @@ fn estimated_subagent_lines_counts_sections() {
         is_active: true,
         context_tokens: 0,
     });
-    // Default (show_thought = false): 1 (header) + 1 ([Thinking: ...]) + 1 ([Output]) + 1 (out) + 1 ([Logs]) + 1 (- log1) = 6
-    assert_eq!(r.estimated_subagent_lines(80), 6);
+    // Default (show_thought = false, thinking moved to bottom status bar):
+    // 1 (header) + 1 ([Output]) + 1 (out) + 1 ([Logs]) + 1 (- log1) = 5
+    assert_eq!(r.estimated_subagent_lines(80), 5);
     // When show_thought = true: 1 (header) + 2 ([Thinking], " thinking") + 1 (think) + 1 (" response")
     // + 1 ([Output]) + 1 (out) + 1 ([Logs]) + 1 (- log1) = 9
     r.show_thought = true;
@@ -1774,4 +1775,17 @@ fn test_tui_renders_subagent_thinking_progress_and_output_during_streaming() {
         screen4.contains("# NES Architecture Research Deliverable"),
         "output content remains visible when show_thought=true, got:\n{screen4}"
     );
+}
+
+#[test]
+fn test_tui_help_command_includes_ctrl_t() {
+    let mut r = TuiRenderer::new();
+    r.input_text = "/help".to_string();
+    r.submit();
+
+    let help_msg = r
+        .messages
+        .last()
+        .expect("should have emitted /help message");
+    assert!(help_msg.contains("Ctrl+T - toggle the thinking block display"));
 }

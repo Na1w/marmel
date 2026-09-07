@@ -21,6 +21,9 @@ max_context_tokens = 8192
 # Preserve reasoning/thinking content in the transcript when enabled.
 preserve_thinking = true
 
+# Maximum reasoning/thinking tokens per turn before cutting off runaway reasoning.
+max_thinking_tokens = 16384
+
 # Timeout (seconds) for a single run_command / PTY invocation.
 command_timeout_secs = 60
 
@@ -39,6 +42,7 @@ enabled = true
 repetition_threshold = 5
 min_pattern_len = 7
 max_stream_tokens = 32768
+max_thinking_tokens = 16384
 
 # ---------------------------------------------------------------------------
 # Orchestration — Manager + Specialist Subagents (REQ-ORCH-001…005 / SPEC Part 5)
@@ -70,6 +74,8 @@ validator_model = "gemma4:cloud"
 # validator_backend_url = "http://localhost:11434/v1"
 # validator_auth_token = ""
 max_validator_iterations = 5
+# Optional reasoning budget / max thinking tokens override for this specialist:
+# max_thinking_tokens = 8192
 
 [orchestration.specialists.debugger]
 tools = ["delegate_task", "write_file", "replace", "read_file", "run_command", "grep_search", "glob", "pty_spawn", "pty_write", "pty_read", "pty_close", "pty_list"]
