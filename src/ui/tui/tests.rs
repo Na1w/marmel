@@ -233,8 +233,8 @@ fn estimated_subagent_lines_counts_sections() {
         is_active: true,
         context_tokens: 0,
     });
-    // Default (show_thought = false): 1 (header) + 1 ([Logs]) + 1 (- log1) = 3
-    assert_eq!(r.estimated_subagent_lines(80), 3);
+    // Default (show_thought = false): 1 (header) + 1 ([Thinking: ...]) + 1 ([Output]) + 1 (out) + 1 ([Logs]) + 1 (- log1) = 6
+    assert_eq!(r.estimated_subagent_lines(80), 6);
     // When show_thought = true: 1 (header) + 2 ([Thinking], " thinking") + 1 (think) + 1 (" response")
     // + 1 ([Output]) + 1 (out) + 1 ([Logs]) + 1 (- log1) = 9
     r.show_thought = true;
@@ -605,19 +605,23 @@ fn test_subagent_thinking_visibility_controlled_by_show_thought() {
     let text_off = lines1.join("\n");
     assert!(
         !text_off.contains("[Thinking]"),
-        "subagent [Thinking] should be hidden when show_thought=false"
+        "subagent full [Thinking] block should be hidden when show_thought=false"
     );
     assert!(
         !text_off.contains("secret subagent thoughts"),
-        "subagent thoughts should be hidden when show_thought=false"
+        "subagent raw thoughts should be hidden when show_thought=false"
     );
     assert!(
-        !text_off.contains("[Output]"),
-        "subagent [Output] should be hidden when show_thought=false"
+        text_off.contains("[Thinking:"),
+        "subagent collapsed [Thinking: ~...] indicator should be shown when show_thought=false"
     );
     assert!(
-        !text_off.contains("deliverable code"),
-        "subagent output content should be hidden when show_thought=false"
+        text_off.contains("[Output]"),
+        "subagent [Output] header should be visible when show_thought=false"
+    );
+    assert!(
+        text_off.contains("deliverable code"),
+        "subagent output content should be visible when show_thought=false"
     );
     assert!(text_off.contains("[Logs]"));
     assert!(text_off.contains("log step"));
@@ -1554,5 +1558,211 @@ fn test_chat_auto_scroll_shows_final_lines_of_multiline_markdown_response() {
     assert!(
         rendered.contains("Bottom line 2"),
         "expected bottom line to be visible in chat viewport, got:\n{rendered}"
+    );
+}
+
+#[test]
+fn test_parallel_specialist_streaming_routes_to_correct_subagents() {
+    let mut r = TuiRenderer::new();
+
+    // Start two parallel subagents
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Started {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-002".to_string()),
+        },
+    ));
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Started {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-003".to_string()),
+        },
+    ));
+
+    // Stream interleaved thinking and content for both specialists
+    r.on_event(&Event::SubagentThinking {
+        agent_tag: "coder-t-002".to_string(),
+        text: "Thinking about Cartridge...".to_string(),
+    });
+    r.on_event(&Event::SubagentThinking {
+        agent_tag: "coder-t-003".to_string(),
+        text: "Thinking about 6502 CPU...".to_string(),
+    });
+    r.on_event(&Event::SubagentMessage {
+        agent_tag: "coder-t-002".to_string(),
+        text: "Cartridge code written.".to_string(),
+    });
+    r.on_event(&Event::SubagentMessage {
+        agent_tag: "coder-t-003".to_string(),
+        text: "CPU instructions written.".to_string(),
+    });
+
+    let s2 = r
+        .subagents
+        .iter()
+        .find(|s| s.name == "coder-t-002")
+        .unwrap();
+    let s3 = r
+        .subagents
+        .iter()
+        .find(|s| s.name == "coder-t-003")
+        .unwrap();
+
+    // coder-t-002 only received its own chunks
+    assert_eq!(s2.thinking, "Thinking about Cartridge...");
+    assert_eq!(s2.content, "Cartridge code written.");
+
+    // coder-t-003 only received its own chunks
+    assert_eq!(s3.thinking, "Thinking about 6502 CPU...");
+    assert_eq!(s3.content, "CPU instructions written.");
+
+    // Manager chat was never polluted with subagent output
+    assert_eq!(r.current_thought, "");
+    assert_eq!(r.current_content, "");
+}
+
+#[test]
+fn test_tui_renders_subagent_thinking_progress_and_output_during_streaming() {
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    let mut r = TuiRenderer::new();
+    r.set_subagents(vec![SubagentDetail {
+        name: "researcher-t-001".to_string(),
+        task_id: Some("t-001".to_string()),
+        prompt: "Research NES CPU".to_string(),
+        started_at: None,
+        worked_duration: std::time::Duration::ZERO,
+        last_activity_at: None,
+        logs: vec![],
+        thinking: String::new(),
+        content: String::new(),
+        is_active: true,
+        context_tokens: 0,
+    }]);
+
+    // 1. When subagent is active but has not produced tokens yet:
+    // It must render an active waiting indicator (never blank).
+    terminal
+        .draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 0, 100, 30);
+            r.render_subagents(frame, area);
+        })
+        .unwrap();
+
+    let mut screen1 = String::new();
+    let buf1 = terminal.backend().buffer();
+    for y in 0..30 {
+        let line: String = (0..100)
+            .map(|x| buf1[(x, y)].symbol().to_string())
+            .collect();
+        screen1.push_str(&line);
+        screen1.push('\n');
+    }
+    assert!(
+        screen1.contains("researcher-t-001"),
+        "subagent header should be visible"
+    );
+    assert!(
+        screen1.contains("[Status: Active - waiting for model response...]"),
+        "active waiting indicator must be shown when subagent is active with 0 tokens, got:\n{screen1}"
+    );
+
+    // 2. Stream tokens of reasoning/thinking:
+    r.on_event(&Event::SubagentThinking {
+        agent_tag: "researcher-t-001".to_string(),
+        text: "Analyzing 6502 addressing modes and cycle timings in detail.".to_string(),
+    });
+
+    terminal
+        .draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 0, 100, 30);
+            r.render_subagents(frame, area);
+        })
+        .unwrap();
+
+    let mut screen2 = String::new();
+    let buf2 = terminal.backend().buffer();
+    for y in 0..30 {
+        let line: String = (0..100)
+            .map(|x| buf2[(x, y)].symbol().to_string())
+            .collect();
+        screen2.push_str(&line);
+        screen2.push('\n');
+    }
+    // With show_thought = false, the collapsed thinking indicator is rendered:
+    assert!(
+        screen2.contains("[Thinking: ~"),
+        "collapsed thinking indicator must be visible when thinking is non-empty, got:\n{screen2}"
+    );
+    assert!(
+        !screen2.contains("Analyzing 6502 addressing modes"),
+        "raw thinking text should be collapsed when show_thought=false"
+    );
+
+    // 3. Stream assistant output content:
+    r.on_event(&Event::SubagentMessage {
+        agent_tag: "researcher-t-001".to_string(),
+        text: "# NES Architecture Research Deliverable\n".to_string(),
+    });
+
+    terminal
+        .draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 0, 100, 30);
+            r.render_subagents(frame, area);
+        })
+        .unwrap();
+
+    let mut screen3 = String::new();
+    let buf3 = terminal.backend().buffer();
+    for y in 0..30 {
+        let line: String = (0..100)
+            .map(|x| buf3[(x, y)].symbol().to_string())
+            .collect();
+        screen3.push_str(&line);
+        screen3.push('\n');
+    }
+    // Output MUST be unconditionally visible regardless of show_thought:
+    assert!(
+        screen3.contains("[Output]"),
+        "[Output] header must be visible even when show_thought=false, got:\n{screen3}"
+    );
+    assert!(
+        screen3.contains("# NES Architecture Research Deliverable"),
+        "subagent content must be visible even when show_thought=false, got:\n{screen3}"
+    );
+
+    // 4. Toggle thought display ON via /thought:
+    r.input_text = "/thought".to_string();
+    r.submit();
+    assert!(r.show_thought);
+
+    terminal
+        .draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 0, 100, 30);
+            r.render_subagents(frame, area);
+        })
+        .unwrap();
+
+    let mut screen4 = String::new();
+    let buf4 = terminal.backend().buffer();
+    for y in 0..30 {
+        let line: String = (0..100)
+            .map(|x| buf4[(x, y)].symbol().to_string())
+            .collect();
+        screen4.push_str(&line);
+        screen4.push('\n');
+    }
+    assert!(
+        screen4.contains("[Thinking]"),
+        "full [Thinking] block must be visible when show_thought=true, got:\n{screen4}"
+    );
+    assert!(
+        screen4.contains("Analyzing 6502 addressing modes and cycle timings in detail."),
+        "raw thinking text must be visible when show_thought=true, got:\n{screen4}"
+    );
+    assert!(
+        screen4.contains("# NES Architecture Research Deliverable"),
+        "output content remains visible when show_thought=true, got:\n{screen4}"
     );
 }

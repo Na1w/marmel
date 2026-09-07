@@ -71,10 +71,6 @@ pub async fn run_specialist_live(
         std::sync::Arc::new(crate::harness::HarnessStats::new()),
         mon_cfg,
     );
-    let mut rep_detector = crate::harness::monitor::RepetitionDetector::new(
-        mon_cfg.repetition_threshold,
-        mon_cfg.min_pattern_len,
-    );
     let mut tools_executed_count = 0usize;
     let mut _turn = 0usize;
 
@@ -97,6 +93,10 @@ pub async fn run_specialist_live(
             crate::orchestrator::set_active_worker_status(&_active_guard.0, "Aborted");
             return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
         }
+        let mut rep_detector = crate::harness::monitor::RepetitionDetector::new(
+            mon_cfg.repetition_threshold,
+            mon_cfg.min_pattern_len,
+        );
         crate::orchestrator::update_active_worker_progress(
             &_active_guard.0,
             _turn,
@@ -170,8 +170,12 @@ pub async fn run_specialist_live(
             }
         }
 
-        let assistant_content = if reply.content.is_empty() && !reply.reasoning.is_empty() {
-            Some("[Thinking completed without content or tool calls]".to_string())
+        let assistant_content = if reply.content.is_empty() {
+            if tool_calls.is_empty() && !reply.reasoning.is_empty() {
+                Some("[Thinking completed without content or tool calls]".to_string())
+            } else {
+                None
+            }
         } else {
             Some(reply.content.clone())
         };
@@ -186,12 +190,7 @@ pub async fn run_specialist_live(
         };
         engine.append(assistant_msg);
 
-        let full_text = if reply.reasoning.is_empty() {
-            reply.content.clone()
-        } else {
-            format!("{}\n{}", reply.reasoning, reply.content)
-        };
-        let is_repeating = rep_triggered || monitor.feed_text(&full_text);
+        let is_repeating = rep_triggered || monitor.feed_text(&reply.content);
 
         if tool_calls.is_empty() {
             if budget_exceeded && nudge_count < 2 {
@@ -232,7 +231,7 @@ pub async fn run_specialist_live(
                         mon_cfg.min_pattern_len,
                     );
                     engine.append(crate::types::Message::User {
-                        content: "SYSTEM NOTICE: Repetitive generation loop detected in your thoughts or responses. Terminate conversational debate immediately and invoke your required tools (such as `read_file`, `write_file`, `run_command`, etc.) to perform the required work, or conclude with 'MISSION COMPLETE'.".to_string(),
+                        content: "SYSTEM NOTICE: Repetitive generation loop detected in your responses. Terminate conversational debate immediately and invoke your required tools (such as `read_file`, `write_file`, `run_command`, etc.) to perform the required work, or conclude with 'MISSION COMPLETE'.".to_string(),
                     });
                     continue;
                 } else {

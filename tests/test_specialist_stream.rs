@@ -31,13 +31,13 @@ async fn test_preemptible_stream_sink_forwards_all_stream_events_to_orchestrator
 
     let ev1 = event_rx.try_recv().ok();
     assert!(
-        matches!(ev1, Some(marmennill::ui::Event::Thinking(ref t)) if t == "thinking chunk"),
+        matches!(ev1, Some(marmennill::ui::Event::SubagentThinking { ref agent_tag, ref text }) if agent_tag == "coder-t-1" && text == "thinking chunk"),
         "expected thinking chunk on UI bus, got: {ev1:?}"
     );
 
     let ev2 = event_rx.try_recv().ok();
     assert!(
-        matches!(ev2, Some(marmennill::ui::Event::Message(ref c)) if c == "content chunk"),
+        matches!(ev2, Some(marmennill::ui::Event::SubagentMessage { ref agent_tag, ref text }) if agent_tag == "coder-t-1" && text == "content chunk"),
         "expected content chunk on UI bus, got: {ev2:?}"
     );
     assert_eq!(status_rx.try_recv().ok(), Some("status note".to_string()));
@@ -85,9 +85,11 @@ async fn test_mock_specialist_live_execution_streams_thinking_and_content_to_ui(
         "You are the Coder specialist.".to_string(),
         &req,
     );
-    let mut cfg = marmennill::config::Config::default();
-    cfg.backend_url = format!("{}/v1", server.uri());
-    cfg.model = "test-model".to_string();
+    let cfg = marmennill::config::Config {
+        backend_url: format!("{}/v1", server.uri()),
+        model: "test-model".to_string(),
+        ..Default::default()
+    };
     let token = tokio_util::sync::CancellationToken::new();
 
     let deliverable = marmennill::agents::run_specialist_live(
@@ -114,23 +116,23 @@ async fn test_mock_specialist_live_execution_streams_thinking_and_content_to_ui(
         statuses.push(st);
     }
 
-    // Assert that the specialist's thinking tokens were delivered to the UI event bus
+    // Assert that the specialist's thinking tokens were delivered to the UI event bus tagged for coder-t-001
     let has_thinking = events.iter().any(|ev| {
-        matches!(ev, marmennill::ui::Event::Thinking(text) if text.contains("Analyzing codebase structure."))
+        matches!(ev, marmennill::ui::Event::SubagentThinking { agent_tag, text } if agent_tag == "coder-t-001" && text.contains("Analyzing codebase structure."))
     });
     assert!(
         has_thinking,
-        "Expected Event::Thinking on UI bus from specialist stream, but got events: {:?}",
+        "Expected Event::SubagentThinking for coder-t-001 on UI bus, but got events: {:?}",
         events
     );
 
-    // Assert that the specialist's content tokens were delivered to the UI event bus
+    // Assert that the specialist's content tokens were delivered to the UI event bus tagged for coder-t-001
     let has_message = events.iter().any(|ev| {
-        matches!(ev, marmennill::ui::Event::Message(text) if text.contains("Implementing file write now."))
+        matches!(ev, marmennill::ui::Event::SubagentMessage { agent_tag, text } if agent_tag == "coder-t-001" && text.contains("Implementing file write now."))
     });
     assert!(
         has_message,
-        "Expected Event::Message on UI bus from specialist stream, but got events: {:?}",
+        "Expected Event::SubagentMessage for coder-t-001 on UI bus, but got events: {:?}",
         events
     );
 

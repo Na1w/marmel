@@ -342,6 +342,40 @@ impl Renderer for TuiRenderer {
                     sa.last_activity_at = Some(std::time::Instant::now());
                 }
             }
+            Event::SubagentMessage { agent_tag, text } => {
+                self.waiting_for_token_since = None;
+                let tok_count = tiktoken_rs::cl100k_base_singleton()
+                    .encode_ordinary(text)
+                    .len();
+                self.tokens_out = self.tokens_out.saturating_add(tok_count);
+                if let Some(sa) = self.subagents.iter_mut().find(|s| s.name == *agent_tag) {
+                    sa.content.push_str(text);
+                    sa.last_activity_at = Some(std::time::Instant::now());
+                } else {
+                    self.upsert_subagent(agent_tag, true, "running");
+                    if let Some(sa) = self.subagents.iter_mut().find(|s| s.name == *agent_tag) {
+                        sa.content.push_str(text);
+                        sa.last_activity_at = Some(std::time::Instant::now());
+                    }
+                }
+            }
+            Event::SubagentThinking { agent_tag, text } => {
+                self.waiting_for_token_since = None;
+                let tok_count = tiktoken_rs::cl100k_base_singleton()
+                    .encode_ordinary(text)
+                    .len();
+                self.tokens_out = self.tokens_out.saturating_add(tok_count);
+                if let Some(sa) = self.subagents.iter_mut().find(|s| s.name == *agent_tag) {
+                    sa.thinking.push_str(text);
+                    sa.last_activity_at = Some(std::time::Instant::now());
+                } else {
+                    self.upsert_subagent(agent_tag, true, "running");
+                    if let Some(sa) = self.subagents.iter_mut().find(|s| s.name == *agent_tag) {
+                        sa.thinking.push_str(text);
+                        sa.last_activity_at = Some(std::time::Instant::now());
+                    }
+                }
+            }
             Event::ToolCall(text) => {
                 self.waiting_for_token_since = None;
                 let tok_count = tiktoken_rs::cl100k_base_singleton()

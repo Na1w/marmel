@@ -243,9 +243,11 @@ impl<'a> TurnStreamHandler<'a> {
         let rep_det = &mut *self.rep_detector;
         let rep_trig = &mut self.rep_triggered;
         self.demux.push_delta(chunk, |kind, text| {
-            rep_det.push(text);
-            if rep_det.is_repeating() {
-                *rep_trig = true;
+            if kind == DeltaKind::Content {
+                rep_det.push(text);
+                if rep_det.is_repeating() {
+                    *rep_trig = true;
+                }
             }
             match kind {
                 DeltaKind::Content => {
@@ -283,9 +285,11 @@ impl<'a> TurnStreamHandler<'a> {
         let rep_det = &mut *self.rep_detector;
         let rep_trig = &mut self.rep_triggered;
         self.demux.push_delta(chunk, |kind, text| {
-            rep_det.push(text);
-            if rep_det.is_repeating() {
-                *rep_trig = true;
+            if kind == DeltaKind::Content {
+                rep_det.push(text);
+                if rep_det.is_repeating() {
+                    *rep_trig = true;
+                }
             }
             match kind {
                 DeltaKind::Content => sink.emit(StreamEvent::Content(text.to_string())),
@@ -686,7 +690,10 @@ where
             }
         }
 
-        if was_aborted_by_steer {
+        if was_aborted_by_steer
+            || crate::orchestrator::is_globally_cancelled()
+            || sink.poll_control() == StreamControl::Abort
+        {
             return Ok(assistant);
         }
 

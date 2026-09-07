@@ -80,6 +80,12 @@ impl Renderer for RawRenderer {
             Event::Message(text) => self.push_line("assistant", text),
             Event::SteerResponse(text) => self.push_line("steer", text),
             Event::Thinking(text) => self.push_line("thinking", text),
+            Event::SubagentMessage { agent_tag, text } => {
+                self.push_line(&format!("{agent_tag}:content"), text);
+            }
+            Event::SubagentThinking { agent_tag, text } => {
+                self.push_line(&format!("{agent_tag}:thinking"), text);
+            }
             Event::ToolCall(text) => self.push_line("tool", text),
             Event::ToolResult(text) => self.push_line("tool-result", text),
             Event::Status(text) => self.push_line("status", text),

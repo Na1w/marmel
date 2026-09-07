@@ -50,7 +50,11 @@ pub fn assemble_final_deliverable(
         .replace("mission complete", "REVOKED");
     rejected.push_str(&revision);
     if !rejected.contains("FAILED") && !rejected.contains("REPLAN REQUIRED") {
-        rejected.push_str("\n\nFAILED (Validator rejected deliverable)");
+        if validator_critique.is_some() {
+            rejected.push_str("\n\nFAILED (Validator rejected deliverable)");
+        } else {
+            rejected.push_str("\n\nFAILED (Task incomplete or terminated prematurely)");
+        }
     }
     rejected
 }

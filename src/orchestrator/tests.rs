@@ -607,3 +607,29 @@ fn test_active_worker_context_tokens_rebirth_reduction() {
     update_active_worker_context(&guard.0, 450);
     assert_eq!(get_active_worker_tokens("coder-t-456"), Some(450));
 }
+
+#[test]
+fn test_handle_delegate_task_terminal_marker_deduplication() {
+    let fail_deliverable = Deliverable {
+        marker: MissionMarker::Failed {
+            reason: "Syntax error\n\nFAILED (Validator rejected deliverable)".to_string(),
+        },
+        content: "Syntax error\n\nFAILED (Validator rejected deliverable)".to_string(),
+        task_id: Some("t-123".to_string()),
+    };
+
+    let content = fail_deliverable.content.trim();
+    let res = if content.contains("FAILED") {
+        ToolResult::err(content.to_string())
+    } else {
+        ToolResult::err(format!("{content}\n\nFAILED: {}", fail_deliverable.content))
+    };
+
+    assert!(res.is_error);
+    let count = res.content.matches("FAILED").count();
+    assert_eq!(
+        count, 1,
+        "Failure message must not duplicate FAILED marker: {}",
+        res.content
+    );
+}

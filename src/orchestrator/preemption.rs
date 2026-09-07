@@ -102,10 +102,16 @@ impl StreamSink for PreemptibleStreamSink {
     fn emit(&mut self, event: StreamEvent) {
         match event {
             StreamEvent::Content(text) => {
-                crate::orchestrator::emit_event(crate::ui::Event::Message(text));
+                crate::orchestrator::emit_event(crate::ui::Event::SubagentMessage {
+                    agent_tag: self.agent_tag.clone(),
+                    text,
+                });
             }
             StreamEvent::Thinking(text) => {
-                crate::orchestrator::emit_event(crate::ui::Event::Thinking(text));
+                crate::orchestrator::emit_event(crate::ui::Event::SubagentThinking {
+                    agent_tag: self.agent_tag.clone(),
+                    text,
+                });
             }
             StreamEvent::Status(status) => {
                 crate::orchestrator::emit_status(status);

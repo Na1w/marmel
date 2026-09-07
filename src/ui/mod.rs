@@ -45,6 +45,10 @@ pub enum Event {
     SteerResponse(String),
     /// A chunk of reasoning / thinking-channel content.
     Thinking(String),
+    /// A chunk of visible content from a specific subagent/specialist.
+    SubagentMessage { agent_tag: String, text: String },
+    /// A chunk of reasoning/thinking from a specific subagent/specialist.
+    SubagentThinking { agent_tag: String, text: String },
     /// A tool invocation (rendered as `name(arguments)`).
     ToolCall(String),
     /// The textual result of a tool execution.

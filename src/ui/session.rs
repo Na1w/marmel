@@ -345,7 +345,7 @@ pub async fn run_session(
                 }
             };
 
-            if renderer.aborted() {
+            if renderer.aborted() || crate::orchestrator::is_globally_cancelled() {
                 break;
             }
 
@@ -389,7 +389,12 @@ pub async fn run_session(
             if tool_calls.is_empty() {
                 let current_plan = manager.as_ref().map(|m| m.plan.clone()).unwrap_or_default();
                 let pending = current_plan.pending_tasks();
-                if !steer_abort_requested && !pending.is_empty() && nudge_count < 5 {
+                if !steer_abort_requested
+                    && !renderer.aborted()
+                    && !crate::orchestrator::is_globally_cancelled()
+                    && !pending.is_empty()
+                    && nudge_count < 5
+                {
                     nudge_count += 1;
                     let pending_str = pending.join(", ");
                     renderer.on_event(&Event::Status(format!(

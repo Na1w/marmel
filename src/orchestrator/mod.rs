@@ -680,18 +680,33 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
     //    check-off and the Manager's synthesis can observe it.
     let tid = deliverable.task_id.as_deref().unwrap_or("unknown");
     match &deliverable.marker {
-        MissionMarker::Complete { .. } => Ok(ToolResult::ok(format!(
-            "{}\n\nMISSION COMPLETE ({tid})",
-            deliverable.content
-        ))),
-        MissionMarker::Failed { reason } => Ok(ToolResult::err(format!(
-            "{}\n\nFAILED: {reason}",
-            deliverable.content
-        ))),
-        MissionMarker::Replan { reason } => Ok(ToolResult::err(format!(
-            "{}\n\nREPLAN REQUIRED: {reason}",
-            deliverable.content
-        ))),
+        MissionMarker::Complete { .. } => {
+            let mut res = deliverable.content.trim().to_string();
+            let complete_token = format!("MISSION COMPLETE ({tid})");
+            if !res.contains(&complete_token) {
+                res.push_str("\n\n");
+                res.push_str(&complete_token);
+            }
+            Ok(ToolResult::ok(res))
+        }
+        MissionMarker::Failed { reason } => {
+            let content = deliverable.content.trim();
+            if content.contains("FAILED") {
+                Ok(ToolResult::err(content.to_string()))
+            } else {
+                Ok(ToolResult::err(format!("{content}\n\nFAILED: {reason}")))
+            }
+        }
+        MissionMarker::Replan { reason } => {
+            let content = deliverable.content.trim();
+            if content.contains("REPLAN REQUIRED") {
+                Ok(ToolResult::err(content.to_string()))
+            } else {
+                Ok(ToolResult::err(format!(
+                    "{content}\n\nREPLAN REQUIRED: {reason}"
+                )))
+            }
+        }
     }
 }
 

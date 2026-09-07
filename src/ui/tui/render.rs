@@ -103,18 +103,24 @@ impl TuiRenderer {
     pub(crate) fn estimated_subagent_lines(&self, width: usize) -> usize {
         if let Some(sa) = self.subagents.get(self.selected_subagent_idx) {
             let mut n = 1; // "=== Details for ... ==="
-            if self.show_thought && !sa.thinking.is_empty() {
-                n += 2; // "[Thinking]", " thinking"
-                for line in sa.thinking.lines() {
-                    n += if line.is_empty() {
-                        1
-                    } else {
-                        wrapped_lines(line, width)
-                    };
+            if !sa.thinking.is_empty() {
+                if self.show_thought {
+                    n += 2; // "[Thinking]", " thinking"
+                    for line in sa.thinking.lines() {
+                        n += if line.is_empty() {
+                            1
+                        } else {
+                            wrapped_lines(line, width)
+                        };
+                    }
+                    n += 1; // " response"
+                } else {
+                    n += 1; // "[Thinking: ~X tokens / Y chars (Ctrl+T or /thought to view)]"
                 }
-                n += 1; // " response"
+            } else if sa.is_active && sa.content.is_empty() {
+                n += 1; // "[Status: Active - waiting for model response...]"
             }
-            if self.show_thought && !sa.content.is_empty() {
+            if !sa.content.is_empty() {
                 n += 1; // "[Output]"
                 for line in sa.content.lines() {
                     n += if line.is_empty() {
@@ -734,25 +740,49 @@ impl TuiRenderer {
                     .add_modifier(Modifier::BOLD),
             ));
 
-            if self.show_thought && !sa.thinking.is_empty() {
-                detail_lines.push(Line::styled(
-                    "[Thinking]",
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                let think_style = Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC);
-                detail_lines.push(Line::styled(" thinking", think_style));
-                for line in sa.thinking.lines() {
-                    let line = format_terminal_math(line);
-                    detail_lines.push(Line::styled(line, think_style));
+            if !sa.thinking.is_empty() {
+                if self.show_thought {
+                    detail_lines.push(Line::styled(
+                        "[Thinking]",
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    let think_style = Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC);
+                    detail_lines.push(Line::styled(" thinking", think_style));
+                    for line in sa.thinking.lines() {
+                        let line = format_terminal_math(line);
+                        detail_lines.push(Line::styled(line, think_style));
+                    }
+                    detail_lines.push(Line::styled(" response", think_style));
+                } else {
+                    let chars = sa.thinking.chars().count();
+                    let tok_count = tiktoken_rs::cl100k_base_singleton()
+                        .encode_ordinary(&sa.thinking)
+                        .len();
+                    detail_lines.push(Line::styled(
+                        format!(
+                            "[Thinking: ~{} tokens / {} chars (Ctrl+T or /thought to view)]",
+                            Self::format_count(tok_count),
+                            Self::format_count(chars)
+                        ),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    ));
                 }
-                detail_lines.push(Line::styled(" response", think_style));
+            } else if sa.is_active && sa.content.is_empty() {
+                detail_lines.push(Line::styled(
+                    "[Status: Active - waiting for model response...]",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                ));
             }
 
-            if self.show_thought && !sa.content.is_empty() {
+            if !sa.content.is_empty() {
                 detail_lines.push(Line::styled(
                     "[Output]",
                     Style::default()

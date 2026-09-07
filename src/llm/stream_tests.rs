@@ -151,3 +151,24 @@ async fn test_turn_stream_handler_detects_pause() {
         Some("mid-stream user steer")
     );
 }
+
+#[tokio::test]
+async fn test_turn_stream_handler_does_not_trigger_repetition_on_thinking() {
+    let mut rep = crate::harness::monitor::RepetitionDetector::new(3, 5);
+    let mut handler = TurnStreamHandler::for_sink(1000, &mut rep, true);
+    let mut sink = VecSink::default();
+
+    // Stream repeating thinking blocks
+    let repeating_thought = "<think>\nLet's consider rule 1.\nWait, check condition.\nLet's consider rule 1.\nWait, check condition.\nLet's consider rule 1.\nWait, check condition.\n</think>";
+    let continue_streaming = handler.on_chunk_with_sink(repeating_thought, &mut sink);
+    assert!(
+        continue_streaming,
+        "Thinking chunks must never trip repetition detector"
+    );
+    assert!(!handler.rep_triggered);
+
+    // Stream content
+    let continue_content = handler.on_chunk_with_sink("Here is the final answer.", &mut sink);
+    assert!(continue_content);
+    assert!(!handler.rep_triggered);
+}
