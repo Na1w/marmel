@@ -149,8 +149,8 @@ impl TuiRenderer {
         // Refresh the plan content from disk (live check-off updates), cached to avoid synchronous disk I/O on every frame.
         let plan_path = std::path::Path::new(crate::manager::phase::MARMEL_DIR)
             .join(crate::manager::phase::PLAN_FILE);
-        let archive_path =
-            std::path::Path::new(crate::manager::phase::MARMEL_DIR).join("execution_plan_archive.md");
+        let archive_path = std::path::Path::new(crate::manager::phase::MARMEL_DIR)
+            .join("execution_plan_archive.md");
 
         if self.last_plan_check.elapsed() >= std::time::Duration::from_millis(250)
             || self.plan_content.is_empty()

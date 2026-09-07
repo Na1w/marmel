@@ -17,8 +17,7 @@ fn decision(decision: &str, response: Option<&str>) -> SteerDecision {
 
 #[test]
 fn test_respond_directly_json() {
-    let json =
-        r#"{"decision": "RespondDirectly", "response": "Executing step 2 in the plan."}"#;
+    let json = r#"{"decision": "RespondDirectly", "response": "Executing step 2 in the plan."}"#;
     let d: SteerDecision = serde_json::from_str(json).unwrap();
     assert_eq!(d.decision, "RespondDirectly");
     assert_eq!(d.response.as_deref(), Some("Executing step 2 in the plan."));

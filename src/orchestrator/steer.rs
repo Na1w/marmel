@@ -14,10 +14,10 @@
 //! `QueueAndContinue`) while keeping the JSON shape fully compatible with the
 //! caesar `SteerDecisionResponse` (including `tier`, `model`, and `subtasks`).
 
-use crate::manager::phase::Plan;
 use crate::agents::{Agent, DelegationRequest, Deliverable};
 use crate::harness::HarnessStats;
 use crate::llm::ChatClient;
+use crate::manager::phase::Plan;
 use crate::orchestrator::OrchestratorManager;
 use crate::types::{ChatRequest, Message};
 use serde::{Deserialize, Serialize};
@@ -531,4 +531,3 @@ Your task: Formulate a direct, helpful, and concise answer to the user in the EX
 
     Ok(final_text)
 }
-
