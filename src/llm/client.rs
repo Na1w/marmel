@@ -199,6 +199,13 @@ impl ChatClient {
         if req_body.model.is_empty() {
             req_body.model = self.model.clone();
         }
+        for msg in &mut req_body.messages {
+            if let crate::types::Message::Assistant { content, .. } = msg
+                && content.is_none()
+            {
+                *content = Some(String::new());
+            }
+        }
 
         tracing::info!(
             "Calling LLM backend at {} (model: {}, messages: {})",

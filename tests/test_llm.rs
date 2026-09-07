@@ -56,3 +56,46 @@ fn test_integration_chat_request_payload_construction() {
     assert!(json_str.contains("read_file"));
     assert!(json_str.contains("write_file"));
 }
+
+#[test]
+fn test_assistant_message_content_never_serializes_as_null() {
+    // Both without and with tool calls, content should serialize as "" (empty string)
+    // and never as null, to prevent Ollama / OpenAI backends returning HTTP 400:
+    // 'invalid message content type: <nil>'
+    let msg_no_content = Message::Assistant {
+        content: None,
+        reasoning_content: None,
+        tool_calls: Vec::new(),
+    };
+    let json_no_content = serde_json::to_string(&msg_no_content).unwrap();
+    assert!(
+        json_no_content.contains(r#""content":"""#),
+        "expected content to serialize as empty string, got: {json_no_content}"
+    );
+    assert!(
+        !json_no_content.contains(r#""content":null"#),
+        "content must never serialize as null"
+    );
+
+    let msg_with_tool_call = Message::Assistant {
+        content: None,
+        reasoning_content: None,
+        tool_calls: vec![marmennill::types::ToolCall::new("call_1", "test_fn", "{}")],
+    };
+    let json_with_tool_call = serde_json::to_string(&msg_with_tool_call).unwrap();
+    assert!(
+        json_with_tool_call.contains(r#""content":"""#),
+        "expected content to serialize as empty string, got: {json_with_tool_call}"
+    );
+    assert!(
+        !json_with_tool_call.contains(r#""content":null"#),
+        "content must never serialize as null"
+    );
+
+    // Also verify deserialization handles both null and empty string gracefully
+    let de_null: Message = serde_json::from_str(r#"{"role":"assistant","content":null}"#).unwrap();
+    assert_eq!(de_null.content(), None);
+
+    let de_empty: Message = serde_json::from_str(r#"{"role":"assistant","content":""}"#).unwrap();
+    assert_eq!(de_empty.content(), Some(""));
+}

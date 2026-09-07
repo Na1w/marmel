@@ -189,7 +189,7 @@ pub async fn run_specialist_live(
             if tool_calls.is_empty() && !reply.reasoning.is_empty() {
                 Some("[Thinking completed without content or tool calls]".to_string())
             } else {
-                None
+                Some(String::new())
             }
         } else {
             Some(reply.content.clone())
