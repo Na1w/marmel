@@ -107,7 +107,8 @@ pub(crate) fn format_tool_call_display(name: &str, args_val: &serde_json::Value)
         }
         "grep_search" => {
             let query = args_val
-                .get("query")
+                .get("pattern")
+                .or_else(|| args_val.get("query"))
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
             if let Some(path) = args_val.get("path").and_then(serde_json::Value::as_str) {

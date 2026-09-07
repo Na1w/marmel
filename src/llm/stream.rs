@@ -789,7 +789,12 @@ where
                 nudge.max_attempts()
             )));
             transcript.push(Message::Assistant {
-                content: assistant.content().map(str::to_string),
+                content: match assistant.content() {
+                    Some(c) if !c.trim().is_empty() => Some(c.to_string()),
+                    _ => Some(format!(
+                        "[Reasoning budget reached: exceeded {max_thinking_tokens} token limit]"
+                    )),
+                },
                 reasoning_content: assistant.reasoning_content().map(str::to_string),
                 tool_calls: Vec::new(),
             });

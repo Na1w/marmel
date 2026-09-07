@@ -216,8 +216,10 @@ pub async fn run_specialist_live(
                     "{agent_tag}: reasoning budget ({max_thinking_tokens} tokens) reached — nudging out of thinking"
                 ));
                 engine.replace_last(crate::types::Message::Assistant {
-                    content: if reply.content.is_empty() {
-                        None
+                    content: if reply.content.trim().is_empty() {
+                        Some(format!(
+                            "[Reasoning budget reached: exceeded {max_thinking_tokens} token limit]"
+                        ))
                     } else {
                         Some(reply.content.clone())
                     },
