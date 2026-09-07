@@ -58,6 +58,7 @@ pub async fn run_specialist_live(
 
     let mut final_content = String::new();
     let mut nudge_count = 0u32;
+    let mut consecutive_thinking_nudges = 0u32;
 
     let _active_guard = crate::orchestrator::register_active_worker(
         ctx.task_id.clone(),
@@ -122,7 +123,7 @@ pub async fn run_specialist_live(
         let max_tokens = mon_cfg.max_stream_tokens.max(256);
         let max_thinking_tokens = specialist_cfg
             .and_then(|s| s.max_thinking_tokens)
-            .unwrap_or(mon_cfg.max_thinking_tokens)
+            .unwrap_or(cfg.max_thinking_tokens)
             .max(256);
         let mut sink =
             crate::orchestrator::PreemptibleStreamSink::register(&agent_tag, &specialist_model);
@@ -207,10 +208,28 @@ pub async fn run_specialist_live(
         let is_repeating = rep_triggered || monitor.feed_text(&reply.content);
 
         if tool_calls.is_empty() {
-            if thinking_budget_exceeded && nudge_count < 2 {
+            if thinking_budget_exceeded {
+                consecutive_thinking_nudges += 1;
+                if consecutive_thinking_nudges >= 2 {
+                    tracing::warn!(
+                        "{agent_tag}: thinking budget exceeded twice consecutively — returning REPLAN REQUIRED"
+                    );
+                    crate::orchestrator::emit_status(format!(
+                        "{agent_tag}: reasoning budget exceeded twice consecutively — task too complex, requesting replan"
+                    ));
+                    crate::orchestrator::set_active_worker_status(
+                        &_active_guard.0,
+                        "Replan Required (task too complex)",
+                    );
+                    let task_ref = ctx.task_id.as_deref().unwrap_or("task");
+                    let replan_msg = format!(
+                        "REPLAN REQUIRED ({task_ref}): task too complex — exceeded single-turn reasoning budget of {max_thinking_tokens} tokens twice consecutively without completing work."
+                    );
+                    return Ok(replan_msg);
+                }
                 nudge_count += 1;
                 tracing::warn!(
-                    "{agent_tag}: thinking budget exceeded — injecting reasoning cutoff nudge ({nudge_count}/2)"
+                    "{agent_tag}: thinking budget exceeded — injecting reasoning cutoff nudge ({consecutive_thinking_nudges}/2)"
                 );
                 crate::orchestrator::emit_status(format!(
                     "{agent_tag}: reasoning budget ({max_thinking_tokens} tokens) reached — nudging out of thinking"
@@ -236,6 +255,8 @@ pub async fn run_specialist_live(
                     ),
                 });
                 continue;
+            } else {
+                consecutive_thinking_nudges = 0;
             }
 
             if budget_exceeded && nudge_count < 2 {

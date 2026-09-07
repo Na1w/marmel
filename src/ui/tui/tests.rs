@@ -1411,19 +1411,10 @@ fn test_plan_caching_and_throttling() {
     assert!(!renderer.plan_is_archived);
 }
 
-static PLAN_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[test]
 fn test_status_bar_displays_right_aligned_elapsed_time() {
-    let _lock = PLAN_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let plan = crate::manager::phase::Plan::default();
-    let backup = plan.read().ok().flatten();
-    if backup.is_some() {
-        let _ = plan.clear();
-    }
-    defer_clear_plan();
-    let r = TuiRenderer::new();
-    crate::manager::phase::record_plan_start_at(
+    let mut r = TuiRenderer::new();
+    r.plan_start_time = Some(
         std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(135))
             .unwrap(),
@@ -1443,11 +1434,6 @@ fn test_status_bar_displays_right_aligned_elapsed_time() {
         .map(|x| buffer[(x, 4)].symbol().to_string())
         .collect();
 
-    defer_clear_plan();
-    if let Some(content) = backup {
-        let _ = plan.create(&content);
-    }
-
     assert!(
         content.contains("Tokens:"),
         "expected 'Tokens:' on the left, got: {content}"
@@ -1464,31 +1450,14 @@ fn test_status_bar_displays_right_aligned_elapsed_time() {
 
 #[test]
 fn test_status_bar_prefers_plan_start_time() {
-    let _lock = PLAN_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let plan = crate::manager::phase::Plan::default();
-    let backup = plan.read().ok().flatten();
-    if backup.is_some() {
-        let _ = plan.clear();
-    }
-    let r = TuiRenderer::new();
-    defer_clear_plan();
+    let mut r = TuiRenderer::new();
 
     // No plan start yet -> None (only counts when actively working on a plan)
     assert!(r.total_project_elapsed().is_none());
 
-    // Now record plan start
-    crate::manager::phase::record_plan_start();
+    // Now record plan start locally on renderer
+    r.plan_start_time = Some(std::time::Instant::now());
     assert!(r.total_project_elapsed().is_some());
-
-    // Clean up afterwards
-    defer_clear_plan();
-    if let Some(content) = backup {
-        let _ = plan.create(&content);
-    }
-}
-
-fn defer_clear_plan() {
-    crate::manager::phase::clear_plan_start();
 }
 
 #[test]
@@ -1788,4 +1757,114 @@ fn test_tui_help_command_includes_ctrl_t() {
         .last()
         .expect("should have emitted /help message");
     assert!(help_msg.contains("Ctrl+T - toggle the thinking block display"));
+}
+
+#[test]
+fn test_subagent_thinking_shows_remaining_budget_countdown() {
+    let mut r = TuiRenderer::new();
+    r.default_thinking_budget = 10_000;
+    r.subagents.push(SubagentDetail {
+        name: "coder-t-001".to_string(),
+        task_id: Some("t-001".to_string()),
+        prompt: String::new(),
+        started_at: None,
+        worked_duration: std::time::Duration::ZERO,
+        last_activity_at: None,
+        logs: vec![],
+        thinking: String::new(),
+        content: String::new(),
+        is_active: true,
+        context_tokens: 0,
+    });
+
+    // 1. Stream 4000 characters in Turn 1: ~1000 tokens. 10000 - 1000 = 9000 remaining (~9.0k remaining).
+    r.on_event(&Event::SubagentThinking {
+        agent_tag: "coder-t-001".to_string(),
+        text: "a".repeat(4000),
+    });
+
+    let backend = ratatui::backend::TestBackend::new(100, 20);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 0, 100, 20);
+            r.render_subagents(frame, area);
+        })
+        .unwrap();
+
+    let mut screen = String::new();
+    let buf = terminal.backend().buffer();
+    for y in 0..20 {
+        let line: String = (0..100).map(|x| buf[(x, y)].symbol().to_string()).collect();
+        screen.push_str(&line);
+        screen.push('\n');
+    }
+
+    assert!(
+        screen.contains("9.0k remaining"),
+        "expected countdown '9.0k remaining' in subagent status bar, got:\n{screen}"
+    );
+    assert!(
+        screen.contains("[Thinking: ~1.0k tokens (9.0k remaining) / 4.0k chars]"),
+        "expected full thinking countdown banner, got:\n{screen}"
+    );
+
+    // 2. Stream message content in Turn 1 — thinking countdown must be cleared from status bar
+    r.on_event(&Event::SubagentMessage {
+        agent_tag: "coder-t-001".to_string(),
+        text: "Deliverable work".to_string(),
+    });
+    terminal
+        .draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 0, 100, 20);
+            r.render_subagents(frame, area);
+        })
+        .unwrap();
+    let mut screen2 = String::new();
+    let buf2 = terminal.backend().buffer();
+    for y in 0..20 {
+        let line: String = (0..100)
+            .map(|x| buf2[(x, y)].symbol().to_string())
+            .collect();
+        screen2.push_str(&line);
+        screen2.push('\n');
+    }
+    assert!(
+        screen2.contains("[Status: Active - streaming output...]"),
+        "expected status to switch to streaming output when content arrives, got:\n{screen2}"
+    );
+    assert!(
+        !screen2.contains("[Thinking: ~"),
+        "thinking banner should not be displayed in status bar when output is streaming"
+    );
+
+    // 3. Turn 2 starts: streams 2000 chars of thinking.
+    // Must count PER-TURN (2000 chars -> 500 tokens, 9.5k remaining), NOT accumulated (6000 chars).
+    r.on_event(&Event::SubagentThinking {
+        agent_tag: "coder-t-001".to_string(),
+        text: "b".repeat(2000),
+    });
+    terminal
+        .draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 0, 100, 20);
+            r.render_subagents(frame, area);
+        })
+        .unwrap();
+    let mut screen3 = String::new();
+    let buf3 = terminal.backend().buffer();
+    for y in 0..20 {
+        let line: String = (0..100)
+            .map(|x| buf3[(x, y)].symbol().to_string())
+            .collect();
+        screen3.push_str(&line);
+        screen3.push('\n');
+    }
+    assert!(
+        screen3.contains("9.5k remaining"),
+        "expected Turn 2 countdown '9.5k remaining' (per-turn reset), got:\n{screen3}"
+    );
+    assert!(
+        screen3.contains("[Thinking: ~500 tokens (9.5k remaining) / 2.0k chars]"),
+        "expected Turn 2 per-turn thinking countdown banner, got:\n{screen3}"
+    );
 }

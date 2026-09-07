@@ -271,7 +271,7 @@ impl Plan {
     /// REQ-PLAN-001: write the initial execution plan to `.marmel/execution_plan.md`,
     /// creating the directory if it does not exist.
     pub fn create(&self, plan_markdown: &str) -> Result<()> {
-        let _guard = PLAN_MUTEX.lock().unwrap();
+        let _guard = PLAN_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("creating {}", self.dir.display()))?;
 
@@ -313,7 +313,7 @@ impl Plan {
 
     /// Clear and remove the active execution plan (and archive) from disk.
     pub fn clear(&self) -> Result<()> {
-        let _guard = PLAN_MUTEX.lock().unwrap();
+        let _guard = PLAN_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let path = self.plan_path();
         if path.exists() {
             tracing::warn!(
@@ -396,7 +396,7 @@ impl Plan {
     /// it would silently lose it, so this returns `Ok(None)` when `is_complete()`
     /// is false and leaves every file untouched.
     pub fn archive(&self) -> Result<Option<PathBuf>> {
-        let _guard = PLAN_MUTEX.lock().unwrap();
+        let _guard = PLAN_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         if !self.is_complete() {
             tracing::warn!(
                 "Plan archive skipped: plan is incomplete (contains pending unchecked tasks)."
@@ -443,7 +443,7 @@ impl Plan {
     /// Returns `Ok(true)` if a pending checkbox was flipped, `Ok(false)` if the
     /// task id was not found (or was already checked), and `Err` on IO failure.
     pub fn check_off(&self, task_id: &str) -> Result<bool> {
-        let _guard = PLAN_MUTEX.lock().unwrap();
+        let _guard = PLAN_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let Some(content) = self.read()? else {
             tracing::warn!("check_off({task_id}): no active plan file on disk");
             return Ok(false);

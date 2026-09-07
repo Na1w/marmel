@@ -23,6 +23,7 @@ pub async fn run_session(
 ) -> Result<()> {
     renderer.clear_abort();
     renderer.init()?;
+    renderer.set_thinking_budgets(cfg);
     crate::debug_log::log_session_start(cfg, &cfg.ui_mode);
 
     let plan = manager.as_ref().map(|m| m.plan.clone()).unwrap_or_default();

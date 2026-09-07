@@ -82,6 +82,7 @@ pub trait Renderer: Send {
     fn set_subagents(&mut self, _subagents: Vec<SubagentDetail>) {}
     fn rehydrate_messages(&mut self, _messages: &[crate::types::Message]) {}
     fn rehydrate_subagents(&mut self, _subagents: &[SubagentDetail]) {}
+    fn set_thinking_budgets(&mut self, _cfg: &crate::config::Config) {}
 }
 
 pub fn restore() {

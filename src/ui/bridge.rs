@@ -382,6 +382,21 @@ pub(crate) fn drain_steer_arbitration_events(
                             *steer_abort_requested = true;
                             steer_queue.push(format!("User rejected plan: {user_msg}"));
                         }
+                        Some("QueueAndContinue") => {
+                            steer_queue.push(user_msg);
+                            if decision
+                                .as_ref()
+                                .and_then(|d| d.response.as_ref())
+                                .is_none()
+                            {
+                                renderer.on_event(&Event::SteerResponse(
+                                    "Instruction queued for next turn while active tasks continue.\n".to_string(),
+                                ));
+                            }
+                            renderer.on_event(&Event::Status(
+                                "Instruction queued for next turn".to_string(),
+                            ));
+                        }
                         _ => {
                             steer_queue.push(user_msg);
                             renderer.on_event(&Event::Status(
@@ -749,6 +764,24 @@ impl StreamSink for RendererSink<'_> {
                     let _ = self.renderer.flush();
                     PauseAction::Resume
                 }
+                Some("QueueAndContinue") => {
+                    self.steer_queue.push(user_msg.to_string());
+                    if decision
+                        .as_ref()
+                        .and_then(|d| d.response.as_ref())
+                        .is_none()
+                    {
+                        self.renderer.on_event(&Event::SteerResponse(
+                            "Instruction queued for next turn while active tasks continue.\n"
+                                .to_string(),
+                        ));
+                    }
+                    self.renderer.on_event(&Event::Status(
+                        "Instruction queued for next turn — resuming stream...".to_string(),
+                    ));
+                    let _ = self.renderer.flush();
+                    PauseAction::Resume
+                }
                 _ => {
                     self.steer_queue.push(user_msg.to_string());
                     self.renderer.on_event(&Event::Status(
@@ -897,6 +930,119 @@ mod tests {
         assert!(renderer.events.iter().any(|e| matches!(
             e,
             Event::Message(m) if m.contains("All files inspected cleanly.")
+        )));
+    }
+
+    #[test]
+    fn test_drain_steer_queue_and_continue_with_streamed_response() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut renderer = TestRenderer::new();
+        let mut steer_queue = Vec::new();
+        let mut steer_abort = false;
+
+        // The streaming arbitrator streams the user-facing explanation first
+        tx.send(SteerArbEvent::Delta(
+            "Instruktionen har köats för nästa tur.".to_string(),
+        ))
+        .unwrap();
+
+        // Then completes with QueueAndContinue decision
+        tx.send(SteerArbEvent::Finished {
+            decision: Some(crate::orchestrator::SteerDecision {
+                decision: "QueueAndContinue".to_string(),
+                response: Some("Instruktionen har köats för nästa tur.".to_string()),
+                tier: None,
+                model: None,
+                subtasks: Vec::new(),
+                sleep_seconds: None,
+            }),
+            user_msg: "lägg till en extra feature sen".to_string(),
+        })
+        .unwrap();
+
+        drain_steer_arbitration_events(
+            &mut rx,
+            &mut renderer,
+            &mut steer_queue,
+            &mut steer_abort,
+            None,
+        );
+
+        assert_eq!(
+            steer_queue,
+            vec!["lägg till en extra feature sen".to_string()]
+        );
+        assert!(!steer_abort);
+
+        // Verify the explanation was sent to the renderer as SteerResponse
+        let steer_responses: Vec<_> = renderer
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::SteerResponse(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            steer_responses,
+            vec!["Instruktionen har köats för nästa tur."]
+        );
+
+        // Verify status was also emitted
+        assert!(renderer.events.iter().any(|e| matches!(
+            e,
+            Event::Status(s) if s.contains("Instruction queued for next turn")
+        )));
+    }
+
+    #[test]
+    fn test_drain_steer_queue_and_continue_fallback_response_when_none() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut renderer = TestRenderer::new();
+        let mut steer_queue = Vec::new();
+        let mut steer_abort = false;
+
+        // Model returned QueueAndContinue without a response field (null)
+        tx.send(SteerArbEvent::Finished {
+            decision: Some(crate::orchestrator::SteerDecision {
+                decision: "QueueAndContinue".to_string(),
+                response: None,
+                tier: None,
+                model: None,
+                subtasks: Vec::new(),
+                sleep_seconds: None,
+            }),
+            user_msg: "fix docs later".to_string(),
+        })
+        .unwrap();
+
+        drain_steer_arbitration_events(
+            &mut rx,
+            &mut renderer,
+            &mut steer_queue,
+            &mut steer_abort,
+            None,
+        );
+
+        assert_eq!(steer_queue, vec!["fix docs later".to_string()]);
+        assert!(!steer_abort);
+
+        // Fallback SteerResponse should be emitted informing the user
+        let steer_responses: Vec<_> = renderer
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::SteerResponse(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steer_responses.len(), 1);
+        assert!(steer_responses[0].contains("Instruction queued for next turn"));
+
+        // Status line was also emitted
+        assert!(renderer.events.iter().any(|e| matches!(
+            e,
+            Event::Status(s) if s.contains("Instruction queued for next turn")
         )));
     }
 }

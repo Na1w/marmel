@@ -41,6 +41,17 @@ fn test_queue_and_continue_json() {
 }
 
 #[test]
+fn test_queue_and_continue_with_response_json() {
+    let json = r#"{"decision": "QueueAndContinue", "response": "Instruktionen har köats för nästa tur medan pågående uppgifter slutförs."}"#;
+    let d: SteerDecision = serde_json::from_str(json).unwrap();
+    assert_eq!(d.decision, "QueueAndContinue");
+    assert_eq!(
+        d.response.as_deref(),
+        Some("Instruktionen har köats för nästa tur medan pågående uppgifter slutförs.")
+    );
+}
+
+#[test]
 fn test_full_caesar_shape_with_subtasks() {
     // The full caesar `SteerDecisionResponse` shape, including tier/model/subtasks.
     let json = r#"{

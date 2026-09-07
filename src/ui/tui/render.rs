@@ -836,51 +836,51 @@ impl TuiRenderer {
             let idx = (self.frame_counter % frames.len() as u64) as usize;
             let dots = if sa.is_active { frames[idx] } else { "" };
 
-            let (bar_text, bar_style) = if !sa.thinking.is_empty()
-                && (sa.content.is_empty() || !self.show_thought)
-            {
-                let chars = sa.thinking.len();
+            let turn_think = self
+                .subagent_turn_thinking
+                .get(&sa.name)
+                .map(|s| s.as_str());
+            let is_thinking = self
+                .subagent_is_thinking
+                .get(&sa.name)
+                .copied()
+                .unwrap_or_else(|| turn_think.map_or(!sa.thinking.is_empty(), |t| !t.is_empty()))
+                && sa.is_active;
+            let active_think = match turn_think {
+                Some(t) => t,
+                None => sa.thinking.as_str(),
+            };
+
+            let (bar_text, bar_style) = if is_thinking {
+                let budget = self.get_thinking_budget(sa);
+                let chars = active_think.len();
                 let tok_count = chars.div_ceil(4);
+                let remaining = budget.saturating_sub(tok_count);
                 let text = format!(
-                    " [Thinking: ~{} tokens / {} chars] {}",
+                    " [Thinking: ~{} tokens ({} remaining) / {} chars] {}",
                     Self::format_count(tok_count),
+                    Self::format_count(remaining),
                     Self::format_count(chars),
                     dots
                 );
+                let fg_color = if remaining <= budget / 5 {
+                    Color::LightRed
+                } else {
+                    Color::Yellow
+                };
                 (
                     text,
                     Style::default()
                         .bg(Color::DarkGray)
-                        .fg(Color::Yellow)
+                        .fg(fg_color)
                         .add_modifier(Modifier::BOLD),
                 )
-            } else if sa.is_active && sa.content.is_empty() {
+            } else if sa.is_active && !sa.content.is_empty() {
+                let text = format!(" [Status: Active - streaming output...] {}", dots);
+                (text, Style::default().bg(Color::DarkGray).fg(Color::Green))
+            } else if sa.is_active {
                 let text = format!(" [Status: Active - waiting for model response...] {}", dots);
                 (text, Style::default().bg(Color::DarkGray).fg(Color::Cyan))
-            } else if sa.is_active {
-                let text = if !sa.thinking.is_empty() {
-                    let tok_count = sa.thinking.len().div_ceil(4);
-                    format!(
-                        " [Status: Active - streaming output... | Thinking: ~{} tokens] {}",
-                        Self::format_count(tok_count),
-                        dots
-                    )
-                } else {
-                    format!(" [Status: Active - streaming output...] {}", dots)
-                };
-                (text, Style::default().bg(Color::DarkGray).fg(Color::Green))
-            } else if !sa.thinking.is_empty() {
-                let chars = sa.thinking.len();
-                let tok_count = chars.div_ceil(4);
-                let text = format!(
-                    " [Thinking: ~{} tokens / {} chars]",
-                    Self::format_count(tok_count),
-                    Self::format_count(chars)
-                );
-                (
-                    text,
-                    Style::default().bg(Color::DarkGray).fg(Color::DarkGray),
-                )
             } else {
                 (
                     " [Status: Idle]".to_string(),

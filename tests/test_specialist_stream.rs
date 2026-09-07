@@ -144,3 +144,69 @@ async fn test_mock_specialist_live_execution_streams_thinking_and_content_to_ui(
         statuses
     );
 }
+
+#[tokio::test]
+async fn test_specialist_consecutive_thinking_nudges_triggers_replan_required() {
+    let _guard = TEST_BUS_MUTEX.lock().await;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(|_req: &Request| {
+            // Specialist turns emit thinking well in excess of 256 tokens (1024 chars) without executing tools
+            let long_thought = format!(
+                "<think>{}</think>",
+                "This problem is extraordinarily intricate and requires deep mathematical analysis beyond normal limits. "
+                    .repeat(25)
+            );
+            let spec_sse = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{long_thought}\"}}}}]}}\n\ndata: [DONE]\n\n"
+            );
+            ResponseTemplate::new(200).set_body_string(spec_sse)
+        })
+        .mount(&server)
+        .await;
+
+    let client = marmennill::llm::ChatClient::new(format!("{}/v1", server.uri()), "test-model");
+    let req = marmennill::agents::DelegationRequest {
+        agent_name: marmennill::agents::Agent::Coder,
+        prompt: "Solve ultra-complex task".to_string(),
+        snippets: vec![],
+        task_id: Some("t-002".to_string()),
+        image_urls: None,
+        audio_urls: None,
+        recursion_granted: false,
+    };
+    let ctx = marmennill::agents::IsolatedContext::from_request(
+        "You are the Coder specialist.".to_string(),
+        &req,
+    );
+    let cfg = marmennill::config::Config {
+        backend_url: format!("{}/v1", server.uri()),
+        model: "test-model".to_string(),
+        max_thinking_tokens: 256,
+        ..Default::default()
+    };
+    let token = tokio_util::sync::CancellationToken::new();
+
+    let deliverable = marmennill::agents::run_specialist_live(
+        &client,
+        marmennill::agents::Agent::Coder,
+        &ctx,
+        &cfg,
+        &token,
+    )
+    .await
+    .expect("specialist execution returns deliverable string");
+
+    assert!(
+        deliverable.contains("REPLAN REQUIRED (t-002): task too complex"),
+        "deliverable should indicate REPLAN REQUIRED due to task too complex after 2 consecutive thinking nudges, got: {deliverable}"
+    );
+    assert!(
+        deliverable
+            .contains("exceeded single-turn reasoning budget of 256 tokens twice consecutively"),
+        "deliverable should mention exceeding reasoning budget twice, got: {deliverable}"
+    );
+}
