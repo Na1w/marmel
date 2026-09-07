@@ -167,7 +167,7 @@ where
         presence_penalty: None,
         stream: Some(true),
         enable_thinking: Some(false),
-        tools: Some(vec![crate::types::ToolDef::sleep()]),
+        tools: None,
     };
 
     let mut extractor = StreamingResponseExtractor::new();
