@@ -553,6 +553,7 @@ async fn test_specialist_stream_preemption_and_resumption_on_shared_model() {
             &req,
             &mut sink,
             512,
+            16384,
             &mut rep_detector,
             false,
             None,

@@ -126,6 +126,7 @@ pub struct StreamConfig {
     pub repetition_threshold: usize,
     pub min_pattern_len: usize,
     pub max_stream_tokens: usize,
+    pub max_thinking_tokens: usize,
 }
 
 impl Default for StreamConfig {
@@ -142,6 +143,7 @@ impl Default for StreamConfig {
             repetition_threshold: 5,
             min_pattern_len: 5,
             max_stream_tokens: 32768,
+            max_thinking_tokens: 16384,
         }
     }
 }
@@ -162,11 +164,11 @@ impl StreamConfig {
             repetition_threshold: mon.repetition_threshold,
             min_pattern_len: mon.min_pattern_len,
             max_stream_tokens: mon.max_stream_tokens,
+            max_thinking_tokens: mon.max_thinking_tokens,
         }
     }
 }
 
-/// Target destination for demuxed stream events.
 /// Target destination for demuxed stream events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamTarget {
@@ -181,7 +183,10 @@ pub enum StreamTarget {
 pub struct TurnStreamHandler<'a> {
     pub max_tokens: usize,
     pub tokens_count: usize,
+    pub max_thinking_tokens: usize,
+    pub thinking_tokens_count: usize,
     pub budget_exceeded: bool,
+    pub thinking_budget_exceeded: bool,
     pub rep_triggered: bool,
     pub demux: ThinkingDemuxer,
     pub rep_detector: &'a mut crate::harness::monitor::RepetitionDetector,
@@ -193,10 +198,17 @@ impl<'a> TurnStreamHandler<'a> {
     /// Create a stream handler targeting orchestrator events with a cancellation token.
     pub fn new(
         max_tokens: usize,
+        max_thinking_tokens: usize,
         rep_detector: &'a mut crate::harness::monitor::RepetitionDetector,
         cancellation_token: &'a tokio_util::sync::CancellationToken,
     ) -> Self {
-        Self::with_cancellation(max_tokens, rep_detector, Some(cancellation_token), false)
+        Self::with_cancellation(
+            max_tokens,
+            max_thinking_tokens,
+            rep_detector,
+            Some(cancellation_token),
+            false,
+        )
     }
 
     /// Create a stream handler for a StreamSink.
@@ -205,12 +217,35 @@ impl<'a> TurnStreamHandler<'a> {
         rep_detector: &'a mut crate::harness::monitor::RepetitionDetector,
         preserve_thinking: bool,
     ) -> Self {
-        Self::with_cancellation(max_tokens, rep_detector, None, preserve_thinking)
+        Self::with_cancellation(
+            max_tokens,
+            usize::MAX,
+            rep_detector,
+            None,
+            preserve_thinking,
+        )
+    }
+
+    /// Create a stream handler for a StreamSink with an explicit thinking budget.
+    pub fn for_sink_with_thinking_budget(
+        max_tokens: usize,
+        max_thinking_tokens: usize,
+        rep_detector: &'a mut crate::harness::monitor::RepetitionDetector,
+        preserve_thinking: bool,
+    ) -> Self {
+        Self::with_cancellation(
+            max_tokens,
+            max_thinking_tokens,
+            rep_detector,
+            None,
+            preserve_thinking,
+        )
     }
 
     /// Create a stream handler with explicit cancellation and configuration.
     pub fn with_cancellation(
         max_tokens: usize,
+        max_thinking_tokens: usize,
         rep_detector: &'a mut crate::harness::monitor::RepetitionDetector,
         cancellation_token: Option<&'a tokio_util::sync::CancellationToken>,
         preserve_thinking: bool,
@@ -218,7 +253,10 @@ impl<'a> TurnStreamHandler<'a> {
         Self {
             max_tokens: max_tokens.max(256),
             tokens_count: 0,
+            max_thinking_tokens: max_thinking_tokens.max(256),
+            thinking_tokens_count: 0,
             budget_exceeded: false,
+            thinking_budget_exceeded: false,
             rep_triggered: false,
             demux: ThinkingDemuxer::with_preserve(preserve_thinking),
             rep_detector,
@@ -242,11 +280,24 @@ impl<'a> TurnStreamHandler<'a> {
         }
         let rep_det = &mut *self.rep_detector;
         let rep_trig = &mut self.rep_triggered;
+        let thinking_tokens_count = &mut self.thinking_tokens_count;
+        let thinking_budget_exceeded = &mut self.thinking_budget_exceeded;
+        let max_thinking_tokens = self.max_thinking_tokens;
         self.demux.push_delta(chunk, |kind, text| {
             if kind == DeltaKind::Content {
                 rep_det.push(text);
                 if rep_det.is_repeating() {
                     *rep_trig = true;
+                }
+            } else if kind == DeltaKind::Thinking && !text.is_empty() {
+                let tok_est = if text.len() <= 4 {
+                    1
+                } else {
+                    text.len().div_ceil(4)
+                };
+                *thinking_tokens_count += tok_est;
+                if *thinking_tokens_count > max_thinking_tokens {
+                    *thinking_budget_exceeded = true;
                 }
             }
             match kind {
@@ -267,6 +318,7 @@ impl<'a> TurnStreamHandler<'a> {
         !cancelled
             && !self.rep_triggered
             && !self.budget_exceeded
+            && !self.thinking_budget_exceeded
             && !crate::orchestrator::is_globally_cancelled()
     }
 
@@ -284,11 +336,24 @@ impl<'a> TurnStreamHandler<'a> {
         }
         let rep_det = &mut *self.rep_detector;
         let rep_trig = &mut self.rep_triggered;
+        let thinking_tokens_count = &mut self.thinking_tokens_count;
+        let thinking_budget_exceeded = &mut self.thinking_budget_exceeded;
+        let max_thinking_tokens = self.max_thinking_tokens;
         self.demux.push_delta(chunk, |kind, text| {
             if kind == DeltaKind::Content {
                 rep_det.push(text);
                 if rep_det.is_repeating() {
                     *rep_trig = true;
+                }
+            } else if kind == DeltaKind::Thinking && !text.is_empty() {
+                let tok_est = if text.len() <= 4 {
+                    1
+                } else {
+                    text.len().div_ceil(4)
+                };
+                *thinking_tokens_count += tok_est;
+                if *thinking_tokens_count > max_thinking_tokens {
+                    *thinking_budget_exceeded = true;
                 }
             }
             match kind {
@@ -314,6 +379,7 @@ impl<'a> TurnStreamHandler<'a> {
         !cancelled
             && !self.rep_triggered
             && !self.budget_exceeded
+            && !self.thinking_budget_exceeded
             && !crate::orchestrator::is_globally_cancelled()
     }
 
@@ -499,17 +565,20 @@ pub(crate) fn build_fallback_continuation_request(
 pub struct ResumableStreamOutput {
     pub reply: StreamedReply,
     pub budget_exceeded: bool,
+    pub thinking_budget_exceeded: bool,
     pub rep_triggered: bool,
     pub was_aborted_by_steer: bool,
 }
 
 /// Drives a resumable streaming chat call against `client`, supporting mid-flight pause,
 /// steering arbitration, and continuation prefill.
+#[allow(clippy::too_many_arguments)]
 pub async fn chat_stream_resumable<S>(
     client: &ChatClient,
     req: &ChatRequest,
     sink: &mut S,
     max_tokens: usize,
+    max_thinking_tokens: usize,
     rep_detector: &mut crate::harness::monitor::RepetitionDetector,
     preserve_thinking: bool,
     cancellation_token: Option<&tokio_util::sync::CancellationToken>,
@@ -519,6 +588,7 @@ where
 {
     let mut stream_handler = TurnStreamHandler::with_cancellation(
         max_tokens,
+        max_thinking_tokens,
         rep_detector,
         cancellation_token,
         preserve_thinking,
@@ -599,6 +669,7 @@ where
     stream_handler.finish_with_sink(sink);
 
     let budget_exceeded = stream_handler.budget_exceeded;
+    let thinking_budget_exceeded = stream_handler.thinking_budget_exceeded;
     let rep_triggered = stream_handler.rep_triggered;
 
     let final_content = stream_handler.demux.content().to_string();
@@ -612,6 +683,7 @@ where
             tool_calls: all_tool_calls,
         },
         budget_exceeded,
+        thinking_budget_exceeded,
         rep_triggered,
         was_aborted_by_steer,
     })
@@ -641,6 +713,7 @@ where
         };
 
         let max_tokens = cfg.max_stream_tokens.max(256);
+        let max_thinking_tokens = cfg.max_thinking_tokens.max(256);
         let mut rep_detector = crate::harness::monitor::RepetitionDetector::new(
             cfg.repetition_threshold,
             cfg.min_pattern_len,
@@ -651,6 +724,7 @@ where
             &req,
             sink,
             max_tokens,
+            max_thinking_tokens,
             &mut rep_detector,
             cfg.preserve_thinking,
             None,
@@ -658,6 +732,7 @@ where
         .await?;
 
         let budget_exceeded = out.budget_exceeded;
+        let thinking_budget_exceeded = out.thinking_budget_exceeded;
         let rep_triggered = out.rep_triggered;
         let was_aborted_by_steer = out.was_aborted_by_steer;
 
@@ -701,6 +776,31 @@ where
             Message::Assistant { tool_calls, .. } => !tool_calls.is_empty(),
             _ => false,
         };
+
+        if thinking_budget_exceeded && !has_tools && empty_attempts < nudge.max_attempts() {
+            empty_attempts += 1;
+            tracing::warn!(
+                "Stream terminated due to reasoning token budget ({max_thinking_tokens}) — injecting reasoning recovery nudge ({}/{})",
+                empty_attempts,
+                nudge.max_attempts()
+            );
+            sink.emit(StreamEvent::Status(format!(
+                "reasoning budget reached ({max_thinking_tokens} tokens) — nudge {empty_attempts}/{}",
+                nudge.max_attempts()
+            )));
+            transcript.push(Message::Assistant {
+                content: assistant.content().map(str::to_string),
+                reasoning_content: assistant.reasoning_content().map(str::to_string),
+                tool_calls: Vec::new(),
+            });
+            transcript.push(Message::User {
+                content: format!(
+                    "SYSTEM NOTICE: Maximum reasoning budget of {max_thinking_tokens} tokens reached for this turn. Stop internal reasoning immediately. Proceed directly to provide your output deliverables or execute required tools."
+                ),
+            });
+            recovery = true;
+            continue;
+        }
 
         if budget_exceeded && !has_tools && empty_attempts < nudge.max_attempts() {
             empty_attempts += 1;

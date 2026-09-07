@@ -172,3 +172,46 @@ async fn test_turn_stream_handler_does_not_trigger_repetition_on_thinking() {
     assert!(continue_content);
     assert!(!handler.rep_triggered);
 }
+
+#[tokio::test]
+async fn test_turn_stream_handler_enforces_thinking_budget() {
+    let mut rep = crate::harness::monitor::RepetitionDetector::new(3, 5);
+    // 256 max thinking tokens (budget is clamped to min 256)
+    let mut handler = TurnStreamHandler::for_sink_with_thinking_budget(5000, 256, &mut rep, true);
+    let mut sink = VecSink::default();
+
+    // Start thinking block
+    assert!(handler.on_chunk_with_sink("<think>\n", &mut sink));
+    assert!(!handler.thinking_budget_exceeded);
+
+    // Stream 250 characters (~63 tokens)
+    let chunk_short = "a".repeat(250);
+    assert!(handler.on_chunk_with_sink(&chunk_short, &mut sink));
+    assert!(!handler.thinking_budget_exceeded);
+
+    // Stream 1200 characters (~300 tokens), exceeding 256 token budget
+    let chunk_long = "b".repeat(1200);
+    let continue_streaming = handler.on_chunk_with_sink(&chunk_long, &mut sink);
+    assert!(
+        !continue_streaming,
+        "Streaming should be cut off when thinking budget is exceeded"
+    );
+    assert!(handler.thinking_budget_exceeded);
+    assert!(!handler.budget_exceeded);
+}
+
+#[test]
+fn test_stream_config_thinking_budget_defaults() {
+    let default_cfg = StreamConfig::default();
+    assert_eq!(default_cfg.max_thinking_tokens, 16384);
+
+    let mut app_cfg = crate::config::Config::default();
+    let stream_cfg = StreamConfig::from_config(&app_cfg);
+    assert_eq!(stream_cfg.max_thinking_tokens, 16384);
+
+    if let Some(ref mut mon) = app_cfg.monitoring {
+        mon.max_thinking_tokens = 4096;
+    }
+    let stream_cfg2 = StreamConfig::from_config(&app_cfg);
+    assert_eq!(stream_cfg2.max_thinking_tokens, 4096);
+}

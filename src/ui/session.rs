@@ -51,12 +51,16 @@ pub async fn run_session(
         let mut recover_handle = tokio::spawn(async move { recover_mgr.recover_frozen().await });
 
         let deliverable_opt = loop {
+            let mut had_events = false;
             while let Ok(msg) = status_rx.try_recv() {
                 renderer.on_event(&Event::Status(msg));
-                let _ = renderer.flush();
+                had_events = true;
             }
             while let Ok(ev) = event_rx.try_recv() {
                 renderer.on_event(&ev);
+                had_events = true;
+            }
+            if had_events {
                 let _ = renderer.flush();
             }
             if let Some(input) = renderer.poll_input()
@@ -234,11 +238,17 @@ pub async fn run_session(
     let stream_cfg = StreamConfig::from_config(cfg);
 
     while !renderer.aborted() {
+        let mut had_events = false;
         while let Ok(msg) = status_rx.try_recv() {
             renderer.on_event(&Event::Status(msg));
+            had_events = true;
         }
         while let Ok(ev) = event_rx.try_recv() {
             renderer.on_event(&ev);
+            had_events = true;
+        }
+        if had_events {
+            let _ = renderer.flush();
         }
 
         drain_steer_arbitration_events(
@@ -503,12 +513,16 @@ pub async fn run_session(
 
                 for mut handle in handles {
                     let res = loop {
+                        let mut had_events = false;
                         while let Ok(msg) = status_rx.try_recv() {
                             renderer.on_event(&Event::Status(msg));
-                            let _ = renderer.flush();
+                            had_events = true;
                         }
                         while let Ok(ev) = event_rx.try_recv() {
                             renderer.on_event(&ev);
+                            had_events = true;
+                        }
+                        if had_events {
                             let _ = renderer.flush();
                         }
                         drain_steer_arbitration_events(
@@ -543,12 +557,16 @@ pub async fn run_session(
                                 );
                             }
                             Err(_) => {
+                                let mut had_events = false;
                                 while let Ok(msg) = status_rx.try_recv() {
                                     renderer.on_event(&Event::Status(msg));
-                                    let _ = renderer.flush();
+                                    had_events = true;
                                 }
                                 while let Ok(ev) = event_rx.try_recv() {
                                     renderer.on_event(&ev);
+                                    had_events = true;
+                                }
+                                if had_events {
                                     let _ = renderer.flush();
                                 }
                                 drain_steer_arbitration_events(
@@ -729,12 +747,16 @@ pub async fn run_session(
                     });
 
                     let result = loop {
+                        let mut had_events = false;
                         while let Ok(msg) = status_rx.try_recv() {
                             renderer.on_event(&Event::Status(msg));
-                            let _ = renderer.flush();
+                            had_events = true;
                         }
                         while let Ok(ev) = event_rx.try_recv() {
                             renderer.on_event(&ev);
+                            had_events = true;
+                        }
+                        if had_events {
                             let _ = renderer.flush();
                         }
                         drain_steer_arbitration_events(
@@ -760,12 +782,16 @@ pub async fn run_session(
                                     .and_then(|r| r);
                             }
                             Err(_) => {
+                                let mut had_events = false;
                                 while let Ok(msg) = status_rx.try_recv() {
                                     renderer.on_event(&Event::Status(msg));
-                                    let _ = renderer.flush();
+                                    had_events = true;
                                 }
                                 while let Ok(ev) = event_rx.try_recv() {
                                     renderer.on_event(&ev);
+                                    had_events = true;
+                                }
+                                if had_events {
                                     let _ = renderer.flush();
                                 }
                                 drain_steer_arbitration_events(

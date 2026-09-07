@@ -45,6 +45,15 @@ impl Message {
             Message::Tool { content, .. } => Some(content.as_str()),
         }
     }
+
+    pub fn reasoning_content(&self) -> Option<&str> {
+        match self {
+            Message::Assistant {
+                reasoning_content, ..
+            } => reasoning_content.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 /// A single tool invocation requested by the assistant.

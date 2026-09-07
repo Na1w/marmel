@@ -265,11 +265,12 @@ pub(crate) fn drain_steer_arbitration_events(
     steer_abort_requested: &mut bool,
     mut subagents: Option<&mut Vec<SubagentDetail>>,
 ) {
+    let mut dirty = false;
     while let Ok(ev) = arb_rx.try_recv() {
+        dirty = true;
         match ev {
             SteerArbEvent::Delta(delta) => {
                 renderer.on_event(&Event::SteerResponse(delta));
-                let _ = renderer.flush();
             }
             SteerArbEvent::DelegationStarted {
                 agent,
@@ -296,7 +297,6 @@ pub(crate) fn drain_steer_arbitration_events(
                     );
                     renderer.set_subagents(sub.clone());
                 }
-                let _ = renderer.flush();
             }
             SteerArbEvent::DelegationCompleted {
                 agent,
@@ -335,7 +335,6 @@ pub(crate) fn drain_steer_arbitration_events(
                     agent.as_str(),
                     deliverable.content
                 ));
-                let _ = renderer.flush();
             }
             SteerArbEvent::SynthesizedAnswer { user_msg, answer } => {
                 steer_queue.push(format!(
@@ -357,14 +356,12 @@ pub(crate) fn drain_steer_arbitration_events(
                     renderer.on_event(&Event::Status(
                         "Steering subtask delegation finished".to_string(),
                     ));
-                    let _ = renderer.flush();
                 } else {
                     match decision.as_ref().map(|d| d.decision.as_str()) {
                         Some("RespondDirectly") => {
                             renderer.on_event(&Event::Status(
                                 "Answered via direct steer response".to_string(),
                             ));
-                            let _ = renderer.flush();
                         }
                         Some("AbortImmediately") => {
                             renderer.request_abort();
@@ -376,7 +373,6 @@ pub(crate) fn drain_steer_arbitration_events(
                             renderer.on_event(&Event::Status(
                                 "Notice forwarded to specialist".to_string(),
                             ));
-                            let _ = renderer.flush();
                         }
                         Some("ApprovePlan") => {
                             steer_queue.push("User approved plan.".to_string());
@@ -391,12 +387,14 @@ pub(crate) fn drain_steer_arbitration_events(
                             renderer.on_event(&Event::Status(
                                 "Instruction queued for next turn".to_string(),
                             ));
-                            let _ = renderer.flush();
                         }
                     }
                 }
             }
         }
+    }
+    if dirty {
+        let _ = renderer.flush();
     }
 }
 

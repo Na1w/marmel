@@ -1415,6 +1415,12 @@ static PLAN_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[test]
 fn test_status_bar_displays_right_aligned_elapsed_time() {
     let _lock = PLAN_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let plan = crate::manager::phase::Plan::default();
+    let backup = plan.read().ok().flatten();
+    if backup.is_some() {
+        let _ = plan.clear();
+    }
+    defer_clear_plan();
     let r = TuiRenderer::new();
     crate::manager::phase::record_plan_start_at(
         std::time::Instant::now()
@@ -1437,6 +1443,9 @@ fn test_status_bar_displays_right_aligned_elapsed_time() {
         .collect();
 
     defer_clear_plan();
+    if let Some(content) = backup {
+        let _ = plan.create(&content);
+    }
 
     assert!(
         content.contains("Tokens:"),

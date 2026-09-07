@@ -120,6 +120,10 @@ pub async fn run_specialist_live(
         };
 
         let max_tokens = mon_cfg.max_stream_tokens.max(256);
+        let max_thinking_tokens = specialist_cfg
+            .and_then(|s| s.max_thinking_tokens)
+            .unwrap_or(mon_cfg.max_thinking_tokens)
+            .max(256);
         let mut sink =
             crate::orchestrator::PreemptibleStreamSink::register(&agent_tag, &specialist_model);
         let stream_out = crate::llm::chat_stream_resumable(
@@ -127,6 +131,7 @@ pub async fn run_specialist_live(
             &req,
             &mut sink,
             max_tokens,
+            max_thinking_tokens,
             &mut rep_detector,
             false,
             Some(token),
@@ -151,6 +156,7 @@ pub async fn run_specialist_live(
 
         let reply = out.reply;
         let budget_exceeded = out.budget_exceeded;
+        let thinking_budget_exceeded = out.thinking_budget_exceeded;
         let rep_triggered = out.rep_triggered;
         if budget_exceeded {
             tracing::warn!(
@@ -158,6 +164,14 @@ pub async fn run_specialist_live(
             );
             crate::orchestrator::emit_status(format!(
                 "{agent_tag}: single-turn output budget ({max_tokens} tokens) reached"
+            ));
+        }
+        if thinking_budget_exceeded {
+            tracing::warn!(
+                "{agent_tag}: maximum single-turn reasoning budget of {max_thinking_tokens} tokens exceeded — cutting stream"
+            );
+            crate::orchestrator::emit_status(format!(
+                "{agent_tag}: single-turn reasoning budget ({max_thinking_tokens} tokens) reached"
             ));
         }
         update_revision(&mut final_content, &reply.content);
@@ -193,6 +207,35 @@ pub async fn run_specialist_live(
         let is_repeating = rep_triggered || monitor.feed_text(&reply.content);
 
         if tool_calls.is_empty() {
+            if thinking_budget_exceeded && nudge_count < 2 {
+                nudge_count += 1;
+                tracing::warn!(
+                    "{agent_tag}: thinking budget exceeded — injecting reasoning cutoff nudge ({nudge_count}/2)"
+                );
+                crate::orchestrator::emit_status(format!(
+                    "{agent_tag}: reasoning budget ({max_thinking_tokens} tokens) reached — nudging out of thinking"
+                ));
+                engine.replace_last(crate::types::Message::Assistant {
+                    content: if reply.content.is_empty() {
+                        None
+                    } else {
+                        Some(reply.content.clone())
+                    },
+                    reasoning_content: if reply.reasoning.is_empty() {
+                        None
+                    } else {
+                        Some(reply.reasoning.clone())
+                    },
+                    tool_calls: Vec::new(),
+                });
+                engine.append(crate::types::Message::User {
+                    content: format!(
+                        "SYSTEM NOTICE: Maximum reasoning budget of {max_thinking_tokens} tokens reached for this turn. Stop internal thinking immediately. Proceed directly to output your deliverables or execute required tools (such as `read_file`, `write_file`, `replace`, `run_command`, etc.)."
+                    ),
+                });
+                continue;
+            }
+
             if budget_exceeded && nudge_count < 2 {
                 nudge_count += 1;
                 tracing::warn!(

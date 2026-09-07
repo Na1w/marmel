@@ -758,10 +758,8 @@ impl TuiRenderer {
                     }
                     detail_lines.push(Line::styled(" response", think_style));
                 } else {
-                    let chars = sa.thinking.chars().count();
-                    let tok_count = tiktoken_rs::cl100k_base_singleton()
-                        .encode_ordinary(&sa.thinking)
-                        .len();
+                    let chars = sa.thinking.len();
+                    let tok_count = chars.div_ceil(4);
                     detail_lines.push(Line::styled(
                         format!(
                             "[Thinking: ~{} tokens / {} chars (Ctrl+T or /thought to view)]",

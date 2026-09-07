@@ -239,11 +239,38 @@ impl TuiRenderer {
             }
         }
     }
+
+    pub(crate) fn render_terminal(&mut self) -> Result<()> {
+        self.last_render = std::time::Instant::now();
+        self.frame_counter = self.frame_counter.wrapping_add(1);
+        let mut terminal = match self.terminal.take() {
+            Some(t) => t,
+            None => {
+                let stdout = io::stdout();
+                let backend = CrosstermBackend::new(stdout);
+                Terminal::new(backend)?
+            }
+        };
+        let res = self.draw(&mut terminal);
+        self.terminal = Some(terminal);
+        res
+    }
 }
 
 impl Default for TuiRenderer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[inline]
+fn estimate_stream_tokens(text: &str) -> usize {
+    if text.is_empty() {
+        0
+    } else if text.len() <= 4 {
+        1
+    } else {
+        text.len().div_ceil(4)
     }
 }
 
@@ -264,7 +291,7 @@ impl Renderer for TuiRenderer {
             self.had_active_plan = true;
         }
 
-        self.flush()?;
+        self.force_flush()?;
         Ok(())
     }
 
@@ -279,9 +306,7 @@ impl Renderer for TuiRenderer {
             }
             Event::Message(text) => {
                 self.waiting_for_token_since = None;
-                let tok_count = tiktoken_rs::cl100k_base_singleton()
-                    .encode_ordinary(text)
-                    .len();
+                let tok_count = estimate_stream_tokens(text);
                 self.tokens_out = self.tokens_out.saturating_add(tok_count);
                 if self.active_agent == "Manager" {
                     self.current_content.push_str(text);
@@ -302,9 +327,7 @@ impl Renderer for TuiRenderer {
             }
             Event::SteerResponse(text) => {
                 self.waiting_for_token_since = None;
-                let tok_count = tiktoken_rs::cl100k_base_singleton()
-                    .encode_ordinary(text)
-                    .len();
+                let tok_count = estimate_stream_tokens(text);
                 self.tokens_out = self.tokens_out.saturating_add(tok_count);
                 // Stream steer arbitrator output as `Marmennill: ` yellow sentences.
                 self.steer_sentence_buffer.push_str(text);
@@ -321,9 +344,7 @@ impl Renderer for TuiRenderer {
             }
             Event::Thinking(text) => {
                 self.waiting_for_token_since = None;
-                let tok_count = tiktoken_rs::cl100k_base_singleton()
-                    .encode_ordinary(text)
-                    .len();
+                let tok_count = estimate_stream_tokens(text);
                 self.tokens_out = self.tokens_out.saturating_add(tok_count);
                 if self.active_agent == "Manager" {
                     self.current_thought.push_str(text);
@@ -344,9 +365,7 @@ impl Renderer for TuiRenderer {
             }
             Event::SubagentMessage { agent_tag, text } => {
                 self.waiting_for_token_since = None;
-                let tok_count = tiktoken_rs::cl100k_base_singleton()
-                    .encode_ordinary(text)
-                    .len();
+                let tok_count = estimate_stream_tokens(text);
                 self.tokens_out = self.tokens_out.saturating_add(tok_count);
                 if let Some(sa) = self.subagents.iter_mut().find(|s| s.name == *agent_tag) {
                     sa.content.push_str(text);
@@ -361,9 +380,7 @@ impl Renderer for TuiRenderer {
             }
             Event::SubagentThinking { agent_tag, text } => {
                 self.waiting_for_token_since = None;
-                let tok_count = tiktoken_rs::cl100k_base_singleton()
-                    .encode_ordinary(text)
-                    .len();
+                let tok_count = estimate_stream_tokens(text);
                 self.tokens_out = self.tokens_out.saturating_add(tok_count);
                 if let Some(sa) = self.subagents.iter_mut().find(|s| s.name == *agent_tag) {
                     sa.thinking.push_str(text);
@@ -378,9 +395,7 @@ impl Renderer for TuiRenderer {
             }
             Event::ToolCall(text) => {
                 self.waiting_for_token_since = None;
-                let tok_count = tiktoken_rs::cl100k_base_singleton()
-                    .encode_ordinary(text)
-                    .len();
+                let tok_count = estimate_stream_tokens(text);
                 self.tokens_out = self.tokens_out.saturating_add(tok_count);
                 self.commit_turn_content();
                 if self.active_agent != "Manager"
@@ -631,45 +646,29 @@ impl Renderer for TuiRenderer {
             }
         }
         let handled = self.handle_events(false);
-        let now = std::time::Instant::now();
-        if handled
-            || now.duration_since(self.last_render) >= Duration::from_millis(16)
-            || matches!(
-                event,
-                Event::Done
-                    | Event::ToolCall(_)
-                    | Event::ToolResult(_)
-                    | Event::Delegation(_)
-                    | Event::Status(_)
-                    | Event::SteerResponse(_)
-            )
-        {
-            self.last_render = now;
+        if handled || matches!(event, Event::Done) {
+            let _ = self.force_flush();
+        } else {
             let _ = self.flush();
         }
     }
 
+    fn force_flush(&mut self) -> Result<()> {
+        self.render_terminal()
+    }
+
     fn flush(&mut self) -> Result<()> {
-        // F3: advance the frame counter on each flush so the status spinner
-        // animates at the ~16 ms render cadence.
-        self.frame_counter = self.frame_counter.wrapping_add(1);
-        let mut terminal = match self.terminal.take() {
-            Some(t) => t,
-            None => {
-                let stdout = io::stdout();
-                let backend = CrosstermBackend::new(stdout);
-                Terminal::new(backend)?
-            }
-        };
-        let res = self.draw(&mut terminal);
-        self.terminal = Some(terminal);
-        res
+        if self.last_render.elapsed() < Duration::from_millis(25) {
+            return Ok(());
+        }
+        self.render_terminal()
     }
 
     fn poll_input(&mut self) -> Option<String> {
         let handled = self.handle_events(false);
-        if handled || self.last_render.elapsed() >= Duration::from_millis(30) {
-            self.last_render = std::time::Instant::now();
+        if handled {
+            let _ = self.force_flush();
+        } else if self.last_render.elapsed() >= Duration::from_millis(25) {
             let _ = self.flush();
         }
         self.rx.try_recv().ok()
@@ -678,7 +677,7 @@ impl Renderer for TuiRenderer {
     fn read_input(&mut self) -> Option<String> {
         self.commit_turn_content();
         self.status_line = "Ready".to_string();
-        let _ = self.flush();
+        let _ = self.force_flush();
         loop {
             // Esc / Ctrl+C sets `aborted`; return `None` so the session loop
             // stops cleanly instead of hanging while waiting for input.
@@ -689,8 +688,9 @@ impl Renderer for TuiRenderer {
             if let Ok(line) = self.rx.try_recv() {
                 return Some(line);
             }
-            if handled || self.last_render.elapsed() >= Duration::from_millis(50) {
-                self.last_render = std::time::Instant::now();
+            if handled {
+                let _ = self.force_flush();
+            } else if self.last_render.elapsed() >= Duration::from_millis(25) {
                 let _ = self.flush();
             }
         }

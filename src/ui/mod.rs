@@ -70,6 +70,9 @@ pub trait Renderer: Send {
     fn init(&mut self) -> Result<()>;
     fn on_event(&mut self, event: &Event);
     fn flush(&mut self) -> Result<()>;
+    fn force_flush(&mut self) -> Result<()> {
+        self.flush()
+    }
     fn poll_input(&mut self) -> Option<String>;
     fn read_input(&mut self) -> Option<String>;
     fn request_abort(&mut self);

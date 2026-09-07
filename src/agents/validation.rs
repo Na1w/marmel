@@ -141,6 +141,7 @@ pub(crate) async fn run_automated_validation(
         };
 
         let max_tokens = mon_cfg.max_stream_tokens.max(256);
+        let max_thinking_tokens = mon_cfg.max_thinking_tokens.max(256);
         let mut sink = crate::orchestrator::PreemptibleStreamSink::register(
             format!("validator-{agent}"),
             &validator_model,
@@ -150,6 +151,7 @@ pub(crate) async fn run_automated_validation(
             &req,
             &mut sink,
             max_tokens,
+            max_thinking_tokens,
             &mut rep_detector,
             false,
             Some(token),
@@ -181,9 +183,15 @@ pub(crate) async fn run_automated_validation(
 
         let reply = out.reply;
         let budget_exceeded = out.budget_exceeded;
+        let thinking_budget_exceeded = out.thinking_budget_exceeded;
         if budget_exceeded {
             tracing::warn!(
                 "validator-{agent}: maximum single-turn output budget of {max_tokens} tokens exceeded"
+            );
+        }
+        if thinking_budget_exceeded {
+            tracing::warn!(
+                "validator-{agent}: maximum single-turn reasoning budget of {max_thinking_tokens} tokens exceeded"
             );
         }
 
