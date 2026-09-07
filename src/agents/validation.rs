@@ -73,7 +73,7 @@ pub(crate) async fn run_automated_validation(
         task_brief, deliverable
     );
 
-    let mut engine = crate::agent::ContextEngineFactory::new(cfg.max_context_tokens)
+    let mut engine = crate::manager::ContextEngineFactory::new(cfg.max_context_tokens)
         .specialist_context(validator_prompt.to_string(), brief);
 
     let registry = crate::orchestrator::SpecialistRegistry::canonical();
@@ -305,29 +305,12 @@ pub(crate) async fn run_automated_validation(
                         arguments: args_val,
                     };
                     let caller = crate::harness::ToolCaller::Specialist(Agent::Validator);
-                    let tool_res = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
-                            tokio::task::block_in_place(|| {
-                                crate::harness::dispatch_for_with_engine(
-                                    &invocation,
-                                    caller,
-                                    Some(&mut engine),
-                                )
-                            })
-                        } else {
-                            crate::harness::dispatch_for_with_engine(
-                                &invocation,
-                                caller,
-                                Some(&mut engine),
-                            )
-                        }
-                    } else {
-                        crate::harness::dispatch_for_with_engine(
-                            &invocation,
-                            caller,
-                            Some(&mut engine),
-                        )
-                    };
+                    let tool_res = crate::harness::dispatch_for_async_with_engine(
+                        &invocation,
+                        caller,
+                        Some(&mut engine),
+                    )
+                    .await;
                     match tool_res {
                         Ok(r) => {
                             tracing::info!(

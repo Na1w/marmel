@@ -614,7 +614,7 @@ impl TuiRenderer {
             || trimmed_lower == "/clear_plan"
             || trimmed_lower == "/clear-plan"
         {
-            let plan = crate::agent::phase::Plan::default();
+            let plan = crate::manager::phase::Plan::default();
             let _ = plan.clear();
             self.show_plan_panel = false;
             self.had_active_plan = false;

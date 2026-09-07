@@ -226,7 +226,7 @@ impl TuiRenderer {
             crate::manager::phase::record_plan_completed();
             Some(inst.elapsed())
         } else {
-            let plan = crate::agent::phase::Plan::default();
+            let plan = crate::manager::phase::Plan::default();
             if plan.is_complete() {
                 crate::manager::phase::record_plan_completed();
                 if let Some(comp) = crate::manager::phase::get_plan_completed_time() {
@@ -255,7 +255,7 @@ impl Renderer for TuiRenderer {
         let backend = CrosstermBackend::new(stdout);
         self.terminal = Some(Terminal::new(backend)?);
 
-        let plan = crate::agent::phase::Plan::default();
+        let plan = crate::manager::phase::Plan::default();
         if let Ok(Some(content)) = plan.read()
             && !content.trim().is_empty()
         {

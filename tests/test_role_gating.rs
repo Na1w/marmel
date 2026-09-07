@@ -200,7 +200,7 @@ fn specialist_delegate_task_allowed_by_allowlist() {
 /// Rebirth is permitted to ALL agents, including all specialists and validator.
 #[test]
 fn all_specialists_and_validator_permitted_rebirth() {
-    let factory = marmennill::agent::ContextEngineFactory::new(1000);
+    let factory = marmennill::manager::ContextEngineFactory::new(1000);
     let roles = [
         Agent::Coder,
         Agent::Researcher,

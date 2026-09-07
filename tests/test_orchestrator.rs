@@ -24,7 +24,7 @@
 //! `backend_url` (`http://localhost:8000/v1`) is refused immediately, causing
 //! the worker to fall back to its deterministic canned deliverable.
 
-use marmennill::agent::Plan;
+use marmennill::manager::Plan;
 use marmennill::agents::{Agent, DelegationRequest, MissionMarker};
 use marmennill::harness::HarnessStats;
 use marmennill::llm::ChatClient;

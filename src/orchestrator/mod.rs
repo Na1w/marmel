@@ -16,13 +16,16 @@ pub mod plan_summary;
 pub mod preemption;
 pub mod registry;
 pub mod steer;
+pub mod steer_extractor;
+#[cfg(test)]
+mod steer_tests;
 pub mod workers;
 
 pub use preemption::{
     PreemptHandle, PreemptibleStreamSink, models_conflict, preempt_conflicting_stream,
 };
 
-use crate::agent::phase::Plan;
+use crate::manager::phase::Plan;
 pub use crate::agents::{
     Agent, DelegationRequest, Deliverable, IsolatedContext, MissionMarker, Specialist,
 };
@@ -437,7 +440,7 @@ impl OrchestratorManager {
     /// gate keeper. A task is only ever checked off when the *marker* is a
     /// genuine [`MissionMarker::Complete`] AND the re-parsed *content* still
     /// carries a `MISSION COMPLETE (t-xxx)` terminal marker (via
-    /// [`crate::agent::phase::Plan::check_plan_on_marker`]). This double gate
+    /// [`crate::manager::phase::Plan::check_plan_on_marker`]). This double gate
     /// guarantees that a `FAILED` / `REPLAN` deliverable — or a REJECTED
     /// deliverable that carries a stale completion token from a pre-validation
     /// draft in its content body — stays unchecked (REQ-PLAN-002 / REQ-ORCH-005).

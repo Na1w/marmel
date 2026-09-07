@@ -274,7 +274,7 @@ pub async fn run_session(
         let mut nudge_count = 0;
         loop {
             turn_count += 1;
-            if turn_count > crate::agent::r#loop::MAX_TURNS || renderer.aborted() {
+            if turn_count > crate::manager::r#loop::MAX_TURNS || renderer.aborted() {
                 break;
             }
 
@@ -593,7 +593,7 @@ pub async fn run_session(
                             ));
                         } else {
                             if let Some(ref tid) = task {
-                                let plan = crate::agent::phase::Plan::default();
+                                let plan = crate::manager::phase::Plan::default();
                                 let _ = plan.check_off(tid);
                             }
                             renderer.on_event(&Event::Delegation(
@@ -818,7 +818,7 @@ pub async fn run_session(
                             ));
                         } else {
                             if let Some(ref tid) = delegated_task {
-                                let plan = crate::agent::phase::Plan::default();
+                                let plan = crate::manager::phase::Plan::default();
                                 let _ = plan.check_off(tid);
                             }
                             renderer.on_event(&Event::Delegation(

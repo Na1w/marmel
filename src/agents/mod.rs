@@ -174,8 +174,8 @@ impl IsolatedContext {
         }
     }
 
-    pub fn into_engine(&self, max_context_tokens: usize) -> crate::agent::ContextEngine {
-        let factory = crate::agent::ContextEngineFactory::new(max_context_tokens);
+    pub fn into_engine(&self, max_context_tokens: usize) -> crate::manager::ContextEngine {
+        let factory = crate::manager::ContextEngineFactory::new(max_context_tokens);
         factory.specialist_context(self.role_system_prompt.clone(), self.brief.clone())
     }
 }

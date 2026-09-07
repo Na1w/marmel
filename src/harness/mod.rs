@@ -185,7 +185,7 @@ pub enum ToolError {
 }
 
 fn write_plan(md: &str) -> Result<ToolResult, ToolError> {
-    let plan = crate::agent::phase::Plan::default();
+    let plan = crate::manager::phase::Plan::default();
     plan.create(md)
         .map(|_| {
             let pending = plan.pending_tasks();
@@ -207,7 +207,7 @@ fn archive_plan() -> Result<ToolResult, ToolError> {
             "Cannot archive plan while background specialist workers are still actively running.",
         ));
     }
-    let plan = crate::agent::phase::Plan::default();
+    let plan = crate::manager::phase::Plan::default();
     match plan.archive() {
         Ok(Some(dest)) => Ok(ToolResult::ok(format!(
             "plan archived to {}",
@@ -308,6 +308,48 @@ fn handle_sleep(args: &serde_json::Value) -> Result<ToolResult, ToolError> {
     }
 }
 
+pub async fn handle_sleep_async(arguments: &serde_json::Value) -> Result<ToolResult, ToolError> {
+    let secs = arguments
+        .get("seconds")
+        .or_else(|| arguments.get("duration"))
+        .or_else(|| arguments.get("duration_seconds"))
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .unwrap_or(5);
+
+    let actual_secs = secs.clamp(1, 300);
+    let reason = arguments
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+
+    let reason_clause = if reason.is_empty() {
+        String::new()
+    } else {
+        format!(" ({reason})")
+    };
+
+    let cancel = crate::orchestrator::bus::global_cancellation_token();
+    if cancel.is_cancelled() {
+        return Ok(ToolResult::err("Sleep cancelled before starting."));
+    }
+
+    let completed = tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_secs(actual_secs)) => true,
+        _ = cancel.cancelled() => false,
+    };
+
+    if completed {
+        Ok(ToolResult::ok(format!(
+            "Slept for {actual_secs} seconds{reason_clause}."
+        )))
+    } else {
+        Ok(ToolResult::err("Sleep interrupted by cancellation signal."))
+    }
+}
+
 /// The primary dispatcher entry point, shared by the Manager and specialists.
 pub fn dispatch(tool: &ToolInvocation) -> Result<ToolResult, ToolError> {
     if let Some(mcp) = get_mcp_manager()
@@ -368,7 +410,7 @@ pub fn dispatch(tool: &ToolInvocation) -> Result<ToolResult, ToolError> {
 }
 
 pub fn handle_rebirth(
-    engine: &mut crate::agent::ContextEngine,
+    engine: &mut crate::manager::ContextEngine,
     arguments: &serde_json::Value,
 ) -> Result<ToolResult, ToolError> {
     let summary = arguments
@@ -387,7 +429,7 @@ pub fn handle_rebirth(
 
 pub fn dispatch_with_engine(
     tool: &ToolInvocation,
-    engine: &mut crate::agent::ContextEngine,
+    engine: &mut crate::manager::ContextEngine,
 ) -> Result<ToolResult, ToolError> {
     if tool.name.as_str() == TOOL_REBIRTH {
         return handle_rebirth(engine, &tool.arguments);
@@ -439,7 +481,7 @@ pub fn dispatch_for(tool: &ToolInvocation, caller: ToolCaller) -> Result<ToolRes
 pub fn dispatch_for_with_engine(
     tool: &ToolInvocation,
     caller: ToolCaller,
-    engine: Option<&mut crate::agent::ContextEngine>,
+    engine: Option<&mut crate::manager::ContextEngine>,
 ) -> Result<ToolResult, ToolError> {
     let caller_str = match caller {
         ToolCaller::Manager => "Manager".to_string(),
@@ -478,9 +520,191 @@ pub fn dispatch_for_with_engine(
     res.map(apply_tool_output_length_limit)
 }
 
+pub async fn dispatch_for_async(
+    tool: &ToolInvocation,
+    caller: ToolCaller,
+) -> Result<ToolResult, ToolError> {
+    dispatch_for_async_with_engine(tool, caller, None).await
+}
+
+pub async fn dispatch_for_async_with_engine(
+    tool: &ToolInvocation,
+    caller: ToolCaller,
+    engine: Option<&mut crate::manager::ContextEngine>,
+) -> Result<ToolResult, ToolError> {
+    let caller_str = match caller {
+        ToolCaller::Manager => "Manager".to_string(),
+        ToolCaller::Specialist(a) => format!("Specialist({a:?})"),
+    };
+    crate::debug_log::log_tool_invocation(&caller_str, &tool.name, &tool.arguments);
+    let start = std::time::Instant::now();
+
+    let res = if caller == ToolCaller::Manager {
+        dispatch_manager_async(tool, engine).await
+    } else {
+        let ToolCaller::Specialist(agent) = caller else {
+            unreachable!("non-Manager caller is a specialist");
+        };
+        dispatch_specialist_async(tool, agent, engine).await
+    };
+
+    let elapsed = start.elapsed().as_millis();
+    match &res {
+        Ok(r) => crate::debug_log::log_tool_result(
+            &caller_str,
+            &tool.name,
+            elapsed,
+            &r.content,
+            r.is_error,
+        ),
+        Err(e) => crate::debug_log::log_tool_result(
+            &caller_str,
+            &tool.name,
+            elapsed,
+            &e.to_string(),
+            true,
+        ),
+    }
+
+    res.map(apply_tool_output_length_limit)
+}
+
+async fn dispatch_manager_async(
+    tool: &ToolInvocation,
+    engine: Option<&mut crate::manager::ContextEngine>,
+) -> Result<ToolResult, ToolError> {
+    let name = tool.name.as_str();
+    if let Some(mcp) = get_mcp_manager()
+        && mcp.has_tool(name)
+    {
+        return match mcp.call_tool(name, &tool.arguments).await {
+            Ok(content) => Ok(ToolResult::ok(content)),
+            Err(e) => Ok(ToolResult::err(format!("MCP tool error: {e}"))),
+        };
+    }
+
+    match name {
+        TOOL_DELEGATE_TASK => crate::orchestrator::handle_delegate_task(&tool.arguments),
+        TOOL_CREATE_PLAN => match tool
+            .arguments
+            .get("plan")
+            .or_else(|| tool.arguments.get("plan_markdown"))
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(md) => write_plan(md),
+            None => Ok(ToolResult::err(
+                "create_plan requires a `plan` or `plan_markdown` string argument",
+            )),
+        },
+        TOOL_ARCHIVE_PLAN => archive_plan(),
+        TOOL_REBIRTH => {
+            if let Some(eng) = engine {
+                handle_rebirth(eng, &tool.arguments)
+            } else {
+                Err(ToolError::BadArguments {
+                    tool: TOOL_REBIRTH.to_string(),
+                    detail: "rebirth requires a live ContextEngine; use dispatch_with_engine"
+                        .to_string(),
+                })
+            }
+        }
+        TOOL_READ_FILE => fs::read_file(&tool.arguments),
+        TOOL_GREP_SEARCH => search::grep_search(&tool.arguments),
+        TOOL_GLOB => search::glob(&tool.arguments),
+        TOOL_SLEEP | TERMINAL_SLEEP | "wait" => handle_sleep_async(&tool.arguments).await,
+        other => Err(ToolError::Forbidden {
+            tool: other.to_string(),
+            caller: "Manager".to_string(),
+        }),
+    }
+}
+
+async fn dispatch_specialist_async(
+    tool: &ToolInvocation,
+    agent: crate::agents::Agent,
+    engine: Option<&mut crate::manager::ContextEngine>,
+) -> Result<ToolResult, ToolError> {
+    let name = tool.name.as_str();
+    if name == TOOL_CREATE_PLAN {
+        return Err(ToolError::Forbidden {
+            tool: name.to_string(),
+            caller: agent.as_str().to_string(),
+        });
+    }
+
+    if let Some(mcp) = get_mcp_manager()
+        && mcp.has_tool(name)
+    {
+        return match mcp.call_tool(name, &tool.arguments).await {
+            Ok(content) => Ok(ToolResult::ok(content)),
+            Err(e) => Ok(ToolResult::err(format!("MCP tool error: {e}"))),
+        };
+    }
+
+    let registry = crate::orchestrator::SpecialistRegistry::canonical();
+    let gate_name = normalize_tool_name(name);
+    if !crate::orchestrator::caller_allows_tool(agent, &gate_name, &registry) {
+        return Err(ToolError::Forbidden {
+            tool: name.to_string(),
+            caller: agent.as_str().to_string(),
+        });
+    }
+
+    match name {
+        TOOL_READ_FILE | TERMINAL_READ_FILE | "view_file" | "get_file" | "read" => {
+            fs::read_file(&tool.arguments)
+        }
+        TOOL_WRITE_FILE | TERMINAL_WRITE_FILE | "create_file" | "write_to_file" | "save_file"
+        | "write" => fs::write_file(&tool.arguments),
+        TOOL_REPLACE | TERMINAL_REPLACE | "replace_file_content" | "edit_file" => {
+            fs::replace(&tool.arguments)
+        }
+        TOOL_RUN_COMMAND | TERMINAL_RUN_COMMAND | "execute_command" | "run" | "exec" | "bash"
+        | "sh" | "cmd" => pty::run_command(&tool.arguments),
+        TOOL_GREP_SEARCH | TERMINAL_GREP_SEARCH | "grep" | "search" => {
+            search::grep_search(&tool.arguments)
+        }
+        TOOL_GLOB | TERMINAL_GLOB | "find_files" | "glob_search" => search::glob(&tool.arguments),
+        TOOL_PTY_SPAWN | "pty__spawn" => pty::pty_spawn(&tool.arguments),
+        TOOL_PTY_WRITE | "pty__write" => pty::pty_write(&tool.arguments),
+        TOOL_PTY_READ | "pty__read" => pty::pty_read(&tool.arguments),
+        TOOL_PTY_CLOSE | "pty__close" => pty::pty_close(&tool.arguments),
+        TOOL_PTY_LIST | "pty__list" => pty::pty_list(&tool.arguments),
+        TOOL_DELEGATE_TASK => crate::orchestrator::handle_delegate_task(&tool.arguments),
+        TOOL_LEAVE_VERDICT => {
+            let verdict = tool
+                .arguments
+                .get("verdict")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("APPROVED");
+            let comments = tool
+                .arguments
+                .get("comments")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            Ok(ToolResult::ok(format!(
+                "Verdict recorded via leave_verdict: {verdict} with comments: {comments}"
+            )))
+        }
+        TOOL_SLEEP | TERMINAL_SLEEP | "wait" => handle_sleep_async(&tool.arguments).await,
+        TOOL_REBIRTH => {
+            if let Some(eng) = engine {
+                handle_rebirth(eng, &tool.arguments)
+            } else {
+                Err(ToolError::BadArguments {
+                    tool: TOOL_REBIRTH.to_string(),
+                    detail: "rebirth requires a live ContextEngine; use dispatch_with_engine"
+                        .to_string(),
+                })
+            }
+        }
+        other => Err(ToolError::UnknownTool(other.to_string())),
+    }
+}
+
 fn dispatch_manager(
     tool: &ToolInvocation,
-    engine: Option<&mut crate::agent::ContextEngine>,
+    engine: Option<&mut crate::manager::ContextEngine>,
 ) -> Result<ToolResult, ToolError> {
     let name = tool.name.as_str();
     if let Some(mcp) = get_mcp_manager()
@@ -552,7 +776,7 @@ fn normalize_tool_name(name: &str) -> String {
 fn dispatch_specialist(
     tool: &ToolInvocation,
     agent: crate::agents::Agent,
-    engine: Option<&mut crate::agent::ContextEngine>,
+    engine: Option<&mut crate::manager::ContextEngine>,
 ) -> Result<ToolResult, ToolError> {
     let name = tool.name.as_str();
     if name == TOOL_CREATE_PLAN {
@@ -638,7 +862,7 @@ fn dispatch_specialist(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::ContextEngine;
+    use crate::manager::ContextEngine;
     use crate::types::Message;
 
     #[test]

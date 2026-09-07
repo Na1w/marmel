@@ -206,7 +206,7 @@ impl ChatClient {
             req_body.model,
             req_body.messages.len()
         );
-        let prompt_tokens = crate::agent::context::count_tokens(&req_body.messages);
+        let prompt_tokens = crate::manager::context::count_tokens(&req_body.messages);
         record_tokens_in(prompt_tokens);
         tracing::debug!(
             "LLM request body: {}",

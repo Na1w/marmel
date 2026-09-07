@@ -245,7 +245,7 @@ impl CrashJournal {
 
 impl Default for CrashJournal {
     fn default() -> Self {
-        Self::new(crate::agent::phase::MARMEL_DIR)
+        Self::new(crate::manager::phase::MARMEL_DIR)
     }
 }
 

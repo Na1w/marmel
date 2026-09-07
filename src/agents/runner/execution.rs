@@ -1,281 +1,9 @@
-//! Specialist live execution runner, turn loops, and deliverable assembly.
+//! Specialist execution loop and tool turn state machine.
 
+use super::assembly::{assemble_final_deliverable, update_revision};
+use super::formatting::{format_tool_args_full, format_tool_args_preview};
 use crate::agents::validation::run_automated_validation;
 use crate::agents::{Agent, IsolatedContext};
-use crate::tool_names::{
-    TOOL_DELEGATE_TASK, TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_LEAVE_VERDICT, TOOL_READ_FILE,
-    TOOL_REPLACE, TOOL_RUN_COMMAND, TOOL_SLEEP, TOOL_WRITE_FILE,
-};
-
-pub(crate) async fn run_specialist_llm(
-    agent: Agent,
-    ctx: &IsolatedContext,
-    token: &tokio_util::sync::CancellationToken,
-) -> String {
-    let snippet_block = if ctx.snippets.is_empty() {
-        "(none)".to_string()
-    } else {
-        ctx.snippets.join("\n---\n")
-    };
-    let canned = format!(
-        "Specialist role `{}` executed its isolated task to completion.\n\n\
-         TASK BRIEF:\n{}\n\n\
-         BOUNDED SNIPPETS ({count}):\n{snippet_block}\n\n\
-         MISSION COMPLETE",
-        ctx.role_system_prompt
-            .trim()
-            .lines()
-            .next()
-            .unwrap_or("specialist"),
-        ctx.brief,
-        count = ctx.snippets.len(),
-        snippet_block = snippet_block,
-    );
-
-    if let Some(res) = try_run_specialist_live(agent, ctx, token).await {
-        return res;
-    }
-    canned
-}
-
-pub(crate) async fn try_run_specialist_live(
-    agent: Agent,
-    ctx: &IsolatedContext,
-    token: &tokio_util::sync::CancellationToken,
-) -> Option<String> {
-    if tokio::runtime::Handle::try_current().is_err() {
-        return None;
-    }
-    // If running inside cargo test suite (integration tests binaries in target/.../deps/), bypass live network calls
-    if std::env::current_exe()
-        .map(|p| {
-            let s = p.to_string_lossy();
-            s.contains("/deps/") || s.contains(r"\deps\")
-        })
-        .unwrap_or(false)
-        && std::env::var("MARMEL_LIVE_TEST").is_err()
-    {
-        return None;
-    }
-    let cfg = crate::config::get_active().or_else(|| crate::config::load(None).ok())?;
-    let specialist_cfg = cfg.orchestration.specialists.get(agent.as_str());
-    let backend_url = specialist_cfg
-        .and_then(|sc| sc.backend_url.as_ref())
-        .unwrap_or(&cfg.backend_url);
-    if backend_url.is_empty() {
-        return None;
-    }
-    let auth_token = specialist_cfg
-        .and_then(|sc| sc.auth_token.as_ref())
-        .unwrap_or(&cfg.auth_token);
-    let model = specialist_cfg
-        .and_then(|sc| sc.model.as_ref())
-        .unwrap_or(&cfg.model);
-    let client = crate::llm::ChatClient::new_with_token(backend_url, model, auth_token);
-    let res = match run_specialist_live(&client, agent, ctx, &cfg, token).await {
-        Ok(s) => s,
-        Err(e) => format!("Specialist execution failed: {e}\n\nFAILED"),
-    };
-    Some(res)
-}
-
-pub(crate) fn format_tool_args_preview(tool: &str, args: &serde_json::Value) -> String {
-    match tool {
-        TOOL_READ_FILE | TOOL_WRITE_FILE | TOOL_REPLACE => args
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        TOOL_RUN_COMMAND => {
-            let cmd = args
-                .get("command")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            if cmd.len() > 40 {
-                format!("{}…", &cmd[..37])
-            } else {
-                cmd.to_string()
-            }
-        }
-        TOOL_GREP_SEARCH => args
-            .get("query")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        TOOL_GLOB => args
-            .get("pattern")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        TOOL_SLEEP => {
-            let secs = args
-                .get("seconds")
-                .or_else(|| args.get("duration"))
-                .or_else(|| args.get("duration_seconds"))
-                .and_then(|v| {
-                    v.as_u64()
-                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                })
-                .unwrap_or(5);
-            format!("{secs}s")
-        }
-        _ => {
-            let s = args.to_string();
-            if s.len() > 30 {
-                format!("{}…", &s[..27])
-            } else {
-                s
-            }
-        }
-    }
-}
-
-pub(crate) fn format_tool_args_full(tool: &str, args: &serde_json::Value) -> String {
-    match tool {
-        TOOL_READ_FILE | TOOL_WRITE_FILE | TOOL_REPLACE => {
-            if let Some(path) = args.get("path").and_then(serde_json::Value::as_str) {
-                if tool == TOOL_WRITE_FILE || tool == TOOL_REPLACE {
-                    let len = args
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map_or(0, str::len);
-                    format!("{path} (content: {len} bytes)")
-                } else {
-                    path.to_string()
-                }
-            } else {
-                args.to_string()
-            }
-        }
-        TOOL_RUN_COMMAND => args
-            .get("command")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        TOOL_GREP_SEARCH => {
-            let q = args
-                .get("query")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let path = args
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            if path.is_empty() {
-                format!("query=\"{q}\"")
-            } else {
-                format!("query=\"{q}\", path=\"{path}\"")
-            }
-        }
-        TOOL_GLOB => args
-            .get("pattern")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        TOOL_DELEGATE_TASK => {
-            let ag = args
-                .get("agent_name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let tid = args
-                .get("task_id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let pr = args
-                .get("prompt")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            format!("agent={ag}, task_id={tid}, prompt=\"{pr}\"")
-        }
-        TOOL_LEAVE_VERDICT => {
-            let v = args
-                .get("verdict")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let c = args
-                .get("comments")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            format!("verdict={v}, comments=\"{c}\"")
-        }
-        TOOL_SLEEP => {
-            let secs = args
-                .get("seconds")
-                .or_else(|| args.get("duration"))
-                .or_else(|| args.get("duration_seconds"))
-                .and_then(|v| {
-                    v.as_u64()
-                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                })
-                .unwrap_or(5);
-            let reason = args
-                .get("reason")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            if reason.is_empty() {
-                format!("seconds={secs}")
-            } else {
-                format!("seconds={secs}, reason=\"{reason}\"")
-            }
-        }
-        _ => args.to_string(),
-    }
-}
-
-pub(crate) fn update_revision(final_content: &mut String, revised: &str) {
-    if !revised.is_empty() {
-        if final_content.is_empty() {
-            *final_content = revised.to_string();
-        } else if !final_content.contains(revised) {
-            final_content.push_str("\n\n");
-            final_content.push_str(revised);
-        }
-    }
-}
-
-pub(crate) fn assemble_final_deliverable(
-    validation_passed: bool,
-    validator_critique: Option<&str>,
-    final_content: &str,
-    task_id: Option<&str>,
-) -> String {
-    let upper = final_content.to_ascii_uppercase();
-    let has_complete = upper.contains("MISSION COMPLETE");
-    let has_replan = upper.contains("REPLAN REQUIRED");
-
-    if validation_passed {
-        if has_replan {
-            return final_content.to_string();
-        }
-        if final_content.trim().is_empty() {
-            return "Specialist terminated without deliverable.\n\nFAILED (incomplete)".to_string();
-        }
-        let mut res = final_content.to_string();
-        if let Some(tid) = task_id.filter(|t| !t.trim().is_empty()) {
-            if !res.contains(&format!("MISSION COMPLETE ({tid})")) {
-                res.push_str(&format!("\n\nMISSION COMPLETE ({tid})"));
-            }
-        } else if !has_complete {
-            res.push_str("\n\nMISSION COMPLETE");
-        }
-        return res;
-    }
-
-    let mut rejected = String::new();
-    if let Some(critique) = validator_critique {
-        rejected.push_str(&format!(
-            "VALIDATOR REJECTION: {critique}\n---------------\n"
-        ));
-    }
-    let revision = final_content
-        .replace("MISSION COMPLETE", "REVOKED")
-        .replace("mission complete", "REVOKED");
-    rejected.push_str(&revision);
-    if !rejected.contains("FAILED") && !rejected.contains("REPLAN REQUIRED") {
-        rejected.push_str("\n\nFAILED (Validator rejected deliverable)");
-    }
-    rejected
-}
 
 pub async fn run_specialist_live(
     client: &crate::llm::ChatClient,
@@ -291,7 +19,7 @@ pub async fn run_specialist_live(
         ctx.role_system_prompt, env_block
     );
 
-    let mut engine = crate::agent::ContextEngineFactory::new(cfg.max_context_tokens)
+    let mut engine = crate::manager::ContextEngineFactory::new(cfg.max_context_tokens)
         .specialist_context(enhanced_system_prompt, ctx.brief.clone());
 
     if !ctx.snippets.is_empty() {
@@ -547,6 +275,10 @@ pub async fn run_specialist_live(
                 tracing::warn!(
                     "{agent_tag}: specialist produced no tool executions or terminal marker — failing deliverable without validation"
                 );
+                crate::orchestrator::set_active_worker_status(
+                    &_active_guard.0,
+                    "Failed (no tools executed)",
+                );
                 return Ok(assemble_final_deliverable(
                     false,
                     Some("Specialist generated conversational text without executing any tools."),
@@ -728,29 +460,12 @@ pub async fn run_specialist_live(
                         arguments: args_val,
                     };
                     let caller = crate::harness::ToolCaller::Specialist(agent);
-                    let tool_res = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
-                            tokio::task::block_in_place(|| {
-                                crate::harness::dispatch_for_with_engine(
-                                    &invocation,
-                                    caller,
-                                    Some(&mut engine),
-                                )
-                            })
-                        } else {
-                            crate::harness::dispatch_for_with_engine(
-                                &invocation,
-                                caller,
-                                Some(&mut engine),
-                            )
-                        }
-                    } else {
-                        crate::harness::dispatch_for_with_engine(
-                            &invocation,
-                            caller,
-                            Some(&mut engine),
-                        )
-                    };
+                    let tool_res = crate::harness::dispatch_for_async_with_engine(
+                        &invocation,
+                        caller,
+                        Some(&mut engine),
+                    )
+                    .await;
                     match tool_res {
                         Ok(r) => {
                             tools_executed_count += 1;

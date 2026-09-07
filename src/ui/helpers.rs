@@ -38,7 +38,7 @@ pub fn format_plan_progress_summary(plan_content: &str) -> String {
 }
 pub(crate) fn load_system_prompt_with_plan(
     _cfg: &Config,
-    plan: &crate::agent::phase::Plan,
+    plan: &crate::manager::phase::Plan,
 ) -> Result<String> {
     let content = include_str!("../../prompts/system.md");
     let env_block = crate::prompts::format_environment_block();
@@ -56,7 +56,7 @@ pub(crate) fn load_system_prompt_with_plan(
 
 #[allow(dead_code)]
 pub(crate) fn load_system_prompt(cfg: &Config) -> Result<String> {
-    load_system_prompt_with_plan(cfg, &crate::agent::phase::Plan::default())
+    load_system_prompt_with_plan(cfg, &crate::manager::phase::Plan::default())
 }
 
 pub(crate) fn format_tool_call_display(name: &str, args_val: &serde_json::Value) -> String {
@@ -175,7 +175,7 @@ pub(crate) fn is_reset_command(line: &str) -> bool {
 }
 
 pub(crate) fn handle_reset_command(
-    plan: &crate::agent::phase::Plan,
+    plan: &crate::manager::phase::Plan,
     renderer: &mut dyn Renderer,
     mut ctx: Option<&mut ContextEngine>,
 ) {
@@ -309,7 +309,7 @@ pub fn rehydrate_subagents(
     messages: &[Message],
     journal: Option<&crate::orchestrator::freeze::CrashJournal>,
     recovered_deliverable: Option<&(String, String)>,
-    plan: Option<&crate::agent::phase::Plan>,
+    plan: Option<&crate::manager::phase::Plan>,
 ) -> Vec<SubagentDetail> {
     let mut subagents = Vec::<SubagentDetail>::new();
 
@@ -636,7 +636,7 @@ mod tests {
     #[test]
     fn test_rehydrate_subagents_from_plan() {
         let tmp = tempfile::tempdir().unwrap();
-        let plan = crate::agent::phase::Plan::at(tmp.path());
+        let plan = crate::manager::phase::Plan::at(tmp.path());
         plan.create("# Plan\n\n- [x] [t-001] Setup project (coder)\n- [ ] [t-002] Write tests\n")
             .unwrap();
 

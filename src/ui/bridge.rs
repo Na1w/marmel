@@ -70,7 +70,7 @@ pub fn spawn_steer_arbitration(
                 .map(|h| crate::orchestrator::format_steering_history(&h))
                 .unwrap_or_else(|| "None".to_string());
 
-            let plan_content = crate::agent::phase::Plan::default()
+            let plan_content = crate::manager::phase::Plan::default()
                 .read()
                 .unwrap_or(None)
                 .unwrap_or_default();
@@ -411,7 +411,7 @@ pub struct RendererSink<'a> {
     pub stats: Arc<crate::harness::HarnessStats>,
     pub goal: &'a str,
     pub subagents: &'a [SubagentDetail],
-    pub plan: Option<&'a crate::agent::phase::Plan>,
+    pub plan: Option<&'a crate::manager::phase::Plan>,
     pub ctx: Option<&'a mut crate::manager::context::ContextEngine>,
     pub steering_history: Option<SharedSteeringHistory>,
 }
@@ -447,7 +447,7 @@ impl StreamSink for RendererSink<'_> {
                 return StreamControl::Abort;
             } else if is_reset_command(&input) {
                 crate::debug_log::log_user_input("command", &input);
-                let default_plan = crate::agent::phase::Plan::default();
+                let default_plan = crate::manager::phase::Plan::default();
                 let plan = self.plan.unwrap_or(&default_plan);
                 let ctx = self.ctx.as_deref_mut();
                 crate::ui::helpers::handle_reset_command(plan, self.renderer, ctx);
@@ -474,7 +474,7 @@ impl StreamSink for RendererSink<'_> {
             ));
             let _ = self.renderer.flush();
 
-            let plan_content = crate::agent::phase::Plan::default()
+            let plan_content = crate::manager::phase::Plan::default()
                 .read()
                 .unwrap_or(None)
                 .unwrap_or_default();
