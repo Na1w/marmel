@@ -46,7 +46,7 @@ pub use steer::{
     SteerDecision, SteerOutcome, SteerSubtaskDecision, StreamingResponseExtractor, arbitrate_steer,
     arbitrate_steer_stream, arbitrate_steer_stream_with_fallback, arbitrate_steer_with_fallback,
     execute_steer_subtask, extract_tasks_to_delegate, format_steering_history,
-    resolve_steer_outcome,
+    normalize_steer_decision, resolve_steer_outcome,
 };
 pub use workers::{
     ActiveWorkerGuard, ActiveWorkerInfo, CompletedWorkerInfo, format_duration_human,

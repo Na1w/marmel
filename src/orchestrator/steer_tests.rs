@@ -384,3 +384,126 @@ async fn test_arbitrate_steer_context_stream_parses_sleep_tool_call() {
     assert_eq!(d.sleep_seconds, Some(7));
     assert!(d.response.as_ref().unwrap().contains("7"));
 }
+
+#[test]
+fn test_normalize_steer_decision() {
+    assert_eq!(
+        normalize_steer_decision(Some("RespondDirectly")),
+        "RespondDirectly"
+    );
+    assert_eq!(
+        normalize_steer_decision(Some("respond_directly")),
+        "RespondDirectly"
+    );
+    assert_eq!(
+        normalize_steer_decision(Some("Respond Directly")),
+        "RespondDirectly"
+    );
+    assert_eq!(
+        normalize_steer_decision(Some("responddirectly")),
+        "RespondDirectly"
+    );
+    assert_eq!(normalize_steer_decision(Some("respond")), "RespondDirectly");
+    assert_eq!(normalize_steer_decision(Some("direct")), "RespondDirectly");
+
+    assert_eq!(normalize_steer_decision(Some("Sleep")), "Sleep");
+    assert_eq!(normalize_steer_decision(Some("sleep")), "Sleep");
+
+    assert_eq!(
+        normalize_steer_decision(Some("AbortImmediately")),
+        "AbortImmediately"
+    );
+    assert_eq!(
+        normalize_steer_decision(Some("abort_immediately")),
+        "AbortImmediately"
+    );
+    assert_eq!(normalize_steer_decision(Some("abort")), "AbortImmediately");
+
+    assert_eq!(
+        normalize_steer_decision(Some("ForwardToWorker")),
+        "ForwardToWorker"
+    );
+    assert_eq!(
+        normalize_steer_decision(Some("forward_to_worker")),
+        "ForwardToWorker"
+    );
+
+    assert_eq!(normalize_steer_decision(Some("ApprovePlan")), "ApprovePlan");
+    assert_eq!(
+        normalize_steer_decision(Some("approve_plan")),
+        "ApprovePlan"
+    );
+
+    assert_eq!(normalize_steer_decision(Some("RejectPlan")), "RejectPlan");
+    assert_eq!(normalize_steer_decision(Some("reject_plan")), "RejectPlan");
+
+    assert_eq!(
+        normalize_steer_decision(Some("DelegateTask")),
+        "DelegateTask"
+    );
+    assert_eq!(
+        normalize_steer_decision(Some("delegate_task")),
+        "DelegateTask"
+    );
+
+    assert_eq!(
+        normalize_steer_decision(Some("QueueAndContinue")),
+        "QueueAndContinue"
+    );
+    assert_eq!(
+        normalize_steer_decision(Some("queue_and_continue")),
+        "QueueAndContinue"
+    );
+
+    assert_eq!(normalize_steer_decision(None), "None");
+    assert_eq!(
+        normalize_steer_decision(Some("completely_unknown")),
+        "Unknown"
+    );
+}
+
+#[tokio::test]
+async fn test_arbitrate_steer_context_stream_plain_text_fallback() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"Coder arbetar på steg 1.\"}}]}\n\ndata: [DONE]\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(chunk))
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new_with_token(server.uri(), "mock", "tok");
+    let stats = HarnessStats::new();
+    let ctx = SteerContext {
+        main_goal: "test goal",
+        orchestrator_status: "Active",
+        pending_approval: "None",
+        plan_progress: "None",
+        plan_content: "None",
+        available_agents: "",
+        steering_history: "None",
+        user_message: "hur går det?",
+        active_subtasks: "None",
+    };
+
+    let mut streamed = String::new();
+    let decision = arbitrate_steer_context_stream(&client, &stats, ctx, |delta| {
+        streamed.push_str(delta);
+    })
+    .await;
+
+    assert!(decision.is_some());
+    let d = decision.unwrap();
+    // Non-JSON plain text response should fall back to RespondDirectly
+    assert_eq!(d.decision, "RespondDirectly");
+    assert!(
+        d.response
+            .as_ref()
+            .unwrap()
+            .contains("Coder arbetar på steg 1.")
+    );
+}

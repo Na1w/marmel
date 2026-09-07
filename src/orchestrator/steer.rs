@@ -254,6 +254,20 @@ where
             subtasks: Vec::new(),
             sleep_seconds: Some(secs),
         })
+    } else if did_stream_response || !raw.is_empty() {
+        let resp = if !raw.is_empty() {
+            raw
+        } else {
+            raw_stream_accum
+        };
+        Some(SteerDecision {
+            decision: "RespondDirectly".to_string(),
+            response: Some(resp),
+            tier: None,
+            model: None,
+            subtasks: Vec::new(),
+            sleep_seconds: None,
+        })
     } else {
         None
     };
@@ -266,6 +280,27 @@ where
         Some(decision)
     } else {
         None
+    }
+}
+
+/// Normalize a steering decision string to a canonical decision name.
+pub fn normalize_steer_decision(decision: Option<&str>) -> &'static str {
+    match decision {
+        None => "None",
+        Some(s) => {
+            let norm = s.trim().to_ascii_lowercase().replace(['_', '-', ' '], "");
+            match norm.as_str() {
+                "responddirectly" | "respond" | "directresponse" | "direct" => "RespondDirectly",
+                "abortimmediately" | "abort" => "AbortImmediately",
+                "forwardtoworker" | "forward" | "forwardnotice" => "ForwardToWorker",
+                "approveplan" | "approve" => "ApprovePlan",
+                "rejectplan" | "reject" => "RejectPlan",
+                "sleep" => "Sleep",
+                "delegatetask" | "delegate" => "DelegateTask",
+                "queueandcontinue" | "queue" => "QueueAndContinue",
+                _ => "Unknown",
+            }
+        }
     }
 }
 
@@ -407,7 +442,7 @@ pub fn extract_tasks_to_delegate(
                 tasks.push((agent, tid, prompt.to_string()));
             }
         }
-    } else if decision.decision.eq_ignore_ascii_case("DelegateTask") {
+    } else if normalize_steer_decision(Some(&decision.decision)) == "DelegateTask" {
         let agent = decision
             .subtasks
             .iter()
