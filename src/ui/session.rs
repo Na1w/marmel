@@ -238,6 +238,8 @@ pub async fn run_session(
     let harness_stats = Arc::new(crate::harness::HarnessStats::new());
     let stream_cfg = StreamConfig::from_config(cfg);
 
+    crate::orchestrator::reset_cancellation();
+
     while !renderer.aborted() {
         let mut had_events = false;
         while let Ok(msg) = status_rx.try_recv() {
@@ -537,7 +539,7 @@ pub async fn run_session(
                         if renderer.aborted() {
                             crate::orchestrator::cancel_all();
                             let _ =
-                                tokio::time::timeout(Duration::from_millis(100), &mut handle).await;
+                                tokio::time::timeout(Duration::from_millis(500), &mut handle).await;
                             break (
                                 String::new(),
                                 None,
@@ -771,7 +773,7 @@ pub async fn run_session(
                         if renderer.aborted() {
                             crate::orchestrator::cancel_all();
                             let _ =
-                                tokio::time::timeout(Duration::from_millis(100), &mut handle).await;
+                                tokio::time::timeout(Duration::from_millis(500), &mut handle).await;
                             break Err(crate::harness::ToolError::Execution(anyhow::anyhow!(
                                 "aborted"
                             )));
@@ -897,6 +899,7 @@ pub async fn run_session(
                 // Steer arbitrator requested AbortImmediately / RejectPlan -> reset abort state, reset subagents, and start next turn immediately
                 steer_abort_requested = false;
                 renderer.clear_abort();
+                crate::orchestrator::reset_cancellation();
                 for s in subagents.iter_mut() {
                     if s.is_active {
                         s.is_active = false;

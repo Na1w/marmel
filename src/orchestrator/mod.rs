@@ -36,8 +36,9 @@ use crate::manager::phase::Plan;
 use crate::tool_names::TOOL_DELEGATE_TASK;
 use anyhow::Result;
 pub use bus::{
-    cancel_all, emit_event, emit_status, global_cancellation_token, is_globally_cancelled,
-    reset_cancellation, set_event_sender, set_status_sender,
+    CURRENT_WORKER_TOKEN, cancel_all, emit_event, emit_status, global_cancellation_token,
+    is_current_or_global_cancelled, is_globally_cancelled, reset_cancellation, set_event_sender,
+    set_status_sender,
 };
 pub use freeze::{CrashJournal, FreezeSnapshot, JournalEventKind};
 pub use plan_summary::generate_plan_progress_summary;
@@ -50,10 +51,11 @@ pub use steer::{
     normalize_steer_decision, resolve_steer_outcome,
 };
 pub use workers::{
-    ActiveWorkerGuard, ActiveWorkerInfo, CompletedWorkerInfo, format_duration_human,
-    get_active_specialist_context_str, get_active_subtasks_str, get_active_worker_tokens,
-    has_active_workers, register_active_worker, set_active_worker_status,
-    update_active_worker_context, update_active_worker_progress,
+    ActiveWorkerGuard, ActiveWorkerInfo, CompletedWorkerInfo, cancel_active_worker,
+    cancel_all_active_workers, format_duration_human, get_active_specialist_context_str,
+    get_active_subtasks_str, get_active_worker_tokens, has_active_workers, register_active_worker,
+    register_active_worker_with_token, set_active_worker_status, update_active_worker_context,
+    update_active_worker_progress,
 };
 
 /// Default fractal recursion bound (REQ-ORCH-001).
@@ -330,15 +332,18 @@ impl OrchestratorManager {
         //    its own role prompt + brief + snippets, never Manager messages[].
         let ctx = IsolatedContext::from_request(self.role_prompt_for(entry.agent), &req);
 
+        let child_token = self.cancellation_token.child_token();
+
         // Register active worker for real-time steering arbitrator visibility
-        let _active_guard = register_active_worker(
+        let _active_guard = register_active_worker_with_token(
             req.task_id.clone(),
             entry.agent.as_str().to_string(),
             req.prompt.clone(),
+            Some(child_token.clone()),
         );
 
         // 5. Build the worker and run to completion (synchronous-from-Manager).
-        let deliverable = if self.cancellation_token.is_cancelled() {
+        let deliverable = if self.cancellation_token.is_cancelled() || child_token.is_cancelled() {
             Deliverable {
                 marker: MissionMarker::Failed {
                     reason: "aborted".to_string(),
@@ -348,7 +353,6 @@ impl OrchestratorManager {
             }
         } else {
             let worker = self.registry.worker(entry.agent);
-            let child_token = self.cancellation_token.child_token();
             worker.run(&ctx, &child_token).await
         };
 

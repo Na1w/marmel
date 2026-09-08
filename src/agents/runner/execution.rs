@@ -14,6 +14,21 @@ pub async fn run_specialist_live(
     cfg: &crate::config::Config,
     token: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<String> {
+    crate::orchestrator::CURRENT_WORKER_TOKEN
+        .scope(
+            token.clone(),
+            run_specialist_live_inner(client, agent, ctx, cfg, token),
+        )
+        .await
+}
+
+async fn run_specialist_live_inner(
+    client: &crate::llm::ChatClient,
+    agent: Agent,
+    ctx: &IsolatedContext,
+    cfg: &crate::config::Config,
+    token: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<String> {
     let env_block = crate::prompts::format_environment_block();
 
     let enhanced_system_prompt = format!(
@@ -74,10 +89,11 @@ pub async fn run_specialist_live(
     let mut nudge_count = 0u32;
     let mut consecutive_thinking_nudges = 0u32;
 
-    let _active_guard = crate::orchestrator::register_active_worker(
+    let _active_guard = crate::orchestrator::register_active_worker_with_token(
         clean_task_id.clone(),
         agent.as_str().to_string(),
         ctx.brief.clone(),
+        Some(token.clone()),
     );
 
     let default_mon = crate::config::MonitoringConfig::default();

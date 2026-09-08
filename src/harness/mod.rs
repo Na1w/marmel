@@ -373,13 +373,24 @@ pub async fn handle_sleep_async(arguments: &serde_json::Value) -> Result<ToolRes
     };
 
     let cancel = crate::orchestrator::bus::global_cancellation_token();
-    if cancel.is_cancelled() {
+    if cancel.is_cancelled() || crate::orchestrator::is_current_or_global_cancelled() {
         return Ok(ToolResult::err("Sleep cancelled before starting."));
     }
+
+    let worker_token = crate::orchestrator::CURRENT_WORKER_TOKEN
+        .try_with(|t| t.clone())
+        .ok();
 
     let completed = tokio::select! {
         _ = tokio::time::sleep(std::time::Duration::from_secs(actual_secs)) => true,
         _ = cancel.cancelled() => false,
+        _ = async {
+            if let Some(ref t) = worker_token {
+                t.cancelled().await
+            } else {
+                std::future::pending::<()>().await
+            }
+        } => false,
     };
 
     if completed {

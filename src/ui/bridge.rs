@@ -132,8 +132,19 @@ pub fn spawn_steer_arbitration(
 
             if is_global_abort {
                 preempt_handle.complete_all(PauseAction::Abort);
+                crate::orchestrator::cancel_all();
             } else {
                 preempt_handle.complete_with_subtask_decision(cur_decision.as_ref());
+                if let Some(ref d) = cur_decision {
+                    for st in &d.subtasks {
+                        if st.action.eq_ignore_ascii_case("Cancel") {
+                            crate::orchestrator::cancel_active_worker(
+                                st.agent_name.as_deref(),
+                                Some(&st.tool_call_id),
+                            );
+                        }
+                    }
+                }
             }
 
             decision = cur_decision;
@@ -343,6 +354,38 @@ pub(crate) fn drain_steer_arbitration_events(
                 // Do NOT push to steer_queue so it does not trigger an orchestrator turn.
             }
             SteerArbEvent::Finished { decision, user_msg } => {
+                if let Some(ref d) = decision {
+                    for st in &d.subtasks {
+                        if st.action.eq_ignore_ascii_case("Cancel") {
+                            let target = st.agent_name.as_deref().unwrap_or(&st.tool_call_id);
+                            let cancelled = crate::orchestrator::cancel_active_worker(
+                                st.agent_name.as_deref(),
+                                Some(&st.tool_call_id),
+                            );
+                            if cancelled {
+                                renderer.on_event(&Event::Status(format!(
+                                    "[Arbitrator] Cancelled specialist subagent '{target}'"
+                                )));
+                            }
+                            if let Some(sub) = subagents.as_deref_mut() {
+                                for s in sub.iter_mut() {
+                                    let matches_id = s.task_id.as_deref() == Some(&st.tool_call_id);
+                                    let matches_agent = st
+                                        .agent_name
+                                        .as_ref()
+                                        .map(|a| a.eq_ignore_ascii_case(&s.name))
+                                        .unwrap_or(false);
+                                    if s.is_active && (matches_id || matches_agent) {
+                                        s.is_active = false;
+                                        s.logs.push("[cancelled by arbitrator]".to_string());
+                                    }
+                                }
+                                renderer.set_subagents(sub.clone());
+                            }
+                        }
+                    }
+                }
+
                 let has_delegations = decision
                     .as_ref()
                     .map(|d| {
@@ -374,6 +417,7 @@ pub(crate) fn drain_steer_arbitration_events(
                             ));
                         }
                         "AbortImmediately" => {
+                            crate::orchestrator::cancel_all();
                             renderer.request_abort();
                             *steer_abort_requested = true;
                             steer_queue.push(user_msg);
@@ -388,6 +432,7 @@ pub(crate) fn drain_steer_arbitration_events(
                             steer_queue.push("User approved plan.".to_string());
                         }
                         "RejectPlan" => {
+                            crate::orchestrator::cancel_all();
                             renderer.request_abort();
                             *steer_abort_requested = true;
                             steer_queue.push(format!("User rejected plan: {user_msg}"));
@@ -578,8 +623,19 @@ impl StreamSink for RendererSink<'_> {
 
             if is_global_abort {
                 preempt_handle.complete_all(PauseAction::Abort);
+                crate::orchestrator::cancel_all();
             } else {
                 preempt_handle.complete_with_subtask_decision(cur_decision.as_ref());
+                if let Some(ref d) = cur_decision {
+                    for st in &d.subtasks {
+                        if st.action.eq_ignore_ascii_case("Cancel") {
+                            crate::orchestrator::cancel_active_worker(
+                                st.agent_name.as_deref(),
+                                Some(&st.tool_call_id),
+                            );
+                        }
+                    }
+                }
             }
 
             decision = cur_decision;
@@ -838,10 +894,14 @@ mod tests {
 
     struct TestRenderer {
         events: Vec<Event>,
+        aborted: bool,
     }
     impl TestRenderer {
         fn new() -> Self {
-            Self { events: Vec::new() }
+            Self {
+                events: Vec::new(),
+                aborted: false,
+            }
         }
     }
     impl Renderer for TestRenderer {
@@ -860,9 +920,11 @@ mod tests {
         fn read_input(&mut self) -> Option<String> {
             None
         }
-        fn request_abort(&mut self) {}
+        fn request_abort(&mut self) {
+            self.aborted = true;
+        }
         fn aborted(&self) -> bool {
-            false
+            self.aborted
         }
         fn shutdown(&mut self) {}
     }
@@ -1240,5 +1302,126 @@ mod tests {
             e,
             Event::Status(s) if s.contains("Answered via direct steer response")
         )));
+    }
+
+    #[test]
+    fn test_drain_steer_cancel_subtask_cancels_worker_and_updates_subagents() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut renderer = TestRenderer::new();
+        let mut steer_queue = Vec::new();
+        let mut steer_abort = false;
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let guard = crate::orchestrator::register_active_worker_with_token(
+            Some("t-001".to_string()),
+            "coder".to_string(),
+            "Running long build".to_string(),
+            Some(token.clone()),
+        );
+
+        let mut subagents = vec![SubagentDetail {
+            name: "coder".to_string(),
+            task_id: Some("t-001".to_string()),
+            prompt: "Running long build".to_string(),
+            is_active: true,
+            ..Default::default()
+        }];
+
+        assert!(!token.is_cancelled());
+
+        tx.send(SteerArbEvent::Finished {
+            decision: Some(crate::orchestrator::SteerDecision {
+                decision: "ForwardToWorker".to_string(),
+                response: None,
+                tier: None,
+                model: None,
+                subtasks: vec![crate::orchestrator::SteerSubtaskDecision {
+                    tool_call_id: "t-001".to_string(),
+                    action: "Cancel".to_string(),
+                    message: None,
+                    agent_name: Some("coder".to_string()),
+                    prompt: None,
+                    sleep_seconds: None,
+                }],
+                sleep_seconds: None,
+            }),
+            user_msg: "cancel coder".to_string(),
+        })
+        .unwrap();
+
+        drain_steer_arbitration_events(
+            &mut rx,
+            &mut renderer,
+            &mut steer_queue,
+            &mut steer_abort,
+            Some(&mut subagents),
+        );
+
+        assert!(
+            token.is_cancelled(),
+            "Active worker token must be cancelled"
+        );
+        assert!(
+            !subagents[0].is_active,
+            "Subagent in UI must be marked inactive"
+        );
+        assert!(
+            subagents[0]
+                .logs
+                .iter()
+                .any(|l| l.contains("cancelled by arbitrator")),
+            "Subagent logs should contain cancellation note"
+        );
+
+        drop(guard);
+    }
+
+    #[test]
+    fn test_drain_steer_abort_cancels_all_active_workers() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut renderer = TestRenderer::new();
+        let mut steer_queue = Vec::new();
+        let mut steer_abort = false;
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let guard = crate::orchestrator::register_active_worker_with_token(
+            Some("t-002".to_string()),
+            "researcher".to_string(),
+            "Researching...".to_string(),
+            Some(token.clone()),
+        );
+
+        assert!(!token.is_cancelled());
+
+        tx.send(SteerArbEvent::Finished {
+            decision: Some(crate::orchestrator::SteerDecision {
+                decision: "AbortImmediately".to_string(),
+                response: Some("Aborting all!".to_string()),
+                tier: None,
+                model: None,
+                subtasks: Vec::new(),
+                sleep_seconds: None,
+            }),
+            user_msg: "stop all".to_string(),
+        })
+        .unwrap();
+
+        drain_steer_arbitration_events(
+            &mut rx,
+            &mut renderer,
+            &mut steer_queue,
+            &mut steer_abort,
+            None,
+        );
+
+        assert!(steer_abort);
+        assert!(renderer.aborted());
+        assert!(
+            token.is_cancelled(),
+            "Active worker token must be cancelled on AbortImmediately"
+        );
+
+        drop(guard);
+        crate::orchestrator::reset_cancellation();
     }
 }

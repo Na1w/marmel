@@ -122,6 +122,31 @@ pub fn parse_verdict_args(args: &serde_json::Value) -> Option<(bool, String)> {
 }
 
 pub(crate) async fn run_automated_validation(
+    client: &crate::llm::ChatClient,
+    agent: Agent,
+    task_id: Option<&str>,
+    task_brief: &str,
+    deliverable: &str,
+    cfg: &crate::config::Config,
+    token: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<(bool, String)> {
+    crate::orchestrator::CURRENT_WORKER_TOKEN
+        .scope(
+            token.clone(),
+            run_automated_validation_inner(
+                client,
+                agent,
+                task_id,
+                task_brief,
+                deliverable,
+                cfg,
+                token,
+            ),
+        )
+        .await
+}
+
+async fn run_automated_validation_inner(
     _client: &crate::llm::ChatClient,
     agent: Agent,
     task_id: Option<&str>,
@@ -209,10 +234,11 @@ pub(crate) async fn run_automated_validation(
         None => format!("validator-{agent}"),
     };
 
-    let _active_guard = crate::orchestrator::register_active_worker(
+    let _active_guard = crate::orchestrator::register_active_worker_with_token(
         clean_task_id.clone(),
         format!("validator-{agent}"),
         format!("Auditing {agent} deliverable"),
+        Some(token.clone()),
     );
 
     let default_mon = crate::config::MonitoringConfig::default();
@@ -466,6 +492,19 @@ pub(crate) async fn run_plan_validation(
     cfg: &crate::config::Config,
     token: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<(bool, String)> {
+    crate::orchestrator::CURRENT_WORKER_TOKEN
+        .scope(
+            token.clone(),
+            run_plan_validation_inner(plan_markdown, cfg, token),
+        )
+        .await
+}
+
+async fn run_plan_validation_inner(
+    plan_markdown: &str,
+    cfg: &crate::config::Config,
+    token: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<(bool, String)> {
     let planner_cfg = cfg.orchestration.specialists.get("planner");
     let validator_cfg = cfg.orchestration.specialists.get(Agent::Validator.as_str());
 
@@ -536,10 +575,11 @@ pub(crate) async fn run_plan_validation(
     }
 
     let val_tag = "validator-planner".to_string();
-    let _active_guard = crate::orchestrator::register_active_worker(
+    let _active_guard = crate::orchestrator::register_active_worker_with_token(
         None,
         val_tag.clone(),
         "Auditing execution plan".to_string(),
+        Some(token.clone()),
     );
 
     let default_mon = crate::config::MonitoringConfig::default();

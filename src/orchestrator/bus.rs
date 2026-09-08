@@ -19,11 +19,17 @@ pub fn global_cancellation_token() -> tokio_util::sync::CancellationToken {
         .unwrap_or_default()
 }
 
+tokio::task_local! {
+    /// Task-local cancellation token for the currently executing specialist worker or validator.
+    pub static CURRENT_WORKER_TOKEN: tokio_util::sync::CancellationToken;
+}
+
 /// Cancel all active subagents, workers, LLM streams, and operations across the entire process.
 pub fn cancel_all() {
     if let Ok(guard) = GLOBAL_CANCELLATION_TOKEN.read() {
         guard.cancel();
     }
+    crate::orchestrator::cancel_all_active_workers();
 }
 
 /// Returns true if a global cancellation / abort signal has been requested.
@@ -31,6 +37,16 @@ pub fn is_globally_cancelled() -> bool {
     GLOBAL_CANCELLATION_TOKEN
         .read()
         .map(|guard| guard.is_cancelled())
+        .unwrap_or(false)
+}
+
+/// Returns true if either a global cancellation or the current worker's cancellation has been triggered.
+pub fn is_current_or_global_cancelled() -> bool {
+    if is_globally_cancelled() {
+        return true;
+    }
+    CURRENT_WORKER_TOKEN
+        .try_with(|t| t.is_cancelled())
         .unwrap_or(false)
 }
 

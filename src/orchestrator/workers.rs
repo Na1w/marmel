@@ -17,6 +17,7 @@ pub struct ActiveWorkerInfo {
     pub validation_rounds: usize,
     pub latest_validator_feedback: Option<String>,
     pub status: String,
+    pub cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// Information about a recently completed specialist task.
@@ -87,6 +88,16 @@ pub fn register_active_worker(
     agent_name: String,
     prompt: String,
 ) -> ActiveWorkerGuard {
+    register_active_worker_with_token(task_id, agent_name, prompt, None)
+}
+
+/// Register a subagent worker as active with start timestamp, task prompt, and optional cancellation token.
+pub fn register_active_worker_with_token(
+    task_id: Option<String>,
+    agent_name: String,
+    prompt: String,
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
+) -> ActiveWorkerGuard {
     let clean_task_id = task_id
         .as_deref()
         .map(|t| {
@@ -103,6 +114,9 @@ pub fn register_active_worker(
     } else {
         format!("{agent_name}-{}", Instant::now().elapsed().as_nanos())
     };
+
+    let effective_token = cancel_token
+        .or_else(|| Some(crate::orchestrator::bus::global_cancellation_token().child_token()));
 
     if let Ok(mut map) = ACTIVE_WORKERS.write() {
         let initial_tokens = WORKER_CONTEXT_TOKENS
@@ -123,6 +137,7 @@ pub fn register_active_worker(
                 validation_rounds: 0,
                 latest_validator_feedback: None,
                 status: "In Progress".to_string(),
+                cancel_token: effective_token,
             },
         );
     }
@@ -330,6 +345,125 @@ pub fn get_active_subtask_by_id(task_id: &str) -> Option<(String, String)> {
     Some((info.agent_name.clone(), running_time))
 }
 
+/// Helper to check if an active worker matches a target agent and/or task ID.
+fn worker_matches(
+    info: &ActiveWorkerInfo,
+    key: &str,
+    target_agent: Option<&str>,
+    target_task: Option<&str>,
+) -> bool {
+    let clean_agent = target_agent.unwrap_or("").trim().to_ascii_lowercase();
+    let clean_task = target_task
+        .unwrap_or("")
+        .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
+        .trim()
+        .to_ascii_lowercase();
+
+    if clean_agent.is_empty() && clean_task.is_empty() {
+        return false;
+    }
+
+    let key_lower = key.to_ascii_lowercase();
+    let worker_agent = info.agent_name.trim().to_ascii_lowercase();
+    let worker_task = info
+        .task_id
+        .as_deref()
+        .unwrap_or("")
+        .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
+        .trim()
+        .to_ascii_lowercase();
+
+    // 1. Direct match on key
+    if (!clean_task.is_empty() && key_lower.contains(&clean_task))
+        || (!clean_agent.is_empty() && key_lower.contains(&clean_agent))
+    {
+        return true;
+    }
+
+    // 2. Match on task id
+    if !clean_task.is_empty()
+        && !worker_task.is_empty()
+        && (worker_task == clean_task
+            || worker_task.contains(&clean_task)
+            || clean_task.contains(&worker_task))
+    {
+        return true;
+    }
+
+    // 3. Cross match: tool_call_id specified agent name (e.g. tool_call_id: "coder" or "validator-coder")
+    if !clean_task.is_empty()
+        && (worker_agent == clean_task
+            || worker_agent.contains(&clean_task)
+            || clean_task.contains(&worker_agent))
+    {
+        return true;
+    }
+
+    // 4. Match on agent name
+    if !clean_agent.is_empty()
+        && (worker_agent == clean_agent
+            || worker_agent.contains(&clean_agent)
+            || clean_agent.contains(&worker_agent))
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Cancel an active specialist worker matching target_agent and/or target_task_id.
+/// Returns true if at least one matching active worker was found and cancelled.
+pub fn cancel_active_worker(target_agent: Option<&str>, target_task_id: Option<&str>) -> bool {
+    let Ok(map) = ACTIVE_WORKERS.read() else {
+        return false;
+    };
+
+    let mut to_cancel = Vec::new();
+    for (key, info) in map.iter() {
+        if worker_matches(info, key, target_agent, target_task_id) {
+            to_cancel.push((key.clone(), info.cancel_token.clone()));
+        }
+    }
+    drop(map);
+
+    let found = !to_cancel.is_empty();
+    for (key, token_opt) in to_cancel {
+        if let Some(token) = token_opt {
+            token.cancel();
+        }
+        set_active_worker_status(&key, "Aborted");
+        crate::orchestrator::emit_status(format!(
+            "[Steering] Cancelled active specialist worker '{key}'"
+        ));
+    }
+    found
+}
+
+/// Cancel all active specialist workers across the registry.
+pub fn cancel_all_active_workers() -> usize {
+    let Ok(map) = ACTIVE_WORKERS.read() else {
+        return 0;
+    };
+
+    let mut to_cancel = Vec::new();
+    for (key, info) in map.iter() {
+        to_cancel.push((key.clone(), info.cancel_token.clone()));
+    }
+    drop(map);
+
+    let count = to_cancel.len();
+    for (key, token_opt) in to_cancel {
+        if let Some(token) = token_opt {
+            token.cancel();
+        }
+        set_active_worker_status(&key, "Aborted");
+        crate::orchestrator::emit_status(format!(
+            "[Steering] Aborted active specialist worker '{key}'"
+        ));
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,5 +499,42 @@ mod tests {
         assert!(completed_str.contains("All checks passed"));
         assert!(completed_str.contains("Started At:"));
         assert!(completed_str.contains("Finished At:"));
+    }
+
+    #[test]
+    fn test_cancel_active_worker_and_cancel_all() {
+        let token1 = tokio_util::sync::CancellationToken::new();
+        let token2 = tokio_util::sync::CancellationToken::new();
+
+        let guard1 = register_active_worker_with_token(
+            Some("t-001".to_string()),
+            "coder".to_string(),
+            "Writing parser".to_string(),
+            Some(token1.clone()),
+        );
+
+        let guard2 = register_active_worker_with_token(
+            Some("t-002".to_string()),
+            "researcher".to_string(),
+            "Investigating bug".to_string(),
+            Some(token2.clone()),
+        );
+
+        assert!(!token1.is_cancelled());
+        assert!(!token2.is_cancelled());
+
+        // Cancel specific worker by task_id
+        let cancelled = cancel_active_worker(None, Some("t-001"));
+        assert!(cancelled);
+        assert!(token1.is_cancelled());
+        assert!(!token2.is_cancelled());
+
+        // Cancel remaining workers with cancel_all_active_workers
+        let count = cancel_all_active_workers();
+        assert!(count >= 1);
+        assert!(token2.is_cancelled());
+
+        drop(guard1);
+        drop(guard2);
     }
 }

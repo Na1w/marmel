@@ -229,16 +229,29 @@ pub fn run_command_pty(command: &str, timeout: Duration) -> Result<String, ToolE
         let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
     });
 
-    // Wait for output with a timeout; on timeout the group is SIGKILLed below.
-    let output = match rx.recv_timeout(timeout) {
-        Ok(o) => o,
-        Err(_) => {
-            // Timed out: kill the whole process group.
-            let _ = session.teardown();
-            return Ok(format!(
-                "[command timed out after {}s and was killed]",
-                timeout.as_secs()
-            ));
+    // Wait for output with a timeout and periodic cancellation checks; on timeout or cancel the group is SIGKILLed.
+    let start = std::time::Instant::now();
+    let poll_interval = std::time::Duration::from_millis(50);
+    let output = loop {
+        match rx.recv_timeout(poll_interval) {
+            Ok(o) => break o,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if crate::orchestrator::is_current_or_global_cancelled() {
+                    let _ = session.teardown();
+                    return Ok("[command aborted by cancellation signal]".to_string());
+                }
+                if start.elapsed() >= timeout {
+                    let _ = session.teardown();
+                    return Ok(format!(
+                        "[command timed out after {}s and was killed]",
+                        timeout.as_secs()
+                    ));
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = session.teardown();
+                return Ok("[command process terminated abruptly]".to_string());
+            }
         }
     };
 

@@ -163,3 +163,27 @@ async fn test_interactive_pty_manager_lifecycle() {
     let list_after = mgr.list().await;
     assert_eq!(list_after.len(), 0);
 }
+
+#[tokio::test]
+async fn test_run_command_pty_cancelled_by_worker_token() {
+    let token = tokio_util::sync::CancellationToken::new();
+    let token_clone = token.clone();
+
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        token_clone.cancel();
+    });
+
+    let res = crate::orchestrator::CURRENT_WORKER_TOKEN
+        .scope(token, async {
+            run_command_pty("sleep 10", Duration::from_secs(10))
+        })
+        .await;
+
+    assert!(res.is_ok());
+    let output = res.unwrap();
+    assert!(
+        output.contains("aborted by cancellation signal"),
+        "Expected aborted output, got: {output}"
+    );
+}

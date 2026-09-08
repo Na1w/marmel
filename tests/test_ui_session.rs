@@ -40,6 +40,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+static TEST_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// A scripted mock renderer that reproduces the TUI's non-blocking poll.
 ///
 /// * `poll_input()` always returns `None` — it is the non-blocking poll that,
@@ -322,6 +325,7 @@ fn tool_call_sse(id: &str, name: &str, args: &str) -> String {
 /// redirection into context, and stays alive for the subsequent turn instead of exiting.
 #[tokio::test]
 async fn test_ui_session_steer_abort_redirection_resets_abort_and_continues() {
+    let _lock = TEST_MUTEX.lock().await;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1079,6 +1083,7 @@ async fn test_stream_preemption_on_synchronous_bridge() {
 
 #[tokio::test]
 async fn test_steering_arbitrator_sleep_re_invokes_after_delay() {
+    let _lock = TEST_MUTEX.lock().await;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{method, path};
