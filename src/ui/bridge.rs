@@ -70,7 +70,7 @@ pub fn spawn_steer_arbitration(
                 .map(|h| crate::orchestrator::format_steering_history(&h))
                 .unwrap_or_else(|| "None".to_string());
 
-            let plan_content = crate::agent::phase::Plan::default()
+            let plan_content = crate::manager::phase::Plan::default()
                 .read()
                 .unwrap_or(None)
                 .unwrap_or_default();
@@ -124,8 +124,10 @@ pub fn spawn_steer_arbitration(
             .await;
 
             let is_global_abort = matches!(
-                cur_decision.as_ref().map(|d| d.decision.as_str()),
-                Some("AbortImmediately") | Some("RejectPlan")
+                crate::orchestrator::normalize_steer_decision(
+                    cur_decision.as_ref().map(|d| d.decision.as_str())
+                ),
+                "AbortImmediately" | "RejectPlan"
             );
 
             if is_global_abort {
@@ -137,7 +139,7 @@ pub fn spawn_steer_arbitration(
             decision = cur_decision;
 
             if let Some(ref d) = decision
-                && d.decision.eq_ignore_ascii_case("Sleep")
+                && crate::orchestrator::normalize_steer_decision(Some(&d.decision)) == "Sleep"
             {
                 let sleep_secs = d.sleep_seconds.unwrap_or(5).min(300);
                 let _ = tx.send(SteerArbEvent::Delta(format!(
@@ -236,7 +238,7 @@ pub fn spawn_steer_arbitration(
         } else if let Some(ref d) = decision {
             if let Some(ref r) = d.response {
                 r.clone()
-            } else if d.decision.eq_ignore_ascii_case("Sleep") {
+            } else if crate::orchestrator::normalize_steer_decision(Some(&d.decision)) == "Sleep" {
                 format!("Slept for {}s", d.sleep_seconds.unwrap_or(5))
             } else {
                 format!("Decision: {}", d.decision)
@@ -265,11 +267,12 @@ pub(crate) fn drain_steer_arbitration_events(
     steer_abort_requested: &mut bool,
     mut subagents: Option<&mut Vec<SubagentDetail>>,
 ) {
+    let mut dirty = false;
     while let Ok(ev) = arb_rx.try_recv() {
+        dirty = true;
         match ev {
             SteerArbEvent::Delta(delta) => {
                 renderer.on_event(&Event::SteerResponse(delta));
-                let _ = renderer.flush();
             }
             SteerArbEvent::DelegationStarted {
                 agent,
@@ -296,7 +299,6 @@ pub(crate) fn drain_steer_arbitration_events(
                     );
                     renderer.set_subagents(sub.clone());
                 }
-                let _ = renderer.flush();
             }
             SteerArbEvent::DelegationCompleted {
                 agent,
@@ -335,18 +337,17 @@ pub(crate) fn drain_steer_arbitration_events(
                     agent.as_str(),
                     deliverable.content
                 ));
-                let _ = renderer.flush();
             }
-            SteerArbEvent::SynthesizedAnswer { user_msg, answer } => {
-                steer_queue.push(format!(
-                    "(User steering inquiry: '{user_msg}'. Arbitrator answered user directly: {answer})"
-                ));
+            SteerArbEvent::SynthesizedAnswer { .. } => {
+                // User steering inquiry was answered directly to the user by arbitrator.
+                // Do NOT push to steer_queue so it does not trigger an orchestrator turn.
             }
             SteerArbEvent::Finished { decision, user_msg } => {
                 let has_delegations = decision
                     .as_ref()
                     .map(|d| {
-                        d.decision.eq_ignore_ascii_case("DelegateTask")
+                        crate::orchestrator::normalize_steer_decision(Some(&d.decision))
+                            == "DelegateTask"
                             || d.subtasks
                                 .iter()
                                 .any(|s| s.action.eq_ignore_ascii_case("DelegateTask"))
@@ -357,46 +358,78 @@ pub(crate) fn drain_steer_arbitration_events(
                     renderer.on_event(&Event::Status(
                         "Steering subtask delegation finished".to_string(),
                     ));
-                    let _ = renderer.flush();
                 } else {
-                    match decision.as_ref().map(|d| d.decision.as_str()) {
-                        Some("RespondDirectly") => {
+                    let norm = crate::orchestrator::normalize_steer_decision(
+                        decision.as_ref().map(|d| d.decision.as_str()),
+                    );
+                    match norm {
+                        "RespondDirectly" => {
                             renderer.on_event(&Event::Status(
                                 "Answered via direct steer response".to_string(),
                             ));
-                            let _ = renderer.flush();
                         }
-                        Some("AbortImmediately") => {
+                        "Sleep" => {
+                            renderer.on_event(&Event::Status(
+                                "Steering arbitrator sleep completed".to_string(),
+                            ));
+                        }
+                        "AbortImmediately" => {
                             renderer.request_abort();
                             *steer_abort_requested = true;
                             steer_queue.push(user_msg);
                         }
-                        Some("ForwardToWorker") => {
+                        "ForwardToWorker" => {
                             steer_queue.push(user_msg);
                             renderer.on_event(&Event::Status(
                                 "Notice forwarded to specialist".to_string(),
                             ));
-                            let _ = renderer.flush();
                         }
-                        Some("ApprovePlan") => {
+                        "ApprovePlan" => {
                             steer_queue.push("User approved plan.".to_string());
                         }
-                        Some("RejectPlan") => {
+                        "RejectPlan" => {
                             renderer.request_abort();
                             *steer_abort_requested = true;
                             steer_queue.push(format!("User rejected plan: {user_msg}"));
                         }
-                        _ => {
+                        "QueueAndContinue" => {
                             steer_queue.push(user_msg);
+                            if decision
+                                .as_ref()
+                                .and_then(|d| d.response.as_ref())
+                                .is_none()
+                            {
+                                renderer.on_event(&Event::SteerResponse(
+                                    "Instruction queued for next turn while active tasks continue.\n".to_string(),
+                                ));
+                            }
                             renderer.on_event(&Event::Status(
                                 "Instruction queued for next turn".to_string(),
                             ));
-                            let _ = renderer.flush();
+                        }
+                        _ => {
+                            let has_response = decision
+                                .as_ref()
+                                .and_then(|d| d.response.as_ref())
+                                .is_some();
+                            if !has_response {
+                                steer_queue.push(user_msg);
+                                renderer.on_event(&Event::Status(
+                                    "Instruction queued for next turn".to_string(),
+                                ));
+                            } else {
+                                renderer.on_event(&Event::Status(
+                                    "Answered via direct steer response".to_string(),
+                                ));
+                            }
                         }
                     }
                 }
             }
         }
+    }
+    if dirty {
+        let _ = renderer.flush();
     }
 }
 
@@ -411,7 +444,7 @@ pub struct RendererSink<'a> {
     pub stats: Arc<crate::harness::HarnessStats>,
     pub goal: &'a str,
     pub subagents: &'a [SubagentDetail],
-    pub plan: Option<&'a crate::agent::phase::Plan>,
+    pub plan: Option<&'a crate::manager::phase::Plan>,
     pub ctx: Option<&'a mut crate::manager::context::ContextEngine>,
     pub steering_history: Option<SharedSteeringHistory>,
 }
@@ -447,7 +480,7 @@ impl StreamSink for RendererSink<'_> {
                 return StreamControl::Abort;
             } else if is_reset_command(&input) {
                 crate::debug_log::log_user_input("command", &input);
-                let default_plan = crate::agent::phase::Plan::default();
+                let default_plan = crate::manager::phase::Plan::default();
                 let plan = self.plan.unwrap_or(&default_plan);
                 let ctx = self.ctx.as_deref_mut();
                 crate::ui::helpers::handle_reset_command(plan, self.renderer, ctx);
@@ -474,7 +507,7 @@ impl StreamSink for RendererSink<'_> {
             ));
             let _ = self.renderer.flush();
 
-            let plan_content = crate::agent::phase::Plan::default()
+            let plan_content = crate::manager::phase::Plan::default()
                 .read()
                 .unwrap_or(None)
                 .unwrap_or_default();
@@ -537,8 +570,10 @@ impl StreamSink for RendererSink<'_> {
             .await;
 
             let is_global_abort = matches!(
-                cur_decision.as_ref().map(|d| d.decision.as_str()),
-                Some("AbortImmediately") | Some("RejectPlan")
+                crate::orchestrator::normalize_steer_decision(
+                    cur_decision.as_ref().map(|d| d.decision.as_str())
+                ),
+                "AbortImmediately" | "RejectPlan"
             );
 
             if is_global_abort {
@@ -550,7 +585,7 @@ impl StreamSink for RendererSink<'_> {
             decision = cur_decision;
 
             if let Some(ref d) = decision
-                && d.decision.eq_ignore_ascii_case("Sleep")
+                && crate::orchestrator::normalize_steer_decision(Some(&d.decision)) == "Sleep"
             {
                 let sleep_secs = d.sleep_seconds.unwrap_or(5).min(300);
                 self.renderer.on_event(&Event::Status(format!(
@@ -594,7 +629,7 @@ impl StreamSink for RendererSink<'_> {
         let recorded_resp = if let Some(ref d) = decision {
             if let Some(ref r) = d.response {
                 r.clone()
-            } else if d.decision.eq_ignore_ascii_case("Sleep") {
+            } else if crate::orchestrator::normalize_steer_decision(Some(&d.decision)) == "Sleep" {
                 format!("Slept for {}s", d.sleep_seconds.unwrap_or(5))
             } else {
                 format!("Decision: {}", d.decision)
@@ -680,52 +715,18 @@ impl StreamSink for RendererSink<'_> {
             }
             PauseAction::Resume
         } else {
-            match decision.as_ref().map(|d| d.decision.as_str()) {
-                Some("RespondDirectly") => {
+            let norm = crate::orchestrator::normalize_steer_decision(
+                decision.as_ref().map(|d| d.decision.as_str()),
+            );
+            match norm {
+                "RespondDirectly" => {
                     self.renderer.on_event(&Event::Status(
                         "Answered via direct steer response — resuming stream...".to_string(),
                     ));
                     let _ = self.renderer.flush();
                     PauseAction::Resume
                 }
-                Some("AbortImmediately") => {
-                    self.renderer.request_abort();
-                    *self.steer_abort_requested = true;
-                    self.steer_queue.push(user_msg.to_string());
-                    self.renderer.on_event(&Event::Status(
-                        "Steering requested immediate abort".to_string(),
-                    ));
-                    let _ = self.renderer.flush();
-                    PauseAction::Abort
-                }
-                Some("RejectPlan") => {
-                    self.renderer.request_abort();
-                    *self.steer_abort_requested = true;
-                    self.steer_queue
-                        .push(format!("User rejected plan: {user_msg}"));
-                    self.renderer.on_event(&Event::Status(
-                        "Plan rejected — aborting current turn".to_string(),
-                    ));
-                    let _ = self.renderer.flush();
-                    PauseAction::Abort
-                }
-                Some("ForwardToWorker") => {
-                    self.steer_queue.push(user_msg.to_string());
-                    self.renderer.on_event(&Event::Status(
-                        "Notice queued for worker — resuming stream...".to_string(),
-                    ));
-                    let _ = self.renderer.flush();
-                    PauseAction::Resume
-                }
-                Some("ApprovePlan") => {
-                    self.steer_queue.push("User approved plan.".to_string());
-                    self.renderer.on_event(&Event::Status(
-                        "Plan approved — resuming stream...".to_string(),
-                    ));
-                    let _ = self.renderer.flush();
-                    PauseAction::Resume
-                }
-                Some("Sleep") => {
+                "Sleep" => {
                     let sleep_secs = decision
                         .as_ref()
                         .and_then(|d| d.sleep_seconds)
@@ -751,11 +752,76 @@ impl StreamSink for RendererSink<'_> {
                     let _ = self.renderer.flush();
                     PauseAction::Resume
                 }
-                _ => {
+                "AbortImmediately" => {
+                    self.renderer.request_abort();
+                    *self.steer_abort_requested = true;
                     self.steer_queue.push(user_msg.to_string());
+                    self.renderer.on_event(&Event::Status(
+                        "Steering requested immediate abort".to_string(),
+                    ));
+                    let _ = self.renderer.flush();
+                    PauseAction::Abort
+                }
+                "RejectPlan" => {
+                    self.renderer.request_abort();
+                    *self.steer_abort_requested = true;
+                    self.steer_queue
+                        .push(format!("User rejected plan: {user_msg}"));
+                    self.renderer.on_event(&Event::Status(
+                        "Plan rejected — aborting current turn".to_string(),
+                    ));
+                    let _ = self.renderer.flush();
+                    PauseAction::Abort
+                }
+                "ForwardToWorker" => {
+                    self.steer_queue.push(user_msg.to_string());
+                    self.renderer.on_event(&Event::Status(
+                        "Notice queued for worker — resuming stream...".to_string(),
+                    ));
+                    let _ = self.renderer.flush();
+                    PauseAction::Resume
+                }
+                "ApprovePlan" => {
+                    self.steer_queue.push("User approved plan.".to_string());
+                    self.renderer.on_event(&Event::Status(
+                        "Plan approved — resuming stream...".to_string(),
+                    ));
+                    let _ = self.renderer.flush();
+                    PauseAction::Resume
+                }
+                "QueueAndContinue" => {
+                    self.steer_queue.push(user_msg.to_string());
+                    if decision
+                        .as_ref()
+                        .and_then(|d| d.response.as_ref())
+                        .is_none()
+                    {
+                        self.renderer.on_event(&Event::SteerResponse(
+                            "Instruction queued for next turn while active tasks continue.\n"
+                                .to_string(),
+                        ));
+                    }
                     self.renderer.on_event(&Event::Status(
                         "Instruction queued for next turn — resuming stream...".to_string(),
                     ));
+                    let _ = self.renderer.flush();
+                    PauseAction::Resume
+                }
+                _ => {
+                    let has_response = decision
+                        .as_ref()
+                        .and_then(|d| d.response.as_ref())
+                        .is_some();
+                    if !has_response {
+                        self.steer_queue.push(user_msg.to_string());
+                        self.renderer.on_event(&Event::Status(
+                            "Instruction queued for next turn — resuming stream...".to_string(),
+                        ));
+                    } else {
+                        self.renderer.on_event(&Event::Status(
+                            "Answered via direct steer response — resuming stream...".to_string(),
+                        ));
+                    }
                     let _ = self.renderer.flush();
                     PauseAction::Resume
                 }
@@ -899,6 +965,280 @@ mod tests {
         assert!(renderer.events.iter().any(|e| matches!(
             e,
             Event::Message(m) if m.contains("All files inspected cleanly.")
+        )));
+    }
+
+    #[test]
+    fn test_drain_steer_queue_and_continue_with_streamed_response() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut renderer = TestRenderer::new();
+        let mut steer_queue = Vec::new();
+        let mut steer_abort = false;
+
+        // The streaming arbitrator streams the user-facing explanation first
+        tx.send(SteerArbEvent::Delta(
+            "Instruktionen har köats för nästa tur.".to_string(),
+        ))
+        .unwrap();
+
+        // Then completes with QueueAndContinue decision
+        tx.send(SteerArbEvent::Finished {
+            decision: Some(crate::orchestrator::SteerDecision {
+                decision: "QueueAndContinue".to_string(),
+                response: Some("Instruktionen har köats för nästa tur.".to_string()),
+                tier: None,
+                model: None,
+                subtasks: Vec::new(),
+                sleep_seconds: None,
+            }),
+            user_msg: "lägg till en extra feature sen".to_string(),
+        })
+        .unwrap();
+
+        drain_steer_arbitration_events(
+            &mut rx,
+            &mut renderer,
+            &mut steer_queue,
+            &mut steer_abort,
+            None,
+        );
+
+        assert_eq!(
+            steer_queue,
+            vec!["lägg till en extra feature sen".to_string()]
+        );
+        assert!(!steer_abort);
+
+        // Verify the explanation was sent to the renderer as SteerResponse
+        let steer_responses: Vec<_> = renderer
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::SteerResponse(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            steer_responses,
+            vec!["Instruktionen har köats för nästa tur."]
+        );
+
+        // Verify status was also emitted
+        assert!(renderer.events.iter().any(|e| matches!(
+            e,
+            Event::Status(s) if s.contains("Instruction queued for next turn")
+        )));
+    }
+
+    #[test]
+    fn test_drain_steer_queue_and_continue_fallback_response_when_none() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut renderer = TestRenderer::new();
+        let mut steer_queue = Vec::new();
+        let mut steer_abort = false;
+
+        // Model returned QueueAndContinue without a response field (null)
+        tx.send(SteerArbEvent::Finished {
+            decision: Some(crate::orchestrator::SteerDecision {
+                decision: "QueueAndContinue".to_string(),
+                response: None,
+                tier: None,
+                model: None,
+                subtasks: Vec::new(),
+                sleep_seconds: None,
+            }),
+            user_msg: "fix docs later".to_string(),
+        })
+        .unwrap();
+
+        drain_steer_arbitration_events(
+            &mut rx,
+            &mut renderer,
+            &mut steer_queue,
+            &mut steer_abort,
+            None,
+        );
+
+        assert_eq!(steer_queue, vec!["fix docs later".to_string()]);
+        assert!(!steer_abort);
+
+        // Fallback SteerResponse should be emitted informing the user
+        let steer_responses: Vec<_> = renderer
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::SteerResponse(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steer_responses.len(), 1);
+        assert!(steer_responses[0].contains("Instruction queued for next turn"));
+
+        // Status line was also emitted
+        assert!(renderer.events.iter().any(|e| matches!(
+            e,
+            Event::Status(s) if s.contains("Instruction queued for next turn")
+        )));
+    }
+
+    #[test]
+    fn test_drain_steer_respond_directly_does_not_queue() {
+        for decision_str in ["RespondDirectly", "respond_directly", "Respond Directly"] {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut renderer = TestRenderer::new();
+            let mut steer_queue = Vec::new();
+            let mut steer_abort = false;
+
+            tx.send(SteerArbEvent::Finished {
+                decision: Some(crate::orchestrator::SteerDecision {
+                    decision: decision_str.to_string(),
+                    response: Some("Coder arbetar med tester.".to_string()),
+                    tier: None,
+                    model: None,
+                    subtasks: Vec::new(),
+                    sleep_seconds: None,
+                }),
+                user_msg: "hur går det?".to_string(),
+            })
+            .unwrap();
+
+            drain_steer_arbitration_events(
+                &mut rx,
+                &mut renderer,
+                &mut steer_queue,
+                &mut steer_abort,
+                None,
+            );
+
+            assert!(
+                steer_queue.is_empty(),
+                "Expected steer_queue to be empty for {decision_str}, but got: {steer_queue:?}"
+            );
+            assert!(!steer_abort);
+            assert!(renderer.events.iter().any(|e| matches!(
+                e,
+                Event::Status(s) if s.contains("Answered via direct steer response")
+            )));
+        }
+    }
+
+    #[test]
+    fn test_drain_steer_synthesized_answer_does_not_queue() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut renderer = TestRenderer::new();
+        let mut steer_queue = Vec::new();
+        let mut steer_abort = false;
+
+        tx.send(SteerArbEvent::SynthesizedAnswer {
+            user_msg: "vad gör subagenten?".to_string(),
+            answer: "Subagenten kör cargo check.".to_string(),
+        })
+        .unwrap();
+
+        tx.send(SteerArbEvent::Finished {
+            decision: Some(crate::orchestrator::SteerDecision {
+                decision: "RespondDirectly".to_string(),
+                response: Some("Subagenten kör cargo check.".to_string()),
+                tier: None,
+                model: None,
+                subtasks: Vec::new(),
+                sleep_seconds: None,
+            }),
+            user_msg: "vad gör subagenten?".to_string(),
+        })
+        .unwrap();
+
+        drain_steer_arbitration_events(
+            &mut rx,
+            &mut renderer,
+            &mut steer_queue,
+            &mut steer_abort,
+            None,
+        );
+
+        assert!(
+            steer_queue.is_empty(),
+            "Synthesized answer must not be pushed to steer_queue, got: {steer_queue:?}"
+        );
+        assert!(!steer_abort);
+    }
+
+    #[test]
+    fn test_drain_steer_sleep_does_not_queue() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut renderer = TestRenderer::new();
+        let mut steer_queue = Vec::new();
+        let mut steer_abort = false;
+
+        tx.send(SteerArbEvent::Finished {
+            decision: Some(crate::orchestrator::SteerDecision {
+                decision: "Sleep".to_string(),
+                response: Some("Väntar 5 sekunder...".to_string()),
+                tier: None,
+                model: None,
+                subtasks: Vec::new(),
+                sleep_seconds: Some(5),
+            }),
+            user_msg: "vänta lite".to_string(),
+        })
+        .unwrap();
+
+        drain_steer_arbitration_events(
+            &mut rx,
+            &mut renderer,
+            &mut steer_queue,
+            &mut steer_abort,
+            None,
+        );
+
+        assert!(
+            steer_queue.is_empty(),
+            "Sleep decision must not be pushed to steer_queue, got: {steer_queue:?}"
+        );
+        assert!(!steer_abort);
+        assert!(renderer.events.iter().any(|e| matches!(
+            e,
+            Event::Status(s) if s.contains("Steering arbitrator sleep completed")
+        )));
+    }
+
+    #[test]
+    fn test_drain_steer_fallback_with_response_does_not_queue() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut renderer = TestRenderer::new();
+        let mut steer_queue = Vec::new();
+        let mut steer_abort = false;
+
+        // Unrecognized decision name, but with a valid direct response string
+        tx.send(SteerArbEvent::Finished {
+            decision: Some(crate::orchestrator::SteerDecision {
+                decision: "InformationalRemark".to_string(),
+                response: Some("All tasks are on track.".to_string()),
+                tier: None,
+                model: None,
+                subtasks: Vec::new(),
+                sleep_seconds: None,
+            }),
+            user_msg: "status?".to_string(),
+        })
+        .unwrap();
+
+        drain_steer_arbitration_events(
+            &mut rx,
+            &mut renderer,
+            &mut steer_queue,
+            &mut steer_abort,
+            None,
+        );
+
+        assert!(
+            steer_queue.is_empty(),
+            "Answered inquiry with unknown decision name must not be queued, got: {steer_queue:?}"
+        );
+        assert!(!steer_abort);
+        assert!(renderer.events.iter().any(|e| matches!(
+            e,
+            Event::Status(s) if s.contains("Answered via direct steer response")
         )));
     }
 }

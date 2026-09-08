@@ -45,6 +45,10 @@ pub enum Event {
     SteerResponse(String),
     /// A chunk of reasoning / thinking-channel content.
     Thinking(String),
+    /// A chunk of visible content from a specific subagent/specialist.
+    SubagentMessage { agent_tag: String, text: String },
+    /// A chunk of reasoning/thinking from a specific subagent/specialist.
+    SubagentThinking { agent_tag: String, text: String },
     /// A tool invocation (rendered as `name(arguments)`).
     ToolCall(String),
     /// The textual result of a tool execution.
@@ -66,6 +70,9 @@ pub trait Renderer: Send {
     fn init(&mut self) -> Result<()>;
     fn on_event(&mut self, event: &Event);
     fn flush(&mut self) -> Result<()>;
+    fn force_flush(&mut self) -> Result<()> {
+        self.flush()
+    }
     fn poll_input(&mut self) -> Option<String>;
     fn read_input(&mut self) -> Option<String>;
     fn request_abort(&mut self);
@@ -75,6 +82,7 @@ pub trait Renderer: Send {
     fn set_subagents(&mut self, _subagents: Vec<SubagentDetail>) {}
     fn rehydrate_messages(&mut self, _messages: &[crate::types::Message]) {}
     fn rehydrate_subagents(&mut self, _subagents: &[SubagentDetail]) {}
+    fn set_thinking_budgets(&mut self, _cfg: &crate::config::Config) {}
 }
 
 pub fn restore() {

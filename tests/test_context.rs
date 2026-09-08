@@ -1,6 +1,6 @@
 //! Phase A integration tests (context engine & compaction).
 
-use marmennill::agent::ContextEngineFactory;
+use marmennill::manager::ContextEngineFactory;
 use marmennill::types::Message;
 
 #[test]

@@ -36,6 +36,8 @@ Marmel is a Rust-based CLI that connects to an OpenAI-compatible chat-completion
 - **LLM streaming client** — SSE streaming with retry/backoff, watchdog timeouts, and `[thinking]` tag demuxing.
 - **Deep-Freeze crash recovery & full UI rehydration** — in-flight delegations are snapshotted and journaled; sessions resume seamlessly with full restoration of chat history, execution plans, and past specialist subagent deliverables in the TUI Agent pane.
 - **MCP (Model Context Protocol) client** — JSON-RPC 2.0 over stdio and SSE/HTTP, with tool discovery and execution.
+- **Reasoning budget enforcement & stream cutoff** — configurable per-specialist and global limits on thinking tokens (`max_thinking_tokens`) with mid-stream cutoff and seamless corrective continuation prompts to prevent runaway reasoning loops.
+- **High-performance, low-overhead UI rendering** — batched async event draining and 40 FPS frame throttling ensure near-zero CPU usage during idle periods and high-throughput streaming.
 - **Two UI modes** — an interactive 3-panel Ratatui TUI (with subagent auto-focus, scroll clamping, and full horizontal cursor navigation) and a headless raw streaming mode.
 - **Live session token accounting** — global atomic tracking of cumulative input and output tokens across Manager turns, specialist subagents, validators, and arbitrators with auto-scaled metrics in the status bar.
 
@@ -171,15 +173,17 @@ Applied after file config, before defaults:
 | `frequency_penalty` | `0.0` | Frequency penalty. |
 | `presence_penalty` | `0.0` | Presence penalty. |
 | `max_context_tokens` | `8192` | Context window budget; compaction triggers at 90%. |
+| `max_thinking_tokens` | `16384` | Maximum reasoning/thinking tokens per single turn before cutting off runaway reasoning. |
 | `preserve_thinking` | `true` | Keep `[thinking]` content in the transcript. |
 | `command_timeout_secs` | `60` | Timeout for a single `run_command` / PTY invocation. |
-| `max_repetition_threshold` | `3` | Consecutive identical turns that trigger cycle breaking. |
+| `max_repetition_threshold` | `5` | Consecutive identical turns that trigger cycle breaking. |
 | `enable_xml_rescue` | `true` | Enable XML-rescue fallback for malformed tool calls. |
 | `ui_mode` | `"tui"` | `"tui"` (Ratatui) or `"raw"` (plain streaming). |
 | `system_prompt_path` | `prompts/system.md` | Path to the Manager system prompt. |
-| `[monitoring]` | — | Resilience harness thresholds (`enabled`, `repetition_threshold`, `min_pattern_len`). |
+| `debug` | `false` | Detailed debug logging to `debug.log`. |
+| `[monitoring]` | — | Resilience harness thresholds (`enabled`, `repetition_threshold`, `min_pattern_len`, `max_stream_tokens`, `max_thinking_tokens`). |
 | `[orchestration]` | — | `max_recursion_depth` (default 3), `manager_module`, `mcp_servers`, `specialists` table. |
-| `[orchestration.specialists.<role>]` | — | Per-specialist `tools`, `model`, `backend_url`, `auth_token`, `mcp_servers`, `validator_model`, `validator_backend_url`, `validator_auth_token`, `max_validator_iterations`, `enable_validator`. |
+| `[orchestration.specialists.<role>]` | — | Per-specialist `tools`, `model`, `backend_url`, `auth_token`, `mcp_servers`, `validator_model`, `validator_backend_url`, `validator_auth_token`, `max_validator_iterations`, `enable_validator`, `max_thinking_tokens` (aliases: `reasoning_budget`, `thinking_budget`). |
 | `[mcp_servers.<name>]` | — | External MCP server registration (`command`, `args`, `env`, `url`). |
 
 ### Specialist Configuration & MCP Routing
@@ -229,6 +233,7 @@ model = "deepseek-coder-v2"
 backend_url = "http://localhost:11434/v1"
 validator_model = "gemma4:cloud"
 max_validator_iterations = 5
+max_thinking_tokens = 8192
 
 # Researcher gets docs search MCP tools
 [orchestration.specialists.researcher]
@@ -270,17 +275,28 @@ The TUI is a 3-panel Ratatui interface: **Chat** / **Plan** / **Subagents**.
 | Key | Action |
 |---|---|
 | `Enter` | Send input. |
-| `Esc` / `Ctrl+C` | Confirm-abort (press twice to quit). |
+| `Esc` / `Ctrl+C` | Confirm-abort (press twice to quit; Esc first restores focus to Chat). |
+| `Ctrl+D` | Instant abort. |
 | `Tab` | Cycle focus (Chat / Plan / Subagents). |
-| `Left` / `Right` / `Home` / `End` / `Delete` | Cursor / navigation. |
-| `Backspace` | Delete grapheme before cursor. |
-| `Ctrl+P` | Toggle plan panel. |
+| `Left` / `Right` | Move cursor left/right (in Chat) or switch selected subagent (in Subagents). |
+| `Home` / `End` | Move cursor to start/end (in Chat) or scroll to top/bottom (in other panels). |
+| `PageUp` / `PageDown` | Scroll panel up/down by 10 lines. |
+| `Up` / `Down` | Scroll panel up/down by 1 line (when not using Ctrl). |
+| `Ctrl+Up` / `Ctrl+Down` | Input history navigation. |
+| `Backspace` / `Delete` | Delete grapheme before / after cursor. |
+| `Ctrl+P` | Toggle execution plan panel. |
 | `Ctrl+A` | Toggle subagents panel. |
-| `Ctrl+Up` / `Ctrl+Down` | Input history. |
-| `/thought` | Toggle thinking block display. |
-| `/help` | Show keybinding legend. |
-| `/reset` | Clear the execution plan. |
-| `/abort` | Explicit abort. |
+| `Ctrl+T` | Toggle reasoning/thinking display. |
+| `Mouse Click / Scroll` | Click to focus panel or position cursor; scroll to scroll panels. |
+
+**Slash commands:**
+
+| Command | Action |
+|---|---|
+| `/help` | Show command and keybinding help in the chat pane. |
+| `/thought` | Toggle display of reasoning/thinking blocks. |
+| `/reset` (`/clear_plan`) | Clear active execution plan and revert phase to Conversational. |
+| `/abort` (`/quit`, `:q`) | Abort current session. |
 
 **Live Status Bar:**
 
@@ -411,6 +427,7 @@ Specialist deliverables are automatically audited by a Validator subagent. Rejec
 - **Multi-turn thought repetition breaker** — detects repetitive reasoning loops across turns in specialist output, purges conversational chatter, and injects targeted corrective nudges.
 - **Live stream interruption & auto-recovery** — cuts SSE generation mid-flight on loop detection, purges toxic history, and retries with increased `frequency_penalty`.
 - **Empty-production nudge** — up to 3 attempts.
+- **Reasoning budget enforcement & stream cutoff** — tracks cumulative thinking tokens during generation; if reasoning exceeds `max_thinking_tokens` (default 16,384 tokens, configurable globally or per-specialist), the stream is gracefully interrupted mid-flight and injected with an automatic continuation prompt instructing the model to stop thinking and directly output its tool calls or answer.
 - **One-turn recovery** — adjusts `enable_thinking`, `frequency_penalty`, and `temperature` on failure.
 
 ### Stream preemption & interactive pause/resume
@@ -465,11 +482,11 @@ Marmel is continuously built and tested across all supported target platforms vi
 - 🍏 **macOS** (`aarch64-apple-darwin`)
 - 🪟 **Windows** (`x86_64-pc-windows-msvc`)
 
-Every commit and pull request runs:
-- `cargo fmt --all -- --check`
-- `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo test --all-targets --all-features` (280+ unit & integration tests)
-- `cargo build --release` (optimized binary verification)
+- Every commit and pull request runs:
+  - `cargo fmt --all -- --check`
+  - `cargo clippy --all-targets --all-features -- -D warnings`
+  - `cargo test --all-targets --all-features` (320+ unit & integration tests)
+  - `cargo build --release` (optimized binary verification)
 
 ---
 
@@ -480,6 +497,7 @@ Every commit and pull request runs:
 | Crate | Version | Purpose |
 |---|---|---|
 | `tokio` | 1.44 (full) | Async runtime. |
+| `tokio-util` | 0.7 (rt) | Async runtime utilities. |
 | `futures` / `futures-util` | 0.3.31 | Async streams / combinators. |
 | `async-trait` | 0.1.86 | Async trait support. |
 | `reqwest` | 0.13 (json, stream) | HTTP client for LLM backend. |
@@ -493,12 +511,13 @@ Every commit and pull request runs:
 | `regex` | 1.11 | Regex search / parsing. |
 | `ignore` | 0.4 | Gitignore-aware file walking. |
 | `unicode-width` | 0.2 | Terminal width calculation. |
-| `unicode-segmentation` | 1.13 | Grapheme segmentation. |
+| `unicode-segmentation` | 1.12 | Grapheme segmentation. |
 | `uuid` | 1.25 (v4) | UUID generation. |
 | `anyhow` | 1.0 | Error handling. |
 | `thiserror` | 2.0 | Error types. |
 | `tracing` / `tracing-subscriber` | 0.1 / 0.3 | Structured logging. |
 | `chrono` | 0.4 (serde) | Timestamps. |
+| `landlock` (linux) | 0.4 | Kernel-enforced unprivileged process isolation. |
 | `libc` (unix) | 0.2 | Process-group kill, home dir lookup. |
 
 ### Dev-dependencies
@@ -523,6 +542,6 @@ MIT
 
 - **Name:** `marmennill`
 - **Binary / CLI:** `marmel`
-- **Version:** `0.5.0`
+- **Version:** `0.7.0`
 - **Language:** Rust (edition 2024, `rust-version = "1.98"`)
 - **Repository:** `https://github.com/Na1w/marmel.git` (branch `main`)

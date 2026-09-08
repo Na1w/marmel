@@ -73,7 +73,7 @@ pub(crate) async fn run_automated_validation(
         task_brief, deliverable
     );
 
-    let mut engine = crate::agent::ContextEngineFactory::new(cfg.max_context_tokens)
+    let mut engine = crate::manager::ContextEngineFactory::new(cfg.max_context_tokens)
         .specialist_context(validator_prompt.to_string(), brief);
 
     let registry = crate::orchestrator::SpecialistRegistry::canonical();
@@ -141,6 +141,7 @@ pub(crate) async fn run_automated_validation(
         };
 
         let max_tokens = mon_cfg.max_stream_tokens.max(256);
+        let max_thinking_tokens = mon_cfg.max_thinking_tokens.max(256);
         let mut sink = crate::orchestrator::PreemptibleStreamSink::register(
             format!("validator-{agent}"),
             &validator_model,
@@ -150,6 +151,7 @@ pub(crate) async fn run_automated_validation(
             &req,
             &mut sink,
             max_tokens,
+            max_thinking_tokens,
             &mut rep_detector,
             false,
             Some(token),
@@ -181,9 +183,15 @@ pub(crate) async fn run_automated_validation(
 
         let reply = out.reply;
         let budget_exceeded = out.budget_exceeded;
+        let thinking_budget_exceeded = out.thinking_budget_exceeded;
         if budget_exceeded {
             tracing::warn!(
                 "validator-{agent}: maximum single-turn output budget of {max_tokens} tokens exceeded"
+            );
+        }
+        if thinking_budget_exceeded {
+            tracing::warn!(
+                "validator-{agent}: maximum single-turn reasoning budget of {max_thinking_tokens} tokens exceeded"
             );
         }
 
@@ -305,29 +313,12 @@ pub(crate) async fn run_automated_validation(
                         arguments: args_val,
                     };
                     let caller = crate::harness::ToolCaller::Specialist(Agent::Validator);
-                    let tool_res = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
-                            tokio::task::block_in_place(|| {
-                                crate::harness::dispatch_for_with_engine(
-                                    &invocation,
-                                    caller,
-                                    Some(&mut engine),
-                                )
-                            })
-                        } else {
-                            crate::harness::dispatch_for_with_engine(
-                                &invocation,
-                                caller,
-                                Some(&mut engine),
-                            )
-                        }
-                    } else {
-                        crate::harness::dispatch_for_with_engine(
-                            &invocation,
-                            caller,
-                            Some(&mut engine),
-                        )
-                    };
+                    let tool_res = crate::harness::dispatch_for_async_with_engine(
+                        &invocation,
+                        caller,
+                        Some(&mut engine),
+                    )
+                    .await;
                     match tool_res {
                         Ok(r) => {
                             tracing::info!(

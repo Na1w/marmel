@@ -125,6 +125,25 @@ pub fn log_llm_response(
     log_raw(&entry);
 }
 
+/// Log periodic in-flight streaming progress for long LLM responses.
+pub fn log_llm_progress(
+    url: &str,
+    model: &str,
+    elapsed_ms: u128,
+    reasoning_len: usize,
+    content_len: usize,
+    approx_tokens: usize,
+) {
+    if !is_enabled() {
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = format!(
+        "[{now}] ... [LLM STREAM PROGRESS] (elapsed: {elapsed_ms}ms) URL: {url} | Model: {model} | ~{approx_tokens} tokens | reasoning: {reasoning_len} chars | content: {content_len} chars\n"
+    );
+    log_raw(&entry);
+}
+
 /// Log an LLM error with timing and error details.
 pub fn log_llm_error(url: &str, model: &str, elapsed_ms: u128, err_str: &str) {
     if !is_enabled() {
@@ -403,6 +422,7 @@ mod tests {
             &serde_json::json!({"prompt": "do something"}),
         );
         log_tool_result("Manager", "delegate_task", 42, "Done!", false);
+        log_llm_progress("http://localhost:11434", "glm-5", 5000, 1200, 0, 300);
 
         let content = std::fs::read_to_string(&log_file).unwrap();
         assert!(content.contains("=== MARMEL DEBUG LOG STARTED"));
@@ -418,6 +438,8 @@ mod tests {
         assert!(content.contains(">>> [TOOL INVOCATION]"));
         assert!(content.contains("delegate_task"));
         assert!(content.contains("<<< [TOOL RESULT: OK]"));
+        assert!(content.contains("... [LLM STREAM PROGRESS]"));
+        assert!(content.contains("reasoning: 1200 chars"));
         set_enabled(false);
         assert!(!is_enabled());
     }

@@ -23,6 +23,7 @@ pub async fn run_session(
 ) -> Result<()> {
     renderer.clear_abort();
     renderer.init()?;
+    renderer.set_thinking_budgets(cfg);
     crate::debug_log::log_session_start(cfg, &cfg.ui_mode);
 
     let plan = manager.as_ref().map(|m| m.plan.clone()).unwrap_or_default();
@@ -51,12 +52,16 @@ pub async fn run_session(
         let mut recover_handle = tokio::spawn(async move { recover_mgr.recover_frozen().await });
 
         let deliverable_opt = loop {
+            let mut had_events = false;
             while let Ok(msg) = status_rx.try_recv() {
                 renderer.on_event(&Event::Status(msg));
-                let _ = renderer.flush();
+                had_events = true;
             }
             while let Ok(ev) = event_rx.try_recv() {
                 renderer.on_event(&ev);
+                had_events = true;
+            }
+            if had_events {
                 let _ = renderer.flush();
             }
             if let Some(input) = renderer.poll_input()
@@ -234,11 +239,17 @@ pub async fn run_session(
     let stream_cfg = StreamConfig::from_config(cfg);
 
     while !renderer.aborted() {
+        let mut had_events = false;
         while let Ok(msg) = status_rx.try_recv() {
             renderer.on_event(&Event::Status(msg));
+            had_events = true;
         }
         while let Ok(ev) = event_rx.try_recv() {
             renderer.on_event(&ev);
+            had_events = true;
+        }
+        if had_events {
+            let _ = renderer.flush();
         }
 
         drain_steer_arbitration_events(
@@ -274,7 +285,7 @@ pub async fn run_session(
         let mut nudge_count = 0;
         loop {
             turn_count += 1;
-            if turn_count > crate::agent::r#loop::MAX_TURNS || renderer.aborted() {
+            if turn_count > crate::manager::r#loop::MAX_TURNS || renderer.aborted() {
                 break;
             }
 
@@ -345,7 +356,7 @@ pub async fn run_session(
                 }
             };
 
-            if renderer.aborted() {
+            if renderer.aborted() || crate::orchestrator::is_globally_cancelled() {
                 break;
             }
 
@@ -389,7 +400,12 @@ pub async fn run_session(
             if tool_calls.is_empty() {
                 let current_plan = manager.as_ref().map(|m| m.plan.clone()).unwrap_or_default();
                 let pending = current_plan.pending_tasks();
-                if !steer_abort_requested && !pending.is_empty() && nudge_count < 5 {
+                if !steer_abort_requested
+                    && !renderer.aborted()
+                    && !crate::orchestrator::is_globally_cancelled()
+                    && !pending.is_empty()
+                    && nudge_count < 5
+                {
                     nudge_count += 1;
                     let pending_str = pending.join(", ");
                     renderer.on_event(&Event::Status(format!(
@@ -498,12 +514,16 @@ pub async fn run_session(
 
                 for mut handle in handles {
                     let res = loop {
+                        let mut had_events = false;
                         while let Ok(msg) = status_rx.try_recv() {
                             renderer.on_event(&Event::Status(msg));
-                            let _ = renderer.flush();
+                            had_events = true;
                         }
                         while let Ok(ev) = event_rx.try_recv() {
                             renderer.on_event(&ev);
+                            had_events = true;
+                        }
+                        if had_events {
                             let _ = renderer.flush();
                         }
                         drain_steer_arbitration_events(
@@ -538,12 +558,16 @@ pub async fn run_session(
                                 );
                             }
                             Err(_) => {
+                                let mut had_events = false;
                                 while let Ok(msg) = status_rx.try_recv() {
                                     renderer.on_event(&Event::Status(msg));
-                                    let _ = renderer.flush();
+                                    had_events = true;
                                 }
                                 while let Ok(ev) = event_rx.try_recv() {
                                     renderer.on_event(&ev);
+                                    had_events = true;
+                                }
+                                if had_events {
                                     let _ = renderer.flush();
                                 }
                                 drain_steer_arbitration_events(
@@ -593,7 +617,7 @@ pub async fn run_session(
                             ));
                         } else {
                             if let Some(ref tid) = task {
-                                let plan = crate::agent::phase::Plan::default();
+                                let plan = crate::manager::phase::Plan::default();
                                 let _ = plan.check_off(tid);
                             }
                             renderer.on_event(&Event::Delegation(
@@ -724,12 +748,16 @@ pub async fn run_session(
                     });
 
                     let result = loop {
+                        let mut had_events = false;
                         while let Ok(msg) = status_rx.try_recv() {
                             renderer.on_event(&Event::Status(msg));
-                            let _ = renderer.flush();
+                            had_events = true;
                         }
                         while let Ok(ev) = event_rx.try_recv() {
                             renderer.on_event(&ev);
+                            had_events = true;
+                        }
+                        if had_events {
                             let _ = renderer.flush();
                         }
                         drain_steer_arbitration_events(
@@ -755,12 +783,16 @@ pub async fn run_session(
                                     .and_then(|r| r);
                             }
                             Err(_) => {
+                                let mut had_events = false;
                                 while let Ok(msg) = status_rx.try_recv() {
                                     renderer.on_event(&Event::Status(msg));
-                                    let _ = renderer.flush();
+                                    had_events = true;
                                 }
                                 while let Ok(ev) = event_rx.try_recv() {
                                     renderer.on_event(&ev);
+                                    had_events = true;
+                                }
+                                if had_events {
                                     let _ = renderer.flush();
                                 }
                                 drain_steer_arbitration_events(
@@ -818,7 +850,7 @@ pub async fn run_session(
                             ));
                         } else {
                             if let Some(ref tid) = delegated_task {
-                                let plan = crate::agent::phase::Plan::default();
+                                let plan = crate::manager::phase::Plan::default();
                                 let _ = plan.check_off(tid);
                             }
                             renderer.on_event(&Event::Delegation(

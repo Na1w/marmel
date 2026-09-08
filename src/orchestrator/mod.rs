@@ -16,19 +16,22 @@ pub mod plan_summary;
 pub mod preemption;
 pub mod registry;
 pub mod steer;
+pub mod steer_extractor;
+#[cfg(test)]
+mod steer_tests;
 pub mod workers;
 
 pub use preemption::{
     PreemptHandle, PreemptibleStreamSink, models_conflict, preempt_conflicting_stream,
 };
 
-use crate::agent::phase::Plan;
 pub use crate::agents::{
     Agent, DelegationRequest, Deliverable, IsolatedContext, MissionMarker, Specialist,
 };
 use crate::config::Config;
 use crate::harness::{HarnessStats, ToolError, ToolResult};
 use crate::llm::ChatClient;
+use crate::manager::phase::Plan;
 use crate::tool_names::TOOL_DELEGATE_TASK;
 use anyhow::Result;
 pub use bus::{
@@ -43,7 +46,7 @@ pub use steer::{
     SteerDecision, SteerOutcome, SteerSubtaskDecision, StreamingResponseExtractor, arbitrate_steer,
     arbitrate_steer_stream, arbitrate_steer_stream_with_fallback, arbitrate_steer_with_fallback,
     execute_steer_subtask, extract_tasks_to_delegate, format_steering_history,
-    resolve_steer_outcome,
+    normalize_steer_decision, resolve_steer_outcome,
 };
 pub use workers::{
     ActiveWorkerGuard, ActiveWorkerInfo, CompletedWorkerInfo, format_duration_human,
@@ -437,7 +440,7 @@ impl OrchestratorManager {
     /// gate keeper. A task is only ever checked off when the *marker* is a
     /// genuine [`MissionMarker::Complete`] AND the re-parsed *content* still
     /// carries a `MISSION COMPLETE (t-xxx)` terminal marker (via
-    /// [`crate::agent::phase::Plan::check_plan_on_marker`]). This double gate
+    /// [`crate::manager::phase::Plan::check_plan_on_marker`]). This double gate
     /// guarantees that a `FAILED` / `REPLAN` deliverable — or a REJECTED
     /// deliverable that carries a stale completion token from a pre-validation
     /// draft in its content body — stays unchecked (REQ-PLAN-002 / REQ-ORCH-005).
@@ -677,18 +680,33 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
     //    check-off and the Manager's synthesis can observe it.
     let tid = deliverable.task_id.as_deref().unwrap_or("unknown");
     match &deliverable.marker {
-        MissionMarker::Complete { .. } => Ok(ToolResult::ok(format!(
-            "{}\n\nMISSION COMPLETE ({tid})",
-            deliverable.content
-        ))),
-        MissionMarker::Failed { reason } => Ok(ToolResult::err(format!(
-            "{}\n\nFAILED: {reason}",
-            deliverable.content
-        ))),
-        MissionMarker::Replan { reason } => Ok(ToolResult::err(format!(
-            "{}\n\nREPLAN REQUIRED: {reason}",
-            deliverable.content
-        ))),
+        MissionMarker::Complete { .. } => {
+            let mut res = deliverable.content.trim().to_string();
+            let complete_token = format!("MISSION COMPLETE ({tid})");
+            if !res.contains(&complete_token) {
+                res.push_str("\n\n");
+                res.push_str(&complete_token);
+            }
+            Ok(ToolResult::ok(res))
+        }
+        MissionMarker::Failed { reason } => {
+            let content = deliverable.content.trim();
+            if content.contains("FAILED") {
+                Ok(ToolResult::err(content.to_string()))
+            } else {
+                Ok(ToolResult::err(format!("{content}\n\nFAILED: {reason}")))
+            }
+        }
+        MissionMarker::Replan { reason } => {
+            let content = deliverable.content.trim();
+            if content.contains("REPLAN REQUIRED") {
+                Ok(ToolResult::err(content.to_string()))
+            } else {
+                Ok(ToolResult::err(format!(
+                    "{content}\n\nREPLAN REQUIRED: {reason}"
+                )))
+            }
+        }
     }
 }
 

@@ -174,8 +174,8 @@ impl IsolatedContext {
         }
     }
 
-    pub fn into_engine(&self, max_context_tokens: usize) -> crate::agent::ContextEngine {
-        let factory = crate::agent::ContextEngineFactory::new(max_context_tokens);
+    pub fn into_engine(&self, max_context_tokens: usize) -> crate::manager::ContextEngine {
+        let factory = crate::manager::ContextEngineFactory::new(max_context_tokens);
         factory.specialist_context(self.role_system_prompt.clone(), self.brief.clone())
     }
 }
@@ -333,6 +333,12 @@ mod tests {
         );
         assert!(rejected.contains("VALIDATOR REJECTION: Syntax error in line 10"));
         assert!(!rejected.contains("MISSION COMPLETE"));
-        assert!(rejected.contains("FAILED"));
+        assert!(rejected.contains("FAILED (Validator rejected deliverable)"));
+
+        // When deliverable failed without validator critique (e.g. premature loop termination)
+        let premature =
+            assemble_final_deliverable(false, None, "Specialist hit token limit", Some("t-005"));
+        assert!(premature.contains("FAILED (Task incomplete or terminated prematurely)"));
+        assert!(!premature.contains("VALIDATOR REJECTION"));
     }
 }

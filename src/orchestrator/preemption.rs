@@ -99,7 +99,25 @@ impl Drop for PreemptibleStreamSink {
 
 #[async_trait::async_trait]
 impl StreamSink for PreemptibleStreamSink {
-    fn emit(&mut self, _event: StreamEvent) {}
+    fn emit(&mut self, event: StreamEvent) {
+        match event {
+            StreamEvent::Content(text) => {
+                crate::orchestrator::emit_event(crate::ui::Event::SubagentMessage {
+                    agent_tag: self.agent_tag.clone(),
+                    text,
+                });
+            }
+            StreamEvent::Thinking(text) => {
+                crate::orchestrator::emit_event(crate::ui::Event::SubagentThinking {
+                    agent_tag: self.agent_tag.clone(),
+                    text,
+                });
+            }
+            StreamEvent::Status(status) => {
+                crate::orchestrator::emit_status(status);
+            }
+        }
+    }
 
     fn poll_control(&mut self) -> StreamControl {
         if let Ok(signal) = self.pause_rx.try_recv() {

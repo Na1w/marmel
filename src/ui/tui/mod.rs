@@ -142,6 +142,18 @@ pub struct TuiRenderer {
     pub tokens_out: usize,
     /// Context window size (tokens) of the orchestrator/main turn.
     pub orchestrator_context_tokens: usize,
+    /// Map of specialist role -> max_thinking_tokens.
+    pub(crate) thinking_budgets: std::collections::HashMap<String, usize>,
+    /// Default thinking budget for specialists without specific overrides.
+    pub(crate) default_thinking_budget: usize,
+    /// Thinking content accumulated during the current active turn per subagent.
+    pub(crate) subagent_turn_thinking: std::collections::HashMap<String, String>,
+    /// Whether the subagent is actively streaming reasoning tokens in the current turn.
+    pub(crate) subagent_is_thinking: std::collections::HashMap<String, bool>,
+    /// Optional local override or cache of execution plan start instant.
+    pub(crate) plan_start_time: Option<std::time::Instant>,
+    /// Optional local override or cache of execution plan completed instant.
+    pub(crate) plan_completed_time: Option<std::time::Instant>,
 }
 
 impl TuiRenderer {
@@ -213,20 +225,69 @@ impl TuiRenderer {
             archive_mtime: None,
             plan_is_archived: false,
             session_start: std::time::Instant::now(),
+            thinking_budgets: std::collections::HashMap::new(),
+            default_thinking_budget: 16384,
+            subagent_turn_thinking: std::collections::HashMap::new(),
+            subagent_is_thinking: std::collections::HashMap::new(),
+            plan_start_time: None,
+            plan_completed_time: None,
         }
+    }
+
+    /// Populate thinking budget limits per specialist and globally from config.
+    pub fn set_thinking_budgets(&mut self, cfg: &Config) {
+        let global_budget = if cfg.max_thinking_tokens != 16384 {
+            cfg.max_thinking_tokens
+        } else {
+            cfg.monitoring
+                .as_ref()
+                .map(|m| m.max_thinking_tokens)
+                .unwrap_or(cfg.max_thinking_tokens)
+        };
+        self.default_thinking_budget = global_budget;
+        self.thinking_budgets.clear();
+        for (role, spec) in &cfg.orchestration.specialists {
+            if let Some(b) = spec.max_thinking_tokens {
+                self.thinking_budgets.insert(role.clone(), b);
+            }
+        }
+    }
+
+    /// Resolve the thinking token budget for a given subagent.
+    pub(crate) fn get_thinking_budget(&self, sa: &SubagentDetail) -> usize {
+        if let Some(b) = self.thinking_budgets.get(&sa.name) {
+            return *b;
+        }
+        let role = sa.name.split('-').next().unwrap_or(&sa.name);
+        if let Some(b) = self.thinking_budgets.get(role) {
+            return *b;
+        }
+        self.default_thinking_budget
     }
 
     /// Total duration spent working on an execution plan.
     /// Only counts when actively working on a plan; freezes as soon as the plan is completed / archived.
     pub(crate) fn total_project_elapsed(&self) -> Option<std::time::Duration> {
-        let (inst, _) = crate::manager::phase::get_plan_start_time()?;
-        if let Some(comp) = crate::manager::phase::get_plan_completed_time() {
+        let (inst, _) = self
+            .plan_start_time
+            .map(|t| (t, chrono::Local::now()))
+            .or_else(|| {
+                if self.had_active_plan {
+                    crate::manager::phase::get_plan_start_time()
+                } else {
+                    None
+                }
+            })?;
+        if let Some(comp) = self
+            .plan_completed_time
+            .or_else(crate::manager::phase::get_plan_completed_time)
+        {
             Some(comp.duration_since(inst))
         } else if self.plan_is_archived {
             crate::manager::phase::record_plan_completed();
             Some(inst.elapsed())
         } else {
-            let plan = crate::agent::phase::Plan::default();
+            let plan = crate::manager::phase::Plan::default();
             if plan.is_complete() {
                 crate::manager::phase::record_plan_completed();
                 if let Some(comp) = crate::manager::phase::get_plan_completed_time() {
@@ -239,11 +300,38 @@ impl TuiRenderer {
             }
         }
     }
+
+    pub(crate) fn render_terminal(&mut self) -> Result<()> {
+        self.last_render = std::time::Instant::now();
+        self.frame_counter = self.frame_counter.wrapping_add(1);
+        let mut terminal = match self.terminal.take() {
+            Some(t) => t,
+            None => {
+                let stdout = io::stdout();
+                let backend = CrosstermBackend::new(stdout);
+                Terminal::new(backend)?
+            }
+        };
+        let res = self.draw(&mut terminal);
+        self.terminal = Some(terminal);
+        res
+    }
 }
 
 impl Default for TuiRenderer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[inline]
+fn estimate_stream_tokens(text: &str) -> usize {
+    if text.is_empty() {
+        0
+    } else if text.len() <= 4 {
+        1
+    } else {
+        text.len().div_ceil(4)
     }
 }
 
@@ -255,7 +343,7 @@ impl Renderer for TuiRenderer {
         let backend = CrosstermBackend::new(stdout);
         self.terminal = Some(Terminal::new(backend)?);
 
-        let plan = crate::agent::phase::Plan::default();
+        let plan = crate::manager::phase::Plan::default();
         if let Ok(Some(content)) = plan.read()
             && !content.trim().is_empty()
         {
@@ -264,7 +352,7 @@ impl Renderer for TuiRenderer {
             self.had_active_plan = true;
         }
 
-        self.flush()?;
+        self.force_flush()?;
         Ok(())
     }
 
@@ -279,9 +367,7 @@ impl Renderer for TuiRenderer {
             }
             Event::Message(text) => {
                 self.waiting_for_token_since = None;
-                let tok_count = tiktoken_rs::cl100k_base_singleton()
-                    .encode_ordinary(text)
-                    .len();
+                let tok_count = estimate_stream_tokens(text);
                 self.tokens_out = self.tokens_out.saturating_add(tok_count);
                 if self.active_agent == "Manager" {
                     self.current_content.push_str(text);
@@ -302,9 +388,7 @@ impl Renderer for TuiRenderer {
             }
             Event::SteerResponse(text) => {
                 self.waiting_for_token_since = None;
-                let tok_count = tiktoken_rs::cl100k_base_singleton()
-                    .encode_ordinary(text)
-                    .len();
+                let tok_count = estimate_stream_tokens(text);
                 self.tokens_out = self.tokens_out.saturating_add(tok_count);
                 // Stream steer arbitrator output as `Marmennill: ` yellow sentences.
                 self.steer_sentence_buffer.push_str(text);
@@ -321,9 +405,7 @@ impl Renderer for TuiRenderer {
             }
             Event::Thinking(text) => {
                 self.waiting_for_token_since = None;
-                let tok_count = tiktoken_rs::cl100k_base_singleton()
-                    .encode_ordinary(text)
-                    .len();
+                let tok_count = estimate_stream_tokens(text);
                 self.tokens_out = self.tokens_out.saturating_add(tok_count);
                 if self.active_agent == "Manager" {
                     self.current_thought.push_str(text);
@@ -342,24 +424,63 @@ impl Renderer for TuiRenderer {
                     sa.last_activity_at = Some(std::time::Instant::now());
                 }
             }
+            Event::SubagentMessage { agent_tag, text } => {
+                self.waiting_for_token_since = None;
+                let tok_count = estimate_stream_tokens(text);
+                self.tokens_out = self.tokens_out.saturating_add(tok_count);
+                self.subagent_turn_thinking.remove(agent_tag);
+                self.subagent_is_thinking.insert(agent_tag.clone(), false);
+                if let Some(sa) = self.subagents.iter_mut().find(|s| s.name == *agent_tag) {
+                    sa.content.push_str(text);
+                    sa.last_activity_at = Some(std::time::Instant::now());
+                } else {
+                    self.upsert_subagent(agent_tag, true, "running");
+                    if let Some(sa) = self.subagents.iter_mut().find(|s| s.name == *agent_tag) {
+                        sa.content.push_str(text);
+                        sa.last_activity_at = Some(std::time::Instant::now());
+                    }
+                }
+            }
+            Event::SubagentThinking { agent_tag, text } => {
+                self.waiting_for_token_since = None;
+                let tok_count = estimate_stream_tokens(text);
+                self.tokens_out = self.tokens_out.saturating_add(tok_count);
+                self.subagent_is_thinking.insert(agent_tag.clone(), true);
+                self.subagent_turn_thinking
+                    .entry(agent_tag.clone())
+                    .or_default()
+                    .push_str(text);
+                if let Some(sa) = self.subagents.iter_mut().find(|s| s.name == *agent_tag) {
+                    sa.thinking.push_str(text);
+                    sa.last_activity_at = Some(std::time::Instant::now());
+                } else {
+                    self.upsert_subagent(agent_tag, true, "running");
+                    if let Some(sa) = self.subagents.iter_mut().find(|s| s.name == *agent_tag) {
+                        sa.thinking.push_str(text);
+                        sa.last_activity_at = Some(std::time::Instant::now());
+                    }
+                }
+            }
             Event::ToolCall(text) => {
                 self.waiting_for_token_since = None;
-                let tok_count = tiktoken_rs::cl100k_base_singleton()
-                    .encode_ordinary(text)
-                    .len();
+                let tok_count = estimate_stream_tokens(text);
                 self.tokens_out = self.tokens_out.saturating_add(tok_count);
                 self.commit_turn_content();
-                if self.active_agent != "Manager"
-                    && let Some(sa) = self
+                if self.active_agent != "Manager" {
+                    self.subagent_turn_thinking.remove(&self.active_agent);
+                    self.subagent_is_thinking
+                        .insert(self.active_agent.clone(), false);
+                    if let Some(sa) = self
                         .subagents
                         .iter_mut()
                         .find(|s| s.name == self.active_agent)
-                {
-                    let log_entry = text.clone();
-                    if sa.logs.last().map(String::as_str) != Some(log_entry.as_str()) {
-                        sa.logs.push(log_entry);
+                    {
+                        let log_entry = text.clone();
+                        if sa.logs.last().map(String::as_str) != Some(log_entry.as_str()) {
+                            sa.logs.push(log_entry);
+                        }
+                        sa.last_activity_at = Some(std::time::Instant::now());
                     }
-                    sa.last_activity_at = Some(std::time::Instant::now());
                 } else {
                     self.messages.push(format!("[Tool Call] {text}"));
                     if self.chat_auto_scroll {
@@ -434,6 +555,12 @@ impl Renderer for TuiRenderer {
                         if sa.logs.last().map(String::as_str) != Some(clean.as_str()) {
                             sa.logs.push(clean);
                         }
+                        if text.contains("thinking / calling model")
+                            || text.contains("calling backend")
+                        {
+                            self.subagent_turn_thinking.remove(&sa.name);
+                            self.subagent_is_thinking.insert(sa.name.clone(), false);
+                        }
                         sa.last_activity_at = Some(std::time::Instant::now());
                         routed = true;
                         break;
@@ -456,6 +583,11 @@ impl Renderer for TuiRenderer {
                     };
                     if sa.logs.last().map(String::as_str) != Some(clean.as_str()) {
                         sa.logs.push(clean);
+                    }
+                    if text.contains("thinking / calling model") || text.contains("calling backend")
+                    {
+                        self.subagent_turn_thinking.remove(&sa.name);
+                        self.subagent_is_thinking.insert(sa.name.clone(), false);
                     }
                     sa.last_activity_at = Some(std::time::Instant::now());
                 }
@@ -481,6 +613,8 @@ impl Renderer for TuiRenderer {
                         // live even before the session loop pushes the
                         // authoritative list (t-c304).
                         self.upsert_subagent(&name, true, &format!("started task {t}"));
+                        self.subagent_turn_thinking.remove(&name);
+                        self.subagent_is_thinking.insert(name.clone(), false);
                         if let Some(s) = self.subagents.iter_mut().find(|s| s.name == name) {
                             s.task_id = task.clone();
                         }
@@ -493,6 +627,8 @@ impl Renderer for TuiRenderer {
                         };
                         let t = task.as_deref().unwrap_or("(no task id)");
                         self.upsert_subagent(&name, false, &format!("completed task {t}"));
+                        self.subagent_turn_thinking.remove(&name);
+                        self.subagent_is_thinking.remove(&name);
                         self.plan_mtime = None;
                         self.last_plan_check = std::time::Instant::now()
                             .checked_sub(std::time::Duration::from_secs(1))
@@ -597,45 +733,29 @@ impl Renderer for TuiRenderer {
             }
         }
         let handled = self.handle_events(false);
-        let now = std::time::Instant::now();
-        if handled
-            || now.duration_since(self.last_render) >= Duration::from_millis(16)
-            || matches!(
-                event,
-                Event::Done
-                    | Event::ToolCall(_)
-                    | Event::ToolResult(_)
-                    | Event::Delegation(_)
-                    | Event::Status(_)
-                    | Event::SteerResponse(_)
-            )
-        {
-            self.last_render = now;
+        if handled || matches!(event, Event::Done) {
+            let _ = self.force_flush();
+        } else {
             let _ = self.flush();
         }
     }
 
+    fn force_flush(&mut self) -> Result<()> {
+        self.render_terminal()
+    }
+
     fn flush(&mut self) -> Result<()> {
-        // F3: advance the frame counter on each flush so the status spinner
-        // animates at the ~16 ms render cadence.
-        self.frame_counter = self.frame_counter.wrapping_add(1);
-        let mut terminal = match self.terminal.take() {
-            Some(t) => t,
-            None => {
-                let stdout = io::stdout();
-                let backend = CrosstermBackend::new(stdout);
-                Terminal::new(backend)?
-            }
-        };
-        let res = self.draw(&mut terminal);
-        self.terminal = Some(terminal);
-        res
+        if self.last_render.elapsed() < Duration::from_millis(25) {
+            return Ok(());
+        }
+        self.render_terminal()
     }
 
     fn poll_input(&mut self) -> Option<String> {
         let handled = self.handle_events(false);
-        if handled || self.last_render.elapsed() >= Duration::from_millis(30) {
-            self.last_render = std::time::Instant::now();
+        if handled {
+            let _ = self.force_flush();
+        } else if self.last_render.elapsed() >= Duration::from_millis(25) {
             let _ = self.flush();
         }
         self.rx.try_recv().ok()
@@ -644,7 +764,7 @@ impl Renderer for TuiRenderer {
     fn read_input(&mut self) -> Option<String> {
         self.commit_turn_content();
         self.status_line = "Ready".to_string();
-        let _ = self.flush();
+        let _ = self.force_flush();
         loop {
             // Esc / Ctrl+C sets `aborted`; return `None` so the session loop
             // stops cleanly instead of hanging while waiting for input.
@@ -655,8 +775,9 @@ impl Renderer for TuiRenderer {
             if let Ok(line) = self.rx.try_recv() {
                 return Some(line);
             }
-            if handled || self.last_render.elapsed() >= Duration::from_millis(50) {
-                self.last_render = std::time::Instant::now();
+            if handled {
+                let _ = self.force_flush();
+            } else if self.last_render.elapsed() >= Duration::from_millis(25) {
                 let _ = self.flush();
             }
         }
@@ -845,6 +966,10 @@ impl Renderer for TuiRenderer {
         let h = self.chat_height.get();
         self.chat_scroll = n.saturating_sub(h) as u16;
         let _ = self.flush();
+    }
+
+    fn set_thinking_budgets(&mut self, cfg: &crate::config::Config) {
+        self.set_thinking_budgets(cfg);
     }
 }
 

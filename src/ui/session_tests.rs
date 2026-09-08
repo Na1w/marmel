@@ -54,7 +54,7 @@ async fn test_ui_run_session_raw_single_turn() {
     let cfg = config_for_backend(&server.uri());
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let plan = crate::agent::phase::Plan::at(tmp.path());
+    let plan = crate::manager::phase::Plan::at(tmp.path());
     let stats = Arc::new(crate::harness::HarnessStats::new());
     let manager = Arc::new(OrchestratorManager::new(
         ChatClient::new(server.uri(), "marmel-manager"),
@@ -131,7 +131,7 @@ async fn test_ui_run_session_executes_tool_calls() {
     let cfg = config_for_backend(&server.uri());
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let plan = crate::agent::phase::Plan::at(tmp.path());
+    let plan = crate::manager::phase::Plan::at(tmp.path());
     let stats = Arc::new(crate::harness::HarnessStats::new());
     let manager = Arc::new(OrchestratorManager::new(
         ChatClient::new(server.uri(), "marmel-manager"),
@@ -203,7 +203,7 @@ impl Renderer for RecordingRenderer {
 fn test_manager(dir: &tempfile::TempDir) -> OrchestratorManager {
     OrchestratorManager::new(
         crate::llm::ChatClient::new("http://localhost:9999/v1", "test-model"),
-        crate::agent::phase::Plan::at(dir.path()),
+        crate::manager::phase::Plan::at(dir.path()),
         Arc::new(crate::harness::HarnessStats::new()),
     )
 }
@@ -253,7 +253,7 @@ fn test_is_reset_command_matches_aliases() {
 #[test]
 fn test_handle_reset_command_clears_plan_and_notifies() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let plan = crate::agent::phase::Plan::at(tmp.path());
+    let plan = crate::manager::phase::Plan::at(tmp.path());
     plan.create("# Plan\n- [ ] [t-1] test\n").unwrap();
     assert!(plan.exists());
 
@@ -285,7 +285,7 @@ async fn test_renderer_sink_handles_reset_command() {
     use crate::ui::bridge::RendererSink;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let plan = crate::agent::phase::Plan::at(tmp.path());
+    let plan = crate::manager::phase::Plan::at(tmp.path());
     plan.create("# Plan\n- [ ] [t-1] test\n").unwrap();
     assert!(plan.exists());
 
@@ -400,7 +400,7 @@ async fn test_ui_run_session_executes_parallel_delegations() {
     let cfg = config_for_backend(&server.uri());
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let plan = crate::agent::phase::Plan::at(tmp.path());
+    let plan = crate::manager::phase::Plan::at(tmp.path());
     let stats = Arc::new(crate::harness::HarnessStats::new());
     let manager = Arc::new(OrchestratorManager::new(
         ChatClient::new(server.uri(), "marmel-manager"),

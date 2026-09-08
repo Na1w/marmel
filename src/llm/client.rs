@@ -199,6 +199,13 @@ impl ChatClient {
         if req_body.model.is_empty() {
             req_body.model = self.model.clone();
         }
+        for msg in &mut req_body.messages {
+            if let crate::types::Message::Assistant { content, .. } = msg
+                && content.is_none()
+            {
+                *content = Some(String::new());
+            }
+        }
 
         tracing::info!(
             "Calling LLM backend at {} (model: {}, messages: {})",
@@ -206,7 +213,7 @@ impl ChatClient {
             req_body.model,
             req_body.messages.len()
         );
-        let prompt_tokens = crate::agent::context::count_tokens(&req_body.messages);
+        let prompt_tokens = crate::manager::context::count_tokens(&req_body.messages);
         record_tokens_in(prompt_tokens);
         tracing::debug!(
             "LLM request body: {}",
@@ -344,6 +351,8 @@ impl ChatClient {
 
         let consume = async {
             let mut last_chunk_at = std::time::Instant::now();
+            let mut last_progress_log = std::time::Instant::now();
+            let mut last_logged_chars = 0usize;
             loop {
                 if !on_delta("") {
                     break;
@@ -365,6 +374,32 @@ impl ChatClient {
                             on_delta,
                         )? {
                             break;
+                        }
+                        let total_chars = content.len() + reasoning.len();
+                        if total_chars > 0
+                            && (last_progress_log.elapsed() >= Duration::from_secs(5)
+                                || total_chars.saturating_sub(last_logged_chars) >= 4000)
+                        {
+                            let elapsed_s = req_start.elapsed().as_secs();
+                            let approx_toks = (total_chars / 4).max(1);
+                            tracing::info!(
+                                "LLM stream progress ({}, elapsed {}s): ~{} tokens ({} reasoning chars, {} content chars)",
+                                req_body.model,
+                                elapsed_s,
+                                approx_toks,
+                                reasoning.len(),
+                                content.len(),
+                            );
+                            crate::debug_log::log_llm_progress(
+                                &url,
+                                &req_body.model,
+                                req_start.elapsed().as_millis(),
+                                reasoning.len(),
+                                content.len(),
+                                approx_toks,
+                            );
+                            last_progress_log = std::time::Instant::now();
+                            last_logged_chars = total_chars;
                         }
                     }
                     Ok(None) => break,

@@ -774,7 +774,7 @@ impl RepetitionDetector {
                 {
                     let cnt = counts.entry(l).or_insert(0);
                     *cnt += 1;
-                    if *cnt >= th {
+                    if *cnt >= th * 2 {
                         return true;
                     }
                 }

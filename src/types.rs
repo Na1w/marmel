@@ -13,7 +13,7 @@ pub enum Message {
     User { content: String },
     #[serde(rename = "assistant")]
     Assistant {
-        #[serde(default)]
+        #[serde(default, serialize_with = "serialize_assistant_content")]
         content: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
@@ -25,6 +25,19 @@ pub enum Message {
         tool_call_id: String,
         content: String,
     },
+}
+
+fn serialize_assistant_content<S>(
+    content: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match content {
+        Some(s) => serializer.serialize_str(s),
+        None => serializer.serialize_str(""),
+    }
 }
 
 impl Message {
@@ -43,6 +56,15 @@ impl Message {
             Message::User { content } => Some(content.as_str()),
             Message::Assistant { content, .. } => content.as_deref(),
             Message::Tool { content, .. } => Some(content.as_str()),
+        }
+    }
+
+    pub fn reasoning_content(&self) -> Option<&str> {
+        match self {
+            Message::Assistant {
+                reasoning_content, ..
+            } => reasoning_content.as_deref(),
+            _ => None,
         }
     }
 }

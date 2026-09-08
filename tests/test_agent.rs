@@ -74,7 +74,7 @@ fn test_specialist_tool_filtering_and_allowlists() {
 
 #[test]
 fn test_subagent_history_message_sequence() {
-    let mut engine = marmennill::agent::ContextEngineFactory::new(128_000).specialist_context(
+    let mut engine = marmennill::manager::ContextEngineFactory::new(128_000).specialist_context(
         "You are an expert coder.".to_string(),
         "Implement feature X.".to_string(),
     );

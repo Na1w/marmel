@@ -158,6 +158,13 @@ impl TuiRenderer {
                                 {
                                     self.focused_panel = FocusedPanel::Chat;
                                 }
+                            } else if ctrl && (c == 't' || c == 'T') {
+                                self.confirm_abort = false;
+                                self.show_thought = !self.show_thought;
+                                let state = if self.show_thought { "ON" } else { "OFF" };
+                                self.messages
+                                    .push(format!("[CLI] Thinking display: {state}"));
+                                self.chat_auto_scroll = true;
                             } else if !c.is_control() {
                                 self.confirm_abort = false;
                                 // F1: insert the character at the cursor.
@@ -597,6 +604,7 @@ impl TuiRenderer {
                  Tab - cycle focus (Chat / Plan / Subagents)\n\
                  Ctrl+P - toggle the plan panel\n\
                  Ctrl+A - toggle the subagents panel\n\
+                 Ctrl+T - toggle the thinking block display\n\
                  Ctrl+Up / Ctrl+Down - input history navigation\n\
                  Esc / Ctrl+C - confirm-abort (first press arms, second aborts; Esc first returns focus to Chat)\n\
                  Mouse scroll / click - scroll panels / change focus\n\
@@ -614,7 +622,7 @@ impl TuiRenderer {
             || trimmed_lower == "/clear_plan"
             || trimmed_lower == "/clear-plan"
         {
-            let plan = crate::agent::phase::Plan::default();
+            let plan = crate::manager::phase::Plan::default();
             let _ = plan.clear();
             self.show_plan_panel = false;
             self.had_active_plan = false;

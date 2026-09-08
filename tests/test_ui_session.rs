@@ -207,7 +207,7 @@ async fn test_ui_run_session_continues_after_first_turn() {
     ]);
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let plan = marmennill::agent::Plan::at(tmp.path());
+    let plan = marmennill::manager::Plan::at(tmp.path());
     let stats = std::sync::Arc::new(marmennill::harness::HarnessStats::new());
     let manager = std::sync::Arc::new(marmennill::orchestrator::OrchestratorManager::new(
         marmennill::llm::ChatClient::new(server.uri(), "marmel-manager"),
@@ -270,7 +270,7 @@ async fn test_ui_run_session_auto_nudges_when_plan_incomplete_capped_at_5() {
     let cfg = config_for_backend(&server.uri());
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let plan = marmennill::agent::phase::Plan::at(tmp.path());
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
     plan.create("# Plan\n- [ ] [t-001] incomplete task\n")
         .expect("plan created");
 
@@ -439,7 +439,7 @@ async fn test_ui_session_stream_pause_and_resume_on_user_question() {
     );
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let plan = marmennill::agent::Plan::at(tmp.path());
+    let plan = marmennill::manager::Plan::at(tmp.path());
     let stats = std::sync::Arc::new(marmennill::harness::HarnessStats::new());
     let manager = std::sync::Arc::new(marmennill::orchestrator::OrchestratorManager::new(
         marmennill::llm::ChatClient::new(server.uri(), "marmel-manager"),
@@ -553,6 +553,7 @@ async fn test_specialist_stream_preemption_and_resumption_on_shared_model() {
             &req,
             &mut sink,
             512,
+            16384,
             &mut rep_detector,
             false,
             None,
@@ -647,7 +648,7 @@ async fn test_ui_session_rehydrates_transcript_and_resumes_plan() {
         .await;
 
     let tmp = tempfile::tempdir().unwrap();
-    let plan = marmennill::agent::phase::Plan::at(tmp.path());
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
     plan.create("# Execution Plan: Test Rehydration\n\n- [x] [t-101] First task\n- [ ] [t-102] Second task\n")
         .unwrap();
 
@@ -738,7 +739,7 @@ async fn test_ui_session_recovers_frozen_and_injects_deliverable() {
         .await;
 
     let tmp = tempfile::tempdir().unwrap();
-    let plan = marmennill::agent::phase::Plan::at(tmp.path());
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
     plan.create("# Execution Plan: Crash Recovery\n\n- [ ] [t-801] Interrupted task\n- [ ] [t-802] Next task\n")
         .unwrap();
 
@@ -839,7 +840,7 @@ async fn test_ui_session_rehydrates_subagents_and_populates_agent_pane() {
         .await;
 
     let tmp = tempfile::tempdir().unwrap();
-    let plan = marmennill::agent::phase::Plan::at(tmp.path());
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
     plan.create("# Execution Plan\n\n- [ ] [t-901] First task\n- [ ] [t-902] Second task\n")
         .unwrap();
 

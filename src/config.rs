@@ -43,6 +43,8 @@ pub struct MonitoringConfig {
     pub min_pattern_len: usize,
     /// Maximum output tokens per single streaming turn before cutting off runaway generation.
     pub max_stream_tokens: usize,
+    /// Maximum reasoning/thinking tokens per single streaming turn before cutting off runaway reasoning.
+    pub max_thinking_tokens: usize,
 }
 
 impl Default for MonitoringConfig {
@@ -52,6 +54,7 @@ impl Default for MonitoringConfig {
             repetition_threshold: 5,
             min_pattern_len: 5,
             max_stream_tokens: 32768,
+            max_thinking_tokens: 16384,
         }
     }
 }
@@ -82,6 +85,9 @@ pub struct SpecialistConfig {
     /// Whether automated validation is enabled for this specialist (default: true).
     #[serde(alias = "auto_validate", alias = "enable_validation")]
     pub enable_validator: Option<bool>,
+    /// Optional max thinking tokens override for this specialist.
+    #[serde(alias = "reasoning_budget", alias = "thinking_budget")]
+    pub max_thinking_tokens: Option<usize>,
     /// MCP servers whose tools this specialist is allowed to see.
     pub mcp_servers: Vec<String>,
 }
@@ -106,6 +112,8 @@ pub struct Config {
     pub ui_mode: String,
     /// Detailed debug logging to debug.log.
     pub debug: bool,
+    /// Maximum reasoning/thinking tokens per single turn before cutting off runaway reasoning.
+    pub max_thinking_tokens: usize,
     /// Resilience harness thresholds.
     pub monitoring: Option<MonitoringConfig>,
     /// Orchestration block.
@@ -132,6 +140,7 @@ impl Default for Config {
             enable_xml_rescue: true,
             ui_mode: "tui".to_string(),
             debug: false,
+            max_thinking_tokens: 16384,
             monitoring: Some(MonitoringConfig::default()),
             orchestration: OrchestrationConfig::default_depth(),
             mcp_servers: HashMap::new(),

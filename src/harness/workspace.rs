@@ -13,11 +13,11 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 /// Plan file name inside the marmel directory (reused from `agent::phase`).
-pub const PLAN_FILE: &str = crate::agent::phase::PLAN_FILE;
+pub const PLAN_FILE: &str = crate::manager::phase::PLAN_FILE;
 /// Session log file name inside the marmel directory.
 pub const LOG_FILE: &str = "marmel.log";
 /// Phase-override file name inside the marmel directory (reused from `agent::phase`).
-pub const FORCED_PHASE_FILE: &str = crate::agent::phase::FORCED_PHASE_FILE;
+pub const FORCED_PHASE_FILE: &str = crate::manager::phase::FORCED_PHASE_FILE;
 /// Archive subdirectory name inside the marmel directory.
 pub const ARCHIVE_DIR: &str = "archive";
 
@@ -35,7 +35,7 @@ pub struct Workspace {
 
 impl Default for Workspace {
     fn default() -> Self {
-        Self::at(crate::agent::phase::MARMEL_DIR)
+        Self::at(crate::manager::phase::MARMEL_DIR)
     }
 }
 
@@ -165,7 +165,7 @@ mod tests {
     #[test]
     fn test_workspace_new_default() {
         let ws = Workspace::new().unwrap();
-        assert_eq!(ws.root(), Path::new(crate::agent::phase::MARMEL_DIR));
+        assert_eq!(ws.root(), Path::new(crate::manager::phase::MARMEL_DIR));
         assert!(ws.root().is_dir());
         assert_eq!(ws.plan_path(), ws.root().join(PLAN_FILE));
         assert_eq!(ws.log_path(), ws.root().join(LOG_FILE));
