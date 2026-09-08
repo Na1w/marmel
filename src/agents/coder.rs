@@ -1,10 +1,10 @@
 //! Specialist: **Coder** — Lead Software Engineer.
 //!
 //! Domain (REQ-ORCH-002): system architecture, refactoring, and code
-//! implementation. Forbidden from genealogy / kinship.
+//! implementation.
 //!
-//! Allowed tool namespaces: `delegate_task`, `cli_*`, `terminal__*`,
-//! `kiwix__*`, `pdf__*`, `memory__*`, `puppeteer__*`.
+//! Allowed tool namespaces: `delegate_task`, `write_file`, `replace`,
+//! `read_file`, `run_command`, `grep_search`, `glob`, `rebirth`, `sleep`.
 
 use crate::agents::{Agent, Specialist};
 use async_trait::async_trait;

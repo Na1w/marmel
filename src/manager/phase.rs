@@ -453,14 +453,22 @@ impl Plan {
             .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
             .trim();
         let tid_lower = clean_tid.to_ascii_lowercase();
+        let re_tid = Regex::new(&format!(
+            r"(?i)(?:^|[^\w-]){}(?:[^\w-]|$)",
+            regex::escape(&tid_lower)
+        ))
+        .ok();
         let mut flipped = false;
         let re_box = Regex::new(r"\[\s*\]").expect("box regex");
         let updated = content
             .lines()
             .map(|line| {
                 if !flipped {
-                    let line_lower = line.to_ascii_lowercase();
-                    if line_lower.contains(&tid_lower) && re_box.is_match(line) {
+                    let matches_tid = match &re_tid {
+                        Some(re) => re.is_match(line),
+                        None => line.to_ascii_lowercase().contains(&tid_lower),
+                    };
+                    if matches_tid && re_box.is_match(line) {
                         flipped = true;
                         return re_box.replace(line, "[x]").to_string();
                     }

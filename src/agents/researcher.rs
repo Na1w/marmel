@@ -1,11 +1,10 @@
-//! Specialist: **Researcher** — Deep Knowledge & Archival Specialist.
+//! Specialist: **Researcher** — Deep Knowledge & Research Specialist.
 //!
-//! Domain (REQ-ORCH-002): exhaustive research — ZIM encyclopedias, PDFs,
-//! historical archives, statistics. Must prioritize local ZIM before external
-//! APIs and cite verifiable references.
+//! Domain (REQ-ORCH-002): comprehensive codebase exploration, information
+//! retrieval, architecture analysis, and documentation.
 //!
-//! Allowed tool namespaces: `delegate_task`, `kiwix__*`, `pdf__*`,
-//! `riksarkivet__*`, `terminal__*`, `memory__*`, `scb__*`, `brave_search__*`.
+//! Allowed tool namespaces: `delegate_task`, `write_file`, `replace`,
+//! `read_file`, `run_command`, `grep_search`, `glob`, `rebirth`, `sleep`.
 
 use crate::agents::{Agent, Specialist};
 use async_trait::async_trait;

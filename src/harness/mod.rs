@@ -350,14 +350,44 @@ pub async fn handle_sleep_async(arguments: &serde_json::Value) -> Result<ToolRes
     }
 }
 
+/// Safely execute an async future synchronously from any thread or Tokio runtime context.
+///
+/// If inside a multi-threaded Tokio runtime, it uses `tokio::task::block_in_place`.
+/// If inside a current-thread Tokio runtime (where `block_in_place` would panic),
+/// it runs the future on a dedicated worker thread via `std::thread::scope`.
+/// If outside any Tokio runtime, it creates a temporary runtime to drive the future.
+pub fn block_on_safe<F, R>(f: F) -> R
+where
+    F: std::future::Future<Output = R> + Send,
+    R: Send,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(f))
+            }
+            _ => std::thread::scope(|s| {
+                s.spawn(|| handle.block_on(f))
+                    .join()
+                    .expect("worker thread panicked during block_on_safe")
+            }),
+        }
+    } else if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        rt.block_on(f)
+    } else {
+        panic!("failed to initialize tokio runtime for synchronous bridge");
+    }
+}
+
 /// The primary dispatcher entry point, shared by the Manager and specialists.
 pub fn dispatch(tool: &ToolInvocation) -> Result<ToolResult, ToolError> {
     if let Some(mcp) = get_mcp_manager()
         && mcp.has_tool(&tool.name)
     {
-        let mcp_res = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(mcp.call_tool(&tool.name, &tool.arguments))
-        });
+        let mcp_res = block_on_safe(mcp.call_tool(&tool.name, &tool.arguments));
         return match mcp_res {
             Ok(content) => Ok(ToolResult::ok(content)),
             Err(e) => Ok(ToolResult::err(format!("MCP tool error: {e}"))),
@@ -676,7 +706,11 @@ async fn dispatch_specialist_async(
                 .arguments
                 .get("verdict")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("APPROVED");
+                .ok_or_else(|| ToolError::BadArguments {
+                    tool: TOOL_LEAVE_VERDICT.to_string(),
+                    detail: "missing mandatory string field `verdict` ('APPROVED' or 'REJECTED')"
+                        .to_string(),
+                })?;
             let comments = tool
                 .arguments
                 .get("comments")
@@ -710,9 +744,7 @@ fn dispatch_manager(
     if let Some(mcp) = get_mcp_manager()
         && mcp.has_tool(name)
     {
-        let mcp_res = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(mcp.call_tool(name, &tool.arguments))
-        });
+        let mcp_res = block_on_safe(mcp.call_tool(name, &tool.arguments));
         return match mcp_res {
             Ok(content) => Ok(ToolResult::ok(content)),
             Err(e) => Ok(ToolResult::err(format!("MCP tool error: {e}"))),
@@ -789,9 +821,7 @@ fn dispatch_specialist(
     if let Some(mcp) = get_mcp_manager()
         && mcp.has_tool(name)
     {
-        let mcp_res = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(mcp.call_tool(name, &tool.arguments))
-        });
+        let mcp_res = block_on_safe(mcp.call_tool(name, &tool.arguments));
         return match mcp_res {
             Ok(content) => Ok(ToolResult::ok(content)),
             Err(e) => Ok(ToolResult::err(format!("MCP tool error: {e}"))),
@@ -833,7 +863,11 @@ fn dispatch_specialist(
                 .arguments
                 .get("verdict")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("APPROVED");
+                .ok_or_else(|| ToolError::BadArguments {
+                    tool: TOOL_LEAVE_VERDICT.to_string(),
+                    detail: "missing mandatory string field `verdict` ('APPROVED' or 'REJECTED')"
+                        .to_string(),
+                })?;
             let comments = tool
                 .arguments
                 .get("comments")

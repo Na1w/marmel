@@ -554,10 +554,8 @@ pub fn pty_spawn(args: &Value) -> Result<ToolResult, ToolError> {
     let cols = args.get("cols").and_then(Value::as_u64).unwrap_or(80) as u16;
     let cwd = crate::harness::get_workspace_root();
 
-    let output = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current()
-            .block_on(GLOBAL_PTY_MANAGER.spawn(id, command, &cwd, rows, cols))
-    })?;
+    let output =
+        crate::harness::block_on_safe(GLOBAL_PTY_MANAGER.spawn(id, command, &cwd, rows, cols))?;
 
     Ok(ToolResult::ok(format!(
         "PTY session '{id}' started.\nOutput:\n{output}"
@@ -585,9 +583,8 @@ pub fn pty_write(args: &Value) -> Result<ToolResult, ToolError> {
 
     let wait_ms = args.get("wait_ms").and_then(Value::as_u64).unwrap_or(300);
 
-    let (output, is_alive) = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(GLOBAL_PTY_MANAGER.write(id, input, wait_ms))
-    })?;
+    let (output, is_alive) =
+        crate::harness::block_on_safe(GLOBAL_PTY_MANAGER.write(id, input, wait_ms))?;
 
     Ok(ToolResult::ok(format!(
         "Status: alive={is_alive}\nOutput:\n{output}"
@@ -607,9 +604,7 @@ pub fn pty_read(args: &Value) -> Result<ToolResult, ToolError> {
 
     let wait_ms = args.get("wait_ms").and_then(Value::as_u64).unwrap_or(0);
 
-    let (output, is_alive) = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(GLOBAL_PTY_MANAGER.read(id, wait_ms))
-    })?;
+    let (output, is_alive) = crate::harness::block_on_safe(GLOBAL_PTY_MANAGER.read(id, wait_ms))?;
 
     Ok(ToolResult::ok(format!(
         "Status: alive={is_alive}\nOutput:\n{output}"
@@ -627,9 +622,7 @@ pub fn pty_close(args: &Value) -> Result<ToolResult, ToolError> {
             detail: "missing string field `id` or `session_id`".into(),
         })?;
 
-    let closed = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(GLOBAL_PTY_MANAGER.close(id))
-    });
+    let closed = crate::harness::block_on_safe(GLOBAL_PTY_MANAGER.close(id));
 
     if closed {
         Ok(ToolResult::ok(format!("PTY session '{id}' closed.")))
@@ -642,9 +635,7 @@ pub fn pty_close(args: &Value) -> Result<ToolResult, ToolError> {
 
 /// Tool handler: `pty_list`.
 pub fn pty_list(_args: &Value) -> Result<ToolResult, ToolError> {
-    let list = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(GLOBAL_PTY_MANAGER.list())
-    });
+    let list = crate::harness::block_on_safe(GLOBAL_PTY_MANAGER.list());
 
     Ok(ToolResult::ok(
         serde_json::to_string_pretty(&list).unwrap_or_else(|_| "[]".to_string()),

@@ -183,7 +183,7 @@ Applied after file config, before defaults:
 | `debug` | `false` | Detailed debug logging to `debug.log`. |
 | `[monitoring]` | — | Resilience harness thresholds (`enabled`, `repetition_threshold`, `min_pattern_len`, `max_stream_tokens`, `max_thinking_tokens`). |
 | `[orchestration]` | — | `max_recursion_depth` (default 3), `manager_module`, `mcp_servers`, `specialists` table. |
-| `[orchestration.specialists.<role>]` | — | Per-specialist `tools`, `model`, `backend_url`, `auth_token`, `mcp_servers`, `validator_model`, `validator_backend_url`, `validator_auth_token`, `max_validator_iterations`, `enable_validator`, `max_thinking_tokens` (aliases: `reasoning_budget`, `thinking_budget`). |
+| `[orchestration.specialists.<role>]` | — | Per-specialist `tools`, `model`, `backend_url`, `auth_token`, `mcp_servers`, `validator_model`, `validator_backend_url`, `validator_auth_token`, `max_validator_iterations`, `enable_validator` (aliases: `auto_validate`, `enable_validation`), `max_thinking_tokens` (aliases: `reasoning_budget`, `thinking_budget`). |
 | `[mcp_servers.<name>]` | — | External MCP server registration (`command`, `args`, `env`, `url`). |
 
 ### Specialist Configuration & MCP Routing
@@ -258,6 +258,7 @@ model = "deepseek-v4-flash:cloud"
 |---|---|
 | `--config <path>` | Override config file path. |
 | `--raw` | Force headless stdout mode. |
+| `--debug` | Detailed debug logging to `debug.log`. |
 | `-h` / `--help` | Print usage. |
 | `PROMPT` | Optional initial prompt to start the session. |
 
@@ -375,9 +376,9 @@ On non-Linux systems (macOS and Windows), Landlock is conditionally bypassed whi
 | Role | Focus | Tool allowlist |
 |---|---|---|
 | **Coder** | Software engineering, implementation, tests. | Read/write/run tools, search, delegation, sleep. |
-| **Researcher** | Information retrieval, fact-checking, documentation. | Read/search tools, delegation, sleep. |
+| **Researcher** | Information retrieval, codebase exploration, documentation. | Read/write/run tools, search, delegation, sleep. |
 | **Debugger** | Crash forensics, low-level diagnostics, interactive PTY GDB/LLDB. | Read/run/PTY tools, search, delegation, sleep. |
-| **Validator** | Independent QA auditor; issues `leave_verdict` (APPROVED/REJECTED). | Read/search tools, verdict, sleep. |
+| **Validator** | Independent QA auditor; issues `leave_verdict` (APPROVED/REJECTED). | Read/search/PTY tools, verdict, sleep. |
 | **Generalist** | Cross-domain polymath with universal `"*"` tool access. | All tools (including sleep). |
 
 Each specialist runs in an **isolated context** — it sees only its role prompt, the task brief, and bounded snippets, never the Manager's full transcript.
@@ -414,13 +415,13 @@ Each agent turn walks: `PrepareTurn → CallBackend → StreamResponse → Proce
 
 ### Validation loop
 
-Specialist deliverables are automatically audited by a Validator subagent. Rejected work is fed back to the specialist for revision, up to `max_validator_iterations` (default 5).
+Specialist deliverables are automatically audited by a Validator subagent. The `leave_verdict` tool requires an explicit verdict (`APPROVED` or `REJECTED`) and comments; omitted or invalid verdicts trigger immediate corrective tool errors. Rejected work is fed back to the specialist for revision, up to `max_validator_iterations` (default 5).
 
 ### Resilience
 
 - **XML tool-call rescue** — recovers plain-text XML tool calls into structured JSON.
 - **Semantic tool repetition & cycle gate** — blocks identical repeated calls and cuts alternating tool cycles.
-- **Multi-tier text repetition breaker** — rolling 1000-char buffer tracking:
+- **Multi-tier text repetition breaker** — rolling 16,384-char buffer tracking:
   - $\ge 3$ identical consecutive lines.
   - $\ge 3$ repeated line bigrams.
   - $\ge 3$ repeated word 4-gram phrases across sentences.

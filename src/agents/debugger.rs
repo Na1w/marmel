@@ -1,10 +1,10 @@
 //! Specialist: **Debugger** — Low-Level Systems Debugger.
 //!
-//! Domain (REQ-ORCH-002): crash forensics, interactive PTY GDB/LLDB, Capstone
-//! disassembly, ABI/codegen root-cause analysis.
+//! Domain (REQ-ORCH-002): crash forensics, interactive PTY execution,
+//! diagnostics, and root-cause analysis.
 //!
-//! Allowed tool namespaces: `delegate_task`, `terminal__*`, `pty__*`,
-//! `kiwix__*`, `memory__*`.
+//! Allowed tool namespaces: `delegate_task`, `write_file`, `replace`,
+//! `read_file`, `run_command`, `grep_search`, `glob`, `pty_*`, `rebirth`, `sleep`.
 
 use crate::agents::{Agent, Specialist};
 use async_trait::async_trait;

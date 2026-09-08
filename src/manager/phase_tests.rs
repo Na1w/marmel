@@ -491,3 +491,27 @@ fn test_checkoff_auto_archives_completed_snapshot() {
 
     fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn test_check_off_avoids_substring_collision() {
+    let dir = temp_marmel();
+    let plan = Plan::at(&dir);
+    let plan_content = "# Execution Plan\n- [ ] [t-010] Tenth task\n- [ ] [t-01] First task\n";
+    plan.create(plan_content).unwrap();
+
+    // Flipping t-01 must flip t-01, NOT t-010 (even though t-010 appears first).
+    let flipped = plan.check_off("t-01").unwrap();
+    assert!(flipped, "t-01 should flip");
+
+    let disk = plan.read().unwrap().unwrap();
+    assert!(
+        disk.contains("- [ ] [t-010] Tenth task"),
+        "t-010 must remain unchecked:\n{disk}"
+    );
+    assert!(
+        disk.contains("- [x] [t-01] First task"),
+        "t-01 must be checked:\n{disk}"
+    );
+
+    fs::remove_dir_all(&dir).unwrap();
+}

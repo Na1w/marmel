@@ -9,7 +9,7 @@
 //! * [`ToolRepetitionDetector`] tracks the last 50 executed tool calls using
 //!   semantic JSON equality (ignoring argument key ordering and pagination
 //!   fields) and blocks repetitions / cuts alternating cycles (REQ-HARN-002).
-//! * [`RepetitionDetector`] watches a 1000-character rolling buffer of streamed
+//! * [`RepetitionDetector`] watches a 16384-character rolling buffer of streamed
 //!   assistant output for text that repeats itself ≥5 times (REQ-HARN-003).
 //!
 //! Every intervention is recorded atomically in the shared [`HarnessStats`]

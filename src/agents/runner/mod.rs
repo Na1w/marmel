@@ -38,7 +38,20 @@ pub(crate) async fn run_specialist_llm(
     if let Some(res) = try_run_specialist_live(agent, ctx, token).await {
         return res;
     }
-    canned
+
+    let is_test_runner = std::env::current_exe()
+        .map(|p| {
+            let s = p.to_string_lossy();
+            s.contains("/deps/") || s.contains(r"\deps\")
+        })
+        .unwrap_or(false)
+        && std::env::var("MARMEL_LIVE_TEST").is_err();
+
+    if is_test_runner {
+        canned
+    } else {
+        "Specialist execution failed: configuration or LLM backend unavailable outside test environment.\n\nFAILED (config_error)".to_string()
+    }
 }
 
 pub(crate) async fn try_run_specialist_live(

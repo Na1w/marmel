@@ -88,9 +88,9 @@ async fn test_sleep_execution_and_cancellation() {
         }),
     };
 
-    // Trigger cancellation after 100ms on a dedicated thread
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    // Trigger cancellation after 100ms on a dedicated async task
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         marmennill::orchestrator::cancel_all();
     });
 

@@ -214,14 +214,33 @@ pub(crate) async fn run_automated_validation(
         };
         engine.append(assistant_msg);
 
+        let mut had_invalid_verdict = false;
         for tc in &tool_calls {
             if tc.function.name == TOOL_LEAVE_VERDICT {
                 let args_val = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
                     .unwrap_or_else(|_| serde_json::Value::String(tc.function.arguments.clone()));
-                let verdict = args_val
-                    .get("verdict")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("APPROVED");
+                let verdict_opt = args_val.get("verdict").and_then(serde_json::Value::as_str);
+
+                let verdict = match verdict_opt {
+                    Some(v)
+                        if v.eq_ignore_ascii_case("APPROVED")
+                            || v.eq_ignore_ascii_case("REJECTED") =>
+                    {
+                        v
+                    }
+                    _ => {
+                        let err_msg = "ERROR: Missing or invalid mandatory argument 'verdict'. You MUST specify verdict as either 'APPROVED' or 'REJECTED'.";
+                        engine.append(crate::types::Message::Tool {
+                            tool_call_id: tc.id.clone(),
+                            content: err_msg.to_string(),
+                        });
+                        tracing::warn!(
+                            "Validator for {agent} omitted or passed invalid verdict: {args_val:?}"
+                        );
+                        had_invalid_verdict = true;
+                        continue;
+                    }
+                };
                 let comments = args_val
                     .get("comments")
                     .or_else(|| args_val.get("comment"))
@@ -253,6 +272,10 @@ pub(crate) async fn run_automated_validation(
                 );
                 return Ok((approved, critique));
             }
+        }
+
+        if had_invalid_verdict {
+            continue;
         }
 
         if tool_calls.is_empty() {

@@ -5,7 +5,7 @@
 //! incomplete work with actionable feedback; never inflates pass status.
 //!
 //! Allowed tool namespaces: `delegate_task`, `read_file`, `grep_search`,
-//! `glob`, `pty_*`, `leave_verdict`, `rebirth`.
+//! `glob`, `pty_*`, `leave_verdict`, `rebirth`, `sleep`.
 
 use crate::agents::{Agent, Specialist};
 use async_trait::async_trait;
