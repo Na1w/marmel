@@ -24,8 +24,99 @@ pub struct PauseSignal {
     pub yielded_tx: oneshot::Sender<oneshot::Sender<PauseAction>>,
 }
 
+/// Detailed identity metadata for an active specialist or validator stream.
+#[derive(Debug, Clone)]
+pub struct StreamIdentity {
+    pub agent_tag: String,
+    pub agent_name: Option<String>,
+    pub task_id: Option<String>,
+    pub cancel_token: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl StreamIdentity {
+    /// Check if this stream matches a target agent name or tool_call_id.
+    ///
+    /// Matches robustly against:
+    /// - target_tool_call_id matching full tag (e.g. "researcher-t-001"), task_id (e.g. "t-001"), or agent_name ("researcher").
+    /// - target_agent matching agent_name (e.g. "researcher") or full tag.
+    /// - Suffix/prefix/substring variations, stripping quotes and brackets, case-insensitive.
+    pub fn matches(&self, target_agent: Option<&str>, target_tool_call_id: &str) -> bool {
+        let tag_lower = self.agent_tag.trim().to_ascii_lowercase();
+
+        let clean_tid = target_tool_call_id
+            .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
+            .trim()
+            .to_ascii_lowercase();
+
+        let clean_agent = target_agent
+            .unwrap_or("")
+            .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
+            .trim()
+            .to_ascii_lowercase();
+
+        if clean_tid.is_empty() && clean_agent.is_empty() {
+            return false;
+        }
+
+        // 1. Direct or partial match on full agent_tag (e.g. "researcher-t-001")
+        if !clean_tid.is_empty()
+            && (tag_lower == clean_tid
+                || tag_lower.ends_with(&format!("-{clean_tid}"))
+                || tag_lower.starts_with(&format!("{clean_tid}-"))
+                || tag_lower.contains(&clean_tid))
+        {
+            return true;
+        }
+        if !clean_agent.is_empty()
+            && (tag_lower == clean_agent
+                || tag_lower.starts_with(&format!("{clean_agent}-"))
+                || tag_lower.ends_with(&format!("-{clean_agent}"))
+                || tag_lower.contains(&clean_agent))
+        {
+            return true;
+        }
+
+        // 2. Direct or partial match on explicit task_id (e.g. "t-001")
+        if let Some(ref tid) = self.task_id {
+            let tid_clean = tid
+                .trim_matches(|c| {
+                    c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\''
+                })
+                .trim()
+                .to_ascii_lowercase();
+            if !clean_tid.is_empty()
+                && (tid_clean == clean_tid
+                    || clean_tid.contains(&tid_clean)
+                    || tid_clean.contains(&clean_tid))
+            {
+                return true;
+            }
+            if !clean_agent.is_empty() && tid_clean == clean_agent {
+                return true;
+            }
+        }
+
+        // 3. Direct or partial match on explicit agent_name (e.g. "researcher")
+        if let Some(ref name) = self.agent_name {
+            let name_clean = name.trim().to_ascii_lowercase();
+            if !clean_agent.is_empty()
+                && (name_clean == clean_agent
+                    || name_clean.contains(&clean_agent)
+                    || clean_agent.contains(&name_clean))
+            {
+                return true;
+            }
+            if !clean_tid.is_empty() && name_clean == clean_tid {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
 struct StreamEntry {
-    agent_tag: String,
+    identity: StreamIdentity,
     model: String,
     pause_tx: mpsc::UnboundedSender<PauseSignal>,
 }
@@ -46,7 +137,7 @@ pub fn models_conflict(m1: &str, m2: &str) -> bool {
 /// RAII StreamSink for background specialists that listens for preemption requests.
 pub struct PreemptibleStreamSink {
     id: u64,
-    agent_tag: String,
+    identity: StreamIdentity,
     model: String,
     pause_rx: mpsc::UnboundedReceiver<PauseSignal>,
     pending_signal: Option<PauseSignal>,
@@ -55,16 +146,47 @@ pub struct PreemptibleStreamSink {
 impl PreemptibleStreamSink {
     /// Register a specialist stream for preemption coordination while running.
     pub fn register(agent_tag: impl Into<String>, model: impl Into<String>) -> Self {
+        Self::register_full(agent_tag, None, None, None, model)
+    }
+
+    /// Register a specialist stream with full identity metadata and optional cancellation token.
+    pub fn register_full(
+        agent_tag: impl Into<String>,
+        agent_name: Option<String>,
+        task_id: Option<String>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
+        model: impl Into<String>,
+    ) -> Self {
         let id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
         let agent_tag = agent_tag.into();
         let model = model.into();
         let (pause_tx, pause_rx) = mpsc::unbounded_channel();
 
+        let inferred_agent_name = agent_name.or_else(|| {
+            if let Some(idx) = agent_tag.find('-') {
+                Some(agent_tag[..idx].to_string())
+            } else {
+                Some(agent_tag.clone())
+            }
+        });
+        let inferred_task_id = task_id.or_else(|| {
+            agent_tag
+                .rfind('-')
+                .map(|idx| agent_tag[idx + 1..].to_string())
+        });
+
+        let identity = StreamIdentity {
+            agent_tag: agent_tag.clone(),
+            agent_name: inferred_agent_name,
+            task_id: inferred_task_id,
+            cancel_token,
+        };
+
         if let Ok(mut map) = ACTIVE_STREAMS.write() {
             map.insert(
                 id,
                 StreamEntry {
-                    agent_tag: agent_tag.clone(),
+                    identity: identity.clone(),
                     model: model.clone(),
                     pause_tx,
                 },
@@ -73,7 +195,7 @@ impl PreemptibleStreamSink {
 
         Self {
             id,
-            agent_tag,
+            identity,
             model,
             pause_rx,
             pending_signal: None,
@@ -81,7 +203,11 @@ impl PreemptibleStreamSink {
     }
 
     pub fn agent_tag(&self) -> &str {
-        &self.agent_tag
+        &self.identity.agent_tag
+    }
+
+    pub fn identity(&self) -> &StreamIdentity {
+        &self.identity
     }
 
     pub fn model(&self) -> &str {
@@ -103,13 +229,13 @@ impl StreamSink for PreemptibleStreamSink {
         match event {
             StreamEvent::Content(text) => {
                 crate::orchestrator::emit_event(crate::ui::Event::SubagentMessage {
-                    agent_tag: self.agent_tag.clone(),
+                    agent_tag: self.identity.agent_tag.clone(),
                     text,
                 });
             }
             StreamEvent::Thinking(text) => {
                 crate::orchestrator::emit_event(crate::ui::Event::SubagentThinking {
-                    agent_tag: self.agent_tag.clone(),
+                    agent_tag: self.identity.agent_tag.clone(),
                     text,
                 });
             }
@@ -132,7 +258,7 @@ impl StreamSink for PreemptibleStreamSink {
         if let Some(signal) = self.pending_signal.take() {
             crate::orchestrator::emit_status(format!(
                 "[{}] Yielded model slot ({}) to Steer Arbitrator — stream paused",
-                self.agent_tag, self.model
+                self.identity.agent_tag, self.model
             ));
             let (action_tx, action_rx) = oneshot::channel();
             if signal.yielded_tx.send(action_tx).is_err() {
@@ -143,7 +269,7 @@ impl StreamSink for PreemptibleStreamSink {
                     if matches!(action, PauseAction::Resume) {
                         crate::orchestrator::emit_status(format!(
                             "[{}] Model slot reclaimed — resuming stream...",
-                            self.agent_tag
+                            self.identity.agent_tag
                         ));
                     }
                     action
@@ -159,13 +285,18 @@ impl StreamSink for PreemptibleStreamSink {
 /// Handle representing an in-flight preempted model stream.
 pub enum PreemptHandle {
     None,
-    Active(Vec<(String, oneshot::Sender<PauseAction>)>),
+    Active(Vec<(StreamIdentity, oneshot::Sender<PauseAction>)>),
 }
 
 impl PreemptHandle {
     pub fn complete_all(self, action: PauseAction) {
         if let PreemptHandle::Active(list) = self {
-            for (_, tx) in list {
+            for (identity, tx) in list {
+                if matches!(action, PauseAction::Abort)
+                    && let Some(ref token) = identity.cancel_token
+                {
+                    token.cancel();
+                }
                 let _ = tx.send(action);
             }
         }
@@ -173,19 +304,19 @@ impl PreemptHandle {
 
     pub fn complete_with_subtask_decision(self, decision: Option<&SteerDecision>) {
         if let PreemptHandle::Active(list) = self {
-            for (agent_tag, tx) in list {
+            for (identity, tx) in list {
                 let cancelled = decision
                     .map(|d| {
                         d.subtasks.iter().any(|st| {
-                            st.action == "Cancel"
-                                && (st.agent_name.as_deref() == Some(&agent_tag)
-                                    || agent_tag.starts_with(&st.tool_call_id)
-                                    || (!st.tool_call_id.is_empty()
-                                        && st.tool_call_id == agent_tag))
+                            st.action.eq_ignore_ascii_case("Cancel")
+                                && identity.matches(st.agent_name.as_deref(), &st.tool_call_id)
                         })
                     })
                     .unwrap_or(false);
                 let action = if cancelled {
+                    if let Some(ref token) = identity.cancel_token {
+                        token.cancel();
+                    }
                     PauseAction::Abort
                 } else {
                     PauseAction::Resume
@@ -199,13 +330,13 @@ impl PreemptHandle {
 /// Preempt any active specialist stream conflicting with `target_model`.
 /// Returns a `PreemptHandle` that must be completed with `PauseAction` after steering.
 pub async fn preempt_conflicting_stream(target_model: &str, user_msg: &str) -> PreemptHandle {
-    let entries: Vec<(String, mpsc::UnboundedSender<PauseSignal>)> = {
+    let entries: Vec<(StreamIdentity, mpsc::UnboundedSender<PauseSignal>)> = {
         let Ok(map) = ACTIVE_STREAMS.read() else {
             return PreemptHandle::None;
         };
         map.values()
             .filter(|entry| models_conflict(&entry.model, target_model))
-            .map(|entry| (entry.agent_tag.clone(), entry.pause_tx.clone()))
+            .map(|entry| (entry.identity.clone(), entry.pause_tx.clone()))
             .collect()
     };
 
@@ -214,7 +345,7 @@ pub async fn preempt_conflicting_stream(target_model: &str, user_msg: &str) -> P
     }
 
     let mut active_senders = Vec::new();
-    for (agent_tag, pause_tx) in entries {
+    for (identity, pause_tx) in entries {
         let (yielded_tx, yielded_rx) = oneshot::channel();
         let signal = PauseSignal {
             user_input: user_msg.to_string(),
@@ -224,7 +355,7 @@ pub async fn preempt_conflicting_stream(target_model: &str, user_msg: &str) -> P
             && let Ok(Ok(action_tx)) =
                 tokio::time::timeout(Duration::from_secs(2), yielded_rx).await
         {
-            active_senders.push((agent_tag, action_tx));
+            active_senders.push((identity, action_tx));
         }
     }
 
@@ -330,5 +461,118 @@ mod tests {
 
         let action = pause_task.await.unwrap();
         assert_eq!(action, PauseAction::Abort);
+    }
+
+    #[test]
+    fn test_stream_identity_matching() {
+        let ident = StreamIdentity {
+            agent_tag: "researcher-t-001".to_string(),
+            agent_name: Some("researcher".to_string()),
+            task_id: Some("t-001".to_string()),
+            cancel_token: None,
+        };
+
+        // Match by task_id
+        assert!(ident.matches(None, "t-001"));
+        assert!(ident.matches(None, "[t-001]"));
+        assert!(ident.matches(None, "\"t-001\""));
+
+        // Match by agent_name
+        assert!(ident.matches(Some("researcher"), ""));
+        assert!(ident.matches(Some("RESEARCHER"), ""));
+
+        // Match by both
+        assert!(ident.matches(Some("researcher"), "t-001"));
+
+        // Match by full tag in tool_call_id
+        assert!(ident.matches(None, "researcher-t-001"));
+
+        // Validator tag matching
+        let val_ident = StreamIdentity {
+            agent_tag: "validator-coder-t-002".to_string(),
+            agent_name: Some("validator-coder".to_string()),
+            task_id: Some("t-002".to_string()),
+            cancel_token: None,
+        };
+        assert!(val_ident.matches(None, "t-002"));
+        assert!(val_ident.matches(Some("validator-coder"), ""));
+        assert!(val_ident.matches(Some("coder"), ""));
+
+        // Negative matches
+        assert!(!ident.matches(None, "t-002"));
+        assert!(!ident.matches(Some("coder"), "t-002"));
+        assert!(!ident.matches(None, ""));
+    }
+
+    #[tokio::test]
+    async fn test_preempt_with_task_id_cancel_and_cancellation_token() {
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        assert!(!cancel_token.is_cancelled());
+
+        let mut sink = PreemptibleStreamSink::register_full(
+            "researcher-t-001",
+            Some("researcher".to_string()),
+            Some("t-001".to_string()),
+            Some(cancel_token.clone()),
+            "model-test-task-cancel",
+        );
+
+        let handle_task = tokio::spawn(async {
+            preempt_conflicting_stream("model-test-task-cancel", "stalled agent check").await
+        });
+
+        // Loop poll_control until Pause is received
+        loop {
+            if let StreamControl::Pause { .. } = sink.poll_control() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let pause_task = tokio::spawn(async move { sink.on_pause("stalled agent check").await });
+
+        let handle = handle_task.await.unwrap();
+        assert!(
+            matches!(handle, PreemptHandle::Active(_)),
+            "handle must be active"
+        );
+
+        // Arbitrator cancels t-001 using just the task_id
+        let decision = SteerDecision {
+            decision: "DelegateTask".to_string(),
+            response: Some(
+                "Terminating stalled researcher and delegating investigative agent".to_string(),
+            ),
+            tier: None,
+            model: None,
+            subtasks: vec![
+                crate::orchestrator::steer::SteerSubtaskDecision {
+                    tool_call_id: "t-001".to_string(),
+                    action: "Cancel".to_string(),
+                    message: None,
+                    agent_name: Some("researcher".to_string()),
+                    prompt: None,
+                    sleep_seconds: None,
+                },
+                crate::orchestrator::steer::SteerSubtaskDecision {
+                    tool_call_id: "steer-task-1".to_string(),
+                    action: "DelegateTask".to_string(),
+                    message: None,
+                    agent_name: Some("coder".to_string()),
+                    prompt: Some("Investigate stalled task".to_string()),
+                    sleep_seconds: None,
+                },
+            ],
+            sleep_seconds: None,
+        };
+
+        handle.complete_with_subtask_decision(Some(&decision));
+
+        let action = pause_task.await.unwrap();
+        assert_eq!(action, PauseAction::Abort);
+        assert!(
+            cancel_token.is_cancelled(),
+            "cancellation token must be triggered on Cancel"
+        );
     }
 }

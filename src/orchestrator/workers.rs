@@ -87,12 +87,19 @@ pub fn register_active_worker(
     agent_name: String,
     prompt: String,
 ) -> ActiveWorkerGuard {
-    let key = if let Some(ref t) = task_id {
-        if !t.trim().is_empty() {
-            format!("{agent_name}-{t}")
-        } else {
-            format!("{agent_name}-{}", Instant::now().elapsed().as_nanos())
-        }
+    let clean_task_id = task_id
+        .as_deref()
+        .map(|t| {
+            t.trim_matches(|c| {
+                c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\''
+            })
+            .trim()
+            .to_string()
+        })
+        .filter(|t| !t.is_empty());
+
+    let key = if let Some(ref t) = clean_task_id {
+        format!("{agent_name}-{t}")
     } else {
         format!("{agent_name}-{}", Instant::now().elapsed().as_nanos())
     };
@@ -106,7 +113,7 @@ pub fn register_active_worker(
         map.insert(
             key.clone(),
             ActiveWorkerInfo {
-                task_id,
+                task_id: clean_task_id,
                 agent_name,
                 prompt,
                 started_at: Instant::now(),
@@ -255,8 +262,8 @@ pub fn get_active_subtasks_str() -> String {
             let task_id_str = info.task_id.as_deref().unwrap_or(id);
             let start_wall_str = info.started_wall.format("%H:%M:%S");
             out.push_str(&format!(
-                "- Tool Call ID: {}\n  Subagent: {}\n  Status: {}\n  Task Prompt: {}\n  Started At: {} (running for {}, {elapsed_secs} total seconds)\n  Implementation Turns: {}\n  Validation Rounds: {}\n",
-                task_id_str, info.agent_name, info.status, info.prompt, start_wall_str, duration_str, info.implementation_turns, info.validation_rounds
+                "- Tool Call ID: {}\n  Subagent Tag: {}\n  Subagent: {}\n  Status: {}\n  Task Prompt: {}\n  Started At: {} (running for {}, {elapsed_secs} total seconds)\n  Implementation Turns: {}\n  Validation Rounds: {}\n",
+                task_id_str, id, info.agent_name, info.status, info.prompt, start_wall_str, duration_str, info.implementation_turns, info.validation_rounds
             ));
             if let Some(ref fb) = info.latest_validator_feedback {
                 let trimmed = fb.trim();

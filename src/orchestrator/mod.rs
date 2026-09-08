@@ -22,7 +22,8 @@ mod steer_tests;
 pub mod workers;
 
 pub use preemption::{
-    PreemptHandle, PreemptibleStreamSink, models_conflict, preempt_conflicting_stream,
+    PreemptHandle, PreemptibleStreamSink, StreamIdentity, models_conflict,
+    preempt_conflicting_stream,
 };
 
 pub use crate::agents::{

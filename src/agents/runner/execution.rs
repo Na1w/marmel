@@ -35,9 +35,21 @@ pub async fn run_specialist_live(
         .cloned()
         .unwrap_or_else(|| cfg.model.clone());
 
-    let agent_tag = match &ctx.task_id {
-        Some(t) if !t.trim().is_empty() => format!("{agent}-{t}"),
-        _ => format!("{agent}"),
+    let clean_task_id = ctx
+        .task_id
+        .as_deref()
+        .map(|t| {
+            t.trim_matches(|c| {
+                c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\''
+            })
+            .trim()
+            .to_string()
+        })
+        .filter(|t| !t.is_empty());
+
+    let agent_tag = match &clean_task_id {
+        Some(t) => format!("{agent}-{t}"),
+        None => format!("{agent}"),
     };
 
     let registry = crate::orchestrator::SpecialistRegistry::canonical();
@@ -61,7 +73,7 @@ pub async fn run_specialist_live(
     let mut consecutive_thinking_nudges = 0u32;
 
     let _active_guard = crate::orchestrator::register_active_worker(
-        ctx.task_id.clone(),
+        clean_task_id.clone(),
         agent.as_str().to_string(),
         ctx.brief.clone(),
     );
@@ -125,8 +137,13 @@ pub async fn run_specialist_live(
             .and_then(|s| s.max_thinking_tokens)
             .unwrap_or(cfg.max_thinking_tokens)
             .max(256);
-        let mut sink =
-            crate::orchestrator::PreemptibleStreamSink::register(&agent_tag, &specialist_model);
+        let mut sink = crate::orchestrator::PreemptibleStreamSink::register_full(
+            &agent_tag,
+            Some(agent.as_str().to_string()),
+            clean_task_id.clone(),
+            Some(token.clone()),
+            &specialist_model,
+        );
         let stream_out = crate::llm::chat_stream_resumable(
             client,
             &req,
@@ -382,6 +399,7 @@ pub async fn run_specialist_live(
                     match run_automated_validation(
                         client,
                         agent,
+                        clean_task_id.as_deref(),
                         &ctx.brief,
                         &final_content,
                         cfg,

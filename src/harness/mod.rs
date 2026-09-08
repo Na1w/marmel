@@ -185,7 +185,48 @@ pub enum ToolError {
 }
 
 fn write_plan(md: &str) -> Result<ToolResult, ToolError> {
-    let plan = crate::manager::phase::Plan::default();
+    block_on_safe(write_plan_async(md))
+}
+
+async fn write_plan_async(md: &str) -> Result<ToolResult, ToolError> {
+    write_plan_internal(md, None).await
+}
+
+async fn write_plan_internal(
+    md: &str,
+    custom_plan: Option<crate::manager::phase::Plan>,
+) -> Result<ToolResult, ToolError> {
+    let cfg = crate::config::load(None).unwrap_or_default();
+    let token = crate::orchestrator::global_cancellation_token();
+
+    let planner_cfg = cfg.orchestration.specialists.get("planner");
+    let validator_cfg = cfg
+        .orchestration
+        .specialists
+        .get(crate::agents::Agent::Validator.as_str());
+    let auto_validate_enabled = planner_cfg
+        .and_then(|sc| sc.enable_validator)
+        .or_else(|| validator_cfg.and_then(|vc| vc.enable_validator))
+        .unwrap_or(true);
+
+    if auto_validate_enabled {
+        match crate::agents::validation::run_plan_validation(md, &cfg, &token).await {
+            Ok((approved, critique)) => {
+                if !approved {
+                    tracing::warn!("create_plan rejected by Strategic Plan Auditor: {critique}");
+                    return Ok(ToolResult::err(format!(
+                        "Execution plan rejected by Strategic Plan Auditor:\n{critique}\n\nPlease revise the execution plan addressing the auditor's critique and call create_plan again."
+                    )));
+                }
+                tracing::info!("create_plan approved by Strategic Plan Auditor: {critique}");
+            }
+            Err(e) => {
+                tracing::warn!("Plan validation skipped due to error: {e:#}");
+            }
+        }
+    }
+
+    let plan = custom_plan.unwrap_or_default();
     plan.create(md)
         .map(|_| {
             let pending = plan.pending_tasks();
@@ -621,7 +662,7 @@ async fn dispatch_manager_async(
             .or_else(|| tool.arguments.get("plan_markdown"))
             .and_then(serde_json::Value::as_str)
         {
-            Some(md) => write_plan(md),
+            Some(md) => Box::pin(write_plan_async(md)).await,
             None => Ok(ToolResult::err(
                 "create_plan requires a `plan` or `plan_markdown` string argument",
             )),
@@ -937,5 +978,60 @@ mod tests {
         let res = dispatch_for(&invocation, ToolCaller::Manager).unwrap();
         assert!(!res.is_error);
         assert!(res.content.contains("MISSION COMPLETE"));
+    }
+
+    #[test]
+    fn test_run_plan_validation_skipped_when_disabled() {
+        let mut cfg = crate::config::Config::default();
+        let planner_spec = crate::config::SpecialistConfig {
+            enable_validator: Some(false),
+            ..Default::default()
+        };
+        cfg.orchestration
+            .specialists
+            .insert("planner".to_string(), planner_spec);
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let res = block_on_safe(crate::agents::validation::run_plan_validation(
+            "# Execution Plan\n- [ ] [t-001] Step one\n",
+            &cfg,
+            &token,
+        ));
+        assert!(res.is_ok());
+        let (approved, comments) = res.unwrap();
+        assert!(approved);
+        assert!(comments.contains("skipped"));
+    }
+
+    #[test]
+    fn test_harness_create_plan_missing_arguments_returns_error() {
+        let invocation = ToolInvocation {
+            name: TOOL_CREATE_PLAN.to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let res = dispatch_for(&invocation, ToolCaller::Manager).unwrap();
+        assert!(res.is_error);
+        assert!(res.content.contains("requires a `plan` or `plan_markdown`"));
+    }
+
+    #[test]
+    fn test_harness_write_plan_internal_writes_to_custom_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = crate::manager::phase::Plan::at(tmp.path().join(".marmel"));
+        let res = block_on_safe(async {
+            write_plan_internal(
+                "# Execution Plan\n## Phase 1\n- [ ] [t-001] Step one\n",
+                Some(plan.clone()),
+            )
+            .await
+        })
+        .unwrap();
+
+        if !res.is_error {
+            assert!(res.content.contains("Execution plan written"));
+            assert!(plan.plan_path().exists());
+        } else {
+            assert!(res.content.contains("Strategic Plan Auditor"));
+        }
     }
 }

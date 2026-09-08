@@ -27,6 +27,8 @@ pub const VALIDATOR_RESEARCHER_ROLE_PROMPT: &str =
 /// Specialist prompt for generalist auditing — statically embedded from prompts/validator_generalist.md.
 pub const VALIDATOR_GENERALIST_ROLE_PROMPT: &str =
     include_str!("../../prompts/validator_generalist.md");
+/// Specialist prompt for planner auditing — statically embedded from prompts/validator_planner.md.
+pub const VALIDATOR_PLANNER_ROLE_PROMPT: &str = include_str!("../../prompts/validator_planner.md");
 
 #[async_trait]
 impl Specialist for Validator {
