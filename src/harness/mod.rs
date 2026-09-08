@@ -742,21 +742,16 @@ async fn dispatch_specialist_async(
         TOOL_PTY_CLOSE | "pty__close" => pty::pty_close(&tool.arguments),
         TOOL_PTY_LIST | "pty__list" => pty::pty_list(&tool.arguments),
         TOOL_DELEGATE_TASK => crate::orchestrator::handle_delegate_task(&tool.arguments),
-        TOOL_LEAVE_VERDICT => {
-            let verdict = tool
-                .arguments
-                .get("verdict")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| ToolError::BadArguments {
-                    tool: TOOL_LEAVE_VERDICT.to_string(),
-                    detail: "missing mandatory string field `verdict` ('APPROVED' or 'REJECTED')"
-                        .to_string(),
-                })?;
-            let comments = tool
-                .arguments
-                .get("comments")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
+        name if crate::agents::validation::is_leave_verdict_tool(name) => {
+            let (approved, comments) = crate::agents::validation::parse_verdict_args(
+                &tool.arguments,
+            )
+            .ok_or_else(|| ToolError::BadArguments {
+                tool: TOOL_LEAVE_VERDICT.to_string(),
+                detail: "missing mandatory string field `verdict` ('APPROVED' or 'REJECTED')"
+                    .to_string(),
+            })?;
+            let verdict = if approved { "APPROVED" } else { "REJECTED" };
             Ok(ToolResult::ok(format!(
                 "Verdict recorded via leave_verdict: {verdict} with comments: {comments}"
             )))
@@ -899,21 +894,16 @@ fn dispatch_specialist(
         TOOL_PTY_READ | "pty__read" => pty::pty_read(&tool.arguments),
         TOOL_PTY_CLOSE | "pty__close" => pty::pty_close(&tool.arguments),
         TOOL_PTY_LIST | "pty__list" => pty::pty_list(&tool.arguments),
-        TOOL_LEAVE_VERDICT => {
-            let verdict = tool
-                .arguments
-                .get("verdict")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| ToolError::BadArguments {
-                    tool: TOOL_LEAVE_VERDICT.to_string(),
-                    detail: "missing mandatory string field `verdict` ('APPROVED' or 'REJECTED')"
-                        .to_string(),
-                })?;
-            let comments = tool
-                .arguments
-                .get("comments")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
+        name if crate::agents::validation::is_leave_verdict_tool(name) => {
+            let (approved, comments) = crate::agents::validation::parse_verdict_args(
+                &tool.arguments,
+            )
+            .ok_or_else(|| ToolError::BadArguments {
+                tool: TOOL_LEAVE_VERDICT.to_string(),
+                detail: "missing mandatory string field `verdict` ('APPROVED' or 'REJECTED')"
+                    .to_string(),
+            })?;
+            let verdict = if approved { "APPROVED" } else { "REJECTED" };
             Ok(ToolResult::ok(format!(
                 "Verdict recorded via leave_verdict: {verdict} with comments: {comments}"
             )))

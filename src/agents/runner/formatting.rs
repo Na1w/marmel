@@ -1,8 +1,8 @@
 //! Tool argument formatting for previews and logs.
 
 use crate::tool_names::{
-    TOOL_DELEGATE_TASK, TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_LEAVE_VERDICT, TOOL_READ_FILE,
-    TOOL_REPLACE, TOOL_RUN_COMMAND, TOOL_SLEEP, TOOL_WRITE_FILE,
+    TOOL_DELEGATE_TASK, TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_READ_FILE, TOOL_REPLACE,
+    TOOL_RUN_COMMAND, TOOL_SLEEP, TOOL_WRITE_FILE,
 };
 
 pub fn format_tool_args_preview(tool: &str, args: &serde_json::Value) -> String {
@@ -113,13 +113,17 @@ pub fn format_tool_args_full(tool: &str, args: &serde_json::Value) -> String {
                 .unwrap_or("");
             format!("agent={ag}, task_id={tid}, prompt=\"{pr}\"")
         }
-        TOOL_LEAVE_VERDICT => {
+        name if crate::agents::validation::is_leave_verdict_tool(name) => {
             let v = args
                 .get("verdict")
+                .or_else(|| args.get("status"))
+                .or_else(|| args.get("decision"))
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
             let c = args
                 .get("comments")
+                .or_else(|| args.get("comment"))
+                .or_else(|| args.get("feedback"))
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
             format!("verdict={v}, comments=\"{c}\"")

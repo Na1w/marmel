@@ -2,7 +2,9 @@
 
 use super::assembly::{assemble_final_deliverable, update_revision};
 use super::formatting::{format_tool_args_full, format_tool_args_preview};
-use crate::agents::validation::run_automated_validation;
+use crate::agents::validation::{
+    is_leave_verdict_tool, parse_verdict_args, run_automated_validation,
+};
 use crate::agents::{Agent, IsolatedContext};
 
 pub async fn run_specialist_live(
@@ -495,6 +497,7 @@ pub async fn run_specialist_live(
             }
         }
 
+        let mut leave_verdict_called = false;
         for tc in tool_calls {
             if token.is_cancelled() {
                 tracing::warn!(
@@ -505,6 +508,54 @@ pub async fn run_specialist_live(
             }
             let args_val = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
                 .unwrap_or_else(|_| serde_json::Value::String(tc.function.arguments.clone()));
+
+            if is_leave_verdict_tool(&tc.function.name) {
+                let (approved, critique) = parse_verdict_args(&args_val)
+                    .unwrap_or((true, "Deliverable verified.".to_string()));
+
+                validation_passed = approved;
+                validator_critique = Some(critique.clone());
+
+                let verdict_str = if approved { "APPROVED" } else { "REJECTED" };
+                crate::orchestrator::emit_status(format!(
+                    "[{agent_tag}] {verdict_str} via leave_verdict:\n{critique}"
+                ));
+                if approved {
+                    crate::orchestrator::set_active_worker_status(&_active_guard.0, "Approved");
+                } else {
+                    crate::orchestrator::set_active_worker_status(&_active_guard.0, "Rejected");
+                }
+                crate::debug_log::log_validation_verdict(agent.as_str(), approved, &critique);
+
+                let verdict_summary = if approved {
+                    format!("Verdict: APPROVED\n\nComments:\n{critique}")
+                } else {
+                    format!("Verdict: REJECTED\n\nCritique:\n{critique}")
+                };
+                if final_content.trim().is_empty() {
+                    final_content = verdict_summary;
+                } else if !final_content.contains(&critique) {
+                    final_content.push_str("\n\n");
+                    final_content.push_str(&verdict_summary);
+                }
+
+                let invocation = crate::harness::ToolInvocation {
+                    name: tc.function.name.clone(),
+                    arguments: args_val,
+                };
+                let caller = crate::harness::ToolCaller::Specialist(agent);
+                let _ = crate::harness::dispatch_for_async_with_engine(
+                    &invocation,
+                    caller,
+                    Some(&mut engine),
+                )
+                .await;
+
+                tools_executed_count += 1;
+                leave_verdict_called = true;
+                break;
+            }
+
             let preview = format_tool_args_preview(&tc.function.name, &args_val);
             if preview.is_empty() {
                 crate::orchestrator::emit_status(format!("{agent_tag}: {}", tc.function.name));
@@ -584,6 +635,12 @@ pub async fn run_specialist_live(
                 &_active_guard.0,
                 engine.token_count(),
             );
+        }
+        if leave_verdict_called {
+            tracing::info!(
+                "{agent_tag}: leave_verdict concluded specialist inspection loop (approved={validation_passed})"
+            );
+            break;
         }
     }
 

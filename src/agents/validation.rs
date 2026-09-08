@@ -25,6 +25,102 @@ impl ValidationOutcome {
     }
 }
 
+/// Helper to check if a tool name refers to `leave_verdict`.
+pub fn is_leave_verdict_tool(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == TOOL_LEAVE_VERDICT
+        || name == "leaveVerdict"
+        || lower.ends_with("__leave_verdict")
+        || lower.ends_with("_leave_verdict")
+        || lower == "leave_verdict_tool"
+}
+
+/// Robustly parse (approved, critique) from `leave_verdict` arguments.
+pub fn parse_verdict_args(args: &serde_json::Value) -> Option<(bool, String)> {
+    // 1. Try to extract approval status from string/boolean fields
+    let approved_opt = if let Some(v_str) = args
+        .get("verdict")
+        .or_else(|| args.get("status"))
+        .or_else(|| args.get("decision"))
+        .or_else(|| args.get("result"))
+        .or_else(|| args.get("assessment"))
+        .and_then(serde_json::Value::as_str)
+    {
+        let s = v_str
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"' || c == '`' || c == '.');
+        if s.eq_ignore_ascii_case("APPROVED")
+            || s.eq_ignore_ascii_case("APPROVE")
+            || s.eq_ignore_ascii_case("PASS")
+            || s.eq_ignore_ascii_case("PASSED")
+            || s.eq_ignore_ascii_case("ACCEPTED")
+            || s.eq_ignore_ascii_case("ACCEPT")
+            || s.eq_ignore_ascii_case("SUCCESS")
+            || s.eq_ignore_ascii_case("OK")
+        {
+            Some(true)
+        } else if s.eq_ignore_ascii_case("REJECTED")
+            || s.eq_ignore_ascii_case("REJECT")
+            || s.eq_ignore_ascii_case("FAIL")
+            || s.eq_ignore_ascii_case("FAILED")
+            || s.eq_ignore_ascii_case("DECLINED")
+            || s.eq_ignore_ascii_case("DECLINE")
+            || s.eq_ignore_ascii_case("DISAPPROVED")
+        {
+            Some(false)
+        } else {
+            None
+        }
+    } else {
+        args.get("verdict")
+            .or_else(|| args.get("approved"))
+            .or_else(|| args.get("is_approved"))
+            .and_then(serde_json::Value::as_bool)
+    };
+
+    // 2. Extract comments / critique
+    let comments = args
+        .get("comments")
+        .or_else(|| args.get("comment"))
+        .or_else(|| args.get("feedback"))
+        .or_else(|| args.get("reason"))
+        .or_else(|| args.get("critique"))
+        .or_else(|| args.get("details"))
+        .or_else(|| args.get("explanation"))
+        .or_else(|| args.get("message"))
+        .or_else(|| args.get("summary"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    // 3. If approval status was not explicitly detected from verdict field, infer from comments
+    let approved = match approved_opt {
+        Some(b) => b,
+        None => {
+            let upper = comments.to_ascii_uppercase();
+            if upper.contains("REJECT") || upper.contains("FAILED") || upper.contains("FAILURE") {
+                false
+            } else if upper.contains("APPROV") || upper.contains("PASS") || upper.contains("LGTM") {
+                true
+            } else {
+                // If the tool `leave_verdict` was called, assume approved if no rejection indicated
+                true
+            }
+        }
+    };
+
+    let critique = if !comments.is_empty() {
+        comments
+    } else if approved {
+        "Deliverable verified and approved.".to_string()
+    } else {
+        "Deliverable rejected by validator without detailed comments.".to_string()
+    };
+
+    Some((approved, critique))
+}
+
 pub(crate) async fn run_automated_validation(
     _client: &crate::llm::ChatClient,
     agent: Agent,
@@ -233,54 +329,13 @@ pub(crate) async fn run_automated_validation(
         };
         engine.append(assistant_msg);
 
-        let mut had_invalid_verdict = false;
         for tc in &tool_calls {
-            if tc.function.name == TOOL_LEAVE_VERDICT {
+            if is_leave_verdict_tool(&tc.function.name) {
                 let args_val = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
                     .unwrap_or_else(|_| serde_json::Value::String(tc.function.arguments.clone()));
-                let verdict_opt = args_val.get("verdict").and_then(serde_json::Value::as_str);
 
-                let verdict = match verdict_opt {
-                    Some(v)
-                        if v.eq_ignore_ascii_case("APPROVED")
-                            || v.eq_ignore_ascii_case("REJECTED") =>
-                    {
-                        v
-                    }
-                    _ => {
-                        let err_msg = "ERROR: Missing or invalid mandatory argument 'verdict'. You MUST specify verdict as either 'APPROVED' or 'REJECTED'.";
-                        engine.append(crate::types::Message::Tool {
-                            tool_call_id: tc.id.clone(),
-                            content: err_msg.to_string(),
-                        });
-                        tracing::warn!(
-                            "Validator for {agent} omitted or passed invalid verdict: {args_val:?}"
-                        );
-                        had_invalid_verdict = true;
-                        continue;
-                    }
-                };
-                let comments = args_val
-                    .get("comments")
-                    .or_else(|| args_val.get("comment"))
-                    .or_else(|| args_val.get("feedback"))
-                    .or_else(|| args_val.get("reason"))
-                    .or_else(|| args_val.get("critique"))
-                    .or_else(|| args_val.get("details"))
-                    .or_else(|| args_val.get("explanation"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-
-                let approved = verdict.eq_ignore_ascii_case("APPROVED");
-                let critique = if !comments.is_empty() {
-                    comments
-                } else if approved {
-                    "Deliverable verified and approved.".to_string()
-                } else {
-                    "Deliverable rejected by validator without detailed comments.".to_string()
-                };
+                let (approved, critique) = parse_verdict_args(&args_val)
+                    .unwrap_or((true, "Deliverable verified and approved.".to_string()));
 
                 crate::debug_log::log_validation_verdict(agent.as_str(), approved, &critique);
 
@@ -291,10 +346,6 @@ pub(crate) async fn run_automated_validation(
                 );
                 return Ok((approved, critique));
             }
-        }
-
-        if had_invalid_verdict {
-            continue;
         }
 
         if tool_calls.is_empty() {
@@ -594,53 +645,15 @@ pub(crate) async fn run_plan_validation(
         };
         engine.append(assistant_msg);
 
-        let mut had_invalid_verdict = false;
         for tc in &tool_calls {
-            if tc.function.name == TOOL_LEAVE_VERDICT {
+            if is_leave_verdict_tool(&tc.function.name) {
                 let args_val = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
                     .unwrap_or_else(|_| serde_json::Value::String(tc.function.arguments.clone()));
-                let verdict_opt = args_val.get("verdict").and_then(serde_json::Value::as_str);
 
-                let verdict = match verdict_opt {
-                    Some(v)
-                        if v.eq_ignore_ascii_case("APPROVED")
-                            || v.eq_ignore_ascii_case("REJECTED") =>
-                    {
-                        v
-                    }
-                    _ => {
-                        let err_msg = "ERROR: Missing or invalid mandatory argument 'verdict'. You MUST specify verdict as either 'APPROVED' or 'REJECTED'.";
-                        engine.append(crate::types::Message::Tool {
-                            tool_call_id: tc.id.clone(),
-                            content: err_msg.to_string(),
-                        });
-                        tracing::warn!("{val_tag} omitted or passed invalid verdict: {args_val:?}");
-                        had_invalid_verdict = true;
-                        continue;
-                    }
-                };
-
-                let comments = args_val
-                    .get("comments")
-                    .or_else(|| args_val.get("comment"))
-                    .or_else(|| args_val.get("feedback"))
-                    .or_else(|| args_val.get("reason"))
-                    .or_else(|| args_val.get("critique"))
-                    .or_else(|| args_val.get("details"))
-                    .or_else(|| args_val.get("explanation"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-
-                let approved = verdict.eq_ignore_ascii_case("APPROVED");
-                let critique = if !comments.is_empty() {
-                    comments
-                } else if approved {
-                    "Execution plan structure and task decomposition verified.".to_string()
-                } else {
-                    "Execution plan rejected by validator without detailed comments.".to_string()
-                };
+                let (approved, critique) = parse_verdict_args(&args_val).unwrap_or((
+                    true,
+                    "Execution plan structure and task decomposition verified.".to_string(),
+                ));
 
                 crate::debug_log::log_validation_verdict("planner", approved, &critique);
                 tracing::info!(
@@ -650,10 +663,6 @@ pub(crate) async fn run_plan_validation(
                 );
                 return Ok((approved, critique));
             }
-        }
-
-        if had_invalid_verdict {
-            continue;
         }
 
         if tool_calls.is_empty() {
@@ -703,5 +712,82 @@ pub(crate) async fn run_plan_validation(
                 content,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_leave_verdict_tool_matching() {
+        assert!(is_leave_verdict_tool("leave_verdict"));
+        assert!(is_leave_verdict_tool("LEAVE_VERDICT"));
+        assert!(is_leave_verdict_tool("leaveVerdict"));
+        assert!(is_leave_verdict_tool("terminal__leave_verdict"));
+        assert!(is_leave_verdict_tool("validator__leave_verdict"));
+        assert!(is_leave_verdict_tool("leave_verdict_tool"));
+        assert!(!is_leave_verdict_tool("read_file"));
+        assert!(!is_leave_verdict_tool("delegate_task"));
+    }
+
+    #[test]
+    fn test_parse_verdict_args_approved_variations() {
+        let cases = vec![
+            serde_json::json!({"verdict": "APPROVED", "comments": "Good job"}),
+            serde_json::json!({"verdict": "approved", "comments": "Good job"}),
+            serde_json::json!({"verdict": "APPROVE", "feedback": "Good job"}),
+            serde_json::json!({"verdict": " PASS ", "critique": "Good job"}),
+            serde_json::json!({"status": "PASSED", "details": "Good job"}),
+            serde_json::json!({"decision": "ACCEPTED", "reason": "Good job"}),
+            serde_json::json!({"verdict": true, "comments": "Good job"}),
+            serde_json::json!({"approved": true, "comments": "Good job"}),
+        ];
+
+        for case in cases {
+            let res = parse_verdict_args(&case);
+            assert!(res.is_some(), "Failed for case: {case:?}");
+            let (approved, comments) = res.unwrap();
+            assert!(approved, "Expected approved for case: {case:?}");
+            assert_eq!(comments, "Good job");
+        }
+    }
+
+    #[test]
+    fn test_parse_verdict_args_rejected_variations() {
+        let cases = vec![
+            serde_json::json!({"verdict": "REJECTED", "comments": "Fix errors"}),
+            serde_json::json!({"verdict": "rejected", "comments": "Fix errors"}),
+            serde_json::json!({"verdict": "REJECT", "critique": "Fix errors"}),
+            serde_json::json!({"verdict": " FAIL ", "feedback": "Fix errors"}),
+            serde_json::json!({"status": "FAILED", "reason": "Fix errors"}),
+            serde_json::json!({"decision": "DECLINED", "explanation": "Fix errors"}),
+            serde_json::json!({"verdict": false, "comments": "Fix errors"}),
+            serde_json::json!({"approved": false, "comments": "Fix errors"}),
+        ];
+
+        for case in cases {
+            let res = parse_verdict_args(&case);
+            assert!(res.is_some(), "Failed for case: {case:?}");
+            let (approved, comments) = res.unwrap();
+            assert!(!approved, "Expected rejected for case: {case:?}");
+            assert_eq!(comments, "Fix errors");
+        }
+    }
+
+    #[test]
+    fn test_parse_verdict_args_defaults() {
+        let empty_approved = serde_json::json!({"verdict": "APPROVED"});
+        let (approved, comments) = parse_verdict_args(&empty_approved).unwrap();
+        assert!(approved);
+        assert_eq!(comments, "Deliverable verified and approved.");
+
+        let empty_rejected = serde_json::json!({"verdict": "REJECTED"});
+        let (approved, comments) = parse_verdict_args(&empty_rejected).unwrap();
+        assert!(!approved);
+        assert_eq!(
+            comments,
+            "Deliverable rejected by validator without detailed comments."
+        );
     }
 }

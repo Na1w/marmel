@@ -678,3 +678,295 @@ async fn test_validator_reminded_3_times_and_assumed_approved() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn test_delegated_validator_approved_leave_verdict_stops_loop_immediately() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+
+    marmennill::harness::with_workspace_root(tmp_path.clone(), async move {
+        let server = MockServer::start().await;
+        let call_counter = Arc::new(AtomicUsize::new(0));
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with({
+                let counter = call_counter.clone();
+                move |_req: &wiremock::Request| {
+                    let call_idx = counter.fetch_add(1, Ordering::SeqCst);
+                    let body = match call_idx {
+                        // Turn 0: Validator calls leave_verdict (APPROVED)
+                        0 => {
+                            let args = serde_json::json!({
+                                "verdict": "APPROVED",
+                                "comments": "Code inspection complete and verified."
+                            })
+                            .to_string();
+                            tool_call_sse("call_val_ok", "leave_verdict", &args)
+                        }
+                        // Turn 1 should NEVER be called!
+                        _ => text_sse("Should not be called!"),
+                    };
+                    ResponseTemplate::new(200).set_body_string(body)
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let backend_url = format!("{}/v1", server.uri());
+        let specialist_cfg = marmennill::config::SpecialistConfig {
+            backend_url: Some(backend_url.clone()),
+            auth_token: Some("test-token".to_string()),
+            model: Some("test-model".to_string()),
+            enable_validator: Some(false),
+            ..Default::default()
+        };
+
+        let mut cfg = Config {
+            backend_url: backend_url.clone(),
+            auth_token: "test-token".to_string(),
+            model: "test-model".to_string(),
+            ..Default::default()
+        };
+        cfg.orchestration
+            .specialists
+            .insert("validator".to_string(), specialist_cfg);
+
+        let client = ChatClient::new(&backend_url, "test-model");
+        let ctx = IsolatedContext {
+            role_system_prompt: "You are the Validator specialist.".to_string(),
+            brief: "Audit src/lib.rs.".to_string(),
+            snippets: vec![],
+            task_id: Some("t-val-01".to_string()),
+            image_urls: vec![],
+            audio_urls: vec![],
+        };
+        let token = CancellationToken::new();
+
+        let result = run_specialist_live(&client, Agent::Validator, &ctx, &cfg, &token)
+            .await
+            .expect("specialist live run should complete");
+
+        // Exactly 1 LLM call must have occurred — loop ended immediately upon leave_verdict!
+        assert_eq!(
+            call_counter.load(Ordering::SeqCst),
+            1,
+            "Validator must stop inspection loop immediately on leave_verdict"
+        );
+
+        assert!(
+            result.contains("MISSION COMPLETE (t-val-01)"),
+            "Deliverable should contain MISSION COMPLETE: {result}"
+        );
+        assert!(
+            result.contains("Verdict: APPROVED"),
+            "Deliverable should contain approval verdict: {result}"
+        );
+
+        let marker = marmennill::agents::MissionMarker::parse(&result);
+        assert_eq!(
+            marker,
+            Some(marmennill::agents::MissionMarker::Complete {
+                task_id: Some("t-val-01".to_string())
+            }),
+            "Marker must be Complete: {result}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_delegated_validator_rejected_leave_verdict_stops_loop_immediately() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+
+    marmennill::harness::with_workspace_root(tmp_path.clone(), async move {
+        let server = MockServer::start().await;
+        let call_counter = Arc::new(AtomicUsize::new(0));
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with({
+                let counter = call_counter.clone();
+                move |_req: &wiremock::Request| {
+                    let call_idx = counter.fetch_add(1, Ordering::SeqCst);
+                    let body = match call_idx {
+                        // Turn 0: Validator calls leave_verdict (REJECTED)
+                        0 => {
+                            let args = serde_json::json!({
+                                "verdict": "REJECTED",
+                                "comments": "Missing error handling in parse_args"
+                            })
+                            .to_string();
+                            tool_call_sse("call_val_rej", "leave_verdict", &args)
+                        }
+                        // Turn 1 should NEVER be called!
+                        _ => text_sse("Should not be called!"),
+                    };
+                    ResponseTemplate::new(200).set_body_string(body)
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let backend_url = format!("{}/v1", server.uri());
+        let specialist_cfg = marmennill::config::SpecialistConfig {
+            backend_url: Some(backend_url.clone()),
+            auth_token: Some("test-token".to_string()),
+            model: Some("test-model".to_string()),
+            enable_validator: Some(false),
+            ..Default::default()
+        };
+
+        let mut cfg = Config {
+            backend_url: backend_url.clone(),
+            auth_token: "test-token".to_string(),
+            model: "test-model".to_string(),
+            ..Default::default()
+        };
+        cfg.orchestration
+            .specialists
+            .insert("validator".to_string(), specialist_cfg);
+
+        let client = ChatClient::new(&backend_url, "test-model");
+        let ctx = IsolatedContext {
+            role_system_prompt: "You are the Validator specialist.".to_string(),
+            brief: "Audit src/lib.rs.".to_string(),
+            snippets: vec![],
+            task_id: Some("t-val-02".to_string()),
+            image_urls: vec![],
+            audio_urls: vec![],
+        };
+        let token = CancellationToken::new();
+
+        let result = run_specialist_live(&client, Agent::Validator, &ctx, &cfg, &token)
+            .await
+            .expect("specialist live run should complete");
+
+        // Exactly 1 LLM call must have occurred — loop ended immediately upon leave_verdict!
+        assert_eq!(
+            call_counter.load(Ordering::SeqCst),
+            1,
+            "Validator must stop inspection loop immediately on leave_verdict"
+        );
+
+        assert!(
+            result.contains("FAILED"),
+            "Deliverable should contain FAILED: {result}"
+        );
+        assert!(
+            result.contains("Missing error handling in parse_args"),
+            "Deliverable should contain critique: {result}"
+        );
+
+        let marker = marmennill::agents::MissionMarker::parse(&result);
+        assert!(
+            matches!(
+                marker,
+                Some(marmennill::agents::MissionMarker::Failed { .. })
+            ),
+            "Marker must be Failed: {result}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_delegated_validator_skips_subsequent_tools_in_same_turn_after_leave_verdict() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+
+    marmennill::harness::with_workspace_root(tmp_path.clone(), async move {
+        let server = MockServer::start().await;
+        let call_counter = Arc::new(AtomicUsize::new(0));
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with({
+                let counter = call_counter.clone();
+                move |_req: &wiremock::Request| {
+                    let _ = counter.fetch_add(1, Ordering::SeqCst);
+                    // Turn 0: emit leave_verdict followed by read_file in the same turn
+                    let body = format!(
+                        "data: {}\n\ndata: [DONE]\n\n",
+                        serde_json::json!({
+                            "id": "chatcmpl-test",
+                            "choices": [{
+                                "delta": {
+                                    "content": null,
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": "call_v",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "leave_verdict",
+                                                "arguments": serde_json::json!({
+                                                    "verdict": "APPROVED",
+                                                    "comments": "Inspected and clean."
+                                                }).to_string()
+                                            }
+                                        },
+                                        {
+                                            "index": 1,
+                                            "id": "call_rf",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "read_file",
+                                                "arguments": serde_json::json!({
+                                                    "path": "non_existent_file_should_not_be_read.rs"
+                                                }).to_string()
+                                            }
+                                        }
+                                    ]
+                                },
+                                "finish_reason": "tool_calls"
+                            }]
+                        })
+                    );
+                    ResponseTemplate::new(200).set_body_string(body)
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let backend_url = format!("{}/v1", server.uri());
+        let specialist_cfg = marmennill::config::SpecialistConfig {
+            backend_url: Some(backend_url.clone()),
+            auth_token: Some("test-token".to_string()),
+            model: Some("test-model".to_string()),
+            enable_validator: Some(false),
+            ..Default::default()
+        };
+
+        let mut cfg = Config {
+            backend_url: backend_url.clone(),
+            auth_token: "test-token".to_string(),
+            model: "test-model".to_string(),
+            ..Default::default()
+        };
+        cfg.orchestration
+            .specialists
+            .insert("validator".to_string(), specialist_cfg);
+
+        let client = ChatClient::new(&backend_url, "test-model");
+        let ctx = IsolatedContext {
+            role_system_prompt: "You are the Validator specialist.".to_string(),
+            brief: "Audit codebase.".to_string(),
+            snippets: vec![],
+            task_id: Some("t-val-03".to_string()),
+            image_urls: vec![],
+            audio_urls: vec![],
+        };
+        let token = CancellationToken::new();
+
+        let result = run_specialist_live(&client, Agent::Validator, &ctx, &cfg, &token)
+            .await
+            .expect("specialist live run should complete");
+
+        // Verify that leave_verdict concluded immediately with approval
+        assert!(result.contains("MISSION COMPLETE (t-val-03)"));
+        assert_eq!(call_counter.load(Ordering::SeqCst), 1);
+    })
+    .await;
+}
