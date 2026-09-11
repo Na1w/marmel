@@ -192,9 +192,9 @@ fn test_context_rebirth_reconstruction() {
 
 #[test]
 fn test_context_utf8_safe_slicing() {
-    // Multibyte chars (é, ö, €, 中, 文) must never be severed mid-byte
+    // Multibyte chars (é, ü, €, 中, 文) must never be severed mid-byte
     // regardless of the requested byte offsets (REQ-CORE-006).
-    let s = "héllo wörld € 中文";
+    let s = "héllo würld € 中文";
 
     // Offsets landing mid-char must be clamped to char boundaries.
     let sliced = utf8_safe_slice(s, 2, 14);

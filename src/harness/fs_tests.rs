@@ -2,16 +2,7 @@ use super::*;
 use std::fs;
 
 fn temp_dir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "marmel_fs_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    tempfile::tempdir().unwrap().keep()
 }
 
 /// REQ-TOOL-002: replace on a non-matching string returns an error and
@@ -189,7 +180,7 @@ fn test_harness_read_file_multibyte_safety() {
     let expected_slice: String = repeated.chars().skip(5).take(15).collect();
     assert!(r.content.starts_with(&expected_slice));
 
-    fs::remove_dir_all(&dir).unwrap();
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -168,12 +168,8 @@ pub(crate) fn is_abort_command(line: &str) -> bool {
         || t.eq_ignore_ascii_case(":q!")
         || t.eq_ignore_ascii_case("/stop")
         || t.eq_ignore_ascii_case("stop")
-        || t.eq_ignore_ascii_case("/stopp")
-        || t.eq_ignore_ascii_case("stopp")
         || t.eq_ignore_ascii_case("/cancel")
         || t.eq_ignore_ascii_case("cancel")
-        || t.eq_ignore_ascii_case("/avbryt")
-        || t.eq_ignore_ascii_case("avbryt")
 }
 
 pub(crate) fn is_reset_command(line: &str) -> bool {
@@ -232,11 +228,20 @@ pub(crate) fn update_subagent_lifecycle(
     prompt: Option<String>,
     started: bool,
 ) {
-    let name = match &task {
-        Some(t) if !t.trim().is_empty() => format!("{}-{t}", agent.as_str()),
-        _ => agent.as_str().to_string(),
+    let clean_task = task
+        .as_ref()
+        .map(|t| {
+            t.trim_matches(|c| {
+                c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\''
+            })
+            .trim()
+        })
+        .filter(|t| !t.is_empty());
+    let name = match clean_task {
+        Some(t) => format!("{}-{t}", agent.as_str()),
+        None => agent.as_str().to_string(),
     };
-    let task_str = task.clone().unwrap_or_default();
+    let task_str = clean_task.unwrap_or("").to_string();
     let log_entry = if started {
         format!("started task {task_str}")
     } else {
@@ -673,12 +678,8 @@ mod tests {
         assert!(is_abort_command(":q!"));
         assert!(is_abort_command("/stop"));
         assert!(is_abort_command("stop"));
-        assert!(is_abort_command("/stopp"));
-        assert!(is_abort_command("stopp"));
         assert!(is_abort_command("/cancel"));
         assert!(is_abort_command("cancel"));
-        assert!(is_abort_command("/avbryt"));
-        assert!(is_abort_command("avbryt"));
         assert!(!is_abort_command("continue"));
         assert!(!is_abort_command("status"));
     }

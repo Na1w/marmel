@@ -412,7 +412,7 @@ async fn test_ui_run_session_executes_parallel_delegations() {
     run_session(
         &cfg,
         &mut renderer,
-        Some("kör parallella uppgifter".to_string()),
+        Some("run parallel tasks".to_string()),
         Some(manager),
     )
     .await

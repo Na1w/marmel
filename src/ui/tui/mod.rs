@@ -373,7 +373,24 @@ impl Renderer for TuiRenderer {
                 self.waiting_for_token_since = None;
                 let tok_count = estimate_stream_tokens(text);
                 self.tokens_out = self.tokens_out.saturating_add(tok_count);
-                if self.active_agent == "Manager" {
+                let is_active_subagent = self.active_agent != "Manager"
+                    && self
+                        .subagents
+                        .iter()
+                        .any(|s| s.name == self.active_agent && s.is_active);
+                if is_active_subagent {
+                    if let Some(sa) = self
+                        .subagents
+                        .iter_mut()
+                        .find(|s| s.name == self.active_agent)
+                    {
+                        sa.content.push_str(text);
+                        sa.last_activity_at = Some(std::time::Instant::now());
+                    }
+                } else {
+                    if self.active_agent != "Manager" {
+                        self.active_agent = "Manager".to_string();
+                    }
                     self.current_content.push_str(text);
                     if self.chat_auto_scroll {
                         let w = self.chat_width.get();
@@ -381,13 +398,6 @@ impl Renderer for TuiRenderer {
                         let h = self.chat_height.get();
                         self.chat_scroll = n.saturating_sub(h) as u16;
                     }
-                } else if let Some(sa) = self
-                    .subagents
-                    .iter_mut()
-                    .find(|s| s.name == self.active_agent)
-                {
-                    sa.content.push_str(text);
-                    sa.last_activity_at = Some(std::time::Instant::now());
                 }
             }
             Event::SteerResponse(text) => {
@@ -411,7 +421,24 @@ impl Renderer for TuiRenderer {
                 self.waiting_for_token_since = None;
                 let tok_count = estimate_stream_tokens(text);
                 self.tokens_out = self.tokens_out.saturating_add(tok_count);
-                if self.active_agent == "Manager" {
+                let is_active_subagent = self.active_agent != "Manager"
+                    && self
+                        .subagents
+                        .iter()
+                        .any(|s| s.name == self.active_agent && s.is_active);
+                if is_active_subagent {
+                    if let Some(sa) = self
+                        .subagents
+                        .iter_mut()
+                        .find(|s| s.name == self.active_agent)
+                    {
+                        sa.thinking.push_str(text);
+                        sa.last_activity_at = Some(std::time::Instant::now());
+                    }
+                } else {
+                    if self.active_agent != "Manager" {
+                        self.active_agent = "Manager".to_string();
+                    }
                     self.current_thought.push_str(text);
                     if self.chat_auto_scroll {
                         let w = self.chat_width.get();
@@ -419,13 +446,6 @@ impl Renderer for TuiRenderer {
                         let h = self.chat_height.get();
                         self.chat_scroll = n.saturating_sub(h) as u16;
                     }
-                } else if let Some(sa) = self
-                    .subagents
-                    .iter_mut()
-                    .find(|s| s.name == self.active_agent)
-                {
-                    sa.thinking.push_str(text);
-                    sa.last_activity_at = Some(std::time::Instant::now());
                 }
             }
             Event::SubagentMessage { agent_tag, text } => {
@@ -470,7 +490,12 @@ impl Renderer for TuiRenderer {
                 let tok_count = estimate_stream_tokens(text);
                 self.tokens_out = self.tokens_out.saturating_add(tok_count);
                 self.commit_turn_content();
-                if self.active_agent != "Manager" {
+                let is_active_subagent = self.active_agent != "Manager"
+                    && self
+                        .subagents
+                        .iter()
+                        .any(|s| s.name == self.active_agent && s.is_active);
+                if is_active_subagent {
                     self.subagent_turn_thinking.remove(&self.active_agent);
                     self.subagent_is_thinking
                         .insert(self.active_agent.clone(), false);
@@ -486,6 +511,9 @@ impl Renderer for TuiRenderer {
                         sa.last_activity_at = Some(std::time::Instant::now());
                     }
                 } else {
+                    if self.active_agent != "Manager" {
+                        self.active_agent = "Manager".to_string();
+                    }
                     self.messages.push(format!("[Tool Call] {text}"));
                     if self.chat_auto_scroll {
                         let w = self.chat_width.get();
@@ -498,7 +526,27 @@ impl Renderer for TuiRenderer {
             Event::ToolResult(text) => {
                 self.waiting_for_token_since = None;
                 self.commit_turn_content();
-                if self.active_agent == "Manager" {
+                let is_active_subagent = self.active_agent != "Manager"
+                    && self
+                        .subagents
+                        .iter()
+                        .any(|s| s.name == self.active_agent && s.is_active);
+                if is_active_subagent {
+                    if let Some(sa) = self
+                        .subagents
+                        .iter_mut()
+                        .find(|s| s.name == self.active_agent)
+                    {
+                        let log_entry = text.clone();
+                        if sa.logs.last().map(String::as_str) != Some(log_entry.as_str()) {
+                            sa.logs.push(log_entry);
+                        }
+                        sa.last_activity_at = Some(std::time::Instant::now());
+                    }
+                } else {
+                    if self.active_agent != "Manager" {
+                        self.active_agent = "Manager".to_string();
+                    }
                     self.messages.push(format!("[Tool Result] {text}"));
                     if self.chat_auto_scroll {
                         let w = self.chat_width.get();
@@ -575,7 +623,7 @@ impl Renderer for TuiRenderer {
                     && let Some(sa) = self
                         .subagents
                         .iter_mut()
-                        .find(|s| s.name == self.active_agent)
+                        .find(|s| s.name == self.active_agent && s.is_active)
                 {
                     let clean = if let Some(stripped) = text.strip_prefix(&format!("{}: ", sa.name))
                     {
@@ -600,16 +648,28 @@ impl Renderer for TuiRenderer {
                 self.commit_turn_content();
                 match de {
                     crate::orchestrator::DelegationEvent::Started { agent, task } => {
-                        let name = match task {
-                            Some(t) if !t.trim().is_empty() => format!("{agent}-{t}"),
-                            _ => format!("{agent}"),
+                        let clean_task = task
+                            .as_ref()
+                            .map(|t| {
+                                t.trim_matches(|c| {
+                                    c == '['
+                                        || c == ']'
+                                        || c == '('
+                                        || c == ')'
+                                        || c == '"'
+                                        || c == '\''
+                                })
+                                .trim()
+                            })
+                            .filter(|t| !t.is_empty());
+                        let name = match clean_task {
+                            Some(t) => format!("{agent}-{t}"),
+                            None => format!("{agent}"),
                         };
                         self.active_agent = name.clone();
-                        let t = task.as_deref().unwrap_or("(no task id)");
-                        if let Some(tid) = task
-                            && !tid.trim().is_empty()
-                        {
-                            self.active_plan_task = Some(tid.clone());
+                        let t = clean_task.unwrap_or("(no task id)");
+                        if let Some(tid) = clean_task {
+                            self.active_plan_task = Some(tid.to_string());
                             self.plan_auto_scroll = true;
                             self.show_plan_panel = true;
                         }
@@ -620,16 +680,30 @@ impl Renderer for TuiRenderer {
                         self.subagent_turn_thinking.remove(&name);
                         self.subagent_is_thinking.insert(name.clone(), false);
                         if let Some(s) = self.subagents.iter_mut().find(|s| s.name == name) {
-                            s.task_id = task.clone();
+                            s.task_id = clean_task.map(|tid| tid.to_string());
                         }
                         self.status_line = format!("Delegating to specialist {name} for {t}");
                     }
                     crate::orchestrator::DelegationEvent::Completed { agent, task } => {
-                        let name = match task {
-                            Some(t) if !t.trim().is_empty() => format!("{agent}-{t}"),
-                            _ => format!("{agent}"),
+                        let clean_task = task
+                            .as_ref()
+                            .map(|t| {
+                                t.trim_matches(|c| {
+                                    c == '['
+                                        || c == ']'
+                                        || c == '('
+                                        || c == ')'
+                                        || c == '"'
+                                        || c == '\''
+                                })
+                                .trim()
+                            })
+                            .filter(|t| !t.is_empty());
+                        let name = match clean_task {
+                            Some(t) => format!("{agent}-{t}"),
+                            None => format!("{agent}"),
                         };
-                        let t = task.as_deref().unwrap_or("(no task id)");
+                        let t = clean_task.unwrap_or("(no task id)");
                         self.upsert_subagent(&name, false, &format!("completed task {t}"));
                         self.subagent_turn_thinking.remove(&name);
                         self.subagent_is_thinking.remove(&name);
@@ -638,14 +712,9 @@ impl Renderer for TuiRenderer {
                             .checked_sub(std::time::Duration::from_secs(1))
                             .unwrap_or_else(std::time::Instant::now);
 
-                        let completed_msg = match task {
-                            Some(tid) if !tid.trim().is_empty() => {
-                                let clean = tid.trim().trim_matches(|c| {
-                                    c == '[' || c == ']' || c == '"' || c == '\''
-                                });
-                                format!("[{clean}] completed.")
-                            }
-                            _ => format!("[{agent}] completed."),
+                        let completed_msg = match clean_task {
+                            Some(clean) => format!("[{clean}] completed."),
+                            None => format!("[{agent}] completed."),
                         };
                         self.messages.push(completed_msg);
                         if self.chat_auto_scroll {
@@ -654,7 +723,7 @@ impl Renderer for TuiRenderer {
                             let h = self.chat_height.get();
                             self.chat_scroll = n.saturating_sub(h) as u16;
                         }
-                        if self.active_plan_task.as_deref() == task.as_deref() {
+                        if self.active_plan_task.as_deref() == clean_task {
                             self.active_plan_task = self
                                 .subagents
                                 .iter()
@@ -679,25 +748,34 @@ impl Renderer for TuiRenderer {
                         }
                     }
                     crate::orchestrator::DelegationEvent::Failed { agent, task } => {
-                        let name = match task {
-                            Some(t) if !t.trim().is_empty() => format!("{agent}-{t}"),
-                            _ => format!("{agent}"),
+                        let clean_task = task
+                            .as_ref()
+                            .map(|t| {
+                                t.trim_matches(|c| {
+                                    c == '['
+                                        || c == ']'
+                                        || c == '('
+                                        || c == ')'
+                                        || c == '"'
+                                        || c == '\''
+                                })
+                                .trim()
+                            })
+                            .filter(|t| !t.is_empty());
+                        let name = match clean_task {
+                            Some(t) => format!("{agent}-{t}"),
+                            None => format!("{agent}"),
                         };
-                        let t = task.as_deref().unwrap_or("(no task id)");
+                        let t = clean_task.unwrap_or("(no task id)");
                         self.upsert_subagent(&name, false, &format!("failed task {t}"));
                         self.plan_mtime = None;
                         self.last_plan_check = std::time::Instant::now()
                             .checked_sub(std::time::Duration::from_secs(1))
                             .unwrap_or_else(std::time::Instant::now);
 
-                        let failed_msg = match task {
-                            Some(tid) if !tid.trim().is_empty() => {
-                                let clean = tid.trim().trim_matches(|c| {
-                                    c == '[' || c == ']' || c == '"' || c == '\''
-                                });
-                                format!("[{clean}] failed.")
-                            }
-                            _ => format!("[{agent}] failed."),
+                        let failed_msg = match clean_task {
+                            Some(clean) => format!("[{clean}] failed."),
+                            None => format!("[{agent}] failed."),
                         };
                         self.messages.push(failed_msg);
                         if self.chat_auto_scroll {
@@ -706,7 +784,7 @@ impl Renderer for TuiRenderer {
                             let h = self.chat_height.get();
                             self.chat_scroll = n.saturating_sub(h) as u16;
                         }
-                        if self.active_plan_task.as_deref() == task.as_deref() {
+                        if self.active_plan_task.as_deref() == clean_task {
                             self.active_plan_task = self
                                 .subagents
                                 .iter()
@@ -869,18 +947,23 @@ impl Renderer for TuiRenderer {
         let any_active = self.subagents.iter().any(|s| s.is_active);
         if any_active {
             self.show_subagent_panel = true;
-            let active_names: Vec<&str> = self
-                .subagents
-                .iter()
-                .filter(|s| s.is_active)
-                .map(|s| s.name.as_str())
-                .collect();
-            if !self
-                .subagents
-                .iter()
-                .any(|s| s.name == self.active_agent && s.is_active)
+            if self.active_agent != "Manager"
+                && !self
+                    .subagents
+                    .iter()
+                    .any(|s| s.name == self.active_agent && s.is_active)
             {
-                self.active_agent = active_names[0].to_string();
+                let active_names: Vec<&str> = self
+                    .subagents
+                    .iter()
+                    .filter(|s| s.is_active)
+                    .map(|s| s.name.as_str())
+                    .collect();
+                if !active_names.is_empty() {
+                    self.active_agent = active_names[0].to_string();
+                } else {
+                    self.active_agent = "Manager".to_string();
+                }
             }
         } else {
             if self.active_agent != "Manager" {
@@ -986,6 +1069,10 @@ impl Renderer for TuiRenderer {
 
     fn set_thinking_budgets(&mut self, cfg: &crate::config::Config) {
         self.set_thinking_budgets(cfg);
+    }
+
+    fn reset_active_agent(&mut self) {
+        self.active_agent = "Manager".to_string();
     }
 }
 

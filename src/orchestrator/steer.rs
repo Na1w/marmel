@@ -428,8 +428,15 @@ pub fn extract_tasks_to_delegate(
                     .as_deref()
                     .and_then(Agent::from_str)
                     .unwrap_or(Agent::Coder);
-                let tid = if !s.tool_call_id.trim().is_empty() {
-                    s.tool_call_id.clone()
+                let cleaned = s
+                    .tool_call_id
+                    .trim_matches(|c| {
+                        c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\''
+                    })
+                    .trim()
+                    .to_string();
+                let tid = if !cleaned.is_empty() {
+                    cleaned
                 } else {
                     format!("steer-task-{idx}")
                 };
@@ -451,8 +458,15 @@ pub fn extract_tasks_to_delegate(
         let tid = decision
             .subtasks
             .first()
-            .filter(|s| !s.tool_call_id.trim().is_empty())
-            .map(|s| s.tool_call_id.clone())
+            .map(|s| {
+                s.tool_call_id
+                    .trim_matches(|c| {
+                        c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\''
+                    })
+                    .trim()
+                    .to_string()
+            })
+            .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "steer-task-1".to_string());
         let prompt = decision
             .subtasks

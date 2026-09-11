@@ -42,12 +42,12 @@ fn test_queue_and_continue_json() {
 
 #[test]
 fn test_queue_and_continue_with_response_json() {
-    let json = r#"{"decision": "QueueAndContinue", "response": "Instruktionen har köats för nästa tur medan pågående uppgifter slutförs."}"#;
+    let json = r#"{"decision": "QueueAndContinue", "response": "Instruction queued for next turn while active tasks complete."}"#;
     let d: SteerDecision = serde_json::from_str(json).unwrap();
     assert_eq!(d.decision, "QueueAndContinue");
     assert_eq!(
         d.response.as_deref(),
-        Some("Instruktionen har köats för nästa tur medan pågående uppgifter slutförs.")
+        Some("Instruction queued for next turn while active tasks complete.")
     );
 }
 
@@ -204,6 +204,28 @@ fn test_extract_tasks_to_delegate_explicit_subtasks() {
 }
 
 #[test]
+fn test_extract_tasks_to_delegate_bracket_stripping() {
+    let json = r#"{
+        "decision": "DelegateTask",
+        "response": "Researching codebase",
+        "subtasks": [
+            {
+                "tool_call_id": "[steer-task-1]",
+                "action": "DelegateTask",
+                "agent_name": "researcher",
+                "prompt": "Find usages"
+            }
+        ]
+    }"#;
+    let d: SteerDecision = serde_json::from_str(json).unwrap();
+    let tasks = extract_tasks_to_delegate(&d, "check usages");
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].0, Agent::Researcher);
+    assert_eq!(tasks[0].1, "steer-task-1");
+    assert_eq!(tasks[0].2, "Find usages");
+}
+
+#[test]
 fn test_extract_tasks_to_delegate_toplevel_fallback() {
     let json = r#"{
         "decision": "DelegateTask",
@@ -262,7 +284,7 @@ async fn test_synthesize_steer_subtask_response_streams_answer() {
         .and(path("/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200).set_body_string(
-                "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"De 3 testerna som misslyckas är i modul foo.\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+                "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"The 3 failing tests are in module foo.\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
             ),
         )
         .mount(&server)
@@ -282,30 +304,27 @@ async fn test_synthesize_steer_subtask_response_streams_answer() {
     let res = synthesize_steer_subtask_response(
         &client,
         &stats,
-        "Vilka tester misslyckas?",
+        "Which tests are failing?",
         &deliverables,
         |delta| streamed.push(delta.to_string()),
     )
     .await;
     assert!(res.is_ok());
     let final_text = res.unwrap();
-    assert_eq!(final_text, "De 3 testerna som misslyckas är i modul foo.");
-    assert_eq!(
-        streamed.join(""),
-        "De 3 testerna som misslyckas är i modul foo."
-    );
+    assert_eq!(final_text, "The 3 failing tests are in module foo.");
+    assert_eq!(streamed.join(""), "The 3 failing tests are in module foo.");
 }
 
 #[test]
 fn test_sleep_decision_json() {
     let json = r#"{
         "decision": "Sleep",
-        "response": "Väntar 10 sekunder...",
+        "response": "Waiting 10 seconds...",
         "sleep_seconds": 10
     }"#;
     let d: SteerDecision = serde_json::from_str(json).unwrap();
     assert_eq!(d.decision, "Sleep");
-    assert_eq!(d.response.as_deref(), Some("Väntar 10 sekunder..."));
+    assert_eq!(d.response.as_deref(), Some("Waiting 10 seconds..."));
     assert_eq!(d.sleep_seconds, Some(10));
 }
 
@@ -313,7 +332,7 @@ fn test_sleep_decision_json() {
 fn test_subtask_sleep_json() {
     let json = r#"{
         "decision": "ForwardToWorker",
-        "response": "Beordrar codern att vila",
+        "response": "Ordering coder to sleep",
         "subtasks": [
             {
                 "tool_call_id": "coder-1",
@@ -334,19 +353,19 @@ fn test_format_steering_history() {
 
     let history = vec![
         (
-            "Vad gör den nu?".to_string(),
-            "Codern kör just nu testerna.".to_string(),
+            "What is it doing now?".to_string(),
+            "Coder is currently running tests.".to_string(),
         ),
         (
-            "Hur många tester är det?".to_string(),
-            "Totalt körs 12 tester.".to_string(),
+            "How many tests are there?".to_string(),
+            "A total of 12 tests are running.".to_string(),
         ),
     ];
     let formatted = format_steering_history(&history);
-    assert!(formatted.contains("User: \"Vad gör den nu?\""));
-    assert!(formatted.contains("Arbitrator: \"Codern kör just nu testerna.\""));
-    assert!(formatted.contains("User: \"Hur många tester är det?\""));
-    assert!(formatted.contains("Arbitrator: \"Totalt körs 12 tester.\""));
+    assert!(formatted.contains("User: \"What is it doing now?\""));
+    assert!(formatted.contains("Arbitrator: \"Coder is currently running tests.\""));
+    assert!(formatted.contains("User: \"How many tests are there?\""));
+    assert!(formatted.contains("Arbitrator: \"A total of 12 tests are running.\""));
 }
 
 #[tokio::test]
@@ -373,7 +392,7 @@ async fn test_arbitrate_steer_context_stream_parses_sleep_tool_call() {
         plan_content: "None",
         available_agents: "",
         steering_history: "None",
-        user_message: "vänta 7 sekunder",
+        user_message: "wait 7 seconds",
         active_subtasks: "None",
     };
 
@@ -468,7 +487,7 @@ async fn test_arbitrate_steer_context_stream_plain_text_fallback() {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
-    let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"Coder arbetar på steg 1.\"}}]}\n\ndata: [DONE]\n\n";
+    let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"Coder is working on step 1.\"}}]}\n\ndata: [DONE]\n\n";
 
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -486,7 +505,7 @@ async fn test_arbitrate_steer_context_stream_plain_text_fallback() {
         plan_content: "None",
         available_agents: "",
         steering_history: "None",
-        user_message: "hur går det?",
+        user_message: "how is it going?",
         active_subtasks: "None",
     };
 
@@ -504,6 +523,6 @@ async fn test_arbitrate_steer_context_stream_plain_text_fallback() {
         d.response
             .as_ref()
             .unwrap()
-            .contains("Coder arbetar på steg 1.")
+            .contains("Coder is working on step 1.")
     );
 }

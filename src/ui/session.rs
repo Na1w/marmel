@@ -320,6 +320,7 @@ pub async fn run_session(
                 ));
             }
 
+            renderer.reset_active_agent();
             renderer.on_event(&Event::TokensIn(ctx.token_count()));
             renderer.on_event(&Event::Status(format!("Running ({})", stream_cfg.model)));
             renderer.flush()?;

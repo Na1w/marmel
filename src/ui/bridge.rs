@@ -498,8 +498,14 @@ pub struct RendererSink<'a> {
 impl StreamSink for RendererSink<'_> {
     fn emit(&mut self, event: StreamEvent) {
         match event {
-            StreamEvent::Content(text) => self.renderer.on_event(&Event::Message(text)),
-            StreamEvent::Thinking(text) => self.renderer.on_event(&Event::Thinking(text)),
+            StreamEvent::Content(text) => {
+                self.renderer.reset_active_agent();
+                self.renderer.on_event(&Event::Message(text));
+            }
+            StreamEvent::Thinking(text) => {
+                self.renderer.reset_active_agent();
+                self.renderer.on_event(&Event::Thinking(text));
+            }
             StreamEvent::Status(text) => self.renderer.on_event(&Event::Status(text)),
         }
         let _ = self.renderer.flush();
@@ -750,6 +756,7 @@ impl StreamSink for RendererSink<'_> {
                         task: Some(task_id.clone()),
                     },
                 ));
+                self.renderer.reset_active_agent();
                 self.renderer.on_event(&Event::Message(format!(
                     "\n[Steering Subtask — {} ({}):]\n{}\n",
                     agent.as_str(),
@@ -769,6 +776,7 @@ impl StreamSink for RendererSink<'_> {
                     deliverable.content
                 ));
             }
+            self.renderer.reset_active_agent();
             PauseAction::Resume
         } else {
             let norm = crate::orchestrator::normalize_steer_decision(
@@ -1039,7 +1047,7 @@ mod tests {
 
         // The streaming arbitrator streams the user-facing explanation first
         tx.send(SteerArbEvent::Delta(
-            "Instruktionen har köats för nästa tur.".to_string(),
+            "Instruction queued for next turn.".to_string(),
         ))
         .unwrap();
 
@@ -1047,13 +1055,13 @@ mod tests {
         tx.send(SteerArbEvent::Finished {
             decision: Some(crate::orchestrator::SteerDecision {
                 decision: "QueueAndContinue".to_string(),
-                response: Some("Instruktionen har köats för nästa tur.".to_string()),
+                response: Some("Instruction queued for next turn.".to_string()),
                 tier: None,
                 model: None,
                 subtasks: Vec::new(),
                 sleep_seconds: None,
             }),
-            user_msg: "lägg till en extra feature sen".to_string(),
+            user_msg: "add an extra feature later".to_string(),
         })
         .unwrap();
 
@@ -1065,10 +1073,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(
-            steer_queue,
-            vec!["lägg till en extra feature sen".to_string()]
-        );
+        assert_eq!(steer_queue, vec!["add an extra feature later".to_string()]);
         assert!(!steer_abort);
 
         // Verify the explanation was sent to the renderer as SteerResponse
@@ -1080,10 +1085,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            steer_responses,
-            vec!["Instruktionen har köats för nästa tur."]
-        );
+        assert_eq!(steer_responses, vec!["Instruction queued for next turn."]);
 
         // Verify status was also emitted
         assert!(renderer.events.iter().any(|e| matches!(
@@ -1154,13 +1156,13 @@ mod tests {
             tx.send(SteerArbEvent::Finished {
                 decision: Some(crate::orchestrator::SteerDecision {
                     decision: decision_str.to_string(),
-                    response: Some("Coder arbetar med tester.".to_string()),
+                    response: Some("Coder is working on tests.".to_string()),
                     tier: None,
                     model: None,
                     subtasks: Vec::new(),
                     sleep_seconds: None,
                 }),
-                user_msg: "hur går det?".to_string(),
+                user_msg: "how is it going?".to_string(),
             })
             .unwrap();
 
@@ -1192,21 +1194,21 @@ mod tests {
         let mut steer_abort = false;
 
         tx.send(SteerArbEvent::SynthesizedAnswer {
-            user_msg: "vad gör subagenten?".to_string(),
-            answer: "Subagenten kör cargo check.".to_string(),
+            user_msg: "what is the subagent doing?".to_string(),
+            answer: "Subagent is running cargo check.".to_string(),
         })
         .unwrap();
 
         tx.send(SteerArbEvent::Finished {
             decision: Some(crate::orchestrator::SteerDecision {
                 decision: "RespondDirectly".to_string(),
-                response: Some("Subagenten kör cargo check.".to_string()),
+                response: Some("Subagent is running cargo check.".to_string()),
                 tier: None,
                 model: None,
                 subtasks: Vec::new(),
                 sleep_seconds: None,
             }),
-            user_msg: "vad gör subagenten?".to_string(),
+            user_msg: "what is the subagent doing?".to_string(),
         })
         .unwrap();
 
@@ -1235,13 +1237,13 @@ mod tests {
         tx.send(SteerArbEvent::Finished {
             decision: Some(crate::orchestrator::SteerDecision {
                 decision: "Sleep".to_string(),
-                response: Some("Väntar 5 sekunder...".to_string()),
+                response: Some("Waiting 5 seconds...".to_string()),
                 tier: None,
                 model: None,
                 subtasks: Vec::new(),
                 sleep_seconds: Some(5),
             }),
-            user_msg: "vänta lite".to_string(),
+            user_msg: "wait a moment".to_string(),
         })
         .unwrap();
 

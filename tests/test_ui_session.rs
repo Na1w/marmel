@@ -928,13 +928,13 @@ async fn test_steering_conversation_history_accumulates_and_passes_to_arbitrator
         .respond_with(move |req: &wiremock::Request| {
             let body = String::from_utf8_lossy(&req.body).to_string();
             rb.lock().unwrap().push(body.clone());
-            if body.contains("Hur många är kvar?") {
+            if body.contains("How many are left?") {
                 ResponseTemplate::new(200).set_body_string(
-                    "data: {\"id\":\"c2\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"RespondDirectly\\\", \\\"response\\\": \\\"Det är 2 tester kvar.\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+                    "data: {\"id\":\"c2\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"RespondDirectly\\\", \\\"response\\\": \\\"There are 2 tests remaining.\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
                 )
             } else {
                 ResponseTemplate::new(200).set_body_string(
-                    "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"RespondDirectly\\\", \\\"response\\\": \\\"Kör tester just nu.\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+                    "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"RespondDirectly\\\", \\\"response\\\": \\\"Running tests right now.\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
                 )
             }
         })
@@ -948,13 +948,13 @@ async fn test_steering_conversation_history_accumulates_and_passes_to_arbitrator
     let mut renderer = ScriptedRenderer::new(vec![]);
     let steering_history = Arc::new(std::sync::RwLock::new(Vec::<(String, String)>::new()));
 
-    // Turn 1: user asks "Vad gör du nu?"
+    // Turn 1: user asks "What are you doing now?"
     marmennill::ui::bridge::spawn_steer_arbitration(
         &client,
         stats.clone(),
         "build system",
         &[],
-        "Vad gör du nu?".to_string(),
+        "What are you doing now?".to_string(),
         &arb_tx,
         &mut renderer,
         Some(Arc::clone(&steering_history)),
@@ -976,17 +976,17 @@ async fn test_steering_conversation_history_accumulates_and_passes_to_arbitrator
     {
         let hist = steering_history.read().unwrap();
         assert_eq!(hist.len(), 1);
-        assert_eq!(hist[0].0, "Vad gör du nu?");
-        assert!(hist[0].1.contains("Kör tester just nu."));
+        assert_eq!(hist[0].0, "What are you doing now?");
+        assert!(hist[0].1.contains("Running tests right now."));
     }
 
-    // Turn 2: user asks "Hur många är kvar?"
+    // Turn 2: user asks "How many are left?"
     marmennill::ui::bridge::spawn_steer_arbitration(
         &client,
         stats.clone(),
         "build system",
         &[],
-        "Hur många är kvar?".to_string(),
+        "How many are left?".to_string(),
         &arb_tx,
         &mut renderer,
         Some(Arc::clone(&steering_history)),
@@ -1008,8 +1008,8 @@ async fn test_steering_conversation_history_accumulates_and_passes_to_arbitrator
     {
         let hist = steering_history.read().unwrap();
         assert_eq!(hist.len(), 2);
-        assert_eq!(hist[1].0, "Hur många är kvar?");
-        assert!(hist[1].1.contains("Det är 2 tester kvar."));
+        assert_eq!(hist[1].0, "How many are left?");
+        assert!(hist[1].1.contains("There are 2 tests remaining."));
     }
 
     // Verify that the second request payload sent to the mock server actually contained the history!
@@ -1017,7 +1017,8 @@ async fn test_steering_conversation_history_accumulates_and_passes_to_arbitrator
     assert!(bodies.len() >= 2);
     let second_req = &bodies[1];
     assert!(
-        second_req.contains("Vad gör du nu?") && second_req.contains("Kör tester just nu."),
+        second_req.contains("What are you doing now?")
+            && second_req.contains("Running tests right now."),
         "Second request must contain the accumulated conversation history, got: {second_req}"
     );
 }
@@ -1111,12 +1112,12 @@ async fn test_steering_arbitrator_sleep_re_invokes_after_delay() {
             if count == 0 {
                 // Call 1: Arbitrator decides to Sleep for 1 second
                 ResponseTemplate::new(200).set_body_string(
-                    "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"Sleep\\\", \\\"sleep_seconds\\\": 1, \\\"response\\\": \\\"Väntar 1s på tester...\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+                    "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"Sleep\\\", \\\"sleep_seconds\\\": 1, \\\"response\\\": \\\"Waiting 1s for tests...\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
                 )
             } else {
                 // Call 2: After waking up from sleep, Arbitrator is re-invoked and responds directly!
                 ResponseTemplate::new(200).set_body_string(
-                    "data: {\"id\":\"c2\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"RespondDirectly\\\", \\\"response\\\": \\\"Tester har nu slutförts utan fel.\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+                    "data: {\"id\":\"c2\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"RespondDirectly\\\", \\\"response\\\": \\\"Tests have now completed without errors.\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
                 )
             }
         })
@@ -1135,7 +1136,7 @@ async fn test_steering_arbitrator_sleep_re_invokes_after_delay() {
         stats.clone(),
         "run tests",
         &[],
-        "Vänta på tester och rapportera".to_string(),
+        "Wait for tests and report".to_string(),
         &arb_tx,
         &mut renderer,
         Some(Arc::clone(&steering_history)),
@@ -1168,12 +1169,16 @@ async fn test_steering_arbitrator_sleep_re_invokes_after_delay() {
     assert_eq!(dec.decision, "RespondDirectly");
     assert_eq!(
         dec.response.as_deref(),
-        Some("Tester har nu slutförts utan fel.")
+        Some("Tests have now completed without errors.")
     );
 
     // Verify conversation history recorded the progression
     let hist = steering_history.read().unwrap();
     assert_eq!(hist.len(), 2);
     assert!(hist[0].1.contains("slept for 1s"));
-    assert!(hist[1].1.contains("Tester har nu slutförts utan fel."));
+    assert!(
+        hist[1]
+            .1
+            .contains("Tests have now completed without errors.")
+    );
 }

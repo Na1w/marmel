@@ -1868,3 +1868,80 @@ fn test_subagent_thinking_shows_remaining_budget_countdown() {
         "expected Turn 2 per-turn thinking countdown banner, got:\n{screen3}"
     );
 }
+
+#[test]
+fn test_manager_output_routes_to_chat_when_specialist_inactive() {
+    let mut r = TuiRenderer::new();
+    r.subagents.push(SubagentDetail {
+        name: "researcher-steer-task-1".to_string(),
+        task_id: Some("steer-task-1".to_string()),
+        prompt: String::new(),
+        started_at: None,
+        worked_duration: std::time::Duration::ZERO,
+        last_activity_at: None,
+        logs: vec![],
+        thinking: String::new(),
+        content: String::new(),
+        is_active: false,
+        context_tokens: 0,
+    });
+    r.active_agent = "researcher-steer-task-1".to_string();
+
+    r.on_event(&Event::Message("Hello from Manager".to_string()));
+    assert_eq!(r.active_agent, "Manager");
+    assert_eq!(r.current_content, "Hello from Manager");
+    assert_eq!(r.subagents[0].content, "");
+
+    r.active_agent = "researcher-steer-task-1".to_string();
+    r.on_event(&Event::Thinking("Manager thinking".to_string()));
+    assert_eq!(r.active_agent, "Manager");
+    assert_eq!(r.current_thought, "Manager thinking");
+    assert_eq!(r.subagents[0].thinking, "");
+}
+
+#[test]
+fn test_delegation_events_sanitize_bracketed_task_ids() {
+    let mut r = TuiRenderer::new();
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Started {
+            agent: crate::agents::Agent::Researcher,
+            task: Some("[steer-task-1]".to_string()),
+        },
+    ));
+    assert_eq!(r.active_agent, "researcher-steer-task-1");
+    assert_eq!(r.subagents.len(), 1);
+    assert_eq!(r.subagents[0].name, "researcher-steer-task-1");
+    assert!(r.subagents[0].is_active);
+
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Completed {
+            agent: crate::agents::Agent::Researcher,
+            task: Some("steer-task-1".to_string()),
+        },
+    ));
+    assert_eq!(r.active_agent, "Manager");
+    assert!(!r.subagents[0].is_active);
+}
+
+#[test]
+fn test_set_subagents_preserves_manager_active_agent() {
+    let mut r = TuiRenderer::new();
+    assert_eq!(r.active_agent, "Manager");
+
+    let active_list = vec![SubagentDetail {
+        name: "coder-t-1".to_string(),
+        task_id: Some("t-1".to_string()),
+        prompt: String::new(),
+        started_at: None,
+        worked_duration: std::time::Duration::ZERO,
+        last_activity_at: None,
+        logs: vec![],
+        thinking: String::new(),
+        content: String::new(),
+        is_active: true,
+        context_tokens: 0,
+    }];
+    r.set_subagents(active_list);
+
+    assert_eq!(r.active_agent, "Manager");
+}
