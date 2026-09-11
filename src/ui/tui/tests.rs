@@ -881,6 +881,156 @@ fn test_plan_auto_scrolls_to_started_task() {
 }
 
 #[test]
+fn test_extract_plan_line_task_id() {
+    assert_eq!(
+        extract_plan_line_task_id("- [ ] [t-001] Do task 1"),
+        Some("t-001".to_string())
+    );
+    assert_eq!(
+        extract_plan_line_task_id("- [ ] [t-100a1] Do subtask"),
+        Some("t-100a1".to_string())
+    );
+    assert_eq!(
+        extract_plan_line_task_id("- [ ] **[t-100]**: Bold task"),
+        Some("t-100".to_string())
+    );
+    assert_eq!(
+        extract_plan_line_task_id("- [ ] t-005: Colon task"),
+        Some("t-005".to_string())
+    );
+    assert_eq!(
+        extract_plan_line_task_id("1. [ ] (t-006) Numbered task"),
+        Some("t-006".to_string())
+    );
+    assert_eq!(
+        extract_plan_line_task_id("* [ ] `t-007` Backtick task"),
+        Some("t-007".to_string())
+    );
+    assert_eq!(
+        extract_plan_line_task_id("- [x] [t-008] Completed task"),
+        Some("t-008".to_string())
+    );
+    assert_eq!(extract_plan_line_task_id("- [ ] No task id here"), None);
+    assert_eq!(extract_plan_line_task_id("# Plan header"), None);
+}
+
+#[test]
+fn test_line_matches_task_id_exact_and_boundary() {
+    let line_a1 = "- [ ] [t-100a1] Subtask A1 (depends on t-100)";
+    let line_100 = "- [ ] [t-100] Primary task 100";
+    let line_1 = "- [ ] [t-1] Task one";
+
+    // Exact match must succeed
+    assert!(line_matches_task_id(line_a1, "t-100a1"));
+    assert!(line_matches_task_id(line_100, "t-100"));
+    assert!(line_matches_task_id(line_1, "t-1"));
+
+    // Crucial bugfix: t-100 must NOT match t-100a1, even though t-100 is a substring!
+    assert!(!line_matches_task_id(line_a1, "t-100"));
+    assert!(!line_matches_task_id(line_a1, "t-1"));
+    assert!(!line_matches_task_id(line_a1, "t-10"));
+
+    // t-1 must NOT match t-100
+    assert!(!line_matches_task_id(line_100, "t-1"));
+    assert!(!line_matches_task_id(line_100, "t-10"));
+    assert!(!line_matches_task_id(line_100, "t-100a1"));
+}
+
+#[test]
+fn test_render_plan_highlights_all_concurrent_active_tasks_and_avoids_substring_collision() {
+    let mut r = TuiRenderer::new();
+    let plan_text = "\
+# Plan
+- [ ] [t-100] Task 100
+- [ ] [t-100a1] Task 100a1
+- [ ] [t-100b] Task 100b
+- [ ] [t-200] Task 200
+- [x] [t-050] Task 50 completed
+";
+    r.plan_content = plan_text.to_string();
+
+    // Two agents active in parallel: coder on t-100, and researcher on t-200
+    r.subagents = vec![
+        SubagentDetail {
+            name: "coder-t-100".to_string(),
+            task_id: Some("t-100".to_string()),
+            prompt: "Task 100".to_string(),
+            is_active: true,
+            ..Default::default()
+        },
+        SubagentDetail {
+            name: "researcher-t-200".to_string(),
+            task_id: Some("t-200".to_string()),
+            prompt: "Task 200".to_string(),
+            is_active: true,
+            ..Default::default()
+        },
+    ];
+    // active_plan_task records the latest started task (t-200)
+    r.active_plan_task = Some("t-200".to_string());
+
+    let backend = ratatui::backend::TestBackend::new(80, 10);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 0, 80, 10);
+            r.render_plan(frame, area, plan_text, false);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+
+    // Helper to find a rendered line in the buffer and get the color of its first non-space cell
+    let find_line_fg = |needle: &str| -> Option<Color> {
+        for y in 0..10 {
+            let row_str: String = (0..80)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect();
+            if row_str.contains(needle) {
+                // Find first cell belonging to the task text
+                for x in 1..79 {
+                    if buffer[(x, y)].symbol() == "[" {
+                        return buffer[(x, y)].style().fg;
+                    }
+                }
+            }
+        }
+        None
+    };
+
+    // Both active tasks (t-100 and t-200) MUST be highlighted in Yellow
+    assert_eq!(
+        find_line_fg("[t-100]"),
+        Some(Color::Yellow),
+        "Active task t-100 must be highlighted in Yellow"
+    );
+    assert_eq!(
+        find_line_fg("[t-200]"),
+        Some(Color::Yellow),
+        "Active task t-200 must be highlighted in Yellow"
+    );
+
+    // Inactive tasks sharing substring (t-100a1 and t-100b) MUST NOT be Yellow (must be LightRed)
+    assert_eq!(
+        find_line_fg("[t-100a1]"),
+        Some(Color::LightRed),
+        "Inactive task t-100a1 must be LightRed, not Yellow"
+    );
+    assert_eq!(
+        find_line_fg("[t-100b]"),
+        Some(Color::LightRed),
+        "Inactive task t-100b must be LightRed, not Yellow"
+    );
+
+    // Completed task [t-050] must be Green
+    assert_eq!(
+        find_line_fg("[t-050]"),
+        Some(Color::Green),
+        "Completed task t-050 must be Green"
+    );
+}
+
+#[test]
 fn test_subagent_scrolling_and_focus() {
     let mut r = TuiRenderer::new();
     r.focused_panel = FocusedPanel::Subagents;

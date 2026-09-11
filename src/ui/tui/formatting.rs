@@ -509,51 +509,138 @@ pub fn visual_line_offset_of_first_pending(text: &str, width: usize) -> Option<u
     None
 }
 
+/// Trims surrounding brackets, parentheses, and quotes from a task identifier.
+pub fn clean_task_id(tid: &str) -> &str {
+    tid.trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
+        .trim()
+}
+
+/// Extracts the task ID for a checklist item line in an execution plan.
+///
+/// Recognizes formats like:
+/// - `- [ ] [t-001] Description`
+/// - `- [ ] [t-100a1] Description`
+/// - `- [ ] **[t-001]** Description`
+/// - `- [ ] t-001: Description`
+/// - `1. [ ] (t-001) Description`
+/// - `* [ ] `t-001` Description`
+pub fn extract_plan_line_task_id(line: &str) -> Option<String> {
+    static CHECKBOX_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = CHECKBOX_RE.get_or_init(|| {
+        regex::Regex::new(r"^\s*(?:[-*+]|\d+[.)])?\s*(?:\[\s*[ xX]?\s*\]|\(\s*[ xX]?\s*\))\s*")
+            .expect("valid checkbox regex")
+    });
+
+    let mat = re.find(line)?;
+    let after_box = &line[mat.end()..];
+
+    // Primary: Task ID immediately after the checkbox
+    let trimmed = after_box.trim_start_matches(|c: char| {
+        c.is_whitespace()
+            || c == '['
+            || c == '('
+            || c == '*'
+            || c == '_'
+            || c == '`'
+            || c == '"'
+            || c == '\''
+    });
+    let primary_id: String = trimmed
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+
+    if !primary_id.is_empty()
+        && (primary_id.starts_with("t-")
+            || primary_id.starts_with("T-")
+            || primary_id.contains('-')
+            || ((primary_id.starts_with('t') || primary_id.starts_with('T'))
+                && primary_id.len() >= 2))
+    {
+        return Some(primary_id.to_ascii_lowercase());
+    }
+
+    // Secondary: Explicit bracketed task ID anywhere on the line, e.g. `[t-001]`
+    static BRACKETED_TID_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let b_re = BRACKETED_TID_RE.get_or_init(|| {
+        regex::Regex::new(r"\[([tT]-[A-Za-z0-9_-]+)\]").expect("valid bracketed tid regex")
+    });
+    if let Some(caps) = b_re.captures(line) {
+        return Some(caps[1].to_ascii_lowercase());
+    }
+
+    None
+}
+
+/// Checks if an execution plan line matches a specific task ID with strict boundary semantics,
+/// preventing partial substring collisions (e.g. `t-100` must not match `t-100a1`, and `t-1` must not match `t-100`).
+pub fn line_matches_task_id(line: &str, task_id: &str) -> bool {
+    let clean_target = clean_task_id(task_id);
+    if clean_target.is_empty() {
+        return false;
+    }
+    let target_lower = clean_target.to_ascii_lowercase();
+
+    // 1. If line has an extracted task ID from its checklist marker, require exact match
+    if let Some(line_tid) = extract_plan_line_task_id(line) {
+        return line_tid == target_lower;
+    }
+
+    // 2. Fallback: Search all occurrences in line with strict non-identifier boundaries
+    let line_lower = line.to_ascii_lowercase();
+    let mut search_start = 0;
+    while let Some(pos) = line_lower[search_start..].find(&target_lower) {
+        let abs_pos = search_start + pos;
+        let before = if abs_pos == 0 {
+            None
+        } else {
+            line_lower[..abs_pos].chars().last()
+        };
+        let after_pos = abs_pos + target_lower.len();
+        let after = line_lower[after_pos..].chars().next();
+
+        let before_ok = before
+            .map(|c| !c.is_alphanumeric() && c != '-' && c != '_')
+            .unwrap_or(true);
+        let after_ok = after
+            .map(|c| !c.is_alphanumeric() && c != '-' && c != '_')
+            .unwrap_or(true);
+
+        if before_ok && after_ok {
+            return true;
+        }
+        search_start = abs_pos + target_lower.len();
+        if search_start >= line_lower.len() {
+            break;
+        }
+    }
+    false
+}
+
 /// Compute the visual (wrapped) line offset of a specific task in the execution plan text (e.g. `t-001`).
 /// Returns `None` if the task ID is not found.
 pub fn visual_line_offset_of_task(text: &str, task_id: &str, width: usize) -> Option<usize> {
-    let clean_tid = task_id
-        .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
-        .trim();
+    let clean_tid = clean_task_id(task_id);
     if clean_tid.is_empty() {
         return None;
     }
-    let tid_lower = clean_tid.to_lowercase();
     let mut visual_offset = 0;
     let mut candidate_offset = None;
 
     for raw_line in text.lines() {
-        let line_lower = raw_line.to_lowercase();
-        if let Some(pos) = line_lower.find(&tid_lower) {
-            let before = if pos == 0 {
-                None
-            } else {
-                line_lower[..pos].chars().last()
-            };
-            let after_pos = pos + tid_lower.len();
-            let after = line_lower[after_pos..].chars().next();
-
-            let before_ok = before
-                .map(|c| !c.is_alphanumeric() && c != '-' && c != '_')
-                .unwrap_or(true);
-            let after_ok = after
-                .map(|c| !c.is_alphanumeric() && c != '-' && c != '_')
-                .unwrap_or(true);
-
-            if before_ok && after_ok {
-                // If this line has a checkbox, it's definitively the task checklist item
-                if raw_line.contains("[ ]")
-                    || raw_line.contains("[x]")
-                    || raw_line.contains("[X]")
-                    || raw_line.contains("( )")
-                    || raw_line.contains("(x)")
-                    || raw_line.contains("(X)")
-                {
-                    return Some(visual_offset);
-                }
-                if candidate_offset.is_none() {
-                    candidate_offset = Some(visual_offset);
-                }
+        if line_matches_task_id(raw_line, clean_tid) {
+            // If this line has a checkbox, it's definitively the task checklist item
+            if raw_line.contains("[ ]")
+                || raw_line.contains("[x]")
+                || raw_line.contains("[X]")
+                || raw_line.contains("( )")
+                || raw_line.contains("(x)")
+                || raw_line.contains("(X)")
+            {
+                return Some(visual_offset);
+            }
+            if candidate_offset.is_none() {
+                candidate_offset = Some(visual_offset);
             }
         }
         visual_offset += wrapped_lines(raw_line, width).max(1);

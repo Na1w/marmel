@@ -921,7 +921,7 @@ impl Renderer for TuiRenderer {
                     if existing.prompt.is_empty() && !incoming.prompt.is_empty() {
                         existing.prompt = incoming.prompt.clone();
                     }
-                    if existing.task_id.is_none() && incoming.task_id.is_some() {
+                    if incoming.task_id.is_some() {
                         existing.task_id = incoming.task_id.clone();
                     }
                     // Keep locally-streamed thinking/content if the incoming

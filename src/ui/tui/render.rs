@@ -505,6 +505,34 @@ impl TuiRenderer {
             .border_style(Style::default().fg(plan_border_color))
             .title(" Execution Plan ");
 
+        // Gather ALL active tasks across active subagents and active_plan_task
+        let mut active_tasks: Vec<String> = Vec::new();
+        for s in &self.subagents {
+            if s.is_active {
+                let tid_opt = s.task_id.as_deref().or_else(|| {
+                    if let Some(pos) = s.name.find("-t-") {
+                        Some(&s.name[pos + 1..])
+                    } else {
+                        None
+                    }
+                });
+                if let Some(tid) = tid_opt {
+                    let clean = clean_task_id(tid);
+                    if !clean.is_empty()
+                        && !active_tasks.iter().any(|t| t.eq_ignore_ascii_case(clean))
+                    {
+                        active_tasks.push(clean.to_string());
+                    }
+                }
+            }
+        }
+        if let Some(tid) = &self.active_plan_task {
+            let clean = clean_task_id(tid);
+            if !clean.is_empty() && !active_tasks.iter().any(|t| t.eq_ignore_ascii_case(clean)) {
+                active_tasks.push(clean.to_string());
+            }
+        }
+
         let target_task = self.active_plan_task.as_deref().or_else(|| {
             self.subagents
                 .iter()
@@ -515,17 +543,9 @@ impl TuiRenderer {
         let mut plan_lines = Vec::new();
         for raw_line in plan.lines() {
             let line = raw_line.replace('\t', "    ");
-            let is_active_task = if let Some(tid) = target_task {
-                let clean_tid = tid
-                    .trim_matches(|c| {
-                        c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\''
-                    })
-                    .trim()
-                    .to_lowercase();
-                !clean_tid.is_empty() && line.to_lowercase().contains(&clean_tid)
-            } else {
-                false
-            };
+            let is_active_task = active_tasks
+                .iter()
+                .any(|tid| line_matches_task_id(&line, tid));
 
             let style = if line.starts_with("# ") || line.starts_with("## ") {
                 Style::default()
