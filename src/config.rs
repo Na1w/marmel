@@ -8,6 +8,9 @@ use std::path::PathBuf;
 /// Default delegation depth bound.
 pub const DEFAULT_MAX_RECURSION_DEPTH: usize = 3;
 
+/// Default reasoning/thinking token budget per single turn.
+pub const DEFAULT_MAX_THINKING_TOKENS: usize = 32768;
+
 /// Orchestration configuration parsed from marmel.toml.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -54,7 +57,7 @@ impl Default for MonitoringConfig {
             repetition_threshold: 5,
             min_pattern_len: 5,
             max_stream_tokens: 32768,
-            max_thinking_tokens: 16384,
+            max_thinking_tokens: DEFAULT_MAX_THINKING_TOKENS,
         }
     }
 }
@@ -140,7 +143,7 @@ impl Default for Config {
             enable_xml_rescue: true,
             ui_mode: "tui".to_string(),
             debug: false,
-            max_thinking_tokens: 16384,
+            max_thinking_tokens: DEFAULT_MAX_THINKING_TOKENS,
             monitoring: Some(MonitoringConfig::default()),
             orchestration: OrchestrationConfig::default_depth(),
             mcp_servers: HashMap::new(),

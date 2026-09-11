@@ -203,11 +203,17 @@ async fn test_turn_stream_handler_enforces_thinking_budget() {
 #[test]
 fn test_stream_config_thinking_budget_defaults() {
     let default_cfg = StreamConfig::default();
-    assert_eq!(default_cfg.max_thinking_tokens, 16384);
+    assert_eq!(
+        default_cfg.max_thinking_tokens,
+        crate::config::DEFAULT_MAX_THINKING_TOKENS
+    );
 
     let mut app_cfg = crate::config::Config::default();
     let stream_cfg = StreamConfig::from_config(&app_cfg);
-    assert_eq!(stream_cfg.max_thinking_tokens, 16384);
+    assert_eq!(
+        stream_cfg.max_thinking_tokens,
+        crate::config::DEFAULT_MAX_THINKING_TOKENS
+    );
 
     if let Some(ref mut mon) = app_cfg.monitoring {
         mon.max_thinking_tokens = 4096;

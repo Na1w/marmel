@@ -229,7 +229,7 @@ impl TuiRenderer {
             plan_is_archived: false,
             session_start: std::time::Instant::now(),
             thinking_budgets: std::collections::HashMap::new(),
-            default_thinking_budget: 16384,
+            default_thinking_budget: crate::config::DEFAULT_MAX_THINKING_TOKENS,
             subagent_turn_thinking: std::collections::HashMap::new(),
             subagent_is_thinking: std::collections::HashMap::new(),
             plan_start_time: None,
@@ -239,7 +239,8 @@ impl TuiRenderer {
 
     /// Populate thinking budget limits per specialist and globally from config.
     pub fn set_thinking_budgets(&mut self, cfg: &Config) {
-        let global_budget = if cfg.max_thinking_tokens != 16384 {
+        let global_budget = if cfg.max_thinking_tokens != crate::config::DEFAULT_MAX_THINKING_TOKENS
+        {
             cfg.max_thinking_tokens
         } else {
             cfg.monitoring

@@ -22,7 +22,7 @@ max_context_tokens = 8192
 preserve_thinking = true
 
 # Maximum reasoning/thinking tokens per turn before cutting off runaway reasoning.
-max_thinking_tokens = 16384
+max_thinking_tokens = 32768
 
 # Timeout (seconds) for a single run_command / PTY invocation.
 command_timeout_secs = 60
@@ -42,7 +42,7 @@ enabled = true
 repetition_threshold = 5
 min_pattern_len = 7
 max_stream_tokens = 32768
-max_thinking_tokens = 16384
+max_thinking_tokens = 32768
 
 # ---------------------------------------------------------------------------
 # Orchestration — Manager + Specialist Subagents (REQ-ORCH-001…005 / SPEC Part 5)

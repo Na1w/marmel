@@ -173,7 +173,7 @@ Applied after file config, before defaults:
 | `frequency_penalty` | `0.0` | Frequency penalty. |
 | `presence_penalty` | `0.0` | Presence penalty. |
 | `max_context_tokens` | `8192` | Context window budget; compaction triggers at 90%. |
-| `max_thinking_tokens` | `16384` | Maximum reasoning/thinking tokens per single turn before cutting off runaway reasoning. |
+| `max_thinking_tokens` | `32768` | Maximum reasoning/thinking tokens per single turn before cutting off runaway reasoning. |
 | `preserve_thinking` | `true` | Keep `[thinking]` content in the transcript. |
 | `command_timeout_secs` | `60` | Timeout for a single `run_command` / PTY invocation. |
 | `max_repetition_threshold` | `5` | Consecutive identical turns that trigger cycle breaking. |

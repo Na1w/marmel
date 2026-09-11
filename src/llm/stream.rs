@@ -143,7 +143,7 @@ impl Default for StreamConfig {
             repetition_threshold: 5,
             min_pattern_len: 5,
             max_stream_tokens: 32768,
-            max_thinking_tokens: 16384,
+            max_thinking_tokens: crate::config::DEFAULT_MAX_THINKING_TOKENS,
         }
     }
 }
