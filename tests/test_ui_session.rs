@@ -59,6 +59,7 @@ struct ScriptedRenderer {
     poll_cursor: usize,
     /// Whether an abort was requested (via `/abort`).
     aborted: bool,
+    user_exit: bool,
     rehydrated: Vec<marmennill::types::Message>,
     subagents: Vec<marmennill::ui::SubagentDetail>,
     events: Vec<Event>,
@@ -72,6 +73,7 @@ impl ScriptedRenderer {
             poll_script: Vec::new(),
             poll_cursor: 0,
             aborted: false,
+            user_exit: false,
             rehydrated: Vec::new(),
             subagents: Vec::new(),
             events: Vec::new(),
@@ -85,6 +87,7 @@ impl ScriptedRenderer {
             poll_script,
             poll_cursor: 0,
             aborted: false,
+            user_exit: false,
             rehydrated: Vec::new(),
             subagents: Vec::new(),
             events: Vec::new(),
@@ -133,8 +136,16 @@ impl Renderer for ScriptedRenderer {
     fn aborted(&self) -> bool {
         self.aborted
     }
+    fn request_user_exit(&mut self) {
+        self.user_exit = true;
+        self.aborted = true;
+    }
+    fn user_exit_requested(&self) -> bool {
+        self.user_exit
+    }
     fn clear_abort(&mut self) {
         self.aborted = false;
+        self.user_exit = false;
     }
     fn shutdown(&mut self) {}
 }

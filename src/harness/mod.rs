@@ -197,7 +197,11 @@ async fn write_plan_internal(
     custom_plan: Option<crate::manager::phase::Plan>,
 ) -> Result<ToolResult, ToolError> {
     let cfg = crate::config::load(None).unwrap_or_default();
-    let token = crate::orchestrator::global_cancellation_token();
+    let token = if custom_plan.is_some() {
+        tokio_util::sync::CancellationToken::new()
+    } else {
+        crate::orchestrator::global_cancellation_token()
+    };
 
     let planner_cfg = cfg.orchestration.specialists.get("planner");
     let validator_cfg = cfg
@@ -214,6 +218,11 @@ async fn write_plan_internal(
             Ok((approved, critique)) => {
                 if !approved {
                     tracing::warn!("create_plan rejected by Strategic Plan Auditor: {critique}");
+                    if token.is_cancelled() {
+                        return Ok(ToolResult::err(format!(
+                            "Execution plan rejected by Strategic Plan Auditor:\n{critique}"
+                        )));
+                    }
                     return Ok(ToolResult::err(format!(
                         "Execution plan rejected by Strategic Plan Auditor:\n{critique}\n\nPlease revise the execution plan addressing the auditor's critique and call create_plan again."
                     )));
@@ -221,6 +230,11 @@ async fn write_plan_internal(
                 tracing::info!("create_plan approved by Strategic Plan Auditor: {critique}");
             }
             Err(e) => {
+                if token.is_cancelled() {
+                    return Ok(ToolResult::err(
+                        "Plan creation aborted by cancellation signal.",
+                    ));
+                }
                 tracing::warn!("Plan validation skipped due to error: {e:#}");
             }
         }

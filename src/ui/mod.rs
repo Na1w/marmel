@@ -78,6 +78,12 @@ pub trait Renderer: Send {
     fn request_abort(&mut self);
     fn aborted(&self) -> bool;
     fn clear_abort(&mut self) {}
+    fn request_user_exit(&mut self) {
+        self.request_abort();
+    }
+    fn user_exit_requested(&self) -> bool {
+        false
+    }
     fn shutdown(&mut self);
     fn set_subagents(&mut self, _subagents: Vec<SubagentDetail>) {}
     fn rehydrate_messages(&mut self, _messages: &[crate::types::Message]) {}

@@ -25,22 +25,19 @@ impl TuiRenderer {
             }
             handled = true;
             match event::read() {
-                Ok(TermEvent::Key(key)) if key.kind == KeyEventKind::Press => {
+                Ok(TermEvent::Key(key))
+                    if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat =>
+                {
                     match key.code {
                         KeyCode::Enter => self.submit(),
                         KeyCode::Esc => {
-                            // Esc arms confirm-abort (or aborts if already armed or focus switched).
+                            // Esc arms confirm-abort (or aborts if already armed).
                             if self.confirm_abort {
-                                self.aborted = true;
-                                self.confirm_abort = false;
-                                self.status_line = "Aborted by user.".to_string();
-                                crate::orchestrator::cancel_all();
-                            } else if self.focused_panel != FocusedPanel::Chat {
-                                self.focused_panel = FocusedPanel::Chat;
-                                self.confirm_abort = true;
-                                self.status_line =
-                                    "Abort armed. Press ESC again to abort.".to_string();
+                                Renderer::request_user_exit(self);
                             } else {
+                                if self.focused_panel != FocusedPanel::Chat {
+                                    self.focused_panel = FocusedPanel::Chat;
+                                }
                                 self.confirm_abort = true;
                                 self.status_line =
                                     "Abort armed. Press ESC again to abort.".to_string();
@@ -125,10 +122,7 @@ impl TuiRenderer {
                             if ctrl && (c == 'c' || c == 'C') {
                                 // Ctrl+C arms/triggers confirm-abort.
                                 if self.confirm_abort {
-                                    self.aborted = true;
-                                    self.confirm_abort = false;
-                                    self.status_line = "Aborted by user.".to_string();
-                                    crate::orchestrator::cancel_all();
+                                    Renderer::request_user_exit(self);
                                 } else {
                                     self.confirm_abort = true;
                                     self.status_line =
@@ -137,10 +131,7 @@ impl TuiRenderer {
                                 }
                             } else if ctrl && (c == 'd' || c == 'D') {
                                 // Ctrl+D is treated as abort.
-                                self.aborted = true;
-                                self.confirm_abort = false;
-                                self.status_line = "Aborted by user.".to_string();
-                                crate::orchestrator::cancel_all();
+                                Renderer::request_user_exit(self);
                             } else if ctrl && (c == 'p' || c == 'P') {
                                 self.confirm_abort = false;
                                 // F12: single Ctrl+P handler (toggle plan panel).
@@ -652,7 +643,7 @@ impl TuiRenderer {
         self.messages.push(format!("User: {trimmed}"));
         self.chat_auto_scroll = true;
         if is_abort(&line) {
-            self.aborted = true;
+            Renderer::request_user_exit(self);
         }
         // Forward the line to the session loop.
         let _ = self.tx.send(line);

@@ -45,6 +45,7 @@ pub struct RawRenderer {
     /// Buffered lines awaiting a flush.
     buffer: Vec<u8>,
     aborted: bool,
+    user_exit: bool,
 }
 
 impl RawRenderer {
@@ -52,6 +53,7 @@ impl RawRenderer {
         Self {
             buffer: Vec::new(),
             aborted: false,
+            user_exit: false,
         }
     }
 
@@ -143,6 +145,17 @@ impl Renderer for RawRenderer {
 
     fn clear_abort(&mut self) {
         self.aborted = false;
+        self.user_exit = false;
+    }
+
+    fn request_user_exit(&mut self) {
+        self.aborted = true;
+        self.user_exit = true;
+        crate::orchestrator::cancel_all();
+    }
+
+    fn user_exit_requested(&self) -> bool {
+        self.user_exit
     }
 
     fn shutdown(&mut self) {

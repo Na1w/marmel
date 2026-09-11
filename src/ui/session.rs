@@ -176,6 +176,7 @@ pub async fn run_session(
                 Some(line) => {
                     if is_abort_command(&line) {
                         crate::debug_log::log_user_input("command", &line);
+                        renderer.request_user_exit();
                         renderer.shutdown();
                         return Ok(());
                     }
@@ -266,7 +267,7 @@ pub async fn run_session(
         if let Some(steer) = renderer.poll_input() {
             if is_abort_command(&steer) {
                 crate::debug_log::log_user_input("command", &steer);
-                renderer.request_abort();
+                renderer.request_user_exit();
                 break;
             }
             if is_reset_command(&steer) {
@@ -540,7 +541,10 @@ pub async fn run_session(
                             Some(&mut subagents),
                         );
                         drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
-                        if renderer.aborted() {
+                        if renderer.aborted()
+                            || steer_abort_requested
+                            || crate::orchestrator::is_globally_cancelled()
+                        {
                             crate::orchestrator::cancel_all();
                             let _ =
                                 tokio::time::timeout(Duration::from_millis(500), &mut handle).await;
@@ -590,7 +594,8 @@ pub async fn run_session(
                                 );
                                 if let Some(input) = renderer.poll_input() {
                                     if is_abort_command(&input) {
-                                        renderer.request_abort();
+                                        crate::debug_log::log_user_input("command", &input);
+                                        renderer.request_user_exit();
                                     } else if is_reset_command(&input) {
                                         handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
                                     } else if !input.trim().is_empty() {
@@ -801,7 +806,10 @@ pub async fn run_session(
                             Some(&mut subagents),
                         );
                         drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
-                        if renderer.aborted() {
+                        if renderer.aborted()
+                            || steer_abort_requested
+                            || crate::orchestrator::is_globally_cancelled()
+                        {
                             crate::orchestrator::cancel_all();
                             let _ =
                                 tokio::time::timeout(Duration::from_millis(500), &mut handle).await;
@@ -842,7 +850,8 @@ pub async fn run_session(
                                 );
                                 if let Some(input) = renderer.poll_input() {
                                     if is_abort_command(&input) {
-                                        renderer.request_abort();
+                                        crate::debug_log::log_user_input("command", &input);
+                                        renderer.request_user_exit();
                                     } else if is_reset_command(&input) {
                                         handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
                                     } else if !input.trim().is_empty() {
@@ -940,6 +949,9 @@ pub async fn run_session(
             &mut steer_abort_requested,
             Some(&mut subagents),
         );
+        if renderer.user_exit_requested() {
+            break;
+        }
         if steer_abort_requested || renderer.aborted() {
             if steer_abort_requested {
                 // Steer arbitrator requested AbortImmediately / RejectPlan -> reset abort state, reset subagents, and start next turn immediately
@@ -980,7 +992,7 @@ pub async fn run_session(
             Some(line) => {
                 if is_abort_command(&line) {
                     crate::debug_log::log_user_input("command", &line);
-                    renderer.request_abort();
+                    renderer.request_user_exit();
                     break;
                 }
                 if is_reset_command(&line) {

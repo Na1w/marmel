@@ -521,7 +521,7 @@ impl StreamSink for RendererSink<'_> {
         if let Some(input) = self.renderer.poll_input() {
             if is_abort_command(&input) {
                 crate::debug_log::log_user_input("command", &input);
-                self.renderer.request_abort();
+                self.renderer.request_user_exit();
                 return StreamControl::Abort;
             } else if is_reset_command(&input) {
                 crate::debug_log::log_user_input("command", &input);
@@ -1313,7 +1313,7 @@ mod tests {
 
         let token = tokio_util::sync::CancellationToken::new();
         let guard = crate::orchestrator::register_active_worker_with_token(
-            Some("t-001".to_string()),
+            Some("t-steer-cancel-001".to_string()),
             "coder".to_string(),
             "Running long build".to_string(),
             Some(token.clone()),
@@ -1321,7 +1321,7 @@ mod tests {
 
         let mut subagents = vec![SubagentDetail {
             name: "coder".to_string(),
-            task_id: Some("t-001".to_string()),
+            task_id: Some("t-steer-cancel-001".to_string()),
             prompt: "Running long build".to_string(),
             is_active: true,
             ..Default::default()
@@ -1336,7 +1336,7 @@ mod tests {
                 tier: None,
                 model: None,
                 subtasks: vec![crate::orchestrator::SteerSubtaskDecision {
-                    tool_call_id: "t-001".to_string(),
+                    tool_call_id: "t-steer-cancel-001".to_string(),
                     action: "Cancel".to_string(),
                     message: None,
                     agent_name: Some("coder".to_string()),
@@ -1385,7 +1385,7 @@ mod tests {
 
         let token = tokio_util::sync::CancellationToken::new();
         let guard = crate::orchestrator::register_active_worker_with_token(
-            Some("t-002".to_string()),
+            Some("t-steer-abort-002".to_string()),
             "researcher".to_string(),
             "Researching...".to_string(),
             Some(token.clone()),

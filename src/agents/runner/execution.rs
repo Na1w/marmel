@@ -119,7 +119,7 @@ async fn run_specialist_live_inner(
 
     loop {
         _turn += 1;
-        if token.is_cancelled() {
+        if token.is_cancelled() || crate::orchestrator::is_current_or_global_cancelled() {
             tracing::warn!("{agent_tag}: aborted by cancellation signal");
             crate::orchestrator::set_active_worker_status(&_active_guard.0, "Aborted");
             return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
@@ -177,7 +177,7 @@ async fn run_specialist_live_inner(
         let out = match stream_out {
             Ok(o) => o,
             Err(e) => {
-                if token.is_cancelled() {
+                if token.is_cancelled() || crate::orchestrator::is_current_or_global_cancelled() {
                     tracing::warn!("{agent_tag}: aborted during LLM call");
                     return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
                 }
@@ -185,7 +185,10 @@ async fn run_specialist_live_inner(
             }
         };
 
-        if out.was_aborted_by_steer || token.is_cancelled() {
+        if out.was_aborted_by_steer
+            || token.is_cancelled()
+            || crate::orchestrator::is_current_or_global_cancelled()
+        {
             tracing::warn!("{agent_tag}: aborted during LLM call");
             return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
         }
@@ -405,8 +408,10 @@ async fn run_specialist_live_inner(
             {
                 if val_iter < max_val_iterations {
                     val_iter += 1;
-                    if token.is_cancelled() {
+                    if token.is_cancelled() || crate::orchestrator::is_current_or_global_cancelled()
+                    {
                         tracing::warn!("{agent_tag}: aborted before validation pass");
+                        crate::orchestrator::set_active_worker_status(&_active_guard.0, "Aborted");
                         return Ok(
                             "Task aborted by user instruction.\n\nFAILED (aborted)".to_string()
                         );
@@ -494,6 +499,16 @@ async fn run_specialist_live_inner(
                         }
                         Err(e) => {
                             tracing::warn!("Automated validator encountered error: {e}");
+                            if token.is_cancelled()
+                                || crate::orchestrator::is_current_or_global_cancelled()
+                            {
+                                crate::orchestrator::set_active_worker_status(
+                                    &_active_guard.0,
+                                    "Aborted",
+                                );
+                                return Ok("Task aborted by user instruction.\n\nFAILED (aborted)"
+                                    .to_string());
+                            }
                             break;
                         }
                     }
@@ -515,11 +530,12 @@ async fn run_specialist_live_inner(
 
         let mut leave_verdict_called = false;
         for tc in tool_calls {
-            if token.is_cancelled() {
+            if token.is_cancelled() || crate::orchestrator::is_current_or_global_cancelled() {
                 tracing::warn!(
                     "{agent_tag}: aborted before executing tool {}",
                     tc.function.name
                 );
+                crate::orchestrator::set_active_worker_status(&_active_guard.0, "Aborted");
                 return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
             }
             let args_val = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
@@ -605,6 +621,17 @@ async fn run_specialist_live_inner(
                     err_msg
                 }
                 crate::harness::monitor::Intervention::None => {
+                    if token.is_cancelled() || crate::orchestrator::is_current_or_global_cancelled()
+                    {
+                        tracing::warn!(
+                            "{agent_tag}: aborted before dispatching tool {}",
+                            tc.function.name
+                        );
+                        crate::orchestrator::set_active_worker_status(&_active_guard.0, "Aborted");
+                        return Ok(
+                            "Task aborted by user instruction.\n\nFAILED (aborted)".to_string()
+                        );
+                    }
                     let invocation = crate::harness::ToolInvocation {
                         name: tc.function.name.clone(),
                         arguments: args_val,

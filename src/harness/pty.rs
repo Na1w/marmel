@@ -501,7 +501,17 @@ impl PtyManager {
         };
 
         if wait_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
+            while tokio::time::Instant::now() < deadline {
+                if crate::orchestrator::is_current_or_global_cancelled() {
+                    return Err(ToolError::Execution(anyhow::anyhow!(
+                        "PTY read aborted by cancellation signal"
+                    )));
+                }
+                let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let step = rem.min(Duration::from_millis(50));
+                tokio::time::sleep(step).await;
+            }
         }
 
         let (new_output, is_alive) = {

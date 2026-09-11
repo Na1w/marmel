@@ -199,7 +199,7 @@ pub trait Specialist: Send + Sync + fmt::Debug {
         ctx: &IsolatedContext,
         token: &tokio_util::sync::CancellationToken,
     ) -> Deliverable {
-        if token.is_cancelled() {
+        if token.is_cancelled() || crate::orchestrator::is_current_or_global_cancelled() {
             return Deliverable {
                 marker: MissionMarker::Failed {
                     reason: "aborted".to_string(),

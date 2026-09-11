@@ -257,9 +257,8 @@ async fn run_automated_validation_inner(
         _turn += 1;
         if token.is_cancelled() {
             tracing::warn!("{val_tag}: aborted by cancellation token");
-            return Ok((
-                false,
-                "Validation aborted by cancellation signal.".to_string(),
+            return Err(anyhow::anyhow!(
+                "Validation aborted by cancellation signal."
             ));
         }
         crate::orchestrator::update_active_worker_context(&_active_guard.0, engine.token_count());
@@ -304,9 +303,8 @@ async fn run_automated_validation_inner(
             Err(e) => {
                 if token.is_cancelled() {
                     tracing::warn!("validator-{agent}: aborted during LLM call");
-                    return Ok((
-                        false,
-                        "Validation aborted by cancellation signal.".to_string(),
+                    return Err(anyhow::anyhow!(
+                        "Validation aborted by cancellation signal."
                     ));
                 }
                 tracing::error!("validator-{agent} LLM chat call error on turn {_turn}: {e:?}");
@@ -316,9 +314,8 @@ async fn run_automated_validation_inner(
 
         if out.was_aborted_by_steer || token.is_cancelled() {
             tracing::warn!("validator-{agent}: aborted during LLM call");
-            return Ok((
-                false,
-                "Validation aborted by cancellation signal.".to_string(),
+            return Err(anyhow::anyhow!(
+                "Validation aborted by cancellation signal."
             ));
         }
 
@@ -396,6 +393,15 @@ async fn run_automated_validation_inner(
         }
 
         for tc in tool_calls {
+            if token.is_cancelled() || crate::orchestrator::is_current_or_global_cancelled() {
+                tracing::warn!(
+                    "validator-{agent}: aborted before tool {}",
+                    tc.function.name
+                );
+                return Err(anyhow::anyhow!(
+                    "Validation aborted by cancellation signal."
+                ));
+            }
             let args_val = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
                 .unwrap_or_else(|_| serde_json::Value::String(tc.function.arguments.clone()));
             let desc = format_tool_args_preview(&tc.function.name, &args_val);
@@ -427,6 +433,16 @@ async fn run_automated_validation_inner(
                     err_msg
                 }
                 crate::harness::monitor::Intervention::None => {
+                    if token.is_cancelled() || crate::orchestrator::is_current_or_global_cancelled()
+                    {
+                        tracing::warn!(
+                            "validator-{agent}: aborted before dispatching tool {}",
+                            tc.function.name
+                        );
+                        return Err(anyhow::anyhow!(
+                            "Validation aborted by cancellation signal."
+                        ));
+                    }
                     let invocation = crate::harness::ToolInvocation {
                         name: tc.function.name.clone(),
                         arguments: args_val,
@@ -734,6 +750,15 @@ async fn run_plan_validation_inner(
         for tc in &tool_calls {
             if tc.function.name == TOOL_LEAVE_VERDICT {
                 continue;
+            }
+            if token.is_cancelled() || crate::orchestrator::is_current_or_global_cancelled() {
+                tracing::warn!(
+                    "{val_tag}: aborted before executing tool {}",
+                    tc.function.name
+                );
+                return Err(anyhow::anyhow!(
+                    "Plan validation aborted by cancellation signal."
+                ));
             }
             let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
                 .unwrap_or_else(|_| serde_json::Value::String(tc.function.arguments.clone()));

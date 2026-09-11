@@ -51,6 +51,8 @@ pub struct TuiRenderer {
     pub(crate) cursor: usize,
     /// Whether the user is in the "confirm abort" state.
     pub(crate) confirm_abort: bool,
+    /// Whether an explicit user exit was requested (Esc twice, Ctrl+C twice, Ctrl+D, or abort command).
+    pub(crate) user_exit: bool,
     /// Frame counter for animations (e.g. status spinner).
     pub(crate) frame_counter: u64,
     /// The status bar text. Defaults to `"Ready"`.
@@ -167,6 +169,7 @@ impl TuiRenderer {
             input_text: String::new(),
             cursor: 0,
             confirm_abort: false,
+            user_exit: false,
             frame_counter: 0,
             status_line: "Ready".to_string(),
             tokens_in: 0,
@@ -786,8 +789,19 @@ impl Renderer for TuiRenderer {
     fn request_abort(&mut self) {
         self.aborted = true;
         self.confirm_abort = false;
+        crate::orchestrator::cancel_all();
+    }
+
+    fn request_user_exit(&mut self) {
+        self.aborted = true;
+        self.user_exit = true;
+        self.confirm_abort = false;
         self.status_line = "Aborted by user.".to_string();
         crate::orchestrator::cancel_all();
+    }
+
+    fn user_exit_requested(&self) -> bool {
+        self.user_exit
     }
 
     fn aborted(&self) -> bool {
@@ -796,6 +810,7 @@ impl Renderer for TuiRenderer {
 
     fn clear_abort(&mut self) {
         self.aborted = false;
+        self.user_exit = false;
         self.confirm_abort = false;
         crate::orchestrator::reset_cancellation();
     }
@@ -991,11 +1006,5 @@ pub async fn run(
 
 /// Returns `true` for explicit exit/abort commands.
 pub(crate) fn is_abort(line: &str) -> bool {
-    let t = line.trim();
-    t.eq_ignore_ascii_case("/abort")
-        || t.eq_ignore_ascii_case("/exit")
-        || t.eq_ignore_ascii_case("/quit")
-        || t.eq_ignore_ascii_case("/q")
-        || t.eq_ignore_ascii_case(":q")
-        || t.eq_ignore_ascii_case(":q!")
+    crate::ui::helpers::is_abort_command(line)
 }

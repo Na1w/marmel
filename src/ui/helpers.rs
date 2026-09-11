@@ -158,11 +158,22 @@ pub fn chunk_utf8(s: &str, max: usize) -> Vec<&str> {
 pub(crate) fn is_abort_command(line: &str) -> bool {
     let t = line.trim();
     t.eq_ignore_ascii_case("/abort")
+        || t.eq_ignore_ascii_case("abort")
         || t.eq_ignore_ascii_case("/exit")
+        || t.eq_ignore_ascii_case("exit")
         || t.eq_ignore_ascii_case("/quit")
+        || t.eq_ignore_ascii_case("quit")
         || t.eq_ignore_ascii_case("/q")
         || t.eq_ignore_ascii_case(":q")
         || t.eq_ignore_ascii_case(":q!")
+        || t.eq_ignore_ascii_case("/stop")
+        || t.eq_ignore_ascii_case("stop")
+        || t.eq_ignore_ascii_case("/stopp")
+        || t.eq_ignore_ascii_case("stopp")
+        || t.eq_ignore_ascii_case("/cancel")
+        || t.eq_ignore_ascii_case("cancel")
+        || t.eq_ignore_ascii_case("/avbryt")
+        || t.eq_ignore_ascii_case("avbryt")
 }
 
 pub(crate) fn is_reset_command(line: &str) -> bool {
@@ -646,5 +657,29 @@ mod tests {
         assert_eq!(subagents[0].name, "coder-t-001");
         assert_eq!(subagents[0].task_id.as_deref(), Some("t-001"));
         assert!(!subagents[0].is_active);
+    }
+
+    #[test]
+    fn test_is_abort_command_recognizes_variants() {
+        assert!(is_abort_command("/abort"));
+        assert!(is_abort_command("abort"));
+        assert!(is_abort_command("ABORT"));
+        assert!(is_abort_command("/exit"));
+        assert!(is_abort_command("exit"));
+        assert!(is_abort_command("/quit"));
+        assert!(is_abort_command("quit"));
+        assert!(is_abort_command("/q"));
+        assert!(is_abort_command(":q"));
+        assert!(is_abort_command(":q!"));
+        assert!(is_abort_command("/stop"));
+        assert!(is_abort_command("stop"));
+        assert!(is_abort_command("/stopp"));
+        assert!(is_abort_command("stopp"));
+        assert!(is_abort_command("/cancel"));
+        assert!(is_abort_command("cancel"));
+        assert!(is_abort_command("/avbryt"));
+        assert!(is_abort_command("avbryt"));
+        assert!(!is_abort_command("continue"));
+        assert!(!is_abort_command("status"));
     }
 }
