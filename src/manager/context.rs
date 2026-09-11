@@ -223,6 +223,8 @@ pub struct ContextEngine {
     compaction_retry_count: u32,
     /// Whether a rebirth advisory has already been emitted for the current context window.
     rebirth_advisory_emitted: bool,
+    /// Recovery turns elapsed since the last rebirth without another rebirth attempt.
+    consecutive_rebirths: usize,
 }
 
 impl ContextEngine {
@@ -234,6 +236,7 @@ impl ContextEngine {
             prefill: SlowPrefillTracker::new(),
             compaction_retry_count: 0,
             rebirth_advisory_emitted: false,
+            consecutive_rebirths: 0,
         }
     }
 
@@ -303,10 +306,21 @@ impl ContextEngine {
         self.token_count() > compaction_threshold(self.max_context_tokens)
     }
 
-    /// Whether a rebirth advisory should be emitted right now (> 80% of budget and not yet emitted).
+    /// Whether a rebirth advisory should be emitted right now (> 80% of budget, not yet emitted, and no consecutive rebirth).
     pub fn should_advise_rebirth(&self) -> bool {
         !self.rebirth_advisory_emitted
+            && self.consecutive_rebirths == 0
             && self.token_count() > rebirth_advisory_threshold(self.max_context_tokens)
+    }
+
+    /// Number of consecutive rebirth executions without other actions.
+    pub fn consecutive_rebirths(&self) -> usize {
+        self.consecutive_rebirths
+    }
+
+    /// Reset the consecutive rebirth counter when other productive work is executed.
+    pub fn reset_consecutive_rebirths(&mut self) {
+        self.consecutive_rebirths = 0;
     }
 
     /// Inject the `SYSTEM: CONTEXT BUDGET ADVISORY` user message instructing the
@@ -551,7 +565,10 @@ impl ContextEngine {
             "Context compaction executed (rebirth): {initial_tokens} tokens ({initial_msgs} msgs) -> {final_tokens} tokens ({final_msgs} msgs), summary: {summary}"
         );
 
-        self.rebirth_advisory_emitted = false;
+        self.consecutive_rebirths = self.consecutive_rebirths.saturating_add(1);
+        if self.token_count() <= rebirth_advisory_threshold(self.max_context_tokens) {
+            self.rebirth_advisory_emitted = false;
+        }
         if let Some(stats) = &self.stats {
             stats.record_rebirth();
         }

@@ -464,16 +464,20 @@ async fn run_automated_validation_inner(
                     tool_call_id: tc.id,
                     content,
                 });
-            }
-            if engine.should_compact() {
-                engine.compact();
-            } else if engine.should_advise_rebirth() {
-                engine.inject_rebirth_advisory();
+            } else {
+                engine.append(crate::types::Message::User {
+                    content: "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. Do NOT call rebirth again. Continue your validation inspection and submit your verdict via leave_verdict.)".to_string(),
+                });
             }
             crate::orchestrator::update_active_worker_context(
                 &_active_guard.0,
                 engine.token_count(),
             );
+        }
+        if engine.should_compact() {
+            engine.compact();
+        } else if engine.should_advise_rebirth() {
+            engine.inject_rebirth_advisory();
         }
     }
 

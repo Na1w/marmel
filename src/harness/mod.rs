@@ -495,6 +495,11 @@ pub fn handle_rebirth(
     engine: &mut crate::manager::ContextEngine,
     arguments: &serde_json::Value,
 ) -> Result<ToolResult, ToolError> {
+    if engine.consecutive_rebirths() > 0 {
+        return Ok(ToolResult::err(
+            "Rebirth checkpoint was already applied. You cannot invoke rebirth consecutively. You must make progress on your tasks before invoking rebirth again.",
+        ));
+    }
     let summary = arguments
         .get("summary")
         .and_then(serde_json::Value::as_str)
@@ -516,6 +521,7 @@ pub fn dispatch_with_engine(
     if tool.name.as_str() == TOOL_REBIRTH {
         return handle_rebirth(engine, &tool.arguments);
     }
+    engine.reset_consecutive_rebirths();
     dispatch(tool)
 }
 
@@ -653,7 +659,7 @@ pub async fn dispatch_for_async_with_engine(
 
 async fn dispatch_manager_async(
     tool: &ToolInvocation,
-    engine: Option<&mut crate::manager::ContextEngine>,
+    mut engine: Option<&mut crate::manager::ContextEngine>,
 ) -> Result<ToolResult, ToolError> {
     let name = tool.name.as_str();
     if let Some(mcp) = get_mcp_manager()
@@ -663,6 +669,12 @@ async fn dispatch_manager_async(
             Ok(content) => Ok(ToolResult::ok(content)),
             Err(e) => Ok(ToolResult::err(format!("MCP tool error: {e}"))),
         };
+    }
+
+    if name != TOOL_REBIRTH
+        && let Some(ref mut eng) = engine
+    {
+        eng.reset_consecutive_rebirths();
     }
 
     match name {
@@ -704,7 +716,7 @@ async fn dispatch_manager_async(
 async fn dispatch_specialist_async(
     tool: &ToolInvocation,
     agent: crate::agents::Agent,
-    engine: Option<&mut crate::manager::ContextEngine>,
+    mut engine: Option<&mut crate::manager::ContextEngine>,
 ) -> Result<ToolResult, ToolError> {
     let name = tool.name.as_str();
     if name == TOOL_CREATE_PLAN {
@@ -730,6 +742,12 @@ async fn dispatch_specialist_async(
             tool: name.to_string(),
             caller: agent.as_str().to_string(),
         });
+    }
+
+    if name != TOOL_REBIRTH
+        && let Some(ref mut eng) = engine
+    {
+        eng.reset_consecutive_rebirths();
     }
 
     match name {
@@ -785,7 +803,7 @@ async fn dispatch_specialist_async(
 
 fn dispatch_manager(
     tool: &ToolInvocation,
-    engine: Option<&mut crate::manager::ContextEngine>,
+    mut engine: Option<&mut crate::manager::ContextEngine>,
 ) -> Result<ToolResult, ToolError> {
     let name = tool.name.as_str();
     if let Some(mcp) = get_mcp_manager()
@@ -796,6 +814,12 @@ fn dispatch_manager(
             Ok(content) => Ok(ToolResult::ok(content)),
             Err(e) => Ok(ToolResult::err(format!("MCP tool error: {e}"))),
         };
+    }
+
+    if name != TOOL_REBIRTH
+        && let Some(ref mut eng) = engine
+    {
+        eng.reset_consecutive_rebirths();
     }
 
     match name {
@@ -855,7 +879,7 @@ fn normalize_tool_name(name: &str) -> String {
 fn dispatch_specialist(
     tool: &ToolInvocation,
     agent: crate::agents::Agent,
-    engine: Option<&mut crate::manager::ContextEngine>,
+    mut engine: Option<&mut crate::manager::ContextEngine>,
 ) -> Result<ToolResult, ToolError> {
     let name = tool.name.as_str();
     if name == TOOL_CREATE_PLAN {
@@ -882,6 +906,12 @@ fn dispatch_specialist(
             tool: name.to_string(),
             caller: agent.as_str().to_string(),
         });
+    }
+
+    if name != TOOL_REBIRTH
+        && let Some(ref mut eng) = engine
+    {
+        eng.reset_consecutive_rebirths();
     }
 
     match name {
@@ -964,6 +994,42 @@ mod tests {
         let result = handle_rebirth(&mut engine, &args).unwrap();
         assert!(!result.is_error);
         assert_eq!(engine.messages().len(), 4);
+    }
+
+    #[test]
+    fn test_harness_consecutive_rebirth_rejected() {
+        let mut engine = ContextEngine::new(2048);
+        engine.set_system_prompt("You are a coding assistant.".to_string());
+        engine.set_goal("Refactor the parser.".to_string());
+        let args = serde_json::json!({
+            "summary": "Completed initial refactoring steps."
+        });
+        // First rebirth succeeds
+        let result1 = handle_rebirth(&mut engine, &args).unwrap();
+        assert!(!result1.is_error);
+        assert_eq!(engine.messages().len(), 4);
+
+        // Immediate consecutive rebirth is rejected
+        let result2 = handle_rebirth(&mut engine, &args).unwrap();
+        assert!(result2.is_error);
+        assert!(
+            result2
+                .content
+                .contains("cannot invoke rebirth consecutively")
+        );
+        assert_eq!(engine.messages().len(), 4);
+
+        // Another tool resets the consecutive tracker
+        let inv = ToolInvocation {
+            name: TOOL_GLOB.to_string(),
+            arguments: serde_json::json!({ "pattern": "*.rs" }),
+        };
+        let _ = dispatch_with_engine(&inv, &mut engine);
+        assert_eq!(engine.consecutive_rebirths(), 0);
+
+        // Now rebirth succeeds again
+        let result3 = handle_rebirth(&mut engine, &args).unwrap();
+        assert!(!result3.is_error);
     }
 
     #[test]

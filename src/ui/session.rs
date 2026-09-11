@@ -382,17 +382,20 @@ pub async fn run_session(
             let _ = ctx.save_transcript(&transcript_path);
             renderer.flush()?;
 
-            if ctx.should_compact() {
-                ctx.compact();
-                let _ = ctx.save_transcript(&transcript_path);
-                renderer.on_event(&Event::TokensIn(ctx.token_count()));
-                renderer.on_event(&Event::Status("context compacted".to_string()));
-            } else if ctx.should_advise_rebirth() {
-                ctx.inject_rebirth_advisory();
-                let _ = ctx.save_transcript(&transcript_path);
-                renderer.on_event(&Event::Status(
-                    "context advisory: rebirth recommended (>= 80% budget)".to_string(),
-                ));
+            if tool_calls.is_empty() {
+                ctx.reset_consecutive_rebirths();
+                if ctx.should_compact() {
+                    ctx.compact();
+                    let _ = ctx.save_transcript(&transcript_path);
+                    renderer.on_event(&Event::TokensIn(ctx.token_count()));
+                    renderer.on_event(&Event::Status("context compacted".to_string()));
+                } else if ctx.should_advise_rebirth() {
+                    ctx.inject_rebirth_advisory();
+                    let _ = ctx.save_transcript(&transcript_path);
+                    renderer.on_event(&Event::Status(
+                        "context advisory: rebirth recommended (>= 80% budget)".to_string(),
+                    ));
+                }
             }
 
             for steer in steer_queue.drain(..) {
@@ -431,6 +434,7 @@ pub async fn run_session(
             });
 
             if all_parallel && tool_calls.len() > 1 {
+                ctx.reset_consecutive_rebirths();
                 let mut handles = Vec::new();
                 for call in &tool_calls {
                     let name = call.function.name.clone();
@@ -641,7 +645,7 @@ pub async fn run_session(
                     let _ = ctx.save_transcript(&transcript_path);
                 }
             } else {
-                for call in tool_calls {
+                for call in &tool_calls {
                     if renderer.aborted() {
                         break;
                     }
@@ -717,17 +721,42 @@ pub async fn run_session(
                         let res = crate::harness::handle_rebirth(&mut ctx, &args_val);
                         match res {
                             Ok(r) => {
-                                let _ = ctx.save_transcript(&transcript_path);
-                                renderer.on_event(&Event::ToolResult(r.content));
-                                renderer.on_event(&Event::TokensIn(ctx.token_count()));
-                                renderer.on_event(&Event::Status(
-                                    "rebirth checkpoint applied".to_string(),
-                                ));
+                                renderer.on_event(&Event::ToolResult(r.content.clone()));
+                                if !r.is_error {
+                                    let _ = ctx.save_transcript(&transcript_path);
+                                    renderer.on_event(&Event::TokensIn(ctx.token_count()));
+                                    renderer.on_event(&Event::Status(
+                                        "rebirth checkpoint applied".to_string(),
+                                    ));
+                                    let current_plan = manager
+                                        .as_ref()
+                                        .map(|m| m.plan.clone())
+                                        .unwrap_or_default();
+                                    let pending = current_plan.pending_tasks();
+                                    let continuation_msg = if !pending.is_empty() {
+                                        let pending_str = pending.join(", ");
+                                        format!(
+                                            "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. You have active pending tasks in your plan: [{pending_str}]. Do NOT call rebirth again. Proceed immediately with delegating or executing these pending tasks.)"
+                                        )
+                                    } else {
+                                        "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. Do NOT call rebirth again. Proceed immediately with delivering your final synthesis to the user.)".to_string()
+                                    };
+                                    ctx.append(Message::User {
+                                        content: continuation_msg,
+                                    });
+                                    let _ = ctx.save_transcript(&transcript_path);
+                                } else {
+                                    ctx.append(Message::Tool {
+                                        tool_call_id: call.id.clone(),
+                                        content: format!("ERROR: {}", r.content),
+                                    });
+                                    let _ = ctx.save_transcript(&transcript_path);
+                                }
                             }
                             Err(e) => {
                                 renderer.on_event(&Event::ToolResult(format!("ERROR: {e}")));
                                 ctx.append(Message::Tool {
-                                    tool_call_id: call.id,
+                                    tool_call_id: call.id.clone(),
                                     content: format!("ERROR: {e}"),
                                 });
                                 let _ = ctx.save_transcript(&transcript_path);
@@ -736,6 +765,8 @@ pub async fn run_session(
                         renderer.flush()?;
                         continue;
                     }
+
+                    ctx.reset_consecutive_rebirths();
 
                     let invocation = crate::harness::ToolInvocation {
                         name: name.clone(),
@@ -871,10 +902,25 @@ pub async fn run_session(
                     drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
 
                     ctx.append(Message::Tool {
-                        tool_call_id: call.id,
+                        tool_call_id: call.id.clone(),
                         content: result_content,
                     });
                     let _ = ctx.save_transcript(&transcript_path);
+                }
+            }
+
+            if !tool_calls.is_empty() {
+                if ctx.should_compact() {
+                    ctx.compact();
+                    let _ = ctx.save_transcript(&transcript_path);
+                    renderer.on_event(&Event::TokensIn(ctx.token_count()));
+                    renderer.on_event(&Event::Status("context compacted".to_string()));
+                } else if ctx.should_advise_rebirth() {
+                    ctx.inject_rebirth_advisory();
+                    let _ = ctx.save_transcript(&transcript_path);
+                    renderer.on_event(&Event::Status(
+                        "context advisory: rebirth recommended (>= 80% budget)".to_string(),
+                    ));
                 }
             }
 

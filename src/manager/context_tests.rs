@@ -731,3 +731,21 @@ fn test_rebirth_advisory_reset_on_perform_rebirth() {
         "collapsed context is well below 80%"
     );
 }
+
+#[test]
+fn test_context_consecutive_rebirth_suppresses_advisory() {
+    let budget = 300;
+    let mut engine = ContextEngine::new(budget);
+    engine.set_system_prompt("System prompt.".to_string());
+    engine.set_goal("User goal.".to_string());
+
+    assert_eq!(engine.consecutive_rebirths(), 0);
+    engine.perform_rebirth("First checkpoint.");
+    assert_eq!(engine.consecutive_rebirths(), 1);
+
+    // Even if token count were high, should_advise_rebirth is false when consecutive_rebirths > 0
+    assert!(!engine.should_advise_rebirth());
+
+    engine.reset_consecutive_rebirths();
+    assert_eq!(engine.consecutive_rebirths(), 0);
+}

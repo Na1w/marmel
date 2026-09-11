@@ -533,6 +533,14 @@ impl ToolRepetitionDetector {
 
     /// Classify `record` against the current buffer without mutating it.
     fn classify(&self, record: &ToolCallRecord) -> Intervention {
+        if record.name == crate::tool_names::TOOL_REBIRTH
+            && self
+                .buffer
+                .back()
+                .is_some_and(|b| b.name == crate::tool_names::TOOL_REBIRTH)
+        {
+            return Intervention::Block;
+        }
         if self.detect_consecutive(record) {
             return Intervention::Block;
         }
@@ -1177,11 +1185,25 @@ impl HarnessMonitor {
     /// configured repetition threshold.
     pub fn intervention_error(&self, intervention: Intervention) -> Option<String> {
         match intervention {
-            Intervention::Block => Some(format!(
-                "TOOL REPETITION DETECTED: You have called this tool with identical \
-                 arguments {} times in a row. Stop looping and try an alternative approach.",
-                self.tool_rep.threshold
-            )),
+            Intervention::Block => {
+                let last_is_rebirth = self
+                    .tool_rep
+                    .buffer
+                    .back()
+                    .is_some_and(|b| b.name == crate::tool_names::TOOL_REBIRTH);
+                if last_is_rebirth {
+                    Some(
+                        "TOOL REPETITION DETECTED: Rebirth checkpoint was already applied. You cannot invoke rebirth consecutively. Make progress using other tools."
+                            .to_string(),
+                    )
+                } else {
+                    Some(format!(
+                        "TOOL REPETITION DETECTED: You have called this tool with identical \
+                         arguments {} times in a row. Stop looping and try an alternative approach.",
+                        self.tool_rep.threshold
+                    ))
+                }
+            }
             Intervention::Cut => Some(
                 "TOOL CYCLE DETECTED: You are repeating a loop of tool calls. Step back \
                  and re-evaluate your plan."

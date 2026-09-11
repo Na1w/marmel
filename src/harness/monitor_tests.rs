@@ -565,3 +565,36 @@ fn test_monitor_prune_orphan_keeps_all_when_all_matched() {
         .collect();
     assert_eq!(tool_msgs.len(), 2, "both tool messages survive");
 }
+
+#[test]
+fn test_monitor_consecutive_rebirth_blocked() {
+    let mut monitor = HarnessMonitor::new(std::sync::Arc::new(HarnessStats::new()));
+    let args1 = serde_json::json!({ "summary": "first checkpoint" });
+    let args2 = serde_json::json!({ "summary": "second checkpoint with different text" });
+
+    // First rebirth is permitted
+    assert_eq!(
+        monitor.observe_tool(crate::tool_names::TOOL_REBIRTH, &args1),
+        Intervention::None
+    );
+
+    // Consecutive rebirth is immediately blocked even with different summary
+    assert_eq!(
+        monitor.observe_tool(crate::tool_names::TOOL_REBIRTH, &args2),
+        Intervention::Block
+    );
+    let err = monitor.intervention_error(Intervention::Block).unwrap();
+    assert!(err.contains("Rebirth checkpoint was already applied"));
+
+    // Running another tool allows rebirth again
+    let read_args = serde_json::json!({ "path": "src/lib.rs" });
+    assert_eq!(
+        monitor.observe_tool(crate::tool_names::TOOL_READ_FILE, &read_args),
+        Intervention::None
+    );
+
+    assert_eq!(
+        monitor.observe_tool(crate::tool_names::TOOL_REBIRTH, &args2),
+        Intervention::None
+    );
+}
