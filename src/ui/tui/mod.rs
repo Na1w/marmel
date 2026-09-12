@@ -272,6 +272,7 @@ impl TuiRenderer {
     /// Total duration spent working on an execution plan.
     /// Only counts when actively working on a plan; freezes as soon as the plan is completed / archived.
     pub(crate) fn total_project_elapsed(&self) -> Option<std::time::Duration> {
+        let using_global_plan = self.plan_start_time.is_none();
         let (inst, _) = self
             .plan_start_time
             .map(|t| (t, chrono::Local::now()))
@@ -282,26 +283,29 @@ impl TuiRenderer {
                     None
                 }
             })?;
-        if let Some(comp) = self
-            .plan_completed_time
-            .or_else(crate::manager::phase::get_plan_completed_time)
-        {
-            Some(comp.duration_since(inst))
+        let global_completed = if using_global_plan && self.had_active_plan {
+            crate::manager::phase::get_plan_completed_time()
+        } else {
+            None
+        };
+        if let Some(comp) = self.plan_completed_time.or(global_completed) {
+            Some(comp.checked_duration_since(inst).unwrap_or_default())
         } else if self.plan_is_archived {
-            crate::manager::phase::record_plan_completed();
+            if using_global_plan && self.had_active_plan {
+                crate::manager::phase::record_plan_completed();
+            }
             Some(inst.elapsed())
         } else {
-            let plan = crate::manager::phase::Plan::default();
-            if plan.is_complete() {
-                crate::manager::phase::record_plan_completed();
-                if let Some(comp) = crate::manager::phase::get_plan_completed_time() {
-                    Some(comp.duration_since(inst))
-                } else {
-                    Some(inst.elapsed())
+            if using_global_plan && self.had_active_plan {
+                let plan = crate::manager::phase::Plan::default();
+                if plan.is_complete() {
+                    crate::manager::phase::record_plan_completed();
+                    if let Some(comp) = crate::manager::phase::get_plan_completed_time() {
+                        return Some(comp.checked_duration_since(inst).unwrap_or_default());
+                    }
                 }
-            } else {
-                Some(inst.elapsed())
             }
+            Some(inst.elapsed())
         }
     }
 

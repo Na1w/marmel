@@ -1560,11 +1560,11 @@ fn test_plan_caching_and_throttling() {
 #[test]
 fn test_status_bar_displays_right_aligned_elapsed_time() {
     let mut r = TuiRenderer::new();
-    r.plan_start_time = Some(
-        std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(135))
-            .unwrap(),
-    );
+    let start = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(135))
+        .unwrap();
+    r.plan_start_time = Some(start);
+    r.plan_completed_time = Some(start + std::time::Duration::from_secs(135));
 
     let backend = ratatui::backend::TestBackend::new(100, 5);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
