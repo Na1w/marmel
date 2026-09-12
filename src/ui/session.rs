@@ -527,7 +527,10 @@ pub async fn run_session(
                                 call.function.name
                             )
                         });
-                        tracing::warn!("Manager tool {} blocked by repetition detector", call.function.name);
+                        tracing::warn!(
+                            "Manager tool {} blocked by repetition detector",
+                            call.function.name
+                        );
                         let call_id = call.id.clone();
                         let handle = tokio::task::spawn_blocking(move || {
                             (
@@ -828,7 +831,10 @@ pub async fn run_session(
                                 call.function.name
                             )
                         });
-                        tracing::warn!("Manager tool {} blocked by repetition detector", call.function.name);
+                        tracing::warn!(
+                            "Manager tool {} blocked by repetition detector",
+                            call.function.name
+                        );
                         renderer.on_event(&Event::ToolResult(format!("ERROR: {err_msg}")));
                         renderer.flush()?;
                         ctx.append(Message::Tool {

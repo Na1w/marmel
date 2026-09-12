@@ -100,11 +100,7 @@ fn message_tokens(enc: &tiktoken_rs::CoreBPE, m: &Message) -> usize {
             content,
             reasoning_content,
             tool_calls,
-        } => count_assistant_tokens(
-            content.as_deref(),
-            reasoning_content.as_deref(),
-            tool_calls,
-        ),
+        } => count_assistant_tokens(content.as_deref(), reasoning_content.as_deref(), tool_calls),
         Message::Tool { content, .. } => enc.encode_ordinary(content).len(),
     }
 }

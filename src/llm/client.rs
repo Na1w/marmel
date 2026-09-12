@@ -42,8 +42,16 @@ fn count_reply_tokens(
     tool_calls: &[crate::types::ToolCall],
 ) -> usize {
     crate::manager::context::count_assistant_tokens(
-        if content.is_empty() { None } else { Some(content) },
-        if reasoning.is_empty() { None } else { Some(reasoning) },
+        if content.is_empty() {
+            None
+        } else {
+            Some(content)
+        },
+        if reasoning.is_empty() {
+            None
+        } else {
+            Some(reasoning)
+        },
         tool_calls,
     )
 }

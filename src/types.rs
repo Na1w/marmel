@@ -1,8 +1,8 @@
 //! Wire types for the OpenAI-compatible chat completions API and tool calls.
 
+use crate::tool_names::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use crate::tool_names::*;
 
 /// A message in the chat transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
