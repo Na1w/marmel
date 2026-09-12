@@ -4,11 +4,11 @@ use super::workers::has_active_workers;
 use std::sync::LazyLock;
 
 static RE_ID: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"\b(t-[a-zA-Z0-9_\-]+)\b").unwrap());
+    LazyLock::new(|| regex::Regex::new(r"\b(t-[a-zA-Z0-9_\-]+)\b").expect("valid task id regex"));
 static RE_CHECKBOX_DONE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"\[[xX]\]").unwrap());
+    LazyLock::new(|| regex::Regex::new(r"\[[xX]\]").expect("valid done checkbox regex"));
 static RE_CHECKBOX_PENDING: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"\[\s*\]|\(\s*\)").unwrap());
+    LazyLock::new(|| regex::Regex::new(r"\[\s*\]|\(\s*\)").expect("valid pending checkbox regex"));
 
 /// Dynamically parses the markdown execution plan and correlates each task with active background workers.
 /// Generates real-time breakdown of Completed, Currently In Progress, and Pending steps.
@@ -61,12 +61,10 @@ pub fn generate_plan_progress_summary(plan_content: &str) -> String {
                 })
                 .trim();
 
-            let matched_active = if let Some(cap) = RE_ID.captures(trimmed) {
-                let tid = cap.get(1).unwrap().as_str().to_lowercase();
-                super::workers::get_active_subtask_by_id(&tid)
-            } else {
-                None
-            };
+            let matched_active = RE_ID
+                .captures(trimmed)
+                .and_then(|cap| cap.get(1))
+                .and_then(|m| super::workers::get_active_subtask_by_id(&m.as_str().to_lowercase()));
 
             if let Some((agent_name, running_time)) = matched_active {
                 in_progress_tasks.push(format!(

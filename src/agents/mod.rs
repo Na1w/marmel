@@ -86,13 +86,15 @@ pub enum MissionMarker {
     Replan { reason: String },
 }
 
-static TASK_ID_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+static TASK_ID_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"\(?\[?(t-[A-Za-z0-9_-]+)\]?\)?").expect("valid task regex")
+});
 
 fn find_task_id(text: &str) -> Option<&str> {
-    let re = TASK_ID_RE.get_or_init(|| {
-        regex::Regex::new(r"\(?\[?(t-[A-Za-z0-9_-]+)\]?\)?").expect("valid task regex")
-    });
-    re.captures(text).map(|c| c.get(1).unwrap().as_str())
+    TASK_ID_RE
+        .captures(text)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str())
 }
 
 fn contains_failed_marker(upper: &str) -> bool {

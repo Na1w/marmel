@@ -103,7 +103,9 @@ impl CrashJournal {
     /// worker runs. Generates a fresh `worker_id`, records it in `.session_frozen.json`
     /// and appends a `frozen` journal record. Returns the worker_id.
     pub fn snapshot(&self, agent: Agent, req: &DelegationRequest) -> anyhow::Result<String> {
-        let _guard = JOURNAL_MUTEX.lock().unwrap();
+        let _guard = JOURNAL_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let worker_id = Uuid::new_v4().to_string();
         let mut list = self.read_frozen_list()?;
         list.push(FreezeSnapshot {
@@ -125,14 +127,18 @@ impl CrashJournal {
     /// REQ-ORCH-003 (persistence): the current pending (frozen) snapshot, or
     /// `None` when no delegation is frozen. This is the rehydration source.
     pub fn frozen(&self) -> anyhow::Result<Option<FreezeSnapshot>> {
-        let _guard = JOURNAL_MUTEX.lock().unwrap();
+        let _guard = JOURNAL_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let list = self.read_frozen_list()?;
         Ok(list.into_iter().next())
     }
 
     /// All in-flight pending snapshots.
     pub fn frozen_all(&self) -> anyhow::Result<Vec<FreezeSnapshot>> {
-        let _guard = JOURNAL_MUTEX.lock().unwrap();
+        let _guard = JOURNAL_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.read_frozen_list()
     }
 
@@ -142,7 +148,9 @@ impl CrashJournal {
     /// freeze). Appends a `Resolved`/`Failed` journal event preserving the
     /// frozen delegation's agent and task identity for audit.
     pub fn clear(&self, worker_id: &str, resolved: bool) -> anyhow::Result<()> {
-        let _guard = JOURNAL_MUTEX.lock().unwrap();
+        let _guard = JOURNAL_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let kind = if resolved {
             JournalEventKind::Resolved
         } else {
@@ -169,7 +177,9 @@ impl CrashJournal {
 
     /// The pending Crash Journal entries (audit/recovery diagnostics).
     pub fn journal(&self) -> anyhow::Result<Vec<JournalEvent>> {
-        let _guard = JOURNAL_MUTEX.lock().unwrap();
+        let _guard = JOURNAL_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = self.journal_path();
         if !path.exists() {
             return Ok(Vec::new());
@@ -183,7 +193,9 @@ impl CrashJournal {
 
     /// Whether a frozen snapshot exists (used by the recovery bootstrap).
     pub fn is_frozen(&self) -> bool {
-        let _guard = JOURNAL_MUTEX.lock().unwrap();
+        let _guard = JOURNAL_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.read_frozen_list()
             .map(|l| !l.is_empty())
             .unwrap_or(false)

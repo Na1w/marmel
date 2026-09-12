@@ -48,8 +48,9 @@ pub const ULIMIT_FILE_BLOCKS_FALLBACK: &str = "2097152";
 /// - Bell (`\x07`) and backspace (`\x08`) are removed.
 /// - Other control characters below ` ` (0x20) are removed, except `\n`, `\r`,
 ///   `\t`, and `\x1b` (ESC, which is preserved so CSI color codes survive).
-static RE_OSC: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r"\x1b\][0-9]+;.*?(?:\x07|\x1b\\)").unwrap());
+static RE_OSC: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"\x1b\][0-9]+;.*?(?:\x07|\x1b\\)").expect("valid OSC regex")
+});
 
 pub fn sanitize_terminal_output(text: &str) -> String {
     let cleaned = RE_OSC.replace_all(text, "");
@@ -95,19 +96,27 @@ pub fn build_sandboxed_command(command: &str, cwd: &std::path::Path) -> CommandB
             "stty -echo 2>/dev/null || true; ulimit -f {ULIMIT_FILE_BLOCKS} 2>/dev/null || ulimit -f {ULIMIT_FILE_BLOCKS_FALLBACK} 2>/dev/null; {command}"
         );
 
-        let is_marmel_binary = std::env::current_exe()
-            .ok()
+        let current_exe = std::env::current_exe().ok();
+        let is_marmel_binary = current_exe
+            .as_ref()
             .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
             .is_some_and(|name| name == "marmel" || name == "marmel.exe");
 
         if cfg!(target_os = "linux") && is_marmel_binary {
-            let exe = std::env::current_exe().unwrap();
-            let mut cmd = CommandBuilder::new(exe);
-            cmd.arg("--internal-sandbox-exec");
-            cmd.arg(cwd.to_string_lossy().as_ref());
-            cmd.arg(&wrapped);
-            cmd.cwd(cwd);
-            cmd
+            if let Some(exe) = current_exe {
+                let mut cmd = CommandBuilder::new(exe);
+                cmd.arg("--internal-sandbox-exec");
+                cmd.arg(cwd.to_string_lossy().as_ref());
+                cmd.arg(&wrapped);
+                cmd.cwd(cwd);
+                cmd
+            } else {
+                let mut cmd = CommandBuilder::new("sh");
+                cmd.arg("-c");
+                cmd.arg(&wrapped);
+                cmd.cwd(cwd);
+                cmd
+            }
         } else {
             let mut cmd = CommandBuilder::new("sh");
             cmd.arg("-c");
@@ -331,7 +340,10 @@ impl PtyManager {
                 let now = std::time::Instant::now();
                 map.retain(|key, session| {
                     let idle_time = {
-                        let buf = session.shared_buf.lock().unwrap();
+                        let buf = session
+                            .shared_buf
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         now.duration_since(buf.last_activity)
                     };
                     if idle_time > Duration::from_secs(300) {
@@ -400,17 +412,23 @@ impl PtyManager {
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
-                        let mut lock = shared_buf_reader.lock().unwrap();
+                        let mut lock = shared_buf_reader
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         lock.is_alive = false;
                         break;
                     }
                     Ok(n) => {
-                        let mut lock = shared_buf_reader.lock().unwrap();
+                        let mut lock = shared_buf_reader
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         lock.output.extend_from_slice(&buf[..n]);
                         lock.last_activity = std::time::Instant::now();
                     }
                     Err(_) => {
-                        let mut lock = shared_buf_reader.lock().unwrap();
+                        let mut lock = shared_buf_reader
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         lock.is_alive = false;
                         break;
                     }
@@ -435,7 +453,9 @@ impl PtyManager {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let initial_output = {
-            let mut lock = shared_buf.lock().unwrap();
+            let mut lock = shared_buf
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let new_bytes = &lock.output[lock.cursor..];
             let s = sanitize_terminal_output(&String::from_utf8_lossy(new_bytes));
             lock.cursor = lock.output.len();
@@ -464,14 +484,18 @@ impl PtyManager {
         };
 
         {
-            let mut w = writer.lock().unwrap();
+            let mut w = writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             use std::io::Write;
             w.write_all(input.as_bytes()).map_err(|e| {
                 ToolError::Execution(anyhow::anyhow!("Failed to write to PTY: {e}"))
             })?;
             w.flush()
                 .map_err(|e| ToolError::Execution(anyhow::anyhow!("Failed to flush PTY: {e}")))?;
-            let mut buf = shared_buf.lock().unwrap();
+            let mut buf = shared_buf
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             buf.last_activity = std::time::Instant::now();
         }
 
@@ -479,7 +503,9 @@ impl PtyManager {
         tokio::time::sleep(wait_dur).await;
 
         let (new_output, is_alive) = {
-            let mut lock = shared_buf.lock().unwrap();
+            let mut lock = shared_buf
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let new_bytes = &lock.output[lock.cursor..];
             let s = sanitize_terminal_output(&String::from_utf8_lossy(new_bytes));
             lock.cursor = lock.output.len();
@@ -517,7 +543,9 @@ impl PtyManager {
         }
 
         let (new_output, is_alive) = {
-            let mut lock = shared_buf.lock().unwrap();
+            let mut lock = shared_buf
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let new_bytes = &lock.output[lock.cursor..];
             let s = sanitize_terminal_output(&String::from_utf8_lossy(new_bytes));
             lock.cursor = lock.output.len();
@@ -539,7 +567,10 @@ impl PtyManager {
         let now = std::time::Instant::now();
         map.values()
             .map(|s| {
-                let buf = s.shared_buf.lock().unwrap();
+                let buf = s
+                    .shared_buf
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let idle_secs = now.duration_since(buf.last_activity).as_secs();
                 serde_json::json!({
                     "session_id": s.id,

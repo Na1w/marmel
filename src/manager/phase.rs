@@ -28,7 +28,7 @@
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 /// Directory (relative to the workspace) holding the plan and phase override.
 pub const MARMEL_DIR: &str = ".marmel";
@@ -168,20 +168,19 @@ pub fn get_plan_start_time() -> Option<(std::time::Instant, chrono::DateTime<chr
     None
 }
 
-/// Regex matching a `(t-xxx)` / `[t-xxx]` task-id token. Compiled exactly once
-/// via `OnceLock` (CODE_REVIEW Point 2).
-static TASK_ID_RE: OnceLock<Regex> = OnceLock::new();
+/// Regex matching a `(t-xxx)` / `[t-xxx]` task-id token.
+static TASK_ID_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\(?\[?(t-[A-Za-z0-9_-]+)\]?\)?").expect("valid task-id regex"));
 
 /// Extract the first `(t-xxx)` task-id token from text. Used to bind a
 /// `MISSION COMPLETE (t-xxx)` marker to its plan line (REQ-ORCH-005). The
 /// regex is intentionally self-contained so this module carries no dependency
 /// on the agents module.
 fn find_task_id(text: &str) -> Option<String> {
-    let re = TASK_ID_RE.get_or_init(|| {
-        Regex::new(r"\(?\[?(t-[A-Za-z0-9_-]+)\]?\)?").expect("valid task-id regex")
-    });
-    re.captures(text)
-        .map(|c| c.get(1).unwrap().as_str().to_string())
+    TASK_ID_RE
+        .captures(text)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
 }
 
 /// The terminal marker a subagent appends to its deliverable
