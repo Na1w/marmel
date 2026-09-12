@@ -156,9 +156,9 @@ fn test_streaming_response_extractor_no_response_field() {
 #[test]
 fn test_streaming_response_extractor_escapes() {
     let mut extractor = StreamingResponseExtractor::new();
-    let chunk = "{\"decision\": \"RespondDirectly\", \"response\": \"\\\"Citat\\\" och \\\\backslashes\\\\ samt \\t tabb och \\u0041\"}";
+    let chunk = "{\"decision\": \"RespondDirectly\", \"response\": \"\\\"Quotes\\\" and \\\\backslashes\\\\ plus \\t tab and \\u0041\"}";
     let (out, finished) = extractor.push_chunk(chunk);
-    assert_eq!(out, "\"Citat\" och \\backslashes\\ samt \t tabb och A");
+    assert_eq!(out, "\"Quotes\" and \\backslashes\\ plus \t tab and A");
     assert!(finished);
 }
 

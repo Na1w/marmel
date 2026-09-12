@@ -251,6 +251,10 @@ fn all_specialists_and_validator_permitted_rebirth() {
 /// Sleep is permitted to ALL callers, including Manager and all specialists.
 #[test]
 fn all_agents_permitted_sleep() {
+    // Cancel immediately so the test verifies permission/role-gating without
+    // blocking the test thread for 6 redundant seconds.
+    marmennill::orchestrator::cancel_all();
+
     let sleep_tool = ToolInvocation {
         name: "sleep".to_string(),
         arguments: serde_json::json!({
@@ -283,4 +287,6 @@ fn all_agents_permitted_sleep() {
             res.err()
         );
     }
+
+    marmennill::orchestrator::reset_cancellation();
 }
