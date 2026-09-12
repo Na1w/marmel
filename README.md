@@ -32,7 +32,7 @@ Marmel is a Rust-based CLI that connects to an OpenAI-compatible chat-completion
 - **Stream preemption & cooperative pause/resume** — mid-flight user steering and queries can pause/preempt active specialist LLM streams on shared local backends without losing state, servicing arbitration before resuming.
 - **Interactive Steer Arbitrator & multi-turn history** — real-time user steering mid-flight (respond, abort, queue, forward, approve/reject plan, delegate, or sleep) with multi-turn conversation memory, immediate stream preemption, and human-readable duration formatting (minutes and seconds).
 - **Agent sleep tool (`sleep`)** — universal sleep tool enabling specialists and the Steer Arbitrator to pause for $N$ seconds (with clean cancellation checks and cooperative runtime yielding) before retrying or checking status.
-- **Extended prefill watchdog** — 300s (5-minute) timeout window accommodating slow prefill on long-context local models (e.g. Gemma 4, Llama 3, DeepSeek) without premature aborts.
+- **Extended prefill watchdog** — 300s (5-minute) timeout window accommodating slow prefill on long-context local models (e.g. Qwen 3.8 27B, DeepSeek) without premature aborts.
 - **LLM streaming client** — SSE streaming with persistent HTTP connection pooling (`reqwest::Client`), retry/backoff, watchdog timeouts, and `[thinking]` tag demuxing.
 - **Deep-Freeze crash recovery & full UI rehydration** — in-flight delegations are snapshotted and journaled; sessions resume seamlessly with full restoration of chat history, execution plans, and past specialist subagent deliverables in the TUI Agent pane.
 - **MCP (Model Context Protocol) client** — JSON-RPC 2.0 over stdio and SSE/HTTP, with tool discovery, execution, and automatic child process cleanup (`kill_on_drop`) protecting against orphaned or zombie processes.
@@ -133,6 +133,20 @@ marmel --config /path/to/marmel.toml
 
 ---
 
+## Local Models & Recommendations
+
+Marmel's autonomous multi-agent architecture (planning, tool dispatch, strict role boundaries, and iterative self-correction) relies heavily on reliable JSON tool calling and solid instruction-following capabilities. When choosing a model for local or self-hosted deployment:
+
+- **Recommended:**
+  - **Qwen 3.8 27B** (`qwen-3.8-27b`) — strongly recommended for both Manager and specialist subagents, offering an optimal balance of throughput, reasoning depth, and robust JSON schema tool calling.
+  - **DeepSeek v4.0 Flash / v4.1 Flash** — highly capable alternative with fast prefill, accurate coding, and reliable multi-turn execution.
+- **Bare Minimum:**
+  - **Gemma 4 12B QAT** — the smallest model with which Marmel has been run successfully. Note that this is the absolute **bare minimum**; smaller parameter classes or weaker quantizations lack the reliability required for multi-step plan execution and role compliance.
+- **Not Recommended:**
+  - **Qwen 3.6 35B** — explicitly **not recommended** due to observed regressions in tool calling reliability and behavioral instability in agentic loops.
+
+---
+
 ## Configuration
 
 ### Config file lookup order
@@ -167,7 +181,7 @@ Applied after file config, before defaults:
 |---|---|---|
 | `backend_url` | `http://localhost:8000/v1` | OpenAI-compatible chat completions base URL (no trailing slash). |
 | `auth_token` | `""` | Optional bearer token. |
-| `model` | `llama3.1-8b-instruct` | Model identifier. |
+| `model` | `qwen-3.8-27b` | Model identifier (minimum recommended: Qwen 3.8 27B). |
 | `temperature` | `0.7` | Sampling temperature. |
 | `top_p` | `0.9` | Nucleus sampling. |
 | `frequency_penalty` | `0.0` | Frequency penalty. |
@@ -199,7 +213,7 @@ Marmel enforces strict context boundaries and Role-Based Access Control (RBAC). 
 
 ```toml
 backend_url = "http://localhost:8000/v1"
-model = "llama3.1-8b-instruct"
+model = "qwen-3.8-27b"
 max_context_tokens = 8192
 ui_mode = "tui"
 
@@ -303,7 +317,7 @@ The TUI is a 3-panel Ratatui interface: **Chat** / **Plan** / **Subagents**.
 
 The bottom status bar continuously reports session token metrics and active agent status:
 ```text
- Tokens: 1.5k in / 320 out (1.8k total) | Status: Running (gemma-4-12b) … [1 active: coder-t-001]
+ Tokens: 1.5k in / 320 out (1.8k total) | Status: Running (qwen-3.8-27b) … [1 active: coder-t-001]
 ```
 - **Tokens `in`:** Cumulative prompt tokens across all Manager and specialist subagent invocations.
 - **Tokens `out`:** Cumulative completion tokens (content, reasoning/thinking, and tool call payloads).
@@ -453,7 +467,7 @@ Marmel equips all agents and the Steer Arbitrator with a dedicated `sleep` tool 
 - **Proactive rebirth advisory at 80%:** Generates an advisory notification instructing the model to invoke `rebirth` with summarized continuation state (active file paths, exact read line numbers or byte offsets, intermediate data) before forced compaction occurs.
 - **Universal rebirth availability:** The `rebirth` tool is available to all roles, including the Validator, enabling clean state resets across the entire hierarchy.
 - **Forced compaction at 90%:** Escalates from 70% to 50% target ratios on compaction retries, pruning orphaned tool calls while strictly pinning system and goal messages.
-- **Slow-prefill watchdog (300s):** Provides a 5-minute timeout window accommodating slow prefill on long-context local models (e.g. Gemma 4, DeepSeek, Llama 3) without premature aborts.
+- **Slow-prefill watchdog (300s):** Provides a 5-minute timeout window accommodating slow prefill on long-context local models (e.g. Qwen 3.8 27B, DeepSeek) without premature aborts.
 
 ### Deep-Freeze crash recovery & full UI rehydration
 

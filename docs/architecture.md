@@ -8,7 +8,7 @@
 
 ## 1. Project Purpose
 
-**Marmel** (crate name `marmennill`, binary `marmel`, version 0.6.0 — `Cargo.toml:1-8`) is an **autonomous agentic coding assistant**: a terminal-driven orchestrator that plans, delegates, executes, and validates multi-step software engineering and research tasks against **any OpenAI-compatible LLM backend** (Ollama, vLLM, OpenRouter, local GPU servers) (`README.md:1-7`).
+**Marmel** (crate name `marmennill`, binary `marmel`, version 0.8.0 — `Cargo.toml:1-8`) is an **autonomous agentic coding assistant**: a terminal-driven orchestrator that plans, delegates, executes, and validates multi-step software engineering and research tasks against **any OpenAI-compatible LLM backend** (Ollama, vLLM, OpenRouter, local GPU servers) (`README.md:1-7`).
 
 ### 1.1 The problem it solves
 
@@ -135,7 +135,7 @@ Note the dual naming: new code says `manager`, older paths (and several doc comm
 
 | TOML key (example files) | Rust target | Notes |
 |---|---|---|
-| `backend_url`, `auth_token`, `model` | `Config` (`config.rs:93-95`) | Example: `http://localhost:8000/v1` + `llama3.1-8b-instruct`; cloud file: `http://127.0.0.1:11434/v1` + `deepseek-v4-flash:cloud` |
+| `backend_url`, `auth_token`, `model` | `Config` (`config.rs:93-95`) | Example: `http://localhost:8000/v1` + `qwen-3.8-27b`; cloud file: `http://127.0.0.1:11434/v1` + `deepseek-v4-flash:cloud` |
 | `temperature`, `top_p`, `frequency_penalty`, `presence_penalty` | `Config` (`config.rs:96-99`) | Sampling forwarded into `ChatRequest` (`src/types.rs:96-101`) |
 | `max_context_tokens` | `Config` (`config.rs:100`) | 8192 in example; **128000** in `marmel.toml.cloud`; drives compaction thresholds |
 | `preserve_thinking` | `Config` (`config.rs:102`) | Controls `ThinkingDemuxer` tag retention (`src/llm/thinking.rs:53`) |
@@ -149,7 +149,7 @@ Note the dual naming: new code says `manager`, older paths (and several doc comm
 
 ### 4.3 Loading pipeline (`src/config.rs:157-255`)
 
-1. Start from `Config::default()` (`config.rs:117-140`: backend `http://localhost:8000/v1`, model `llama3.1-8b-instruct`, `system_prompt_path = prompts/system.md`, `ui_mode = tui`, `enable_xml_rescue = true`).
+1. Start from `Config::default()` (`config.rs:117-140`: backend `http://localhost:8000/v1`, model `qwen-3.8-27b`, `system_prompt_path = prompts/system.md`, `ui_mode = tui`, `enable_xml_rescue = true`).
 2. **File resolution** (`resolve_config_path`, `config.rs:185-215`), first match wins: explicit `--config` → CWD `marmel.toml`, `.marmel.toml`, `.marmel/marmel.toml`, `.marmel/config.toml` → home `~/.marmel/marmel.toml`, `~/.marmel/config.toml`, `~/.config/marmel/config.toml`, `~/.config/marmel/marmel.toml`.
 3. The file is parsed into `PartialConfig` and **field-wise merged** (`merge`, `config.rs:257-349`); empty strings/absent fields keep defaults; `orchestration.specialists` and `mcp_servers` maps are extended rather than replaced.
 4. **Environment overrides** (`config.rs:165-179`): `MARMEL_AUTH_TOKEN`, `MARMEL_BACKEND_URL`, `MARMEL_MODEL`.

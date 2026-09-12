@@ -130,7 +130,7 @@ impl Default for Config {
         Config {
             backend_url: "http://localhost:8000/v1".to_string(),
             auth_token: String::new(),
-            model: "llama3.1-8b-instruct".to_string(),
+            model: "qwen-3.8-27b".to_string(),
             temperature: 0.7,
             top_p: 0.9,
             frequency_penalty: 0.0,
