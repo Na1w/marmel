@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use crate::tool_names::*;
 
 /// A message in the chat transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,7 +148,7 @@ impl ToolDef {
         ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
-                name: "delegate_task".to_string(),
+                name: TOOL_DELEGATE_TASK.to_string(),
                 description: "Dispatch a bounded unit of domain work to a specialist subagent. The subagent receives only the brief and the supplied snippets, never the full conversation history."
                     .to_string(),
                 parameters: serde_json::json!({
@@ -192,7 +193,7 @@ impl ToolDef {
         ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
-                name: "create_plan".to_string(),
+                name: TOOL_CREATE_PLAN.to_string(),
                 description:
                     "Write or overwrite the workspace execution plan in .marmel/execution_plan.md."
                         .to_string(),
@@ -214,7 +215,7 @@ impl ToolDef {
         ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
-                name: "read_file".to_string(),
+                name: TOOL_READ_FILE.to_string(),
                 description: "Read paginated UTF-8 text from a file by character offset and limit."
                     .to_string(),
                 parameters: serde_json::json!({
@@ -234,7 +235,7 @@ impl ToolDef {
         ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
-                name: "write_file".to_string(),
+                name: TOOL_WRITE_FILE.to_string(),
                 description: "Create a new file or completely overwrite an existing file."
                     .to_string(),
                 parameters: serde_json::json!({
@@ -253,7 +254,7 @@ impl ToolDef {
         ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
-                name: "replace".to_string(),
+                name: TOOL_REPLACE.to_string(),
                 description: "Replace an exact, unique block of text within a file. Fails if old_str matches 0 or >1 times."
                     .to_string(),
                 parameters: serde_json::json!({
@@ -273,7 +274,7 @@ impl ToolDef {
         ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
-                name: "run_command".to_string(),
+                name: TOOL_RUN_COMMAND.to_string(),
                 description: "Execute a command line inside a dedicated PTY with timeout and process-group isolation. For animations, TUIs, interactive programs, or servers, pass a short timeout_seconds (e.g. 3) to prevent indefinite blocking."
                     .to_string(),
                 parameters: serde_json::json!({
@@ -292,7 +293,7 @@ impl ToolDef {
         ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
-                name: "grep_search".to_string(),
+                name: TOOL_GREP_SEARCH.to_string(),
                 description:
                     "Search for a regex pattern across workspace files honoring .gitignore."
                         .to_string(),
@@ -313,7 +314,7 @@ impl ToolDef {
         ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
-                name: "glob".to_string(),
+                name: TOOL_GLOB.to_string(),
                 description: "Find files matching a glob pattern.".to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -330,7 +331,7 @@ impl ToolDef {
         ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
-                name: "rebirth".to_string(),
+                name: TOOL_REBIRTH.to_string(),
                 description: "Compact conversation history into a structured checkpoint summary to preserve context budget. CRITICAL: Your summary MUST record all pertinent state in detail so you can seamlessly continue without starting over—including active file paths, exact line numbers or byte offsets reached (e.g. when reading files with offset/limit in `read_file`), intermediate discoveries, variables, and immediate next actions."
                     .to_string(),
                 parameters: serde_json::json!({
@@ -351,7 +352,7 @@ impl ToolDef {
         ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
-                name: "archive_current_plan".to_string(),
+                name: TOOL_ARCHIVE_PLAN.to_string(),
                 description: "Archive the current execution plan to `.marmel/archive/` once all tasks have been completed."
                     .to_string(),
                 parameters: serde_json::json!({
@@ -366,7 +367,7 @@ impl ToolDef {
         ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
-                name: "pty_spawn".to_string(),
+                name: TOOL_PTY_SPAWN.to_string(),
                 description: "Spawn an interactive persistent PTY terminal session (e.g. for gdb, interactive shells, or long-running commands)."
                     .to_string(),
                 parameters: serde_json::json!({
@@ -387,7 +388,7 @@ impl ToolDef {
         ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
-                name: "pty_write".to_string(),
+                name: TOOL_PTY_WRITE.to_string(),
                 description: "Send input text or commands to an active interactive PTY session."
                     .to_string(),
                 parameters: serde_json::json!({
@@ -407,7 +408,7 @@ impl ToolDef {
         ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
-                name: "pty_read".to_string(),
+                name: TOOL_PTY_READ.to_string(),
                 description: "Read unread buffer output from an active interactive PTY session."
                     .to_string(),
                 parameters: serde_json::json!({
@@ -426,7 +427,7 @@ impl ToolDef {
         ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
-                name: "pty_close".to_string(),
+                name: TOOL_PTY_CLOSE.to_string(),
                 description: "Close an active interactive PTY session and kill its process group."
                     .to_string(),
                 parameters: serde_json::json!({
@@ -444,7 +445,7 @@ impl ToolDef {
         ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
-                name: "pty_list".to_string(),
+                name: TOOL_PTY_LIST.to_string(),
                 description: "List all active interactive PTY sessions.".to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -458,7 +459,7 @@ impl ToolDef {
         ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
-                name: "leave_verdict".to_string(),
+                name: TOOL_LEAVE_VERDICT.to_string(),
                 description: "Record the final verification verdict for this task. You must call this tool to finish validation."
                     .to_string(),
                 parameters: serde_json::json!({
@@ -484,7 +485,7 @@ impl ToolDef {
         ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
-                name: "sleep".to_string(),
+                name: TOOL_SLEEP.to_string(),
                 description: "Pause execution for a specified number of seconds before being invoked again. Useful when waiting for background builds, tests, or external processes to finish."
                     .to_string(),
                 parameters: serde_json::json!({

@@ -25,16 +25,16 @@ impl Specialist for Coder {
 
     fn tool_namespaces(&self) -> &[&'static str] {
         &[
-            "delegate_task",
-            "write_file",
-            "replace",
-            "read_file",
-            "run_command",
-            "grep_search",
-            "glob",
-            "rebirth",
-            "sleep",
-            "terminal__sleep",
+            crate::tool_names::TOOL_DELEGATE_TASK,
+            crate::tool_names::TOOL_WRITE_FILE,
+            crate::tool_names::TOOL_REPLACE,
+            crate::tool_names::TOOL_READ_FILE,
+            crate::tool_names::TOOL_RUN_COMMAND,
+            crate::tool_names::TOOL_GREP_SEARCH,
+            crate::tool_names::TOOL_GLOB,
+            crate::tool_names::TOOL_REBIRTH,
+            crate::tool_names::TOOL_SLEEP,
+            crate::tool_names::TERMINAL_SLEEP,
         ]
     }
 

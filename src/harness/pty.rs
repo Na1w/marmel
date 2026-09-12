@@ -48,9 +48,11 @@ pub const ULIMIT_FILE_BLOCKS_FALLBACK: &str = "2097152";
 /// - Bell (`\x07`) and backspace (`\x08`) are removed.
 /// - Other control characters below ` ` (0x20) are removed, except `\n`, `\r`,
 ///   `\t`, and `\x1b` (ESC, which is preserved so CSI color codes survive).
+static RE_OSC: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"\x1b\][0-9]+;.*?(?:\x07|\x1b\\)").unwrap());
+
 pub fn sanitize_terminal_output(text: &str) -> String {
-    let re_osc = Regex::new(r"\x1b\][0-9]+;.*?(?:\x07|\x1b\\)").unwrap();
-    let cleaned = re_osc.replace_all(text, "");
+    let cleaned = RE_OSC.replace_all(text, "");
     cleaned
         .chars()
         .filter(|&c| {

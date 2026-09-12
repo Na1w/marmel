@@ -24,23 +24,23 @@ impl Specialist for Debugger {
 
     fn tool_namespaces(&self) -> &[&'static str] {
         &[
-            "delegate_task",
-            "write_file",
-            "replace",
-            "read_file",
-            "run_command",
-            "grep_search",
-            "glob",
-            "pty_spawn",
-            "pty_write",
-            "pty_read",
-            "pty_close",
-            "pty_list",
+            crate::tool_names::TOOL_DELEGATE_TASK,
+            crate::tool_names::TOOL_WRITE_FILE,
+            crate::tool_names::TOOL_REPLACE,
+            crate::tool_names::TOOL_READ_FILE,
+            crate::tool_names::TOOL_RUN_COMMAND,
+            crate::tool_names::TOOL_GREP_SEARCH,
+            crate::tool_names::TOOL_GLOB,
+            crate::tool_names::TOOL_PTY_SPAWN,
+            crate::tool_names::TOOL_PTY_WRITE,
+            crate::tool_names::TOOL_PTY_READ,
+            crate::tool_names::TOOL_PTY_CLOSE,
+            crate::tool_names::TOOL_PTY_LIST,
             "pty__*",
             "pty_*",
-            "rebirth",
-            "sleep",
-            "terminal__sleep",
+            crate::tool_names::TOOL_REBIRTH,
+            crate::tool_names::TOOL_SLEEP,
+            crate::tool_names::TERMINAL_SLEEP,
         ]
     }
 }

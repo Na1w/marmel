@@ -31,7 +31,6 @@ pub fn message_style(msg: &str) -> (Style, bool) {
             true,
         )
     } else if first.starts_with("Marmennill: ")
-        || first.starts_with("Kvaser: ")
         || first.starts_with("[Steer Arbitrator]")
     {
         (

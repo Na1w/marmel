@@ -432,7 +432,7 @@ impl TuiRenderer {
             let prefix = if self
                 .messages
                 .last()
-                .is_some_and(|m| m.starts_with("Marmennill: ") || m.starts_with("Kvaser: "))
+                .is_some_and(|m| m.starts_with("Marmennill: "))
             {
                 ""
             } else {

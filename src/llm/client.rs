@@ -41,16 +41,11 @@ fn count_reply_tokens(
     reasoning: &str,
     tool_calls: &[crate::types::ToolCall],
 ) -> usize {
-    let enc = tiktoken_rs::cl100k_base_singleton();
-    enc.encode_ordinary(content).len()
-        + enc.encode_ordinary(reasoning).len()
-        + tool_calls
-            .iter()
-            .map(|tc| {
-                1 + enc.encode_ordinary(&tc.function.name).len()
-                    + enc.encode_ordinary(&tc.function.arguments).len()
-            })
-            .sum::<usize>()
+    crate::manager::context::count_assistant_tokens(
+        if content.is_empty() { None } else { Some(content) },
+        if reasoning.is_empty() { None } else { Some(reasoning) },
+        tool_calls,
+    )
 }
 
 /// A single fully-assembled assistant reply chunk sequence.
@@ -69,6 +64,14 @@ pub struct ChatClient {
     auth_token: String,
     model: String,
     initial_timeout_secs: u64,
+    client: reqwest::Client,
+}
+
+fn default_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Error)]
@@ -110,6 +113,7 @@ impl ChatClient {
             auth_token: cfg.auth_token.clone(),
             model: cfg.model.clone(),
             initial_timeout_secs: INITIAL_RESPONSE_WATCHDOG_SECS,
+            client: default_http_client(),
         }
     }
 
@@ -119,6 +123,7 @@ impl ChatClient {
             auth_token: String::new(),
             model: model.into(),
             initial_timeout_secs: INITIAL_RESPONSE_WATCHDOG_SECS,
+            client: default_http_client(),
         }
     }
 
@@ -132,7 +137,13 @@ impl ChatClient {
             auth_token: auth_token.into(),
             model: model.into(),
             initial_timeout_secs: INITIAL_RESPONSE_WATCHDOG_SECS,
+            client: default_http_client(),
         }
+    }
+
+    pub fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
+        self
     }
 
     pub fn with_initial_timeout_secs(mut self, secs: u64) -> Self {
@@ -184,10 +195,7 @@ impl ChatClient {
     where
         F: FnMut(&str) -> bool,
     {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| ChatError::Transport(e.to_string()))?;
+        let client = &self.client;
 
         let url = format!(
             "{}/chat/completions",

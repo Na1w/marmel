@@ -71,6 +71,24 @@ pub fn count_tokens(messages: &[Message]) -> usize {
     messages.iter().map(|m| message_tokens(enc, m)).sum()
 }
 
+/// Count BPE tokens for an assistant turn's content, reasoning, and tool calls.
+pub fn count_assistant_tokens(
+    content: Option<&str>,
+    reasoning: Option<&str>,
+    tool_calls: &[crate::types::ToolCall],
+) -> usize {
+    let enc = bpe();
+    content.map_or(0, |c| enc.encode_ordinary(c).len())
+        + reasoning.map_or(0, |r| enc.encode_ordinary(r).len())
+        + tool_calls
+            .iter()
+            .map(|tc| {
+                1 + enc.encode_ordinary(&tc.function.name).len()
+                    + enc.encode_ordinary(&tc.function.arguments).len()
+            })
+            .sum::<usize>()
+}
+
 /// BPE token count of a single message: 3 tokens framing overhead plus the
 /// encoded lengths of its content, reasoning, tool calls, or tool content.
 fn message_tokens(enc: &tiktoken_rs::CoreBPE, m: &Message) -> usize {
@@ -82,19 +100,11 @@ fn message_tokens(enc: &tiktoken_rs::CoreBPE, m: &Message) -> usize {
             content,
             reasoning_content,
             tool_calls,
-        } => {
-            content.as_ref().map_or(0, |c| enc.encode_ordinary(c).len())
-                + reasoning_content
-                    .as_ref()
-                    .map_or(0, |r| enc.encode_ordinary(r).len())
-                + tool_calls
-                    .iter()
-                    .map(|tc| {
-                        1 + enc.encode_ordinary(&tc.function.name).len()
-                            + enc.encode_ordinary(&tc.function.arguments).len()
-                    })
-                    .sum::<usize>()
-        }
+        } => count_assistant_tokens(
+            content.as_deref(),
+            reasoning_content.as_deref(),
+            tool_calls,
+        ),
         Message::Tool { content, .. } => enc.encode_ordinary(content).len(),
     }
 }

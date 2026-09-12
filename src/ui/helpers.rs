@@ -37,10 +37,15 @@ pub fn format_plan_progress_summary(plan_content: &str) -> String {
     crate::orchestrator::generate_plan_progress_summary(plan_content)
 }
 pub(crate) fn load_system_prompt_with_plan(
-    _cfg: &Config,
+    cfg: &Config,
     plan: &crate::manager::phase::Plan,
 ) -> Result<String> {
-    let content = include_str!("../../prompts/system.md");
+    let content = if cfg.system_prompt_path.exists() {
+        std::fs::read_to_string(&cfg.system_prompt_path)
+            .unwrap_or_else(|_| include_str!("../../prompts/system.md").to_string())
+    } else {
+        include_str!("../../prompts/system.md").to_string()
+    };
     let env_block = crate::prompts::format_environment_block();
     let mut prompt = format!("{content}\n\n{env_block}\n");
     if let Ok(Some(plan_content)) = plan.read()
@@ -61,14 +66,14 @@ pub(crate) fn load_system_prompt(cfg: &Config) -> Result<String> {
 
 pub(crate) fn format_tool_call_display(name: &str, args_val: &serde_json::Value) -> String {
     match name {
-        "create_plan" => {
+        crate::tool_names::TOOL_CREATE_PLAN => {
             let len = args_val
                 .get("plan_markdown")
                 .and_then(serde_json::Value::as_str)
                 .map_or(0, str::len);
             format!("create_plan(plan_markdown: {len} chars)")
         }
-        "delegate_task" => {
+        crate::tool_names::TOOL_DELEGATE_TASK => {
             let agent = args_val
                 .get("agent_name")
                 .and_then(serde_json::Value::as_str)
@@ -83,7 +88,9 @@ pub(crate) fn format_tool_call_display(name: &str, args_val: &serde_json::Value)
                 format!("delegate_task(agent: {agent}, task_id: {task_id})")
             }
         }
-        "write_file" | "read_file" | "replace" => {
+        crate::tool_names::TOOL_WRITE_FILE
+        | crate::tool_names::TOOL_READ_FILE
+        | crate::tool_names::TOOL_REPLACE => {
             let path = args_val
                 .get("path")
                 .and_then(serde_json::Value::as_str)
@@ -94,7 +101,7 @@ pub(crate) fn format_tool_call_display(name: &str, args_val: &serde_json::Value)
                 format!("{name}({path})")
             }
         }
-        "run_command" => {
+        crate::tool_names::TOOL_RUN_COMMAND => {
             let cmd = args_val
                 .get("command")
                 .and_then(serde_json::Value::as_str)
@@ -105,7 +112,7 @@ pub(crate) fn format_tool_call_display(name: &str, args_val: &serde_json::Value)
                 format!("run_command({cmd})")
             }
         }
-        "grep_search" => {
+        crate::tool_names::TOOL_GREP_SEARCH => {
             let query = args_val
                 .get("pattern")
                 .or_else(|| args_val.get("query"))
@@ -117,7 +124,7 @@ pub(crate) fn format_tool_call_display(name: &str, args_val: &serde_json::Value)
                 format!("grep_search({query})")
             }
         }
-        "glob" => {
+        crate::tool_names::TOOL_GLOB => {
             let pattern = args_val
                 .get("pattern")
                 .and_then(serde_json::Value::as_str)

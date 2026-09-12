@@ -242,6 +242,7 @@ struct PartialConfig {
     pub command_timeout_secs: Option<u64>,
     pub max_repetition_threshold: Option<usize>,
     pub enable_xml_rescue: Option<bool>,
+    pub max_thinking_tokens: Option<usize>,
     pub ui_mode: Option<String>,
     pub monitoring: Option<PartialMonitoringConfig>,
     pub orchestration: Option<PartialOrchestrationConfig>,
@@ -254,6 +255,8 @@ struct PartialMonitoringConfig {
     pub enabled: Option<bool>,
     pub repetition_threshold: Option<usize>,
     pub min_pattern_len: Option<usize>,
+    pub max_stream_tokens: Option<usize>,
+    pub max_thinking_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -319,6 +322,9 @@ fn merge(mut base: Config, partial: PartialConfig) -> Config {
     if let Some(v) = partial.enable_xml_rescue {
         base.enable_xml_rescue = v;
     }
+    if let Some(v) = partial.max_thinking_tokens {
+        base.max_thinking_tokens = v;
+    }
 
     if let Some(p_mon) = partial.monitoring {
         let base_mon = base
@@ -332,6 +338,12 @@ fn merge(mut base: Config, partial: PartialConfig) -> Config {
         }
         if let Some(l) = p_mon.min_pattern_len {
             base_mon.min_pattern_len = l;
+        }
+        if let Some(s) = p_mon.max_stream_tokens {
+            base_mon.max_stream_tokens = s;
+        }
+        if let Some(th) = p_mon.max_thinking_tokens {
+            base_mon.max_thinking_tokens = th;
         }
     }
 
@@ -543,5 +555,24 @@ mod tests {
         let retrieved = get_active().expect("active config should be present");
         assert_eq!(retrieved.model, "test-custom-model-123");
         assert_eq!(retrieved.backend_url, "http://custom:1234/v1");
+    }
+
+    #[test]
+    fn test_monitoring_stream_and_thinking_tokens_parse() {
+        let toml_str = r#"
+            max_thinking_tokens = 16384
+
+            [monitoring]
+            enabled = true
+            max_stream_tokens = 32768
+            max_thinking_tokens = 8192
+        "#;
+        let partial: PartialConfig = toml::from_str(toml_str).expect("parses");
+        let cfg = merge(Config::default(), partial);
+
+        assert_eq!(cfg.max_thinking_tokens, 16384);
+        let mon = cfg.monitoring.expect("monitoring present");
+        assert_eq!(mon.max_stream_tokens, 32768);
+        assert_eq!(mon.max_thinking_tokens, 8192);
     }
 }

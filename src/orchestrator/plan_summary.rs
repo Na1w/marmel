@@ -1,9 +1,17 @@
 //! Real-time execution plan progress and active worker correlation summary.
 
 use super::workers::has_active_workers;
+use std::sync::LazyLock;
+
+static RE_ID: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\b(t-[a-zA-Z0-9_\-]+)\b").unwrap());
+static RE_CHECKBOX_DONE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\[[xX]\]").unwrap());
+static RE_CHECKBOX_PENDING: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\[\s*\]|\(\s*\)").unwrap());
 
 /// Dynamically parses the markdown execution plan and correlates each task with active background workers.
-/// Generates real-time breakdown of Completed, Currently In Progress, and Pending steps matching Kvaser.
+/// Generates real-time breakdown of Completed, Currently In Progress, and Pending steps.
 pub fn generate_plan_progress_summary(plan_content: &str) -> String {
     if plan_content.trim().is_empty() || plan_content == "None" {
         return "No active execution plan on disk.".to_string();
@@ -13,10 +21,6 @@ pub fn generate_plan_progress_summary(plan_content: &str) -> String {
     let mut in_progress_tasks = Vec::new();
     let mut pending_tasks = Vec::new();
 
-    let re_id = regex::Regex::new(r"\b(t-[a-zA-Z0-9_\-]+)\b").unwrap();
-    let re_checkbox_done = regex::Regex::new(r"\[[xX]\]").unwrap();
-    let re_checkbox_pending = regex::Regex::new(r"\[\s*\]|\(\s*\)").unwrap();
-
     let _has_workers = has_active_workers();
 
     for line in plan_content.lines() {
@@ -25,9 +29,9 @@ pub fn generate_plan_progress_summary(plan_content: &str) -> String {
             continue;
         }
 
-        let is_done = re_checkbox_done.is_match(trimmed);
-        let is_pending = re_checkbox_pending.is_match(trimmed)
-            || (!is_done && re_id.is_match(trimmed) && !trimmed.starts_with('#'));
+        let is_done = RE_CHECKBOX_DONE.is_match(trimmed);
+        let is_pending = RE_CHECKBOX_PENDING.is_match(trimmed)
+            || (!is_done && RE_ID.is_match(trimmed) && !trimmed.starts_with('#'));
 
         if is_done {
             let clean_line = trimmed
@@ -57,7 +61,7 @@ pub fn generate_plan_progress_summary(plan_content: &str) -> String {
                 })
                 .trim();
 
-            let matched_active = if let Some(cap) = re_id.captures(trimmed) {
+            let matched_active = if let Some(cap) = RE_ID.captures(trimmed) {
                 let tid = cap.get(1).unwrap().as_str().to_lowercase();
                 super::workers::get_active_subtask_by_id(&tid)
             } else {
