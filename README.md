@@ -10,7 +10,9 @@ Marmel is a Rust-based CLI that connects to an OpenAI-compatible chat-completion
 
 - [Features](#features)
 - [Architecture](#architecture)
+- [Interactive Prototyping & Steering](#interactive-prototyping--steering)
 - [Quick Start](#quick-start)
+- [Local Models & Recommendations](#local-models--recommendations)
 - [Configuration](#configuration)
 - [Usage](#usage)
 - [Specialist Roles](#specialist-roles)
@@ -84,6 +86,19 @@ Marmel is a Rust-based CLI that connects to an OpenAI-compatible chat-completion
 4. Each specialist runs in an **isolated context** (role prompt + task brief + bounded snippets), executes tools against the local workspace, and returns a deliverable with a terminal marker (`MISSION COMPLETE`, `FAILED`, or `REPLAN REQUIRED`).
 5. A Validator subagent audits the deliverable; rejected work is fed back for revision.
 6. The Manager auto-checks-off completed plan tasks on disk and synthesizes the final answer.
+
+---
+
+## Interactive Prototyping & Steering
+
+Marmel is designed around the core philosophy that **autonomous coding is most effective when paired with continuous, real-time interactivity**:
+
+- **Autonomy First — Rapid Prototyping:** Marmel's primary mission is autonomous coding. Given a high-level goal, it autonomously explores the workspace, architects a disk-backed execution plan, delegates atomic tasks to specialized subagents, writes code, runs terminal commands, and validates deliverables to produce functional, working prototypes quickly.
+- **Designed for Continuous Interactivity:** Marmel never locks you out into a passive waiting state. At any point—even while subagents are actively streaming tokens or running commands—you can type into the prompt:
+  - **Give instant feedback & steering:** Clarify requirements, provide course corrections, reject or modify planned tasks, or steer the technical approach mid-flight.
+  - **Ask questions & discuss:** Wondering why an agent chose a specific approach, what an error message means, or what the current execution state looks like? Ask freely. The Steer Arbitrator will cooperatively pause active specialist streams, answer your question or discuss alternatives, and resume execution without losing state.
+  - **Full conversational memory:** Multi-turn steering history ensures you can have natural, context-aware dialogues with the model throughout the entire lifecycle of a task.
+- **Iterative Refinement:** Prototyping is just the beginning. Once Marmel delivers an initial working implementation, the workflow naturally flows into iterative enhancement. You review the output, suggest adjustments, and let Marmel autonomously iterate on edge cases, test coverage, performance optimizations, and polish.
 
 ---
 
