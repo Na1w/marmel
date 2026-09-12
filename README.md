@@ -543,6 +543,6 @@ MIT
 
 - **Name:** `marmennill`
 - **Binary / CLI:** `marmel`
-- **Version:** `0.7.0`
+- **Version:** `0.8.0`
 - **Language:** Rust (edition 2024, `rust-version = "1.98"`)
 - **Repository:** `https://github.com/Na1w/marmel.git` (branch `main`)
