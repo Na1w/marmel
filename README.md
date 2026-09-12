@@ -27,15 +27,15 @@ Marmel is a Rust-based CLI that connects to an OpenAI-compatible chat-completion
 - **Disk-backed execution plan & auto-resume** — the plan lives at `.marmel/execution_plan.md` in `- [ ] [t-xxx]` checkbox format, auto-checked-off on completion, auto-resumed on session restart, and archived when done.
 - **Five specialist roles** with per-role tool allowlists — `coder`, `researcher`, `debugger`, `validator`, and `generalist`.
 - **Automated validation loop** — specialist deliverables are automatically audited by a Validator subagent; rejected work is fed back for revision (up to 5 iterations by default).
-- **Multi-tier resilience harness** — XML tool-call rescue, semantic tool repetition detection, and text loop breaking (consecutive lines, line bigrams, word 4-grams) with live SSE stream interruption and automatic retry.
+- **Multi-tier resilience harness** — XML tool-call rescue, semantic tool repetition detection, and text loop breaking (consecutive lines, line bigrams, word 4-grams) with live SSE stream interruption and automatic retry, integrated across specialist execution and the interactive session loop.
 - **Context engine with proactive rebirth & compaction** — `cl100k_base` BPE token counting, KV-cache prefix preservation, proactive rebirth advisory at 80% budget with state preservation instructions (offsets, files, data), forced compaction at 90%, and universal `rebirth` tool availability across all agents and validators.
 - **Stream preemption & cooperative pause/resume** — mid-flight user steering and queries can pause/preempt active specialist LLM streams on shared local backends without losing state, servicing arbitration before resuming.
 - **Interactive Steer Arbitrator & multi-turn history** — real-time user steering mid-flight (respond, abort, queue, forward, approve/reject plan, delegate, or sleep) with multi-turn conversation memory, immediate stream preemption, and human-readable duration formatting (minutes and seconds).
 - **Agent sleep tool (`sleep`)** — universal sleep tool enabling specialists and the Steer Arbitrator to pause for $N$ seconds (with clean cancellation checks and cooperative runtime yielding) before retrying or checking status.
 - **Extended prefill watchdog** — 300s (5-minute) timeout window accommodating slow prefill on long-context local models (e.g. Gemma 4, Llama 3, DeepSeek) without premature aborts.
-- **LLM streaming client** — SSE streaming with retry/backoff, watchdog timeouts, and `[thinking]` tag demuxing.
+- **LLM streaming client** — SSE streaming with persistent HTTP connection pooling (`reqwest::Client`), retry/backoff, watchdog timeouts, and `[thinking]` tag demuxing.
 - **Deep-Freeze crash recovery & full UI rehydration** — in-flight delegations are snapshotted and journaled; sessions resume seamlessly with full restoration of chat history, execution plans, and past specialist subagent deliverables in the TUI Agent pane.
-- **MCP (Model Context Protocol) client** — JSON-RPC 2.0 over stdio and SSE/HTTP, with tool discovery and execution.
+- **MCP (Model Context Protocol) client** — JSON-RPC 2.0 over stdio and SSE/HTTP, with tool discovery, execution, and automatic child process cleanup (`kill_on_drop`) protecting against orphaned or zombie processes.
 - **Reasoning budget enforcement & stream cutoff** — configurable per-specialist and global limits on thinking tokens (`max_thinking_tokens`) with mid-stream cutoff and seamless corrective continuation prompts to prevent runaway reasoning loops.
 - **High-performance, low-overhead UI rendering** — batched async event draining and 40 FPS frame throttling ensure near-zero CPU usage during idle periods and high-throughput streaming.
 - **Two UI modes** — an interactive 3-panel Ratatui TUI (with subagent auto-focus, scroll clamping, and full horizontal cursor navigation) and a headless raw streaming mode.
@@ -419,8 +419,8 @@ Specialist deliverables are automatically audited by a Validator subagent. The `
 
 ### Resilience
 
-- **XML tool-call rescue** — recovers plain-text XML tool calls into structured JSON.
-- **Semantic tool repetition & cycle gate** — blocks identical repeated calls and cuts alternating tool cycles.
+- **XML tool-call rescue** — recovers plain-text XML tool calls into structured JSON, active in both specialist subagent runs and the interactive session loop.
+- **Semantic tool repetition & cycle gate** — blocks identical repeated calls and cuts alternating tool cycles across specialist execution and interactive Manager sessions.
 - **Multi-tier text repetition breaker** — rolling 16,384-char buffer tracking:
   - $\ge 3$ identical consecutive lines.
   - $\ge 3$ repeated line bigrams.
@@ -486,7 +486,7 @@ Marmel is continuously built and tested across all supported target platforms vi
 - Every commit and pull request runs:
   - `cargo fmt --all -- --check`
   - `cargo clippy --all-targets --all-features -- -D warnings`
-  - `cargo test --all-targets --all-features` (320+ unit & integration tests)
+  - `cargo test --all-targets --all-features` (370+ unit & integration tests)
   - `cargo build --release` (optimized binary verification)
 
 ---
