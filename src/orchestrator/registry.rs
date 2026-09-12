@@ -36,87 +36,18 @@ impl SpecialistRegistry {
     /// MUST be present; the Manager validates against this set.
     pub fn canonical() -> Self {
         let mut reg = Self::default();
-        reg.register(
-            Agent::Coder,
-            "src/agents/coder.rs",
-            &[
-                "delegate_task",
-                "write_file",
-                "replace",
-                "read_file",
-                "run_command",
-                "grep_search",
-                "glob",
-                "rebirth",
-                "sleep",
-                "terminal__sleep",
-            ],
-            None,
-        );
-        reg.register(
-            Agent::Researcher,
-            "src/agents/researcher.rs",
-            &[
-                "delegate_task",
-                "write_file",
-                "replace",
-                "read_file",
-                "run_command",
-                "grep_search",
-                "glob",
-                "rebirth",
-                "sleep",
-                "terminal__sleep",
-            ],
-            None,
-        );
-        reg.register(
-            Agent::Debugger,
-            "src/agents/debugger.rs",
-            &[
-                "delegate_task",
-                "write_file",
-                "replace",
-                "read_file",
-                "run_command",
-                "grep_search",
-                "glob",
-                "pty_spawn",
-                "pty_write",
-                "pty_read",
-                "pty_close",
-                "pty_list",
-                "pty__*",
-                "pty_*",
-                "rebirth",
-                "sleep",
-                "terminal__sleep",
-            ],
-            None,
-        );
-        reg.register(
-            Agent::Validator,
-            "src/agents/validator.rs",
-            &[
-                "delegate_task",
-                "read_file",
-                "grep_search",
-                "glob",
-                "pty_spawn",
-                "pty_write",
-                "pty_read",
-                "pty_close",
-                "pty_list",
-                "pty__*",
-                "pty_*",
-                "leave_verdict",
-                "rebirth",
-                "sleep",
-                "terminal__sleep",
-            ],
-            None,
-        );
-        reg.register(Agent::Generalist, "src/agents/generalist.rs", &["*"], None);
+        let canonical_specs: [(Agent, &str); 5] = [
+            (Agent::Coder, "src/agents/coder.rs"),
+            (Agent::Researcher, "src/agents/researcher.rs"),
+            (Agent::Debugger, "src/agents/debugger.rs"),
+            (Agent::Validator, "src/agents/validator.rs"),
+            (Agent::Generalist, "src/agents/generalist.rs"),
+        ];
+        for (agent, module) in canonical_specs {
+            let worker = reg.worker(agent);
+            let tools = worker.tool_namespaces();
+            reg.register(agent, module, tools, None);
+        }
         reg
     }
 

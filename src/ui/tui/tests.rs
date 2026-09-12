@@ -469,10 +469,6 @@ fn test_orchestrator_content_is_white_and_steer_is_yellow() {
     assert_eq!(yellow_style.fg, Some(Color::LightYellow));
     assert!(yellow_style.add_modifier.contains(Modifier::BOLD));
 
-    let (kvaser_style, special_kvaser) = message_style("Kvaser: Direct answer");
-    assert!(special_kvaser);
-    assert_eq!(kvaser_style.fg, Some(Color::LightYellow));
-
     let mut r = TuiRenderer::new();
     // Orchestrator stream -> goes to current_content
     r.on_event(&Event::Message("chunk of orchestrator".to_string()));

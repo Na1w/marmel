@@ -196,7 +196,9 @@ async fn write_plan_internal(
     md: &str,
     custom_plan: Option<crate::manager::phase::Plan>,
 ) -> Result<ToolResult, ToolError> {
-    let cfg = crate::config::load(None).unwrap_or_default();
+    let cfg = crate::config::get_active()
+        .or_else(|| crate::config::load(None).ok())
+        .unwrap_or_default();
     let token = if custom_plan.is_some() {
         tokio_util::sync::CancellationToken::new()
     } else {

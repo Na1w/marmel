@@ -30,10 +30,7 @@ pub fn message_style(msg: &str) -> (Style, bool) {
                 .add_modifier(Modifier::BOLD),
             true,
         )
-    } else if first.starts_with("Marmennill: ")
-        || first.starts_with("Kvaser: ")
-        || first.starts_with("[Steer Arbitrator]")
-    {
+    } else if first.starts_with("Marmennill: ") || first.starts_with("[Steer Arbitrator]") {
         (
             Style::default()
                 .fg(Color::LightYellow)

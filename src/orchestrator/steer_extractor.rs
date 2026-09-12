@@ -30,8 +30,9 @@ impl StreamingResponseExtractor {
                 if let Some(colon_pos) = rest.find(':') {
                     let after_colon = &rest[colon_pos + 1..];
                     let trimmed = after_colon.trim_start();
-                    if trimmed.starts_with('"') {
-                        let quote_pos = after_colon.find('"').unwrap();
+                    if let Some(quote_pos) = after_colon.find('"')
+                        && trimmed.starts_with('"')
+                    {
                         self.in_response_field = true;
                         let content_after_quote = &after_colon[quote_pos + 1..];
                         let chars: Vec<char> = content_after_quote.chars().collect();

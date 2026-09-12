@@ -32,6 +32,14 @@ pub async fn run_session(
     let mut ctx = ContextEngine::new(cfg.max_context_tokens);
     ctx.set_system_prompt(system.clone());
 
+    let stats = manager
+        .as_ref()
+        .map(|m| Arc::clone(&m.stats))
+        .unwrap_or_else(|| Arc::new(crate::harness::HarnessStats::new()));
+    let default_mon = crate::config::MonitoringConfig::default();
+    let mon_cfg = cfg.monitoring.as_ref().unwrap_or(&default_mon);
+    let mut monitor = crate::harness::monitor::HarnessMonitor::new_with_config(stats, mon_cfg);
+
     let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let (steer_arb_tx, mut steer_arb_rx) = tokio::sync::mpsc::unbounded_channel::<SteerArbEvent>();
@@ -370,12 +378,20 @@ pub async fn run_session(
                     content,
                     ..
                 } => {
-                    if tool_calls.is_empty()
-                        && let Some(text) = content
-                    {
-                        crate::debug_log::log_user_output("assistant_reply", text);
+                    if tool_calls.is_empty() {
+                        if let Some(text) = content {
+                            crate::debug_log::log_user_output("assistant_reply", text);
+                            if cfg.enable_xml_rescue {
+                                monitor.rescue_xml(text)
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        tool_calls.clone()
                     }
-                    tool_calls.clone()
                 }
                 _ => Vec::new(),
             };
@@ -497,6 +513,35 @@ pub async fn run_session(
                     } else {
                         renderer
                             .on_event(&Event::ToolCall(format_tool_call_display(&name, &args_val)));
+                    }
+
+                    let intervention = monitor.observe_tool(&name, &args_val);
+                    if matches!(
+                        intervention,
+                        crate::harness::monitor::Intervention::Block
+                            | crate::harness::monitor::Intervention::Cut
+                    ) {
+                        let err_msg = monitor.intervention_error(intervention).unwrap_or_else(|| {
+                            format!(
+                                "ERROR: Tool repetition detected for '{}'. Do not repeat identical calls.",
+                                call.function.name
+                            )
+                        });
+                        tracing::warn!(
+                            "Manager tool {} blocked by repetition detector",
+                            call.function.name
+                        );
+                        let call_id = call.id.clone();
+                        let handle = tokio::task::spawn_blocking(move || {
+                            (
+                                call_id,
+                                delegated_agent,
+                                delegated_task,
+                                Ok(crate::harness::ToolResult::err(err_msg)),
+                            )
+                        });
+                        handles.push(handle);
+                        continue;
                     }
 
                     let invocation = crate::harness::ToolInvocation {
@@ -773,6 +818,32 @@ pub async fn run_session(
                     }
 
                     ctx.reset_consecutive_rebirths();
+
+                    let intervention = monitor.observe_tool(&name, &args_val);
+                    if matches!(
+                        intervention,
+                        crate::harness::monitor::Intervention::Block
+                            | crate::harness::monitor::Intervention::Cut
+                    ) {
+                        let err_msg = monitor.intervention_error(intervention).unwrap_or_else(|| {
+                            format!(
+                                "ERROR: Tool repetition detected for '{}'. Do not repeat identical calls.",
+                                call.function.name
+                            )
+                        });
+                        tracing::warn!(
+                            "Manager tool {} blocked by repetition detector",
+                            call.function.name
+                        );
+                        renderer.on_event(&Event::ToolResult(format!("ERROR: {err_msg}")));
+                        renderer.flush()?;
+                        ctx.append(Message::Tool {
+                            tool_call_id: call.id.clone(),
+                            content: format!("ERROR: {err_msg}"),
+                        });
+                        let _ = ctx.save_transcript(&transcript_path);
+                        continue;
+                    }
 
                     let invocation = crate::harness::ToolInvocation {
                         name: name.clone(),

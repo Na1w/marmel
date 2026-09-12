@@ -515,3 +515,13 @@ fn test_check_off_avoids_substring_collision() {
 
     fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn test_output_is_success_benign_failure_phrases() {
+    assert!(output_is_success("All tests passed. 0 failed; 0 errors"));
+    assert!(output_is_success("Operation completed without error."));
+    assert!(output_is_success("0 tests failed."));
+    assert!(!output_is_success("Compilation error: undefined variable"));
+    assert!(!output_is_success("FAILED to run tests"));
+    assert!(!output_is_success("REPLAN REQUIRED: missing dependency"));
+}

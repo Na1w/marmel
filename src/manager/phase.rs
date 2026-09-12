@@ -28,7 +28,7 @@
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 /// Directory (relative to the workspace) holding the plan and phase override.
 pub const MARMEL_DIR: &str = ".marmel";
@@ -59,20 +59,39 @@ impl MissionPhase {
     }
 }
 
-/// A regex matching a task line in the `- [ ] [t-xxx]` format (with optional indentation or bolding).
-///
-/// The capture group holds the task id (e.g. `t-001`).
-fn task_line_re() -> Regex {
+static TASK_LINE_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
     Regex::new(r"(?mi)^\s*[-*]\s*\[\s*\]\s*\*{0,2}\[?(t-[A-Za-z0-9_-]+)\]?\*{0,2}")
         .expect("valid task regex")
-}
+});
+
+static ALL_TASKS_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"(?mi)^\s*[-*]\s*\[\s*[ xX]?\s*\]\s*\*{0,2}\[?(t-[A-Za-z0-9_-]+)\]?\*{0,2}")
+        .expect("valid task regex")
+});
+
+static UNCHECKED_BOX_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"\[\s*\]|\(\s*\)").expect("unchecked box regex"));
+
+static CHECKED_BOX_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"\[[xX]\]|\([xX]\)").expect("checked box regex"));
 
 /// Returns `true` when a tool's output indicates success, i.e. it does not
 /// contain the error markers `ERROR`, `FAILED`, or `REPLAN REQUIRED`
-/// (REQ-PLAN-002). Comparison is case-insensitive.
+/// (REQ-PLAN-002). Benign phrases like "0 tests failed" or "no error" are exempted.
 pub fn output_is_success(output: &str) -> bool {
     let upper = output.to_ascii_uppercase();
-    !upper.contains("ERROR") && !upper.contains("FAILED") && !upper.contains("REPLAN REQUIRED")
+    if upper.contains("REPLAN REQUIRED") {
+        return false;
+    }
+    let sanitized = upper
+        .replace("0 FAILED", "")
+        .replace("0 TESTS FAILED", "")
+        .replace("0 TEST FAILED", "")
+        .replace("NO ERROR", "")
+        .replace("NO ERRORS", "")
+        .replace("WITHOUT ERROR", "")
+        .replace("0 ERRORS", "");
+    !sanitized.contains("ERROR") && !sanitized.contains("FAILED")
 }
 
 /// Mutex ensuring atomic filesystem operations across parallel subagents on the execution plan.
@@ -149,20 +168,19 @@ pub fn get_plan_start_time() -> Option<(std::time::Instant, chrono::DateTime<chr
     None
 }
 
-/// Regex matching a `(t-xxx)` / `[t-xxx]` task-id token. Compiled exactly once
-/// via `OnceLock` (CODE_REVIEW Point 2).
-static TASK_ID_RE: OnceLock<Regex> = OnceLock::new();
+/// Regex matching a `(t-xxx)` / `[t-xxx]` task-id token.
+static TASK_ID_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\(?\[?(t-[A-Za-z0-9_-]+)\]?\)?").expect("valid task-id regex"));
 
 /// Extract the first `(t-xxx)` task-id token from text. Used to bind a
 /// `MISSION COMPLETE (t-xxx)` marker to its plan line (REQ-ORCH-005). The
 /// regex is intentionally self-contained so this module carries no dependency
 /// on the agents module.
 fn find_task_id(text: &str) -> Option<String> {
-    let re = TASK_ID_RE.get_or_init(|| {
-        Regex::new(r"\(?\[?(t-[A-Za-z0-9_-]+)\]?\)?").expect("valid task-id regex")
-    });
-    re.captures(text)
-        .map(|c| c.get(1).unwrap().as_str().to_string())
+    TASK_ID_RE
+        .captures(text)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
 }
 
 /// The terminal marker a subagent appends to its deliverable
@@ -360,12 +378,8 @@ impl Plan {
 
     /// Parse *all* task ids present in the plan (both `- [ ]` and `- [x]`).
     pub fn all_tasks(&self) -> Vec<String> {
-        let re = Regex::new(
-            r"(?mi)^\s*[-*]\s*\[\s*[ xX]?\s*\]\s*\*{0,2}\[?(t-[A-Za-z0-9_-]+)\]?\*{0,2}",
-        )
-        .expect("valid task regex");
         match self.read() {
-            Ok(Some(content)) => re
+            Ok(Some(content)) => ALL_TASKS_RE
                 .captures_iter(&content)
                 .map(|c| c[1].to_string())
                 .collect(),
@@ -379,13 +393,11 @@ impl Plan {
             return false;
         };
         // If there are ANY unchecked checkboxes (`[ ]` or `( )`) anywhere in the plan, it is NOT complete!
-        let re_unchecked = Regex::new(r"\[\s*\]|\(\s*\)").expect("unchecked box regex");
-        if re_unchecked.is_match(&content) {
+        if UNCHECKED_BOX_RE.is_match(&content) {
             return false;
         }
         // Must contain at least one completed checkbox ([x] or (x))
-        let re_checked = Regex::new(r"\[[xX]\]|\([xX]\)").expect("checked box regex");
-        re_checked.is_match(&content)
+        CHECKED_BOX_RE.is_match(&content)
     }
 
     /// Archive the current execution plan to `.marmel/archive/execution_plan_<timestamp>.md`
@@ -624,8 +636,8 @@ impl Plan {
 
 /// Parse all unchecked (`- [ ] [t-xxx]`) task ids from raw plan markdown.
 pub fn parse_unchecked_tasks(markdown: &str) -> Vec<String> {
-    let re = task_line_re();
-    re.captures_iter(markdown)
+    TASK_LINE_RE
+        .captures_iter(markdown)
         .map(|c| c[1].to_string())
         .collect()
 }

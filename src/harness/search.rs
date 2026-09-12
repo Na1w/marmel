@@ -101,6 +101,9 @@ pub(crate) fn glob_in_root(pattern: &str, root: &Path) -> Vec<String> {
 }
 
 /// Translate a glob pattern into an anchored regex.
+static EMPTY_REGEX: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new("^$").expect("valid regex"));
+
 fn glob_to_regex(pattern: &str) -> Regex {
     let mut re = String::from("^");
     let mut chars = pattern.chars().peekable();
@@ -127,7 +130,7 @@ fn glob_to_regex(pattern: &str) -> Regex {
         }
     }
     re.push('$');
-    Regex::new(&re).unwrap_or_else(|_| Regex::new("^$").unwrap())
+    Regex::new(&re).unwrap_or_else(|_| EMPTY_REGEX.clone())
 }
 
 #[cfg(test)]

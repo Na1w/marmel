@@ -8,7 +8,7 @@
 
 ## 1. Executive Summary
 
-- **What it is.** Marmel (crate `marmennill`, binary `marmel`, v0.6.0) is an autonomous, terminal-native agentic coding assistant that plans, delegates, executes, and validates multi-step engineering tasks against **any OpenAI-compatible LLM backend** (Ollama, vLLM, OpenRouter, local GPU servers) (`docs/architecture.md` §1; `Cargo.toml`).
+- **What it is.** Marmel (crate `marmennill`, binary `marmel`, v0.8.0) is an autonomous, terminal-native agentic coding assistant that plans, delegates, executes, and validates multi-step engineering tasks against **any OpenAI-compatible LLM backend** (Ollama, vLLM, OpenRouter, local GPU servers) (`docs/architecture.md` §1; `Cargo.toml`).
 - **How it is built.** Single-crate Rust (edition 2024, tokio multi-thread runtime, ~369 locked dependencies) organized into eleven modules: `manager`, `agents`, `orchestrator`, `harness`, `llm`, `mcp`, `ui`, plus `config`, `prompts`, `types`, `tool_names` (`docs/architecture.md` §3, §5).
 - **Core pattern: fractal Manager + Specialists.** An `OrchestratorManager` decomposes a goal into a disk-backed plan (`.marmel/execution_plan.md`) and delegates atomic tasks to five specialists (coder, researcher, debugger, validator, generalist), each in a strictly isolated context that never sees the Manager's transcript (`docs/analysis_orchestrator_manager.md` §1; `src/agents/mod.rs`).
 - **Least privilege is real, not aspirational.** The Manager physically cannot write files or run commands — enforced simultaneously at the prompt, tool-schema (`ToolDef::manager_tools`), and dispatch layers (`src/harness/mod.rs`); the Validator is read-only with a dedicated `leave_verdict` tool (`docs/analysis_agents_ui.md` §1).
