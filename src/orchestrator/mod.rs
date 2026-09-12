@@ -633,10 +633,11 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
         .or_else(|| crate::config::load(None).ok())
         .unwrap_or_default();
     let stats = Arc::new(HarnessStats::new());
-    let manager = OrchestratorManager::new(
+    let manager = OrchestratorManager::from_config(
         ChatClient::new_with_token(&cfg.backend_url, &cfg.model, &cfg.auth_token),
         Plan::default(),
         stats,
+        &cfg,
     );
 
     let deliverable = if let Ok(handle) = tokio::runtime::Handle::try_current() {
