@@ -162,35 +162,17 @@ impl Renderer for RawRenderer {
         let _ = self.flush();
     }
 
-    fn rehydrate_messages(&mut self, messages: &[crate::types::Message]) {
-        let delegated_call_ids: std::collections::HashSet<&str> = messages
-            .iter()
-            .filter_map(|m| match m {
-                crate::types::Message::Assistant { tool_calls, .. } => Some(tool_calls),
-                _ => None,
-            })
-            .flatten()
-            .filter(|call| call.function.name == "delegate_task")
-            .map(|call| call.id.as_str())
-            .collect();
-
-        for msg in messages.iter().skip(1) {
-            match msg {
-                crate::types::Message::User { content } => {
-                    if !content.starts_with("(SYSTEM NOTICE:") && !content.starts_with("(SYSTEM:") {
-                        self.push_line("user", content);
-                    }
+    fn rehydrate_ui(&mut self, records: &[crate::ui::UiRecord]) {
+        for rec in records {
+            match rec {
+                crate::ui::UiRecord::User { text } => {
+                    self.push_line("user", text);
                 }
-                crate::types::Message::Assistant {
-                    content,
-                    tool_calls,
-                    ..
-                } => {
-                    for call in tool_calls {
-                        self.push_line(
-                            "tool",
-                            &format!("{}({})", call.function.name, call.function.arguments),
-                        );
+                crate::ui::UiRecord::Assistant { content, thinking } => {
+                    if let Some(r) = thinking
+                        && !r.trim().is_empty()
+                    {
+                        self.push_line("thinking", r);
                     }
                     if let Some(c) = content
                         && !c.trim().is_empty()
@@ -198,28 +180,67 @@ impl Renderer for RawRenderer {
                         self.push_line("assistant", c);
                     }
                 }
-                crate::types::Message::Tool {
-                    tool_call_id,
-                    content,
-                } => {
-                    if delegated_call_ids.contains(tool_call_id.as_str()) {
-                        let summary = if let Some(first_line) = content.lines().next() {
-                            if first_line.starts_with("MISSION COMPLETE") {
-                                first_line.to_string()
-                            } else {
-                                "Task completed".to_string()
-                            }
-                        } else {
-                            "Task completed".to_string()
-                        };
-                        self.push_line("tool-result", &summary);
-                    } else {
-                        self.push_line("tool-result", content);
-                    }
+                crate::ui::UiRecord::SteerResponse { text } => {
+                    self.push_line("steer", text);
                 }
-                _ => {}
+                crate::ui::UiRecord::ToolCall { display } => {
+                    self.push_line("tool", display);
+                }
+                crate::ui::UiRecord::ToolResult { display } => {
+                    self.push_line("tool-result", display);
+                }
+                crate::ui::UiRecord::TaskCompleted { task_id } => {
+                    self.push_line("delegation", &format!("DONE    specialist on {task_id}"));
+                }
+                crate::ui::UiRecord::TaskFailed { task_id } => {
+                    self.push_line("delegation", &format!("FAILED  specialist on {task_id}"));
+                }
+                crate::ui::UiRecord::Status { text } => {
+                    self.push_line("status", text);
+                }
             }
         }
         let _ = self.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::UiRecord;
+
+    #[test]
+    fn test_raw_renderer_rehydrate_ui() {
+        let mut r = RawRenderer::new();
+        let records = vec![
+            UiRecord::User {
+                text: "My task".to_string(),
+            },
+            UiRecord::Assistant {
+                content: Some("I am on it".to_string()),
+                thinking: Some("Reasoning here".to_string()),
+            },
+            UiRecord::SteerResponse {
+                text: "Steer text".to_string(),
+            },
+            UiRecord::ToolCall {
+                display: "read_file(foo.txt)".to_string(),
+            },
+            UiRecord::ToolResult {
+                display: "content".to_string(),
+            },
+            UiRecord::TaskCompleted {
+                task_id: "t-1".to_string(),
+            },
+            UiRecord::TaskFailed {
+                task_id: "t-2".to_string(),
+            },
+            UiRecord::Status {
+                text: "Running tests".to_string(),
+            },
+        ];
+
+        // Calling rehydrate_ui should not panic and should properly format
+        r.rehydrate_ui(&records);
     }
 }

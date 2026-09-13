@@ -571,6 +571,7 @@ impl TuiRenderer {
         let line = std::mem::take(&mut self.input_text);
         self.cursor = 0;
         if line.trim().is_empty() {
+            let _ = self.tx.send(String::new());
             return;
         }
         // Handle the `/thought` toggle locally (reference §13).

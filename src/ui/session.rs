@@ -1,10 +1,11 @@
 //! Interactive session runner driving multi-turn manager and specialist execution.
 
 use super::bridge::{
-    RendererSink, SteerArbEvent, drain_steer_arbitration_events, spawn_steer_arbitration,
+    RendererSink, SteerArbEvent, drain_steer_arbitration_events_with_transcript,
+    spawn_steer_arbitration,
 };
 use super::helpers::*;
-use super::{Event, Renderer};
+use super::{Event, Renderer, UiRecord, UiTranscript};
 use crate::config::Config;
 use crate::llm::{ChatClient, StreamConfig, chat_client_turn};
 use crate::manager::context::ContextEngine;
@@ -107,17 +108,25 @@ pub async fn run_session(
 
         if let Some(deliverable) = deliverable_opt {
             let task_info = deliverable.task_id.as_deref().unwrap_or("recovered");
-            renderer.on_event(&Event::ToolResult(format!(
-                "[Recovered task {task_info}] {}",
-                deliverable.content
-            )));
-            let _ = renderer.flush();
             recovered_deliverable = Some((task_info.to_string(), deliverable.content));
         }
     }
 
+    let ui_transcript_path = plan.ui_transcript_path();
+    let mut ui_transcript = if ui_transcript_path.exists() {
+        match UiTranscript::load(&ui_transcript_path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Failed to load UI transcript: {e}");
+                UiTranscript::new()
+            }
+        }
+    } else {
+        UiTranscript::new()
+    };
+
     let transcript_path = plan.transcript_path();
-    let transcript_loaded = if plan.exists() {
+    let transcript_loaded = if transcript_path.exists() {
         match ctx.load_transcript(&transcript_path) {
             Ok(true) => {
                 ctx.set_system_prompt(system.clone());
@@ -129,8 +138,19 @@ pub async fn run_session(
         false
     };
 
-    if transcript_loaded {
+    let has_rehydrated = if !ui_transcript.is_empty() {
+        renderer.rehydrate_ui(ui_transcript.records());
+        true
+    } else if transcript_loaded {
+        ui_transcript = UiTranscript::from_legacy_messages(ctx.messages());
         renderer.rehydrate_messages(ctx.messages());
+        let _ = ui_transcript.save(&ui_transcript_path);
+        true
+    } else {
+        false
+    };
+
+    if has_rehydrated {
         renderer.on_event(&Event::Status(
             "Session transcript rehydrated from disk (Ready)".to_string(),
         ));
@@ -138,6 +158,11 @@ pub async fn run_session(
     }
 
     if let Some((task_info, content)) = recovered_deliverable.as_ref() {
+        let display = format!("[Recovered task {task_info}] {content}");
+        renderer.on_event(&Event::ToolResult(display.clone()));
+        let _ = renderer.flush();
+        ui_transcript.append(UiRecord::ToolResult { display });
+        let _ = ui_transcript.save(&ui_transcript_path);
         ctx.append(Message::User {
             content: format!(
                 "(SYSTEM NOTICE: A previous interrupted task [{task_info}] was recovered successfully from checkpoint:\n{content}\nUse this deliverable to proceed with subsequent pending plan tasks.)"
@@ -191,13 +216,19 @@ pub async fn run_session(
                     if is_reset_command(&line) {
                         crate::debug_log::log_user_input("command", &line);
                         handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
+                        ui_transcript.clear();
+                        let _ = std::fs::remove_file(&ui_transcript_path);
                         continue;
                     }
                     let trimmed = line.trim();
                     if !trimmed.is_empty() {
                         crate::debug_log::log_user_input("interactive_goal", trimmed);
-                        if transcript_loaded {
+                        if has_rehydrated {
                             steer_queue.push(trimmed.to_string());
+                            ui_transcript.append(UiRecord::User {
+                                text: trimmed.to_string(),
+                            });
+                            let _ = ui_transcript.save(&ui_transcript_path);
                             break ctx
                                 .messages()
                                 .get(1)
@@ -229,8 +260,10 @@ pub async fn run_session(
         },
     };
 
-    if !transcript_loaded {
+    if !has_rehydrated {
         ctx.set_goal(goal.clone());
+        ui_transcript.append(UiRecord::User { text: goal.clone() });
+        let _ = ui_transcript.save(&ui_transcript_path);
     }
 
     if has_pending_plan {
@@ -263,14 +296,20 @@ pub async fn run_session(
             let _ = renderer.flush();
         }
 
-        drain_steer_arbitration_events(
+        drain_steer_arbitration_events_with_transcript(
             &mut steer_arb_rx,
             &mut *renderer,
             &mut steer_queue,
             &mut steer_abort_requested,
             Some(&mut subagents),
+            Some(&mut ui_transcript),
         );
-        drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
+        drain_delegation_events_with_transcript(
+            manager.as_deref(),
+            &mut *renderer,
+            &mut subagents,
+            Some(&mut ui_transcript),
+        );
 
         if let Some(steer) = renderer.poll_input() {
             if is_abort_command(&steer) {
@@ -281,11 +320,15 @@ pub async fn run_session(
             if is_reset_command(&steer) {
                 crate::debug_log::log_user_input("command", &steer);
                 handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
+                ui_transcript.clear();
+                let _ = std::fs::remove_file(&ui_transcript_path);
                 continue;
             }
             if !steer.trim().is_empty() {
                 crate::debug_log::log_user_input("midflight_steer", &steer);
-                steer_queue.push(steer);
+                steer_queue.push(steer.clone());
+                ui_transcript.append(UiRecord::User { text: steer });
+                let _ = ui_transcript.save(&ui_transcript_path);
             }
         }
         for steer in steer_queue.drain(..) {
@@ -303,14 +346,20 @@ pub async fn run_session(
             while let Ok(msg) = status_rx.try_recv() {
                 renderer.on_event(&Event::Status(msg));
             }
-            drain_steer_arbitration_events(
+            drain_steer_arbitration_events_with_transcript(
                 &mut steer_arb_rx,
                 &mut *renderer,
                 &mut steer_queue,
                 &mut steer_abort_requested,
                 Some(&mut subagents),
+                Some(&mut ui_transcript),
             );
-            drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
+            drain_delegation_events_with_transcript(
+                manager.as_deref(),
+                &mut *renderer,
+                &mut subagents,
+                Some(&mut ui_transcript),
+            );
             renderer.flush()?;
 
             for steer in steer_queue.drain(..) {
@@ -398,6 +447,25 @@ pub async fn run_session(
 
             ctx.append(assistant);
             let _ = ctx.save_transcript(&transcript_path);
+            if let Some(Message::Assistant {
+                content,
+                reasoning_content,
+                ..
+            }) = ctx.messages().last()
+            {
+                let c = content.as_ref().filter(|s| !s.trim().is_empty()).cloned();
+                let r = reasoning_content
+                    .as_ref()
+                    .filter(|s| !s.trim().is_empty())
+                    .cloned();
+                if c.is_some() || r.is_some() {
+                    ui_transcript.append(UiRecord::Assistant {
+                        content: c,
+                        thinking: r,
+                    });
+                    let _ = ui_transcript.save(&ui_transcript_path);
+                }
+            }
             renderer.flush()?;
 
             if tool_calls.is_empty() {
@@ -511,8 +579,10 @@ pub async fn run_session(
                             },
                         ));
                     } else {
-                        renderer
-                            .on_event(&Event::ToolCall(format_tool_call_display(&name, &args_val)));
+                        let display = format_tool_call_display(&name, &args_val);
+                        renderer.on_event(&Event::ToolCall(display.clone()));
+                        ui_transcript.append(UiRecord::ToolCall { display });
+                        let _ = ui_transcript.save(&ui_transcript_path);
                     }
 
                     let intervention = monitor.observe_tool(&name, &args_val);
@@ -579,14 +649,20 @@ pub async fn run_session(
                         if had_events {
                             let _ = renderer.flush();
                         }
-                        drain_steer_arbitration_events(
+                        drain_steer_arbitration_events_with_transcript(
                             &mut steer_arb_rx,
                             &mut *renderer,
                             &mut steer_queue,
                             &mut steer_abort_requested,
                             Some(&mut subagents),
+                            Some(&mut ui_transcript),
                         );
-                        drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
+                        drain_delegation_events_with_transcript(
+                            manager.as_deref(),
+                            &mut *renderer,
+                            &mut subagents,
+                            Some(&mut ui_transcript),
+                        );
                         if renderer.aborted()
                             || steer_abort_requested
                             || crate::orchestrator::is_globally_cancelled()
@@ -626,17 +702,19 @@ pub async fn run_session(
                                 if had_events {
                                     let _ = renderer.flush();
                                 }
-                                drain_steer_arbitration_events(
+                                drain_steer_arbitration_events_with_transcript(
                                     &mut steer_arb_rx,
                                     &mut *renderer,
                                     &mut steer_queue,
                                     &mut steer_abort_requested,
                                     Some(&mut subagents),
+                                    Some(&mut ui_transcript),
                                 );
-                                drain_delegation_events(
+                                drain_delegation_events_with_transcript(
                                     manager.as_deref(),
                                     &mut *renderer,
                                     &mut subagents,
+                                    Some(&mut ui_transcript),
                                 );
                                 if let Some(input) = renderer.poll_input() {
                                     if is_abort_command(&input) {
@@ -644,6 +722,8 @@ pub async fn run_session(
                                         renderer.request_user_exit();
                                     } else if is_reset_command(&input) {
                                         handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
+                                        ui_transcript.clear();
+                                        let _ = std::fs::remove_file(&ui_transcript_path);
                                     } else if !input.trim().is_empty() {
                                         spawn_steer_arbitration(
                                             &client,
@@ -668,26 +748,39 @@ pub async fn run_session(
                     };
                     if let Some(ag) = agent {
                         update_subagent_lifecycle(&mut subagents, ag, task.clone(), None, false);
+                        let tid = task.clone().unwrap_or_else(|| ag.to_string());
                         if is_error {
                             renderer.on_event(&Event::Delegation(
                                 crate::orchestrator::DelegationEvent::Failed { agent: ag, task },
                             ));
+                            ui_transcript.append(UiRecord::TaskFailed { task_id: tid });
                         } else {
-                            if let Some(ref tid) = task {
+                            if let Some(ref tid_task) = task {
                                 let plan = crate::manager::phase::Plan::default();
-                                let _ = plan.check_off(tid);
+                                let _ = plan.check_off(tid_task);
                             }
                             renderer.on_event(&Event::Delegation(
                                 crate::orchestrator::DelegationEvent::Completed { agent: ag, task },
                             ));
+                            ui_transcript.append(UiRecord::TaskCompleted { task_id: tid });
                         }
+                        let _ = ui_transcript.save(&ui_transcript_path);
                         renderer.set_subagents(subagents.clone());
                     } else {
                         renderer.on_event(&Event::ToolResult(result_content.clone()));
+                        ui_transcript.append(UiRecord::ToolResult {
+                            display: result_content.clone(),
+                        });
+                        let _ = ui_transcript.save(&ui_transcript_path);
                     }
                     renderer.flush()?;
 
-                    drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
+                    drain_delegation_events_with_transcript(
+                        manager.as_deref(),
+                        &mut *renderer,
+                        &mut subagents,
+                        Some(&mut ui_transcript),
+                    );
 
                     ctx.append(Message::Tool {
                         tool_call_id: call_id,
@@ -758,12 +851,19 @@ pub async fn run_session(
                             },
                         ));
                     } else {
-                        renderer
-                            .on_event(&Event::ToolCall(format_tool_call_display(&name, &args_val)));
+                        let display = format_tool_call_display(&name, &args_val);
+                        renderer.on_event(&Event::ToolCall(display.clone()));
+                        ui_transcript.append(UiRecord::ToolCall { display });
+                        let _ = ui_transcript.save(&ui_transcript_path);
                     }
                     renderer.flush()?;
 
-                    drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
+                    drain_delegation_events_with_transcript(
+                        manager.as_deref(),
+                        &mut *renderer,
+                        &mut subagents,
+                        Some(&mut ui_transcript),
+                    );
 
                     if name == crate::tool_names::TOOL_REBIRTH {
                         renderer
@@ -774,6 +874,10 @@ pub async fn run_session(
                             Ok(r) => {
                                 renderer.on_event(&Event::ToolResult(r.content.clone()));
                                 if !r.is_error {
+                                    ui_transcript.append(UiRecord::Status {
+                                        text: format!("Rebirth checkpoint applied: {}", r.content),
+                                    });
+                                    let _ = ui_transcript.save(&ui_transcript_path);
                                     let _ = ctx.save_transcript(&transcript_path);
                                     renderer.on_event(&Event::TokensIn(ctx.token_count()));
                                     renderer.on_event(&Event::Status(
@@ -870,14 +974,20 @@ pub async fn run_session(
                         if had_events {
                             let _ = renderer.flush();
                         }
-                        drain_steer_arbitration_events(
+                        drain_steer_arbitration_events_with_transcript(
                             &mut steer_arb_rx,
                             &mut *renderer,
                             &mut steer_queue,
                             &mut steer_abort_requested,
                             Some(&mut subagents),
+                            Some(&mut ui_transcript),
                         );
-                        drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
+                        drain_delegation_events_with_transcript(
+                            manager.as_deref(),
+                            &mut *renderer,
+                            &mut subagents,
+                            Some(&mut ui_transcript),
+                        );
                         if renderer.aborted()
                             || steer_abort_requested
                             || crate::orchestrator::is_globally_cancelled()
@@ -908,17 +1018,19 @@ pub async fn run_session(
                                 if had_events {
                                     let _ = renderer.flush();
                                 }
-                                drain_steer_arbitration_events(
+                                drain_steer_arbitration_events_with_transcript(
                                     &mut steer_arb_rx,
                                     &mut *renderer,
                                     &mut steer_queue,
                                     &mut steer_abort_requested,
                                     Some(&mut subagents),
+                                    Some(&mut ui_transcript),
                                 );
-                                drain_delegation_events(
+                                drain_delegation_events_with_transcript(
                                     manager.as_deref(),
                                     &mut *renderer,
                                     &mut subagents,
+                                    Some(&mut ui_transcript),
                                 );
                                 if let Some(input) = renderer.poll_input() {
                                     if is_abort_command(&input) {
@@ -926,6 +1038,8 @@ pub async fn run_session(
                                         renderer.request_user_exit();
                                     } else if is_reset_command(&input) {
                                         handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
+                                        ui_transcript.clear();
+                                        let _ = std::fs::remove_file(&ui_transcript_path);
                                     } else if !input.trim().is_empty() {
                                         spawn_steer_arbitration(
                                             &client,
@@ -955,6 +1069,7 @@ pub async fn run_session(
                             None,
                             false,
                         );
+                        let tid = delegated_task.clone().unwrap_or_else(|| agent.to_string());
                         if is_error {
                             renderer.on_event(&Event::Delegation(
                                 crate::orchestrator::DelegationEvent::Failed {
@@ -962,6 +1077,7 @@ pub async fn run_session(
                                     task: delegated_task,
                                 },
                             ));
+                            ui_transcript.append(UiRecord::TaskFailed { task_id: tid });
                         } else {
                             if let Some(ref tid) = delegated_task {
                                 let plan = crate::manager::phase::Plan::default();
@@ -973,14 +1089,25 @@ pub async fn run_session(
                                     task: delegated_task,
                                 },
                             ));
+                            ui_transcript.append(UiRecord::TaskCompleted { task_id: tid });
                         }
+                        let _ = ui_transcript.save(&ui_transcript_path);
                         renderer.set_subagents(subagents.clone());
                     } else {
                         renderer.on_event(&Event::ToolResult(result_content.clone()));
+                        ui_transcript.append(UiRecord::ToolResult {
+                            display: result_content.clone(),
+                        });
+                        let _ = ui_transcript.save(&ui_transcript_path);
                     }
                     renderer.flush()?;
 
-                    drain_delegation_events(manager.as_deref(), &mut *renderer, &mut subagents);
+                    drain_delegation_events_with_transcript(
+                        manager.as_deref(),
+                        &mut *renderer,
+                        &mut subagents,
+                        Some(&mut ui_transcript),
+                    );
 
                     ctx.append(Message::Tool {
                         tool_call_id: call.id.clone(),
@@ -1014,12 +1141,13 @@ pub async fn run_session(
             }
         }
 
-        drain_steer_arbitration_events(
+        drain_steer_arbitration_events_with_transcript(
             &mut steer_arb_rx,
             &mut *renderer,
             &mut steer_queue,
             &mut steer_abort_requested,
             Some(&mut subagents),
+            Some(&mut ui_transcript),
         );
         if renderer.user_exit_requested() {
             break;
@@ -1070,12 +1198,20 @@ pub async fn run_session(
                 if is_reset_command(&line) {
                     crate::debug_log::log_user_input("command", &line);
                     handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
+                    ui_transcript.clear();
+                    let _ = std::fs::remove_file(&ui_transcript_path);
                     continue;
                 }
                 if !line.trim().is_empty() {
                     crate::debug_log::log_user_input("interactive_input", &line);
-                    ctx.append(Message::User { content: line });
+                    ctx.append(Message::User {
+                        content: line.clone(),
+                    });
                     let _ = ctx.save_transcript(&transcript_path);
+                    ui_transcript.append(UiRecord::User { text: line });
+                    let _ = ui_transcript.save(&ui_transcript_path);
+                } else {
+                    continue;
                 }
             }
             None => {

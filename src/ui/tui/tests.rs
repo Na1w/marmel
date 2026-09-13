@@ -1548,6 +1548,153 @@ fn test_rehydrate_messages_summarizes_delegation_results() {
 }
 
 #[test]
+fn test_rehydrate_messages_preserves_order_thinking_and_filters_synthetic() {
+    let mut r = TuiRenderer::new();
+    let messages = vec![
+        crate::types::Message::System {
+            content: "system prompt".to_string(),
+        },
+        crate::types::Message::User {
+            content: "Please refactor the auth system".to_string(),
+        },
+        crate::types::Message::Assistant {
+            content: Some("I will check auth files now.".to_string()),
+            reasoning_content: Some("Let's look at the codebase structure.".to_string()),
+            tool_calls: vec![crate::types::ToolCall::new(
+                "call-glob-1",
+                "glob",
+                r#"{"pattern": "src/auth*.rs"}"#,
+            )],
+        },
+        crate::types::Message::Tool {
+            tool_call_id: "call-glob-1".to_string(),
+            content: "src/auth.rs\nsrc/auth_middleware.rs".to_string(),
+        },
+        // Synthetic notices that should NOT leak as User messages:
+        crate::types::Message::User {
+            content: "(SYSTEM NOTICE: Active execution plan detected...)".to_string(),
+        },
+        crate::types::Message::User {
+            content: "[System] User executed /reset. The execution plan has been removed.".to_string(),
+        },
+        crate::types::Message::User {
+            content: "(User steering resulted in subtask 't-001' executed by specialist 'coder'. Deliverable:\nfn main() {})".to_string(),
+        },
+        // Rebirth checkpoint that should be formatted as status:
+        crate::types::Message::System {
+            content: "(SYSTEM: REBIRTH CHECKPOINT: Summary of progress so far)".to_string(),
+        },
+    ];
+
+    r.rehydrate_messages(&messages);
+
+    // 1. Goal should be present as User message
+    assert_eq!(r.messages[0], "User: Please refactor the auth system");
+
+    // 2. Thinking should be preserved with <think> tag
+    assert!(
+        r.messages[1].contains("<think>")
+            && r.messages[1].contains("Let's look at the codebase structure.")
+    );
+
+    // 3. Assistant content should come BEFORE tool call
+    assert_eq!(r.messages[2], "I will check auth files now.");
+    assert!(r.messages[3].contains("[Tool Call] glob(src/auth*.rs)"));
+
+    // 4. Tool result
+    assert_eq!(
+        r.messages[4],
+        "[Tool Result] src/auth.rs\nsrc/auth_middleware.rs"
+    );
+
+    // 5. Rebirth checkpoint should be formatted as [Status]
+    assert_eq!(
+        r.messages[5],
+        "[Status] Rebirth checkpoint: Summary of progress so far"
+    );
+
+    // 6. Synthetic messages should NOT have been added
+    assert!(
+        !r.messages
+            .iter()
+            .any(|m| m.contains("Active execution plan detected")),
+        "Synthetic plan notices must not appear in chat pane"
+    );
+    assert!(
+        !r.messages
+            .iter()
+            .any(|m| m.contains("User executed /reset")),
+        "Synthetic reset notice must not appear in chat pane"
+    );
+    assert!(
+        !r.messages
+            .iter()
+            .any(|m| m.contains("User steering resulted in subtask")),
+        "Synthetic steer deliverable must not appear in chat pane"
+    );
+
+    // 7. Auto-scroll should be enabled
+    assert!(r.chat_auto_scroll);
+}
+
+#[test]
+fn test_rehydrate_ui_records_renders_clean_chat_history() {
+    use crate::ui::UiRecord;
+    let mut r = TuiRenderer::new();
+    let records = vec![
+        UiRecord::User {
+            text: "Initial objective".to_string(),
+        },
+        UiRecord::Assistant {
+            content: Some("Working on it.".to_string()),
+            thinking: Some("Reasoning about steps.".to_string()),
+        },
+        UiRecord::SteerResponse {
+            text: "I adjusted the approach.".to_string(),
+        },
+        UiRecord::ToolCall {
+            display: "read_file(src/lib.rs)".to_string(),
+        },
+        UiRecord::ToolResult {
+            display: "// file contents".to_string(),
+        },
+        UiRecord::TaskCompleted {
+            task_id: "t-101".to_string(),
+        },
+        UiRecord::TaskFailed {
+            task_id: "t-102".to_string(),
+        },
+        UiRecord::Status {
+            text: "Recovery succeeded".to_string(),
+        },
+    ];
+
+    r.rehydrate_ui(&records);
+
+    assert_eq!(r.messages.len(), 9);
+    assert_eq!(r.messages[0], "User: Initial objective");
+    assert_eq!(r.messages[1], "<think>\nReasoning about steps.\n</think>");
+    assert_eq!(r.messages[2], "Working on it.");
+    assert_eq!(r.messages[3], "Marmennill: I adjusted the approach.");
+    assert_eq!(r.messages[4], "[Tool Call] read_file(src/lib.rs)");
+    assert_eq!(r.messages[5], "[Tool Result] // file contents");
+    assert_eq!(r.messages[6], "[t-101] completed.");
+    assert_eq!(r.messages[7], "[t-102] failed.");
+    assert_eq!(r.messages[8], "[Status] Recovery succeeded");
+    assert!(r.chat_auto_scroll);
+}
+
+#[test]
+fn test_tui_submit_empty_line_sends_to_channel_for_enter_resume() {
+    let mut r = TuiRenderer::new();
+    r.input_text = String::new();
+    r.submit();
+
+    // Receiver should have received an empty line so read_input unblocks on Enter
+    assert_eq!(r.rx.try_recv().ok(), Some("".to_string()));
+}
+
+#[test]
 fn test_plan_caching_and_throttling() {
     let mut renderer = TuiRenderer::new();
     renderer.plan_content = "Cached plan".to_string();

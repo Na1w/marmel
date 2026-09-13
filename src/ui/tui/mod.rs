@@ -997,44 +997,19 @@ impl Renderer for TuiRenderer {
         }
     }
 
-    fn rehydrate_messages(&mut self, messages: &[crate::types::Message]) {
+    fn rehydrate_ui(&mut self, records: &[crate::ui::UiRecord]) {
         self.commit_turn_content();
-        let delegated_call_ids: std::collections::HashSet<&str> = messages
-            .iter()
-            .filter_map(|m| match m {
-                crate::types::Message::Assistant { tool_calls, .. } => Some(tool_calls),
-                _ => None,
-            })
-            .flatten()
-            .filter(|call| call.function.name == "delegate_task")
-            .map(|call| call.id.as_str())
-            .collect();
-
-        for msg in messages.iter().skip(1) {
-            match msg {
-                crate::types::Message::User { content } => {
-                    if !content.starts_with("(SYSTEM NOTICE:") && !content.starts_with("(SYSTEM:") {
-                        self.messages.push(format!("User: {content}"));
-                    }
+        for rec in records {
+            match rec {
+                crate::ui::UiRecord::User { text } => {
+                    self.messages.push(format!("User: {text}"));
                 }
-                crate::types::Message::Assistant {
-                    content,
-                    tool_calls,
-                    ..
-                } => {
-                    for call in tool_calls {
-                        let args_val =
-                            serde_json::from_str::<serde_json::Value>(&call.function.arguments)
-                                .unwrap_or_else(|_| {
-                                    serde_json::Value::String(call.function.arguments.clone())
-                                });
-                        self.messages.push(format!(
-                            "[Tool Call] {}",
-                            crate::ui::helpers::format_tool_call_display(
-                                &call.function.name,
-                                &args_val
-                            )
-                        ));
+                crate::ui::UiRecord::Assistant { content, thinking } => {
+                    if let Some(r) = thinking
+                        && !r.trim().is_empty()
+                    {
+                        self.messages
+                            .push(format!("<think>\n{}\n</think>", r.trim()));
                     }
                     if let Some(c) = content
                         && !c.trim().is_empty()
@@ -1042,28 +1017,34 @@ impl Renderer for TuiRenderer {
                         self.messages.push(c.clone());
                     }
                 }
-                crate::types::Message::Tool {
-                    tool_call_id,
-                    content,
-                } => {
-                    if delegated_call_ids.contains(tool_call_id.as_str()) {
-                        let summary = if let Some(first_line) = content.lines().next() {
-                            if first_line.starts_with("MISSION COMPLETE") {
-                                first_line.to_string()
-                            } else {
-                                "Task completed".to_string()
-                            }
-                        } else {
-                            "Task completed".to_string()
-                        };
-                        self.messages.push(format!("[Tool Result] {summary}"));
+                crate::ui::UiRecord::SteerResponse { text } => {
+                    self.messages.push(format!("Marmennill: {text}"));
+                }
+                crate::ui::UiRecord::ToolCall { display } => {
+                    self.messages.push(format!("[Tool Call] {display}"));
+                }
+                crate::ui::UiRecord::ToolResult { display } => {
+                    self.messages.push(format!("[Tool Result] {display}"));
+                }
+                crate::ui::UiRecord::TaskCompleted { task_id } => {
+                    self.messages.push(format!("[{task_id}] completed."));
+                }
+                crate::ui::UiRecord::TaskFailed { task_id } => {
+                    self.messages.push(format!("[{task_id}] failed."));
+                }
+                crate::ui::UiRecord::Status { text } => {
+                    if text.starts_with("[Status]")
+                        || text.starts_with("[CLI]")
+                        || text.starts_with("System Error")
+                    {
+                        self.messages.push(text.clone());
                     } else {
-                        self.messages.push(format!("[Tool Result] {content}"));
+                        self.messages.push(format!("[Status] {text}"));
                     }
                 }
-                _ => {}
             }
         }
+        self.chat_auto_scroll = true;
         let w = self.chat_width.get();
         let n = self.estimated_chat_lines(w);
         let h = self.chat_height.get();

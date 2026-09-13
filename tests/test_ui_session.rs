@@ -61,6 +61,7 @@ struct ScriptedRenderer {
     aborted: bool,
     user_exit: bool,
     rehydrated: Vec<marmennill::types::Message>,
+    rehydrated_ui: Vec<marmennill::ui::UiRecord>,
     subagents: Vec<marmennill::ui::SubagentDetail>,
     events: Vec<Event>,
 }
@@ -75,6 +76,7 @@ impl ScriptedRenderer {
             aborted: false,
             user_exit: false,
             rehydrated: Vec::new(),
+            rehydrated_ui: Vec::new(),
             subagents: Vec::new(),
             events: Vec::new(),
         }
@@ -89,6 +91,7 @@ impl ScriptedRenderer {
             aborted: false,
             user_exit: false,
             rehydrated: Vec::new(),
+            rehydrated_ui: Vec::new(),
             subagents: Vec::new(),
             events: Vec::new(),
         }
@@ -102,8 +105,13 @@ impl Renderer for ScriptedRenderer {
     fn on_event(&mut self, event: &Event) {
         self.events.push(event.clone());
     }
+    fn rehydrate_ui(&mut self, records: &[marmennill::ui::UiRecord]) {
+        self.rehydrated_ui = records.to_vec();
+    }
     fn rehydrate_messages(&mut self, messages: &[marmennill::types::Message]) {
         self.rehydrated = messages.to_vec();
+        let transcript = marmennill::ui::UiTranscript::from_legacy_messages(messages);
+        self.rehydrated_ui = transcript.records().to_vec();
     }
     fn set_subagents(&mut self, subagents: Vec<marmennill::ui::SubagentDetail>) {
         self.subagents = subagents;
@@ -702,15 +710,15 @@ async fn test_ui_session_rehydrates_transcript_and_resumes_plan() {
         .await
         .expect("session 2 succeeds");
 
-    // Verify that session 2 rehydrated past transcript messages
+    // Verify that session 2 rehydrated past transcript records
     assert!(
-        !renderer2.rehydrated.is_empty(),
-        "renderer2 should have received rehydrated messages from session 1"
+        !renderer2.rehydrated_ui.is_empty(),
+        "renderer2 should have received rehydrated records from session 1"
     );
     // Verify that the rehydrated transcript contains the tool call from session 1
     assert!(
-        renderer2.rehydrated.iter().any(|m| matches!(m, marmennill::types::Message::Tool { content, .. } if content.contains("Cargo.toml"))),
-        "rehydrated messages should include tool result from session 1"
+        renderer2.rehydrated_ui.iter().any(|r| matches!(r, marmennill::ui::UiRecord::ToolResult { display } if display.contains("Cargo.toml"))),
+        "rehydrated records should include tool result from session 1"
     );
     assert!(turn_counter.load(Ordering::SeqCst) >= 3);
 }
@@ -1180,5 +1188,335 @@ async fn test_steering_arbitrator_sleep_re_invokes_after_delay() {
         hist[1]
             .1
             .contains("Tests have now completed without errors.")
+    );
+}
+
+#[tokio::test]
+async fn test_ui_session_rehydrates_without_plan_if_transcript_exists() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(completion_sse("Conversational reply.")),
+        )
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
+    // NOTE: plan.exists() is FALSE! We do not create an execution plan file.
+    assert!(!plan.exists());
+
+    // Pre-create a transcript file (e.g. from previous conversational exchange)
+    let transcript_path = plan.transcript_path();
+    std::fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+    let past_msgs = vec![
+        marmennill::types::Message::System {
+            content: "system prompt".to_string(),
+        },
+        marmennill::types::Message::User {
+            content: "What is this codebase?".to_string(),
+        },
+        marmennill::types::Message::Assistant {
+            content: Some("It is Marmel.".to_string()),
+            reasoning_content: None,
+            tool_calls: vec![],
+        },
+    ];
+    let json = serde_json::to_string(&past_msgs).unwrap();
+    std::fs::write(&transcript_path, json).unwrap();
+
+    let cfg = Config {
+        backend_url: format!("{}/v1", server.uri()),
+        system_prompt_path: PathBuf::from("prompts/system.md"),
+        ui_mode: "tui".to_string(),
+        ..Config::default()
+    };
+
+    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::from_config(&cfg),
+        plan.clone(),
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    let mut renderer = ScriptedRenderer::new(vec!["/abort".to_string()]);
+    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr))
+        .await
+        .expect("session succeeds");
+
+    // Even though plan.exists() is false, past transcript should have been rehydrated from transcript_path
+    assert!(
+        !renderer.rehydrated.is_empty(),
+        "transcript should be rehydrated from disk even if plan.exists() is false"
+    );
+    assert_eq!(
+        renderer.rehydrated.get(1).and_then(|m| m.content()),
+        Some("What is this codebase?")
+    );
+    assert_eq!(
+        renderer.rehydrated.get(2).and_then(|m| m.content()),
+        Some("It is Marmel.")
+    );
+}
+
+#[tokio::test]
+async fn test_ui_session_recovered_deliverable_placed_after_rehydrated_transcript() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(completion_sse("Synthesis reply.")),
+        )
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
+    plan.create("# Execution Plan\n\n- [ ] [t-701] Task 1\n- [ ] [t-702] Task 2\n")
+        .unwrap();
+
+    let transcript_path = plan.transcript_path();
+    let past_msgs = vec![
+        marmennill::types::Message::System {
+            content: "system prompt".to_string(),
+        },
+        marmennill::types::Message::User {
+            content: "Initial user goal".to_string(),
+        },
+    ];
+    let json = serde_json::to_string(&past_msgs).unwrap();
+    std::fs::write(&transcript_path, json).unwrap();
+
+    let cfg = Config {
+        backend_url: format!("{}/v1", server.uri()),
+        system_prompt_path: PathBuf::from("prompts/system.md"),
+        ui_mode: "tui".to_string(),
+        ..Config::default()
+    };
+
+    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::from_config(&cfg),
+        plan.clone(),
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    // Manually snapshot a frozen task to simulate crash recovery
+    let frozen_req = marmennill::orchestrator::DelegationRequest {
+        agent_name: marmennill::agents::Agent::Generalist,
+        prompt: "Run task".to_string(),
+        snippets: vec![],
+        task_id: Some("t-701".to_string()),
+        image_urls: None,
+        audio_urls: None,
+        recursion_granted: false,
+    };
+    mgr.journal
+        .snapshot(marmennill::agents::Agent::Generalist, &frozen_req)
+        .unwrap();
+
+    let mut renderer = ScriptedRenderer::new(vec!["/abort".to_string()]);
+    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr))
+        .await
+        .expect("session succeeds");
+
+    // Verify transcript was rehydrated
+    assert!(!renderer.rehydrated.is_empty());
+    assert_eq!(
+        renderer.rehydrated.get(1).and_then(|m| m.content()),
+        Some("Initial user goal")
+    );
+
+    // Verify ToolResult for recovered deliverable was emitted in events
+    assert!(renderer.events.iter().any(|e| match e {
+        Event::ToolResult(text) => text.contains("Recovered task t-701"),
+        _ => false,
+    }));
+}
+
+#[tokio::test]
+async fn test_ui_session_saves_and_rehydrates_ui_transcript() {
+    let _lock = TEST_MUTEX.lock().await;
+    use marmennill::ui::{UiRecord, UiTranscript};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(completion_sse("First assistant reply.")),
+        )
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
+    let cfg = Config {
+        backend_url: format!("{}/v1", server.uri()),
+        system_prompt_path: PathBuf::from("prompts/system.md"),
+        ui_mode: "tui".to_string(),
+        ..Config::default()
+    };
+
+    // Session 1: Run with initial goal "First goal", then immediately "/abort" after the turn.
+    {
+        let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+            marmennill::llm::ChatClient::from_config(&cfg),
+            plan.clone(),
+            Arc::new(marmennill::harness::HarnessStats::new()),
+        ));
+        let mut renderer =
+            ScriptedRenderer::new(vec!["First goal".to_string(), "/abort".to_string()]);
+        marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr))
+            .await
+            .expect("session 1 succeeds");
+
+        // Assert that .ui_transcript.json was created on disk
+        let ui_transcript_path = plan.ui_transcript_path();
+        assert!(
+            ui_transcript_path.exists(),
+            "ui_transcript.json must be persisted"
+        );
+
+        let loaded = UiTranscript::load(&ui_transcript_path).expect("must load ui_transcript.json");
+        assert_eq!(loaded.records().len(), 2);
+        assert_eq!(
+            loaded.records()[0],
+            UiRecord::User {
+                text: "First goal".to_string()
+            }
+        );
+        assert_eq!(
+            loaded.records()[1],
+            UiRecord::Assistant {
+                content: Some("First assistant reply.".to_string()),
+                thinking: None,
+            }
+        );
+    }
+
+    // Session 2: Resume/rehydrate session from disk on the same directory
+    {
+        let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+            marmennill::llm::ChatClient::from_config(&cfg),
+            plan.clone(),
+            Arc::new(marmennill::harness::HarnessStats::new()),
+        ));
+        let mut renderer = ScriptedRenderer::new(vec!["/abort".to_string()]);
+        marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr))
+            .await
+            .expect("session 2 succeeds");
+
+        // Verified that rehydrate_ui was called directly with the saved records!
+        assert_eq!(renderer.rehydrated_ui.len(), 2);
+        assert_eq!(
+            renderer.rehydrated_ui[0],
+            UiRecord::User {
+                text: "First goal".to_string()
+            }
+        );
+        assert_eq!(
+            renderer.rehydrated_ui[1],
+            UiRecord::Assistant {
+                content: Some("First assistant reply.".to_string()),
+                thinking: None,
+            }
+        );
+        // And legacy rehydration was NOT called (rehydrated remains empty)
+        assert!(
+            renderer.rehydrated.is_empty(),
+            "clean ui_transcript rehydration bypasses legacy conversion"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_ui_session_migrates_legacy_transcript_to_ui_transcript() {
+    let _lock = TEST_MUTEX.lock().await;
+    use marmennill::ui::{UiRecord, UiTranscript};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(completion_sse("Another reply.")))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
+    let cfg = Config {
+        backend_url: format!("{}/v1", server.uri()),
+        system_prompt_path: PathBuf::from("prompts/system.md"),
+        ui_mode: "tui".to_string(),
+        ..Config::default()
+    };
+
+    // Pre-create ONLY legacy .session_transcript.json (no .ui_transcript.json)
+    let transcript_path = plan.transcript_path();
+    std::fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+    let past_msgs = vec![
+        marmennill::types::Message::System {
+            content: "system prompt".to_string(),
+        },
+        marmennill::types::Message::User {
+            content: "Legacy user message".to_string(),
+        },
+        marmennill::types::Message::Assistant {
+            content: Some("Legacy assistant reply".to_string()),
+            reasoning_content: Some("Legacy thinking".to_string()),
+            tool_calls: vec![],
+        },
+    ];
+    let json = serde_json::to_string(&past_msgs).unwrap();
+    std::fs::write(&transcript_path, json).unwrap();
+    assert!(!plan.ui_transcript_path().exists());
+
+    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::from_config(&cfg),
+        plan.clone(),
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+    let mut renderer = ScriptedRenderer::new(vec!["/abort".to_string()]);
+    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr))
+        .await
+        .expect("session succeeds");
+
+    // Check that .ui_transcript.json was migrated and saved
+    assert!(
+        plan.ui_transcript_path().exists(),
+        "must migrate and create ui_transcript.json"
+    );
+    let migrated =
+        UiTranscript::load(plan.ui_transcript_path()).expect("load migrated ui_transcript");
+    assert_eq!(migrated.records().len(), 2);
+    assert_eq!(
+        migrated.records()[0],
+        UiRecord::User {
+            text: "Legacy user message".to_string()
+        }
+    );
+    assert_eq!(
+        migrated.records()[1],
+        UiRecord::Assistant {
+            content: Some("Legacy assistant reply".to_string()),
+            thinking: Some("Legacy thinking".to_string()),
+        }
+    );
+
+    // Check that renderer was rehydrated with the migrated records
+    assert_eq!(renderer.rehydrated_ui.len(), 2);
+    assert_eq!(
+        renderer.rehydrated_ui[0],
+        UiRecord::User {
+            text: "Legacy user message".to_string()
+        }
     );
 }

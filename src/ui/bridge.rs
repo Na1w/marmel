@@ -276,7 +276,25 @@ pub(crate) fn drain_steer_arbitration_events(
     renderer: &mut dyn Renderer,
     steer_queue: &mut Vec<String>,
     steer_abort_requested: &mut bool,
+    subagents: Option<&mut Vec<SubagentDetail>>,
+) {
+    drain_steer_arbitration_events_with_transcript(
+        arb_rx,
+        renderer,
+        steer_queue,
+        steer_abort_requested,
+        subagents,
+        None,
+    );
+}
+
+pub(crate) fn drain_steer_arbitration_events_with_transcript(
+    arb_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SteerArbEvent>,
+    renderer: &mut dyn Renderer,
+    steer_queue: &mut Vec<String>,
+    steer_abort_requested: &mut bool,
     mut subagents: Option<&mut Vec<SubagentDetail>>,
+    mut ui_transcript: Option<&mut crate::ui::UiTranscript>,
 ) {
     let mut dirty = false;
     while let Ok(ev) = arb_rx.try_recv() {
@@ -343,15 +361,23 @@ pub(crate) fn drain_steer_arbitration_events(
                     );
                     renderer.set_subagents(sub.clone());
                 }
+                if let Some(ref mut tr) = ui_transcript {
+                    tr.append(crate::ui::UiRecord::TaskCompleted {
+                        task_id: task_id.clone(),
+                    });
+                }
                 steer_queue.push(format!(
                     "(User steering resulted in subtask '{task_id}' executed by specialist '{}'. Deliverable:\n{})",
                     agent.as_str(),
                     deliverable.content
                 ));
             }
-            SteerArbEvent::SynthesizedAnswer { .. } => {
+            SteerArbEvent::SynthesizedAnswer { answer, .. } => {
                 // User steering inquiry was answered directly to the user by arbitrator.
                 // Do NOT push to steer_queue so it does not trigger an orchestrator turn.
+                if let Some(ref mut tr) = ui_transcript {
+                    tr.append(crate::ui::UiRecord::SteerResponse { text: answer });
+                }
             }
             SteerArbEvent::Finished { decision, user_msg } => {
                 if let Some(ref d) = decision {
@@ -384,6 +410,13 @@ pub(crate) fn drain_steer_arbitration_events(
                             }
                         }
                     }
+                }
+
+                if let Some(ref d) = decision
+                    && let Some(ref resp) = d.response
+                    && let Some(ref mut tr) = ui_transcript
+                {
+                    tr.append(crate::ui::UiRecord::SteerResponse { text: resp.clone() });
                 }
 
                 let has_delegations = decision
@@ -447,6 +480,11 @@ pub(crate) fn drain_steer_arbitration_events(
                                 renderer.on_event(&Event::SteerResponse(
                                     "Instruction queued for next turn while active tasks continue.\n".to_string(),
                                 ));
+                                if let Some(ref mut tr) = ui_transcript {
+                                    tr.append(crate::ui::UiRecord::SteerResponse {
+                                        text: "Instruction queued for next turn while active tasks continue.\n".to_string(),
+                                    });
+                                }
                             }
                             renderer.on_event(&Event::Status(
                                 "Instruction queued for next turn".to_string(),

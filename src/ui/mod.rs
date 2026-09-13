@@ -4,10 +4,12 @@ pub mod bridge;
 pub(crate) mod helpers;
 pub mod raw;
 pub mod session;
+pub mod transcript;
 pub mod tui;
 
 pub use helpers::{chunk_utf8, format_active_subtasks, format_plan_progress_summary};
 pub use session::run_session;
+pub use transcript::{UiRecord, UiTranscript};
 
 use crate::orchestrator::DelegationEvent;
 use anyhow::Result;
@@ -86,7 +88,11 @@ pub trait Renderer: Send {
     }
     fn shutdown(&mut self);
     fn set_subagents(&mut self, _subagents: Vec<SubagentDetail>) {}
-    fn rehydrate_messages(&mut self, _messages: &[crate::types::Message]) {}
+    fn rehydrate_ui(&mut self, _records: &[UiRecord]) {}
+    fn rehydrate_messages(&mut self, messages: &[crate::types::Message]) {
+        let transcript = UiTranscript::from_legacy_messages(messages);
+        self.rehydrate_ui(transcript.records());
+    }
     fn rehydrate_subagents(&mut self, _subagents: &[SubagentDetail]) {}
     fn set_thinking_budgets(&mut self, _cfg: &crate::config::Config) {}
     fn reset_active_agent(&mut self) {}

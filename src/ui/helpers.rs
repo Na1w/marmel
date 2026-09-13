@@ -295,10 +295,20 @@ pub(crate) fn update_subagent_lifecycle(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn drain_delegation_events(
     manager: Option<&OrchestratorManager>,
     renderer: &mut dyn Renderer,
     subagents: &mut Vec<SubagentDetail>,
+) {
+    drain_delegation_events_with_transcript(manager, renderer, subagents, None);
+}
+
+pub(crate) fn drain_delegation_events_with_transcript(
+    manager: Option<&OrchestratorManager>,
+    renderer: &mut dyn Renderer,
+    subagents: &mut Vec<SubagentDetail>,
+    mut ui_transcript: Option<&mut crate::ui::UiTranscript>,
 ) {
     let Some(manager) = manager else {
         return;
@@ -313,10 +323,21 @@ pub(crate) fn drain_delegation_events(
                 update_subagent_lifecycle(subagents, *agent, task.clone(), None, true);
                 changed = true;
             }
-            DelegationEvent::Completed { agent, task }
-            | DelegationEvent::Failed { agent, task } => {
+            DelegationEvent::Completed { agent, task } => {
                 update_subagent_lifecycle(subagents, *agent, task.clone(), None, false);
                 changed = true;
+                if let Some(ref mut tr) = ui_transcript {
+                    let task_id = task.clone().unwrap_or_else(|| agent.to_string());
+                    tr.append(crate::ui::UiRecord::TaskCompleted { task_id });
+                }
+            }
+            DelegationEvent::Failed { agent, task } => {
+                update_subagent_lifecycle(subagents, *agent, task.clone(), None, false);
+                changed = true;
+                if let Some(ref mut tr) = ui_transcript {
+                    let task_id = task.clone().unwrap_or_else(|| agent.to_string());
+                    tr.append(crate::ui::UiRecord::TaskFailed { task_id });
+                }
             }
         }
         renderer.on_event(&Event::Delegation(event));
