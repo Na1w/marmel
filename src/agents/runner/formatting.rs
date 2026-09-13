@@ -18,7 +18,8 @@ pub fn format_tool_args_preview(tool: &str, args: &serde_json::Value) -> String 
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
             if cmd.len() > 40 {
-                format!("{}…", &cmd[..37])
+                let cut = cmd.floor_char_boundary(37);
+                format!("{}…", &cmd[..cut])
             } else {
                 cmd.to_string()
             }
@@ -48,7 +49,8 @@ pub fn format_tool_args_preview(tool: &str, args: &serde_json::Value) -> String 
         _ => {
             let s = args.to_string();
             if s.len() > 30 {
-                format!("{}…", &s[..27])
+                let cut = s.floor_char_boundary(27);
+                format!("{}…", &s[..cut])
             } else {
                 s
             }
@@ -149,5 +151,27 @@ pub fn format_tool_args_full(tool: &str, args: &serde_json::Value) -> String {
             }
         }
         _ => args.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_format_tool_args_preview_utf8_char_boundary_no_panic() {
+        // Reproduce the user's exact panic:
+        // '—' is 3 bytes (bytes 26..29 of the serialized JSON string), so byte index 27 lands inside '—'.
+        let prefix = "a".repeat(24);
+        let val = json!({ "k": format!("{prefix}—rest_of_string") });
+        let res = format_tool_args_preview("custom_tool", &val);
+        assert!(res.ends_with('…'));
+
+        // Also test run_command with multi-byte character around byte 37
+        let cmd_prefix = "b".repeat(36);
+        let cmd_val = json!({ "command": format!("{cmd_prefix}—cargo test") });
+        let cmd_res = format_tool_args_preview(TOOL_RUN_COMMAND, &cmd_val);
+        assert!(cmd_res.ends_with('…'));
     }
 }

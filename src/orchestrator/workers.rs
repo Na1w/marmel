@@ -283,7 +283,8 @@ pub fn get_active_subtasks_str() -> String {
             if let Some(ref fb) = info.latest_validator_feedback {
                 let trimmed = fb.trim();
                 let summary = if trimmed.len() > 300 {
-                    format!("{}...", &trimmed[..297])
+                    let cut = trimmed.floor_char_boundary(297);
+                    format!("{}...", &trimmed[..cut])
                 } else {
                     trimmed.to_string()
                 };
@@ -314,7 +315,8 @@ pub fn get_active_subtasks_str() -> String {
             if let Some(ref fb) = info.latest_validator_feedback {
                 let trimmed = fb.trim();
                 let summary = if trimmed.len() > 300 {
-                    format!("{}...", &trimmed[..297])
+                    let cut = trimmed.floor_char_boundary(297);
+                    format!("{}...", &trimmed[..cut])
                 } else {
                     trimmed.to_string()
                 };
@@ -536,5 +538,28 @@ mod tests {
 
         drop(guard1);
         drop(guard2);
+    }
+
+    #[test]
+    fn test_format_workers_summary_utf8_char_boundary_no_panic() {
+        let prefix = "e".repeat(296);
+        let fb = format!(
+            "{prefix}—feedback text that exceeds 300 characters easily and has em-dash right at the cut boundary"
+        );
+        let guard = register_active_worker(
+            Some("task-utf8".to_string()),
+            "coder".to_string(),
+            "UTF8 test".to_string(),
+        );
+        update_active_worker_progress(&guard.0, 1, 1, Some(fb));
+
+        let status_str = get_active_subtasks_str();
+        assert!(status_str.contains("Latest Validator Feedback:"));
+        assert!(status_str.contains("..."));
+
+        drop(guard);
+        let completed_str = get_active_subtasks_str();
+        assert!(completed_str.contains("Latest Validator Feedback:"));
+        assert!(completed_str.contains("..."));
     }
 }

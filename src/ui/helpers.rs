@@ -107,7 +107,8 @@ pub(crate) fn format_tool_call_display(name: &str, args_val: &serde_json::Value)
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
             if cmd.len() > 60 {
-                format!("run_command({}…)", &cmd[..57])
+                let cut = cmd.floor_char_boundary(57);
+                format!("run_command({}…)", &cmd[..cut])
             } else {
                 format!("run_command({cmd})")
             }
@@ -134,7 +135,8 @@ pub(crate) fn format_tool_call_display(name: &str, args_val: &serde_json::Value)
         _ => {
             let s = args_val.to_string();
             if s.len() > 60 {
-                format!("{name}({}…)", &s[..57])
+                let cut = s.floor_char_boundary(57);
+                format!("{name}({}…)", &s[..cut])
             } else {
                 format!("{name}({s})")
             }
@@ -689,5 +691,21 @@ mod tests {
         assert!(is_abort_command("cancel"));
         assert!(!is_abort_command("continue"));
         assert!(!is_abort_command("status"));
+    }
+
+    #[test]
+    fn test_format_tool_call_utf8_char_boundary_no_panic() {
+        let cmd_prefix = "c".repeat(56);
+        let cmd = format!("{cmd_prefix}—cargo check");
+        let args = serde_json::json!({ "command": cmd });
+        let formatted = format_tool_call_display(crate::tool_names::TOOL_RUN_COMMAND, &args);
+        assert!(formatted.starts_with("run_command("));
+        assert!(formatted.ends_with("…)"));
+
+        let custom_prefix = "d".repeat(56);
+        let custom_args = serde_json::json!({ "arg": format!("{custom_prefix}—value") });
+        let custom_formatted = format_tool_call_display("custom", &custom_args);
+        assert!(custom_formatted.starts_with("custom("));
+        assert!(custom_formatted.ends_with("…)"));
     }
 }
