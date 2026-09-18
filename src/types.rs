@@ -552,7 +552,14 @@ impl ToolDef {
     }
 
     pub fn default_tools() -> Vec<ToolDef> {
-        let roles = &["coder", "researcher", "debugger", "validator", "generalist"];
+        let roles = &[
+            "coder",
+            "researcher",
+            "debugger",
+            "validator",
+            "generalist",
+            "planner",
+        ];
         vec![
             Self::delegate_task(roles),
             Self::create_plan(),
@@ -575,7 +582,14 @@ impl ToolDef {
     }
 
     pub fn manager_tools() -> Vec<ToolDef> {
-        let roles = &["coder", "researcher", "debugger", "validator", "generalist"];
+        let roles = &[
+            "coder",
+            "researcher",
+            "debugger",
+            "validator",
+            "generalist",
+            "planner",
+        ];
         vec![
             Self::delegate_task(roles),
             Self::create_plan(),

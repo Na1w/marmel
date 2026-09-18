@@ -36,12 +36,13 @@ impl SpecialistRegistry {
     /// MUST be present; the Manager validates against this set.
     pub fn canonical() -> Self {
         let mut reg = Self::default();
-        let canonical_specs: [(Agent, &str); 5] = [
+        let canonical_specs: [(Agent, &str); 6] = [
             (Agent::Coder, "src/agents/coder.rs"),
             (Agent::Researcher, "src/agents/researcher.rs"),
             (Agent::Debugger, "src/agents/debugger.rs"),
             (Agent::Validator, "src/agents/validator.rs"),
             (Agent::Generalist, "src/agents/generalist.rs"),
+            (Agent::Planner, "src/agents/planner.rs"),
         ];
         for (agent, module) in canonical_specs {
             let worker = reg.worker(agent);
@@ -86,6 +87,7 @@ impl SpecialistRegistry {
             Agent::Debugger => Arc::new(crate::agents::debugger::Debugger),
             Agent::Validator => Arc::new(crate::agents::validator::Validator),
             Agent::Generalist => Arc::new(crate::agents::generalist::Generalist),
+            Agent::Planner => Arc::new(crate::agents::planner::Planner),
         }
     }
 
@@ -134,6 +136,7 @@ mod tests {
             Agent::Debugger,
             Agent::Validator,
             Agent::Generalist,
+            Agent::Planner,
         ] {
             let entry = reg
                 .resolve(role)
@@ -160,7 +163,7 @@ mod tests {
                 role
             );
         }
-        assert_eq!(reg.agent_ids().len(), 5);
+        assert_eq!(reg.agent_ids().len(), 6);
     }
 
     /// REQ-ORCH-002: `SpecialistEntry::allows` honors the tool allowlist —

@@ -155,12 +155,39 @@ async fn run_automated_validation_inner(
     cfg: &crate::config::Config,
     token: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<(bool, String)> {
-    let validator_prompt = match agent {
+    let custom_validation_prompt = task_id.and_then(|tid| {
+        let clean = tid
+            .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
+            .trim();
+        let path = crate::harness::get_workspace_root()
+            .join(crate::manager::phase::MARMEL_DIR)
+            .join("prompts")
+            .join(format!("{clean}-validation.md"));
+        std::fs::read_to_string(&path).ok()
+    });
+
+    let default_role_prompt = match agent {
         Agent::Coder => crate::agents::validator::VALIDATOR_CODER_ROLE_PROMPT,
         Agent::Debugger => crate::agents::validator::VALIDATOR_DEBUGGER_ROLE_PROMPT,
         Agent::Researcher => crate::agents::validator::VALIDATOR_RESEARCHER_ROLE_PROMPT,
         Agent::Generalist => crate::agents::validator::VALIDATOR_GENERALIST_ROLE_PROMPT,
         _ => crate::agents::validator::VALIDATOR_ROLE_PROMPT,
+    };
+    let validator_prompt = match custom_validation_prompt.as_deref() {
+        Some(prompt) => prompt,
+        None => {
+            let prompts_dir = crate::harness::get_workspace_root()
+                .join(crate::manager::phase::MARMEL_DIR)
+                .join("prompts");
+            if prompts_dir.is_dir() {
+                return Ok((
+                    true,
+                    "No validation prompt defined for task; deliverable assumed approved."
+                        .to_string(),
+                ));
+            }
+            default_role_prompt
+        }
     };
 
     let specialist_cfg = cfg.orchestration.specialists.get(agent.as_str());

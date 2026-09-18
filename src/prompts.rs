@@ -12,6 +12,14 @@ pub const VALIDATOR_DEBUGGER_PROMPT: &str = include_str!("../prompts/validator_d
 pub const VALIDATOR_RESEARCHER_PROMPT: &str = include_str!("../prompts/validator_researcher.md");
 pub const VALIDATOR_GENERALIST_PROMPT: &str = include_str!("../prompts/validator_generalist.md");
 pub const VALIDATOR_PLANNER_PROMPT: &str = include_str!("../prompts/validator_planner.md");
+pub const PLANNER_PROMPT: &str = include_str!("../prompts/planner.md");
+pub const PROMPT_BUILDER_PROMPT: &str = include_str!("../prompts/prompt_builder.md");
+
+pub const SKILL_CLEAN_CODE: &str = include_str!("../prompts/skills/clean_code.md");
+pub const SKILL_DEBUGGING: &str = include_str!("../prompts/skills/debugging.md");
+pub const SKILL_RESEARCH: &str = include_str!("../prompts/skills/research.md");
+pub const SKILL_VERIFICATION: &str = include_str!("../prompts/skills/verification.md");
+pub const SKILL_TESTING: &str = include_str!("../prompts/skills/testing.md");
 
 /// Returns a markdown section describing the current operating system, shell,
 /// architecture, and workspace directory for injection into agent prompts.

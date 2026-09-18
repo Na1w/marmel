@@ -1,16 +1,22 @@
 //! Specialist Subagents — isolated-context, run-to-completion workers.
 
+pub mod catalog;
 pub mod coder;
 pub mod debugger;
 pub mod generalist;
+pub mod planner;
+pub mod prompt_builder;
 pub mod researcher;
 pub mod runner;
 pub mod validation;
 pub mod validator;
 
+pub use catalog::{AgentArchetype, Catalog, Skill, SkillSource};
 pub use coder::Coder;
 pub use debugger::Debugger;
 pub use generalist::Generalist;
+pub use planner::Planner;
+pub use prompt_builder::{AgentBlueprint, PromptBuilder};
 pub use researcher::Researcher;
 pub use runner::run_specialist_live;
 pub(crate) use runner::run_specialist_llm;
@@ -35,6 +41,8 @@ pub enum Agent {
     Validator,
     /// Supreme Polymath — dense reasoning and cross-domain logic.
     Generalist,
+    /// Strategic Planner — mission architecture, task decomposition, and execution plan creation.
+    Planner,
 }
 
 impl fmt::Display for Agent {
@@ -51,6 +59,7 @@ impl Agent {
             Agent::Debugger => "debugger",
             Agent::Validator => "validator",
             Agent::Generalist => "generalist",
+            Agent::Planner => "planner",
         }
     }
 
@@ -62,6 +71,7 @@ impl Agent {
             "debugger" => Some(Self::Debugger),
             "validator" => Some(Self::Validator),
             "generalist" | "deepbrain" => Some(Self::Generalist),
+            "planner" => Some(Self::Planner),
             _ => None,
         }
     }
@@ -162,6 +172,7 @@ pub struct IsolatedContext {
     pub snippets: Vec<String>,
     pub image_urls: Vec<String>,
     pub audio_urls: Vec<String>,
+    pub blueprint: Option<AgentBlueprint>,
 }
 
 impl IsolatedContext {
@@ -173,7 +184,13 @@ impl IsolatedContext {
             snippets: req.snippets.clone(),
             image_urls: req.image_urls.clone().unwrap_or_default(),
             audio_urls: req.audio_urls.clone().unwrap_or_default(),
+            blueprint: None,
         }
+    }
+
+    pub fn with_blueprint(mut self, blueprint: AgentBlueprint) -> Self {
+        self.blueprint = Some(blueprint);
+        self
     }
 
     pub fn into_engine(&self, max_context_tokens: usize) -> crate::manager::ContextEngine {
@@ -239,6 +256,8 @@ mod tests {
         assert_eq!(Agent::from_str("validator"), Some(Agent::Validator));
         assert_eq!(Agent::from_str("generalist"), Some(Agent::Generalist));
         assert_eq!(Agent::from_str("deepbrain"), Some(Agent::Generalist));
+        assert_eq!(Agent::from_str("planner"), Some(Agent::Planner));
+        assert_eq!(Agent::Planner.to_string(), "planner");
         assert_eq!(Agent::from_str("unknown"), None);
     }
 

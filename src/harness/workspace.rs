@@ -82,6 +82,19 @@ impl Workspace {
         self.root.join(ARCHIVE_DIR)
     }
 
+    /// Canonical path of the synthesized prompts directory (`.marmel/prompts/`).
+    pub fn prompts_dir(&self) -> PathBuf {
+        self.root.join("prompts")
+    }
+
+    /// Path to a specific synthesized prompt markdown file (`.marmel/prompts/<task_id>.md`).
+    pub fn prompt_path_for_task(&self, task_id: &str) -> PathBuf {
+        let clean = task_id
+            .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
+            .trim();
+        self.prompts_dir().join(format!("{clean}.md"))
+    }
+
     /// Create the workspace directory and validate it is writable by writing
     /// and removing a probe file.
     pub fn ensure_writable(&self) -> Result<()> {

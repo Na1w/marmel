@@ -29,11 +29,17 @@ async fn run_specialist_live_inner(
     cfg: &crate::config::Config,
     token: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<String> {
-    let env_block = crate::prompts::format_environment_block();
+    let tools_list = if let Some(ref bp) = ctx.blueprint {
+        bp.allowed_tools.join("`, `")
+    } else {
+        "write_file`, `replace`, `read_file`, `run_command`, `grep_search`, `glob`, `rebirth"
+            .to_string()
+    };
 
+    let env_block = crate::prompts::format_environment_block();
     let enhanced_system_prompt = format!(
-        "{}\n\n{}\n- Tools available: `write_file`, `replace`, `read_file`, `run_command`, `grep_search`, `glob`, `rebirth`.\n- You MUST save files and execute real work to complete the task.\n- Context Preservation: If context usage is high (>= 80%) or advised, call `rebirth` with a detailed summary capturing all pertinent state (including active file paths, current read offsets or line numbers reached in `read_file`, intermediate findings, and next actions) so work resumes seamlessly without starting over.",
-        ctx.role_system_prompt, env_block
+        "{}\n\n{}\n- Tools available: `{}`.\n- You MUST save files and execute real work to complete the task.\n- Context Preservation: If context usage is high (>= 80%) or advised, call `rebirth` with a detailed summary capturing all pertinent state (including active file paths, current read offsets or line numbers reached in `read_file`, intermediate findings, and next actions) so work resumes seamlessly without starting over.",
+        ctx.role_system_prompt, env_block, tools_list
     );
 
     let mut engine = crate::manager::ContextEngineFactory::new(cfg.max_context_tokens)
@@ -73,7 +79,12 @@ async fn run_specialist_live_inner(
     let reg_entry = registry.resolve(agent).expect("agent is registered");
     let mut tools = Vec::new();
     for tool in crate::types::ToolDef::default_tools() {
-        if reg_entry.allows(&tool.function.name) {
+        let is_allowed = if let Some(ref bp) = ctx.blueprint {
+            bp.allowed_tools.iter().any(|t| t == &tool.function.name)
+        } else {
+            reg_entry.allows(&tool.function.name)
+        };
+        if is_allowed {
             tools.push(tool);
         }
     }
@@ -112,8 +123,26 @@ async fn run_specialist_live_inner(
         .and_then(|sc| sc.max_validator_iterations)
         .unwrap_or(5);
 
-    let mut validation_passed =
-        !auto_validate_enabled || max_val_iterations == 0 || agent == Agent::Validator;
+    let ws_root = crate::harness::get_workspace_root();
+    let prompts_dir = ws_root
+        .join(crate::manager::phase::MARMEL_DIR)
+        .join("prompts");
+    let has_prompts_dir = prompts_dir.is_dir();
+    let has_validation_prompt = clean_task_id
+        .as_deref()
+        .map(|tid| prompts_dir.join(format!("{tid}-validation.md")).exists())
+        .unwrap_or(false);
+
+    let requires_validation = auto_validate_enabled
+        && agent != Agent::Validator
+        && agent != Agent::Planner
+        && if has_prompts_dir {
+            has_validation_prompt
+        } else {
+            true
+        };
+
+    let mut validation_passed = !requires_validation || max_val_iterations == 0;
     let mut validator_critique: Option<String> = None;
     let mut val_iter = 0usize;
 
@@ -400,8 +429,7 @@ async fn run_specialist_live_inner(
                 }
             }
 
-            if auto_validate_enabled
-                && agent != Agent::Validator
+            if requires_validation
                 && !final_content.is_empty()
                 && (tools_executed_count > 0 || has_terminal_marker)
                 && !upper.contains("REPLAN REQUIRED")

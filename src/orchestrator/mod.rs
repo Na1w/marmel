@@ -266,7 +266,16 @@ impl OrchestratorManager {
     /// Create (or overwrite) the on-disk execution plan via `create_plan`.
     pub fn create_plan(&self, plan_markdown: &str) -> Result<()> {
         crate::debug_log::log_plan_update("create_plan", plan_markdown);
-        self.plan.create(plan_markdown)
+        self.plan.create(plan_markdown)?;
+        let prompts_dir = self.plan.dir().join("prompts");
+        let ws_root = self.plan.dir().parent().unwrap_or_else(|| self.plan.dir());
+        let catalog = crate::agents::Catalog::discover(ws_root);
+        crate::agents::PromptBuilder::pregenerate_for_plan_offline(
+            plan_markdown,
+            &catalog,
+            &prompts_dir,
+        );
+        Ok(())
     }
 
     /// REQ-ORCH-005: emit a `delegate_task` and **block** until the specialist
@@ -328,9 +337,45 @@ impl OrchestratorManager {
                 String::new()
             });
 
-        // 4. Build the ISOLATED context (REQ-ORCH-003): the specialist sees only
-        //    its own role prompt + brief + snippets, never Manager messages[].
-        let ctx = IsolatedContext::from_request(self.role_prompt_for(entry.agent), &req);
+        // 4. Build the ISOLATED context (REQ-ORCH-003): Disk-first lookup!
+        //    If a prompt already exists for this task on disk (from plan pregeneration),
+        //    load it immediately for zero-latency startup. Fall back to JIT synthesis
+        //    for ad-hoc or un-planned tasks.
+        let prompts_dir = self.plan.dir().join("prompts");
+        let ws_root = self.plan.dir().parent().unwrap_or_else(|| self.plan.dir());
+
+        let saved_prompt_path = req.task_id.as_deref().map(|tid| {
+            let clean = tid
+                .trim_matches(|c| {
+                    c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\''
+                })
+                .trim();
+            prompts_dir.join(format!("{clean}.md"))
+        });
+
+        let blueprint = if let Some(path) = saved_prompt_path.filter(|p| p.exists()) {
+            crate::agents::AgentBlueprint::load_from_disk(&path).ok()
+        } else {
+            None
+        };
+
+        let blueprint = match blueprint {
+            Some(bp) => bp,
+            None => {
+                let catalog = crate::agents::Catalog::discover(ws_root);
+                crate::agents::PromptBuilder::build_blueprint(
+                    Some(&self.client),
+                    Some(self.client.model()),
+                    &catalog,
+                    &req,
+                    Some(&prompts_dir),
+                )
+                .await
+            }
+        };
+
+        let ctx = IsolatedContext::from_request(blueprint.system_prompt.clone(), &req)
+            .with_blueprint(blueprint);
 
         let child_token = self.cancellation_token.child_token();
 
@@ -423,7 +468,32 @@ impl OrchestratorManager {
         // Rebuild the isolated context from the preserved in-flight `sub_req`
         // — this is the SOLE exception to isolation, scoped to the frozen
         // session (SPEC §3.4). Rehydrate with the identical worker_id.
-        let ctx = IsolatedContext::from_request(self.role_prompt_for(entry.agent), &snap.sub_req);
+        let prompts_dir = self.plan.dir().join("prompts");
+        let ws_root = self.plan.dir().parent().unwrap_or_else(|| self.plan.dir());
+        let saved_prompt_path = snap.sub_req.task_id.as_deref().map(|tid| {
+            let clean = tid
+                .trim_matches(|c| {
+                    c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\''
+                })
+                .trim();
+            prompts_dir.join(format!("{clean}.md"))
+        });
+        let blueprint = if let Some(path) = saved_prompt_path.filter(|p| p.exists()) {
+            crate::agents::AgentBlueprint::load_from_disk(&path).ok()
+        } else {
+            None
+        };
+        let (prompt, blueprint) = if let Some(bp) = blueprint {
+            (bp.system_prompt.clone(), Some(bp))
+        } else {
+            let catalog = crate::agents::Catalog::discover(ws_root);
+            let bp = crate::agents::PromptBuilder::synthesize_offline(&catalog, &snap.sub_req);
+            (bp.system_prompt.clone(), Some(bp))
+        };
+        let mut ctx = IsolatedContext::from_request(prompt, &snap.sub_req);
+        if let Some(bp) = blueprint {
+            ctx = ctx.with_blueprint(bp);
+        }
         let worker = self.registry.worker(entry.agent);
         let child_token = self.cancellation_token.child_token();
         let deliverable = worker.run(&ctx, &child_token).await;
@@ -469,15 +539,17 @@ impl OrchestratorManager {
         d
     }
 
-    /// REQ-ORCH-001: resolve the role system prompt for a specialist. Reads the
-    /// canonical per-role constant (isolated-context messages[0]).
-    fn role_prompt_for(&self, agent: Agent) -> String {
+    /// REQ-ORCH-001: resolve the role system prompt for a specialist.
+    /// Used in tests to verify specialist prompt isolation invariants.
+    #[cfg(test)]
+    pub(crate) fn role_prompt_for(&self, agent: Agent) -> String {
         match agent {
             Agent::Coder => crate::agents::coder::CODER_ROLE_PROMPT.to_string(),
             Agent::Researcher => crate::agents::researcher::RESEARCHER_ROLE_PROMPT.to_string(),
             Agent::Debugger => crate::agents::debugger::DEBUGGER_ROLE_PROMPT.to_string(),
             Agent::Validator => crate::agents::validator::VALIDATOR_ROLE_PROMPT.to_string(),
             Agent::Generalist => crate::agents::generalist::GENERALIST_ROLE_PROMPT.to_string(),
+            Agent::Planner => crate::agents::planner::PLANNER_ROLE_PROMPT.to_string(),
         }
     }
 

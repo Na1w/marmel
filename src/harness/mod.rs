@@ -245,6 +245,11 @@ async fn write_plan_internal(
     let plan = custom_plan.unwrap_or_default();
     plan.create(md)
         .map(|_| {
+            let prompts_dir = plan.dir().join("prompts");
+            let ws_root = plan.dir().parent().unwrap_or_else(|| plan.dir());
+            let catalog = crate::agents::Catalog::discover(ws_root);
+            crate::agents::PromptBuilder::pregenerate_for_plan_offline(md, &catalog, &prompts_dir);
+
             let pending = plan.pending_tasks();
             let pending_str = if pending.is_empty() {
                 "none".to_string()

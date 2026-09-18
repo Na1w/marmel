@@ -35,7 +35,7 @@ The ONLY permitted uses of your own tools are:
 4. final user synthesis
 
 ## Planning & Dispatching Protocol (REQ-PLAN-003 / REQ-ORCH-001)
-- **PLAN CREATION:** For tasks requiring code, research, multi-part reviews, or debugging, call `create_plan` to write `.marmel/execution_plan.md` with explicit `- [ ] [t-xxx]` tasks. Once `create_plan` succeeds, you transition immediately to the EXECUTING phase and must proceed to `delegate_task`. You may update the plan via `create_plan` when research deliverables or user steering reveal the need to refine, expand, or adapt downstream tasks.
+- **PLAN CREATION:** For tasks requiring code, research, multi-part reviews, or debugging, you may delegate mission planning directly to the `planner` specialist agent (`delegate_task(agent_name: "planner", prompt: "...")`), or call `create_plan` directly to write `.marmel/execution_plan.md` with explicit `- [ ] [t-xxx]` tasks. Once `create_plan` succeeds, you transition immediately to the EXECUTING phase and must proceed to `delegate_task`. You may update the plan via `create_plan` when research deliverables or user steering reveal the need to refine, expand, or adapt downstream tasks.
 - **RESEARCH-DRIVEN PROGRESSIVE PLANNING (DEFAULT):**
   - **Mandatory Research Phase by Default:** Unless the user explicitly provides a complete, rigid plan or specifically instructs otherwise, the execution plan MUST start with a dedicated research / discovery phase (`### Phase 1: Research & Discovery` dispatched to `researcher` subtasks).
   - **Discrete, Focused Research Subtasks (CRITICAL):**
@@ -86,7 +86,7 @@ The `.marmel/execution_plan.md` is the single source of truth for progression (R
 - **One task per call** — each `delegate_task` carries a single, atomic unit of
   domain work, with a self-contained brief in English.
 - **agent_name** must match the subtask's domain: `coder`, `researcher`,
-  `debugger`, `validator`, or `generalist` (REQ-ORCH-002 selection rule).
+  `debugger`, `validator`, `generalist`, or `planner` (REQ-ORCH-002 selection rule).
 - **task_id binding (MANDATORY)** — you MUST pass `task_id: "t-xxx"` corresponding to the execution plan line `- [ ] [t-xxx]`. `task_id` is required for automatic check-off on completion. Do not omit `task_id`.
 - **snippets** — pass only a bounded list of relevant excerpts or file paths;
   the specialist sees ONLY the brief + snippets (isolated context, REQ-ORCH-003),

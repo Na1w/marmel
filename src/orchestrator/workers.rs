@@ -280,6 +280,30 @@ pub fn get_active_subtasks_str() -> String {
                 "- Tool Call ID: {}\n  Subagent Tag: {}\n  Subagent: {}\n  Status: {}\n  Task Prompt: {}\n  Started At: {} (running for {}, {elapsed_secs} total seconds)\n  Implementation Turns: {}\n  Validation Rounds: {}\n",
                 task_id_str, id, info.agent_name, info.status, info.prompt, start_wall_str, duration_str, info.implementation_turns, info.validation_rounds
             ));
+            let clean_tid = info.task_id.as_deref().map(|t| {
+                t.trim_matches(|c| {
+                    c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\''
+                })
+                .trim()
+            });
+            if let Some(tid) = clean_tid {
+                let prompt_file = crate::harness::get_workspace_root()
+                    .join(crate::manager::phase::MARMEL_DIR)
+                    .join("prompts")
+                    .join(format!("{tid}.md"));
+                if let Ok(bp) = crate::agents::AgentBlueprint::load_from_disk(&prompt_file) {
+                    out.push_str(&format!(
+                        "  Assigned Role: {}\n  Allowed Tools: {}\n  Assigned Skills: {}\n",
+                        bp.role_name,
+                        bp.allowed_tools.join(", "),
+                        if bp.selected_skills.is_empty() {
+                            "None".to_string()
+                        } else {
+                            bp.selected_skills.join(", ")
+                        }
+                    ));
+                }
+            }
             if let Some(ref fb) = info.latest_validator_feedback {
                 let trimmed = fb.trim();
                 let summary = if trimmed.len() > 300 {
