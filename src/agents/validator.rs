@@ -42,6 +42,7 @@ impl Specialist for Validator {
             crate::tool_names::TOOL_READ_FILE,
             crate::tool_names::TOOL_GREP_SEARCH,
             crate::tool_names::TOOL_GLOB,
+            crate::tool_names::TOOL_RUN_COMMAND,
             crate::tool_names::TOOL_PTY_SPAWN,
             crate::tool_names::TOOL_PTY_WRITE,
             crate::tool_names::TOOL_PTY_READ,
@@ -66,7 +67,7 @@ mod tests {
         let v = Validator;
         assert_eq!(v.name(), Agent::Validator);
         assert!(v.tool_namespaces().contains(&"read_file"));
-        assert!(!v.tool_namespaces().contains(&"run_command"));
+        assert!(v.tool_namespaces().contains(&"run_command"));
         assert!(v.tool_namespaces().contains(&"grep_search"));
         assert!(v.tool_namespaces().contains(&"glob"));
         assert!(v.tool_namespaces().contains(&"pty_spawn"));

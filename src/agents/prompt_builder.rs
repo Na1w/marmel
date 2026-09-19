@@ -70,10 +70,8 @@ impl AgentBlueprint {
         Ok(dest)
     }
 
-    /// Load an existing synthesized prompt blueprint from disk.
-    pub fn load_from_disk(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading prompt file {}", path.display()))?;
+    /// Parse a synthesized prompt blueprint from raw markdown text with YAML frontmatter.
+    pub fn parse_from_markdown(raw: &str) -> Result<Self> {
         let trimmed = raw.trim();
 
         if let Some(stripped) = trimmed.strip_prefix("---")
@@ -156,10 +154,48 @@ impl AgentBlueprint {
             });
         }
 
-        anyhow::bail!(
-            "invalid prompt file format: missing frontmatter in {}",
-            path.display()
-        )
+        // Fallback: check if the markdown body contains explicit tool directives like
+        // `- **ALLOWED TOOLS:** You are granted access to: ...` or `- Tools available: ...`
+        let mut allowed_tools = Vec::new();
+        for line in raw.lines() {
+            let lower = line.to_ascii_lowercase();
+            if lower.contains("allowed tools") || lower.contains("tools available") {
+                for part in line.split('`') {
+                    let token = part.trim().trim_matches([',', ' ', '.', '`']);
+                    if !token.is_empty() && !token.contains(' ') {
+                        let norm = crate::harness::normalize_tool_name(token);
+                        if crate::types::ToolDef::default_tools()
+                            .iter()
+                            .any(|d| d.function.name == norm || d.function.name == token)
+                            && !allowed_tools.contains(&token.to_string())
+                        {
+                            allowed_tools.push(token.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if !allowed_tools.is_empty() {
+            return Ok(AgentBlueprint {
+                role_name: "custom_specialist".to_string(),
+                reasoning: "Parsed from inline prompt tool directives".to_string(),
+                selected_skills: Vec::new(),
+                allowed_tools,
+                system_prompt: raw.to_string(),
+                task_id: None,
+            });
+        }
+
+        anyhow::bail!("invalid prompt format: missing frontmatter or tool specification")
+    }
+
+    /// Load an existing synthesized prompt blueprint from disk.
+    pub fn load_from_disk(path: &Path) -> Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading prompt file {}", path.display()))?;
+        Self::parse_from_markdown(&raw)
+            .with_context(|| format!("parsing prompt file {}", path.display()))
     }
 }
 
@@ -526,14 +562,23 @@ impl PromptBuilder {
 
             // 2. Validation prompt (optional)
             let desc_lower = item.description.to_ascii_lowercase();
-            let needs_validation = agent == crate::agents::Agent::Coder
-                || agent == crate::agents::Agent::Debugger
-                || desc_lower.contains("implement")
-                || desc_lower.contains("refactor")
-                || desc_lower.contains("fix")
-                || desc_lower.contains("create")
-                || desc_lower.contains("build")
-                || desc_lower.contains("patch");
+            let is_doc_or_config = desc_lower.contains("readme")
+                || desc_lower.contains("docs")
+                || desc_lower.contains("documentation")
+                || desc_lower.contains("markdown")
+                || desc_lower.contains("report")
+                || desc_lower.contains("summary")
+                || desc_lower.contains("summariz");
+
+            let needs_validation = !is_doc_or_config
+                && (agent == crate::agents::Agent::Coder
+                    || agent == crate::agents::Agent::Debugger
+                    || desc_lower.contains("implement")
+                    || desc_lower.contains("refactor")
+                    || desc_lower.contains("fix")
+                    || desc_lower.contains("patch")
+                    || (desc_lower.contains("build") && !desc_lower.contains("verify"))
+                    || desc_lower.contains("unit test"));
 
             if needs_validation
                 && agent != crate::agents::Agent::Planner
@@ -542,7 +587,7 @@ impl PromptBuilder {
                 let val_filename = format!("{}-validation.md", item.task_id);
                 let val_dest = prompts_dir.join(val_filename.clone());
                 let val_content = format!(
-                    "---\nrole_name: \"validator\"\ntask_id: \"{}\"\ntarget_brief: \"{}\"\ncreated_at: \"{}\"\n---\n\n# Independent Quality Verification for {}\n\n**Mission:** Independently audit the deliverable for task `{}`.\n**Brief:** {}\n\n## Verification Protocol:\n1. Inspect created or modified files to verify correctness and conformance.\n2. Execute test suites or checks if applicable.\n3. Conclude by calling `leave_verdict(verdict=\"APPROVED\" | \"REJECTED\", comments=\"...\")`.\n",
+                    "---\nrole_name: \"validator\"\ntask_id: \"{}\"\ntarget_brief: \"{}\"\ncreated_at: \"{}\"\nallowed_tools:\n  - \"read_file\"\n  - \"grep_search\"\n  - \"glob\"\n  - \"run_command\"\n  - \"leave_verdict\"\n  - \"rebirth\"\n---\n\n# Independent Quality Verification for {}\n\n**Mission:** Independently audit the deliverable for task `{}`.\n**Brief:** {}\n\n## Verification Protocol:\n1. Inspect created or modified files to verify correctness and conformance.\n2. Execute test suites or checks if applicable.\n3. Conclude by calling `leave_verdict(verdict=\"APPROVED\" | \"REJECTED\", comments=\"...\")`.\n",
                     item.task_id,
                     item.description.replace('"', "\\\""),
                     chrono::Utc::now().to_rfc3339(),
@@ -643,14 +688,19 @@ mod tests {
 
 ### Phase 2: Implementation
 - [ ] [t-002] Implement parser logic (coder)
+
+### Phase 3: Documentation
+- [ ] [t-003] Produce documentation in README.md (generalist)
 "#;
         let generated = PromptBuilder::pregenerate_for_plan_offline(plan, &catalog, tmp.path());
         assert!(generated.contains(&"t-001.md".to_string()));
         assert!(generated.contains(&"t-002.md".to_string()));
+        assert!(generated.contains(&"t-003.md".to_string()));
         // t-002 is a coder task ("implement"), so it must also generate t-002-validation.md
         assert!(generated.contains(&"t-002-validation.md".to_string()));
-        // t-001 is a pure research task, so it should NOT have validation
+        // t-001 is pure research and t-003 is documentation, so neither should have validation
         assert!(!generated.contains(&"t-001-validation.md".to_string()));
+        assert!(!generated.contains(&"t-003-validation.md".to_string()));
     }
 
     #[test]

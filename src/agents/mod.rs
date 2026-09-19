@@ -177,6 +177,7 @@ pub struct IsolatedContext {
 
 impl IsolatedContext {
     pub fn from_request(role_system_prompt: String, req: &DelegationRequest) -> Self {
+        let blueprint = AgentBlueprint::parse_from_markdown(&role_system_prompt).ok();
         Self {
             role_system_prompt,
             brief: req.prompt.clone(),
@@ -184,13 +185,20 @@ impl IsolatedContext {
             snippets: req.snippets.clone(),
             image_urls: req.image_urls.clone().unwrap_or_default(),
             audio_urls: req.audio_urls.clone().unwrap_or_default(),
-            blueprint: None,
+            blueprint,
         }
     }
 
     pub fn with_blueprint(mut self, blueprint: AgentBlueprint) -> Self {
         self.blueprint = Some(blueprint);
         self
+    }
+
+    /// Retrieve the explicit list of allowed tools defined in the prompt blueprint, if any.
+    pub fn allowed_tools(&self) -> Option<&[String]> {
+        self.blueprint
+            .as_ref()
+            .map(|bp| bp.allowed_tools.as_slice())
     }
 
     pub fn into_engine(&self, max_context_tokens: usize) -> crate::manager::ContextEngine {

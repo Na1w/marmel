@@ -163,12 +163,57 @@ impl HarnessStats {
 }
 
 /// The role requesting a tool execution, used to enforce the orchestration tool policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolCaller {
     /// The Manager.
     Manager,
-    /// A specialist identified by its role.
+    /// A specialist identified by its role, using default registry allowlist.
     Specialist(crate::agents::Agent),
+    /// A specialist whose allowed tools are governed explicitly by its prompt/blueprint.
+    SpecialistWithTools {
+        agent: crate::agents::Agent,
+        allowed_tools: Vec<String>,
+    },
+}
+
+impl ToolCaller {
+    pub fn role_name(&self) -> String {
+        match self {
+            ToolCaller::Manager => "Manager".to_string(),
+            ToolCaller::Specialist(a) => a.as_str().to_string(),
+            ToolCaller::SpecialistWithTools { agent, .. } => agent.as_str().to_string(),
+        }
+    }
+
+    pub fn agent(&self) -> Option<crate::agents::Agent> {
+        match self {
+            ToolCaller::Manager => None,
+            ToolCaller::Specialist(a) => Some(*a),
+            ToolCaller::SpecialistWithTools { agent, .. } => Some(*agent),
+        }
+    }
+
+    pub fn allowed_tools(&self) -> Option<&[String]> {
+        match self {
+            ToolCaller::SpecialistWithTools { allowed_tools, .. } => Some(allowed_tools.as_slice()),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ToolCaller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ToolCaller::Manager => write!(f, "Manager"),
+            ToolCaller::Specialist(a) => write!(f, "Specialist({a:?})"),
+            ToolCaller::SpecialistWithTools {
+                agent,
+                allowed_tools,
+            } => {
+                write!(f, "SpecialistWithTools({agent:?}, tools={allowed_tools:?})")
+            }
+        }
+    }
 }
 
 /// Errors that can occur while dispatching a tool.
@@ -592,20 +637,17 @@ pub fn dispatch_for_with_engine(
     caller: ToolCaller,
     engine: Option<&mut crate::manager::ContextEngine>,
 ) -> Result<ToolResult, ToolError> {
-    let caller_str = match caller {
+    let caller_str = match &caller {
         ToolCaller::Manager => "Manager".to_string(),
         ToolCaller::Specialist(a) => format!("Specialist({a:?})"),
+        ToolCaller::SpecialistWithTools { agent, .. } => format!("Specialist({agent:?})"),
     };
     crate::debug_log::log_tool_invocation(&caller_str, &tool.name, &tool.arguments);
     let start = std::time::Instant::now();
 
-    let res = if caller == ToolCaller::Manager {
-        dispatch_manager(tool, engine)
-    } else {
-        let ToolCaller::Specialist(agent) = caller else {
-            unreachable!("non-Manager caller is a specialist");
-        };
-        dispatch_specialist(tool, agent, engine)
+    let res = match caller {
+        ToolCaller::Manager => dispatch_manager(tool, engine),
+        specialist => dispatch_specialist(tool, specialist, engine),
     };
 
     let elapsed = start.elapsed().as_millis();
@@ -641,20 +683,17 @@ pub async fn dispatch_for_async_with_engine(
     caller: ToolCaller,
     engine: Option<&mut crate::manager::ContextEngine>,
 ) -> Result<ToolResult, ToolError> {
-    let caller_str = match caller {
+    let caller_str = match &caller {
         ToolCaller::Manager => "Manager".to_string(),
         ToolCaller::Specialist(a) => format!("Specialist({a:?})"),
+        ToolCaller::SpecialistWithTools { agent, .. } => format!("Specialist({agent:?})"),
     };
     crate::debug_log::log_tool_invocation(&caller_str, &tool.name, &tool.arguments);
     let start = std::time::Instant::now();
 
-    let res = if caller == ToolCaller::Manager {
-        dispatch_manager_async(tool, engine).await
-    } else {
-        let ToolCaller::Specialist(agent) = caller else {
-            unreachable!("non-Manager caller is a specialist");
-        };
-        dispatch_specialist_async(tool, agent, engine).await
+    let res = match caller {
+        ToolCaller::Manager => dispatch_manager_async(tool, engine).await,
+        specialist => dispatch_specialist_async(tool, specialist, engine).await,
     };
 
     let elapsed = start.elapsed().as_millis();
@@ -736,14 +775,15 @@ async fn dispatch_manager_async(
 
 async fn dispatch_specialist_async(
     tool: &ToolInvocation,
-    agent: crate::agents::Agent,
+    caller: ToolCaller,
     mut engine: Option<&mut crate::manager::ContextEngine>,
 ) -> Result<ToolResult, ToolError> {
     let name = tool.name.as_str();
+    let caller_str = caller.role_name();
     if name == TOOL_CREATE_PLAN {
         return Err(ToolError::Forbidden {
             tool: name.to_string(),
-            caller: agent.as_str().to_string(),
+            caller: caller_str,
         });
     }
 
@@ -756,12 +796,23 @@ async fn dispatch_specialist_async(
         };
     }
 
-    let registry = crate::orchestrator::SpecialistRegistry::canonical();
     let gate_name = normalize_tool_name(name);
-    if !crate::orchestrator::caller_allows_tool(agent, &gate_name, &registry) {
+    let is_allowed = match &caller {
+        ToolCaller::SpecialistWithTools { allowed_tools, .. } => allowed_tools.iter().any(|t| {
+            let norm = normalize_tool_name(t);
+            norm == gate_name || t == name || t == &gate_name || norm == name
+        }),
+        ToolCaller::Specialist(agent) => {
+            let registry = crate::orchestrator::SpecialistRegistry::canonical();
+            crate::orchestrator::caller_allows_tool(*agent, &gate_name, &registry)
+        }
+        ToolCaller::Manager => false,
+    };
+
+    if !is_allowed {
         return Err(ToolError::Forbidden {
             tool: name.to_string(),
-            caller: agent.as_str().to_string(),
+            caller: caller_str,
         });
     }
 
@@ -879,7 +930,7 @@ fn dispatch_manager(
     }
 }
 
-fn normalize_tool_name(name: &str) -> String {
+pub(crate) fn normalize_tool_name(name: &str) -> String {
     match name {
         TOOL_READ_FILE | "view_file" | "get_file" | "read" => TERMINAL_READ_FILE.to_string(),
         TOOL_WRITE_FILE | "create_file" | "write_to_file" | "save_file" | "write" => {
@@ -899,14 +950,15 @@ fn normalize_tool_name(name: &str) -> String {
 
 fn dispatch_specialist(
     tool: &ToolInvocation,
-    agent: crate::agents::Agent,
+    caller: ToolCaller,
     mut engine: Option<&mut crate::manager::ContextEngine>,
 ) -> Result<ToolResult, ToolError> {
     let name = tool.name.as_str();
+    let caller_str = caller.role_name();
     if name == TOOL_CREATE_PLAN {
         return Err(ToolError::Forbidden {
             tool: name.to_string(),
-            caller: agent.as_str().to_string(),
+            caller: caller_str,
         });
     }
 
@@ -920,12 +972,23 @@ fn dispatch_specialist(
         };
     }
 
-    let registry = crate::orchestrator::SpecialistRegistry::canonical();
     let gate_name = normalize_tool_name(name);
-    if !crate::orchestrator::caller_allows_tool(agent, &gate_name, &registry) {
+    let is_allowed = match &caller {
+        ToolCaller::SpecialistWithTools { allowed_tools, .. } => allowed_tools.iter().any(|t| {
+            let norm = normalize_tool_name(t);
+            norm == gate_name || t == name || t == &gate_name || norm == name
+        }),
+        ToolCaller::Specialist(agent) => {
+            let registry = crate::orchestrator::SpecialistRegistry::canonical();
+            crate::orchestrator::caller_allows_tool(*agent, &gate_name, &registry)
+        }
+        ToolCaller::Manager => false,
+    };
+
+    if !is_allowed {
         return Err(ToolError::Forbidden {
             tool: name.to_string(),
-            caller: agent.as_str().to_string(),
+            caller: caller_str,
         });
     }
 

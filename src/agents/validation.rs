@@ -225,13 +225,28 @@ async fn run_automated_validation_inner(
     let mut engine = crate::manager::ContextEngineFactory::new(cfg.max_context_tokens)
         .specialist_context(validator_prompt.to_string(), brief);
 
+    let custom_blueprint = custom_validation_prompt
+        .as_deref()
+        .and_then(|p| crate::agents::AgentBlueprint::parse_from_markdown(p).ok());
+    let prompt_allowed_tools = custom_blueprint
+        .as_ref()
+        .map(|bp| bp.allowed_tools.as_slice());
+
     let registry = crate::orchestrator::SpecialistRegistry::canonical();
     let val_entry = registry
         .resolve(Agent::Validator)
         .expect("validator is registered");
     let mut tools = Vec::new();
     for tool in crate::types::ToolDef::default_tools() {
-        if val_entry.allows(&tool.function.name) {
+        let is_allowed = if let Some(allowed) = prompt_allowed_tools {
+            allowed.iter().any(|t| {
+                let norm = crate::harness::normalize_tool_name(t);
+                norm == tool.function.name || t == &tool.function.name
+            })
+        } else {
+            val_entry.allows(&tool.function.name)
+        };
+        if is_allowed {
             tools.push(tool);
         }
     }
@@ -474,7 +489,14 @@ async fn run_automated_validation_inner(
                         name: tc.function.name.clone(),
                         arguments: args_val,
                     };
-                    let caller = crate::harness::ToolCaller::Specialist(Agent::Validator);
+                    let caller = if let Some(allowed) = prompt_allowed_tools {
+                        crate::harness::ToolCaller::SpecialistWithTools {
+                            agent: Agent::Validator,
+                            allowed_tools: allowed.to_vec(),
+                        }
+                    } else {
+                        crate::harness::ToolCaller::Specialist(Agent::Validator)
+                    };
                     let tool_res = crate::harness::dispatch_for_async_with_engine(
                         &invocation,
                         caller,
@@ -591,7 +613,7 @@ async fn run_plan_validation_inner(
          Instructions:\n\
          1. Inspect the workspace and examine files using available inspection tools (`read_file`, `grep_search`, `glob`) if needed to evaluate feasibility and existing structure.\n\
          2. You are an auditor: you cannot execute shell commands or modify files. Solely analyze, inspect, and evaluate the proposed plan.\n\
-         3. Audit the plan against the criteria: format (# Execution Plan, `- [ ] [t-xxx]`), phase headers, no monolithic tasks, decomposed research tasks (no single catch-all research tasks), unit & integration tests, and feasibility.\n\
+         3. Audit the plan against dynamic criteria: proper format (# Execution Plan, `- [ ] [t-xxx]`), phase headers, atomic task granularity (no monolithic catch-all tasks), and contextual testing/verification (unit/integration tests ONLY when relevant to the project scope and deliverable — do not demand tests for docs, scripts, or simple configs).\n\
          4. When your verification is complete, you MUST call the `leave_verdict` tool with `verdict` ('APPROVED' or 'REJECTED') and detailed `comments`.\n\
          5. If rejected, provide clear, actionable critique explaining what must be decomposed or fixed so the Manager can revise the plan.",
         plan_markdown

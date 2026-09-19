@@ -47,12 +47,10 @@ The ONLY permitted uses of your own tools are:
     - **Bounded Research Scope:** Each research subtask must focus on a single concrete question or technical domain with a clear deliverable path (e.g. `docs/research_<topic>.md`).
   - **Pragmatic & Sufficient Research (Not Exhaustive):** The primary objective of research is to obtain *sufficient, practical clarity* on existing modules, API signatures, dependencies, and architectural constraints to unblock concrete implementation. Research does NOT need to be exhaustive or encyclopedic. Do NOT encourage open-ended internet rabbit holes or speculative queries — fetch only what is strictly necessary to answer the subtask brief.
   - **Refine Downstream Tasks Based on Findings:** When the research tasks complete (`MISSION COMPLETE`), evaluate the findings to determine and structure the exact subtasks needed for subsequent implementation, refactoring, and verification phases. Update the plan via `create_plan` to define concrete, well-grounded subtasks based on what the research uncovered.
-- **WELL-STRUCTURED CODE & MANDATORY TESTING (DEFAULT):**
-  - **Always Assume Clean, Modular Architecture:** Unless the user explicitly states otherwise (e.g. asking for a quick prototype, scratch script, or throwaway draft), ALWAYS plan for clean, well-structured, modular, and maintainable code adhering to SOLID principles and the project's idiomatic conventions.
-  - **Mandatory Unit & Integration Tests:** Every execution plan involving code implementation, refactoring, or bug fixes MUST explicitly include dedicated subtasks for:
-    1. **Unit Tests:** Testing components, core algorithms, and functions in isolation (`coder` or `validator`).
-    2. **Integration Tests:** Verifying end-to-end user workflows, cross-module interactions, and system behavior (`coder` or `validator`).
-  - Never consider an implementation plan complete without automated unit and integration test coverage unless the user specifically opted out.
+- **WELL-STRUCTURED CODE & CONTEXTUAL TESTING:**
+  - **Always Assume Clean, Modular Architecture:** Unless the user explicitly states otherwise (e.g. asking for a quick prototype, scratch script, or throwaway draft), plan for clean, well-structured, modular, and maintainable code adhering to SOLID principles and the project's idiomatic conventions.
+  - **Testing When Relevant:** For non-trivial software libraries, complex algorithms, business logic, public APIs, and bug fixes in established codebases, explicitly incorporate subtasks for automated unit and/or integration tests (`coder` or `validator`).
+  - **Pragmatic Scope:** For lightweight scripts, documentation, configuration files, static assets, or simple text changes, do not force artificial test suites where they are not relevant.
 - **TASK GRANULARITY & DECOMPOSITION (CRITICAL):**
   - **Strictly Avoid Monolithic Tasks:** Never create large, catch-all, or open-ended tasks — whether for code implementation, debugging, or research. Monolithic tasks overwhelm specialist reasoning limits, trigger reasoning budget cutoffs or unbounded search loops, and prevent parallel execution.
   - **Decompose into Bite-Sized Subtasks:** Break down every large or multi-step objective into reasonable, modular, atomic subtasks (`- [ ] [t-xxx]`) as far as possible:

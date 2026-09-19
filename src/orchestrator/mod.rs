@@ -678,21 +678,35 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
     req.task_id = Some(clean_task_id);
 
     // 2c. Guard: reject re-delegation of tasks already checked off in the plan.
-    #[cfg(not(test))]
     {
         let plan = Plan::default();
         if let Some(ref tid) = req.task_id
             && let Ok(Some(content)) = plan.read()
         {
-            let tid_lower = tid.to_ascii_lowercase();
-            let is_checked = content.lines().any(|line| {
-                let lower = line.to_ascii_lowercase();
-                lower.contains(&tid_lower) && (line.contains("[x]") || line.contains("[X]"))
+            let clean_tid = tid
+                .trim()
+                .trim_matches(|c| {
+                    c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\''
+                })
+                .trim();
+            let tid_lower = clean_tid.to_ascii_lowercase();
+            let re_checked = regex::Regex::new(&format!(
+                r"(?i)^\s*(?:[-*]|\d+\.)\s*\[\s*[xX]\s*\]\s*\*{{0,2}}\[?{}\]?\*{{0,2}}\b",
+                regex::escape(&tid_lower)
+            ))
+            .ok();
+            let is_checked = content.lines().any(|line| match &re_checked {
+                Some(re) => re.is_match(line),
+                None => {
+                    let lower = line.to_ascii_lowercase();
+                    lower.contains(&format!("[{tid_lower}]"))
+                        && (line.contains("[x]") || line.contains("[X]"))
+                }
             });
             if is_checked {
-                tracing::warn!("Rejecting re-delegation of already completed task [{tid}]");
+                tracing::warn!("Rejecting re-delegation of already completed task [{clean_tid}]");
                 return Ok(ToolResult::err(format!(
-                    "Task '{tid}' is already completed and checked off in the execution plan. Do not re-delegate completed tasks. Proceed with your final report synthesis."
+                    "Task '{clean_tid}' is already completed and checked off in the execution plan. Do not re-delegate completed tasks. Proceed with your final report synthesis."
                 )));
             }
         }

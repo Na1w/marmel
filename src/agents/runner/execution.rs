@@ -78,9 +78,13 @@ async fn run_specialist_live_inner(
     let registry = crate::orchestrator::SpecialistRegistry::canonical();
     let reg_entry = registry.resolve(agent).expect("agent is registered");
     let mut tools = Vec::new();
+    let prompt_allowed_tools = ctx.allowed_tools();
     for tool in crate::types::ToolDef::default_tools() {
-        let is_allowed = if let Some(ref bp) = ctx.blueprint {
-            bp.allowed_tools.iter().any(|t| t == &tool.function.name)
+        let is_allowed = if let Some(allowed) = prompt_allowed_tools {
+            allowed.iter().any(|t| {
+                let norm = crate::harness::normalize_tool_name(t);
+                norm == tool.function.name || t == &tool.function.name
+            })
         } else {
             reg_entry.allows(&tool.function.name)
         };
@@ -603,7 +607,14 @@ async fn run_specialist_live_inner(
                     name: tc.function.name.clone(),
                     arguments: args_val,
                 };
-                let caller = crate::harness::ToolCaller::Specialist(agent);
+                let caller = if let Some(allowed) = ctx.allowed_tools() {
+                    crate::harness::ToolCaller::SpecialistWithTools {
+                        agent,
+                        allowed_tools: allowed.to_vec(),
+                    }
+                } else {
+                    crate::harness::ToolCaller::Specialist(agent)
+                };
                 let _ = crate::harness::dispatch_for_async_with_engine(
                     &invocation,
                     caller,
@@ -664,7 +675,14 @@ async fn run_specialist_live_inner(
                         name: tc.function.name.clone(),
                         arguments: args_val,
                     };
-                    let caller = crate::harness::ToolCaller::Specialist(agent);
+                    let caller = if let Some(allowed) = ctx.allowed_tools() {
+                        crate::harness::ToolCaller::SpecialistWithTools {
+                            agent,
+                            allowed_tools: allowed.to_vec(),
+                        }
+                    } else {
+                        crate::harness::ToolCaller::Specialist(agent)
+                    };
                     let tool_res = crate::harness::dispatch_for_async_with_engine(
                         &invocation,
                         caller,

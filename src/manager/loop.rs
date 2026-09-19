@@ -393,7 +393,7 @@ impl AgentLoop {
                     let mut futures = FuturesUnordered::new();
                     for tool in reads {
                         let invocation = tool.invocation.clone();
-                        let caller = self.caller;
+                        let caller = self.caller.clone();
                         futures.push(async move {
                             let result = tokio::task::spawn_blocking(move || {
                                 dispatch_for(&invocation, caller)
@@ -446,7 +446,7 @@ impl AgentLoop {
                             break;
                         }
                         let inv = tool.invocation.clone();
-                        let caller = self.caller;
+                        let caller = self.caller.clone();
                         let dispatch_res =
                             tokio::task::spawn_blocking(move || dispatch_for(&inv, caller)).await;
 

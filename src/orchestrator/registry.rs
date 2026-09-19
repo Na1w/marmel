@@ -185,12 +185,12 @@ mod tests {
         let brain = reg.resolve(Agent::Generalist).unwrap();
         assert!(brain.allows("anything_at_all"));
 
-        // Validator allowlist checks.
+        // Validator allowlist checks (per AGENTS.md, Validator allows run_command for running test suites).
         let validator = reg.resolve(Agent::Validator).unwrap();
         assert!(validator.allows("read_file"));
         assert!(validator.allows("pty_spawn"));
         assert!(validator.allows("pty_read"));
-        assert!(!validator.allows("run_command"));
+        assert!(validator.allows("run_command"));
         assert!(!validator.allows("write_file"));
         assert!(!validator.allows("replace"));
         assert!(!validator.allows("bogus_tool"));

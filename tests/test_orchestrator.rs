@@ -310,3 +310,40 @@ async fn test_handle_delegate_task_synchronous_inside_async_context() {
         "handle_delegate_task must not panic in async context"
     );
 }
+
+#[tokio::test]
+async fn test_handle_delegate_task_rejection_anchoring() {
+    let _tmp = setup();
+    let plan = Plan::default();
+    plan.create(
+        "# Execution Plan\n\
+- [x] [t-006] Verify build/compile\n\
+- [ ] [t-008] Verify integration test\n\
+- [x] [t-011] Produce report summarizing (t-006...t-008)\n",
+    )
+    .unwrap();
+
+    // t-006 is marked [x] on its own line: must be rejected as already completed
+    let args_completed = serde_json::json!({
+        "agent_name": "validator",
+        "prompt": "Run build check",
+        "task_id": "t-006",
+    });
+    let res = handle_delegate_task(&args_completed).unwrap();
+    assert!(res.is_error);
+    assert!(res.content.contains("already completed"));
+
+    // t-008 is marked [ ] on its line, but mentioned in [x] t-011's description:
+    // must NOT be rejected by the completed-task guard!
+    let args_pending = serde_json::json!({
+        "agent_name": "validator",
+        "prompt": "Run integration test",
+        "task_id": "t-008",
+    });
+    let res2 = handle_delegate_task(&args_pending).unwrap();
+    assert!(
+        !res2.content.contains("already completed"),
+        "t-008 must not be rejected as completed, got: {}",
+        res2.content
+    );
+}

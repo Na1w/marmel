@@ -142,13 +142,14 @@ async fn validator_forbidden_from_file_modification_and_execution_tools() {
             "command": "cargo test"
         }),
     };
-    match dispatch_for(&tool_run, ToolCaller::Specialist(Agent::Validator)) {
-        Err(ToolError::Forbidden { tool: t, caller }) => {
-            assert_eq!(t, "run_command");
-            assert_eq!(caller, "validator");
-        }
-        other => panic!("Validator must be forbidden from run_command, got {other:?}"),
-    }
+    // Per AGENTS.md, Validator is permitted run_command to run test suites.
+    assert!(
+        !matches!(
+            dispatch_for(&tool_run, ToolCaller::Specialist(Agent::Validator)),
+            Err(ToolError::Forbidden { .. })
+        ),
+        "Validator must be permitted run_command per AGENTS.md"
+    );
 
     let tool_pty = ToolInvocation {
         name: "pty_list".to_string(),
@@ -289,4 +290,62 @@ fn all_agents_permitted_sleep() {
     }
 
     marmennill::orchestrator::reset_cancellation();
+}
+
+#[tokio::test]
+async fn test_prompt_based_tool_gating() {
+    // 1. A Validator whose prompt explicitly includes `run_command` is permitted `run_command`.
+    let tool_run = ToolInvocation {
+        name: "run_command".to_string(),
+        arguments: serde_json::json!({
+            "command": "echo test"
+        }),
+    };
+    let validator_caller_with_run = ToolCaller::SpecialistWithTools {
+        agent: Agent::Validator,
+        allowed_tools: vec![
+            "read_file".to_string(),
+            "run_command".to_string(),
+            "leave_verdict".to_string(),
+        ],
+    };
+    assert!(
+        dispatch_for(&tool_run, validator_caller_with_run).is_ok(),
+        "Validator with run_command in prompt must be permitted to execute run_command"
+    );
+
+    // 2. A Coder whose prompt omits `write_file` is forbidden from `write_file`.
+    let tool_write = ToolInvocation {
+        name: "write_file".to_string(),
+        arguments: serde_json::json!({
+            "path": "test.txt",
+            "content": "hello"
+        }),
+    };
+    let coder_read_only = ToolCaller::SpecialistWithTools {
+        agent: Agent::Coder,
+        allowed_tools: vec!["read_file".to_string(), "grep_search".to_string()],
+    };
+    match dispatch_for(&tool_write, coder_read_only) {
+        Err(ToolError::Forbidden { tool, .. }) => {
+            assert_eq!(tool, "write_file");
+        }
+        other => panic!("Coder without write_file in prompt must be forbidden, got: {other:?}"),
+    }
+
+    // 3. Normalization: aliases matching the canonical name are properly gated.
+    let tool_read_alias = ToolInvocation {
+        name: "view_file".to_string(),
+        arguments: serde_json::json!({
+            "path": "Cargo.toml"
+        }),
+    };
+    let researcher_caller = ToolCaller::SpecialistWithTools {
+        agent: Agent::Researcher,
+        allowed_tools: vec!["read_file".to_string()],
+    };
+    assert!(
+        dispatch_for(&tool_read_alias, researcher_caller).is_ok(),
+        "Allowed tool read_file must allow alias view_file"
+    );
 }

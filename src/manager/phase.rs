@@ -484,8 +484,8 @@ impl Plan {
             .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
             .trim();
         let tid_lower = clean_tid.to_ascii_lowercase();
-        let re_tid = Regex::new(&format!(
-            r"(?i)(?:^|[^\w-]){}(?:[^\w-]|$)",
+        let re_task_checkbox = Regex::new(&format!(
+            r"(?i)^\s*(?:[-*]|\d+\.)\s*\[\s*\]\s*\*{{0,2}}\[?{}\]?\*{{0,2}}\b",
             regex::escape(&tid_lower)
         ))
         .ok();
@@ -495,11 +495,14 @@ impl Plan {
             .lines()
             .map(|line| {
                 if !flipped {
-                    let matches_tid = match &re_tid {
+                    let is_target = match &re_task_checkbox {
                         Some(re) => re.is_match(line),
-                        None => line.to_ascii_lowercase().contains(&tid_lower),
+                        None => {
+                            let lower = line.to_ascii_lowercase();
+                            lower.contains(&format!("[{tid_lower}]")) && re_box.is_match(line)
+                        }
                     };
-                    if matches_tid && re_box.is_match(line) {
+                    if is_target && re_box.is_match(line) {
                         flipped = true;
                         return re_box.replace(line, "[x]").to_string();
                     }
