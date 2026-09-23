@@ -112,7 +112,7 @@ async fn test_ui_run_session_executes_tool_calls() {
                 if n == 0 {
                     ResponseTemplate::new(200).set_body_string(tool_call_sse(
                         "call-glob-1",
-                        "glob",
+                        crate::tool_names::TOOL_GLOB,
                         r#"{"pattern": "Cargo.toml"}"#,
                     ))
                 } else {
@@ -158,6 +158,8 @@ struct RecordingRenderer {
     delegation_events: Vec<DelegationEvent>,
     events: Vec<Event>,
     input_queue: std::collections::VecDeque<String>,
+    /// Shared abort / user-exit flags (trait-default abort surface).
+    input_state: crate::ui::InputState,
 }
 
 impl RecordingRenderer {
@@ -167,6 +169,7 @@ impl RecordingRenderer {
             delegation_events: Vec::new(),
             events: Vec::new(),
             input_queue: std::collections::VecDeque::new(),
+            input_state: crate::ui::InputState::default(),
         }
     }
 }
@@ -187,12 +190,13 @@ impl Renderer for RecordingRenderer {
     fn poll_input(&mut self) -> Option<String> {
         self.input_queue.pop_front()
     }
-    fn read_input(&mut self) -> Option<String> {
-        None
+    // `read_input` uses the trait default (queued input is only drained by
+    // `poll_input` in this double).
+    fn input_state(&mut self) -> &mut crate::ui::InputState {
+        &mut self.input_state
     }
-    fn request_abort(&mut self) {}
-    fn aborted(&self) -> bool {
-        false
+    fn input_state_shared(&self) -> &crate::ui::InputState {
+        &self.input_state
     }
     fn shutdown(&mut self) {}
     fn set_subagents(&mut self, subagents: Vec<SubagentDetail>) {
@@ -380,12 +384,12 @@ async fn test_ui_run_session_executes_parallel_delegations() {
                     ResponseTemplate::new(200).set_body_string(multiple_tool_calls_sse(&[
                         (
                             "call-del-1",
-                            "delegate_task",
+                            crate::tool_names::TOOL_DELEGATE_TASK,
                             r#"{"agent_name": "coder", "prompt": "task 1", "task_id": "t-001"}"#,
                         ),
                         (
                             "call-del-2",
-                            "delegate_task",
+                            crate::tool_names::TOOL_DELEGATE_TASK,
                             r#"{"agent_name": "generalist", "prompt": "task 2", "task_id": "t-002"}"#,
                         ),
                     ]))

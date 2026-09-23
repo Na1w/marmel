@@ -418,10 +418,16 @@ mod tests {
         log_mcp_response("git", "tools/list", 25, "[]", false);
         log_tool_invocation(
             "Manager",
-            "delegate_task",
+            crate::tool_names::TOOL_DELEGATE_TASK,
             &serde_json::json!({"prompt": "do something"}),
         );
-        log_tool_result("Manager", "delegate_task", 42, "Done!", false);
+        log_tool_result(
+            "Manager",
+            crate::tool_names::TOOL_DELEGATE_TASK,
+            42,
+            "Done!",
+            false,
+        );
         log_llm_progress("http://localhost:11434", "glm-5", 5000, 1200, 0, 300);
 
         let content = std::fs::read_to_string(&log_file).unwrap();

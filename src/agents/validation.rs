@@ -1,7 +1,19 @@
 //! Automated validator loop and verdict evaluation for specialist deliverables.
+//!
+//! The turn-loop scaffolding lives once in [`crate::agents::runner::fix_loop`];
+//! this file keeps only the validator-specific prompt/brief construction and
+//! the verdict-parsing helpers, as thin wrappers over the shared driver.
+//!
+//! **Abort semantics (unified, see fix_loop module docs):** every
+//! abort/cancellation path returns `Err`, never `Ok(false, …)`. A cancelled
+//! validation is not a verdict; surfacing it as a failure lets callers
+//! distinguish "user aborted" from "validator rejected".
 
 use crate::agents::Agent;
-use crate::agents::runner::{format_tool_args_full, format_tool_args_preview};
+use crate::agents::runner::fix_loop::{
+    FixLoopResult, LoopParams, assemble_tools, register_loop_worker, resolve_validator_backend,
+    run_fix_loop,
+};
 use crate::tool_names::TOOL_LEAVE_VERDICT;
 
 /// The outcome of an automated validation pass.
@@ -166,13 +178,7 @@ async fn run_automated_validation_inner(
         std::fs::read_to_string(&path).ok()
     });
 
-    let default_role_prompt = match agent {
-        Agent::Coder => crate::agents::validator::VALIDATOR_CODER_ROLE_PROMPT,
-        Agent::Debugger => crate::agents::validator::VALIDATOR_DEBUGGER_ROLE_PROMPT,
-        Agent::Researcher => crate::agents::validator::VALIDATOR_RESEARCHER_ROLE_PROMPT,
-        Agent::Generalist => crate::agents::validator::VALIDATOR_GENERALIST_ROLE_PROMPT,
-        _ => crate::agents::validator::VALIDATOR_ROLE_PROMPT,
-    };
+    let default_role_prompt = crate::agents::validator::role_prompt_for(agent);
     let validator_prompt = match custom_validation_prompt.as_deref() {
         Some(prompt) => prompt,
         None => {
@@ -190,27 +196,8 @@ async fn run_automated_validation_inner(
         }
     };
 
-    let specialist_cfg = cfg.orchestration.specialists.get(agent.as_str());
-    let validator_cfg = cfg.orchestration.specialists.get(Agent::Validator.as_str());
-    let validator_backend = specialist_cfg
-        .and_then(|sc| sc.validator_backend_url.as_ref())
-        .or_else(|| validator_cfg.and_then(|vc| vc.backend_url.as_ref()))
-        .unwrap_or(&cfg.backend_url);
-    let validator_token = specialist_cfg
-        .and_then(|sc| sc.validator_auth_token.as_ref())
-        .or_else(|| validator_cfg.and_then(|vc| vc.auth_token.as_ref()))
-        .unwrap_or(&cfg.auth_token);
-    let validator_model = specialist_cfg
-        .and_then(|sc| sc.validator_model.as_ref())
-        .or_else(|| validator_cfg.and_then(|vc| vc.model.as_ref()))
-        .cloned()
-        .unwrap_or_else(|| cfg.model.clone());
-
-    let val_client = crate::llm::ChatClient::new_with_token(
-        validator_backend,
-        &validator_model,
-        validator_token,
-    );
+    let (backend, auth, validator_model) = resolve_validator_backend(cfg, agent);
+    let val_client = crate::llm::ChatClient::new_with_token(&backend, &validator_model, &auth);
 
     let brief = format!(
         "Task Brief:\n{}\n\nSpecialist Deliverable:\n{}\n\n\
@@ -236,30 +223,24 @@ async fn run_automated_validation_inner(
     let val_entry = registry
         .resolve(Agent::Validator)
         .expect("validator is registered");
-    let mut tools = Vec::new();
-    for tool in crate::types::ToolDef::default_tools() {
-        let is_allowed = if let Some(allowed) = prompt_allowed_tools {
-            allowed.iter().any(|t| {
-                let norm = crate::harness::normalize_tool_name(t);
-                norm == tool.function.name || t == &tool.function.name
-            })
-        } else {
-            val_entry.allows(&tool.function.name)
-        };
-        if is_allowed {
-            tools.push(tool);
-        }
-    }
-    if let Some(mcp) = crate::harness::get_mcp_manager() {
-        let servers = validator_cfg
-            .map(|vc| vc.mcp_servers.clone())
-            .filter(|s| !s.is_empty())
-            .or_else(|| specialist_cfg.map(|sc| sc.mcp_servers.clone()))
-            .unwrap_or_default();
-        for tool in mcp.tools_for_servers(&servers) {
-            tools.push(crate::types::ToolDef::from_mcp(&tool));
-        }
-    }
+    let mcp_servers = cfg
+        .orchestration
+        .specialists
+        .get(Agent::Validator.as_str())
+        .map(|vc| vc.mcp_servers.clone())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            cfg.orchestration
+                .specialists
+                .get(agent.as_str())
+                .map(|sc| sc.mcp_servers.clone())
+        })
+        .unwrap_or_default();
+    let tools = assemble_tools(
+        prompt_allowed_tools,
+        |name| val_entry.allows(name),
+        &mcp_servers,
+    );
 
     let clean_task_id = task_id
         .map(|t| {
@@ -275,12 +256,13 @@ async fn run_automated_validation_inner(
         Some(tid) => format!("validator-{agent}-{tid}"),
         None => format!("validator-{agent}"),
     };
+    let worker_name = format!("validator-{agent}");
 
-    let _active_guard = crate::orchestrator::register_active_worker_with_token(
+    let _active_guard = register_loop_worker(
         clean_task_id.clone(),
-        format!("validator-{agent}"),
+        worker_name.clone(),
         format!("Auditing {agent} deliverable"),
-        Some(token.clone()),
+        token,
     );
 
     let default_mon = crate::config::MonitoringConfig::default();
@@ -289,271 +271,57 @@ async fn run_automated_validation_inner(
         std::sync::Arc::new(crate::harness::HarnessStats::new()),
         mon_cfg,
     );
-    let mut rep_detector = crate::harness::monitor::RepetitionDetector::new(
-        mon_cfg.repetition_threshold,
-        mon_cfg.min_pattern_len,
-    );
-    let mut verdict_nudge_count = 0usize;
-    let mut _turn = 0usize;
-    loop {
-        _turn += 1;
-        if token.is_cancelled() {
-            tracing::warn!("{val_tag}: aborted by cancellation token");
-            return Err(anyhow::anyhow!(
+
+    let caller = if let Some(allowed) = prompt_allowed_tools {
+        crate::harness::ToolCaller::SpecialistWithTools {
+            agent: Agent::Validator,
+            allowed_tools: allowed.to_vec(),
+        }
+    } else {
+        crate::harness::ToolCaller::Specialist(Agent::Validator)
+    };
+
+    let mut params = LoopParams {
+        client: &val_client,
+        model: validator_model,
+        tag: val_tag.clone(),
+        worker_name,
+        task_id: clean_task_id,
+        worker_key: _active_guard.0.clone(),
+        engine: &mut engine,
+        tools,
+        token,
+        mon_cfg,
+        cfg,
+        temperature: 0.0,
+        status_template: format!("{val_tag}: evaluating test & inspection output..."),
+        default_verdict_critique: "Deliverable verified and approved.".to_string(),
+        verdict_log_role: agent.as_str().to_string(),
+        dispatch_verdict_tools: true,
+        abort_log_prefix: format!("validator-{agent}"),
+        emit_tool_status: true,
+        rebirth_notice: "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. Do NOT call rebirth again. Continue your validation inspection and submit your verdict via leave_verdict.)".to_string(),
+    };
+
+    match run_fix_loop(&mut params, &mut monitor, caller).await {
+        Ok(FixLoopResult::Verdict { approved, critique }) => Ok((approved, critique)),
+        Ok(FixLoopResult::Exhausted) => {
+            // Unreachable in practice (the driver returns a verdict after 3
+            // nudges), but keeps the historical fallback explicit.
+            Ok((
+                true,
+                "Validator completed turns without calling leave_verdict; assumed approved."
+                    .to_string(),
+            ))
+        }
+        Ok(FixLoopResult::Aborted) => {
+            // Strict abort semantics: cancellation is a failure, not a verdict.
+            Err(anyhow::anyhow!(
                 "Validation aborted by cancellation signal."
-            ));
+            ))
         }
-        crate::orchestrator::update_active_worker_context(&_active_guard.0, engine.token_count());
-        crate::orchestrator::emit_status(format!(
-            "{val_tag}: evaluating test & inspection output (turn {_turn})...",
-        ));
-        let req = crate::types::ChatRequest {
-            model: validator_model.clone(),
-            messages: engine.messages().to_vec(),
-            tools: Some(tools.clone()),
-            stream: Some(true),
-            enable_thinking: None,
-            temperature: Some(0.0),
-            top_p: Some(cfg.top_p),
-            presence_penalty: Some(cfg.presence_penalty),
-            frequency_penalty: Some(cfg.frequency_penalty),
-        };
-
-        let max_tokens = mon_cfg.max_stream_tokens.max(256);
-        let max_thinking_tokens = mon_cfg.max_thinking_tokens.max(256);
-        let mut sink = crate::orchestrator::PreemptibleStreamSink::register_full(
-            &val_tag,
-            Some(format!("validator-{agent}")),
-            clean_task_id.clone(),
-            Some(token.clone()),
-            &validator_model,
-        );
-        let stream_out = crate::llm::chat_stream_resumable(
-            &val_client,
-            &req,
-            &mut sink,
-            max_tokens,
-            max_thinking_tokens,
-            &mut rep_detector,
-            false,
-            Some(token),
-        )
-        .await;
-
-        let out = match stream_out {
-            Ok(o) => o,
-            Err(e) => {
-                if token.is_cancelled() {
-                    tracing::warn!("validator-{agent}: aborted during LLM call");
-                    return Err(anyhow::anyhow!(
-                        "Validation aborted by cancellation signal."
-                    ));
-                }
-                tracing::error!("validator-{agent} LLM chat call error on turn {_turn}: {e:?}");
-                break;
-            }
-        };
-
-        if out.was_aborted_by_steer || token.is_cancelled() {
-            tracing::warn!("validator-{agent}: aborted during LLM call");
-            return Err(anyhow::anyhow!(
-                "Validation aborted by cancellation signal."
-            ));
-        }
-
-        let reply = out.reply;
-        let budget_exceeded = out.budget_exceeded;
-        let thinking_budget_exceeded = out.thinking_budget_exceeded;
-        if budget_exceeded {
-            tracing::warn!(
-                "validator-{agent}: maximum single-turn output budget of {max_tokens} tokens exceeded"
-            );
-        }
-        if thinking_budget_exceeded {
-            tracing::warn!(
-                "validator-{agent}: maximum single-turn reasoning budget of {max_thinking_tokens} tokens exceeded"
-            );
-        }
-
-        let mut tool_calls = reply.tool_calls.clone();
-        if tool_calls.is_empty() && cfg.enable_xml_rescue {
-            let rescued = monitor.rescue_xml(&reply.content);
-            if !rescued.is_empty() {
-                tool_calls = rescued;
-            }
-        }
-
-        let assistant_msg = crate::types::Message::Assistant {
-            content: Some(reply.content.clone()),
-            reasoning_content: if reply.reasoning.is_empty() {
-                None
-            } else {
-                Some(reply.reasoning.clone())
-            },
-            tool_calls: tool_calls.clone(),
-        };
-        engine.append(assistant_msg);
-
-        for tc in &tool_calls {
-            if is_leave_verdict_tool(&tc.function.name) {
-                let args_val = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
-                    .unwrap_or_else(|_| serde_json::Value::String(tc.function.arguments.clone()));
-
-                let (approved, critique) = parse_verdict_args(&args_val)
-                    .unwrap_or((true, "Deliverable verified and approved.".to_string()));
-
-                crate::debug_log::log_validation_verdict(agent.as_str(), approved, &critique);
-
-                tracing::info!(
-                    "Validator recorded verdict for {agent} via leave_verdict: approved={}, critique:\n{}",
-                    approved,
-                    critique
-                );
-                return Ok((approved, critique));
-            }
-        }
-
-        if tool_calls.is_empty() {
-            if verdict_nudge_count < 3 {
-                verdict_nudge_count += 1;
-                engine.append(crate::types::Message::User {
-                    content: format!(
-                        "System: You have not submitted a verdict using the 'leave_verdict' tool (reminder {}/3). Do not output text. If your analysis and verification are complete, you MUST call the 'leave_verdict' tool with verdict ('APPROVED' or 'REJECTED') and comments. If you need to perform further verification, invoke the appropriate tools.",
-                        verdict_nudge_count
-                    ),
-                });
-                continue;
-            } else {
-                tracing::info!(
-                    "Validator for {agent} did not invoke leave_verdict after 3 reminders; assuming approved."
-                );
-                return Ok((
-                    true,
-                    "Validator completed verification without calling leave_verdict after 3 reminders; assumed approved.".to_string(),
-                ));
-            }
-        }
-
-        for tc in tool_calls {
-            if token.is_cancelled() || crate::orchestrator::is_current_or_global_cancelled() {
-                tracing::warn!(
-                    "validator-{agent}: aborted before tool {}",
-                    tc.function.name
-                );
-                return Err(anyhow::anyhow!(
-                    "Validation aborted by cancellation signal."
-                ));
-            }
-            let args_val = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
-                .unwrap_or_else(|_| serde_json::Value::String(tc.function.arguments.clone()));
-            let desc = format_tool_args_preview(&tc.function.name, &args_val);
-            crate::orchestrator::emit_status(format!(
-                "validator-{agent}: running {}({desc})",
-                tc.function.name
-            ));
-            let full_args = format_tool_args_full(&tc.function.name, &args_val);
-            tracing::info!(
-                "validator-{agent} invoking tool: {}({})",
-                tc.function.name,
-                full_args
-            );
-
-            let intervention = monitor.observe_tool(&tc.function.name, &args_val);
-            let content = match intervention {
-                crate::harness::monitor::Intervention::Block
-                | crate::harness::monitor::Intervention::Cut => {
-                    let err_msg = monitor.intervention_error(intervention).unwrap_or_else(|| {
-                        format!(
-                            "ERROR: Tool repetition detected for '{}'. Conclude your review by calling leave_verdict.",
-                            tc.function.name
-                        )
-                    });
-                    tracing::warn!(
-                        "validator-{agent} tool {} blocked by repetition detector",
-                        tc.function.name
-                    );
-                    err_msg
-                }
-                crate::harness::monitor::Intervention::None => {
-                    if token.is_cancelled() || crate::orchestrator::is_current_or_global_cancelled()
-                    {
-                        tracing::warn!(
-                            "validator-{agent}: aborted before dispatching tool {}",
-                            tc.function.name
-                        );
-                        return Err(anyhow::anyhow!(
-                            "Validation aborted by cancellation signal."
-                        ));
-                    }
-                    let invocation = crate::harness::ToolInvocation {
-                        name: tc.function.name.clone(),
-                        arguments: args_val,
-                    };
-                    let caller = if let Some(allowed) = prompt_allowed_tools {
-                        crate::harness::ToolCaller::SpecialistWithTools {
-                            agent: Agent::Validator,
-                            allowed_tools: allowed.to_vec(),
-                        }
-                    } else {
-                        crate::harness::ToolCaller::Specialist(Agent::Validator)
-                    };
-                    let tool_res = crate::harness::dispatch_for_async_with_engine(
-                        &invocation,
-                        caller,
-                        Some(&mut engine),
-                    )
-                    .await;
-                    match tool_res {
-                        Ok(r) => {
-                            tracing::info!(
-                                "validator-{agent} tool {} completed with {} chars",
-                                tc.function.name,
-                                r.content.len()
-                            );
-                            r.content
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "validator-{agent} tool {} error: {e}",
-                                tc.function.name
-                            );
-                            format!("ERROR: {e}")
-                        }
-                    }
-                }
-            };
-            let is_rebirth = tc.function.name == crate::tool_names::TOOL_REBIRTH;
-            let execution_succeeded = !content.starts_with("ERROR:");
-            if !is_rebirth || !execution_succeeded {
-                engine.append(crate::types::Message::Tool {
-                    tool_call_id: tc.id,
-                    content,
-                });
-            } else {
-                engine.append(crate::types::Message::User {
-                    content: "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. Do NOT call rebirth again. Continue your validation inspection and submit your verdict via leave_verdict.)".to_string(),
-                });
-            }
-            crate::orchestrator::update_active_worker_context(
-                &_active_guard.0,
-                engine.token_count(),
-            );
-        }
-        if engine.should_compact() {
-            engine.compact();
-        } else if engine.should_advise_rebirth() {
-            engine.inject_rebirth_advisory();
-        }
+        Err(e) => Err(e),
     }
-
-    // If the loop finished all turns without an explicit leave_verdict tool call, assume approved:
-    tracing::info!(
-        "Validator for {agent} completed turns without calling leave_verdict; assuming approved."
-    );
-    Ok((
-        true,
-        "Validator completed turns without calling leave_verdict; assumed approved.".to_string(),
-    ))
 }
 
 pub(crate) async fn run_plan_validation(
@@ -588,25 +356,8 @@ async fn run_plan_validation_inner(
 
     let validator_prompt = crate::agents::validator::VALIDATOR_PLANNER_ROLE_PROMPT;
 
-    let validator_backend = planner_cfg
-        .and_then(|sc| sc.validator_backend_url.as_ref())
-        .or_else(|| validator_cfg.and_then(|vc| vc.backend_url.as_ref()))
-        .unwrap_or(&cfg.backend_url);
-    let validator_token = planner_cfg
-        .and_then(|sc| sc.validator_auth_token.as_ref())
-        .or_else(|| validator_cfg.and_then(|vc| vc.auth_token.as_ref()))
-        .unwrap_or(&cfg.auth_token);
-    let validator_model = planner_cfg
-        .and_then(|sc| sc.validator_model.as_ref())
-        .or_else(|| validator_cfg.and_then(|vc| vc.model.as_ref()))
-        .cloned()
-        .unwrap_or_else(|| cfg.model.clone());
-
-    let val_client = crate::llm::ChatClient::new_with_token(
-        validator_backend,
-        &validator_model,
-        validator_token,
-    );
+    let (backend, auth, validator_model) = resolve_validator_backend(cfg, Agent::Planner);
+    let val_client = crate::llm::ChatClient::new_with_token(&backend, &validator_model, &auth);
 
     let brief = format!(
         "Proposed Execution Plan:\n```markdown\n{}\n```\n\n\
@@ -626,227 +377,93 @@ async fn run_plan_validation_inner(
     let val_entry = registry
         .resolve(Agent::Validator)
         .expect("validator is registered");
-    let mut tools = Vec::new();
-    for tool in crate::types::ToolDef::default_tools() {
-        if val_entry.allows(&tool.function.name) {
-            tools.push(tool);
-        }
-    }
-    if let Some(mcp) = crate::harness::get_mcp_manager() {
-        let servers = validator_cfg
-            .map(|vc| vc.mcp_servers.clone())
-            .filter(|s| !s.is_empty())
-            .or_else(|| planner_cfg.map(|sc| sc.mcp_servers.clone()))
-            .unwrap_or_default();
-        for tool in mcp.tools_for_servers(&servers) {
-            tools.push(crate::types::ToolDef::from_mcp(&tool));
-        }
-    }
+    let mcp_servers = validator_cfg
+        .map(|vc| vc.mcp_servers.clone())
+        .filter(|s| !s.is_empty())
+        .or_else(|| planner_cfg.map(|sc| sc.mcp_servers.clone()))
+        .unwrap_or_default();
+    let tools = assemble_tools(None, |name| val_entry.allows(name), &mcp_servers);
 
     let val_tag = "validator-planner".to_string();
-    let _active_guard = crate::orchestrator::register_active_worker_with_token(
+    let _active_guard = register_loop_worker(
         None,
         val_tag.clone(),
         "Auditing execution plan".to_string(),
-        Some(token.clone()),
+        token,
     );
 
     let default_mon = crate::config::MonitoringConfig::default();
     let mon_cfg = cfg.monitoring.as_ref().unwrap_or(&default_mon);
-    let monitor = crate::harness::monitor::HarnessMonitor::new_with_config(
+    let mut monitor = crate::harness::monitor::HarnessMonitor::new_with_config(
         std::sync::Arc::new(crate::harness::HarnessStats::new()),
         mon_cfg,
     );
-    let mut rep_detector = crate::harness::monitor::RepetitionDetector::new(
-        mon_cfg.repetition_threshold,
-        mon_cfg.min_pattern_len,
-    );
-    let mut verdict_nudge_count = 0usize;
-    let mut _turn = 0usize;
 
-    loop {
-        _turn += 1;
-        if token.is_cancelled() {
-            tracing::warn!("{val_tag}: aborted by cancellation token");
-            return Ok((
-                false,
-                "Plan validation aborted by cancellation signal.".to_string(),
-            ));
+    let mut params = LoopParams {
+        client: &val_client,
+        model: validator_model,
+        tag: val_tag.clone(),
+        worker_name: val_tag.clone(),
+        task_id: None,
+        worker_key: _active_guard.0.clone(),
+        engine: &mut engine,
+        tools,
+        token,
+        mon_cfg,
+        cfg,
+        temperature: 0.0,
+        status_template: format!("{val_tag}: auditing execution plan structure & granularity..."),
+        default_verdict_critique:
+            "Execution plan structure and task decomposition verified.".to_string(),
+        verdict_log_role: "planner".to_string(),
+        // The plan auditor treats leave_verdict as terminal-only (detected
+        // before dispatch); never dispatch it as a regular tool.
+        dispatch_verdict_tools: false,
+        abort_log_prefix: val_tag.clone(),
+        emit_tool_status: false,
+        rebirth_notice: "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. Do NOT call rebirth again. Continue your validation inspection and submit your verdict via leave_verdict.)".to_string(),
+    };
+
+    match run_fix_loop(
+        &mut params,
+        &mut monitor,
+        crate::harness::ToolCaller::Specialist(Agent::Validator),
+    )
+    .await
+    {
+        Ok(FixLoopResult::Verdict { approved, critique }) => Ok((approved, critique)),
+        Ok(FixLoopResult::Exhausted) => Ok((
+            true,
+            "Auditor did not leave explicit verdict after 3 reminders; assumed approved."
+                .to_string(),
+        )),
+        Ok(FixLoopResult::Aborted) => {
+            // Strict abort semantics: cancellation is a failure, not a verdict.
+            // (Previously returned Ok((false, …)) — a soft rejection that
+            // downstream consumers could mistake for an auditor verdict.)
+            Err(anyhow::anyhow!(
+                "Plan validation aborted by cancellation signal."
+            ))
         }
-        crate::orchestrator::update_active_worker_context(&_active_guard.0, engine.token_count());
-        crate::orchestrator::emit_status(format!(
-            "{val_tag}: auditing execution plan structure & granularity (turn {_turn})...",
-        ));
-
-        let req = crate::types::ChatRequest {
-            model: validator_model.clone(),
-            messages: engine.messages().to_vec(),
-            tools: Some(tools.clone()),
-            stream: Some(true),
-            enable_thinking: None,
-            temperature: Some(0.0),
-            top_p: Some(cfg.top_p),
-            presence_penalty: Some(cfg.presence_penalty),
-            frequency_penalty: Some(cfg.frequency_penalty),
-        };
-
-        let max_tokens = mon_cfg.max_stream_tokens.max(256);
-        let max_thinking_tokens = mon_cfg.max_thinking_tokens.max(256);
-        let mut sink = crate::orchestrator::PreemptibleStreamSink::register_full(
-            &val_tag,
-            Some("validator-planner".to_string()),
-            None,
-            Some(token.clone()),
-            &validator_model,
-        );
-        let stream_out = crate::llm::chat_stream_resumable(
-            &val_client,
-            &req,
-            &mut sink,
-            max_tokens,
-            max_thinking_tokens,
-            &mut rep_detector,
-            false,
-            Some(token),
-        )
-        .await;
-
-        let out = match stream_out {
-            Ok(o) => o,
-            Err(e) => {
-                if token.is_cancelled() {
-                    tracing::warn!("{val_tag}: aborted during LLM call");
-                    return Ok((
-                        false,
-                        "Plan validation aborted by cancellation signal.".to_string(),
-                    ));
-                }
-                tracing::error!("{val_tag} LLM chat call error on turn {_turn}: {e:?}");
-                return Err(e);
-            }
-        };
-
-        if out.was_aborted_by_steer || token.is_cancelled() {
-            tracing::warn!("{val_tag}: aborted during LLM call");
-            return Ok((
-                false,
-                "Plan validation aborted by cancellation signal.".to_string(),
-            ));
-        }
-
-        let reply = out.reply;
-        let mut tool_calls = reply.tool_calls.clone();
-        if tool_calls.is_empty() && cfg.enable_xml_rescue {
-            let rescued = monitor.rescue_xml(&reply.content);
-            if !rescued.is_empty() {
-                tool_calls = rescued;
-            }
-        }
-
-        let assistant_msg = crate::types::Message::Assistant {
-            content: Some(reply.content.clone()),
-            reasoning_content: if reply.reasoning.is_empty() {
-                None
-            } else {
-                Some(reply.reasoning.clone())
-            },
-            tool_calls: tool_calls.clone(),
-        };
-        engine.append(assistant_msg);
-
-        for tc in &tool_calls {
-            if is_leave_verdict_tool(&tc.function.name) {
-                let args_val = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
-                    .unwrap_or_else(|_| serde_json::Value::String(tc.function.arguments.clone()));
-
-                let (approved, critique) = parse_verdict_args(&args_val).unwrap_or((
-                    true,
-                    "Execution plan structure and task decomposition verified.".to_string(),
-                ));
-
-                crate::debug_log::log_validation_verdict("planner", approved, &critique);
-                tracing::info!(
-                    "Validator recorded verdict for plan via leave_verdict: approved={}, critique:\n{}",
-                    approved,
-                    critique
-                );
-                return Ok((approved, critique));
-            }
-        }
-
-        if tool_calls.is_empty() {
-            if verdict_nudge_count < 3 {
-                verdict_nudge_count += 1;
-                engine.append(crate::types::Message::User {
-                    content: format!(
-                        "System: You have not submitted a verdict using the 'leave_verdict' tool (reminder {}/3). Do not output text. If your analysis and verification are complete, you MUST call the 'leave_verdict' tool with verdict ('APPROVED' or 'REJECTED') and comments. If you need to perform further verification, invoke the appropriate tools.",
-                        verdict_nudge_count
-                    ),
-                });
-                continue;
-            } else {
-                tracing::info!(
-                    "{val_tag} did not invoke leave_verdict after 3 reminders; assuming approved."
-                );
-                return Ok((
-                    true,
-                    "Auditor did not leave explicit verdict after 3 reminders; assumed approved."
-                        .to_string(),
-                ));
-            }
-        }
-
-        for tc in &tool_calls {
-            if tc.function.name == TOOL_LEAVE_VERDICT {
-                continue;
-            }
-            if token.is_cancelled() || crate::orchestrator::is_current_or_global_cancelled() {
-                tracing::warn!(
-                    "{val_tag}: aborted before executing tool {}",
-                    tc.function.name
-                );
-                return Err(anyhow::anyhow!(
-                    "Plan validation aborted by cancellation signal."
-                ));
-            }
-            let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
-                .unwrap_or_else(|_| serde_json::Value::String(tc.function.arguments.clone()));
-            let invocation = crate::harness::ToolInvocation {
-                name: tc.function.name.clone(),
-                arguments: args,
-            };
-            let tool_res = crate::harness::dispatch_for_async_with_engine(
-                &invocation,
-                crate::harness::ToolCaller::Specialist(Agent::Validator),
-                Some(&mut engine),
-            )
-            .await;
-            let content = match tool_res {
-                Ok(r) => r.content,
-                Err(e) => format!("Tool error: {e}"),
-            };
-            engine.append(crate::types::Message::Tool {
-                tool_call_id: tc.id.clone(),
-                content,
-            });
-        }
+        Err(e) => Err(e),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool_names::{TERMINAL_LEAVE_VERDICT, TOOL_DELEGATE_TASK, TOOL_READ_FILE};
 
     #[test]
     fn test_is_leave_verdict_tool_matching() {
-        assert!(is_leave_verdict_tool("leave_verdict"));
+        assert!(is_leave_verdict_tool(TOOL_LEAVE_VERDICT));
         assert!(is_leave_verdict_tool("LEAVE_VERDICT"));
         assert!(is_leave_verdict_tool("leaveVerdict"));
-        assert!(is_leave_verdict_tool("terminal__leave_verdict"));
+        assert!(is_leave_verdict_tool(TERMINAL_LEAVE_VERDICT));
         assert!(is_leave_verdict_tool("validator__leave_verdict"));
         assert!(is_leave_verdict_tool("leave_verdict_tool"));
-        assert!(!is_leave_verdict_tool("read_file"));
-        assert!(!is_leave_verdict_tool("delegate_task"));
+        assert!(!is_leave_verdict_tool(TOOL_READ_FILE));
+        assert!(!is_leave_verdict_tool(TOOL_DELEGATE_TASK));
     }
 
     #[test]

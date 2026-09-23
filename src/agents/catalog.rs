@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::tool_names::{
+    TOOL_CREATE_PLAN, TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_LEAVE_VERDICT, TOOL_PTY_CLOSE,
+    TOOL_PTY_LIST, TOOL_PTY_READ, TOOL_PTY_SPAWN, TOOL_PTY_WRITE, TOOL_READ_FILE, TOOL_REBIRTH,
+    TOOL_REPLACE, TOOL_RUN_COMMAND, TOOL_WRITE_FILE,
+};
+
 /// Origin of a loaded skill or archetype.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SkillSource {
@@ -126,13 +132,13 @@ impl Catalog {
                 .to_string(),
             default_skills: vec!["clean_code".to_string(), "testing".to_string()],
             default_tools: vec![
-                "read_file".to_string(),
-                "write_file".to_string(),
-                "replace".to_string(),
-                "run_command".to_string(),
-                "grep_search".to_string(),
-                "glob".to_string(),
-                "rebirth".to_string(),
+                TOOL_READ_FILE.to_string(),
+                TOOL_WRITE_FILE.to_string(),
+                TOOL_REPLACE.to_string(),
+                TOOL_RUN_COMMAND.to_string(),
+                TOOL_GREP_SEARCH.to_string(),
+                TOOL_GLOB.to_string(),
+                TOOL_REBIRTH.to_string(),
             ],
             source: SkillSource::Builtin,
         });
@@ -145,17 +151,17 @@ impl Catalog {
                     .to_string(),
             default_skills: vec!["debugging".to_string(), "testing".to_string()],
             default_tools: vec![
-                "read_file".to_string(),
-                "replace".to_string(),
-                "run_command".to_string(),
-                "pty_spawn".to_string(),
-                "pty_write".to_string(),
-                "pty_read".to_string(),
-                "pty_close".to_string(),
-                "pty_list".to_string(),
-                "grep_search".to_string(),
-                "glob".to_string(),
-                "rebirth".to_string(),
+                TOOL_READ_FILE.to_string(),
+                TOOL_REPLACE.to_string(),
+                TOOL_RUN_COMMAND.to_string(),
+                TOOL_PTY_SPAWN.to_string(),
+                TOOL_PTY_WRITE.to_string(),
+                TOOL_PTY_READ.to_string(),
+                TOOL_PTY_CLOSE.to_string(),
+                TOOL_PTY_LIST.to_string(),
+                TOOL_GREP_SEARCH.to_string(),
+                TOOL_GLOB.to_string(),
+                TOOL_REBIRTH.to_string(),
             ],
             source: SkillSource::Builtin,
         });
@@ -167,12 +173,12 @@ impl Catalog {
                 .to_string(),
             default_skills: vec!["research".to_string()],
             default_tools: vec![
-                "read_file".to_string(),
-                "grep_search".to_string(),
-                "glob".to_string(),
-                "run_command".to_string(),
-                "write_file".to_string(),
-                "rebirth".to_string(),
+                TOOL_READ_FILE.to_string(),
+                TOOL_GREP_SEARCH.to_string(),
+                TOOL_GLOB.to_string(),
+                TOOL_RUN_COMMAND.to_string(),
+                TOOL_WRITE_FILE.to_string(),
+                TOOL_REBIRTH.to_string(),
             ],
             source: SkillSource::Builtin,
         });
@@ -185,10 +191,10 @@ impl Catalog {
                     .to_string(),
             default_skills: vec!["verification".to_string()],
             default_tools: vec![
-                "read_file".to_string(),
-                "grep_search".to_string(),
-                "glob".to_string(),
-                "leave_verdict".to_string(),
+                TOOL_READ_FILE.to_string(),
+                TOOL_GREP_SEARCH.to_string(),
+                TOOL_GLOB.to_string(),
+                TOOL_LEAVE_VERDICT.to_string(),
             ],
             source: SkillSource::Builtin,
         });
@@ -204,13 +210,13 @@ impl Catalog {
                 "testing".to_string(),
             ],
             default_tools: vec![
-                "read_file".to_string(),
-                "write_file".to_string(),
-                "replace".to_string(),
-                "run_command".to_string(),
-                "grep_search".to_string(),
-                "glob".to_string(),
-                "rebirth".to_string(),
+                TOOL_READ_FILE.to_string(),
+                TOOL_WRITE_FILE.to_string(),
+                TOOL_REPLACE.to_string(),
+                TOOL_RUN_COMMAND.to_string(),
+                TOOL_GREP_SEARCH.to_string(),
+                TOOL_GLOB.to_string(),
+                TOOL_REBIRTH.to_string(),
             ],
             source: SkillSource::Builtin,
         });
@@ -223,11 +229,11 @@ impl Catalog {
                     .to_string(),
             default_skills: Vec::new(),
             default_tools: vec![
-                "read_file".to_string(),
-                "grep_search".to_string(),
-                "glob".to_string(),
-                "create_plan".to_string(),
-                "rebirth".to_string(),
+                TOOL_READ_FILE.to_string(),
+                TOOL_GREP_SEARCH.to_string(),
+                TOOL_GLOB.to_string(),
+                TOOL_CREATE_PLAN.to_string(),
+                TOOL_REBIRTH.to_string(),
             ],
             source: SkillSource::Builtin,
         });
@@ -580,7 +586,7 @@ Always avoid unsafe where possible.
         let skill = Catalog::parse_skill_markdown("fallback", md, SkillSource::Builtin);
         assert_eq!(skill.id, "rust_safety");
         assert_eq!(skill.name, "Rust Safety Patterns");
-        assert_eq!(skill.suggested_tools, vec!["read_file", "replace"]);
+        assert_eq!(skill.suggested_tools, vec![TOOL_READ_FILE, TOOL_REPLACE]);
         assert!(skill.content.contains("Always avoid unsafe"));
     }
 
@@ -602,6 +608,9 @@ tools: read_file, grep_search
         assert_eq!(agents[0].id, "rust_specialist");
         assert_eq!(agents[0].default_skills, vec!["clean_code", "testing"]);
         assert_eq!(agents[1].id, "security_auditor");
-        assert_eq!(agents[1].default_tools, vec!["read_file", "grep_search"]);
+        assert_eq!(
+            agents[1].default_tools,
+            vec![TOOL_READ_FILE, TOOL_GREP_SEARCH]
+        );
     }
 }

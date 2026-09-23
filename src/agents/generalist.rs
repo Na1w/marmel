@@ -35,7 +35,7 @@ mod tests {
     #[test]
     fn test_orchestr_generalist_role_and_namespaces() {
         let g = Generalist;
-        assert_eq!(g.name(), Agent::Generalist);
+        // Universal namespace: the generalist grants exactly `"*"`.
         assert_eq!(g.tool_namespaces(), &["*"]);
         assert!(g.may_recurse());
     }

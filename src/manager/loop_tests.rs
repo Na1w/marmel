@@ -1,6 +1,12 @@
 use super::*;
 use std::fs;
 
+use crate::tool_names::{
+    TOOL_ARCHIVE_PLAN, TOOL_CREATE_PLAN, TOOL_DELEGATE_TASK, TOOL_GLOB, TOOL_GREP_SEARCH,
+    TOOL_LEAVE_VERDICT, TOOL_PTY_CLOSE, TOOL_PTY_LIST, TOOL_PTY_READ, TOOL_PTY_SPAWN,
+    TOOL_PTY_WRITE, TOOL_READ_FILE, TOOL_REBIRTH, TOOL_REPLACE, TOOL_RUN_COMMAND, TOOL_WRITE_FILE,
+};
+
 /// Build an isolated plan manager with a small plan.
 fn test_plan() -> (std::path::PathBuf, Plan) {
     let dir = std::env::temp_dir().join(format!(
@@ -40,32 +46,32 @@ fn test_agent_turn_phase_sequence() {
 /// REQ-LOOP-003: read tools are flagged parallel, write tools sequential.
 #[test]
 fn test_agent_tool_classification() {
-    assert!(is_read_tool("read_file"));
-    assert!(is_read_tool("grep_search"));
-    assert!(is_read_tool("glob"));
-    assert!(!is_read_tool("write_file"));
+    assert!(is_read_tool(TOOL_READ_FILE));
+    assert!(is_read_tool(TOOL_GREP_SEARCH));
+    assert!(is_read_tool(TOOL_GLOB));
+    assert!(!is_read_tool(TOOL_WRITE_FILE));
 
-    assert!(is_write_tool("write_file"));
-    assert!(is_write_tool("replace"));
-    assert!(is_write_tool("run_command"));
-    assert!(!is_write_tool("read_file"));
+    assert!(is_write_tool(TOOL_WRITE_FILE));
+    assert!(is_write_tool(TOOL_REPLACE));
+    assert!(is_write_tool(TOOL_RUN_COMMAND));
+    assert!(!is_write_tool(TOOL_READ_FILE));
 
     // REQ-ORCH-005: delegate_task is sequential (blocking, synchronous-from-
     // Manager), never parallelized with reads.
-    assert!(is_write_tool("delegate_task"));
-    assert!(!is_read_tool("delegate_task"));
+    assert!(is_write_tool(TOOL_DELEGATE_TASK));
+    assert!(!is_read_tool(TOOL_DELEGATE_TASK));
 
     // Verify unclassified / domain / MCP / plan tools are sequential and not dropped
     for tool_name in &[
-        "create_plan",
-        "archive_current_plan",
-        "rebirth",
-        "leave_verdict",
-        "pty_spawn",
-        "pty_write",
-        "pty_read",
-        "pty_close",
-        "pty_list",
+        TOOL_CREATE_PLAN,
+        TOOL_ARCHIVE_PLAN,
+        TOOL_REBIRTH,
+        TOOL_LEAVE_VERDICT,
+        TOOL_PTY_SPAWN,
+        TOOL_PTY_WRITE,
+        TOOL_PTY_READ,
+        TOOL_PTY_CLOSE,
+        TOOL_PTY_LIST,
         "mcp__custom_server__tool",
     ] {
         assert!(is_write_tool(tool_name));
@@ -81,7 +87,7 @@ async fn test_unclassified_tools_not_dropped() {
     let mut loop_ = AgentLoop::new(plan).with_caller(ToolCaller::Specialist(Agent::Validator));
     // `leave_verdict` is outside the basic read/write set and was previously dropped by AgentLoop.
     loop_.enqueue_tools(vec![serde_json::json!({
-        "name": "leave_verdict",
+        "name": TOOL_LEAVE_VERDICT,
         "arguments": { "verdict": "APPROVED", "comments": "LGTM" }
     })]);
     let outcome = loop_.run_turn().await.unwrap();
@@ -137,7 +143,7 @@ async fn test_agent_loop_checkoff_success() {
     let mut loop_ = AgentLoop::new(plan);
     // Queue a read_file tool call annotated with t-001.
     loop_.enqueue_tools(vec![serde_json::json!({
-        "name": "read_file",
+        "name": TOOL_READ_FILE,
         "arguments": { "path": "Cargo.toml", "task_id": "t-001" }
     })]);
     let outcome = loop_.run_turn().await.unwrap();
@@ -161,7 +167,7 @@ async fn test_agent_monitor_blocks_repetition_through_loop() {
     // 5x identical run_command "ls" (caesar default threshold).
     for _ in 0..5 {
         loop_.enqueue_tools(vec![serde_json::json!({
-            "name": "run_command",
+            "name": TOOL_RUN_COMMAND,
             "arguments": { "command": "ls" }
         })]);
     }
@@ -188,7 +194,7 @@ async fn test_agent_monitor_rescue_xml_through_loop() {
     let text = r#"prefix <tool_call>{"function":"read_file","arguments":{"path":"Cargo.toml"}}</tool_call> suffix"#;
     let calls = loop_.rescue_xml_calls(text);
     assert_eq!(calls.len(), 1, "one XML tool call must be rescued");
-    assert_eq!(calls[0].function.name, "read_file");
+    assert_eq!(calls[0].function.name, TOOL_READ_FILE);
     assert!(
         calls[0].id.starts_with("call_text_"),
         "rescued id must be call_text_{{uuid}}, got {}",
@@ -488,7 +494,7 @@ async fn test_agentloop_abort_stops_turn_and_kills_pty() {
     loop_.track_pty_pid(999_999);
     // Queue a tool that would otherwise run; the abort must pre-empt it.
     loop_.enqueue_tools(vec![serde_json::json!({
-        "name": "read_file",
+        "name": TOOL_READ_FILE,
         "arguments": { "path": "Cargo.toml", "task_id": "t-001" }
     })]);
     // Queue an abort: the turn must stop immediately with Aborted.
@@ -527,7 +533,7 @@ async fn test_agentloop_abort_midflight_interrupts_execute_tools() {
     // Queue a slow write tool annotated with t-001. It sleeps long enough for
     // the abort to be raised mid-flight and caught after dispatch returns.
     loop_.enqueue_tools(vec![serde_json::json!({
-        "name": "run_command",
+        "name": TOOL_RUN_COMMAND,
         "arguments": { "command": cmd, "timeout_seconds": 2, "task_id": "t-001" }
     })]);
     // Arm the abort flag from a separate OS thread after a short delay,

@@ -12,11 +12,11 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-/// Plan file name inside the marmel directory (reused from `agent::phase`).
+/// Plan file name inside the marmel directory (reused from `manager::phase`).
 pub const PLAN_FILE: &str = crate::manager::phase::PLAN_FILE;
 /// Session log file name inside the marmel directory.
 pub const LOG_FILE: &str = "marmel.log";
-/// Phase-override file name inside the marmel directory (reused from `agent::phase`).
+/// Phase-override file name inside the marmel directory (reused from `manager::phase`).
 pub const FORCED_PHASE_FILE: &str = crate::manager::phase::FORCED_PHASE_FILE;
 /// Archive subdirectory name inside the marmel directory.
 pub const ARCHIVE_DIR: &str = "archive";

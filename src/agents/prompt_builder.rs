@@ -5,6 +5,9 @@
 
 use crate::agents::DelegationRequest;
 use crate::agents::catalog::Catalog;
+use crate::tool_names::{
+    TOOL_CREATE_PLAN, TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_READ_FILE, TOOL_REBIRTH,
+};
 use crate::types::{ChatRequest, Message};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -331,8 +334,8 @@ impl PromptBuilder {
 
         // Sanitize tools: ensure rebirth is present if non-trivial tools are included
         let mut tools = parsed.allowed_tools;
-        if !tools.iter().any(|t| t == "rebirth") {
-            tools.push("rebirth".to_string());
+        if !tools.iter().any(|t| t == TOOL_REBIRTH) {
+            tools.push(TOOL_REBIRTH.to_string());
         }
 
         Ok(AgentBlueprint {
@@ -359,11 +362,11 @@ impl PromptBuilder {
                 reasoning: "Strategic Planner configured with AGENTS archetypes and strictly zero micro-skills".to_string(),
                 selected_skills: Vec::new(),
                 allowed_tools: vec![
-                    "read_file".to_string(),
-                    "grep_search".to_string(),
-                    "glob".to_string(),
-                    "create_plan".to_string(),
-                    "rebirth".to_string(),
+                    TOOL_READ_FILE.to_string(),
+                    TOOL_GREP_SEARCH.to_string(),
+                    TOOL_GLOB.to_string(),
+                    TOOL_CREATE_PLAN.to_string(),
+                    TOOL_REBIRTH.to_string(),
                 ],
                 system_prompt,
                 task_id: req.task_id.clone(),
@@ -442,8 +445,8 @@ impl PromptBuilder {
             }
         }
 
-        if !allowed_tools.iter().any(|t| t == "rebirth") {
-            allowed_tools.push("rebirth".to_string());
+        if !allowed_tools.iter().any(|t| t == TOOL_REBIRTH) {
+            allowed_tools.push(TOOL_REBIRTH.to_string());
         }
 
         // Assemble synthesized prompt
@@ -617,6 +620,7 @@ pub struct PlanTaskItem {
 mod tests {
     use super::*;
     use crate::agents::Agent;
+    use crate::tool_names::{TOOL_REPLACE, TOOL_RUN_COMMAND, TOOL_WRITE_FILE};
 
     #[test]
     fn test_offline_synthesizer() {
@@ -640,8 +644,12 @@ mod tests {
         );
         assert!(blueprint.selected_skills.contains(&"debugging".to_string()));
         assert!(blueprint.selected_skills.contains(&"testing".to_string()));
-        assert!(blueprint.allowed_tools.contains(&"run_command".to_string()));
-        assert!(blueprint.allowed_tools.contains(&"replace".to_string()));
+        assert!(
+            blueprint
+                .allowed_tools
+                .contains(&TOOL_RUN_COMMAND.to_string())
+        );
+        assert!(blueprint.allowed_tools.contains(&TOOL_REPLACE.to_string()));
         assert!(blueprint.system_prompt.contains("Active Domain Skills"));
     }
 
@@ -653,9 +661,9 @@ mod tests {
             reasoning: "Unit test blueprint".to_string(),
             selected_skills: vec!["clean_code".to_string()],
             allowed_tools: vec![
-                "read_file".to_string(),
-                "write_file".to_string(),
-                "rebirth".to_string(),
+                TOOL_READ_FILE.to_string(),
+                TOOL_WRITE_FILE.to_string(),
+                TOOL_REBIRTH.to_string(),
             ],
             system_prompt: "You are a test agent.".to_string(),
             task_id: Some("t-042".to_string()),
@@ -671,7 +679,7 @@ mod tests {
         assert_eq!(loaded.selected_skills, vec!["clean_code"]);
         assert_eq!(
             loaded.allowed_tools,
-            vec!["read_file", "write_file", "rebirth"]
+            vec![TOOL_READ_FILE, TOOL_WRITE_FILE, TOOL_REBIRTH]
         );
         assert_eq!(loaded.system_prompt, "You are a test agent.");
     }
@@ -723,9 +731,21 @@ mod tests {
             blueprint.selected_skills.is_empty(),
             "Planner must have 0 micro-skills"
         );
-        assert!(blueprint.allowed_tools.contains(&"create_plan".to_string()));
-        assert!(blueprint.allowed_tools.contains(&"read_file".to_string()));
-        assert!(!blueprint.allowed_tools.contains(&"write_file".to_string()));
+        assert!(
+            blueprint
+                .allowed_tools
+                .contains(&TOOL_CREATE_PLAN.to_string())
+        );
+        assert!(
+            blueprint
+                .allowed_tools
+                .contains(&TOOL_READ_FILE.to_string())
+        );
+        assert!(
+            !blueprint
+                .allowed_tools
+                .contains(&TOOL_WRITE_FILE.to_string())
+        );
         assert!(
             blueprint
                 .system_prompt

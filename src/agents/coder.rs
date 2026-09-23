@@ -51,10 +51,15 @@ mod tests {
 
     #[test]
     fn test_orchestr_coder_role_and_namespaces() {
-        let c = Coder;
-        assert_eq!(c.name(), Agent::Coder);
-        assert!(c.tool_namespaces().contains(&"write_file"));
-        assert!(c.tool_namespaces().contains(&"rebirth"));
-        assert!(c.may_recurse());
+        crate::agents::assert_specialist_role(
+            &Coder,
+            Agent::Coder,
+            &[
+                crate::tool_names::TOOL_WRITE_FILE,
+                crate::tool_names::TOOL_REBIRTH,
+            ],
+            &[],
+            true,
+        );
     }
 }

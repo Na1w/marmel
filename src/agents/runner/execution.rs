@@ -1,7 +1,6 @@
 //! Specialist execution loop and tool turn state machine.
 
 use super::assembly::{assemble_final_deliverable, update_revision};
-use super::formatting::{format_tool_args_full, format_tool_args_preview};
 use crate::agents::validation::{
     is_leave_verdict_tool, parse_verdict_args, run_automated_validation,
 };
@@ -77,28 +76,17 @@ async fn run_specialist_live_inner(
 
     let registry = crate::orchestrator::SpecialistRegistry::canonical();
     let reg_entry = registry.resolve(agent).expect("agent is registered");
-    let mut tools = Vec::new();
     let prompt_allowed_tools = ctx.allowed_tools();
-    for tool in crate::types::ToolDef::default_tools() {
-        let is_allowed = if let Some(allowed) = prompt_allowed_tools {
-            allowed.iter().any(|t| {
-                let norm = crate::harness::normalize_tool_name(t);
-                norm == tool.function.name || t == &tool.function.name
-            })
-        } else {
-            reg_entry.allows(&tool.function.name)
-        };
-        if is_allowed {
-            tools.push(tool);
-        }
-    }
-    if let Some(mcp) = crate::harness::get_mcp_manager()
-        && let Some(sc) = specialist_cfg
-    {
-        for tool in mcp.tools_for_servers(&sc.mcp_servers) {
-            tools.push(crate::types::ToolDef::from_mcp(&tool));
-        }
-    }
+    // Shared tool-assembly helper (duplicates.md §6b): default tools filtered
+    // by blueprint allow-list / registry namespaces + MCP fan-out.
+    let mcp_servers = specialist_cfg
+        .map(|sc| sc.mcp_servers.clone())
+        .unwrap_or_default();
+    let tools = super::fix_loop::assemble_tools(
+        prompt_allowed_tools,
+        |name| reg_entry.allows(name),
+        &mcp_servers,
+    );
 
     let mut final_content = String::new();
     let mut nudge_count = 0u32;
@@ -171,60 +159,44 @@ async fn run_specialist_live_inner(
         crate::orchestrator::emit_status(format!(
             "{agent_tag}: thinking / calling model ({specialist_model})..."
         ));
-        let req = crate::types::ChatRequest {
-            model: specialist_model.clone(),
-            messages: engine.messages().to_vec(),
-            tools: Some(tools.clone()),
-            stream: Some(true),
-            enable_thinking: None,
-            temperature: Some(cfg.temperature),
-            top_p: Some(cfg.top_p),
-            presence_penalty: Some(cfg.presence_penalty),
-            frequency_penalty: Some(cfg.frequency_penalty),
-        };
-
+        // Shared turn-request builder + shared streaming plumbing (duplicates.md §6b).
+        let req = super::fix_loop::build_turn_request(
+            &specialist_model,
+            &engine,
+            &tools,
+            cfg,
+            cfg.temperature,
+        );
         let max_tokens = mon_cfg.max_stream_tokens.max(256);
         let max_thinking_tokens = specialist_cfg
             .and_then(|s| s.max_thinking_tokens)
             .unwrap_or(cfg.max_thinking_tokens)
             .max(256);
-        let mut sink = crate::orchestrator::PreemptibleStreamSink::register_full(
-            &agent_tag,
-            Some(agent.as_str().to_string()),
-            clean_task_id.clone(),
-            Some(token.clone()),
-            &specialist_model,
-        );
-        let stream_out = crate::llm::chat_stream_resumable(
+        let stream_out = super::fix_loop::stream_single_turn(
             client,
             &req,
-            &mut sink,
+            &agent_tag,
+            agent.as_str(),
+            &specialist_model,
+            clean_task_id.clone(),
+            token,
             max_tokens,
             max_thinking_tokens,
             &mut rep_detector,
-            false,
-            Some(token),
         )
         .await;
 
         let out = match stream_out {
-            Ok(o) => o,
-            Err(e) => {
-                if token.is_cancelled() || crate::orchestrator::is_current_or_global_cancelled() {
-                    tracing::warn!("{agent_tag}: aborted during LLM call");
-                    return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
-                }
-                return Err(e);
+            Ok(Some(o)) => o,
+            Ok(None) => {
+                // Strict abort semantics (fix_loop module docs): cancellation is
+                // surfaced as a FAILED deliverable, never silently swallowed.
+                tracing::warn!("{agent_tag}: aborted during LLM call");
+                crate::orchestrator::set_active_worker_status(&_active_guard.0, "Aborted");
+                return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
             }
+            Err(e) => return Err(e),
         };
-
-        if out.was_aborted_by_steer
-            || token.is_cancelled()
-            || crate::orchestrator::is_current_or_global_cancelled()
-        {
-            tracing::warn!("{agent_tag}: aborted during LLM call");
-            return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
-        }
 
         let reply = out.reply;
         let budget_exceeded = out.budget_exceeded;
@@ -627,98 +599,51 @@ async fn run_specialist_live_inner(
                 break;
             }
 
-            let preview = format_tool_args_preview(&tc.function.name, &args_val);
-            if preview.is_empty() {
-                crate::orchestrator::emit_status(format!("{agent_tag}: {}", tc.function.name));
-            } else {
-                crate::orchestrator::emit_status(format!(
-                    "{agent_tag}: {}({preview})",
-                    tc.function.name
-                ));
-            }
-            let full_args = format_tool_args_full(&tc.function.name, &args_val);
-            tracing::info!(
-                "{agent_tag} invoking tool: {}({})",
-                tc.function.name,
-                full_args
-            );
-
-            let intervention = monitor.observe_tool(&tc.function.name, &args_val);
-            let content = match intervention {
-                crate::harness::monitor::Intervention::Block
-                | crate::harness::monitor::Intervention::Cut => {
-                    let err_msg = monitor.intervention_error(intervention).unwrap_or_else(|| {
-                        format!(
-                            "ERROR: Tool repetition detected for '{}'. Do not repeat identical calls — proceed with your task or save deliverables with write_file.",
-                            tc.function.name
-                        )
-                    });
-                    tracing::warn!(
-                        "{agent_tag} tool {} blocked by repetition detector",
-                        tc.function.name
-                    );
-                    err_msg
+            // Shared tool-dispatch core (duplicates.md §6b): monitor intervention
+            // check → cancellation check → dispatch. `None` means aborted.
+            let caller = if let Some(allowed) = ctx.allowed_tools() {
+                crate::harness::ToolCaller::SpecialistWithTools {
+                    agent,
+                    allowed_tools: allowed.to_vec(),
                 }
-                crate::harness::monitor::Intervention::None => {
-                    if token.is_cancelled() || crate::orchestrator::is_current_or_global_cancelled()
-                    {
-                        tracing::warn!(
-                            "{agent_tag}: aborted before dispatching tool {}",
-                            tc.function.name
-                        );
-                        crate::orchestrator::set_active_worker_status(&_active_guard.0, "Aborted");
-                        return Ok(
-                            "Task aborted by user instruction.\n\nFAILED (aborted)".to_string()
-                        );
+            } else {
+                crate::harness::ToolCaller::Specialist(agent)
+            };
+            let dispatched = super::fix_loop::dispatch_tool_call(
+                &mut monitor,
+                &tc,
+                caller,
+                &mut engine,
+                token,
+                &agent_tag,
+                true,
+                "ERROR: ",
+                "Tool repetition detected for '{tool}'. Do not repeat identical calls — proceed with your task or save deliverables with write_file.",
+            )
+            .await;
+            let (content, execution_succeeded) = match dispatched {
+                Some(d) => {
+                    // Behavior-preserving: the original loop only counted a
+                    // tool as executed when dispatch returned Ok (not on
+                    // errors or repetition blocks).
+                    if d.1 {
+                        tools_executed_count += 1;
+                        nudge_count = 0;
                     }
-                    let invocation = crate::harness::ToolInvocation {
-                        name: tc.function.name.clone(),
-                        arguments: args_val,
-                    };
-                    let caller = if let Some(allowed) = ctx.allowed_tools() {
-                        crate::harness::ToolCaller::SpecialistWithTools {
-                            agent,
-                            allowed_tools: allowed.to_vec(),
-                        }
-                    } else {
-                        crate::harness::ToolCaller::Specialist(agent)
-                    };
-                    let tool_res = crate::harness::dispatch_for_async_with_engine(
-                        &invocation,
-                        caller,
-                        Some(&mut engine),
-                    )
-                    .await;
-                    match tool_res {
-                        Ok(r) => {
-                            tools_executed_count += 1;
-                            nudge_count = 0;
-                            tracing::info!(
-                                "{agent_tag} tool {} completed with {} chars output",
-                                tc.function.name,
-                                r.content.len()
-                            );
-                            r.content
-                        }
-                        Err(e) => {
-                            tracing::warn!("{agent_tag} tool {} error: {e}", tc.function.name);
-                            format!("ERROR: {e}")
-                        }
-                    }
+                    d
+                }
+                None => {
+                    crate::orchestrator::set_active_worker_status(&_active_guard.0, "Aborted");
+                    return Ok("Task aborted by user instruction.\n\nFAILED (aborted)".to_string());
                 }
             };
-            let is_rebirth = tc.function.name == crate::tool_names::TOOL_REBIRTH;
-            let execution_succeeded = !content.starts_with("ERROR:");
-            if !is_rebirth || !execution_succeeded {
-                engine.append(crate::types::Message::Tool {
-                    tool_call_id: tc.id,
-                    content,
-                });
-            } else {
-                engine.append(crate::types::Message::User {
-                    content: "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. Do NOT call rebirth again. Proceed immediately using your required tools to perform the task and conclude with 'MISSION COMPLETE'.)".to_string(),
-                });
-            }
+            super::fix_loop::append_tool_result(
+                &mut engine,
+                &tc,
+                content,
+                execution_succeeded,
+                "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. Do NOT call rebirth again. Proceed immediately using your required tools to perform the task and conclude with 'MISSION COMPLETE').",
+            );
             crate::orchestrator::update_active_worker_context(
                 &_active_guard.0,
                 engine.token_count(),

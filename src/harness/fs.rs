@@ -266,7 +266,7 @@ pub(crate) fn str_arg<'a>(args: &'a Value, key: &str, tool: &str) -> Result<&'a 
             if let Some(v) = args
                 .get("query")
                 .or_else(|| args.get("search"))
-                .or_else(|| args.get("glob"))
+                .or_else(|| args.get(crate::tool_names::TOOL_GLOB))
                 .or_else(|| args.get("regex"))
                 .and_then(Value::as_str)
             {
@@ -288,7 +288,7 @@ pub(crate) fn str_arg<'a>(args: &'a Value, key: &str, tool: &str) -> Result<&'a 
         "new_str" => {
             if let Some(v) = args
                 .get("replacement")
-                .or_else(|| args.get("replace"))
+                .or_else(|| args.get(crate::tool_names::TOOL_REPLACE))
                 .or_else(|| args.get("new"))
                 .or_else(|| args.get("replacement_content"))
                 .and_then(Value::as_str)

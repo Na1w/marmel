@@ -2,6 +2,7 @@
 
 pub mod assembly;
 pub mod execution;
+pub mod fix_loop;
 pub mod formatting;
 
 pub use assembly::*;

@@ -45,10 +45,15 @@ mod tests {
 
     #[test]
     fn test_planner_role_and_namespaces() {
-        let p = Planner;
-        assert_eq!(p.name(), Agent::Planner);
-        assert!(p.tool_namespaces().contains(&"create_plan"));
-        assert!(p.tool_namespaces().contains(&"read_file"));
-        assert!(!p.may_recurse());
+        crate::agents::assert_specialist_role(
+            &Planner,
+            Agent::Planner,
+            &[
+                crate::tool_names::TOOL_CREATE_PLAN,
+                crate::tool_names::TOOL_READ_FILE,
+            ],
+            &[],
+            false,
+        );
     }
 }

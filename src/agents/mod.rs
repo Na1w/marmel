@@ -251,6 +251,40 @@ pub trait Specialist: Send + Sync + fmt::Debug {
     }
 }
 
+/// Shared assertion helper for per-specialist role/namespace tests
+/// (duplicates.md §6a): the six specialist files previously each embedded a
+/// near-identical `#[cfg(test)]` block; they now delegate to this helper.
+#[cfg(test)]
+pub(crate) fn assert_specialist_role(
+    agent: &dyn Specialist,
+    expected: Agent,
+    must_contain: &[&str],
+    must_not_contain: &[&str],
+    may_recurse: bool,
+) {
+    assert_eq!(agent.name(), expected);
+    for ns in must_contain {
+        assert!(
+            agent.tool_namespaces().contains(ns),
+            "{:?} must grant namespace `{ns}`",
+            expected
+        );
+    }
+    for ns in must_not_contain {
+        assert!(
+            !agent.tool_namespaces().contains(ns),
+            "{:?} must NOT grant namespace `{ns}`",
+            expected
+        );
+    }
+    assert_eq!(
+        agent.may_recurse(),
+        may_recurse,
+        "{:?} may_recurse mismatch",
+        expected
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::runner::assemble_final_deliverable;

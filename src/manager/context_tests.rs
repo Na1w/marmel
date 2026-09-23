@@ -6,7 +6,11 @@ fn assistant_with_tool(id: &str) -> Message {
     Message::Assistant {
         content: Some("let me call a tool".to_string()),
         reasoning_content: None,
-        tool_calls: vec![ToolCall::new(id, "read_file", "{\"path\":\"x\"}")],
+        tool_calls: vec![ToolCall::new(
+            id,
+            crate::tool_names::TOOL_READ_FILE,
+            "{\"path\":\"x\"}",
+        )],
     }
 }
 

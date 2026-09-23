@@ -116,7 +116,7 @@ impl UiTranscript {
                 _ => None,
             })
             .flatten()
-            .filter(|call| call.function.name == "delegate_task")
+            .filter(|call| call.function.name == crate::tool_names::TOOL_DELEGATE_TASK)
             .map(|call| call.id.as_str())
             .collect();
 
@@ -274,7 +274,7 @@ mod tests {
                 reasoning_content: Some("Checking directory.".to_string()),
                 tool_calls: vec![crate::types::ToolCall::new(
                     "call-1",
-                    "glob",
+                    crate::tool_names::TOOL_GLOB,
                     r#"{"pattern": "src/auth/*.rs"}"#,
                 )],
             },

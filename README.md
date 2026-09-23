@@ -45,7 +45,12 @@ Marmel is a Rust-based CLI that connects to an OpenAI-compatible chat-completion
 
 ---
 
-## Architecture
+### Architecture
+- **Types**: `src/types/` (wire, tools)
+- **UI**: `src/ui/` (session/, bridge/)
+- **Harness**: `src/harness/` (common, plan, sleep, monitor/)
+- **Orchestrator**: `src/orchestrator/` (delegation, delegate)
+- **Agents**: `src/agents/` (validation/)
 
 ```
                     ┌─────────────────────────────────────────────┐

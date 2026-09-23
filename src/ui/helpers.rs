@@ -364,7 +364,7 @@ pub fn rehydrate_subagents(
     for msg in messages {
         if let Message::Assistant { tool_calls, .. } = msg {
             for call in tool_calls {
-                if call.function.name == "delegate_task" {
+                if call.function.name == crate::tool_names::TOOL_DELEGATE_TASK {
                     let args_val =
                         serde_json::from_str::<serde_json::Value>(&call.function.arguments).ok();
                     let agent_name = args_val
@@ -617,7 +617,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: vec![ToolCall::new(
                     "call_1",
-                    "delegate_task",
+                    crate::tool_names::TOOL_DELEGATE_TASK,
                     serde_json::json!({
                         "agent_name": "coder",
                         "task_id": "t-001",
@@ -660,7 +660,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: vec![ToolCall::new(
                     "call_frozen",
-                    "delegate_task",
+                    crate::tool_names::TOOL_DELEGATE_TASK,
                     serde_json::json!({
                         "agent_name": "researcher",
                         "task_id": "t-002",

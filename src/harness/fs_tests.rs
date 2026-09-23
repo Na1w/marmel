@@ -240,11 +240,15 @@ fn test_harness_read_file_limit_clamping() {
 #[test]
 fn test_harness_path_confinement_sandbox() {
     // Valid workspace path succeeds
-    let valid = resolve_safe_path("Cargo.toml", "read_file").unwrap();
+    let valid = resolve_safe_path("Cargo.toml", crate::tool_names::TOOL_READ_FILE).unwrap();
     assert!(valid.ends_with("Cargo.toml"));
 
     // Path traversal escaping root fails with Forbidden
-    let escape_err = resolve_safe_path("../../../../../etc/passwd", "read_file").unwrap_err();
+    let escape_err = resolve_safe_path(
+        "../../../../../etc/passwd",
+        crate::tool_names::TOOL_READ_FILE,
+    )
+    .unwrap_err();
     match escape_err {
         ToolError::Forbidden { caller, .. } => {
             assert!(caller.contains("escapes workspace root"));
@@ -253,7 +257,8 @@ fn test_harness_path_confinement_sandbox() {
     }
 
     // Absolute path outside workspace/temp fails with Forbidden
-    let abs_err = resolve_safe_path("/root/.ssh/id_rsa", "read_file").unwrap_err();
+    let abs_err =
+        resolve_safe_path("/root/.ssh/id_rsa", crate::tool_names::TOOL_READ_FILE).unwrap_err();
     match abs_err {
         ToolError::Forbidden { caller, .. } => {
             assert!(caller.contains("escapes workspace root"));

@@ -23,6 +23,9 @@
 //! `libc::kill` call must be wrapped in an explicit `unsafe {}` block.
 
 use crate::harness::{ToolError, ToolResult};
+use crate::tool_names::{
+    TOOL_PTY_CLOSE, TOOL_PTY_READ, TOOL_PTY_SPAWN, TOOL_PTY_WRITE, TOOL_RUN_COMMAND,
+};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use regex::Regex;
 use serde_json::Value;
@@ -150,7 +153,7 @@ impl PtySession {
             .process_group_leader()
             .or_else(|| child.process_id().map(|p| p as i32))
             .ok_or_else(|| ToolError::BadArguments {
-                tool: "run_command".into(),
+                tool: TOOL_RUN_COMMAND.into(),
                 detail: "could not obtain child process id".into(),
             })?;
 
@@ -159,7 +162,7 @@ impl PtySession {
             .process_id()
             .map(|p| p as i32)
             .ok_or_else(|| ToolError::BadArguments {
-                tool: "run_command".into(),
+                tool: TOOL_RUN_COMMAND.into(),
                 detail: "could not obtain child process id".into(),
             })?;
 
@@ -201,7 +204,7 @@ impl PtySession {
 /// If `timeout_seconds` (or `timeout`) is provided, it is clamped to [1, 300] seconds.
 /// Otherwise `DEFAULT_TIMEOUT_SECS` (60 s) is used.
 pub fn run_command(args: &Value) -> Result<ToolResult, ToolError> {
-    let command = crate::harness::fs::str_arg(args, "command", "run_command")?;
+    let command = crate::harness::fs::str_arg(args, "command", TOOL_RUN_COMMAND)?;
     let timeout_secs = args
         .get("timeout_seconds")
         .or_else(|| args.get("timeout"))
@@ -594,7 +597,7 @@ pub fn pty_spawn(args: &Value) -> Result<ToolResult, ToolError> {
         .or_else(|| args.get("session_id"))
         .and_then(Value::as_str)
         .ok_or_else(|| ToolError::BadArguments {
-            tool: "pty_spawn".into(),
+            tool: TOOL_PTY_SPAWN.into(),
             detail: "missing string field `id` or `session_id`".into(),
         })?;
 
@@ -602,7 +605,7 @@ pub fn pty_spawn(args: &Value) -> Result<ToolResult, ToolError> {
         args.get("command")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::BadArguments {
-                tool: "pty_spawn".into(),
+                tool: TOOL_PTY_SPAWN.into(),
                 detail: "missing string field `command`".into(),
             })?;
 
@@ -625,7 +628,7 @@ pub fn pty_write(args: &Value) -> Result<ToolResult, ToolError> {
         .or_else(|| args.get("session_id"))
         .and_then(Value::as_str)
         .ok_or_else(|| ToolError::BadArguments {
-            tool: "pty_write".into(),
+            tool: TOOL_PTY_WRITE.into(),
             detail: "missing string field `id` or `session_id`".into(),
         })?;
 
@@ -633,7 +636,7 @@ pub fn pty_write(args: &Value) -> Result<ToolResult, ToolError> {
         args.get("input")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::BadArguments {
-                tool: "pty_write".into(),
+                tool: TOOL_PTY_WRITE.into(),
                 detail: "missing string field `input`".into(),
             })?;
 
@@ -654,7 +657,7 @@ pub fn pty_read(args: &Value) -> Result<ToolResult, ToolError> {
         .or_else(|| args.get("session_id"))
         .and_then(Value::as_str)
         .ok_or_else(|| ToolError::BadArguments {
-            tool: "pty_read".into(),
+            tool: TOOL_PTY_READ.into(),
             detail: "missing string field `id` or `session_id`".into(),
         })?;
 
@@ -674,7 +677,7 @@ pub fn pty_close(args: &Value) -> Result<ToolResult, ToolError> {
         .or_else(|| args.get("session_id"))
         .and_then(Value::as_str)
         .ok_or_else(|| ToolError::BadArguments {
-            tool: "pty_close".into(),
+            tool: TOOL_PTY_CLOSE.into(),
             detail: "missing string field `id` or `session_id`".into(),
         })?;
 

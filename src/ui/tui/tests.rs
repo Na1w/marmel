@@ -1515,7 +1515,7 @@ fn test_rehydrate_messages_summarizes_delegation_results() {
             reasoning_content: None,
             tool_calls: vec![crate::types::ToolCall::new(
                 "call-del-1",
-                "delegate_task",
+                crate::tool_names::TOOL_DELEGATE_TASK,
                 r#"{"agent_name": "coder", "task_id": "t-001", "prompt": "build feature"}"#,
             )],
         },
@@ -1562,7 +1562,7 @@ fn test_rehydrate_messages_preserves_order_thinking_and_filters_synthetic() {
             reasoning_content: Some("Let's look at the codebase structure.".to_string()),
             tool_calls: vec![crate::types::ToolCall::new(
                 "call-glob-1",
-                "glob",
+                crate::tool_names::TOOL_GLOB,
                 r#"{"pattern": "src/auth*.rs"}"#,
             )],
         },

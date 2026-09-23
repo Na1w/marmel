@@ -1,5 +1,7 @@
 use super::*;
 use crate::agents::DelegationRequest;
+use crate::harness::{ToolError, ToolResult};
+use crate::tool_names::TOOL_DELEGATE_TASK;
 
 /// Build a manager rooted at a fresh temp plan dir for tests.
 fn test_manager(dir: &tempfile::TempDir) -> OrchestratorManager {

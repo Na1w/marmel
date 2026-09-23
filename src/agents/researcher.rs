@@ -44,10 +44,15 @@ mod tests {
 
     #[test]
     fn test_orchestr_researcher_role_and_namespaces() {
-        let r = Researcher;
-        assert_eq!(r.name(), Agent::Researcher);
-        assert!(r.tool_namespaces().contains(&"read_file"));
-        assert!(r.tool_namespaces().contains(&"rebirth"));
-        assert!(!r.may_recurse());
+        crate::agents::assert_specialist_role(
+            &Researcher,
+            Agent::Researcher,
+            &[
+                crate::tool_names::TOOL_READ_FILE,
+                crate::tool_names::TOOL_REBIRTH,
+            ],
+            &[],
+            false,
+        );
     }
 }

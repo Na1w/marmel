@@ -57,5 +57,20 @@ pub const TERMINAL_GREP_SEARCH: &str = "terminal__grep_search";
 pub const TERMINAL_GLOB: &str = "terminal__glob";
 /// `terminal__list_directory` — caesar-style namespaced variant of `list_directory`.
 pub const TERMINAL_LIST_DIRECTORY: &str = "terminal__list_directory";
+/// `list_directory` — list the contents of a directory.
+pub const TOOL_LIST_DIRECTORY: &str = "list_directory";
 /// `terminal__sleep` — caesar-style namespaced variant of `sleep`.
 pub const TERMINAL_SLEEP: &str = "terminal__sleep";
+/// `terminal__leave_verdict` — caesar-style namespaced variant of `leave_verdict`.
+pub const TERMINAL_LEAVE_VERDICT: &str = "terminal__leave_verdict";
+
+/// Namespace prefix for the caesar-style namespaced tool variants
+/// (e.g. `terminal__read_file`). Use `terminal_tool()` to build a full
+/// namespaced name from a bare tool name.
+pub const TERMINAL_PREFIX: &str = "terminal__";
+
+/// Build a caesar-style namespaced tool name from a bare tool name,
+/// e.g. `terminal_tool(TOOL_READ_FILE)` == `"terminal__read_file"`.
+pub fn terminal_tool(bare: &str) -> String {
+    format!("{TERMINAL_PREFIX}{bare}")
+}

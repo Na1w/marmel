@@ -67,7 +67,22 @@ pub enum Event {
     TokensOut(usize),
 }
 
+/// Shared abort / user-exit flag state for renderers that use the trait's
+/// default abort-flag implementations (see [`Renderer`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InputState {
+    /// Whether an abort was requested (e.g. via `/abort` or Esc / Ctrl+C).
+    pub aborted: bool,
+    /// Whether an explicit user exit was requested.
+    pub user_exit: bool,
+}
+
 /// Abstraction over the interactive TUI and the headless raw mode.
+///
+/// The abort-flag surface (`request_abort` / `aborted` / `clear_abort` /
+/// `request_user_exit` / `user_exit_requested`) has trait defaults backed by
+/// [`InputState`]; renderers with extra abort state (e.g. the TUI's
+/// confirm-abort) override the individual methods they need.
 pub trait Renderer: Send {
     fn init(&mut self) -> Result<()>;
     fn on_event(&mut self, event: &Event);
@@ -75,17 +90,40 @@ pub trait Renderer: Send {
     fn force_flush(&mut self) -> Result<()> {
         self.flush()
     }
-    fn poll_input(&mut self) -> Option<String>;
-    fn read_input(&mut self) -> Option<String>;
-    fn request_abort(&mut self);
-    fn aborted(&self) -> bool;
-    fn clear_abort(&mut self) {}
+    /// Non-blocking input poll; no input by default.
+    fn poll_input(&mut self) -> Option<String> {
+        None
+    }
+    /// Blocking input read; no input by default.
+    fn read_input(&mut self) -> Option<String> {
+        None
+    }
+    /// Set the shared abort flag.
+    fn request_abort(&mut self) {
+        self.input_state().aborted = true;
+    }
+    /// Whether an abort was requested.
+    fn aborted(&self) -> bool {
+        self.input_state_shared().aborted
+    }
+    /// Clear the shared abort flag.
+    fn clear_abort(&mut self) {
+        let state = self.input_state();
+        state.aborted = false;
+        state.user_exit = false;
+    }
+    /// Request a user exit; by default this is a plain abort.
     fn request_user_exit(&mut self) {
         self.request_abort();
     }
+    /// Whether a user exit was explicitly requested.
     fn user_exit_requested(&self) -> bool {
-        false
+        self.input_state_shared().user_exit
     }
+    /// Access the renderer's shared abort / user-exit state.
+    fn input_state(&mut self) -> &mut InputState;
+    /// Shared-borrow view of the renderer's abort / user-exit state.
+    fn input_state_shared(&self) -> &InputState;
     fn shutdown(&mut self);
     fn set_subagents(&mut self, _subagents: Vec<SubagentDetail>) {}
     fn rehydrate_ui(&mut self, _records: &[UiRecord]) {}

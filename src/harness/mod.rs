@@ -1,5 +1,6 @@
 //! Tool harness: dispatcher and built-in tool implementations.
 
+use crate::tool_names::TOOL_LIST_DIRECTORY;
 use crate::tool_names::{
     TERMINAL_GLOB, TERMINAL_GREP_SEARCH, TERMINAL_LIST_DIRECTORY, TERMINAL_READ_FILE,
     TERMINAL_REPLACE, TERMINAL_RUN_COMMAND, TERMINAL_SLEEP, TERMINAL_WRITE_FILE, TOOL_ARCHIVE_PLAN,
@@ -9,12 +10,19 @@ use crate::tool_names::{
 };
 use std::sync::Arc;
 
+pub mod common;
 pub mod fs;
 pub mod monitor;
+pub mod plan;
 pub mod pty;
 pub mod sandbox;
 pub mod search;
+pub mod sleep;
 pub mod workspace;
+
+pub use common::{HarnessStats, ToolCaller, ToolError, ToolInvocation, ToolResult};
+use plan::{archive_plan, write_plan};
+use sleep::{handle_sleep, handle_sleep_async};
 
 static MCP_MANAGER: std::sync::RwLock<Option<Arc<crate::mcp::McpManager>>> =
     std::sync::RwLock::new(None);
@@ -71,409 +79,6 @@ pub fn get_mcp_manager() -> Option<Arc<crate::mcp::McpManager>> {
     MCP_MANAGER.read().ok().and_then(|lock| lock.clone())
 }
 
-/// A single tool execution request as parsed from a ToolCall.
-#[derive(Debug, Clone)]
-pub struct ToolInvocation {
-    pub name: String,
-    pub arguments: serde_json::Value,
-}
-
-/// The result of executing a tool.
-#[derive(Debug, Clone)]
-pub struct ToolResult {
-    pub content: String,
-    /// Whether this was an error result.
-    pub is_error: bool,
-}
-
-impl ToolResult {
-    pub fn ok(content: impl Into<String>) -> Self {
-        Self {
-            content: content.into(),
-            is_error: false,
-        }
-    }
-
-    pub fn err(content: impl Into<String>) -> Self {
-        Self {
-            content: content.into(),
-            is_error: true,
-        }
-    }
-}
-
-/// Resilience intervention counters tracked across the session.
-#[derive(Debug, Default)]
-pub struct HarnessStats {
-    /// Number of text repetition loops truncated.
-    pub repetition_breaks: std::sync::atomic::AtomicU64,
-    /// Number of empty model responses recovered by nudge.
-    pub empty_prods: std::sync::atomic::AtomicU64,
-    /// Number of automated context prunings executed.
-    pub context_compactions: std::sync::atomic::AtomicU64,
-    /// Number of plain-text XML tool calls converted to JSON.
-    pub xml_tool_rescues: std::sync::atomic::AtomicU64,
-    /// Number of HTTP 503/502 retries performed.
-    pub backend_retries: std::sync::atomic::AtomicU64,
-    /// Number of rebirth checkpoints generated.
-    pub session_rebirths: std::sync::atomic::AtomicU64,
-    /// Number of steer-arbitrator decisions produced.
-    pub steer_arbitrations: std::sync::atomic::AtomicU64,
-}
-
-impl HarnessStats {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn record_compaction(&self) {
-        self.context_compactions
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn record_rebirth(&self) {
-        self.session_rebirths
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn record_repetition_break(&self) {
-        self.repetition_breaks
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn record_empty_prod(&self) {
-        self.empty_prods
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn record_xml_rescue(&self) {
-        self.xml_tool_rescues
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn record_backend_retry(&self) {
-        self.backend_retries
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn record_steer_arbitration(&self) {
-        self.steer_arbitrations
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// The role requesting a tool execution, used to enforce the orchestration tool policy.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ToolCaller {
-    /// The Manager.
-    Manager,
-    /// A specialist identified by its role, using default registry allowlist.
-    Specialist(crate::agents::Agent),
-    /// A specialist whose allowed tools are governed explicitly by its prompt/blueprint.
-    SpecialistWithTools {
-        agent: crate::agents::Agent,
-        allowed_tools: Vec<String>,
-    },
-}
-
-impl ToolCaller {
-    pub fn role_name(&self) -> String {
-        match self {
-            ToolCaller::Manager => "Manager".to_string(),
-            ToolCaller::Specialist(a) => a.as_str().to_string(),
-            ToolCaller::SpecialistWithTools { agent, .. } => agent.as_str().to_string(),
-        }
-    }
-
-    pub fn agent(&self) -> Option<crate::agents::Agent> {
-        match self {
-            ToolCaller::Manager => None,
-            ToolCaller::Specialist(a) => Some(*a),
-            ToolCaller::SpecialistWithTools { agent, .. } => Some(*agent),
-        }
-    }
-
-    pub fn allowed_tools(&self) -> Option<&[String]> {
-        match self {
-            ToolCaller::SpecialistWithTools { allowed_tools, .. } => Some(allowed_tools.as_slice()),
-            _ => None,
-        }
-    }
-}
-
-impl std::fmt::Display for ToolCaller {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ToolCaller::Manager => write!(f, "Manager"),
-            ToolCaller::Specialist(a) => write!(f, "Specialist({a:?})"),
-            ToolCaller::SpecialistWithTools {
-                agent,
-                allowed_tools,
-            } => {
-                write!(f, "SpecialistWithTools({agent:?}, tools={allowed_tools:?})")
-            }
-        }
-    }
-}
-
-/// Errors that can occur while dispatching a tool.
-#[derive(Debug, thiserror::Error)]
-pub enum ToolError {
-    #[error("unknown tool: {0}")]
-    UnknownTool(String),
-    #[error("invalid arguments for {tool}: {detail}")]
-    BadArguments { tool: String, detail: String },
-    #[error("tool `{tool}` is forbidden for caller `{caller}` by orchestration policy")]
-    Forbidden { tool: String, caller: String },
-    #[error("{0}")]
-    Execution(#[from] anyhow::Error),
-}
-
-fn write_plan(md: &str) -> Result<ToolResult, ToolError> {
-    block_on_safe(write_plan_async(md))
-}
-
-async fn write_plan_async(md: &str) -> Result<ToolResult, ToolError> {
-    write_plan_internal(md, None).await
-}
-
-async fn write_plan_internal(
-    md: &str,
-    custom_plan: Option<crate::manager::phase::Plan>,
-) -> Result<ToolResult, ToolError> {
-    let cfg = crate::config::get_active()
-        .or_else(|| crate::config::load(None).ok())
-        .unwrap_or_default();
-    let token = if custom_plan.is_some() {
-        tokio_util::sync::CancellationToken::new()
-    } else {
-        crate::orchestrator::global_cancellation_token()
-    };
-
-    let planner_cfg = cfg.orchestration.specialists.get("planner");
-    let validator_cfg = cfg
-        .orchestration
-        .specialists
-        .get(crate::agents::Agent::Validator.as_str());
-    let auto_validate_enabled = planner_cfg
-        .and_then(|sc| sc.enable_validator)
-        .or_else(|| validator_cfg.and_then(|vc| vc.enable_validator))
-        .unwrap_or(true);
-
-    if auto_validate_enabled {
-        match crate::agents::validation::run_plan_validation(md, &cfg, &token).await {
-            Ok((approved, critique)) => {
-                if !approved {
-                    tracing::warn!("create_plan rejected by Strategic Plan Auditor: {critique}");
-                    if token.is_cancelled() {
-                        return Ok(ToolResult::err(format!(
-                            "Execution plan rejected by Strategic Plan Auditor:\n{critique}"
-                        )));
-                    }
-                    return Ok(ToolResult::err(format!(
-                        "Execution plan rejected by Strategic Plan Auditor:\n{critique}\n\nPlease revise the execution plan addressing the auditor's critique and call create_plan again."
-                    )));
-                }
-                tracing::info!("create_plan approved by Strategic Plan Auditor: {critique}");
-            }
-            Err(e) => {
-                if token.is_cancelled() {
-                    return Ok(ToolResult::err(
-                        "Plan creation aborted by cancellation signal.",
-                    ));
-                }
-                tracing::warn!("Plan validation skipped due to error: {e:#}");
-            }
-        }
-    }
-
-    let plan = custom_plan.unwrap_or_default();
-    plan.create(md)
-        .map(|_| {
-            let prompts_dir = plan.dir().join("prompts");
-            let ws_root = plan.dir().parent().unwrap_or_else(|| plan.dir());
-            let catalog = crate::agents::Catalog::discover(ws_root);
-            crate::agents::PromptBuilder::pregenerate_for_plan_offline(md, &catalog, &prompts_dir);
-
-            let pending = plan.pending_tasks();
-            let pending_str = if pending.is_empty() {
-                "none".to_string()
-            } else {
-                pending.join(", ")
-            };
-            ToolResult::ok(format!(
-                "Execution plan written to .marmel/execution_plan.md.\nRecognized pending tasks: [{pending_str}].\nPhase is now EXECUTING. You must proceed immediately to emit `delegate_task` tool calls for the first pending task(s). Do NOT call create_plan again unless you explicitly intend to overwrite the plan."
-            ))
-        })
-        .map_err(ToolError::Execution)
-}
-
-fn archive_plan() -> Result<ToolResult, ToolError> {
-    if crate::orchestrator::has_active_workers() {
-        return Ok(ToolResult::err(
-            "Cannot archive plan while background specialist workers are still actively running.",
-        ));
-    }
-    let plan = crate::manager::phase::Plan::default();
-    match plan.archive() {
-        Ok(Some(dest)) => Ok(ToolResult::ok(format!(
-            "plan archived to {}",
-            dest.display()
-        ))),
-        Ok(None) => {
-            if plan.plan_path().exists() {
-                Ok(ToolResult::err(
-                    "plan is not complete and cannot be archived yet",
-                ))
-            } else {
-                Ok(ToolResult::ok("no plan file to archive"))
-            }
-        }
-        Err(e) => Err(ToolError::Execution(e)),
-    }
-}
-
-fn handle_sleep(args: &serde_json::Value) -> Result<ToolResult, ToolError> {
-    let secs = args
-        .get("seconds")
-        .or_else(|| args.get("duration"))
-        .or_else(|| args.get("duration_seconds"))
-        .and_then(|v| {
-            v.as_u64()
-                .or_else(|| {
-                    v.as_i64()
-                        .and_then(|i| if i > 0 { Some(i as u64) } else { None })
-                })
-                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-        })
-        .unwrap_or(5);
-    let max_sleep = 300; // Cap at 5 minutes
-    let actual_secs = secs.clamp(1, max_sleep);
-    let reason = args
-        .get("reason")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let reason_clause = if reason.is_empty() {
-        String::new()
-    } else {
-        format!(" ({reason})")
-    };
-
-    let cancel = crate::orchestrator::bus::global_cancellation_token();
-    if cancel.is_cancelled() {
-        return Ok(ToolResult::err("Sleep cancelled before starting."));
-    }
-
-    let completed = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        match handle.runtime_flavor() {
-            tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| {
-                handle.block_on(async {
-                    tokio::select! {
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(actual_secs)) => true,
-                        _ = cancel.cancelled() => false,
-                    }
-                })
-            }),
-            _ => {
-                let start = std::time::Instant::now();
-                let dur = std::time::Duration::from_secs(actual_secs);
-                let mut done = false;
-                while start.elapsed() < dur {
-                    if cancel.is_cancelled() {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                if start.elapsed() >= dur && !cancel.is_cancelled() {
-                    done = true;
-                }
-                done
-            }
-        }
-    } else {
-        let start = std::time::Instant::now();
-        let dur = std::time::Duration::from_secs(actual_secs);
-        let mut done = false;
-        while start.elapsed() < dur {
-            if cancel.is_cancelled() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        if start.elapsed() >= dur && !cancel.is_cancelled() {
-            done = true;
-        }
-        done
-    };
-
-    if completed {
-        Ok(ToolResult::ok(format!(
-            "Slept for {actual_secs} seconds{reason_clause}."
-        )))
-    } else {
-        Ok(ToolResult::err("Sleep interrupted by cancellation signal."))
-    }
-}
-
-pub async fn handle_sleep_async(arguments: &serde_json::Value) -> Result<ToolResult, ToolError> {
-    let secs = arguments
-        .get("seconds")
-        .or_else(|| arguments.get("duration"))
-        .or_else(|| arguments.get("duration_seconds"))
-        .and_then(|v| {
-            v.as_u64()
-                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-        })
-        .unwrap_or(5);
-
-    let actual_secs = secs.clamp(1, 300);
-    let reason = arguments
-        .get("reason")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-
-    let reason_clause = if reason.is_empty() {
-        String::new()
-    } else {
-        format!(" ({reason})")
-    };
-
-    let cancel = crate::orchestrator::bus::global_cancellation_token();
-    if cancel.is_cancelled() || crate::orchestrator::is_current_or_global_cancelled() {
-        return Ok(ToolResult::err("Sleep cancelled before starting."));
-    }
-
-    let worker_token = crate::orchestrator::CURRENT_WORKER_TOKEN
-        .try_with(|t| t.clone())
-        .ok();
-
-    let completed = tokio::select! {
-        _ = tokio::time::sleep(std::time::Duration::from_secs(actual_secs)) => true,
-        _ = cancel.cancelled() => false,
-        _ = async {
-            if let Some(ref t) = worker_token {
-                t.cancelled().await
-            } else {
-                std::future::pending::<()>().await
-            }
-        } => false,
-    };
-
-    if completed {
-        Ok(ToolResult::ok(format!(
-            "Slept for {actual_secs} seconds{reason_clause}."
-        )))
-    } else {
-        Ok(ToolResult::err("Sleep interrupted by cancellation signal."))
-    }
-}
-
-/// Safely execute an async future synchronously from any thread or Tokio runtime context.
-///
-/// If inside a multi-threaded Tokio runtime, it uses `tokio::task::block_in_place`.
-/// If inside a current-thread Tokio runtime (where `block_in_place` would panic),
-/// it runs the future on a dedicated worker thread via `std::thread::scope`.
-/// If outside any Tokio runtime, it creates a temporary runtime to drive the future.
 pub fn block_on_safe<F, R>(f: F) -> R
 where
     F: std::future::Future<Output = R> + Send,
@@ -745,7 +350,7 @@ async fn dispatch_manager_async(
             .or_else(|| tool.arguments.get("plan_markdown"))
             .and_then(serde_json::Value::as_str)
         {
-            Some(md) => Box::pin(write_plan_async(md)).await,
+            Some(md) => Box::pin(plan::write_plan_async(md)).await,
             None => Ok(ToolResult::err(
                 "create_plan requires a `plan` or `plan_markdown` string argument",
             )),
@@ -943,7 +548,7 @@ pub(crate) fn normalize_tool_name(name: &str) -> String {
         TOOL_GREP_SEARCH | "grep" | "search" => TERMINAL_GREP_SEARCH.to_string(),
         TOOL_GLOB | "find_files" | "glob_search" => TERMINAL_GLOB.to_string(),
         TOOL_SLEEP | TERMINAL_SLEEP | "wait" => TERMINAL_SLEEP.to_string(),
-        "list_directory" | "ls" | "list_files" => TERMINAL_LIST_DIRECTORY.to_string(),
+        TOOL_LIST_DIRECTORY | "ls" | "list_files" => TERMINAL_LIST_DIRECTORY.to_string(),
         other => other.to_string(),
     }
 }
@@ -1054,6 +659,7 @@ mod tests {
     use super::*;
     use crate::manager::ContextEngine;
     use crate::types::Message;
+    use plan::write_plan_internal;
 
     #[test]
     fn test_harness_rebirth_collapses_to_four_messages() {

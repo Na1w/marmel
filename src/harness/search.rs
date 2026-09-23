@@ -6,6 +6,7 @@
 
 use crate::harness::fs::{str_arg, usize_arg};
 use crate::harness::{ToolError, ToolResult};
+use crate::tool_names::{TOOL_GLOB, TOOL_GREP_SEARCH};
 use ignore::WalkBuilder;
 use regex::Regex;
 use serde_json::Value;
@@ -22,13 +23,13 @@ pub const GLOB_HARD_CAP: usize = 500;
 /// file, and collects lines matching the regex. Returns at most `max_results`
 /// matches, hard-capped at 500.
 pub fn grep_search(args: &Value) -> Result<ToolResult, ToolError> {
-    let pattern = str_arg(args, "pattern", "grep_search")?;
+    let pattern = str_arg(args, "pattern", TOOL_GREP_SEARCH)?;
     let raw_root = args.get("path").and_then(Value::as_str).unwrap_or(".");
-    let safe_root = crate::harness::fs::resolve_safe_path(raw_root, "grep_search")?;
-    let max_results = usize_arg(args, "max_results", 100, "grep_search")?.min(GREP_HARD_CAP);
+    let safe_root = crate::harness::fs::resolve_safe_path(raw_root, TOOL_GREP_SEARCH)?;
+    let max_results = usize_arg(args, "max_results", 100, TOOL_GREP_SEARCH)?.min(GREP_HARD_CAP);
 
     let re = Regex::new(pattern).map_err(|e| ToolError::BadArguments {
-        tool: "grep_search".into(),
+        tool: TOOL_GREP_SEARCH.into(),
         detail: format!("invalid regex: {e}"),
     })?;
 
@@ -65,7 +66,7 @@ pub fn grep_search(args: &Value) -> Result<ToolResult, ToolError> {
 ///
 /// Matches are relative paths. Root is the workspace root directory.
 pub fn glob(args: &Value) -> Result<ToolResult, ToolError> {
-    let pattern = str_arg(args, "pattern", "glob")?;
+    let pattern = str_arg(args, "pattern", TOOL_GLOB)?;
     let root = crate::harness::get_workspace_root();
     let matches = glob_in_root(pattern, &root);
     if matches.is_empty() {
