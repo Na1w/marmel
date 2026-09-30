@@ -226,7 +226,12 @@ pub trait Specialist: Send + Sync + fmt::Debug {
         ctx: &IsolatedContext,
         token: &tokio_util::sync::CancellationToken,
     ) -> Deliverable {
-        if token.is_cancelled() || crate::orchestrator::is_current_or_global_cancelled() {
+        if token.is_cancelled()
+            || (!cfg!(test) && crate::orchestrator::is_globally_cancelled())
+            || crate::orchestrator::CURRENT_WORKER_TOKEN
+                .try_with(|t| t.is_cancelled())
+                .unwrap_or(false)
+        {
             return Deliverable {
                 marker: MissionMarker::Failed {
                     reason: "aborted".to_string(),

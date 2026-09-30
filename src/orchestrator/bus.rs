@@ -12,6 +12,10 @@ static GLOBAL_CANCELLATION_TOKEN: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(tokio_util::sync::CancellationToken::new()));
 
 /// Get the current session-wide cancellation token.
+///
+/// Clone-and-drop: the read guard is held only for the `clone()` and is
+/// dropped before this function returns; no nested locks are ever taken while
+/// a guard is held. Reset/clone semantics are intentionally untouched here.
 pub fn global_cancellation_token() -> tokio_util::sync::CancellationToken {
     GLOBAL_CANCELLATION_TOKEN
         .read()
@@ -58,6 +62,12 @@ pub fn reset_cancellation() {
 }
 
 /// Register an unbounded channel to receive real-time status updates across all agents and specialists.
+///
+/// Intentionally a swap (not a once-only `OnceLock`): the single call site
+/// (`src/ui/session.rs`, `run_session`) is reachable multiple times per process
+/// lifetime (UI restart / reconnect re-runs `run_session` and re-registers the
+/// senders). The write guard is held only for the swap itself and dropped
+/// before any other operation.
 pub fn set_status_sender(tx: tokio::sync::mpsc::UnboundedSender<String>) {
     if let Ok(mut lock) = STATUS_SENDER.write() {
         *lock = Some(tx);
@@ -65,6 +75,12 @@ pub fn set_status_sender(tx: tokio::sync::mpsc::UnboundedSender<String>) {
 }
 
 /// Register an unbounded channel to receive real-time UI events across all agents and specialists.
+///
+/// Intentionally a swap (not a once-only `OnceLock`): the single call site
+/// (`src/ui/session.rs`, `run_session`) is reachable multiple times per process
+/// lifetime (UI restart / reconnect re-runs `run_session` and re-registers the
+/// senders). The write guard is held only for the swap itself and dropped
+/// before any other operation.
 pub fn set_event_sender(tx: tokio::sync::mpsc::UnboundedSender<crate::ui::Event>) {
     if let Ok(mut lock) = EVENT_SENDER.write() {
         *lock = Some(tx);
@@ -72,19 +88,33 @@ pub fn set_event_sender(tx: tokio::sync::mpsc::UnboundedSender<crate::ui::Event>
 }
 
 /// Emit a status update to the active UI renderer.
+///
+/// Contention-free pattern: clone the sender out under the read lock, drop the
+/// guard, and only then perform the channel send with NO lock held. The send
+/// must never happen while the guard is alive, so emitters never block behind
+/// (or hold up) each other or behind the setter's write lock.
 pub fn emit_status(msg: impl Into<String>) {
-    if let Ok(lock) = STATUS_SENDER.read()
-        && let Some(tx) = lock.as_ref()
-    {
+    let tx = STATUS_SENDER
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone());
+    if let Some(tx) = tx {
         let _ = tx.send(msg.into());
     }
 }
 
 /// Emit a UI event directly to the active UI renderer.
+///
+/// Contention-free pattern: clone the sender out under the read lock, drop the
+/// guard, and only then perform the channel send with NO lock held. The send
+/// must never happen while the guard is alive, so emitters never block behind
+/// (or hold up) each other or behind the setter's write lock.
 pub fn emit_event(ev: crate::ui::Event) {
-    if let Ok(lock) = EVENT_SENDER.read()
-        && let Some(tx) = lock.as_ref()
-    {
+    let tx = EVENT_SENDER
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone());
+    if let Some(tx) = tx {
         let _ = tx.send(ev);
     }
 }

@@ -635,3 +635,70 @@ fn test_handle_delegate_task_terminal_marker_deduplication() {
         res.content
     );
 }
+
+/// Concurrency regression (Phase 2): 20 concurrent emitters hammer
+/// `emit_status` / `emit_event` (clone-the-sender-out-and-drop pattern) while
+/// a SINGLE drainer task consumes the channels. No panic, no deadlock, fast
+/// completion. (Unbounded channels + a single drainer — multiple drainers
+/// would race over message ownership.)
+#[tokio::test]
+async fn test_bus_hammer_concurrent_emitters() {
+    let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (event_tx, mut event_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::ui::Event>();
+    set_status_sender(status_tx);
+    set_event_sender(event_tx);
+
+    let n_emitters = 20;
+    let per_emitter = 50;
+    let mut handles = Vec::with_capacity(n_emitters);
+    for i in 0..n_emitters {
+        handles.push(tokio::spawn(async move {
+            for j in 0..per_emitter {
+                emit_status(format!("status-{i}-{j}"));
+                emit_event(crate::ui::Event::Message(format!("event-{i}-{j}")));
+            }
+        }));
+    }
+    for h in handles {
+        h.await.expect("emitter task panicked");
+    }
+
+    // Single drainer: drain both channels to exhaustion (bounded by a
+    // generous wall-clock guard so a hang fails the test instead of hanging).
+    // Count only OUR messages by pattern — other lib tests (e.g. preemption)
+    // may emit into the process-global bus concurrently, and those must be
+    // tolerated, not counted.
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut status_count = 0usize;
+        while let Ok(msg) = status_rx.try_recv() {
+            if msg.starts_with("status-") {
+                status_count += 1;
+            }
+        }
+        let mut event_count = 0usize;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let crate::ui::Event::Message(text) = ev
+                && text.starts_with("event-")
+            {
+                event_count += 1;
+            }
+        }
+        (status_count, event_count)
+    })
+    .await
+    .expect("drain must complete quickly (no deadlock)");
+    let (status_count, event_count) = drained;
+
+    // Every emit from our 20 emitters must have landed in the channels
+    // (unbounded: no drops).
+    let expected = n_emitters * per_emitter;
+    assert_eq!(
+        status_count, expected,
+        "expected exactly {expected} status messages, got {status_count}"
+    );
+    assert_eq!(
+        event_count, expected,
+        "expected exactly {expected} events, got {event_count}"
+    );
+}

@@ -58,12 +58,15 @@ pub fn get_workspace_root() -> std::path::PathBuf {
     }
     if let Ok(lock) = WORKSPACE_ROOT.read()
         && let Some(ref p) = *lock
+        && p.exists()
     {
         return p.clone();
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let canonical = cwd.canonicalize().unwrap_or(cwd);
-    set_workspace_root(&canonical);
+    if canonical.exists() {
+        set_workspace_root(&canonical);
+    }
     canonical
 }
 

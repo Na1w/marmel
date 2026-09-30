@@ -41,6 +41,12 @@ use super::phase::Plan;
 pub const MAX_TURNS: usize = 100;
 /// Watchdog bound for the entire turn, in seconds (REQ-LOOP-002).
 pub const TURN_WATCHDOG_SECS: u64 = 600;
+/// Per-delegation bound, in seconds. This is the maximum wall-clock time a
+/// single `delegate()` call (one specialist task) may run before being
+/// cancelled. It is distinct from [`TURN_WATCHDOG_SECS`], which bounds an
+/// entire interactive turn in `run_turn` and does NOT bound the delegation
+/// call made from `run_executing`.
+pub const DELEGATE_TIMEOUT_SECS: u64 = 1800;
 
 /// The discrete phases a single agent turn passes through (REQ-LOOP-001).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,6 +396,12 @@ impl AgentLoop {
 
                     // Parallel read-only tools via FuturesUnordered. Each read is
                     // spawned onto a blocking thread so multiple reads overlap.
+                    // Audit (t-m3z6): the `FuturesUnordered` is unbounded, but its
+                    // size is capped by the number of tool calls in a single LLM
+                    // response (not a hot loop), and each closure captures only
+                    // cloned `'static` `Send` data (`ToolInvocation`, `ToolCaller`)
+                    // with no borrows of `self` — safe for the blocking pool.
+                    // Bounding the pool concurrency is out of scope here.
                     let mut futures = FuturesUnordered::new();
                     for tool in reads {
                         let invocation = tool.invocation.clone();
@@ -591,6 +603,15 @@ impl AgentLoop {
 /// mode the silent dispatcher does NOT inject user prose mid-dispatch (it is
 /// deferred to final synthesis). `Signal::Abort` cancels all in-flight sub-task
 /// futures immediately and SIGKILLs every active PTY process group.
+/// Test-only: the injectable delegation future (replaces `manager.delegate`).
+#[cfg(test)]
+type TestDelegateFn = Arc<
+    dyn Fn(DelegationRequest)
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Deliverable>> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub struct ManagerLoop {
     /// The `OrchestratorManager` owning the shared `.marmel` plan and the
     /// `delegate()` method (Phase 0).
@@ -605,6 +626,16 @@ pub struct ManagerLoop {
     pending_signals: Vec<Signal>,
     /// Process-group ids of active PTY sessions, killed on abort.
     active_pty_pids: Vec<i32>,
+    /// Test-only: override the per-delegation timeout with a short value so
+    /// the timeout path can be exercised without waiting 30 minutes. `None`
+    /// (the production default) uses [`DELEGATE_TIMEOUT_SECS`].
+    #[cfg(test)]
+    delegate_timeout: Option<Duration>,
+    /// Test-only: replace the real `manager.delegate(req)` future with a
+    /// custom one (e.g. a future that sleeps past the injected timeout).
+    /// `None` (the production default) delegates to the real worker.
+    #[cfg(test)]
+    delegate_override: Option<TestDelegateFn>,
 }
 
 impl ManagerLoop {
@@ -617,7 +648,32 @@ impl ManagerLoop {
             abort_flag: Arc::new(AtomicBool::new(false)),
             pending_signals: Vec::new(),
             active_pty_pids: Vec::new(),
+            #[cfg(test)]
+            delegate_timeout: None,
+            #[cfg(test)]
+            delegate_override: None,
         }
+    }
+
+    /// Test-only: override the per-delegation timeout (see `delegate_timeout`).
+    #[cfg(test)]
+    pub fn with_delegate_timeout(mut self, d: Duration) -> Self {
+        self.delegate_timeout = Some(d);
+        self
+    }
+
+    /// Test-only: replace the `delegate()` future with a custom one.
+    #[cfg(test)]
+    pub fn with_delegate_override<F>(mut self, f: F) -> Self
+    where
+        F: Fn(DelegationRequest)
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Deliverable>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.delegate_override = Some(Arc::new(f));
+        self
     }
 
     /// Queue a user signal for the next execution round (REQ-LOOP-004).
@@ -710,6 +766,17 @@ impl ManagerLoop {
                 break;
             }
 
+            // Per-delegation bound (test-injectable via the `delegate_timeout`
+            // seam; production always uses [`DELEGATE_TIMEOUT_SECS`]).
+            #[cfg(test)]
+            let timeout = self
+                .delegate_timeout
+                .unwrap_or(Duration::from_secs(DELEGATE_TIMEOUT_SECS));
+            #[cfg(not(test))]
+            let timeout = Duration::from_secs(DELEGATE_TIMEOUT_SECS);
+            #[cfg(test)]
+            let delegate_override = self.delegate_override.clone();
+
             // Silent Dispatcher: one self-contained DelegateRequest per task.
             let mut handles = Vec::with_capacity(pending.len());
             for task_id in pending {
@@ -726,11 +793,48 @@ impl ManagerLoop {
                 };
                 let mgr = self.manager.clone();
                 let abort = self.abort_flag.clone();
+                let agent_name = req.agent_name;
+                let task_id = req.task_id.clone();
+                #[cfg(test)]
+                let override_ = delegate_override.clone();
                 handles.push(tokio::spawn(async move {
                     if abort.load(Ordering::SeqCst) {
                         return Err(anyhow::anyhow!("aborted"));
                     }
-                    mgr.delegate(req).await
+                    match tokio::time::timeout(
+                        timeout,
+                        async {
+                            #[cfg(test)]
+                            if let Some(override_) = override_ {
+                                return override_(req).await;
+                            }
+                            mgr.delegate(req).await
+                        },
+                    )
+                    .await
+                    {
+                        Ok(res) => res,
+                        Err(_elapsed) => {
+                            // Per-delegation bound exceeded: tear down the
+                            // specialist's worker (its child cancel token in the
+                            // workers registry) so it is not orphaned, then
+                            // surface a hard error for the turn loop to map to
+                            // `TurnOutcome::Error`.
+                            tracing::error!(
+                                agent = %agent_name,
+                                task_id = ?task_id,
+                                timeout_secs = DELEGATE_TIMEOUT_SECS,
+                                "delegation timed out; cancelling worker"
+                            );
+                            crate::orchestrator::workers::cancel_active_worker(
+                                Some(agent_name.to_string().as_str()),
+                                task_id.as_deref(),
+                            );
+                            Err(anyhow::anyhow!(
+                                "delegation to {agent_name} (task {task_id:?}) timed out after {DELEGATE_TIMEOUT_SECS}s"
+                            ))
+                        }
+                    }
                 }));
             }
 

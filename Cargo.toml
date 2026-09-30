@@ -41,6 +41,7 @@ unicode-segmentation = "1.12"
 uuid = { version = "1.25", features = ["v4"] }
 
 # System Diagnostics & Errors
+dashmap = "6"
 anyhow = "1.0"
 thiserror = "2.0"
 tracing = "0.1"

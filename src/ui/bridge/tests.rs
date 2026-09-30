@@ -481,6 +481,9 @@ fn test_drain_steer_cancel_subtask_cancels_worker_and_updates_subagents() {
 
 #[test]
 fn test_drain_steer_abort_cancels_all_active_workers() {
+    let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut renderer = TestRenderer::new();
     let mut steer_queue = Vec::new();

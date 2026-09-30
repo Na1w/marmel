@@ -289,6 +289,9 @@ fn coder_scheduler() -> Box<dyn Fn(&str) -> Agent> {
 #[tokio::test]
 #[cfg_attr(windows, ignore)]
 async fn test_agent_managerloop_silent_dispatcher_delegates_all() {
+    let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let manager = Arc::new(test_manager(tmp.path()));
     manager
@@ -328,6 +331,9 @@ async fn test_agent_managerloop_silent_dispatcher_delegates_all() {
 #[tokio::test]
 #[cfg_attr(windows, ignore)]
 async fn test_managerloop_one_task_per_call_no_takeover() {
+    let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let manager = test_manager(tmp.path());
     manager
@@ -360,6 +366,9 @@ async fn test_managerloop_one_task_per_call_no_takeover() {
 #[tokio::test]
 #[cfg_attr(windows, ignore)]
 async fn test_managerloop_parallel_independent_delegation() {
+    let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let manager = temp_manager(tmp.path());
     manager
@@ -569,4 +578,71 @@ async fn test_agentloop_full_phase_sequence_no_tools() {
     let outcome = loop_.run_turn().await.unwrap();
     assert_eq!(outcome, TurnOutcome::Continue);
     fs::remove_dir_all(&_dir).unwrap();
+}
+
+/// Concurrency regression (Phase 2): a specialist whose delegation future
+/// sleeps FAR beyond the per-delegation bound must be torn down by
+/// `tokio::time::timeout` — the loop returns a hard `Err` (mapped to
+/// `TurnOutcome::Error` upstream) without hanging. The timeout is injected
+/// via the `with_delegate_timeout` / `with_delegate_override` test seams so
+/// the test runs in ~1s instead of waiting `DELEGATE_TIMEOUT_SECS` (30 min).
+#[tokio::test]
+async fn test_managerloop_delegate_timeout_returns_error_without_hanging() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manager = temp_manager(tmp.path());
+    manager
+        .create_plan("- [ ] [t-501] A task that will never finish.\n")
+        .unwrap();
+
+    let mut ml = ManagerLoop::new(Arc::new(manager), coder_scheduler())
+        // Inject a ~1s per-delegation bound (production uses
+        // DELEGATE_TIMEOUT_SECS = 1800s).
+        .with_delegate_timeout(std::time::Duration::from_millis(1000))
+        // Mock/scheduler agent: the delegation future sleeps far beyond the
+        // injected bound, so the timeout must fire first.
+        .with_delegate_override(|req| {
+            let task_id = req.task_id.clone();
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                Ok(Deliverable {
+                    marker: crate::agents::MissionMarker::Complete {
+                        task_id: task_id.clone(),
+                    },
+                    content: "MISSION COMPLETE".to_string(),
+                    task_id,
+                })
+            })
+        });
+
+    // Bounded by a generous wall-clock guard: a correct implementation
+    // returns in ~1s; a regression (timeout not applied / deadlock) hangs
+    // until this fires.
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), ml.run_executing())
+        .await
+        .expect("run_executing must return (no hang)");
+
+    let err = result
+        .expect_err("delegation exceeding the per-delegation bound must surface a hard error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("timed out"),
+        "expected a timeout error, got: {msg}"
+    );
+    // The error must be attributable to the delegated task.
+    assert!(
+        msg.contains("t-501"),
+        "timeout error must name the task, got: {msg}"
+    );
+    // Must have been fast (timeout ~1s), not the 30-minute production bound.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "timeout path must return quickly, took {:?}",
+        started.elapsed()
+    );
+    // The timed-out task must remain unchecked on disk (no check-off).
+    assert!(
+        !Plan::at(tmp.path()).is_complete(),
+        "a timed-out delegation must not check off its task"
+    );
 }

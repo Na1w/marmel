@@ -1,10 +1,18 @@
 //! Active specialist workers registry, context token tracking, and RAII guards.
+//!
+//! All worker state lives in a single sharded [`DashMap`] (`WORKERS`). A worker
+//! key survives completion: on drop the entry is flipped to a "completed"
+//! phase in place (preserving the last-seen context token count), and a
+//! bounded 10-entry completed cap evicts the oldest completed entry. No
+//! function in this module ever holds more than one map guard at a time.
 
-use std::collections::BTreeMap;
-use std::sync::{LazyLock, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::LazyLock;
 use std::time::Instant;
 
-/// Information about an active specialist worker currently executing a task.
+use dashmap::DashMap;
+
+/// Information about a specialist worker currently executing a task.
 #[derive(Debug, Clone)]
 pub struct ActiveWorkerInfo {
     pub task_id: Option<String>,
@@ -37,46 +45,96 @@ pub struct CompletedWorkerInfo {
     pub status: String,
 }
 
-static ACTIVE_WORKERS: LazyLock<RwLock<BTreeMap<String, ActiveWorkerInfo>>> =
-    LazyLock::new(|| RwLock::new(BTreeMap::new()));
+/// Merged per-worker state: the active worker info plus the persisted
+/// after-completion context token count and completion timestamps.
+#[derive(Debug, Clone)]
+pub struct WorkerState {
+    pub info: ActiveWorkerInfo,
+    /// Last-seen context token count. Always in sync with
+    /// [`WorkerState::info.context_tokens`] while the worker is active, and
+    /// preserved after completion so `get_active_worker_tokens` keeps
+    /// returning the last value for recently-finished workers.
+    pub last_tokens: usize,
+    /// Monotonic completion sequence (None while active); used to order the
+    /// recently-completed list and to evict the oldest completed entry.
+    pub completed_seq: Option<u64>,
+    pub completed_at: Option<Instant>,
+    pub completed_wall: Option<chrono::DateTime<chrono::Local>>,
+}
 
-static WORKER_CONTEXT_TOKENS: LazyLock<RwLock<BTreeMap<String, usize>>> =
-    LazyLock::new(|| RwLock::new(BTreeMap::new()));
+impl WorkerState {
+    /// True if this worker is still active (not yet completed).
+    pub fn is_active(&self) -> bool {
+        self.completed_seq.is_none()
+    }
 
-static RECENT_COMPLETED_WORKERS: LazyLock<RwLock<Vec<CompletedWorkerInfo>>> =
-    LazyLock::new(|| RwLock::new(Vec::new()));
+    /// Project this state into the legacy completed-worker view.
+    pub fn completed_info(&self) -> Option<CompletedWorkerInfo> {
+        let completed_at = self.completed_at?;
+        Some(CompletedWorkerInfo {
+            task_id: self.info.task_id.clone(),
+            agent_name: self.info.agent_name.clone(),
+            prompt: self.info.prompt.clone(),
+            started_at: self.info.started_at,
+            started_wall: self.info.started_wall,
+            completed_at,
+            completed_wall: self.completed_wall?,
+            duration: completed_at - self.info.started_at,
+            implementation_turns: self.info.implementation_turns,
+            validation_rounds: self.info.validation_rounds,
+            latest_validator_feedback: self.info.latest_validator_feedback.clone(),
+            status: self.info.status.clone(),
+        })
+    }
+}
+
+/// Bound on how many completed worker entries survive in the map.
+const MAX_RECENT_COMPLETED: usize = 10;
+
+/// Single sharded map holding every worker (active and recently completed).
+static WORKERS: LazyLock<DashMap<String, WorkerState>> = LazyLock::new(DashMap::new);
+
+/// Monotonic sequence handed out to completed entries (oldest = smallest).
+static COMPLETED_SEQ: LazyLock<std::sync::atomic::AtomicU64> =
+    LazyLock::new(|| AtomicU64::new(0));
+
+#[cfg(test)]
+pub static TEST_WORKERS_MUTEX: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
 /// RAII guard that automatically unregisters an active worker on drop and moves it to recently completed.
 pub struct ActiveWorkerGuard(pub String);
 
 impl Drop for ActiveWorkerGuard {
     fn drop(&mut self) {
-        if let Ok(mut map) = ACTIVE_WORKERS.write()
-            && let Some(info) = map.remove(&self.0)
-        {
-            if let Ok(mut last_map) = WORKER_CONTEXT_TOKENS.write() {
-                last_map.insert(self.0.clone(), info.context_tokens);
+        // Single entry mutation: flip this worker to completed in place,
+        // preserving the key and its last-seen token count.
+        let seq = COMPLETED_SEQ.fetch_add(1, Ordering::SeqCst);
+        if let Some(mut entry) = WORKERS.get_mut(&self.0) {
+            entry.last_tokens = entry.info.context_tokens;
+            entry.completed_seq = Some(seq);
+            entry.completed_at = Some(Instant::now());
+            entry.completed_wall = Some(chrono::Local::now());
+        }
+        // Bounded completed ring: evict oldest completed entries while over cap.
+        loop {
+            let mut completed: Vec<(String, u64)> = WORKERS
+                .iter()
+                .filter_map(|e| e.value().completed_seq.map(|s| (e.key().clone(), s)))
+                .collect();
+            if completed.len() <= MAX_RECENT_COMPLETED {
+                break;
             }
-            if let Ok(mut completed) = RECENT_COMPLETED_WORKERS.write() {
-                let duration = info.started_at.elapsed();
-                completed.push(CompletedWorkerInfo {
-                    task_id: info.task_id,
-                    agent_name: info.agent_name,
-                    prompt: info.prompt,
-                    started_at: info.started_at,
-                    started_wall: info.started_wall,
-                    completed_at: Instant::now(),
-                    completed_wall: chrono::Local::now(),
-                    duration,
-                    implementation_turns: info.implementation_turns,
-                    validation_rounds: info.validation_rounds,
-                    latest_validator_feedback: info.latest_validator_feedback,
-                    status: info.status,
-                });
-                if completed.len() > 10 {
-                    let remove_count = completed.len() - 10;
-                    completed.drain(0..remove_count);
+            completed.sort_by_key(|(_, s)| *s);
+            let to_remove = completed.len().saturating_sub(MAX_RECENT_COMPLETED);
+            let mut removed_any = false;
+            for (key, _) in completed.into_iter().take(to_remove) {
+                if WORKERS.remove(&key).is_some() {
+                    removed_any = true;
                 }
+            }
+            if !removed_any {
+                break;
             }
         }
     }
@@ -118,15 +176,14 @@ pub fn register_active_worker_with_token(
     let effective_token = cancel_token
         .or_else(|| Some(crate::orchestrator::bus::global_cancellation_token().child_token()));
 
-    if let Ok(mut map) = ACTIVE_WORKERS.write() {
-        let initial_tokens = WORKER_CONTEXT_TOKENS
-            .read()
-            .ok()
-            .and_then(|m| m.get(&key).copied())
-            .unwrap_or(0);
-        map.insert(
-            key.clone(),
-            ActiveWorkerInfo {
+    // Reuse the last-seen token count for a previously completed worker with
+    // the same key (single per-entry lookup, released before the insert).
+    let initial_tokens = WORKERS.get(&key).map(|e| e.last_tokens).unwrap_or(0);
+
+    WORKERS.insert(
+        key.clone(),
+        WorkerState {
+            info: ActiveWorkerInfo {
                 task_id: clean_task_id,
                 agent_name,
                 prompt,
@@ -139,20 +196,47 @@ pub fn register_active_worker_with_token(
                 status: "In Progress".to_string(),
                 cancel_token: effective_token,
             },
-        );
-    }
+            last_tokens: initial_tokens,
+            completed_seq: None,
+            completed_at: None,
+            completed_wall: None,
+        },
+    );
     ActiveWorkerGuard(key)
 }
 
 /// Update the active specialist worker's context token count.
 pub fn update_active_worker_context(key: &str, tokens: usize) {
-    if let Ok(mut map) = ACTIVE_WORKERS.write()
-        && let Some(info) = map.get_mut(key)
-    {
-        info.context_tokens = tokens;
-    }
-    if let Ok(mut last_map) = WORKER_CONTEXT_TOKENS.write() {
-        last_map.insert(key.to_string(), tokens);
+    if let Some(mut entry) = WORKERS.get_mut(key) {
+        entry.last_tokens = tokens;
+        if entry.is_active() {
+            entry.info.context_tokens = tokens;
+        }
+    } else {
+        // Preserve the legacy behavior of persisting the token count for keys
+        // with no live entry (e.g. updated after completion or eviction).
+        WORKERS.insert(
+            key.to_string(),
+            WorkerState {
+                info: ActiveWorkerInfo {
+                    task_id: None,
+                    agent_name: key.to_string(),
+                    prompt: String::new(),
+                    started_at: Instant::now(),
+                    started_wall: chrono::Local::now(),
+                    context_tokens: tokens,
+                    implementation_turns: 0,
+                    validation_rounds: 0,
+                    latest_validator_feedback: None,
+                    status: "Completed".to_string(),
+                    cancel_token: None,
+                },
+                last_tokens: tokens,
+                completed_seq: Some(COMPLETED_SEQ.fetch_add(1, Ordering::SeqCst)),
+                completed_at: Some(Instant::now()),
+                completed_wall: Some(chrono::Local::now()),
+            },
+        );
     }
 }
 
@@ -163,63 +247,58 @@ pub fn update_active_worker_progress(
     val_rounds: usize,
     feedback: Option<String>,
 ) {
-    if let Ok(mut map) = ACTIVE_WORKERS.write()
-        && let Some(info) = map.get_mut(key)
+    if let Some(mut entry) = WORKERS.get_mut(key)
+        && entry.is_active()
     {
-        info.implementation_turns = turns;
-        info.validation_rounds = val_rounds;
+        entry.info.implementation_turns = turns;
+        entry.info.validation_rounds = val_rounds;
         if let Some(fb) = feedback {
-            info.latest_validator_feedback = Some(fb);
+            entry.info.latest_validator_feedback = Some(fb);
         }
     }
 }
 
 /// Set the descriptive status of an active specialist worker (e.g. "Approved", "Revising", "Failed", "Aborted").
 pub fn set_active_worker_status(key: &str, status: &str) {
-    if let Ok(mut map) = ACTIVE_WORKERS.write()
-        && let Some(info) = map.get_mut(key)
+    if let Some(mut entry) = WORKERS.get_mut(key)
+        && entry.is_active()
     {
-        info.status = status.to_string();
+        entry.info.status = status.to_string();
     }
 }
 
 /// Get the context token count for an active specialist worker by its key (e.g. `coder-t-001`).
 pub fn get_active_worker_tokens(key: &str) -> Option<usize> {
-    if let Ok(map) = ACTIVE_WORKERS.read()
-        && let Some(w) = map.get(key)
-    {
-        return Some(w.context_tokens);
-    }
-    if let Ok(map) = WORKER_CONTEXT_TOKENS.read()
-        && let Some(&tokens) = map.get(key)
-    {
-        return Some(tokens);
-    }
-    None
+    WORKERS.get(key).map(|e| e.last_tokens)
 }
 
 /// Format the active specialist context tokens for display in the status bar.
 /// Returns None if no specialist workers are active or context is 0.
 pub fn get_active_specialist_context_str() -> Option<String> {
-    let map = ACTIVE_WORKERS.read().ok()?;
-    if map.is_empty() {
+    let mut active: Vec<(String, WorkerState)> = WORKERS
+        .iter()
+        .filter(|e| e.value().is_active())
+        .map(|e| (e.key().clone(), e.value().clone()))
+        .collect();
+    active.sort_by(|a, b| a.0.cmp(&b.0));
+    if active.is_empty() {
         return None;
     }
-    let entries: Vec<String> = map
-        .values()
-        .filter(|w| w.context_tokens > 0)
-        .map(|w| {
-            let count_str = if w.context_tokens >= 1_000_000 {
-                format!("{:.1}M", w.context_tokens as f64 / 1_000_000.0)
-            } else if w.context_tokens >= 1_000 {
-                format!("{:.1}k", w.context_tokens as f64 / 1_000.0)
+    let entries: Vec<String> = active
+        .iter()
+        .filter(|(_, w)| w.info.context_tokens > 0)
+        .map(|(_, w)| {
+            let count_str = if w.info.context_tokens >= 1_000_000 {
+                format!("{:.1}M", w.info.context_tokens as f64 / 1_000_000.0)
+            } else if w.info.context_tokens >= 1_000 {
+                format!("{:.1}k", w.info.context_tokens as f64 / 1_000.0)
             } else {
-                format!("{}", w.context_tokens)
+                format!("{}", w.info.context_tokens)
             };
-            if let Some(ref tid) = w.task_id {
-                format!("{}-{}: {}", w.agent_name, tid, count_str)
+            if let Some(ref tid) = w.info.task_id {
+                format!("{}-{}: {}", w.info.agent_name, tid, count_str)
             } else {
-                format!("{}: {}", w.agent_name, count_str)
+                format!("{}: {}", w.info.agent_name, count_str)
             }
         })
         .collect();
@@ -233,10 +312,7 @@ pub fn get_active_specialist_context_str() -> Option<String> {
 
 /// Returns true if there are currently any active background specialist workers.
 pub fn has_active_workers() -> bool {
-    let Ok(map) = ACTIVE_WORKERS.read() else {
-        return false;
-    };
-    !map.is_empty()
+    WORKERS.iter().any(|e| e.value().is_active())
 }
 
 /// Helper to format elapsed durations into human-readable minutes and seconds (e.g. "2m 15s" or "45s").
@@ -253,32 +329,45 @@ pub fn format_duration_human(secs: u64) -> String {
 /// Formats all currently active and recently completed subagent workers with their tool call ID, prompt, running time,
 /// implementation turns, validation rounds, and latest validator feedback.
 pub fn get_active_subtasks_str() -> String {
-    let active_map = ACTIVE_WORKERS.read().ok();
-    let completed_list = RECENT_COMPLETED_WORKERS.read().ok();
+    // Active workers, in key order (matches the previous BTreeMap ordering).
+    let mut active: Vec<(String, WorkerState)> = WORKERS
+        .iter()
+        .filter(|e| e.value().is_active())
+        .map(|e| (e.key().clone(), e.value().clone()))
+        .collect();
+    active.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let has_active = active_map.as_ref().map(|m| !m.is_empty()).unwrap_or(false);
-    let has_completed = completed_list
-        .as_ref()
-        .map(|c| !c.is_empty())
-        .unwrap_or(false);
+    // Recently completed workers, most recent first (matches the previous
+    // Vec push-order rendered in reverse).
+    let mut completed: Vec<(String, WorkerState)> = WORKERS
+        .iter()
+        .filter(|e| !e.value().is_active())
+        .map(|e| (e.key().clone(), e.value().clone()))
+        .collect();
+    completed.sort_by(|a, b| {
+        b.1
+            .completed_seq
+            .unwrap_or(u64::MAX)
+            .cmp(&a.1.completed_seq.unwrap_or(u64::MAX))
+    });
 
-    if !has_active && !has_completed {
+    if active.is_empty() && completed.is_empty() {
         return "None".to_string();
     }
 
     let mut out = String::new();
-    if let Some(map) = active_map
-        && !map.is_empty()
-    {
+    if !active.is_empty() {
         out.push_str("Active Background Subagents:\n");
-        for (id, info) in map.iter() {
+        for (id, state) in &active {
+            let info = &state.info;
             let elapsed_secs = info.started_at.elapsed().as_secs();
             let duration_str = format_duration_human(elapsed_secs);
             let task_id_str = info.task_id.as_deref().unwrap_or(id);
             let start_wall_str = info.started_wall.format("%H:%M:%S");
             out.push_str(&format!(
                 "- Tool Call ID: {}\n  Subagent Tag: {}\n  Subagent: {}\n  Status: {}\n  Task Prompt: {}\n  Started At: {} (running for {}, {elapsed_secs} total seconds)\n  Implementation Turns: {}\n  Validation Rounds: {}\n",
-                task_id_str, id, info.agent_name, info.status, info.prompt, start_wall_str, duration_str, info.implementation_turns, info.validation_rounds
+                task_id_str, id, info.agent_name, info.status, info.prompt, start_wall_str,
+                duration_str, info.implementation_turns, info.validation_rounds
             ));
             let clean_tid = info.task_id.as_deref().map(|t| {
                 t.trim_matches(|c| {
@@ -323,15 +412,23 @@ pub fn get_active_subtasks_str() -> String {
         }
     }
 
-    if let Some(completed) = completed_list
-        && !completed.is_empty()
-    {
+    if !completed.is_empty() {
         out.push_str("Recently Completed Subagents:\n");
-        for info in completed.iter().rev() {
-            let duration_str = format_duration_human(info.duration.as_secs());
+        for (_id, state) in &completed {
+            let info = &state.info;
+            let duration_str = format_duration_human(
+                state
+                    .completed_at
+                    .map(|c| c - info.started_at)
+                    .unwrap_or_default()
+                    .as_secs(),
+            );
             let task_id_str = info.task_id.as_deref().unwrap_or(&info.agent_name);
             let start_wall_str = info.started_wall.format("%H:%M:%S");
-            let finish_wall_str = info.completed_wall.format("%H:%M:%S");
+            let finish_wall_str = state
+                .completed_wall
+                .unwrap_or(info.started_wall)
+                .format("%H:%M:%S");
             out.push_str(&format!(
                 "- Tool Call ID: {}\n  Subagent: {}\n  Status: {}\n  Task Prompt: {}\n  Started At: {}\n  Finished At: {} (total duration: {})\n  Implementation Turns: {}\n  Validation Rounds: {}\n",
                 task_id_str, info.agent_name, info.status, info.prompt, start_wall_str, finish_wall_str, duration_str, info.implementation_turns, info.validation_rounds
@@ -361,14 +458,24 @@ pub fn get_active_subtasks_str() -> String {
 /// Helper to find an active worker matching a given task id substring.
 pub fn get_active_subtask_by_id(task_id: &str) -> Option<(String, String)> {
     let tid = task_id.to_lowercase();
-    let map = ACTIVE_WORKERS.read().ok()?;
-    let (_k, info) = map.iter().find(|(k, v)| {
-        v.task_id.as_deref().map(str::to_lowercase) == Some(tid.clone())
+    let mut active: Vec<(String, WorkerState)> = WORKERS
+        .iter()
+        .filter(|e| e.value().is_active())
+        .map(|e| (e.key().clone(), e.value().clone()))
+        .collect();
+    active.sort_by(|a, b| a.0.cmp(&b.0));
+    let (_key, state) = active.iter().find(|(k, s)| {
+        s.info
+            .task_id
+            .as_deref()
+            .map(str::to_lowercase)
+            .as_deref()
+            == Some(tid.as_str())
             || k.to_lowercase().contains(&tid)
-            || v.prompt.to_lowercase().contains(&tid)
+            || s.info.prompt.to_lowercase().contains(&tid)
     })?;
-    let running_time = format_duration_human(info.started_at.elapsed().as_secs());
-    Some((info.agent_name.clone(), running_time))
+    let running_time = format_duration_human(state.info.started_at.elapsed().as_secs());
+    Some((state.info.agent_name.clone(), running_time))
 }
 
 /// Helper to check if an active worker matches a target agent and/or task ID.
@@ -399,58 +506,45 @@ fn worker_matches(
         .trim()
         .to_ascii_lowercase();
 
-    // 1. Direct match on key
-    if (!clean_task.is_empty() && key_lower.contains(&clean_task))
-        || (!clean_agent.is_empty() && key_lower.contains(&clean_agent))
-    {
-        return true;
-    }
+    let task_matches = !clean_task.is_empty()
+        && (key_lower.contains(&clean_task)
+            || (!worker_task.is_empty()
+                && (worker_task == clean_task
+                    || worker_task.contains(&clean_task)
+                    || clean_task.contains(&worker_task)))
+            || (!worker_agent.is_empty()
+                && (worker_agent == clean_task
+                    || worker_agent.contains(&clean_task)
+                    || clean_task.contains(&worker_agent))));
 
-    // 2. Match on task id
-    if !clean_task.is_empty()
-        && !worker_task.is_empty()
-        && (worker_task == clean_task
-            || worker_task.contains(&clean_task)
-            || clean_task.contains(&worker_task))
-    {
-        return true;
-    }
-
-    // 3. Cross match: tool_call_id specified agent name (e.g. tool_call_id: "coder" or "validator-coder")
-    if !clean_task.is_empty()
-        && (worker_agent == clean_task
-            || worker_agent.contains(&clean_task)
-            || clean_task.contains(&worker_agent))
-    {
-        return true;
-    }
-
-    // 4. Match on agent name
-    if !clean_agent.is_empty()
-        && (worker_agent == clean_agent
+    let agent_matches = !clean_agent.is_empty()
+        && (key_lower.contains(&clean_agent)
+            || worker_agent == clean_agent
             || worker_agent.contains(&clean_agent)
-            || clean_agent.contains(&worker_agent))
-    {
-        return true;
-    }
+            || clean_agent.contains(&worker_agent));
 
-    false
+    if !clean_task.is_empty() && !clean_agent.is_empty() {
+        task_matches && agent_matches
+    } else if !clean_task.is_empty() {
+        task_matches
+    } else if !clean_agent.is_empty() {
+        agent_matches
+    } else {
+        false
+    }
 }
 
 /// Cancel an active specialist worker matching target_agent and/or target_task_id.
 /// Returns true if at least one matching active worker was found and cancelled.
 pub fn cancel_active_worker(target_agent: Option<&str>, target_task_id: Option<&str>) -> bool {
-    let Ok(map) = ACTIVE_WORKERS.read() else {
-        return false;
-    };
-
     let mut to_cancel = Vec::new();
-    for (key, info) in map.iter() {
-        if worker_matches(info, key, target_agent, target_task_id) {
-            to_cancel.push((key.clone(), info.cancel_token.clone()));
+    for e in WORKERS.iter() {
+        let key = e.key();
+        let state = e.value();
+        if state.is_active() && worker_matches(&state.info, key, target_agent, target_task_id) {
+            to_cancel.push((key.clone(), state.info.cancel_token.clone()));
         }
     }
-    drop(map);
 
     let found = !to_cancel.is_empty();
     for (key, token_opt) in to_cancel {
@@ -467,15 +561,14 @@ pub fn cancel_active_worker(target_agent: Option<&str>, target_task_id: Option<&
 
 /// Cancel all active specialist workers across the registry.
 pub fn cancel_all_active_workers() -> usize {
-    let Ok(map) = ACTIVE_WORKERS.read() else {
-        return 0;
-    };
-
     let mut to_cancel = Vec::new();
-    for (key, info) in map.iter() {
-        to_cancel.push((key.clone(), info.cancel_token.clone()));
+    for e in WORKERS.iter() {
+        let key = e.key();
+        let state = e.value();
+        if state.is_active() {
+            to_cancel.push((key.clone(), state.info.cancel_token.clone()));
+        }
     }
-    drop(map);
 
     let count = to_cancel.len();
     for (key, token_opt) in to_cancel {
@@ -529,6 +622,7 @@ mod tests {
 
     #[test]
     fn test_cancel_active_worker_and_cancel_all() {
+        let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let token1 = tokio_util::sync::CancellationToken::new();
         let token2 = tokio_util::sync::CancellationToken::new();
 
@@ -585,5 +679,79 @@ mod tests {
         let completed_str = get_active_subtasks_str();
         assert!(completed_str.contains("Latest Validator Feedback:"));
         assert!(completed_str.contains("..."));
+    }
+
+    /// Concurrency regression (Phase 2): 50 concurrent workers hammer the
+    /// single sharded `WORKERS` DashMap — each registers via
+    /// `register_active_worker_with_token`, interleaves
+    /// `update_active_worker_context` + `set_active_worker_status`, then drops
+    /// its guard (single-entry mutation + bounded-ring eviction). The whole
+    /// batch must finish well within a generous wall-clock bound (no
+    /// deadlock), and the completed ring must stay capped at 10 entries.
+    #[tokio::test]
+    async fn test_workers_stress_concurrent_register_update_drop() {
+        let n = 50;
+        let mut handles = Vec::with_capacity(n);
+        for i in 0..n {
+            handles.push(tokio::spawn(async move {
+                let guard = register_active_worker_with_token(
+                    Some(format!("stress-{i}")),
+                    format!("agent-{i}"),
+                    format!("stress prompt {i}"),
+                    None,
+                );
+                // Interleave context-token updates and status changes on the
+                // same entry while other workers churn the map concurrently.
+                for j in 0..5 {
+                    update_active_worker_context(&guard.0, 100 * (j + 1));
+                    set_active_worker_status(&guard.0, &format!("status-{j}"));
+                }
+                drop(guard);
+            }));
+        }
+        // Generous bound: a correct implementation finishes in <1s; a
+        // deadlock would hang until this fires.
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            for h in handles {
+                h.await.expect("worker task panicked");
+            }
+        })
+        .await
+        .expect("50 concurrent worker register/update/drop tasks must complete (no deadlock)");
+
+        // Every one of OUR 50 workers must be completed (not active) after its
+        // guard dropped. (We check our own keys, not `has_active_workers()`,
+        // because other lib tests share the process-global map concurrently.)
+        let my_active = (0..n)
+            .filter(|i| {
+                WORKERS
+                    .get(&format!("agent-{i}-stress-{i}"))
+                    .is_some_and(|e| e.is_active())
+            })
+            .count();
+        assert_eq!(
+            my_active, 0,
+            "all 50 stress workers must have completed after their guards dropped"
+        );
+        // Bounded completed ring: the cap is a hard invariant of the drop
+        // path. Other lib tests churn the shared global map concurrently, so
+        // a *momentary* count of 11 can be observed mid-drop; poll until the
+        // ring settles at or below the cap (it must, given every drop evicts).
+        let mut settled = false;
+        for _ in 0..100 {
+            let completed_count = WORKERS
+                .iter()
+                .filter(|e| !e.value().is_active())
+                .count();
+            if completed_count <= MAX_RECENT_COMPLETED {
+                settled = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            settled,
+            "completed ring must settle at <= {MAX_RECENT_COMPLETED} entries"
+        );
     }
 }

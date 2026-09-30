@@ -580,3 +580,6 @@ MIT
 - **Version:** `0.8.0`
 - **Language:** Rust (edition 2024, `rust-version = "1.98"`)
 - **Repository:** `https://github.com/Na1w/marmel.git` (branch `main`)
+
+### Troubleshooting / Concurrency
+Marmel has been hardened against concurrency issues. The worker registry now uses a sharded `DashMap` to prevent deadlocks from multi-lock sequences, the event bus utilizes a lock-free emission path by dropping guards before asynchronous sends, and all worker delegations now have a hard 1800s timeout with automatic cancellation to prevent manager hangs.
