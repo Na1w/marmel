@@ -44,6 +44,8 @@ pub struct TuiRenderer {
     pub(crate) current_content: String,
     /// The execution plan text. Defaults to `"No active execution plan."`.
     pub(crate) plan_content: String,
+    /// Multi-line text editor widget for input.
+    pub(crate) textarea: ratatui_textarea::TextArea<'static>,
     /// The current text in the input box.
     pub(crate) input_text: String,
     /// Byte offset of the input cursor within `input_text` (always on a char
@@ -165,6 +167,7 @@ impl TuiRenderer {
             current_thought: String::new(),
             current_content: String::new(),
             plan_content: "No active execution plan.".to_string(),
+            textarea: ratatui_textarea::TextArea::default(),
             input_text: String::new(),
             cursor: 0,
             confirm_abort: false,

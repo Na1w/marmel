@@ -2238,3 +2238,19 @@ fn test_set_subagents_preserves_manager_active_agent() {
 
     assert_eq!(r.active_agent, "Manager");
 }
+
+#[test]
+fn test_ansi_and_markdown() {
+    use ansi_to_tui::IntoText;
+
+    // Test ANSI parsing
+    let ansi_bytes = b"\x1b[32mok\x1b[0m \x1b[31mFAILED\x1b[0m";
+    let text = ansi_bytes.into_text().expect("ansi parsing should succeed");
+    assert_eq!(text.lines.len(), 1);
+    assert!(text.lines[0].spans.len() >= 2);
+
+    // Test Markdown parsing
+    let md = "# Title\n\n```rust\nfn main() {}\n```";
+    let md_text = tui_markdown::from_str(md);
+    assert!(!md_text.lines.is_empty());
+}
