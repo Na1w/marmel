@@ -68,33 +68,48 @@ fn apply_landlock_linux(workspace_root: &Path) -> Result<()> {
         }
     }
 
-    // 3. User build caches: ~/.cargo and ~/.cache (so cargo/pip/npm can download & build)
+    // 3. User build caches and toolchains in HOME
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        let cargo_dir = home.join(".cargo");
-        if cargo_dir.exists()
-            && let Ok(fd) = PathFd::new(&cargo_dir)
-        {
-            ruleset = ruleset
-                .add_rule(PathBeneath::new(fd, AccessFs::from_all(abi)))
-                .context("adding ~/.cargo rule to Landlock")?;
+        // Read/Write caches for build tools (cargo, pip, npm)
+        for dir_name in [".cargo", ".cache", ".npm"] {
+            let p = home.join(dir_name);
+            if p.exists()
+                && let Ok(fd) = PathFd::new(&p)
+            {
+                ruleset = ruleset
+                    .add_rule(PathBeneath::new(fd, AccessFs::from_all(abi)))
+                    .context(format!("adding ~/{dir_name} rule to Landlock"))?;
+            }
         }
-        let cache_dir = home.join(".cache");
-        if cache_dir.exists()
-            && let Ok(fd) = PathFd::new(&cache_dir)
-        {
-            ruleset = ruleset
-                .add_rule(PathBeneath::new(fd, AccessFs::from_all(abi)))
-                .context("adding ~/.cache rule to Landlock")?;
+        // Read-only user toolchains and configurations (rustup, local binaries, gitconfig, config)
+        for entry in [".rustup", ".config", ".local", ".gitconfig"] {
+            let p = home.join(entry);
+            if p.exists()
+                && let Ok(fd) = PathFd::new(&p)
+            {
+                ruleset = ruleset
+                    .add_rule(PathBeneath::new(fd, AccessFs::from_read(abi)))
+                    .context(format!("adding ~/{entry} read rule to Landlock"))?;
+            }
         }
-        // ~/.rustup read-only
-        let rustup_dir = home.join(".rustup");
-        if rustup_dir.exists()
-            && let Ok(fd) = PathFd::new(&rustup_dir)
-        {
-            ruleset = ruleset
-                .add_rule(PathBeneath::new(fd, AccessFs::from_read(abi)))
-                .context("adding ~/.rustup read rule to Landlock")?;
-        }
+    }
+
+    // Custom CARGO_HOME / RUSTUP_HOME if set outside ~/.cargo or ~/.rustup
+    if let Some(cargo_home) = std::env::var_os("CARGO_HOME").map(PathBuf::from)
+        && cargo_home.exists()
+        && let Ok(fd) = PathFd::new(&cargo_home)
+    {
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(fd, AccessFs::from_all(abi)))
+            .context("adding CARGO_HOME rule to Landlock")?;
+    }
+    if let Some(rustup_home) = std::env::var_os("RUSTUP_HOME").map(PathBuf::from)
+        && rustup_home.exists()
+        && let Ok(fd) = PathFd::new(&rustup_home)
+    {
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(fd, AccessFs::from_read(abi)))
+            .context("adding RUSTUP_HOME rule to Landlock")?;
     }
 
     // 4. Essential device nodes with read/write access (/dev/null, /dev/zero, /dev/full, /dev/tty, /dev/pts, /dev/shm)
