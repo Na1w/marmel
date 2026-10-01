@@ -364,6 +364,10 @@ pub async fn run_fix_loop(
                 "{}: maximum single-turn reasoning budget of {max_thinking_tokens} tokens exceeded",
                 p.tag
             );
+            crate::orchestrator::emit_status(format!(
+                "{}: reasoning budget ({max_thinking_tokens} tokens) reached — nudging out of thinking",
+                p.tag
+            ));
         }
 
         let mut tool_calls = reply.tool_calls.clone();
@@ -403,11 +407,16 @@ pub async fn run_fix_loop(
         if tool_calls.is_empty() {
             if verdict_nudge_count < 3 {
                 verdict_nudge_count += 1;
-                p.engine.append(Message::User {
-                    content: format!(
-                        "System: You have not submitted a verdict using the 'leave_verdict' tool (reminder {verdict_nudge_count}/3). Do not output text. If your analysis and verification are complete, you MUST call the 'leave_verdict' tool with verdict ('APPROVED' or 'REJECTED') and comments. If you need to perform further verification, invoke the appropriate tools.",
-                    ),
-                });
+                let notice = if out.thinking_budget_exceeded {
+                    format!(
+                        "SYSTEM NOTICE: Maximum reasoning budget of {max_thinking_tokens} tokens reached for this turn. Stop internal reasoning immediately. You have not submitted a verdict using the 'leave_verdict' tool (reminder {verdict_nudge_count}/3). Proceed directly to call the 'leave_verdict' tool with verdict ('APPROVED' or 'REJECTED') and comments, or invoke required inspection tools."
+                    )
+                } else {
+                    format!(
+                        "System: You have not submitted a verdict using the 'leave_verdict' tool (reminder {verdict_nudge_count}/3). Do not output text. If your analysis and verification are complete, you MUST call the 'leave_verdict' tool with verdict ('APPROVED' or 'REJECTED') and comments. If you need to perform further verification, invoke the appropriate tools."
+                    )
+                };
+                p.engine.append(Message::User { content: notice });
                 continue;
             } else {
                 tracing::info!(

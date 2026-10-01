@@ -9,7 +9,7 @@ use std::path::PathBuf;
 pub const DEFAULT_MAX_RECURSION_DEPTH: usize = 3;
 
 /// Default reasoning/thinking token budget per single turn.
-pub const DEFAULT_MAX_THINKING_TOKENS: usize = 32768;
+pub const DEFAULT_MAX_THINKING_TOKENS: usize = 8192;
 
 /// Orchestration configuration parsed from marmel.toml.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
