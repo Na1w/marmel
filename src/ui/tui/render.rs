@@ -852,9 +852,9 @@ impl TuiRenderer {
 
         // Subagent bottom status bar (rendered like main UI status bar).
         if let (Some(status_area), Some(sa)) = (status_area_opt, sa_opt) {
-            let frames = ["…", "..", "."];
-            let idx = (self.frame_counter % frames.len() as u64) as usize;
-            let dots = if sa.is_active { frames[idx] } else { "" };
+            let frames = ["-", "\\", "|", "/"];
+            let idx = ((self.session_start.elapsed().as_millis() / 125) % frames.len() as u128) as usize;
+            let spinner = if sa.is_active { frames[idx] } else { "" };
 
             let turn_think = self
                 .subagent_turn_thinking
@@ -881,7 +881,7 @@ impl TuiRenderer {
                     Self::format_count(tok_count),
                     Self::format_count(remaining),
                     Self::format_count(chars),
-                    dots
+                    spinner
                 );
                 let fg_color = if remaining <= budget / 5 {
                     Color::LightRed
@@ -896,10 +896,10 @@ impl TuiRenderer {
                         .add_modifier(Modifier::BOLD),
                 )
             } else if sa.is_active && !sa.content.is_empty() {
-                let text = format!(" [Status: Active - streaming output...] {}", dots);
+                let text = format!(" [Status: Active - streaming output...] {}", spinner);
                 (text, Style::default().bg(Color::DarkGray).fg(Color::Green))
             } else if sa.is_active {
-                let text = format!(" [Status: Active - waiting for model response...] {}", dots);
+                let text = format!(" [Status: Active - waiting for model response...] {}", spinner);
                 (text, Style::default().bg(Color::DarkGray).fg(Color::Cyan))
             } else {
                 (
@@ -977,13 +977,16 @@ impl TuiRenderer {
             status_str.push_str(&count_suffix);
         }
         // F3: animated activity indicator. When the status line indicates an
-        // active phase, append a cycling suffix derived from `frame_counter`.
+        // active phase, append a cycling suffix derived from `session_start`.
         let active_phase = [
             "Running",
             "Delegating",
             "calling backend",
+            "calling model",
             "Starting",
             "streaming",
+            "thinking",
+            "Arbitrating",
         ]
         .iter()
         .any(|k| status_str.contains(k));
@@ -992,8 +995,8 @@ impl TuiRenderer {
             status_str.push_str(&format!(" ({:.1}s)", elapsed));
         }
         if active_phase {
-            let frames = ["…", "..", "."];
-            let idx = (self.frame_counter % frames.len() as u64) as usize;
+            let frames = ["-", "\\", "|", "/"];
+            let idx = ((self.session_start.elapsed().as_millis() / 125) % frames.len() as u128) as usize;
             status_str.push(' ');
             status_str.push_str(frames[idx]);
         }

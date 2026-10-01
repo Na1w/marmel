@@ -1433,7 +1433,7 @@ dependencies = [
 
 [[package]]
 name = "marmennill"
-version = "0.9.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
