@@ -40,7 +40,7 @@ Marmel is a Rust-based CLI that connects to an OpenAI-compatible chat-completion
 - **MCP (Model Context Protocol) client** — JSON-RPC 2.0 over stdio and SSE/HTTP, with tool discovery, execution, and automatic child process cleanup (`kill_on_drop`) protecting against orphaned or zombie processes.
 - **Reasoning budget enforcement & stream cutoff** — configurable per-specialist and global limits on thinking tokens (`max_thinking_tokens`) with mid-stream cutoff and seamless corrective continuation prompts to prevent runaway reasoning loops.
 - **High-performance, low-overhead UI rendering** — batched async event draining and 40 FPS frame throttling ensure near-zero CPU usage during idle periods and high-throughput streaming.
-- **Two UI modes** — an interactive 3-panel Ratatui TUI (with subagent auto-focus, scroll clamping, and full horizontal cursor navigation) and a headless raw streaming mode.
+- **Two UI modes** — an interactive 3-panel Ratatui TUI (featuring multi-line textarea editing with undo/redo, Kitty keyboard protocol enhancement, bracketed paste, native Markdown chat styling, full ANSI color rendering, smooth 125ms clock spinner, subagent auto-focus, and scroll clamping) and a headless raw streaming mode.
 - **Live session token accounting** — global atomic tracking of cumulative input and output tokens across Manager turns, specialist subagents, validators, and arbitrators with auto-scaled metrics in the status bar.
 
 ---
@@ -309,14 +309,16 @@ The TUI is a 3-panel Ratatui interface: **Chat** / **Plan** / **Subagents**.
 
 | Key | Action |
 |---|---|
-| `Enter` | Send input. |
+| `Enter` | Send input message. |
+| `Shift+Enter` / `Alt+Enter` / `Ctrl+J` | Insert newline in multi-line input box. |
+| `Ctrl+Z` / `Ctrl+Y` | Multi-level undo and redo in the input textarea. |
 | `Esc` / `Ctrl+C` | Confirm-abort (press twice to quit; Esc first restores focus to Chat). |
 | `Ctrl+D` | Instant abort. |
 | `Tab` | Cycle focus (Chat / Plan / Subagents). |
 | `Left` / `Right` | Move cursor left/right (in Chat) or switch selected subagent (in Subagents). |
-| `Home` / `End` | Move cursor to start/end (in Chat) or scroll to top/bottom (in other panels). |
+| `Home` / `End` | Move cursor to start/end of line (in Chat) or scroll to top/bottom (in other panels). |
 | `PageUp` / `PageDown` | Scroll panel up/down by 10 lines. |
-| `Up` / `Down` | Scroll panel up/down by 1 line (when not using Ctrl). |
+| `Up` / `Down` | Move cursor up/down lines in input (in Chat) or scroll panel up/down by 1 line. |
 | `Ctrl+Up` / `Ctrl+Down` | Input history navigation. |
 | `Backspace` / `Delete` | Delete grapheme before / after cursor. |
 | `Ctrl+P` | Toggle execution plan panel. |
@@ -394,8 +396,11 @@ All built-in file and search tools (`read_file`, `write_file`, `replace`, `grep_
 ### 2. Linux Landlock LSM Process Isolation (Linux)
 
 For terminal command execution (`run_command` and interactive PTY sessions), Marmel leverages **Linux Landlock LSM** (Linux kernel $\ge 5.13$) for unprivileged kernel-enforced sandboxing:
-- **Workspace & Build Caches (Read/Write/Exec):** Full access is granted to the workspace root, `/tmp`, `~/.cargo`, and `~/.cache`. This allows package managers (`cargo build`, `cargo add`, `npm`, `pip`) to download, cache, and compile dependencies normally.
-- **System Toolchains (Read-Only + Exec):** System binaries and libraries (`/usr`, `/bin`, `/lib`, `/lib64`, `/etc`, `/dev`, `/proc`, `/sys`) and `~/.rustup` toolchains are strictly read-only.
+- **Workspace & Build Caches (Read/Write/Exec):** Full access is granted to the workspace root, `/tmp`, `/var/tmp`, `~/.cargo`, `~/.cache`, and `~/.npm`. This allows package managers (`cargo build`, `cargo add`, `npm`, `pip`) to download, cache, and compile dependencies normally.
+- **System Devices & Terminal Nodes:** Read/write access is explicitly granted to `/dev/null`, `/dev/zero`, `/dev/tty`, `/dev/pts`, and `/dev/shm`, ensuring stream redirection (`> /dev/null 2>&1`), interactive terminals, and shared memory execute seamlessly without permission denied errors.
+- **Network & DNS Resolution:** Read-only access to `/run` and `/var` ensures dynamic system symlinks (such as `/etc/resolv.conf` pointing to `/run/systemd/resolve/stub-resolv.conf`) resolve hostnames and DNS lookups reliably.
+- **Developer Configurations:** Read-only access to user developer configs (`~/.gitconfig`, `~/.config`, `~/.local`) and `~/.rustup` toolchains, respecting custom `CARGO_HOME` and `RUSTUP_HOME` paths.
+- **System Toolchains (Read-Only + Exec):** System binaries and libraries (`/usr`, `/bin`, `/lib`, `/lib64`, `/etc`, `/proc`, `/sys`) are strictly read-only.
 - **Sensitive Directories (Completely Blocked):** Critical directories such as `~/.ssh`, `~/.gnupg`, and other directories outside the workspace are blocked by the kernel.
 - **Inherited Sub-process Protection:** Landlock restrictions are applied via `--internal-sandbox-exec` right before the subshell starts, permanently confining bash, cargo, python, and any spawned sub-processes.
 
@@ -540,8 +545,12 @@ Marmel is continuously built and tested across all supported target platforms vi
 | `serde` / `serde_json` | 1.0 | Serialization. |
 | `toml` | 1.1 | Config parsing. |
 | `ratatui` | 0.30 | TUI rendering. |
-| `crossterm` | 0.29 (event-stream) | Terminal handling. |
+| `ratatui-textarea` | 0.9 | Multi-line input editing with undo/redo. |
+| `ansi-to-tui` | 8.0 | ANSI escape code parsing for terminal output. |
+| `tui-markdown` | 0.3 | Native Markdown parsing and styling for TUI. |
+| `crossterm` | 0.29 (event-stream) | Terminal handling and keyboard protocol enhancement. |
 | `portable-pty` | 0.9 | PTY creation for command execution. |
+| `dashmap` | 6 | Sharded lock-free concurrent map for worker registry. |
 | `tiktoken-rs` | 0.12 | BPE token counting (cl100k_base). |
 | `regex` | 1.11 | Regex search / parsing. |
 | `ignore` | 0.4 | Gitignore-aware file walking. |
@@ -577,7 +586,7 @@ MIT
 
 - **Name:** `marmennill`
 - **Binary / CLI:** `marmel`
-- **Version:** `0.8.0`
+- **Version:** `1.0.0`
 - **Language:** Rust (edition 2024, `rust-version = "1.98"`)
 - **Repository:** `https://github.com/Na1w/marmel.git` (branch `main`)
 
