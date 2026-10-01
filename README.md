@@ -15,7 +15,9 @@ Marmel is a Rust-based CLI that connects to an OpenAI-compatible chat-completion
 - [Local Models & Recommendations](#local-models--recommendations)
 - [Configuration](#configuration)
 - [Usage](#usage)
-- [Specialist Roles](#specialist-roles)
+- [Specialist Roles & Agent Archetypes](#specialist-roles--agent-archetypes)
+- [Dynamic Prompt Designer & Skill Catalog](#dynamic-prompt-designer--skill-catalog)
+- [Sandboxing & Cross-Platform Security Model](#sandboxing--cross-platform-security-model)
 - [How It Works](#how-it-works)
 - [Testing](#testing)
 - [Dependencies](#dependencies)
@@ -27,7 +29,9 @@ Marmel is a Rust-based CLI that connects to an OpenAI-compatible chat-completion
 
 - **Fractal Manager + Specialist orchestration** — a Manager decomposes a goal into a disk-backed execution plan and delegates each atomic task to a domain specialist. The Manager never performs domain work itself; it only plans, delegates, and synthesizes.
 - **Disk-backed execution plan & auto-resume** — the plan lives at `.marmel/execution_plan.md` in `- [ ] [t-xxx]` checkbox format, auto-checked-off on completion, auto-resumed on session restart, and archived when done.
-- **Five specialist roles** with per-role tool allowlists — `coder`, `researcher`, `debugger`, `validator`, and `generalist`.
+- **Dynamic Prompt Designer & Agent Architect** — tailored worker system prompts and least-privilege tool allowlists are synthesized on disk (`.marmel/prompts/<task_id>.md`) before task delegation, combining archetype defaults with contextually relevant domain skills.
+- **Granular Multi-Tier Skill Catalog** — hierarchical capability discovery supporting project-level (`skills/*.md`, `skills/*/SKILL.md`, `AGENTS.md`), user-level (`~/.marmel/`), and built-in base skills (`clean_code`, `debugging`, `research`, `verification`, `testing`) with automatic tool permission inheritance and runtime gating.
+- **Strategic Planner with Clean Abstraction** — a dedicated Planner archetype configured with the workspace's full archetype catalog but strictly zero micro-skills, keeping high-level architectural decomposition uncluttered by low-level code mechanics.
 - **Automated validation loop** — specialist deliverables are automatically audited by a Validator subagent; rejected work is fed back for revision (up to 5 iterations by default).
 - **Multi-tier resilience harness** — XML tool-call rescue, semantic tool repetition detection, and text loop breaking (consecutive lines, line bigrams, word 4-grams) with live SSE stream interruption and automatic retry, integrated across specialist execution and the interactive session loop.
 - **Context engine with proactive rebirth & compaction** — `cl100k_base` BPE token counting, KV-cache prefix preservation, proactive rebirth advisory at 80% budget with state preservation instructions (offsets, files, data), forced compaction at 90%, and universal `rebirth` tool availability across all agents and validators.
@@ -373,12 +377,156 @@ Raw mode is pipe-friendly and streams labelled events to stdout:
 | Path | Purpose |
 |---|---|
 | `.marmel/execution_plan.md` | Active execution plan. |
+| `.marmel/prompts/` | Synthesized agent blueprints & worker prompts (`<task_id>.md`). |
 | `.marmel/forced_phase.txt` | Phase override. |
 | `.marmel/marmel.log` | Session log (rotated at 5MB, 3 backups). |
 | `.marmel/archive/` | Archived completed plans. |
 | `.marmel/.session_frozen.json` | Deep-Freeze crash checkpoint. |
 | `.marmel/.session_journal.json` | Append-only crash journal. |
 | `.marmel/tmp/` | Temporary tool overflows. |
+
+---
+
+## Specialist Roles & Agent Archetypes
+
+Marmel separates high-level planning from concrete task execution. Rather than relying on a monolithic prompt, tasks are delegated to specialized agent archetypes defined with tailored system prompts, default skills, and scoped toolsets.
+
+### Built-in Archetypes
+
+| Archetype | Focus | Default Skills | Default Tools |
+|---|---|---|---|
+| **Coder** | System architecture, implementation, refactoring, unit test suites. | `clean_code`, `testing` | `read_file`, `write_file`, `replace`, `run_command`, `grep_search`, `glob`, `rebirth` |
+| **Researcher** | Codebase reconnaissance, documentation inspection, API contracts. | `research` | `read_file`, `grep_search`, `glob`, `rebirth` |
+| **Debugger** | Systems diagnostics, crash forensics, regression isolation, minimal bug fixes. | `debugging`, `testing` | `read_file`, `write_file`, `replace`, `run_command`, `grep_search`, `glob`, `pty_*`, `rebirth` |
+| **Validator** | Independent quality auditor; runs test suites and issues formal verdicts. | `verification` | `read_file`, `grep_search`, `glob`, `run_command`, `leave_verdict` |
+| **Generalist** | Cross-domain polymath for multi-disciplinary or integration tasks. | `clean_code`, `research`, `testing` | All tools, `rebirth` |
+| **Planner** | Strategic mission architect for reconnaissance and phased plan authoring. | *(strictly zero)* | `read_file`, `grep_search`, `glob`, `create_plan`, `rebirth` |
+
+Each specialist runs in an **isolated context** — it sees only its role prompt, the task brief, and bounded snippets, never the Manager's full transcript.
+
+### Custom Workspace Archetypes (`AGENTS.md`)
+
+Teams can define or customize archetypes directly in their workspace by creating an `AGENTS.md` file in the project root (or globally at `~/.marmel/AGENTS.md`):
+
+```markdown
+## Coder
+description: Lead Software Engineer responsible for system architecture and unit tests.
+skills: clean_code, testing
+tools: read_file, write_file, replace, run_command, grep_search, glob, rebirth
+
+## SecurityAuditor
+description: Vulnerability scanner and cryptographic audit specialist.
+skills: security_review, clean_code
+tools: read_file, grep_search, glob, run_command, leave_verdict
+```
+
+---
+
+## Dynamic Prompt Designer & Skill Catalog
+
+Rather than relying on static, one-size-fits-all prompts, Marmel features an autonomous **Agent Architect & Dynamic Prompt Builder** that designs bespoke subagent specifications Just-In-Time (JIT) before delegation.
+
+### 1. Granular Skill Composition
+
+A **Skill** is a discrete, modular unit of domain knowledge, best practices, and operational guidelines. Skills define:
+- `id` & `name`: Unique skill identifier and display title.
+- `description`: Summary of domain expertise used by the planner and architect.
+- `suggested_tools`: Tools typically required to exercise this skill (e.g. `read_file`, `grep_search`).
+- **Markdown Body:** Concise rules, architectural patterns, and checklists.
+
+#### Skill File Format (`skills/*.md` or `skills/*/SKILL.md`)
+```markdown
+---
+id: distributed_systems
+name: Distributed Systems & Consensus
+description: Best practices for consensus protocols, idempotency, and network partitioning.
+suggested_tools:
+  - read_file
+  - run_command
+---
+
+## Distributed Systems Guidelines
+- Ensure all network RPCs are idempotent with client-generated request tokens.
+- Handle partial failures gracefully: always configure timeouts, exponential backoff, and circuit breakers.
+- Never assume in-order network delivery; use vector clocks or monotonic sequence numbers.
+```
+
+### 2. Multi-Tier Discovery Precedence
+
+The Skill Catalog automatically scans and resolves skills and archetypes in the following order (higher tiers override lower tiers):
+
+1. **Project Workspace (Highest Priority):**
+   - `<workspace>/skills/*.md`
+   - `<workspace>/skills/*/SKILL.md`
+   - `<workspace>/AGENTS.md`
+2. **User Home Directory:**
+   - `~/.marmel/skills/*.md`
+   - `~/.marmel/skills/*/SKILL.md`
+   - `~/.marmel/AGENTS.md`
+3. **Built-in Base Skills (Compiled-in):**
+   - `clean_code` — modular design, surgical `replace` operations, robust error handling.
+   - `debugging` — root-cause isolation, crash reproduction, minimal targeted fixes.
+   - `research` — codebase mapping, API contract discovery, zero speculative assumptions.
+   - `testing` — test suite authoring, edge case coverage, deterministic regression tests.
+   - `verification` — independent audit criteria, verification matrices, formal verdict issuance.
+
+### 3. Dynamic Tool Gating & Least Privilege
+
+Marmel strictly adheres to the principle of least privilege:
+- **Automatic Tool Inheritance:** An agent's allowed tools are computed as the union of its archetype's `default_tools` and the `suggested_tools` of all active skills selected for the task.
+- **Runtime Tool Gating:** When a subagent runs, the tool harness wraps the invocation in `ToolCaller::SpecialistWithTools { agent, allowed_tools }`. Any attempt to call a tool outside the synthesized allowlist is intercepted and blocked with `ToolError::Forbidden`.
+- **Manager Insulation:** The Manager is restricted to planning (`create_plan`), reconnaissance (`read_file`, `grep_search`, `glob`), and delegation (`delegate_task`). It cannot call domain tools (`write_file`, `replace`, `run_command`), preventing accidental modifications.
+
+### 4. Disk-First Synthesis & Full Auditability
+
+When an execution plan is formulated, the Agent Architect pre-generates prompt pairs directly onto disk at `.marmel/prompts/<task_id>.md`:
+
+```markdown
+---
+role_name: "coder_specialist"
+task_id: "t-002"
+created_at: "2026-10-01T04:30:00Z"
+reasoning: "Synthesized based on archetype coder and keywords parser, stream"
+selected_skills:
+  - "clean_code"
+  - "testing"
+allowed_tools:
+  - "read_file"
+  - "write_file"
+  - "replace"
+  - "run_command"
+  - "grep_search"
+  - "glob"
+  - "rebirth"
+---
+
+# Marmel: coder_specialist
+
+**Mission:** You are a dynamically synthesized specialist dedicated to executing the delegated task with surgical precision.
+
+## Active Domain Skills
+### Skill: Clean Code & Architecture
+...
+
+### Skill: Unit & Integration Testing
+...
+
+## Strict Operational Discipline
+- **ALLOWED TOOLS:** You are granted access to: `read_file`, `write_file`, `replace`, `run_command`, `grep_search`, `glob`, `rebirth`.
+- **TASK SCOPE:** Execute ONLY the assigned task. Do NOT take over planning or subsequent tasks.
+- **ZERO HALLUCINATION:** Inspect real code and verify actual command outputs.
+- **TERMINAL MARKERS:** Always conclude with `MISSION COMPLETE` upon successful completion, or `FAILED: <reason>` if impossible.
+```
+
+- **Transparent Inspection:** Users can open `.marmel/prompts/` to see the exact prompt and tool grants prepared for any task.
+- **Deterministic Offline Mode:** If LLM architect synthesis is not enabled or offline, Marmel uses deterministic keyword heuristics and archetype defaults to synthesize robust blueprints with zero network latency.
+
+### 5. Strategic Planner with Clean Abstraction
+
+The **Strategic Planner** (`planner`) is configured with the full archetype catalog from `AGENTS.md` so it understands team capabilities and task decomposition strategies. Crucially, the planner is initialized with **strictly zero micro-skills**:
+- Keeps the planner focused on workspace reconnaissance, dependency ordering, and phase structuring.
+- Prevents planning prompts from drowning in low-level coding or debugging guidelines.
+- Ensures generated execution plans are clean, high-level, and delegable to specialists.
 
 ---
 
@@ -407,20 +555,6 @@ For terminal command execution (`run_command` and interactive PTY sessions), Mar
 ### 3. macOS & Windows Compatibility
 
 On non-Linux systems (macOS and Windows), Landlock is conditionally bypassed while **Path Confinement**, working-directory encapsulation, and process-group cleanup remain 100% active.
-
----
-
-## Specialist Roles
-
-| Role | Focus | Tool allowlist |
-|---|---|---|
-| **Coder** | Software engineering, implementation, tests. | Read/write/run tools, search, delegation, sleep. |
-| **Researcher** | Information retrieval, codebase exploration, documentation. | Read/write/run tools, search, delegation, sleep. |
-| **Debugger** | Crash forensics, low-level diagnostics, interactive PTY GDB/LLDB. | Read/run/PTY tools, search, delegation, sleep. |
-| **Validator** | Independent QA auditor; issues `leave_verdict` (APPROVED/REJECTED). | Read/search/PTY tools, verdict, sleep. |
-| **Generalist** | Cross-domain polymath with universal `"*"` tool access. | All tools (including sleep). |
-
-Each specialist runs in an **isolated context** — it sees only its role prompt, the task brief, and bounded snippets, never the Manager's full transcript.
 
 ---
 
