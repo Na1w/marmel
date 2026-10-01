@@ -29,7 +29,18 @@ impl TuiRenderer {
                     if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat =>
                 {
                     match key.code {
-                        KeyCode::Enter => self.submit(),
+                        KeyCode::Enter => {
+                            if key.modifiers.contains(KeyModifiers::SHIFT)
+                                || key.modifiers.contains(KeyModifiers::ALT)
+                                || key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                self.ensure_textarea_in_sync();
+                                self.textarea.insert_newline();
+                                self.sync_input_from_textarea();
+                            } else {
+                                self.submit();
+                            }
+                        }
                         KeyCode::Esc => {
                             // Esc arms confirm-abort (or aborts if already armed).
                             if self.confirm_abort {
@@ -49,6 +60,12 @@ impl TuiRenderer {
                         KeyCode::Up => {
                             if key.modifiers.contains(KeyModifiers::CONTROL) {
                                 self.history_prev();
+                            } else if self.focused_panel == FocusedPanel::Chat
+                                && self.textarea.cursor().0 > 0
+                            {
+                                self.ensure_textarea_in_sync();
+                                self.textarea.input(key);
+                                self.sync_input_from_textarea();
                             } else {
                                 self.scroll_up(1);
                             }
@@ -56,6 +73,12 @@ impl TuiRenderer {
                         KeyCode::Down => {
                             if key.modifiers.contains(KeyModifiers::CONTROL) {
                                 self.history_next();
+                            } else if self.focused_panel == FocusedPanel::Chat
+                                && self.textarea.cursor().0 + 1 < self.textarea.lines().len()
+                            {
+                                self.ensure_textarea_in_sync();
+                                self.textarea.input(key);
+                                self.sync_input_from_textarea();
                             } else {
                                 self.scroll_down(1);
                             }
@@ -71,8 +94,9 @@ impl TuiRenderer {
                                 let h = self.subagent_height.get();
                                 self.subagent_scroll = n.saturating_sub(h) as u16;
                             } else if self.focused_panel == FocusedPanel::Chat {
-                                // F1: move input cursor left by one grapheme.
-                                self.cursor_left();
+                                self.ensure_textarea_in_sync();
+                                self.textarea.input(key);
+                                self.sync_input_from_textarea();
                             }
                         }
                         KeyCode::Right => {
@@ -87,35 +111,42 @@ impl TuiRenderer {
                                 let h = self.subagent_height.get();
                                 self.subagent_scroll = n.saturating_sub(h) as u16;
                             } else if self.focused_panel == FocusedPanel::Chat {
-                                // F1: move input cursor right by one grapheme.
-                                self.cursor_right();
+                                self.ensure_textarea_in_sync();
+                                self.textarea.input(key);
+                                self.sync_input_from_textarea();
                             }
                         }
                         KeyCode::Home => {
                             if self.focused_panel == FocusedPanel::Chat {
-                                // F1: move input cursor to the start.
-                                self.cursor = 0;
+                                self.ensure_textarea_in_sync();
+                                self.textarea.input(key);
+                                self.sync_input_from_textarea();
                             } else {
                                 self.scroll_to_top();
                             }
                         }
                         KeyCode::End => {
                             if self.focused_panel == FocusedPanel::Chat {
-                                // F1: move input cursor to the end.
-                                self.cursor = self.input_text.len();
+                                self.ensure_textarea_in_sync();
+                                self.textarea.input(key);
+                                self.sync_input_from_textarea();
                             } else {
                                 self.scroll_to_bottom();
                             }
                         }
                         KeyCode::Delete => {
-                            // F1: forward-delete the grapheme after the cursor.
                             if self.focused_panel == FocusedPanel::Chat {
-                                self.delete_forward();
+                                self.ensure_textarea_in_sync();
+                                self.textarea.input(key);
+                                self.sync_input_from_textarea();
                             }
                         }
                         KeyCode::Backspace | KeyCode::Char('\x08') | KeyCode::Char('\x7f') => {
-                            // F1: delete the grapheme before the cursor.
-                            self.delete_backward();
+                            if self.focused_panel == FocusedPanel::Chat {
+                                self.ensure_textarea_in_sync();
+                                self.textarea.input(key);
+                                self.sync_input_from_textarea();
+                            }
                         }
                         KeyCode::Char(c) => {
                             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -156,10 +187,23 @@ impl TuiRenderer {
                                 self.messages
                                     .push(format!("[CLI] Thinking display: {state}"));
                                 self.chat_auto_scroll = true;
-                            } else if !c.is_control() {
+                            } else if ctrl && (c == 'z' || c == 'Z') {
+                                self.ensure_textarea_in_sync();
+                                self.textarea.undo();
+                                self.sync_input_from_textarea();
+                            } else if ctrl && (c == 'y' || c == 'Y') {
+                                self.ensure_textarea_in_sync();
+                                self.textarea.redo();
+                                self.sync_input_from_textarea();
+                            } else if (ctrl && (c == 'j' || c == 'J')) || c == '\n' {
+                                self.ensure_textarea_in_sync();
+                                self.textarea.insert_newline();
+                                self.sync_input_from_textarea();
+                            } else if self.focused_panel == FocusedPanel::Chat && !c.is_control() {
                                 self.confirm_abort = false;
-                                // F1: insert the character at the cursor.
-                                self.insert_char(c);
+                                self.ensure_textarea_in_sync();
+                                self.textarea.input(key);
+                                self.sync_input_from_textarea();
                             }
                         }
                         _ => {}
@@ -228,6 +272,19 @@ impl TuiRenderer {
                     }
                     _ => {}
                 },
+                Ok(TermEvent::Paste(text)) => {
+                    if self.focused_panel == FocusedPanel::Chat {
+                        self.ensure_textarea_in_sync();
+                        for ch in text.chars() {
+                            if ch == '\n' {
+                                self.textarea.insert_newline();
+                            } else if ch != '\r' {
+                                self.textarea.insert_char(ch);
+                            }
+                        }
+                        self.sync_input_from_textarea();
+                    }
+                }
                 Ok(TermEvent::Resize(_, _)) => {
                     // F6: explicit resize handling — clamp all scroll offsets and
                     // trigger a flush so no stale viewport shows blank space.
@@ -244,6 +301,51 @@ impl TuiRenderer {
         handled
     }
 
+    pub(crate) fn sync_input_from_textarea(&mut self) {
+        self.input_text = self.textarea.lines().join("\n");
+        let cursor = self.textarea.cursor();
+        let (row, col) = (cursor.0, cursor.1);
+        let mut byte_idx = 0;
+        for (r, line) in self.textarea.lines().iter().enumerate() {
+            if r == row {
+                let char_idx = col.min(line.chars().count());
+                byte_idx += line
+                    .chars()
+                    .take(char_idx)
+                    .map(|c| c.len_utf8())
+                    .sum::<usize>();
+                break;
+            } else {
+                byte_idx += line.len() + 1;
+            }
+        }
+        self.cursor = byte_idx;
+    }
+
+    pub(crate) fn set_input_content(&mut self, text: &str) {
+        self.input_text = text.to_string();
+        let lines: Vec<String> = if text.is_empty() {
+            vec![String::new()]
+        } else {
+            text.split('\n').map(|s| s.to_string()).collect()
+        };
+        self.textarea = ratatui_textarea::TextArea::new(lines);
+        self.textarea.move_cursor(ratatui_textarea::CursorMove::End);
+        self.cursor = text.len();
+    }
+
+    pub(crate) fn ensure_textarea_in_sync(&mut self) {
+        if self.textarea.lines().join("\n") != self.input_text {
+            let lines: Vec<String> = if self.input_text.is_empty() {
+                vec![String::new()]
+            } else {
+                self.input_text.split('\n').map(|s| s.to_string()).collect()
+            };
+            self.textarea = ratatui_textarea::TextArea::new(lines);
+            self.textarea.move_cursor(ratatui_textarea::CursorMove::End);
+        }
+    }
+
     pub(crate) fn sanitize_cursor(&mut self) {
         if self.cursor > self.input_text.len() {
             self.cursor = self.input_text.len();
@@ -257,6 +359,7 @@ impl TuiRenderer {
     }
 
     /// Move the input cursor one grapheme to the left (F1).
+    #[allow(dead_code)]
     pub(crate) fn cursor_left(&mut self) {
         self.sanitize_cursor();
         let before = &self.input_text[..self.cursor];
@@ -265,9 +368,15 @@ impl TuiRenderer {
             self.cursor -= last.len();
         }
         self.sanitize_cursor();
+        self.ensure_textarea_in_sync();
+        self.textarea.input(crossterm::event::KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::NONE,
+        ));
     }
 
     /// Move the input cursor one grapheme to the right (F1).
+    #[allow(dead_code)]
     pub(crate) fn cursor_right(&mut self) {
         self.sanitize_cursor();
         let after = &self.input_text[self.cursor..];
@@ -275,9 +384,15 @@ impl TuiRenderer {
             self.cursor += first.len();
         }
         self.sanitize_cursor();
+        self.ensure_textarea_in_sync();
+        self.textarea.input(crossterm::event::KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        ));
     }
 
     /// Delete the grapheme immediately before the cursor (Backspace, F1).
+    #[allow(dead_code)]
     pub(crate) fn delete_backward(&mut self) {
         self.sanitize_cursor();
         let before = &self.input_text[..self.cursor];
@@ -288,9 +403,11 @@ impl TuiRenderer {
             self.cursor = start;
         }
         self.sanitize_cursor();
+        self.ensure_textarea_in_sync();
     }
 
     /// Delete the grapheme immediately after the cursor (Delete, F1).
+    #[allow(dead_code)]
     pub(crate) fn delete_forward(&mut self) {
         self.sanitize_cursor();
         let after = &self.input_text[self.cursor..];
@@ -299,13 +416,16 @@ impl TuiRenderer {
                 .replace_range(self.cursor..self.cursor + first.len(), "");
         }
         self.sanitize_cursor();
+        self.ensure_textarea_in_sync();
     }
 
     /// Insert a character at the cursor position (F1).
+    #[allow(dead_code)]
     pub(crate) fn insert_char(&mut self, c: char) {
         self.sanitize_cursor();
         self.input_text.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+        self.ensure_textarea_in_sync();
     }
 
     /// F7: click within the input area places the cursor at the
@@ -323,6 +443,9 @@ impl TuiRenderer {
         }
         self.cursor = byte_offset.min(self.input_text.len());
         self.sanitize_cursor();
+        self.ensure_textarea_in_sync();
+        self.textarea
+            .move_cursor(ratatui_textarea::CursorMove::Jump(0, self.cursor as u16));
     }
 
     /// Clamp all scroll offsets to their recomputed maxima (F6).
@@ -515,8 +638,8 @@ impl TuiRenderer {
             self.history_index = Some(idx - 1);
         }
         if let Some(idx) = self.history_index {
-            self.input_text = self.history[idx].clone();
-            self.cursor = self.input_text.len();
+            let text = self.history[idx].clone();
+            self.set_input_content(&text);
         }
     }
 
@@ -525,12 +648,12 @@ impl TuiRenderer {
         if let Some(idx) = self.history_index {
             if idx + 1 < self.history.len() {
                 self.history_index = Some(idx + 1);
-                self.input_text = self.history[idx + 1].clone();
-                self.cursor = self.input_text.len();
+                let text = self.history[idx + 1].clone();
+                self.set_input_content(&text);
             } else {
                 self.history_index = None;
-                self.input_text = self.input_draft.clone();
-                self.cursor = self.input_text.len();
+                let text = self.input_draft.clone();
+                self.set_input_content(&text);
             }
         }
     }
@@ -568,7 +691,14 @@ impl TuiRenderer {
 
     /// Send the current input line to the agent as a user message.
     pub(crate) fn submit(&mut self) {
-        let line = std::mem::take(&mut self.input_text);
+        self.ensure_textarea_in_sync();
+        let line = if !self.input_text.is_empty() {
+            std::mem::take(&mut self.input_text)
+        } else {
+            self.textarea.lines().join("\n")
+        };
+        self.textarea = ratatui_textarea::TextArea::default();
+        self.input_text.clear();
         self.cursor = 0;
         if line.trim().is_empty() {
             let _ = self.tx.send(String::new());
@@ -593,10 +723,13 @@ impl TuiRenderer {
                  /reset, /reset_plan, /reset-plan, /clear_plan, /clear-plan - clear the execution plan\n\
                  /abort, /exit, /quit, /q, :q, :q! - abort the current session\n\n\
                  [CLI] Keybindings:\n\
+                 Enter - send input message\n\
+                 Shift+Enter / Alt+Enter / Ctrl+J - insert newline\n\
                  Tab - cycle focus (Chat / Plan / Subagents)\n\
                  Ctrl+P - toggle the plan panel\n\
                  Ctrl+A - toggle the subagents panel\n\
                  Ctrl+T - toggle the thinking block display\n\
+                 Ctrl+Z / Ctrl+Y - undo / redo input\n\
                  Ctrl+Up / Ctrl+Down - input history navigation\n\
                  Esc / Ctrl+C - confirm-abort (first press arms, second aborts; Esc first returns focus to Chat)\n\
                  Mouse scroll / click - scroll panels / change focus\n\

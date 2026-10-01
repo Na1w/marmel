@@ -1,16 +1,22 @@
 //! Specialist Subagents — isolated-context, run-to-completion workers.
 
+pub mod catalog;
 pub mod coder;
 pub mod debugger;
 pub mod generalist;
+pub mod planner;
+pub mod prompt_builder;
 pub mod researcher;
 pub mod runner;
 pub mod validation;
 pub mod validator;
 
+pub use catalog::{AgentArchetype, Catalog, Skill, SkillSource};
 pub use coder::Coder;
 pub use debugger::Debugger;
 pub use generalist::Generalist;
+pub use planner::Planner;
+pub use prompt_builder::{AgentBlueprint, PromptBuilder};
 pub use researcher::Researcher;
 pub use runner::run_specialist_live;
 pub(crate) use runner::run_specialist_llm;
@@ -35,6 +41,8 @@ pub enum Agent {
     Validator,
     /// Supreme Polymath — dense reasoning and cross-domain logic.
     Generalist,
+    /// Strategic Planner — mission architecture, task decomposition, and execution plan creation.
+    Planner,
 }
 
 impl fmt::Display for Agent {
@@ -51,6 +59,7 @@ impl Agent {
             Agent::Debugger => "debugger",
             Agent::Validator => "validator",
             Agent::Generalist => "generalist",
+            Agent::Planner => "planner",
         }
     }
 
@@ -62,6 +71,7 @@ impl Agent {
             "debugger" => Some(Self::Debugger),
             "validator" => Some(Self::Validator),
             "generalist" | "deepbrain" => Some(Self::Generalist),
+            "planner" => Some(Self::Planner),
             _ => None,
         }
     }
@@ -162,10 +172,12 @@ pub struct IsolatedContext {
     pub snippets: Vec<String>,
     pub image_urls: Vec<String>,
     pub audio_urls: Vec<String>,
+    pub blueprint: Option<AgentBlueprint>,
 }
 
 impl IsolatedContext {
     pub fn from_request(role_system_prompt: String, req: &DelegationRequest) -> Self {
+        let blueprint = AgentBlueprint::parse_from_markdown(&role_system_prompt).ok();
         Self {
             role_system_prompt,
             brief: req.prompt.clone(),
@@ -173,7 +185,20 @@ impl IsolatedContext {
             snippets: req.snippets.clone(),
             image_urls: req.image_urls.clone().unwrap_or_default(),
             audio_urls: req.audio_urls.clone().unwrap_or_default(),
+            blueprint,
         }
+    }
+
+    pub fn with_blueprint(mut self, blueprint: AgentBlueprint) -> Self {
+        self.blueprint = Some(blueprint);
+        self
+    }
+
+    /// Retrieve the explicit list of allowed tools defined in the prompt blueprint, if any.
+    pub fn allowed_tools(&self) -> Option<&[String]> {
+        self.blueprint
+            .as_ref()
+            .map(|bp| bp.allowed_tools.as_slice())
     }
 
     pub fn into_engine(&self, max_context_tokens: usize) -> crate::manager::ContextEngine {
@@ -201,7 +226,12 @@ pub trait Specialist: Send + Sync + fmt::Debug {
         ctx: &IsolatedContext,
         token: &tokio_util::sync::CancellationToken,
     ) -> Deliverable {
-        if token.is_cancelled() || crate::orchestrator::is_current_or_global_cancelled() {
+        if token.is_cancelled()
+            || (!cfg!(test) && crate::orchestrator::is_globally_cancelled())
+            || crate::orchestrator::CURRENT_WORKER_TOKEN
+                .try_with(|t| t.is_cancelled())
+                .unwrap_or(false)
+        {
             return Deliverable {
                 marker: MissionMarker::Failed {
                     reason: "aborted".to_string(),
@@ -226,6 +256,40 @@ pub trait Specialist: Send + Sync + fmt::Debug {
     }
 }
 
+/// Shared assertion helper for per-specialist role/namespace tests
+/// (duplicates.md §6a): the six specialist files previously each embedded a
+/// near-identical `#[cfg(test)]` block; they now delegate to this helper.
+#[cfg(test)]
+pub(crate) fn assert_specialist_role(
+    agent: &dyn Specialist,
+    expected: Agent,
+    must_contain: &[&str],
+    must_not_contain: &[&str],
+    may_recurse: bool,
+) {
+    assert_eq!(agent.name(), expected);
+    for ns in must_contain {
+        assert!(
+            agent.tool_namespaces().contains(ns),
+            "{:?} must grant namespace `{ns}`",
+            expected
+        );
+    }
+    for ns in must_not_contain {
+        assert!(
+            !agent.tool_namespaces().contains(ns),
+            "{:?} must NOT grant namespace `{ns}`",
+            expected
+        );
+    }
+    assert_eq!(
+        agent.may_recurse(),
+        may_recurse,
+        "{:?} may_recurse mismatch",
+        expected
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::runner::assemble_final_deliverable;
@@ -239,6 +303,8 @@ mod tests {
         assert_eq!(Agent::from_str("validator"), Some(Agent::Validator));
         assert_eq!(Agent::from_str("generalist"), Some(Agent::Generalist));
         assert_eq!(Agent::from_str("deepbrain"), Some(Agent::Generalist));
+        assert_eq!(Agent::from_str("planner"), Some(Agent::Planner));
+        assert_eq!(Agent::Planner.to_string(), "planner");
         assert_eq!(Agent::from_str("unknown"), None);
     }
 

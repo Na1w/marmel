@@ -325,6 +325,29 @@ impl TuiRenderer {
         let mut chat_lines = Vec::new();
         for msg in &self.messages {
             let (msg_style, has_special_style) = message_style(msg);
+            if !has_special_style && msg.contains("```") {
+                let (thought_opt, content) = extract_thought_and_content(msg);
+                if self.show_thought
+                    && let Some(t) = thought_opt
+                {
+                    for line in t.lines() {
+                        let cleaned = format_terminal_math(line.trim());
+                        if !cleaned.is_empty() {
+                            chat_lines.push(Line::from(Span::styled(
+                                cleaned,
+                                Style::default()
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(Modifier::ITALIC),
+                            )));
+                        }
+                    }
+                }
+                if !content.trim().is_empty() {
+                    chat_lines.extend(render_markdown_lines(&content));
+                }
+                continue;
+            }
+
             let mut in_think = false;
             for raw_line in msg.lines() {
                 let line = raw_line.replace('\t', "    ");
@@ -356,14 +379,24 @@ impl TuiRenderer {
                             }
                             let cleaned = format_terminal_math(trimmed);
                             if has_special_style {
-                                chat_lines.push(Line::from(Span::styled(cleaned, msg_style)));
+                                if cleaned.contains('\x1b') {
+                                    chat_lines.extend(parse_ansi_lines(&cleaned));
+                                } else {
+                                    chat_lines.push(Line::from(Span::styled(cleaned, msg_style)));
+                                }
                             } else if trimmed.starts_with("[Tool Call] ")
                                 || trimmed.starts_with("[Tool Result] ")
                             {
-                                chat_lines.push(Line::from(Span::styled(
-                                    cleaned,
-                                    Style::default().fg(Color::Magenta),
-                                )));
+                                if cleaned.contains('\x1b') {
+                                    chat_lines.extend(parse_ansi_lines(&cleaned));
+                                } else {
+                                    chat_lines.push(Line::from(Span::styled(
+                                        cleaned,
+                                        Style::default().fg(Color::Magenta),
+                                    )));
+                                }
+                            } else if cleaned.contains('\x1b') {
+                                chat_lines.extend(parse_ansi_lines(&cleaned));
                             } else {
                                 // Orchestrator / Model content: WHITE
                                 chat_lines.push(Line::from(Span::styled(
@@ -402,28 +435,33 @@ impl TuiRenderer {
             }
         }
 
-        // Streaming content (Orchestrator output - WHITE).
+        // Streaming content (Orchestrator output - WHITE or syntax highlighted).
         if !self.current_content.is_empty() {
-            for raw_line in self.current_content.lines() {
-                let line = raw_line.replace('\t', "    ");
-                let trimmed = line.trim();
-                if trimmed == "<think>"
-                    || trimmed == "</think>"
-                    || trimmed == "<thought>"
-                    || trimmed == "</thought>"
-                    || trimmed == "<think></think>"
-                    || trimmed == "<thought></thought>"
-                {
-                    continue;
+            if self.current_content.contains("```") {
+                let cleaned = strip_think_tags(&self.current_content);
+                chat_lines.extend(render_markdown_lines(&cleaned));
+            } else {
+                for raw_line in self.current_content.lines() {
+                    let line = raw_line.replace('\t', "    ");
+                    let trimmed = line.trim();
+                    if trimmed == "<think>"
+                        || trimmed == "</think>"
+                        || trimmed == "<thought>"
+                        || trimmed == "</thought>"
+                        || trimmed == "<think></think>"
+                        || trimmed == "<thought></thought>"
+                    {
+                        continue;
+                    }
+                    let cleaned = format_terminal_math(&strip_think_tags(&line));
+                    if cleaned.trim().is_empty() && !line.trim().is_empty() {
+                        continue;
+                    }
+                    chat_lines.push(Line::from(Span::styled(
+                        cleaned,
+                        Style::default().fg(Color::White),
+                    )));
                 }
-                let cleaned = format_terminal_math(&strip_think_tags(&line));
-                if cleaned.trim().is_empty() && !line.trim().is_empty() {
-                    continue;
-                }
-                chat_lines.push(Line::from(Span::styled(
-                    cleaned,
-                    Style::default().fg(Color::White),
-                )));
             }
         }
 
@@ -803,9 +841,13 @@ impl TuiRenderer {
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ));
-                for line in sa.content.lines() {
-                    let line = format_terminal_math(line);
-                    detail_lines.push(Line::raw(line));
+                if sa.content.contains("```") {
+                    detail_lines.extend(render_markdown_lines(&sa.content));
+                } else {
+                    for line in sa.content.lines() {
+                        let line = format_terminal_math(line);
+                        detail_lines.push(Line::raw(line));
+                    }
                 }
             }
 
@@ -817,7 +859,16 @@ impl TuiRenderer {
                         .add_modifier(Modifier::BOLD),
                 ));
                 for log in &sa.logs {
-                    detail_lines.push(Line::raw(format!("- {log}")));
+                    if log.contains('\x1b') {
+                        let parsed = parse_ansi_lines(log);
+                        for line in parsed {
+                            let mut spans = vec![Span::raw("- ")];
+                            spans.extend(line.spans);
+                            detail_lines.push(Line::from(spans));
+                        }
+                    } else {
+                        detail_lines.push(Line::raw(format!("- {log}")));
+                    }
                 }
             }
         } else {
@@ -852,9 +903,10 @@ impl TuiRenderer {
 
         // Subagent bottom status bar (rendered like main UI status bar).
         if let (Some(status_area), Some(sa)) = (status_area_opt, sa_opt) {
-            let frames = ["…", "..", "."];
-            let idx = (self.frame_counter % frames.len() as u64) as usize;
-            let dots = if sa.is_active { frames[idx] } else { "" };
+            let frames = ["-", "\\", "|", "/"];
+            let idx =
+                ((self.session_start.elapsed().as_millis() / 125) % frames.len() as u128) as usize;
+            let spinner = if sa.is_active { frames[idx] } else { "" };
 
             let turn_think = self
                 .subagent_turn_thinking
@@ -881,7 +933,7 @@ impl TuiRenderer {
                     Self::format_count(tok_count),
                     Self::format_count(remaining),
                     Self::format_count(chars),
-                    dots
+                    spinner
                 );
                 let fg_color = if remaining <= budget / 5 {
                     Color::LightRed
@@ -896,10 +948,13 @@ impl TuiRenderer {
                         .add_modifier(Modifier::BOLD),
                 )
             } else if sa.is_active && !sa.content.is_empty() {
-                let text = format!(" [Status: Active - streaming output...] {}", dots);
+                let text = format!(" [Status: Active - streaming output...] {}", spinner);
                 (text, Style::default().bg(Color::DarkGray).fg(Color::Green))
             } else if sa.is_active {
-                let text = format!(" [Status: Active - waiting for model response...] {}", dots);
+                let text = format!(
+                    " [Status: Active - waiting for model response...] {}",
+                    spinner
+                );
                 (text, Style::default().bg(Color::DarkGray).fg(Color::Cyan))
             } else {
                 (
@@ -977,13 +1032,16 @@ impl TuiRenderer {
             status_str.push_str(&count_suffix);
         }
         // F3: animated activity indicator. When the status line indicates an
-        // active phase, append a cycling suffix derived from `frame_counter`.
+        // active phase, append a cycling suffix derived from `session_start`.
         let active_phase = [
             "Running",
             "Delegating",
             "calling backend",
+            "calling model",
             "Starting",
             "streaming",
+            "thinking",
+            "Arbitrating",
         ]
         .iter()
         .any(|k| status_str.contains(k));
@@ -992,8 +1050,9 @@ impl TuiRenderer {
             status_str.push_str(&format!(" ({:.1}s)", elapsed));
         }
         if active_phase {
-            let frames = ["…", "..", "."];
-            let idx = (self.frame_counter % frames.len() as u64) as usize;
+            let frames = ["-", "\\", "|", "/"];
+            let idx =
+                ((self.session_start.elapsed().as_millis() / 125) % frames.len() as u128) as usize;
             status_str.push(' ');
             status_str.push_str(frames[idx]);
         }
@@ -1064,35 +1123,21 @@ impl TuiRenderer {
         frame.render_widget(status_paragraph, area);
     }
 
-    pub(crate) fn render_input(&self, frame: &mut ratatui::Frame, area: Rect) {
+    pub(crate) fn render_input(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        self.ensure_textarea_in_sync();
+
+        let border_color = if self.confirm_abort {
+            Color::Red
+        } else {
+            Color::Cyan
+        };
         let input_block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(Style::default().fg(border_color))
+            .title(" Input (Enter: Send, Alt/Shift+Enter: Newline, Ctrl+Z: Undo) ");
 
-        let max_text_width = area.width.saturating_sub(2) as usize;
-        let cursor_char_idx = self.input_text[..self.cursor.min(self.input_text.len())]
-            .chars()
-            .count();
-
-        // Calculate a sliding window (scroll_offset) that keeps the cursor visible
-        let scroll_offset = if cursor_char_idx < max_text_width {
-            0
-        } else {
-            cursor_char_idx + 1 - max_text_width
-        };
-
-        let visible_text: String = self
-            .input_text
-            .chars()
-            .skip(scroll_offset)
-            .take(max_text_width)
-            .collect();
-
-        let visible_cursor_offset = cursor_char_idx.saturating_sub(scroll_offset) as u16;
-        let cursor_pos_x = area.x + 1 + visible_cursor_offset;
-
-        let input_paragraph = Paragraph::new(visible_text.as_str()).block(input_block);
-        frame.render_widget(input_paragraph, area);
-        frame.set_cursor_position((cursor_pos_x, area.y + 1));
+        self.textarea.set_block(input_block);
+        self.textarea.set_cursor_line_style(Style::default());
+        frame.render_widget(&self.textarea, area);
     }
 }

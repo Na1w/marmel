@@ -13,7 +13,10 @@ use super::{Event, Renderer, SubagentDetail};
 use crate::config::Config;
 use crate::orchestrator::OrchestratorManager;
 use anyhow::Result;
-use crossterm::event::DisableMouseCapture;
+use crossterm::event::{
+    DisableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -44,6 +47,8 @@ pub struct TuiRenderer {
     pub(crate) current_content: String,
     /// The execution plan text. Defaults to `"No active execution plan."`.
     pub(crate) plan_content: String,
+    /// Multi-line text editor widget for input.
+    pub(crate) textarea: ratatui_textarea::TextArea<'static>,
     /// The current text in the input box.
     pub(crate) input_text: String,
     /// Byte offset of the input cursor within `input_text` (always on a char
@@ -51,8 +56,8 @@ pub struct TuiRenderer {
     pub(crate) cursor: usize,
     /// Whether the user is in the "confirm abort" state.
     pub(crate) confirm_abort: bool,
-    /// Whether an explicit user exit was requested (Esc twice, Ctrl+C twice, Ctrl+D, or abort command).
-    pub(crate) user_exit: bool,
+    /// Shared abort / user-exit flags (trait-default abort surface).
+    pub(crate) input_state: crate::ui::InputState,
     /// Frame counter for animations (e.g. status spinner).
     pub(crate) frame_counter: u64,
     /// The status bar text. Defaults to `"Ready"`.
@@ -114,7 +119,6 @@ pub struct TuiRenderer {
     /// Completed input lines forwarded to the session loop.
     pub(crate) rx: Receiver<String>,
     pub(crate) tx: Sender<String>,
-    pub(crate) aborted: bool,
     /// Persistent terminal instance to preserve Ratatui frame diff buffers.
     pub(crate) terminal: Option<Terminal<CrosstermBackend<io::Stdout>>>,
 
@@ -166,10 +170,11 @@ impl TuiRenderer {
             current_thought: String::new(),
             current_content: String::new(),
             plan_content: "No active execution plan.".to_string(),
+            textarea: ratatui_textarea::TextArea::default(),
             input_text: String::new(),
             cursor: 0,
             confirm_abort: false,
-            user_exit: false,
+            input_state: crate::ui::InputState::default(),
             frame_counter: 0,
             status_line: "Ready".to_string(),
             tokens_in: 0,
@@ -205,7 +210,6 @@ impl TuiRenderer {
 
             rx,
             tx,
-            aborted: false,
             terminal: None,
 
             chat_auto_scroll: true,
@@ -324,6 +328,20 @@ impl TuiRenderer {
         self.terminal = Some(terminal);
         res
     }
+
+    /// Drain pending terminal events and apply the 25 ms render-throttle
+    /// flush: force a full re-render when events were handled, otherwise only
+    /// flush if the throttle window has elapsed. `blocking` mirrors
+    /// [`Self::handle_events`]: `false` for the non-blocking poll path,
+    /// `true` for the blocking `read_input` loop.
+    pub(crate) fn drain_and_throttle_flush(&mut self, blocking: bool) {
+        let handled = self.handle_events(blocking);
+        if handled {
+            let _ = self.force_flush();
+        } else if self.last_render.elapsed() >= Duration::from_millis(25) {
+            let _ = self.flush();
+        }
+    }
 }
 
 impl Default for TuiRenderer {
@@ -346,7 +364,11 @@ fn estimate_stream_tokens(text: &str) -> usize {
 impl Renderer for TuiRenderer {
     fn init(&mut self) -> Result<()> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
         let stdout = io::stdout();
         let backend = CrosstermBackend::new(stdout);
         self.terminal = Some(Terminal::new(backend)?);
@@ -838,12 +860,7 @@ impl Renderer for TuiRenderer {
     }
 
     fn poll_input(&mut self) -> Option<String> {
-        let handled = self.handle_events(false);
-        if handled {
-            let _ = self.force_flush();
-        } else if self.last_render.elapsed() >= Duration::from_millis(25) {
-            let _ = self.flush();
-        }
+        self.drain_and_throttle_flush(false);
         self.rx.try_recv().ok()
     }
 
@@ -854,52 +871,52 @@ impl Renderer for TuiRenderer {
         loop {
             // Esc / Ctrl+C sets `aborted`; return `None` so the session loop
             // stops cleanly instead of hanging while waiting for input.
-            if self.aborted {
+            if self.aborted() {
                 return None;
             }
-            let handled = self.handle_events(true);
+            self.drain_and_throttle_flush(true);
             if let Ok(line) = self.rx.try_recv() {
                 return Some(line);
-            }
-            if handled {
-                let _ = self.force_flush();
-            } else if self.last_render.elapsed() >= Duration::from_millis(25) {
-                let _ = self.flush();
             }
         }
     }
 
+    fn input_state(&mut self) -> &mut crate::ui::InputState {
+        &mut self.input_state
+    }
+
+    fn input_state_shared(&self) -> &crate::ui::InputState {
+        &self.input_state
+    }
+
     fn request_abort(&mut self) {
-        self.aborted = true;
+        self.input_state.aborted = true;
         self.confirm_abort = false;
         crate::orchestrator::cancel_all();
     }
 
     fn request_user_exit(&mut self) {
-        self.aborted = true;
-        self.user_exit = true;
+        self.input_state.aborted = true;
+        self.input_state.user_exit = true;
         self.confirm_abort = false;
         self.status_line = "Aborted by user.".to_string();
         crate::orchestrator::cancel_all();
     }
 
-    fn user_exit_requested(&self) -> bool {
-        self.user_exit
-    }
-
-    fn aborted(&self) -> bool {
-        self.aborted
-    }
-
     fn clear_abort(&mut self) {
-        self.aborted = false;
-        self.user_exit = false;
+        self.input_state.aborted = false;
+        self.input_state.user_exit = false;
         self.confirm_abort = false;
         crate::orchestrator::reset_cancellation();
     }
 
     fn shutdown(&mut self) {
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(
+            io::stdout(),
+            PopKeyboardEnhancementFlags,
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        );
         let _ = disable_raw_mode();
     }
 
@@ -1061,10 +1078,21 @@ impl Renderer for TuiRenderer {
     }
 }
 
+impl Drop for TuiRenderer {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 /// Leave the alternate screen (best-effort, from the panic hook).
 pub fn leave_alt_screen() -> std::io::Result<()> {
     let _ = disable_raw_mode();
-    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)
+    execute!(
+        io::stdout(),
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )
 }
 
 /// Run the interactive TUI session using the CLI's optional initial prompt.

@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::agents::{Agent, Specialist};
+use crate::tool_names::TERMINAL_PREFIX;
 
 /// Static descriptor for one registered specialist.
 #[derive(Debug, Clone)]
@@ -36,12 +37,13 @@ impl SpecialistRegistry {
     /// MUST be present; the Manager validates against this set.
     pub fn canonical() -> Self {
         let mut reg = Self::default();
-        let canonical_specs: [(Agent, &str); 5] = [
+        let canonical_specs: [(Agent, &str); 6] = [
             (Agent::Coder, "src/agents/coder.rs"),
             (Agent::Researcher, "src/agents/researcher.rs"),
             (Agent::Debugger, "src/agents/debugger.rs"),
             (Agent::Validator, "src/agents/validator.rs"),
             (Agent::Generalist, "src/agents/generalist.rs"),
+            (Agent::Planner, "src/agents/planner.rs"),
         ];
         for (agent, module) in canonical_specs {
             let worker = reg.worker(agent);
@@ -86,6 +88,7 @@ impl SpecialistRegistry {
             Agent::Debugger => Arc::new(crate::agents::debugger::Debugger),
             Agent::Validator => Arc::new(crate::agents::validator::Validator),
             Agent::Generalist => Arc::new(crate::agents::generalist::Generalist),
+            Agent::Planner => Arc::new(crate::agents::planner::Planner),
         }
     }
 
@@ -104,15 +107,15 @@ impl SpecialistEntry {
     /// prefixes match by `<ns>*` (e.g. `terminal__*`); a bare exact tool name
     /// matches directly.
     pub fn allows(&self, tool: &str) -> bool {
-        let bare = tool.strip_prefix("terminal__").unwrap_or(tool);
+        let bare = tool.strip_prefix(TERMINAL_PREFIX).unwrap_or(tool);
         self.tool_namespaces.iter().any(|ns| {
-            let ns_bare = ns.strip_prefix("terminal__").unwrap_or(ns);
+            let ns_bare = ns.strip_prefix(TERMINAL_PREFIX).unwrap_or(ns);
             if ns == "*" || ns_bare == "*" {
                 return true;
             }
             if let Some(p) = ns.strip_suffix('*')
                 && (tool.starts_with(p)
-                    || bare.starts_with(p.strip_prefix("terminal__").unwrap_or(p)))
+                    || bare.starts_with(p.strip_prefix(TERMINAL_PREFIX).unwrap_or(p)))
             {
                 return true;
             }
@@ -124,6 +127,10 @@ impl SpecialistEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool_names::{
+        TERMINAL_RUN_COMMAND, TOOL_DELEGATE_TASK, TOOL_PTY_READ, TOOL_PTY_SPAWN, TOOL_READ_FILE,
+        TOOL_REPLACE, TOOL_RUN_COMMAND, TOOL_WRITE_FILE,
+    };
 
     #[test]
     fn test_orchestr_registry_every_role_resolves() {
@@ -134,6 +141,7 @@ mod tests {
             Agent::Debugger,
             Agent::Validator,
             Agent::Generalist,
+            Agent::Planner,
         ] {
             let entry = reg
                 .resolve(role)
@@ -160,7 +168,7 @@ mod tests {
                 role
             );
         }
-        assert_eq!(reg.agent_ids().len(), 5);
+        assert_eq!(reg.agent_ids().len(), 6);
     }
 
     /// REQ-ORCH-002: `SpecialistEntry::allows` honors the tool allowlist —
@@ -169,10 +177,10 @@ mod tests {
     fn test_orchestr_registry_allowlist_enforces_namespace() {
         let reg = SpecialistRegistry::canonical();
         let coder = reg.resolve(Agent::Coder).unwrap();
-        assert!(coder.allows("run_command"), "run_command matches");
-        assert!(coder.allows("terminal__run_command"), "terminal__* matches");
-        assert!(coder.allows("write_file"), "write_file matches");
-        assert!(coder.allows("delegate_task"), "exact tool name matches");
+        assert!(coder.allows(TOOL_RUN_COMMAND), "run_command matches");
+        assert!(coder.allows(TERMINAL_RUN_COMMAND), "terminal__* matches");
+        assert!(coder.allows(TOOL_WRITE_FILE), "write_file matches");
+        assert!(coder.allows(TOOL_DELEGATE_TASK), "exact tool name matches");
         assert!(
             !coder.allows("unknown_phantom_tool"),
             "unregistered tools are forbidden to the Coder"
@@ -182,14 +190,14 @@ mod tests {
         let brain = reg.resolve(Agent::Generalist).unwrap();
         assert!(brain.allows("anything_at_all"));
 
-        // Validator allowlist checks.
+        // Validator allowlist checks (per AGENTS.md, Validator allows run_command for running test suites).
         let validator = reg.resolve(Agent::Validator).unwrap();
-        assert!(validator.allows("read_file"));
-        assert!(validator.allows("pty_spawn"));
-        assert!(validator.allows("pty_read"));
-        assert!(!validator.allows("run_command"));
-        assert!(!validator.allows("write_file"));
-        assert!(!validator.allows("replace"));
+        assert!(validator.allows(TOOL_READ_FILE));
+        assert!(validator.allows(TOOL_PTY_SPAWN));
+        assert!(validator.allows(TOOL_PTY_READ));
+        assert!(validator.allows(TOOL_RUN_COMMAND));
+        assert!(!validator.allows(TOOL_WRITE_FILE));
+        assert!(!validator.allows(TOOL_REPLACE));
         assert!(!validator.allows("bogus_tool"));
     }
 

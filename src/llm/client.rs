@@ -1,9 +1,9 @@
 //! Reqwest SSE chat client with retry and timeout watchdogs.
 
+use crate::net::Retryable;
 use crate::types::{ChatChunk, ChatRequest};
 use anyhow::Result;
 use eventsource_stream::Eventsource;
-use futures_util::StreamExt;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -13,10 +13,9 @@ pub const INITIAL_RESPONSE_WATCHDOG_SECS: u64 = 300;
 pub const INTER_CHUNK_WATCHDOG_SECS: u64 = 60;
 /// Upper bound on the entire streaming read (20 minutes safety watchdog for up to 32k tokens).
 pub const OVERALL_READ_TIMEOUT_SECS: u64 = 1200;
-/// Maximum total attempts (initial + up to 2 retries for 503/429/timeouts).
-pub const MAX_ATTEMPTS: u32 = 3;
-/// Backoff base: sleep = `BACKOFF_BASE_MS × attempt`.
-pub const BACKOFF_BASE_MS: u64 = 1000;
+// Retry policy (MAX_ATTEMPTS / BACKOFF_BASE_MS / retry_with_backoff) now lives
+// in the shared `crate::net::retry` module, used by both this client and the
+// MCP HTTP/SSE transport (see docs/refactor_audit/duplicates.md §3).
 
 static GLOBAL_TOKENS_IN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GLOBAL_TOKENS_OUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -76,10 +75,8 @@ pub struct ChatClient {
 }
 
 fn default_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .build()
-        .unwrap_or_default()
+    // Shared client builder (was hand-rolled here and in mcp/http.rs).
+    crate::net::build_http_client(Some(Duration::from_secs(10)), None).unwrap_or_default()
 }
 
 #[derive(Debug, Error)]
@@ -98,7 +95,9 @@ pub(crate) enum ChatError {
     Transport(String),
 }
 
-impl ChatError {
+impl crate::net::Retryable for ChatError {
+    /// Retryable classes: transient HTTP statuses (503/429/502/504), watchdog
+    /// timeouts, transport failures, and SSE stream errors.
     fn is_retryable(&self) -> bool {
         matches!(
             self,
@@ -171,19 +170,26 @@ impl ChatClient {
         self.chat_stream(req, |_| true).await
     }
 
-    pub async fn chat_stream<F>(&self, req: &ChatRequest, mut on_delta: F) -> Result<StreamedReply>
+    pub async fn chat_stream<F>(&self, req: &ChatRequest, on_delta: F) -> Result<StreamedReply>
     where
         F: FnMut(&str) -> bool,
     {
+        let mut on_delta = on_delta;
+        // Shared retry/backoff policy constants (see crate::net::retry, also
+        // used by the MCP HTTP/SSE transport). Inlined here rather than via
+        // `retry_with_backoff` because the per-attempt future borrows the
+        // `on_delta` callback, which the helper's boxed-Future signature cannot
+        // express.
         let mut attempt = 0u32;
         loop {
             attempt += 1;
             match self.try_chat_once(req, &mut on_delta).await {
                 Ok(reply) => return Ok(reply),
-                Err(e) if e.is_retryable() && attempt < MAX_ATTEMPTS => {
-                    let ms = BACKOFF_BASE_MS * attempt as u64;
+                Err(e) if e.is_retryable() && attempt < crate::net::MAX_ATTEMPTS => {
+                    let ms = crate::net::BACKOFF_BASE_MS * attempt as u64;
                     tracing::warn!(
-                        "LLM backend call attempt {attempt}/{MAX_ATTEMPTS} failed ({e}), retrying in {ms}ms..."
+                        "LLM backend call attempt {attempt}/{} failed ({e}), retrying in {ms}ms...",
+                        crate::net::MAX_ATTEMPTS
                     );
                     tokio::time::sleep(Duration::from_millis(ms)).await;
                 }
@@ -244,41 +250,31 @@ impl ChatClient {
         }
 
         let first_start = std::time::Instant::now();
+        let send_deadline = first_start + Duration::from_secs(self.initial_timeout_secs);
         let send_fut = builder.send();
         tokio::pin!(send_fut);
+        #[allow(clippy::never_loop)]
         let resp = loop {
-            if !on_delta("") {
-                return Ok(StreamedReply::default());
-            }
-            if first_start.elapsed() >= Duration::from_secs(self.initial_timeout_secs) {
-                let elapsed = req_start.elapsed().as_millis();
-                crate::debug_log::log_llm_error(
-                    &url,
-                    &req_body.model,
-                    elapsed,
-                    "initial timeout waiting for first response",
-                );
-                return Err(ChatError::InitialTimeout);
-            }
-            match tokio::time::timeout(Duration::from_millis(50), &mut send_fut).await {
-                Ok(res) => match res {
-                    Ok(r) => break r,
-                    Err(e) => {
-                        let elapsed = req_start.elapsed().as_millis();
-                        crate::debug_log::log_llm_error(
-                            &url,
-                            &req_body.model,
-                            elapsed,
-                            &e.to_string(),
-                        );
-                        return Err(ChatError::Transport(e.to_string()));
-                    }
-                },
-                Err(_) => {
-                    if !on_delta("") {
-                        return Ok(StreamedReply::default());
-                    }
+            // Shared SSE pump skeleton (50 ms poll + abort + watchdog deadline).
+            match crate::net::pump_future(&mut send_fut, Some(send_deadline), on_delta).await {
+                crate::net::PumpNext::Item(Some(Ok(r))) => break r,
+                crate::net::PumpNext::Item(Some(Err(e))) => {
+                    let elapsed = req_start.elapsed().as_millis();
+                    crate::debug_log::log_llm_error(&url, &req_body.model, elapsed, &e.to_string());
+                    return Err(ChatError::Transport(e.to_string()));
                 }
+                crate::net::PumpNext::Item(None) => unreachable!("send future never yields None"),
+                crate::net::PumpNext::IdleTimeout => {
+                    let elapsed = req_start.elapsed().as_millis();
+                    crate::debug_log::log_llm_error(
+                        &url,
+                        &req_body.model,
+                        elapsed,
+                        "initial timeout waiting for first response",
+                    );
+                    return Err(ChatError::InitialTimeout);
+                }
+                crate::net::PumpNext::Aborted => return Ok(StreamedReply::default()),
             }
         };
 
@@ -305,21 +301,10 @@ impl ChatClient {
             std::collections::BTreeMap::<usize, (Option<String>, String, String)>::new();
         let mut in_reasoning = false;
 
-        let first = loop {
-            if !on_delta("") {
-                return Ok(StreamedReply::default());
-            }
-            if first_start.elapsed() >= Duration::from_secs(self.initial_timeout_secs) {
-                return Err(ChatError::InitialTimeout);
-            }
-            match tokio::time::timeout(Duration::from_millis(50), stream.next()).await {
-                Ok(res) => break res,
-                Err(_) => {
-                    if !on_delta("") {
-                        return Ok(StreamedReply::default());
-                    }
-                }
-            }
+        let first = match crate::net::pump_next(&mut stream, Some(send_deadline), on_delta).await {
+            crate::net::PumpNext::Item(res) => res,
+            crate::net::PumpNext::IdleTimeout => return Err(ChatError::InitialTimeout),
+            crate::net::PumpNext::Aborted => return Ok(StreamedReply::default()),
         };
 
         if let Some(ev) = first {
@@ -370,14 +355,11 @@ impl ChatClient {
             let mut last_progress_log = std::time::Instant::now();
             let mut last_logged_chars = 0usize;
             loop {
-                if !on_delta("") {
-                    break;
-                }
-                if last_chunk_at.elapsed() >= Duration::from_secs(INTER_CHUNK_WATCHDOG_SECS) {
-                    return Err(ChatError::StallTimeout);
-                }
-                match tokio::time::timeout(Duration::from_millis(50), stream.next()).await {
-                    Ok(Some(ev)) => {
+                // Inter-chunk watchdog: deadline is recomputed per chunk so the
+                // 60 s limit applies to the silent gap since the last event.
+                let stall_deadline = last_chunk_at + Duration::from_secs(INTER_CHUNK_WATCHDOG_SECS);
+                match crate::net::pump_next(&mut stream, Some(stall_deadline), on_delta).await {
+                    crate::net::PumpNext::Item(Some(ev)) => {
                         last_chunk_at = std::time::Instant::now();
                         let ev = ev.map_err(|e| ChatError::Stream(e.to_string()))?;
                         if consume_event(
@@ -418,12 +400,9 @@ impl ChatClient {
                             last_logged_chars = total_chars;
                         }
                     }
-                    Ok(None) => break,
-                    Err(_) => {
-                        if !on_delta("") {
-                            break;
-                        }
-                    }
+                    crate::net::PumpNext::Item(None) => break,
+                    crate::net::PumpNext::IdleTimeout => return Err(ChatError::StallTimeout),
+                    crate::net::PumpNext::Aborted => break,
                 }
             }
             if in_reasoning {

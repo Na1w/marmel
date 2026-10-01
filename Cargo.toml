@@ -1,6 +1,6 @@
 [package]
 name = "marmennill"
-version = "0.9.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.98"
 default-run = "marmel"
@@ -30,6 +30,9 @@ toml = "1.1"
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 portable-pty = "0.9"
+ansi-to-tui = "8.0"
+ratatui-textarea = "0.9"
+tui-markdown = "0.3"
 
 # Text Processing, Tokenization & Search
 tiktoken-rs = "0.12"
@@ -41,6 +44,7 @@ unicode-segmentation = "1.12"
 uuid = { version = "1.25", features = ["v4"] }
 
 # System Diagnostics & Errors
+dashmap = "6"
 anyhow = "1.0"
 thiserror = "2.0"
 tracing = "0.1"

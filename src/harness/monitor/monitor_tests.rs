@@ -1,6 +1,10 @@
 use super::*;
 use std::sync::Arc;
 
+use crate::tool_names::{
+    TOOL_GREP_SEARCH, TOOL_READ_FILE, TOOL_REPLACE, TOOL_RUN_COMMAND, TOOL_WRITE_FILE,
+};
+
 /// Helper: build a ToolCallRecord for the given name and JSON args.
 fn rec(name: &str, args: &str) -> ToolCallRecord {
     let arguments = serde_json::from_str(args).unwrap();
@@ -14,7 +18,7 @@ fn test_monitor_xml_tool_rescue() {
     let rescue = XMLToolRescue::new();
     let calls = rescue.rescue(json_style);
     assert_eq!(calls.len(), 1, "JSON-embedded tool call must be rescued");
-    assert_eq!(calls[0].function.name, "read_file");
+    assert_eq!(calls[0].function.name, TOOL_READ_FILE);
     assert!(calls[0].id.starts_with("call_text_"));
     // serde_json serializes with sorted keys; compare semantically.
     let parsed: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
@@ -28,20 +32,20 @@ fn test_monitor_xml_tool_rescue() {
         r#"<tool_call function="write_file">{"path": "a.txt", "content": "hi"}</tool_call>"#;
     let calls = rescue.rescue(attr_style);
     assert_eq!(calls.len(), 1, "attribute-style tool call must be rescued");
-    assert_eq!(calls[0].function.name, "write_file");
+    assert_eq!(calls[0].function.name, TOOL_WRITE_FILE);
 
     // Legacy SPEC pattern: <function=name> with <parameter> pairs.
     let legacy = r#"tool_call <function=replace><parameter=path>src/main.rs</parameter><parameter=old_str>foo</parameter><parameter=new_str>bar</parameter></function> tool_call"#;
     let calls = rescue.rescue(legacy);
     assert_eq!(calls.len(), 1, "legacy function block must be rescued");
-    assert_eq!(calls[0].function.name, "replace");
+    assert_eq!(calls[0].function.name, TOOL_REPLACE);
     assert!(calls[0].function.arguments.contains("src/main.rs"));
 
     // Caesar's exact XML pattern: <tool_call><function=name><parameter=key>val</parameter></function></tool_call>.
     let caesar_style = r#"<tool_call><function=read_file><parameter=path>src/main.rs</parameter><parameter=offset>10</parameter></function></tool_call>"#;
     let calls = rescue.rescue(caesar_style);
     assert_eq!(calls.len(), 1, "caesar XML pattern must be rescued");
-    assert_eq!(calls[0].function.name, "read_file");
+    assert_eq!(calls[0].function.name, TOOL_READ_FILE);
     assert!(calls[0].function.arguments.contains("src/main.rs"));
     assert!(calls[0].function.arguments.contains("10"));
 }
@@ -87,15 +91,15 @@ fn test_monitor_json_semantic_equality() {
     // Key ordering must be ignored.
     let mut det = ToolRepetitionDetector::new(3);
     assert_eq!(
-        det.evaluate(rec("read_file", r#"{"a":1,"b":2}"#)),
+        det.evaluate(rec(TOOL_READ_FILE, r#"{"a":1,"b":2}"#)),
         Intervention::None
     );
     assert_eq!(
-        det.evaluate(rec("read_file", r#"{"b":2,"a":1}"#)),
+        det.evaluate(rec(TOOL_READ_FILE, r#"{"b":2,"a":1}"#)),
         Intervention::None
     );
     assert_eq!(
-        det.evaluate(rec("read_file", r#"{"a":1,"b":2}"#)),
+        det.evaluate(rec(TOOL_READ_FILE, r#"{"a":1,"b":2}"#)),
         Intervention::Block,
         "swapped argument keys must still be detected as repetition"
     );
@@ -106,15 +110,15 @@ fn test_monitor_pagination_exemption() {
     // Consecutive read_file calls varying only by offset must NOT block.
     let mut det = ToolRepetitionDetector::new(3);
     assert_eq!(
-        det.evaluate(rec("read_file", r#"{"path":"f","offset":0}"#)),
+        det.evaluate(rec(TOOL_READ_FILE, r#"{"path":"f","offset":0}"#)),
         Intervention::None
     );
     assert_eq!(
-        det.evaluate(rec("read_file", r#"{"path":"f","offset":10}"#)),
+        det.evaluate(rec(TOOL_READ_FILE, r#"{"path":"f","offset":10}"#)),
         Intervention::None
     );
     assert_eq!(
-        det.evaluate(rec("read_file", r#"{"path":"f","offset":20}"#)),
+        det.evaluate(rec(TOOL_READ_FILE, r#"{"path":"f","offset":20}"#)),
         Intervention::None,
         "offset-only variation must be exempt from repetition"
     );
@@ -122,30 +126,30 @@ fn test_monitor_pagination_exemption() {
     // Consecutive grep_search calls varying only by page must NOT block.
     let mut det = ToolRepetitionDetector::new(3);
     assert_eq!(
-        det.evaluate(rec("grep_search", r#"{"pattern":"x","page":1}"#)),
+        det.evaluate(rec(TOOL_GREP_SEARCH, r#"{"pattern":"x","page":1}"#)),
         Intervention::None
     );
     assert_eq!(
-        det.evaluate(rec("grep_search", r#"{"pattern":"x","page":2}"#)),
+        det.evaluate(rec(TOOL_GREP_SEARCH, r#"{"pattern":"x","page":2}"#)),
         Intervention::None
     );
     assert_eq!(
-        det.evaluate(rec("grep_search", r#"{"pattern":"x","page":3}"#)),
+        det.evaluate(rec(TOOL_GREP_SEARCH, r#"{"pattern":"x","page":3}"#)),
         Intervention::None
     );
 
     // But identical non-paginated repetition still blocks.
     let mut det = ToolRepetitionDetector::new(3);
     assert_eq!(
-        det.evaluate(rec("run_command", r#"{"command":"ls"}"#)),
+        det.evaluate(rec(TOOL_RUN_COMMAND, r#"{"command":"ls"}"#)),
         Intervention::None
     );
     assert_eq!(
-        det.evaluate(rec("run_command", r#"{"command":"ls"}"#)),
+        det.evaluate(rec(TOOL_RUN_COMMAND, r#"{"command":"ls"}"#)),
         Intervention::None
     );
     assert_eq!(
-        det.evaluate(rec("run_command", r#"{"command":"ls"}"#)),
+        det.evaluate(rec(TOOL_RUN_COMMAND, r#"{"command":"ls"}"#)),
         Intervention::Block
     );
 }
@@ -155,7 +159,7 @@ fn test_monitor_sliding_buffer_capacity() {
     let mut det = ToolRepetitionDetector::new(3);
     for i in 0..100 {
         det.record(rec(
-            "run_command",
+            TOOL_RUN_COMMAND,
             &format!(r#"{{"command":"echo {}"}}"#, i),
         ));
     }
@@ -506,7 +510,11 @@ fn test_monitor_prune_orphan_tool_messages() {
     let assistant = Message::Assistant {
         content: Some("calling".to_string()),
         reasoning_content: None,
-        tool_calls: vec![ToolCall::new("call_1", "read_file", r#"{"path":"a.rs"}"#)],
+        tool_calls: vec![ToolCall::new(
+            "call_1",
+            TOOL_READ_FILE,
+            r#"{"path":"a.rs"}"#,
+        )],
     };
     let orphan = Message::Tool {
         tool_call_id: "call_orphan".to_string(),
@@ -545,8 +553,8 @@ fn test_monitor_prune_orphan_keeps_all_when_all_matched() {
         content: Some("calling".to_string()),
         reasoning_content: None,
         tool_calls: vec![
-            ToolCall::new("call_1", "read_file", r#"{"path":"a.rs"}"#),
-            ToolCall::new("call_2", "grep_search", r#"{"pattern":"x"}"#),
+            ToolCall::new("call_1", TOOL_READ_FILE, r#"{"path":"a.rs"}"#),
+            ToolCall::new("call_2", TOOL_GREP_SEARCH, r#"{"pattern":"x"}"#),
         ],
     };
     let t1 = Message::Tool {

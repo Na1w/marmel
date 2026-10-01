@@ -12,11 +12,11 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-/// Plan file name inside the marmel directory (reused from `agent::phase`).
+/// Plan file name inside the marmel directory (reused from `manager::phase`).
 pub const PLAN_FILE: &str = crate::manager::phase::PLAN_FILE;
 /// Session log file name inside the marmel directory.
 pub const LOG_FILE: &str = "marmel.log";
-/// Phase-override file name inside the marmel directory (reused from `agent::phase`).
+/// Phase-override file name inside the marmel directory (reused from `manager::phase`).
 pub const FORCED_PHASE_FILE: &str = crate::manager::phase::FORCED_PHASE_FILE;
 /// Archive subdirectory name inside the marmel directory.
 pub const ARCHIVE_DIR: &str = "archive";
@@ -80,6 +80,19 @@ impl Workspace {
     /// Canonical path of the archive subdirectory.
     pub fn archive_dir(&self) -> PathBuf {
         self.root.join(ARCHIVE_DIR)
+    }
+
+    /// Canonical path of the synthesized prompts directory (`.marmel/prompts/`).
+    pub fn prompts_dir(&self) -> PathBuf {
+        self.root.join("prompts")
+    }
+
+    /// Path to a specific synthesized prompt markdown file (`.marmel/prompts/<task_id>.md`).
+    pub fn prompt_path_for_task(&self, task_id: &str) -> PathBuf {
+        let clean = task_id
+            .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
+            .trim();
+        self.prompts_dir().join(format!("{clean}.md"))
     }
 
     /// Create the workspace directory and validate it is writable by writing

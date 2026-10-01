@@ -516,7 +516,8 @@ pub async fn run_session(
             nudge_count = 0;
 
             let all_parallel = tool_calls.iter().all(|c| {
-                c.function.name == "delegate_task" || crate::manager::is_read_tool(&c.function.name)
+                c.function.name == crate::tool_names::TOOL_DELEGATE_TASK
+                    || crate::manager::is_read_tool(&c.function.name)
             });
 
             if all_parallel && tool_calls.len() > 1 {
@@ -528,7 +529,7 @@ pub async fn run_session(
                     let args_val = serde_json::from_str::<serde_json::Value>(&args_str)
                         .unwrap_or_else(|_| serde_json::Value::String(args_str.clone()));
 
-                    let is_delegate = name == "delegate_task";
+                    let is_delegate = name == crate::tool_names::TOOL_DELEGATE_TASK;
                     let delegated_agent = if is_delegate {
                         args_val
                             .get("agent_name")
@@ -799,7 +800,7 @@ pub async fn run_session(
                     let args_val = serde_json::from_str::<serde_json::Value>(&args_str)
                         .unwrap_or_else(|_| serde_json::Value::String(args_str.clone()));
 
-                    let is_delegate = name == "delegate_task";
+                    let is_delegate = name == crate::tool_names::TOOL_DELEGATE_TASK;
                     let args_obj = args_val.as_object();
                     let delegated_agent = if is_delegate {
                         args_obj

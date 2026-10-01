@@ -30,6 +30,19 @@ pub const VALIDATOR_GENERALIST_ROLE_PROMPT: &str =
 /// Specialist prompt for planner auditing — statically embedded from prompts/validator_planner.md.
 pub const VALIDATOR_PLANNER_ROLE_PROMPT: &str = include_str!("../../prompts/validator_planner.md");
 
+/// Centralized per-specialist validator role-prompt mapping (static, compile-time
+/// prompts — see REQ-ORCH-002 role discipline). Previously duplicated as a
+/// `match agent { … }` inside the validation loops (duplicates.md §6b).
+pub fn role_prompt_for(agent: crate::agents::Agent) -> &'static str {
+    match agent {
+        crate::agents::Agent::Coder => VALIDATOR_CODER_ROLE_PROMPT,
+        crate::agents::Agent::Debugger => VALIDATOR_DEBUGGER_ROLE_PROMPT,
+        crate::agents::Agent::Researcher => VALIDATOR_RESEARCHER_ROLE_PROMPT,
+        crate::agents::Agent::Generalist => VALIDATOR_GENERALIST_ROLE_PROMPT,
+        _ => VALIDATOR_ROLE_PROMPT,
+    }
+}
+
 #[async_trait]
 impl Specialist for Validator {
     fn name(&self) -> Agent {
@@ -42,6 +55,7 @@ impl Specialist for Validator {
             crate::tool_names::TOOL_READ_FILE,
             crate::tool_names::TOOL_GREP_SEARCH,
             crate::tool_names::TOOL_GLOB,
+            crate::tool_names::TOOL_RUN_COMMAND,
             crate::tool_names::TOOL_PTY_SPAWN,
             crate::tool_names::TOOL_PTY_WRITE,
             crate::tool_names::TOOL_PTY_READ,
@@ -63,18 +77,24 @@ mod tests {
 
     #[test]
     fn test_orchestr_validator_role_and_namespaces() {
-        let v = Validator;
-        assert_eq!(v.name(), Agent::Validator);
-        assert!(v.tool_namespaces().contains(&"read_file"));
-        assert!(!v.tool_namespaces().contains(&"run_command"));
-        assert!(v.tool_namespaces().contains(&"grep_search"));
-        assert!(v.tool_namespaces().contains(&"glob"));
-        assert!(v.tool_namespaces().contains(&"pty_spawn"));
-        assert!(v.tool_namespaces().contains(&"pty_read"));
-        assert!(v.tool_namespaces().contains(&"leave_verdict"));
-        assert!(v.tool_namespaces().contains(&"rebirth"));
-        assert!(!v.tool_namespaces().contains(&"write_file"));
-        assert!(!v.tool_namespaces().contains(&"replace"));
-        assert!(!v.may_recurse());
+        crate::agents::assert_specialist_role(
+            &Validator,
+            Agent::Validator,
+            &[
+                crate::tool_names::TOOL_READ_FILE,
+                crate::tool_names::TOOL_RUN_COMMAND,
+                crate::tool_names::TOOL_GREP_SEARCH,
+                crate::tool_names::TOOL_GLOB,
+                crate::tool_names::TOOL_PTY_SPAWN,
+                crate::tool_names::TOOL_PTY_READ,
+                crate::tool_names::TOOL_LEAVE_VERDICT,
+                crate::tool_names::TOOL_REBIRTH,
+            ],
+            &[
+                crate::tool_names::TOOL_WRITE_FILE,
+                crate::tool_names::TOOL_REPLACE,
+            ],
+            false,
+        );
     }
 }

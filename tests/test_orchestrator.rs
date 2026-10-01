@@ -31,15 +31,46 @@ use marmennill::manager::Plan;
 use marmennill::orchestrator::{
     DelegationEvent, OrchestratorManager, RecursionDepth, handle_delegate_task,
 };
-use std::sync::Arc;
+use std::ops::Deref;
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock};
+use tokio::sync::Mutex;
 
-/// Create a fresh temp dir and set the process cwd to it (so no `marmel.toml`
-/// is found and the worker falls back to its deterministic canned deliverable
-/// instead of attempting a live LLM call).
-fn setup() -> tempfile::TempDir {
+static TEST_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// Guard that locks test execution, sets cwd to a fresh temp dir, and restores
+/// cwd when dropped to prevent parallel test cwd races.
+struct TestGuard {
+    _tmp: tempfile::TempDir,
+    orig_cwd: PathBuf,
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl Deref for TestGuard {
+    type Target = tempfile::TempDir;
+
+    fn deref(&self) -> &Self::Target {
+        &self._tmp
+    }
+}
+
+impl Drop for TestGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.orig_cwd);
+    }
+}
+
+/// Create a fresh temp dir, lock the test mutex, and set the process cwd to it.
+async fn setup() -> TestGuard {
+    let lock = TEST_MUTEX.lock().await;
+    let orig_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let tmp = tempfile::tempdir().unwrap();
     std::env::set_current_dir(tmp.path()).expect("set cwd to temp dir");
-    tmp
+    TestGuard {
+        _tmp: tmp,
+        orig_cwd,
+        _lock: lock,
+    }
 }
 
 /// Build a manager rooted at a fresh temp plan dir for tests.
@@ -78,7 +109,7 @@ fn req(
 /// unconditional gate at tools_manager.rs:914).
 #[tokio::test]
 async fn test_depth_gate_rejects_at_bound_regardless_of_grant() {
-    let tmp = setup();
+    let tmp = setup().await;
     let mut m = test_manager(&tmp);
     m.orchestration.max_recursion_depth = 3;
     // Place the manager at the max depth (0→1→2→3 is allowed; depth 3 + 1 is not).
@@ -101,7 +132,7 @@ async fn test_depth_gate_rejects_at_bound_regardless_of_grant() {
 /// (parity with caesar, which returns before spawning a worker on rejection).
 #[tokio::test]
 async fn test_depth_gate_rejection_emits_no_started_event() {
-    let tmp = setup();
+    let tmp = setup().await;
     let mut m = test_manager(&tmp);
     m.orchestration.max_recursion_depth = 1;
     m.depth = RecursionDepth(1); // at the bound
@@ -121,7 +152,7 @@ async fn test_depth_gate_rejection_emits_no_started_event() {
 /// A delegation within the bound succeeds and emits Started + Completed.
 #[tokio::test]
 async fn test_depth_gate_allows_within_bound() {
-    let tmp = setup();
+    let tmp = setup().await;
     let mut m = test_manager(&tmp);
     m.orchestration.max_recursion_depth = 3;
     // Root depth 0; a single delegation (0→1) is within the bound.
@@ -140,7 +171,7 @@ async fn test_depth_gate_allows_within_bound() {
 /// the worker runs and clears it on clean termination (SPEC §3.4).
 #[tokio::test]
 async fn test_deep_freeze_snapshots_and_clears() {
-    let tmp = setup();
+    let tmp = setup().await;
     let m = test_manager(&tmp);
     assert!(!m.journal.is_frozen());
     let d = m
@@ -166,7 +197,7 @@ async fn test_deep_freeze_snapshots_and_clears() {
 /// worker_id and preserved sub_req.
 #[tokio::test]
 async fn test_deep_freeze_recover_rehydrates() {
-    let tmp = setup();
+    let tmp = setup().await;
     let m = test_manager(&tmp);
     let r = req(
         Agent::Generalist,
@@ -198,7 +229,7 @@ async fn test_deep_freeze_recover_rehydrates() {
 /// With nothing frozen, `recover_frozen()` is a clean no-op.
 #[tokio::test]
 async fn test_deep_freeze_recover_none_when_clean() {
-    let tmp = setup();
+    let tmp = setup().await;
     let m = test_manager(&tmp);
     assert!(!m.journal.is_frozen());
     let res = m.recover_frozen().await.expect("no error on clean boot");
@@ -213,7 +244,7 @@ async fn test_deep_freeze_recover_none_when_clean() {
 /// event for the specialist + task.
 #[tokio::test]
 async fn test_delegation_events_started_then_completed() {
-    let tmp = setup();
+    let tmp = setup().await;
     let m = test_manager(&tmp);
     let _ = m
         .delegate(req(
@@ -243,7 +274,7 @@ async fn test_delegation_events_started_then_completed() {
 /// `MISSION COMPLETE (t-xxx)` flips the plan line `[ ]` → `[x]`.
 #[tokio::test]
 async fn test_check_off_complete_flips() {
-    let tmp = setup();
+    let tmp = setup().await;
     let m = test_manager(&tmp);
     m.create_plan("- [ ] [t-101] Build the parser.\n- [ ] [t-102] Test the parser.\n")
         .expect("plan written");
@@ -266,7 +297,7 @@ async fn test_check_off_complete_flips() {
 
 #[tokio::test]
 async fn test_orchestrator_abort_signal_lifecycle_and_cancellation() {
-    let tmp = setup();
+    let tmp = setup().await;
     let m = test_manager(&tmp);
 
     // Initial state: not cancelled
@@ -296,7 +327,7 @@ async fn test_orchestrator_abort_signal_lifecycle_and_cancellation() {
 
 #[tokio::test]
 async fn test_handle_delegate_task_synchronous_inside_async_context() {
-    let _tmp = setup();
+    let _tmp = setup().await;
 
     let args = serde_json::json!({
         "agent_name": "coder",
@@ -308,5 +339,42 @@ async fn test_handle_delegate_task_synchronous_inside_async_context() {
     assert!(
         res.is_ok(),
         "handle_delegate_task must not panic in async context"
+    );
+}
+
+#[tokio::test]
+async fn test_handle_delegate_task_rejection_anchoring() {
+    let _tmp = setup().await;
+    let plan = Plan::default();
+    plan.create(
+        "# Execution Plan\n\
+- [x] [t-006] Verify build/compile\n\
+- [ ] [t-008] Verify integration test\n\
+- [x] [t-011] Produce report summarizing (t-006...t-008)\n",
+    )
+    .unwrap();
+
+    // t-006 is marked [x] on its own line: must be rejected as already completed
+    let args_completed = serde_json::json!({
+        "agent_name": "validator",
+        "prompt": "Run build check",
+        "task_id": "t-006",
+    });
+    let res = handle_delegate_task(&args_completed).unwrap();
+    assert!(res.is_error);
+    assert!(res.content.contains("already completed"));
+
+    // t-008 is marked [ ] on its line, but mentioned in [x] t-011's description:
+    // must NOT be rejected by the completed-task guard!
+    let args_pending = serde_json::json!({
+        "agent_name": "validator",
+        "prompt": "Run integration test",
+        "task_id": "t-008",
+    });
+    let res2 = handle_delegate_task(&args_pending).unwrap();
+    assert!(
+        !res2.content.contains("already completed"),
+        "t-008 must not be rejected as completed, got: {}",
+        res2.content
     );
 }

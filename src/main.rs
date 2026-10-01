@@ -1,7 +1,7 @@
 //! Marmennill (marmel) — agentic coding assistant CLI entry point.
 
 use anyhow::Result;
-use marmennill::{agent, config, harness, llm, mcp, orchestrator, ui};
+use marmennill::{config, harness, llm, manager, mcp, orchestrator, ui};
 
 /// Command-line arguments accepted by the `marmel` binary.
 #[derive(Debug, Default)]
@@ -94,7 +94,7 @@ fn main() -> Result<()> {
 }
 
 fn boot_manager(cfg: &config::Config) -> std::sync::Arc<orchestrator::OrchestratorManager> {
-    let plan = agent::phase::Plan::default();
+    let plan = manager::phase::Plan::default();
     let stats = std::sync::Arc::new(harness::HarnessStats::new());
     let client = llm::ChatClient::from_config(cfg);
     std::sync::Arc::new(orchestrator::OrchestratorManager::from_config(
@@ -153,8 +153,9 @@ fn setup_panic_hook(use_raw: bool) {
         let _ = tracing_subscriber::fmt()
             .with_writer(std::io::stderr)
             .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new("info,tui_markdown=error")
+                }),
             )
             .try_init();
     } else {
@@ -173,8 +174,9 @@ fn setup_panic_hook(use_raw: bool) {
                 .with_writer(file)
                 .with_ansi(false)
                 .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                        tracing_subscriber::EnvFilter::new("info,tui_markdown=error")
+                    }),
                 )
                 .try_init();
         }

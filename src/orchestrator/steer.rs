@@ -221,11 +221,10 @@ where
             decision.sleep_seconds = Some(5);
         }
         Some(decision)
-    } else if let Some(tc) = reply
-        .tool_calls
-        .iter()
-        .find(|tc| tc.function.name == "sleep" || tc.function.name == "terminal__sleep")
-    {
+    } else if let Some(tc) = reply.tool_calls.iter().find(|tc| {
+        tc.function.name == crate::tool_names::TOOL_SLEEP
+            || tc.function.name == crate::tool_names::TERMINAL_SLEEP
+    }) {
         let args: serde_json::Value =
             serde_json::from_str(&tc.function.arguments).unwrap_or_default();
         let secs = args
@@ -295,7 +294,7 @@ pub fn normalize_steer_decision(decision: Option<&str>) -> &'static str {
                 "forwardtoworker" | "forward" | "forwardnotice" => "ForwardToWorker",
                 "approveplan" | "approve" => "ApprovePlan",
                 "rejectplan" | "reject" => "RejectPlan",
-                "sleep" => "Sleep",
+                crate::tool_names::TOOL_SLEEP => "Sleep",
                 "delegatetask" | "delegate" => "DelegateTask",
                 "queueandcontinue" | "queue" => "QueueAndContinue",
                 _ => "Unknown",

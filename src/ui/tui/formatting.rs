@@ -1,7 +1,9 @@
 //! Formatting, text parsing, terminal math, and word wrapping utilities for TUI.
 
+use ansi_to_tui::IntoText;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -736,4 +738,63 @@ pub fn extract_complete_sentences(buffer: &mut String) -> Vec<String> {
 
 pub fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
     x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)
+}
+
+/// Parse a string that may contain ANSI escape sequences into Ratatui `Line`s.
+/// If ANSI sequences are present and successfully parsed, returns styled lines.
+/// Otherwise returns plain text lines.
+pub fn parse_ansi_lines(input: &str) -> Vec<Line<'static>> {
+    if input.contains('\x1b')
+        && let Ok(text) = input.as_bytes().into_text()
+    {
+        return text.lines;
+    }
+    input.lines().map(|l| Line::raw(l.to_string())).collect()
+}
+
+/// Render a markdown string into Ratatui `Line`s with syntax-highlighted code blocks.
+pub fn render_markdown_lines(input: &str) -> Vec<Line<'static>> {
+    let text = tui_markdown::from_str(input);
+    text.lines
+        .into_iter()
+        .map(|line| {
+            let spans: Vec<Span<'static>> = line
+                .spans
+                .into_iter()
+                .map(|span| Span::styled(span.content.to_string(), span.style))
+                .collect();
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Extract thought blocks and remaining content from a message.
+pub fn extract_thought_and_content(msg: &str) -> (Option<String>, String) {
+    let mut thought = String::new();
+    let mut content = String::new();
+    let mut in_think = false;
+
+    for raw_line in msg.lines() {
+        let line = raw_line.replace('\t', "    ");
+        let segments = parse_line_segments(&line, &mut in_think);
+        for seg in segments {
+            match seg {
+                LineSegment::Thought(t) => {
+                    thought.push_str(t);
+                    thought.push('\n');
+                }
+                LineSegment::Content(c) => {
+                    content.push_str(c);
+                    content.push('\n');
+                }
+            }
+        }
+    }
+
+    let thought_opt = if thought.trim().is_empty() {
+        None
+    } else {
+        Some(thought.trim().to_string())
+    };
+    (thought_opt, content)
 }

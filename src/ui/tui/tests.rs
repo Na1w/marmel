@@ -1515,7 +1515,7 @@ fn test_rehydrate_messages_summarizes_delegation_results() {
             reasoning_content: None,
             tool_calls: vec![crate::types::ToolCall::new(
                 "call-del-1",
-                "delegate_task",
+                crate::tool_names::TOOL_DELEGATE_TASK,
                 r#"{"agent_name": "coder", "task_id": "t-001", "prompt": "build feature"}"#,
             )],
         },
@@ -1562,7 +1562,7 @@ fn test_rehydrate_messages_preserves_order_thinking_and_filters_synthetic() {
             reasoning_content: Some("Let's look at the codebase structure.".to_string()),
             tool_calls: vec![crate::types::ToolCall::new(
                 "call-glob-1",
-                "glob",
+                crate::tool_names::TOOL_GLOB,
                 r#"{"pattern": "src/auth*.rs"}"#,
             )],
         },
@@ -2237,4 +2237,59 @@ fn test_set_subagents_preserves_manager_active_agent() {
     r.set_subagents(active_list);
 
     assert_eq!(r.active_agent, "Manager");
+}
+
+#[test]
+fn test_ansi_and_markdown() {
+    use ansi_to_tui::IntoText;
+
+    // Test ANSI parsing
+    let ansi_bytes = b"\x1b[32mok\x1b[0m \x1b[31mFAILED\x1b[0m";
+    let text = ansi_bytes.into_text().expect("ansi parsing should succeed");
+    assert_eq!(text.lines.len(), 1);
+    assert!(text.lines[0].spans.len() >= 2);
+
+    // Test Markdown parsing
+    let md = "# Title\n\n```rust\nfn main() {}\n```";
+    let md_text = tui_markdown::from_str(md);
+    assert!(!md_text.lines.is_empty());
+}
+
+#[test]
+fn test_multiline_input_trailing_newlines_preserved() {
+    let mut r = TuiRenderer::new();
+    r.set_input_content("hello\nworld\n");
+    assert_eq!(r.textarea.lines().len(), 3);
+    assert_eq!(r.textarea.lines(), &["hello", "world", ""]);
+
+    // Ensure sync preserves the trailing empty line
+    r.ensure_textarea_in_sync();
+    assert_eq!(r.textarea.lines().len(), 3);
+    assert_eq!(r.input_text, "hello\nworld\n");
+}
+
+#[test]
+fn test_insert_newline_and_sync() {
+    let mut r = TuiRenderer::new();
+    r.set_input_content("first line");
+    r.ensure_textarea_in_sync();
+    r.textarea.insert_newline();
+    r.sync_input_from_textarea();
+    assert_eq!(r.input_text, "first line\n");
+    assert_eq!(r.textarea.lines().len(), 2);
+    assert_eq!(r.textarea.lines(), &["first line", ""]);
+
+    r.textarea.insert_str("second line");
+    r.sync_input_from_textarea();
+    assert_eq!(r.input_text, "first line\nsecond line");
+    assert_eq!(r.textarea.lines(), &["first line", "second line"]);
+}
+
+#[test]
+fn test_submit_multiline_input() {
+    let mut r = TuiRenderer::new();
+    r.set_input_content("line 1\nline 2");
+    r.submit();
+    assert_eq!(r.input_text, "");
+    assert_eq!(r.textarea.lines(), &[""]);
 }

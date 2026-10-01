@@ -1,6 +1,12 @@
 use super::*;
 use std::fs;
 
+use crate::tool_names::{
+    TOOL_ARCHIVE_PLAN, TOOL_CREATE_PLAN, TOOL_DELEGATE_TASK, TOOL_GLOB, TOOL_GREP_SEARCH,
+    TOOL_LEAVE_VERDICT, TOOL_PTY_CLOSE, TOOL_PTY_LIST, TOOL_PTY_READ, TOOL_PTY_SPAWN,
+    TOOL_PTY_WRITE, TOOL_READ_FILE, TOOL_REBIRTH, TOOL_REPLACE, TOOL_RUN_COMMAND, TOOL_WRITE_FILE,
+};
+
 /// Build an isolated plan manager with a small plan.
 fn test_plan() -> (std::path::PathBuf, Plan) {
     let dir = std::env::temp_dir().join(format!(
@@ -40,32 +46,32 @@ fn test_agent_turn_phase_sequence() {
 /// REQ-LOOP-003: read tools are flagged parallel, write tools sequential.
 #[test]
 fn test_agent_tool_classification() {
-    assert!(is_read_tool("read_file"));
-    assert!(is_read_tool("grep_search"));
-    assert!(is_read_tool("glob"));
-    assert!(!is_read_tool("write_file"));
+    assert!(is_read_tool(TOOL_READ_FILE));
+    assert!(is_read_tool(TOOL_GREP_SEARCH));
+    assert!(is_read_tool(TOOL_GLOB));
+    assert!(!is_read_tool(TOOL_WRITE_FILE));
 
-    assert!(is_write_tool("write_file"));
-    assert!(is_write_tool("replace"));
-    assert!(is_write_tool("run_command"));
-    assert!(!is_write_tool("read_file"));
+    assert!(is_write_tool(TOOL_WRITE_FILE));
+    assert!(is_write_tool(TOOL_REPLACE));
+    assert!(is_write_tool(TOOL_RUN_COMMAND));
+    assert!(!is_write_tool(TOOL_READ_FILE));
 
     // REQ-ORCH-005: delegate_task is sequential (blocking, synchronous-from-
     // Manager), never parallelized with reads.
-    assert!(is_write_tool("delegate_task"));
-    assert!(!is_read_tool("delegate_task"));
+    assert!(is_write_tool(TOOL_DELEGATE_TASK));
+    assert!(!is_read_tool(TOOL_DELEGATE_TASK));
 
     // Verify unclassified / domain / MCP / plan tools are sequential and not dropped
     for tool_name in &[
-        "create_plan",
-        "archive_current_plan",
-        "rebirth",
-        "leave_verdict",
-        "pty_spawn",
-        "pty_write",
-        "pty_read",
-        "pty_close",
-        "pty_list",
+        TOOL_CREATE_PLAN,
+        TOOL_ARCHIVE_PLAN,
+        TOOL_REBIRTH,
+        TOOL_LEAVE_VERDICT,
+        TOOL_PTY_SPAWN,
+        TOOL_PTY_WRITE,
+        TOOL_PTY_READ,
+        TOOL_PTY_CLOSE,
+        TOOL_PTY_LIST,
         "mcp__custom_server__tool",
     ] {
         assert!(is_write_tool(tool_name));
@@ -81,7 +87,7 @@ async fn test_unclassified_tools_not_dropped() {
     let mut loop_ = AgentLoop::new(plan).with_caller(ToolCaller::Specialist(Agent::Validator));
     // `leave_verdict` is outside the basic read/write set and was previously dropped by AgentLoop.
     loop_.enqueue_tools(vec![serde_json::json!({
-        "name": "leave_verdict",
+        "name": TOOL_LEAVE_VERDICT,
         "arguments": { "verdict": "APPROVED", "comments": "LGTM" }
     })]);
     let outcome = loop_.run_turn().await.unwrap();
@@ -137,7 +143,7 @@ async fn test_agent_loop_checkoff_success() {
     let mut loop_ = AgentLoop::new(plan);
     // Queue a read_file tool call annotated with t-001.
     loop_.enqueue_tools(vec![serde_json::json!({
-        "name": "read_file",
+        "name": TOOL_READ_FILE,
         "arguments": { "path": "Cargo.toml", "task_id": "t-001" }
     })]);
     let outcome = loop_.run_turn().await.unwrap();
@@ -161,7 +167,7 @@ async fn test_agent_monitor_blocks_repetition_through_loop() {
     // 5x identical run_command "ls" (caesar default threshold).
     for _ in 0..5 {
         loop_.enqueue_tools(vec![serde_json::json!({
-            "name": "run_command",
+            "name": TOOL_RUN_COMMAND,
             "arguments": { "command": "ls" }
         })]);
     }
@@ -188,7 +194,7 @@ async fn test_agent_monitor_rescue_xml_through_loop() {
     let text = r#"prefix <tool_call>{"function":"read_file","arguments":{"path":"Cargo.toml"}}</tool_call> suffix"#;
     let calls = loop_.rescue_xml_calls(text);
     assert_eq!(calls.len(), 1, "one XML tool call must be rescued");
-    assert_eq!(calls[0].function.name, "read_file");
+    assert_eq!(calls[0].function.name, TOOL_READ_FILE);
     assert!(
         calls[0].id.starts_with("call_text_"),
         "rescued id must be call_text_{{uuid}}, got {}",
@@ -282,7 +288,11 @@ fn coder_scheduler() -> Box<dyn Fn(&str) -> Agent> {
 /// deliverables — no conversational filler.
 #[tokio::test]
 #[cfg_attr(windows, ignore)]
+#[allow(clippy::await_holding_lock)]
 async fn test_agent_managerloop_silent_dispatcher_delegates_all() {
+    let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let manager = Arc::new(test_manager(tmp.path()));
     manager
@@ -321,7 +331,11 @@ async fn test_agent_managerloop_silent_dispatcher_delegates_all() {
 /// still unchecked.
 #[tokio::test]
 #[cfg_attr(windows, ignore)]
+#[allow(clippy::await_holding_lock)]
 async fn test_managerloop_one_task_per_call_no_takeover() {
+    let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let manager = test_manager(tmp.path());
     manager
@@ -353,7 +367,11 @@ async fn test_managerloop_one_task_per_call_no_takeover() {
 /// without a sequential plan write.
 #[tokio::test]
 #[cfg_attr(windows, ignore)]
+#[allow(clippy::await_holding_lock)]
 async fn test_managerloop_parallel_independent_delegation() {
+    let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let manager = temp_manager(tmp.path());
     manager
@@ -488,7 +506,7 @@ async fn test_agentloop_abort_stops_turn_and_kills_pty() {
     loop_.track_pty_pid(999_999);
     // Queue a tool that would otherwise run; the abort must pre-empt it.
     loop_.enqueue_tools(vec![serde_json::json!({
-        "name": "read_file",
+        "name": TOOL_READ_FILE,
         "arguments": { "path": "Cargo.toml", "task_id": "t-001" }
     })]);
     // Queue an abort: the turn must stop immediately with Aborted.
@@ -527,7 +545,7 @@ async fn test_agentloop_abort_midflight_interrupts_execute_tools() {
     // Queue a slow write tool annotated with t-001. It sleeps long enough for
     // the abort to be raised mid-flight and caught after dispatch returns.
     loop_.enqueue_tools(vec![serde_json::json!({
-        "name": "run_command",
+        "name": TOOL_RUN_COMMAND,
         "arguments": { "command": cmd, "timeout_seconds": 2, "task_id": "t-001" }
     })]);
     // Arm the abort flag from a separate OS thread after a short delay,
@@ -563,4 +581,71 @@ async fn test_agentloop_full_phase_sequence_no_tools() {
     let outcome = loop_.run_turn().await.unwrap();
     assert_eq!(outcome, TurnOutcome::Continue);
     fs::remove_dir_all(&_dir).unwrap();
+}
+
+/// Concurrency regression (Phase 2): a specialist whose delegation future
+/// sleeps FAR beyond the per-delegation bound must be torn down by
+/// `tokio::time::timeout` — the loop returns a hard `Err` (mapped to
+/// `TurnOutcome::Error` upstream) without hanging. The timeout is injected
+/// via the `with_delegate_timeout` / `with_delegate_override` test seams so
+/// the test runs in ~1s instead of waiting `DELEGATE_TIMEOUT_SECS` (30 min).
+#[tokio::test]
+async fn test_managerloop_delegate_timeout_returns_error_without_hanging() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manager = temp_manager(tmp.path());
+    manager
+        .create_plan("- [ ] [t-501] A task that will never finish.\n")
+        .unwrap();
+
+    let mut ml = ManagerLoop::new(Arc::new(manager), coder_scheduler())
+        // Inject a ~1s per-delegation bound (production uses
+        // DELEGATE_TIMEOUT_SECS = 1800s).
+        .with_delegate_timeout(std::time::Duration::from_millis(1000))
+        // Mock/scheduler agent: the delegation future sleeps far beyond the
+        // injected bound, so the timeout must fire first.
+        .with_delegate_override(|req| {
+            let task_id = req.task_id.clone();
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                Ok(Deliverable {
+                    marker: crate::agents::MissionMarker::Complete {
+                        task_id: task_id.clone(),
+                    },
+                    content: "MISSION COMPLETE".to_string(),
+                    task_id,
+                })
+            })
+        });
+
+    // Bounded by a generous wall-clock guard: a correct implementation
+    // returns in ~1s; a regression (timeout not applied / deadlock) hangs
+    // until this fires.
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), ml.run_executing())
+        .await
+        .expect("run_executing must return (no hang)");
+
+    let err = result
+        .expect_err("delegation exceeding the per-delegation bound must surface a hard error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("timed out"),
+        "expected a timeout error, got: {msg}"
+    );
+    // The error must be attributable to the delegated task.
+    assert!(
+        msg.contains("t-501"),
+        "timeout error must name the task, got: {msg}"
+    );
+    // Must have been fast (timeout ~1s), not the 30-minute production bound.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "timeout path must return quickly, took {:?}",
+        started.elapsed()
+    );
+    // The timed-out task must remain unchecked on disk (no check-off).
+    assert!(
+        !Plan::at(tmp.path()).is_complete(),
+        "a timed-out delegation must not check off its task"
+    );
 }

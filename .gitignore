@@ -30,4 +30,17 @@ __pycache__/
 .session_frozen.json
 .session_journal.json
 forced_phase.txt
+
+# kvaser/orchestrator working files
+example_failure/
+execution_failure_2/
+.kvaser/
+execution_plan.md
+execution_plan.completed.*.md
+
+# Local (machine-specific) configs
+marmel.toml
+marmel.toml.cloud
+
+# IDE
 .idea/

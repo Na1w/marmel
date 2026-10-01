@@ -51,10 +51,15 @@ mod tests {
 
     #[test]
     fn test_orchestr_debugger_role_and_namespaces() {
-        let d = Debugger;
-        assert_eq!(d.name(), Agent::Debugger);
-        assert!(d.tool_namespaces().contains(&"run_command"));
-        assert!(d.tool_namespaces().contains(&"rebirth"));
-        assert!(!d.may_recurse());
+        crate::agents::assert_specialist_role(
+            &Debugger,
+            Agent::Debugger,
+            &[
+                crate::tool_names::TOOL_RUN_COMMAND,
+                crate::tool_names::TOOL_REBIRTH,
+            ],
+            &[],
+            false,
+        );
     }
 }

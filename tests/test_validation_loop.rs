@@ -146,6 +146,7 @@ async fn test_specialist_validation_rejection_and_revision_loop() {
             task_id: Some("task-t-001".to_string()),
             image_urls: vec![],
             audio_urls: vec![],
+            blueprint: None,
         };
         let token = CancellationToken::new();
 
@@ -245,6 +246,7 @@ async fn test_specialist_chatter_loop_terminates_fast() {
             task_id: Some("task-t-002".to_string()),
             image_urls: vec![],
             audio_urls: vec![],
+            blueprint: None,
         };
         let token = CancellationToken::new();
 
@@ -340,6 +342,7 @@ async fn test_specialist_recovers_after_repetition_nudge_and_succeeds() {
             task_id: Some("task-t-003".to_string()),
             image_urls: vec![],
             audio_urls: vec![],
+            blueprint: None,
         };
         let token = CancellationToken::new();
 
@@ -457,6 +460,7 @@ async fn test_specialist_revision_recovers_after_repetition_nudge_and_succeeds()
             task_id: Some("task-t-004".to_string()),
             image_urls: vec![],
             audio_urls: vec![],
+            blueprint: None,
         };
         let token = CancellationToken::new();
 
@@ -546,6 +550,7 @@ async fn test_specialist_approved_without_explicit_mission_complete() {
             task_id: Some("t-005".to_string()),
             image_urls: vec![],
             audio_urls: vec![],
+            blueprint: None,
         };
         let token = CancellationToken::new();
 
@@ -650,6 +655,7 @@ async fn test_validator_reminded_3_times_and_assumed_approved() {
             task_id: Some("t-006".to_string()),
             image_urls: vec![],
             audio_urls: vec![],
+            blueprint: None,
         };
         let token = CancellationToken::new();
 
@@ -740,6 +746,7 @@ async fn test_delegated_validator_approved_leave_verdict_stops_loop_immediately(
             task_id: Some("t-val-01".to_string()),
             image_urls: vec![],
             audio_urls: vec![],
+            blueprint: None,
         };
         let token = CancellationToken::new();
 
@@ -836,6 +843,7 @@ async fn test_delegated_validator_rejected_leave_verdict_stops_loop_immediately(
             task_id: Some("t-val-02".to_string()),
             image_urls: vec![],
             audio_urls: vec![],
+            blueprint: None,
         };
         let token = CancellationToken::new();
 
@@ -957,6 +965,7 @@ async fn test_delegated_validator_skips_subsequent_tools_in_same_turn_after_leav
             task_id: Some("t-val-03".to_string()),
             image_urls: vec![],
             audio_urls: vec![],
+            blueprint: None,
         };
         let token = CancellationToken::new();
 

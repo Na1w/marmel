@@ -57,9 +57,8 @@ struct ScriptedRenderer {
     /// Lines returned by `poll_input()`, consumed in order.
     poll_script: Vec<String>,
     poll_cursor: usize,
-    /// Whether an abort was requested (via `/abort`).
-    aborted: bool,
-    user_exit: bool,
+    /// Shared abort / user-exit flags (trait-default abort surface).
+    input_state: marmennill::ui::InputState,
     rehydrated: Vec<marmennill::types::Message>,
     rehydrated_ui: Vec<marmennill::ui::UiRecord>,
     subagents: Vec<marmennill::ui::SubagentDetail>,
@@ -73,8 +72,7 @@ impl ScriptedRenderer {
             read_cursor: 0,
             poll_script: Vec::new(),
             poll_cursor: 0,
-            aborted: false,
-            user_exit: false,
+            input_state: marmennill::ui::InputState::default(),
             rehydrated: Vec::new(),
             rehydrated_ui: Vec::new(),
             subagents: Vec::new(),
@@ -88,8 +86,7 @@ impl ScriptedRenderer {
             read_cursor: 0,
             poll_script,
             poll_cursor: 0,
-            aborted: false,
-            user_exit: false,
+            input_state: marmennill::ui::InputState::default(),
             rehydrated: Vec::new(),
             rehydrated_ui: Vec::new(),
             subagents: Vec::new(),
@@ -138,22 +135,17 @@ impl Renderer for ScriptedRenderer {
         self.read_cursor += 1;
         line
     }
-    fn request_abort(&mut self) {
-        self.aborted = true;
+    // Abort-flag surface uses the trait defaults backed by `input_state`,
+    // except `request_user_exit`, which also sets the user-exit flag.
+    fn input_state(&mut self) -> &mut marmennill::ui::InputState {
+        &mut self.input_state
     }
-    fn aborted(&self) -> bool {
-        self.aborted
+    fn input_state_shared(&self) -> &marmennill::ui::InputState {
+        &self.input_state
     }
     fn request_user_exit(&mut self) {
-        self.user_exit = true;
-        self.aborted = true;
-    }
-    fn user_exit_requested(&self) -> bool {
-        self.user_exit
-    }
-    fn clear_abort(&mut self) {
-        self.aborted = false;
-        self.user_exit = false;
+        self.input_state.user_exit = true;
+        self.input_state.aborted = true;
     }
     fn shutdown(&mut self) {}
 }

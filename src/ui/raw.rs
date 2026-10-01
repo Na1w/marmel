@@ -5,7 +5,7 @@
 //! captured by scripts. It never enters raw mode or the alternate screen, so
 //! the terminal is always left in a sane state.
 
-use super::{Event, Renderer, chunk_utf8};
+use super::{Event, InputState, Renderer, chunk_utf8};
 use crate::config::Config;
 use crate::orchestrator::OrchestratorManager;
 use anyhow::Result;
@@ -44,16 +44,15 @@ pub fn restore() -> std::io::Result<()> {
 pub struct RawRenderer {
     /// Buffered lines awaiting a flush.
     buffer: Vec<u8>,
-    aborted: bool,
-    user_exit: bool,
+    /// Shared abort / user-exit flags (trait-default abort surface).
+    input_state: InputState,
 }
 
 impl RawRenderer {
     pub fn new() -> Self {
         Self {
             buffer: Vec::new(),
-            aborted: false,
-            user_exit: false,
+            input_state: InputState::default(),
         }
     }
 
@@ -124,38 +123,23 @@ impl Renderer for RawRenderer {
         Ok(())
     }
 
-    fn poll_input(&mut self) -> Option<String> {
-        // In headless mode there is no interactive stdin prompt; the CLI
-        // positional prompt (or `None`) already supplied the goal.
-        None
+    // `poll_input` / `read_input` use the trait defaults (no interactive
+    // stdin in headless mode); the abort-flag surface uses the trait
+    // defaults backed by `input_state`, except `request_user_exit`, which
+    // additionally cancels all active work.
+
+    fn input_state(&mut self) -> &mut InputState {
+        &mut self.input_state
     }
 
-    fn read_input(&mut self) -> Option<String> {
-        // No interactive input in headless mode.
-        None
-    }
-
-    fn request_abort(&mut self) {
-        self.aborted = true;
-    }
-
-    fn aborted(&self) -> bool {
-        self.aborted
-    }
-
-    fn clear_abort(&mut self) {
-        self.aborted = false;
-        self.user_exit = false;
+    fn input_state_shared(&self) -> &InputState {
+        &self.input_state
     }
 
     fn request_user_exit(&mut self) {
-        self.aborted = true;
-        self.user_exit = true;
+        self.input_state.aborted = true;
+        self.input_state.user_exit = true;
         crate::orchestrator::cancel_all();
-    }
-
-    fn user_exit_requested(&self) -> bool {
-        self.user_exit
     }
 
     fn shutdown(&mut self) {

@@ -517,6 +517,32 @@ fn test_check_off_avoids_substring_collision() {
 }
 
 #[test]
+fn test_check_off_does_not_flip_task_mentioned_in_other_description() {
+    let dir = temp_marmel();
+    let plan = Plan::at(&dir);
+    let plan_content = "# Execution Plan\n\
+- [ ] [t-006] Verify build/compile\n\
+- [ ] [t-007] Verify unit test\n\
+- [ ] [t-011] Produce report summarizing (t-006...t-008)\n";
+    plan.create(plan_content).unwrap();
+
+    // Check off t-006 the first time
+    assert!(plan.check_off("t-006").unwrap());
+    // Checking off t-006 a second time must NOT check off t-011
+    assert!(!plan.check_off("t-006").unwrap());
+
+    let disk = plan.read().unwrap().unwrap();
+    assert!(disk.contains("- [x] [t-006] Verify build/compile"));
+    assert!(disk.contains("- [ ] [t-007] Verify unit test"));
+    assert!(
+        disk.contains("- [ ] [t-011] Produce report summarizing (t-006...t-008)"),
+        "t-011 must remain unchecked:\n{disk}"
+    );
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn test_output_is_success_benign_failure_phrases() {
     assert!(output_is_success("All tests passed. 0 failed; 0 errors"));
     assert!(output_is_success("Operation completed without error."));
