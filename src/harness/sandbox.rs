@@ -35,7 +35,7 @@ pub fn apply_sandbox(workspace_root: &Path) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn apply_landlock_linux(workspace_root: &Path) -> Result<()> {
-    let abi = ABI::V1;
+    let abi = ABI::V5;
     let status = Ruleset::default()
         .handle_access(AccessFs::from_all(abi))
         .context("configuring Landlock access rights")?
@@ -173,7 +173,7 @@ mod tests {
     #[test]
     fn test_landlock_ruleset_builds_with_devices() {
         let tmp = tempfile::tempdir().unwrap();
-        let abi = ABI::V1;
+        let abi = ABI::V5;
         let ruleset = Ruleset::default()
             .handle_access(AccessFs::from_all(abi))
             .unwrap()
@@ -214,6 +214,63 @@ mod tests {
             assert!(
                 status.is_ok_and(|s| s.success()),
                 "marmel --internal-sandbox-exec must succeed writing to /dev/null and reading /etc/resolv.conf"
+            );
+        }
+    }
+
+    #[test]
+    fn test_internal_sandbox_cross_directory_rename() {
+        let exe = std::env::current_exe().expect("current test binary");
+        let marmel_bin = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("marmel"));
+        if let Some(bin) = marmel_bin
+            && bin.exists()
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let d1 = tmp.path().join("d1");
+            let d2 = tmp.path().join("d2");
+            std::fs::create_dir_all(&d1).unwrap();
+            std::fs::create_dir_all(&d2).unwrap();
+            std::fs::write(d1.join("test.txt"), "rename test payload").unwrap();
+
+            // Direct rename syscall via python3 to ensure kernel rename() succeeds without EXDEV
+            let script = format!(
+                "import os; os.rename('{}/d1/test.txt', '{}/d2/test.txt')",
+                tmp.path().display(),
+                tmp.path().display()
+            );
+            let cmd = if std::process::Command::new("python3")
+                .arg("--version")
+                .output()
+                .is_ok()
+            {
+                format!("python3 -c \"{script}\"")
+            } else {
+                format!(
+                    "mv '{}/d1/test.txt' '{}/d2/test.txt'",
+                    tmp.path().display(),
+                    tmp.path().display()
+                )
+            };
+
+            let status = std::process::Command::new(bin)
+                .arg("--internal-sandbox-exec")
+                .arg(tmp.path())
+                .arg(cmd)
+                .status();
+            assert!(
+                status.is_ok_and(|s| s.success()),
+                "Cross-directory rename inside Landlock sandbox must succeed natively without EXDEV"
+            );
+            assert!(
+                d2.join("test.txt").exists(),
+                "Renamed file must exist at destination"
+            );
+            assert!(
+                !d1.join("test.txt").exists(),
+                "Original file must no longer exist in source"
             );
         }
     }
