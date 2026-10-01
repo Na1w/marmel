@@ -139,7 +139,7 @@ async fn validator_forbidden_from_file_modification_and_execution_tools() {
     let tool_run = ToolInvocation {
         name: "run_command".to_string(),
         arguments: serde_json::json!({
-            "command": "cargo test"
+            "command": "echo test"
         }),
     };
     // Per AGENTS.md, Validator is permitted run_command to run test suites.

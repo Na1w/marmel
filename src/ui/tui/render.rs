@@ -1134,7 +1134,7 @@ impl TuiRenderer {
         let input_block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border_color))
-            .title(" Input (Enter: Send, Shift+Enter: Newline, Ctrl+Z: Undo) ");
+            .title(" Input (Enter: Send, Alt/Shift+Enter: Newline, Ctrl+Z: Undo) ");
 
         self.textarea.set_block(input_block);
         self.textarea.set_cursor_line_style(Style::default());

@@ -32,6 +32,7 @@ impl TuiRenderer {
                         KeyCode::Enter => {
                             if key.modifiers.contains(KeyModifiers::SHIFT)
                                 || key.modifiers.contains(KeyModifiers::ALT)
+                                || key.modifiers.contains(KeyModifiers::CONTROL)
                             {
                                 self.ensure_textarea_in_sync();
                                 self.textarea.insert_newline();
@@ -194,6 +195,10 @@ impl TuiRenderer {
                                 self.ensure_textarea_in_sync();
                                 self.textarea.redo();
                                 self.sync_input_from_textarea();
+                            } else if (ctrl && (c == 'j' || c == 'J')) || c == '\n' {
+                                self.ensure_textarea_in_sync();
+                                self.textarea.insert_newline();
+                                self.sync_input_from_textarea();
                             } else if self.focused_panel == FocusedPanel::Chat && !c.is_control() {
                                 self.confirm_abort = false;
                                 self.ensure_textarea_in_sync();
@@ -267,6 +272,19 @@ impl TuiRenderer {
                     }
                     _ => {}
                 },
+                Ok(TermEvent::Paste(text)) => {
+                    if self.focused_panel == FocusedPanel::Chat {
+                        self.ensure_textarea_in_sync();
+                        for ch in text.chars() {
+                            if ch == '\n' {
+                                self.textarea.insert_newline();
+                            } else if ch != '\r' {
+                                self.textarea.insert_char(ch);
+                            }
+                        }
+                        self.sync_input_from_textarea();
+                    }
+                }
                 Ok(TermEvent::Resize(_, _)) => {
                     // F6: explicit resize handling — clamp all scroll offsets and
                     // trigger a flush so no stale viewport shows blank space.
@@ -309,7 +327,7 @@ impl TuiRenderer {
         let lines: Vec<String> = if text.is_empty() {
             vec![String::new()]
         } else {
-            text.lines().map(|s| s.to_string()).collect()
+            text.split('\n').map(|s| s.to_string()).collect()
         };
         self.textarea = ratatui_textarea::TextArea::new(lines);
         self.textarea.move_cursor(ratatui_textarea::CursorMove::End);
@@ -321,7 +339,7 @@ impl TuiRenderer {
             let lines: Vec<String> = if self.input_text.is_empty() {
                 vec![String::new()]
             } else {
-                self.input_text.lines().map(|s| s.to_string()).collect()
+                self.input_text.split('\n').map(|s| s.to_string()).collect()
             };
             self.textarea = ratatui_textarea::TextArea::new(lines);
             self.textarea.move_cursor(ratatui_textarea::CursorMove::End);
@@ -705,10 +723,13 @@ impl TuiRenderer {
                  /reset, /reset_plan, /reset-plan, /clear_plan, /clear-plan - clear the execution plan\n\
                  /abort, /exit, /quit, /q, :q, :q! - abort the current session\n\n\
                  [CLI] Keybindings:\n\
+                 Enter - send input message\n\
+                 Shift+Enter / Alt+Enter / Ctrl+J - insert newline\n\
                  Tab - cycle focus (Chat / Plan / Subagents)\n\
                  Ctrl+P - toggle the plan panel\n\
                  Ctrl+A - toggle the subagents panel\n\
                  Ctrl+T - toggle the thinking block display\n\
+                 Ctrl+Z / Ctrl+Y - undo / redo input\n\
                  Ctrl+Up / Ctrl+Down - input history navigation\n\
                  Esc / Ctrl+C - confirm-abort (first press arms, second aborts; Esc first returns focus to Chat)\n\
                  Mouse scroll / click - scroll panels / change focus\n\

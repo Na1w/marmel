@@ -13,7 +13,10 @@ use super::{Event, Renderer, SubagentDetail};
 use crate::config::Config;
 use crate::orchestrator::OrchestratorManager;
 use anyhow::Result;
-use crossterm::event::DisableMouseCapture;
+use crossterm::event::{
+    DisableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -361,7 +364,11 @@ fn estimate_stream_tokens(text: &str) -> usize {
 impl Renderer for TuiRenderer {
     fn init(&mut self) -> Result<()> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
         let stdout = io::stdout();
         let backend = CrosstermBackend::new(stdout);
         self.terminal = Some(Terminal::new(backend)?);
@@ -904,7 +911,12 @@ impl Renderer for TuiRenderer {
     }
 
     fn shutdown(&mut self) {
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(
+            io::stdout(),
+            PopKeyboardEnhancementFlags,
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        );
         let _ = disable_raw_mode();
     }
 
@@ -1066,10 +1078,21 @@ impl Renderer for TuiRenderer {
     }
 }
 
+impl Drop for TuiRenderer {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 /// Leave the alternate screen (best-effort, from the panic hook).
 pub fn leave_alt_screen() -> std::io::Result<()> {
     let _ = disable_raw_mode();
-    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)
+    execute!(
+        io::stdout(),
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )
 }
 
 /// Run the interactive TUI session using the CLI's optional initial prompt.

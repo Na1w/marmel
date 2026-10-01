@@ -2254,3 +2254,42 @@ fn test_ansi_and_markdown() {
     let md_text = tui_markdown::from_str(md);
     assert!(!md_text.lines.is_empty());
 }
+
+#[test]
+fn test_multiline_input_trailing_newlines_preserved() {
+    let mut r = TuiRenderer::new();
+    r.set_input_content("hello\nworld\n");
+    assert_eq!(r.textarea.lines().len(), 3);
+    assert_eq!(r.textarea.lines(), &["hello", "world", ""]);
+
+    // Ensure sync preserves the trailing empty line
+    r.ensure_textarea_in_sync();
+    assert_eq!(r.textarea.lines().len(), 3);
+    assert_eq!(r.input_text, "hello\nworld\n");
+}
+
+#[test]
+fn test_insert_newline_and_sync() {
+    let mut r = TuiRenderer::new();
+    r.set_input_content("first line");
+    r.ensure_textarea_in_sync();
+    r.textarea.insert_newline();
+    r.sync_input_from_textarea();
+    assert_eq!(r.input_text, "first line\n");
+    assert_eq!(r.textarea.lines().len(), 2);
+    assert_eq!(r.textarea.lines(), &["first line", ""]);
+
+    r.textarea.insert_str("second line");
+    r.sync_input_from_textarea();
+    assert_eq!(r.input_text, "first line\nsecond line");
+    assert_eq!(r.textarea.lines(), &["first line", "second line"]);
+}
+
+#[test]
+fn test_submit_multiline_input() {
+    let mut r = TuiRenderer::new();
+    r.set_input_content("line 1\nline 2");
+    r.submit();
+    assert_eq!(r.input_text, "");
+    assert_eq!(r.textarea.lines(), &[""]);
+}
