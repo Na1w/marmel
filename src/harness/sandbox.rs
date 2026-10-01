@@ -93,7 +93,28 @@ fn apply_landlock_linux(workspace_root: &Path) -> Result<()> {
         }
     }
 
-    // 4. System toolchains, device nodes, and binaries (Read-Only + Execute)
+    // 4. Essential device nodes with read/write access (/dev/null, /dev/zero, /dev/full, /dev/tty, /dev/pts, /dev/shm)
+    let rw_devs = [
+        "/dev/null",
+        "/dev/zero",
+        "/dev/full",
+        "/dev/tty",
+        "/dev/urandom",
+        "/dev/random",
+        "/dev/pts",
+        "/dev/shm",
+    ];
+    for p in rw_devs {
+        if Path::new(p).exists()
+            && let Ok(fd) = PathFd::new(p)
+        {
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(fd, AccessFs::from_all(abi)))
+                .context("adding device rw rule to Landlock")?;
+        }
+    }
+
+    // 5. System toolchains, device nodes, and binaries (Read-Only + Execute)
     let ro_paths = [
         "/usr", "/bin", "/lib", "/lib64", "/opt", "/etc", "/dev", "/proc", "/sys",
     ];
@@ -122,6 +143,61 @@ fn apply_landlock_linux(workspace_root: &Path) -> Result<()> {
         Err(e) => {
             tracing::warn!("Failed to enforce Landlock restrictions: {e:#}");
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_landlock_ruleset_builds_with_devices() {
+        let tmp = tempfile::tempdir().unwrap();
+        let abi = ABI::V1;
+        let ruleset = Ruleset::default()
+            .handle_access(AccessFs::from_all(abi))
+            .unwrap()
+            .create();
+        if let Ok(mut r) = ruleset {
+            for dev in ["/dev/null", "/dev/zero", "/dev/tty"] {
+                if let Ok(fd) = PathFd::new(dev) {
+                    r = r
+                        .add_rule(PathBeneath::new(fd, AccessFs::from_all(abi)))
+                        .expect("adding device rule must succeed");
+                }
+            }
+            if let Ok(fd) = PathFd::new(tmp.path()) {
+                let _ = r
+                    .add_rule(PathBeneath::new(fd, AccessFs::from_all(abi)))
+                    .expect("adding tmp rule must succeed");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_internal_sandbox_exec_dev_null() {
+        // Test running marmel binary with --internal-sandbox-exec writing to /dev/null
+        let exe = std::env::current_exe().expect("current test binary");
+        let marmel_bin = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("marmel"));
+        if let Some(bin) = marmel_bin
+            && bin.exists()
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(bin)
+                .arg("--internal-sandbox-exec")
+                .arg(tmp.path())
+                .arg("echo hello > /dev/null")
+                .status();
+            assert!(
+                status.is_ok_and(|s| s.success()),
+                "marmel --internal-sandbox-exec must succeed writing to /dev/null"
+            );
         }
     }
 }
