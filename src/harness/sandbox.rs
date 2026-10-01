@@ -57,11 +57,15 @@ fn apply_landlock_linux(workspace_root: &Path) -> Result<()> {
             .context("adding workspace rule to Landlock")?;
     }
 
-    // 2. Full Read/Write for /tmp
-    if let Ok(fd) = PathFd::new("/tmp") {
-        ruleset = ruleset
-            .add_rule(PathBeneath::new(fd, AccessFs::from_all(abi)))
-            .context("adding /tmp rule to Landlock")?;
+    // 2. Full Read/Write for /tmp and /var/tmp
+    for tmp_dir in ["/tmp", "/var/tmp"] {
+        if Path::new(tmp_dir).exists()
+            && let Ok(fd) = PathFd::new(tmp_dir)
+        {
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(fd, AccessFs::from_all(abi)))
+                .context(format!("adding {tmp_dir} rule to Landlock"))?;
+        }
     }
 
     // 3. User build caches: ~/.cargo and ~/.cache (so cargo/pip/npm can download & build)
@@ -114,9 +118,9 @@ fn apply_landlock_linux(workspace_root: &Path) -> Result<()> {
         }
     }
 
-    // 5. System toolchains, device nodes, and binaries (Read-Only + Execute)
+    // 5. System toolchains, device nodes, runtime files (DNS /run/systemd/resolve), and binaries (Read-Only + Execute)
     let ro_paths = [
-        "/usr", "/bin", "/lib", "/lib64", "/opt", "/etc", "/dev", "/proc", "/sys",
+        "/usr", "/bin", "/lib", "/lib64", "/opt", "/etc", "/dev", "/proc", "/sys", "/run", "/var",
     ];
     for p in ro_paths {
         if Path::new(p).exists()
@@ -147,12 +151,11 @@ fn apply_landlock_linux(workspace_root: &Path) -> Result<()> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn test_landlock_ruleset_builds_with_devices() {
         let tmp = tempfile::tempdir().unwrap();
         let abi = ABI::V1;
@@ -177,9 +180,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
-    fn test_internal_sandbox_exec_dev_null() {
-        // Test running marmel binary with --internal-sandbox-exec writing to /dev/null
+    fn test_internal_sandbox_exec_dev_null_and_dns() {
+        // Test running marmel binary with --internal-sandbox-exec writing to /dev/null and reading DNS config
         let exe = std::env::current_exe().expect("current test binary");
         let marmel_bin = exe
             .parent()
@@ -192,11 +194,11 @@ mod tests {
             let status = std::process::Command::new(bin)
                 .arg("--internal-sandbox-exec")
                 .arg(tmp.path())
-                .arg("echo hello > /dev/null")
+                .arg("echo hello > /dev/null && cat /etc/resolv.conf > /dev/null")
                 .status();
             assert!(
                 status.is_ok_and(|s| s.success()),
-                "marmel --internal-sandbox-exec must succeed writing to /dev/null"
+                "marmel --internal-sandbox-exec must succeed writing to /dev/null and reading /etc/resolv.conf"
             );
         }
     }
