@@ -154,7 +154,7 @@ fn setup_panic_hook(use_raw: bool) {
             .with_writer(std::io::stderr)
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,tui_markdown=error")),
             )
             .try_init();
     } else {
@@ -174,7 +174,7 @@ fn setup_panic_hook(use_raw: bool) {
                 .with_ansi(false)
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,tui_markdown=error")),
                 )
                 .try_init();
         }
