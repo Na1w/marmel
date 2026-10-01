@@ -94,10 +94,7 @@ pub fn set_event_sender(tx: tokio::sync::mpsc::UnboundedSender<crate::ui::Event>
 /// must never happen while the guard is alive, so emitters never block behind
 /// (or hold up) each other or behind the setter's write lock.
 pub fn emit_status(msg: impl Into<String>) {
-    let tx = STATUS_SENDER
-        .read()
-        .ok()
-        .and_then(|guard| guard.clone());
+    let tx = STATUS_SENDER.read().ok().and_then(|guard| guard.clone());
     if let Some(tx) = tx {
         let _ = tx.send(msg.into());
     }
@@ -110,10 +107,7 @@ pub fn emit_status(msg: impl Into<String>) {
 /// must never happen while the guard is alive, so emitters never block behind
 /// (or hold up) each other or behind the setter's write lock.
 pub fn emit_event(ev: crate::ui::Event) {
-    let tx = EVENT_SENDER
-        .read()
-        .ok()
-        .and_then(|guard| guard.clone());
+    let tx = EVENT_SENDER.read().ok().and_then(|guard| guard.clone());
     if let Some(tx) = tx {
         let _ = tx.send(ev);
     }

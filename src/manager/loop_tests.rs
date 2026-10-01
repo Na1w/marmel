@@ -288,6 +288,7 @@ fn coder_scheduler() -> Box<dyn Fn(&str) -> Agent> {
 /// deliverables — no conversational filler.
 #[tokio::test]
 #[cfg_attr(windows, ignore)]
+#[allow(clippy::await_holding_lock)]
 async fn test_agent_managerloop_silent_dispatcher_delegates_all() {
     let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
         .lock()
@@ -330,6 +331,7 @@ async fn test_agent_managerloop_silent_dispatcher_delegates_all() {
 /// still unchecked.
 #[tokio::test]
 #[cfg_attr(windows, ignore)]
+#[allow(clippy::await_holding_lock)]
 async fn test_managerloop_one_task_per_call_no_takeover() {
     let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
         .lock()
@@ -365,6 +367,7 @@ async fn test_managerloop_one_task_per_call_no_takeover() {
 /// without a sequential plan write.
 #[tokio::test]
 #[cfg_attr(windows, ignore)]
+#[allow(clippy::await_holding_lock)]
 async fn test_managerloop_parallel_independent_delegation() {
     let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
         .lock()

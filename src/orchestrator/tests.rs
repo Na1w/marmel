@@ -644,8 +644,7 @@ fn test_handle_delegate_task_terminal_marker_deduplication() {
 #[tokio::test]
 async fn test_bus_hammer_concurrent_emitters() {
     let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let (event_tx, mut event_rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::ui::Event>();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<crate::ui::Event>();
     set_status_sender(status_tx);
     set_event_sender(event_tx);
 

@@ -327,18 +327,18 @@ impl TuiRenderer {
             let (msg_style, has_special_style) = message_style(msg);
             if !has_special_style && msg.contains("```") {
                 let (thought_opt, content) = extract_thought_and_content(msg);
-                if self.show_thought {
-                    if let Some(t) = thought_opt {
-                        for line in t.lines() {
-                            let cleaned = format_terminal_math(line.trim());
-                            if !cleaned.is_empty() {
-                                chat_lines.push(Line::from(Span::styled(
-                                    cleaned,
-                                    Style::default()
-                                        .fg(Color::DarkGray)
-                                        .add_modifier(Modifier::ITALIC),
-                                )));
-                            }
+                if self.show_thought
+                    && let Some(t) = thought_opt
+                {
+                    for line in t.lines() {
+                        let cleaned = format_terminal_math(line.trim());
+                        if !cleaned.is_empty() {
+                            chat_lines.push(Line::from(Span::styled(
+                                cleaned,
+                                Style::default()
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(Modifier::ITALIC),
+                            )));
                         }
                     }
                 }
@@ -904,7 +904,8 @@ impl TuiRenderer {
         // Subagent bottom status bar (rendered like main UI status bar).
         if let (Some(status_area), Some(sa)) = (status_area_opt, sa_opt) {
             let frames = ["-", "\\", "|", "/"];
-            let idx = ((self.session_start.elapsed().as_millis() / 125) % frames.len() as u128) as usize;
+            let idx =
+                ((self.session_start.elapsed().as_millis() / 125) % frames.len() as u128) as usize;
             let spinner = if sa.is_active { frames[idx] } else { "" };
 
             let turn_think = self
@@ -950,7 +951,10 @@ impl TuiRenderer {
                 let text = format!(" [Status: Active - streaming output...] {}", spinner);
                 (text, Style::default().bg(Color::DarkGray).fg(Color::Green))
             } else if sa.is_active {
-                let text = format!(" [Status: Active - waiting for model response...] {}", spinner);
+                let text = format!(
+                    " [Status: Active - waiting for model response...] {}",
+                    spinner
+                );
                 (text, Style::default().bg(Color::DarkGray).fg(Color::Cyan))
             } else {
                 (
@@ -1047,7 +1051,8 @@ impl TuiRenderer {
         }
         if active_phase {
             let frames = ["-", "\\", "|", "/"];
-            let idx = ((self.session_start.elapsed().as_millis() / 125) % frames.len() as u128) as usize;
+            let idx =
+                ((self.session_start.elapsed().as_millis() / 125) % frames.len() as u128) as usize;
             status_str.push(' ');
             status_str.push_str(frames[idx]);
         }

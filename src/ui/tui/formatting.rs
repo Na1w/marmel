@@ -744,10 +744,10 @@ pub fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
 /// If ANSI sequences are present and successfully parsed, returns styled lines.
 /// Otherwise returns plain text lines.
 pub fn parse_ansi_lines(input: &str) -> Vec<Line<'static>> {
-    if input.contains('\x1b') {
-        if let Ok(text) = input.as_bytes().into_text() {
-            return text.lines;
-        }
+    if input.contains('\x1b')
+        && let Ok(text) = input.as_bytes().into_text()
+    {
+        return text.lines;
     }
     input.lines().map(|l| Line::raw(l.to_string())).collect()
 }

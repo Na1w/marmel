@@ -606,8 +606,10 @@ impl AgentLoop {
 /// Test-only: the injectable delegation future (replaces `manager.delegate`).
 #[cfg(test)]
 type TestDelegateFn = Arc<
-    dyn Fn(DelegationRequest)
-        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Deliverable>> + Send>>
+    dyn Fn(
+            DelegationRequest,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Deliverable>> + Send>>
         + Send
         + Sync,
 >;
@@ -666,8 +668,10 @@ impl ManagerLoop {
     #[cfg(test)]
     pub fn with_delegate_override<F>(mut self, f: F) -> Self
     where
-        F: Fn(DelegationRequest)
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Deliverable>> + Send>>
+        F: Fn(
+                DelegationRequest,
+            )
+                -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Deliverable>> + Send>>
             + Send
             + Sync
             + 'static,

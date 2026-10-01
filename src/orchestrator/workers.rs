@@ -6,8 +6,8 @@
 //! bounded 10-entry completed cap evicts the oldest completed entry. No
 //! function in this module ever holds more than one map guard at a time.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use dashmap::DashMap;
@@ -95,8 +95,7 @@ const MAX_RECENT_COMPLETED: usize = 10;
 static WORKERS: LazyLock<DashMap<String, WorkerState>> = LazyLock::new(DashMap::new);
 
 /// Monotonic sequence handed out to completed entries (oldest = smallest).
-static COMPLETED_SEQ: LazyLock<std::sync::atomic::AtomicU64> =
-    LazyLock::new(|| AtomicU64::new(0));
+static COMPLETED_SEQ: LazyLock<std::sync::atomic::AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
 
 #[cfg(test)]
 pub static TEST_WORKERS_MUTEX: std::sync::LazyLock<std::sync::Mutex<()>> =
@@ -345,8 +344,7 @@ pub fn get_active_subtasks_str() -> String {
         .map(|e| (e.key().clone(), e.value().clone()))
         .collect();
     completed.sort_by(|a, b| {
-        b.1
-            .completed_seq
+        b.1.completed_seq
             .unwrap_or(u64::MAX)
             .cmp(&a.1.completed_seq.unwrap_or(u64::MAX))
     });
@@ -465,12 +463,7 @@ pub fn get_active_subtask_by_id(task_id: &str) -> Option<(String, String)> {
         .collect();
     active.sort_by(|a, b| a.0.cmp(&b.0));
     let (_key, state) = active.iter().find(|(k, s)| {
-        s.info
-            .task_id
-            .as_deref()
-            .map(str::to_lowercase)
-            .as_deref()
-            == Some(tid.as_str())
+        s.info.task_id.as_deref().map(str::to_lowercase).as_deref() == Some(tid.as_str())
             || k.to_lowercase().contains(&tid)
             || s.info.prompt.to_lowercase().contains(&tid)
     })?;
@@ -739,10 +732,7 @@ mod tests {
         // ring settles at or below the cap (it must, given every drop evicts).
         let mut settled = false;
         for _ in 0..100 {
-            let completed_count = WORKERS
-                .iter()
-                .filter(|e| !e.value().is_active())
-                .count();
+            let completed_count = WORKERS.iter().filter(|e| !e.value().is_active()).count();
             if completed_count <= MAX_RECENT_COMPLETED {
                 settled = true;
                 break;

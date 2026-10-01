@@ -291,7 +291,11 @@ impl TuiRenderer {
         for (r, line) in self.textarea.lines().iter().enumerate() {
             if r == row {
                 let char_idx = col.min(line.chars().count());
-                byte_idx += line.chars().take(char_idx).map(|c| c.len_utf8()).sum::<usize>();
+                byte_idx += line
+                    .chars()
+                    .take(char_idx)
+                    .map(|c| c.len_utf8())
+                    .sum::<usize>();
                 break;
             } else {
                 byte_idx += line.len() + 1;
@@ -347,7 +351,10 @@ impl TuiRenderer {
         }
         self.sanitize_cursor();
         self.ensure_textarea_in_sync();
-        self.textarea.input(crossterm::event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        self.textarea.input(crossterm::event::KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::NONE,
+        ));
     }
 
     /// Move the input cursor one grapheme to the right (F1).
@@ -360,7 +367,10 @@ impl TuiRenderer {
         }
         self.sanitize_cursor();
         self.ensure_textarea_in_sync();
-        self.textarea.input(crossterm::event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        self.textarea.input(crossterm::event::KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        ));
     }
 
     /// Delete the grapheme immediately before the cursor (Backspace, F1).
@@ -416,7 +426,8 @@ impl TuiRenderer {
         self.cursor = byte_offset.min(self.input_text.len());
         self.sanitize_cursor();
         self.ensure_textarea_in_sync();
-        self.textarea.move_cursor(ratatui_textarea::CursorMove::Jump(0, self.cursor as u16));
+        self.textarea
+            .move_cursor(ratatui_textarea::CursorMove::Jump(0, self.cursor as u16));
     }
 
     /// Clamp all scroll offsets to their recomputed maxima (F6).
