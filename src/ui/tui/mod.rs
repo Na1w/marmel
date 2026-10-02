@@ -56,6 +56,10 @@ pub struct TuiRenderer {
     pub(crate) cursor: usize,
     /// Whether the user is in the "confirm abort" state.
     pub(crate) confirm_abort: bool,
+    /// Timestamp when confirm-abort was armed. Abort expires after 3 seconds.
+    pub(crate) abort_armed_at: Option<std::time::Instant>,
+    /// Whether UI state has changed and needs a flush/redraw.
+    pub(crate) dirty: bool,
     /// Shared abort / user-exit flags (trait-default abort surface).
     pub(crate) input_state: crate::ui::InputState,
     /// Frame counter for animations (e.g. status spinner).
@@ -113,6 +117,10 @@ pub struct TuiRenderer {
     pub(crate) cached_message_lines: std::cell::RefCell<Vec<usize>>,
     /// Sum of all cached per-message line counts.
     pub(crate) cached_total_message_lines: std::cell::Cell<usize>,
+    /// Pre-rendered styled lines for each message in `messages` to avoid re-parsing markdown/ANSI on every frame.
+    pub(crate) cached_rendered_messages: std::cell::RefCell<Vec<Vec<ratatui::text::Line<'static>>>>,
+    /// `show_thought` value used for the pre-rendered message cache.
+    pub(crate) cached_rendered_show_thought: std::cell::Cell<bool>,
     /// Whether subagent details auto-scroll. Defaults to `false`.
     pub(crate) subagent_autoscroll: bool,
 
@@ -174,6 +182,8 @@ impl TuiRenderer {
             input_text: String::new(),
             cursor: 0,
             confirm_abort: false,
+            abort_armed_at: None,
+            dirty: true,
             input_state: crate::ui::InputState::default(),
             frame_counter: 0,
             status_line: "Ready".to_string(),
@@ -206,6 +216,8 @@ impl TuiRenderer {
             cached_show_thought: std::cell::Cell::new(false),
             cached_message_lines: std::cell::RefCell::new(Vec::new()),
             cached_total_message_lines: std::cell::Cell::new(0),
+            cached_rendered_messages: std::cell::RefCell::new(Vec::new()),
+            cached_rendered_show_thought: std::cell::Cell::new(false),
             subagent_autoscroll: true,
 
             rx,
@@ -329,17 +341,47 @@ impl TuiRenderer {
         res
     }
 
-    /// Drain pending terminal events and apply the 25 ms render-throttle
-    /// flush: force a full re-render when events were handled, otherwise only
-    /// flush if the throttle window has elapsed. `blocking` mirrors
-    /// [`Self::handle_events`]: `false` for the non-blocking poll path,
-    /// `true` for the blocking `read_input` loop.
+    /// Check whether abort is actively armed and within the 3-second confirmation window.
+    pub(crate) fn is_abort_armed(&self) -> bool {
+        self.confirm_abort
+            && self
+                .abort_armed_at
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(3))
+    }
+
+    /// Drain pending terminal events and apply render-throttling:
+    /// - Force a full re-render when terminal events were handled.
+    /// - When state is dirty (new events, tokens, status updates), flush up to 40 FPS (25 ms).
+    /// - When an animated spinner is active, flush at 8 FPS (125 ms).
+    /// - When completely idle and clean, do NOT re-render (0% CPU idle).
     pub(crate) fn drain_and_throttle_flush(&mut self, blocking: bool) {
         let handled = self.handle_events(blocking);
         if handled {
+            self.dirty = false;
             let _ = self.force_flush();
-        } else if self.last_render.elapsed() >= Duration::from_millis(25) {
-            let _ = self.flush();
+        } else {
+            let active_spinner = self.subagents.iter().any(|s| s.is_active)
+                || [
+                    "Running",
+                    "Delegating",
+                    "calling backend",
+                    "calling model",
+                    "Starting",
+                    "streaming",
+                    "thinking",
+                    "Arbitrating",
+                ]
+                .iter()
+                .any(|k| self.status_line.contains(k));
+
+            if self.dirty {
+                if self.last_render.elapsed() >= Duration::from_millis(25) {
+                    self.dirty = false;
+                    let _ = self.flush();
+                }
+            } else if active_spinner && self.last_render.elapsed() >= Duration::from_millis(125) {
+                let _ = self.flush();
+            }
         }
     }
 }
@@ -387,6 +429,7 @@ impl Renderer for TuiRenderer {
     }
 
     fn on_event(&mut self, event: &Event) {
+        self.dirty = true;
         match event {
             Event::TokensIn(count) => {
                 self.orchestrator_context_tokens = *count;
@@ -587,7 +630,9 @@ impl Renderer for TuiRenderer {
                     let remaining = std::mem::take(&mut self.steer_sentence_buffer);
                     self.append_steer_sentence(remaining.trim());
                 }
-                self.status_line = text.lines().next().unwrap_or("").to_string();
+                if !self.is_abort_armed() {
+                    self.status_line = text.lines().next().unwrap_or("").to_string();
+                }
                 let is_waiting = self.status_line.contains("Running")
                     || self.status_line.contains("thinking")
                     || self.status_line.contains("calling backend")
@@ -892,6 +937,8 @@ impl Renderer for TuiRenderer {
     fn request_abort(&mut self) {
         self.input_state.aborted = true;
         self.confirm_abort = false;
+        self.abort_armed_at = None;
+        self.dirty = true;
         crate::orchestrator::cancel_all();
     }
 
@@ -899,7 +946,9 @@ impl Renderer for TuiRenderer {
         self.input_state.aborted = true;
         self.input_state.user_exit = true;
         self.confirm_abort = false;
+        self.abort_armed_at = None;
         self.status_line = "Aborted by user.".to_string();
+        self.dirty = true;
         crate::orchestrator::cancel_all();
     }
 
@@ -907,6 +956,8 @@ impl Renderer for TuiRenderer {
         self.input_state.aborted = false;
         self.input_state.user_exit = false;
         self.confirm_abort = false;
+        self.abort_armed_at = None;
+        self.dirty = true;
         crate::orchestrator::reset_cancellation();
     }
 

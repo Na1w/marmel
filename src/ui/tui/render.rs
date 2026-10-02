@@ -69,6 +69,118 @@ impl TuiRenderer {
             let total = self.cached_total_message_lines.get().saturating_sub(old) + new_lines;
             self.cached_total_message_lines.set(total);
         }
+        let mut cached_rendered = self.cached_rendered_messages.borrow_mut();
+        if !cached_rendered.is_empty() {
+            cached_rendered.pop();
+        }
+    }
+
+    /// Render a single message into styled lines.
+    pub(crate) fn render_single_message(&self, msg: &str) -> Vec<Line<'static>> {
+        let mut chat_lines = Vec::new();
+        let (msg_style, has_special_style) = message_style(msg);
+        if !has_special_style && msg.contains("```") {
+            let (thought_opt, content) = extract_thought_and_content(msg);
+            if self.show_thought
+                && let Some(t) = thought_opt
+            {
+                for line in t.lines() {
+                    let cleaned = format_terminal_math(line.trim());
+                    if !cleaned.is_empty() {
+                        chat_lines.push(Line::from(Span::styled(
+                            cleaned,
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        )));
+                    }
+                }
+            }
+            if !content.trim().is_empty() {
+                chat_lines.extend(render_markdown_lines(&content));
+            }
+            return chat_lines;
+        }
+
+        let mut in_think = false;
+        for raw_line in msg.lines() {
+            let line = raw_line.replace('\t', "    ");
+            let segments = parse_line_segments(&line, &mut in_think);
+            for seg in segments {
+                match seg {
+                    LineSegment::Thought(t) => {
+                        if !self.show_thought {
+                            continue;
+                        }
+                        let trimmed = t.trim();
+                        if trimmed.is_empty() {
+                            chat_lines.push(Line::from(""));
+                            continue;
+                        }
+                        let cleaned = format_terminal_math(trimmed);
+                        chat_lines.push(Line::from(Span::styled(
+                            cleaned,
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        )));
+                    }
+                    LineSegment::Content(c) => {
+                        let trimmed = c.trim();
+                        if trimmed.is_empty() {
+                            chat_lines.push(Line::from(""));
+                            continue;
+                        }
+                        let cleaned = format_terminal_math(trimmed);
+                        if has_special_style {
+                            if cleaned.contains('\x1b') {
+                                chat_lines.extend(parse_ansi_lines(&cleaned));
+                            } else {
+                                chat_lines.push(Line::from(Span::styled(cleaned, msg_style)));
+                            }
+                        } else if trimmed.starts_with("[Tool Call] ")
+                            || trimmed.starts_with("[Tool Result] ")
+                        {
+                            if cleaned.contains('\x1b') {
+                                chat_lines.extend(parse_ansi_lines(&cleaned));
+                            } else {
+                                chat_lines.push(Line::from(Span::styled(
+                                    cleaned,
+                                    Style::default().fg(Color::Magenta),
+                                )));
+                            }
+                        } else if cleaned.contains('\x1b') {
+                            chat_lines.extend(parse_ansi_lines(&cleaned));
+                        } else {
+                            // Orchestrator / Model content: WHITE
+                            chat_lines.push(Line::from(Span::styled(
+                                cleaned,
+                                Style::default().fg(Color::White),
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        chat_lines
+    }
+
+    /// Ensure the pre-rendered message cache is up to date for current `messages` and `show_thought`.
+    pub(crate) fn ensure_rendered_message_cache(&self) {
+        let cached_st = self.cached_rendered_show_thought.get();
+        let mut cached = self.cached_rendered_messages.borrow_mut();
+        if cached_st != self.show_thought {
+            self.cached_rendered_show_thought.set(self.show_thought);
+            cached.clear();
+        }
+        if cached.len() < self.messages.len() {
+            let start = cached.len();
+            for msg in &self.messages[start..] {
+                cached.push(self.render_single_message(msg));
+            }
+        } else if cached.len() > self.messages.len() {
+            cached.truncate(self.messages.len());
+        }
     }
 
     /// Estimate the total wrapped line count of the chat transcript at `width`
@@ -323,90 +435,11 @@ impl TuiRenderer {
         self.chat_height.set(chat_h);
 
         let mut chat_lines = Vec::new();
-        for msg in &self.messages {
-            let (msg_style, has_special_style) = message_style(msg);
-            if !has_special_style && msg.contains("```") {
-                let (thought_opt, content) = extract_thought_and_content(msg);
-                if self.show_thought
-                    && let Some(t) = thought_opt
-                {
-                    for line in t.lines() {
-                        let cleaned = format_terminal_math(line.trim());
-                        if !cleaned.is_empty() {
-                            chat_lines.push(Line::from(Span::styled(
-                                cleaned,
-                                Style::default()
-                                    .fg(Color::DarkGray)
-                                    .add_modifier(Modifier::ITALIC),
-                            )));
-                        }
-                    }
-                }
-                if !content.trim().is_empty() {
-                    chat_lines.extend(render_markdown_lines(&content));
-                }
-                continue;
-            }
-
-            let mut in_think = false;
-            for raw_line in msg.lines() {
-                let line = raw_line.replace('\t', "    ");
-                let segments = parse_line_segments(&line, &mut in_think);
-                for seg in segments {
-                    match seg {
-                        LineSegment::Thought(t) => {
-                            if !self.show_thought {
-                                continue;
-                            }
-                            let trimmed = t.trim();
-                            if trimmed.is_empty() {
-                                chat_lines.push(Line::from(""));
-                                continue;
-                            }
-                            let cleaned = format_terminal_math(trimmed);
-                            chat_lines.push(Line::from(Span::styled(
-                                cleaned,
-                                Style::default()
-                                    .fg(Color::DarkGray)
-                                    .add_modifier(Modifier::ITALIC),
-                            )));
-                        }
-                        LineSegment::Content(c) => {
-                            let trimmed = c.trim();
-                            if trimmed.is_empty() {
-                                chat_lines.push(Line::from(""));
-                                continue;
-                            }
-                            let cleaned = format_terminal_math(trimmed);
-                            if has_special_style {
-                                if cleaned.contains('\x1b') {
-                                    chat_lines.extend(parse_ansi_lines(&cleaned));
-                                } else {
-                                    chat_lines.push(Line::from(Span::styled(cleaned, msg_style)));
-                                }
-                            } else if trimmed.starts_with("[Tool Call] ")
-                                || trimmed.starts_with("[Tool Result] ")
-                            {
-                                if cleaned.contains('\x1b') {
-                                    chat_lines.extend(parse_ansi_lines(&cleaned));
-                                } else {
-                                    chat_lines.push(Line::from(Span::styled(
-                                        cleaned,
-                                        Style::default().fg(Color::Magenta),
-                                    )));
-                                }
-                            } else if cleaned.contains('\x1b') {
-                                chat_lines.extend(parse_ansi_lines(&cleaned));
-                            } else {
-                                // Orchestrator / Model content: WHITE
-                                chat_lines.push(Line::from(Span::styled(
-                                    cleaned,
-                                    Style::default().fg(Color::White),
-                                )));
-                            }
-                        }
-                    }
-                }
+        self.ensure_rendered_message_cache();
+        {
+            let cached = self.cached_rendered_messages.borrow();
+            for msg_lines in &*cached {
+                chat_lines.extend(msg_lines.iter().cloned());
             }
         }
 
@@ -486,16 +519,7 @@ impl TuiRenderer {
             }
         }
 
-        let mut total_chat_lines = 0;
-        for line in &chat_lines {
-            let line_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
-            if line_len == 0 {
-                total_chat_lines += 1;
-            } else {
-                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                total_chat_lines += wrapped_lines(&text, chat_w).max(1);
-            }
-        }
+        let total_chat_lines = self.estimated_chat_lines(chat_w);
 
         let max_scroll = total_chat_lines.saturating_sub(chat_h);
         if self.chat_auto_scroll || (self.chat_scroll as usize) > max_scroll {
@@ -880,16 +904,7 @@ impl TuiRenderer {
         self.subagent_width.set(details_w);
         self.subagent_height.set(details_h);
 
-        let mut total_detail_lines = 0;
-        for line in &detail_lines {
-            let line_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
-            if line_len == 0 {
-                total_detail_lines += 1;
-            } else {
-                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                total_detail_lines += wrapped_lines(&text, details_w).max(1);
-            }
-        }
+        let total_detail_lines = self.estimated_subagent_lines(details_w);
 
         let max_scroll = total_detail_lines.saturating_sub(details_h);
         if self.subagent_autoscroll || (self.subagent_scroll as usize) > max_scroll {
@@ -1060,7 +1075,7 @@ impl TuiRenderer {
         let tokens_in = self.tokens_in.max(global_in);
         let tokens_out = self.tokens_out.max(global_out);
         let tokens_str = Self::format_token_counts(tokens_in, tokens_out);
-        let (status_text, status_style) = if self.confirm_abort {
+        let (status_text, status_style) = if self.is_abort_armed() {
             (
                 " ⚠ [ABORT ARMED] Press ESC or Ctrl+C again to abort | Any other key to cancel "
                     .to_string(),
@@ -1126,7 +1141,7 @@ impl TuiRenderer {
     pub(crate) fn render_input(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         self.ensure_textarea_in_sync();
 
-        let border_color = if self.confirm_abort {
+        let border_color = if self.is_abort_armed() {
             Color::Red
         } else {
             Color::Cyan

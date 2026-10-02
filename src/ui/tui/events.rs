@@ -42,16 +42,20 @@ impl TuiRenderer {
                             }
                         }
                         KeyCode::Esc => {
-                            // Esc arms confirm-abort (or aborts if already armed).
-                            if self.confirm_abort {
+                            // Esc arms confirm-abort (or aborts if already armed within 3s).
+                            if self.is_abort_armed() {
+                                self.confirm_abort = false;
+                                self.abort_armed_at = None;
                                 Renderer::request_user_exit(self);
                             } else {
                                 if self.focused_panel != FocusedPanel::Chat {
                                     self.focused_panel = FocusedPanel::Chat;
                                 }
                                 self.confirm_abort = true;
+                                self.abort_armed_at = Some(std::time::Instant::now());
                                 self.status_line =
                                     "Abort armed. Press ESC again to abort.".to_string();
+                                self.dirty = true;
                             }
                         }
                         KeyCode::Tab => self.cycle_focus(),
@@ -152,19 +156,25 @@ impl TuiRenderer {
                             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                             if ctrl && (c == 'c' || c == 'C') {
                                 // Ctrl+C arms/triggers confirm-abort.
-                                if self.confirm_abort {
+                                if self.is_abort_armed() {
+                                    self.confirm_abort = false;
+                                    self.abort_armed_at = None;
                                     Renderer::request_user_exit(self);
                                 } else {
                                     self.confirm_abort = true;
+                                    self.abort_armed_at = Some(std::time::Instant::now());
                                     self.status_line =
                                         "Abort armed. Press Ctrl+C or ESC again to abort."
                                             .to_string();
+                                    self.dirty = true;
                                 }
                             } else if ctrl && (c == 'd' || c == 'D') {
                                 // Ctrl+D is treated as abort.
+                                self.abort_armed_at = None;
                                 Renderer::request_user_exit(self);
                             } else if ctrl && (c == 'p' || c == 'P') {
                                 self.confirm_abort = false;
+                                self.abort_armed_at = None;
                                 // F12: single Ctrl+P handler (toggle plan panel).
                                 self.show_plan_panel = !self.show_plan_panel;
                                 if !self.show_plan_panel && self.focused_panel == FocusedPanel::Plan
@@ -173,6 +183,7 @@ impl TuiRenderer {
                                 }
                             } else if ctrl && (c == 'a' || c == 'A') {
                                 self.confirm_abort = false;
+                                self.abort_armed_at = None;
                                 // F12: single Ctrl+A handler (toggle subagents).
                                 self.toggle_subagent_panel();
                                 if !self.show_subagent_panel
@@ -182,6 +193,7 @@ impl TuiRenderer {
                                 }
                             } else if ctrl && (c == 't' || c == 'T') {
                                 self.confirm_abort = false;
+                                self.abort_armed_at = None;
                                 self.show_thought = !self.show_thought;
                                 let state = if self.show_thought { "ON" } else { "OFF" };
                                 self.messages
@@ -201,6 +213,7 @@ impl TuiRenderer {
                                 self.sync_input_from_textarea();
                             } else if self.focused_panel == FocusedPanel::Chat && !c.is_control() {
                                 self.confirm_abort = false;
+                                self.abort_armed_at = None;
                                 self.ensure_textarea_in_sync();
                                 self.textarea.input(key);
                                 self.sync_input_from_textarea();

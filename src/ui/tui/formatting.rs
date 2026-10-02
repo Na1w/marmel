@@ -134,10 +134,11 @@ pub fn strip_think_tags(line: &str) -> String {
 /// Format LaTeX math expressions ($$...$$, $...$, and common math symbols)
 /// into clean, readable terminal Unicode text.
 pub fn format_terminal_math(text: &str) -> String {
-    let mut s = text.to_string();
-    if !s.contains('$') && !s.contains('\\') && !s.contains('^') && !s.contains('_') {
-        return s;
+    // Fast path: if there are no math delimiters, return unmodified text immediately.
+    if !text.contains('$') {
+        return text.to_string();
     }
+    let mut s = text.to_string();
 
     // Replace display math $$...$$
     while let Some(start) = s.find("$$") {
@@ -185,10 +186,13 @@ pub fn format_terminal_math(text: &str) -> String {
         }
     }
 
-    format_math_expr(&s)
+    s
 }
 
 pub fn format_math_expr(expr: &str) -> String {
+    if !expr.contains('\\') && !expr.contains('^') && !expr.contains('_') && !expr.contains('|') {
+        return expr.to_string();
+    }
     let mut out = expr
         .replace(r"\|", "|")
         .replace(r"\cdot", "·")

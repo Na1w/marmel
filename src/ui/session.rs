@@ -339,7 +339,10 @@ pub async fn run_session(
         let mut nudge_count = 0;
         loop {
             turn_count += 1;
-            if turn_count > crate::manager::r#loop::MAX_TURNS || renderer.aborted() {
+            if turn_count > crate::manager::r#loop::MAX_TURNS
+                || renderer.aborted()
+                || renderer.user_exit_requested()
+            {
                 break;
             }
 
@@ -417,7 +420,10 @@ pub async fn run_session(
                 }
             };
 
-            if renderer.aborted() || crate::orchestrator::is_globally_cancelled() {
+            if renderer.aborted()
+                || renderer.user_exit_requested()
+                || crate::orchestrator::is_globally_cancelled()
+            {
                 break;
             }
 
@@ -637,6 +643,9 @@ pub async fn run_session(
                 renderer.flush()?;
 
                 for mut handle in handles {
+                    if renderer.user_exit_requested() {
+                        break;
+                    }
                     let res = loop {
                         let mut had_events = false;
                         while let Ok(msg) = status_rx.try_recv() {
@@ -664,6 +673,17 @@ pub async fn run_session(
                             &mut subagents,
                             Some(&mut ui_transcript),
                         );
+                        if renderer.user_exit_requested() {
+                            crate::orchestrator::cancel_all();
+                            break (
+                                String::new(),
+                                None,
+                                None,
+                                Err(crate::harness::ToolError::Execution(anyhow::anyhow!(
+                                    "aborted by user"
+                                ))),
+                            );
+                        }
                         if renderer.aborted()
                             || steer_abort_requested
                             || crate::orchestrator::is_globally_cancelled()
@@ -738,6 +758,17 @@ pub async fn run_session(
                                         );
                                     }
                                 }
+                                if renderer.user_exit_requested() {
+                                    crate::orchestrator::cancel_all();
+                                    break (
+                                        String::new(),
+                                        None,
+                                        None,
+                                        Err(crate::harness::ToolError::Execution(anyhow::anyhow!(
+                                            "aborted by user"
+                                        ))),
+                                    );
+                                }
                             }
                         }
                     };
@@ -788,10 +819,13 @@ pub async fn run_session(
                         content: result_content,
                     });
                     let _ = ctx.save_transcript(&transcript_path);
+                    if renderer.user_exit_requested() {
+                        break;
+                    }
                 }
             } else {
                 for call in &tool_calls {
-                    if renderer.aborted() {
+                    if renderer.aborted() || renderer.user_exit_requested() {
                         break;
                     }
 
@@ -989,6 +1023,12 @@ pub async fn run_session(
                             &mut subagents,
                             Some(&mut ui_transcript),
                         );
+                        if renderer.user_exit_requested() {
+                            crate::orchestrator::cancel_all();
+                            break Err(crate::harness::ToolError::Execution(anyhow::anyhow!(
+                                "aborted by user"
+                            )));
+                        }
                         if renderer.aborted()
                             || steer_abort_requested
                             || crate::orchestrator::is_globally_cancelled()
@@ -1054,6 +1094,12 @@ pub async fn run_session(
                                         );
                                     }
                                 }
+                                if renderer.user_exit_requested() {
+                                    crate::orchestrator::cancel_all();
+                                    break Err(crate::harness::ToolError::Execution(
+                                        anyhow::anyhow!("aborted by user"),
+                                    ));
+                                }
                             }
                         }
                     };
@@ -1115,7 +1161,14 @@ pub async fn run_session(
                         content: result_content,
                     });
                     let _ = ctx.save_transcript(&transcript_path);
+                    if renderer.user_exit_requested() {
+                        break;
+                    }
                 }
+            }
+
+            if renderer.user_exit_requested() {
+                break;
             }
 
             if !tool_calls.is_empty() {
