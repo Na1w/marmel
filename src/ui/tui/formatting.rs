@@ -134,234 +134,380 @@ pub fn strip_think_tags(line: &str) -> String {
 /// Format LaTeX math expressions ($$...$$, $...$, and common math symbols)
 /// into clean, readable terminal Unicode text.
 pub fn format_terminal_math(text: &str) -> String {
-    // Fast path: if there are no math delimiters, return unmodified text immediately.
-    if !text.contains('$') {
+    // Fast path: if there are no math delimiters or symbols, return unmodified text immediately.
+    if !text.contains('$') && !text.contains('\\') && !text.contains('^') && !text.contains('_') {
         return text.to_string();
     }
-    let mut s = text.to_string();
 
-    // Replace display math $$...$$
-    while let Some(start) = s.find("$$") {
-        if let Some(end_rel) = s[start + 2..].find("$$") {
-            let end = start + 2 + end_rel;
-            let inner = &s[start + 2..end];
-            let formatted = format_math_expr(inner.trim());
-            s.replace_range(start..end + 2, &format!("  {formatted}"));
-        } else {
-            let inner = &s[start + 2..];
-            let formatted = format_math_expr(inner.trim());
-            s.replace_range(start.., &format!("  {formatted}"));
-            break;
-        }
-    }
-
-    // Replace inline math $...$
+    let mut result = String::with_capacity(text.len());
     let mut i = 0;
-    while i < s.len() {
-        if let Some(start_rel) = s[i..].find('$') {
-            let start = i + start_rel;
-            if start + 1 < s.len() && s.as_bytes()[start + 1] == b'$' {
-                i = start + 2;
-                continue;
-            }
-            if let Some(end_rel) = s[start + 1..].find('$') {
-                let end = start + 1 + end_rel;
-                let inner = &s[start + 1..end];
-                if !inner.trim().is_empty()
-                    && !inner
-                        .chars()
-                        .all(|c| c.is_ascii_digit() || c == '.' || c == ',')
-                {
-                    let formatted = format_math_expr(inner);
-                    s.replace_range(start..end + 1, &formatted);
-                    i = start + formatted.len();
-                    continue;
+    let bytes = text.as_bytes();
+
+    while i < text.len() {
+        if bytes[i] == b'$' {
+            if i + 1 < text.len() && bytes[i + 1] == b'$' {
+                // Display math: $$...$$
+                let start = i + 2;
+                if let Some(end_rel) = text[start..].find("$$") {
+                    let end = start + end_rel;
+                    let inner = &text[start..end];
+                    let formatted = format_math_expr(inner.trim());
+                    result.push_str("  ");
+                    result.push_str(&formatted);
+                    i = end + 2;
+                } else {
+                    let inner = &text[start..];
+                    let formatted = format_math_expr(inner.trim());
+                    result.push_str("  ");
+                    result.push_str(&formatted);
+                    break;
                 }
-                i = end + 1;
             } else {
-                break;
+                // Inline math: $...$
+                let start = i + 1;
+                if let Some(end_rel) = text[start..].find('$') {
+                    let end = start + end_rel;
+                    let inner = &text[start..end];
+                    if !inner.trim().is_empty()
+                        && !inner
+                            .chars()
+                            .all(|c| c.is_ascii_digit() || c == '.' || c == ',')
+                    {
+                        let formatted = format_math_expr(inner);
+                        result.push_str(&formatted);
+                        i = end + 1;
+                        continue;
+                    }
+                    // Currency or numbers: keep verbatim $inner$
+                    result.push('$');
+                    result.push_str(inner);
+                    result.push('$');
+                    i = end + 1;
+                } else {
+                    result.push('$');
+                    i += 1;
+                }
             }
         } else {
-            break;
+            let next_dollar = text[i..].find('$').map(|rel| i + rel).unwrap_or(text.len());
+            let chunk = &text[i..next_dollar];
+            if chunk.contains('\\') || chunk.contains('^') || chunk.contains('_') {
+                result.push_str(&format_math_expr(chunk));
+            } else {
+                result.push_str(chunk);
+            }
+            i = next_dollar;
         }
     }
 
-    s
+    result
 }
 
 pub fn format_math_expr(expr: &str) -> String {
     if !expr.contains('\\') && !expr.contains('^') && !expr.contains('_') && !expr.contains('|') {
         return expr.to_string();
     }
-    let mut out = expr
-        .replace(r"\|", "|")
-        .replace(r"\cdot", "·")
-        .replace(r"\times", "×")
-        .replace(r"\pm", "±")
-        .replace(r"\mp", "∓")
-        .replace(r"\leq", "≤")
-        .replace(r"\le", "≤")
-        .replace(r"\geq", "≥")
-        .replace(r"\ge", "≥")
-        .replace(r"\neq", "≠")
-        .replace(r"\ne", "≠")
-        .replace(r"\approx", "≈")
-        .replace(r"\to", "→")
-        .replace(r"\rightarrow", "→")
-        .replace(r"\leftarrow", "←")
-        .replace(r"\dots", "…")
-        .replace(r"\cdots", "…")
-        .replace(r"\quad", "  ")
-        .replace(r"\qquad", "    ")
-        .replace(r"\alpha", "α")
-        .replace(r"\beta", "β")
-        .replace(r"\gamma", "γ")
-        .replace(r"\theta", "θ")
-        .replace(r"\lambda", "λ")
-        .replace(r"\mu", "μ")
-        .replace(r"\pi", "π")
-        .replace(r"\sigma", "σ")
-        .replace(r"\omega", "ω")
-        .replace(r"\Delta", "Δ")
-        .replace(r"\sum", "∑")
-        .replace(r"\prod", "∏")
-        .replace(r"\int", "∫")
-        .replace(r"\infty", "∞");
 
-    // Replace superscripts
-    out = out
-        .replace("^2", "²")
-        .replace("^3", "³")
-        .replace("^0", "⁰")
-        .replace("^1", "¹")
-        .replace("^4", "⁴")
-        .replace("^5", "⁵")
-        .replace("^6", "⁶")
-        .replace("^7", "⁷")
-        .replace("^8", "⁸")
-        .replace("^9", "⁹")
-        .replace("^{+}", "⁺")
-        .replace("^{-}", "⁻")
-        .replace("^{2}", "²")
-        .replace("^{3}", "³")
-        .replace("^{0}", "⁰")
-        .replace("^{1}", "¹")
-        .replace("^{n}", "ⁿ")
-        .replace("^{t}", "ᵗ")
-        .replace("^{T}", "ᵀ")
-        .replace("^n", "ⁿ")
-        .replace("^t", "ᵗ")
-        .replace("^T", "ᵀ");
+    let mut out = String::with_capacity(expr.len());
+    let mut cursor = 0;
 
-    // Replace subscripts
-    out = out
-        .replace("_{0}", "₀")
-        .replace("_{1}", "₁")
-        .replace("_{2}", "₂")
-        .replace("_{3}", "₃")
-        .replace("_{4}", "₄")
-        .replace("_{5}", "₅")
-        .replace("_{6}", "₆")
-        .replace("_{7}", "₇")
-        .replace("_{8}", "₈")
-        .replace("_{9}", "₉")
-        .replace("_{i}", "ᵢ")
-        .replace("_{n}", "ₙ")
-        .replace("_{x}", "ₓ")
-        .replace("_{y}", "ᵧ")
-        .replace("_{z}", "₂")
-        .replace("_0", "₀")
-        .replace("_1", "₁")
-        .replace("_2", "₂")
-        .replace("_3", "₃")
-        .replace("_4", "₄")
-        .replace("_5", "₅")
-        .replace("_6", "₆")
-        .replace("_7", "₇")
-        .replace("_8", "₈")
-        .replace("_9", "₉")
-        .replace("_i", "ᵢ")
-        .replace("_n", "ₙ")
-        .replace("_x", "ₓ")
-        .replace("_y", "ᵧ");
+    while cursor < expr.len() {
+        let rest = &expr[cursor..];
+        let first_byte = rest.as_bytes()[0];
 
-    while let Some(start) = out.find(r"\text{") {
-        if let Some(end_rel) = out[start + 6..].find('}') {
-            let end = start + 6 + end_rel;
-            let inner = out[start + 6..end].to_string();
-            out.replace_range(start..end + 1, &inner);
-        } else {
-            break;
-        }
-    }
+        if first_byte == b'\\' {
+            if rest.starts_with(r"\|") {
+                out.push('|');
+                cursor += 2;
+                continue;
+            }
+            if let Some(stripped) = rest.strip_prefix(r"\text{")
+                && let Some(end_rel) = stripped.find('}')
+            {
+                out.push_str(&stripped[..end_rel]);
+                cursor += 6 + end_rel + 1;
+                continue;
+            }
+            if let Some(stripped) = rest.strip_prefix(r"\sqrt{")
+                && let Some(end_rel) = stripped.find('}')
+            {
+                let inner = &stripped[..end_rel];
+                out.push('√');
+                out.push('(');
+                out.push_str(&format_math_expr(inner));
+                out.push(')');
+                cursor += 6 + end_rel + 1;
+                continue;
+            }
+            if let Some(stripped) = rest.strip_prefix(r"\frac{")
+                && let Some(mid_rel) = stripped.find("}{")
+                && let Some(end_rel) = stripped[mid_rel + 2..].find('}')
+            {
+                let num = &stripped[..mid_rel];
+                let den = &stripped[mid_rel + 2..mid_rel + 2 + end_rel];
+                out.push('(');
+                out.push_str(&format_math_expr(num));
+                out.push_str(")/(");
+                out.push_str(&format_math_expr(den));
+                out.push(')');
+                cursor += 6 + mid_rel + 2 + end_rel + 1;
+                continue;
+            }
 
-    while let Some(start) = out.find(r"\sqrt{") {
-        if let Some(end_rel) = out[start + 6..].find('}') {
-            let end = start + 6 + end_rel;
-            let inner = out[start + 6..end].to_string();
-            out.replace_range(start..end + 1, &format!("√({inner})"));
-        } else {
-            break;
-        }
-    }
+            const SYMBOLS: &[(&str, &str)] = &[
+                (r"\rightarrow", "→"),
+                (r"\leftarrow", "←"),
+                (r"\approx", "≈"),
+                (r"\cdots", "…"),
+                (r"\qquad", "    "),
+                (r"\lambda", "λ"),
+                (r"\Delta", "Δ"),
+                (r"\infty", "∞"),
+                (r"\alpha", "α"),
+                (r"\gamma", "γ"),
+                (r"\theta", "θ"),
+                (r"\sigma", "σ"),
+                (r"\omega", "ω"),
+                (r"\times", "×"),
+                (r"\cdot", "·"),
+                (r"\dots", "…"),
+                (r"\quad", "  "),
+                (r"\beta", "β"),
+                (r"\prod", "∏"),
+                (r"\leq", "≤"),
+                (r"\geq", "≥"),
+                (r"\neq", "≠"),
+                (r"\sum", "∑"),
+                (r"\int", "∫"),
+                (r"\pm", "±"),
+                (r"\mp", "∓"),
+                (r"\le", "≤"),
+                (r"\ge", "≥"),
+                (r"\ne", "≠"),
+                (r"\to", "→"),
+                (r"\mu", "μ"),
+                (r"\pi", "π"),
+            ];
 
-    while let Some(start) = out.find(r"\frac{") {
-        if let Some(mid_rel) = out[start + 6..].find("}{") {
-            let mid = start + 6 + mid_rel;
-            if let Some(end_rel) = out[mid + 2..].find('}') {
-                let end = mid + 2 + end_rel;
-                let num = out[start + 6..mid].to_string();
-                let den = out[mid + 2..end].to_string();
-                out.replace_range(start..end + 1, &format!("({num})/({den})"));
+            let mut matched = false;
+            for &(cmd, repl) in SYMBOLS {
+                if rest.starts_with(cmd) {
+                    out.push_str(repl);
+                    cursor += cmd.len();
+                    matched = true;
+                    break;
+                }
+            }
+            if matched {
+                continue;
+            }
+        } else if first_byte == b'^' {
+            const SUPERSCRIPTS: &[(&str, &str)] = &[
+                ("^{+}", "⁺"),
+                ("^{-}", "⁻"),
+                ("^{0}", "⁰"),
+                ("^{1}", "¹"),
+                ("^{2}", "²"),
+                ("^{3}", "³"),
+                ("^{4}", "⁴"),
+                ("^{5}", "⁵"),
+                ("^{6}", "⁶"),
+                ("^{7}", "⁷"),
+                ("^{8}", "⁸"),
+                ("^{9}", "⁹"),
+                ("^{n}", "ⁿ"),
+                ("^{t}", "ᵗ"),
+                ("^{T}", "ᵀ"),
+                ("^0", "⁰"),
+                ("^1", "¹"),
+                ("^2", "²"),
+                ("^3", "³"),
+                ("^4", "⁴"),
+                ("^5", "⁵"),
+                ("^6", "⁶"),
+                ("^7", "⁷"),
+                ("^8", "⁸"),
+                ("^9", "⁹"),
+                ("^n", "ⁿ"),
+                ("^t", "ᵗ"),
+                ("^T", "ᵀ"),
+            ];
+            let mut matched = false;
+            for &(pattern, repl) in SUPERSCRIPTS {
+                if rest.starts_with(pattern) {
+                    out.push_str(repl);
+                    cursor += pattern.len();
+                    matched = true;
+                    break;
+                }
+            }
+            if matched {
+                continue;
+            }
+        } else if first_byte == b'_' {
+            const SUBSCRIPTS: &[(&str, &str)] = &[
+                ("_{0}", "₀"),
+                ("_{1}", "₁"),
+                ("_{2}", "₂"),
+                ("_{3}", "₃"),
+                ("_{4}", "₄"),
+                ("_{5}", "₅"),
+                ("_{6}", "₆"),
+                ("_{7}", "₇"),
+                ("_{8}", "₈"),
+                ("_{9}", "₉"),
+                ("_{i}", "ᵢ"),
+                ("_{n}", "ₙ"),
+                ("_{x}", "ₓ"),
+                ("_{y}", "ᵧ"),
+                ("_{z}", "₂"),
+                ("_0", "₀"),
+                ("_1", "₁"),
+                ("_2", "₂"),
+                ("_3", "₃"),
+                ("_4", "₄"),
+                ("_5", "₅"),
+                ("_6", "₆"),
+                ("_7", "₇"),
+                ("_8", "₈"),
+                ("_9", "₉"),
+                ("_i", "ᵢ"),
+                ("_n", "ₙ"),
+                ("_x", "ₓ"),
+                ("_y", "ᵧ"),
+            ];
+            let mut matched = false;
+            for &(pattern, repl) in SUBSCRIPTS {
+                if rest.starts_with(pattern) {
+                    out.push_str(repl);
+                    cursor += pattern.len();
+                    matched = true;
+                    break;
+                }
+            }
+            if matched {
                 continue;
             }
         }
-        break;
+
+        let ch = rest.chars().next().unwrap();
+        out.push(ch);
+        cursor += ch.len_utf8();
     }
 
     out
 }
 
-/// Count the wrapped lines a single message occupies at `width`, excluding
-/// think-block lines when `show_thought` is `false` (reference §11.2).
-pub fn count_single_message_lines(msg: &str, width: usize, show_thought: bool) -> usize {
-    let mut n = 0;
+/// Render a single message into styled lines with markdown, thinking tags, and ANSI handling.
+pub fn render_message_lines(msg: &str, show_thought: bool) -> Vec<Line<'static>> {
+    let mut chat_lines = Vec::new();
+    let (msg_style, has_special_style) = message_style(msg);
+    if !has_special_style && msg.contains("```") {
+        let (thought_opt, content) = extract_thought_and_content(msg);
+        if show_thought && let Some(t) = thought_opt {
+            for line in t.lines() {
+                let cleaned = format_terminal_math(line.trim());
+                if !cleaned.is_empty() {
+                    chat_lines.push(Line::from(Span::styled(
+                        cleaned,
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    )));
+                }
+            }
+        }
+        if !content.trim().is_empty() {
+            chat_lines.extend(render_markdown_lines(&content));
+        }
+        return chat_lines;
+    }
+
     let mut in_think = false;
-    for line in msg.lines() {
-        let segments = parse_line_segments(line, &mut in_think);
+    for raw_line in msg.lines() {
+        let line = raw_line.replace('\t', "    ");
+        let segments = parse_line_segments(&line, &mut in_think);
         for seg in segments {
             match seg {
                 LineSegment::Thought(t) => {
                     if !show_thought {
                         continue;
                     }
-                    if t.trim().is_empty() {
-                        n += 1;
-                    } else {
-                        let cleaned = format_terminal_math(t.trim());
-                        n += if cleaned.is_empty() {
-                            1
-                        } else {
-                            wrapped_lines(&cleaned, width)
-                        };
+                    let trimmed = t.trim();
+                    if trimmed.is_empty() {
+                        chat_lines.push(Line::from(""));
+                        continue;
                     }
+                    let cleaned = format_terminal_math(trimmed);
+                    chat_lines.push(Line::from(Span::styled(
+                        cleaned,
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    )));
                 }
                 LineSegment::Content(c) => {
-                    if c.trim().is_empty() {
-                        n += 1;
-                    } else {
-                        let cleaned = format_terminal_math(c.trim());
-                        n += if cleaned.is_empty() {
-                            1
+                    let trimmed = c.trim();
+                    if trimmed.is_empty() {
+                        chat_lines.push(Line::from(""));
+                        continue;
+                    }
+                    let cleaned = format_terminal_math(trimmed);
+                    if has_special_style {
+                        if cleaned.contains('\x1b') {
+                            chat_lines.extend(parse_ansi_lines(&cleaned));
                         } else {
-                            wrapped_lines(&cleaned, width)
-                        };
+                            chat_lines.push(Line::from(Span::styled(cleaned, msg_style)));
+                        }
+                    } else if trimmed.starts_with("[Tool Call] ")
+                        || trimmed.starts_with("[Tool Result] ")
+                    {
+                        if cleaned.contains('\x1b') {
+                            chat_lines.extend(parse_ansi_lines(&cleaned));
+                        } else {
+                            chat_lines.push(Line::from(Span::styled(
+                                cleaned,
+                                Style::default().fg(Color::Magenta),
+                            )));
+                        }
+                    } else if cleaned.contains('\x1b') {
+                        chat_lines.extend(parse_ansi_lines(&cleaned));
+                    } else {
+                        // Orchestrator / Model content: WHITE
+                        chat_lines.push(Line::from(Span::styled(
+                            cleaned,
+                            Style::default().fg(Color::White),
+                        )));
                     }
                 }
             }
         }
     }
-    n
+    chat_lines
+}
+
+/// Count the total wrapped lines occupied by rendered `Line`s at `width`.
+pub fn count_wrapped_rendered_lines(lines: &[Line<'_>], width: usize) -> usize {
+    let mut total = 0;
+    for line in lines {
+        let line_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
+        if line_len == 0 {
+            total += 1;
+        } else if line.spans.len() == 1 {
+            total += wrapped_lines(&line.spans[0].content, width).max(1);
+        } else {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            total += wrapped_lines(&text, width).max(1);
+        }
+    }
+    total
+}
+
+/// Count the wrapped lines a single message occupies at `width`, excluding
+/// think-block lines when `show_thought` is `false` (reference §11.2).
+pub fn count_single_message_lines(msg: &str, width: usize, show_thought: bool) -> usize {
+    let lines = render_message_lines(msg, show_thought);
+    count_wrapped_rendered_lines(&lines, width)
 }
 
 /// Grapheme-aware word-wrap line counter (reference §11.1).

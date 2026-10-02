@@ -267,6 +267,32 @@ fn message_line_caching_matches_reference() {
 }
 
 #[test]
+fn test_chat_line_estimation_matches_rendered_markdown_and_streaming() {
+    let mut r = TuiRenderer::new();
+    r.messages.push(
+        "Here is code:\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\nDone!".to_string(),
+    );
+    r.current_content = "Streaming:\n```python\nprint(123)\n```\nAll done!".to_string();
+
+    let width = 80;
+    let est = r.estimated_chat_lines(width);
+
+    let mut actual_lines = Vec::new();
+    r.ensure_rendered_message_cache();
+    {
+        let cached = r.cached_rendered_messages.borrow();
+        for msg in &*cached {
+            actual_lines.extend(msg.iter().cloned());
+        }
+    }
+    actual_lines.extend(r.render_streaming_content());
+
+    let actual_count = count_wrapped_rendered_lines(&actual_lines, width);
+    assert_eq!(est, actual_count);
+    assert!(est > 0);
+}
+
+#[test]
 fn history_navigation_recalls_and_restores_draft() {
     let mut r = TuiRenderer::new();
     r.history.push("first".to_string());

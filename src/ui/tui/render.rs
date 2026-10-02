@@ -20,37 +20,44 @@ impl TuiRenderer {
     /// `show_thought` changes, an incremental append when new messages are
     /// added, and a truncate when messages are removed.
     pub(crate) fn ensure_message_cache(&self, width: usize) {
+        self.ensure_rendered_message_cache();
         let cached_w = self.cached_chat_width.get();
         let cached_st = self.cached_show_thought.get();
         let mut cached_lines = self.cached_message_lines.borrow_mut();
+        let rendered = self.cached_rendered_messages.borrow();
 
-        if cached_w != width || cached_st != self.show_thought {
-            // Full recompute.
-            self.cached_chat_width.set(width);
-            self.cached_show_thought.set(self.show_thought);
-            cached_lines.clear();
-            let mut total = 0;
-            for msg in &self.messages {
-                let lines = count_single_message_lines(msg, width, self.show_thought);
-                cached_lines.push(lines);
-                total += lines;
+        if cached_w != width
+            || cached_st != self.show_thought
+            || cached_lines.len() != rendered.len()
+        {
+            if cached_w != width || cached_st != self.show_thought {
+                // Full recompute.
+                self.cached_chat_width.set(width);
+                self.cached_show_thought.set(self.show_thought);
+                cached_lines.clear();
+                let mut total = 0;
+                for msg_lines in rendered.iter() {
+                    let lines = count_wrapped_rendered_lines(msg_lines, width);
+                    cached_lines.push(lines);
+                    total += lines;
+                }
+                self.cached_total_message_lines.set(total);
+            } else if cached_lines.len() < rendered.len() {
+                // Incremental append (new messages added).
+                let start = cached_lines.len();
+                let mut total = self.cached_total_message_lines.get();
+                for msg_lines in &rendered[start..] {
+                    let lines = count_wrapped_rendered_lines(msg_lines, width);
+                    cached_lines.push(lines);
+                    total += lines;
+                }
+                self.cached_total_message_lines.set(total);
+            } else if cached_lines.len() > rendered.len() {
+                // Truncate (messages removed).
+                cached_lines.truncate(rendered.len());
+                let total: usize = cached_lines.iter().sum();
+                self.cached_total_message_lines.set(total);
             }
-            self.cached_total_message_lines.set(total);
-        } else if cached_lines.len() < self.messages.len() {
-            // Incremental append (new messages added).
-            let start = cached_lines.len();
-            let mut total = self.cached_total_message_lines.get();
-            for msg in &self.messages[start..] {
-                let lines = count_single_message_lines(msg, width, self.show_thought);
-                cached_lines.push(lines);
-                total += lines;
-            }
-            self.cached_total_message_lines.set(total);
-        } else if cached_lines.len() > self.messages.len() {
-            // Truncate (messages removed).
-            cached_lines.truncate(self.messages.len());
-            let total: usize = cached_lines.iter().sum();
-            self.cached_total_message_lines.set(total);
         }
     }
 
@@ -58,111 +65,39 @@ impl TuiRenderer {
     /// message is appended to during steer streaming) and update the total
     /// (reference §11.4).
     pub(crate) fn invalidate_last_message_cache(&self) {
+        let last_idx = match self.messages.len().checked_sub(1) {
+            Some(i) => i,
+            None => return,
+        };
+
+        let new_rendered = self.render_single_message(&self.messages[last_idx]);
+        let width = self.cached_chat_width.get();
+        let new_lines = count_wrapped_rendered_lines(&new_rendered, width);
+
+        let mut cached_rendered = self.cached_rendered_messages.borrow_mut();
+        if cached_rendered.len() == self.messages.len() {
+            cached_rendered[last_idx] = new_rendered;
+        } else if cached_rendered.len() == last_idx {
+            cached_rendered.push(new_rendered);
+        }
+        drop(cached_rendered);
+
         let mut cached_lines = self.cached_message_lines.borrow_mut();
-        if !cached_lines.is_empty() && cached_lines.len() == self.messages.len() {
-            let last_idx = cached_lines.len() - 1;
+        if cached_lines.len() == self.messages.len() {
             let old = cached_lines[last_idx];
-            let width = self.cached_chat_width.get();
-            let new_lines =
-                count_single_message_lines(&self.messages[last_idx], width, self.show_thought);
             cached_lines[last_idx] = new_lines;
             let total = self.cached_total_message_lines.get().saturating_sub(old) + new_lines;
             self.cached_total_message_lines.set(total);
-        }
-        let mut cached_rendered = self.cached_rendered_messages.borrow_mut();
-        if !cached_rendered.is_empty() {
-            cached_rendered.pop();
+        } else if cached_lines.len() == last_idx {
+            cached_lines.push(new_lines);
+            let total = self.cached_total_message_lines.get() + new_lines;
+            self.cached_total_message_lines.set(total);
         }
     }
 
     /// Render a single message into styled lines.
     pub(crate) fn render_single_message(&self, msg: &str) -> Vec<Line<'static>> {
-        let mut chat_lines = Vec::new();
-        let (msg_style, has_special_style) = message_style(msg);
-        if !has_special_style && msg.contains("```") {
-            let (thought_opt, content) = extract_thought_and_content(msg);
-            if self.show_thought
-                && let Some(t) = thought_opt
-            {
-                for line in t.lines() {
-                    let cleaned = format_terminal_math(line.trim());
-                    if !cleaned.is_empty() {
-                        chat_lines.push(Line::from(Span::styled(
-                            cleaned,
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::ITALIC),
-                        )));
-                    }
-                }
-            }
-            if !content.trim().is_empty() {
-                chat_lines.extend(render_markdown_lines(&content));
-            }
-            return chat_lines;
-        }
-
-        let mut in_think = false;
-        for raw_line in msg.lines() {
-            let line = raw_line.replace('\t', "    ");
-            let segments = parse_line_segments(&line, &mut in_think);
-            for seg in segments {
-                match seg {
-                    LineSegment::Thought(t) => {
-                        if !self.show_thought {
-                            continue;
-                        }
-                        let trimmed = t.trim();
-                        if trimmed.is_empty() {
-                            chat_lines.push(Line::from(""));
-                            continue;
-                        }
-                        let cleaned = format_terminal_math(trimmed);
-                        chat_lines.push(Line::from(Span::styled(
-                            cleaned,
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::ITALIC),
-                        )));
-                    }
-                    LineSegment::Content(c) => {
-                        let trimmed = c.trim();
-                        if trimmed.is_empty() {
-                            chat_lines.push(Line::from(""));
-                            continue;
-                        }
-                        let cleaned = format_terminal_math(trimmed);
-                        if has_special_style {
-                            if cleaned.contains('\x1b') {
-                                chat_lines.extend(parse_ansi_lines(&cleaned));
-                            } else {
-                                chat_lines.push(Line::from(Span::styled(cleaned, msg_style)));
-                            }
-                        } else if trimmed.starts_with("[Tool Call] ")
-                            || trimmed.starts_with("[Tool Result] ")
-                        {
-                            if cleaned.contains('\x1b') {
-                                chat_lines.extend(parse_ansi_lines(&cleaned));
-                            } else {
-                                chat_lines.push(Line::from(Span::styled(
-                                    cleaned,
-                                    Style::default().fg(Color::Magenta),
-                                )));
-                            }
-                        } else if cleaned.contains('\x1b') {
-                            chat_lines.extend(parse_ansi_lines(&cleaned));
-                        } else {
-                            // Orchestrator / Model content: WHITE
-                            chat_lines.push(Line::from(Span::styled(
-                                cleaned,
-                                Style::default().fg(Color::White),
-                            )));
-                        }
-                    }
-                }
-            }
-        }
-        chat_lines
+        render_message_lines(msg, self.show_thought)
     }
 
     /// Ensure the pre-rendered message cache is up to date for current `messages` and `show_thought`.
@@ -183,29 +118,104 @@ impl TuiRenderer {
         }
     }
 
+    /// Render streaming thought lines.
+    pub(crate) fn render_streaming_thought(&self) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        let think_style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+        for line in self.current_thought.lines() {
+            let line = line.replace('\t', "    ");
+            let trimmed = line.trim();
+            if trimmed == "<think>"
+                || trimmed == "</think>"
+                || trimmed == "<thought>"
+                || trimmed == "</thought>"
+                || trimmed == "<think></think>"
+                || trimmed == "<thought></thought>"
+            {
+                continue;
+            }
+            let cleaned = format_terminal_math(&strip_think_tags(&line));
+            if cleaned.trim().is_empty() && !line.trim().is_empty() {
+                continue;
+            }
+            lines.push(Line::from(Span::styled(cleaned, think_style)));
+        }
+        lines
+    }
+
+    /// Render streaming content lines.
+    pub(crate) fn render_streaming_content(&self) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        if self.current_content.contains("```") {
+            let cleaned = strip_think_tags(&self.current_content);
+            lines.extend(render_markdown_lines(&cleaned));
+        } else {
+            for raw_line in self.current_content.lines() {
+                let line = raw_line.replace('\t', "    ");
+                let trimmed = line.trim();
+                if trimmed == "<think>"
+                    || trimmed == "</think>"
+                    || trimmed == "<thought>"
+                    || trimmed == "</thought>"
+                    || trimmed == "<think></think>"
+                    || trimmed == "<thought></thought>"
+                {
+                    continue;
+                }
+                let cleaned = format_terminal_math(&strip_think_tags(&line));
+                if cleaned.trim().is_empty() && !line.trim().is_empty() {
+                    continue;
+                }
+                lines.push(Line::from(Span::styled(
+                    cleaned,
+                    Style::default().fg(Color::White),
+                )));
+            }
+        }
+        lines
+    }
+
+    /// Render streaming steer sentence lines.
+    pub(crate) fn render_streaming_steer(&self) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        let prefix = if self
+            .messages
+            .last()
+            .is_some_and(|m| m.starts_with("Marmennill: "))
+        {
+            ""
+        } else {
+            "Marmennill: "
+        };
+        let formatted = format!("{prefix}{}", self.steer_sentence_buffer);
+        let steer_style = Style::default()
+            .fg(Color::LightYellow)
+            .add_modifier(Modifier::BOLD);
+        for line in formatted.lines() {
+            let line = line.replace('\t', "    ");
+            lines.push(Line::from(Span::styled(line, steer_style)));
+        }
+        lines
+    }
+
     /// Estimate the total wrapped line count of the chat transcript at `width`
     /// (reference §11.5), including streaming buffers.
     pub(crate) fn estimated_chat_lines(&self, width: usize) -> usize {
         self.ensure_message_cache(width);
         let mut n = self.cached_total_message_lines.get();
         if self.show_thought && !self.current_thought.is_empty() {
-            n += count_single_message_lines(&self.current_thought, width, self.show_thought);
+            let think_lines = self.render_streaming_thought();
+            n += count_wrapped_rendered_lines(&think_lines, width);
         }
         if !self.current_content.is_empty() {
-            n += count_single_message_lines(&self.current_content, width, self.show_thought);
+            let content_lines = self.render_streaming_content();
+            n += count_wrapped_rendered_lines(&content_lines, width);
         }
         if !self.steer_sentence_buffer.is_empty() {
-            let prefix = if self
-                .messages
-                .last()
-                .is_some_and(|m| m.starts_with("Marmennill: "))
-            {
-                ""
-            } else {
-                "Marmennill: "
-            };
-            let formatted = format!("{prefix}{}", self.steer_sentence_buffer);
-            n += wrapped_lines(&formatted, width);
+            let steer_lines = self.render_streaming_steer();
+            n += count_wrapped_rendered_lines(&steer_lines, width);
         }
         n
     }
@@ -445,78 +455,17 @@ impl TuiRenderer {
 
         // Streaming thoughts (reference §4.4.1).
         if self.show_thought && !self.current_thought.is_empty() {
-            let think_style = Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC);
-            for line in self.current_thought.lines() {
-                let line = line.replace('\t', "    ");
-                let trimmed = line.trim();
-                if trimmed == "<think>"
-                    || trimmed == "</think>"
-                    || trimmed == "<thought>"
-                    || trimmed == "</thought>"
-                    || trimmed == "<think></think>"
-                    || trimmed == "<thought></thought>"
-                {
-                    continue;
-                }
-                let cleaned = format_terminal_math(&strip_think_tags(&line));
-                if cleaned.trim().is_empty() && !line.trim().is_empty() {
-                    continue;
-                }
-                chat_lines.push(Line::from(Span::styled(cleaned, think_style)));
-            }
+            chat_lines.extend(self.render_streaming_thought());
         }
 
         // Streaming content (Orchestrator output - WHITE or syntax highlighted).
         if !self.current_content.is_empty() {
-            if self.current_content.contains("```") {
-                let cleaned = strip_think_tags(&self.current_content);
-                chat_lines.extend(render_markdown_lines(&cleaned));
-            } else {
-                for raw_line in self.current_content.lines() {
-                    let line = raw_line.replace('\t', "    ");
-                    let trimmed = line.trim();
-                    if trimmed == "<think>"
-                        || trimmed == "</think>"
-                        || trimmed == "<thought>"
-                        || trimmed == "</thought>"
-                        || trimmed == "<think></think>"
-                        || trimmed == "<thought></thought>"
-                    {
-                        continue;
-                    }
-                    let cleaned = format_terminal_math(&strip_think_tags(&line));
-                    if cleaned.trim().is_empty() && !line.trim().is_empty() {
-                        continue;
-                    }
-                    chat_lines.push(Line::from(Span::styled(
-                        cleaned,
-                        Style::default().fg(Color::White),
-                    )));
-                }
-            }
+            chat_lines.extend(self.render_streaming_content());
         }
 
         // Streaming steer sentence (Steer Arbitrator output - YELLOW BOLD).
         if !self.steer_sentence_buffer.is_empty() {
-            let prefix = if self
-                .messages
-                .last()
-                .is_some_and(|m| m.starts_with("Marmennill: "))
-            {
-                ""
-            } else {
-                "Marmennill: "
-            };
-            let formatted = format!("{prefix}{}", self.steer_sentence_buffer);
-            let steer_style = Style::default()
-                .fg(Color::LightYellow)
-                .add_modifier(Modifier::BOLD);
-            for line in formatted.lines() {
-                let line = line.replace('\t', "    ");
-                chat_lines.push(Line::from(Span::styled(line, steer_style)));
-            }
+            chat_lines.extend(self.render_streaming_steer());
         }
 
         let total_chat_lines = self.estimated_chat_lines(chat_w);
@@ -904,7 +853,7 @@ impl TuiRenderer {
         self.subagent_width.set(details_w);
         self.subagent_height.set(details_h);
 
-        let total_detail_lines = self.estimated_subagent_lines(details_w);
+        let total_detail_lines = count_wrapped_rendered_lines(&detail_lines, details_w);
 
         let max_scroll = total_detail_lines.saturating_sub(details_h);
         if self.subagent_autoscroll || (self.subagent_scroll as usize) > max_scroll {
