@@ -156,6 +156,18 @@ async fn run_specialist_live_inner(
             validator_critique.clone(),
         );
         crate::orchestrator::update_active_worker_context(&_active_guard.0, engine.token_count());
+
+        let notices = crate::orchestrator::drain_worker_notices(&_active_guard.0);
+        for notice in notices {
+            engine.append(crate::types::Message::User {
+                content: format!(
+                    "[Steering Notice from Arbitrator — ID: {}]:\n\"{}\"\n\n\
+                    To reply to the Arbitrator regarding this notice, invoke the 'reply_to_arbitrator' tool with `notice_id: \"{}\"` and your `message`.",
+                    notice.notice_id, notice.user_inquiry, notice.notice_id
+                ),
+            });
+        }
+
         crate::orchestrator::emit_status(format!(
             "{agent_tag}: thinking / calling model ({specialist_model})..."
         ));

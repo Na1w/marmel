@@ -6,7 +6,8 @@ use crate::tool_names::{
     TERMINAL_REPLACE, TERMINAL_RUN_COMMAND, TERMINAL_SLEEP, TERMINAL_WRITE_FILE, TOOL_ARCHIVE_PLAN,
     TOOL_CREATE_PLAN, TOOL_DELEGATE_TASK, TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_LEAVE_VERDICT,
     TOOL_PTY_CLOSE, TOOL_PTY_LIST, TOOL_PTY_READ, TOOL_PTY_SPAWN, TOOL_PTY_WRITE, TOOL_READ_FILE,
-    TOOL_REBIRTH, TOOL_REPLACE, TOOL_RUN_COMMAND, TOOL_SLEEP, TOOL_WRITE_FILE,
+    TOOL_REBIRTH, TOOL_REPLACE, TOOL_REPLY_TO_ARBITRATOR, TOOL_RUN_COMMAND, TOOL_SLEEP,
+    TOOL_WRITE_FILE,
 };
 use std::sync::Arc;
 
@@ -374,6 +375,7 @@ async fn dispatch_manager_async(
         TOOL_GREP_SEARCH => search::grep_search(&tool.arguments),
         TOOL_GLOB => search::glob(&tool.arguments),
         TOOL_SLEEP | TERMINAL_SLEEP | "wait" => handle_sleep_async(&tool.arguments).await,
+        TOOL_REPLY_TO_ARBITRATOR => handle_reply_to_arbitrator("Manager", &tool.arguments),
         other => Err(ToolError::Forbidden {
             tool: other.to_string(),
             caller: "Manager".to_string(),
@@ -405,16 +407,22 @@ async fn dispatch_specialist_async(
     }
 
     let gate_name = normalize_tool_name(name);
-    let is_allowed = match &caller {
-        ToolCaller::SpecialistWithTools { allowed_tools, .. } => allowed_tools.iter().any(|t| {
-            let norm = normalize_tool_name(t);
-            norm == gate_name || t == name || t == &gate_name || norm == name
-        }),
-        ToolCaller::Specialist(agent) => {
-            let registry = crate::orchestrator::SpecialistRegistry::canonical();
-            crate::orchestrator::caller_allows_tool(*agent, &gate_name, &registry)
+    let is_allowed = if gate_name == TOOL_REPLY_TO_ARBITRATOR {
+        true
+    } else {
+        match &caller {
+            ToolCaller::SpecialistWithTools { allowed_tools, .. } => {
+                allowed_tools.iter().any(|t| {
+                    let norm = normalize_tool_name(t);
+                    norm == gate_name || t == name || t == &gate_name || norm == name
+                })
+            }
+            ToolCaller::Specialist(agent) => {
+                let registry = crate::orchestrator::SpecialistRegistry::canonical();
+                crate::orchestrator::caller_allows_tool(*agent, &gate_name, &registry)
+            }
+            ToolCaller::Manager => false,
         }
-        ToolCaller::Manager => false,
     };
 
     if !is_allowed {
@@ -466,6 +474,7 @@ async fn dispatch_specialist_async(
             )))
         }
         TOOL_SLEEP | TERMINAL_SLEEP | "wait" => handle_sleep_async(&tool.arguments).await,
+        TOOL_REPLY_TO_ARBITRATOR => handle_reply_to_arbitrator(&caller_str, &tool.arguments),
         TOOL_REBIRTH => {
             if let Some(eng) = engine {
                 handle_rebirth(eng, &tool.arguments)
@@ -478,6 +487,46 @@ async fn dispatch_specialist_async(
             }
         }
         other => Err(ToolError::UnknownTool(other.to_string())),
+    }
+}
+
+pub fn handle_reply_to_arbitrator(
+    caller: &str,
+    args: &serde_json::Value,
+) -> Result<ToolResult, ToolError> {
+    let notice_id = args
+        .get("notice_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ToolError::BadArguments {
+            tool: TOOL_REPLY_TO_ARBITRATOR.to_string(),
+            detail: "missing mandatory string field `notice_id`".to_string(),
+        })?;
+    let message = args
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ToolError::BadArguments {
+            tool: TOOL_REPLY_TO_ARBITRATOR.to_string(),
+            detail: "missing mandatory string field `message`".to_string(),
+        })?;
+
+    match crate::orchestrator::record_worker_reply(caller, notice_id, message) {
+        Ok(notice) => {
+            crate::orchestrator::emit_status(format!(
+                "[{caller}] Replied to notice {notice_id} for Steer Arbitrator"
+            ));
+            Ok(ToolResult::ok(format!(
+                "Reply to Arbitrator for notice '{notice_id}' recorded successfully (original inquiry: \"{}\").",
+                notice.user_inquiry
+            )))
+        }
+        Err(e) => {
+            crate::orchestrator::emit_status(format!(
+                "[{caller}] Delivered message to Steer Arbitrator ({e})"
+            ));
+            Ok(ToolResult::ok(format!(
+                "Message delivered to Arbitrator (notice: '{notice_id}', note: {e})."
+            )))
+        }
     }
 }
 

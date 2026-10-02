@@ -381,6 +381,31 @@ impl ToolDef {
         }
     }
 
+    pub fn reply_to_arbitrator() -> ToolDef {
+        ToolDef {
+            kind: "function".to_string(),
+            function: ToolFunctionDef {
+                name: TOOL_REPLY_TO_ARBITRATOR.to_string(),
+                description: "Send a direct message or clarification back to the arbitrator in response to a specific steering notice."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "notice_id": {
+                            "type": "string",
+                            "description": "The exact ID of the steering notice you are replying to (e.g. 'notice-1' or 'steer-1')."
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "Your response, clarification, or explanation for the arbitrator."
+                        }
+                    },
+                    "required": ["notice_id", "message"]
+                }),
+            },
+        }
+    }
+
     /// Minify and sanitize a JSON Schema by removing non-semantic metadata keys
     /// (`$schema`, `title`, `$id`, empty `$defs`/`definitions`) that bloat LLM tool definitions
     /// and degrade KV cache efficiency on local and small models.
@@ -453,6 +478,7 @@ impl ToolDef {
             Self::rebirth(),
             Self::leave_verdict(),
             Self::sleep(),
+            Self::reply_to_arbitrator(),
         ]
     }
 
@@ -474,6 +500,7 @@ impl ToolDef {
             Self::glob(),
             Self::rebirth(),
             Self::sleep(),
+            Self::reply_to_arbitrator(),
         ]
     }
 }

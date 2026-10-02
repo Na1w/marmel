@@ -32,6 +32,7 @@ const KNOWN_TOOL_NAMES: &[&str] = &[
     "pty_list",
     "leave_verdict",
     "sleep",
+    "reply_to_arbitrator",
     "delegate_task",
     "list_directory",
     "terminal__read_file",

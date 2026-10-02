@@ -14,6 +14,9 @@ pub mod bus;
 pub mod delegate;
 pub mod delegation;
 pub mod freeze;
+pub mod notice;
+#[cfg(test)]
+mod notice_tests;
 pub mod plan_summary;
 pub mod preemption;
 pub mod registry;
@@ -22,6 +25,12 @@ pub mod steer_extractor;
 #[cfg(test)]
 mod steer_tests;
 pub mod workers;
+
+pub use notice::{
+    SteerNotice, SteerNoticeReply, WorkerReplyEvaluation, clear_all_notices, drain_worker_notices,
+    evaluate_worker_reply, get_pending_notice, get_worker_reply, next_notice_id,
+    post_notice_to_worker, record_worker_reply,
+};
 
 pub use preemption::{
     PreemptHandle, PreemptibleStreamSink, StreamIdentity, models_conflict,

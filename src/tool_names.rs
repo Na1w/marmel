@@ -42,6 +42,8 @@ pub const TOOL_PTY_LIST: &str = "pty_list";
 pub const TOOL_LEAVE_VERDICT: &str = "leave_verdict";
 /// `sleep` — pause execution for a specified duration in seconds.
 pub const TOOL_SLEEP: &str = "sleep";
+/// `reply_to_arbitrator` — send a response or clarification back to the Steer Arbitrator.
+pub const TOOL_REPLY_TO_ARBITRATOR: &str = "reply_to_arbitrator";
 
 /// `terminal__read_file` — caesar-style namespaced variant of `read_file`.
 pub const TERMINAL_READ_FILE: &str = "terminal__read_file";

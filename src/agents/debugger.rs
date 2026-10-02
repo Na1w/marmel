@@ -41,6 +41,7 @@ impl Specialist for Debugger {
             crate::tool_names::TOOL_REBIRTH,
             crate::tool_names::TOOL_SLEEP,
             crate::tool_names::TERMINAL_SLEEP,
+            crate::tool_names::TOOL_REPLY_TO_ARBITRATOR,
         ]
     }
 }

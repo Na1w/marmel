@@ -242,6 +242,23 @@ pub fn spawn_steer_arbitration(
             }
         }
 
+        if let Some(ref d) = decision
+            && crate::orchestrator::normalize_steer_decision(Some(&d.decision)) == "ForwardToWorker"
+        {
+            for st in &d.subtasks {
+                if st.action.eq_ignore_ascii_case("ForwardNotice") {
+                    let target = st.agent_name.as_deref().unwrap_or(&st.tool_call_id);
+                    let msg_to_send = st.message.as_deref().unwrap_or(&msg);
+                    let notice =
+                        crate::orchestrator::post_notice_to_worker(target, msg_to_send, None);
+                    let _ = tx.send(SteerArbEvent::Delta(format!(
+                        "\n[Arbitrator]: Forwarded notice {} to {} — awaiting specialist reply.\n",
+                        notice.notice_id, target
+                    )));
+                }
+            }
+        }
+
         let recorded_resp = if let Some(ref synth) = synthesized_answer_opt {
             synth.clone()
         } else if let Some(ref d) = decision {

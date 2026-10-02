@@ -108,6 +108,9 @@ impl SpecialistEntry {
     /// matches directly.
     pub fn allows(&self, tool: &str) -> bool {
         let bare = tool.strip_prefix(TERMINAL_PREFIX).unwrap_or(tool);
+        if bare == crate::tool_names::TOOL_REPLY_TO_ARBITRATOR {
+            return true;
+        }
         self.tool_namespaces.iter().any(|ns| {
             let ns_bare = ns.strip_prefix(TERMINAL_PREFIX).unwrap_or(ns);
             if ns == "*" || ns_bare == "*" {

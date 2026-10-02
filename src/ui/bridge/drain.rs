@@ -188,10 +188,25 @@ pub(crate) fn drain_steer_arbitration_events_with_transcript(
                             steer_queue.push(user_msg);
                         }
                         "ForwardToWorker" => {
+                            let target = decision
+                                .as_ref()
+                                .and_then(|d| {
+                                    d.subtasks.iter().find_map(|st| {
+                                        if st.action.eq_ignore_ascii_case("ForwardNotice") {
+                                            st.agent_name.as_deref().or(Some(&st.tool_call_id))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                })
+                                .unwrap_or("worker");
+                            let notice =
+                                crate::orchestrator::post_notice_to_worker(target, &user_msg, None);
+                            renderer.on_event(&Event::Status(format!(
+                                "Notice {} forwarded to {} — waiting for specialist reply...",
+                                notice.notice_id, target
+                            )));
                             steer_queue.push(user_msg);
-                            renderer.on_event(&Event::Status(
-                                "Notice forwarded to specialist".to_string(),
-                            ));
                         }
                         "ApprovePlan" => {
                             steer_queue.push("User approved plan.".to_string());

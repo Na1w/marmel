@@ -123,7 +123,9 @@ pub fn assemble_tools(
 ) -> Vec<ToolDef> {
     let mut tools = Vec::new();
     for tool in ToolDef::default_tools() {
-        let is_allowed = if let Some(allowed) = allowed_tools {
+        let is_allowed = if tool.function.name == crate::tool_names::TOOL_REPLY_TO_ARBITRATOR {
+            true
+        } else if let Some(allowed) = allowed_tools {
             allowed.iter().any(|t| {
                 let norm = harness::normalize_tool_name(t);
                 norm == tool.function.name || t == &tool.function.name
@@ -306,6 +308,17 @@ pub async fn run_fix_loop(
         }
         update_active_worker_context(&p.worker_key, p.engine.token_count());
         emit_status(format!("{} (turn {turn})", p.status_template));
+
+        let notices = crate::orchestrator::drain_worker_notices(&p.worker_key);
+        for notice in notices {
+            p.engine.append(Message::User {
+                content: format!(
+                    "[Steering Notice from Arbitrator — ID: {}]:\n\"{}\"\n\n\
+                    To reply to the Arbitrator regarding this notice, invoke the 'reply_to_arbitrator' tool with `notice_id: \"{}\"` and your `message`.",
+                    notice.notice_id, notice.user_inquiry, notice.notice_id
+                ),
+            });
+        }
 
         let req = build_turn_request(&p.model, p.engine, &p.tools, p.cfg, p.temperature);
 

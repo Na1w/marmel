@@ -369,10 +369,24 @@ impl StreamSink for RendererSink<'_> {
                     PauseAction::Abort
                 }
                 "ForwardToWorker" => {
+                    let target = decision
+                        .as_ref()
+                        .and_then(|d| {
+                            d.subtasks.iter().find_map(|st| {
+                                if st.action.eq_ignore_ascii_case("ForwardNotice") {
+                                    st.agent_name.as_deref().or(Some(&st.tool_call_id))
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .unwrap_or("worker");
+                    let notice = crate::orchestrator::post_notice_to_worker(target, user_msg, None);
+                    self.renderer.on_event(&Event::Status(format!(
+                        "Notice {} forwarded to {} — resuming stream...",
+                        notice.notice_id, target
+                    )));
                     self.steer_queue.push(user_msg.to_string());
-                    self.renderer.on_event(&Event::Status(
-                        "Notice queued for worker — resuming stream...".to_string(),
-                    ));
                     let _ = self.renderer.flush();
                     PauseAction::Resume
                 }

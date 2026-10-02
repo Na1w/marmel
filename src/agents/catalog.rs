@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::tool_names::{
     TOOL_CREATE_PLAN, TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_LEAVE_VERDICT, TOOL_PTY_CLOSE,
     TOOL_PTY_LIST, TOOL_PTY_READ, TOOL_PTY_SPAWN, TOOL_PTY_WRITE, TOOL_READ_FILE, TOOL_REBIRTH,
-    TOOL_REPLACE, TOOL_RUN_COMMAND, TOOL_WRITE_FILE,
+    TOOL_REPLACE, TOOL_REPLY_TO_ARBITRATOR, TOOL_RUN_COMMAND, TOOL_WRITE_FILE,
 };
 
 /// Origin of a loaded skill or archetype.
@@ -139,6 +139,7 @@ impl Catalog {
                 TOOL_GREP_SEARCH.to_string(),
                 TOOL_GLOB.to_string(),
                 TOOL_REBIRTH.to_string(),
+                TOOL_REPLY_TO_ARBITRATOR.to_string(),
             ],
             source: SkillSource::Builtin,
         });
@@ -162,6 +163,7 @@ impl Catalog {
                 TOOL_GREP_SEARCH.to_string(),
                 TOOL_GLOB.to_string(),
                 TOOL_REBIRTH.to_string(),
+                TOOL_REPLY_TO_ARBITRATOR.to_string(),
             ],
             source: SkillSource::Builtin,
         });
@@ -179,6 +181,7 @@ impl Catalog {
                 TOOL_RUN_COMMAND.to_string(),
                 TOOL_WRITE_FILE.to_string(),
                 TOOL_REBIRTH.to_string(),
+                TOOL_REPLY_TO_ARBITRATOR.to_string(),
             ],
             source: SkillSource::Builtin,
         });
@@ -195,6 +198,7 @@ impl Catalog {
                 TOOL_GREP_SEARCH.to_string(),
                 TOOL_GLOB.to_string(),
                 TOOL_LEAVE_VERDICT.to_string(),
+                TOOL_REPLY_TO_ARBITRATOR.to_string(),
             ],
             source: SkillSource::Builtin,
         });
@@ -217,6 +221,7 @@ impl Catalog {
                 TOOL_GREP_SEARCH.to_string(),
                 TOOL_GLOB.to_string(),
                 TOOL_REBIRTH.to_string(),
+                TOOL_REPLY_TO_ARBITRATOR.to_string(),
             ],
             source: SkillSource::Builtin,
         });
@@ -234,6 +239,7 @@ impl Catalog {
                 TOOL_GLOB.to_string(),
                 TOOL_CREATE_PLAN.to_string(),
                 TOOL_REBIRTH.to_string(),
+                TOOL_REPLY_TO_ARBITRATOR.to_string(),
             ],
             source: SkillSource::Builtin,
         });
