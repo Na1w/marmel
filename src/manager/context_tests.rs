@@ -753,3 +753,96 @@ fn test_context_consecutive_rebirth_suppresses_advisory() {
     engine.reset_consecutive_rebirths();
     assert_eq!(engine.consecutive_rebirths(), 0);
 }
+
+#[test]
+fn test_compaction_preserves_rebirth_checkpoint() {
+    let budget = 300;
+    let mut engine = ContextEngine::new(budget);
+    engine.set_system_prompt("System prompt for coding agent.".to_string());
+    engine.set_goal("Initial user goal for refactoring.".to_string());
+
+    // Rebirth creates the 4-message structure with the checkpoint summary.
+    engine
+        .perform_rebirth("Vital checkpoint: inspected parser.rs at line 250, next step is ast.rs");
+    assert_eq!(engine.messages().len(), 4);
+    assert!(matches!(
+        &engine.messages()[3],
+        Message::System { content } if content.contains("Vital checkpoint")
+    ));
+
+    // Append many post-rebirth turns until token count triggers compaction (> 90% of 300 = 270 tokens).
+    for i in 0..15 {
+        engine.append(Message::User {
+            content: format!(
+                "Post-rebirth user command number {i} with verbose padding text here."
+            ),
+        });
+        engine.append(Message::Assistant {
+            content: Some(format!(
+                "Assistant response to turn {i} with detailed explanation and data."
+            )),
+            reasoning_content: None,
+            tool_calls: vec![],
+        });
+    }
+
+    assert!(
+        engine.should_compact(),
+        "transcript should exceed 90% budget"
+    );
+
+    // Perform automatic compaction.
+    engine.compact();
+
+    // Verify budget target:
+    let target = compaction_target(budget);
+    assert!(
+        engine.token_count() <= target,
+        "compact brings transcript to <= 70%"
+    );
+
+    // Verify pins: [0] system prompt, [1] user goal.
+    assert!(matches!(engine.messages()[0], Message::System { .. }));
+    assert!(matches!(engine.messages()[1], Message::User { .. }));
+
+    // CRITICAL: The rebirth checkpoint MUST survive compaction!
+    let checkpoint_exists = engine.messages().iter().any(|m| match m {
+        Message::System { content } => {
+            content.starts_with(REBIRTH_CHECKPOINT_PREFIX) && content.contains("Vital checkpoint")
+        }
+        _ => false,
+    });
+    assert!(
+        checkpoint_exists,
+        "Rebirth checkpoint MUST survive context compaction!"
+    );
+}
+
+#[test]
+fn test_compact_to_target_preserves_rebirth_checkpoint() {
+    let budget = 300;
+    let mut engine = ContextEngine::new(budget);
+    engine.set_system_prompt("System prompt.".to_string());
+    engine.set_goal("User goal.".to_string());
+    engine.perform_rebirth("Checkpoint summary state.");
+
+    for i in 0..15 {
+        engine.append(Message::User {
+            content: format!("Turn {i} verbose text padding padding padding."),
+        });
+    }
+
+    let compacted = engine.compact_with_retry(budget);
+    assert!(compacted);
+
+    let checkpoint_exists = engine.messages().iter().any(|m| match m {
+        Message::System { content } => {
+            content.starts_with(REBIRTH_CHECKPOINT_PREFIX) && content.contains("Checkpoint summary")
+        }
+        _ => false,
+    });
+    assert!(
+        checkpoint_exists,
+        "Rebirth checkpoint MUST survive compact_with_retry!"
+    );
+}

@@ -642,7 +642,7 @@ async fn run_specialist_live_inner(
                 &tc,
                 content,
                 execution_succeeded,
-                "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. Do NOT call rebirth again. Proceed immediately using your required tools to perform the task and conclude with 'MISSION COMPLETE').",
+                "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. Do not call rebirth consecutively without making progress. Proceed immediately using your required tools to perform the task and conclude with 'MISSION COMPLETE').",
             );
             crate::orchestrator::update_active_worker_context(
                 &_active_guard.0,

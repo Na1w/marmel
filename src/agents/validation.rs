@@ -300,7 +300,7 @@ async fn run_automated_validation_inner(
         dispatch_verdict_tools: true,
         abort_log_prefix: format!("validator-{agent}"),
         emit_tool_status: true,
-        rebirth_notice: "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. Do NOT call rebirth again. Continue your validation inspection and submit your verdict via leave_verdict.)".to_string(),
+        rebirth_notice: "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. Do not call rebirth consecutively without making progress. Continue your validation inspection and submit your verdict via leave_verdict.)".to_string(),
     };
 
     match run_fix_loop(&mut params, &mut monitor, caller).await {
@@ -421,7 +421,7 @@ async fn run_plan_validation_inner(
         dispatch_verdict_tools: false,
         abort_log_prefix: val_tag.clone(),
         emit_tool_status: false,
-        rebirth_notice: "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. Do NOT call rebirth again. Continue your validation inspection and submit your verdict via leave_verdict.)".to_string(),
+        rebirth_notice: "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. Do not call rebirth consecutively without making progress. Continue your validation inspection and submit your verdict via leave_verdict.)".to_string(),
     };
 
     match run_fix_loop(

@@ -359,11 +359,20 @@ impl ContextEngine {
         let initial_msgs = self.messages.len();
         let target = compaction_target(self.max_context_tokens);
 
-        // Always pin the first two messages.
-        let mut kept: Vec<Message> = self.messages.iter().take(2).cloned().collect();
+        // Always pin the first two messages (system and goal).
+        // If an active REBIRTH CHECKPOINT exists in messages[2..], pin up through the checkpoint
+        // so that distilled session state is never dropped during compaction.
+        let rebirth_idx = self.messages.iter().enumerate().rposition(|(i, m)| {
+            i >= 2
+                && match m {
+                    Message::System { content } => content.starts_with(REBIRTH_CHECKPOINT_PREFIX),
+                    _ => false,
+                }
+        });
+        let prefix_end = rebirth_idx.map(|idx| idx + 1).unwrap_or(2);
 
-        // Preserve the most recent turns (index 2 onward) while under budget.
-        let tail: Vec<Message> = self.messages.iter().skip(2).cloned().collect();
+        let mut kept: Vec<Message> = self.messages.iter().take(prefix_end).cloned().collect();
+        let tail: Vec<Message> = self.messages.iter().skip(prefix_end).cloned().collect();
         let mut kept_tail: Vec<Message> = Vec::new();
         let mut total = count_tokens(&kept);
 
@@ -492,11 +501,20 @@ impl ContextEngine {
             return false;
         }
 
-        // Always pin the first two messages.
-        let mut kept: Vec<Message> = self.messages.iter().take(2).cloned().collect();
+        // Always pin the first two messages (system and goal).
+        // If an active REBIRTH CHECKPOINT exists in messages[2..], pin up through the checkpoint
+        // so that distilled session state is never dropped during compaction.
+        let rebirth_idx = self.messages.iter().enumerate().rposition(|(i, m)| {
+            i >= 2
+                && match m {
+                    Message::System { content } => content.starts_with(REBIRTH_CHECKPOINT_PREFIX),
+                    _ => false,
+                }
+        });
+        let prefix_end = rebirth_idx.map(|idx| idx + 1).unwrap_or(2);
 
-        // Preserve the most recent turns (index 2 onward) while under budget.
-        let tail: Vec<Message> = self.messages.iter().skip(2).cloned().collect();
+        let mut kept: Vec<Message> = self.messages.iter().take(prefix_end).cloned().collect();
+        let tail: Vec<Message> = self.messages.iter().skip(prefix_end).cloned().collect();
         let mut kept_tail: Vec<Message> = Vec::new();
         let mut total = count_tokens(&kept);
 
@@ -509,7 +527,10 @@ impl ContextEngine {
             kept_tail.push(m);
         }
         kept_tail.reverse();
-        let removed = self.messages.len().saturating_sub(2 + kept_tail.len());
+        let removed = self
+            .messages
+            .len()
+            .saturating_sub(prefix_end + kept_tail.len());
         kept.extend(kept_tail);
 
         // Eliminate orphaned tool messages introduced by the pruning above.

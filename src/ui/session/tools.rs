@@ -445,10 +445,10 @@ pub(crate) async fn dispatch_tool_calls(
                             let continuation_msg = if !pending.is_empty() {
                                 let pending_str = pending.join(", ");
                                 format!(
-                                    "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. You have active pending tasks in your plan: [{pending_str}]. Do NOT call rebirth again. Proceed immediately with delegating or executing these pending tasks.)"
+                                    "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. You have active pending tasks in your plan: [{pending_str}]. Do not call rebirth consecutively without making progress. Proceed immediately with delegating or executing these pending tasks.)"
                                 )
                             } else {
-                                "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. Do NOT call rebirth again. Proceed immediately with delivering your final synthesis to the user.)".to_string()
+                                "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. Do not call rebirth consecutively without making progress. Proceed immediately with delivering your final synthesis to the user.)".to_string()
                             };
                             ctx.append(Message::User {
                                 content: continuation_msg,
