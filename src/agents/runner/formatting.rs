@@ -60,17 +60,35 @@ pub fn format_tool_args_preview(tool: &str, args: &serde_json::Value) -> String 
 
 pub fn format_tool_args_full(tool: &str, args: &serde_json::Value) -> String {
     match tool {
-        TOOL_READ_FILE | TOOL_WRITE_FILE | TOOL_REPLACE => {
+        TOOL_WRITE_FILE => {
             if let Some(path) = args.get("path").and_then(serde_json::Value::as_str) {
-                if tool == TOOL_WRITE_FILE || tool == TOOL_REPLACE {
-                    let len = args
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map_or(0, str::len);
-                    format!("{path} (content: {len} bytes)")
-                } else {
-                    path.to_string()
-                }
+                let len = args
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or(0, str::len);
+                format!("{path} (content: {len} bytes)")
+            } else {
+                args.to_string()
+            }
+        }
+        TOOL_REPLACE => {
+            if let Some(path) = args.get("path").and_then(serde_json::Value::as_str) {
+                let old_len = args
+                    .get("old_str")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or(0, str::len);
+                let new_len = args
+                    .get("new_str")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or(0, str::len);
+                format!("{path} (replace: {old_len}b -> {new_len}b)")
+            } else {
+                args.to_string()
+            }
+        }
+        TOOL_READ_FILE => {
+            if let Some(path) = args.get("path").and_then(serde_json::Value::as_str) {
+                path.to_string()
             } else {
                 args.to_string()
             }
@@ -173,5 +191,23 @@ mod tests {
         let cmd_val = json!({ "command": format!("{cmd_prefix}—cargo test") });
         let cmd_res = format_tool_args_preview(TOOL_RUN_COMMAND, &cmd_val);
         assert!(cmd_res.ends_with('…'));
+    }
+
+    #[test]
+    fn test_format_tool_args_full_replace_and_write_file() {
+        let replace_val = json!({
+            "path": "cpu/ppc/jit/jit.cpp",
+            "old_str": "int a = 1;",
+            "new_str": "int a = 2; int b = 3;"
+        });
+        let res = format_tool_args_full(TOOL_REPLACE, &replace_val);
+        assert_eq!(res, "cpu/ppc/jit/jit.cpp (replace: 10b -> 21b)");
+
+        let write_val = json!({
+            "path": "test.txt",
+            "content": "hello world"
+        });
+        let write_res = format_tool_args_full(TOOL_WRITE_FILE, &write_val);
+        assert_eq!(write_res, "test.txt (content: 11 bytes)");
     }
 }
