@@ -558,11 +558,8 @@ pub async fn handle_reply_to_arbitrator_async(
             if eval.decision.eq_ignore_ascii_case("AskFollowUp")
                 && let Some(follow_up) = eval.follow_up_prompt
             {
-                let follow_up_notice = crate::orchestrator::post_notice_to_worker(
-                    caller,
-                    &follow_up,
-                    Some(notice_id),
-                );
+                let follow_up_notice =
+                    crate::orchestrator::post_notice_to_worker(caller, &follow_up, Some(notice_id));
                 if let Some(user_status) = eval.user_status {
                     crate::orchestrator::emit_event(crate::ui::Event::SteerResponse(format!(
                         "\n[Arbitrator]: {user_status}\n\n"

@@ -201,8 +201,11 @@ async fn test_handle_reply_to_arbitrator_ask_followup() {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     crate::orchestrator::set_event_sender(event_tx);
 
-    let _notice =
-        post_notice_to_worker("coder", "Please migrate to new format", Some("notice-follow-1"));
+    let _notice = post_notice_to_worker(
+        "coder",
+        "Please migrate to new format",
+        Some("notice-follow-1"),
+    );
     let initial_notices = drain_worker_notices("coder");
     assert_eq!(initial_notices.len(), 1);
 
