@@ -347,20 +347,251 @@ pub(crate) fn drain_delegation_events_with_transcript(
     }
 }
 
+/// Sanitize task id string by stripping markdown enclosing characters.
+pub fn clean_task_id(tid: &str) -> String {
+    tid.trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
+        .trim()
+        .to_string()
+}
+
+/// Find a subagent in the list by matching name, task id, or suffix.
+pub fn find_subagent_mut<'a>(
+    subagents: &'a mut [SubagentDetail],
+    name: &str,
+    task_id: Option<&str>,
+) -> Option<&'a mut SubagentDetail> {
+    subagents.iter_mut().find(|s| {
+        if s.name == name {
+            return true;
+        }
+        if let (Some(a), Some(b)) = (s.task_id.as_deref(), task_id) {
+            let a_clean = clean_task_id(a);
+            let b_clean = clean_task_id(b);
+            if !a_clean.is_empty() && a_clean == b_clean {
+                return true;
+            }
+        }
+        if let Some(tid) = task_id {
+            let clean = clean_task_id(tid);
+            if !clean.is_empty() && s.name.ends_with(&clean) {
+                return true;
+            }
+        }
+        if let Some(s_tid) = s.task_id.as_deref() {
+            let clean = clean_task_id(s_tid);
+            if !clean.is_empty() && name.ends_with(&clean) {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// Load synthesized prompt blueprint from disk (`.marmel/prompts/<task_id>.md`).
+pub fn load_prompt_from_disk(
+    plan: Option<&crate::manager::phase::Plan>,
+    task_id: Option<&str>,
+) -> String {
+    let Some(tid) = task_id else {
+        return String::new();
+    };
+    let clean = clean_task_id(tid);
+    if clean.is_empty() {
+        return String::new();
+    }
+    let prompt_file = if let Some(p) = plan {
+        p.dir().join("prompts").join(format!("{clean}.md"))
+    } else {
+        std::path::Path::new(".marmel")
+            .join("prompts")
+            .join(format!("{clean}.md"))
+    };
+    if !prompt_file.exists() {
+        return String::new();
+    }
+    if let Ok(bp) = crate::agents::AgentBlueprint::load_from_disk(&prompt_file)
+        && !bp.system_prompt.is_empty()
+    {
+        return bp.system_prompt;
+    }
+    std::fs::read_to_string(&prompt_file).unwrap_or_default()
+}
+
+/// Check whether a subagent task was in-flight when the session stopped (e.g. frozen,
+/// pending in crash journal, or pending in plan without matching tool result).
+fn is_subagent_in_flight(
+    journal: Option<&crate::orchestrator::freeze::CrashJournal>,
+    plan: Option<&crate::manager::phase::Plan>,
+    task_id: Option<&str>,
+    name: &str,
+) -> bool {
+    // 1. If currently frozen in .session_frozen.json -> definitely in-flight
+    if let Some(j) = journal
+        && let Ok(frozen) = j.frozen_all()
+    {
+        for snap in frozen {
+            if let Some(tid) = task_id {
+                let clean = clean_task_id(tid);
+                if snap.sub_req.task_id.as_deref().map(clean_task_id) == Some(clean) {
+                    return true;
+                }
+            }
+            let snap_name = match snap.sub_req.task_id.as_deref().map(clean_task_id) {
+                Some(tid) if !tid.is_empty() => format!("{}-{tid}", snap.agent_name.as_str()),
+                _ => snap.agent_name.as_str().to_string(),
+            };
+            if name == snap_name || name.ends_with(&snap.worker_id) {
+                return true;
+            }
+        }
+    }
+
+    // 2. If CrashJournal has a Frozen event without subsequent Resolved/Failed
+    if let Some(j) = journal
+        && let Ok(entries) = j.journal()
+    {
+        let mut latest_kind = None;
+        for entry in entries {
+            let matches = if let Some(tid) = task_id {
+                let clean = clean_task_id(tid);
+                entry.task_id.as_deref().map(clean_task_id) == Some(clean)
+            } else {
+                name.starts_with(entry.agent.as_str())
+            };
+            if matches {
+                latest_kind = Some(entry.kind);
+            }
+        }
+        if latest_kind == Some(crate::orchestrator::freeze::JournalEventKind::Frozen) {
+            return true;
+        }
+    }
+
+    // 3. If plan has this task_id as pending
+    if let Some(p) = plan
+        && let Some(tid) = task_id
+    {
+        let pending = p.pending_tasks();
+        let clean = clean_task_id(tid);
+        if pending.iter().any(|pt| clean_task_id(pt) == clean) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Rehydrate the list of specialist subagents from historical session artifacts:
-/// 1. Messages in the transcript (`delegate_task` tool calls and matching `tool` results).
-/// 2. Crash journal entries in `.session_journal.json`.
-/// 3. Recovered deliverable from deep-freeze checkpoint (if any).
-/// 4. Completed tasks in the on-disk execution plan.
+/// 1. Frozen in-flight workers from `.session_frozen.json`.
+/// 2. Messages in the transcript (`delegate_task` tool calls and matching `tool` results).
+/// 3. Crash journal entries in `.session_journal.json`.
+/// 4. UI transcript records (`TaskCompleted` / `TaskFailed`).
+/// 5. Recovered deliverable from deep-freeze checkpoint (if any).
+/// 6. Tasks in the on-disk execution plan.
+/// 7. Synthesized prompts on disk in `.marmel/prompts/`.
+#[allow(dead_code)]
 pub fn rehydrate_subagents(
     messages: &[Message],
     journal: Option<&crate::orchestrator::freeze::CrashJournal>,
     recovered_deliverable: Option<&(String, String)>,
     plan: Option<&crate::manager::phase::Plan>,
 ) -> Vec<SubagentDetail> {
+    rehydrate_subagents_with_ui(messages, journal, recovered_deliverable, plan, None)
+}
+
+/// Rehydrate the list of specialist subagents with optional UI transcript support.
+pub fn rehydrate_subagents_with_ui(
+    messages: &[Message],
+    journal: Option<&crate::orchestrator::freeze::CrashJournal>,
+    recovered_deliverable: Option<&(String, String)>,
+    plan: Option<&crate::manager::phase::Plan>,
+    ui_transcript: Option<&crate::ui::UiTranscript>,
+) -> Vec<SubagentDetail> {
     let mut subagents = Vec::<SubagentDetail>::new();
 
-    // 1. Rehydrate from messages in transcript: look for delegate_task tool calls and results
+    // 1. Rehydrate frozen in-flight workers from `.session_frozen.json`
+    if let Some(j) = journal
+        && let Ok(snapshots) = j.frozen_all()
+    {
+        for snap in snapshots {
+            let task_id = snap.sub_req.task_id.as_deref().map(clean_task_id);
+            let task_str = task_id.as_deref().unwrap_or("");
+            let name = match &task_id {
+                Some(tid) if !tid.is_empty() => format!("{}-{tid}", snap.agent_name.as_str()),
+                _ => snap.agent_name.as_str().to_string(),
+            };
+            let is_recovered = recovered_deliverable.is_some_and(|(rec_task, _)| {
+                let clean_rec = clean_task_id(rec_task);
+                task_id.as_deref() == Some(&clean_rec) || name.ends_with(&clean_rec)
+            });
+            let is_active = !is_recovered;
+            let mut logs = vec![format!("started task {task_str}")];
+            if is_active {
+                logs.push("recovering interrupted task".to_string());
+            } else {
+                logs.push(format!("completed task {task_str}"));
+            }
+
+            let (content, context_tokens) = if is_recovered {
+                if let Some((_, rec_content)) = recovered_deliverable {
+                    let toks = tiktoken_rs::cl100k_base_singleton()
+                        .encode_ordinary(rec_content)
+                        .len();
+                    (rec_content.clone(), toks)
+                } else {
+                    (String::new(), 0)
+                }
+            } else {
+                (String::new(), 0)
+            };
+
+            let prompt = if !snap.sub_req.prompt.is_empty() {
+                snap.sub_req.prompt.clone()
+            } else {
+                load_prompt_from_disk(plan, task_id.as_deref())
+            };
+
+            let now = std::time::Instant::now();
+            if let Some(existing) = find_subagent_mut(&mut subagents, &name, task_id.as_deref()) {
+                if existing.prompt.is_empty() && !prompt.is_empty() {
+                    existing.prompt = prompt;
+                }
+                if existing.task_id.is_none() && task_id.is_some() {
+                    existing.task_id = task_id;
+                }
+                if is_active {
+                    existing.is_active = true;
+                    existing.started_at = Some(now);
+                    existing.last_activity_at = Some(now);
+                } else if !content.is_empty() {
+                    existing.content = content;
+                    existing.context_tokens = context_tokens;
+                    existing.is_active = false;
+                }
+                for log in logs {
+                    if !existing.logs.contains(&log) {
+                        existing.logs.push(log);
+                    }
+                }
+            } else {
+                subagents.push(SubagentDetail {
+                    name,
+                    task_id,
+                    prompt,
+                    started_at: if is_active { Some(now) } else { None },
+                    worked_duration: std::time::Duration::ZERO,
+                    last_activity_at: if is_active { Some(now) } else { None },
+                    logs,
+                    thinking: String::new(),
+                    content,
+                    is_active,
+                    context_tokens,
+                });
+            }
+        }
+    }
+
+    // 2. Rehydrate from messages in transcript (`delegate_task` tool calls and matching results)
     for msg in messages {
         if let Message::Assistant { tool_calls, .. } = msg {
             for call in tool_calls {
@@ -372,12 +603,13 @@ pub fn rehydrate_subagents(
                         .and_then(|v| v.get("agent_name"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("specialist");
-                    let task_id = args_val
+                    let raw_task_id = args_val
                         .as_ref()
                         .and_then(|v| v.get("task_id"))
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
-                    let prompt = args_val
+                    let task_id = raw_task_id.as_deref().map(clean_task_id);
+                    let prompt_val = args_val
                         .as_ref()
                         .and_then(|v| v.get("prompt"))
                         .and_then(|v| v.as_str())
@@ -400,18 +632,29 @@ pub fn rehydrate_subagents(
 
                     let task_str = task_id.as_deref().unwrap_or("");
                     let mut logs = vec![format!("started task {task_str}")];
-                    let content = if let Some(c) = matching_tool {
+                    let (content, is_active) = if let Some(c) = matching_tool {
                         logs.push(format!("completed task {task_str}"));
-                        c
+                        (c, false)
                     } else if let Some((rec_task, rec_content)) = recovered_deliverable {
-                        if task_id.as_deref() == Some(rec_task) || name.ends_with(rec_task) {
+                        let clean_rec = clean_task_id(rec_task);
+                        if task_id.as_deref() == Some(&clean_rec) || name.ends_with(&clean_rec) {
                             logs.push(format!("completed task {task_str}"));
-                            rec_content.clone()
+                            (rec_content.clone(), false)
                         } else {
-                            String::new()
+                            let active =
+                                is_subagent_in_flight(journal, plan, task_id.as_deref(), &name);
+                            (String::new(), active)
                         }
                     } else {
-                        String::new()
+                        let active =
+                            is_subagent_in_flight(journal, plan, task_id.as_deref(), &name);
+                        (String::new(), active)
+                    };
+
+                    let prompt = if !prompt_val.is_empty() {
+                        prompt_val
+                    } else {
+                        load_prompt_from_disk(plan, task_id.as_deref())
                     };
 
                     let context_tokens = if !content.is_empty() {
@@ -422,16 +665,25 @@ pub fn rehydrate_subagents(
                         0
                     };
 
-                    if let Some(existing) = subagents.iter_mut().find(|s| s.name == name) {
+                    let now = std::time::Instant::now();
+                    if let Some(existing) =
+                        find_subagent_mut(&mut subagents, &name, task_id.as_deref())
+                    {
                         if existing.content.is_empty() && !content.is_empty() {
                             existing.content = content;
                             existing.context_tokens = context_tokens;
+                            existing.is_active = false;
                         }
                         if existing.prompt.is_empty() && !prompt.is_empty() {
                             existing.prompt = prompt;
                         }
                         if existing.task_id.is_none() && task_id.is_some() {
                             existing.task_id = task_id;
+                        }
+                        if is_active && !existing.is_active && existing.content.is_empty() {
+                            existing.is_active = true;
+                            existing.started_at = Some(now);
+                            existing.last_activity_at = Some(now);
                         }
                         for log in logs {
                             if !existing.logs.contains(&log) {
@@ -443,13 +695,13 @@ pub fn rehydrate_subagents(
                             name,
                             task_id,
                             prompt,
-                            started_at: None,
+                            started_at: if is_active { Some(now) } else { None },
                             worked_duration: std::time::Duration::ZERO,
-                            last_activity_at: None,
+                            last_activity_at: if is_active { Some(now) } else { None },
                             logs,
                             thinking: String::new(),
                             content,
-                            is_active: false,
+                            is_active,
                             context_tokens,
                         });
                     }
@@ -458,32 +710,50 @@ pub fn rehydrate_subagents(
         }
     }
 
-    // 2. Incorporate crash journal events (if any delegation was logged)
+    // 3. Incorporate crash journal events (.session_journal.json)
     if let Some(j) = journal
         && let Ok(entries) = j.journal()
     {
         for entry in entries {
-            let name = match &entry.task_id {
+            let task_id = entry.task_id.as_deref().map(clean_task_id);
+            let name = match &task_id {
                 Some(tid) if !tid.trim().is_empty() => {
                     format!("{}-{tid}", entry.agent.as_str())
                 }
                 _ => entry.agent.as_str().to_string(),
             };
-            let task_str = entry.task_id.as_deref().unwrap_or("");
-            let log_entry = match entry.kind {
+            let task_str = task_id.as_deref().unwrap_or("");
+            let (log_entry, is_active) = match entry.kind {
                 crate::orchestrator::freeze::JournalEventKind::Resolved => {
-                    format!("completed task {task_str}")
+                    (format!("completed task {task_str}"), false)
                 }
                 crate::orchestrator::freeze::JournalEventKind::Failed => {
-                    format!("failed task {task_str}")
+                    (format!("failed task {task_str}"), false)
                 }
                 crate::orchestrator::freeze::JournalEventKind::Frozen => {
-                    format!("started task {task_str}")
+                    let active = is_subagent_in_flight(journal, plan, task_id.as_deref(), &name);
+                    (format!("started task {task_str}"), active)
                 }
             };
-            if let Some(existing) = subagents.iter_mut().find(|s| s.name == name) {
+            let prompt = load_prompt_from_disk(plan, task_id.as_deref());
+            let now = std::time::Instant::now();
+            if let Some(existing) = find_subagent_mut(&mut subagents, &name, task_id.as_deref()) {
                 if !existing.logs.contains(&log_entry) {
                     existing.logs.push(log_entry);
+                }
+                if existing.prompt.is_empty() && !prompt.is_empty() {
+                    existing.prompt = prompt;
+                }
+                if entry.kind == crate::orchestrator::freeze::JournalEventKind::Resolved
+                    || entry.kind == crate::orchestrator::freeze::JournalEventKind::Failed
+                {
+                    existing.is_active = false;
+                } else if is_active && existing.content.is_empty() {
+                    existing.is_active = true;
+                    if existing.started_at.is_none() {
+                        existing.started_at = Some(now);
+                    }
+                    existing.last_activity_at = Some(now);
                 }
             } else {
                 let mut logs = vec![format!("started task {task_str}")];
@@ -492,52 +762,79 @@ pub fn rehydrate_subagents(
                 }
                 subagents.push(SubagentDetail {
                     name,
-                    task_id: entry.task_id,
-                    prompt: String::new(),
-                    started_at: None,
+                    task_id,
+                    prompt,
+                    started_at: if is_active { Some(now) } else { None },
                     worked_duration: std::time::Duration::ZERO,
-                    last_activity_at: None,
+                    last_activity_at: if is_active { Some(now) } else { None },
                     logs,
                     thinking: String::new(),
                     content: String::new(),
-                    is_active: false,
+                    is_active,
                     context_tokens: 0,
                 });
             }
         }
     }
 
-    // 3. Fold in recovered_deliverable if not already present
-    if let Some((rec_task, rec_content)) = recovered_deliverable {
-        let matched = subagents
-            .iter_mut()
-            .find(|s| s.task_id.as_deref() == Some(rec_task) || s.name.ends_with(rec_task));
-        if let Some(existing) = matched {
-            if existing.content.is_empty() {
-                existing.content = rec_content.clone();
-                existing.context_tokens = tiktoken_rs::cl100k_base_singleton()
-                    .encode_ordinary(rec_content)
-                    .len();
+    // 4. Incorporate UI transcript events (TaskCompleted, TaskFailed)
+    if let Some(tr) = ui_transcript {
+        for record in tr.records() {
+            match record {
+                crate::ui::UiRecord::TaskCompleted { task_id } => {
+                    let clean = clean_task_id(task_id);
+                    if let Some(sa) = find_subagent_mut(&mut subagents, &clean, Some(&clean)) {
+                        sa.is_active = false;
+                        let comp_log = format!("completed task {clean}");
+                        if !sa.logs.contains(&comp_log) {
+                            sa.logs.push(comp_log);
+                        }
+                    }
+                }
+                crate::ui::UiRecord::TaskFailed { task_id } => {
+                    let clean = clean_task_id(task_id);
+                    if let Some(sa) = find_subagent_mut(&mut subagents, &clean, Some(&clean)) {
+                        sa.is_active = false;
+                        let fail_log = format!("failed task {clean}");
+                        if !sa.logs.contains(&fail_log) {
+                            sa.logs.push(fail_log);
+                        }
+                    }
+                }
+                _ => {}
             }
-            let completed_log = format!("completed task {rec_task}");
+        }
+    }
+
+    // 5. Fold in recovered_deliverable if not already present
+    if let Some((rec_task, rec_content)) = recovered_deliverable {
+        let clean_rec = clean_task_id(rec_task);
+        if let Some(existing) = find_subagent_mut(&mut subagents, &clean_rec, Some(&clean_rec)) {
+            existing.content = rec_content.clone();
+            existing.context_tokens = tiktoken_rs::cl100k_base_singleton()
+                .encode_ordinary(rec_content)
+                .len();
+            existing.is_active = false;
+            let completed_log = format!("completed task {clean_rec}");
             if !existing.logs.contains(&completed_log) {
                 existing.logs.push(completed_log);
             }
         } else {
-            let name = format!("specialist-{rec_task}");
+            let name = format!("specialist-{clean_rec}");
             let context_tokens = tiktoken_rs::cl100k_base_singleton()
                 .encode_ordinary(rec_content)
                 .len();
+            let prompt = load_prompt_from_disk(plan, Some(&clean_rec));
             subagents.push(SubagentDetail {
                 name,
-                task_id: Some(rec_task.clone()),
-                prompt: String::new(),
+                task_id: Some(clean_rec.clone()),
+                prompt,
                 started_at: None,
                 worked_duration: std::time::Duration::ZERO,
                 last_activity_at: None,
                 logs: vec![
-                    format!("started task {rec_task}"),
-                    format!("completed task {rec_task}"),
+                    format!("started task {clean_rec}"),
+                    format!("completed task {clean_rec}"),
                 ],
                 thinking: String::new(),
                 content: rec_content.clone(),
@@ -547,7 +844,7 @@ pub fn rehydrate_subagents(
         }
     }
 
-    // 4. Check off tasks from execution plan that might have completed
+    // 6. Check off tasks from execution plan that might have completed
     if let Some(p) = plan {
         let all = p.all_tasks();
         let pending = p.pending_tasks();
@@ -555,14 +852,15 @@ pub fn rehydrate_subagents(
         let plan_content = p.read().ok().flatten().unwrap_or_default();
 
         for tid in completed {
+            let clean = clean_task_id(&tid);
             if !subagents
                 .iter()
-                .any(|s| s.task_id.as_deref() == Some(&tid) || s.name.ends_with(&tid))
+                .any(|s| s.task_id.as_deref() == Some(&clean) || s.name.ends_with(&clean))
             {
                 // Detect role if specified on the task line, e.g. (coder)
                 let matching_line = plan_content
                     .lines()
-                    .find(|line| line.contains(&tid))
+                    .find(|line| line.contains(&clean) || line.contains(&tid))
                     .unwrap_or("");
                 let role = if matching_line.contains("(coder)") {
                     "coder"
@@ -575,22 +873,37 @@ pub fn rehydrate_subagents(
                 } else {
                     "specialist"
                 };
+                let prompt = load_prompt_from_disk(plan, Some(&clean));
                 subagents.push(SubagentDetail {
-                    name: format!("{role}-{tid}"),
-                    task_id: Some(tid.clone()),
-                    prompt: String::new(),
+                    name: format!("{role}-{clean}"),
+                    task_id: Some(clean.clone()),
+                    prompt,
                     started_at: None,
                     worked_duration: std::time::Duration::ZERO,
                     last_activity_at: None,
                     logs: vec![
-                        format!("started task {tid}"),
-                        format!("completed task {tid}"),
+                        format!("started task {clean}"),
+                        format!("completed task {clean}"),
                     ],
                     thinking: String::new(),
                     content: String::new(),
                     is_active: false,
                     context_tokens: 0,
                 });
+            }
+        }
+    }
+
+    // 7. Final pass: populate any missing prompts from disk for all subagents
+    for sa in &mut subagents {
+        if sa.prompt.is_empty() {
+            let tid = sa
+                .task_id
+                .as_deref()
+                .or_else(|| sa.name.rsplit_once('-').map(|(_, t)| t));
+            let prompt = load_prompt_from_disk(plan, tid);
+            if !prompt.is_empty() {
+                sa.prompt = prompt;
             }
         }
     }
@@ -728,5 +1041,145 @@ mod tests {
         let custom_formatted = format_tool_call_display("custom", &custom_args);
         assert!(custom_formatted.starts_with("custom("));
         assert!(custom_formatted.ends_with("…)"));
+    }
+
+    #[test]
+    fn test_rehydrate_subagents_active_when_in_flight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = crate::manager::phase::Plan::at(tmp.path());
+        plan.create("# Plan\n\n- [ ] [t-001] In-flight task (coder)\n")
+            .unwrap();
+
+        // Delegation started, but NO matching tool response in messages
+        let messages = vec![
+            Message::System {
+                content: "sys".to_string(),
+            },
+            Message::Assistant {
+                content: Some("Delegating to coder".to_string()),
+                reasoning_content: None,
+                tool_calls: vec![ToolCall::new(
+                    "call_in_flight",
+                    crate::tool_names::TOOL_DELEGATE_TASK,
+                    serde_json::json!({
+                        "agent_name": "coder",
+                        "task_id": "t-001",
+                        "prompt": "finish this task"
+                    })
+                    .to_string(),
+                )],
+            },
+        ];
+
+        let subagents = rehydrate_subagents(&messages, None, None, Some(&plan));
+        assert_eq!(subagents.len(), 1);
+        let s = &subagents[0];
+        assert_eq!(s.name, "coder-t-001");
+        assert_eq!(s.task_id.as_deref(), Some("t-001"));
+        assert!(
+            s.is_active,
+            "in-flight subagent must be rehydrated as active"
+        );
+        assert!(s.started_at.is_some(), "started_at must be populated");
+        assert!(
+            s.last_activity_at.is_some(),
+            "last_activity_at must be populated"
+        );
+        assert_eq!(s.logs, vec!["started task t-001"]);
+    }
+
+    #[test]
+    fn test_rehydrate_subagents_from_crash_journal_frozen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = crate::orchestrator::freeze::CrashJournal::new(tmp.path());
+
+        let req = crate::agents::DelegationRequest {
+            agent_name: crate::agents::Agent::Debugger,
+            prompt: "Diagnose crash dump".to_string(),
+            snippets: vec![],
+            task_id: Some("t-debug-1".to_string()),
+            image_urls: None,
+            audio_urls: None,
+            recursion_granted: false,
+        };
+        let _ = journal
+            .snapshot(crate::agents::Agent::Debugger, &req)
+            .unwrap();
+        assert!(journal.is_frozen());
+
+        let subagents = rehydrate_subagents(&[], Some(&journal), None, None);
+        assert_eq!(subagents.len(), 1);
+        let s = &subagents[0];
+        assert_eq!(s.name, "debugger-t-debug-1");
+        assert_eq!(s.task_id.as_deref(), Some("t-debug-1"));
+        assert_eq!(s.prompt, "Diagnose crash dump");
+        assert!(s.is_active, "frozen subagent must be rehydrated as active");
+        assert!(s.logs.contains(&"recovering interrupted task".to_string()));
+    }
+
+    #[test]
+    fn test_rehydrate_subagents_loads_prompt_from_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = crate::manager::phase::Plan::at(tmp.path());
+        plan.create("# Plan\n\n- [x] [t-005] Completed task (coder)\n")
+            .unwrap();
+
+        // Write a synthesized prompt to .marmel/prompts/t-005.md
+        let prompts_dir = plan.dir().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        let prompt_file = prompts_dir.join("t-005.md");
+        std::fs::write(
+            &prompt_file,
+            "# Synthesized Prompt for Coder\nYou are Coder.",
+        )
+        .unwrap();
+
+        let subagents = rehydrate_subagents(&[], None, None, Some(&plan));
+        assert_eq!(subagents.len(), 1);
+        let s = &subagents[0];
+        assert_eq!(s.name, "coder-t-005");
+        assert_eq!(s.prompt, "# Synthesized Prompt for Coder\nYou are Coder.");
+    }
+
+    #[test]
+    fn test_rehydrate_subagents_ui_transcript_completion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = crate::manager::phase::Plan::at(tmp.path());
+        plan.create("# Plan\n\n- [ ] [t-001] Task 1\n").unwrap();
+
+        let messages = vec![
+            Message::System {
+                content: "sys".to_string(),
+            },
+            Message::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![ToolCall::new(
+                    "call_1",
+                    crate::tool_names::TOOL_DELEGATE_TASK,
+                    serde_json::json!({
+                        "agent_name": "coder",
+                        "task_id": "t-001",
+                        "prompt": "work"
+                    })
+                    .to_string(),
+                )],
+            },
+        ];
+
+        let mut ui_transcript = crate::ui::UiTranscript::new();
+        ui_transcript.append(crate::ui::UiRecord::TaskCompleted {
+            task_id: "t-001".to_string(),
+        });
+
+        let subagents =
+            rehydrate_subagents_with_ui(&messages, None, None, Some(&plan), Some(&ui_transcript));
+        assert_eq!(subagents.len(), 1);
+        let s = &subagents[0];
+        assert!(
+            !s.is_active,
+            "subagent completed in ui_transcript must not be active"
+        );
+        assert!(s.logs.contains(&"completed task t-001".to_string()));
     }
 }

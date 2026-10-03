@@ -48,13 +48,81 @@ pub async fn run_session(
     crate::orchestrator::set_status_sender(status_tx);
     crate::orchestrator::set_event_sender(event_tx);
 
+    let ui_transcript_path = plan.ui_transcript_path();
+    let mut ui_transcript = if ui_transcript_path.exists() {
+        match UiTranscript::load(&ui_transcript_path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Failed to load UI transcript: {e}");
+                UiTranscript::new()
+            }
+        }
+    } else {
+        UiTranscript::new()
+    };
+
+    let transcript_path = plan.transcript_path();
+    let transcript_loaded = if transcript_path.exists() {
+        match ctx.load_transcript(&transcript_path) {
+            Ok(true) => {
+                ctx.set_system_prompt(system.clone());
+                true
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
+
+    let has_rehydrated = if !ui_transcript.is_empty() {
+        renderer.rehydrate_ui(ui_transcript.records());
+        true
+    } else if transcript_loaded {
+        ui_transcript = UiTranscript::from_legacy_messages(ctx.messages());
+        renderer.rehydrate_messages(ctx.messages());
+        let _ = ui_transcript.save(&ui_transcript_path);
+        true
+    } else {
+        false
+    };
+
+    if has_rehydrated {
+        renderer.on_event(&Event::Status(
+            "Session transcript rehydrated from disk (Ready)".to_string(),
+        ));
+        let _ = renderer.flush();
+    }
+
+    let mut steer_queue = Vec::<String>::new();
+    let mut steer_abort_requested = false;
+    let mut subagents = rehydrate_subagents_with_ui(
+        ctx.messages(),
+        manager.as_ref().map(|m| &m.journal),
+        None,
+        Some(&plan),
+        Some(&ui_transcript),
+    );
+
+    if !subagents.is_empty() {
+        renderer.rehydrate_subagents(&subagents);
+        let _ = renderer.flush();
+    }
+
     let mut recovered_deliverable: Option<(String, String)> = None;
     if let Some(mgr) = manager.as_ref()
         && mgr.journal.is_frozen()
     {
-        renderer.on_event(&Event::Status(
-            "Deep-Freeze checkpoint detected: recovering interrupted task...".to_string(),
-        ));
+        let frozen_task_id = mgr
+            .journal
+            .frozen()
+            .ok()
+            .flatten()
+            .and_then(|s| s.sub_req.task_id);
+        let frozen_task_str = frozen_task_id.as_deref().unwrap_or("task");
+
+        renderer.on_event(&Event::Status(format!(
+            "Deep-Freeze checkpoint detected: recovering interrupted task [{frozen_task_str}]..."
+        )));
         let _ = renderer.flush();
 
         let recover_mgr = mgr.clone();
@@ -108,53 +176,39 @@ pub async fn run_session(
 
         if let Some(deliverable) = deliverable_opt {
             let task_info = deliverable.task_id.as_deref().unwrap_or("recovered");
-            recovered_deliverable = Some((task_info.to_string(), deliverable.content));
-        }
-    }
+            let rec_content = deliverable.content.clone();
+            recovered_deliverable = Some((task_info.to_string(), rec_content.clone()));
 
-    let ui_transcript_path = plan.ui_transcript_path();
-    let mut ui_transcript = if ui_transcript_path.exists() {
-        match UiTranscript::load(&ui_transcript_path) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!("Failed to load UI transcript: {e}");
-                UiTranscript::new()
+            if let Some(sa) = find_subagent_mut(
+                &mut subagents,
+                &format!("specialist-{task_info}"),
+                Some(task_info),
+            ) {
+                sa.is_active = false;
+                sa.content = rec_content.clone();
+                sa.context_tokens = tiktoken_rs::cl100k_base_singleton()
+                    .encode_ordinary(&rec_content)
+                    .len();
+                let comp_log = format!("completed task {task_info}");
+                if !sa.logs.contains(&comp_log) {
+                    sa.logs.push(comp_log);
+                }
             }
-        }
-    } else {
-        UiTranscript::new()
-    };
-
-    let transcript_path = plan.transcript_path();
-    let transcript_loaded = if transcript_path.exists() {
-        match ctx.load_transcript(&transcript_path) {
-            Ok(true) => {
-                ctx.set_system_prompt(system.clone());
-                true
+            renderer.set_subagents(subagents.clone());
+            let _ = renderer.flush();
+        } else if let Some(ref tid) = frozen_task_id {
+            if let Some(sa) =
+                find_subagent_mut(&mut subagents, &format!("specialist-{tid}"), Some(tid))
+            {
+                sa.is_active = false;
+                let fail_log = format!("failed task {tid}");
+                if !sa.logs.contains(&fail_log) {
+                    sa.logs.push(fail_log);
+                }
             }
-            _ => false,
+            renderer.set_subagents(subagents.clone());
+            let _ = renderer.flush();
         }
-    } else {
-        false
-    };
-
-    let has_rehydrated = if !ui_transcript.is_empty() {
-        renderer.rehydrate_ui(ui_transcript.records());
-        true
-    } else if transcript_loaded {
-        ui_transcript = UiTranscript::from_legacy_messages(ctx.messages());
-        renderer.rehydrate_messages(ctx.messages());
-        let _ = ui_transcript.save(&ui_transcript_path);
-        true
-    } else {
-        false
-    };
-
-    if has_rehydrated {
-        renderer.on_event(&Event::Status(
-            "Session transcript rehydrated from disk (Ready)".to_string(),
-        ));
-        let _ = renderer.flush();
     }
 
     if let Some((task_info, content)) = recovered_deliverable.as_ref() {
@@ -182,20 +236,6 @@ pub async fn run_session(
         renderer.on_event(&Event::Status(format!(
             "Active plan pending: [{pending_str}] — Press Enter to resume"
         )));
-        let _ = renderer.flush();
-    }
-
-    let mut steer_queue = Vec::<String>::new();
-    let mut steer_abort_requested = false;
-    let mut subagents = rehydrate_subagents(
-        ctx.messages(),
-        manager.as_ref().map(|m| &m.journal),
-        recovered_deliverable.as_ref(),
-        Some(&plan),
-    );
-
-    if !subagents.is_empty() {
-        renderer.rehydrate_subagents(&subagents);
         let _ = renderer.flush();
     }
 
@@ -795,6 +835,20 @@ pub async fn run_session(
                     if let Some(ag) = agent {
                         update_subagent_lifecycle(&mut subagents, ag, task.clone(), None, false);
                         let tid = task.clone().unwrap_or_else(|| ag.to_string());
+                        let clean_tid = task.as_deref().map(clean_task_id);
+                        let sa_name = match &clean_tid {
+                            Some(t) if !t.is_empty() => format!("{}-{t}", ag.as_str()),
+                            _ => ag.as_str().to_string(),
+                        };
+                        if let Some(sa) =
+                            find_subagent_mut(&mut subagents, &sa_name, clean_tid.as_deref())
+                            && !is_error
+                        {
+                            sa.content = result_content.clone();
+                            sa.context_tokens = tiktoken_rs::cl100k_base_singleton()
+                                .encode_ordinary(&result_content)
+                                .len();
+                        }
                         if is_error {
                             renderer.on_event(&Event::Delegation(
                                 crate::orchestrator::DelegationEvent::Failed { agent: ag, task },
@@ -1141,6 +1195,20 @@ pub async fn run_session(
                             false,
                         );
                         let tid = delegated_task.clone().unwrap_or_else(|| agent.to_string());
+                        let clean_tid = delegated_task.as_deref().map(clean_task_id);
+                        let sa_name = match &clean_tid {
+                            Some(t) if !t.is_empty() => format!("{}-{t}", agent.as_str()),
+                            _ => agent.as_str().to_string(),
+                        };
+                        if let Some(sa) =
+                            find_subagent_mut(&mut subagents, &sa_name, clean_tid.as_deref())
+                            && !is_error
+                        {
+                            sa.content = result_content.clone();
+                            sa.context_tokens = tiktoken_rs::cl100k_base_singleton()
+                                .encode_ordinary(&result_content)
+                                .len();
+                        }
                         if is_error {
                             renderer.on_event(&Event::Delegation(
                                 crate::orchestrator::DelegationEvent::Failed {

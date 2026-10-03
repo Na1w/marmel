@@ -815,6 +815,26 @@ async fn test_ui_session_recovers_frozen_and_injects_deliverable() {
         "renderer should have received ToolResult for recovered task"
     );
 
+    // Verify subagent was populated in renderer with recovered deliverable
+    let sa = renderer
+        .subagents
+        .iter()
+        .find(|s| s.task_id.as_deref() == Some("t-801"))
+        .expect("recovered specialist for t-801 should be present in subagents");
+    assert_eq!(sa.name, "generalist-t-801");
+    assert!(
+        !sa.is_active,
+        "recovered subagent should be marked inactive after completion"
+    );
+    assert!(
+        sa.content.contains("MISSION COMPLETE"),
+        "subagent should carry the recovered deliverable content"
+    );
+    assert!(
+        sa.logs.iter().any(|l| l.contains("completed task t-801")),
+        "logs should record completion"
+    );
+
     let _ = wid;
 }
 
