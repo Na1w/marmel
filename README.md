@@ -17,7 +17,7 @@ A terminal-driven autonomous coding assistant in Rust. Marmel connects to any Op
   - [Slash Commands](#slash-commands)
   - [Headless Raw Mode](#headless-raw-mode)
   - [Runtime Directory (`.marmel/`)](#runtime-directory-marmel)
-- [Real-Time Steering & Bi-Directional Dialogue](#real-time-steering--bi-directional-dialogue)
+- [Real-Time Steering & Live Dialogue](#real-time-steering--live-dialogue)
 - [Agent Archetypes & Customization](#agent-archetypes--customization)
   - [Built-In Archetypes](#built-in-archetypes)
   - [Custom Archetypes (`AGENTS.md`)](#custom-archetypes-agentsmd)
@@ -35,7 +35,7 @@ Marmel is designed for autonomous multi-step software engineering with continuou
 - **Plan-Driven Execution:** When given a goal, the Manager creates a disk-backed execution plan at `.marmel/execution_plan.md` using a checkbox format (`- [ ] [t-xxx]`). Tasks are automatically checked off as they finish, and interrupted sessions resume seamlessly from the next unchecked task.
 - **Dynamic Subagents & JIT Prompt Architect:** Tasks are not sent to static prompts. An Agent Architect dynamically synthesizes a bespoke subagent blueprint (`.marmel/prompts/<task_id>.md`) combining archetype capabilities, domain skills (`skills/`), and least-privilege tool allowlists before delegation.
 - **Automated Validation:** Work produced by specialists is audited by an independent Validator subagent. If tests fail or requirements are missed, feedback is returned for revision.
-- **Real-Time Steering & Bi-Directional Mediation:** You can type into the prompt at any point. The Steer Arbitrator pauses active streams, answers questions, or dispatches notices (`notice_id`) to active workers. Workers reply via `reply_to_arbitrator`, and the Arbitrator synthesizes a clear answer back to you.
+- **Real-Time Steering & Interactive Dialogue:** You can type into the prompt at any point. Marmel pauses active subagents to answer questions, adjust the execution plan, or converse directly with working agents in real time.
 - **Model Context Protocol (MCP):** Connect external tool servers via stdio or HTTP/SSE using standard MCP configurations.
 - **Workspace Security:** File operations are strictly confined to the workspace. On Linux, terminal commands are isolated using Linux Landlock LSM to protect sensitive directories like `~/.ssh` and `~/.gnupg`.
 
@@ -48,8 +48,8 @@ Marmel is designed for autonomous multi-step software engineering with continuou
                            ┌───────────────────────────┐
                            │     Steer Arbitrator      │◄────────────┐
                            └──────┬─────────────┬──────┘             │
-                  Steer Directives│             │ Notice             │ reply_to_arbitrator
-                  / Plan Updates  │             │ (notice_id)        │ (Bi-directional)
+                  Steer Directives│             │ Inquiry / Guidance │ Live Response /
+                  / Plan Updates  │             │                    │ Clarification
                                   ▼             ▼                    │
       ┌───────────────────────────────────┐   ┌──────────────────────┴────────────┐
       │        OrchestratorManager        │   │      Dynamic Subagent Worker      │
@@ -274,16 +274,14 @@ Internal session files are stored in `.marmel/` within the workspace root:
 
 ---
 
-## Real-Time Steering & Bi-Directional Dialogue
+## Real-Time Steering & Live Dialogue
 
 Marmel allows you to interact with the assistant at any time—even while subagents are running commands or streaming output:
 
-1. **Stream Preemption:** Submitting a message while an agent is streaming immediately pauses the agent stream.
-2. **Steer Arbitrator:** An arbitrator evaluates your input:
-   - **Direct Answers:** If you ask a question (e.g. *"What are you currently doing?"* or *"Why SQLite?"*), the arbitrator responds immediately without resetting the agent's work.
-   - **Course Correction:** If you reject or adjust an approach, the arbitrator updates the plan or aborts the current subtask cleanly.
-   - **Forward to Worker:** If the question concerns internal implementation details of an active worker, the arbitrator delivers a notice to the worker's inbox.
-3. **Bi-Directional Worker Replies:** Active workers can call `reply_to_arbitrator(notice_id, message)` to report back. The Arbitrator synthesizes a clean, direct explanation for you (or asks targeted follow-ups) before resuming execution.
+- **Immediate Pausing:** Submitting a message while an agent is working immediately pauses execution.
+- **Direct Answers & Status:** Ask questions (e.g. *"What are you currently doing?"* or *"Why SQLite?"*) to get instant answers without disrupting the agent's work.
+- **Course Correction:** Provide feedback, reject an approach, adjust the plan, or abort the current subtask mid-flight.
+- **Direct Dialogue with Workers:** If your inquiry concerns an active subagent's internal reasoning, Marmel communicates directly with the working agent, retrieves its explanation, and reports back to you before resuming.
 
 ---
 
