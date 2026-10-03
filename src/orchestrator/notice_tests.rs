@@ -91,6 +91,31 @@ async fn test_handle_reply_to_arbitrator_success_and_validation() {
     let _lock = TEST_NOTICE_MUTEX.lock().await;
     clear_all_notices();
 
+    let server = MockServer::start().await;
+    let response_json = serde_json::json!({
+        "decision": "SynthesizeResponse",
+        "response": "Coder bekräftar att async I/O har implementerats.",
+        "follow_up_prompt": null,
+        "user_status": null
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(sse_delta(&response_json.to_string())),
+        )
+        .mount(&server)
+        .await;
+
+    let cfg = crate::config::Config {
+        backend_url: server.uri(),
+        ..Default::default()
+    };
+    crate::config::set_active(cfg);
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    crate::orchestrator::set_event_sender(event_tx);
+
     let notice = post_notice_to_worker("coder", "Please use async I/O", Some("notice-async-1"));
 
     // Missing notice_id should fail with BadArguments
@@ -133,6 +158,85 @@ async fn test_handle_reply_to_arbitrator_success_and_validation() {
     // Notice is now resolved
     assert!(get_pending_notice("notice-async-1").is_none());
     assert!(get_worker_reply("notice-async-1").is_some());
+
+    // Verify Event::SteerResponse was emitted to the user
+    let ev = event_rx
+        .try_recv()
+        .expect("Event::SteerResponse should be emitted");
+    match ev {
+        crate::ui::Event::SteerResponse(text) => {
+            assert!(text.contains("Coder bekräftar att async I/O har implementerats."));
+        }
+        other => panic!("Expected Event::SteerResponse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_handle_reply_to_arbitrator_ask_followup() {
+    let _lock = TEST_NOTICE_MUTEX.lock().await;
+    clear_all_notices();
+
+    let server = MockServer::start().await;
+    let response_json = serde_json::json!({
+        "decision": "AskFollowUp",
+        "response": null,
+        "follow_up_prompt": "What about backward compatibility with older files?",
+        "user_status": "Ställer följdfråga om bakåtkompatibilitet..."
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(sse_delta(&response_json.to_string())),
+        )
+        .mount(&server)
+        .await;
+
+    let cfg = crate::config::Config {
+        backend_url: server.uri(),
+        ..Default::default()
+    };
+    crate::config::set_active(cfg);
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    crate::orchestrator::set_event_sender(event_tx);
+
+    let _notice =
+        post_notice_to_worker("coder", "Please migrate to new format", Some("notice-follow-1"));
+    let initial_notices = drain_worker_notices("coder");
+    assert_eq!(initial_notices.len(), 1);
+
+    let tool_reply = ToolInvocation {
+        name: crate::tool_names::TOOL_REPLY_TO_ARBITRATOR.to_string(),
+        arguments: serde_json::json!({
+            "notice_id": "notice-follow-1",
+            "message": "Migrated to new binary format."
+        }),
+    };
+
+    let res = dispatch_for_async(&tool_reply, ToolCaller::Specialist(Agent::Coder)).await;
+    assert!(res.is_ok());
+    let out = res.unwrap();
+    assert!(out.content.contains("follow-up question"));
+
+    // Check user received status notice
+    let ev = event_rx
+        .try_recv()
+        .expect("SteerResponse emitted for user status");
+    match ev {
+        crate::ui::Event::SteerResponse(text) => {
+            assert!(text.contains("Ställer följdfråga om bakåtkompatibilitet"));
+        }
+        other => panic!("Expected SteerResponse, got {other:?}"),
+    }
+
+    // Check worker's inbox received the follow-up notice
+    let drained = drain_worker_notices("coder");
+    assert_eq!(drained.len(), 1);
+    assert_eq!(
+        drained[0].user_inquiry,
+        "What about backward compatibility with older files?"
+    );
 }
 
 fn sse_delta(content: &str) -> String {

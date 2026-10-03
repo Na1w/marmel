@@ -375,7 +375,9 @@ async fn dispatch_manager_async(
         TOOL_GREP_SEARCH => search::grep_search(&tool.arguments),
         TOOL_GLOB => search::glob(&tool.arguments),
         TOOL_SLEEP | TERMINAL_SLEEP | "wait" => handle_sleep_async(&tool.arguments).await,
-        TOOL_REPLY_TO_ARBITRATOR => handle_reply_to_arbitrator("Manager", &tool.arguments),
+        TOOL_REPLY_TO_ARBITRATOR => {
+            handle_reply_to_arbitrator_async("Manager", &tool.arguments).await
+        }
         other => Err(ToolError::Forbidden {
             tool: other.to_string(),
             caller: "Manager".to_string(),
@@ -474,7 +476,9 @@ async fn dispatch_specialist_async(
             )))
         }
         TOOL_SLEEP | TERMINAL_SLEEP | "wait" => handle_sleep_async(&tool.arguments).await,
-        TOOL_REPLY_TO_ARBITRATOR => handle_reply_to_arbitrator(&caller_str, &tool.arguments),
+        TOOL_REPLY_TO_ARBITRATOR => {
+            handle_reply_to_arbitrator_async(&caller_str, &tool.arguments).await
+        }
         TOOL_REBIRTH => {
             if let Some(eng) = engine {
                 handle_rebirth(eng, &tool.arguments)
@@ -490,7 +494,7 @@ async fn dispatch_specialist_async(
     }
 }
 
-pub fn handle_reply_to_arbitrator(
+pub async fn handle_reply_to_arbitrator_async(
     caller: &str,
     args: &serde_json::Value,
 ) -> Result<ToolResult, ToolError> {
@@ -509,25 +513,100 @@ pub fn handle_reply_to_arbitrator(
             detail: "missing mandatory string field `message`".to_string(),
         })?;
 
-    match crate::orchestrator::record_worker_reply(caller, notice_id, message) {
-        Ok(notice) => {
-            crate::orchestrator::emit_status(format!(
-                "[{caller}] Replied to notice {notice_id} for Steer Arbitrator"
-            ));
+    let record_res = crate::orchestrator::record_worker_reply(caller, notice_id, message);
+    let notice = match record_res {
+        Ok(n) => n,
+        Err(_) => {
+            if let Some(r) = crate::orchestrator::get_pending_notice(notice_id) {
+                r
+            } else {
+                crate::orchestrator::SteerNotice {
+                    notice_id: notice_id.to_string(),
+                    user_inquiry: "Status update from specialist worker".to_string(),
+                    target_worker: caller.to_string(),
+                    created_at_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
+                }
+            }
+        }
+    };
+
+    crate::orchestrator::emit_status(format!(
+        "[{caller}] Replied to notice {notice_id} — Steer Arbitrator evaluating..."
+    ));
+
+    let cfg = crate::config::get_active()
+        .or_else(|| crate::config::load(None).ok())
+        .unwrap_or_default();
+    let client = crate::llm::ChatClient::from_config(&cfg);
+    let stats = Arc::new(HarnessStats::new());
+
+    let eval_res = crate::orchestrator::evaluate_worker_reply(
+        &client,
+        &stats,
+        &notice,
+        caller,
+        message,
+        |_delta| {},
+    )
+    .await;
+
+    match eval_res {
+        Ok(eval) => {
+            if eval.decision.eq_ignore_ascii_case("AskFollowUp")
+                && let Some(follow_up) = eval.follow_up_prompt
+            {
+                let follow_up_notice = crate::orchestrator::post_notice_to_worker(
+                    caller,
+                    &follow_up,
+                    Some(notice_id),
+                );
+                if let Some(user_status) = eval.user_status {
+                    crate::orchestrator::emit_event(crate::ui::Event::SteerResponse(format!(
+                        "\n[Arbitrator]: {user_status}\n\n"
+                    )));
+                } else {
+                    crate::orchestrator::emit_status(format!(
+                        "[Arbitrator]: Follow-up question sent to {caller} ({})",
+                        follow_up_notice.notice_id
+                    ));
+                }
+                Ok(ToolResult::ok(format!(
+                    "Reply to notice '{notice_id}' received by Arbitrator. Arbitrator has posted follow-up question: \"{follow_up}\". Check notices and reply when ready."
+                )))
+            } else {
+                let resp = eval
+                    .response
+                    .unwrap_or_else(|| format!("Specialist [{caller}] explains: {message}"));
+                crate::orchestrator::emit_event(crate::ui::Event::SteerResponse(format!(
+                    "\n[Arbitrator]: {resp}\n\n"
+                )));
+                Ok(ToolResult::ok(format!(
+                    "Reply to Arbitrator for notice '{notice_id}' recorded successfully (original inquiry: \"{}\").",
+                    notice.user_inquiry
+                )))
+            }
+        }
+        Err(e) => {
+            let fallback_resp = format!("Specialist [{caller}] explains: {message}");
+            crate::orchestrator::emit_event(crate::ui::Event::SteerResponse(format!(
+                "\n[Arbitrator]: {fallback_resp}\n\n"
+            )));
             Ok(ToolResult::ok(format!(
-                "Reply to Arbitrator for notice '{notice_id}' recorded successfully (original inquiry: \"{}\").",
+                "Reply to Arbitrator for notice '{notice_id}' recorded successfully (original inquiry: \"{}\", note: {e}).",
                 notice.user_inquiry
             )))
         }
-        Err(e) => {
-            crate::orchestrator::emit_status(format!(
-                "[{caller}] Delivered message to Steer Arbitrator ({e})"
-            ));
-            Ok(ToolResult::ok(format!(
-                "Message delivered to Arbitrator (notice: '{notice_id}', note: {e})."
-            )))
-        }
     }
+}
+
+pub fn handle_reply_to_arbitrator(
+    caller: &str,
+    args: &serde_json::Value,
+) -> Result<ToolResult, ToolError> {
+    block_on_safe(handle_reply_to_arbitrator_async(caller, args))
 }
 
 fn dispatch_manager(
@@ -580,6 +659,7 @@ fn dispatch_manager(
         TOOL_GREP_SEARCH => search::grep_search(&tool.arguments),
         TOOL_GLOB => search::glob(&tool.arguments),
         TOOL_SLEEP | TERMINAL_SLEEP | "wait" => handle_sleep(&tool.arguments),
+        TOOL_REPLY_TO_ARBITRATOR => handle_reply_to_arbitrator("Manager", &tool.arguments),
         other => Err(ToolError::Forbidden {
             tool: other.to_string(),
             caller: "Manager".to_string(),
@@ -630,16 +710,22 @@ fn dispatch_specialist(
     }
 
     let gate_name = normalize_tool_name(name);
-    let is_allowed = match &caller {
-        ToolCaller::SpecialistWithTools { allowed_tools, .. } => allowed_tools.iter().any(|t| {
-            let norm = normalize_tool_name(t);
-            norm == gate_name || t == name || t == &gate_name || norm == name
-        }),
-        ToolCaller::Specialist(agent) => {
-            let registry = crate::orchestrator::SpecialistRegistry::canonical();
-            crate::orchestrator::caller_allows_tool(*agent, &gate_name, &registry)
+    let is_allowed = if gate_name == TOOL_REPLY_TO_ARBITRATOR {
+        true
+    } else {
+        match &caller {
+            ToolCaller::SpecialistWithTools { allowed_tools, .. } => {
+                allowed_tools.iter().any(|t| {
+                    let norm = normalize_tool_name(t);
+                    norm == gate_name || t == name || t == &gate_name || norm == name
+                })
+            }
+            ToolCaller::Specialist(agent) => {
+                let registry = crate::orchestrator::SpecialistRegistry::canonical();
+                crate::orchestrator::caller_allows_tool(*agent, &gate_name, &registry)
+            }
+            ToolCaller::Manager => false,
         }
-        ToolCaller::Manager => false,
     };
 
     if !is_allowed {
@@ -691,6 +777,7 @@ fn dispatch_specialist(
             )))
         }
         TOOL_SLEEP | TERMINAL_SLEEP | "wait" => handle_sleep(&tool.arguments),
+        TOOL_REPLY_TO_ARBITRATOR => handle_reply_to_arbitrator(&caller_str, &tool.arguments),
         TOOL_REBIRTH => {
             if let Some(eng) = engine {
                 handle_rebirth(eng, &tool.arguments)

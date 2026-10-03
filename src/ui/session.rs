@@ -289,6 +289,10 @@ pub async fn run_session(
             had_events = true;
         }
         while let Ok(ev) = event_rx.try_recv() {
+            if let Event::SteerResponse(ref text) = ev {
+                ui_transcript.append(UiRecord::SteerResponse { text: text.clone() });
+                let _ = ui_transcript.save(&ui_transcript_path);
+            }
             renderer.on_event(&ev);
             had_events = true;
         }
@@ -653,6 +657,11 @@ pub async fn run_session(
                             had_events = true;
                         }
                         while let Ok(ev) = event_rx.try_recv() {
+                            if let Event::SteerResponse(ref text) = ev {
+                                ui_transcript
+                                    .append(UiRecord::SteerResponse { text: text.clone() });
+                                let _ = ui_transcript.save(&ui_transcript_path);
+                            }
                             renderer.on_event(&ev);
                             had_events = true;
                         }
@@ -717,6 +726,11 @@ pub async fn run_session(
                                     had_events = true;
                                 }
                                 while let Ok(ev) = event_rx.try_recv() {
+                                    if let Event::SteerResponse(ref text) = ev {
+                                        ui_transcript
+                                            .append(UiRecord::SteerResponse { text: text.clone() });
+                                        let _ = ui_transcript.save(&ui_transcript_path);
+                                    }
                                     renderer.on_event(&ev);
                                     had_events = true;
                                 }
@@ -1003,6 +1017,11 @@ pub async fn run_session(
                             had_events = true;
                         }
                         while let Ok(ev) = event_rx.try_recv() {
+                            if let Event::SteerResponse(ref text) = ev {
+                                ui_transcript
+                                    .append(UiRecord::SteerResponse { text: text.clone() });
+                                let _ = ui_transcript.save(&ui_transcript_path);
+                            }
                             renderer.on_event(&ev);
                             had_events = true;
                         }
@@ -1053,6 +1072,11 @@ pub async fn run_session(
                                     had_events = true;
                                 }
                                 while let Ok(ev) = event_rx.try_recv() {
+                                    if let Event::SteerResponse(ref text) = ev {
+                                        ui_transcript
+                                            .append(UiRecord::SteerResponse { text: text.clone() });
+                                        let _ = ui_transcript.save(&ui_transcript_path);
+                                    }
                                     renderer.on_event(&ev);
                                     had_events = true;
                                 }
