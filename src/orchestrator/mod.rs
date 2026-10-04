@@ -45,10 +45,13 @@ use crate::harness::HarnessStats;
 use crate::llm::ChatClient;
 use crate::manager::phase::Plan;
 use anyhow::Result;
+#[cfg(test)]
+pub use bus::clear_steering_history;
 pub use bus::{
-    CURRENT_WORKER_TOKEN, cancel_all, emit_event, emit_status, global_cancellation_token,
-    is_current_or_global_cancelled, is_globally_cancelled, reset_cancellation, set_event_sender,
-    set_status_sender,
+    CURRENT_WORKER_TOKEN, SharedSteeringHistory, cancel_all, emit_event, emit_status,
+    get_steering_history, global_cancellation_token, is_current_or_global_cancelled,
+    is_globally_cancelled, record_steering_exchange, reset_cancellation, set_event_sender,
+    set_status_sender, set_steering_history,
 };
 pub use delegate::{brief_for_task, caller_allows_tool, handle_delegate_task};
 pub use delegation::{Delegation, DelegationEvent, OrchestrationConfig, RecursionDepth};

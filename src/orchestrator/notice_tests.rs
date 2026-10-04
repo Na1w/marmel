@@ -116,6 +116,12 @@ async fn test_handle_reply_to_arbitrator_success_and_validation() {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     crate::orchestrator::set_event_sender(event_tx);
 
+    let steering_history = std::sync::Arc::new(std::sync::RwLock::new(vec![(
+        "Please use async I/O".to_string(),
+        "Forwarded notice notice-async-1 to coder (awaiting specialist reply)".to_string(),
+    )]));
+    crate::orchestrator::set_steering_history(std::sync::Arc::clone(&steering_history));
+
     let notice = post_notice_to_worker("coder", "Please use async I/O", Some("notice-async-1"));
 
     // Missing notice_id should fail with BadArguments
@@ -169,6 +175,24 @@ async fn test_handle_reply_to_arbitrator_success_and_validation() {
         }
         other => panic!("Expected Event::SteerResponse, got {other:?}"),
     }
+
+    // Verify steering history was updated with specialist details and synthesized response
+    {
+        let hist = steering_history.read().unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].0, "Please use async I/O");
+        assert!(
+            hist[0]
+                .1
+                .contains("Coder bekräftar att async I/O har implementerats.")
+        );
+        assert!(
+            hist[0]
+                .1
+                .contains("Switched to tokio::fs for all file operations.")
+        );
+        assert!(!hist[0].1.contains("awaiting specialist reply"));
+    }
 }
 
 #[tokio::test]
@@ -200,6 +224,12 @@ async fn test_handle_reply_to_arbitrator_ask_followup() {
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     crate::orchestrator::set_event_sender(event_tx);
+
+    let steering_history = std::sync::Arc::new(std::sync::RwLock::new(vec![(
+        "Please migrate to new format".to_string(),
+        "Forwarded notice notice-follow-1 to coder (awaiting specialist reply)".to_string(),
+    )]));
+    crate::orchestrator::set_steering_history(std::sync::Arc::clone(&steering_history));
 
     let _notice = post_notice_to_worker(
         "coder",
@@ -240,6 +270,128 @@ async fn test_handle_reply_to_arbitrator_ask_followup() {
         drained[0].user_inquiry,
         "What about backward compatibility with older files?"
     );
+
+    // Verify steering history recorded the follow-up state awaiting next reply
+    {
+        let hist = steering_history.read().unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].0, "Please migrate to new format");
+        assert!(
+            hist[0]
+                .1
+                .contains("What about backward compatibility with older files?")
+        );
+        assert!(hist[0].1.contains("awaiting specialist reply"));
+        assert!(hist[0].1.contains("Migrated to new binary format."));
+    }
+}
+
+#[tokio::test]
+async fn test_steering_history_multiple_notices_resolved_out_of_order() {
+    let _lock = TEST_NOTICE_MUTEX.lock().await;
+    clear_all_notices();
+
+    let server = MockServer::start().await;
+    let eval_coder = serde_json::json!({
+        "decision": "SynthesizeResponse",
+        "response": "Coder har fixat PPC JIT.",
+        "follow_up_prompt": null,
+        "user_status": null
+    });
+    let eval_dbg = serde_json::json!({
+        "decision": "SynthesizeResponse",
+        "response": "Debugger har isolerat minnesläckan.",
+        "follow_up_prompt": null,
+        "user_status": null
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&req.body).to_string();
+            if body.contains("Debugger") || body.contains("debugger") {
+                ResponseTemplate::new(200).set_body_string(sse_delta(&eval_dbg.to_string()))
+            } else {
+                ResponseTemplate::new(200).set_body_string(sse_delta(&eval_coder.to_string()))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let cfg = crate::config::Config {
+        backend_url: server.uri(),
+        ..Default::default()
+    };
+    crate::config::set_active(cfg);
+
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    crate::orchestrator::set_event_sender(event_tx);
+
+    let steering_history = std::sync::Arc::new(std::sync::RwLock::new(vec![
+        (
+            "Vad gör codern?".to_string(),
+            "Forwarded notice notice-1 to coder (awaiting specialist reply)".to_string(),
+        ),
+        (
+            "Vad gör debuggern?".to_string(),
+            "Forwarded notice notice-2 to debugger (awaiting specialist reply)".to_string(),
+        ),
+    ]));
+    crate::orchestrator::set_steering_history(std::sync::Arc::clone(&steering_history));
+
+    let _n1 = post_notice_to_worker("coder", "Vad gör codern?", Some("notice-1"));
+    let _n2 = post_notice_to_worker("debugger", "Vad gör debuggern?", Some("notice-2"));
+
+    // Debugger replies FIRST (out-of-order)
+    let tool_dbg = ToolInvocation {
+        name: crate::tool_names::TOOL_REPLY_TO_ARBITRATOR.to_string(),
+        arguments: serde_json::json!({
+            "notice_id": "notice-2",
+            "message": "Minnesläckan berodde på en saknad free i malloc-wrapper."
+        }),
+    };
+    let res_dbg = dispatch_for_async(&tool_dbg, ToolCaller::Specialist(Agent::Debugger)).await;
+    assert!(res_dbg.is_ok());
+
+    // Verify: notice-2 (debugger) is updated, notice-1 (coder) is still pending
+    {
+        let hist = steering_history.read().unwrap();
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[0].0, "Vad gör codern?");
+        assert!(hist[0].1.contains("awaiting specialist reply"));
+
+        assert_eq!(hist[1].0, "Vad gör debuggern?");
+        assert!(hist[1].1.contains("Debugger har isolerat minnesläckan."));
+        assert!(hist[1].1.contains("malloc-wrapper"));
+        assert!(!hist[1].1.contains("awaiting specialist reply"));
+    }
+
+    // Coder replies SECOND
+    let tool_coder = ToolInvocation {
+        name: crate::tool_names::TOOL_REPLY_TO_ARBITRATOR.to_string(),
+        arguments: serde_json::json!({
+            "notice_id": "notice-1",
+            "message": "Implementerat JIT-instruktionerna för PowerPC 604e."
+        }),
+    };
+    let res_coder = dispatch_for_async(&tool_coder, ToolCaller::Specialist(Agent::Coder)).await;
+    assert!(res_coder.is_ok());
+
+    // Verify: BOTH notices are now updated with their respective specialist details!
+    {
+        let hist = steering_history.read().unwrap();
+        assert_eq!(hist.len(), 2);
+
+        assert_eq!(hist[0].0, "Vad gör codern?");
+        assert!(hist[0].1.contains("Coder har fixat PPC JIT."));
+        assert!(hist[0].1.contains("PowerPC 604e"));
+        assert!(!hist[0].1.contains("awaiting specialist reply"));
+
+        assert_eq!(hist[1].0, "Vad gör debuggern?");
+        assert!(hist[1].1.contains("Debugger har isolerat minnesläckan."));
+        assert!(hist[1].1.contains("malloc-wrapper"));
+        assert!(!hist[1].1.contains("awaiting specialist reply"));
+    }
 }
 
 fn sse_delta(content: &str) -> String {

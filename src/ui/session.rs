@@ -47,6 +47,7 @@ pub async fn run_session(
     let steering_history = Arc::new(std::sync::RwLock::new(Vec::<(String, String)>::new()));
     crate::orchestrator::set_status_sender(status_tx);
     crate::orchestrator::set_event_sender(event_tx);
+    crate::orchestrator::set_steering_history(Arc::clone(&steering_history));
 
     let ui_transcript_path = plan.ui_transcript_path();
     let mut ui_transcript = if ui_transcript_path.exists() {
@@ -87,6 +88,12 @@ pub async fn run_session(
     };
 
     if has_rehydrated {
+        let rehydrated_steering = ui_transcript.extract_steering_history();
+        if !rehydrated_steering.is_empty()
+            && let Ok(mut hist) = steering_history.write()
+        {
+            *hist = rehydrated_steering;
+        }
         renderer.on_event(&Event::Status(
             "Session transcript rehydrated from disk (Ready)".to_string(),
         ));
@@ -257,6 +264,9 @@ pub async fn run_session(
                         crate::debug_log::log_user_input("command", &line);
                         handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
                         ui_transcript.clear();
+                        if let Ok(mut hist) = steering_history.write() {
+                            hist.clear();
+                        }
                         let _ = std::fs::remove_file(&ui_transcript_path);
                         continue;
                     }
@@ -365,6 +375,9 @@ pub async fn run_session(
                 crate::debug_log::log_user_input("command", &steer);
                 handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
                 ui_transcript.clear();
+                if let Ok(mut hist) = steering_history.write() {
+                    hist.clear();
+                }
                 let _ = std::fs::remove_file(&ui_transcript_path);
                 continue;
             }
@@ -798,6 +811,9 @@ pub async fn run_session(
                                     } else if is_reset_command(&input) {
                                         handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
                                         ui_transcript.clear();
+                                        if let Ok(mut hist) = steering_history.write() {
+                                            hist.clear();
+                                        }
                                         let _ = std::fs::remove_file(&ui_transcript_path);
                                     } else if !input.trim().is_empty() {
                                         spawn_steer_arbitration(
@@ -1158,6 +1174,9 @@ pub async fn run_session(
                                     } else if is_reset_command(&input) {
                                         handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
                                         ui_transcript.clear();
+                                        if let Ok(mut hist) = steering_history.write() {
+                                            hist.clear();
+                                        }
                                         let _ = std::fs::remove_file(&ui_transcript_path);
                                     } else if !input.trim().is_empty() {
                                         spawn_steer_arbitration(
@@ -1345,6 +1364,9 @@ pub async fn run_session(
                     crate::debug_log::log_user_input("command", &line);
                     handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
                     ui_transcript.clear();
+                    if let Ok(mut hist) = steering_history.write() {
+                        hist.clear();
+                    }
                     let _ = std::fs::remove_file(&ui_transcript_path);
                     continue;
                 }

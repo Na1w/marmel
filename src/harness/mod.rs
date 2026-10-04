@@ -570,6 +570,15 @@ pub async fn handle_reply_to_arbitrator_async(
                         follow_up_notice.notice_id
                     ));
                 }
+                let follow_up_record = format!(
+                    "Forwarded follow-up {} to {caller}: \"{follow_up}\" (awaiting specialist reply)\n[Specialist {caller} prior reply]: {message}",
+                    follow_up_notice.notice_id
+                );
+                crate::orchestrator::record_steering_exchange(
+                    Some(notice_id),
+                    &notice.user_inquiry,
+                    &follow_up_record,
+                );
                 Ok(ToolResult::ok(format!(
                     "Reply to notice '{notice_id}' received by Arbitrator. Arbitrator has posted follow-up question: \"{follow_up}\". Check notices and reply when ready."
                 )))
@@ -580,6 +589,16 @@ pub async fn handle_reply_to_arbitrator_async(
                 crate::orchestrator::emit_event(crate::ui::Event::SteerResponse(format!(
                     "\n[Arbitrator]: {resp}\n\n"
                 )));
+                let full_history_resp = if resp.contains(message) {
+                    resp.clone()
+                } else {
+                    format!("{resp}\n[Specialist {caller}]: {message}")
+                };
+                crate::orchestrator::record_steering_exchange(
+                    Some(notice_id),
+                    &notice.user_inquiry,
+                    &full_history_resp,
+                );
                 Ok(ToolResult::ok(format!(
                     "Reply to Arbitrator for notice '{notice_id}' recorded successfully (original inquiry: \"{}\").",
                     notice.user_inquiry
@@ -591,6 +610,11 @@ pub async fn handle_reply_to_arbitrator_async(
             crate::orchestrator::emit_event(crate::ui::Event::SteerResponse(format!(
                 "\n[Arbitrator]: {fallback_resp}\n\n"
             )));
+            crate::orchestrator::record_steering_exchange(
+                Some(notice_id),
+                &notice.user_inquiry,
+                &fallback_resp,
+            );
             Ok(ToolResult::ok(format!(
                 "Reply to Arbitrator for notice '{notice_id}' recorded successfully (original inquiry: \"{}\", note: {e}).",
                 notice.user_inquiry

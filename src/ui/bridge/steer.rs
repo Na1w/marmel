@@ -27,7 +27,7 @@ pub enum SteerArbEvent {
     },
 }
 
-pub type SharedSteeringHistory = Arc<std::sync::RwLock<Vec<(String, String)>>>;
+pub use crate::orchestrator::SharedSteeringHistory;
 
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_steer_arbitration(
@@ -242,6 +242,7 @@ pub fn spawn_steer_arbitration(
             }
         }
 
+        let mut forwarded_notices = Vec::new();
         if let Some(ref d) = decision
             && crate::orchestrator::normalize_steer_decision(Some(&d.decision)) == "ForwardToWorker"
         {
@@ -255,6 +256,7 @@ pub fn spawn_steer_arbitration(
                         "\n[Arbitrator]: Forwarded notice {} to {} — awaiting specialist reply.\n",
                         notice.notice_id, target
                     )));
+                    forwarded_notices.push((notice.notice_id, target.to_string()));
                 }
             }
         }
@@ -266,6 +268,18 @@ pub fn spawn_steer_arbitration(
                 r.clone()
             } else if crate::orchestrator::normalize_steer_decision(Some(&d.decision)) == "Sleep" {
                 format!("Slept for {}s", d.sleep_seconds.unwrap_or(5))
+            } else if !forwarded_notices.is_empty() {
+                forwarded_notices
+                    .iter()
+                    .map(|(nid, tgt)| {
+                        format!("Forwarded notice {nid} to {tgt} (awaiting specialist reply)")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else if crate::orchestrator::normalize_steer_decision(Some(&d.decision))
+                == "ForwardToWorker"
+            {
+                "Forwarded notice to worker (awaiting specialist reply)".to_string()
             } else {
                 format!("Decision: {}", d.decision)
             }

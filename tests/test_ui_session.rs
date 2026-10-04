@@ -182,6 +182,7 @@ fn completion_sse(text: &str) -> String {
 /// via an explicit `/abort`.
 #[tokio::test]
 async fn test_ui_run_session_continues_after_first_turn() {
+    let _lock = TEST_MUTEX.lock().await;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -261,6 +262,7 @@ async fn test_ui_run_session_continues_after_first_turn() {
 /// and respects the 5-retry safeguard.
 #[tokio::test]
 async fn test_ui_run_session_auto_nudges_when_plan_incomplete_capped_at_5() {
+    let _lock = TEST_MUTEX.lock().await;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -400,6 +402,7 @@ async fn test_ui_session_steer_abort_redirection_resets_abort_and_continues() {
 /// and the stream seamlessly resumes with assistant prefix continuation, delivering the full answer.
 #[tokio::test]
 async fn test_ui_session_stream_pause_and_resume_on_user_question() {
+    let _lock = TEST_MUTEX.lock().await;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -486,6 +489,7 @@ async fn test_ui_session_stream_pause_and_resume_on_user_question() {
 /// resumed seamlessly via Assistant Prefill continuation.
 #[tokio::test]
 async fn test_specialist_stream_preemption_and_resumption_on_shared_model() {
+    let _lock = TEST_MUTEX.lock().await;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -615,6 +619,7 @@ async fn test_specialist_stream_preemption_and_resumption_on_shared_model() {
 
 #[tokio::test]
 async fn test_ui_session_rehydrates_transcript_and_resumes_plan() {
+    let _lock = TEST_MUTEX.lock().await;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -717,6 +722,7 @@ async fn test_ui_session_rehydrates_transcript_and_resumes_plan() {
 
 #[tokio::test]
 async fn test_ui_session_recovers_frozen_and_injects_deliverable() {
+    let _lock = TEST_MUTEX.lock().await;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -840,6 +846,7 @@ async fn test_ui_session_recovers_frozen_and_injects_deliverable() {
 
 #[tokio::test]
 async fn test_ui_session_rehydrates_subagents_and_populates_agent_pane() {
+    let _lock = TEST_MUTEX.lock().await;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -936,6 +943,7 @@ async fn test_ui_session_rehydrates_subagents_and_populates_agent_pane() {
 
 #[tokio::test]
 async fn test_steering_conversation_history_accumulates_and_passes_to_arbitrator() {
+    let _lock = TEST_MUTEX.lock().await;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1044,7 +1052,156 @@ async fn test_steering_conversation_history_accumulates_and_passes_to_arbitrator
 }
 
 #[tokio::test]
+async fn test_steering_conversation_history_accumulates_worker_reply_to_arbitrator() {
+    let _lock = TEST_MUTEX.lock().await;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let received_bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let rb = received_bodies.clone();
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&req.body).to_string();
+            rb.lock().unwrap().push(body.clone());
+            if body.contains("Original User Inquiry") {
+                // Evaluation of worker reply
+                ResponseTemplate::new(200).set_body_string(
+                    "data: {\"id\":\"c_eval\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"SynthesizeResponse\\\", \\\"response\\\": \\\"Codern har tagit bort jit_invalidate_all()-anropen och ctest 7/7 passerar.\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+                )
+            } else if body.contains("Hur gick testet?") {
+                // Turn 2: user asks follow-up
+                ResponseTemplate::new(200).set_body_string(
+                    "data: {\"id\":\"c2\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"RespondDirectly\\\", \\\"response\\\": \\\"Testet gick bra.\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+                )
+            } else {
+                // Turn 1: user asks "Hur går det för codern?" -> ForwardToWorker
+                ResponseTemplate::new(200).set_body_string(
+                    "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"ForwardToWorker\\\", \\\"subtasks\\\": [{\\\"tool_call_id\\\": \\\"call_1\\\", \\\"action\\\": \\\"ForwardNotice\\\", \\\"agent_name\\\": \\\"coder\\\", \\\"message\\\": \\\"Hur går det för codern?\\\"}]}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+                )
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let client =
+        marmennill::llm::ChatClient::new(format!("{}/v1", server.uri()), "test".to_string());
+    let cfg = marmennill::config::Config {
+        backend_url: format!("{}/v1", server.uri()),
+        ..Default::default()
+    };
+    marmennill::config::set_active(cfg);
+
+    let stats = Arc::new(marmennill::harness::HarnessStats::new());
+    let (arb_tx, mut arb_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    marmennill::orchestrator::set_event_sender(event_tx);
+
+    let mut renderer = ScriptedRenderer::new(vec![]);
+    let steering_history = Arc::new(std::sync::RwLock::new(Vec::<(String, String)>::new()));
+    marmennill::orchestrator::set_steering_history(Arc::clone(&steering_history));
+
+    // Turn 1: user asks "Hur går det för codern?"
+    marmennill::ui::bridge::spawn_steer_arbitration(
+        &client,
+        stats.clone(),
+        "build PPC JIT",
+        &[],
+        "Hur går det för codern?".to_string(),
+        &arb_tx,
+        &mut renderer,
+        Some(Arc::clone(&steering_history)),
+    );
+
+    // Wait for first arbitration to finish
+    loop {
+        if let Some(event) = arb_rx.recv().await
+            && matches!(
+                event,
+                marmennill::ui::bridge::SteerArbEvent::Finished { .. }
+            )
+        {
+            break;
+        }
+    }
+
+    // Verify history recorded initial pending status
+    let notice_id = {
+        let hist = steering_history.read().unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].0, "Hur går det för codern?");
+        assert!(hist[0].1.contains("awaiting specialist reply"));
+        // Extract notice id from recorded text (e.g. "Forwarded notice notice-1 to coder...")
+        let text = &hist[0].1;
+        let start = text.find("notice-").unwrap();
+        let end = text[start..]
+            .find(' ')
+            .map(|i| start + i)
+            .unwrap_or(text.len());
+        text[start..end].to_string()
+    };
+
+    // Specialist worker replies via handle_reply_to_arbitrator_async
+    let args = serde_json::json!({
+        "notice_id": notice_id,
+        "message": "Status: tagit bort de två jit_invalidate_all()-anropen och ctest 7/7 passerar."
+    });
+    let reply_res = marmennill::harness::handle_reply_to_arbitrator_async("coder", &args).await;
+    assert!(reply_res.is_ok());
+
+    // Verify history was UPDATED with worker reply and synthesized response
+    {
+        let hist = steering_history.read().unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].0, "Hur går det för codern?");
+        assert!(hist[0].1.contains(
+            "Codern har tagit bort jit_invalidate_all()-anropen och ctest 7/7 passerar."
+        ));
+        assert!(hist[0].1.contains("[Specialist coder]:"));
+        assert!(!hist[0].1.contains("awaiting specialist reply"));
+    }
+
+    // Turn 2: user asks "Hur gick testet?"
+    marmennill::ui::bridge::spawn_steer_arbitration(
+        &client,
+        stats.clone(),
+        "build PPC JIT",
+        &[],
+        "Hur gick testet?".to_string(),
+        &arb_tx,
+        &mut renderer,
+        Some(Arc::clone(&steering_history)),
+    );
+
+    loop {
+        if let Some(event) = arb_rx.recv().await
+            && matches!(
+                event,
+                marmennill::ui::bridge::SteerArbEvent::Finished { .. }
+            )
+        {
+            break;
+        }
+    }
+
+    // Verify that the prompt sent to the model for turn 2 contained the specialist's reply in steering history!
+    let bodies = received_bodies.lock().unwrap();
+    let turn2_req = bodies
+        .iter()
+        .find(|b| b.contains("Hur gick testet?"))
+        .expect("Turn 2 request must exist");
+    assert!(
+        turn2_req
+            .contains("Codern har tagit bort jit_invalidate_all()-anropen och ctest 7/7 passerar."),
+        "Turn 2 request must contain the specialist reply from steering history! Request was: {turn2_req}"
+    );
+}
+
+#[tokio::test]
 async fn test_stream_preemption_on_synchronous_bridge() {
+    let _lock = TEST_MUTEX.lock().await;
     use marmennill::llm::{PauseAction, StreamControl, StreamSink};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1205,6 +1362,7 @@ async fn test_steering_arbitrator_sleep_re_invokes_after_delay() {
 
 #[tokio::test]
 async fn test_ui_session_rehydrates_without_plan_if_transcript_exists() {
+    let _lock = TEST_MUTEX.lock().await;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1276,6 +1434,7 @@ async fn test_ui_session_rehydrates_without_plan_if_transcript_exists() {
 
 #[tokio::test]
 async fn test_ui_session_recovered_deliverable_placed_after_rehydrated_transcript() {
+    let _lock = TEST_MUTEX.lock().await;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1530,5 +1689,63 @@ async fn test_ui_session_migrates_legacy_transcript_to_ui_transcript() {
         UiRecord::User {
             text: "Legacy user message".to_string()
         }
+    );
+}
+
+#[tokio::test]
+async fn test_ui_session_rehydrates_steering_history_from_ui_transcript() {
+    let _lock = TEST_MUTEX.lock().await;
+    use marmennill::ui::{UiRecord, UiTranscript};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(completion_sse("Assistant ready.")),
+        )
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
+    let cfg = Config {
+        backend_url: format!("{}/v1", server.uri()),
+        system_prompt_path: PathBuf::from("prompts/system.md"),
+        ui_mode: "tui".to_string(),
+        ..Config::default()
+    };
+
+    // Pre-populate UI transcript with user steering and arbitrator response
+    let mut initial_transcript = UiTranscript::new();
+    initial_transcript.append(UiRecord::User {
+        text: "Hur går det för codern?".to_string(),
+    });
+    initial_transcript.append(UiRecord::SteerResponse {
+        text: "\n[Arbitrator]: Codern har tagit bort jit_invalidate_all()-anropen och ctest 7/7 passerar.\n"
+            .to_string(),
+    });
+    initial_transcript.save(plan.ui_transcript_path()).unwrap();
+
+    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::from_config(&cfg),
+        plan.clone(),
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+    let mut renderer = ScriptedRenderer::new(vec!["/abort".to_string()]);
+    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr))
+        .await
+        .expect("session rehydrates and succeeds");
+
+    // Verify steering history in orchestrator bus was restored from the transcript
+    let restored_hist = marmennill::orchestrator::get_steering_history()
+        .expect("steering history must be registered in orchestrator bus");
+    let hist = restored_hist.read().unwrap();
+    assert_eq!(hist.len(), 1);
+    assert_eq!(hist[0].0, "Hur går det för codern?");
+    assert_eq!(
+        hist[0].1,
+        "Codern har tagit bort jit_invalidate_all()-anropen och ctest 7/7 passerar."
     );
 }

@@ -277,6 +277,9 @@ pub(crate) async fn dispatch_tool_calls(
                             } else if is_reset_command(&input) {
                                 handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
                                 ui_transcript.clear();
+                                if let Ok(mut hist) = steering_history.write() {
+                                    hist.clear();
+                                }
                                 let _ = std::fs::remove_file(&ui_transcript_path);
                             } else if !input.trim().is_empty() {
                                 spawn_steer_arbitration(
@@ -593,6 +596,9 @@ pub(crate) async fn dispatch_tool_calls(
                             } else if is_reset_command(&input) {
                                 handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
                                 ui_transcript.clear();
+                                if let Ok(mut hist) = steering_history.write() {
+                                    hist.clear();
+                                }
                                 let _ = std::fs::remove_file(&ui_transcript_path);
                             } else if !input.trim().is_empty() {
                                 spawn_steer_arbitration(

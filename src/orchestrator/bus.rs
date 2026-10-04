@@ -7,6 +7,12 @@ static EVENT_SENDER: std::sync::RwLock<
     Option<tokio::sync::mpsc::UnboundedSender<crate::ui::Event>>,
 > = std::sync::RwLock::new(None);
 
+/// Shared, thread-safe steering conversation history for the active session.
+pub type SharedSteeringHistory = std::sync::Arc<std::sync::RwLock<Vec<(String, String)>>>;
+
+static STEERING_HISTORY: std::sync::RwLock<Option<SharedSteeringHistory>> =
+    std::sync::RwLock::new(None);
+
 static GLOBAL_CANCELLATION_TOKEN: std::sync::LazyLock<
     std::sync::RwLock<tokio_util::sync::CancellationToken>,
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(tokio_util::sync::CancellationToken::new()));
@@ -110,5 +116,109 @@ pub fn emit_event(ev: crate::ui::Event) {
     let tx = EVENT_SENDER.read().ok().and_then(|guard| guard.clone());
     if let Some(tx) = tx {
         let _ = tx.send(ev);
+    }
+}
+
+/// Register the shared steering conversation history for the active session.
+///
+/// Follows the same swap pattern as `set_status_sender` and `set_event_sender`:
+/// reachable multiple times across session reconnects/restarts.
+pub fn set_steering_history(hist: SharedSteeringHistory) {
+    if let Ok(mut lock) = STEERING_HISTORY.write() {
+        *lock = Some(hist);
+    }
+}
+
+/// Retrieve the active session's shared steering conversation history, if registered.
+pub fn get_steering_history() -> Option<SharedSteeringHistory> {
+    STEERING_HISTORY.read().ok().and_then(|guard| guard.clone())
+}
+
+/// Reset or clear the active steering conversation history registration.
+#[cfg(test)]
+pub fn clear_steering_history() {
+    if let Ok(mut lock) = STEERING_HISTORY.write() {
+        *lock = None;
+    }
+}
+
+/// Record or update a steering exchange in the active session's steering history.
+///
+/// Matches in 4 stages:
+/// 1. By `notice_id` in pending responses (e.g. "Forwarded notice notice-1 to coder (awaiting specialist reply)").
+/// 2. By `user_inquiry` text against pending entries.
+/// 3. Most recent pending entry waiting for a specialist reply.
+/// 4. If no pending entry exists, appends `(user_inquiry, arbitrator_response)`.
+pub fn record_steering_exchange(
+    notice_id: Option<&str>,
+    user_inquiry: &str,
+    arbitrator_response: &str,
+) {
+    let Some(hist_lock) = get_steering_history() else {
+        return;
+    };
+    let Ok(mut hist) = hist_lock.write() else {
+        return;
+    };
+
+    let mut matched = false;
+
+    // 1. Try matching by notice_id in pending responses (most accurate)
+    if let Some(nid) = notice_id {
+        for (_user_q, resp_text) in hist.iter_mut().rev() {
+            if resp_text.contains(nid)
+                && (resp_text.contains("awaiting specialist reply")
+                    || resp_text.contains("ForwardToWorker")
+                    || resp_text.contains("follow-up")
+                    || resp_text.starts_with("Decision:"))
+            {
+                *resp_text = arbitrator_response.to_string();
+                matched = true;
+                break;
+            }
+        }
+    }
+
+    // 2. Try matching by user_inquiry substring against pending entries
+    if !matched {
+        let inq_trimmed = user_inquiry.trim();
+        if !inq_trimmed.is_empty() {
+            for (user_q, resp_text) in hist.iter_mut().rev() {
+                let q_trimmed = user_q.trim();
+                if !q_trimmed.is_empty()
+                    && (q_trimmed == inq_trimmed
+                        || inq_trimmed.contains(q_trimmed)
+                        || q_trimmed.contains(inq_trimmed))
+                    && (resp_text.starts_with("Decision:")
+                        || resp_text.contains("awaiting specialist reply")
+                        || resp_text.contains("ForwardToWorker")
+                        || resp_text.contains("follow-up"))
+                {
+                    *resp_text = arbitrator_response.to_string();
+                    matched = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // 3. Try matching the most recent pending entry waiting for a specialist reply
+    if !matched {
+        for (_user_q, resp_text) in hist.iter_mut().rev() {
+            if resp_text.starts_with("Decision:")
+                || resp_text.contains("awaiting specialist reply")
+                || resp_text.contains("ForwardToWorker")
+                || resp_text.contains("follow-up")
+            {
+                *resp_text = arbitrator_response.to_string();
+                matched = true;
+                break;
+            }
+        }
+    }
+
+    // 4. If still not matched, append new entry
+    if !matched {
+        hist.push((user_inquiry.to_string(), arbitrator_response.to_string()));
     }
 }

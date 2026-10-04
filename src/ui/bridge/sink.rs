@@ -224,6 +224,10 @@ impl StreamSink for RendererSink<'_> {
                 r.clone()
             } else if crate::orchestrator::normalize_steer_decision(Some(&d.decision)) == "Sleep" {
                 format!("Slept for {}s", d.sleep_seconds.unwrap_or(5))
+            } else if crate::orchestrator::normalize_steer_decision(Some(&d.decision))
+                == "ForwardToWorker"
+            {
+                "Forwarded notice to worker (awaiting specialist reply)".to_string()
             } else {
                 format!("Decision: {}", d.decision)
             }

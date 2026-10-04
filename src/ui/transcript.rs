@@ -104,6 +104,66 @@ impl UiTranscript {
         Ok(())
     }
 
+    /// Extract paired user steering queries and their corresponding arbitrator responses.
+    ///
+    /// Ignores synthetic internal messages and pairs each user prompt with
+    /// subsequent `SteerResponse`s, updating pending decisions when resolution occurs.
+    pub fn extract_steering_history(&self) -> Vec<(String, String)> {
+        let mut history: Vec<(String, String)> = Vec::new();
+        let mut current_user: Option<String> = None;
+
+        for record in &self.records {
+            match record {
+                UiRecord::User { text } => {
+                    let trimmed = text.trim();
+                    let is_synthetic = trimmed.starts_with("(SYSTEM NOTICE:")
+                        || trimmed.starts_with("(SYSTEM:")
+                        || trimmed.starts_with("SYSTEM:")
+                        || trimmed.starts_with("[System]")
+                        || trimmed.starts_with("(User steering resulted in subtask");
+                    if !is_synthetic {
+                        current_user = Some(text.clone());
+                    }
+                }
+                UiRecord::SteerResponse { text } => {
+                    let clean_resp = text
+                        .trim()
+                        .strip_prefix("[Arbitrator]:")
+                        .unwrap_or(text.trim())
+                        .trim()
+                        .to_string();
+
+                    if clean_resp.is_empty() {
+                        continue;
+                    }
+
+                    if let Some(ref user_q) = current_user {
+                        if let Some((last_q, last_resp)) = history.last_mut()
+                            && last_q == user_q
+                        {
+                            if last_resp.contains("awaiting specialist reply")
+                                || last_resp.starts_with("Decision:")
+                                || last_resp.contains("följdfråga")
+                                || last_resp.contains("follow-up")
+                            {
+                                *last_resp = clean_resp;
+                            } else {
+                                last_resp.push('\n');
+                                last_resp.push_str(&clean_resp);
+                            }
+                        } else {
+                            history.push((user_q.clone(), clean_resp));
+                        }
+                    } else {
+                        history.push(("User inquiry".to_string(), clean_resp));
+                    }
+                }
+                _ => {}
+            }
+        }
+        history
+    }
+
     /// Convert legacy LLM messages (`Message`) into `UiRecord`s for backward compatibility.
     ///
     /// This isolates legacy prefix checks and heuristic filtering into a single migration path.
@@ -335,5 +395,59 @@ mod tests {
                 text: "Rebirth checkpoint: Completed auth refactor".to_string()
             }
         );
+    }
+
+    #[test]
+    fn test_extract_steering_history_pairs_and_resolves_pending() {
+        let mut transcript = UiTranscript::new();
+        transcript.append(UiRecord::User {
+            text: "Build PPC JIT".to_string(),
+        });
+        transcript.append(UiRecord::Assistant {
+            content: Some("I will implement PPC JIT.".to_string()),
+            thinking: None,
+        });
+
+        // User asks steering question
+        transcript.append(UiRecord::User {
+            text: "Hur går det för codern?".to_string(),
+        });
+        transcript.append(UiRecord::SteerResponse {
+            text:
+                "\n[Arbitrator]: Forwarded notice notice-1 to coder — awaiting specialist reply.\n"
+                    .to_string(),
+        });
+
+        // Intermediate tool logs while worker is working
+        transcript.append(UiRecord::ToolCall {
+            display: "run_command(ctest)".to_string(),
+        });
+        transcript.append(UiRecord::ToolResult {
+            display: "7/7 tests passed".to_string(),
+        });
+
+        // Specialist reply synthesized for the user
+        transcript.append(UiRecord::SteerResponse {
+            text: "\n[Arbitrator]: Codern har tagit bort jit_invalidate_all och alla 7 tester passerar.\n"
+                .to_string(),
+        });
+
+        // Second steering turn
+        transcript.append(UiRecord::User {
+            text: "Vad är nästa steg?".to_string(),
+        });
+        transcript.append(UiRecord::SteerResponse {
+            text: "Kör real-ROM-test med timeout.".to_string(),
+        });
+
+        let history = transcript.extract_steering_history();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].0, "Hur går det för codern?");
+        assert_eq!(
+            history[0].1,
+            "Codern har tagit bort jit_invalidate_all och alla 7 tester passerar."
+        );
+        assert_eq!(history[1].0, "Vad är nästa steg?");
+        assert_eq!(history[1].1, "Kör real-ROM-test med timeout.");
     }
 }
