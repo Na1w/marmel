@@ -6,6 +6,8 @@ use crate::agents::validation::{
 };
 use crate::agents::{Agent, IsolatedContext};
 
+const MAX_CONSECUTIVE_THINKING_NUDGES: u32 = 5;
+
 pub async fn run_specialist_live(
     client: &crate::llm::ChatClient,
     agent: Agent,
@@ -262,15 +264,19 @@ async fn run_specialist_live_inner(
 
         let is_repeating = rep_triggered || monitor.feed_text(&reply.content);
 
+        if !thinking_budget_exceeded || !tool_calls.is_empty() {
+            consecutive_thinking_nudges = 0;
+        }
+
         if tool_calls.is_empty() {
             if thinking_budget_exceeded {
                 consecutive_thinking_nudges += 1;
-                if consecutive_thinking_nudges >= 2 {
+                if consecutive_thinking_nudges >= MAX_CONSECUTIVE_THINKING_NUDGES {
                     tracing::warn!(
-                        "{agent_tag}: thinking budget exceeded twice consecutively — returning REPLAN REQUIRED"
+                        "{agent_tag}: thinking budget exceeded {MAX_CONSECUTIVE_THINKING_NUDGES} times consecutively — returning REPLAN REQUIRED"
                     );
                     crate::orchestrator::emit_status(format!(
-                        "{agent_tag}: reasoning budget exceeded twice consecutively — task too complex, requesting replan"
+                        "{agent_tag}: reasoning budget exceeded {MAX_CONSECUTIVE_THINKING_NUDGES} times consecutively — task too complex, requesting replan"
                     ));
                     crate::orchestrator::set_active_worker_status(
                         &_active_guard.0,
@@ -278,13 +284,12 @@ async fn run_specialist_live_inner(
                     );
                     let task_ref = ctx.task_id.as_deref().unwrap_or("task");
                     let replan_msg = format!(
-                        "REPLAN REQUIRED ({task_ref}): task too complex — exceeded single-turn reasoning budget of {max_thinking_tokens} tokens twice consecutively without completing work."
+                        "REPLAN REQUIRED ({task_ref}): task too complex — exceeded single-turn reasoning budget of {max_thinking_tokens} tokens {MAX_CONSECUTIVE_THINKING_NUDGES} times consecutively without completing work."
                     );
                     return Ok(replan_msg);
                 }
-                nudge_count += 1;
                 tracing::warn!(
-                    "{agent_tag}: thinking budget exceeded — injecting reasoning cutoff nudge ({consecutive_thinking_nudges}/2)"
+                    "{agent_tag}: thinking budget exceeded — injecting reasoning cutoff nudge ({consecutive_thinking_nudges}/{MAX_CONSECUTIVE_THINKING_NUDGES})"
                 );
                 crate::orchestrator::emit_status(format!(
                     "{agent_tag}: reasoning budget ({max_thinking_tokens} tokens) reached — nudging out of thinking"
@@ -310,8 +315,6 @@ async fn run_specialist_live_inner(
                     ),
                 });
                 continue;
-            } else {
-                consecutive_thinking_nudges = 0;
             }
 
             if budget_exceeded && nudge_count < 2 {
