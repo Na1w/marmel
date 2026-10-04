@@ -39,7 +39,8 @@ pub async fn run_session(
         .unwrap_or_else(|| Arc::new(crate::harness::HarnessStats::new()));
     let default_mon = crate::config::MonitoringConfig::default();
     let mon_cfg = cfg.monitoring.as_ref().unwrap_or(&default_mon);
-    let mut monitor = crate::harness::monitor::HarnessMonitor::new_with_config(stats, mon_cfg);
+    let mut monitor =
+        crate::harness::monitor::HarnessMonitor::new_with_config(stats.clone(), mon_cfg);
 
     let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
@@ -115,9 +116,13 @@ pub async fn run_session(
         let _ = renderer.flush();
     }
 
-    let mut recovered_deliverable: Option<(String, String)> = None;
-    if let Some(mgr) = manager.as_ref()
+    let client = ChatClient::from_config(cfg);
+    let harness_stats = stats.clone();
+    let stream_cfg = StreamConfig::from_config(cfg);
+
+    while let Some(mgr) = manager.as_ref()
         && mgr.journal.is_frozen()
+        && !renderer.aborted()
     {
         let frozen_task_id = mgr
             .journal
@@ -134,6 +139,7 @@ pub async fn run_session(
 
         let recover_mgr = mgr.clone();
         let mut recover_handle = tokio::spawn(async move { recover_mgr.recover_frozen().await });
+        let mut arb_handle: Option<tokio::task::JoinHandle<()>> = None;
 
         let deliverable_opt = loop {
             let mut had_events = false;
@@ -142,19 +148,61 @@ pub async fn run_session(
                 had_events = true;
             }
             while let Ok(ev) = event_rx.try_recv() {
+                if let Event::SteerResponse(ref text) = ev {
+                    ui_transcript.append(UiRecord::SteerResponse { text: text.clone() });
+                    let _ = ui_transcript.save(&ui_transcript_path);
+                }
                 renderer.on_event(&ev);
                 had_events = true;
             }
             if had_events {
                 let _ = renderer.flush();
             }
-            if let Some(input) = renderer.poll_input()
-                && is_abort_command(&input)
-            {
-                crate::orchestrator::cancel_all();
-                renderer.on_event(&Event::Status("Recovery aborted by user".to_string()));
-                let _ = renderer.flush();
-                break None;
+
+            drain_steer_arbitration_events_with_transcript(
+                &mut steer_arb_rx,
+                &mut *renderer,
+                &mut steer_queue,
+                &mut steer_abort_requested,
+                Some(&mut subagents),
+                Some(&mut ui_transcript),
+            );
+            drain_delegation_events_with_transcript(
+                manager.as_deref(),
+                &mut *renderer,
+                &mut subagents,
+                Some(&mut ui_transcript),
+            );
+
+            if let Some(input) = renderer.poll_input() {
+                if is_abort_command(&input) {
+                    crate::orchestrator::cancel_all();
+                    renderer.on_event(&Event::Status("Recovery aborted by user".to_string()));
+                    let _ = renderer.flush();
+                    break None;
+                }
+                if !input.trim().is_empty() {
+                    crate::debug_log::log_user_input("recovery_steer", &input);
+                    ui_transcript.append(UiRecord::User {
+                        text: input.clone(),
+                    });
+                    let _ = ui_transcript.save(&ui_transcript_path);
+                    let initial_goal = ctx
+                        .messages()
+                        .get(1)
+                        .and_then(|m| m.content())
+                        .unwrap_or("Recover interrupted tasks");
+                    arb_handle = Some(spawn_steer_arbitration(
+                        &client,
+                        harness_stats.clone(),
+                        initial_goal,
+                        &subagents,
+                        input,
+                        &steer_arb_tx,
+                        &mut *renderer,
+                        Some(Arc::clone(&steering_history)),
+                    ));
+                }
             }
             if renderer.aborted() {
                 crate::orchestrator::cancel_all();
@@ -181,10 +229,32 @@ pub async fn run_session(
             }
         };
 
+        if let Some(handle) = arb_handle.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+            while let Ok(msg) = status_rx.try_recv() {
+                renderer.on_event(&Event::Status(msg));
+            }
+            while let Ok(ev) = event_rx.try_recv() {
+                if let Event::SteerResponse(ref text) = ev {
+                    ui_transcript.append(UiRecord::SteerResponse { text: text.clone() });
+                    let _ = ui_transcript.save(&ui_transcript_path);
+                }
+                renderer.on_event(&ev);
+            }
+            drain_steer_arbitration_events_with_transcript(
+                &mut steer_arb_rx,
+                &mut *renderer,
+                &mut steer_queue,
+                &mut steer_abort_requested,
+                Some(&mut subagents),
+                Some(&mut ui_transcript),
+            );
+            let _ = renderer.flush();
+        }
+
         if let Some(deliverable) = deliverable_opt {
             let task_info = deliverable.task_id.as_deref().unwrap_or("recovered");
             let rec_content = deliverable.content.clone();
-            recovered_deliverable = Some((task_info.to_string(), rec_content.clone()));
 
             if let Some(sa) = find_subagent_mut(
                 &mut subagents,
@@ -203,6 +273,18 @@ pub async fn run_session(
             }
             renderer.set_subagents(subagents.clone());
             let _ = renderer.flush();
+
+            let display = format!("[Recovered task {task_info}] {rec_content}");
+            renderer.on_event(&Event::ToolResult(display.clone()));
+            let _ = renderer.flush();
+            ui_transcript.append(UiRecord::ToolResult { display });
+            let _ = ui_transcript.save(&ui_transcript_path);
+            ctx.append(Message::User {
+                content: format!(
+                    "(SYSTEM NOTICE: A previous interrupted task [{task_info}] was recovered successfully from checkpoint:\n{rec_content}\nUse this deliverable to proceed with subsequent pending plan tasks.)"
+                ),
+            });
+            let _ = ctx.save_transcript(&transcript_path);
         } else if let Some(ref tid) = frozen_task_id {
             if let Some(sa) =
                 find_subagent_mut(&mut subagents, &format!("specialist-{tid}"), Some(tid))
@@ -215,22 +297,20 @@ pub async fn run_session(
             }
             renderer.set_subagents(subagents.clone());
             let _ = renderer.flush();
+            break;
+        } else {
+            break;
         }
     }
 
-    if let Some((task_info, content)) = recovered_deliverable.as_ref() {
-        let display = format!("[Recovered task {task_info}] {content}");
-        renderer.on_event(&Event::ToolResult(display.clone()));
-        let _ = renderer.flush();
-        ui_transcript.append(UiRecord::ToolResult { display });
-        let _ = ui_transcript.save(&ui_transcript_path);
-        ctx.append(Message::User {
-            content: format!(
-                "(SYSTEM NOTICE: A previous interrupted task [{task_info}] was recovered successfully from checkpoint:\n{content}\nUse this deliverable to proceed with subsequent pending plan tasks.)"
-            ),
-        });
-        let _ = ctx.save_transcript(&transcript_path);
-    }
+    drain_steer_arbitration_events_with_transcript(
+        &mut steer_arb_rx,
+        &mut *renderer,
+        &mut steer_queue,
+        &mut steer_abort_requested,
+        Some(&mut subagents),
+        Some(&mut ui_transcript),
+    );
 
     let pending_tasks = plan.pending_tasks();
     let has_pending_plan = !pending_tasks.is_empty();
@@ -274,17 +354,97 @@ pub async fn run_session(
                     if !trimmed.is_empty() {
                         crate::debug_log::log_user_input("interactive_goal", trimmed);
                         if has_rehydrated {
-                            steer_queue.push(trimmed.to_string());
                             ui_transcript.append(UiRecord::User {
                                 text: trimmed.to_string(),
                             });
                             let _ = ui_transcript.save(&ui_transcript_path);
-                            break ctx
+
+                            renderer.on_event(&Event::Status(
+                                "Arbitrating user steering instruction...".to_string(),
+                            ));
+                            let _ = renderer.flush();
+
+                            let main_goal = ctx
                                 .messages()
                                 .get(1)
                                 .and_then(|m| m.content())
-                                .unwrap_or(trimmed)
-                                .to_string();
+                                .unwrap_or(trimmed);
+                            let plan_content = plan.read().unwrap_or(None).unwrap_or_default();
+                            let plan_progress_str =
+                                crate::ui::helpers::format_plan_progress_summary(&plan_content);
+                            let history_str = steering_history
+                                .read()
+                                .ok()
+                                .map(|h| crate::orchestrator::format_steering_history(&h))
+                                .unwrap_or_else(|| "None".to_string());
+                            let active_subtasks_str =
+                                crate::ui::helpers::format_active_subtasks(&subagents);
+                            let steer_ctx = crate::orchestrator::steer::SteerContext {
+                                main_goal,
+                                orchestrator_status: "Active (resume prompt)",
+                                pending_approval: "None",
+                                plan_progress: &plan_progress_str,
+                                plan_content: &plan_content,
+                                available_agents: "",
+                                steering_history: &history_str,
+                                user_message: trimmed,
+                                active_subtasks: &active_subtasks_str,
+                            };
+                            let decision =
+                                crate::orchestrator::steer::arbitrate_steer_context_stream(
+                                    &client,
+                                    &harness_stats,
+                                    steer_ctx,
+                                    |delta| {
+                                        renderer.on_event(&Event::SteerResponse(delta.to_string()));
+                                        let _ = renderer.flush();
+                                    },
+                                )
+                                .await;
+
+                            renderer.on_event(&Event::Status("Ready".to_string()));
+                            let _ = renderer.flush();
+
+                            if let Some(ref d) = decision {
+                                if let Some(ref resp) = d.response {
+                                    ui_transcript
+                                        .append(UiRecord::SteerResponse { text: resp.clone() });
+                                    let _ = ui_transcript.save(&ui_transcript_path);
+                                    if let Ok(mut hist) = steering_history.write() {
+                                        hist.push((trimmed.to_string(), resp.clone()));
+                                    }
+                                }
+                                let norm = crate::orchestrator::normalize_steer_decision(Some(
+                                    &d.decision,
+                                ));
+                                if norm == "AbortImmediately" || norm == "RejectPlan" {
+                                    crate::orchestrator::cancel_all();
+                                    renderer.request_user_exit();
+                                    renderer.shutdown();
+                                    return Ok(());
+                                }
+                            }
+
+                            let norm = decision
+                                .as_ref()
+                                .map(|d| {
+                                    crate::orchestrator::normalize_steer_decision(Some(&d.decision))
+                                })
+                                .unwrap_or("RespondDirectly");
+
+                            if norm == "RespondDirectly" {
+                                if has_pending_plan {
+                                    let pending_str = plan.pending_tasks().join(", ");
+                                    renderer.on_event(&Event::Status(format!(
+                                        "Active plan pending: [{pending_str}] — Press Enter to resume"
+                                    )));
+                                    let _ = renderer.flush();
+                                }
+                                continue;
+                            }
+
+                            steer_queue.push(trimmed.to_string());
+                            break main_goal.to_string();
                         } else {
                             break trimmed.to_string();
                         }
@@ -325,10 +485,6 @@ pub async fn run_session(
         });
         let _ = ctx.save_transcript(&transcript_path);
     }
-
-    let client = ChatClient::from_config(cfg);
-    let harness_stats = Arc::new(crate::harness::HarnessStats::new());
-    let stream_cfg = StreamConfig::from_config(cfg);
 
     crate::orchestrator::reset_cancellation();
 
@@ -383,9 +539,27 @@ pub async fn run_session(
             }
             if !steer.trim().is_empty() {
                 crate::debug_log::log_user_input("midflight_steer", &steer);
-                steer_queue.push(steer.clone());
-                ui_transcript.append(UiRecord::User { text: steer });
+                ui_transcript.append(UiRecord::User {
+                    text: steer.clone(),
+                });
                 let _ = ui_transcript.save(&ui_transcript_path);
+                if has_pending_plan
+                    || crate::orchestrator::has_active_workers()
+                    || subagents.iter().any(|s| s.is_active)
+                {
+                    spawn_steer_arbitration(
+                        &client,
+                        harness_stats.clone(),
+                        &goal,
+                        &subagents,
+                        steer,
+                        &steer_arb_tx,
+                        &mut *renderer,
+                        Some(Arc::clone(&steering_history)),
+                    );
+                } else {
+                    steer_queue.push(steer);
+                }
             }
         }
         for steer in steer_queue.drain(..) {

@@ -39,7 +39,7 @@ pub fn spawn_steer_arbitration(
     arb_tx: &tokio::sync::mpsc::UnboundedSender<SteerArbEvent>,
     renderer: &mut dyn Renderer,
     steering_history: Option<SharedSteeringHistory>,
-) {
+) -> tokio::task::JoinHandle<()> {
     let client = client.clone();
     let stats = stats.clone();
     let goal = goal.to_string();
@@ -297,5 +297,5 @@ pub fn spawn_steer_arbitration(
             decision,
             user_msg: msg,
         });
-    });
+    })
 }

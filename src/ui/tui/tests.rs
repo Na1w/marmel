@@ -1527,6 +1527,51 @@ fn test_rehydrate_subagents_enables_panel_and_selects_latest() {
 }
 
 #[test]
+fn test_rehydrate_subagents_selects_active_subagent() {
+    let mut r = TuiRenderer::new();
+    let subagents = vec![
+        SubagentDetail {
+            name: "coder-t-001".to_string(),
+            task_id: Some("t-001".to_string()),
+            prompt: "task 1".to_string(),
+            started_at: None,
+            last_activity_at: None,
+            logs: vec!["started task t-001".to_string()],
+            thinking: String::new(),
+            content: String::new(),
+            is_active: true,
+            context_tokens: 100,
+            worked_duration: Duration::ZERO,
+        },
+        SubagentDetail {
+            name: "researcher-t-002".to_string(),
+            task_id: Some("t-002".to_string()),
+            prompt: "task 2".to_string(),
+            started_at: None,
+            last_activity_at: None,
+            logs: vec![
+                "started task t-002".to_string(),
+                "completed task t-002".to_string(),
+            ],
+            thinking: String::new(),
+            content: "output 2".to_string(),
+            is_active: false,
+            context_tokens: 200,
+            worked_duration: Duration::ZERO,
+        },
+    ];
+
+    r.rehydrate_subagents(&subagents);
+
+    assert!(r.show_subagent_panel);
+    assert_eq!(r.subagents.len(), 2);
+    assert_eq!(
+        r.selected_subagent_idx, 0,
+        "Should select active subagent rather than later inactive ones"
+    );
+}
+
+#[test]
 fn test_rehydrate_messages_summarizes_delegation_results() {
     let mut r = TuiRenderer::new();
     let messages = vec![

@@ -1061,7 +1061,11 @@ impl Renderer for TuiRenderer {
         self.set_subagents(subagents.to_vec());
         if !self.subagents.is_empty() {
             self.show_subagent_panel = true;
-            self.selected_subagent_idx = self.subagents.len().saturating_sub(1);
+            if let Some(idx) = self.subagents.iter().position(|s| s.is_active) {
+                self.selected_subagent_idx = idx;
+            } else {
+                self.selected_subagent_idx = self.subagents.len().saturating_sub(1);
+            }
         }
     }
 

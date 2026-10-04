@@ -1749,3 +1749,150 @@ async fn test_ui_session_rehydrates_steering_history_from_ui_transcript() {
         "Codern har tagit bort jit_invalidate_all()-anropen och ctest 7/7 passerar."
     );
 }
+
+/// Verify that during Deep-Freeze recovery of an interrupted task, user inquiries
+/// submitted via poll_input are arbitrated live by the Steer Arbitrator and streamed
+/// as SteerResponse events to the UI.
+#[tokio::test]
+async fn test_ui_session_recovery_arbitrates_user_input_and_streams_steer_response() {
+    let _lock = TEST_MUTEX.lock().await;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(|req: &wiremock::Request| {
+            let body_str = String::from_utf8_lossy(&req.body);
+            if body_str.contains("Steer Arbitrator") || body_str.contains("Arbitrate the user") {
+                let body = completion_sse(
+                    r#"{"decision": "RespondDirectly", "response": "Återställning pågår för t-001."}"#,
+                );
+                ResponseTemplate::new(200).set_body_string(body)
+            } else {
+                let body = completion_sse("Mock specialist recovery response.\n\nMISSION COMPLETE (t-001)");
+                ResponseTemplate::new(200).set_body_string(body)
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let cfg = config_for_backend(&server.uri());
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
+    plan.create("# Plan\n- [ ] [t-001] frozen task\n")
+        .expect("plan created");
+
+    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::from_config(&cfg),
+        plan.clone(),
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    // Freeze a delegation in the journal
+    let sub_req = marmennill::agents::DelegationRequest {
+        agent_name: marmennill::agents::Agent::Generalist,
+        prompt: "Perform recovery work".to_string(),
+        snippets: vec![],
+        task_id: Some("t-001".to_string()),
+        image_urls: None,
+        audio_urls: None,
+        recursion_granted: false,
+    };
+    mgr.journal
+        .snapshot(marmennill::agents::Agent::Generalist, &sub_req)
+        .expect("snapshot frozen");
+    assert!(mgr.journal.is_frozen());
+
+    // Scripted input: midflight poll_input during recovery asks a status question,
+    // then /abort at the resume prompt.
+    let mut renderer = ScriptedRenderer::with_poll(
+        vec!["/abort".to_string()],
+        vec!["Hur går det med återställningen?".to_string()],
+    );
+
+    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr.clone()))
+        .await
+        .expect("session recovers and terminates on abort");
+
+    // The journal should be cleared after recovery
+    assert!(!mgr.journal.is_frozen());
+
+    // Verify that SteerResponse was emitted to the renderer
+    let had_steer_response = renderer.events.iter().any(|ev| match ev {
+        marmennill::ui::Event::SteerResponse(text) => text.contains("Återställning pågår"),
+        _ => false,
+    });
+    assert!(
+        had_steer_response,
+        "Steering arbitrator response must be streamed to renderer during recovery"
+    );
+}
+
+/// Verify that when multiple tasks are frozen in .session_frozen.json,
+/// recover_frozen loops through and recovers all of them sequentially.
+#[tokio::test]
+async fn test_ui_session_recovers_multiple_frozen_tasks_sequentially() {
+    let _lock = TEST_MUTEX.lock().await;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(|_req: &wiremock::Request| {
+            let body = completion_sse("Mock task completed.\n\nMISSION COMPLETE");
+            ResponseTemplate::new(200).set_body_string(body)
+        })
+        .mount(&server)
+        .await;
+
+    let cfg = config_for_backend(&server.uri());
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
+    plan.create("# Plan\n- [ ] [t-001] first\n- [ ] [t-002] second\n")
+        .expect("plan created");
+
+    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::from_config(&cfg),
+        plan.clone(),
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    // Freeze two tasks
+    let req1 = marmennill::agents::DelegationRequest {
+        agent_name: marmennill::agents::Agent::Generalist,
+        prompt: "Task 1".to_string(),
+        snippets: vec![],
+        task_id: Some("t-001".to_string()),
+        image_urls: None,
+        audio_urls: None,
+        recursion_granted: false,
+    };
+    let req2 = marmennill::agents::DelegationRequest {
+        agent_name: marmennill::agents::Agent::Coder,
+        prompt: "Task 2".to_string(),
+        snippets: vec![],
+        task_id: Some("t-002".to_string()),
+        image_urls: None,
+        audio_urls: None,
+        recursion_granted: false,
+    };
+    mgr.journal
+        .snapshot(marmennill::agents::Agent::Generalist, &req1)
+        .unwrap();
+    mgr.journal
+        .snapshot(marmennill::agents::Agent::Coder, &req2)
+        .unwrap();
+    assert_eq!(mgr.journal.frozen_all().unwrap().len(), 2);
+
+    let mut renderer = ScriptedRenderer::new(vec!["/abort".to_string()]);
+
+    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr.clone()))
+        .await
+        .expect("session recovers all tasks");
+
+    // All frozen checkpoints must be released
+    assert!(!mgr.journal.is_frozen());
+    assert_eq!(mgr.journal.frozen_all().unwrap().len(), 0);
+}

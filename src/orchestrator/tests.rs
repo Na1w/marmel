@@ -369,6 +369,14 @@ async fn test_orchestr_recover_frozen_rehydrates_identical_worker() {
     assert!(recovered.content.contains("Resume the analysis."));
     // The frozen checkpoint was released after rehydration.
     assert!(!m2.journal.is_frozen());
+    let evs = m2.delegation_events.lock().unwrap().clone();
+    assert_eq!(evs.len(), 2);
+    assert!(
+        matches!(&evs[0], DelegationEvent::Started { agent: Agent::Generalist, task: Some(t) } if t == "t-777")
+    );
+    assert!(
+        matches!(&evs[1], DelegationEvent::Completed { agent: Agent::Generalist, task: Some(t) } if t == "t-777")
+    );
     let _ = worker_id;
 }
 
@@ -419,6 +427,15 @@ async fn test_orchestr_recover_frozen_fails_when_role_unknown() {
             .iter()
             .any(|e| e.kind == JournalEventKind::Failed && e.worker_id == wid)
     );
+    let evs = m2.delegation_events.lock().unwrap().clone();
+    assert_eq!(evs.len(), 1);
+    assert!(matches!(
+        &evs[0],
+        DelegationEvent::Failed {
+            agent: Agent::Coder,
+            ..
+        }
+    ));
 }
 
 // --- REQ-ORCH-005: `handle_delegate_task` handler-level tests ---

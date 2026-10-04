@@ -373,6 +373,12 @@ impl OrchestratorManager {
                 snap.agent_name
             );
             let _ = self.journal.clear(&snap.worker_id, false);
+            if let Ok(mut ev) = self.delegation_events.lock() {
+                ev.push(DelegationEvent::Failed {
+                    agent: snap.agent_name,
+                    task: snap.sub_req.task_id.clone(),
+                });
+            }
             return Err(anyhow::anyhow!(
                 "Deep-Freeze: frozen worker {} (agent {}) cannot be rehydrated: \
                  role no longer registered",
@@ -410,14 +416,73 @@ impl OrchestratorManager {
         if let Some(bp) = blueprint {
             ctx = ctx.with_blueprint(bp);
         }
-        let worker = self.registry.worker(entry.agent);
+
+        if let Ok(mut ev) = self.delegation_events.lock() {
+            ev.push(DelegationEvent::Started {
+                agent: entry.agent,
+                task: snap.sub_req.task_id.clone(),
+            });
+        }
+        crate::debug_log::log_delegation_start(
+            entry.agent.as_str(),
+            snap.sub_req.task_id.as_deref(),
+            &snap.sub_req.prompt,
+            snap.sub_req.snippets.len(),
+        );
+        let start_time = std::time::Instant::now();
+
         let child_token = self.cancellation_token.child_token();
-        let deliverable = worker.run(&ctx, &child_token).await;
+
+        // Register active worker for real-time steering arbitrator visibility
+        let _active_guard = register_active_worker_with_token(
+            snap.sub_req.task_id.clone(),
+            entry.agent.as_str().to_string(),
+            snap.sub_req.prompt.clone(),
+            Some(child_token.clone()),
+        );
+
+        let deliverable = if self.cancellation_token.is_cancelled() || child_token.is_cancelled() {
+            Deliverable {
+                marker: MissionMarker::Failed {
+                    reason: "aborted".to_string(),
+                },
+                content: "Task aborted by user instruction.\n\nFAILED (aborted)".to_string(),
+                task_id: snap.sub_req.task_id.clone(),
+            }
+        } else {
+            let worker = self.registry.worker(entry.agent);
+            worker.run(&ctx, &child_token).await
+        };
+
+        let elapsed_ms = start_time.elapsed().as_millis();
+        let marker_str = format!("{:?}", deliverable.marker);
+        crate::debug_log::log_delegation_finish(
+            entry.agent.as_str(),
+            snap.sub_req.task_id.as_deref(),
+            &marker_str,
+            elapsed_ms,
+            &deliverable.content,
+        );
 
         // The frozen delegation resolved: release the checkpoint so it is not
         // resumed again on a subsequent boot.
         let clean = !matches!(deliverable.marker, MissionMarker::Failed { .. });
         let _ = self.journal.clear(&snap.worker_id, clean);
+
+        if let Ok(mut ev) = self.delegation_events.lock() {
+            if clean {
+                ev.push(DelegationEvent::Completed {
+                    agent: entry.agent,
+                    task: snap.sub_req.task_id.clone(),
+                });
+            } else {
+                ev.push(DelegationEvent::Failed {
+                    agent: entry.agent,
+                    task: snap.sub_req.task_id.clone(),
+                });
+            }
+        }
+
         Ok(Some(self.apply_check_off(
             deliverable,
             snap.sub_req.task_id.clone(),
