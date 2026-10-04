@@ -9,8 +9,8 @@ use thiserror::Error;
 
 /// First SSE event must arrive within this window or the request fails (5 minutes for long prefill).
 pub const INITIAL_RESPONSE_WATCHDOG_SECS: u64 = 300;
-/// Maximum silent pause allowed between stream chunks once streaming has started.
-pub const INTER_CHUNK_WATCHDOG_SECS: u64 = 60;
+/// Maximum silent pause allowed between stream chunks once streaming has started (5 minutes for long prefill or generation pause).
+pub const INTER_CHUNK_WATCHDOG_SECS: u64 = 300;
 /// Upper bound on the entire streaming read (20 minutes safety watchdog for up to 32k tokens).
 pub const OVERALL_READ_TIMEOUT_SECS: u64 = 1200;
 // Retry policy (MAX_ATTEMPTS / BACKOFF_BASE_MS / retry_with_backoff) now lives
@@ -71,6 +71,7 @@ pub struct ChatClient {
     auth_token: String,
     model: String,
     initial_timeout_secs: u64,
+    stall_timeout_secs: u64,
     client: reqwest::Client,
 }
 
@@ -120,6 +121,7 @@ impl ChatClient {
             auth_token: cfg.auth_token.clone(),
             model: cfg.model.clone(),
             initial_timeout_secs: INITIAL_RESPONSE_WATCHDOG_SECS,
+            stall_timeout_secs: INTER_CHUNK_WATCHDOG_SECS,
             client: default_http_client(),
         }
     }
@@ -130,6 +132,7 @@ impl ChatClient {
             auth_token: String::new(),
             model: model.into(),
             initial_timeout_secs: INITIAL_RESPONSE_WATCHDOG_SECS,
+            stall_timeout_secs: INTER_CHUNK_WATCHDOG_SECS,
             client: default_http_client(),
         }
     }
@@ -144,6 +147,7 @@ impl ChatClient {
             auth_token: auth_token.into(),
             model: model.into(),
             initial_timeout_secs: INITIAL_RESPONSE_WATCHDOG_SECS,
+            stall_timeout_secs: INTER_CHUNK_WATCHDOG_SECS,
             client: default_http_client(),
         }
     }
@@ -155,6 +159,11 @@ impl ChatClient {
 
     pub fn with_initial_timeout_secs(mut self, secs: u64) -> Self {
         self.initial_timeout_secs = secs;
+        self
+    }
+
+    pub fn with_stall_timeout_secs(mut self, secs: u64) -> Self {
+        self.stall_timeout_secs = secs;
         self
     }
 
@@ -356,8 +365,8 @@ impl ChatClient {
             let mut last_logged_chars = 0usize;
             loop {
                 // Inter-chunk watchdog: deadline is recomputed per chunk so the
-                // 60 s limit applies to the silent gap since the last event.
-                let stall_deadline = last_chunk_at + Duration::from_secs(INTER_CHUNK_WATCHDOG_SECS);
+                // stall limit applies to the silent gap since the last event.
+                let stall_deadline = last_chunk_at + Duration::from_secs(self.stall_timeout_secs);
                 match crate::net::pump_next(&mut stream, Some(stall_deadline), on_delta).await {
                     crate::net::PumpNext::Item(Some(ev)) => {
                         last_chunk_at = std::time::Instant::now();

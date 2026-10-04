@@ -190,3 +190,16 @@ fn test_consume_event_does_not_double_count_tokens() {
         "consume_event must not increment token counter on chunks"
     );
 }
+
+#[test]
+fn test_chat_client_default_and_custom_watchdogs() {
+    let client = ChatClient::new("http://localhost:8000/v1", "test-model");
+    assert_eq!(client.initial_timeout_secs, 300);
+    assert_eq!(client.stall_timeout_secs, 300);
+
+    let customized = client
+        .with_stall_timeout_secs(600)
+        .with_initial_timeout_secs(120);
+    assert_eq!(customized.initial_timeout_secs, 120);
+    assert_eq!(customized.stall_timeout_secs, 600);
+}
