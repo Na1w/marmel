@@ -331,12 +331,19 @@ pub(crate) fn drain_delegation_events_with_transcript(
                     tr.append(crate::ui::UiRecord::TaskCompleted { task_id });
                 }
             }
-            DelegationEvent::Failed { agent, task } => {
+            DelegationEvent::Failed {
+                agent,
+                task,
+                reason,
+            } => {
                 update_subagent_lifecycle(subagents, *agent, task.clone(), None, false);
                 changed = true;
                 if let Some(ref mut tr) = ui_transcript {
                     let task_id = task.clone().unwrap_or_else(|| agent.to_string());
-                    tr.append(crate::ui::UiRecord::TaskFailed { task_id });
+                    tr.append(crate::ui::UiRecord::TaskFailed {
+                        task_id,
+                        reason: reason.clone(),
+                    });
                 }
             }
         }
@@ -791,7 +798,7 @@ pub fn rehydrate_subagents_with_ui(
                         }
                     }
                 }
-                crate::ui::UiRecord::TaskFailed { task_id } => {
+                crate::ui::UiRecord::TaskFailed { task_id, .. } => {
                     let clean = clean_task_id(task_id);
                     if let Some(sa) = find_subagent_mut(&mut subagents, &clean, Some(&clean)) {
                         sa.is_active = false;
@@ -909,6 +916,110 @@ pub fn rehydrate_subagents_with_ui(
     }
 
     subagents
+}
+
+/// Extract a concise, human-readable failure reason from specialist or tool error outputs.
+pub fn extract_failure_reason(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "unknown failure".to_string();
+    }
+
+    // 1. Look for VALIDATOR REJECTION: <critique>
+    if let Some(pos) = trimmed.find("VALIDATOR REJECTION:") {
+        let after = &trimmed[pos + "VALIDATOR REJECTION:".len()..];
+        let first_line = after.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        let clean = first_line.trim().trim_end_matches('.').trim();
+        if !clean.is_empty() && clean != "---------------" {
+            return truncate_reason(clean, 120);
+        }
+    }
+
+    // 2. Look for REPLAN REQUIRED (<task>): <reason> or REPLAN REQUIRED: <reason>
+    if let Some(pos) = trimmed.find("REPLAN REQUIRED") {
+        let after = &trimmed[pos + "REPLAN REQUIRED".len()..];
+        let after = after.trim_start();
+        let after = if after.starts_with('(') {
+            if let Some(close_idx) = after.find(')') {
+                after[close_idx + 1..].trim_start()
+            } else {
+                after
+            }
+        } else {
+            after
+        };
+        let after = after.strip_prefix(':').unwrap_or(after).trim();
+        let first_line = after.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        let clean = first_line.trim();
+        if !clean.is_empty() {
+            return truncate_reason(clean, 120);
+        }
+    }
+
+    // 3. Look for explicit FAILED (<reason>)
+    if let Some(pos) = trimmed.find("FAILED (") {
+        let after = &trimmed[pos + "FAILED (".len()..];
+        if let Some(close_idx) = after.find(')') {
+            let inner = after[..close_idx].trim();
+            if !inner.is_empty() {
+                return truncate_reason(inner, 120);
+            }
+        }
+    }
+
+    // 4. Look for FAILED: <reason>
+    if let Some(pos) = trimmed.find("FAILED:") {
+        let after = &trimmed[pos + "FAILED:".len()..];
+        let first_line = after.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        let clean = first_line.trim();
+        if !clean.is_empty() {
+            return truncate_reason(clean, 120);
+        }
+    }
+
+    // 5. Look for ERROR: <reason>
+    if let Some(pos) = trimmed.find("ERROR:") {
+        let after = &trimmed[pos + "ERROR:".len()..];
+        let first_line = after.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        let clean = first_line.trim();
+        if !clean.is_empty() {
+            return truncate_reason(clean, 120);
+        }
+    }
+
+    // 6. Look for lines starting with "Task aborted"
+    for line in trimmed.lines() {
+        let l = line.trim();
+        if l.to_ascii_lowercase().starts_with("task aborted") {
+            return truncate_reason(l, 120);
+        }
+    }
+
+    // 7. Fallback: first non-empty line
+    let first_line = trimmed
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or(trimmed);
+    let clean = first_line
+        .trim()
+        .trim_matches(|c| c == '*' || c == '`' || c == '#')
+        .trim();
+    truncate_reason(clean, 120)
+}
+
+fn truncate_reason(s: &str, max_len: usize) -> String {
+    let s = s.trim();
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        let mut truncated = s[..max_len].to_string();
+        if let Some(last_space) = truncated.rfind(' ')
+            && last_space > max_len * 2 / 3
+        {
+            truncated.truncate(last_space);
+        }
+        format!("{truncated}...")
+    }
 }
 
 #[cfg(test)]
@@ -1181,5 +1292,42 @@ mod tests {
             "subagent completed in ui_transcript must not be active"
         );
         assert!(s.logs.contains(&"completed task t-001".to_string()));
+    }
+
+    #[test]
+    fn test_extract_failure_reason() {
+        assert_eq!(
+            extract_failure_reason(
+                "VALIDATOR REJECTION: Specialist generated conversational text without executing any tools.\n---------------\nFAILED"
+            ),
+            "Specialist generated conversational text without executing any tools"
+        );
+        assert_eq!(
+            extract_failure_reason(
+                "REPLAN REQUIRED (t-002): task too complex — exceeded reasoning budget"
+            ),
+            "task too complex — exceeded reasoning budget"
+        );
+        assert_eq!(
+            extract_failure_reason("REPLAN REQUIRED: missing dependency foo"),
+            "missing dependency foo"
+        );
+        assert_eq!(
+            extract_failure_reason("Task aborted by user instruction.\n\nFAILED (aborted)"),
+            "aborted"
+        );
+        assert_eq!(
+            extract_failure_reason("FAILED: compilation error on line 42"),
+            "compilation error on line 42"
+        );
+        assert_eq!(
+            extract_failure_reason("ERROR: timeout waiting for response"),
+            "timeout waiting for response"
+        );
+        assert_eq!(
+            extract_failure_reason("Custom single-line failure message"),
+            "Custom single-line failure message"
+        );
+        assert_eq!(extract_failure_reason("   "), "unknown failure");
     }
 }

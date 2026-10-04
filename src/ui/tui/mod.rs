@@ -818,7 +818,11 @@ impl Renderer for TuiRenderer {
                             self.status_line = format!("{name} finished task {t}");
                         }
                     }
-                    crate::orchestrator::DelegationEvent::Failed { agent, task } => {
+                    crate::orchestrator::DelegationEvent::Failed {
+                        agent,
+                        task,
+                        reason,
+                    } => {
                         let clean_task = task
                             .as_ref()
                             .map(|t| {
@@ -838,16 +842,23 @@ impl Renderer for TuiRenderer {
                             None => format!("{agent}"),
                         };
                         let t = clean_task.unwrap_or("(no task id)");
-                        self.upsert_subagent(&name, false, &format!("failed task {t}"));
+                        let log_entry = match reason.as_deref().filter(|r| !r.is_empty()) {
+                            Some(r) => format!("failed task {t}: {r}"),
+                            None => format!("failed task {t}"),
+                        };
+                        self.upsert_subagent(&name, false, &log_entry);
                         self.plan_mtime = None;
                         self.last_plan_check = std::time::Instant::now()
                             .checked_sub(std::time::Duration::from_secs(1))
                             .unwrap_or_else(std::time::Instant::now);
 
-                        let failed_msg = match clean_task {
-                            Some(clean) => format!("[{clean}] failed."),
-                            None => format!("[{agent}] failed."),
-                        };
+                        let failed_msg =
+                            match (clean_task, reason.as_deref().filter(|r| !r.is_empty())) {
+                                (Some(clean), Some(r)) => format!("[{clean} failed: {r}]"),
+                                (Some(clean), None) => format!("[{clean}] failed."),
+                                (None, Some(r)) => format!("[{agent} failed: {r}]"),
+                                (None, None) => format!("[{agent}] failed."),
+                            };
                         self.messages.push(failed_msg);
                         if self.chat_auto_scroll {
                             let w = self.chat_width.get();
@@ -876,7 +887,10 @@ impl Renderer for TuiRenderer {
                             );
                         } else {
                             self.active_agent = "Manager".to_string();
-                            self.status_line = format!("{name} failed task {t}");
+                            self.status_line = match reason.as_deref().filter(|r| !r.is_empty()) {
+                                Some(r) => format!("{name} failed task {t}: {r}"),
+                                None => format!("{name} failed task {t}"),
+                            };
                         }
                     }
                 };
@@ -1101,8 +1115,12 @@ impl Renderer for TuiRenderer {
                 crate::ui::UiRecord::TaskCompleted { task_id } => {
                     self.messages.push(format!("[{task_id}] completed."));
                 }
-                crate::ui::UiRecord::TaskFailed { task_id } => {
-                    self.messages.push(format!("[{task_id}] failed."));
+                crate::ui::UiRecord::TaskFailed { task_id, reason } => {
+                    let msg = match reason.as_deref().filter(|r| !r.is_empty()) {
+                        Some(r) => format!("[{task_id} failed: {r}]"),
+                        None => format!("[{task_id}] failed."),
+                    };
+                    self.messages.push(msg);
                 }
                 crate::ui::UiRecord::Status { text } => {
                     if text.starts_with("[Status]")

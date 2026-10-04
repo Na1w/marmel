@@ -29,7 +29,11 @@ pub enum UiRecord {
     /// Completion event for a delegated task.
     TaskCompleted { task_id: String },
     /// Failure event for a delegated task.
-    TaskFailed { task_id: String },
+    TaskFailed {
+        task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// System, rebirth, or status message.
     Status { text: String },
 }
@@ -291,6 +295,7 @@ mod tests {
         });
         transcript.append(UiRecord::TaskFailed {
             task_id: "t-002".to_string(),
+            reason: Some("syntax error on line 42".to_string()),
         });
         transcript.append(UiRecord::SteerResponse {
             text: "Arbitrator response".to_string(),
@@ -302,6 +307,17 @@ mod tests {
         let json = serde_json::to_string_pretty(&transcript).unwrap();
         let loaded: UiTranscript = serde_json::from_str(&json).unwrap();
         assert_eq!(transcript, loaded);
+
+        // Verify backwards compatibility when reason is omitted in JSON
+        let legacy_json = r#"{"records":[{"type":"TaskFailed","task_id":"t-legacy"}]}"#;
+        let legacy_loaded: UiTranscript = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(
+            legacy_loaded.records()[0],
+            UiRecord::TaskFailed {
+                task_id: "t-legacy".to_string(),
+                reason: None,
+            }
+        );
     }
 
     #[test]

@@ -336,10 +336,26 @@ impl OrchestratorManager {
 
         // Surface the delegation completion to the UI.
         if let Ok(mut ev) = self.delegation_events.lock() {
-            ev.push(DelegationEvent::Completed {
-                agent: entry.agent,
-                task: req.task_id.clone(),
-            });
+            if matches!(deliverable.marker, MissionMarker::Failed { .. }) {
+                let reason = match &deliverable.marker {
+                    MissionMarker::Failed { reason } => {
+                        Some(crate::ui::helpers::extract_failure_reason(reason))
+                    }
+                    _ => Some(crate::ui::helpers::extract_failure_reason(
+                        &deliverable.content,
+                    )),
+                };
+                ev.push(DelegationEvent::Failed {
+                    agent: entry.agent,
+                    task: req.task_id.clone(),
+                    reason,
+                });
+            } else {
+                ev.push(DelegationEvent::Completed {
+                    agent: entry.agent,
+                    task: req.task_id.clone(),
+                });
+            }
         }
 
         // Bind task_id & auto check-off.
@@ -377,6 +393,7 @@ impl OrchestratorManager {
                 ev.push(DelegationEvent::Failed {
                     agent: snap.agent_name,
                     task: snap.sub_req.task_id.clone(),
+                    reason: Some("role no longer registered".to_string()),
                 });
             }
             return Err(anyhow::anyhow!(
@@ -476,9 +493,18 @@ impl OrchestratorManager {
                     task: snap.sub_req.task_id.clone(),
                 });
             } else {
+                let reason = match &deliverable.marker {
+                    MissionMarker::Failed { reason } => {
+                        Some(crate::ui::helpers::extract_failure_reason(reason))
+                    }
+                    _ => Some(crate::ui::helpers::extract_failure_reason(
+                        &deliverable.content,
+                    )),
+                };
                 ev.push(DelegationEvent::Failed {
                     agent: entry.agent,
                     task: snap.sub_req.task_id.clone(),
+                    reason,
                 });
             }
         }

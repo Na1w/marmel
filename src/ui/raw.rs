@@ -99,9 +99,21 @@ impl Renderer for RawRenderer {
                     let t = task.as_deref().unwrap_or("(no task id)");
                     self.push_line("delegation", &format!("DONE    {agent} on {t}"));
                 }
-                crate::orchestrator::DelegationEvent::Failed { agent, task } => {
+                crate::orchestrator::DelegationEvent::Failed {
+                    agent,
+                    task,
+                    reason,
+                } => {
                     let t = task.as_deref().unwrap_or("(no task id)");
-                    self.push_line("delegation", &format!("FAILED  {agent} on {t}"));
+                    let reason_suffix = reason
+                        .as_deref()
+                        .filter(|r| !r.is_empty())
+                        .map(|r| format!(": {r}"))
+                        .unwrap_or_default();
+                    self.push_line(
+                        "delegation",
+                        &format!("FAILED  {agent} on {t}{reason_suffix}"),
+                    );
                 }
             },
             Event::Done => {
@@ -176,8 +188,16 @@ impl Renderer for RawRenderer {
                 crate::ui::UiRecord::TaskCompleted { task_id } => {
                     self.push_line("delegation", &format!("DONE    specialist on {task_id}"));
                 }
-                crate::ui::UiRecord::TaskFailed { task_id } => {
-                    self.push_line("delegation", &format!("FAILED  specialist on {task_id}"));
+                crate::ui::UiRecord::TaskFailed { task_id, reason } => {
+                    let reason_suffix = reason
+                        .as_deref()
+                        .filter(|r| !r.is_empty())
+                        .map(|r| format!(": {r}"))
+                        .unwrap_or_default();
+                    self.push_line(
+                        "delegation",
+                        &format!("FAILED  specialist on {task_id}{reason_suffix}"),
+                    );
                 }
                 crate::ui::UiRecord::Status { text } => {
                     self.push_line("status", text);
@@ -218,6 +238,7 @@ mod tests {
             },
             UiRecord::TaskFailed {
                 task_id: "t-2".to_string(),
+                reason: Some("compilation error".to_string()),
             },
             UiRecord::Status {
                 text: "Running tests".to_string(),

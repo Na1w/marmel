@@ -46,7 +46,12 @@ pub fn message_style(msg: &str) -> (Style, bool) {
                 .add_modifier(Modifier::BOLD),
             true,
         )
-    } else if first.starts_with('[') && first.ends_with("failed.") {
+    } else if first.starts_with('[')
+        && (first.ends_with("failed.")
+            || first.ends_with("failed]")
+            || first.contains(" failed:")
+            || first.contains(" failed]"))
+    {
         (
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             true,

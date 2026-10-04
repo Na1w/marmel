@@ -384,7 +384,16 @@ async fn test_ui_session_steer_abort_redirection_resets_abort_and_continues() {
         vec![String::new(), "stop and list files instead".to_string()],
     );
 
-    marmennill::ui::run_session(&cfg, &mut renderer, None, None)
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan = marmennill::manager::Plan::at(tmp.path());
+    let stats = std::sync::Arc::new(marmennill::harness::HarnessStats::new());
+    let manager = std::sync::Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::new(server.uri(), "marmel-manager"),
+        plan,
+        stats,
+    ));
+
+    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(manager))
         .await
         .expect("run_session should complete without error");
 

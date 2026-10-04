@@ -410,6 +410,48 @@ fn delegation_completed_marks_idle_and_stops_routing() {
     assert_eq!(r.subagents[0].content, "");
 }
 
+#[test]
+fn test_delegation_failed_renders_reason_in_chatlog() {
+    let mut r = TuiRenderer::new();
+
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Started {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-001".to_string()),
+        },
+    ));
+
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Failed {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-001".to_string()),
+            reason: Some("compilation error: unresolved import".to_string()),
+        },
+    ));
+
+    assert_eq!(r.messages.len(), 1);
+    assert_eq!(
+        r.messages[0],
+        "[t-001 failed: compilation error: unresolved import]"
+    );
+    assert!(!r.subagents[0].is_active);
+    assert!(
+        r.subagents[0]
+            .logs
+            .contains(&"failed task t-001: compilation error: unresolved import".to_string())
+    );
+
+    // When reason is None, falls back to [task] failed.
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Failed {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-002".to_string()),
+            reason: None,
+        },
+    ));
+    assert_eq!(r.messages[1], "[t-002] failed.");
+}
+
 /// t-c304: `set_subagents` adopts the session-loop's authoritative list,
 /// preserving locally-streamed thinking/content and dropping stale entries.
 #[test]
@@ -1734,6 +1776,11 @@ fn test_rehydrate_ui_records_renders_clean_chat_history() {
         },
         UiRecord::TaskFailed {
             task_id: "t-102".to_string(),
+            reason: None,
+        },
+        UiRecord::TaskFailed {
+            task_id: "t-103".to_string(),
+            reason: Some("syntax error in mod.rs".to_string()),
         },
         UiRecord::Status {
             text: "Recovery succeeded".to_string(),
@@ -1742,7 +1789,7 @@ fn test_rehydrate_ui_records_renders_clean_chat_history() {
 
     r.rehydrate_ui(&records);
 
-    assert_eq!(r.messages.len(), 9);
+    assert_eq!(r.messages.len(), 10);
     assert_eq!(r.messages[0], "User: Initial objective");
     assert_eq!(r.messages[1], "<think>\nReasoning about steps.\n</think>");
     assert_eq!(r.messages[2], "Working on it.");
@@ -1751,7 +1798,8 @@ fn test_rehydrate_ui_records_renders_clean_chat_history() {
     assert_eq!(r.messages[5], "[Tool Result] // file contents");
     assert_eq!(r.messages[6], "[t-101] completed.");
     assert_eq!(r.messages[7], "[t-102] failed.");
-    assert_eq!(r.messages[8], "[Status] Recovery succeeded");
+    assert_eq!(r.messages[8], "[t-103 failed: syntax error in mod.rs]");
+    assert_eq!(r.messages[9], "[Status] Recovery succeeded");
     assert!(r.chat_auto_scroll);
 }
 

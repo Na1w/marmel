@@ -307,10 +307,18 @@ pub(crate) async fn dispatch_tool_calls(
                 update_subagent_lifecycle(&mut subagents, ag, task.clone(), None, false);
                 let tid = task.clone().unwrap_or_else(|| ag.to_string());
                 if is_error {
+                    let reason = crate::ui::helpers::extract_failure_reason(&result_content);
                     renderer.on_event(&Event::Delegation(
-                        crate::orchestrator::DelegationEvent::Failed { agent: ag, task },
+                        crate::orchestrator::DelegationEvent::Failed {
+                            agent: ag,
+                            task,
+                            reason: Some(reason.clone()),
+                        },
                     ));
-                    ui_transcript.append(UiRecord::TaskFailed { task_id: tid });
+                    ui_transcript.append(UiRecord::TaskFailed {
+                        task_id: tid,
+                        reason: Some(reason),
+                    });
                 } else {
                     if let Some(ref tid_task) = task {
                         let plan = crate::manager::phase::Plan::default();
@@ -631,13 +639,18 @@ pub(crate) async fn dispatch_tool_calls(
                 );
                 let tid = delegated_task.clone().unwrap_or_else(|| agent.to_string());
                 if is_error {
+                    let reason = crate::ui::helpers::extract_failure_reason(&result_content);
                     renderer.on_event(&Event::Delegation(
                         crate::orchestrator::DelegationEvent::Failed {
                             agent,
                             task: delegated_task,
+                            reason: Some(reason.clone()),
                         },
                     ));
-                    ui_transcript.append(UiRecord::TaskFailed { task_id: tid });
+                    ui_transcript.append(UiRecord::TaskFailed {
+                        task_id: tid,
+                        reason: Some(reason),
+                    });
                 } else {
                     if let Some(ref tid) = delegated_task {
                         let plan = crate::manager::phase::Plan::default();
