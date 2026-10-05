@@ -58,7 +58,8 @@ pub(crate) fn load_system_prompt_with_plan(
             }
         }
     }
-    if let Ok(Some(plan_content)) = plan.read()
+    if cfg.enable_rehydration
+        && let Ok(Some(plan_content)) = plan.read()
         && !plan_content.trim().is_empty()
     {
         prompt.push_str(&format!(

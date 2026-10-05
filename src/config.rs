@@ -125,6 +125,8 @@ pub struct Config {
     pub mcp_servers: HashMap<String, crate::mcp::McpServerConfig>,
     /// Optional base prompt appended to the orchestrator system prompt.
     pub base_prompt: Option<String>,
+    /// Whether to rehydrate past session state / transcripts on startup (default: false).
+    pub enable_rehydration: bool,
 }
 
 impl Default for Config {
@@ -150,6 +152,7 @@ impl Default for Config {
             orchestration: OrchestrationConfig::default_depth(),
             mcp_servers: HashMap::new(),
             base_prompt: None,
+            enable_rehydration: false,
         }
     }
 }
@@ -191,6 +194,9 @@ pub fn load(explicit_path: Option<&str>) -> Result<Config> {
         && !m.trim().is_empty()
     {
         cfg.model = m;
+    }
+    if let Ok(val) = std::env::var("MARMEL_ENABLE_REHYDRATION") {
+        cfg.enable_rehydration = val == "1" || val.eq_ignore_ascii_case("true");
     }
 
     cfg.expand_paths();
@@ -252,6 +258,7 @@ struct PartialConfig {
     #[serde(default)]
     pub mcp_servers: HashMap<String, crate::mcp::McpServerConfig>,
     pub base_prompt: Option<String>,
+    pub enable_rehydration: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -331,6 +338,9 @@ fn merge(mut base: Config, partial: PartialConfig) -> Config {
     }
     if let Some(v) = partial.base_prompt {
         base.base_prompt = Some(v);
+    }
+    if let Some(v) = partial.enable_rehydration {
+        base.enable_rehydration = v;
     }
 
     if let Some(p_mon) = partial.monitoring {

@@ -157,6 +157,7 @@ fn config_for_backend(backend: &str) -> Config {
         // Point at a real, loadable system prompt so `load_system_prompt` succeeds.
         system_prompt_path: PathBuf::from("prompts/system.md"),
         ui_mode: "tui".to_string(),
+        enable_rehydration: true,
         ..Config::default()
     }
 }
@@ -685,6 +686,7 @@ async fn test_ui_session_rehydrates_transcript_and_resumes_plan() {
         backend_url: format!("{}/v1", server.uri()),
         system_prompt_path: PathBuf::from("prompts/system.md"),
         ui_mode: "tui".to_string(),
+        enable_rehydration: true,
         ..Config::default()
     };
 
@@ -777,6 +779,7 @@ async fn test_ui_session_recovers_frozen_and_injects_deliverable() {
         backend_url: format!("{}/v1", server.uri()),
         system_prompt_path: PathBuf::from("prompts/system.md"),
         ui_mode: "tui".to_string(),
+        enable_rehydration: true,
         ..Config::default()
     };
 
@@ -899,6 +902,7 @@ async fn test_ui_session_rehydrates_subagents_and_populates_agent_pane() {
         backend_url: format!("{}/v1", server.uri()),
         system_prompt_path: PathBuf::from("prompts/system.md"),
         ui_mode: "tui".to_string(),
+        enable_rehydration: true,
         ..Config::default()
     };
 
@@ -1412,6 +1416,7 @@ async fn test_ui_session_rehydrates_without_plan_if_transcript_exists() {
         backend_url: format!("{}/v1", server.uri()),
         system_prompt_path: PathBuf::from("prompts/system.md"),
         ui_mode: "tui".to_string(),
+        enable_rehydration: true,
         ..Config::default()
     };
 
@@ -1477,6 +1482,7 @@ async fn test_ui_session_recovered_deliverable_placed_after_rehydrated_transcrip
         backend_url: format!("{}/v1", server.uri()),
         system_prompt_path: PathBuf::from("prompts/system.md"),
         ui_mode: "tui".to_string(),
+        enable_rehydration: true,
         ..Config::default()
     };
 
@@ -1541,6 +1547,7 @@ async fn test_ui_session_saves_and_rehydrates_ui_transcript() {
         backend_url: format!("{}/v1", server.uri()),
         system_prompt_path: PathBuf::from("prompts/system.md"),
         ui_mode: "tui".to_string(),
+        enable_rehydration: true,
         ..Config::default()
     };
 
@@ -1636,6 +1643,7 @@ async fn test_ui_session_migrates_legacy_transcript_to_ui_transcript() {
         backend_url: format!("{}/v1", server.uri()),
         system_prompt_path: PathBuf::from("prompts/system.md"),
         ui_mode: "tui".to_string(),
+        enable_rehydration: true,
         ..Config::default()
     };
 
@@ -1723,6 +1731,7 @@ async fn test_ui_session_rehydrates_steering_history_from_ui_transcript() {
         backend_url: format!("{}/v1", server.uri()),
         system_prompt_path: PathBuf::from("prompts/system.md"),
         ui_mode: "tui".to_string(),
+        enable_rehydration: true,
         ..Config::default()
     };
 
@@ -1904,4 +1913,209 @@ async fn test_ui_session_recovers_multiple_frozen_tasks_sequentially() {
     // All frozen checkpoints must be released
     assert!(!mgr.journal.is_frozen());
     assert_eq!(mgr.journal.frozen_all().unwrap().len(), 0);
+}
+
+/// Verify that when a user enters a steering instruction at the resume prompt
+/// and the arbitrator decides `AbortImmediately`, Marmel does NOT terminate/exit,
+/// but cancels previous plan tasks, clears the old plan file, and stays alive to execute
+/// the subsequent turn with the redirected user instruction.
+#[tokio::test]
+async fn test_ui_session_resume_prompt_steer_abort_immediately_continues_session() {
+    let _lock = TEST_MUTEX.lock().await;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let assistant_turns = Arc::new(AtomicUsize::new(0));
+    let arbitrator_calls = Arc::new(AtomicUsize::new(0));
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let assistant_turns = assistant_turns.clone();
+            let arbitrator_calls = arbitrator_calls.clone();
+            move |req: &wiremock::Request| {
+                let body_str = String::from_utf8_lossy(&req.body);
+                if body_str.contains("Steer Arbitrator") || body_str.contains("Arbitrate the user") {
+                    arbitrator_calls.fetch_add(1, Ordering::SeqCst);
+                    let body = completion_sse(
+                        r#"{"decision": "AbortImmediately", "response": "Aborting old plan and redirecting to maciotwo trace."}"#,
+                    );
+                    ResponseTemplate::new(200).set_body_string(body)
+                } else {
+                    let n = assistant_turns.fetch_add(1, Ordering::SeqCst);
+                    let body = if n == 0 {
+                        // Manager receives the redirected steer instruction in context
+                        assert!(
+                            body_str.contains("Trace control flow at maciotwo"),
+                            "Manager request must contain the redirected user instruction"
+                        );
+                        completion_sse("Started planning around maciotwo trace.\n\nMISSION COMPLETE")
+                    } else {
+                        completion_sse("Finished subsequent turn.")
+                    };
+                    ResponseTemplate::new(200).set_body_string(body)
+                }
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let cfg = config_for_backend(&server.uri());
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
+    plan.create("# Plan\n- [ ] [t-001] old cuda task\n")
+        .expect("plan created");
+
+    // Create a previous UI transcript so has_rehydrated is true
+    let mut ui_transcript = marmennill::ui::UiTranscript::new();
+    ui_transcript.append(marmennill::ui::UiRecord::User {
+        text: "investigate cuda".to_string(),
+    });
+    ui_transcript
+        .save(plan.ui_transcript_path())
+        .expect("ui transcript saved");
+
+    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::from_config(&cfg),
+        plan.clone(),
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    // User provides redirecting instruction at resume prompt, then /abort after the turn completes
+    let mut renderer = ScriptedRenderer::new(vec![
+        "Trace control flow at maciotwo.cpp".to_string(),
+        "/abort".to_string(),
+    ]);
+
+    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr.clone()))
+        .await
+        .expect("session must not exit on AbortImmediately, but continue executing");
+
+    assert_eq!(
+        arbitrator_calls.load(Ordering::SeqCst),
+        1,
+        "Steering arbitrator must be called for the user instruction"
+    );
+    assert!(
+        assistant_turns.load(Ordering::SeqCst) >= 1,
+        "Orchestrator must execute at least one turn for the redirected instruction"
+    );
+
+    // Old plan file should have been removed to allow replanning
+    assert!(
+        !plan.exists(),
+        "Old execution_plan.md must be removed on AbortImmediately to allow new plan creation"
+    );
+
+    let had_steer_response = renderer.events.iter().any(|ev| match ev {
+        marmennill::ui::Event::SteerResponse(text) => text.contains("Aborting old plan"),
+        _ => false,
+    });
+    assert!(
+        had_steer_response,
+        "Steering arbitrator response must be streamed to renderer"
+    );
+}
+
+/// Verify that when `enable_rehydration: false` (the default):
+/// 1. Past transcripts on disk are NOT loaded or rehydrated into the renderer.
+/// 2. Frozen journal checkpoints are NOT recovered on startup.
+/// 3. Startup prompts for a fresh user goal instead of resuming pending plans.
+/// 4. Saving transcripts and progress still occurs during the session.
+#[tokio::test]
+async fn test_ui_session_disabled_rehydration_starts_fresh_and_skips_recovery() {
+    let _lock = TEST_MUTEX.lock().await;
+    use marmennill::ui::{UiRecord, UiTranscript};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(completion_sse("Fresh session reply.")),
+        )
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
+    plan.create("# Plan\n- [ ] [t-001] old pending task\n")
+        .expect("plan created");
+
+    // Pre-create old UI transcript
+    let mut old_ui_transcript = UiTranscript::new();
+    old_ui_transcript.append(UiRecord::User {
+        text: "Old user goal from yesterday".to_string(),
+    });
+    old_ui_transcript
+        .save(plan.ui_transcript_path())
+        .expect("old transcript saved");
+
+    // Config with enable_rehydration: false (default)
+    let cfg = Config {
+        backend_url: format!("{}/v1", server.uri()),
+        system_prompt_path: PathBuf::from("prompts/system.md"),
+        ui_mode: "tui".to_string(),
+        enable_rehydration: false,
+        ..Config::default()
+    };
+    assert!(!cfg.enable_rehydration);
+
+    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::from_config(&cfg),
+        plan.clone(),
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    // Snapshot a frozen task
+    let frozen_req = marmennill::orchestrator::DelegationRequest {
+        agent_name: marmennill::agents::Agent::Generalist,
+        prompt: "Frozen task".to_string(),
+        snippets: vec![],
+        task_id: Some("t-999".to_string()),
+        image_urls: None,
+        audio_urls: None,
+        recursion_granted: false,
+    };
+    mgr.journal
+        .snapshot(marmennill::agents::Agent::Generalist, &frozen_req)
+        .unwrap();
+    assert!(mgr.journal.is_frozen());
+
+    // User provides a brand new goal; should not resume old pending plan
+    let mut renderer =
+        ScriptedRenderer::new(vec!["Brand new goal".to_string(), "/abort".to_string()]);
+
+    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr.clone()))
+        .await
+        .expect("session runs cleanly without rehydration");
+
+    // 1. Renderer did not rehydrate past transcript
+    assert!(
+        renderer.rehydrated_ui.is_empty(),
+        "UI records must not be rehydrated when enable_rehydration is false"
+    );
+    assert!(
+        renderer.rehydrated.is_empty(),
+        "Legacy messages must not be rehydrated when enable_rehydration is false"
+    );
+
+    // 2. Frozen journal checkpoint was NOT recovered on startup
+    assert!(
+        mgr.journal.is_frozen(),
+        "Frozen checkpoint should remain untouched when startup recovery is disabled"
+    );
+
+    // 3. Saving still works: ui_transcript should have the new goal and reply
+    let saved = UiTranscript::load(plan.ui_transcript_path()).expect("must load ui_transcript");
+    let has_fresh_goal = saved.records().iter().any(|r| match r {
+        UiRecord::User { text } => text == "Brand new goal",
+        _ => false,
+    });
+    assert!(
+        has_fresh_goal,
+        "New session must still save transcripts even with rehydration disabled"
+    );
 }

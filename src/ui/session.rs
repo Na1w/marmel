@@ -51,41 +51,48 @@ pub async fn run_session(
     crate::orchestrator::set_steering_history(Arc::clone(&steering_history));
 
     let ui_transcript_path = plan.ui_transcript_path();
-    let mut ui_transcript = if ui_transcript_path.exists() {
-        match UiTranscript::load(&ui_transcript_path) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!("Failed to load UI transcript: {e}");
-                UiTranscript::new()
-            }
-        }
-    } else {
-        UiTranscript::new()
-    };
-
     let transcript_path = plan.transcript_path();
-    let transcript_loaded = if transcript_path.exists() {
-        match ctx.load_transcript(&transcript_path) {
-            Ok(true) => {
-                ctx.set_system_prompt(system.clone());
-                true
-            }
-            _ => false,
-        }
-    } else {
-        false
-    };
 
-    let has_rehydrated = if !ui_transcript.is_empty() {
-        renderer.rehydrate_ui(ui_transcript.records());
-        true
-    } else if transcript_loaded {
-        ui_transcript = UiTranscript::from_legacy_messages(ctx.messages());
-        renderer.rehydrate_messages(ctx.messages());
-        let _ = ui_transcript.save(&ui_transcript_path);
-        true
+    let (mut ui_transcript, transcript_loaded, has_rehydrated) = if cfg.enable_rehydration {
+        let mut ut = if ui_transcript_path.exists() {
+            match UiTranscript::load(&ui_transcript_path) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("Failed to load UI transcript: {e}");
+                    UiTranscript::new()
+                }
+            }
+        } else {
+            UiTranscript::new()
+        };
+
+        let tl = if transcript_path.exists() {
+            match ctx.load_transcript(&transcript_path) {
+                Ok(true) => {
+                    ctx.set_system_prompt(system.clone());
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+
+        let hr = if !ut.is_empty() {
+            renderer.rehydrate_ui(ut.records());
+            true
+        } else if tl {
+            ut = UiTranscript::from_legacy_messages(ctx.messages());
+            renderer.rehydrate_messages(ctx.messages());
+            let _ = ut.save(&ui_transcript_path);
+            true
+        } else {
+            false
+        };
+
+        (ut, tl, hr)
     } else {
-        false
+        (UiTranscript::new(), false, false)
     };
 
     if has_rehydrated {
@@ -103,24 +110,30 @@ pub async fn run_session(
 
     let mut steer_queue = Vec::<String>::new();
     let mut steer_abort_requested = false;
-    let mut subagents = rehydrate_subagents_with_ui(
-        ctx.messages(),
-        manager.as_ref().map(|m| &m.journal),
-        None,
-        Some(&plan),
-        Some(&ui_transcript),
-    );
+    let mut subagents = if cfg.enable_rehydration {
+        let sa = rehydrate_subagents_with_ui(
+            ctx.messages(),
+            manager.as_ref().map(|m| &m.journal),
+            None,
+            Some(&plan),
+            Some(&ui_transcript),
+        );
 
-    if !subagents.is_empty() {
-        renderer.rehydrate_subagents(&subagents);
-        let _ = renderer.flush();
-    }
+        if !sa.is_empty() {
+            renderer.rehydrate_subagents(&sa);
+            let _ = renderer.flush();
+        }
+        sa
+    } else {
+        Vec::new()
+    };
 
     let client = ChatClient::from_config(cfg);
     let harness_stats = stats.clone();
     let stream_cfg = StreamConfig::from_config(cfg);
 
-    while let Some(mgr) = manager.as_ref()
+    while cfg.enable_rehydration
+        && let Some(mgr) = manager.as_ref()
         && mgr.journal.is_frozen()
         && !renderer.aborted()
     {
@@ -313,7 +326,11 @@ pub async fn run_session(
     );
 
     let pending_tasks = plan.pending_tasks();
-    let has_pending_plan = !pending_tasks.is_empty();
+    let mut has_pending_plan = if cfg.enable_rehydration {
+        !pending_tasks.is_empty()
+    } else {
+        false
+    };
 
     if has_pending_plan {
         let pending_str = pending_tasks.join(", ");
@@ -419,9 +436,16 @@ pub async fn run_session(
                                 ));
                                 if norm == "AbortImmediately" || norm == "RejectPlan" {
                                     crate::orchestrator::cancel_all();
-                                    renderer.request_user_exit();
-                                    renderer.shutdown();
-                                    return Ok(());
+                                    crate::orchestrator::reset_cancellation();
+                                    for s in subagents.iter_mut() {
+                                        s.is_active = false;
+                                        s.logs.push("[aborted by user steering]".to_string());
+                                    }
+                                    renderer.set_subagents(subagents.clone());
+                                    let _ = std::fs::remove_file(plan.plan_path());
+                                    has_pending_plan = false;
+                                    steer_queue.push(trimmed.to_string());
+                                    break main_goal.to_string();
                                 }
                             }
 
