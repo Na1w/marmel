@@ -123,6 +123,8 @@ pub struct Config {
     pub orchestration: OrchestrationConfig,
     /// Configured external MCP servers (`[mcp_servers.<name>]`).
     pub mcp_servers: HashMap<String, crate::mcp::McpServerConfig>,
+    /// Optional base prompt appended to the orchestrator system prompt.
+    pub base_prompt: Option<String>,
 }
 
 impl Default for Config {
@@ -147,6 +149,7 @@ impl Default for Config {
             monitoring: Some(MonitoringConfig::default()),
             orchestration: OrchestrationConfig::default_depth(),
             mcp_servers: HashMap::new(),
+            base_prompt: None,
         }
     }
 }
@@ -248,6 +251,7 @@ struct PartialConfig {
     pub orchestration: Option<PartialOrchestrationConfig>,
     #[serde(default)]
     pub mcp_servers: HashMap<String, crate::mcp::McpServerConfig>,
+    pub base_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -324,6 +328,9 @@ fn merge(mut base: Config, partial: PartialConfig) -> Config {
     }
     if let Some(v) = partial.max_thinking_tokens {
         base.max_thinking_tokens = v;
+    }
+    if let Some(v) = partial.base_prompt {
+        base.base_prompt = Some(v);
     }
 
     if let Some(p_mon) = partial.monitoring {
@@ -574,5 +581,31 @@ mod tests {
         let mon = cfg.monitoring.expect("monitoring present");
         assert_eq!(mon.max_stream_tokens, 32768);
         assert_eq!(mon.max_thinking_tokens, 8192);
+    }
+
+    #[test]
+    fn test_base_prompt_parses_and_merges() {
+        let toml_str = r#"
+            backend_url = "http://localhost:9000/v1"
+            base_prompt = "Do not schedule tasks in parallel on this machine."
+        "#;
+        let partial: PartialConfig = toml::from_str(toml_str).expect("parses");
+        let cfg = merge(Config::default(), partial);
+
+        assert_eq!(
+            cfg.base_prompt.as_deref(),
+            Some("Do not schedule tasks in parallel on this machine.")
+        );
+    }
+
+    #[test]
+    fn test_base_prompt_default_is_none() {
+        let toml_str = r#"
+            backend_url = "http://localhost:9000/v1"
+        "#;
+        let partial: PartialConfig = toml::from_str(toml_str).expect("parses");
+        let cfg = merge(Config::default(), partial);
+
+        assert!(cfg.base_prompt.is_none());
     }
 }

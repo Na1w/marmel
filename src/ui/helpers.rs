@@ -48,6 +48,16 @@ pub(crate) fn load_system_prompt_with_plan(
     };
     let env_block = crate::prompts::format_environment_block();
     let mut prompt = format!("{content}\n\n{env_block}\n");
+    if let Some(ref base_prompt) = cfg.base_prompt {
+        let trimmed = base_prompt.trim();
+        if !trimmed.is_empty() {
+            if trimmed.starts_with('#') {
+                prompt.push_str(&format!("\n{trimmed}\n"));
+            } else {
+                prompt.push_str(&format!("\n## Machine Specific Guidance\n{trimmed}\n"));
+            }
+        }
+    }
     if let Ok(Some(plan_content)) = plan.read()
         && !plan_content.trim().is_empty()
     {
@@ -1329,5 +1339,48 @@ mod tests {
             "Custom single-line failure message"
         );
         assert_eq!(extract_failure_reason("   "), "unknown failure");
+    }
+
+    #[test]
+    fn test_load_system_prompt_without_base_prompt() {
+        let cfg = Config::default();
+        let plan = crate::manager::phase::Plan::default();
+        let prompt = load_system_prompt_with_plan(&cfg, &plan).expect("load success");
+        assert!(!prompt.contains("## Machine Specific Guidance"));
+    }
+
+    #[test]
+    fn test_load_system_prompt_with_base_prompt() {
+        let cfg = Config {
+            base_prompt: Some("Schemalägg inga tasks parallellt.".to_string()),
+            ..Default::default()
+        };
+        let plan = crate::manager::phase::Plan::default();
+        let prompt = load_system_prompt_with_plan(&cfg, &plan).expect("load success");
+        assert!(prompt.contains("## Machine Specific Guidance"));
+        assert!(prompt.contains("Schemalägg inga tasks parallellt."));
+    }
+
+    #[test]
+    fn test_load_system_prompt_with_heading_base_prompt() {
+        let cfg = Config {
+            base_prompt: Some("### Custom Instructions\nSingle worker only.".to_string()),
+            ..Default::default()
+        };
+        let plan = crate::manager::phase::Plan::default();
+        let prompt = load_system_prompt_with_plan(&cfg, &plan).expect("load success");
+        assert!(!prompt.contains("## Machine Specific Guidance"));
+        assert!(prompt.contains("### Custom Instructions\nSingle worker only."));
+    }
+
+    #[test]
+    fn test_load_system_prompt_with_whitespace_base_prompt() {
+        let cfg = Config {
+            base_prompt: Some("   \n\t  ".to_string()),
+            ..Default::default()
+        };
+        let plan = crate::manager::phase::Plan::default();
+        let prompt = load_system_prompt_with_plan(&cfg, &plan).expect("load success");
+        assert!(!prompt.contains("## Machine Specific Guidance"));
     }
 }
