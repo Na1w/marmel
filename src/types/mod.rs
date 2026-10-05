@@ -6,5 +6,5 @@ mod wire;
 pub use tools::{ToolDef, ToolFunctionDef};
 pub use wire::{
     ChatChunk, ChatRequest, ChunkChoice, ChunkDelta, ChunkToolCall, ChunkToolFunction, Message,
-    ToolCall, ToolFunction,
+    ToolCall, ToolFunction, ensure_valid_json_arguments,
 };

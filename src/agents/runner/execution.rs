@@ -7,6 +7,7 @@ use crate::agents::validation::{
 use crate::agents::{Agent, IsolatedContext};
 
 const MAX_CONSECUTIVE_THINKING_NUDGES: u32 = 5;
+const MAX_CONSECUTIVE_MALFORMED_TOOL_CALLS: u32 = 5;
 
 pub async fn run_specialist_live(
     client: &crate::llm::ChatClient,
@@ -93,6 +94,7 @@ async fn run_specialist_live_inner(
     let mut final_content = String::new();
     let mut nudge_count = 0u32;
     let mut consecutive_thinking_nudges = 0u32;
+    let mut consecutive_malformed_tool_calls = 0u32;
 
     let _active_guard = crate::orchestrator::register_active_worker_with_token(
         clean_task_id.clone(),
@@ -547,8 +549,13 @@ async fn run_specialist_live_inner(
             }
         }
 
+        let mut turn_had_malformed_tool_call = false;
+        let mut turn_had_successful_tool_call = false;
         let mut leave_verdict_called = false;
         for tc in tool_calls {
+            if tc.is_malformed() {
+                turn_had_malformed_tool_call = true;
+            }
             if token.is_cancelled() || crate::orchestrator::is_current_or_global_cancelled() {
                 tracing::warn!(
                     "{agent_tag}: aborted before executing tool {}",
@@ -643,6 +650,7 @@ async fn run_specialist_live_inner(
                     // errors or repetition blocks).
                     if d.1 {
                         tools_executed_count += 1;
+                        turn_had_successful_tool_call = true;
                         nudge_count = 0;
                     }
                     d
@@ -663,6 +671,29 @@ async fn run_specialist_live_inner(
                 &_active_guard.0,
                 engine.token_count(),
             );
+        }
+
+        if turn_had_malformed_tool_call {
+            consecutive_malformed_tool_calls += 1;
+            if consecutive_malformed_tool_calls >= MAX_CONSECUTIVE_MALFORMED_TOOL_CALLS {
+                tracing::warn!(
+                    "{agent_tag}: model produced malformed/truncated tool calls {MAX_CONSECUTIVE_MALFORMED_TOOL_CALLS} times consecutively — returning REPLAN REQUIRED"
+                );
+                crate::orchestrator::emit_status(format!(
+                    "{agent_tag}: malformed tool calls ({MAX_CONSECUTIVE_MALFORMED_TOOL_CALLS} times consecutively) — requesting replan"
+                ));
+                crate::orchestrator::set_active_worker_status(
+                    &_active_guard.0,
+                    "Replan Required (repeated malformed tool calls)",
+                );
+                let task_ref = ctx.task_id.as_deref().unwrap_or("task");
+                let replan_msg = format!(
+                    "REPLAN REQUIRED ({task_ref}): model repeatedly produced truncated or invalid tool calls {MAX_CONSECUTIVE_MALFORMED_TOOL_CALLS} times consecutively without generating valid arguments."
+                );
+                return Ok(replan_msg);
+            }
+        } else if turn_had_successful_tool_call || leave_verdict_called {
+            consecutive_malformed_tool_calls = 0;
         }
         if engine.should_compact() {
             engine.compact();

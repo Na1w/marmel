@@ -301,8 +301,237 @@ async fn test_specialist_thinking_nudges_reset_when_thinking_within_budget() {
         deliverable.contains("MISSION COMPLETE (t-003)"),
         "deliverable should complete successfully, got: {deliverable}"
     );
+    assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 8);
+}
+
+#[tokio::test]
+async fn test_specialist_truncated_tool_call_feedback_and_recovery() {
+    let _guard = TEST_BUS_MUTEX.lock().await;
+
+    let server = MockServer::start().await;
+    let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cc = call_count.clone();
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |req: &Request| {
+            let n = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body_str = String::from_utf8_lossy(&req.body);
+
+            // In all requests from Marmel, body must be completely valid JSON!
+            let _parsed: serde_json::Value =
+                serde_json::from_str(&body_str).expect("every request body sent by Marmel must be valid JSON");
+
+            if body_str.contains("leave_verdict") || body_str.contains("Specialist Deliverable") {
+                let val_sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"val_1\",\"type\":\"function\",\"function\":{\"name\":\"leave_verdict\",\"arguments\":\"{\\\"verdict\\\":\\\"APPROVED\\\",\\\"comments\\\":\\\"Code verified\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
+                return ResponseTemplate::new(200).set_body_string(val_sse);
+            }
+
+            if n == 0 {
+                // Turn 0: Model streams a truncated tool call (unterminated JSON string)
+                let truncated_sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_bad\",\"type\":\"function\",\"function\":{\"name\":\"run_command\",\"arguments\":\"{\\\"command\\\":\\\"cd /tmp && cat\"}}]}}]}\n\ndata: [DONE]\n\n";
+                ResponseTemplate::new(200).set_body_string(truncated_sse)
+            } else if n == 1 {
+                // Turn 1: Model should have received feedback about the malformed/truncated tool call!
+                assert!(
+                    body_str.contains("Invalid or truncated arguments for tool 'run_command'"),
+                    "request should contain feedback about truncated tool call, got: {body_str}"
+                );
+                // Model successfully executes a valid tool call
+                let ok_sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_ok\",\"type\":\"function\",\"function\":{\"name\":\"glob\",\"arguments\":\"{\\\"pattern\\\":\\\"*\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
+                ResponseTemplate::new(200).set_body_string(ok_sse)
+            } else {
+                // Turn 2: Concludes with MISSION COMPLETE
+                let complete_sse = "data: {\"choices\":[{\"delta\":{\"content\":\"MISSION COMPLETE (t-004)\"}}]}\n\ndata: [DONE]\n\n";
+                ResponseTemplate::new(200).set_body_string(complete_sse)
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let client = marmennill::llm::ChatClient::new(format!("{}/v1", server.uri()), "test-model");
+    let req = marmennill::agents::DelegationRequest {
+        agent_name: marmennill::agents::Agent::Coder,
+        prompt: "Fix truncated tool call".to_string(),
+        snippets: vec![],
+        task_id: Some("t-004".to_string()),
+        image_urls: None,
+        audio_urls: None,
+        recursion_granted: false,
+    };
+    let ctx = marmennill::agents::IsolatedContext::from_request(
+        "You are the Coder specialist.".to_string(),
+        &req,
+    );
+    let cfg = marmennill::config::Config {
+        backend_url: format!("{}/v1", server.uri()),
+        model: "test-model".to_string(),
+        ..Default::default()
+    };
+    let token = tokio_util::sync::CancellationToken::new();
+
+    let deliverable = marmennill::agents::run_specialist_live(
+        &client,
+        marmennill::agents::Agent::Coder,
+        &ctx,
+        &cfg,
+        &token,
+    )
+    .await
+    .expect("specialist execution should succeed after recovering from truncated tool call");
+
+    assert!(
+        deliverable.contains("MISSION COMPLETE (t-004)"),
+        "deliverable should complete successfully, got: {deliverable}"
+    );
+}
+
+#[tokio::test]
+async fn test_specialist_repeated_malformed_tool_calls_triggers_replan() {
+    let _guard = TEST_BUS_MUTEX.lock().await;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(|req: &Request| {
+            let body_str = String::from_utf8_lossy(&req.body);
+            // Every request body sent by Marmel must be valid JSON!
+            let _parsed: serde_json::Value =
+                serde_json::from_str(&body_str).expect("every request body sent by Marmel must be valid JSON");
+
+            // Always stream a truncated tool call
+            let truncated_sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_bad\",\"type\":\"function\",\"function\":{\"name\":\"run_command\",\"arguments\":\"{\\\"command\\\":\\\"cd /tmp && cat\"}}]}}]}\n\ndata: [DONE]\n\n";
+            ResponseTemplate::new(200).set_body_string(truncated_sse)
+        })
+        .mount(&server)
+        .await;
+
+    let client = marmennill::llm::ChatClient::new(format!("{}/v1", server.uri()), "test-model");
+    let req = marmennill::agents::DelegationRequest {
+        agent_name: marmennill::agents::Agent::Coder,
+        prompt: "Endless truncated tool call".to_string(),
+        snippets: vec![],
+        task_id: Some("t-005".to_string()),
+        image_urls: None,
+        audio_urls: None,
+        recursion_granted: false,
+    };
+    let ctx = marmennill::agents::IsolatedContext::from_request(
+        "You are the Coder specialist.".to_string(),
+        &req,
+    );
+    let cfg = marmennill::config::Config {
+        backend_url: format!("{}/v1", server.uri()),
+        model: "test-model".to_string(),
+        ..Default::default()
+    };
+    let token = tokio_util::sync::CancellationToken::new();
+
+    let deliverable = marmennill::agents::run_specialist_live(
+        &client,
+        marmennill::agents::Agent::Coder,
+        &ctx,
+        &cfg,
+        &token,
+    )
+    .await
+    .expect("specialist execution returns deliverable string");
+
+    assert!(
+        deliverable.contains("REPLAN REQUIRED (t-005)"),
+        "deliverable should indicate REPLAN REQUIRED due to repeated malformed tool calls, got: {deliverable}"
+    );
+    assert!(
+        deliverable
+            .contains("repeatedly produced truncated or invalid tool calls 5 times consecutively"),
+        "deliverable should mention 5 times consecutively, got: {deliverable}"
+    );
+}
+
+#[tokio::test]
+async fn test_specialist_malformed_tool_calls_reset_on_successful_tool_call() {
+    let _guard = TEST_BUS_MUTEX.lock().await;
+
+    let server = MockServer::start().await;
+    let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cc = call_count.clone();
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |req: &Request| {
+            let n = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body_str = String::from_utf8_lossy(&req.body);
+
+            // In all requests from Marmel, body must be completely valid JSON!
+            let _parsed: serde_json::Value =
+                serde_json::from_str(&body_str).expect("every request body sent by Marmel must be valid JSON");
+
+            if body_str.contains("leave_verdict") || body_str.contains("Specialist Deliverable") {
+                let val_sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"val_1\",\"type\":\"function\",\"function\":{\"name\":\"leave_verdict\",\"arguments\":\"{\\\"verdict\\\":\\\"APPROVED\\\",\\\"comments\\\":\\\"Code verified\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
+                return ResponseTemplate::new(200).set_body_string(val_sse);
+            }
+
+            if n < 3 {
+                // Turns 0, 1, 2: 3 malformed tool calls in a row
+                let truncated_sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_bad\",\"type\":\"function\",\"function\":{\"name\":\"run_command\",\"arguments\":\"{\\\"command\\\":\\\"cat <<EOF\"}}]}}]}\n\ndata: [DONE]\n\n";
+                ResponseTemplate::new(200).set_body_string(truncated_sse)
+            } else if n == 3 {
+                // Turn 3: Successful tool call! Counter must reset to 0!
+                let ok_sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_ok\",\"type\":\"function\",\"function\":{\"name\":\"glob\",\"arguments\":\"{\\\"pattern\\\":\\\"*\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
+                ResponseTemplate::new(200).set_body_string(ok_sse)
+            } else if n < 7 {
+                // Turns 4, 5, 6: 3 more malformed tool calls in a row.
+                // If counter did not reset, 3 + 3 = 6 would have triggered REPLAN REQUIRED at 5!
+                let truncated_sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_bad\",\"type\":\"function\",\"function\":{\"name\":\"run_command\",\"arguments\":\"{\\\"command\\\":\\\"cat <<EOF\"}}]}}]}\n\ndata: [DONE]\n\n";
+                ResponseTemplate::new(200).set_body_string(truncated_sse)
+            } else {
+                // Turn 7: Concludes successfully with MISSION COMPLETE
+                let complete_sse = "data: {\"choices\":[{\"delta\":{\"content\":\"MISSION COMPLETE (t-006)\"}}]}\n\ndata: [DONE]\n\n";
+                ResponseTemplate::new(200).set_body_string(complete_sse)
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let client = marmennill::llm::ChatClient::new(format!("{}/v1", server.uri()), "test-model");
+    let req = marmennill::agents::DelegationRequest {
+        agent_name: marmennill::agents::Agent::Coder,
+        prompt: "Reset test for malformed calls".to_string(),
+        snippets: vec![],
+        task_id: Some("t-006".to_string()),
+        image_urls: None,
+        audio_urls: None,
+        recursion_granted: false,
+    };
+    let ctx = marmennill::agents::IsolatedContext::from_request(
+        "You are the Coder specialist.".to_string(),
+        &req,
+    );
+    let cfg = marmennill::config::Config {
+        backend_url: format!("{}/v1", server.uri()),
+        model: "test-model".to_string(),
+        ..Default::default()
+    };
+    let token = tokio_util::sync::CancellationToken::new();
+
+    let deliverable = marmennill::agents::run_specialist_live(
+        &client,
+        marmennill::agents::Agent::Coder,
+        &ctx,
+        &cfg,
+        &token,
+    )
+    .await
+    .expect("specialist execution should complete without premature replan");
+
+    assert!(
+        deliverable.contains("MISSION COMPLETE (t-006)"),
+        "deliverable should complete successfully, got: {deliverable}"
+    );
     assert!(
         !deliverable.contains("REPLAN REQUIRED"),
-        "deliverable should NOT trigger REPLAN REQUIRED because counter was reset, got: {deliverable}"
+        "deliverable should NOT trigger REPLAN REQUIRED because counter was reset by successful call, got: {deliverable}"
     );
+    assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 8);
 }

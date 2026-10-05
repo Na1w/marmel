@@ -823,6 +823,23 @@ pub async fn run_session(
                         let _ = ui_transcript.save(&ui_transcript_path);
                     }
 
+                    if call.is_malformed() {
+                        let call_id = call.id.clone();
+                        let err_msg = format!(
+                            "ERROR: Invalid or truncated arguments for tool '{name}': output was cut off or contained unterminated JSON. Please reissue the tool call with complete, valid JSON arguments."
+                        );
+                        let handle = tokio::task::spawn_blocking(move || {
+                            (
+                                call_id,
+                                delegated_agent,
+                                delegated_task,
+                                Ok(crate::harness::ToolResult::err(err_msg)),
+                            )
+                        });
+                        handles.push(handle);
+                        continue;
+                    }
+
                     let intervention = monitor.observe_tool(&name, &args_val);
                     if matches!(
                         intervention,
@@ -1224,6 +1241,20 @@ pub async fn run_session(
                     }
 
                     ctx.reset_consecutive_rebirths();
+
+                    if call.is_malformed() {
+                        let err_msg = format!(
+                            "ERROR: Invalid or truncated arguments for tool '{name}': output was cut off or contained unterminated JSON. Please reissue the tool call with complete, valid JSON arguments."
+                        );
+                        renderer.on_event(&Event::ToolResult(err_msg.clone()));
+                        renderer.flush()?;
+                        ctx.append(Message::Tool {
+                            tool_call_id: call.id.clone(),
+                            content: err_msg,
+                        });
+                        let _ = ctx.save_transcript(&transcript_path);
+                        continue;
+                    }
 
                     let intervention = monitor.observe_tool(&name, &args_val);
                     if matches!(

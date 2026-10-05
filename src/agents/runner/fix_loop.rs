@@ -191,6 +191,18 @@ pub async fn dispatch_tool_call(
     error_prefix: &str,
     intervention_fallback: &str,
 ) -> Option<(String, bool)> {
+    if tc.is_malformed() {
+        let err_msg = format!(
+            "{error_prefix}Invalid or truncated arguments for tool '{}': output was cut off or contained unterminated JSON. Please reissue the tool call with complete, valid JSON arguments.",
+            tc.function.name
+        );
+        tracing::warn!(
+            "{abort_log_prefix} tool {} had malformed/truncated arguments",
+            tc.function.name
+        );
+        return Some((err_msg, false));
+    }
+
     let args_val: serde_json::Value = serde_json::from_str(&tc.function.arguments)
         .unwrap_or_else(|_| serde_json::Value::String(tc.function.arguments.clone()));
     if emit_tool_status {
@@ -294,6 +306,7 @@ pub async fn run_fix_loop(
     let mut rep_detector =
         RepetitionDetector::new(p.mon_cfg.repetition_threshold, p.mon_cfg.min_pattern_len);
     let mut verdict_nudge_count = 0usize;
+    let mut consecutive_malformed_tool_calls = 0u32;
     let mut turn = 0usize;
 
     loop {
@@ -443,7 +456,12 @@ pub async fn run_fix_loop(
             }
         }
 
+        let mut turn_had_malformed = false;
+        let mut turn_had_successful_tool_call = false;
         for tc in &tool_calls {
+            if tc.is_malformed() {
+                turn_had_malformed = true;
+            }
             if !p.dispatch_verdict_tools && is_leave_verdict_tool(&tc.function.name) {
                 continue;
             }
@@ -469,6 +487,9 @@ pub async fn run_fix_loop(
             .await
             {
                 Some((content, succeeded)) => {
+                    if succeeded {
+                        turn_had_successful_tool_call = true;
+                    }
                     append_tool_result(p.engine, tc, content, succeeded, &p.rebirth_notice);
                 }
                 None => {
@@ -476,6 +497,22 @@ pub async fn run_fix_loop(
                 }
             }
             update_active_worker_context(&p.worker_key, p.engine.token_count());
+        }
+
+        if turn_had_malformed {
+            consecutive_malformed_tool_calls += 1;
+            if consecutive_malformed_tool_calls >= 5 {
+                tracing::warn!(
+                    "{}: model produced malformed/truncated tool calls 5 times consecutively — terminating fix loop",
+                    p.tag
+                );
+                return Ok(FixLoopResult::Verdict {
+                    approved: false,
+                    critique: "Specialist/Validator repeatedly produced malformed or truncated tool calls 5 times consecutively.".to_string(),
+                });
+            }
+        } else if turn_had_successful_tool_call {
+            consecutive_malformed_tool_calls = 0;
         }
         if p.engine.should_compact() {
             p.engine.compact();

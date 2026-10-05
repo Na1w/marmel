@@ -84,19 +84,72 @@ fn default_tool_type() -> String {
     "function".to_string()
 }
 
+/// Ensure tool arguments are valid JSON so OpenAI-compatible backends never reject
+/// the request with HTTP 400 (e.g. Jinja/Python `json.loads` on conversation history).
+pub fn ensure_valid_json_arguments(raw: &str) -> (String, bool) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return ("{}".to_string(), false);
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(serde_json::Value::Object(map)) => {
+            if map.contains_key("_error")
+                && map.get("_error").and_then(serde_json::Value::as_str)
+                    == Some("malformed_arguments")
+            {
+                (trimmed.to_string(), true)
+            } else {
+                (trimmed.to_string(), false)
+            }
+        }
+        Ok(other) => {
+            let wrapped = serde_json::json!({ "_raw_value": other }).to_string();
+            (wrapped, false)
+        }
+        Err(_) => {
+            let fallback = serde_json::json!({
+                "_error": "malformed_arguments",
+                "_raw": raw
+            })
+            .to_string();
+            (fallback, true)
+        }
+    }
+}
+
 impl ToolCall {
     pub fn new(
         id: impl Into<String>,
         name: impl Into<String>,
         arguments: impl Into<String>,
     ) -> Self {
+        let (valid_args, _) = ensure_valid_json_arguments(&arguments.into());
         Self {
             id: id.into(),
             kind: "function".to_string(),
             function: ToolFunction {
                 name: name.into(),
-                arguments: arguments.into(),
+                arguments: valid_args,
             },
+        }
+    }
+
+    /// Ensure the arguments field is valid JSON so OpenAI backends never fail on conversation history.
+    pub fn sanitize_arguments(&mut self) {
+        let (valid_args, _) = ensure_valid_json_arguments(&self.function.arguments);
+        self.function.arguments = valid_args;
+    }
+
+    /// Check whether the tool arguments were truncated or malformed JSON.
+    pub fn is_malformed(&self) -> bool {
+        if let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(&self.function.arguments)
+        {
+            map.contains_key("_error")
+                && map.get("_error").and_then(serde_json::Value::as_str)
+                    == Some("malformed_arguments")
+        } else {
+            true
         }
     }
 }
@@ -189,5 +242,52 @@ mod tests {
         let tc: ToolCall = serde_json::from_str(json_str).unwrap();
         assert_eq!(tc.kind, "function");
         assert_eq!(tc.id, "call_456");
+    }
+
+    #[test]
+    fn test_ensure_valid_json_arguments_valid() {
+        let (res, malformed) = ensure_valid_json_arguments(r#"{"path":"src/main.rs"}"#);
+        assert_eq!(res, r#"{"path":"src/main.rs"}"#);
+        assert!(!malformed);
+    }
+
+    #[test]
+    fn test_ensure_valid_json_arguments_empty() {
+        let (res, malformed) = ensure_valid_json_arguments("");
+        assert_eq!(res, "{}");
+        assert!(!malformed);
+    }
+
+    #[test]
+    fn test_ensure_valid_json_arguments_truncated() {
+        let (res, malformed) = ensure_valid_json_arguments(r#"{"command":"cd /tmp && cat"#);
+        assert!(malformed);
+        let parsed: serde_json::Value = serde_json::from_str(&res).expect("must be valid json");
+        assert_eq!(parsed["_error"], "malformed_arguments");
+        assert_eq!(parsed["_raw"], r#"{"command":"cd /tmp && cat"#);
+    }
+
+    #[test]
+    fn test_tool_call_new_sanitizes_truncated() {
+        let tc = ToolCall::new(
+            "call_bad",
+            crate::tool_names::TOOL_RUN_COMMAND,
+            r#"{"command":"echo 'hello"#,
+        );
+        assert!(tc.is_malformed());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&tc.function.arguments).expect("must be valid json");
+        assert_eq!(parsed["_error"], "malformed_arguments");
+    }
+
+    #[test]
+    fn test_tool_call_new_valid() {
+        let tc = ToolCall::new(
+            "call_ok",
+            crate::tool_names::TOOL_RUN_COMMAND,
+            r#"{"command":"echo hello"}"#,
+        );
+        assert!(!tc.is_malformed());
+        assert_eq!(tc.function.arguments, r#"{"command":"echo hello"}"#);
     }
 }

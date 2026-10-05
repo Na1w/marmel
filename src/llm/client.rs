@@ -231,10 +231,18 @@ impl ChatClient {
             req_body.model = self.model.clone();
         }
         for msg in &mut req_body.messages {
-            if let crate::types::Message::Assistant { content, .. } = msg
-                && content.is_none()
+            if let crate::types::Message::Assistant {
+                content,
+                tool_calls,
+                ..
+            } = msg
             {
-                *content = Some(String::new());
+                if content.is_none() {
+                    *content = Some(String::new());
+                }
+                for tc in tool_calls {
+                    tc.sanitize_arguments();
+                }
             }
         }
 
