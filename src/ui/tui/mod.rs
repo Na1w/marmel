@@ -721,17 +721,7 @@ impl Renderer for TuiRenderer {
                     crate::orchestrator::DelegationEvent::Started { agent, task } => {
                         let clean_task = task
                             .as_ref()
-                            .map(|t| {
-                                t.trim_matches(|c| {
-                                    c == '['
-                                        || c == ']'
-                                        || c == '('
-                                        || c == ')'
-                                        || c == '"'
-                                        || c == '\''
-                                })
-                                .trim()
-                            })
+                            .map(|t| crate::task_id::normalize_task_id_ref(t))
                             .filter(|t| !t.is_empty());
                         let name = match clean_task {
                             Some(t) => format!("{agent}-{t}"),
@@ -758,17 +748,7 @@ impl Renderer for TuiRenderer {
                     crate::orchestrator::DelegationEvent::Completed { agent, task } => {
                         let clean_task = task
                             .as_ref()
-                            .map(|t| {
-                                t.trim_matches(|c| {
-                                    c == '['
-                                        || c == ']'
-                                        || c == '('
-                                        || c == ')'
-                                        || c == '"'
-                                        || c == '\''
-                                })
-                                .trim()
-                            })
+                            .map(|t| crate::task_id::normalize_task_id_ref(t))
                             .filter(|t| !t.is_empty());
                         let name = match clean_task {
                             Some(t) => format!("{agent}-{t}"),
@@ -825,17 +805,7 @@ impl Renderer for TuiRenderer {
                     } => {
                         let clean_task = task
                             .as_ref()
-                            .map(|t| {
-                                t.trim_matches(|c| {
-                                    c == '['
-                                        || c == ']'
-                                        || c == '('
-                                        || c == ')'
-                                        || c == '"'
-                                        || c == '\''
-                                })
-                                .trim()
-                            })
+                            .map(|t| crate::task_id::normalize_task_id_ref(t))
                             .filter(|t| !t.is_empty());
                         let name = match clean_task {
                             Some(t) => format!("{agent}-{t}"),
@@ -1069,77 +1039,6 @@ impl Renderer for TuiRenderer {
         } else if self.selected_subagent_idx >= self.subagents.len() {
             self.selected_subagent_idx = self.subagents.len().saturating_sub(1);
         }
-    }
-
-    fn rehydrate_subagents(&mut self, subagents: &[SubagentDetail]) {
-        self.set_subagents(subagents.to_vec());
-        if !self.subagents.is_empty() {
-            self.show_subagent_panel = true;
-            if let Some(idx) = self.subagents.iter().position(|s| s.is_active) {
-                self.selected_subagent_idx = idx;
-            } else {
-                self.selected_subagent_idx = self.subagents.len().saturating_sub(1);
-            }
-        }
-    }
-
-    fn rehydrate_ui(&mut self, records: &[crate::ui::UiRecord]) {
-        self.commit_turn_content();
-        for rec in records {
-            match rec {
-                crate::ui::UiRecord::User { text } => {
-                    self.messages.push(format!("User: {text}"));
-                }
-                crate::ui::UiRecord::Assistant { content, thinking } => {
-                    if let Some(r) = thinking
-                        && !r.trim().is_empty()
-                    {
-                        self.messages
-                            .push(format!("<think>\n{}\n</think>", r.trim()));
-                    }
-                    if let Some(c) = content
-                        && !c.trim().is_empty()
-                    {
-                        self.messages.push(c.clone());
-                    }
-                }
-                crate::ui::UiRecord::SteerResponse { text } => {
-                    self.messages.push(format!("Marmennill: {text}"));
-                }
-                crate::ui::UiRecord::ToolCall { display } => {
-                    self.messages.push(format!("[Tool Call] {display}"));
-                }
-                crate::ui::UiRecord::ToolResult { display } => {
-                    self.messages.push(format!("[Tool Result] {display}"));
-                }
-                crate::ui::UiRecord::TaskCompleted { task_id } => {
-                    self.messages.push(format!("[{task_id}] completed."));
-                }
-                crate::ui::UiRecord::TaskFailed { task_id, reason } => {
-                    let msg = match reason.as_deref().filter(|r| !r.is_empty()) {
-                        Some(r) => format!("[{task_id} failed: {r}]"),
-                        None => format!("[{task_id}] failed."),
-                    };
-                    self.messages.push(msg);
-                }
-                crate::ui::UiRecord::Status { text } => {
-                    if text.starts_with("[Status]")
-                        || text.starts_with("[CLI]")
-                        || text.starts_with("System Error")
-                    {
-                        self.messages.push(text.clone());
-                    } else {
-                        self.messages.push(format!("[Status] {text}"));
-                    }
-                }
-            }
-        }
-        self.chat_auto_scroll = true;
-        let w = self.chat_width.get();
-        let n = self.estimated_chat_lines(w);
-        let h = self.chat_height.get();
-        self.chat_scroll = n.saturating_sub(h) as u16;
-        let _ = self.flush();
     }
 
     fn set_thinking_budgets(&mut self, cfg: &crate::config::Config) {

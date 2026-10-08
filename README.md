@@ -158,7 +158,8 @@ Marmel searches for configuration in the following priority order (first match w
 | `max_context_tokens` | `8192` | Maximum context tokens before compaction triggers. |
 | `max_thinking_tokens` | `32768` | Maximum reasoning/thinking tokens before forcing continuation. |
 | `preserve_thinking` | `true` | Retain thinking blocks in the session transcript. |
-| `command_timeout_secs` | `60` | Timeout per terminal command or PTY invocation. |
+| `command_timeout_secs` | `60` | Timeout per terminal command or PTY invocation. Valid range `1..=300` seconds; an out-of-range value is logged and clamped into that range, never applied verbatim. |
+| `sandbox_disabled` | `false` | Fail-closed opt-out of the Linux Landlock command sandbox: `true` runs commands unsandboxed and always logs an attributable warning. `MARMEL_DISABLE_SANDBOX=1` is an equivalent escape hatch — either source opts out. |
 | `max_repetition_threshold` | `5` | Consecutive identical turns that trigger loop interruption. |
 | `enable_xml_rescue` | `true` | Parse pseudo-XML tool calls into valid JSON tool calls. |
 | `ui_mode` | `"tui"` | Interface mode: `"tui"` (Ratatui) or `"raw"` (streaming stdout). |
@@ -174,6 +175,9 @@ backend_url = "http://localhost:11434/v1"
 model = "qwen-3.8-27b"
 max_context_tokens = 8192
 ui_mode = "tui"
+
+# Fail-closed sandbox opt-out (default false): true runs commands unsandboxed.
+sandbox_disabled = false
 
 # Optional external MCP servers
 [mcp_servers.fs]
@@ -269,8 +273,6 @@ Internal session files are stored in `.marmel/` within the workspace root:
 | `.marmel/prompts/` | Synthesized agent prompts and tool grants (`<task_id>.md`). |
 | `.marmel/marmel.log` | Rotating application log (5MB limit, 3 backups kept). |
 | `.marmel/archive/` | Archived completed execution plans. |
-| `.marmel/.session_frozen.json` | Checkpoint used for crash recovery and resume. |
-| `.marmel/.session_journal.json` | Append-only event journal. |
 
 ---
 
@@ -346,6 +348,8 @@ Marmel is designed to prevent accidental modifications outside the target projec
 2. **Process Sandboxing (Linux Landlock LSM):** Terminal commands (`run_command` and PTY sessions) execute inside an unprivileged Landlock sandbox on Linux. Read/write access is restricted to the workspace, temporary build directories (`/tmp`, `/var/tmp`), and language caches (`~/.cargo`, `~/.cache`, `~/.npm`). Access to sensitive directories such as `~/.ssh` and `~/.gnupg` is denied by the kernel.
 3. **Non-Linux Platforms:** On macOS and Windows, path confinement and working directory boundaries are actively enforced in-process.
 
+**Sandbox Opt-Out (fail-closed).** The sandbox is always on unless you explicitly opt out: the typed knob `sandbox_disabled` defaults to `false` in `marmel.toml`, and the equivalent environment escape hatch is `MARMEL_DISABLE_SANDBOX`. Either source opts out on its own, and every honoured opt-out is announced with an attributable warning naming the setting that was set (`warning: Landlock sandbox DISABLED by <setting>: this command runs WITHOUT Landlock.`). The parsing is fail-closed — only `1`, `true`, `yes` or `on` (case-insensitive, surrounding blanks ignored) disable the sandbox, while a malformed or falsy value such as `0`, `false`, `off`, `no`, an empty value, or a typo leaves it **enabled**. Opting out is also never a way to make a failed sandbox non-fatal: if Landlock cannot be established, the command is refused instead of running unsandboxed — the sandbox re-entry step prints the reason to stderr and exits with `SANDBOX_REFUSE_EXIT_CODE` (`73`, `sysexits.h` `EX_UNAVAILABLE`) without exec-ing the command.
+
 ---
 
 ## Testing
@@ -359,7 +363,6 @@ cargo test
 The test suite covers:
 - Core orchestration and recursive delegation bounds.
 - Tool allowlists, role gating, and path confinement.
-- Crash recovery and state rehydration.
 - Stream preemption and steer arbitration.
 - Repetition breakers and XML tool call rescue.
 

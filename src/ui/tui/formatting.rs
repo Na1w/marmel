@@ -1,7 +1,7 @@
 //! Formatting, text parsing, terminal math, and word wrapping utilities for TUI.
 
 use ansi_to_tui::IntoText;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
@@ -508,13 +508,6 @@ pub fn count_wrapped_rendered_lines(lines: &[Line<'_>], width: usize) -> usize {
     total
 }
 
-/// Count the wrapped lines a single message occupies at `width`, excluding
-/// think-block lines when `show_thought` is `false` (reference §11.2).
-pub fn count_single_message_lines(msg: &str, width: usize, show_thought: bool) -> usize {
-    let lines = render_message_lines(msg, show_thought);
-    count_wrapped_rendered_lines(&lines, width)
-}
-
 /// Grapheme-aware word-wrap line counter (reference §11.1).
 ///
 /// - `width == 0` → returns the raw line count (no wrapping).
@@ -647,15 +640,15 @@ pub fn wrapped_lines(text: &str, width: usize) -> usize {
 
 /// Compute the visual (wrapped) line offset of the first uncompleted task checkbox (`- [ ]`)
 /// in the execution plan text. Returns `None` if no uncompleted task is present.
+///
+/// "What counts as an uncompleted task line" is decided by
+/// [`crate::plan_parse`] (dedup cluster C3) — the same rule the on-disk plan
+/// authority uses — and only the wrapped-line arithmetic stays here.
 pub fn visual_line_offset_of_first_pending(text: &str, width: usize) -> Option<usize> {
-    static UNCHECKED_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = UNCHECKED_RE.get_or_init(|| {
-        regex::Regex::new(r"^\s*(?:[-*]|\d+\.)?\s*(\[\s*\]|\(\s*\))")
-            .expect("valid unchecked regex")
-    });
+    let target = crate::plan_parse::first_unchecked_line_index(text)?;
     let mut visual_offset = 0;
-    for raw_line in text.lines() {
-        if re.is_match(raw_line) {
+    for (idx, raw_line) in text.lines().enumerate() {
+        if idx == target {
             return Some(visual_offset);
         }
         visual_offset += wrapped_lines(raw_line, width).max(1);
@@ -665,110 +658,30 @@ pub fn visual_line_offset_of_first_pending(text: &str, width: usize) -> Option<u
 
 /// Trims surrounding brackets, parentheses, and quotes from a task identifier.
 pub fn clean_task_id(tid: &str) -> &str {
-    tid.trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
-        .trim()
+    crate::task_id::normalize_task_id_ref(tid)
 }
 
 /// Extracts the task ID for a checklist item line in an execution plan.
 ///
-/// Recognizes formats like:
+/// The grammar lives in [`crate::plan_parse::task_id_of_line`] (dedup cluster
+/// C3) so the plan panel, the delegation guard and the on-disk check-off all
+/// agree. Recognized formats include:
 /// - `- [ ] [t-001] Description`
 /// - `- [ ] [t-100a1] Description`
 /// - `- [ ] **[t-001]** Description`
 /// - `- [ ] t-001: Description`
+/// - `- [ ] (t-002) Description`
 /// - `1. [ ] (t-001) Description`
 /// - `* [ ] `t-001` Description`
+/// - `  - [X] (t-003) Description` (indented / blockquoted)
 pub fn extract_plan_line_task_id(line: &str) -> Option<String> {
-    static CHECKBOX_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = CHECKBOX_RE.get_or_init(|| {
-        regex::Regex::new(r"^\s*(?:[-*+]|\d+[.)])?\s*(?:\[\s*[ xX]?\s*\]|\(\s*[ xX]?\s*\))\s*")
-            .expect("valid checkbox regex")
-    });
-
-    let mat = re.find(line)?;
-    let after_box = &line[mat.end()..];
-
-    // Primary: Task ID immediately after the checkbox
-    let trimmed = after_box.trim_start_matches(|c: char| {
-        c.is_whitespace()
-            || c == '['
-            || c == '('
-            || c == '*'
-            || c == '_'
-            || c == '`'
-            || c == '"'
-            || c == '\''
-    });
-    let primary_id: String = trimmed
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
-        .collect();
-
-    if !primary_id.is_empty()
-        && (primary_id.starts_with("t-")
-            || primary_id.starts_with("T-")
-            || primary_id.contains('-')
-            || ((primary_id.starts_with('t') || primary_id.starts_with('T'))
-                && primary_id.len() >= 2))
-    {
-        return Some(primary_id.to_ascii_lowercase());
-    }
-
-    // Secondary: Explicit bracketed task ID anywhere on the line, e.g. `[t-001]`
-    static BRACKETED_TID_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let b_re = BRACKETED_TID_RE.get_or_init(|| {
-        regex::Regex::new(r"\[([tT]-[A-Za-z0-9_-]+)\]").expect("valid bracketed tid regex")
-    });
-    if let Some(caps) = b_re.captures(line) {
-        return Some(caps[1].to_ascii_lowercase());
-    }
-
-    None
+    crate::plan_parse::task_id_of_line(line)
 }
 
 /// Checks if an execution plan line matches a specific task ID with strict boundary semantics,
 /// preventing partial substring collisions (e.g. `t-100` must not match `t-100a1`, and `t-1` must not match `t-100`).
 pub fn line_matches_task_id(line: &str, task_id: &str) -> bool {
-    let clean_target = clean_task_id(task_id);
-    if clean_target.is_empty() {
-        return false;
-    }
-    let target_lower = clean_target.to_ascii_lowercase();
-
-    // 1. If line has an extracted task ID from its checklist marker, require exact match
-    if let Some(line_tid) = extract_plan_line_task_id(line) {
-        return line_tid == target_lower;
-    }
-
-    // 2. Fallback: Search all occurrences in line with strict non-identifier boundaries
-    let line_lower = line.to_ascii_lowercase();
-    let mut search_start = 0;
-    while let Some(pos) = line_lower[search_start..].find(&target_lower) {
-        let abs_pos = search_start + pos;
-        let before = if abs_pos == 0 {
-            None
-        } else {
-            line_lower[..abs_pos].chars().last()
-        };
-        let after_pos = abs_pos + target_lower.len();
-        let after = line_lower[after_pos..].chars().next();
-
-        let before_ok = before
-            .map(|c| !c.is_alphanumeric() && c != '-' && c != '_')
-            .unwrap_or(true);
-        let after_ok = after
-            .map(|c| !c.is_alphanumeric() && c != '-' && c != '_')
-            .unwrap_or(true);
-
-        if before_ok && after_ok {
-            return true;
-        }
-        search_start = abs_pos + target_lower.len();
-        if search_start >= line_lower.len() {
-            break;
-        }
-    }
-    false
+    crate::plan_parse::line_matches_task_id(line, task_id)
 }
 
 /// Compute the visual (wrapped) line offset of a specific task in the execution plan text (e.g. `t-001`).
@@ -783,14 +696,9 @@ pub fn visual_line_offset_of_task(text: &str, task_id: &str, width: usize) -> Op
 
     for raw_line in text.lines() {
         if line_matches_task_id(raw_line, clean_tid) {
-            // If this line has a checkbox, it's definitively the task checklist item
-            if raw_line.contains("[ ]")
-                || raw_line.contains("[x]")
-                || raw_line.contains("[X]")
-                || raw_line.contains("( )")
-                || raw_line.contains("(x)")
-                || raw_line.contains("(X)")
-            {
+            // If this line is a checklist item of the shared grammar, it is
+            // definitively the task line (otherwise keep it as a weak candidate).
+            if crate::plan_parse::parse_task_line(raw_line).is_some() {
                 return Some(visual_offset);
             }
             if candidate_offset.is_none() {
@@ -800,29 +708,6 @@ pub fn visual_line_offset_of_task(text: &str, task_id: &str, width: usize) -> Op
         visual_offset += wrapped_lines(raw_line, width).max(1);
     }
     candidate_offset
-}
-
-/// Compute a centered rectangle of `percent_x`% width and `percent_y`% height
-/// within `r` (reference §9.1).
-#[allow(dead_code)]
-pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
 }
 
 /// Extract complete sentences from a streaming buffer (reference §10).
@@ -952,4 +837,83 @@ pub fn extract_thought_and_content(msg: &str) -> (Option<String>, String) {
         Some(thought.trim().to_string())
     };
     (thought_opt, content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The UI seams must report exactly what the single grammar owner reports,
+    /// including the parenthesised task id form the plan panel used to miss.
+    #[test]
+    fn plan_line_seams_delegate_to_plan_parse() {
+        const PAREN: &str = "- [ ] (t-c3ui-2) Migrate schema";
+        const PAREN_DONE: &str = "- [x] (t-c3ui-1) Baseline";
+        const INDENT: &str = "    * [ ] [t-c3ui-3] Indented star bullet";
+        const BOLD: &str = "- [X] **[t-c3ui-4]** Bold decoration";
+        const PROSE: &str = "Prose that quotes (t-c3ui-2) without a checkbox";
+        const HEADER: &str = "### Phase 1";
+
+        for line in [PAREN, PAREN_DONE, INDENT, BOLD] {
+            assert_eq!(
+                extract_plan_line_task_id(line),
+                crate::plan_parse::task_id_of_line(line),
+                "UI extraction diverges for {line:?}"
+            );
+        }
+        assert_eq!(
+            extract_plan_line_task_id(PAREN).as_deref(),
+            Some("t-c3ui-2")
+        );
+        assert_eq!(
+            extract_plan_line_task_id(PAREN_DONE).as_deref(),
+            Some("t-c3ui-1")
+        );
+        assert_eq!(
+            extract_plan_line_task_id(INDENT).as_deref(),
+            Some("t-c3ui-3")
+        );
+        assert_eq!(extract_plan_line_task_id(BOLD).as_deref(), Some("t-c3ui-4"));
+        assert_eq!(extract_plan_line_task_id(PROSE), None);
+        assert_eq!(extract_plan_line_task_id(HEADER), None);
+
+        assert!(line_matches_task_id(PAREN, "t-c3ui-2"));
+        assert!(line_matches_task_id(PAREN, "[t-c3ui-2]"));
+        assert!(!line_matches_task_id(PAREN, "t-c3ui-20"));
+        assert!(!line_matches_task_id(PAREN, ""));
+        assert!(!line_matches_task_id(PROSE, "t-c3ui-9"));
+    }
+
+    /// Plan-panel scroll offsets must agree with the shared grammar's line index
+    /// for wide panels (no wrapping), and must skip already-checked tasks.
+    #[test]
+    fn plan_offsets_agree_with_shared_grammar() {
+        let plan = "\
+# Plan
+- [x] (t-c3ui-1) Baseline
+- [ ] [t-c3ui-2] Pending in bracket form
+- [ ] t-c3ui-3 Pending in bare form
+";
+        assert_eq!(
+            visual_line_offset_of_first_pending(plan, 500),
+            crate::plan_parse::first_unchecked_line_index(plan)
+        );
+        assert_eq!(visual_line_offset_of_first_pending(plan, 500), Some(2));
+        assert_eq!(visual_line_offset_of_task(plan, "t-c3ui-1", 500), Some(1));
+        assert_eq!(visual_line_offset_of_task(plan, "t-c3ui-3", 500), Some(3));
+        assert_eq!(visual_line_offset_of_task(plan, "t-c3ui-404", 500), None);
+        // Wrapped panels still use the UI's own wrapped-line accounting.
+        let wrapped = visual_line_offset_of_first_pending(
+            &plan.replacen(
+                "- [ ] t-c3ui-3 Pending in bare form",
+                "- [ ] t-c3ui-3 a very long pending description that will wrap at twenty columns",
+                1,
+            ),
+            20,
+        );
+        assert!(
+            wrapped.is_some_and(|off| off >= 2),
+            "wrapped offset: {wrapped:?}"
+        );
+    }
 }

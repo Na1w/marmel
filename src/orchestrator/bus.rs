@@ -144,11 +144,29 @@ pub fn clear_steering_history() {
 
 /// Record or update a steering exchange in the active session's steering history.
 ///
-/// Matches in 4 stages:
-/// 1. By `notice_id` in pending responses (e.g. "Forwarded notice notice-1 to coder (awaiting specialist reply)").
-/// 2. By `user_inquiry` text against pending entries.
-/// 3. Most recent pending entry waiting for a specialist reply.
-/// 4. If no pending entry exists, appends `(user_inquiry, arbitrator_response)`.
+/// A recorded entry is addressed by an **identity key**, never by a substring of
+/// one (recon M3, task t-071). The correlation stages are:
+///
+/// 1. `notice_id` — the most recent pending entry whose recorded arbitrator text
+///    names that very id as a whole identifier token (`entry_names_notice_id`).
+/// 2. `user_inquiry` — the most recent pending entry whose recorded inquiry is
+///    the **same inquiry** (`same_steering_inquiry`: trim + ASCII case-fold, then
+///    whole-string equality).
+/// 3. Otherwise the exchange is appended as its own entry.
+///
+/// Deliberately removed (behaviour change is the point):
+/// * the bidirectional substring test `inq.contains(q) || q.contains(inq)`, which
+///   let a lookup for `t-1` address the `t-10` entry (and an empty inquiry match
+///   every entry), and
+/// * the "rewrite the most recent pending entry whatever it was" fallback, which
+///   re-attributed an answer to an unrelated steer and erased that entry's
+///   `awaiting specialist reply` marker — after which the specialist's own
+///   `reply_to_arbitrator` could no longer be correlated and got appended as a
+///   duplicate entry.
+///
+/// Same exact-identity discipline as worker routing
+/// (`WorkerRoutingIdentity::routes` in `orchestrator::notice`, `worker_matches`
+/// in `orchestrator::workers`): no substring fallback anywhere.
 pub fn record_steering_exchange(
     notice_id: Option<&str>,
     user_inquiry: &str,
@@ -163,14 +181,12 @@ pub fn record_steering_exchange(
 
     let mut matched = false;
 
-    // 1. Try matching by notice_id in pending responses (most accurate)
-    if let Some(nid) = notice_id {
+    // 1. Exact notice-id key: the entry has to name this id as a whole token, so
+    //    `notice-1` never addresses the entry recorded for `notice-10`.
+    if let Some(nid) = notice_id.map(str::trim).filter(|id| !id.is_empty()) {
         for (_user_q, resp_text) in hist.iter_mut().rev() {
-            if resp_text.contains(nid)
-                && (resp_text.contains("awaiting specialist reply")
-                    || resp_text.contains("ForwardToWorker")
-                    || resp_text.contains("follow-up")
-                    || resp_text.starts_with("Decision:"))
+            if super::steer::entry_names_notice_id(resp_text, nid)
+                && super::steer::steering_entry_is_pending(resp_text)
             {
                 *resp_text = arbitrator_response.to_string();
                 matched = true;
@@ -179,36 +195,12 @@ pub fn record_steering_exchange(
         }
     }
 
-    // 2. Try matching by user_inquiry substring against pending entries
+    // 2. Exact inquiry key: whole-string equality after trim + case-fold. A
+    //    prefix, a suffix or any other partial overlap is a *different* steer.
     if !matched {
-        let inq_trimmed = user_inquiry.trim();
-        if !inq_trimmed.is_empty() {
-            for (user_q, resp_text) in hist.iter_mut().rev() {
-                let q_trimmed = user_q.trim();
-                if !q_trimmed.is_empty()
-                    && (q_trimmed == inq_trimmed
-                        || inq_trimmed.contains(q_trimmed)
-                        || q_trimmed.contains(inq_trimmed))
-                    && (resp_text.starts_with("Decision:")
-                        || resp_text.contains("awaiting specialist reply")
-                        || resp_text.contains("ForwardToWorker")
-                        || resp_text.contains("follow-up"))
-                {
-                    *resp_text = arbitrator_response.to_string();
-                    matched = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    // 3. Try matching the most recent pending entry waiting for a specialist reply
-    if !matched {
-        for (_user_q, resp_text) in hist.iter_mut().rev() {
-            if resp_text.starts_with("Decision:")
-                || resp_text.contains("awaiting specialist reply")
-                || resp_text.contains("ForwardToWorker")
-                || resp_text.contains("follow-up")
+        for (user_q, resp_text) in hist.iter_mut().rev() {
+            if super::steer::same_steering_inquiry(user_inquiry, user_q)
+                && super::steer::steering_entry_is_pending(resp_text)
             {
                 *resp_text = arbitrator_response.to_string();
                 matched = true;
@@ -217,7 +209,8 @@ pub fn record_steering_exchange(
         }
     }
 
-    // 4. If still not matched, append new entry
+    // 3. No recorded entry is addressed by this exchange: keep it as its own
+    //    entry instead of overwriting an unrelated pending one.
     if !matched {
         hist.push((user_inquiry.to_string(), arbitrator_response.to_string()));
     }

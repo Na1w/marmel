@@ -1,6 +1,5 @@
 use super::*;
 use ratatui::Terminal;
-use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
 use std::time::Duration;
 
@@ -83,18 +82,6 @@ fn message_style_matches_reference_prefixes() {
 }
 
 #[test]
-fn centered_rect_is_centered() {
-    let r = Rect::new(0, 0, 100, 100);
-    let c = centered_rect(70, 60, r);
-    // 70% width centered: x = 15, width = 70.
-    assert_eq!(c.x, 15);
-    assert_eq!(c.width, 70);
-    // 60% height centered: y = 20, height = 60.
-    assert_eq!(c.y, 20);
-    assert_eq!(c.height, 60);
-}
-
-#[test]
 fn append_steer_sentence_creates_marmennill_messages() {
     let mut r = TuiRenderer::new();
     r.append_steer_sentence("Hello");
@@ -134,15 +121,6 @@ fn wrapped_lines_expands_tabs_and_trims_trailing_spaces() {
 fn wrapped_lines_empty_string_has_no_lines() {
     // An empty string has no raw lines, so it contributes 0 wrapped lines.
     assert_eq!(wrapped_lines("", 80), 0);
-}
-
-#[test]
-fn count_single_message_lines_excludes_think_when_hidden() {
-    let msg = "User: hi\n<think>\nsecret\n</think>\nvisible";
-    // show_thought = false → think block excluded: "User: hi" + "visible".
-    assert_eq!(count_single_message_lines(msg, 80, false), 2);
-    // show_thought = true → think block included without raw tag lines: "User: hi" + "secret" + "visible".
-    assert_eq!(count_single_message_lines(msg, 80, true), 3);
 }
 
 #[test]
@@ -1516,294 +1494,6 @@ This is a quadratic equation in the form $at^2 + bt + c = 0$ where:
 }
 
 #[test]
-fn test_rehydrate_subagents_enables_panel_and_selects_latest() {
-    let mut r = TuiRenderer::new();
-    assert!(!r.show_subagent_panel);
-    assert_eq!(r.subagents.len(), 0);
-
-    let subagents = vec![
-        SubagentDetail {
-            name: "coder-t-001".to_string(),
-            task_id: Some("t-001".to_string()),
-            prompt: "task 1".to_string(),
-            started_at: None,
-            last_activity_at: None,
-            logs: vec![
-                "started task t-001".to_string(),
-                "completed task t-001".to_string(),
-            ],
-            thinking: String::new(),
-            content: "output 1".to_string(),
-            is_active: false,
-            context_tokens: 100,
-            worked_duration: Duration::ZERO,
-        },
-        SubagentDetail {
-            name: "researcher-t-002".to_string(),
-            task_id: Some("t-002".to_string()),
-            prompt: "task 2".to_string(),
-            started_at: None,
-            last_activity_at: None,
-            logs: vec![
-                "started task t-002".to_string(),
-                "completed task t-002".to_string(),
-            ],
-            thinking: String::new(),
-            content: "output 2".to_string(),
-            is_active: false,
-            context_tokens: 200,
-            worked_duration: Duration::ZERO,
-        },
-    ];
-
-    r.rehydrate_subagents(&subagents);
-
-    assert!(
-        r.show_subagent_panel,
-        "Subagents panel must be visible after rehydration"
-    );
-    assert_eq!(r.subagents.len(), 2);
-    assert_eq!(r.selected_subagent_idx, 1, "Should select latest subagent");
-    assert_eq!(r.subagents[0].name, "coder-t-001");
-    assert_eq!(r.subagents[1].name, "researcher-t-002");
-}
-
-#[test]
-fn test_rehydrate_subagents_selects_active_subagent() {
-    let mut r = TuiRenderer::new();
-    let subagents = vec![
-        SubagentDetail {
-            name: "coder-t-001".to_string(),
-            task_id: Some("t-001".to_string()),
-            prompt: "task 1".to_string(),
-            started_at: None,
-            last_activity_at: None,
-            logs: vec!["started task t-001".to_string()],
-            thinking: String::new(),
-            content: String::new(),
-            is_active: true,
-            context_tokens: 100,
-            worked_duration: Duration::ZERO,
-        },
-        SubagentDetail {
-            name: "researcher-t-002".to_string(),
-            task_id: Some("t-002".to_string()),
-            prompt: "task 2".to_string(),
-            started_at: None,
-            last_activity_at: None,
-            logs: vec![
-                "started task t-002".to_string(),
-                "completed task t-002".to_string(),
-            ],
-            thinking: String::new(),
-            content: "output 2".to_string(),
-            is_active: false,
-            context_tokens: 200,
-            worked_duration: Duration::ZERO,
-        },
-    ];
-
-    r.rehydrate_subagents(&subagents);
-
-    assert!(r.show_subagent_panel);
-    assert_eq!(r.subagents.len(), 2);
-    assert_eq!(
-        r.selected_subagent_idx, 0,
-        "Should select active subagent rather than later inactive ones"
-    );
-}
-
-#[test]
-fn test_rehydrate_messages_summarizes_delegation_results() {
-    let mut r = TuiRenderer::new();
-    let messages = vec![
-        crate::types::Message::System {
-            content: "system".to_string(),
-        },
-        crate::types::Message::User {
-            content: "goal".to_string(),
-        },
-        crate::types::Message::Assistant {
-            content: None,
-            reasoning_content: None,
-            tool_calls: vec![crate::types::ToolCall::new(
-                "call-del-1",
-                crate::tool_names::TOOL_DELEGATE_TASK,
-                r#"{"agent_name": "coder", "task_id": "t-001", "prompt": "build feature"}"#,
-            )],
-        },
-        crate::types::Message::Tool {
-            tool_call_id: "call-del-1".to_string(),
-            content: "MISSION COMPLETE (t-001):\nline 1\nline 2\nline 3\n... 2000 lines ..."
-                .to_string(),
-        },
-    ];
-
-    r.rehydrate_messages(&messages);
-
-    assert!(
-        r.messages
-            .iter()
-            .any(|m| m.contains("[Tool Call] delegate_task(agent: coder, task_id: t-001)"))
-    );
-    // Should NOT dump the multi-line deliverable into chat
-    assert!(
-        !r.messages
-            .iter()
-            .any(|m| m.contains("line 1") || m.contains("2000 lines"))
-    );
-    // Should contain the summarized mission marker
-    assert!(
-        r.messages
-            .iter()
-            .any(|m| m == "[Tool Result] MISSION COMPLETE (t-001):")
-    );
-}
-
-#[test]
-fn test_rehydrate_messages_preserves_order_thinking_and_filters_synthetic() {
-    let mut r = TuiRenderer::new();
-    let messages = vec![
-        crate::types::Message::System {
-            content: "system prompt".to_string(),
-        },
-        crate::types::Message::User {
-            content: "Please refactor the auth system".to_string(),
-        },
-        crate::types::Message::Assistant {
-            content: Some("I will check auth files now.".to_string()),
-            reasoning_content: Some("Let's look at the codebase structure.".to_string()),
-            tool_calls: vec![crate::types::ToolCall::new(
-                "call-glob-1",
-                crate::tool_names::TOOL_GLOB,
-                r#"{"pattern": "src/auth*.rs"}"#,
-            )],
-        },
-        crate::types::Message::Tool {
-            tool_call_id: "call-glob-1".to_string(),
-            content: "src/auth.rs\nsrc/auth_middleware.rs".to_string(),
-        },
-        // Synthetic notices that should NOT leak as User messages:
-        crate::types::Message::User {
-            content: "(SYSTEM NOTICE: Active execution plan detected...)".to_string(),
-        },
-        crate::types::Message::User {
-            content: "[System] User executed /reset. The execution plan has been removed.".to_string(),
-        },
-        crate::types::Message::User {
-            content: "(User steering resulted in subtask 't-001' executed by specialist 'coder'. Deliverable:\nfn main() {})".to_string(),
-        },
-        // Rebirth checkpoint that should be formatted as status:
-        crate::types::Message::System {
-            content: "(SYSTEM: REBIRTH CHECKPOINT: Summary of progress so far)".to_string(),
-        },
-    ];
-
-    r.rehydrate_messages(&messages);
-
-    // 1. Goal should be present as User message
-    assert_eq!(r.messages[0], "User: Please refactor the auth system");
-
-    // 2. Thinking should be preserved with <think> tag
-    assert!(
-        r.messages[1].contains("<think>")
-            && r.messages[1].contains("Let's look at the codebase structure.")
-    );
-
-    // 3. Assistant content should come BEFORE tool call
-    assert_eq!(r.messages[2], "I will check auth files now.");
-    assert!(r.messages[3].contains("[Tool Call] glob(src/auth*.rs)"));
-
-    // 4. Tool result
-    assert_eq!(
-        r.messages[4],
-        "[Tool Result] src/auth.rs\nsrc/auth_middleware.rs"
-    );
-
-    // 5. Rebirth checkpoint should be formatted as [Status]
-    assert_eq!(
-        r.messages[5],
-        "[Status] Rebirth checkpoint: Summary of progress so far"
-    );
-
-    // 6. Synthetic messages should NOT have been added
-    assert!(
-        !r.messages
-            .iter()
-            .any(|m| m.contains("Active execution plan detected")),
-        "Synthetic plan notices must not appear in chat pane"
-    );
-    assert!(
-        !r.messages
-            .iter()
-            .any(|m| m.contains("User executed /reset")),
-        "Synthetic reset notice must not appear in chat pane"
-    );
-    assert!(
-        !r.messages
-            .iter()
-            .any(|m| m.contains("User steering resulted in subtask")),
-        "Synthetic steer deliverable must not appear in chat pane"
-    );
-
-    // 7. Auto-scroll should be enabled
-    assert!(r.chat_auto_scroll);
-}
-
-#[test]
-fn test_rehydrate_ui_records_renders_clean_chat_history() {
-    use crate::ui::UiRecord;
-    let mut r = TuiRenderer::new();
-    let records = vec![
-        UiRecord::User {
-            text: "Initial objective".to_string(),
-        },
-        UiRecord::Assistant {
-            content: Some("Working on it.".to_string()),
-            thinking: Some("Reasoning about steps.".to_string()),
-        },
-        UiRecord::SteerResponse {
-            text: "I adjusted the approach.".to_string(),
-        },
-        UiRecord::ToolCall {
-            display: "read_file(src/lib.rs)".to_string(),
-        },
-        UiRecord::ToolResult {
-            display: "// file contents".to_string(),
-        },
-        UiRecord::TaskCompleted {
-            task_id: "t-101".to_string(),
-        },
-        UiRecord::TaskFailed {
-            task_id: "t-102".to_string(),
-            reason: None,
-        },
-        UiRecord::TaskFailed {
-            task_id: "t-103".to_string(),
-            reason: Some("syntax error in mod.rs".to_string()),
-        },
-        UiRecord::Status {
-            text: "Recovery succeeded".to_string(),
-        },
-    ];
-
-    r.rehydrate_ui(&records);
-
-    assert_eq!(r.messages.len(), 10);
-    assert_eq!(r.messages[0], "User: Initial objective");
-    assert_eq!(r.messages[1], "<think>\nReasoning about steps.\n</think>");
-    assert_eq!(r.messages[2], "Working on it.");
-    assert_eq!(r.messages[3], "Marmennill: I adjusted the approach.");
-    assert_eq!(r.messages[4], "[Tool Call] read_file(src/lib.rs)");
-    assert_eq!(r.messages[5], "[Tool Result] // file contents");
-    assert_eq!(r.messages[6], "[t-101] completed.");
-    assert_eq!(r.messages[7], "[t-102] failed.");
-    assert_eq!(r.messages[8], "[t-103 failed: syntax error in mod.rs]");
-    assert_eq!(r.messages[9], "[Status] Recovery succeeded");
-    assert!(r.chat_auto_scroll);
-}
-
-#[test]
 fn test_tui_submit_empty_line_sends_to_channel_for_enter_resume() {
     let mut r = TuiRenderer::new();
     r.input_text = String::new();
@@ -2411,4 +2101,48 @@ fn test_submit_multiline_input() {
     r.submit();
     assert_eq!(r.input_text, "");
     assert_eq!(r.textarea.lines(), &[""]);
+}
+
+#[test]
+fn test_clean_task_id_delegates_to_task_id_normalizer() {
+    // Dedup cluster C1 part 2: this borrowed UI seam must stay a pure delegation
+    // to `crate::task_id`; re-spelling the trimming chain here fails this test.
+    for raw in [
+        "[t-001]",
+        "\"t-001\"",
+        "  ('t-001')  ",
+        "t-001",
+        "[t-001",
+        "[t-001]]",
+    ] {
+        assert_eq!(clean_task_id(raw), "t-001", "borrowed UI seam for {raw:?}");
+        assert_eq!(
+            clean_task_id(raw),
+            crate::task_id::normalize_task_id_ref(raw),
+            "borrowed UI seam diverges from the canonical normalizer for {raw:?}"
+        );
+    }
+    for raw in ["", "[]", "   ", "\"\"", "[ ]", "[\"\"]"] {
+        assert_eq!(clean_task_id(raw), "", "borrowed UI seam for {raw:?}");
+    }
+}
+
+#[test]
+fn test_line_matches_task_id_accepts_decorated_targets() {
+    // The plan-line matcher consumes the delegated seam: decoration on the target
+    // must not change matching, and empty targets must never match.
+    assert!(line_matches_task_id(
+        "- [ ] [t-100] Do the thing",
+        "[t-100]"
+    ));
+    assert!(line_matches_task_id(
+        "- [ ] [t-100] Do the thing",
+        " \"t-100\" "
+    ));
+    assert!(!line_matches_task_id(
+        "- [ ] [t-100a1] Do the thing",
+        "[t-100]"
+    ));
+    assert!(!line_matches_task_id("- [ ] [t-100] Do the thing", "[]"));
+    assert!(!line_matches_task_id("- [ ] [t-100] Do the thing", ""));
 }

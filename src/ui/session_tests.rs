@@ -231,7 +231,7 @@ fn drain_delegation_events_folds_lifecycle_into_subagent_list() {
         });
     }
 
-    drain_delegation_events(Some(&manager), &mut renderer, &mut subagents);
+    drain_delegation_events_with_transcript(Some(&manager), &mut renderer, &mut subagents, None);
 
     assert_eq!(renderer.delegation_events.len(), 2);
     assert_eq!(subagents.len(), 1);

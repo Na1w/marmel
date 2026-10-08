@@ -6,7 +6,9 @@
 //! the terminal is always left in a sane state.
 
 use super::{Event, InputState, Renderer, chunk_utf8};
+use crate::agents::Agent;
 use crate::config::Config;
+use crate::markers::MARKER_FAILED;
 use crate::orchestrator::OrchestratorManager;
 use anyhow::Result;
 #[cfg(unix)]
@@ -64,6 +66,22 @@ impl RawRenderer {
     }
 }
 
+/// The `delegation` line raw mode prints for a failed delegation.
+///
+/// Gate t-059: the verdict word is the marker owner's constant
+/// ([`crate::markers::MARKER_FAILED`]) rather than a hand-typed literal, so the
+/// vocabulary has one owner. The rendered bytes are unchanged — `FAILED` is
+/// followed by exactly two spaces to column-align with `STARTED →` / `DONE` —
+/// and that alignment is pinned by `test_delegation_failed_line_keeps_its_exact_bytes`.
+fn delegation_failed_line(agent: Agent, task: Option<&str>, reason: Option<&str>) -> String {
+    let t = task.unwrap_or("(no task id)");
+    let reason_suffix = reason
+        .filter(|reason| !reason.is_empty())
+        .map(|reason| format!(": {reason}"))
+        .unwrap_or_default();
+    format!("{MARKER_FAILED}  {agent} on {t}{reason_suffix}")
+}
+
 impl Default for RawRenderer {
     fn default() -> Self {
         Self::new()
@@ -104,15 +122,9 @@ impl Renderer for RawRenderer {
                     task,
                     reason,
                 } => {
-                    let t = task.as_deref().unwrap_or("(no task id)");
-                    let reason_suffix = reason
-                        .as_deref()
-                        .filter(|r| !r.is_empty())
-                        .map(|r| format!(": {r}"))
-                        .unwrap_or_default();
                     self.push_line(
                         "delegation",
-                        &format!("FAILED  {agent} on {t}{reason_suffix}"),
+                        &delegation_failed_line(*agent, task.as_deref(), reason.as_deref()),
                     );
                 }
             },
@@ -157,95 +169,61 @@ impl Renderer for RawRenderer {
     fn shutdown(&mut self) {
         let _ = self.flush();
     }
-
-    fn rehydrate_ui(&mut self, records: &[crate::ui::UiRecord]) {
-        for rec in records {
-            match rec {
-                crate::ui::UiRecord::User { text } => {
-                    self.push_line("user", text);
-                }
-                crate::ui::UiRecord::Assistant { content, thinking } => {
-                    if let Some(r) = thinking
-                        && !r.trim().is_empty()
-                    {
-                        self.push_line("thinking", r);
-                    }
-                    if let Some(c) = content
-                        && !c.trim().is_empty()
-                    {
-                        self.push_line("assistant", c);
-                    }
-                }
-                crate::ui::UiRecord::SteerResponse { text } => {
-                    self.push_line("steer", text);
-                }
-                crate::ui::UiRecord::ToolCall { display } => {
-                    self.push_line("tool", display);
-                }
-                crate::ui::UiRecord::ToolResult { display } => {
-                    self.push_line("tool-result", display);
-                }
-                crate::ui::UiRecord::TaskCompleted { task_id } => {
-                    self.push_line("delegation", &format!("DONE    specialist on {task_id}"));
-                }
-                crate::ui::UiRecord::TaskFailed { task_id, reason } => {
-                    let reason_suffix = reason
-                        .as_deref()
-                        .filter(|r| !r.is_empty())
-                        .map(|r| format!(": {r}"))
-                        .unwrap_or_default();
-                    self.push_line(
-                        "delegation",
-                        &format!("FAILED  specialist on {task_id}{reason_suffix}"),
-                    );
-                }
-                crate::ui::UiRecord::Status { text } => {
-                    self.push_line("status", text);
-                }
-            }
-        }
-        let _ = self.flush();
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::UiRecord;
 
     #[test]
-    fn test_raw_renderer_rehydrate_ui() {
+    fn test_raw_renderer_push_line_buffers_labelled_lines() {
         let mut r = RawRenderer::new();
-        let records = vec![
-            UiRecord::User {
-                text: "My task".to_string(),
-            },
-            UiRecord::Assistant {
-                content: Some("I am on it".to_string()),
-                thinking: Some("Reasoning here".to_string()),
-            },
-            UiRecord::SteerResponse {
-                text: "Steer text".to_string(),
-            },
-            UiRecord::ToolCall {
-                display: "read_file(foo.txt)".to_string(),
-            },
-            UiRecord::ToolResult {
-                display: "content".to_string(),
-            },
-            UiRecord::TaskCompleted {
-                task_id: "t-1".to_string(),
-            },
-            UiRecord::TaskFailed {
-                task_id: "t-2".to_string(),
-                reason: Some("compilation error".to_string()),
-            },
-            UiRecord::Status {
-                text: "Running tests".to_string(),
-            },
-        ];
+        r.push_line("assistant", "I am on it");
+        r.push_line("tool-result", "content");
+        let buffered = String::from_utf8(r.buffer.clone()).expect("buffer is valid utf-8");
+        assert_eq!(buffered, "[assistant] I am on it\n[tool-result] content\n");
+    }
 
-        // Calling rehydrate_ui should not panic and should properly format
-        r.rehydrate_ui(&records);
+    /// Gate t-059 byte-pin: the verdict word now comes from
+    /// `crate::markers::MARKER_FAILED`, and every rendered byte is unchanged —
+    /// including the two spaces that column-align `FAILED` with `STARTED →` /
+    /// `DONE`, the `(no task id)` placeholder and the empty-reason filter.
+    #[test]
+    fn test_delegation_failed_line_keeps_its_exact_bytes() {
+        assert_eq!(
+            delegation_failed_line(Agent::Coder, Some("t-059"), Some("boom")),
+            "FAILED  coder on t-059: boom"
+        );
+        assert_eq!(
+            delegation_failed_line(Agent::Coder, None, None),
+            "FAILED  coder on (no task id)"
+        );
+        assert_eq!(
+            delegation_failed_line(Agent::Coder, Some("t-1"), Some("")),
+            "FAILED  coder on t-1"
+        );
+        // The verdict word is the owner's constant, not a local spelling.
+        assert_eq!(
+            delegation_failed_line(Agent::Coder, Some("t-9"), None),
+            format!("{MARKER_FAILED}  coder on t-9")
+        );
+        // It reaches the wire as one labelled line.
+        let mut r = RawRenderer::new();
+        r.push_line(
+            "delegation",
+            &delegation_failed_line(Agent::Coder, Some("t-059"), Some("boom")),
+        );
+        let buffered = String::from_utf8(r.buffer.clone()).expect("buffer is valid utf-8");
+        assert_eq!(buffered, "[delegation] FAILED  coder on t-059: boom\n");
+    }
+
+    #[test]
+    fn test_raw_renderer_push_line_splits_long_text() {
+        let mut r = RawRenderer::new();
+        r.push_line("status", &"a".repeat(600));
+        let buffered = String::from_utf8(r.buffer.clone()).expect("buffer is valid utf-8");
+        let lines: Vec<&str> = buffered.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|l| l.starts_with("[status] ")));
     }
 }

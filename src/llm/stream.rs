@@ -4,7 +4,7 @@ use crate::types::{ChatRequest, Message};
 use anyhow::Result;
 use std::future::Future;
 
-use super::client::{ChatClient, StreamedReply};
+use super::client::{ChatClient, ReplyOutcome, StreamedReply, TerminalCause};
 use super::thinking::{
     DeltaKind, NudgePolicy, RecoveryAdjustment, ThinkingDemuxer, apply_recovery,
 };
@@ -270,59 +270,11 @@ impl<'a> TurnStreamHandler<'a> {
         self.pause_requested.take()
     }
 
-    /// Process an incoming chunk delta targeting orchestrator events. Returns true to continue streaming, false to cut stream.
-    pub fn on_chunk(&mut self, chunk: &str) -> bool {
-        if !chunk.is_empty() {
-            self.tokens_count += 1;
-            if self.tokens_count > self.max_tokens {
-                self.budget_exceeded = true;
-            }
-        }
-        let rep_det = &mut *self.rep_detector;
-        let rep_trig = &mut self.rep_triggered;
-        let thinking_tokens_count = &mut self.thinking_tokens_count;
-        let thinking_budget_exceeded = &mut self.thinking_budget_exceeded;
-        let max_thinking_tokens = self.max_thinking_tokens;
-        self.demux.push_delta(chunk, |kind, text| {
-            if kind == DeltaKind::Content {
-                rep_det.push(text);
-                if rep_det.is_repeating() {
-                    *rep_trig = true;
-                }
-            } else if kind == DeltaKind::Thinking && !text.is_empty() {
-                let tok_est = if text.len() <= 4 {
-                    1
-                } else {
-                    text.len().div_ceil(4)
-                };
-                *thinking_tokens_count += tok_est;
-                if *thinking_tokens_count > max_thinking_tokens {
-                    *thinking_budget_exceeded = true;
-                }
-            }
-            match kind {
-                DeltaKind::Content => {
-                    crate::orchestrator::emit_event(crate::ui::Event::Message(text.to_string()));
-                }
-                DeltaKind::Thinking => {
-                    crate::orchestrator::emit_event(crate::ui::Event::Thinking(text.to_string()));
-                }
-            }
-        });
-
-        let cancelled = self
-            .cancellation_token
-            .map(|t| t.is_cancelled())
-            .unwrap_or(false);
-
-        !cancelled
-            && !self.rep_triggered
-            && !self.budget_exceeded
-            && !self.thinking_budget_exceeded
-            && !crate::orchestrator::is_globally_cancelled()
-    }
-
     /// Process an incoming chunk delta delivering events to `sink`. Returns true to continue streaming, false to cut stream.
+    ///
+    /// This is the single chunk entry point: the orchestrator-transcript variant
+    /// that used to sit next to it (`on_chunk`) had no callers and was removed
+    /// as dead plumbing.
     pub fn on_chunk_with_sink<S: StreamSink + ?Sized>(
         &mut self,
         chunk: &str,
@@ -383,19 +335,10 @@ impl<'a> TurnStreamHandler<'a> {
             && !crate::orchestrator::is_globally_cancelled()
     }
 
-    /// Flushes any pending thinking/content deltas to orchestrator events.
-    pub fn finish(&mut self) {
-        self.demux.finish_delta(|kind, text| match kind {
-            DeltaKind::Content => {
-                crate::orchestrator::emit_event(crate::ui::Event::Message(text.to_string()));
-            }
-            DeltaKind::Thinking => {
-                crate::orchestrator::emit_event(crate::ui::Event::Thinking(text.to_string()));
-            }
-        });
-    }
-
     /// Flushes any pending thinking/content deltas to `sink`.
+    ///
+    /// Single flush entry point: the orchestrator-transcript twin (`finish`)
+    /// had no callers and was removed as dead plumbing.
     pub fn finish_with_sink<S: StreamSink + ?Sized>(&mut self, sink: &mut S) {
         self.demux.finish_delta(|kind, text| match kind {
             DeltaKind::Content => sink.emit(StreamEvent::Content(text.to_string())),
@@ -466,7 +409,16 @@ where
             }
         }
 
-        if is_empty_production(&assistant) && nudge.should_nudge(empty_attempts) {
+        // An interrupted turn is never "empty production": nudging would re-send
+        // the request after deltas had already been delivered. The terminal state
+        // is surfaced on the sink instead, so the caller sees the cut/cancel.
+        if reply.outcome.is_interrupted() {
+            sink.emit(StreamEvent::Status(format!(
+                "LLM reply {} after {} deltas — partial output, not a completed answer",
+                reply.outcome.as_str(),
+                reply.deltas,
+            )));
+        } else if is_empty_production(&assistant) && nudge.should_nudge(empty_attempts) {
             empty_attempts += 1;
             sink.emit(StreamEvent::Status(format!(
                 "empty production — nudge {empty_attempts}/{}",
@@ -495,10 +447,11 @@ fn is_empty_production(m: &Message) -> bool {
 
 pub(crate) fn build_request(cfg: &StreamConfig, messages: Vec<Message>) -> ChatRequest {
     let mut tools = crate::types::ToolDef::manager_tools();
-    if let Some(mcp) = crate::harness::get_mcp_manager() {
-        for tool in mcp.tools_for_servers(&cfg.mcp_servers) {
-            tools.push(crate::types::ToolDef::from_mcp(&tool));
-        }
+    // Advertising goes through the same policy gate as dispatch (t-034c): a MCP
+    // name the policy refused is never even offered to the model, so the schema
+    // list and the dispatchable set can never disagree.
+    for tool in crate::harness::allowed_mcp_tools(&cfg.mcp_servers) {
+        tools.push(crate::types::ToolDef::from_mcp(&tool));
     }
 
     ChatRequest {
@@ -598,6 +551,14 @@ where
     let base_messages = req.messages.clone();
     let mut all_tool_calls = Vec::new();
     let mut was_aborted_by_steer = false;
+    // The terminal state of the last attempt, carried out on the assembled
+    // reply: a cancelled or truncated turn must never look like an answer.
+    let mut outcome;
+    let mut cause;
+    let mut finish_reason: Option<String> = None;
+    let mut deltas = 0usize;
+    let mut bytes = 0usize;
+    let mut dropped_tool_calls = 0usize;
 
     loop {
         let reply_res = client
@@ -629,6 +590,15 @@ where
                 }
             }
         };
+
+        outcome = reply.outcome;
+        cause = reply.cause;
+        if reply.finish_reason.is_some() {
+            finish_reason = reply.finish_reason.clone();
+        }
+        deltas += reply.deltas;
+        bytes += reply.bytes;
+        dropped_tool_calls += reply.dropped_tool_calls;
 
         all_tool_calls.extend(reply.tool_calls);
 
@@ -675,12 +645,25 @@ where
     let final_content = stream_handler.demux.content().to_string();
     let final_thinking = stream_handler.demux.thinking().to_string();
 
+    // A steer abort is a caller-initiated stop: the preserved partial output
+    // must never read as a completed answer.
+    if was_aborted_by_steer {
+        outcome = ReplyOutcome::Cancelled;
+        cause = TerminalCause::CallerAbort;
+    }
+
     Ok(ResumableStreamOutput {
         reply: StreamedReply {
             content: final_content,
             reasoning: final_thinking,
             raw: String::new(),
             tool_calls: all_tool_calls,
+            outcome,
+            cause,
+            finish_reason,
+            deltas,
+            bytes,
+            dropped_tool_calls,
         },
         budget_exceeded,
         thinking_budget_exceeded,
@@ -857,7 +840,15 @@ where
             continue;
         }
 
-        if is_empty_production(&assistant) && nudge.should_nudge(empty_attempts) {
+        // Same honesty rule as the manager driver: an interrupted turn is not an
+        // empty production to be nudged, and its terminal state is surfaced.
+        if out.reply.outcome.is_interrupted() {
+            sink.emit(StreamEvent::Status(format!(
+                "LLM reply {} after {} deltas — partial output, not a completed answer",
+                out.reply.outcome.as_str(),
+                out.reply.deltas,
+            )));
+        } else if is_empty_production(&assistant) && nudge.should_nudge(empty_attempts) {
             empty_attempts += 1;
             sink.emit(StreamEvent::Status(format!(
                 "empty production — nudge {empty_attempts}/{}",

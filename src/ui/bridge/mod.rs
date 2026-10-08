@@ -1,5 +1,7 @@
 //! Bridge between LLM streaming turns, interactive renderer, and steer arbitration.
 
+mod action;
+mod arbiter;
 mod drain;
 mod sink;
 mod steer;

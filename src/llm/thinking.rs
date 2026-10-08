@@ -36,6 +36,29 @@ impl Default for RecoveryAdjustment {
     }
 }
 
+/// Documented valid range for `temperature` on an OpenAI-compatible
+/// `/chat/completions` endpoint: `MIN_TEMPERATURE..=MAX_TEMPERATURE` (0.0..=2.0).
+/// Outside it the provider answers **400**, so recovery requests are clamped here.
+pub const MIN_TEMPERATURE: f32 = 0.0;
+/// See [`MIN_TEMPERATURE`].
+pub const MAX_TEMPERATURE: f32 = 2.0;
+
+/// Documented valid range for `frequency_penalty` and `presence_penalty`:
+/// `-2.0..=2.0`.
+pub const MIN_PENALTY: f32 = -2.0;
+/// See [`MIN_PENALTY`].
+pub const MAX_PENALTY: f32 = 2.0;
+
+/// Documented valid range for `top_p`: `0.0..=1.0`.
+pub const MIN_TOP_P: f32 = 0.0;
+/// See [`MIN_TOP_P`].
+pub const MAX_TOP_P: f32 = 1.0;
+
+/// `temperature` used when the request leaves it unset (mirrors `Config::default`).
+const DEFAULT_TEMPERATURE: f32 = 0.7;
+/// `frequency_penalty` used when the request leaves it unset (mirrors `Config::default`).
+const DEFAULT_FREQUENCY_PENALTY: f32 = 0.0;
+
 /// Streaming demuxer that separates `[thinking]…[/thinking]` content from the
 /// visible assistant payload on-the-fly. Tags may be split across arbitrary
 /// delta boundaries (a single char per push is fine).
@@ -266,15 +289,174 @@ pub fn demux_stream(raw: &str) -> ThinkingDemuxer {
 /// - `frequency_penalty += 0.5`
 /// - `temperature += 0.1`
 ///
+/// Every sampling parameter of the returned request is additionally clamped into
+/// the provider's **documented valid range** ([`MIN_TEMPERATURE`]..=[`MAX_TEMPERATURE`]
+/// for `temperature`, [`MIN_PENALTY`]..=[`MAX_PENALTY`] for both penalties,
+/// [`MIN_TOP_P`]..=[`MAX_TOP_P`] for `top_p`). Without that, the recovery deltas
+/// push a legal configured value out of range (e.g. `frequency_penalty = 2.0`
+/// becomes `2.5`) and the provider answers **HTTP 400** — the recovery turn then
+/// fails instead of recovering. Any such rewrite is a typed [`RecoveryClamp`]
+/// and is logged once per request (old → new), never silently.
+///
 /// The returned request is a mutated copy intended for exactly one turn; the
 /// caller is responsible for not reusing it on subsequent turns.
 pub fn apply_recovery(req: &ChatRequest, adj: RecoveryAdjustment) -> ChatRequest {
+    let outcome = apply_recovery_report(req, adj);
+    outcome.log_clamps();
+    outcome.request
+}
+
+/// Same policy as [`apply_recovery`], but returning the typed report of what had
+/// to be clamped so callers/tests can assert the outcome, not just the numbers.
+pub fn apply_recovery_report(req: &ChatRequest, adj: RecoveryAdjustment) -> RecoveryOutcome {
     let mut out = req.clone();
+    let mut clamps = Vec::new();
+
     out.enable_thinking = Some(false);
-    out.frequency_penalty =
-        Some(req.frequency_penalty.unwrap_or(0.0) + adj.frequency_penalty_delta);
-    out.temperature = Some(req.temperature.unwrap_or(0.7) + adj.temperature_delta);
-    out
+
+    // The recovery shift is what overflows the documented range, so the shifted
+    // value — not the raw configured one — is what gets clamped.
+    out.frequency_penalty = clamp_param(
+        "frequency_penalty",
+        Some(
+            req.frequency_penalty.unwrap_or(DEFAULT_FREQUENCY_PENALTY)
+                + adj.frequency_penalty_delta,
+        ),
+        (MIN_PENALTY, MAX_PENALTY),
+        &mut clamps,
+    );
+    out.temperature = clamp_param(
+        "temperature",
+        Some(req.temperature.unwrap_or(DEFAULT_TEMPERATURE) + adj.temperature_delta),
+        (MIN_TEMPERATURE, MAX_TEMPERATURE),
+        &mut clamps,
+    );
+
+    // Pass-through sampling parameters belong to the request that is actually put
+    // on the wire, so they are validated here too.
+    out.top_p = clamp_param("top_p", out.top_p, (MIN_TOP_P, MAX_TOP_P), &mut clamps);
+    out.presence_penalty = clamp_param(
+        "presence_penalty",
+        out.presence_penalty,
+        (MIN_PENALTY, MAX_PENALTY),
+        &mut clamps,
+    );
+
+    RecoveryOutcome {
+        request: out,
+        clamps,
+    }
+}
+
+/// Clamp one optional parameter into `range`, pushing a [`RecoveryClamp`] when
+/// the value actually moved. `None` stays `None` (the field is not serialized).
+fn clamp_param(
+    param: &'static str,
+    value: Option<f32>,
+    range: (f32, f32),
+    clamps: &mut Vec<RecoveryClamp>,
+) -> Option<f32> {
+    let requested = value?;
+    let (min, max) = range;
+    let (applied, reason) = if !requested.is_finite() {
+        (min, ClampReason::NotFinite)
+    } else if requested < min {
+        (min, ClampReason::BelowRange)
+    } else if requested > max {
+        (max, ClampReason::AboveRange)
+    } else {
+        return Some(requested);
+    };
+    clamps.push(RecoveryClamp {
+        param,
+        requested,
+        applied,
+        valid_range: range,
+        reason,
+    });
+    Some(applied)
+}
+
+/// Why a recovery parameter had to be rewritten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClampReason {
+    /// Below the documented minimum.
+    BelowRange,
+    /// Above the documented maximum.
+    AboveRange,
+    /// Not a finite number (`NaN` / `±inf`): cannot be serialized meaningfully.
+    NotFinite,
+}
+
+impl ClampReason {
+    /// Machine-readable reason, used in [`RecoveryClamp::label`].
+    pub fn label(self) -> &'static str {
+        match self {
+            ClampReason::BelowRange => "below-range",
+            ClampReason::AboveRange => "above-range",
+            ClampReason::NotFinite => "not-finite",
+        }
+    }
+}
+
+/// One parameter rewritten by the recovery policy because the requested value was
+/// outside the documented valid range.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecoveryClamp {
+    /// Wire name of the parameter (as it appears in the request body).
+    pub param: &'static str,
+    /// The value that was asked for.
+    pub requested: f32,
+    /// The value applied instead.
+    pub applied: f32,
+    /// The documented valid range `(min, max)`.
+    pub valid_range: (f32, f32),
+    /// Why it moved.
+    pub reason: ClampReason,
+}
+
+impl RecoveryClamp {
+    /// Old → new, with the documented range: `temperature 2.1 -> 2 (documented 0..=2, above-range)`.
+    pub fn label(&self) -> String {
+        let (min, max) = self.valid_range;
+        format!(
+            "{} {} -> {} (documented {min}..={max}, {})",
+            self.param,
+            self.requested,
+            self.applied,
+            self.reason.label()
+        )
+    }
+}
+
+/// The typed outcome of [`apply_recovery_report`].
+#[derive(Debug, Clone)]
+pub struct RecoveryOutcome {
+    /// The recovery request, ready to issue: every sampling parameter is inside
+    /// its documented range, so the provider cannot reject it as invalid.
+    pub request: ChatRequest,
+    /// One entry per out-of-range parameter (empty when nothing had to change).
+    pub clamps: Vec<RecoveryClamp>,
+}
+
+impl RecoveryOutcome {
+    /// Log every clamp applied, **once per request**, naming old → new. A clamped
+    /// recovery turn is therefore always visible in the log.
+    pub fn log_clamps(&self) {
+        if self.clamps.is_empty() {
+            return;
+        }
+        let changes = self
+            .clamps
+            .iter()
+            .map(RecoveryClamp::label)
+            .collect::<Vec<_>>()
+            .join("; ");
+        tracing::warn!(
+            clamped = %changes,
+            "recovery request had out-of-range parameters; clamped into the documented range instead of issuing a request the provider rejects with 400"
+        );
+    }
 }
 
 /// REQ-LLM-004: Empty-production nudge state.

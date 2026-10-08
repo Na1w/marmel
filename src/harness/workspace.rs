@@ -87,12 +87,21 @@ impl Workspace {
         self.root.join("prompts")
     }
 
-    /// Path to a specific synthesized prompt markdown file (`.marmel/prompts/<task_id>.md`).
-    pub fn prompt_path_for_task(&self, task_id: &str) -> PathBuf {
-        let clean = task_id
-            .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
-            .trim();
-        self.prompts_dir().join(format!("{clean}.md"))
+    /// Path to a specific synthesized prompt markdown file
+    /// (`.marmel/prompts/<task_id>.md`).
+    ///
+    /// Gate t-046: the task id is validated as a single path segment before it is
+    /// joined onto the prompts directory, so an id such as `../../etc/x`, `a/b`
+    /// or `..\\..\\x` is reported as an error instead of silently becoming a path
+    /// outside that directory. The id is never sanitized, trimmed or clamped —
+    /// callers must propagate [`crate::task_id::TaskIdError`].
+    pub fn prompt_path_for_task(
+        &self,
+        task_id: &str,
+    ) -> std::result::Result<PathBuf, crate::task_id::TaskIdError> {
+        let clean = crate::task_id::normalize_task_id_ref(task_id);
+        let id = crate::task_id::validate_task_id(clean)?;
+        Ok(self.prompts_dir().join(format!("{id}.md")))
     }
 
     /// Create the workspace directory and validate it is writable by writing
@@ -182,5 +191,88 @@ mod tests {
         assert!(ws.root().is_dir());
         assert_eq!(ws.plan_path(), ws.root().join(PLAN_FILE));
         assert_eq!(ws.log_path(), ws.root().join(LOG_FILE));
+    }
+
+    /// Gate t-046: an accepted task id resolves to a single file name *inside*
+    /// the prompts directory — decoration is normalized, the rest is verbatim.
+    #[test]
+    fn prompt_path_for_task_resolves_inside_the_prompts_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("ws_prompt_paths");
+        let ws = Workspace::at(&root);
+        ws.ensure_writable().expect("workspace must be writable");
+
+        for (raw, file_name) in [
+            ("t-001", "t-001.md"),
+            ("  [t-001]  ", "t-001.md"),
+            ("task-t-046", "task-t-046.md"),
+            ("t_val_01", "t_val_01.md"),
+        ] {
+            let path = ws
+                .prompt_path_for_task(raw)
+                .unwrap_or_else(|err| panic!("{raw:?} must be accepted: {err}"));
+            assert_eq!(path, ws.prompts_dir().join(file_name), "for {raw:?}");
+            let relative = path.strip_prefix(&root).unwrap_or_else(|_| {
+                panic!("{raw:?} escaped the workspace root: {}", path.display())
+            });
+            assert_eq!(relative, Path::new("prompts").join(file_name));
+        }
+    }
+
+    /// Gate t-046: a hostile task id is refused outright. The call reports the
+    /// typed rejection and leaves nothing behind — no file in the workspace, and
+    /// nothing at the location the unguarded join would have reached.
+    #[test]
+    fn prompt_path_for_task_rejects_hostile_ids_and_creates_no_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("ws_hostile_ids");
+        let ws = Workspace::at(&root);
+        ws.ensure_writable().expect("workspace must be writable");
+
+        for hostile in [
+            "../../etc/x",
+            "../../escape",
+            "a/b",
+            "..\\..\\escape",
+            "..",
+            ".",
+            ".hidden",
+            "t-001/extra",
+            "t 001",
+            "",
+            "   ",
+        ] {
+            let err = ws
+                .prompt_path_for_task(hostile)
+                .err()
+                .unwrap_or_else(|| panic!("{hostile:?} must be refused"));
+            assert!(
+                !err.to_string().is_empty(),
+                "rejection of {hostile:?} must carry a reason"
+            );
+        }
+
+        // Nothing was created anywhere in the workspace.
+        let entries: Vec<String> = std::fs::read_dir(&root)
+            .expect("read workspace")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(entries.is_empty(), "no file may be created: {entries:?}");
+
+        // Control: the ungated join injects parent-directory components, i.e. it
+        // leaves the workspace root as soon as the path is resolved (it would
+        // land in the temp directory that holds this workspace).
+        let would_be = root.join("prompts").join("../../escape.md");
+        assert!(
+            would_be
+                .components()
+                .any(|c| c == std::path::Component::ParentDir),
+            "control: the ungated join must carry a '..' component: {would_be:?}"
+        );
+        let resolved_escape = temp.path().join("escape.md");
+        assert!(
+            !resolved_escape.exists(),
+            "the escape target {resolved_escape:?} must not exist"
+        );
     }
 }

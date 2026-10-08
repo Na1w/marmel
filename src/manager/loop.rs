@@ -1,892 +1,551 @@
-//! Turn state machine driving the agent loop and automatic plan check-off.
+//! Turn-budget constants, wall-clock bounds and repeated-failure accounting
+//! consumed by the **live** turn loops.
 //!
-//! REQ-LOOP-001 (Turn Lifecycle): each agent turn passes through
-//! `PrepareTurn -> CallBackend -> StreamResponse -> ProcessResponse -> ExecuteTools
-//! -> CheckFinish`, then either starts the next turn or completes.
+//! # Why this module is small
 //!
-//! REQ-LOOP-002 (Turn Limits): maximum 100 turns per interactive request; a 600 s
-//! watchdog bounds the entire turn.
+//! The `AgentLoop` / `ManagerLoop` state machines that used to live here were
+//! **deleted** (decision + evidence: `docs/decision_dead_code_manager.md`,
+//! recon item H8). Neither type was ever constructed outside `src/manager/`
+//! (only unit tests), and both duplicated executors that *do* run in the
+//! shipped binary:
 //!
-//! REQ-LOOP-003 (Parallel Tool Execution): independent read-only tools
-//! (`read_file`, `grep_search`, `glob`) run in parallel via `FuturesUnordered`;
-//! writing tools (`write_file`, `replace`, `run_command`) run sequentially in the
-//! order they appear.
+//! * Manager interactive turn loop (turn budget, steer queue, compaction
+//!   trigger, parallel read-only tool fan-out, sequential write dispatch):
+//!   `src/ui/session.rs`.
+//! * Specialist turn loop (LLM call, XML rescue, repetition gate, tool
+//!   dispatch, abort/cancellation): `src/agents/runner/execution.rs` and
+//!   `src/agents/runner/fix_loop.rs`.
+//! * Silent-dispatch delegation (one task per `delegate_task` call, auto
+//!   check-off): `src/orchestrator/delegate.rs::handle_delegate_task` →
+//!   `OrchestratorManager::delegate`.
 //!
-//! REQ-LOOP-004 (Mid-Flight Steering & Abort): user input during execution is
-//! queued as `Steer(prompt)`, drained at the top of `PrepareTurn` and injected as
-//! an immediate user message. An `Abort` stops the turn immediately, kills active
-//! PTY process groups with `SIGKILL`, and reverts the session to ready.
+//! Keeping a second, un-instantiated copy of those loops meant ~40 green unit
+//! tests certified behaviour the binary never ran, and the two executors could
+//! (and did) drift. Only the items the live loops actually import remain here.
 //!
-//! REQ-PLAN-002 (Disk check-off) is wired into `ExecuteTools`: successful tool
-//! outputs (no `ERROR`/`FAILED`/`REPLAN REQUIRED`) toggle the annotated task on
-//! disk in `.marmel/execution_plan.md`.
+//! # Requirements enforced by the surviving items
+//!
+//! * **REQ-LOOP-002** (turn limit half): the 100-turn cap below is enforced at
+//!   `src/ui/session.rs`.
+//! * **REQ-LOOP-002** (wall-clock half — restored by t-031c): the 600 s turn
+//!   watchdog below is enforced **in the live session loop**
+//!   (`src/ui/session.rs::run_session_with_bounds`), together with an absolute
+//!   per-turn hard cap. The constants used to be enforced only by the deleted
+//!   `AgentLoop::run_turn`, which the binary never called.
+//! * **REQ-LOOP-003** (parallel read-only tools): the read/write split below is
+//!   the gate the live loop uses to decide whether a batch of tool calls may be
+//!   dispatched concurrently.
+//! * **H5 failure budget** (recon `docs/recon_bugs_manager.md`): [`FailureBudget`]
+//!   below is the per-session repeated-failure accounting the live loop applies
+//!   per task id / tool call, so an impossible task cannot be retried blindly
+//!   for the whole turn budget.
 
-use anyhow::Result;
-use futures_util::StreamExt;
-use futures_util::stream::FuturesUnordered;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::tool_names::{TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_READ_FILE};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::agents::{Agent, DelegationRequest, Deliverable};
-use crate::harness::monitor::{HarnessMonitor, Intervention};
-use crate::harness::{HarnessStats, ToolCaller, ToolInvocation, ToolResult, dispatch_for};
-use crate::orchestrator::{MAX_EXECUTING_ROUNDS, OrchestratorManager, brief_for_task};
-use crate::tool_names::{TOOL_DELEGATE_TASK, TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_READ_FILE};
-use crate::types::{Message, ToolCall};
-
-use super::phase::Plan;
-
 /// Maximum number of turns per interactive request (REQ-LOOP-002).
+///
+/// Live caller: the Manager session loop in `src/ui/session.rs`, which breaks
+/// its turn loop once this budget is exhausted.
 pub const MAX_TURNS: usize = 100;
-/// Watchdog bound for the entire turn, in seconds (REQ-LOOP-002).
+
+/// Wall-clock watchdog bound for **one** turn, in seconds (REQ-LOOP-002).
+///
+/// A turn is torn down once it has gone this long with **no observable
+/// progress** — no status/event traffic from workers, no completed tool call,
+/// no streamed steer arbitration. Progress-aware on purpose: a legitimately
+/// long delegation keeps emitting `emit_status(...)` lines from
+/// `src/agents/runner/{execution,fix_loop}.rs`, so it is never cut off, while a
+/// genuinely stuck turn (hung tool, silent worker, wedged round) dies.
+///
+/// Live enforcement: `src/ui/session.rs` (checked in the tool-round poll loops
+/// and against the in-flight backend call), with the original 600 s value of
+/// the deleted `TURN_WATCHDOG_SECS`.
 pub const TURN_WATCHDOG_SECS: u64 = 600;
-/// Per-delegation bound, in seconds. This is the maximum wall-clock time a
-/// single `delegate()` call (one specialist task) may run before being
-/// cancelled. It is distinct from [`TURN_WATCHDOG_SECS`], which bounds an
-/// entire interactive turn in `run_turn` and does NOT bound the delegation
-/// call made from `run_executing`.
-pub const DELEGATE_TIMEOUT_SECS: u64 = 1800;
 
-/// The discrete phases a single agent turn passes through (REQ-LOOP-001).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnPhase {
-    /// Collect + prepare the transcript; drain queued steer prompts.
-    PrepareTurn,
-    /// Send the prepared request to the LLM backend.
-    CallBackend,
-    /// Stream the assistant response from the backend.
-    StreamResponse,
-    /// Demux content vs. tool calls from the response.
-    ProcessResponse,
-    /// Execute any requested tools (parallel reads, sequential writes).
-    ExecuteTools,
-    /// Decide whether to continue or finish the session.
-    CheckFinish,
-}
+/// Absolute wall-clock bound for **one** turn, in seconds, regardless of how
+/// much progress it reports.
+///
+/// This is the backstop that makes an infinite turn impossible: a turn made of
+/// many *individually* legitimate delegations (each up to tens of minutes) can
+/// keep the [`TURN_WATCHDOG_SECS`] idle window refreshed forever. Deliberately
+/// generous and config-independent — it is a runaway guard, not a UX timeout.
+pub const TURN_HARD_CAP_SECS: u64 = 3 * 60 * 60;
 
-impl TurnPhase {
-    /// Advance to the next phase.
-    pub fn next(self) -> Self {
-        match self {
-            TurnPhase::PrepareTurn => TurnPhase::CallBackend,
-            TurnPhase::CallBackend => TurnPhase::StreamResponse,
-            TurnPhase::StreamResponse => TurnPhase::ProcessResponse,
-            TurnPhase::ProcessResponse => TurnPhase::ExecuteTools,
-            TurnPhase::ExecuteTools => TurnPhase::CheckFinish,
-            TurnPhase::CheckFinish => TurnPhase::PrepareTurn,
-        }
-    }
-}
-
-/// A steering or abort signal queued by the user mid-flight (REQ-LOOP-004).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Signal {
-    /// User-supplied prompt injected at the top of `PrepareTurn`.
-    Steer(String),
-    /// Immediate halt (Ctrl+C / /abort); kills PTY process groups and reverts
-    /// to ready.
-    Abort,
-}
-
-/// Outcome of a single agent turn.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TurnOutcome {
-    /// More work remains; the loop should start the next turn.
-    Continue,
-    /// A tool produced an error and the loop should stop.
-    ToolError(String),
-    /// A terminal error occurred.
-    Error(String),
-    /// The user aborted the session.
-    Aborted,
-    /// The session finished (e.g. plan complete or max turns reached).
-    Complete,
-}
-
-/// A tool invocation parsed from an assistant response together with any task-id
-/// annotation embedded in its arguments (used for REQ-PLAN-002 check-off).
-#[derive(Debug, Clone)]
-struct PendingTool {
-    invocation: ToolInvocation,
-    /// Optional task id like `t-001` extracted from the tool arguments/name.
-    task_id: Option<String>,
-}
-
-/// Regex matching a `[t-xxx]` task id annotation embedded in tool arguments.
-/// Compiled exactly once via `OnceLock` (CODE_REVIEW Point 2).
-static TASK_ID_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-
-/// Extract an optional task id from a tool's arguments JSON string.
-fn extract_task_id(_name: &str, args: &serde_json::Value) -> Option<String> {
-    // A `task_id` may be embedded in the JSON arguments (plan annotation).
-    let candidate = args.get("task_id").and_then(|v| v.as_str());
-    if let Some(c) = candidate {
-        let clean = c
-            .trim()
-            .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
-            .trim();
-        if !clean.is_empty() {
-            return Some(clean.to_string());
-        }
-    }
-    // Fall back to scanning the raw argument text for `(t-xxx)` or `[t-xxx]`.
-    let raw = args.to_string();
-    let re = TASK_ID_RE.get_or_init(|| {
-        regex::Regex::new(r"\(?\[?(t-[A-Za-z0-9_-]+)\]?\)?").expect("valid task regex")
-    });
-    re.captures(&raw).map(|m| m[1].to_string())
-}
+/// How many failures of the same task/tool call are tolerated inside one
+/// session before the live loop stops retrying it blindly (recon H5).
+///
+/// Reaching the threshold injects a strategy-change escalation into the model
+/// context; the *next* attempt is refused outright and the turn ends.
+pub const TASK_FAILURE_ESCALATION_THRESHOLD: u32 = 2;
 
 /// Returns `true` for read-only tools eligible for parallel execution
 /// (REQ-LOOP-003).
+///
+/// Every other tool — writers, `run_command`, plan tools, `rebirth`, PTY tools,
+/// MCP tools and `delegate_task` — must run sequentially in the order it
+/// appears in the assistant response.
 pub fn is_read_tool(name: &str) -> bool {
     matches!(name, TOOL_READ_FILE | TOOL_GREP_SEARCH | TOOL_GLOB)
 }
 
-/// Returns `true` for writing/executing tools that must run sequentially.
-///
-/// Any tool that is not a read-only parallel tool must run sequentially
-/// (REQ-LOOP-003, REQ-ORCH-005), including plan tools, rebirth, PTY tools, and MCP tools.
-pub fn is_write_tool(name: &str) -> bool {
-    !is_read_tool(name)
+/// Why the wall-clock bound tore a turn down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadlineKind {
+    /// No observable progress for [`TURN_WATCHDOG_SECS`] worth of idle time.
+    Stalled,
+    /// The absolute per-turn bound was reached even though the turn was busy.
+    HardCap,
 }
 
-/// The turn state machine. Each `run_turn` walks through the strict phase
-/// sequence and returns an outcome; the caller loops until `Complete`.
-#[derive(Debug)]
-pub struct AgentLoop {
-    plan: Plan,
-    turn_count: usize,
-    transcript: Vec<Message>,
-    pending_signals: Vec<Signal>,
-    pending_tools: Vec<PendingTool>,
-    /// Process-group ids of active PTY sessions, tracked for abort (REQ-LOOP-004).
-    active_pty_pids: Vec<i32>,
-    /// Abort/cancel flag set by `Signal::Abort` immediately (REQ-LOOP-004), so a
-    /// signal raised mid-flight during `ExecuteTools` interrupts an in-flight
-    /// parallel read dispatch without waiting for the next turn to drain. The
-    /// flag is cleared at the top of each turn after it is drained.
-    abort_flag: Arc<AtomicBool>,
-    /// Composed resilience monitor (REQ-HARN-001…004): XML tool rescue,
-    /// semantic repetition/cycle detector, text repetition breaker, and the
-    /// shared stats registry. Present in every loop (Manager turn loop AND each
-    /// specialist's delegated turn) so the resilience harness is active in the
-    /// live runtime, not just unit-tested.
-    monitor: HarnessMonitor,
-    /// Whether an XML-rescued call has been detected this turn (for reporting).
-    rescued_this_turn: bool,
-    /// The role whose tool calls this loop dispatches. Defaults to the Manager
-    /// (REQ-ORCH-001); a specialist's delegated turn sets
-    /// `ToolCaller::Specialist(agent)` so its tools are gated by the registry
-    /// allowlist (REQ-ORCH-002).
-    caller: ToolCaller,
-}
+impl DeadlineKind {
+    /// Short, stable tag used in status lines and debug logs.
+    pub fn label(self) -> &'static str {
+        match self {
+            DeadlineKind::Stalled => "stalled turn",
+            DeadlineKind::HardCap => "turn deadline",
+        }
+    }
 
-impl Default for AgentLoop {
-    fn default() -> Self {
-        Self::new(Plan::default())
+    /// User-visible reason. Wording is deliberately explicit: the turn was cut
+    /// off by a bound, not by the user, and in-flight work was cancelled.
+    pub fn describe(self, idle_limit: Duration, hard_limit: Duration) -> String {
+        match self {
+            DeadlineKind::Stalled => format!(
+                "turn watchdog: no progress for {}s (limit {}s) — turn aborted and in-flight work cancelled",
+                idle_limit.as_secs(),
+                idle_limit.as_secs()
+            ),
+            DeadlineKind::HardCap => format!(
+                "turn deadline: this turn exceeded its {}s wall-clock bound — turn aborted and in-flight work cancelled",
+                hard_limit.as_secs()
+            ),
+        }
     }
 }
 
-impl AgentLoop {
-    /// Create a new agent loop bound to a plan manager, with a fresh isolated
-    /// stats registry and a fully armed resilience monitor. The loop dispatches
-    /// as the Manager (REQ-ORCH-001).
-    pub fn new(plan: Plan) -> Self {
+/// Per-turn wall-clock watchdog (REQ-LOOP-002, wall-clock half).
+///
+/// Two independent bounds: an **idle** bound (no observable progress) and an
+/// **absolute** hard cap. The session loop arms it per turn
+/// ([`TurnWatchdog::rearm`]), feeds it observable progress
+/// ([`TurnWatchdog::note_progress`]) and asks it before blocking on anything
+/// that can hang.
+///
+/// The clock is injectable (`*_at` variants) so the bound is testable without
+/// waiting 600 s.
+#[derive(Debug, Clone, Copy)]
+pub struct TurnWatchdog {
+    started: Instant,
+    last_progress: Instant,
+    idle_limit: Duration,
+    hard_limit: Duration,
+}
+
+impl TurnWatchdog {
+    /// Arm a watchdog with the given idle / absolute bounds.
+    pub fn new(idle_limit: Duration, hard_limit: Duration) -> Self {
+        Self::at(Instant::now(), idle_limit, hard_limit)
+    }
+
+    /// Arm a watchdog anchored at an explicit start instant (test seam).
+    pub fn at(start: Instant, idle_limit: Duration, hard_limit: Duration) -> Self {
         Self {
-            plan,
-            turn_count: 0,
-            transcript: Vec::new(),
-            pending_signals: Vec::new(),
-            pending_tools: Vec::new(),
-            active_pty_pids: Vec::new(),
-            abort_flag: Arc::new(AtomicBool::new(false)),
-            monitor: HarnessMonitor::with_new_stats(),
-            rescued_this_turn: false,
-            caller: ToolCaller::Manager,
+            started: start,
+            last_progress: start,
+            idle_limit,
+            hard_limit,
         }
     }
 
-    /// Create an agent loop bound to a plan manager and a shared session stats
-    /// registry. The monitor records all resilience interventions into the same
-    /// `Arc<HarnessStats>` so counters are aggregated across the session
-    /// (REQ-HARN-004), while each loop keeps its own isolated repetition buffers.
-    pub fn with_stats(plan: Plan, stats: Arc<HarnessStats>) -> Self {
-        Self {
-            plan,
-            turn_count: 0,
-            transcript: Vec::new(),
-            pending_signals: Vec::new(),
-            pending_tools: Vec::new(),
-            active_pty_pids: Vec::new(),
-            abort_flag: Arc::new(AtomicBool::new(false)),
-            monitor: HarnessMonitor::new(stats),
-            rescued_this_turn: false,
-            caller: ToolCaller::Manager,
+    /// Start timing a new turn.
+    pub fn rearm(&mut self) {
+        self.rearm_at(Instant::now());
+    }
+
+    /// Start timing a new turn anchored at an explicit instant (test seam).
+    pub fn rearm_at(&mut self, now: Instant) {
+        self.started = now;
+        self.last_progress = now;
+    }
+
+    /// Record observable forward progress, resetting the stalled-turn window.
+    pub fn note_progress(&mut self) {
+        self.note_progress_at(Instant::now());
+    }
+
+    /// [`TurnWatchdog::note_progress`] anchored at an explicit instant (test seam).
+    pub fn note_progress_at(&mut self, now: Instant) {
+        if now > self.last_progress {
+            self.last_progress = now;
         }
     }
 
-    /// Set the caller role whose tool calls this loop dispatches. A specialist
-    /// turn must set `ToolCaller::Specialist(agent)` so its tools are gated by
-    /// the registry allowlist (REQ-ORCH-002); the default is the Manager.
-    pub fn with_caller(mut self, caller: ToolCaller) -> Self {
-        self.caller = caller;
-        self
+    /// Whether the turn must be torn down, and why (`None` = still inside the
+    /// bounds).
+    pub fn expired(&self) -> Option<DeadlineKind> {
+        self.expired_at(Instant::now())
     }
 
-    /// Access the composed resilience monitor (for wiring the streaming layer).
-    pub fn monitor(&mut self) -> &mut HarnessMonitor {
-        &mut self.monitor
-    }
-
-    /// Feed a chunk of streamed assistant output into the text repetition
-    /// detector (REQ-HARN-003). Returns `true` when the stream must be
-    /// terminated because a ≥5-length pattern repeated ≥5 times; the repeated
-    /// block is truncated and `repetition_breaks` is incremented once.
-    pub fn feed_stream_text(&mut self, chunk: &str) -> bool {
-        self.monitor.feed_text(chunk)
-    }
-
-    /// Intercept plain-text XML tool calls in `text` (REQ-HARN-001): returns
-    /// structured [`ToolCall`]s with `call_text_{uuid}` ids and increments
-    /// `xml_tool_rescues`. The caller routes the returned calls to execution.
-    pub fn rescue_xml_calls(&mut self, text: &str) -> Vec<ToolCall> {
-        let calls = self.monitor.rescue_xml(text);
-        if !calls.is_empty() {
-            self.rescued_this_turn = true;
-        }
-        calls
-    }
-
-    /// The current turn phase, computed from the loop's internal state.
-    pub fn turn(&self) -> usize {
-        self.turn_count
-    }
-
-    /// Queue a user signal for the next turn (REQ-LOOP-004).
+    /// [`TurnWatchdog::expired`] anchored at an explicit instant (test seam).
     ///
-    /// An `Abort` additionally sets the shared abort flag **immediately**, so a
-    /// signal raised mid-flight during `ExecuteTools` interrupts an in-flight
-    /// parallel read dispatch without waiting for the next turn to drain
-    /// (REQ-LOOP-004: cancel in-flight tool futures and SIGKILL active PTY
-    /// process groups as soon as abort fires). The flag is cleared at the top of
-    /// each turn after it is drained.
-    pub fn signal(&mut self, signal: Signal) {
-        if matches!(signal, Signal::Abort) {
-            self.abort_flag.store(true, Ordering::SeqCst);
+    /// The hard cap is evaluated first: it is the unconditional bound, so a
+    /// turn that is both idle and over-cap is reported as the harder failure.
+    pub fn expired_at(&self, now: Instant) -> Option<DeadlineKind> {
+        if self.elapsed_at(now) >= self.hard_limit {
+            return Some(DeadlineKind::HardCap);
         }
-        self.pending_signals.push(signal);
+        if self.idle_at(now) >= self.idle_limit {
+            return Some(DeadlineKind::Stalled);
+        }
+        None
     }
 
-    /// Drain queued steer prompts; if an abort is queued, returns `true`.
+    /// Total wall-clock time this turn has been running.
+    pub fn elapsed(&self) -> Duration {
+        self.elapsed_at(Instant::now())
+    }
+
+    /// [`TurnWatchdog::elapsed`] anchored at an explicit instant (test seam).
+    pub fn elapsed_at(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.started)
+    }
+
+    /// Idle time since the last observed progress.
+    pub fn idle(&self) -> Duration {
+        self.idle_at(Instant::now())
+    }
+
+    /// [`TurnWatchdog::idle`] anchored at an explicit instant (test seam).
+    pub fn idle_at(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.last_progress)
+    }
+
+    /// Time left before the **absolute** per-turn bound.
     ///
-    /// The shared abort flag is cleared at the start so a stale flag from a
-    /// previous turn does not leak into a fresh turn; it is re-armed below if an
-    /// `Abort` signal is actually pending.
-    fn drain_signals(&mut self) -> bool {
-        self.abort_flag.store(false, Ordering::SeqCst);
-        let signals = std::mem::take(&mut self.pending_signals);
-        let mut aborted = false;
-        for s in signals {
-            match s {
-                Signal::Steer(prompt) => {
-                    self.transcript.push(Message::User { content: prompt });
-                }
-                Signal::Abort => aborted = true,
-            }
-        }
-        if aborted {
-            // Re-arm so any in-flight tool future that checks the flag sees it.
-            self.abort_flag.store(true, Ordering::SeqCst);
-        }
-        aborted
+    /// Used to bound an await whose internal progress the session loop cannot
+    /// observe — a single backend call. The idle bound is not used there: a
+    /// live-but-slow stream does not surface events into the session loop, so
+    /// only the absolute bound may cut it off.
+    pub fn time_to_hard_limit(&self) -> Duration {
+        self.time_to_hard_limit_at(Instant::now())
     }
 
-    /// Run one full turn through the state machine. Returns the outcome.
-    pub async fn run_turn(&mut self) -> Result<TurnOutcome> {
-        self.turn_count += 1;
-        if self.turn_count > MAX_TURNS {
-            return Ok(TurnOutcome::Complete);
-        }
-
-        let mut phase = TurnPhase::PrepareTurn;
-        let deadline = Instant::now() + Duration::from_secs(TURN_WATCHDOG_SECS);
-
-        loop {
-            // Watchdog: bound the whole turn (REQ-LOOP-002).
-            if Instant::now() >= deadline {
-                return Ok(TurnOutcome::Error("turn watchdog exceeded".to_string()));
-            }
-
-            match phase {
-                TurnPhase::PrepareTurn => {
-                    // Drain queued steer/abort signals (REQ-LOOP-004).
-                    let aborted = self.drain_signals();
-                    if aborted {
-                        self.abort_pty_process_groups();
-                        return Ok(TurnOutcome::Aborted);
-                    }
-                    phase = TurnPhase::CallBackend;
-                }
-                TurnPhase::CallBackend => {
-                    // (The real LLM call lives in the UI/backend layer; here we
-                    // expose the hook so the phase machine is complete.)
-                    phase = TurnPhase::StreamResponse;
-                }
-                TurnPhase::StreamResponse => {
-                    // Streaming is handled by the backend layer; the transcript
-                    // is already populated by the caller via `push_message`.
-                    phase = TurnPhase::ProcessResponse;
-                }
-                TurnPhase::ProcessResponse => {
-                    // Demux content vs tool calls. The caller supplies tool calls
-                    // via `enqueue_tools`; here we just advance.
-                    phase = TurnPhase::ExecuteTools;
-                }
-                TurnPhase::ExecuteTools => {
-                    let tools = std::mem::take(&mut self.pending_tools);
-                    if tools.is_empty() {
-                        // No tool calls this turn: advance to CheckFinish so the
-                        // loop can decide continue vs complete.
-                        phase = TurnPhase::CheckFinish;
-                        continue;
-                    }
-                    let mut error: Option<String> = None;
-
-                    // REQ-HARN-002: semantic repetition & cycle gate. Before any
-                    // tool executes, observe it in the sliding buffer. A ≥3
-                    // identical repetition blocks, an ≥3 alternating cycle cuts;
-                    // the SPEC error payload is returned and the call is NOT
-                    // dispatched. Pagination-only variation is exempt.
-                    let mut blocked: Vec<String> = Vec::new();
-                    let mut filtered = Vec::new();
-                    for tool in &tools {
-                        let intervention = self
-                            .monitor
-                            .observe_tool(&tool.invocation.name, &tool.invocation.arguments);
-                        match intervention {
-                            Intervention::None => filtered.push(tool.clone()),
-                            other => {
-                                if let Some(msg) = self.monitor.intervention_error(other) {
-                                    blocked.push(msg);
-                                }
-                            }
-                        }
-                    }
-                    // If any call was blocked/cut, return the SPEC error instead
-                    // of executing it (REQ-HARN-002).
-                    if !blocked.is_empty() {
-                        return Ok(TurnOutcome::ToolError(blocked.join("\n")));
-                    }
-                    let tools = filtered;
-
-                    // Partition into parallel reads and sequential writes
-                    // (REQ-LOOP-003).
-                    let reads: Vec<_> = tools
-                        .iter()
-                        .filter(|t| is_read_tool(&t.invocation.name))
-                        .cloned()
-                        .collect();
-                    let writes: Vec<_> = tools
-                        .iter()
-                        .filter(|t| is_write_tool(&t.invocation.name))
-                        .cloned()
-                        .collect();
-
-                    // Parallel read-only tools via FuturesUnordered. Each read is
-                    // spawned onto a blocking thread so multiple reads overlap.
-                    // Audit (t-m3z6): the `FuturesUnordered` is unbounded, but its
-                    // size is capped by the number of tool calls in a single LLM
-                    // response (not a hot loop), and each closure captures only
-                    // cloned `'static` `Send` data (`ToolInvocation`, `ToolCaller`)
-                    // with no borrows of `self` — safe for the blocking pool.
-                    // Bounding the pool concurrency is out of scope here.
-                    let mut futures = FuturesUnordered::new();
-                    for tool in reads {
-                        let invocation = tool.invocation.clone();
-                        let caller = self.caller.clone();
-                        futures.push(async move {
-                            let result = tokio::task::spawn_blocking(move || {
-                                dispatch_for(&invocation, caller)
-                            })
-                            .await
-                            .map_err(|e| crate::harness::ToolError::Execution(e.into()))
-                            .and_then(|r| r);
-                            (tool, result)
-                        });
-                    }
-                    let mut completed: Vec<(
-                        PendingTool,
-                        Result<ToolResult, crate::harness::ToolError>,
-                    )> = Vec::new();
-                    while let Some(res) = futures.next().await {
-                        // REQ-LOOP-004: an abort raised mid-flight interrupts the
-                        // in-flight parallel read dispatch immediately. Dropping
-                        // the `FuturesUnordered` cancels the remaining pending
-                        // futures; SIGKILL every active PTY process group before
-                        // returning.
-                        if self.abort_flag.load(Ordering::SeqCst) {
-                            self.abort_pty_process_groups();
-                            return Ok(TurnOutcome::Aborted);
-                        }
-                        completed.push(res);
-                    }
-                    for (tool, res) in completed {
-                        match res {
-                            Ok(r) => {
-                                if r.is_error {
-                                    error = Some(r.content);
-                                } else {
-                                    self.check_off(&tool, &r.content);
-                                }
-                            }
-                            Err(e) => error = Some(e.to_string()),
-                        }
-                    }
-
-                    // Sequential write tools in order of appearance.
-                    for tool in writes {
-                        // REQ-LOOP-004: an abort raised mid-flight stops the
-                        // sequential write loop immediately and SIGKILLs every
-                        // active PTY process group.
-                        if self.abort_flag.load(Ordering::SeqCst) {
-                            self.abort_pty_process_groups();
-                            return Ok(TurnOutcome::Aborted);
-                        }
-                        if error.is_some() {
-                            break;
-                        }
-                        let inv = tool.invocation.clone();
-                        let caller = self.caller.clone();
-                        let dispatch_res =
-                            tokio::task::spawn_blocking(move || dispatch_for(&inv, caller)).await;
-
-                        match dispatch_res {
-                            Ok(Ok(r)) => {
-                                if r.is_error {
-                                    error = Some(r.content);
-                                } else {
-                                    self.check_off(&tool, &r.content);
-                                }
-                            }
-                            Ok(Err(e)) => error = Some(e.to_string()),
-                            Err(e) => error = Some(format!("task join error: {e}")),
-                        }
-                        // REQ-LOOP-004: check again after dispatch so a mid-flight
-                        // abort raised while a long-running write was executing is
-                        // caught as soon as it returns.
-                        if self.abort_flag.load(Ordering::SeqCst) {
-                            self.abort_pty_process_groups();
-                            return Ok(TurnOutcome::Aborted);
-                        }
-                    }
-
-                    if let Some(err) = error {
-                        return Ok(TurnOutcome::ToolError(err));
-                    }
-                    phase = TurnPhase::CheckFinish;
-                }
-                TurnPhase::CheckFinish => {
-                    // If the plan is complete, finish; else continue to next turn.
-                    if self.plan.is_complete() {
-                        return Ok(TurnOutcome::Complete);
-                    }
-                    return Ok(TurnOutcome::Continue);
-                }
-            }
-        }
+    /// [`TurnWatchdog::time_to_hard_limit`] anchored at an explicit instant
+    /// (test seam).
+    pub fn time_to_hard_limit_at(&self, now: Instant) -> Duration {
+        self.hard_limit.saturating_sub(self.elapsed_at(now))
     }
 
-    /// Check off a task on disk when the tool output was successful
-    /// (REQ-PLAN-002). The task id may be absent; that is fine.
+    /// Time left before the **idle** bound fires.
     ///
-    /// t-205: leverages the marker-aware path. For a `delegate_task` invocation
-    /// the returned `output` is the subagent deliverable content, so
-    /// [`Plan::check_plan_on_marker`] parses its `MISSION COMPLETE` / `FAILED` /
-    /// `REPLAN` terminal marker to gate the check-off (only a genuine completion
-    /// flips the line). Non-delegation tools keep the legacy free-form success
-    /// heuristic via `check_off_on_success`, and neither path bypasses the
-    /// archive/check-off guards.
-    fn check_off(&self, tool: &PendingTool, output: &str) {
-        if let Some(task) = &tool.task_id {
-            if tool.invocation.name == TOOL_DELEGATE_TASK {
-                let _ = self
-                    .plan
-                    .check_plan_on_marker(Some(task), output)
-                    .unwrap_or(false);
-            } else {
-                // Non-delegation tools: the loop already surfaced any tool error
-                // via `r.is_error` before calling `check_off`. Legacy behavior
-                // uses a hardcoded success string (the free-form `output_is_success`
-                // heuristic on e.g. `read_file` output would falsely flag benign
-                // occurrences of "error" like "thiserror"), so keep "ok".
-                let _ = self.plan.check_off_on_success(task, "ok");
-            }
-        }
+    /// The live caller is the tool-round join loop: `join_poll_slice` in
+    /// `src/ui/session.rs` caps each iteration's handle poll by this value, so a
+    /// round being joined never sleeps past the moment the idle bound is allowed
+    /// to break the wait (the slice is additionally floored at 1 ms so a
+    /// sub-millisecond remainder cannot turn the loop into a spin). While a round
+    /// is being joined, the idle bound — not the absolute cap — is what tears the
+    /// wait down, so it is the bound the poll interval has to honour.
+    pub fn time_to_idle_limit(&self) -> Duration {
+        self.time_to_idle_limit_at(Instant::now())
     }
 
-    /// Register a PTY session's process-group id so it can be killed on abort.
-    pub fn track_pty_pid(&mut self, pid: i32) {
-        self.active_pty_pids.push(pid);
-    }
-
-    /// Clone of the shared abort flag, so an external task (e.g. the UI/backend
-    /// layer) can raise a mid-flight abort while `run_turn` is executing tools
-    /// (REQ-LOOP-004). Setting it to `true` interrupts the in-flight dispatch.
-    pub fn abort_flag_handle(&self) -> Arc<AtomicBool> {
-        self.abort_flag.clone()
-    }
-
-    /// Kill all active PTY process groups with SIGKILL and revert to ready
-    /// (REQ-LOOP-004).
-    fn abort_pty_process_groups(&self) {
-        #[cfg(unix)]
-        {
-            for &pid in &self.active_pty_pids {
-                let _ = crate::harness::pty::kill_process_group(pid);
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = &self.active_pty_pids;
-        }
-    }
-
-    /// Push a raw transcript message (used by the backend streaming layer).
-    pub fn push_message(&mut self, msg: Message) {
-        self.transcript.push(msg);
-    }
-
-    /// Queue tool calls (extracted by the response processor) for execution.
-    pub fn enqueue_tools(&mut self, tools: Vec<serde_json::Value>) {
-        for t in tools {
-            let name = t
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let args = t
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
-            let task_id = extract_task_id(&name, &args);
-            let invocation = ToolInvocation {
-                name,
-                arguments: args,
-            };
-            self.pending_tools.push(PendingTool {
-                invocation,
-                task_id,
-            });
-        }
+    /// [`TurnWatchdog::time_to_idle_limit`] anchored at an explicit instant
+    /// (test seam).
+    pub fn time_to_idle_limit_at(&self, now: Instant) -> Duration {
+        self.idle_limit.saturating_sub(self.idle_at(now))
     }
 }
 
-/// The Manager's turn loop — a strict **Silent Dispatcher** engine
-/// (REQ-ORCH-001 / REQ-PLAN-003 / REQ-LOOP-004).
-///
-/// In the **Executing** phase the Manager never emits conversational filler or
-/// domain prose. Its output stream consists of `delegate_task` calls only. Each
-/// unchecked `- [ ] [t-xxx]` plan item is delegated to the specialist whose
-/// domain matches the task (via the `scheduler` closure), **one task per call**
-/// (REQ-ORCH-005). A specialist MUST NOT autonomously iterate the whole plan:
-/// it executes exactly the single task it was delegated (the `delegate()`
-/// path binds a single `task_id` and auto-checks it on `MISSION COMPLETE`).
-///
-/// **Parallel delegation (REQ-ORCH-005):** independent pending tasks (sharing
-/// no mutable state) are emitted concurrently. `delegate()` is synchronous
-/// from the Manager's perspective, but multiple independent futures are spawned
-/// and polled together, so a round of independent sub-tasks overlaps.
-///
-/// **Steer / Abort (REQ-LOOP-004):** `Signal::Steer` is queued; in Executing
-/// mode the silent dispatcher does NOT inject user prose mid-dispatch (it is
-/// deferred to final synthesis). `Signal::Abort` cancels all in-flight sub-task
-/// futures immediately and SIGKILLs every active PTY process group.
-/// Test-only: the injectable delegation future (replaces `manager.delegate`).
-#[cfg(test)]
-type TestDelegateFn = Arc<
-    dyn Fn(
-            DelegationRequest,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Deliverable>> + Send>>
-        + Send
-        + Sync,
->;
-
-pub struct ManagerLoop {
-    /// The `OrchestratorManager` owning the shared `.marmel` plan and the
-    /// `delegate()` method (Phase 0).
-    manager: Arc<OrchestratorManager>,
-    /// Maps a plan `task_id` to the specialist whose domain matches the task's
-    /// type (REQ-ORCH-002 selection rule).
-    scheduler: Box<dyn Fn(&str) -> Agent>,
-    /// Abort/cancel flag set by `Signal::Abort` (checked between rounds and
-    /// after each spawn, so in-flight futures are cancelled immediately).
-    abort_flag: Arc<AtomicBool>,
-    /// Queued user signals (REQ-LOOP-004).
-    pending_signals: Vec<Signal>,
-    /// Process-group ids of active PTY sessions, killed on abort.
-    active_pty_pids: Vec<i32>,
-    /// Test-only: override the per-delegation timeout with a short value so
-    /// the timeout path can be exercised without waiting 30 minutes. `None`
-    /// (the production default) uses [`DELEGATE_TIMEOUT_SECS`].
-    #[cfg(test)]
-    delegate_timeout: Option<Duration>,
-    /// Test-only: replace the real `manager.delegate(req)` future with a
-    /// custom one (e.g. a future that sleeps past the injected timeout).
-    /// `None` (the production default) delegates to the real worker.
-    #[cfg(test)]
-    delegate_override: Option<TestDelegateFn>,
+/// Outcome of recording one more failure of the same key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureVerdict {
+    /// Below the escalation threshold: an unchanged retry is still allowed.
+    Continue { count: u32 },
+    /// Threshold reached: the loop must surface a strategy-change escalation
+    /// before any further attempt.
+    Escalate { count: u32 },
 }
 
-impl ManagerLoop {
-    /// Create a Manager turn loop rooted at a shared `OrchestratorManager` and
-    /// a task-id → specialist scheduler.
-    pub fn new(manager: Arc<OrchestratorManager>, scheduler: Box<dyn Fn(&str) -> Agent>) -> Self {
+/// Per-session accounting of repeated failures of the same task/tool call
+/// (recon H5: "no failure budget").
+///
+/// Deliberately a plain `HashMap<String, u32>`: explicit, local to the session
+/// loop, and trivially auditable. A key is a plan task id for delegated work
+/// (`task:t-012`) or a tool signature for direct tool calls
+/// (`tool:read_file:{...}`).
+///
+/// Policy with the default threshold of 2:
+/// 1. failure → `Continue { 1 }` — retry is allowed,
+/// 2. failure → `Escalate { 2 }` — inject a strategy-change notice,
+/// 3. next attempt → [`FailureBudget::retry_allowed`] is `false`, so the call is
+///    **never dispatched**; the session loop stops and says why.
+#[derive(Debug, Clone, Default)]
+pub struct FailureBudget {
+    counts: HashMap<String, u32>,
+    threshold: u32,
+}
+
+impl FailureBudget {
+    /// Budget with the given escalation threshold. A threshold of `0` is
+    /// meaningless (it would refuse every call before the first attempt), so it
+    /// is clamped to `1`.
+    pub fn new(threshold: u32) -> Self {
         Self {
-            manager,
-            scheduler,
-            abort_flag: Arc::new(AtomicBool::new(false)),
-            pending_signals: Vec::new(),
-            active_pty_pids: Vec::new(),
-            #[cfg(test)]
-            delegate_timeout: None,
-            #[cfg(test)]
-            delegate_override: None,
+            counts: HashMap::new(),
+            threshold: threshold.max(1),
         }
     }
 
-    /// Test-only: override the per-delegation timeout (see `delegate_timeout`).
-    #[cfg(test)]
-    pub fn with_delegate_timeout(mut self, d: Duration) -> Self {
-        self.delegate_timeout = Some(d);
-        self
+    /// The effective escalation threshold.
+    pub fn threshold(&self) -> u32 {
+        self.threshold
     }
 
-    /// Test-only: replace the `delegate()` future with a custom one.
-    #[cfg(test)]
-    pub fn with_delegate_override<F>(mut self, f: F) -> Self
-    where
-        F: Fn(
-                DelegationRequest,
-            )
-                -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Deliverable>> + Send>>
-            + Send
-            + Sync
-            + 'static,
-    {
-        self.delegate_override = Some(Arc::new(f));
-        self
+    /// Recorded failure count for `key`.
+    pub fn count(&self, key: &str) -> u32 {
+        self.counts.get(key).copied().unwrap_or(0)
     }
 
-    /// Queue a user signal for the next execution round (REQ-LOOP-004).
-    ///
-    /// An `Abort` additionally sets the shared abort flag **immediately**, so a
-    /// signal raised mid-round interrupts an in-flight parallel dispatch without
-    /// waiting for the round to drain (REQ-LOOP-004: cancel all in-flight
-    /// sub-tasks and SIGKILL active PTY process groups as soon as abort fires).
-    /// The flag is cleared at the top of each round after it is drained.
-    pub fn signal(&mut self, signal: Signal) {
-        if matches!(signal, Signal::Abort) {
-            self.abort_flag.store(true, Ordering::SeqCst);
-        }
-        self.pending_signals.push(signal);
+    /// Whether an unchanged retry of `key` may be dispatched at all.
+    pub fn retry_allowed(&self, key: &str) -> bool {
+        self.count(key) < self.threshold
     }
 
-    /// Register a PTY process-group id so it can be SIGKILLed on abort
-    /// (REQ-LOOP-004).
-    pub fn track_pty_pid(&mut self, pid: i32) {
-        self.active_pty_pids.push(pid);
-    }
-
-    /// Drain queued signals. Returns `true` when an abort is pending.
-    ///
-    /// The shared abort flag is cleared at the start so a stale flag from a
-    /// previous round does not leak into a fresh execution; it is re-armed below
-    /// if an `Abort` signal is actually pending.
-    fn drain_signals(&mut self) -> bool {
-        self.abort_flag.store(false, Ordering::SeqCst);
-        let signals = std::mem::take(&mut self.pending_signals);
-        let mut aborted = false;
-        for s in signals {
-            match s {
-                // In Executing mode the Manager is a silent dispatcher: a steer
-                // is NOT injected into the Manager transcript mid-round (no
-                // filler); it is deferred to the final synthesis round.
-                Signal::Steer(_) => {}
-                Signal::Abort => aborted = true,
-            }
-        }
-        if aborted {
-            // Re-arm so any in-flight sub-task that checks the flag sees it.
-            self.abort_flag.store(true, Ordering::SeqCst);
-        }
-        aborted
-    }
-
-    /// SIGKILL every active PTY process group immediately (REQ-LOOP-004).
-    fn abort_pty_process_groups(&self) {
-        #[cfg(unix)]
-        {
-            for &pid in &self.active_pty_pids {
-                let _ = crate::harness::pty::kill_process_group(pid);
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = &self.active_pty_pids;
+    /// Record one failure of `key` and report what the loop must do next.
+    pub fn record(&mut self, key: &str) -> FailureVerdict {
+        let entry = self.counts.entry(key.to_string()).or_insert(0);
+        *entry = entry.saturating_add(1);
+        let count = *entry;
+        if count >= self.threshold {
+            FailureVerdict::Escalate { count }
+        } else {
+            FailureVerdict::Continue { count }
         }
     }
 
-    /// Drive the **Executing** phase as a strict Silent Dispatcher
-    /// (REQ-PLAN-003 / REQ-ORCH-001).
-    ///
-    /// Iterates the on-disk plan: for every unchecked `- [ ] [t-xxx]` it routes
-    /// a single `DelegationRequest` to the specialist returned by `scheduler`,
-    /// and independent tasks are delegated **in parallel** (REQ-ORCH-005). Each
-    /// `delegate()` auto-checks-off the task on `MISSION COMPLETE (t-xxx)` and
-    /// leaves it unchecked on `FAILED`/`REPLAN REQUIRED`.
-    ///
-    /// The loop is bounded by [`MAX_EXECUTING_ROUNDS`] so an un-delegate-able
-    /// plan fails loudly instead of spinning. An `Abort` signal cancels all
-    /// in-flight sub-tasks and SIGKILLs every active PTY process group, then
-    /// returns the deliverables gathered so far.
-    pub async fn run_executing(&mut self) -> Result<Vec<Deliverable>> {
-        let mut results: Vec<Deliverable> = Vec::new();
-        let mut attempts = 0;
-
-        while !self.manager.plan.is_complete() && attempts < MAX_EXECUTING_ROUNDS {
-            // REQ-LOOP-004: drain queued steer/abort at the top of the round.
-            if self.drain_signals() {
-                self.abort_flag.store(true, Ordering::SeqCst);
-                self.abort_pty_process_groups();
-                return Ok(results);
-            }
-
-            attempts += 1;
-            let pending = self.manager.plan.pending_tasks();
-            if pending.is_empty() {
-                break;
-            }
-
-            // Per-delegation bound (test-injectable via the `delegate_timeout`
-            // seam; production always uses [`DELEGATE_TIMEOUT_SECS`]).
-            #[cfg(test)]
-            let timeout = self
-                .delegate_timeout
-                .unwrap_or(Duration::from_secs(DELEGATE_TIMEOUT_SECS));
-            #[cfg(not(test))]
-            let timeout = Duration::from_secs(DELEGATE_TIMEOUT_SECS);
-            #[cfg(test)]
-            let delegate_override = self.delegate_override.clone();
-
-            // Silent Dispatcher: one self-contained DelegateRequest per task.
-            let mut handles = Vec::with_capacity(pending.len());
-            for task_id in pending {
-                let agent = (self.scheduler)(&task_id);
-                let brief = brief_for_task(&self.manager.plan, &task_id);
-                let req = DelegationRequest {
-                    agent_name: agent,
-                    prompt: brief,
-                    snippets: vec![],
-                    task_id: Some(task_id),
-                    image_urls: None,
-                    audio_urls: None,
-                    recursion_granted: false,
-                };
-                let mgr = self.manager.clone();
-                let abort = self.abort_flag.clone();
-                let agent_name = req.agent_name;
-                let task_id = req.task_id.clone();
-                #[cfg(test)]
-                let override_ = delegate_override.clone();
-                handles.push(tokio::spawn(async move {
-                    if abort.load(Ordering::SeqCst) {
-                        return Err(anyhow::anyhow!("aborted"));
-                    }
-                    match tokio::time::timeout(
-                        timeout,
-                        async {
-                            #[cfg(test)]
-                            if let Some(override_) = override_ {
-                                return override_(req).await;
-                            }
-                            mgr.delegate(req).await
-                        },
-                    )
-                    .await
-                    {
-                        Ok(res) => res,
-                        Err(_elapsed) => {
-                            // Per-delegation bound exceeded: tear down the
-                            // specialist's worker (its child cancel token in the
-                            // workers registry) so it is not orphaned, then
-                            // surface a hard error for the turn loop to map to
-                            // `TurnOutcome::Error`.
-                            tracing::error!(
-                                agent = %agent_name,
-                                task_id = ?task_id,
-                                timeout_secs = DELEGATE_TIMEOUT_SECS,
-                                "delegation timed out; cancelling worker"
-                            );
-                            crate::orchestrator::workers::cancel_active_worker(
-                                Some(agent_name.to_string().as_str()),
-                                task_id.as_deref(),
-                            );
-                            Err(anyhow::anyhow!(
-                                "delegation to {agent_name} (task {task_id:?}) timed out after {DELEGATE_TIMEOUT_SECS}s"
-                            ))
-                        }
-                    }
-                }));
-            }
-
-            // Poll the in-flight sub-tasks. On abort, cancel ALL remaining
-            // in-flight futures immediately (REQ-LOOP-004) and SIGKILL every
-            // active PTY process group before returning. Dropping an `abort()`ed
-            // `JoinHandle` leaves the spawned task running in the background, so
-            // we explicitly cancel every handle still in flight, not just the
-            // one we happen to be awaiting.
-            let mut round: Vec<Deliverable> = Vec::new();
-            // Drain the in-flight handles. On abort, cancel every handle that has
-            // not yet been awaited (REQ-LOOP-004: no in-flight sub-task is left
-            // running), then SIGKILL all PTY process groups.
-            while let Some(h) = handles.pop() {
-                if self.abort_flag.load(Ordering::SeqCst) {
-                    // Cancel every in-flight sub-task still pending (including
-                    // this one), then SIGKILL all PTY process groups.
-                    for remaining in &handles {
-                        remaining.abort();
-                    }
-                    h.abort();
-                    self.abort_pty_process_groups();
-                    return Ok(results);
-                }
-                match h.await {
-                    Ok(Ok(d)) => round.push(d),
-                    Ok(Err(e)) => {
-                        // A per-task failure is surfaced via its Deliverable
-                        // marker (FAILED / REPLAN) rather than aborting the
-                        // whole round; a hard error still aborts the loop.
-                        tracing::warn!("delegation failed: {e}");
-                        return Err(e);
-                    }
-                    Err(_) => {
-                        // Task cancelled (abort raced) — stop immediately.
-                        self.abort_pty_process_groups();
-                        return Ok(results);
-                    }
-                }
-            }
-            results.extend(round);
-            // `delegate()` auto-checked-off completed tasks (REQ-PLAN-002);
-            // the next round re-reads the plan for whatever remains.
-        }
-        Ok(results)
+    /// A success pays off the debt for `key`.
+    pub fn clear(&mut self, key: &str) {
+        self.counts.remove(key);
     }
 }
 
 #[cfg(test)]
-#[path = "loop_tests.rs"]
-mod tests;
+mod tests {
+    use super::*;
+    use crate::tool_names::{
+        TOOL_CREATE_PLAN, TOOL_DELEGATE_TASK, TOOL_READ_FILE, TOOL_REBIRTH, TOOL_REPLACE,
+        TOOL_RUN_COMMAND, TOOL_WRITE_FILE,
+    };
+
+    /// REQ-LOOP-003: exactly the three read-only tools are parallel-safe.
+    #[test]
+    fn read_tool_gate_covers_only_read_only_tools() {
+        assert!(is_read_tool(TOOL_READ_FILE));
+        assert!(is_read_tool(TOOL_GREP_SEARCH));
+        assert!(is_read_tool(TOOL_GLOB));
+    }
+
+    /// REQ-LOOP-003: mutating, executing and orchestration tools are never
+    /// classified as parallel-safe reads.
+    #[test]
+    fn mutating_and_orchestration_tools_are_not_reads() {
+        for tool in [
+            TOOL_WRITE_FILE,
+            TOOL_REPLACE,
+            TOOL_RUN_COMMAND,
+            TOOL_CREATE_PLAN,
+            TOOL_REBIRTH,
+            TOOL_DELEGATE_TASK,
+            "mcp__server__anything",
+            "",
+        ] {
+            assert!(!is_read_tool(tool), "{tool} must not run in parallel");
+        }
+    }
+
+    /// REQ-LOOP-002: the interactive turn budget stays at 100 turns.
+    #[test]
+    fn turn_budget_is_one_hundred() {
+        assert_eq!(MAX_TURNS, 100);
+    }
+
+    /// REQ-LOOP-002: the 600 s watchdog bound exists again, and it is paired
+    /// with an absolute per-turn cap (the H5 wall-clock gap).
+    #[test]
+    fn turn_wall_clock_bounds_are_declared() {
+        assert_eq!(TURN_WATCHDOG_SECS, 600);
+        assert_eq!(TURN_HARD_CAP_SECS, 3 * 60 * 60);
+        let hard_cap = Duration::from_secs(TURN_HARD_CAP_SECS);
+        let watchdog = Duration::from_secs(TURN_WATCHDOG_SECS);
+        assert!(hard_cap > watchdog);
+        assert_eq!(TASK_FAILURE_ESCALATION_THRESHOLD, 2);
+    }
+
+    // ---- TurnWatchdog -----------------------------------------------------
+
+    /// REQ-LOOP-002: a turn that reports no progress is cut off at the idle
+    /// bound, and the reason names the watchdog.
+    #[test]
+    fn watchdog_fires_when_a_turn_makes_no_progress() {
+        let start = Instant::now();
+        let wd = TurnWatchdog::at(
+            start,
+            Duration::from_secs(TURN_WATCHDOG_SECS),
+            Duration::from_secs(TURN_HARD_CAP_SECS),
+        );
+        assert_eq!(wd.expired_at(start + Duration::from_secs(599)), None);
+        assert_eq!(
+            wd.expired_at(start + Duration::from_secs(600)),
+            Some(DeadlineKind::Stalled)
+        );
+        let reason = DeadlineKind::Stalled.describe(
+            Duration::from_secs(TURN_WATCHDOG_SECS),
+            Duration::from_secs(TURN_HARD_CAP_SECS),
+        );
+        assert!(reason.contains("turn watchdog"));
+        assert!(reason.contains("in-flight work cancelled"));
+    }
+
+    /// The idle window is relative to the last observed progress: a busy turn
+    /// (delegation status lines, completed tool calls) is never cut off by the
+    /// watchdog, only by the hard cap.
+    #[test]
+    fn watchdog_progress_refreshes_the_stalled_window() {
+        let start = Instant::now();
+        let mut wd = TurnWatchdog::at(start, Duration::from_secs(10), Duration::from_secs(1000));
+        wd.note_progress_at(start + Duration::from_secs(9));
+        assert_eq!(wd.expired_at(start + Duration::from_secs(18)), None);
+        assert_eq!(
+            wd.expired_at(start + Duration::from_secs(19)),
+            Some(DeadlineKind::Stalled)
+        );
+        assert_eq!(
+            wd.idle_at(start + Duration::from_secs(15)),
+            Duration::from_secs(6)
+        );
+    }
+
+    /// The absolute cap fires even for a turn that keeps reporting progress —
+    /// this is the bound that makes an infinite turn impossible.
+    #[test]
+    fn watchdog_hard_cap_fires_regardless_of_progress() {
+        let start = Instant::now();
+        let mut wd = TurnWatchdog::at(start, Duration::from_secs(600), Duration::from_secs(30));
+        for tick in 1..=10 {
+            wd.note_progress_at(start + Duration::from_secs(tick * 3));
+        }
+        assert_eq!(wd.expired_at(start + Duration::from_secs(29)), None);
+        assert_eq!(
+            wd.expired_at(start + Duration::from_secs(30)),
+            Some(DeadlineKind::HardCap)
+        );
+        assert!(
+            DeadlineKind::HardCap
+                .describe(Duration::from_secs(600), Duration::from_secs(30))
+                .contains("30s wall-clock bound")
+        );
+    }
+
+    /// The remaining-time helpers feed `tokio::time::timeout` and never underflow.
+    #[test]
+    fn watchdog_reports_remaining_await_budgets() {
+        let start = Instant::now();
+        let wd = TurnWatchdog::at(start, Duration::from_secs(10), Duration::from_secs(30));
+        assert_eq!(wd.time_to_idle_limit_at(start), Duration::from_secs(10));
+        assert_eq!(wd.time_to_hard_limit_at(start), Duration::from_secs(30));
+        // Well past both bounds: saturating, never negative / never panicking.
+        let late = start + Duration::from_secs(500);
+        assert_eq!(wd.time_to_idle_limit_at(late), Duration::ZERO);
+        assert_eq!(wd.time_to_hard_limit_at(late), Duration::ZERO);
+    }
+
+    /// `rearm` bounds exactly one turn: the previous turn's elapsed time is not
+    /// carried over into the next turn's budget.
+    #[test]
+    fn watchdog_rearm_bounds_one_turn() {
+        let start = Instant::now();
+        let mut wd = TurnWatchdog::at(start, Duration::from_secs(5), Duration::from_secs(6));
+        // The previous turn had already burned 5 s when the loop re-armed.
+        wd.rearm_at(start + Duration::from_secs(5));
+        // Nothing is carried over into the new turn.
+        assert_eq!(
+            wd.elapsed_at(start + Duration::from_secs(6)),
+            Duration::from_secs(1)
+        );
+        // The absolute cap is measured from the re-arm too: 9 s of total session
+        // time would exceed a 6 s cap, but this turn has only used 4 s.
+        assert_eq!(wd.expired_at(start + Duration::from_secs(9)), None);
+        // 5 s of silence inside the new turn is the stalled bound...
+        assert_eq!(
+            wd.expired_at(start + Duration::from_secs(10)),
+            Some(DeadlineKind::Stalled)
+        );
+        // ...whereas observable progress keeps the idle bound quiet and leaves the
+        // absolute bound as the only way out: 6 s into the re-armed turn.
+        wd.note_progress_at(start + Duration::from_secs(9));
+        assert_eq!(
+            wd.expired_at(start + Duration::from_secs(11)),
+            Some(DeadlineKind::HardCap)
+        );
+    }
+
+    // ---- FailureBudget ----------------------------------------------------
+
+    /// Recon H5: two failures of the same task escalate, and the third attempt
+    /// is refused instead of being retried blindly.
+    #[test]
+    fn failure_budget_escalates_at_threshold_and_then_refunds_no_more_attempts() {
+        let mut budget = FailureBudget::new(TASK_FAILURE_ESCALATION_THRESHOLD);
+        let key = "task:t-042";
+
+        assert!(budget.retry_allowed(key));
+        assert_eq!(budget.record(key), FailureVerdict::Continue { count: 1 });
+        assert!(budget.retry_allowed(key));
+        assert_eq!(budget.record(key), FailureVerdict::Escalate { count: 2 });
+        // Threshold reached: no further unchanged attempt may be dispatched.
+        assert!(!budget.retry_allowed(key));
+        assert_eq!(budget.count(key), 2);
+    }
+
+    /// A success pays off the debt, so a task that eventually works is not
+    /// penalised for its earlier failures.
+    #[test]
+    fn failure_budget_success_clears_the_counter() {
+        let mut budget = FailureBudget::new(2);
+        let key = "task:t-007";
+        budget.record(key);
+        budget.record(key);
+        assert!(!budget.retry_allowed(key));
+        budget.clear(key);
+        assert_eq!(budget.count(key), 0);
+        assert!(budget.retry_allowed(key));
+        assert_eq!(budget.record(key), FailureVerdict::Continue { count: 1 });
+    }
+
+    /// Different tasks/tool calls are accounted separately: one impossible task
+    /// must not freeze the rest of the plan.
+    #[test]
+    fn failure_budget_keys_are_independent() {
+        let mut budget = FailureBudget::new(2);
+        budget.record("task:t-001");
+        budget.record("task:t-001");
+        budget.record("tool:read_file:{\"path\":\"nope\"}");
+        assert!(!budget.retry_allowed("task:t-001"));
+        assert!(budget.retry_allowed("task:t-002"));
+        assert!(budget.retry_allowed("tool:read_file:{\"path\":\"nope\"}"));
+    }
+
+    /// A degenerate threshold may never refuse a call before it was attempted.
+    #[test]
+    fn failure_budget_threshold_is_clamped_to_one() {
+        let mut budget = FailureBudget::new(0);
+        assert_eq!(budget.threshold(), 1);
+        assert_eq!(
+            budget.record("task:t-009"),
+            FailureVerdict::Escalate { count: 1 }
+        );
+        assert!(!budget.retry_allowed("task:t-009"));
+    }
+}

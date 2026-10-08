@@ -2,7 +2,7 @@
 //!
 //! Verifies:
 //! 1. Plan creation pre-generates prompt pairs (`<task_id>.md` and optional `<task_id>-validation.md`) on disk.
-//! 2. Disk-first lookup in `delegate()` rehydrates exact saved prompt specifications.
+//! 2. Disk-first lookup in `delegate()` restores the exact saved prompt specifications.
 //! 3. Planner agent blueprint includes `AGENTS.md` archetypes and strictly zero micro-skills.
 //! 4. Project-level `skills/` and `AGENTS.md` override and augment catalog archetypes.
 //! 5. All tests run offline against deterministic mock/canned data.

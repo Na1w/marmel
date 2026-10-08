@@ -91,7 +91,7 @@ impl ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
                 name: TOOL_READ_FILE.to_string(),
-                description: "Read paginated UTF-8 text from a file by character offset and limit."
+                description: "Read paginated UTF-8 text from a file by character offset and limit. A hard 262 144-byte read ceiling caps what is ever loaded from disk: for a larger file the returned text is the loaded head followed by a `[read_file truncated] … truncated: true` report carrying file_bytes, read_cap_bytes, bytes_read, loaded_characters, showing_characters and next_offset. That report is never chopped by the generic tool-output limit — re-run with offset=<next_offset> (limit max 8000) to keep walking the loaded head, and use grep_search or glob to locate content past the ceiling."
                     .to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -321,7 +321,8 @@ impl ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
                 name: TOOL_PTY_LIST.to_string(),
-                description: "List all active interactive PTY sessions.".to_string(),
+                description: "List all active interactive PTY sessions. Each session is reported as a JSON object with the keys: session_id, pid, is_alive, idle_seconds, retained_bytes (the size of the retained ring window, not a cumulative counter), total_bytes_read (historical alias of retained_bytes, kept for compatibility), dropped_bytes (window head discarded because the buffer is capped), truncated (true when dropped_bytes is non-zero), child_reaped (whether the child process has been reaped) and child_exit_status (the child exit code once reaped, otherwise null)."
+                    .to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {}
