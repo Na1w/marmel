@@ -13,7 +13,6 @@
 pub mod bus;
 pub mod delegate;
 pub mod delegation;
-pub mod freeze;
 pub mod notice;
 #[cfg(test)]
 mod notice_tests;
@@ -27,9 +26,11 @@ mod steer_tests;
 pub mod workers;
 
 pub use notice::{
-    SteerNotice, SteerNoticeReply, WorkerReplyEvaluation, clear_all_notices, drain_worker_notices,
-    evaluate_worker_reply, get_pending_notice, get_worker_reply, next_notice_id,
-    post_notice_to_worker, record_worker_reply,
+    NoticeReplyRejection, SteerNotice, SteerNoticeReply, WorkerReplyEvaluation, clear_all_notices,
+    drain_worker_notices, drain_worker_notices_mid_turn, drain_worker_notices_report,
+    evaluate_worker_reply, get_pending_notice, get_pending_notice_for_worker, get_worker_reply,
+    next_notice_id, notice_addresses_worker, post_notice_to_worker, record_worker_reply,
+    record_worker_reply_for_notice, render_notice_for_worker,
 };
 
 pub use preemption::{
@@ -55,9 +56,9 @@ pub use bus::{
 };
 pub use delegate::{brief_for_task, caller_allows_tool, handle_delegate_task};
 pub use delegation::{Delegation, DelegationEvent, OrchestrationConfig, RecursionDepth};
-pub use freeze::{CrashJournal, FreezeSnapshot, JournalEventKind};
 pub use plan_summary::generate_plan_progress_summary;
 pub use registry::SpecialistRegistry;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 pub use steer::{
     SteerDecision, SteerOutcome, SteerSubtaskDecision, StreamingResponseExtractor, arbitrate_steer,
@@ -97,15 +98,16 @@ pub struct OrchestratorManager {
     pub stats: Arc<HarnessStats>,
     /// Current recursion depth (the Manager is the root, depth 0).
     pub depth: RecursionDepth,
-    /// File-backed Deep-Freeze Crash Journal rooted at the shared `.marmel/`
-    /// plan dir (SPEC §3.4). Snapshot on delegation, rehydrate on resume.
-    pub journal: CrashJournal,
     /// Delegation lifecycle events surfaced to the UI (t6-REQ-3). The Manager
     /// records a `Started`/`Completed` event per delegation so renderers can show
     /// which specialist is active and on which task. Interior mutability
-    /// (`Arc<Mutex<_>>`) lets the shared Manager (held by the `ManagerLoop` as
-    /// `Arc<OrchestratorManager>`) be drained concurrently by the UI without a
-    /// `&mut` borrow, so `delegate` stays `&self`.
+    /// (`Arc<Mutex<_>>`) lets the shared Manager — built in `boot_manager`
+    /// (`src/main.rs`) and handed to the live session runner as
+    /// `Arc<OrchestratorManager>` (`run_session` in `src/ui/session.rs`, which
+    /// drives the Manager turn loop while delegated specialist turns run in
+    /// `src/agents/runner/*`) — be drained concurrently by the UI
+    /// (`drain_delegation_events_with_transcript`) without a `&mut` borrow, so
+    /// `delegate` stays `&self`.
     pub delegation_events: Arc<std::sync::Mutex<Vec<DelegationEvent>>>,
     /// Cancellation token for this manager and its subagent worker hierarchy.
     pub cancellation_token: tokio_util::sync::CancellationToken,
@@ -136,7 +138,6 @@ impl OrchestratorManager {
         stats: Arc<HarnessStats>,
         orchestration: OrchestrationConfig,
     ) -> Self {
-        let journal = CrashJournal::new(plan.dir());
         let cancellation_token = global_cancellation_token().child_token();
         Self {
             client,
@@ -145,7 +146,6 @@ impl OrchestratorManager {
             orchestration,
             stats,
             depth: RecursionDepth::root(),
-            journal,
             delegation_events: Arc::new(std::sync::Mutex::new(Vec::new())),
             cancellation_token,
         }
@@ -240,34 +240,37 @@ impl OrchestratorManager {
         );
         let start_time = std::time::Instant::now();
 
-        // 3. Deep-Freeze: snapshot this in-flight delegation to the Crash
-        //    Journal BEFORE the worker runs (SPEC §3.4). If the process dies
-        //    mid-run, the identical `worker_id` + `sub_req` survive on disk.
-        let worker_id = self
-            .journal
-            .snapshot(entry.agent, &req)
-            .unwrap_or_else(|e| {
-                // A journal write failure must not silently lose a task: surface
-                // it as an error so the caller can fail loudly (REQ-ORCH-005).
-                tracing::warn!("Deep-Freeze snapshot failed: {e}");
-                String::new()
-            });
-
         // 4. Build the ISOLATED context (REQ-ORCH-003): Disk-first lookup!
         //    If a prompt already exists for this task on disk (from plan pregeneration),
         //    load it immediately for zero-latency startup. Fall back to JIT synthesis
         //    for ad-hoc or un-planned tasks.
+        //
+        //    Gate t-055: the disk-first path is built through
+        //    [`saved_prompt_path_for_task`] so the task id passes
+        //    [`crate::task_id::validate_task_id`] before it is ever joined onto the
+        //    prompts directory. A rejected id is reported and the read is skipped —
+        //    exactly the shape of a missing prompt file — so the delegation falls
+        //    back to JIT prompt synthesis instead of reading (or deriving) some
+        //    other file name.
         let prompts_dir = self.plan.dir().join("prompts");
         let ws_root = self.plan.dir().parent().unwrap_or_else(|| self.plan.dir());
 
-        let saved_prompt_path = req.task_id.as_deref().map(|tid| {
-            let clean = tid
-                .trim_matches(|c| {
-                    c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\''
-                })
-                .trim();
-            prompts_dir.join(format!("{clean}.md"))
-        });
+        let saved_prompt_path = match saved_prompt_path_for_task(
+            &prompts_dir,
+            req.task_id.as_deref(),
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::warn!(
+                    "Rejected task id {:?} while looking up its synthesized prompt under {}: {err}. \
+                     The prompt is treated as unavailable, so no read outside the prompts \
+                     directory is attempted and JIT prompt synthesis is used for this delegation.",
+                    req.task_id,
+                    prompts_dir.display()
+                );
+                None
+            }
+        };
 
         let blueprint = if let Some(path) = saved_prompt_path.filter(|p| p.exists()) {
             crate::agents::AgentBlueprint::load_from_disk(&path).ok()
@@ -307,9 +310,21 @@ impl OrchestratorManager {
         let deliverable = if self.cancellation_token.is_cancelled() || child_token.is_cancelled() {
             Deliverable {
                 marker: MissionMarker::Failed {
-                    reason: "aborted".to_string(),
+                    reason: crate::markers::ABORT_REASON.to_string(),
                 },
-                content: "Task aborted by user instruction.\n\nFAILED (aborted)".to_string(),
+                // gate t-070: the whole aborted-deliverable body — sentence and
+                // verdict trailer — is spelled by the single owner
+                // `crate::markers::aborted_deliverable`, the same call
+                // `orchestrator::delegate::handle_delegate_task`,
+                // `agents::Generalist::run` and
+                // `agents::runner::execution::aborted_deliverable` make. This
+                // site used to hand-build `"…\n\nFAILED (aborted)"` through
+                // `failed_trailer`, which is the one marker vocabulary copy the
+                // conservative single-owner scan could not see (this file
+                // declares `#[cfg(test)] mod …` items *before* its production
+                // code, so the line-by-line scan stops at line 18) — the reason
+                // `HAND_OFF_MARKER_SITES` existed and the reason it is now empty.
+                content: crate::markers::aborted_deliverable("aborted by user instruction"),
                 task_id: req.task_id.clone(),
             }
         } else {
@@ -326,13 +341,6 @@ impl OrchestratorManager {
             elapsed_ms,
             &deliverable.content,
         );
-
-        // 6. Deep-Freeze: the delegation terminated (cleanly). Release the
-        //    frozen checkpoint so a later recovery does not re-resume a task
-        //    that already finished.
-        if !worker_id.is_empty() {
-            let _ = self.journal.clear(&worker_id, true);
-        }
 
         // Surface the delegation completion to the UI.
         if let Ok(mut ev) = self.delegation_events.lock() {
@@ -362,177 +370,40 @@ impl OrchestratorManager {
         Ok(self.apply_check_off(deliverable, req.task_id.clone()))
     }
 
-    /// REQ-ORCH-003 (persistence) / Deep-Freeze recovery: after a crash, the
-    /// system rehydrates the frozen subagent using the identical `worker_id`
-    /// from the Crash Journal. When the Manager boots (or is asked to recover),
-    /// call this to either *resume* the in-flight task or *fail it properly*.
-    ///
-    /// - If a frozen snapshot exists, it re-delegates with the preserved
-    ///   in-flight `sub_req` under the same `worker_id`, then clears the
-    ///   checkpoint on success.
-    /// - If the preserved request cannot be resumed (e.g. the agent is no
-    ///   longer registered), it records a `Failed` journal event so the plan
-    ///   line stays unchecked and the parent can re-plan — it does NOT crash.
-    ///
-    /// Returns the rehydrated deliverable when a frozen delegation was
-    /// resumed, or `None` when there was nothing frozen (clean boot).
-    pub async fn recover_frozen(&self) -> Result<Option<Deliverable>> {
-        let Some(snap) = self.journal.frozen()? else {
-            return Ok(None);
-        };
-
-        // Re-resolve the specialist (REQ-ORCH-002). If the role disappeared,
-        // fail the frozen task properly instead of silently dropping it.
-        let Some(entry) = self.registry.resolve(snap.agent_name) else {
-            tracing::warn!(
-                "Deep-Freeze: agent {} no longer registered; failing frozen task",
-                snap.agent_name
-            );
-            let _ = self.journal.clear(&snap.worker_id, false);
-            if let Ok(mut ev) = self.delegation_events.lock() {
-                ev.push(DelegationEvent::Failed {
-                    agent: snap.agent_name,
-                    task: snap.sub_req.task_id.clone(),
-                    reason: Some("role no longer registered".to_string()),
-                });
-            }
-            return Err(anyhow::anyhow!(
-                "Deep-Freeze: frozen worker {} (agent {}) cannot be rehydrated: \
-                 role no longer registered",
-                snap.worker_id,
-                snap.agent_name
-            ));
-        };
-
-        // Rebuild the isolated context from the preserved in-flight `sub_req`
-        // — this is the SOLE exception to isolation, scoped to the frozen
-        // session (SPEC §3.4). Rehydrate with the identical worker_id.
-        let prompts_dir = self.plan.dir().join("prompts");
-        let ws_root = self.plan.dir().parent().unwrap_or_else(|| self.plan.dir());
-        let saved_prompt_path = snap.sub_req.task_id.as_deref().map(|tid| {
-            let clean = tid
-                .trim_matches(|c| {
-                    c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\''
-                })
-                .trim();
-            prompts_dir.join(format!("{clean}.md"))
-        });
-        let blueprint = if let Some(path) = saved_prompt_path.filter(|p| p.exists()) {
-            crate::agents::AgentBlueprint::load_from_disk(&path).ok()
-        } else {
-            None
-        };
-        let (prompt, blueprint) = if let Some(bp) = blueprint {
-            (bp.system_prompt.clone(), Some(bp))
-        } else {
-            let catalog = crate::agents::Catalog::discover(ws_root);
-            let bp = crate::agents::PromptBuilder::synthesize_offline(&catalog, &snap.sub_req);
-            (bp.system_prompt.clone(), Some(bp))
-        };
-        let mut ctx = IsolatedContext::from_request(prompt, &snap.sub_req);
-        if let Some(bp) = blueprint {
-            ctx = ctx.with_blueprint(bp);
-        }
-
-        if let Ok(mut ev) = self.delegation_events.lock() {
-            ev.push(DelegationEvent::Started {
-                agent: entry.agent,
-                task: snap.sub_req.task_id.clone(),
-            });
-        }
-        crate::debug_log::log_delegation_start(
-            entry.agent.as_str(),
-            snap.sub_req.task_id.as_deref(),
-            &snap.sub_req.prompt,
-            snap.sub_req.snippets.len(),
-        );
-        let start_time = std::time::Instant::now();
-
-        let child_token = self.cancellation_token.child_token();
-
-        // Register active worker for real-time steering arbitrator visibility
-        let _active_guard = register_active_worker_with_token(
-            snap.sub_req.task_id.clone(),
-            entry.agent.as_str().to_string(),
-            snap.sub_req.prompt.clone(),
-            Some(child_token.clone()),
-        );
-
-        let deliverable = if self.cancellation_token.is_cancelled() || child_token.is_cancelled() {
-            Deliverable {
-                marker: MissionMarker::Failed {
-                    reason: "aborted".to_string(),
-                },
-                content: "Task aborted by user instruction.\n\nFAILED (aborted)".to_string(),
-                task_id: snap.sub_req.task_id.clone(),
-            }
-        } else {
-            let worker = self.registry.worker(entry.agent);
-            worker.run(&ctx, &child_token).await
-        };
-
-        let elapsed_ms = start_time.elapsed().as_millis();
-        let marker_str = format!("{:?}", deliverable.marker);
-        crate::debug_log::log_delegation_finish(
-            entry.agent.as_str(),
-            snap.sub_req.task_id.as_deref(),
-            &marker_str,
-            elapsed_ms,
-            &deliverable.content,
-        );
-
-        // The frozen delegation resolved: release the checkpoint so it is not
-        // resumed again on a subsequent boot.
-        let clean = !matches!(deliverable.marker, MissionMarker::Failed { .. });
-        let _ = self.journal.clear(&snap.worker_id, clean);
-
-        if let Ok(mut ev) = self.delegation_events.lock() {
-            if clean {
-                ev.push(DelegationEvent::Completed {
-                    agent: entry.agent,
-                    task: snap.sub_req.task_id.clone(),
-                });
-            } else {
-                let reason = match &deliverable.marker {
-                    MissionMarker::Failed { reason } => {
-                        Some(crate::ui::helpers::extract_failure_reason(reason))
-                    }
-                    _ => Some(crate::ui::helpers::extract_failure_reason(
-                        &deliverable.content,
-                    )),
-                };
-                ev.push(DelegationEvent::Failed {
-                    agent: entry.agent,
-                    task: snap.sub_req.task_id.clone(),
-                    reason,
-                });
-            }
-        }
-
-        Ok(Some(self.apply_check_off(
-            deliverable,
-            snap.sub_req.task_id.clone(),
-        )))
-    }
-
     /// Auto check-off: on `MISSION COMPLETE (task-id)` flip `- [ ] [t-xxx]` to
     /// `- [x] [t-xxx]`; on FAILED/REPLAN leave unchecked (REQ-PLAN-002).
     ///
     /// t-202/t-302: the authoritative [`MissionMarker`] on the deliverable is the
     /// gate keeper. A task is only ever checked off when the *marker* is a
-    /// genuine [`MissionMarker::Complete`] AND the re-parsed *content* still
-    /// carries a `MISSION COMPLETE (t-xxx)` terminal marker (via
-    /// [`crate::manager::phase::Plan::check_plan_on_marker`]). This double gate
-    /// guarantees that a `FAILED` / `REPLAN` deliverable — or a REJECTED
-    /// deliverable that carries a stale completion token from a pre-validation
-    /// draft in its content body — stays unchecked (REQ-PLAN-002 / REQ-ORCH-005).
-    /// The resolved `task_id` override is passed as the explicit binding so
+    /// genuine [`MissionMarker::Complete`] AND the *content* still carries a
+    /// `MISSION COMPLETE (t-xxx)` terminal marker. This double gate guarantees
+    /// that a `FAILED` / `REPLAN` deliverable — or a REJECTED deliverable that
+    /// carries a stale completion token from a pre-validation draft in its
+    /// content body — stays unchecked (REQ-PLAN-002 / REQ-ORCH-005). The
+    /// resolved `task_id` override is passed as the explicit binding so
     /// check-off still works when the subagent omits the parenthesized id.
+    ///
+    /// t-035a: the already-parsed `d.marker` is **threaded into**
+    /// [`Plan::check_plan_on_deliverable`] instead of being dropped, so the plan
+    /// layer resolves the verdict and the task id from the structured marker
+    /// (the single authority) rather than re-deriving them from the body. The
+    /// body scan below stays as the second gate and is produced by the same
+    /// owner (`crate::markers` through [`MissionMarker::parse`]) — it can never
+    /// diverge from the plan layer's parse, and a marker naming a **different**
+    /// task id aborts the check-off there.
     fn apply_check_off(&self, d: Deliverable, task_id: Option<String>) -> Deliverable {
         let tid = d.task_id.clone().or(task_id);
         if matches!(d.marker, MissionMarker::Complete { .. }) {
-            // Second gate: the *content* must still carry the terminal marker.
-            if let Ok(true) = self.plan.check_plan_on_marker(tid.as_deref(), &d.content)
+            // Second gate: the *content* must still carry a terminal completion
+            // marker, judged by the marker owner — no second parser here.
+            let body_says_complete = matches!(
+                MissionMarker::parse(&d.content),
+                Some(MissionMarker::Complete { .. })
+            );
+            if body_says_complete
+                && let Ok(true) =
+                    self.plan
+                        .check_plan_on_deliverable(Some(&d.marker), tid.as_deref(), &d.content)
                 && let Some(t) = &tid
             {
                 crate::debug_log::log_plan_update(
@@ -568,6 +439,14 @@ impl OrchestratorManager {
     ///
     /// The `scheduler` closure maps a task id to the specialist whose domain
     /// matches that task's type (REQ-ORCH-002 selection rule).
+    ///
+    /// The loop gate uses the **fallible** plan API ([`Plan::try_pending_tasks`]),
+    /// so an unreadable plan is an error, never a completion (bug M8):
+    /// * `Ok(non-empty)` — dispatch those tasks (the normal path);
+    /// * `Ok(empty)` — the plan **was read successfully** and nothing is pending
+    ///   (all boxes ticked, or no plan file at all): the completion path;
+    /// * `Err(_)` — the plan state is **UNKNOWN**: logged and propagated, so no
+    ///   caller can read this run as "the mission is finished".
     pub async fn run_executing(
         &mut self,
         scheduler: &dyn Fn(&str) -> Agent,
@@ -579,12 +458,35 @@ impl OrchestratorManager {
         let mut results = Vec::new();
         let mut attempts = 0;
         // Cap iterations so an un-delegate-able task cannot loop forever.
-        while !self.plan.is_complete() && attempts < MAX_EXECUTING_ROUNDS {
-            attempts += 1;
-            let pending = self.plan.pending_tasks();
+        //
+        // M8 (t-031h fallible API; folded hand-off): this gate used to be
+        // `!is_complete() && pending_tasks()`. `pending_tasks()` swallows a read
+        // failure (it logs, then yields an EMPTY `Vec`), and the `is_empty()`
+        // break below returned `Ok(results)` — byte-for-byte what a finished plan
+        // returns. An unreadable plan therefore silently dropped the remaining
+        // work and let the mission look complete. The gate now reads the plan
+        // exactly ONCE per round through `try_pending_tasks()`, which propagates
+        // the failure (it also removes the old second `PLAN_MUTEX` acquisition per
+        // round made by `is_complete()`; nothing else on this path holds the
+        // guard, so there is no second lock path and no re-entrant deadlock).
+        while attempts < MAX_EXECUTING_ROUNDS {
+            let pending = match self.plan.try_pending_tasks() {
+                Ok(pending) => pending,
+                Err(e) => {
+                    let e = e.context(
+                        "Silent Dispatcher stopped: the execution plan state is UNKNOWN, so no \
+                         task can be dispatched and the mission is NOT complete",
+                    );
+                    tracing::error!("{e:#}");
+                    return Err(e);
+                }
+            };
             if pending.is_empty() {
+                // A successfully read plan with nothing pending (every box ticked,
+                // or no plan file on disk): the pre-existing completion path.
                 break;
             }
+            attempts += 1;
             for task_id in &pending {
                 // Resolve the right specialist for this task.
                 let agent = scheduler(task_id);
@@ -629,6 +531,37 @@ impl OrchestratorManager {
         self.cancellation_token.cancel();
         cancel_all();
     }
+}
+
+/// Disk-first prompt path for a delegation request, gated on the canonical
+/// task-id grammar.
+///
+/// Gate t-055 (single grammar authority): `.marmel/prompts/<task_id>.md` is an
+/// on-disk path derived from a task id that originates as LLM output
+/// (`delegate_task` argument / plan checkbox), so the id must pass
+/// [`crate::task_id::validate_task_id`] before it is joined onto `prompts_dir`.
+/// That function is the only place in the crate that defines the task-id
+/// grammar — this helper does not re-implement, extend or bypass it.
+///
+/// Contract (same shape as
+/// [`crate::harness::workspace::Workspace::prompt_path_for_task`]):
+/// * the raw id is normalized first (decoration stripping only, order unchanged)
+///   and the **normalized** value is validated and joined byte-for-byte — never
+///   sanitized, trimmed, clamped or mended into a different file name;
+/// * `Ok(None)` means "no task id was supplied" (the JIT-synthesis case);
+/// * `Err(TaskIdError)` means the id was refused: the caller must skip the read
+///   and degrade exactly like a missing prompt file, which is what makes the
+///   JIT fallback observable rather than a silent path escape.
+fn saved_prompt_path_for_task(
+    prompts_dir: &Path,
+    raw_task_id: Option<&str>,
+) -> Result<Option<PathBuf>, crate::task_id::TaskIdError> {
+    let Some(raw) = raw_task_id else {
+        return Ok(None);
+    };
+    let clean = crate::task_id::normalize_task_id_ref(raw);
+    let id = crate::task_id::validate_task_id(clean)?;
+    Ok(Some(prompts_dir.join(format!("{id}.md"))))
 }
 
 #[cfg(test)]

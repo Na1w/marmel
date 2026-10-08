@@ -112,6 +112,219 @@ fn test_llm_recovery_defaults_when_absent() {
     assert_eq!(recovered.temperature, Some(0.8)); // 0.7 default + 0.1
 }
 
+// ---------------------------------------------------------------------------
+// t-035d — recovery parameters must be clamped into the documented ranges.
+// Before the fix `frequency_penalty = 2.0` became `2.5` and `temperature = 2.0`
+// became `2.1`, both of which the provider rejects with HTTP 400, so the
+// recovery turn could never recover.
+// ---------------------------------------------------------------------------
+
+fn approx_eq(a: f32, b: f32) -> bool {
+    (a - b).abs() < 1e-3
+}
+
+fn clamp_of<'a>(outcome: &'a RecoveryOutcome, param: &str) -> Option<&'a RecoveryClamp> {
+    outcome.clamps.iter().find(|c| c.param == param)
+}
+
+/// Every documented range is enforced on the request that is actually issued,
+/// and each rewrite is reported as a typed [`RecoveryClamp`].
+#[test]
+fn test_llm_recovery_clamps_above_range_parameters() {
+    let mut base = req();
+    base.temperature = Some(2.0); // +0.1 -> 2.1 -> 2.0
+    base.frequency_penalty = Some(2.0); // +0.5 -> 2.5 -> 2.0
+    base.presence_penalty = Some(3.5); //  -> 2.0
+    base.top_p = Some(1.5); //  -> 1.0
+
+    let outcome = apply_recovery_report(&base, RecoveryAdjustment::default());
+
+    for clamp in &outcome.clamps {
+        let (min, max) = clamp.valid_range;
+        assert!(
+            (min..=max).contains(&clamp.applied),
+            "{} clamped outside its documented range: {} -> {}",
+            clamp.param,
+            clamp.requested,
+            clamp.applied
+        );
+        assert_ne!(
+            clamp.requested, clamp.applied,
+            "a recorded clamp must actually have moved the value"
+        );
+    }
+
+    let temperature = clamp_of(&outcome, "temperature").expect("temperature clamp recorded");
+    assert_eq!(temperature.reason, ClampReason::AboveRange);
+    assert!(
+        approx_eq(temperature.requested, 2.1),
+        "requested was {}",
+        temperature.requested
+    );
+    assert_eq!(temperature.applied, MAX_TEMPERATURE);
+    assert_eq!(temperature.valid_range, (MIN_TEMPERATURE, MAX_TEMPERATURE));
+
+    let frequency = clamp_of(&outcome, "frequency_penalty").expect("frequency clamp recorded");
+    assert_eq!(frequency.requested, 2.5);
+    assert_eq!(frequency.applied, MAX_PENALTY);
+    assert_eq!(frequency.reason, ClampReason::AboveRange);
+
+    assert_eq!(
+        clamp_of(&outcome, "presence_penalty").map(|c| (c.requested, c.applied)),
+        Some((3.5, MAX_PENALTY))
+    );
+    assert_eq!(
+        clamp_of(&outcome, "top_p").map(|c| (c.requested, c.applied)),
+        Some((1.5, MAX_TOP_P))
+    );
+
+    // The request that goes on the wire carries the clamped values.
+    assert_eq!(outcome.request.temperature, Some(MAX_TEMPERATURE));
+    assert_eq!(outcome.request.frequency_penalty, Some(MAX_PENALTY));
+    assert_eq!(outcome.request.presence_penalty, Some(MAX_PENALTY));
+    assert_eq!(outcome.request.top_p, Some(MAX_TOP_P));
+    assert_eq!(outcome.request.enable_thinking, Some(false));
+
+    // The source request is untouched (one-turn semantics preserved).
+    assert_eq!(base.temperature, Some(2.0));
+    assert_eq!(base.frequency_penalty, Some(2.0));
+    assert_eq!(base.presence_penalty, Some(3.5));
+
+    // And the serialized body is well-formed: every sampling number in it is
+    // inside its documented range.
+    let body = serde_json::to_value(&outcome.request).expect("request body serializes");
+    for (field, (min, max)) in [
+        ("temperature", (MIN_TEMPERATURE, MAX_TEMPERATURE)),
+        ("top_p", (MIN_TOP_P, MAX_TOP_P)),
+        ("frequency_penalty", (MIN_PENALTY, MAX_PENALTY)),
+        ("presence_penalty", (MIN_PENALTY, MAX_PENALTY)),
+    ] {
+        if let Some(value) = body.get(field).and_then(|v| v.as_f64()) {
+            assert!(
+                (f64::from(min)..=f64::from(max)).contains(&value),
+                "`{field}` left the documented range in the serialized body: {value}"
+            );
+        }
+    }
+}
+
+/// Below-range shifts (a caller-supplied negative delta) and non-finite values are
+/// clamped too — never serialized as `NaN`/`inf`, never sent as-is.
+#[test]
+fn test_llm_recovery_clamps_below_range_and_non_finite_parameters() {
+    let mut base = req();
+    base.temperature = Some(0.2);
+    base.frequency_penalty = Some(0.0);
+    base.presence_penalty = Some(f32::INFINITY);
+    let adj = RecoveryAdjustment {
+        frequency_penalty_delta: -2.5,
+        temperature_delta: -0.5,
+    };
+    let outcome = apply_recovery_report(&base, adj);
+
+    let temperature = clamp_of(&outcome, "temperature").expect("temperature clamp recorded");
+    assert!(approx_eq(temperature.requested, -0.3));
+    assert_eq!(temperature.applied, MIN_TEMPERATURE);
+    assert_eq!(temperature.reason, ClampReason::BelowRange);
+
+    let frequency = clamp_of(&outcome, "frequency_penalty").expect("frequency clamp recorded");
+    assert_eq!(frequency.requested, -2.5);
+    assert_eq!(frequency.applied, MIN_PENALTY);
+    assert_eq!(frequency.reason, ClampReason::BelowRange);
+
+    let presence = clamp_of(&outcome, "presence_penalty").expect("presence clamp recorded");
+    assert_eq!(presence.reason, ClampReason::NotFinite);
+    assert_eq!(presence.applied, MIN_PENALTY);
+
+    let mut nan = req();
+    nan.temperature = Some(f32::NAN);
+    let outcome = apply_recovery_report(&nan, RecoveryAdjustment::default());
+    let temperature = clamp_of(&outcome, "temperature").expect("NaN temperature clamped");
+    assert_eq!(temperature.reason, ClampReason::NotFinite);
+    assert_eq!(temperature.applied, MIN_TEMPERATURE);
+    assert_eq!(outcome.request.temperature, Some(MIN_TEMPERATURE));
+    // A NaN would serialize as `null` and is rejected; the clamped body is a number.
+    let body = serde_json::to_value(&outcome.request).expect("serializes");
+    assert!(body.get("temperature").and_then(|v| v.as_f64()).is_some());
+}
+
+/// An already well-formed request is passed through unmodified apart from the
+/// recovery shift itself, and reports no clamps.
+#[test]
+fn test_llm_recovery_in_range_parameters_are_not_clamped() {
+    let base = req();
+    let outcome = apply_recovery_report(&base, RecoveryAdjustment::default());
+    assert!(
+        outcome.clamps.iter().all(|c| c.param != "top_p"),
+        "unset/valid pass-through parameters must not be rewritten: {:?}",
+        outcome.clamps
+    );
+    assert!(approx_eq(outcome.request.temperature.unwrap(), 0.8));
+    assert!(approx_eq(outcome.request.frequency_penalty.unwrap(), 0.7));
+    assert_eq!(outcome.request.top_p, None);
+    assert_eq!(outcome.request.presence_penalty, None);
+}
+
+/// The clamp is not silent: `apply_recovery` logs it once per request, old → new.
+#[test]
+fn test_llm_recovery_clamp_is_logged_once_with_old_and_new_value() {
+    use std::io::Write;
+
+    thread_local! {
+        static LINES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    struct Sink;
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            LINES.with(|l| {
+                l.borrow_mut()
+                    .push(String::from_utf8_lossy(buf).into_owned())
+            });
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    struct Maker;
+    impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for Maker {
+        type Writer = Sink;
+        fn make_writer(&self) -> Sink {
+            Sink
+        }
+    }
+
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(Maker)
+        .finish();
+
+    let mut base = req();
+    base.frequency_penalty = Some(2.0);
+
+    LINES.with(|l| l.borrow_mut().clear());
+    let recovered = tracing::subscriber::with_default(subscriber, || {
+        apply_recovery(&base, RecoveryAdjustment::default())
+    });
+    let logged = LINES.with(|l| l.borrow().join("\n"));
+
+    assert_eq!(recovered.frequency_penalty, Some(MAX_PENALTY));
+    assert!(
+        logged.contains("WARN") && logged.contains("frequency_penalty 2.5 -> 2"),
+        "the clamp must be logged with its old -> new value, got: {logged:?}"
+    );
+    let clamp_lines = logged
+        .lines()
+        .filter(|line| line.contains("frequency_penalty 2.5 -> 2"))
+        .count();
+    assert_eq!(
+        clamp_lines, 1,
+        "exactly one clamp line per request, got {clamp_lines}: {logged:?}"
+    );
+}
+
 /// REQ-LLM-004: nudge policy allows up to 3 empty-production attempts.
 #[test]
 fn test_llm_empty_production_nudges() {

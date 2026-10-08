@@ -11,6 +11,26 @@ pub const DEFAULT_MAX_RECURSION_DEPTH: usize = 3;
 /// Default reasoning/thinking token budget per single turn.
 pub const DEFAULT_MAX_THINKING_TOKENS: usize = 32768;
 
+/// Default per-harness-command timeout in seconds (`command_timeout_secs`).
+pub const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 60;
+
+/// Inclusive lower bound of a valid command timeout, in seconds.
+pub const MIN_COMMAND_TIMEOUT_SECS: u64 = 1;
+
+/// Inclusive upper bound of a valid command timeout, in seconds.
+///
+/// A configured value (or a per-call `timeout_seconds` override) outside
+/// [`MIN_COMMAND_TIMEOUT_SECS`]..=[`MAX_COMMAND_TIMEOUT_SECS`] is clamped into
+/// this range on read — it is never used verbatim, and never silently:
+/// see [`effective_command_timeout_secs`].
+pub const MAX_COMMAND_TIMEOUT_SECS: u64 = 300;
+
+/// Config key that disables the Landlock sandbox, used verbatim in the
+/// attributable opt-out label that [`crate::harness::pty::log_sandbox_decision`]
+/// warns about (alongside the env fallback
+/// [`crate::harness::pty::SANDBOX_OPTOUT_ENV`]).
+pub const SANDBOX_DISABLED_KEY: &str = "sandbox_disabled";
+
 /// Orchestration configuration parsed from marmel.toml.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -109,7 +129,27 @@ pub struct Config {
     pub max_context_tokens: usize,
     pub system_prompt_path: PathBuf,
     pub preserve_thinking: bool,
+    /// Timeout applied to each harness command (`run_command` / PTY execution)
+    /// when the call itself does not pass a `timeout_seconds` override.
+    /// Documented valid range: [`MIN_COMMAND_TIMEOUT_SECS`]..=
+    /// [`MAX_COMMAND_TIMEOUT_SECS`] seconds (1..=300); out-of-range values are
+    /// clamped into it when read (see [`effective_command_timeout_secs`]).
+    /// Default [`DEFAULT_COMMAND_TIMEOUT_SECS`] (60 s).
     pub command_timeout_secs: u64,
+    /// Disable the Landlock sandbox re-entry for harness commands.
+    ///
+    /// Default `false`: the sandbox is **on** and every command is re-entered
+    /// through the resolved executable (fail-closed — see
+    /// [`crate::harness::sandbox`], which refuses to exec with
+    /// `SANDBOX_REFUSE_EXIT_CODE` when Landlock cannot be enforced).
+    ///
+    /// `true` is an explicit, attributable operator opt-out and is equivalent to
+    /// the environment fallback `MARMEL_DISABLE_SANDBOX`
+    /// ([`crate::harness::pty::SANDBOX_OPTOUT_ENV`]): **either** source opts out,
+    /// and the skip is always warned about by
+    /// [`crate::harness::pty::log_sandbox_decision`]. Read through
+    /// [`sandbox_opt_out`].
+    pub sandbox_disabled: bool,
     pub max_repetition_threshold: usize,
     pub enable_xml_rescue: bool,
     pub ui_mode: String,
@@ -125,8 +165,6 @@ pub struct Config {
     pub mcp_servers: HashMap<String, crate::mcp::McpServerConfig>,
     /// Optional base prompt appended to the orchestrator system prompt.
     pub base_prompt: Option<String>,
-    /// Whether to rehydrate past session state / transcripts on startup (default: false).
-    pub enable_rehydration: bool,
 }
 
 impl Default for Config {
@@ -142,7 +180,8 @@ impl Default for Config {
             max_context_tokens: 8192,
             system_prompt_path: PathBuf::from("prompts/system.md"),
             preserve_thinking: true,
-            command_timeout_secs: 60,
+            command_timeout_secs: DEFAULT_COMMAND_TIMEOUT_SECS,
+            sandbox_disabled: false,
             max_repetition_threshold: 5,
             enable_xml_rescue: true,
             ui_mode: "tui".to_string(),
@@ -152,7 +191,6 @@ impl Default for Config {
             orchestration: OrchestrationConfig::default_depth(),
             mcp_servers: HashMap::new(),
             base_prompt: None,
-            enable_rehydration: false,
         }
     }
 }
@@ -169,6 +207,103 @@ pub fn set_active(cfg: Config) {
 /// Retrieve a clone of the globally active configuration, if set.
 pub fn get_active() -> Option<Config> {
     ACTIVE_CONFIG.read().ok().and_then(|lock| lock.clone())
+}
+
+/// Drop the globally active configuration (test-only: restores the "no config
+/// loaded" state so an installed config can never leak into another test).
+#[cfg(test)]
+pub(crate) fn clear_active() {
+    if let Ok(mut lock) = ACTIVE_CONFIG.write() {
+        *lock = None;
+    }
+}
+
+/// The configured per-command timeout (seconds) of the active config, clamped
+/// into the documented range [`MIN_COMMAND_TIMEOUT_SECS`]..=
+/// [`MAX_COMMAND_TIMEOUT_SECS`]; [`DEFAULT_COMMAND_TIMEOUT_SECS`] when no config
+/// is active.
+///
+/// An out-of-range configured value is **logged** (old → new) and clamped — it is
+/// never applied verbatim and never silently ignored.
+pub fn active_command_timeout_secs() -> u64 {
+    let Some(cfg) = get_active() else {
+        return DEFAULT_COMMAND_TIMEOUT_SECS;
+    };
+    let configured = cfg.command_timeout_secs;
+    let applied = configured.clamp(MIN_COMMAND_TIMEOUT_SECS, MAX_COMMAND_TIMEOUT_SECS);
+    if applied != configured {
+        tracing::warn!(
+            key = "command_timeout_secs",
+            requested = configured,
+            applied,
+            valid_range = format!(
+                "{}..={}",
+                MIN_COMMAND_TIMEOUT_SECS, MAX_COMMAND_TIMEOUT_SECS
+            ),
+            "configured command timeout is out of range; clamped ({}s -> {}s)",
+            configured,
+            applied
+        );
+    }
+    applied
+}
+
+/// The timeout applied to one harness command, in seconds.
+///
+/// An explicit per-call override (`timeout_seconds` / `timeout` on the tool call)
+/// wins; otherwise the configured [`Config::command_timeout_secs`] is used. The
+/// result is always inside the documented range, so neither a misconfigured file
+/// nor a model-supplied override can produce an unusable timeout.
+pub fn effective_command_timeout_secs(requested: Option<u64>) -> u64 {
+    match requested {
+        Some(requested) => {
+            let applied = requested.clamp(MIN_COMMAND_TIMEOUT_SECS, MAX_COMMAND_TIMEOUT_SECS);
+            if applied != requested {
+                tracing::debug!(
+                    requested,
+                    applied,
+                    "per-call timeout override is out of range; clamped ({requested}s -> {applied}s)"
+                );
+            }
+            applied
+        }
+        None => active_command_timeout_secs(),
+    }
+}
+
+/// `true` when the active config disables the Landlock sandbox
+/// ([`Config::sandbox_disabled`]). Default `false` (sandbox on, fail-closed).
+pub fn sandbox_disabled() -> bool {
+    get_active().is_some_and(|cfg| cfg.sandbox_disabled)
+}
+
+/// Merge an environment-derived sandbox opt-out with the typed config knob.
+///
+/// Pure and injectable: `env_opt_out` is whatever the caller parsed from
+/// [`crate::harness::pty::SANDBOX_OPTOUT_ENV`], and `config_disabled` is the
+/// resolved [`Config::sandbox_disabled`]. **Either source opts out**; when both
+/// are set the env value keeps attribution (it names the variable that was set),
+/// which is why the two are ordered this way and never AND-ed.
+pub fn merge_sandbox_opt_out(
+    env_opt_out: crate::harness::pty::OptOut,
+    config_disabled: bool,
+) -> crate::harness::pty::OptOut {
+    use crate::harness::pty::OptOut;
+    match env_opt_out {
+        // Already an explicit, attributable env opt-out: keep it as-is.
+        opt_out @ OptOut::Explicit { .. } => opt_out,
+        OptOut::None if config_disabled => OptOut::Explicit {
+            setting: format!("{SANDBOX_DISABLED_KEY}=true"),
+        },
+        OptOut::None => OptOut::None,
+    }
+}
+
+/// The opt-out fed into [`crate::harness::pty::SandboxInputs::opt_out`]: the
+/// env-derived opt-out (still parsed by the harness, so it keeps working on its
+/// own) layered with the typed config knob from the active config.
+pub fn sandbox_opt_out(env_opt_out: crate::harness::pty::OptOut) -> crate::harness::pty::OptOut {
+    merge_sandbox_opt_out(env_opt_out, sandbox_disabled())
 }
 
 /// Config lookup order: CLI --config > ./.marmel.toml > ~/.config/marmel/config.toml > env vars > defaults.
@@ -194,9 +329,6 @@ pub fn load(explicit_path: Option<&str>) -> Result<Config> {
         && !m.trim().is_empty()
     {
         cfg.model = m;
-    }
-    if let Ok(val) = std::env::var("MARMEL_ENABLE_REHYDRATION") {
-        cfg.enable_rehydration = val == "1" || val.eq_ignore_ascii_case("true");
     }
 
     cfg.expand_paths();
@@ -249,6 +381,7 @@ struct PartialConfig {
     pub system_prompt_path: Option<PathBuf>,
     pub preserve_thinking: Option<bool>,
     pub command_timeout_secs: Option<u64>,
+    pub sandbox_disabled: Option<bool>,
     pub max_repetition_threshold: Option<usize>,
     pub enable_xml_rescue: Option<bool>,
     pub max_thinking_tokens: Option<usize>,
@@ -258,7 +391,6 @@ struct PartialConfig {
     #[serde(default)]
     pub mcp_servers: HashMap<String, crate::mcp::McpServerConfig>,
     pub base_prompt: Option<String>,
-    pub enable_rehydration: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -327,6 +459,9 @@ fn merge(mut base: Config, partial: PartialConfig) -> Config {
     if let Some(v) = partial.command_timeout_secs {
         base.command_timeout_secs = v;
     }
+    if let Some(v) = partial.sandbox_disabled {
+        base.sandbox_disabled = v;
+    }
     if let Some(v) = partial.max_repetition_threshold {
         base.max_repetition_threshold = v;
     }
@@ -338,9 +473,6 @@ fn merge(mut base: Config, partial: PartialConfig) -> Config {
     }
     if let Some(v) = partial.base_prompt {
         base.base_prompt = Some(v);
-    }
-    if let Some(v) = partial.enable_rehydration {
-        base.enable_rehydration = v;
     }
 
     if let Some(p_mon) = partial.monitoring {
@@ -617,5 +749,364 @@ mod tests {
         let cfg = merge(Config::default(), partial);
 
         assert!(cfg.base_prompt.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // t-035d — typed knobs that the harness actually reads:
+    //   * `command_timeout_secs` used to be parsed and merged but never read, so
+    //     every command ran with the built-in default;
+    //   * the sandbox had no typed knob at all (env-only opt-out).
+    // These tests are pty-free: the sandbox outcome is asserted through
+    // `should_apply_sandbox(&SandboxInputs)`, never by executing a command.
+    // -----------------------------------------------------------------------
+
+    /// Install a config as the process-global active config and restore the
+    /// previous state (including "none active") when the guard is dropped, so a
+    /// failing assertion cannot leak config state into another test.
+    struct ActiveConfigTestGuard {
+        previous: Option<Config>,
+    }
+
+    impl ActiveConfigTestGuard {
+        fn install(cfg: Config) -> Self {
+            let previous = get_active();
+            set_active(cfg);
+            Self { previous }
+        }
+    }
+
+    impl Drop for ActiveConfigTestGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(cfg) => set_active(cfg),
+                None => clear_active(),
+            }
+        }
+    }
+
+    /// Set `MARMEL_DISABLE_SANDBOX` for one test and restore the environment
+    /// afterwards.
+    struct SandboxEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl SandboxEnvGuard {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var_os(crate::harness::pty::SANDBOX_OPTOUT_ENV);
+            // SAFETY: these tests are gated with `--test-threads=1`, and the key
+            // is read by nothing else in this binary while it is set; the guard
+            // restores the original state on drop.
+            unsafe {
+                std::env::set_var(crate::harness::pty::SANDBOX_OPTOUT_ENV, value);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for SandboxEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: as above — single-threaded test run, restoring the previous
+            // value of a key no other test in this binary depends on.
+            unsafe {
+                match self.previous.take() {
+                    Some(previous) => {
+                        std::env::set_var(crate::harness::pty::SANDBOX_OPTOUT_ENV, previous);
+                    }
+                    None => {
+                        std::env::remove_var(crate::harness::pty::SANDBOX_OPTOUT_ENV);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The decision the harness would take for `opt_out` — pure logic, no PTY,
+    /// no Landlock probe, no `current_exe()`.
+    fn sandbox_decision_for(
+        opt_out: crate::harness::pty::OptOut,
+    ) -> crate::harness::pty::SandboxDecision {
+        use crate::harness::pty::SandboxInputs;
+        let exe = std::path::PathBuf::from("/usr/local/bin/marmel-dev");
+        let inputs = SandboxInputs {
+            landlock_supported: true,
+            test_harness_exe: false,
+            resolved_exe: Some(exe.as_path()),
+            opt_out,
+        };
+        crate::harness::pty::should_apply_sandbox(&inputs)
+    }
+
+    fn partial_from(toml_str: &str) -> Config {
+        let partial: PartialConfig = toml::from_str(toml_str).expect("parses");
+        merge(Config::default(), partial)
+    }
+
+    #[test]
+    fn sandbox_disabled_knob_defaults_to_false() {
+        assert!(
+            !Config::default().sandbox_disabled,
+            "the sandbox must default to ON (fail-closed)"
+        );
+        assert!(
+            !partial_from("backend_url = \"http://localhost:9000/v1\"\n").sandbox_disabled,
+            "an absent `sandbox_disabled` keeps the default"
+        );
+        assert!(
+            !partial_from("sandbox_disabled = false\n").sandbox_disabled,
+            "an explicit false stays false"
+        );
+        // No active config ⇒ knob off.
+        let previous = get_active();
+        clear_active();
+        let observed = sandbox_disabled();
+        if let Some(cfg) = previous {
+            set_active(cfg);
+        }
+        assert!(!observed, "no active config must never disable the sandbox");
+    }
+
+    #[test]
+    fn sandbox_disabled_knob_parses_from_toml() {
+        let cfg = partial_from("sandbox_disabled = true\n");
+        assert!(cfg.sandbox_disabled, "`sandbox_disabled = true` parses");
+
+        // It also parses in a realistic file, next to the other knobs, without
+        // disturbing them.
+        let cfg = partial_from(
+            r#"
+                backend_url = "http://localhost:9000/v1"
+                command_timeout_secs = 90
+                sandbox_disabled = true
+
+                [monitoring]
+                enabled = true
+            "#,
+        );
+        assert!(cfg.sandbox_disabled);
+        assert_eq!(cfg.command_timeout_secs, 90);
+        assert_eq!(cfg.backend_url, "http://localhost:9000/v1");
+    }
+
+    /// (a) the knob reaches `SandboxInputs::opt_out` and therefore the decision.
+    #[test]
+    fn sandbox_disabled_knob_reaches_sandbox_inputs_opt_out() {
+        let cfg = partial_from("sandbox_disabled = true\n");
+        assert!(cfg.sandbox_disabled);
+
+        let _guard = ActiveConfigTestGuard::install(cfg);
+        // Env unset: the env parser contributes `None`, so only the knob can opt out.
+        let _env = SandboxEnvGuard::set("");
+        let env_opt_out = crate::harness::sandbox::opt_out_from_env();
+        assert_eq!(
+            env_opt_out,
+            crate::harness::pty::OptOut::None,
+            "an empty env value is not an opt-out"
+        );
+
+        let opt_out = sandbox_opt_out(env_opt_out);
+        assert_eq!(
+            opt_out,
+            crate::harness::pty::OptOut::Explicit {
+                setting: format!("{SANDBOX_DISABLED_KEY}=true")
+            },
+            "the typed knob must produce the opt-out that the harness feeds into SandboxInputs"
+        );
+
+        assert_eq!(
+            sandbox_decision_for(opt_out),
+            crate::harness::pty::SandboxDecision::Skip {
+                resolved_exe: Some(std::path::PathBuf::from("/usr/local/bin/marmel-dev")),
+                skip: crate::harness::pty::SandboxSkip::OptOut {
+                    setting: format!("{SANDBOX_DISABLED_KEY}=true")
+                }
+            },
+            "with the knob on, the harness must skip the Landlock re-entry (and warn)"
+        );
+    }
+
+    /// (b) direction 1: knob OFF + env set ⇒ the env opt-out still applies.
+    #[test]
+    fn sandbox_env_opt_out_wins_independently_of_the_knob() {
+        let _guard = ActiveConfigTestGuard::install(Config {
+            sandbox_disabled: false,
+            ..Config::default()
+        });
+        let _env = SandboxEnvGuard::set("1");
+
+        let env_opt_out = crate::harness::sandbox::opt_out_from_env();
+        assert_eq!(
+            env_opt_out,
+            crate::harness::pty::OptOut::Explicit {
+                setting: format!("{}=1", crate::harness::pty::SANDBOX_OPTOUT_ENV)
+            },
+            "the env fallback must keep working on its own"
+        );
+
+        let opt_out = sandbox_opt_out(env_opt_out);
+        assert_eq!(
+            opt_out,
+            crate::harness::pty::OptOut::Explicit {
+                setting: format!("{}=1", crate::harness::pty::SANDBOX_OPTOUT_ENV)
+            },
+            "the env setting keeps attribution even with the knob present"
+        );
+        assert!(
+            matches!(
+                sandbox_decision_for(opt_out),
+                crate::harness::pty::SandboxDecision::Skip {
+                    skip: crate::harness::pty::SandboxSkip::OptOut { .. },
+                    ..
+                }
+            ),
+            "knob off + env set must still Skip"
+        );
+    }
+
+    /// (b) direction 2: knob ON + env unset ⇒ Skip; and with both set the outcome
+    /// is the same Skip (never an AND of the two sources).
+    #[test]
+    fn sandbox_knob_opts_out_without_the_env_var() {
+        let _guard = ActiveConfigTestGuard::install(Config {
+            sandbox_disabled: true,
+            ..Config::default()
+        });
+        let _env = SandboxEnvGuard::set("0"); // present but falsy: not an env opt-out
+
+        let env_opt_out = crate::harness::sandbox::opt_out_from_env();
+        assert_eq!(env_opt_out, crate::harness::pty::OptOut::None);
+
+        let opt_out = sandbox_opt_out(env_opt_out.clone());
+        assert_eq!(
+            opt_out,
+            crate::harness::pty::OptOut::Explicit {
+                setting: format!("{SANDBOX_DISABLED_KEY}=true")
+            }
+        );
+        assert!(matches!(
+            sandbox_decision_for(opt_out),
+            crate::harness::pty::SandboxDecision::Skip {
+                skip: crate::harness::pty::SandboxSkip::OptOut { .. },
+                ..
+            }
+        ));
+
+        // Both sources at once: still a Skip, attributed to the env variable.
+        let _both = SandboxEnvGuard::set("yes");
+        let both = sandbox_opt_out(crate::harness::sandbox::opt_out_from_env());
+        assert_eq!(
+            both,
+            crate::harness::pty::OptOut::Explicit {
+                setting: format!("{}=yes", crate::harness::pty::SANDBOX_OPTOUT_ENV)
+            }
+        );
+
+        // And with the knob off and nothing in the env, the sandbox is ON.
+        let _off = ActiveConfigTestGuard::install(Config::default());
+        let _none = SandboxEnvGuard::set("");
+        assert_eq!(
+            sandbox_decision_for(sandbox_opt_out(crate::harness::sandbox::opt_out_from_env())),
+            crate::harness::pty::SandboxDecision::Apply {
+                resolved_exe: std::path::PathBuf::from("/usr/local/bin/marmel-dev")
+            },
+            "nothing opted out ⇒ Landlock re-entry (fail-closed default)"
+        );
+    }
+
+    /// (d) the configured `command_timeout_secs` is what the harness applies.
+    #[test]
+    fn command_timeout_secs_reaches_execution_timeout() {
+        let cfg = partial_from("command_timeout_secs = 17\n");
+        assert_eq!(cfg.command_timeout_secs, 17, "parsed and merged");
+
+        let _guard = ActiveConfigTestGuard::install(cfg);
+        let applied = effective_command_timeout_secs(None);
+        assert_eq!(applied, 17, "the configured value must be the applied one");
+        assert_eq!(
+            std::time::Duration::from_secs(applied),
+            std::time::Duration::from_secs(17),
+            "the value handed to the execution timeout is the configured one"
+        );
+
+        // A per-call override still wins over the configured default.
+        assert_eq!(effective_command_timeout_secs(Some(42)), 42);
+
+        // No config loaded at all ⇒ the documented built-in default.
+        let _clear = ActiveConfigTestGuard::install(Config::default());
+        assert_eq!(
+            active_command_timeout_secs(),
+            DEFAULT_COMMAND_TIMEOUT_SECS,
+            "the default config keeps 60 s"
+        );
+    }
+
+    #[test]
+    fn command_timeout_secs_default_when_no_config_is_active() {
+        let previous = get_active();
+        clear_active();
+        let applied = effective_command_timeout_secs(None);
+        match previous {
+            Some(cfg) => set_active(cfg),
+            None => clear_active(),
+        }
+        assert_eq!(applied, DEFAULT_COMMAND_TIMEOUT_SECS);
+        assert_eq!(Config::default().command_timeout_secs, 60);
+    }
+
+    /// Out-of-range values (from the file or from the model) are clamped into the
+    /// documented range instead of being applied verbatim.
+    #[test]
+    fn command_timeout_secs_out_of_range_is_clamped() {
+        for (configured, expected) in [
+            (0, MIN_COMMAND_TIMEOUT_SECS),
+            (9999, MAX_COMMAND_TIMEOUT_SECS),
+            (30, 30),
+        ] {
+            let _guard = ActiveConfigTestGuard::install(Config {
+                command_timeout_secs: configured,
+                ..Config::default()
+            });
+            let applied = effective_command_timeout_secs(None);
+            assert_eq!(
+                applied, expected,
+                "`command_timeout_secs = {configured}` must apply as {expected} s"
+            );
+            assert!(
+                (MIN_COMMAND_TIMEOUT_SECS..=MAX_COMMAND_TIMEOUT_SECS).contains(&applied),
+                "applied value left the documented range: {applied}"
+            );
+        }
+
+        let _guard = ActiveConfigTestGuard::install(Config::default());
+        assert_eq!(
+            effective_command_timeout_secs(Some(0)),
+            MIN_COMMAND_TIMEOUT_SECS
+        );
+        assert_eq!(
+            effective_command_timeout_secs(Some(9999)),
+            MAX_COMMAND_TIMEOUT_SECS
+        );
+    }
+
+    /// The harness call site really reads both knobs: a renamed or removed
+    /// wiring line must fail here, not in production.
+    #[test]
+    fn harness_call_site_wires_both_config_knobs() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/harness/pty.rs"))
+                .expect("src/harness/pty.rs must be readable");
+
+        assert!(
+            src.contains("crate::config::sandbox_opt_out(opt_out_from_env())"),
+            "the SandboxInputs construction must feed the config knob into \
+             SandboxInputs::opt_out alongside the env fallback"
+        );
+        assert!(
+            src.contains("crate::config::effective_command_timeout_secs("),
+            "run_command must take its timeout from the config, not the built-in constant"
+        );
+        assert!(
+            src.contains("opt_out_from_env()"),
+            "the env-only opt-out must keep working on its own"
+        );
     }
 }

@@ -1,7 +1,13 @@
 //! Steer arbitration: event type, shared history, and the spawned arbitrator task.
+//!
+//! The arbitration round machine itself is shared with the paused-stream sink and lives in
+//! [`super::arbiter`]; this module is the adapter that feeds it the spawned-task inputs and
+//! surfaces its progress as [`SteerArbEvent`]s.
 
-use crate::llm::{ChatClient, PauseAction};
-use crate::ui::helpers::{format_active_subtasks, format_plan_progress_summary};
+use super::action;
+use super::arbiter::{self, ArbitrationChannel, SleepNotice};
+use crate::llm::ChatClient;
+use crate::ui::helpers::format_active_subtasks;
 use crate::ui::{Event, Renderer, SubagentDetail};
 use std::sync::Arc;
 
@@ -21,6 +27,12 @@ pub enum SteerArbEvent {
         user_msg: String,
         answer: String,
     },
+    /// A steering instruction whose arbitration ended in a **terminal Sleep**: it never reached
+    /// an action, so the host queues it for the next seam instead of dropping it.
+    DeferredSteer {
+        user_msg: String,
+        reason: String,
+    },
     Finished {
         decision: Option<crate::orchestrator::SteerDecision>,
         user_msg: String,
@@ -28,6 +40,45 @@ pub enum SteerArbEvent {
 }
 
 pub use crate::orchestrator::SharedSteeringHistory;
+
+/// Arbitration channel of the spawned-task host: progress is pushed onto the steer-arbitration
+/// event channel and rendered by [`super::drain`] on the UI side.
+struct EventChannel<'a> {
+    tx: &'a tokio::sync::mpsc::UnboundedSender<SteerArbEvent>,
+    first_round_active_subtasks: String,
+    first_round_has_active: bool,
+}
+
+impl ArbitrationChannel for EventChannel<'_> {
+    fn active_subtasks(&self, round: usize) -> String {
+        if round == 1 {
+            self.first_round_active_subtasks.clone()
+        } else {
+            crate::orchestrator::get_active_subtasks_str()
+        }
+    }
+
+    fn has_active_work(&self, round: usize) -> bool {
+        if round == 1 {
+            self.first_round_has_active
+        } else {
+            crate::orchestrator::has_active_workers()
+        }
+    }
+
+    fn round_started(&mut self, _round: usize) {
+        // "Arbitrating user steering instruction..." is emitted once, before the task is
+        // spawned; later rounds surface through the streamed deltas only.
+    }
+
+    fn decision_delta(&mut self, delta: &str) {
+        let _ = self.tx.send(SteerArbEvent::Delta(delta.to_string()));
+    }
+
+    fn sleep_notice(&mut self, notice: &SleepNotice) {
+        let _ = self.tx.send(SteerArbEvent::Delta(notice.delta_text()));
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_steer_arbitration(
@@ -55,137 +106,48 @@ pub fn spawn_steer_arbitration(
     let _ = renderer.flush();
 
     tokio::spawn(async move {
-        let mut loop_count = 0;
-        let mut decision = None;
         let mut synthesized_answer_opt = None;
 
-        while loop_count < 5 {
-            loop_count += 1;
-            let delta_tx = tx.clone();
-            let history_str = steering_history
-                .as_ref()
-                .and_then(|h| h.read().ok())
-                .map(|h| crate::orchestrator::format_steering_history(&h))
-                .unwrap_or_else(|| "None".to_string());
+        let mut channel = EventChannel {
+            tx: &tx,
+            first_round_active_subtasks: active_subtasks_str,
+            first_round_has_active: initial_has_active,
+        };
+        // A cancelled sleep does not end this host's work: the arbitration result is still
+        // post-processed (delegations, notices, history entry, `Finished` event).
+        let arbiter::ArbitrationOutcome {
+            decision, sleep, ..
+        } = arbiter::arbitrate_steering(
+            &mut channel,
+            &arbiter::ArbitrationRequest {
+                client: &client,
+                stats: &stats,
+                goal: &goal,
+                user_msg: &msg,
+                steering_history: steering_history.as_ref(),
+            },
+        )
+        .await;
 
-            let plan_content = crate::manager::phase::Plan::default()
-                .read()
-                .unwrap_or(None)
-                .unwrap_or_default();
-            let plan_progress_str = format_plan_progress_summary(&plan_content);
-            let active_subtasks_str = if loop_count == 1 {
-                active_subtasks_str.clone()
-            } else {
-                crate::orchestrator::get_active_subtasks_str()
-            };
-            let has_active = if loop_count == 1 {
-                initial_has_active
-            } else {
-                crate::orchestrator::has_active_workers()
-            };
-
-            let effective_msg = if loop_count == 1 {
-                msg.clone()
-            } else {
-                format!(
-                    "{msg} (SYSTEM NOTICE: You already slept as requested and have now woken up to re-evaluate. Inspect the updated Active Subtasks and Plan Progress above and deliver your direct factual response or action now.)"
-                )
-            };
-
-            let ctx = crate::orchestrator::steer::SteerContext {
-                main_goal: &goal,
-                orchestrator_status: if !has_active {
-                    "Active (planning/turn)"
-                } else {
-                    "Active (subagents executing)"
-                },
-                pending_approval: "None",
-                plan_progress: &plan_progress_str,
-                plan_content: &plan_content,
-                available_agents: "",
-                steering_history: &history_str,
-                user_message: &effective_msg,
-                active_subtasks: &active_subtasks_str,
-            };
-            let preempt_handle =
-                crate::orchestrator::preempt_conflicting_stream(client.model(), &effective_msg)
-                    .await;
-
-            let cur_decision = crate::orchestrator::steer::arbitrate_steer_context_stream(
-                &client,
-                &stats,
-                ctx,
-                move |delta| {
-                    let _ = delta_tx.send(SteerArbEvent::Delta(delta.to_string()));
-                },
-            )
-            .await;
-
-            let is_global_abort = matches!(
-                crate::orchestrator::normalize_steer_decision(
-                    cur_decision.as_ref().map(|d| d.decision.as_str())
-                ),
-                "AbortImmediately" | "RejectPlan"
+        // Durable steering around Sleep: if the round machine ended on a Sleep decision, the
+        // instruction never reached an action, so it is queued for the next seam rather than lost
+        // with this arbitration.
+        if arbiter::is_terminal_sleep(decision.as_ref()) {
+            let reason = arbiter::durable_steer_reason(&sleep);
+            tracing::warn!(
+                sleep_extensions = sleep.extensions,
+                slept_secs = sleep.slept_secs,
+                reason = %reason,
+                "Steering instruction survived a terminal arbitrator sleep — queued for the next seam"
             );
-
-            if is_global_abort {
-                preempt_handle.complete_all(PauseAction::Abort);
-                crate::orchestrator::cancel_all();
-            } else {
-                preempt_handle.complete_with_subtask_decision(cur_decision.as_ref());
-                if let Some(ref d) = cur_decision {
-                    for st in &d.subtasks {
-                        if st.action.eq_ignore_ascii_case("Cancel") {
-                            crate::orchestrator::cancel_active_worker(
-                                st.agent_name.as_deref(),
-                                Some(&st.tool_call_id),
-                            );
-                        }
-                    }
-                }
-            }
-
-            decision = cur_decision;
-
-            if let Some(ref d) = decision
-                && crate::orchestrator::normalize_steer_decision(Some(&d.decision)) == "Sleep"
-            {
-                let sleep_secs = d.sleep_seconds.unwrap_or(5).min(300);
-                let _ = tx.send(SteerArbEvent::Delta(format!(
-                    "\n[Steering Arbitrator sleeping for {sleep_secs}s...]\n"
-                )));
-                if let Some(ref hist_lock) = steering_history
-                    && let Ok(mut hist) = hist_lock.write()
-                {
-                    let note = d.response.as_deref().unwrap_or("Slept");
-                    hist.push((msg.clone(), format!("{note} (slept for {sleep_secs}s)")));
-                }
-                let cancel = crate::orchestrator::bus::global_cancellation_token();
-                let was_cancelled = tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)) => {
-                        let _ = tx.send(SteerArbEvent::Delta(format!(
-                            "[Steering Arbitrator woke up after {sleep_secs}s — re-evaluating status...]\n\n"
-                        )));
-                        false
-                    }
-                    _ = cancel.cancelled() => {
-                        let _ = tx.send(SteerArbEvent::Delta(
-                            "[Steering Arbitrator sleep cancelled]\n".to_string()
-                        ));
-                        true
-                    }
-                };
-                if was_cancelled {
-                    break;
-                }
-                continue;
-            }
-
-            break;
+            let _ = tx.send(SteerArbEvent::DeferredSteer {
+                user_msg: msg.clone(),
+                reason,
+            });
         }
 
         if let Some(ref d) = decision {
-            let tasks = crate::orchestrator::steer::extract_tasks_to_delegate(d, &msg);
+            let tasks = arbiter::delegation_tasks(Some(d), &msg);
             let mut completed_deliverables = Vec::new();
             for (agent, task_id, prompt) in tasks {
                 let _ = tx.send(SteerArbEvent::DelegationStarted {
@@ -193,24 +155,8 @@ pub fn spawn_steer_arbitration(
                     task_id: task_id.clone(),
                     prompt: prompt.clone(),
                 });
-                let res = crate::orchestrator::steer::execute_steer_subtask(
-                    &client,
-                    stats.clone(),
-                    agent,
-                    Some(task_id.clone()),
-                    &prompt,
-                )
-                .await;
-                let deliverable = match res {
-                    Ok(deliv) => deliv,
-                    Err(e) => crate::agents::Deliverable {
-                        marker: crate::agents::MissionMarker::Failed {
-                            reason: e.to_string(),
-                        },
-                        content: format!("Execution failed: {e}"),
-                        task_id: Some(task_id.clone()),
-                    },
-                };
+                let deliverable =
+                    arbiter::run_delegated_subtask(&client, &stats, agent, &task_id, &prompt).await;
                 let _ = tx.send(SteerArbEvent::DelegationCompleted {
                     agent,
                     task_id: task_id.clone(),
@@ -246,46 +192,32 @@ pub fn spawn_steer_arbitration(
         if let Some(ref d) = decision
             && crate::orchestrator::normalize_steer_decision(Some(&d.decision)) == "ForwardToWorker"
         {
-            for st in &d.subtasks {
-                if st.action.eq_ignore_ascii_case("ForwardNotice") {
-                    let target = st.agent_name.as_deref().unwrap_or(&st.tool_call_id);
-                    let msg_to_send = st.message.as_deref().unwrap_or(&msg);
-                    let notice =
-                        crate::orchestrator::post_notice_to_worker(target, msg_to_send, None);
-                    let _ = tx.send(SteerArbEvent::Delta(format!(
-                        "\n[Arbitrator]: Forwarded notice {} to {} — awaiting specialist reply.\n",
-                        notice.notice_id, target
-                    )));
-                    forwarded_notices.push((notice.notice_id, target.to_string()));
+            for (st, subtask_action) in action::routed(Some(d)) {
+                if subtask_action != action::ACTION_FORWARD_NOTICE {
+                    continue;
                 }
+                let target = action::notice_target(st);
+                let msg_to_send = st.message.as_deref().unwrap_or(&msg);
+                let posted = arbiter::post_notice_observable(target, msg_to_send);
+                let _ = tx.send(SteerArbEvent::Delta(format!(
+                    "\n[Arbitrator]: Forwarded notice {} to {} — awaiting specialist reply.\n",
+                    posted.notice.notice_id, target
+                )));
+                if !posted.dropped_older.is_empty() {
+                    // Inbox backpressure stays (drop-oldest at INBOX_CAPACITY) but is surfaced
+                    // instead of silently losing steering instructions.
+                    let drop_text = arbiter::capacity_drop_text(target, &posted.dropped_older);
+                    let _ = tx.send(SteerArbEvent::Delta(format!("[Arbitrator]: {drop_text}\n")));
+                }
+                forwarded_notices.push((posted.notice.notice_id, target.to_string()));
             }
         }
 
-        let recorded_resp = if let Some(ref synth) = synthesized_answer_opt {
-            synth.clone()
-        } else if let Some(ref d) = decision {
-            if let Some(ref r) = d.response {
-                r.clone()
-            } else if crate::orchestrator::normalize_steer_decision(Some(&d.decision)) == "Sleep" {
-                format!("Slept for {}s", d.sleep_seconds.unwrap_or(5))
-            } else if !forwarded_notices.is_empty() {
-                forwarded_notices
-                    .iter()
-                    .map(|(nid, tgt)| {
-                        format!("Forwarded notice {nid} to {tgt} (awaiting specialist reply)")
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            } else if crate::orchestrator::normalize_steer_decision(Some(&d.decision))
-                == "ForwardToWorker"
-            {
-                "Forwarded notice to worker (awaiting specialist reply)".to_string()
-            } else {
-                format!("Decision: {}", d.decision)
-            }
-        } else {
-            "No decision".to_string()
-        };
+        let recorded_resp = arbiter::recorded_response(
+            decision.as_ref(),
+            synthesized_answer_opt.as_deref(),
+            &forwarded_notices,
+        );
 
         if let Some(ref hist_lock) = steering_history
             && let Ok(mut hist) = hist_lock.write()

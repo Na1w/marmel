@@ -2,6 +2,7 @@ use super::*;
 use crate::agents::DelegationRequest;
 use crate::harness::{ToolError, ToolResult};
 use crate::tool_names::TOOL_DELEGATE_TASK;
+use std::path::Path;
 
 /// Build a manager rooted at a fresh temp plan dir for tests.
 fn test_manager(dir: &tempfile::TempDir) -> OrchestratorManager {
@@ -307,137 +308,6 @@ fn test_orchestr_synthesize_joins_deliverables() {
     assert!(out.contains("second"));
 }
 
-/// Deep-Freeze: `delegate()` snapshots the in-flight delegation to the
-/// Crash Journal and clears it once the worker returns (SPEC §3.4). After a
-/// clean run there is nothing frozen left on disk.
-#[tokio::test]
-async fn test_orchestr_delegate_snapshots_and_clears() {
-    let tmp = tempfile::tempdir().unwrap();
-    let m = test_manager(&tmp);
-    let req = DelegationRequest {
-        agent_name: Agent::Coder,
-        prompt: "Build the parser.".to_string(),
-        snippets: vec![],
-        task_id: None,
-        image_urls: None,
-        audio_urls: None,
-        recursion_granted: false,
-    };
-    assert!(!m.journal.is_frozen());
-    let d = m.delegate(req).await.expect("delegation succeeds");
-    assert!(matches!(d.marker, MissionMarker::Complete { .. }));
-    // Clean termination leaves no frozen checkpoint behind.
-    assert!(!m.journal.is_frozen());
-    // The journal logged at least a Frozen + Resolved pair.
-    let log = m.journal.journal().unwrap();
-    assert!(log.iter().any(|e| e.kind == JournalEventKind::Frozen));
-    assert!(log.iter().any(|e| e.kind == JournalEventKind::Resolved));
-}
-
-/// Deep-Freeze recovery: a manually frozen delegation is rehydrated by
-/// `recover_frozen()` using the identical worker_id and preserved sub_req.
-#[tokio::test]
-async fn test_orchestr_recover_frozen_rehydrates_identical_worker() {
-    let tmp = tempfile::tempdir().unwrap();
-    let m = test_manager(&tmp);
-    let req = DelegationRequest {
-        agent_name: Agent::Generalist,
-        prompt: "Resume the analysis.".to_string(),
-        snippets: vec!["notes.md".to_string()],
-        task_id: Some("t-777".to_string()),
-        image_urls: None,
-        audio_urls: None,
-        recursion_granted: false,
-    };
-    // Simulate a crash: freeze the delegation by hand (as `delegate()` would
-    // at start) and do NOT clear — as if the process died mid-run.
-    let worker_id = m
-        .journal
-        .snapshot(Agent::Generalist, &req)
-        .expect("snapshot written");
-    assert!(m.journal.is_frozen());
-
-    // Rehydrate on a "restarted" Manager rooted at the same plan dir.
-    let m2 = test_manager(&tmp);
-    let recovered = m2
-        .recover_frozen()
-        .await
-        .expect("recovery succeeds")
-        .expect("a frozen delegation existed");
-    assert!(matches!(recovered.marker, MissionMarker::Complete { .. }));
-    // The preserved brief is what was re-executed.
-    assert!(recovered.content.contains("Resume the analysis."));
-    // The frozen checkpoint was released after rehydration.
-    assert!(!m2.journal.is_frozen());
-    let evs = m2.delegation_events.lock().unwrap().clone();
-    assert_eq!(evs.len(), 2);
-    assert!(
-        matches!(&evs[0], DelegationEvent::Started { agent: Agent::Generalist, task: Some(t) } if t == "t-777")
-    );
-    assert!(
-        matches!(&evs[1], DelegationEvent::Completed { agent: Agent::Generalist, task: Some(t) } if t == "t-777")
-    );
-    let _ = worker_id;
-}
-
-/// Deep-Freeze recovery: with nothing frozen, `recover_frozen()` is a clean
-/// no-op (returns `None`).
-#[tokio::test]
-async fn test_orchestr_recover_frozen_none_when_clean() {
-    let tmp = tempfile::tempdir().unwrap();
-    let m = test_manager(&tmp);
-    assert!(!m.journal.is_frozen());
-    let res = m.recover_frozen().await.expect("no error on clean boot");
-    assert!(res.is_none());
-}
-
-/// Deep-Freeze recovery: a frozen delegation whose agent is no longer
-/// registered fails loudly (the frozen task is marked Failed, not silently
-/// dropped), satisfying "rehydrate OR properly fail".
-#[tokio::test]
-async fn test_orchestr_recover_frozen_fails_when_role_unknown() {
-    let tmp = tempfile::tempdir().unwrap();
-    // Freeze a delegation into the journal dir directly.
-    let m = test_manager(&tmp);
-    let req = DelegationRequest {
-        agent_name: Agent::Coder,
-        prompt: "orphan task".to_string(),
-        snippets: vec![],
-        task_id: None,
-        image_urls: None,
-        audio_urls: None,
-        recursion_granted: false,
-    };
-    let wid = m.journal.snapshot(Agent::Coder, &req).unwrap();
-
-    // A manager with an EMPTY registry cannot rehydrate the frozen role.
-    let mut m2 = test_manager(&tmp);
-    m2.registry = SpecialistRegistry::default();
-    let err = m2
-        .recover_frozen()
-        .await
-        .expect_err("fails loudly when role unknown");
-    assert!(err.to_string().contains("cannot be rehydrated"));
-    // The frozen checkpoint is released with a Failed journal event.
-    assert!(!m2.journal.is_frozen());
-    assert!(
-        m2.journal
-            .journal()
-            .unwrap()
-            .iter()
-            .any(|e| e.kind == JournalEventKind::Failed && e.worker_id == wid)
-    );
-    let evs = m2.delegation_events.lock().unwrap().clone();
-    assert_eq!(evs.len(), 1);
-    assert!(matches!(
-        &evs[0],
-        DelegationEvent::Failed {
-            agent: Agent::Coder,
-            ..
-        }
-    ));
-}
-
 // --- REQ-ORCH-005: `handle_delegate_task` handler-level tests ---
 
 /// REQ-ORCH-005 canonical signature: `handle_delegate_task` accepts the full
@@ -567,6 +437,250 @@ async fn test_orchestr_run_executing_rejects_domain_module() {
         .unwrap();
     let res = m.run_executing(&|_| Agent::Researcher).await;
     assert!(res.is_err());
+}
+
+// --- M8: the Silent Dispatcher must never read "the plan could not be read" as
+//     "the mission is finished" (`docs/recon_bugs_manager.md` M8). The gate now
+//     uses the fallible plan API added in t-031h (`Plan::try_pending_tasks`), so
+//     a read failure is an Err, a successfully-read empty pending list is the
+//     only completion signal, and dispatch of real pending tasks is unchanged.
+
+/// Minimal ERROR-level log capture (same shape as the WARN counter in
+/// `steer_tests.rs`): proves the plan-read failure is *logged* loudly, not only
+/// returned as a `Result`.
+#[derive(Clone, Debug, Default)]
+struct ErrorLogCapture {
+    messages: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl ErrorLogCapture {
+    fn messages(&self) -> Vec<String> {
+        self.messages.lock().unwrap().clone()
+    }
+}
+
+struct MessageVisitor<'a> {
+    found: &'a mut Vec<String>,
+}
+
+impl tracing::field::Visit for MessageVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.found.push(format!("{value:?}"));
+        }
+    }
+}
+
+impl tracing::Subscriber for ErrorLogCapture {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.level() == &tracing::Level::ERROR
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        if event.metadata().level() != &tracing::Level::ERROR {
+            return;
+        }
+        let mut messages = self.messages.lock().unwrap();
+        event.record(&mut MessageVisitor {
+            found: &mut messages,
+        });
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// M8 (i): an execution plan that exists but **cannot be read** must abort the
+/// Silent Dispatcher with an explicit, logged error — it must never return `Ok`
+/// (which the Manager reads as "the Executing phase is done"), and it must never
+/// delegate anything or touch the plan on disk.
+#[tokio::test]
+async fn test_orchestr_run_executing_plan_read_error_is_not_completion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut m = test_manager(&tmp);
+    std::fs::create_dir_all(m.plan.dir()).unwrap();
+    // A plan file that exists but is not decodable: `fs::read_to_string` fails.
+    let undecodable: [u8; 12] = [
+        0xff, 0xfe, 0x00, b'-', b' ', b'[', b' ', b']', b' ', b'[', b't', b'-',
+    ];
+    std::fs::write(m.plan.plan_path(), undecodable).unwrap();
+
+    // Precondition at the plan layer: the state is UNKNOWN. The old Vec-shaped
+    // wrapper still degrades to an empty list — which is exactly the lie this
+    // call site used to act on.
+    assert!(m.plan.exists(), "the plan file is on disk");
+    assert!(
+        m.plan.try_pending_tasks().is_err(),
+        "the fallible API must surface the read failure"
+    );
+    assert!(
+        m.plan.pending_tasks().is_empty(),
+        "the compatibility wrapper still swallows the failure"
+    );
+    assert!(
+        !m.plan.is_complete(),
+        "an unreadable plan is never complete (M8)"
+    );
+
+    let capture = ErrorLogCapture::default();
+    let guard = tracing::subscriber::set_default(capture.clone());
+    let res = m.run_executing(&|_| Agent::Coder).await;
+    drop(guard);
+
+    let err =
+        res.expect_err("M8: a plan read failure must NOT return Ok — the mission is not complete");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("could not be read") && msg.contains("execution_plan.md"),
+        "the error must name the plan and the failure, got: {msg}"
+    );
+    assert!(
+        msg.contains("UNKNOWN") && msg.contains("NOT complete"),
+        "the error must state that the plan state is unknown and the mission is \
+         NOT complete, got: {msg}"
+    );
+
+    // Nothing was dispatched and the plan bytes on disk are untouched: no work
+    // was silently dropped.
+    assert!(
+        m.delegation_events.lock().unwrap().is_empty(),
+        "a plan read failure must not dispatch (or drop) any task"
+    );
+    assert_eq!(
+        std::fs::read(m.plan.plan_path()).expect("plan file still there"),
+        undecodable,
+        "the failed run must not mutate the plan"
+    );
+    assert!(
+        m.plan.try_pending_tasks().is_err(),
+        "the plan state is still UNKNOWN after the failed run"
+    );
+
+    // The failure is logged as an error, not merely returned.
+    let logged = capture.messages();
+    assert!(
+        logged.iter().any(|entry| {
+            entry.contains("Silent Dispatcher stopped") && entry.contains("could not be read")
+        }),
+        "expected an explicit ERROR log naming the failure, got: {logged:?}"
+    );
+}
+
+/// M8 (ii): a plan that **was read successfully** and has nothing pending —
+/// every box ticked, or no plan file at all — keeps the pre-existing completion
+/// path: `Ok(..)`, no delegation, and no error logged. This is what distinguishes
+/// "nothing pending" from "cannot read" in the migrated gate.
+#[tokio::test]
+async fn test_orchestr_run_executing_empty_pending_list_still_completes() {
+    let capture = ErrorLogCapture::default();
+    let guard = tracing::subscriber::set_default(capture.clone());
+
+    // (a) A readable plan whose tasks are all checked off.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut m = test_manager(&tmp);
+    m.create_plan("- [x] [t-800] Already done\n- [x] (t-801) Also done\n")
+        .unwrap();
+    assert!(
+        m.plan
+            .try_pending_tasks()
+            .expect("readable plan")
+            .is_empty(),
+        "the pending list is legitimately empty"
+    );
+    let done = m
+        .run_executing(&|_| Agent::Coder)
+        .await
+        .expect("a successfully-read empty pending list still completes");
+    assert!(done.is_empty(), "there was nothing to dispatch");
+    assert!(
+        m.delegation_events.lock().unwrap().is_empty(),
+        "no delegation for an already finished plan"
+    );
+
+    // (b) No plan file at all: also a successful read with nothing pending.
+    let tmp2 = tempfile::tempdir().unwrap();
+    let mut m2 = test_manager(&tmp2);
+    assert!(!m2.plan.exists());
+    assert!(
+        m2.plan
+            .try_pending_tasks()
+            .expect("no plan file is not an error")
+            .is_empty()
+    );
+    let done2 = m2
+        .run_executing(&|_| Agent::Coder)
+        .await
+        .expect("a missing plan file is a legitimate empty pending set");
+    assert!(done2.is_empty());
+
+    drop(guard);
+    let logged = capture.messages();
+    assert!(
+        logged.is_empty(),
+        "the completion path must not log an error, got: {logged:?}"
+    );
+}
+
+/// M8 (iii): the normal path is unchanged — pending tasks are dispatched once
+/// each, checked off on completion, and the loop terminates via the empty-pending
+/// completion path.
+#[tokio::test]
+async fn test_orchestr_run_executing_dispatches_pending_tasks_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut m = test_manager(&tmp);
+    m.create_plan("- [ ] [t-810] Build the parser\n- [ ] [t-811] Write the tests\n")
+        .unwrap();
+    assert_eq!(
+        m.plan.try_pending_tasks().unwrap(),
+        vec!["t-810".to_string(), "t-811".to_string()]
+    );
+
+    let dispatched: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let scheduler = {
+        let dispatched = dispatched.clone();
+        move |task_id: &str| {
+            dispatched.lock().unwrap().push(task_id.to_string());
+            if task_id == "t-811" {
+                Agent::Debugger
+            } else {
+                Agent::Coder
+            }
+        }
+    };
+
+    let results = m
+        .run_executing(&scheduler)
+        .await
+        .expect("pending tasks dispatch normally");
+    assert_eq!(results.len(), 2, "one deliverable per plan task");
+    assert_eq!(
+        *dispatched.lock().unwrap(),
+        vec!["t-810".to_string(), "t-811".to_string()],
+        "each pending task dispatched exactly once"
+    );
+    assert!(
+        results.iter().all(|d| d.task_id.is_some()),
+        "deliverables stay bound to their task id"
+    );
+
+    // The same completion signal as before the migration: everything checked off.
+    assert!(
+        m.plan.try_pending_tasks().unwrap().is_empty(),
+        "all tasks checked off by the dispatcher"
+    );
+    assert!(m.plan.is_complete(), "the plan reached completion");
+    let events = m.delegation_events.lock().unwrap().clone();
+    assert_eq!(events.len(), 4, "Started + Completed per delegation");
 }
 
 #[tokio::test]
@@ -716,5 +830,332 @@ async fn test_bus_hammer_concurrent_emitters() {
     assert_eq!(
         event_count, expected,
         "expected exactly {expected} events, got {event_count}"
+    );
+}
+
+#[test]
+fn test_stream_identity_matches_decorated_task_ids() {
+    // Dedup cluster C1 part 2: `StreamIdentity::matches` normalizes all three
+    // inputs through `crate::task_id`, and decoration-only / empty targets stay
+    // "absent" (never a wildcard match).
+    let identity = StreamIdentity {
+        agent_tag: "coder-t-001".to_string(),
+        agent_name: Some("coder".to_string()),
+        task_id: Some("[t-001]".to_string()),
+        cancel_token: None,
+    };
+    assert!(identity.matches(Some("[Coder]"), "\"t-001\""));
+    assert!(identity.matches(None, "(t-001)"));
+    assert!(identity.matches(Some("'coder'"), ""));
+    assert!(!identity.matches(None, ""));
+    assert!(!identity.matches(None, "[]"));
+    assert!(!identity.matches(None, "t-999"));
+}
+
+/// Re-export guard (t-048): the live worker loops in `src/agents/runner/*` reach
+/// the notice API through the crate-level `crate::orchestrator::…` path. Pinning
+/// those paths here means a rename inside `notice.rs` fails at compile time
+/// instead of silently leaving a turn loop without a drain seam.
+#[test]
+fn test_notice_api_is_reachable_through_the_crate_level_path() {
+    let _drain_mid_turn =
+        crate::orchestrator::drain_worker_notices_mid_turn as fn(&str) -> Vec<SteerNotice>;
+    let _drain_report = crate::orchestrator::drain_worker_notices_report
+        as fn(&str) -> crate::orchestrator::notice::NoticeDrainOutcome;
+    let _render = crate::orchestrator::render_notice_for_worker as fn(&SteerNotice) -> String;
+    let _addresses = crate::orchestrator::notice_addresses_worker as fn(&SteerNotice, &str) -> bool;
+    let _get_for_worker =
+        crate::orchestrator::get_pending_notice_for_worker as fn(&str, &str) -> Option<SteerNotice>;
+    let _record_reply = crate::orchestrator::record_worker_reply_for_notice
+        as fn(&str, &str, &str) -> Result<SteerNotice, crate::orchestrator::NoticeReplyRejection>;
+
+    let notice = SteerNotice {
+        notice_id: "notice-reexport-probe".to_string(),
+        user_inquiry: "probe the re-export".to_string(),
+        target_worker: "probeagent-t-reexport-probe".to_string(),
+        created_at_ms: 0,
+    };
+    // The rendering carries the notice id verbatim — that is what makes the
+    // strict reply contract satisfiable for a worker.
+    assert!(
+        crate::orchestrator::render_notice_for_worker(&notice).contains("notice-reexport-probe")
+    );
+    assert!(crate::orchestrator::notice_addresses_worker(
+        &notice,
+        "probeagent-t-reexport-probe"
+    ));
+    assert!(!crate::orchestrator::notice_addresses_worker(
+        &notice,
+        "probeagent-t-reexport-other"
+    ));
+}
+
+/// Single-rendering guard (t-048): the transcript text of a steering notice is
+/// produced in exactly ONE place in `src/` — `render_notice_for_worker`.
+///
+/// Before t-048 there were three copies of that format string (the canonical
+/// renderer, one inline copy in the specialist loop, one in the shared fix
+/// loop), and the inline copies had already drifted from the reply contract the
+/// renderer promises. Two live loops each with their own rendering is how a
+/// worker gets told one reply protocol by one turn and another by the next.
+#[test]
+fn test_notice_transcript_is_rendered_in_exactly_one_place() {
+    // Assembled rather than spelled out, so this file cannot match its own
+    // needle (the same trick the raw-tool-name literal guard plays).
+    let needle = format!("[Steering {} Arbitrator", "Notice from");
+
+    let mut hits: Vec<(String, usize)> = Vec::new();
+    walk_src_for(Path::new("src"), &needle, &mut hits);
+
+    let total: usize = hits.iter().map(|(_, count)| count).sum();
+    assert_eq!(
+        hits.len(),
+        1,
+        "the notice transcript rendering must live in exactly one src file, found {hits:?}"
+    );
+    assert_eq!(
+        total, 1,
+        "exactly one rendering of a steering notice may exist in src/, found {total}: {hits:?}"
+    );
+    assert!(
+        hits[0].0.ends_with("orchestrator/notice.rs"),
+        "the single notice rendering must belong to `render_notice_for_worker` in \
+         src/orchestrator/notice.rs, got {}",
+        hits[0].0
+    );
+}
+
+fn walk_src_for(dir: &Path, needle: &str, out: &mut Vec<(String, usize)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_src_for(&path, needle, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            let count = content.matches(needle).count();
+            if count > 0 {
+                out.push((path.to_string_lossy().replace('\\', "/"), count));
+            }
+        }
+    }
+}
+
+// --- Gate t-055: the disk-first prompt lookup in `OrchestratorManager::delegate`
+//     (`saved_prompt_path_for_task`) is grammar-gated by
+//     `crate::task_id::validate_task_id` — the single grammar authority for task
+//     ids. A rejected id is a typed refusal, so the join never happens, the read
+//     is never attempted, and the delegation degrades exactly like a missing
+//     prompt file: JIT prompt synthesis.
+
+/// WARN-level capture for the rejected-task-id boundary (same shape as
+/// [`ErrorLogCapture`] above, at WARN instead of ERROR).
+#[derive(Clone, Default)]
+struct RejectedTaskIdWarns(Arc<std::sync::atomic::AtomicUsize>);
+
+struct WarnMessageVisitor<'a> {
+    found: &'a mut Option<String>,
+}
+
+impl tracing::field::Visit for WarnMessageVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            *self.found = Some(format!("{value:?}"));
+        }
+    }
+}
+
+impl tracing::Subscriber for RejectedTaskIdWarns {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.level() == &tracing::Level::WARN
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _record: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        if event.metadata().level() != &tracing::Level::WARN {
+            return;
+        }
+        let mut found = None;
+        event.record(&mut WarnMessageVisitor { found: &mut found });
+        if let Some(message) = found
+            && message.contains("Rejected task id")
+        {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// Every hostile task-id spelling is refused with its own typed variant, and no
+/// path is ever returned — so the read that used to follow the join is never
+/// attempted, and nothing is created in the prompts directory either.
+#[test]
+fn test_saved_prompt_path_refuses_hostile_task_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plan_dir = tmp.path().join("plan");
+    let prompts_dir = plan_dir.join("prompts");
+    std::fs::create_dir_all(&prompts_dir).unwrap();
+    // Exactly where the un-gated `prompts/{clean}.md` join resolved for the id
+    // `../escape`: one level ABOVE the prompts directory.
+    let planted = plan_dir.join("escape.md");
+    std::fs::write(&planted, "planted blueprint outside the prompts dir").unwrap();
+    let long = format!("t-{}", "y".repeat(70));
+
+    assert_eq!(
+        saved_prompt_path_for_task(&prompts_dir, Some("../escape")).err(),
+        Some(crate::task_id::TaskIdError::DotDotSegment)
+    );
+    assert_eq!(
+        saved_prompt_path_for_task(&prompts_dir, Some("a/b")).err(),
+        Some(crate::task_id::TaskIdError::PathSeparator { ch: '/' })
+    );
+    assert_eq!(
+        saved_prompt_path_for_task(&prompts_dir, Some("..")).err(),
+        Some(crate::task_id::TaskIdError::DotDotSegment)
+    );
+    assert_eq!(
+        saved_prompt_path_for_task(&prompts_dir, Some("")).err(),
+        Some(crate::task_id::TaskIdError::Empty)
+    );
+    assert_eq!(
+        saved_prompt_path_for_task(&prompts_dir, Some(long.as_str())).err(),
+        Some(crate::task_id::TaskIdError::TooLong {
+            len: long.chars().count(),
+            max: crate::task_id::MAX_TASK_ID_LEN,
+        })
+    );
+    assert!(
+        saved_prompt_path_for_task(&prompts_dir, None)
+            .unwrap()
+            .is_none(),
+        "a request without a task id simply has no disk prompt to look up"
+    );
+
+    let stray: Vec<_> = std::fs::read_dir(&prompts_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "refused ids must not create anything in the prompts dir: {stray:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&planted).unwrap(),
+        "planted blueprint outside the prompts dir",
+        "the file outside the prompts dir was neither read nor written"
+    );
+}
+
+/// A normal `t-0NN` id — plain or decorated — still resolves to exactly one file
+/// name inside the prompts directory and round-trips through the disk-first
+/// lookup, so the gate does not change the happy path.
+#[test]
+fn test_saved_prompt_path_round_trips_a_normal_task_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plan_dir = tmp.path().join("plan");
+    let prompts_dir = plan_dir.join("prompts");
+    std::fs::create_dir_all(&prompts_dir).unwrap();
+
+    let bp = crate::agents::AgentBlueprint {
+        role_name: "coder_specialist".to_string(),
+        reasoning: "disk-first round trip".to_string(),
+        selected_skills: vec!["testing".to_string()],
+        allowed_tools: vec![TOOL_DELEGATE_TASK.to_string()],
+        system_prompt: "Disk-first prompt round trip for t-055.".to_string(),
+        task_id: Some("t-055".to_string()),
+    };
+    let written = bp.save_to_disk(&prompts_dir).expect("normal id persists");
+    assert_eq!(written, prompts_dir.join("t-055.md"));
+
+    for raw in ["t-055", "[t-055]", "\"t-055\""] {
+        let path = saved_prompt_path_for_task(&prompts_dir, Some(raw))
+            .unwrap_or_else(|e| panic!("{raw:?} must be accepted by the grammar authority: {e}"))
+            .unwrap_or_else(|| panic!("{raw:?} must resolve to a prompt path"));
+        assert_eq!(
+            path,
+            prompts_dir.join("t-055.md"),
+            "{raw:?} must resolve to the pre-generated file inside the prompts dir"
+        );
+        let loaded = crate::agents::AgentBlueprint::load_from_disk(&path)
+            .expect("the pre-generated prompt is readable");
+        assert_eq!(loaded.role_name, "coder_specialist");
+    }
+}
+
+/// End-to-end at the delegation boundary: a refused task id must not fail the
+/// delegation (the JIT-synthesis fallback is the contract), must be logged as a
+/// warning naming the rejected id, and must never read or write outside the
+/// prompts directory.
+#[test]
+fn test_delegate_with_rejected_task_id_falls_back_to_jit_and_warns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let m = test_manager(&tmp);
+    let prompts_dir = tmp.path().join("prompts");
+    std::fs::create_dir_all(&prompts_dir).unwrap();
+    // The un-gated join for `../escape` resolved to `<plan dir>/escape.md`.
+    let planted = tmp.path().join("escape.md");
+    let planted_text = "---\nrole_name: \"planted_outside_prompts\"\n---\n\nplanted\n";
+    std::fs::write(&planted, planted_text).unwrap();
+
+    let req = DelegationRequest {
+        agent_name: Agent::Coder,
+        prompt: "Implement the escape probe.".to_string(),
+        snippets: vec![],
+        task_id: Some("../escape".to_string()),
+        image_urls: None,
+        audio_urls: None,
+        recursion_granted: false,
+    };
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let deliverable =
+        tracing::subscriber::with_default(RejectedTaskIdWarns(counter.clone()), || {
+            rt.block_on(m.delegate(req))
+        })
+        .expect("a rejected task id must not fail the delegation: JIT synthesis is the fallback");
+    assert_eq!(
+        deliverable.task_id.as_deref(),
+        Some("../escape"),
+        "the deliverable stays bound to the id as supplied — it is never rewritten"
+    );
+    assert!(
+        counter.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+        "the rejection must be reported with a tracing::warn! naming the rejected id"
+    );
+
+    let events = m.delegation_events.lock().unwrap().clone();
+    assert!(
+        events.iter().any(
+            |e| matches!(e, DelegationEvent::Started { task: Some(t), .. } if t == "../escape")
+        ),
+        "the JIT fallback delegation still ran to completion: {events:?}"
+    );
+
+    assert!(
+        !prompts_dir.join("escape.md").exists(),
+        "no prompt file may be derived from the rejected id inside the prompts dir"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&planted).unwrap(),
+        planted_text,
+        "the file outside the prompts dir must be neither read into the run nor rewritten"
     );
 }

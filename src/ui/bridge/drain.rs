@@ -1,5 +1,7 @@
 //! Drain steer-arbitration events from the channel into the renderer / steer queue.
 
+use super::action;
+use super::arbiter;
 use super::steer::SteerArbEvent;
 use crate::ui::{Event, Renderer, SubagentDetail};
 
@@ -111,10 +113,23 @@ pub(crate) fn drain_steer_arbitration_events_with_transcript(
                     tr.append(crate::ui::UiRecord::SteerResponse { text: answer });
                 }
             }
+            SteerArbEvent::DeferredSteer { user_msg, reason } => {
+                // A steer whose arbitration ended in a terminal Sleep is queued here so it is
+                // delivered at the next seam instead of being dropped with the arbitration.
+                tracing::warn!(
+                    target_worker = "arbitrator",
+                    reason = %reason,
+                    "Steering instruction survived a terminal arbitrator sleep — queued for the next seam"
+                );
+                steer_queue.push(user_msg);
+                renderer.on_event(&Event::Status(arbiter::durable_steer_status(&reason)));
+            }
             SteerArbEvent::Finished { decision, user_msg } => {
                 if let Some(ref d) = decision {
-                    for st in &d.subtasks {
-                        if st.action.eq_ignore_ascii_case("Cancel") {
+                    // Never compare the raw `action` string: route every subtask through the
+                    // orchestrator's single normalizer (see `super::action`).
+                    for (st, subtask_action) in action::routed(Some(d)) {
+                        if subtask_action == action::ACTION_CANCEL {
                             let target = st.agent_name.as_deref().unwrap_or(&st.tool_call_id);
                             let cancelled = crate::orchestrator::cancel_active_worker(
                                 st.agent_name.as_deref(),
@@ -156,9 +171,7 @@ pub(crate) fn drain_steer_arbitration_events_with_transcript(
                     .map(|d| {
                         crate::orchestrator::normalize_steer_decision(Some(&d.decision))
                             == "DelegateTask"
-                            || d.subtasks
-                                .iter()
-                                .any(|s| s.action.eq_ignore_ascii_case("DelegateTask"))
+                            || action::any(Some(d), action::ACTION_DELEGATE_TASK)
                     })
                     .unwrap_or(false);
 
@@ -191,21 +204,24 @@ pub(crate) fn drain_steer_arbitration_events_with_transcript(
                             let target = decision
                                 .as_ref()
                                 .and_then(|d| {
-                                    d.subtasks.iter().find_map(|st| {
-                                        if st.action.eq_ignore_ascii_case("ForwardNotice") {
-                                            st.agent_name.as_deref().or(Some(&st.tool_call_id))
-                                        } else {
-                                            None
-                                        }
-                                    })
+                                    action::first(Some(d), action::ACTION_FORWARD_NOTICE)
+                                        .map(action::notice_target)
                                 })
                                 .unwrap_or("worker");
-                            let notice =
-                                crate::orchestrator::post_notice_to_worker(target, &user_msg, None);
+                            let posted = arbiter::post_notice_observable(target, &user_msg);
+                            let notice = posted.notice;
                             renderer.on_event(&Event::Status(format!(
                                 "Notice {} forwarded to {} — waiting for specialist reply...",
                                 notice.notice_id, target
                             )));
+                            if !posted.dropped_older.is_empty() {
+                                // Capacity backpressure is kept (drop-oldest at INBOX_CAPACITY)
+                                // but never silent: the dropped notice ids are surfaced.
+                                let drop_text =
+                                    arbiter::capacity_drop_text(target, &posted.dropped_older);
+                                renderer
+                                    .on_event(&Event::Status(format!("[Arbitrator] {drop_text}")));
+                            }
                             steer_queue.push(user_msg);
                         }
                         "ApprovePlan" => {

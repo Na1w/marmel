@@ -58,19 +58,24 @@ const BASELINE: &[(&str, &str, usize)] = &[
     ("src/harness/monitor/monitor_tests.rs", "glob", 1),
     ("src/harness/monitor/monitor_tests.rs", "read_file", 2),
     ("src/harness/monitor/monitor_tests.rs", "write_file", 1),
-    // Doc-comment examples of wire format.
-    ("src/harness/monitor/repetition.rs", "read_file", 2),
     // Doc-comment + inline comment examples of wire format.
     ("src/harness/monitor/xml.rs", "read_file", 4),
     ("src/harness/monitor/xml.rs", "write_file", 1),
-    // XML rescue wire-text fixtures (raw model output being parsed).
-    ("src/manager/loop_tests.rs", "glob", 2),
-    ("src/manager/loop_tests.rs", "read_file", 1),
     // Inputs to `normalize_steer_decision` (accepts raw LLM decision strings).
     ("src/orchestrator/steer_tests.rs", "delegate_task", 1),
-    ("src/orchestrator/steer_tests.rs", "sleep", 1),
     // Wire-format JSON fixture (serialized tool call shape).
     ("src/types/wire.rs", "read_file", 1),
+    // t-069: the two `sleep` rows this table used to carry are GONE. The fixtures
+    // that needed them now spell the name through the shared table
+    // (`crate::tool_names::TOOL_SLEEP`): `harness/sleep.rs` builds its scanned
+    // needle from `TOOL_SLEEP`, and `tool_args.rs` feeds `json!(TOOL_SLEEP)` as an
+    // arbitrary non-object scalar.
+    // t-070 closed the hand-off t-069 left here: `steer_tests.rs` no longer builds
+    // its scanned needle out of fragments (`["sleep", "_duration_secs("].concat()`)
+    // and no longer passes a bare `"sleep"` decision string, so the
+    // `("src/orchestrator/steer_tests.rs", "sleep", …)` row is deleted — that file
+    // now holds ZERO raw `sleep` literals. Nothing else in `src/` may re-add a
+    // bare tool-name literal without a justified row here.
 ];
 
 fn count_literal(content: &str, tool_name: &str) -> usize {

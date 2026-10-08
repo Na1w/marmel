@@ -18,6 +18,15 @@ use crate::types::ToolCall;
 ///    `<tool_call function="read_file">{"path": "a"}</tool_call>`
 /// 3. SPEC legacy pattern:
 ///    `tool_call <function=read_file><parameter=path>a</parameter></function> tool_call`
+///
+/// Tool-call XML that sits inside a **fenced code block** of the assistant text
+/// is never rescued: it is an example the model was showing, not a call it
+/// wanted to run (recon item **M5**, related note in
+/// `docs/recon_bugs_agents_monitor.md`). The
+/// fence convention follows `crate::plan_parse`: a fence line is three or more
+/// backticks or tildes with only leading whitespace before it, a closing fence
+/// must use the same character and be at least as long as the opener, and an
+/// unterminated fence suppresses the rest of the text.
 #[derive(Debug, Clone)]
 pub struct XMLToolRescue {
     stats: Option<std::sync::Arc<HarnessStats>>,
@@ -47,17 +56,21 @@ impl XMLToolRescue {
 
     /// Scan `text` for any XML-style tool calls and return them as [`ToolCall`]s.
     ///
-    /// Every successfully rescued call is assigned a synthetic id
-    /// `call_text_{uuid}` and increments `xml_tool_rescues` in the attached
+    /// Blocks whose opening sits inside a fenced code block are skipped (see the
+    /// type-level docs). Every successfully rescued call is assigned a synthetic
+    /// id `call_text_{uuid}` and increments `xml_tool_rescues` in the attached
     /// stats (if any).
     pub fn rescue(&self, text: &str) -> Vec<ToolCall> {
         let mut calls = Vec::new();
+        let fenced = fenced_spans(text);
         let mut scan_from = 0usize;
 
         while let Some((start, end)) = find_next_tool_call_block(text, scan_from) {
-            let block = &text[start..end];
-            if let Some(call) = parse_tool_call_block(block) {
-                calls.push(call);
+            if !inside_fenced_span(&fenced, start) {
+                let block = &text[start..end];
+                if let Some(call) = parse_tool_call_block(block) {
+                    calls.push(call);
+                }
             }
             scan_from = end;
         }
@@ -118,6 +131,83 @@ fn find_next_tool_call_block(text: &str, from: usize) -> Option<(usize, usize)> 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fence awareness (backtick / tilde code fences)
+// ---------------------------------------------------------------------------
+
+/// Fence state used by [`fenced_spans`].
+///
+/// `crate::plan_parse` is the single owner of this convention for plan text
+/// (`fence_delimiter` / `FenceState` / `scannable_lines`), but those items are
+/// private to that module and therefore not reachable from here. This mirror is
+/// deliberately the same plain string scanning, **not** a second regex grammar
+/// for fences: it stays byte-for-byte compatible with the plan-layer rules
+/// (three-or-more fence character, leading whitespace allowed, closer must use
+/// the same character and be at least as long as the opener, an unterminated
+/// fence swallows the rest of the document).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FenceState {
+    Outside,
+    Inside { ch: char, len: usize },
+}
+
+/// A fenced-code delimiter line: three or more backticks or tildes with only
+/// leading whitespace before them. Returns the fence character and the length of
+/// the run (mirrors `crate::plan_parse::fence_delimiter`).
+fn fence_delimiter(line: &str) -> Option<(char, usize)> {
+    let trimmed = line.trim_start();
+    let first = trimmed.chars().next()?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let run = trimmed.chars().take_while(|&c| c == first).count();
+    if run < 3 {
+        return None;
+    }
+    Some((first, run))
+}
+
+/// Byte ranges of `text` that sit inside a fenced code block, delimiter lines
+/// included; an unterminated fence extends to the end of the text. This is the
+/// byte-offset form of `crate::plan_parse::scannable_lines`.
+fn fenced_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut state = FenceState::Outside;
+    let mut open_start = 0usize;
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        let line_start = offset;
+        let line_end = offset + line.len();
+        match state {
+            FenceState::Outside => {
+                if let Some((ch, len)) = fence_delimiter(line) {
+                    state = FenceState::Inside { ch, len };
+                    open_start = line_start;
+                }
+            }
+            FenceState::Inside { ch, len } => {
+                if let Some((c, l)) = fence_delimiter(line)
+                    && c == ch
+                    && l >= len
+                {
+                    state = FenceState::Outside;
+                    spans.push((open_start, line_end));
+                }
+            }
+        }
+        offset = line_end;
+    }
+    if let FenceState::Inside { .. } = state {
+        spans.push((open_start, text.len()));
+    }
+    spans
+}
+
+/// True when the byte offset `at` falls inside one of the fenced `spans`.
+fn inside_fenced_span(spans: &[(usize, usize)], at: usize) -> bool {
+    spans.iter().any(|(start, end)| at >= *start && at < *end)
+}
+
 /// Parse a single `<tool_call ...> ... </tool_call>` block body into a
 /// [`ToolCall`]. Returns `None` if the block cannot be understood.
 fn parse_tool_call_block(block: &str) -> Option<ToolCall> {
@@ -153,8 +243,11 @@ fn parse_tool_call_block(block: &str) -> Option<ToolCall> {
                             serde_json::Value::String(inner.to_string()),
                         );
                     } else if name == TOOL_GREP_SEARCH {
+                        // Schema key of the search tool is `pattern`
+                        // (`crate::harness::search::grep_search`); the old
+                        // `query` spelling made every rescued search fail.
                         m.insert(
-                            "query".to_string(),
+                            "pattern".to_string(),
                             serde_json::Value::String(inner.to_string()),
                         );
                     } else if name == TOOL_GLOB {
@@ -189,6 +282,8 @@ fn parse_tool_call_block(block: &str) -> Option<ToolCall> {
             }
         }
 
+        // `query` stays an accepted alias on the input side; the rescued payload
+        // is normalised to the schema key by `canonicalize_arguments`.
         let arguments = if map.is_empty() {
             serde_json::Value::String(args_json.trim().to_string())
         } else {
@@ -299,11 +394,34 @@ fn extract_attribute(block: &str, attr: &str) -> Option<String> {
 
 /// Build a [`ToolCall`] with a synthetic `call_text_{uuid}` id.
 fn make_rescued_call(name: String, arguments: serde_json::Value) -> ToolCall {
+    let arguments = canonicalize_arguments(&name, arguments);
     let arguments = match arguments {
         serde_json::Value::String(s) => s,
         other => other.to_string(),
     };
     ToolCall::new(format!("call_text_{}", uuid_v4()), name, arguments)
+}
+
+/// Align the argument keys of a rescued call with the schema the executor reads.
+///
+/// The search tool takes `pattern` (`crate::harness::search::grep_search`);
+/// `query` is only ever tolerated as an **input** alias — the opening-tag
+/// attribute list in [`parse_tool_call_block`] still accepts it, and
+/// `crate::harness::fs::str_arg` still tolerates it at execution time — but the
+/// rescued payload is renamed so the call cannot fail with a schema error
+/// (recon item **M5**). When both spellings are present the canonical key wins.
+fn canonicalize_arguments(name: &str, arguments: serde_json::Value) -> serde_json::Value {
+    if name != TOOL_GREP_SEARCH {
+        return arguments;
+    }
+    let mut map = match arguments {
+        serde_json::Value::Object(map) => map,
+        other => return other,
+    };
+    if let Some(value) = map.remove("query") {
+        map.entry("pattern".to_string()).or_insert(value);
+    }
+    serde_json::Value::Object(map)
 }
 
 /// Generate a UUID v4 string without external runtime deps beyond `uuid`.

@@ -1,9 +1,10 @@
 //! Persistent UI transcript journal for interactive sessions.
 //!
 //! Separates the user-facing chat and event stream from internal LLM context
-//! mechanics (e.g. synthetic system prompts, auto-nudges, deep-freeze prompts).
+//! mechanics (e.g. synthetic system prompts, auto-nudges).
 
 use anyhow::{Context, Result};
+
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -55,11 +56,6 @@ impl UiTranscript {
     /// Access the underlying records slice.
     pub fn records(&self) -> &[UiRecord] {
         &self.records
-    }
-
-    /// Mutable access to the underlying records.
-    pub fn records_mut(&mut self) -> &mut Vec<UiRecord> {
-        &mut self.records
     }
 
     /// Check if the transcript has no records.
@@ -245,9 +241,15 @@ impl UiTranscript {
                 } => {
                     if delegated_call_ids.contains(tool_call_id.as_str()) {
                         let summary = if let Some(first_line) = content.lines().next() {
-                            if first_line.starts_with("MISSION COMPLETE")
+                            // Gate t-059: the failure heuristic is the marker
+                            // owner's stem table (`markers::has_failure_word`),
+                            // not a hand-typed substring, so it sits on the same
+                            // footing as `markers::starts_with_complete` next to
+                            // it. `error` is tooling vocabulary, not marker
+                            // vocabulary, so it stays local.
+                            if crate::markers::starts_with_complete(first_line)
                                 || first_line.to_lowercase().contains("error")
-                                || first_line.to_lowercase().contains("fail")
+                                || crate::markers::has_failure_word(first_line)
                             {
                                 first_line.to_string()
                             } else {
@@ -465,5 +467,152 @@ mod tests {
         );
         assert_eq!(history[1].0, "Vad är nästa steg?");
         assert_eq!(history[1].1, "Kör real-ROM-test med timeout.");
+    }
+
+    /// Regression (gate t-030): the delegated-result summary tested the first
+    /// line against a hard-coded `"MISSION COMPLETE"` prefix, so every other
+    /// casing of the (case-insensitive) marker degraded to "Task completed".
+    /// The prefix test now comes from `crate::markers`.
+    #[test]
+    fn test_delegate_summary_recognises_any_casing_of_the_completion_marker() {
+        let marker = crate::markers::MARKER_COMPLETE;
+        for first_line in [
+            format!("{marker} (t-60)"),
+            format!("{} (t-60)", marker.to_lowercase()),
+            format!("{} (t-60)", "Mission Complete"),
+        ] {
+            let messages = vec![
+                crate::types::Message::System {
+                    content: "system prompt".to_string(),
+                },
+                crate::types::Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![crate::types::ToolCall::new(
+                        "call-delegate",
+                        crate::tool_names::TOOL_DELEGATE_TASK,
+                        "{}",
+                    )],
+                },
+                crate::types::Message::Tool {
+                    tool_call_id: "call-delegate".to_string(),
+                    content: format!("{first_line}\nrest of the deliverable"),
+                },
+            ];
+            let transcript = UiTranscript::from_legacy_messages(&messages);
+            let summary = transcript
+                .records()
+                .iter()
+                .find_map(|record| match record {
+                    UiRecord::ToolResult { display } => Some(display.clone()),
+                    _ => None,
+                })
+                .expect("a tool result record");
+            assert_eq!(summary, first_line);
+        }
+
+        // A marker that is not on the first line keeps the generic summary.
+        let messages = vec![
+            crate::types::Message::System {
+                content: "system prompt".to_string(),
+            },
+            crate::types::Message::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![crate::types::ToolCall::new(
+                    "call-delegate",
+                    crate::tool_names::TOOL_DELEGATE_TASK,
+                    "{}",
+                )],
+            },
+            crate::types::Message::Tool {
+                tool_call_id: "call-delegate".to_string(),
+                content: format!("Work finished.\n\n{marker} (t-61)"),
+            },
+        ];
+        let transcript = UiTranscript::from_legacy_messages(&messages);
+        let summary = transcript
+            .records()
+            .iter()
+            .find_map(|record| match record {
+                UiRecord::ToolResult { display } => Some(display.clone()),
+                _ => None,
+            })
+            .expect("a tool result record");
+        assert_eq!(summary, "Task completed");
+    }
+
+    /// Gate t-059 byte-pin: the failure half of the delegated-result summary is
+    /// the marker owner's stem table (`crate::markers::has_failure_word`) rather
+    /// than a hand-typed substring, and the rendered summary is unchanged — a
+    /// failure-shaped first line is echoed verbatim, anything else collapses to
+    /// `"Task completed"`.
+    #[test]
+    fn test_delegate_summary_failure_heuristic_is_marker_owned_and_byte_pinned() {
+        let summary_for = |first_line: &str| -> String {
+            let messages = vec![
+                crate::types::Message::System {
+                    content: "system prompt".to_string(),
+                },
+                crate::types::Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![crate::types::ToolCall::new(
+                        "call-delegate",
+                        crate::tool_names::TOOL_DELEGATE_TASK,
+                        "{}",
+                    )],
+                },
+                crate::types::Message::Tool {
+                    tool_call_id: "call-delegate".to_string(),
+                    content: format!("{first_line}\nrest of the deliverable"),
+                },
+            ];
+            UiTranscript::from_legacy_messages(&messages)
+                .records()
+                .iter()
+                .find_map(|record| match record {
+                    UiRecord::ToolResult { display } => Some(display.clone()),
+                    _ => None,
+                })
+                .expect("a tool result record")
+        };
+
+        // Failure- and error-shaped first lines are echoed byte-for-byte.
+        for first_line in [
+            "FAILED (aborted)",
+            "FAILED: build broke",
+            "The delegation failed after three retries",
+            "failure: validator rejected",
+            "ERROR: upstream transport closed",
+        ] {
+            assert_eq!(summary_for(first_line), first_line, "line: {first_line}");
+        }
+        // Anything else keeps the generic summary. A `REPLAN REQUIRED` verdict is
+        // one of them: this summary heuristic predates the marker grammar and only
+        // ever looked at the completion prefix, `error` and the `fail` stem, so
+        // widening it (e.g. to `markers::has_replan_marker`) would change rendered
+        // output and is deliberately out of scope here.
+        for first_line in [
+            "Task finished cleanly",
+            "Mission report",
+            "REPLAN REQUIRED: the decomposition is wrong",
+            "",
+        ] {
+            assert_eq!(
+                summary_for(first_line),
+                "Task completed",
+                "line: {first_line}"
+            );
+        }
+        // The transcript asks the *stem* predicate on purpose: it is weaker than
+        // the FAILED marker, and pinning the difference stops a later "cleanup"
+        // from swapping in `has_failure_marker` and changing this output.
+        assert!(crate::markers::has_failure_word(
+            "failure: validator rejected"
+        ));
+        assert!(!crate::markers::has_failure_marker(
+            "failure: validator rejected"
+        ));
     }
 }

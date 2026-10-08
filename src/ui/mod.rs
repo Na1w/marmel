@@ -126,12 +126,6 @@ pub trait Renderer: Send {
     fn input_state_shared(&self) -> &InputState;
     fn shutdown(&mut self);
     fn set_subagents(&mut self, _subagents: Vec<SubagentDetail>) {}
-    fn rehydrate_ui(&mut self, _records: &[UiRecord]) {}
-    fn rehydrate_messages(&mut self, messages: &[crate::types::Message]) {
-        let transcript = UiTranscript::from_legacy_messages(messages);
-        self.rehydrate_ui(transcript.records());
-    }
-    fn rehydrate_subagents(&mut self, _subagents: &[SubagentDetail]) {}
     fn set_thinking_budgets(&mut self, _cfg: &crate::config::Config) {}
     fn reset_active_agent(&mut self) {}
 }

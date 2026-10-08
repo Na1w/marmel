@@ -1,6 +1,5 @@
 //! Reqwest SSE chat client with retry and timeout watchdogs.
 
-use crate::net::Retryable;
 use crate::types::{ChatChunk, ChatRequest};
 use anyhow::Result;
 use eventsource_stream::Eventsource;
@@ -13,9 +12,9 @@ pub const INITIAL_RESPONSE_WATCHDOG_SECS: u64 = 300;
 pub const INTER_CHUNK_WATCHDOG_SECS: u64 = 300;
 /// Upper bound on the entire streaming read (20 minutes safety watchdog for up to 32k tokens).
 pub const OVERALL_READ_TIMEOUT_SECS: u64 = 1200;
-// Retry policy (MAX_ATTEMPTS / BACKOFF_BASE_MS / retry_with_backoff) now lives
-// in the shared `crate::net::retry` module, used by both this client and the
-// MCP HTTP/SSE transport (see docs/refactor_audit/duplicates.md §3).
+// This client owns no retry policy of its own: the attempt count, the backoff
+// base and the retryability classification (`ChatError::is_retryable`) are
+// consumed from their single owner, `crate::net::retry` (see `src/net/retry.rs`).
 
 static GLOBAL_TOKENS_IN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GLOBAL_TOKENS_OUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -55,13 +54,178 @@ fn count_reply_tokens(
     )
 }
 
+/// Why one streamed reply reached its terminal state.
+///
+/// This is the single terminal-state vocabulary for one LLM reply. It is carried
+/// on [`StreamedReply::outcome`] and is never inferred from the reply being
+/// empty: several providers legitimately answer with empty content plus a
+/// terminal `finish_reason`, which is [`ReplyOutcome::Complete`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyOutcome {
+    /// The stream reached a terminal marker: the SSE `[DONE]` sentinel or a
+    /// terminal `finish_reason` (`stop`, `tool_calls`, `end_turn`, …).
+    /// The only state that may be consumed as a model answer.
+    Complete,
+    /// The **caller** stopped the stream: its `on_delta` hook returned false.
+    /// That hook is where the `CancellationToken`, the preemption path,
+    /// `cancel_all()`, a sink abort and the local stream guards
+    /// (repetition detector, token budgets) all surface. Partial output is
+    /// preserved, the reply is not an answer.
+    Cancelled,
+    /// The stream ended **without** a terminal marker: a clean SSE EOF with no
+    /// `[DONE]` and no `finish_reason`, a dropped connection, a watchdog cut, or
+    /// a transport failure that arrived after deltas had already been delivered
+    /// (which must never be re-sent — see the mid-stream guard in
+    /// [`ChatClient::chat_stream`]). Partial output is preserved, the reply is
+    /// not an answer.
+    Truncated,
+    /// The attempt failed at the HTTP/transport/protocol level **before**
+    /// anything was delivered. This state travels on the error channel (the
+    /// `Err` arm of every public entry point); see
+    /// [`ChatError::terminal_outcome`].
+    Error,
+}
+
+impl ReplyOutcome {
+    /// Whether this terminal state may be consumed as a model answer.
+    /// `Cancelled`, `Truncated` and `Error` are all `false` here.
+    #[must_use]
+    pub fn is_success(self) -> bool {
+        matches!(self, ReplyOutcome::Complete)
+    }
+
+    /// The complement of [`ReplyOutcome::is_success`]: the turn was interrupted,
+    /// so any content it carries is partial and must not be written to the
+    /// conversation as if the model had answered.
+    #[must_use]
+    pub fn is_interrupted(self) -> bool {
+        !self.is_success()
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReplyOutcome::Complete => "complete",
+            ReplyOutcome::Cancelled => "cancelled",
+            ReplyOutcome::Truncated => "truncated",
+            ReplyOutcome::Error => "error",
+        }
+    }
+}
+
+/// Which cause put a reply into its [`ReplyOutcome`]; the two are never collapsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalCause {
+    /// The SSE `[DONE]` sentinel terminated the stream.
+    Done,
+    /// The provider sent a terminal `finish_reason` and the body ended cleanly.
+    FinishReason,
+    /// The caller's `on_delta` hook returned false (cancellation token,
+    /// preemption, `cancel_all()`, sink abort, or a local stream guard).
+    CallerAbort,
+    /// The SSE stream ended without `[DONE]` and without a `finish_reason`.
+    StreamEnd,
+    /// A connection/transport or SSE-decode failure ended the stream.
+    Transport,
+    /// A watchdog (first-event, inter-chunk stall or overall read) cut the stream.
+    Watchdog,
+    /// The backend answered with a non-success HTTP status.
+    HttpStatus,
+}
+
+impl TerminalCause {
+    /// The terminal state this cause maps to. Caller-initiated stops are
+    /// `Cancelled`; anything the provider or the transport left unfinished is
+    /// `Truncated`; a failure that delivered nothing is `Error`.
+    #[must_use]
+    pub const fn outcome(self) -> ReplyOutcome {
+        match self {
+            TerminalCause::Done | TerminalCause::FinishReason => ReplyOutcome::Complete,
+            TerminalCause::CallerAbort => ReplyOutcome::Cancelled,
+            TerminalCause::StreamEnd | TerminalCause::Transport | TerminalCause::Watchdog => {
+                ReplyOutcome::Truncated
+            }
+            TerminalCause::HttpStatus => ReplyOutcome::Error,
+        }
+    }
+}
+
+/// The terminal signal handed to [`ReplyAccumulator::finalize`]: the state, the
+/// cause that produced it, the provider's `finish_reason` when one was seen, and
+/// whether the "LLM reply completed" info lines are emitted (only the full-read
+/// path ever did that).
+#[derive(Debug, Clone)]
+pub(crate) struct Terminal {
+    pub(crate) outcome: ReplyOutcome,
+    pub(crate) cause: TerminalCause,
+    pub(crate) log_summary: bool,
+    pub(crate) finish_reason: Option<String>,
+}
+
+impl Terminal {
+    pub(crate) const fn from_cause(cause: TerminalCause, log_summary: bool) -> Self {
+        Self {
+            outcome: cause.outcome(),
+            cause,
+            log_summary,
+            finish_reason: None,
+        }
+    }
+}
+
 /// A single fully-assembled assistant reply chunk sequence.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct StreamedReply {
     pub content: String,
     pub reasoning: String,
     pub raw: String,
     pub tool_calls: Vec<crate::types::ToolCall>,
+    /// Why the stream ended. Only [`ReplyOutcome::Complete`] may be treated as
+    /// an answer; a default-constructed reply is `Truncated`, never `Complete`.
+    pub outcome: ReplyOutcome,
+    /// Which cause produced [`StreamedReply::outcome`](ReplyOutcome).
+    pub cause: TerminalCause,
+    /// The provider's terminal `finish_reason` when the stream reported one
+    /// (`stop`, `length`, `tool_calls`, …); `None` when it never got that far.
+    /// This is what separates a genuine empty completion from a cut stream.
+    pub finish_reason: Option<String>,
+    /// Deltas already handed to the caller's `on_delta` hook before termination.
+    /// Once this is non-zero the same request must never be re-sent.
+    pub deltas: usize,
+    /// Bytes of accumulated assistant payload (content + reasoning + tool-call
+    /// arguments) carried by this reply.
+    pub bytes: usize,
+    /// Tool-call fragments the provider started but never completed. They are
+    /// counted here instead of being handed over as executable tool calls.
+    pub dropped_tool_calls: usize,
+}
+
+impl Default for StreamedReply {
+    /// An empty reply established no terminal marker, so it is `Truncated` by
+    /// construction: an undecided/empty reply can never pass a success check.
+    fn default() -> Self {
+        Self {
+            content: String::new(),
+            reasoning: String::new(),
+            raw: String::new(),
+            tool_calls: Vec::new(),
+            outcome: ReplyOutcome::Truncated,
+            cause: TerminalCause::StreamEnd,
+            finish_reason: None,
+            deltas: 0,
+            bytes: 0,
+            dropped_tool_calls: 0,
+        }
+    }
+}
+
+impl StreamedReply {
+    /// Whether this reply may be consumed as a model answer. `false` for
+    /// `Cancelled`, `Truncated` and `Error` terminals.
+    #[must_use]
+    pub fn is_success(&self) -> bool {
+        self.outcome.is_success()
+    }
 }
 
 /// Streaming chat client bound to a backend.
@@ -94,23 +258,149 @@ pub(crate) enum ChatError {
     Stream(String),
     #[error("transport error: {0}")]
     Transport(String),
+    /// A failure that arrived **after** deltas had already been delivered to the
+    /// caller. Re-sending the same request is forbidden (it would re-bill the
+    /// prompt and duplicate output the caller has already rendered), so the
+    /// attempt terminates here with the partial accumulation attached; see
+    /// [`StreamProgress::forbid_mid_stream_retry`].
+    #[error("stream interrupted after {deltas} deltas / {bytes} bytes: {cause}")]
+    Interrupted {
+        deltas: usize,
+        bytes: usize,
+        cause: Box<ChatError>,
+        reply: Box<StreamedReply>,
+    },
 }
 
 impl crate::net::Retryable for ChatError {
     /// Retryable classes: transient HTTP statuses (503/429/502/504), watchdog
-    /// timeouts, transport failures, and SSE stream errors.
+    /// timeouts, transport failures and SSE stream errors — all only while
+    /// nothing has reached the caller yet. [`ChatError::Interrupted`] is the one
+    /// class the retry owner is told never to retry: deltas were already
+    /// delivered, so a new attempt of the same request would duplicate output.
     fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            ChatError::HttpStatus {
-                status: 503 | 429 | 502 | 504,
-                ..
-            } | ChatError::InitialTimeout
-                | ChatError::StallTimeout
-                | ChatError::Transport(_)
-                | ChatError::Stream(_)
-                | ChatError::ReadTimeout
-        )
+        match self {
+            ChatError::Interrupted { .. } => false,
+            ChatError::HttpStatus { status, .. } => matches!(status, 503 | 429 | 502 | 504),
+            ChatError::InitialTimeout
+            | ChatError::StallTimeout
+            | ChatError::Transport(_)
+            | ChatError::Stream(_)
+            | ChatError::ReadTimeout => true,
+        }
+    }
+}
+
+impl ChatError {
+    /// The terminal state this failure leaves the turn in: `Truncated` when the
+    /// caller had already received deltas (the partial reply is attached to the
+    /// variant), otherwise `Error` — nothing was delivered, and the error
+    /// channel is what carries the failure.
+    pub(crate) fn terminal_outcome(&self) -> ReplyOutcome {
+        match self {
+            ChatError::Interrupted { .. } => ReplyOutcome::Truncated,
+            _ => ReplyOutcome::Error,
+        }
+    }
+
+    /// The cause class this failure belongs to, for the terminal bookkeeping.
+    pub(crate) fn terminal_cause(&self) -> TerminalCause {
+        match self {
+            ChatError::HttpStatus { .. } => TerminalCause::HttpStatus,
+            ChatError::InitialTimeout | ChatError::StallTimeout | ChatError::ReadTimeout => {
+                TerminalCause::Watchdog
+            }
+            ChatError::Stream(_) | ChatError::Transport(_) | ChatError::Interrupted { .. } => {
+                TerminalCause::Transport
+            }
+        }
+    }
+}
+
+/// Per-call stream progress: the caller's `on_delta` hook plus the counter that
+/// makes the mid-stream retry ban decidable.
+///
+/// This is the mutable state [`crate::net::retry_with_backoff`] threads through
+/// every attempt of [`ChatAttempt`]. The counter is per *call*, not per attempt,
+/// so the single retry owner is told — through [`ChatError::Interrupted`], the
+/// one `ChatError` class whose [`crate::net::Retryable`] classification says
+/// "never retry" — that a request which already delivered deltas must not be
+/// re-sent. No second retry path is added here.
+#[derive(Debug)]
+pub(crate) struct StreamProgress<F> {
+    on_delta: F,
+    /// Deltas already handed to the caller across every attempt of this call.
+    deltas: usize,
+}
+
+impl<F: FnMut(&str) -> bool> StreamProgress<F> {
+    pub(crate) fn new(on_delta: F) -> Self {
+        Self {
+            on_delta,
+            deltas: 0,
+        }
+    }
+
+    /// The caller's delivery/abort hook, as the shared SSE pump wants it.
+    fn on_delta_mut(&mut self) -> &mut F {
+        &mut self.on_delta
+    }
+
+    /// Record one delta delivered to the caller.
+    fn count_delta(&mut self) {
+        self.deltas += 1;
+    }
+
+    /// How many deltas this call has delivered across every attempt.
+    fn deltas(&self) -> usize {
+        self.deltas
+    }
+
+    /// The retry-forbid gate: has this call already delivered anything?
+    fn has_emitted_deltas(&self) -> bool {
+        self.deltas > 0
+    }
+
+    /// Turn a failure that landed after deltas were delivered into the terminal
+    /// `Truncated` state, carrying the partial accumulation. The warn names the
+    /// delta count and the byte count — the re-billing this guard prevented.
+    fn forbid_mid_stream_retry(&self, cause: ChatError, partial: StreamedReply) -> ChatError {
+        tracing::warn!(
+            "LLM stream interrupted after {} deltas / {} bytes: {cause}; a mid-stream retry of the same request is forbidden, terminating as {}",
+            self.deltas,
+            partial.bytes,
+            ReplyOutcome::Truncated.as_str(),
+        );
+        ChatError::Interrupted {
+            deltas: self.deltas,
+            bytes: partial.bytes,
+            cause: Box::new(cause),
+            reply: Box::new(partial),
+        }
+    }
+}
+
+/// One LLM chat attempt driven through the shared retry loop in
+/// [`crate::net::retry`]: each attempt borrows the caller's [`StreamProgress`]
+/// (its `on_delta` callback plus the delivered-delta counter) as the retry
+/// helper's mutable state.
+struct ChatAttempt<'a> {
+    client: &'a ChatClient,
+    req: &'a ChatRequest,
+}
+
+impl<F> crate::net::RetryOp<StreamProgress<F>> for ChatAttempt<'_>
+where
+    F: FnMut(&str) -> bool,
+{
+    type Error = ChatError;
+    type Output = StreamedReply;
+
+    async fn attempt(
+        &mut self,
+        progress: &mut StreamProgress<F>,
+    ) -> Result<StreamedReply, ChatError> {
+        self.client.try_chat_once(self.req, progress).await
     }
 }
 
@@ -179,33 +469,50 @@ impl ChatClient {
         self.chat_stream(req, |_| true).await
     }
 
+    /// Stream one chat completion through the shared retry policy.
+    ///
+    /// Terminal states, and the only honest success check on this path:
+    /// * [`ReplyOutcome::Complete`] — `[DONE]` or a terminal `finish_reason`;
+    /// * [`ReplyOutcome::Cancelled`] — the caller's `on_delta` hook returned
+    ///   false (cancellation token, preemption, `cancel_all()`, sink abort);
+    /// * [`ReplyOutcome::Truncated`] — the stream ended without a terminal
+    ///   marker, or failed after deltas had already been delivered;
+    /// * [`ReplyOutcome::Error`] — the attempt failed before anything was
+    ///   delivered, which is the `Err` arm of this call.
+    ///
+    /// A reply is only ever returned as `Ok` when a request was actually
+    /// answered or cut short; the caller must check
+    /// [`StreamedReply::is_success`] before treating it as an answer.
     pub async fn chat_stream<F>(&self, req: &ChatRequest, on_delta: F) -> Result<StreamedReply>
     where
         F: FnMut(&str) -> bool,
     {
-        let mut on_delta = on_delta;
-        // Shared retry/backoff policy constants (see crate::net::retry, also
-        // used by the MCP HTTP/SSE transport). Inlined here rather than via
-        // `retry_with_backoff` because the per-attempt future borrows the
-        // `on_delta` callback, which the helper's boxed-Future signature cannot
-        // express.
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            match self.try_chat_once(req, &mut on_delta).await {
-                Ok(reply) => return Ok(reply),
-                Err(e) if e.is_retryable() && attempt < crate::net::MAX_ATTEMPTS => {
-                    let ms = crate::net::BACKOFF_BASE_MS * attempt as u64;
-                    tracing::warn!(
-                        "LLM backend call attempt {attempt}/{} failed ({e}), retrying in {ms}ms...",
-                        crate::net::MAX_ATTEMPTS
-                    );
-                    tokio::time::sleep(Duration::from_millis(ms)).await;
-                }
-                Err(e) => {
-                    tracing::error!("LLM backend call failed after {attempt} attempts: {e}");
-                    return Err(anyhow::anyhow!("{e}"));
-                }
+        let mut progress = StreamProgress::new(on_delta);
+        // Shared retry/backoff policy (`crate::net::retry`): the helper hands
+        // the mutable progress state (the `on_delta` callback plus the
+        // delivered-delta counter) to the operation on every attempt. The policy
+        // itself decides not to retry once a failure is reported as
+        // `ChatError::Interrupted`, so no second retry path lives here.
+        let attempt = crate::net::retry_with_backoff(
+            crate::net::MAX_ATTEMPTS,
+            crate::net::BACKOFF_BASE_MS,
+            "LLM backend call",
+            &mut progress,
+            ChatAttempt { client: self, req },
+        )
+        .await;
+
+        match attempt {
+            Ok(reply) => Ok(reply),
+            // Deltas had already reached the caller: the attempt terminated as
+            // `Truncated` with its partial accumulation instead of being re-sent.
+            Err(ChatError::Interrupted { reply, .. }) => Ok(*reply),
+            Err(e) => {
+                tracing::debug!(
+                    "LLM turn terminated as {}: {e}",
+                    e.terminal_outcome().as_str()
+                );
+                Err(anyhow::anyhow!("{e}"))
             }
         }
     }
@@ -213,7 +520,7 @@ impl ChatClient {
     async fn try_chat_once<F>(
         &self,
         req: &ChatRequest,
-        on_delta: &mut F,
+        progress: &mut StreamProgress<F>,
     ) -> Result<StreamedReply, ChatError>
     where
         F: FnMut(&str) -> bool,
@@ -273,7 +580,13 @@ impl ChatClient {
         #[allow(clippy::never_loop)]
         let resp = loop {
             // Shared SSE pump skeleton (50 ms poll + abort + watchdog deadline).
-            match crate::net::pump_future(&mut send_fut, Some(send_deadline), on_delta).await {
+            match crate::net::pump_future(
+                &mut send_fut,
+                Some(send_deadline),
+                progress.on_delta_mut(),
+            )
+            .await
+            {
                 crate::net::PumpNext::Item(Some(Ok(r))) => break r,
                 crate::net::PumpNext::Item(Some(Err(e))) => {
                     let elapsed = req_start.elapsed().as_millis();
@@ -291,7 +604,16 @@ impl ChatClient {
                     );
                     return Err(ChatError::InitialTimeout);
                 }
-                crate::net::PumpNext::Aborted => return Ok(StreamedReply::default()),
+                // The caller stopped the request before a single byte of the
+                // answer arrived: a cancellation, never an empty success.
+                crate::net::PumpNext::Aborted => {
+                    return Ok(cancelled_before_stream(
+                        &url,
+                        &req_body.model,
+                        req_start,
+                        progress,
+                    ));
+                }
             }
         };
 
@@ -311,60 +633,65 @@ impl ChatClient {
 
         let mut stream = resp.bytes_stream().eventsource();
 
-        let mut content = String::new();
-        let mut reasoning = String::new();
-        let mut raw = String::new();
-        let mut tool_calls_map =
-            std::collections::BTreeMap::<usize, (Option<String>, String, String)>::new();
-        let mut in_reasoning = false;
+        // Everything the SSE decoder accumulates for this read, in one owner.
+        let mut state = ReadState::default();
+        // How the read terminated. `StreamEnd` means "the body simply stopped"
+        // which, absent any terminal marker, is a truncation.
+        let mut terminal = Terminal::from_cause(TerminalCause::StreamEnd, true);
 
-        let first = match crate::net::pump_next(&mut stream, Some(send_deadline), on_delta).await {
-            crate::net::PumpNext::Item(res) => res,
-            crate::net::PumpNext::IdleTimeout => return Err(ChatError::InitialTimeout),
-            crate::net::PumpNext::Aborted => return Ok(StreamedReply::default()),
-        };
+        let first =
+            match crate::net::pump_next(&mut stream, Some(send_deadline), progress.on_delta_mut())
+                .await
+            {
+                crate::net::PumpNext::Item(res) => res,
+                crate::net::PumpNext::IdleTimeout => return Err(ChatError::InitialTimeout),
+                crate::net::PumpNext::Aborted => {
+                    return Ok(cancelled_before_stream(
+                        &url,
+                        &req_body.model,
+                        req_start,
+                        progress,
+                    ));
+                }
+            };
 
         if let Some(ev) = first {
             let ev = ev.map_err(|e| ChatError::Stream(e.to_string()))?;
-            if consume_event(
-                &ev,
-                &mut content,
-                &mut reasoning,
-                &mut raw,
-                &mut tool_calls_map,
-                &mut in_reasoning,
-                on_delta,
-            )? {
-                if in_reasoning {
-                    let _ = on_delta("</think>");
+            match consume_event(&ev, &mut state, progress)? {
+                ConsumeMark::Done => terminal = Terminal::from_cause(TerminalCause::Done, false),
+                ConsumeMark::Aborted => {
+                    terminal = Terminal::from_cause(TerminalCause::CallerAbort, false);
                 }
-                let tool_calls = map_to_tool_calls(tool_calls_map);
-                let reply = StreamedReply {
-                    content,
-                    reasoning,
-                    raw,
-                    tool_calls,
-                };
-                let out_toks =
-                    count_reply_tokens(&reply.content, &reply.reasoning, &reply.tool_calls);
-                record_tokens_out(out_toks);
-                let elapsed = req_start.elapsed().as_millis();
-                crate::debug_log::log_llm_response(&url, &req_body.model, 200, elapsed, &reply);
-                return Ok(reply);
+                ConsumeMark::Continue => {}
+            }
+            if terminal.cause != TerminalCause::StreamEnd {
+                if state.in_reasoning {
+                    // The read is over here, so only the closing marker matters.
+                    let _ = progress.on_delta_mut()("</think>");
+                }
+                terminal.finish_reason = state.finish_reason.take();
+                return Ok(
+                    // The very first SSE event already carried the terminal
+                    // marker: no completion-summary lines, as before.
+                    state.into_accumulator().finalize(
+                        &url,
+                        &req_body.model,
+                        req_start,
+                        terminal,
+                        progress,
+                    ),
+                );
             }
         } else {
-            let tool_calls = map_to_tool_calls(tool_calls_map);
-            let reply = StreamedReply {
-                content,
-                reasoning,
-                raw,
-                tool_calls,
-            };
-            let out_toks = count_reply_tokens(&reply.content, &reply.reasoning, &reply.tool_calls);
-            record_tokens_out(out_toks);
-            let elapsed = req_start.elapsed().as_millis();
-            crate::debug_log::log_llm_response(&url, &req_body.model, 200, elapsed, &reply);
-            return Ok(reply);
+            // Empty stream: the first poll yielded `None` — no `[DONE]`, no
+            // `finish_reason`. A cut answer, not an empty success.
+            return Ok(state.into_accumulator().finalize(
+                &url,
+                &req_body.model,
+                req_start,
+                Terminal::from_cause(TerminalCause::StreamEnd, false),
+                progress,
+            ));
         }
 
         let consume = async {
@@ -375,22 +702,30 @@ impl ChatClient {
                 // Inter-chunk watchdog: deadline is recomputed per chunk so the
                 // stall limit applies to the silent gap since the last event.
                 let stall_deadline = last_chunk_at + Duration::from_secs(self.stall_timeout_secs);
-                match crate::net::pump_next(&mut stream, Some(stall_deadline), on_delta).await {
+                match crate::net::pump_next(
+                    &mut stream,
+                    Some(stall_deadline),
+                    progress.on_delta_mut(),
+                )
+                .await
+                {
                     crate::net::PumpNext::Item(Some(ev)) => {
                         last_chunk_at = std::time::Instant::now();
                         let ev = ev.map_err(|e| ChatError::Stream(e.to_string()))?;
-                        if consume_event(
-                            &ev,
-                            &mut content,
-                            &mut reasoning,
-                            &mut raw,
-                            &mut tool_calls_map,
-                            &mut in_reasoning,
-                            on_delta,
-                        )? {
-                            break;
+                        match consume_event(&ev, &mut state, progress)? {
+                            ConsumeMark::Done => {
+                                terminal = Terminal::from_cause(TerminalCause::Done, true);
+                                break;
+                            }
+                            ConsumeMark::Aborted => {
+                                // The caller refused further deltas: its own
+                                // cancellation, never a completed answer.
+                                terminal = Terminal::from_cause(TerminalCause::CallerAbort, true);
+                                break;
+                            }
+                            ConsumeMark::Continue => {}
                         }
-                        let total_chars = content.len() + reasoning.len();
+                        let total_chars = state.content.len() + state.reasoning.len();
                         if total_chars > 0
                             && (last_progress_log.elapsed() >= Duration::from_secs(5)
                                 || total_chars.saturating_sub(last_logged_chars) >= 4000)
@@ -402,131 +737,328 @@ impl ChatClient {
                                 req_body.model,
                                 elapsed_s,
                                 approx_toks,
-                                reasoning.len(),
-                                content.len(),
+                                state.reasoning.len(),
+                                state.content.len(),
                             );
                             crate::debug_log::log_llm_progress(
                                 &url,
                                 &req_body.model,
                                 req_start.elapsed().as_millis(),
-                                reasoning.len(),
-                                content.len(),
+                                state.reasoning.len(),
+                                state.content.len(),
                                 approx_toks,
                             );
                             last_progress_log = std::time::Instant::now();
                             last_logged_chars = total_chars;
                         }
                     }
+                    // The body simply stopped: no `[DONE]`, no terminal
+                    // `finish_reason`. A cut answer, not a completed one.
                     crate::net::PumpNext::Item(None) => break,
-                    crate::net::PumpNext::IdleTimeout => return Err(ChatError::StallTimeout),
-                    crate::net::PumpNext::Aborted => break,
+                    crate::net::PumpNext::IdleTimeout => {
+                        terminal = Terminal::from_cause(TerminalCause::Watchdog, true);
+                        return Err(ChatError::StallTimeout);
+                    }
+                    crate::net::PumpNext::Aborted => {
+                        terminal = Terminal::from_cause(TerminalCause::CallerAbort, true);
+                        break;
+                    }
                 }
             }
-            if in_reasoning {
-                in_reasoning = false;
-                let _ = on_delta("</think>");
+            if state.in_reasoning {
+                state.in_reasoning = false;
+                let _ = progress.on_delta_mut()("</think>");
             }
             Ok::<(), ChatError>(())
         };
-        tokio::time::timeout(Duration::from_secs(OVERALL_READ_TIMEOUT_SECS), consume)
+        let read = tokio::time::timeout(Duration::from_secs(OVERALL_READ_TIMEOUT_SECS), consume)
             .await
-            .map_err(|_| ChatError::ReadTimeout)??;
+            .map_err(|_| ChatError::ReadTimeout)
+            .and_then(|r| r);
 
-        let tool_calls = map_to_tool_calls(tool_calls_map);
-        tracing::info!(
-            "LLM reply completed: {} content chars, {} reasoning chars, {} tool calls",
-            content.len(),
-            reasoning.len(),
-            tool_calls.len()
-        );
-        for tc in &tool_calls {
-            tracing::info!(
-                "Tool call parsed: {} (id: {}) args: {}",
-                tc.function.name,
-                tc.id,
-                tc.function.arguments
+        // Classify why the read stopped before finalizing. `StreamEnd` is the
+        // default "the body just stopped" state; a real failure or a provider
+        // `finish_reason` overrides it so causes are never collapsed.
+        if let Err(cause) = &read {
+            if terminal.cause == TerminalCause::StreamEnd {
+                terminal = Terminal::from_cause(cause.terminal_cause(), true);
+            }
+        } else if terminal.cause == TerminalCause::StreamEnd && state.finish_reason.is_some() {
+            terminal = Terminal::from_cause(TerminalCause::FinishReason, true);
+        }
+        terminal.finish_reason = state.finish_reason.take();
+
+        let reply =
+            state
+                .into_accumulator()
+                .finalize(&url, &req_body.model, req_start, terminal, progress);
+
+        match read {
+            Ok(()) => Ok(reply),
+            // Deltas already reached the caller: the same request must not be
+            // attempted again, so the failure terminates as `Truncated` with
+            // the partial accumulation attached.
+            Err(cause) if progress.has_emitted_deltas() => {
+                Err(progress.forbid_mid_stream_retry(cause, reply))
+            }
+            Err(cause) => Err(cause),
+        }
+    }
+}
+
+/// What one SSE read has decoded so far: the payload, the open/closed state of
+/// the reasoning channel, and the provider's own terminal `finish_reason` (the
+/// marker that separates a genuine — even empty — completion from a cut stream).
+#[derive(Debug, Default)]
+struct ReadState {
+    content: String,
+    reasoning: String,
+    raw: String,
+    tool_calls: std::collections::BTreeMap<usize, (Option<String>, String, String)>,
+    in_reasoning: bool,
+    finish_reason: Option<String>,
+}
+
+impl ReadState {
+    /// Hand the payload over to the single finalizer. The reasoning-channel flag
+    /// and the `finish_reason` are terminal bookkeeping, not reply payload, so
+    /// they stay behind.
+    fn into_accumulator(self) -> ReplyAccumulator {
+        ReplyAccumulator {
+            content: self.content,
+            reasoning: self.reasoning,
+            raw: self.raw,
+            tool_calls: self.tool_calls,
+        }
+    }
+}
+
+/// The deltas accumulated for one in-flight streamed reply, ready to be finalized.
+///
+/// Single owner of the terminal bookkeeping: every successful exit site of
+/// `ChatClient::try_chat_once` routes the accumulation through
+/// [`ReplyAccumulator::finalize`], so the terminal state, the tool-call
+/// filtering, the token counters and the debug-log entry exist in one place.
+#[derive(Debug, Default)]
+pub(crate) struct ReplyAccumulator {
+    pub(crate) content: String,
+    pub(crate) reasoning: String,
+    pub(crate) raw: String,
+    pub(crate) tool_calls: std::collections::BTreeMap<usize, (Option<String>, String, String)>,
+}
+
+impl ReplyAccumulator {
+    /// Assemble the terminal [`StreamedReply`]: record why the stream ended, map
+    /// the index-keyed tool-call accumulator into ordered tool calls (discarding
+    /// fragments the provider never completed), count output tokens, add them to
+    /// the global token counters and write the debug-log response entry.
+    ///
+    /// `terminal` carries the outcome, its cause and the provider's
+    /// `finish_reason` when one was seen. Its `log_summary` flag keeps the one
+    /// behavioural difference between the call sites explicit: only the fully-read
+    /// path emits the "LLM reply completed" / per-tool-call info lines. Every
+    /// interrupted terminal logs a `warn!` instead — it must never look like a
+    /// completed answer.
+    pub(crate) fn finalize(
+        self,
+        url: &str,
+        model: &str,
+        req_start: std::time::Instant,
+        terminal: Terminal,
+        progress: &StreamProgress<impl FnMut(&str) -> bool>,
+    ) -> StreamedReply {
+        let args_bytes: usize = self
+            .tool_calls
+            .values()
+            .map(|(_, _, args)| args.len())
+            .sum();
+        let bytes = self.raw.len() + args_bytes;
+        let (tool_calls, dropped_tool_calls) = map_to_tool_calls(self.tool_calls, terminal.outcome);
+        if terminal.outcome.is_success() {
+            if terminal.log_summary {
+                tracing::info!(
+                    "LLM reply completed: {} content chars, {} reasoning chars, {} tool calls",
+                    self.content.len(),
+                    self.reasoning.len(),
+                    tool_calls.len()
+                );
+                for tc in &tool_calls {
+                    tracing::info!(
+                        "Tool call parsed: {} (id: {}) args: {}",
+                        tc.function.name,
+                        tc.id,
+                        tc.function.arguments
+                    );
+                }
+            }
+        } else {
+            tracing::warn!(
+                "LLM reply {} (cause {:?}): {} content chars, {} reasoning chars, {} deltas already delivered, {} unfinished tool-call fragment(s) dropped, finish_reason={} — partial output, not an answer",
+                terminal.outcome.as_str(),
+                terminal.cause,
+                self.content.len(),
+                self.reasoning.len(),
+                progress.deltas(),
+                dropped_tool_calls,
+                terminal.finish_reason.as_deref().unwrap_or("<none>"),
             );
         }
 
         let reply = StreamedReply {
-            content,
-            reasoning,
-            raw,
+            content: self.content,
+            reasoning: self.reasoning,
+            raw: self.raw,
             tool_calls,
+            outcome: terminal.outcome,
+            cause: terminal.cause,
+            finish_reason: terminal.finish_reason,
+            deltas: progress.deltas(),
+            bytes,
+            dropped_tool_calls,
         };
         let out_toks = count_reply_tokens(&reply.content, &reply.reasoning, &reply.tool_calls);
         record_tokens_out(out_toks);
         let elapsed = req_start.elapsed().as_millis();
-        crate::debug_log::log_llm_response(&url, &req_body.model, 200, elapsed, &reply);
-        Ok(reply)
+        crate::debug_log::log_llm_response(url, model, 200, elapsed, &reply);
+        reply
     }
 }
 
+/// Map the index-keyed accumulator to ordered tool calls and count the fragments
+/// that had to be discarded.
+///
+/// An interrupted reply never yields executable tool calls: a `Cancelled` or
+/// `Truncated` stream can carry half-assembled arguments, and handing those to a
+/// tool executor is precisely the "cancellation looks like success" failure this
+/// module must prevent. Fragments that never got a function name are dropped on
+/// every path.
 fn map_to_tool_calls(
     map: std::collections::BTreeMap<usize, (Option<String>, String, String)>,
-) -> Vec<crate::types::ToolCall> {
-    map.into_values()
+    outcome: ReplyOutcome,
+) -> (Vec<crate::types::ToolCall>, usize) {
+    let total = map.len();
+    let named: Vec<(Option<String>, String, String)> = map
+        .into_values()
+        .filter(|(_, name, _)| !name.trim().is_empty())
+        .collect();
+    let mut dropped = total - named.len();
+    if !outcome.is_success() {
+        dropped += named.len();
+        return (Vec::new(), dropped);
+    }
+    let calls = named
+        .into_iter()
         .map(|(id, name, arguments)| {
             let call_id = id.unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
             crate::types::ToolCall::new(call_id, name, arguments)
         })
-        .collect()
+        .collect();
+    (calls, dropped)
+}
+
+/// A cancellation requested before a single response byte arrived: an empty
+/// `Cancelled` reply, never an empty success.
+fn cancelled_before_stream<F>(
+    url: &str,
+    model: &str,
+    req_start: std::time::Instant,
+    progress: &StreamProgress<F>,
+) -> StreamedReply
+where
+    F: FnMut(&str) -> bool,
+{
+    tracing::warn!(
+        "LLM request cancelled before the response body started ({} deltas delivered) — reporting {}, not an empty completion",
+        progress.deltas(),
+        ReplyOutcome::Cancelled.as_str(),
+    );
+    crate::debug_log::log_llm_error(
+        url,
+        model,
+        req_start.elapsed().as_millis(),
+        "cancelled before response",
+    );
+    StreamedReply {
+        outcome: ReplyOutcome::Cancelled,
+        cause: TerminalCause::CallerAbort,
+        deltas: progress.deltas(),
+        ..StreamedReply::default()
+    }
+}
+
+/// What one SSE event told the read loop about how the stream ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsumeMark {
+    /// The event was consumed; keep reading.
+    Continue,
+    /// The `[DONE]` sentinel arrived: a terminal marker.
+    Done,
+    /// The caller's hook refused the delta: a caller-initiated cancellation.
+    Aborted,
 }
 
 fn consume_event<F>(
     ev: &eventsource_stream::Event,
-    content: &mut String,
-    reasoning: &mut String,
-    raw: &mut String,
-    tool_calls_map: &mut std::collections::BTreeMap<usize, (Option<String>, String, String)>,
-    in_reasoning: &mut bool,
-    on_delta: &mut F,
-) -> Result<bool, ChatError>
+    state: &mut ReadState,
+    progress: &mut StreamProgress<F>,
+) -> Result<ConsumeMark, ChatError>
 where
     F: FnMut(&str) -> bool,
 {
     if ev.data.trim() == "[DONE]" {
-        if *in_reasoning {
-            *in_reasoning = false;
-            let _ = on_delta("</think>");
+        if state.in_reasoning {
+            state.in_reasoning = false;
+            let _ = progress.on_delta_mut()("</think>");
         }
-        return Ok(true);
+        return Ok(ConsumeMark::Done);
     }
     if let Ok(chunk) = serde_json::from_str::<ChatChunk>(&ev.data) {
         for choice in chunk.choices {
+            // The provider's own terminal marker. The first non-empty one wins,
+            // and it is what separates a genuine (even empty) completion from a
+            // stream whose body was cut short.
+            if state.finish_reason.is_none()
+                && let Some(fr) = choice.finish_reason
+                && !fr.is_empty()
+            {
+                state.finish_reason = Some(fr);
+            }
             if let Some(r) = choice.delta.reasoning_content
                 && !r.is_empty()
             {
-                reasoning.push_str(&r);
-                raw.push_str(&r);
-                if !*in_reasoning {
-                    *in_reasoning = true;
-                    if !on_delta("<think>") {
-                        return Ok(true);
+                state.reasoning.push_str(&r);
+                state.raw.push_str(&r);
+                if !state.in_reasoning {
+                    state.in_reasoning = true;
+                    if !progress.on_delta_mut()("<think>") {
+                        return Ok(ConsumeMark::Aborted);
                     }
                 }
-                if !on_delta(&r) {
-                    return Ok(true);
+                progress.count_delta();
+                if !progress.on_delta_mut()(&r) {
+                    return Ok(ConsumeMark::Aborted);
                 }
             }
             if let Some(c) = choice.delta.content
                 && !c.is_empty()
             {
-                if *in_reasoning {
-                    *in_reasoning = false;
-                    if !on_delta("</think>") {
-                        return Ok(true);
+                if state.in_reasoning {
+                    state.in_reasoning = false;
+                    if !progress.on_delta_mut()("</think>") {
+                        return Ok(ConsumeMark::Aborted);
                     }
                 }
-                content.push_str(&c);
-                raw.push_str(&c);
-                if !on_delta(&c) {
-                    return Ok(true);
+                state.content.push_str(&c);
+                state.raw.push_str(&c);
+                progress.count_delta();
+                if !progress.on_delta_mut()(&c) {
+                    return Ok(ConsumeMark::Aborted);
                 }
             }
             if let Some(tcs) = choice.delta.tool_calls {
                 for tc in tcs {
-                    let entry = tool_calls_map
+                    let entry = state
+                        .tool_calls
                         .entry(tc.index)
                         .or_insert_with(|| (None, String::new(), String::new()));
                     if let Some(id) = tc.id {
@@ -541,13 +1073,16 @@ where
                         }
                     }
                 }
-                if !on_delta("") {
-                    return Ok(true);
+                // A keep-alive poll of the caller's hook, as before: a tool-call
+                // only stream must still observe cancellation.
+                progress.count_delta();
+                if !progress.on_delta_mut()("") {
+                    return Ok(ConsumeMark::Aborted);
                 }
             }
         }
     }
-    Ok(false)
+    Ok(ConsumeMark::Continue)
 }
 
 #[cfg(test)]

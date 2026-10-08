@@ -29,7 +29,10 @@ pub const STEER_ARBITRATOR_SYSTEM_PROMPT: &str = include_str!("../../prompts/ste
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteerSubtaskDecision {
     pub tool_call_id: String,
-    /// `"ForwardNotice"` | `"Cancel"` | `"DelegateTask"` | `"Sleep"`.
+    /// Raw action string from the arbitrator. Canonicalized through
+    /// [`SteerSubtaskAction`] / [`normalize_steer_subtask_action`] — the vocabulary is
+    /// `"ForwardNotice"` | `"Cancel"` | `"DelegateTask"` | `"Sleep"`; anything else is
+    /// rejected and logged.
     pub action: String,
     #[serde(default)]
     pub message: Option<String>,
@@ -87,6 +90,44 @@ pub struct SteerContext<'a> {
     pub steering_history: &'a str,
     pub user_message: &'a str,
     pub active_subtasks: &'a str,
+}
+
+/// Build the `Sleep` steer decision from the arguments of a sleep-shaped tool
+/// call in the arbitrator's reply.
+///
+/// Gate t-068: this module used to carry a **fourth, divergent copy** of the
+/// `sleep`-argument extraction — `seconds` / `duration` / `duration_seconds`,
+/// `as_u64` plus a string parse, `unwrap_or(5)` — and applied **no clamp at
+/// all**, so a steered `sleep` with `1e9` or `999999` could request an
+/// unbounded wait. The whole canonicalization (duration keys, every JSON number
+/// shape, the fallback default and the min/max clamp) belongs to the single
+/// owner [`crate::tool_args::sleep_duration_secs`], which the sync and async
+/// `sleep` tool handlers already delegate to; a steered sleep and a tool-call
+/// sleep therefore resolve identical arguments to identical seconds by
+/// construction. Only the user-facing wording stays in this module.
+///
+/// The arbitrator's own wait budget (`ui::bridge::arbiter::MAX_SINGLE_SLEEP_SECONDS`)
+/// is a **separate knob** and is deliberately not consulted here.
+pub(crate) fn sleep_steer_decision(arguments: &str) -> SteerDecision {
+    let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+    let secs = crate::tool_args::sleep_duration_secs(&args);
+    let reason = args
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let response = if reason.is_empty() {
+        format!("Sleeping for {secs} seconds...")
+    } else {
+        format!("Sleeping for {secs} seconds ({reason})...")
+    };
+    SteerDecision {
+        decision: "Sleep".to_string(),
+        response: Some(response),
+        tier: None,
+        model: None,
+        subtasks: Vec::new(),
+        sleep_seconds: Some(secs),
+    }
 }
 
 /// Run the steer arbitrator against the LLM backend with real-time SSE delta streaming and full contextual visibility.
@@ -218,41 +259,18 @@ where
     let parsed_decision = if let Ok(mut decision) = serde_json::from_str::<SteerDecision>(json_text)
     {
         if decision.decision.eq_ignore_ascii_case("Sleep") && decision.sleep_seconds.is_none() {
-            decision.sleep_seconds = Some(5);
+            // gate t-068: the fallback duration is the owner's constant, not a
+            // steer-local literal re-typed next to the extraction it used to pair
+            // with (`Some(5)` + `unwrap_or(5)`, no clamp anywhere).
+            decision.sleep_seconds = Some(crate::tool_args::SLEEP_DEFAULT_SECS);
         }
         Some(decision)
-    } else if let Some(tc) = reply.tool_calls.iter().find(|tc| {
-        tc.function.name == crate::tool_names::TOOL_SLEEP
-            || tc.function.name == crate::tool_names::TERMINAL_SLEEP
-    }) {
-        let args: serde_json::Value =
-            serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-        let secs = args
-            .get("seconds")
-            .or_else(|| args.get("duration"))
-            .or_else(|| args.get("duration_seconds"))
-            .and_then(|v| {
-                v.as_u64()
-                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-            })
-            .unwrap_or(5);
-        let reason = args
-            .get("reason")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let resp = if reason.is_empty() {
-            format!("Sleeping for {secs} seconds...")
-        } else {
-            format!("Sleeping for {secs} seconds ({reason})...")
-        };
-        Some(SteerDecision {
-            decision: "Sleep".to_string(),
-            response: Some(resp),
-            tier: None,
-            model: None,
-            subtasks: Vec::new(),
-            sleep_seconds: Some(secs),
-        })
+    } else if let Some(tc) = reply
+        .tool_calls
+        .iter()
+        .find(|tc| crate::tool_names::is_sleep_tool_name(&tc.function.name))
+    {
+        Some(sleep_steer_decision(&tc.function.arguments))
     } else if did_stream_response || !raw.is_empty() {
         let resp = if !raw.is_empty() {
             raw
@@ -303,7 +321,214 @@ pub fn normalize_steer_decision(decision: Option<&str>) -> &'static str {
     }
 }
 
+/// Canonical comparison key for a per-subtask `action` string.
+///
+/// Same folding rules as [`normalize_steer_decision`]: trim, ASCII lowercase,
+/// and drop `_`, `-` and spaces, so `Cancel Task`, `cancel_task`, `CANCEL-task`
+/// and `CancelTask` are one and the same action.
+fn steer_action_key(action: &str) -> String {
+    action
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['_', '-', ' '], "")
+}
+
+/// Canonical form of a per-subtask steer `action` (H3).
+///
+/// [`SteerSubtaskDecision`] is the single owner of the subtask action vocabulary
+/// — `ForwardNotice` | `Cancel` | `DelegateTask` | `Sleep` — so its canonical
+/// form lives in this module. Every consumer (the preemption handle,
+/// [`extract_tasks_to_delegate`], the UI bridge subtask loops) must route the raw
+/// JSON string through [`normalize_steer_subtask_action`] instead of comparing
+/// the raw string, otherwise a differently-cased or underscored spelling silently
+/// selects the default branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SteerSubtaskAction {
+    /// Post the steering notice to the running worker and await its reply.
+    ForwardNotice,
+    /// Cancel the running worker/subtask (fires its cancellation token).
+    Cancel,
+    /// Delegate a new ad-hoc subtask.
+    DelegateTask,
+    /// Sleep for `sleep_seconds`.
+    Sleep,
+    /// Outside the vocabulary: rejected and logged, never silently defaulted.
+    Unknown,
+}
+
+impl SteerSubtaskAction {
+    /// The canonical spelling used on the wire and in logs.
+    pub fn canonical(self) -> &'static str {
+        match self {
+            Self::ForwardNotice => "ForwardNotice",
+            Self::Cancel => "Cancel",
+            Self::DelegateTask => "DelegateTask",
+            Self::Sleep => "Sleep",
+            Self::Unknown => "Unknown",
+        }
+    }
+
+    /// `true` for a vocabulary action, `false` for a rejected spelling.
+    pub fn is_known(self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+}
+
+impl std::fmt::Display for SteerSubtaskAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.canonical())
+    }
+}
+
+/// Rejection returned by [`SteerSubtaskAction::from_str`] for an action spelling
+/// outside the subtask vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownSteerSubtaskAction {
+    /// The raw spelling that was rejected.
+    pub raw: String,
+}
+
+impl std::fmt::Display for UnknownSteerSubtaskAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unrecognized steer subtask action {:?} (expected one of: ForwardNotice, Cancel, DelegateTask, Sleep)",
+            self.raw
+        )
+    }
+}
+
+impl std::error::Error for UnknownSteerSubtaskAction {}
+
+impl std::str::FromStr for SteerSubtaskAction {
+    type Err = UnknownSteerSubtaskAction;
+
+    fn from_str(action: &str) -> Result<Self, Self::Err> {
+        match steer_action_key(action).as_str() {
+            "cancel" | "canceltask" | "cancelsubtask" | "cancelworker" | "cancelstream"
+            | "abort" | "aborttask" | "abortimmediately" | "abortstream" | "stop" | "stoptask"
+            | "terminate" | "terminatetask" => Ok(Self::Cancel),
+            "forwardnotice" | "forward" | "forwardtoworker" | "forwardmessage" | "sendnotice"
+            | "postnotice" | "notice" | "notifyworker" | "replytoarbitrator"
+            | "answerarbitrator" => Ok(Self::ForwardNotice),
+            "delegatetask" | "delegate" | "delegatenewtask" | "newtask" | "newsubtask"
+            | "createtask" | "starttask" | "spawntask" => Ok(Self::DelegateTask),
+            // t-061: the *tool* spelling of the Sleep action is not a steer-private
+            // vocabulary — it comes from the one tool-alias table in
+            // `crate::tool_names` (see `TOOL_ALIAS_TABLE`), through the
+            // grammar-tolerant matcher, because this grammar folds case and
+            // `_`/`-`/space. The other arms are subtask **actions**, which are a
+            // separate vocabulary and deliberately do not consult the alias table.
+            key if crate::tool_names::is_sleep_tool_grammar_spelling(key) => Ok(Self::Sleep),
+            _ => Err(UnknownSteerSubtaskAction {
+                raw: action.to_string(),
+            }),
+        }
+    }
+}
+
+/// Normalize a per-subtask steer `action` (H3): the one shared entry point every
+/// consumer must use.
+///
+/// Recognized spellings fold to a [`SteerSubtaskAction`] variant; anything
+/// outside the vocabulary is an **explicit rejection** — a `WARN` naming the raw
+/// action, the affected `tool_call_id` and the accepted vocabulary — and yields
+/// [`SteerSubtaskAction::Unknown`], which no action branch matches. Callers must
+/// treat `Unknown` as their documented fallback (do nothing to that subtask)
+/// rather than letting the raw string fall through to a default branch.
+pub fn normalize_steer_subtask_action(action: &str, tool_call_id: &str) -> SteerSubtaskAction {
+    match action.parse() {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            tracing::warn!(
+                action = action,
+                tool_call_id = tool_call_id,
+                accepted = "ForwardNotice | Cancel | DelegateTask | Sleep",
+                reason = %err,
+                "Rejecting steer subtask action outside the vocabulary — no action branch is taken"
+            );
+            SteerSubtaskAction::Unknown
+        }
+    }
+}
+
+/// Prose markers that mark a recorded steering entry as **pending**, i.e. still
+/// awaiting a specialist reply. Owned here because the entries carrying them are
+/// produced by the steering/arbitration path (`ui::bridge` records
+/// "Forwarded notice … (awaiting specialist reply)"; the arbitrator records
+/// "Decision: …") and only the steering-history correlation consumes them.
+const PENDING_ENTRY_MARKERS: [&str; 3] =
+    ["awaiting specialist reply", "ForwardToWorker", "follow-up"];
+
+/// True while a recorded steering entry is still awaiting a specialist reply and
+/// is therefore a legitimate target for a `record_steering_exchange` update.
+pub(crate) fn steering_entry_is_pending(entry_response: &str) -> bool {
+    entry_response.starts_with("Decision:")
+        || PENDING_ENTRY_MARKERS
+            .iter()
+            .any(|marker| entry_response.contains(*marker))
+}
+
+/// Characters that continue an identifier token such as `t-1`, `notice-10` or
+/// `coder-t-001`. Used to anchor [`entry_names_notice_id`] at token boundaries.
+///
+/// `.` counts as part of an identifier because the canonical task-id grammar
+/// allows an inner dot (`t-val-01`, `task-t-001`); the hazard being closed here
+/// is one id being a prefix of another (`t-1` / `t-10`), which is a letter or
+/// digit boundary problem, not a punctuation one.
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')
+}
+
+/// True when `notice_id` occurs in a recorded entry's arbitrator text as a
+/// **whole identifier token** — the exact keyed test that replaced
+/// `entry_text.contains(notice_id)` (recon M3, task t-071).
+///
+/// The boundary anchoring is the whole point: an unanchored `contains` let a
+/// reply for `notice-1` rewrite the entry recorded for `notice-10` — the same
+/// class of mis-attribution that the exact routing rules in
+/// `WorkerRoutingIdentity::routes` and `workers::worker_matches` removed for
+/// worker keys. Matching is case- and byte-exact, because notice ids are stored
+/// verbatim (`PENDING_NOTICES` is keyed by the id itself).
+pub(crate) fn entry_names_notice_id(entry_response: &str, notice_id: &str) -> bool {
+    let notice_id = notice_id.trim();
+    if notice_id.is_empty() {
+        return false;
+    }
+    entry_response
+        .match_indices(notice_id)
+        .any(|(index, matched)| {
+            let before = entry_response[..index].chars().next_back();
+            let after = entry_response[index + matched.len()..].chars().next();
+            !before.is_some_and(is_identifier_char) && !after.is_some_and(is_identifier_char)
+        })
+}
+
+/// True when `incoming` and `recorded` are the **same** steering inquiry.
+///
+/// The inquiry is genuinely part of the steering-history contract (an entry is
+/// keyed by the user message that created it), so it is compared as one whole
+/// string with an explicitly documented normalization — trim, then ASCII
+/// case-fold — and nothing else. No containment in either direction: the old
+/// `inq.contains(q) || q.contains(inq)` test made `t-1` the same inquiry as
+/// `t-10`, made any empty inquiry match every entry (`contains("")`), and let a
+/// prose prefix such as "Deploy the new" absorb the entry recorded for
+/// "Deploy the new allocator".
+pub(crate) fn same_steering_inquiry(incoming: &str, recorded: &str) -> bool {
+    let incoming = incoming.trim().to_ascii_lowercase();
+    let recorded = recorded.trim().to_ascii_lowercase();
+    !incoming.is_empty() && !recorded.is_empty() && incoming == recorded
+}
+
 /// Format the accumulated steering conversation history into a readable transcript for SteerContext.
+///
+/// Pure rendering: an entry's `(inquiry, arbitrator response)` pair is emitted
+/// verbatim (trimmed for display) and this function performs **no** correlation
+/// or de-duplication of its own. Which recorded entry an incoming exchange
+/// belongs to is decided once, by identity key, in
+/// `orchestrator::bus::record_steering_exchange` — using
+/// [`entry_names_notice_id`] / [`same_steering_inquiry`] — so the transcript
+/// cannot silently merge two steers on a partial text overlap.
 pub fn format_steering_history(history: &[(String, String)]) -> String {
     if history.is_empty() {
         "None".to_string()
@@ -408,32 +633,32 @@ pub async fn arbitrate_steer_with_fallback(
 }
 
 /// Helper to extract all subtasks that should be delegated from a SteerDecision.
+///
+/// The per-subtask `action` is routed through [`normalize_steer_subtask_action`]
+/// (H3): only a canonical [`SteerSubtaskAction::DelegateTask`] delegates, and a
+/// rejected action never silently selects the implicit top-level fallback.
 pub fn extract_tasks_to_delegate(
     decision: &SteerDecision,
     user_msg: &str,
 ) -> Vec<(Agent, String, String)> {
     let mut tasks = Vec::new();
-    let has_explicit_subtask_delegations = decision
+    let actions: Vec<SteerSubtaskAction> = decision
         .subtasks
         .iter()
-        .any(|s| s.action.eq_ignore_ascii_case("DelegateTask"));
+        .map(|s| normalize_steer_subtask_action(&s.action, &s.tool_call_id))
+        .collect();
+    let has_explicit_subtask_delegations = actions.contains(&SteerSubtaskAction::DelegateTask);
 
     if has_explicit_subtask_delegations {
         let mut idx = 1;
-        for s in &decision.subtasks {
-            if s.action.eq_ignore_ascii_case("DelegateTask") {
+        for (s, action) in decision.subtasks.iter().zip(actions.iter()) {
+            if *action == SteerSubtaskAction::DelegateTask {
                 let agent = s
                     .agent_name
                     .as_deref()
                     .and_then(Agent::from_str)
                     .unwrap_or(Agent::Coder);
-                let cleaned = s
-                    .tool_call_id
-                    .trim_matches(|c| {
-                        c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\''
-                    })
-                    .trim()
-                    .to_string();
+                let cleaned = crate::task_id::normalize_task_id_ref(&s.tool_call_id).to_string();
                 let tid = if !cleaned.is_empty() {
                     cleaned
                 } else {
@@ -449,6 +674,21 @@ pub fn extract_tasks_to_delegate(
             }
         }
     } else if normalize_steer_decision(Some(&decision.decision)) == "DelegateTask" {
+        if let Some(rejected) = decision
+            .subtasks
+            .iter()
+            .zip(actions.iter())
+            .find(|(_, action)| !action.is_known())
+        {
+            // H3: an action outside the vocabulary is a rejection, not a signal to
+            // build a delegation out of the first subtask. Refuse the fallback.
+            tracing::warn!(
+                action = %rejected.0.action,
+                tool_call_id = %rejected.0.tool_call_id,
+                "Rejected steer subtask action — skipping implicit top-level DelegateTask fallback"
+            );
+            return tasks;
+        }
         let agent = decision
             .subtasks
             .iter()
@@ -457,15 +697,7 @@ pub fn extract_tasks_to_delegate(
         let tid = decision
             .subtasks
             .first()
-            .map(|s| {
-                s.tool_call_id
-                    .trim_matches(|c| {
-                        c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\''
-                    })
-                    .trim()
-                    .to_string()
-            })
-            .filter(|s| !s.is_empty())
+            .and_then(|s| crate::task_id::normalize_task_id(&s.tool_call_id))
             .unwrap_or_else(|| "steer-task-1".to_string());
         let prompt = decision
             .subtasks

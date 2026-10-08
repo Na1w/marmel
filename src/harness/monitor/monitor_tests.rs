@@ -1,6 +1,9 @@
 use super::*;
 use std::sync::Arc;
 
+use crate::harness::monitor::repetition::{
+    LINE_WINDOW, TAIL_SCAN_WINDOW, TEXT_BUFFER_CAPACITY, WORD_WINDOW,
+};
 use crate::tool_names::{
     TOOL_GREP_SEARCH, TOOL_READ_FILE, TOOL_REPLACE, TOOL_RUN_COMMAND, TOOL_WRITE_FILE,
 };
@@ -604,5 +607,291 @@ fn test_monitor_consecutive_rebirth_blocked() {
     assert_eq!(
         monitor.observe_tool(crate::tool_names::TOOL_REBIRTH, &args2),
         Intervention::None
+    );
+}
+
+// --- Bounded scan windows (recon M3 regression guard) ---
+
+/// Non-repeating filler: every line is distinct (the numbers differ), so the
+/// filler itself never trips any of the repetition rules.
+fn filler(n: usize) -> String {
+    format!("Reading file {n} and checking line {n} for marker {n} now.\n")
+}
+
+/// Push filler text until `det` holds at least `target` characters.
+fn fill_until(det: &mut RepetitionDetector, target: usize) {
+    let mut n = 0usize;
+    while det.len() < target {
+        det.push(&filler(n));
+        n += 1;
+    }
+}
+
+#[test]
+fn test_monitor_repetition_window_bounded_after_long_streams() {
+    let mut det = RepetitionDetector::new(3, 5);
+    // Stream far more text than any window (and more than the rolling buffer
+    // capacity): the rolling state must stay pinned at its caps.
+    for n in 0..400 {
+        det.push(&filler(n));
+    }
+    assert_eq!(det.len(), TEXT_BUFFER_CAPACITY, "buffer cap");
+    assert_eq!(
+        det.tail_scan_chars(),
+        TAIL_SCAN_WINDOW,
+        "the tail scan must look at a fixed window, not the whole buffer"
+    );
+    assert!(
+        det.tail_scan_candidates() <= TAIL_SCAN_WINDOW / 3,
+        "candidate pattern lengths must be capped by the scan window"
+    );
+    assert!(
+        det.line_window_len() <= LINE_WINDOW,
+        "the line window must be bounded, got {}",
+        det.line_window_len()
+    );
+    assert!(
+        det.word_window_len() <= WORD_WINDOW,
+        "the word window must be bounded, got {}",
+        det.word_window_len()
+    );
+
+    // A genuine repetition is still detected once the buffer is saturated.
+    for _ in 0..5 {
+        det.push("abcdefghij");
+    }
+    assert!(
+        det.is_repeating(),
+        "a 10-char pattern repeated 5x must fire on a saturated buffer"
+    );
+}
+
+#[test]
+fn test_monitor_repetition_scan_work_is_bounded() {
+    // The per-delta scan budget must be a property of the windows, not of how
+    // much text has streamed by. These counts are the *before* regression: the
+    // old scan grew linearly (and its cost quadratically) with the buffer.
+    let small = {
+        let mut det = RepetitionDetector::new(5, 5);
+        fill_until(&mut det, 300);
+        det
+    };
+    let huge = {
+        let mut det = RepetitionDetector::new(5, 5);
+        for n in 0..400 {
+            det.push(&filler(n));
+        }
+        det
+    };
+    assert!(small.len() >= 300 && small.len() < 400);
+    assert_eq!(huge.len(), TEXT_BUFFER_CAPACITY);
+
+    assert!(
+        huge.tail_scan_chars() <= TAIL_SCAN_WINDOW,
+        "tail scan window must be bounded by TAIL_SCAN_WINDOW, got {}",
+        huge.tail_scan_chars()
+    );
+    assert!(
+        huge.tail_scan_candidates() <= TAIL_SCAN_WINDOW / 5,
+        "tail scan candidates must be bounded, got {}",
+        huge.tail_scan_candidates()
+    );
+    assert!(
+        huge.line_window_len() <= LINE_WINDOW && huge.word_window_len() <= WORD_WINDOW,
+        "rolling windows must be bounded (lines={} words={})",
+        huge.line_window_len(),
+        huge.word_window_len()
+    );
+
+    // Benchmark-style guard on the *measured* cost. Before the fix, one
+    // `is_repeating` call on a saturated 16 384-char buffer measured ~256 ms in
+    // this debug build (23 s for a 4 500-delta stream in the recon replica).
+    // The bounded scan has to stay three orders of magnitude below that.
+    let mut det = huge;
+    let started = std::time::Instant::now();
+    for n in 0..300usize {
+        det.push(&filler(n));
+        let _ = det.is_repeating();
+    }
+    let elapsed = started.elapsed();
+    println!("300 saturated push+is_repeating cycles: {elapsed:?}");
+    // The same 300 deltas measured ~77 s before the fix (256 ms per scan on a
+    // saturated buffer in this debug build). The bounded scan must stay far
+    // below that; 4 s leaves a wide margin over the measured ~0.7 s.
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "the per-delta repetition scan is no longer bounded: 300 saturated \
+         cycles took {elapsed:?}"
+    );
+}
+
+// --- Rescued argument keys & fenced-code awareness (recon M5 regression guard) ---
+
+/// Search-tool call written in the attribute/body encodings.
+fn grep_call_body(pattern: &str) -> String {
+    format!(r#"<tool_call function="{TOOL_GREP_SEARCH}">{pattern}</tool_call>"#)
+}
+
+/// Parse the arguments of a rescued call back into JSON.
+fn rescued_args(call: &ToolCall) -> serde_json::Value {
+    serde_json::from_str(&call.function.arguments).expect("rescued arguments must be a JSON object")
+}
+
+#[test]
+fn test_monitor_xml_rescue_search_call_carries_pattern_key() {
+    let rescue = XMLToolRescue::new();
+
+    // Body encoding: the schema key of the search tool is `pattern`
+    // (`crate::harness::search::grep_search`), never `query`.
+    let calls = rescue.rescue(&grep_call_body("fn main"));
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].function.name, TOOL_GREP_SEARCH);
+    assert_eq!(
+        rescued_args(&calls[0]),
+        serde_json::json!({"pattern": "fn main"})
+    );
+    assert!(
+        !calls[0].function.arguments.contains("query"),
+        "the rescuer must not emit the non-schema key `query`, got {}",
+        calls[0].function.arguments
+    );
+
+    // `query=` remains an accepted INPUT alias on the opening tag, but the
+    // rescued payload is normalised to `pattern`.
+    let alias = format!(r#"<tool_call function="{TOOL_GREP_SEARCH}" query="needle"></tool_call>"#);
+    let calls = rescue.rescue(&alias);
+    assert_eq!(calls.len(), 1, "`query=` must still be accepted as input");
+    assert_eq!(
+        rescued_args(&calls[0]),
+        serde_json::json!({"pattern": "needle"})
+    );
+
+    // Both spellings present: the canonical key wins.
+    let both = format!(
+        r#"<tool_call function="{TOOL_GREP_SEARCH}" pattern="canon" query="alias"></tool_call>"#
+    );
+    let calls = rescue.rescue(&both);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        rescued_args(&calls[0]),
+        serde_json::json!({"pattern": "canon"})
+    );
+
+    // JSON-embedded encoding: alias renamed on the way out as well.
+    let embedded = format!(
+        r#"<tool_call>{{"function": "{TOOL_GREP_SEARCH}", "arguments": {{"query": "todo"}}}}</tool_call>"#
+    );
+    let calls = rescue.rescue(&embedded);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        rescued_args(&calls[0]),
+        serde_json::json!({"pattern": "todo"})
+    );
+}
+
+#[test]
+fn test_monitor_xml_rescue_skips_fenced_code_examples() {
+    let rescue = XMLToolRescue::new();
+    let call = format!(r#"<tool_call function="{TOOL_READ_FILE}" path="a.rs"></tool_call>"#);
+
+    // A tool-call example shown inside a ``` fence is documentation, not a call.
+    let fenced = format!("Here is the syntax:\n```xml\n{call}\n```\nEnd of example.");
+    assert!(
+        rescue.rescue(&fenced).is_empty(),
+        "an XML tool call inside a fenced code block must not be rescued"
+    );
+
+    // ~~~ fences are fences too.
+    let tilde = format!("~~~markdown\n{call}\n~~~\n");
+    assert!(
+        rescue.rescue(&tilde).is_empty(),
+        "a ~~~ fenced example must not be rescued"
+    );
+
+    // A closing fence must be at least as long as the opener (plan_parse rule),
+    // so the inner ``` does not end the ```` block.
+    let longer = format!("````xml\n```\n{call}\n```\n````\n");
+    assert!(
+        rescue.rescue(&longer).is_empty(),
+        "a shorter inner fence must not close the outer fence"
+    );
+
+    // An unterminated fence swallows the remainder of the text.
+    let open = format!("prose\n```\n{call}");
+    assert!(
+        rescue.rescue(&open).is_empty(),
+        "an unterminated fence must suppress the rest of the text"
+    );
+
+    // The very same XML outside fences is still rescued.
+    let outside = format!("prose {call} tail");
+    assert_eq!(
+        rescue.rescue(&outside).len(),
+        1,
+        "the same call outside fences must be rescued"
+    );
+
+    // Mixed: only the unfenced occurrence is rescued.
+    let mixed = format!("```xml\n{call}\n```\nand the real one: {call}");
+    let calls = rescue.rescue(&mixed);
+    assert_eq!(calls.len(), 1, "exactly the unfenced call must be rescued");
+    assert_eq!(calls[0].function.name, TOOL_READ_FILE);
+
+    // Inline single backticks are not fences.
+    let inline = format!("use `{call}` inline");
+    assert_eq!(
+        rescue.rescue(&inline).len(),
+        1,
+        "single backticks are not a code fence"
+    );
+
+    // The legacy encoding is fence-aware too.
+    let p_close = "</para".to_string() + "meter>";
+    let legacy = format!(
+        "tool_call <function={TOOL_READ_FILE}><parameter=path>a.rs{p_close}</function> tool_call"
+    );
+    let fenced_legacy = format!("```\n{legacy}\n```\n");
+    assert!(
+        rescue.rescue(&fenced_legacy).is_empty(),
+        "a legacy tool-call example inside a fence must not be rescued"
+    );
+    assert_eq!(
+        rescue.rescue(&legacy).len(),
+        1,
+        "the same legacy call outside a fence must be rescued"
+    );
+
+    // Guard the other direction: a *real* call whose body happens to contain a
+    // fence is still rescued, because the fence sits inside the call instead of
+    // around it.
+    let close = "</".to_string() + "tool_call>";
+    let body_with_fence = format!(
+        r#"<tool_call function="{TOOL_WRITE_FILE}" path="notes.md">```rust
+fn main() {{}}
+```
+{close}"#
+    );
+    let calls = rescue.rescue(&body_with_fence);
+    assert_eq!(
+        calls.len(),
+        1,
+        "a fence inside the call body must not suppress the call itself"
+    );
+    assert_eq!(calls[0].function.name, TOOL_WRITE_FILE);
+}
+
+#[test]
+fn test_monitor_xml_rescue_fenced_only_does_not_bump_stats() {
+    let stats = Arc::new(HarnessStats::new());
+    let rescue = XMLToolRescue::with_stats(stats.clone());
+    let call = format!(r#"<tool_call function="{TOOL_READ_FILE}" path="a.rs"></tool_call>"#);
+    let fenced = format!("```xml\n{call}\n```\n");
+    assert!(rescue.rescue(&fenced).is_empty());
+    assert_eq!(
+        stats
+            .xml_tool_rescues
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a skipped fenced example must not count as an intervention"
     );
 }

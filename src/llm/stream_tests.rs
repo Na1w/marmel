@@ -1,4 +1,5 @@
 use super::*;
+use crate::llm::client::Terminal;
 
 #[tokio::test]
 async fn test_llm_stream_channel_demuxes_thinking() {
@@ -16,6 +17,9 @@ async fn test_llm_stream_channel_demuxes_thinking() {
                 reasoning: "Let me reason".to_string(),
                 raw: raw_payload.to_string(),
                 tool_calls: vec![],
+                outcome: ReplyOutcome::Complete,
+                cause: TerminalCause::Done,
+                ..StreamedReply::default()
             })
         },
         messages,
@@ -220,4 +224,220 @@ fn test_stream_config_thinking_budget_defaults() {
     }
     let stream_cfg2 = StreamConfig::from_config(&app_cfg);
     assert_eq!(stream_cfg2.max_thinking_tokens, 4096);
+}
+
+// ---------------------------------------------------------------------------
+// Cluster net-C11 guard: the single finalize helper shared by every successful
+// exit site of `ChatClient::try_chat_once` (`ReplyAccumulator::finalize`).
+// These tests pin content assembly, tool-call order, token accounting and the
+// per-terminal-site logging difference.
+// ---------------------------------------------------------------------------
+
+use crate::llm::client::ReplyAccumulator;
+use crate::llm::get_global_token_counts;
+use crate::tool_names::{TOOL_READ_FILE, TOOL_RUN_COMMAND, TOOL_WRITE_FILE};
+
+fn counted_assistant_tokens(
+    content: &str,
+    reasoning: &str,
+    tool_calls: &[crate::types::ToolCall],
+) -> usize {
+    crate::manager::context::count_assistant_tokens(
+        if content.is_empty() {
+            None
+        } else {
+            Some(content)
+        },
+        if reasoning.is_empty() {
+            None
+        } else {
+            Some(reasoning)
+        },
+        tool_calls,
+    )
+}
+
+type AcceptAllHook = Box<dyn FnMut(&str) -> bool>;
+
+/// A delivery hook that accepts everything and has seen no deltas yet.
+fn progress() -> crate::llm::client::StreamProgress<AcceptAllHook> {
+    crate::llm::client::StreamProgress::new(Box::new(|_| true))
+}
+
+/// Same accumulated deltas regardless of the terminal reason.
+fn accumulated_reply() -> ReplyAccumulator {
+    let mut tool_calls = std::collections::BTreeMap::new();
+    tool_calls.insert(
+        0,
+        (
+            Some("call_0".to_string()),
+            TOOL_READ_FILE.to_string(),
+            "{\"path\":\"a.rs\"}".to_string(),
+        ),
+    );
+    ReplyAccumulator {
+        content: "Done.".to_string(),
+        reasoning: "Checking.".to_string(),
+        raw: "Checking.Done.".to_string(),
+        tool_calls,
+    }
+}
+
+#[test]
+fn test_finalize_helper_text_only_reply() {
+    let before = get_global_token_counts().1;
+    let reply = ReplyAccumulator {
+        content: "Hello world!".to_string(),
+        reasoning: "Let me reason".to_string(),
+        raw: "[thinking]Let me reason[/thinking]Hello world!".to_string(),
+        tool_calls: Default::default(),
+    }
+    .finalize(
+        "http://backend.test",
+        "test-model",
+        std::time::Instant::now(),
+        Terminal::from_cause(TerminalCause::Done, false),
+        &progress(),
+    );
+
+    assert_eq!(reply.content, "Hello world!");
+    assert_eq!(reply.reasoning, "Let me reason");
+    assert_eq!(reply.raw, "[thinking]Let me reason[/thinking]Hello world!");
+    assert!(reply.tool_calls.is_empty());
+
+    let expected = counted_assistant_tokens("Hello world!", "Let me reason", &[]);
+    assert!(expected > 0);
+    assert!(get_global_token_counts().1 >= before + expected);
+}
+
+#[test]
+fn test_finalize_helper_keeps_tool_call_order_and_ids() {
+    let before = get_global_token_counts().1;
+    let mut tool_calls = std::collections::BTreeMap::new();
+    // Inserted out of index order on purpose: assembly must follow the stream
+    // `index` key, never arrival order.
+    tool_calls.insert(
+        2,
+        (
+            Some("call_b".to_string()),
+            TOOL_WRITE_FILE.to_string(),
+            "{\"path\":\"b.rs\"}".to_string(),
+        ),
+    );
+    tool_calls.insert(
+        0,
+        (
+            Some("call_a".to_string()),
+            TOOL_READ_FILE.to_string(),
+            "{\"path\":\"a.rs\"}".to_string(),
+        ),
+    );
+    // Missing id: finalize must synthesize a `call_<uuid>` id.
+    tool_calls.insert(
+        1,
+        (
+            None,
+            TOOL_RUN_COMMAND.to_string(),
+            "{\"command\":\"ls\"}".to_string(),
+        ),
+    );
+
+    let reply = ReplyAccumulator {
+        content: String::new(),
+        reasoning: String::new(),
+        raw: String::new(),
+        tool_calls,
+    }
+    .finalize(
+        "http://backend.test",
+        "test-model",
+        std::time::Instant::now(),
+        Terminal::from_cause(TerminalCause::Done, true),
+        &progress(),
+    );
+
+    let names: Vec<&str> = reply
+        .tool_calls
+        .iter()
+        .map(|tc| tc.function.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec![TOOL_READ_FILE, TOOL_RUN_COMMAND, TOOL_WRITE_FILE]
+    );
+    assert_eq!(reply.tool_calls[0].id, "call_a");
+    assert_eq!(reply.tool_calls[2].id, "call_b");
+    assert_eq!(
+        reply.tool_calls[1]
+            .id
+            .strip_prefix("call_")
+            .map(|s| s.len()),
+        Some(36)
+    );
+    assert_eq!(
+        reply.tool_calls[0].function.arguments,
+        "{\"path\":\"a.rs\"}"
+    );
+    assert_eq!(
+        reply.tool_calls[2].function.arguments,
+        "{\"path\":\"b.rs\"}"
+    );
+    assert!(reply.content.is_empty());
+    assert!(reply.reasoning.is_empty());
+    assert!(reply.raw.is_empty());
+
+    let expected = counted_assistant_tokens("", "", &reply.tool_calls);
+    assert!(expected > 0);
+    assert!(get_global_token_counts().1 >= before + expected);
+}
+
+#[test]
+fn test_finalize_helper_terminal_reasons_agree_on_payload() {
+    // A `[DONE]` stop (early terminal site, no completion-summary logging) and a
+    // limit/abort cut after the read loop (full-read terminal site, summary
+    // logging) must yield identical payloads and identical token accounting.
+    let before = get_global_token_counts().1;
+    let stopped = accumulated_reply().finalize(
+        "http://backend.test",
+        "test-model",
+        std::time::Instant::now(),
+        Terminal::from_cause(TerminalCause::Done, false),
+        &progress(),
+    );
+    let stopped_tokens =
+        counted_assistant_tokens(&stopped.content, &stopped.reasoning, &stopped.tool_calls);
+    let limited = accumulated_reply().finalize(
+        "http://backend.test",
+        "test-model",
+        std::time::Instant::now(),
+        // A cut *after* the read loop still reached a terminal marker here, so
+        // it stays a completed reply: only the summary logging differs.
+        Terminal::from_cause(TerminalCause::FinishReason, true),
+        &progress(),
+    );
+
+    assert_eq!(stopped.content, limited.content);
+    assert_eq!(stopped.reasoning, limited.reasoning);
+    assert_eq!(stopped.raw, limited.raw);
+    assert_eq!(stopped.tool_calls.len(), limited.tool_calls.len());
+    for (a, b) in stopped.tool_calls.iter().zip(limited.tool_calls.iter()) {
+        assert_eq!(a.id, b.id);
+        assert_eq!(a.kind, b.kind);
+        assert_eq!(a.function.name, b.function.name);
+        assert_eq!(a.function.arguments, b.function.arguments);
+    }
+
+    assert!(stopped_tokens > 0);
+    // Both terminal reasons must record output tokens.
+    assert!(get_global_token_counts().1 >= before + stopped_tokens * 2);
+
+    // Pre-stream aborts stay outside the finalize helper: an empty reply is
+    // never a success, whatever its content looks like.
+    let aborted = StreamedReply::default();
+    assert!(aborted.content.is_empty());
+    assert!(aborted.reasoning.is_empty());
+    assert!(aborted.raw.is_empty());
+    assert!(aborted.tool_calls.is_empty());
+    assert!(!aborted.is_success());
+    assert_eq!(aborted.outcome, ReplyOutcome::Truncated);
 }

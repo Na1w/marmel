@@ -11,6 +11,12 @@ pub mod runner;
 pub mod validation;
 pub mod validator;
 
+/// Terminal outcome a specialist returns. The marker grammar — marker set,
+/// precedence rules and parser — has a single owner in [`crate::markers`]
+/// (dedup cluster C4, `docs/recon_duplication_helpers.md` §2.4). It is
+/// re-exported under the name the agents layer always published, so no
+/// consumer outside these files needed editing.
+pub use crate::markers::MissionMarker;
 pub use catalog::{AgentArchetype, Catalog, Skill, SkillSource};
 pub use coder::Coder;
 pub use debugger::Debugger;
@@ -23,6 +29,7 @@ pub(crate) use runner::run_specialist_llm;
 pub use validation::ValidationOutcome;
 pub use validator::Validator;
 
+use crate::markers::{ABORT_REASON, aborted_deliverable};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -85,59 +92,13 @@ impl std::str::FromStr for Agent {
     }
 }
 
-/// Terminal outcome a specialist returns.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MissionMarker {
-    /// Task fully satisfied. `task_id` matches the plan line to auto-check.
-    Complete { task_id: Option<String> },
-    /// Task could not be completed; report reason + partial result.
-    Failed { reason: String },
-    /// Task could not be completed AND the plan/goal needs revisiting.
-    Replan { reason: String },
-}
-
-static TASK_ID_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"\(?\[?(t-[A-Za-z0-9_-]+)\]?\)?").expect("valid task regex")
-});
-
-fn find_task_id(text: &str) -> Option<&str> {
-    TASK_ID_RE
-        .captures(text)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str())
-}
-
-fn contains_failed_marker(upper: &str) -> bool {
-    if !upper.contains("FAILED") {
-        return false;
-    }
-    let sanitized = upper
-        .replace("0 FAILED", "")
-        .replace("0 TESTS FAILED", "")
-        .replace("0 TEST FAILED", "");
-    sanitized.contains("FAILED")
-}
-
-impl MissionMarker {
-    pub fn parse(text: &str) -> Option<MissionMarker> {
-        let upper = text.to_ascii_uppercase();
-        if upper.contains("REPLAN REQUIRED") {
-            return Some(MissionMarker::Replan {
-                reason: text.to_string(),
-            });
-        }
-        if upper.contains("MISSION COMPLETE") {
-            let task_id = find_task_id(text).map(|t| t.to_string());
-            return Some(MissionMarker::Complete { task_id });
-        }
-        if contains_failed_marker(&upper) {
-            return Some(MissionMarker::Failed {
-                reason: text.to_string(),
-            });
-        }
-        None
-    }
-}
+// `MissionMarker`, its `parse` and the `contains_failed_marker` sanitiser used
+// to be declared here (and, byte-for-byte, again in `src/manager/phase.rs`).
+// Dedup cluster C4 collapsed them into the single owner `crate::markers`, which
+// is re-exported above under the historical `crate::agents::MissionMarker` path.
+// Deleting this copy also removed the second substring-first parser responsible
+// for bug C1 (`docs/recon_bugs_manager.md`): a FAILED deliverable that merely
+// mentions `MISSION COMPLETE` in its prose was reported as `Complete`.
 
 /// The `delegate_task` argument payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,9 +195,16 @@ pub trait Specialist: Send + Sync + fmt::Debug {
         {
             return Deliverable {
                 marker: MissionMarker::Failed {
-                    reason: "aborted".to_string(),
+                    reason: ABORT_REASON.to_string(),
                 },
-                content: "Task aborted by user instruction.\n\nFAILED (aborted)".to_string(),
+                // Gate t-070: the aborted-deliverable body has exactly one owner,
+                // `crate::markers::aborted_deliverable` — the same call the
+                // runner's own abort path (`runner::execution::aborted_deliverable`),
+                // the `delegate_task` handler and the orchestrator worker loop
+                // make, so the abort text keeps one byte-for-byte spelling
+                // everywhere (it is asserted elsewhere and read by
+                // `ui::helpers::extract_failure_reason`).
+                content: aborted_deliverable("aborted by user instruction"),
                 task_id: ctx.task_id.clone(),
             };
         }
@@ -308,58 +276,127 @@ mod tests {
         assert_eq!(Agent::from_str("unknown"), None);
     }
 
+    /// Dedup cluster C4: the agents layer no longer owns a `MissionMarker`
+    /// copy — `crate::agents::MissionMarker`, `crate::markers::MissionMarker`
+    /// and `crate::manager::phase::MissionMarker` are one and the same type,
+    /// so the plan layer and the specialist layer can never drift apart again.
     #[test]
-    fn test_mission_marker_parse() {
-        assert_eq!(
-            MissionMarker::parse("MISSION COMPLETE (t-001)"),
-            Some(MissionMarker::Complete {
-                task_id: Some("t-001".to_string())
-            })
-        );
-        assert_eq!(
-            MissionMarker::parse("REPLAN REQUIRED: missing deps"),
-            Some(MissionMarker::Replan {
-                reason: "REPLAN REQUIRED: missing deps".to_string()
-            })
-        );
-        assert!(matches!(
-            MissionMarker::parse("FAILED because of test errors"),
-            Some(MissionMarker::Failed { .. })
-        ));
+    fn mission_marker_has_one_owner_reexported_by_both_layers() {
+        let agents_side: MissionMarker = MissionMarker::Complete { task_id: None };
+        let module_side: crate::markers::MissionMarker = agents_side.clone();
+        let plan_side: crate::manager::phase::MissionMarker = module_side.clone();
+        assert_eq!(agents_side, plan_side);
     }
 
+    /// Gate t-059 byte-pin: the abort path builds its trailer through
+    /// `markers::failed_trailer`, and the rendered deliverable text is still
+    /// **exactly** the historical bytes (this string is asserted elsewhere and
+    /// read by `ui::helpers::extract_failure_reason`).
+    #[tokio::test]
+    async fn aborted_deliverable_keeps_its_exact_bytes() {
+        let ctx = IsolatedContext {
+            role_system_prompt: String::new(),
+            brief: "pin the abort trailer".to_string(),
+            task_id: Some("t-059".to_string()),
+            snippets: Vec::new(),
+            image_urls: Vec::new(),
+            audio_urls: Vec::new(),
+            blueprint: None,
+        };
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+
+        let deliverable = Generalist.run(&ctx, &token).await;
+        assert_eq!(
+            deliverable.content,
+            "Task aborted by user instruction.\n\nFAILED (aborted)"
+        );
+        assert_eq!(
+            deliverable.marker,
+            MissionMarker::Failed {
+                reason: "aborted".to_string()
+            }
+        );
+        assert_eq!(deliverable.task_id.as_deref(), Some("t-059"));
+        // The marker owner reads its own trailer back: emit and parse agree.
+        assert_eq!(
+            crate::markers::failure_reason(&deliverable.content),
+            Some("aborted")
+        );
+        assert!(crate::markers::has_failure_marker(&deliverable.content));
+        assert!(
+            !crate::markers::MissionMarker::parse(&deliverable.content)
+                .is_some_and(|m| m.is_complete())
+        );
+    }
+
+    /// Bug C1 regression (a), seen from the specialist layer: a FAILED
+    /// deliverable whose prose mentions `MISSION COMPLETE` must not be
+    /// reported as a completion.
     #[test]
-    fn test_mission_marker_parse_precedence_and_benign_failed() {
-        // MISSION COMPLETE takes precedence over words like "failed" in narrative
-        let narrative =
-            "Previous build failed with syntax error. Fixed now.\n\nMISSION COMPLETE (t-001)";
-        assert_eq!(
-            MissionMarker::parse(narrative),
-            Some(MissionMarker::Complete {
-                task_id: Some("t-001".to_string())
-            })
+    fn regression_failed_deliverable_mentioning_mission_complete_stays_failed() {
+        let content = "FAILED: replace tool rejected; I did not emit \
+                       MISSION COMPLETE (t-014) because the build broke";
+        let marker = MissionMarker::parse(content).expect("a terminal marker");
+        assert!(
+            matches!(marker, MissionMarker::Failed { .. }),
+            "expected Failed, got {marker:?}"
         );
+        assert!(!marker.is_complete());
+    }
 
-        // Test outputs containing "0 failed" must not be parsed as Failed
-        let test_output =
-            "test result: ok. 15 passed; 0 failed; 0 ignored\n\nMISSION COMPLETE (t-002)";
-        assert_eq!(
-            MissionMarker::parse(test_output),
-            Some(MissionMarker::Complete {
-                task_id: Some("t-002".to_string())
-            })
-        );
-
-        // 0 failed without MISSION COMPLETE should not be parsed as Failed
-        let benign = "test result: ok. 15 passed; 0 failed; 0 ignored";
-        assert_eq!(MissionMarker::parse(benign), None);
-
-        // Actual failure without MISSION COMPLETE is parsed as Failed
-        let failed = "Compilation error: FAILED to compile src/main.rs";
+    /// Bug C1 regression (b)/(c) at the deliverable boundary: a genuine
+    /// completion still checks off logically, and `REPLAN REQUIRED` is never a
+    /// success.
+    #[test]
+    fn regression_completion_and_replan_verdicts_at_agents_layer() {
+        let done = "Implemented src/markers.rs and ran cargo test.\n\nMISSION COMPLETE (t-007)";
         assert!(matches!(
-            MissionMarker::parse(failed),
-            Some(MissionMarker::Failed { .. })
+            MissionMarker::parse(done),
+            Some(MissionMarker::Complete { task_id: Some(id) }) if id == "t-007"
         ));
+
+        let replan = MissionMarker::parse("REPLAN REQUIRED: the decomposition is wrong")
+            .expect("a terminal marker");
+        assert!(!replan.is_complete());
+        assert!(replan.is_failure());
+    }
+
+    /// Bug C1 regression (d): the structured `Deliverable.marker` field is
+    /// authoritative over the body text; the positional body parse is only the
+    /// fallback when no structured marker exists.
+    #[test]
+    fn regression_structured_deliverable_marker_wins_over_body_text() {
+        let d = Deliverable {
+            marker: MissionMarker::Complete {
+                task_id: Some("t-005".to_string()),
+            },
+            content: "the first attempt FAILED; this final revision is clean".to_string(),
+            task_id: Some("t-005".to_string()),
+        };
+        let resolved = MissionMarker::resolve(Some(&d.marker), &d.content).expect("resolved");
+        assert_eq!(resolved, d.marker);
+
+        // A structured FAILED is not rescued by a stale completion sentence.
+        let rejected = Deliverable {
+            marker: MissionMarker::Failed {
+                reason: "validator rejected".to_string(),
+            },
+            content: "MISSION COMPLETE (t-006) — revoked before finalization".to_string(),
+            task_id: Some("t-006".to_string()),
+        };
+        assert!(
+            MissionMarker::resolve(Some(&rejected.marker), &rejected.content)
+                .is_some_and(|m| m.is_failure())
+        );
+
+        // Without a structured marker the positional parse decides.
+        assert_eq!(
+            MissionMarker::resolve(None, "done\n\nMISSION COMPLETE (t-009)"),
+            Some(MissionMarker::Complete {
+                task_id: Some("t-009".to_string())
+            })
+        );
     }
 
     #[test]

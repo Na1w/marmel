@@ -1,4 +1,10 @@
 //! JSON-RPC 2.0 MCP Client implementation for stdio and HTTP/SSE.
+//!
+//! The stdio connection below is a raw transport only: the JSON-RPC envelopes,
+//! ids, method names, param shapes and result/error decoding come from
+//! [`super::protocol`] (cluster C7), exactly like the HTTP/SSE transport in
+//! [`super::http`] consumes them. What is stdio-specific here is the child
+//! process, the newline framing and this transport's debug instrumentation.
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -6,12 +12,14 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-use super::http::{HttpSseConnection, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
+use super::http::{HttpSseConnection, MCP_REQUEST_TIMEOUT};
+use super::protocol::{
+    self, JsonRpcNotification, JsonRpcRequest, JsonRpcTransport, RequestIds, decode_reply,
+};
 
 /// Server configuration entry for an MCP server in marmel.toml.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -54,11 +62,27 @@ pub struct StdioMcpConnection {
     child: Child,
     stdin: tokio::process::ChildStdin,
     stdout_reader: BufReader<tokio::process::ChildStdout>,
-    request_id: AtomicU64,
+    /// The protocol layer's monotonic JSON-RPC id allocator
+    /// ([`super::protocol::RequestIds`]); the transport only carries it.
+    request_ids: RequestIds,
+    /// Per-response deadline shared with the HTTP transport
+    /// (`crate::mcp::http::MCP_REQUEST_TIMEOUT`).
+    request_timeout: std::time::Duration,
 }
 
 impl StdioMcpConnection {
     pub async fn spawn(server_name: &str, cfg: &McpServerConfig) -> Result<Self> {
+        Self::spawn_with(server_name, cfg, MCP_REQUEST_TIMEOUT).await
+    }
+
+    /// Spawn with an explicit response deadline. Production callers go through
+    /// [`Self::spawn`] (shared `MCP_REQUEST_TIMEOUT`); the seam keeps the
+    /// deadline behaviour testable without waiting 30 s.
+    pub(crate) async fn spawn_with(
+        server_name: &str,
+        cfg: &McpServerConfig,
+        request_timeout: std::time::Duration,
+    ) -> Result<Self> {
         let cmd_str = cfg
             .command
             .as_ref()
@@ -105,47 +129,72 @@ impl StdioMcpConnection {
             child,
             stdin,
             stdout_reader,
-            request_id: AtomicU64::new(1),
+            request_ids: RequestIds::new(),
+            request_timeout,
         };
 
-        conn.initialize().await?;
+        protocol::initialize(&mut conn).await?;
         Ok(conn)
     }
+}
 
-    async fn send_request(&mut self, method: &str, params: Option<Value>) -> Result<Value> {
-        let id = self.request_id.fetch_add(1, Ordering::SeqCst);
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0",
-            id,
-            method: method.to_string(),
-            params,
-        };
+/// The raw send/receive half of the [`super::protocol`] seam: newline-delimited
+/// JSON-RPC over the child's stdin/stdout. Envelope construction, id allocation,
+/// method names, param shapes and the error-envelope decoding are all the
+/// protocol layer's; this transport supplies the wire and its own instrumentation.
+impl JsonRpcTransport for StdioMcpConnection {
+    fn server_name(&self) -> &str {
+        &self.server_name
+    }
 
-        crate::debug_log::log_mcp_request(&self.server_name, method, req.params.as_ref());
+    fn request_ids(&self) -> &RequestIds {
+        &self.request_ids
+    }
+
+    /// Write one request envelope and return the `result` of the reply that
+    /// carries its id.
+    async fn send_request(&mut self, request: &JsonRpcRequest) -> Result<Value> {
+        let method = request.method.as_str();
+        crate::debug_log::log_mcp_request(&self.server_name, method, request.params_ref());
         let start_time = std::time::Instant::now();
 
-        let mut req_str = serde_json::to_string(&req)?;
-        req_str.push('\n');
+        let mut body = request.body()?;
+        body.push('\n');
 
         self.stdin
-            .write_all(req_str.as_bytes())
+            .write_all(body.as_bytes())
             .await
             .with_context(|| format!("writing request to MCP server '{}'", self.server_name))?;
         self.stdin.flush().await?;
 
-        let timeout_duration = std::time::Duration::from_secs(30);
         let mut line = String::new();
         loop {
             line.clear();
-            let read_fut = self.stdout_reader.read_line(&mut line);
-            let n = tokio::time::timeout(timeout_duration, read_fut)
-                .await
-                .map_err(|_| {
-                    anyhow!(
-                        "timeout waiting for MCP server '{}' response (30s)",
-                        self.server_name
-                    )
-                })??;
+            // Shared pump skeleton from `crate::net::sse` (cluster C4) replaces
+            // the hand-rolled `tokio::time::timeout` around `read_line`. The
+            // deadline is recomputed per read, preserving the flat per-response
+            // timeout the previous code had.
+            let n = {
+                let read_fut = self.stdout_reader.read_line(&mut line);
+                tokio::pin!(read_fut);
+                let deadline = std::time::Instant::now() + self.request_timeout;
+                match crate::net::pump_future(&mut read_fut, Some(deadline), &mut |_| true).await {
+                    crate::net::PumpNext::Item(Some(res)) => res?,
+                    crate::net::PumpNext::Item(None) => {
+                        unreachable!("read_line always resolves to a value")
+                    }
+                    crate::net::PumpNext::IdleTimeout => {
+                        return Err(anyhow!(
+                            "timeout waiting for MCP server '{}' response ({}s)",
+                            self.server_name,
+                            self.request_timeout.as_secs()
+                        ));
+                    }
+                    crate::net::PumpNext::Aborted => {
+                        return Err(anyhow!("MCP request to '{}' aborted", self.server_name));
+                    }
+                }
+            };
             if n == 0 {
                 let err_msg = format!("MCP server '{}' closed stdout stream", self.server_name);
                 crate::debug_log::log_mcp_response(
@@ -161,10 +210,10 @@ impl StdioMcpConnection {
             if trimmed.is_empty() {
                 continue;
             }
-            if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(trimmed) {
-                if !resp.id_matches(id) {
-                    continue;
-                }
+            // Which stdout line answers *this* request (and which is noise, a
+            // log line, or somebody else's event) is decided by the protocol
+            // layer, not by a transport-local rule.
+            if let Some(resp) = decode_reply(trimmed, request.id) {
                 let res = resp.into_result(&self.server_name);
                 let elapsed_ms = start_time.elapsed().as_millis();
                 let res_str = match &res {
@@ -183,97 +232,27 @@ impl StdioMcpConnection {
         }
     }
 
-    async fn send_notification(&mut self, method: &str, params: Option<Value>) -> Result<()> {
-        let notif = JsonRpcNotification {
-            jsonrpc: "2.0",
-            method: method.to_string(),
-            params,
-        };
-        let mut notif_str = serde_json::to_string(&notif)?;
-        notif_str.push('\n');
+    /// Write one notification envelope; no reply is expected.
+    async fn send_notification(&mut self, notification: &JsonRpcNotification) -> Result<()> {
+        let mut body = notification.body()?;
+        body.push('\n');
 
-        self.stdin.write_all(notif_str.as_bytes()).await?;
+        self.stdin.write_all(body.as_bytes()).await?;
         self.stdin.flush().await?;
         Ok(())
     }
+}
 
-    async fn initialize(&mut self) -> Result<()> {
-        let init_params = serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {
-                "tools": {}
-            },
-            "clientInfo": {
-                "name": "marmel",
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        });
-
-        let _result = self.send_request("initialize", Some(init_params)).await?;
-        self.send_notification("notifications/initialized", None)
-            .await?;
-        Ok(())
-    }
-
+impl StdioMcpConnection {
+    /// Discover the tools exposed by this server. The envelope, the request id
+    /// and the decoding come from [`super::protocol`].
     pub async fn list_tools(&mut self) -> Result<Vec<McpTool>> {
-        let result = self.send_request("tools/list", None).await?;
-        let mut tools = Vec::new();
-        if let Some(tools_arr) = result.get("tools").and_then(Value::as_array) {
-            for t in tools_arr {
-                if let Some(name) = t.get("name").and_then(Value::as_str) {
-                    let description = t
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                    let input_schema = t
-                        .get("inputSchema")
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!({"type": "object"}));
-                    tools.push(McpTool {
-                        name: name.to_string(),
-                        description,
-                        input_schema,
-                        server_name: self.server_name.clone(),
-                    });
-                }
-            }
-        }
-        Ok(tools)
+        protocol::list_tools(self).await
     }
 
+    /// Invoke a tool on this server.
     pub async fn call_tool(&mut self, name: &str, arguments: &Value) -> Result<String> {
-        let params = serde_json::json!({
-            "name": name,
-            "arguments": arguments
-        });
-
-        let result = self.send_request("tools/call", Some(params)).await?;
-
-        let mut output = String::new();
-        if let Some(content_arr) = result.get("content").and_then(Value::as_array) {
-            for item in content_arr {
-                if let Some(text) = item.get("text").and_then(Value::as_str) {
-                    output.push_str(text);
-                } else {
-                    output.push_str(&item.to_string());
-                }
-                output.push('\n');
-            }
-        } else if let Some(text) = result.get("text").and_then(Value::as_str) {
-            output.push_str(text);
-        } else if !result.is_null() {
-            output.push_str(&result.to_string());
-        }
-
-        let is_error = result
-            .get("isError")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if is_error {
-            Err(anyhow!(output.trim().to_string()))
-        } else {
-            Ok(output.trim().to_string())
-        }
+        protocol::call_tool(self, name, arguments).await
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
@@ -571,5 +550,262 @@ mod tests {
                 "zeta__tool".to_string(),
             ]
         );
+    }
+
+    // ── net-C4: the stdio transport reads responses through the shared pump ──
+
+    /// `/bin/cat` echoes every line written to it, which is enough to drive the
+    /// `initialize` handshake and a `tools/list` round-trip through
+    /// `crate::net::pump_future` — the shared replacement for the hand-rolled
+    /// `tokio::time::timeout` around `read_line`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_response_is_read_through_the_shared_pump() {
+        let cfg = McpServerConfig {
+            command: Some("/bin/cat".to_string()),
+            ..Default::default()
+        };
+
+        let mut conn =
+            StdioMcpConnection::spawn_with("echo-server", &cfg, std::time::Duration::from_secs(5))
+                .await
+                .expect("the cat-backed handshake should succeed");
+
+        let tools = conn
+            .list_tools()
+            .await
+            .expect("the echoed request must be accepted as an empty answer");
+        assert!(tools.is_empty(), "the echo carries no tool list");
+
+        conn.shutdown().await.expect("shutdown should succeed");
+    }
+
+    /// The pump's idle deadline still surfaces the transport's own timeout error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_read_hits_the_shared_pump_deadline() {
+        // A "server" that never writes anything back.
+        let cfg = McpServerConfig {
+            command: Some("/bin/sleep".to_string()),
+            args: vec!["30".to_string()],
+            ..Default::default()
+        };
+
+        let err = match StdioMcpConnection::spawn_with(
+            "silent-server",
+            &cfg,
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        {
+            Ok(_) => panic!("a server that never answers must hit the deadline"),
+            Err(e) => e.to_string(),
+        };
+
+        assert!(
+            err.contains("timeout waiting for MCP server 'silent-server' response"),
+            "expected the unchanged deadline message, got: {err}"
+        );
+    }
+
+    // ── net-C7: the stdio transport speaks the shared protocol layer ────────
+
+    use crate::mcp::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcTransport};
+
+    /// Read `path` until it holds at least `want` lines, bounded so a server
+    /// that never writes cannot hang the suite.
+    #[cfg(unix)]
+    async fn read_capture_lines(path: &std::path::Path, want: usize) -> Vec<String> {
+        for _ in 0..40 {
+            let lines = std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if lines.len() >= want {
+                return lines;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A scripted "server" on stdout: emits the lines and then idles so its
+    /// stdout stays open while the transport drives a round-trip.
+    #[cfg(unix)]
+    fn scripted_server(lines: &[&str]) -> McpServerConfig {
+        let mut script = String::from("printf '%s\\n'");
+        for line in lines {
+            script.push_str(" '");
+            script.push_str(line);
+            script.push('\'');
+        }
+        script.push_str("; sleep 30");
+        McpServerConfig {
+            command: Some("/bin/sh".to_string()),
+            args: vec!["-c".to_string(), script],
+            ..Default::default()
+        }
+    }
+
+    /// Cluster C7 guard: what the stdio transport puts on the wire is exactly
+    /// the envelope text `crate::mcp::protocol` builds — the very same bytes the
+    /// HTTP/SSE transport sends (see `http_wire_bodies_are_the_protocol_layers_envelopes`
+    /// in `mcp::http_tests`), which is what makes this one protocol layer and
+    /// not two.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_wire_bodies_are_the_protocol_layers_envelopes() {
+        let capture = tempfile::NamedTempFile::new().expect("capture file");
+        let cfg = McpServerConfig {
+            command: Some("/bin/tee".to_string()),
+            args: vec![capture.path().to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+
+        let mut conn =
+            StdioMcpConnection::spawn_with("wire-server", &cfg, std::time::Duration::from_secs(5))
+                .await
+                .expect("the tee-backed handshake should succeed");
+        conn.list_tools().await.expect("tools/list round-trip");
+
+        let lines = read_capture_lines(capture.path(), 3).await;
+        assert_eq!(
+            lines.len(),
+            3,
+            "initialize + notifications/initialized + tools/list, got {lines:?}"
+        );
+
+        // The handshake envelope: built by the protocol layer and pinned to its
+        // literal bytes — identical to the HTTP/SSE transport's first request.
+        assert_eq!(lines[0], JsonRpcRequest::initialize().body().expect("body"));
+        // Pinned to the same literal the HTTP/SSE guard pins
+        // (`canonical_initialize_body` in `mcp::http_tests`): byte-identical
+        // handshakes from the two transports prove one protocol layer, not two.
+        assert_eq!(
+            lines[0],
+            r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"capabilities":{"tools":{}},"clientInfo":{"name":"marmel","version":"@VERSION@"},"protocolVersion":"2024-11-05"}}"#
+                .replace("@VERSION@", env!("CARGO_PKG_VERSION"))
+        );
+
+        // A notification carries no id, and the handshake consumed none, so
+        // `tools/list` is id 1 here exactly as it is over HTTP/SSE.
+        assert_eq!(
+            lines[1],
+            JsonRpcNotification::initialized()
+                .body()
+                .expect("notification body")
+        );
+        assert_eq!(
+            lines[1],
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#
+        );
+        assert_eq!(
+            lines[2],
+            JsonRpcRequest::tools_list(1).body().expect("body")
+        );
+        assert_eq!(
+            lines[2],
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#
+        );
+
+        conn.shutdown().await.expect("shutdown should succeed");
+    }
+
+    /// A stdout line that is not a reply for the pending request — a foreign id,
+    /// or not JSON at all — is skipped by the protocol layer, and the matching
+    /// reply still resolves.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_skips_unrelated_lines_and_resolves_the_matching_reply() {
+        let cfg = scripted_server(&[
+            r#"{"jsonrpc":"2.0","id":99,"result":{"noise":true}}"#,
+            "not json at all",
+            r#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"w1","description":"from fake"},{"name":"w2","inputSchema":{"type":"object"}}]}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"Hello "},{"type":"text","text":"World"}]}}"#,
+        ]);
+
+        let mut conn =
+            StdioMcpConnection::spawn_with("fake-stdio", &cfg, std::time::Duration::from_secs(5))
+                .await
+                .expect("the handshake must match the id 0 line");
+
+        let tools = conn
+            .list_tools()
+            .await
+            .expect("the noise must be skipped and id 1 must resolve");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "w1");
+        assert_eq!(tools[0].description.as_deref(), Some("from fake"));
+        assert_eq!(tools[0].input_schema, json!({"type": "object"}));
+        assert_eq!(tools[1].name, "w2");
+        assert_eq!(tools[1].input_schema, json!({"type": "object"}));
+        assert!(tools.iter().all(|t| t.server_name == "fake-stdio"));
+
+        // The allocator continued where `tools/list` left off, so the scripted
+        // id 2 reply is the answer to this `tools/call`.
+        let reply = conn
+            .call_tool("w1", &json!({}))
+            .await
+            .expect("the id 2 reply must resolve");
+        assert_eq!(reply, "Hello \nWorld");
+
+        conn.shutdown().await.expect("shutdown should succeed");
+    }
+
+    /// A JSON-RPC error envelope on stdout becomes the shared `McpError::JsonRpc`
+    /// message at the caller boundary — the transport does not decode it itself.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_error_envelope_surfaces_as_the_shared_mcp_error() {
+        let cfg = scripted_server(&[
+            r#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#,
+        ]);
+
+        let mut conn =
+            StdioMcpConnection::spawn_with("fake-stdio", &cfg, std::time::Duration::from_secs(5))
+                .await
+                .expect("the handshake should succeed");
+
+        let err = conn
+            .list_tools()
+            .await
+            .expect_err("an error envelope fails");
+        assert_eq!(
+            err.to_string(),
+            "MCP error (-32601) from 'fake-stdio': Method not found (data: None)"
+        );
+
+        conn.shutdown().await.expect("shutdown should succeed");
+    }
+
+    /// The transport seam is implemented (not shadowed) by both transports, and
+    /// the two share the protocol layer's id policy: a fresh connection starts at
+    /// the first request id, and the handshake does not consume one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn both_transports_share_the_protocols_id_allocator_policy() {
+        let cfg = McpServerConfig {
+            command: Some("/bin/cat".to_string()),
+            ..Default::default()
+        };
+        let conn =
+            StdioMcpConnection::spawn_with("echo-server", &cfg, std::time::Duration::from_secs(5))
+                .await
+                .expect("the cat-backed handshake should succeed");
+
+        use crate::mcp::protocol::{FIRST_REQUEST_ID, HANDSHAKE_REQUEST_ID};
+        assert_eq!(
+            conn.request_ids().next(),
+            FIRST_REQUEST_ID,
+            "the handshake must not consume a request id"
+        );
+        assert_ne!(HANDSHAKE_REQUEST_ID, FIRST_REQUEST_ID);
     }
 }

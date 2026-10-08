@@ -782,9 +782,7 @@ impl TuiRenderer {
         }
         self.history_index = None;
         self.input_draft.clear();
-        let user_tokens = tiktoken_rs::cl100k_base_singleton()
-            .encode_ordinary(&line)
-            .len();
+        let user_tokens = crate::manager::context::count_text_tokens(&line);
         self.tokens_in = self.tokens_in.saturating_add(user_tokens);
         // Echo the user's line into the chat view.
         self.messages.push(format!("User: {trimmed}"));
