@@ -7,13 +7,11 @@ use serde_json::json;
 fn test_integration_monitor_xml_rescue_and_repetition() {
     let mut monitor = HarnessMonitor::with_new_stats();
 
-    // 1. Test XML rescue from raw text
     let raw_text = r#"Let me search the files: <tool_call>{"name": "grep_search", "arguments": {"pattern": "fn main"}}</tool_call>"#;
     let rescued = monitor.rescue_xml(raw_text);
     assert_eq!(rescued.len(), 1);
     assert_eq!(rescued[0].function.name, "grep_search");
 
-    // 2. Test repetition detection
     let args = json!({"path": "src/main.rs"});
     let mut blocked = false;
     for _ in 0..10 {
@@ -36,7 +34,6 @@ fn test_integration_monitor_thought_repetition_across_turns() {
     let thought_turn_1 = "I need to create a basic raytracer in C that renders a scene with a sphere and outputs a PPM image. First, I'll structure the code with core components: a Vector3 type for 3D math, a Ray struct, a Sphere struct with center and radius.\n";
     let response_turn_1 = "I'll help you create a basic raytracer in C. Let's start by writing the complete source code.\n";
 
-    // Turn 1
     rep_detector.push(thought_turn_1);
     rep_detector.push(response_turn_1);
     assert!(

@@ -316,8 +316,9 @@ fn default_input_schema() -> Value {
 /// A tool entry without a name is skipped; `description` is optional; a missing
 /// `inputSchema` falls back to an empty object schema. An `inputSchema` that is
 /// present but `null` stays `null` — production has always passed it through,
-/// and the C8 test copy that filtered it out was wrong (that is the drift the
-/// recon flagged at `src/mcp/http_tests.rs:110` vs `src/mcp/http.rs:304`).
+/// and the hand-copied C8 test that filtered it out was wrong (the drift is
+/// recorded on the transport-level `tools/list` decode test in `http_tests`,
+/// which exercises this function instead of a local copy).
 pub(crate) fn parse_tools(result: &Value, server_name: &str) -> Vec<McpTool> {
     let mut tools = Vec::new();
     if let Some(tools_arr) = result.get("tools").and_then(Value::as_array) {

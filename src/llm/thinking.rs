@@ -40,18 +40,15 @@ impl Default for RecoveryAdjustment {
 /// `/chat/completions` endpoint: `MIN_TEMPERATURE..=MAX_TEMPERATURE` (0.0..=2.0).
 /// Outside it the provider answers **400**, so recovery requests are clamped here.
 pub const MIN_TEMPERATURE: f32 = 0.0;
-/// See [`MIN_TEMPERATURE`].
 pub const MAX_TEMPERATURE: f32 = 2.0;
 
 /// Documented valid range for `frequency_penalty` and `presence_penalty`:
 /// `-2.0..=2.0`.
 pub const MIN_PENALTY: f32 = -2.0;
-/// See [`MIN_PENALTY`].
 pub const MAX_PENALTY: f32 = 2.0;
 
 /// Documented valid range for `top_p`: `0.0..=1.0`.
 pub const MIN_TOP_P: f32 = 0.0;
-/// See [`MIN_TOP_P`].
 pub const MAX_TOP_P: f32 = 1.0;
 
 /// `temperature` used when the request leaves it unset (mirrors `Config::default`).
@@ -509,9 +506,7 @@ impl NudgePolicy {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Unit tests (Phase D checkpoint: `cargo test --lib test_llm_`)
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[cfg(test)]

@@ -1,12 +1,12 @@
 //! Integration tests for the orchestrator `delegate` flow (execution plan
 //! task t-a102).
 //!
-//! These tests verify that `wip/src/orchestrator/mod.rs` `delegate` flow is
+//! These tests verify that `src/orchestrator/mod.rs` `delegate` flow is
 //! aligned with caesar's `Orchestrator` logic as captured in
-//! `wip/REFERENCE_ORCHESTRATION_CONTRACT.md`:
+//! the caesar reference orchestration contract (not vendored in this repo):
 //!
 //! 1. **Fractal depth gating** — recursion bounds are STRICTLY enforced. The
-//!    gate is UNCONDITIONAL (parity with caesar `tools_manager.rs:914`), so a
+//!    gate is UNCONDITIONAL (parity with the caesar tools_manager gate), so a
 //!    request that would exceed the bound is rejected regardless of
 //!    `recursion_granted`, and a rejected delegation emits NO `Started` event.
 //! 2. **`DelegationEvent` surfacing** — a successful delegation emits exactly
@@ -97,13 +97,11 @@ fn req(
     }
 }
 
-// ---------------------------------------------------------------------------
 // 1. Fractal depth gating
-// ---------------------------------------------------------------------------
 
 /// The recursion bound is STRICTLY enforced: a delegation at the max depth is
 /// rejected even when `recursion_granted` is false (parity with caesar's
-/// unconditional gate at tools_manager.rs:914).
+/// unconditional gate in caesar tools_manager).
 #[tokio::test]
 async fn test_depth_gate_rejects_at_bound_regardless_of_grant() {
     let tmp = setup().await;
@@ -160,9 +158,7 @@ async fn test_depth_gate_allows_within_bound() {
     assert!(matches!(d.marker, MissionMarker::Complete { .. }));
 }
 
-// ---------------------------------------------------------------------------
 // 2. DelegationEvent surfacing
-// ---------------------------------------------------------------------------
 
 /// A successful delegation emits exactly one `Started` then one `Completed`
 /// event for the specialist + task.
@@ -191,9 +187,7 @@ async fn test_delegation_events_started_then_completed() {
         DelegationEvent::Completed { agent: Agent::Coder, task: Some(t) } if t == "t-77"));
 }
 
-// ---------------------------------------------------------------------------
 // 3. apply_check_off parity
-// ---------------------------------------------------------------------------
 
 /// `MISSION COMPLETE (t-xxx)` flips the plan line `[ ]` → `[x]`.
 #[tokio::test]
@@ -215,19 +209,15 @@ async fn test_check_off_complete_flips() {
     assert_eq!(remaining, vec!["t-102".to_string()]);
 }
 
-// ---------------------------------------------------------------------------
 // 4. Abort signal lifecycle and delegation cancellation
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn test_orchestrator_abort_signal_lifecycle_and_cancellation() {
     let tmp = setup().await;
     let m = test_manager(&tmp);
 
-    // Initial state: not cancelled
     assert!(!m.is_cancelled());
 
-    // Request abort / cancellation
     m.cancel();
     assert!(m.is_cancelled());
 

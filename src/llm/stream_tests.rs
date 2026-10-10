@@ -144,7 +144,6 @@ async fn test_turn_stream_handler_detects_pause() {
         pause_invoked: false,
     };
 
-    // First chunk passes
     assert!(handler.on_chunk_with_sink("chunk1", &mut sink));
     assert!(handler.pause_requested.is_none());
 
@@ -171,7 +170,6 @@ async fn test_turn_stream_handler_does_not_trigger_repetition_on_thinking() {
     );
     assert!(!handler.rep_triggered);
 
-    // Stream content
     let continue_content = handler.on_chunk_with_sink("Here is the final answer.", &mut sink);
     assert!(continue_content);
     assert!(!handler.rep_triggered);
@@ -184,7 +182,6 @@ async fn test_turn_stream_handler_enforces_thinking_budget() {
     let mut handler = TurnStreamHandler::for_sink_with_thinking_budget(5000, 256, &mut rep, true);
     let mut sink = VecSink::default();
 
-    // Start thinking block
     assert!(handler.on_chunk_with_sink("<think>\n", &mut sink));
     assert!(!handler.thinking_budget_exceeded);
 
@@ -226,12 +223,10 @@ fn test_stream_config_thinking_budget_defaults() {
     assert_eq!(stream_cfg2.max_thinking_tokens, 4096);
 }
 
-// ---------------------------------------------------------------------------
 // Cluster net-C11 guard: the single finalize helper shared by every successful
 // exit site of `ChatClient::try_chat_once` (`ReplyAccumulator::finalize`).
 // These tests pin content assembly, tool-call order, token accounting and the
 // per-terminal-site logging difference.
-// ---------------------------------------------------------------------------
 
 use crate::llm::client::ReplyAccumulator;
 use crate::llm::get_global_token_counts;

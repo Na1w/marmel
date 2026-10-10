@@ -368,7 +368,6 @@ async fn test_specialist_recovers_after_repetition_nudge_and_succeeds() {
             "raytracer.c should exist after recovery"
         );
 
-        // Verify deliverable indicates completion
         assert!(result.contains("MISSION COMPLETE (task-t-003)"));
         assert!(!result.contains("FAILED"));
         // H6: `task-t-003` is one token; cutting `t-003` out of it was the
@@ -487,17 +486,14 @@ async fn test_specialist_revision_recovers_after_repetition_nudge_and_succeeds()
             .await
             .expect("specialist live run should complete");
 
-        // Verify both files exist
         assert!(tmp_path.join("src/main.rs").exists());
         assert!(tmp_path.join("tests/main_test.rs").exists());
 
-        // Verify deliverable indicates completion
         assert!(result.contains("MISSION COMPLETE (task-t-004)"));
         assert!(!result.contains("FAILED"));
     }).await;
 }
 
-// ---------------------------------------------------------------------------
 // Gate t-033c — repair of a broken fixture (work item 4).
 //
 // This fixture used to be called
@@ -521,7 +517,6 @@ async fn test_specialist_revision_recovers_after_repetition_nudge_and_succeeds()
 // and it is the VALIDATOR turn that receives the `leave_verdict` APPROVED
 // response. The request bodies are asserted so a future regression that again
 // routes a verdict to the wrong agent cannot pass silently.
-// ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_specialist_without_marker_is_nudged_then_approved_by_validator() {
     let tmp = tempfile::tempdir().unwrap();
@@ -607,7 +602,6 @@ async fn test_specialist_without_marker_is_nudged_then_approved_by_validator() {
     .await;
 }
 
-// ---------------------------------------------------------------------------
 // INTENTIONAL CONTRACT CHANGE (gate t-033c, work item 2).
 //
 // This test used to be named `test_validator_reminded_3_times_and_assumed_
@@ -623,7 +617,6 @@ async fn test_specialist_without_marker_is_nudged_then_approved_by_validator() {
 // marker is revoked, and the `- [ ] [t-006]` plan line stays unchecked. The
 // rewrite below is not a regression caught by accident: it is the new contract,
 // on purpose.
-// ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_validator_reminded_3_times_and_fails_closed_without_verdict() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1016,14 +1009,12 @@ async fn test_delegated_validator_skips_subsequent_tools_in_same_turn_after_leav
     .await;
 }
 
-// ---------------------------------------------------------------------------
 // Gate t-033a — a missing / unreadable / blank per-task validation verdict file
 // (`.marmel/prompts/{task_id}-validation.md`) must be a HARD validation failure.
 // Before the fix the absence of that file *skipped* validation and started the
 // run with `validation_passed = true`, so the deliverable was reported as
 // validated and its plan line checked off although no validator ever ran
 // (H1/H4 in docs/recon_bugs_agents_monitor.md).
-// ---------------------------------------------------------------------------
 
 /// Mount a mock backend that replays `turns` in order (falling back to a
 /// sentinel reply) and records every request body, so a test can prove which

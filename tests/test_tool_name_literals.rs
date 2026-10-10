@@ -61,6 +61,10 @@ const BASELINE: &[(&str, &str, usize)] = &[
     // Doc-comment + inline comment examples of wire format.
     ("src/harness/monitor/xml.rs", "read_file", 4),
     ("src/harness/monitor/xml.rs", "write_file", 1),
+    // OS program name in a spawn fixture (PATH lookup), not a tool identifier.
+    ("src/harness/pty_tests.rs", "sleep", 1),
+    // OS program name in a spawn fixture (PATH lookup), not a tool identifier.
+    ("src/mcp/client.rs", "sleep", 1),
     // Inputs to `normalize_steer_decision` (accepts raw LLM decision strings).
     ("src/orchestrator/steer_tests.rs", "delegate_task", 1),
     // Wire-format JSON fixture (serialized tool call shape).

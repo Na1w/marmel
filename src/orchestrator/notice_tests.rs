@@ -43,20 +43,16 @@ async fn test_worker_inbox_draining_with_exact_role_matching() {
     assert_eq!(drained[0].notice_id, n1.notice_id);
     assert_eq!(drained[0].user_inquiry, "Question 1 for coder");
 
-    // Second drain should be empty
     let empty = drain_worker_notices("coder-t-001");
     assert!(empty.is_empty());
 
-    // Draining for debugger
     let drained_dbg = drain_worker_notices("debugger");
     assert_eq!(drained_dbg.len(), 1);
     assert_eq!(drained_dbg[0].user_inquiry, "Question for debugger");
 }
 
-// ---------------------------------------------------------------------------
 // Routing regression tests — recon H1 (substring/prefix routing) and the
 // disambiguated worker keys `{base}#{n}` introduced for recon H5.
-// ---------------------------------------------------------------------------
 
 /// H1: a notice addressed to the `coder` role must NOT be drained by the
 /// validator worker auditing that coder — its registry key
@@ -366,10 +362,8 @@ async fn test_record_worker_reply_matches_pending_notice() {
     assert_eq!(original.user_inquiry, "Why SQLite?");
     assert_eq!(original.notice_id, "notice-custom-1");
 
-    // Pending notice is removed once replied
     assert!(get_pending_notice("notice-custom-1").is_none());
 
-    // Reply is recorded in store
     let reply = get_worker_reply("notice-custom-1");
     assert!(reply.is_some());
     let rep = reply.unwrap();
@@ -389,7 +383,7 @@ async fn test_handle_reply_to_arbitrator_success_and_validation() {
     let server = MockServer::start().await;
     let response_json = serde_json::json!({
         "decision": "SynthesizeResponse",
-        "response": "Coder bekräftar att async I/O har implementerats.",
+        "response": "Coder confirms that async I/O has been implemented.",
         "follow_up_prompt": null,
         "user_status": null
     });
@@ -441,7 +435,6 @@ async fn test_handle_reply_to_arbitrator_success_and_validation() {
         dispatch_for_async(&tool_missing_msg, ToolCaller::Specialist(Agent::Coder)).await;
     assert!(err_missing_msg.is_err());
 
-    // Valid reply
     let tool_valid = ToolInvocation {
         name: crate::tool_names::TOOL_REPLY_TO_ARBITRATOR.to_string(),
         arguments: serde_json::json!({
@@ -456,22 +449,19 @@ async fn test_handle_reply_to_arbitrator_success_and_validation() {
     assert!(out.content.contains("recorded successfully"));
     assert!(out.content.contains(&notice.user_inquiry));
 
-    // Notice is now resolved
     assert!(get_pending_notice("notice-async-1").is_none());
     assert!(get_worker_reply("notice-async-1").is_some());
 
-    // Verify Event::SteerResponse was emitted to the user
     let ev = event_rx
         .try_recv()
         .expect("Event::SteerResponse should be emitted");
     match ev {
         crate::ui::Event::SteerResponse(text) => {
-            assert!(text.contains("Coder bekräftar att async I/O har implementerats."));
+            assert!(text.contains("Coder confirms that async I/O has been implemented."));
         }
         other => panic!("Expected Event::SteerResponse, got {other:?}"),
     }
 
-    // Verify steering history was updated with specialist details and synthesized response
     {
         let hist = steering_history.read().unwrap();
         assert_eq!(hist.len(), 1);
@@ -479,7 +469,7 @@ async fn test_handle_reply_to_arbitrator_success_and_validation() {
         assert!(
             hist[0]
                 .1
-                .contains("Coder bekräftar att async I/O har implementerats.")
+                .contains("Coder confirms that async I/O has been implemented.")
         );
         assert!(
             hist[0]
@@ -500,7 +490,7 @@ async fn test_handle_reply_to_arbitrator_ask_followup() {
         "decision": "AskFollowUp",
         "response": null,
         "follow_up_prompt": "What about backward compatibility with older files?",
-        "user_status": "Ställer följdfråga om bakåtkompatibilitet..."
+        "user_status": "Asking a follow-up about backward compatibility..."
     });
 
     Mock::given(method("POST"))
@@ -547,18 +537,16 @@ async fn test_handle_reply_to_arbitrator_ask_followup() {
     let out = res.unwrap();
     assert!(out.content.contains("follow-up question"));
 
-    // Check user received status notice
     let ev = event_rx
         .try_recv()
         .expect("SteerResponse emitted for user status");
     match ev {
         crate::ui::Event::SteerResponse(text) => {
-            assert!(text.contains("Ställer följdfråga om bakåtkompatibilitet"));
+            assert!(text.contains("Asking a follow-up about backward compatibility"));
         }
         other => panic!("Expected SteerResponse, got {other:?}"),
     }
 
-    // Check worker's inbox received the follow-up notice
     let drained = drain_worker_notices("coder");
     assert_eq!(drained.len(), 1);
     assert_eq!(
@@ -566,7 +554,6 @@ async fn test_handle_reply_to_arbitrator_ask_followup() {
         "What about backward compatibility with older files?"
     );
 
-    // Verify steering history recorded the follow-up state awaiting next reply
     {
         let hist = steering_history.read().unwrap();
         assert_eq!(hist.len(), 1);
@@ -589,13 +576,13 @@ async fn test_steering_history_multiple_notices_resolved_out_of_order() {
     let server = MockServer::start().await;
     let eval_coder = serde_json::json!({
         "decision": "SynthesizeResponse",
-        "response": "Coder har fixat PPC JIT.",
+        "response": "Coder has fixed the PPC JIT.",
         "follow_up_prompt": null,
         "user_status": null
     });
     let eval_dbg = serde_json::json!({
         "decision": "SynthesizeResponse",
-        "response": "Debugger har isolerat minnesläckan.",
+        "response": "Debugger has isolated the memory leak.",
         "follow_up_prompt": null,
         "user_status": null
     });
@@ -624,25 +611,25 @@ async fn test_steering_history_multiple_notices_resolved_out_of_order() {
 
     let steering_history = std::sync::Arc::new(std::sync::RwLock::new(vec![
         (
-            "Vad gör codern?".to_string(),
+            "What is the coder doing?".to_string(),
             "Forwarded notice notice-1 to coder (awaiting specialist reply)".to_string(),
         ),
         (
-            "Vad gör debuggern?".to_string(),
+            "What is the debugger doing?".to_string(),
             "Forwarded notice notice-2 to debugger (awaiting specialist reply)".to_string(),
         ),
     ]));
     crate::orchestrator::set_steering_history(std::sync::Arc::clone(&steering_history));
 
-    let _n1 = post_notice_to_worker("coder", "Vad gör codern?", Some("notice-1"));
-    let _n2 = post_notice_to_worker("debugger", "Vad gör debuggern?", Some("notice-2"));
+    let _n1 = post_notice_to_worker("coder", "What is the coder doing?", Some("notice-1"));
+    let _n2 = post_notice_to_worker("debugger", "What is the debugger doing?", Some("notice-2"));
 
     // Debugger replies FIRST (out-of-order)
     let tool_dbg = ToolInvocation {
         name: crate::tool_names::TOOL_REPLY_TO_ARBITRATOR.to_string(),
         arguments: serde_json::json!({
             "notice_id": "notice-2",
-            "message": "Minnesläckan berodde på en saknad free i malloc-wrapper."
+            "message": "The memory leak was caused by a missing free in the malloc wrapper."
         }),
     };
     let res_dbg = dispatch_for_async(&tool_dbg, ToolCaller::Specialist(Agent::Debugger)).await;
@@ -652,12 +639,12 @@ async fn test_steering_history_multiple_notices_resolved_out_of_order() {
     {
         let hist = steering_history.read().unwrap();
         assert_eq!(hist.len(), 2);
-        assert_eq!(hist[0].0, "Vad gör codern?");
+        assert_eq!(hist[0].0, "What is the coder doing?");
         assert!(hist[0].1.contains("awaiting specialist reply"));
 
-        assert_eq!(hist[1].0, "Vad gör debuggern?");
-        assert!(hist[1].1.contains("Debugger har isolerat minnesläckan."));
-        assert!(hist[1].1.contains("malloc-wrapper"));
+        assert_eq!(hist[1].0, "What is the debugger doing?");
+        assert!(hist[1].1.contains("Debugger has isolated the memory leak."));
+        assert!(hist[1].1.contains("malloc wrapper"));
         assert!(!hist[1].1.contains("awaiting specialist reply"));
     }
 
@@ -666,7 +653,7 @@ async fn test_steering_history_multiple_notices_resolved_out_of_order() {
         name: crate::tool_names::TOOL_REPLY_TO_ARBITRATOR.to_string(),
         arguments: serde_json::json!({
             "notice_id": "notice-1",
-            "message": "Implementerat JIT-instruktionerna för PowerPC 604e."
+            "message": "Implemented the JIT instructions for PowerPC 604e."
         }),
     };
     let res_coder = dispatch_for_async(&tool_coder, ToolCaller::Specialist(Agent::Coder)).await;
@@ -677,14 +664,14 @@ async fn test_steering_history_multiple_notices_resolved_out_of_order() {
         let hist = steering_history.read().unwrap();
         assert_eq!(hist.len(), 2);
 
-        assert_eq!(hist[0].0, "Vad gör codern?");
-        assert!(hist[0].1.contains("Coder har fixat PPC JIT."));
+        assert_eq!(hist[0].0, "What is the coder doing?");
+        assert!(hist[0].1.contains("Coder has fixed the PPC JIT."));
         assert!(hist[0].1.contains("PowerPC 604e"));
         assert!(!hist[0].1.contains("awaiting specialist reply"));
 
-        assert_eq!(hist[1].0, "Vad gör debuggern?");
-        assert!(hist[1].1.contains("Debugger har isolerat minnesläckan."));
-        assert!(hist[1].1.contains("malloc-wrapper"));
+        assert_eq!(hist[1].0, "What is the debugger doing?");
+        assert!(hist[1].1.contains("Debugger has isolated the memory leak."));
+        assert!(hist[1].1.contains("malloc wrapper"));
         assert!(!hist[1].1.contains("awaiting specialist reply"));
     }
 }
@@ -711,7 +698,7 @@ async fn test_evaluate_worker_reply_synthesize_response() {
 
     let response_json = serde_json::json!({
         "decision": "SynthesizeResponse",
-        "response": "Coder förklarar att SQLite valdes för att minimera externa beroenden.",
+        "response": "Coder explains that SQLite was chosen to minimize external dependencies.",
         "follow_up_prompt": null,
         "user_status": null
     });
@@ -729,7 +716,7 @@ async fn test_evaluate_worker_reply_synthesize_response() {
 
     let notice = SteerNotice {
         notice_id: "notice-eval-1".to_string(),
-        user_inquiry: "Varför valde du SQLite?".to_string(),
+        user_inquiry: "Why did you choose SQLite?".to_string(),
         target_worker: "coder".to_string(),
         created_at_ms: 100,
     };
@@ -740,7 +727,7 @@ async fn test_evaluate_worker_reply_synthesize_response() {
         &stats,
         &notice,
         "coder-t-001",
-        "SQLite har noll konfiguration och fungerar utmärkt med WAL-mode.",
+        "SQLite has zero configuration and works very well with WAL mode.",
         |delta| streamed_deltas.push(delta.to_string()),
     )
     .await
@@ -749,7 +736,7 @@ async fn test_evaluate_worker_reply_synthesize_response() {
     assert_eq!(eval.decision, "SynthesizeResponse");
     assert_eq!(
         eval.response.as_deref(),
-        Some("Coder förklarar att SQLite valdes för att minimera externa beroenden.")
+        Some("Coder explains that SQLite was chosen to minimize external dependencies.")
     );
     assert!(eval.follow_up_prompt.is_none());
     assert!(!streamed_deltas.is_empty());
@@ -763,7 +750,7 @@ async fn test_evaluate_worker_reply_ask_followup() {
         "decision": "AskFollowUp",
         "response": null,
         "follow_up_prompt": "Will switching to SQLite break the transaction isolation requirements in requirement t-003?",
-        "user_status": "Ställer en följdfråga till Coder gällande transaktionsisolering..."
+        "user_status": "Asking Coder a follow-up about transaction isolation..."
     });
 
     Mock::given(method("POST"))
@@ -779,7 +766,7 @@ async fn test_evaluate_worker_reply_ask_followup() {
 
     let notice = SteerNotice {
         notice_id: "notice-eval-2".to_string(),
-        user_inquiry: "Kan vi byta till SQLite?".to_string(),
+        user_inquiry: "Can we switch to SQLite?".to_string(),
         target_worker: "coder".to_string(),
         created_at_ms: 200,
     };
@@ -790,7 +777,7 @@ async fn test_evaluate_worker_reply_ask_followup() {
         &stats,
         &notice,
         "coder-t-001",
-        "Jag kan byta databas.",
+        "I can switch the database.",
         |delta| streamed_deltas.push(delta.to_string()),
     )
     .await
@@ -806,17 +793,39 @@ async fn test_evaluate_worker_reply_ask_followup() {
     );
     assert_eq!(
         eval.user_status.as_deref(),
-        Some("Ställer en följdfråga till Coder gällande transaktionsisolering...")
+        Some("Asking Coder a follow-up about transaction isolation...")
     );
     // When follow-up is requested, no final response is streamed to the user yet
     assert!(streamed_deltas.is_empty());
+}
+
+/// Pin (t-013, producer side of the pair asserted in `ui::transcript`): the
+/// `user_status` example baked into [`WORKER_REPLY_SYSTEM_PROMPT`] must stay
+/// byte-identical to the agreed glossary wording, must stay inside the
+/// language-neutral pending-decision vocabulary shared by
+/// [`crate::orchestrator::bus::record_steering_exchange`] and
+/// [`crate::ui::transcript::UiTranscript::extract_steering_history`], and must stay
+/// ASCII so no consumer ever has to grow a language-specific matcher arm again.
+#[test]
+fn test_worker_reply_prompt_user_status_example_is_pending_and_language_neutral() {
+    assert_eq!(
+        worker_reply_user_status_example(),
+        "Asking Coder a follow-up to clarify the details..."
+    );
+    assert!(
+        super::steer::steering_entry_is_pending(worker_reply_user_status_example()),
+        "the wording the prompt invites must read as a pending decision"
+    );
+    assert!(
+        WORKER_REPLY_SYSTEM_PROMPT.is_ascii(),
+        "the arbitrator prompt must stay language-neutral"
+    );
 }
 
 #[tokio::test]
 async fn test_evaluate_worker_reply_fallback_on_plain_text() {
     let server = MockServer::start().await;
 
-    // LLM outputs non-JSON plain text
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_string(sse_delta(
@@ -893,14 +902,12 @@ fn test_assemble_tools_includes_reply_to_arbitrator_unconditionally() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Storage lifecycle regression tests — recon H4 (no TTL, unbounded inboxes,
 // drained-empty entries never reclaimed, drain only at turn boundaries).
 //
 // Expiry is driven through the module's injectable clock
 // ([`advance_notice_clock_ms`]); no test sleeps, and `clear_all_notices()`
 // resets the offset so a shifted clock never leaks into the next test.
-// ---------------------------------------------------------------------------
 
 /// Minimal `tracing` subscriber that counts WARN events whose message contains
 /// a needle — used to prove that drops are reported, and reported *bounded*
@@ -1309,14 +1316,12 @@ async fn test_mid_turn_drain_drops_expired_notice_with_report() {
     assert!(!has_worker_inbox("coder-t-001"));
 }
 
-// ---------------------------------------------------------------------------
 // Reply-targeting regression tests — recon H6 (`record_worker_reply` used to
 // *guess* the notice: `else if PENDING_NOTICES.len() == 1 { take the first }`).
 //
 // A reply must name the notice it answers. Every assertion below is keyed on
 // the concrete notice ids / per-key deltas, never on absolute process-global
 // counters, because other modules post notices concurrently in parallel runs.
-// ---------------------------------------------------------------------------
 
 /// (a) A reply carrying the explicit id resolves **exactly** that notice: the
 /// right one is consumed and recorded, the worker's other notices are untouched.
@@ -1531,9 +1536,11 @@ async fn test_duplicate_reply_for_resolved_notice_is_rejected() {
     assert!(get_pending_notice(&notice.notice_id).is_none());
 }
 
-/// The harness follow-up round re-posts the *same* id (`src/harness/mod.rs:562`);
-/// after that the id is pending again and answerable once more — which is the
-/// only way a "duplicate" can legitimately reappear.
+/// The harness follow-up round re-posts the *same* id (in
+/// `crate::harness::handle_reply_to_arbitrator_async`, which posts the follow-up
+/// under the notice id it just resolved); after that the id is pending again and
+/// answerable once more — which is the only way a "duplicate" can legitimately
+/// reappear.
 #[tokio::test]
 async fn test_follow_up_repost_of_same_notice_id_is_answerable_again() {
     let _lock = TEST_NOTICE_MUTEX.lock().await;

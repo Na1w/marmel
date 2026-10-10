@@ -70,9 +70,7 @@ pub struct WorkerReplyEvaluation {
     pub user_status: Option<String>,
 }
 
-// ---------------------------------------------------------------------------
 // Storage lifecycle (recon H4): TTL expiry, bounded inboxes, entry reclamation
-// ---------------------------------------------------------------------------
 
 /// Notices awaiting a specialist reply, keyed by `notice_id`.
 static PENDING_NOTICES: LazyLock<DashMap<String, SteerNotice>> = LazyLock::new(DashMap::new);
@@ -650,7 +648,6 @@ pub struct NoticeDrainOutcome {
     pub delivered: Vec<SteerNotice>,
     /// Notices dropped by the TTL sweep this drain triggered.
     pub expired_dropped: usize,
-    /// Their ids (sampled).
     pub expired_ids: Vec<String>,
     /// Inbox map entries reclaimed (empty inboxes of drained/gone workers).
     pub reclaimed_inboxes: usize,
@@ -686,8 +683,6 @@ pub fn drain_worker_notices_mid_turn(worker_key: &str) -> Vec<SteerNotice> {
     drain_worker_notices_report(worker_key).delivered
 }
 
-/// Full-visibility drain: the delivered notices plus what the sweep expired and
-/// how many inbox entries were reclaimed.
 pub fn drain_worker_notices_report(worker_key: &str) -> NoticeDrainOutcome {
     let prune = prune_notice_storage();
     let identity = worker_routing_identity(worker_key);
@@ -773,9 +768,7 @@ pub fn reclaim_worker_inbox(worker_key: &str) -> InboxReclaimReport {
     report
 }
 
-// ---------------------------------------------------------------------------
 // Reply targeting (recon H6): a reply must name the notice it answers
-// ---------------------------------------------------------------------------
 
 /// Why a specialist reply was refused by [`record_worker_reply_for_notice`].
 ///
@@ -1031,10 +1024,8 @@ pub fn record_worker_reply_for_notice(
 /// Same signature (and the same `Result<_, String>` error channel) the existing
 /// callers already use, so no call site has to change to become strict. New
 /// callers should adopt [`record_worker_reply_for_notice`] and branch on
-/// [`NoticeReplyRejection::kind()`] instead of on prose. Callers that should
-/// adopt the strict form: `src/harness/mod.rs:516` (`record_worker_reply(caller,
-/// notice_id, message)` — and the `Err` branch right below it, which currently
-/// re-reads the pending notice instead of surfacing the rejection).
+/// [`NoticeReplyRejection::kind()`] instead of on prose — the harness reply path
+/// (`crate::harness::handle_reply_to_arbitrator_async`) already does.
 pub fn record_worker_reply(
     worker_tag: &str,
     notice_id: &str,
@@ -1085,7 +1076,6 @@ pub fn render_notice_for_worker(notice: &SteerNotice) -> String {
     )
 }
 
-/// Get a recorded worker reply by notice ID.
 pub fn get_worker_reply(notice_id: &str) -> Option<SteerNoticeReply> {
     REPLIED_NOTICES.get(notice_id).map(|e| e.reply.clone())
 }
@@ -1115,6 +1105,58 @@ pub fn clear_all_notices() {
     REPLY_WARN_SEQ.store(0, Ordering::Relaxed);
 }
 
+/// System prompt of [`evaluate_worker_reply`], hoisted out of the function so the
+/// coupling below is assertable (t-013).
+///
+/// Invariant: the `user_status` example must stay **inside the pending-decision
+/// vocabulary** owned by [`crate::orchestrator::steer::steering_entry_is_pending`].
+/// That status notice is emitted verbatim to the user and persisted in the UI
+/// journal, and both the bus correlation and
+/// [`crate::ui::transcript::UiTranscript::extract_steering_history`] decide
+/// whether a later answer *replaces* it by testing that vocabulary. An example
+/// worded outside it — like the Swedish one this prompt used to carry — leaves the
+/// pending placeholder unresolved and duplicates the entry in steering history.
+/// The prompt is kept ASCII so its wording cannot drift into a form only a
+/// language-specific matcher would recognize.
+pub(crate) const WORKER_REPLY_SYSTEM_PROMPT: &str = "\
+You are Marmel's Steer Arbitrator mediating between the user and active specialist workers.
+The user previously sent a steering inquiry or instruction to a specialist worker.
+The specialist worker has now replied back to YOU (the Arbitrator).
+
+Your role:
+Evaluate the worker's reply:
+1. If the worker's reply directly and satisfactorily addresses the user's inquiry, choose 'SynthesizeResponse'.
+   - In 'response', formulate a direct, factual, and concise answer to the user in the EXACT SAME LANGUAGE as the user's inquiry.
+   - Be clear, polite, and factual. Zero filler, no conversational meta-disclaimers.
+2. If the worker's reply is incomplete, ambiguous, contradictory, or raises a concern that requires clarification from the worker before answering the user, choose 'AskFollowUp'.
+   - In 'follow_up_prompt', specify the clear, targeted question for the worker in English.
+   - In 'user_status', provide a brief status notice in the user's language (e.g. 'Asking Coder a follow-up to clarify the details...').
+
+You MUST output ONLY a valid JSON object matching:
+{
+  \"decision\": \"SynthesizeResponse\" | \"AskFollowUp\",
+  \"response\": \"Direct answer to the user in their language (required if decision is SynthesizeResponse)\",
+  \"follow_up_prompt\": \"Follow-up question for the worker in English (required if decision is AskFollowUp)\",
+  \"user_status\": \"Brief status notice for the user (optional for AskFollowUp)\"
+}";
+
+/// The `user_status` example embedded in [`WORKER_REPLY_SYSTEM_PROMPT`], read back
+/// out of the shipped prompt (test seam): the consumer-side tests in
+/// `ui::transcript` assert against the wording the model is actually invited to
+/// emit, so producer and consumer cannot drift apart unnoticed (t-013).
+#[cfg(test)]
+pub(crate) fn worker_reply_user_status_example() -> &'static str {
+    const OPEN: &str = "(e.g. '";
+    let start = WORKER_REPLY_SYSTEM_PROMPT
+        .find(OPEN)
+        .expect("worker-reply prompt carries a user_status example")
+        + OPEN.len();
+    let end = WORKER_REPLY_SYSTEM_PROMPT[start..]
+        .find('\'')
+        .expect("user_status example is quote-terminated");
+    &WORKER_REPLY_SYSTEM_PROMPT[start..start + end]
+}
+
 /// Evaluate a specialist worker's reply through the Steer Arbitrator model:
 /// either synthesize a factual direct answer for the user, or formulate an internal
 /// follow-up question for the worker before presenting anything to the user.
@@ -1129,28 +1171,6 @@ pub async fn evaluate_worker_reply<F>(
 where
     F: FnMut(&str) + Send,
 {
-    let system_prompt = "\
-You are Marmel's Steer Arbitrator mediating between the user and active specialist workers.
-The user previously sent a steering inquiry or instruction to a specialist worker.
-The specialist worker has now replied back to YOU (the Arbitrator).
-
-Your role:
-Evaluate the worker's reply:
-1. If the worker's reply directly and satisfactorily addresses the user's inquiry, choose 'SynthesizeResponse'.
-   - In 'response', formulate a direct, factual, and concise answer to the user in the EXACT SAME LANGUAGE as the user's inquiry.
-   - Be clear, polite, and factual. Zero filler, no conversational meta-disclaimers.
-2. If the worker's reply is incomplete, ambiguous, contradictory, or raises a concern that requires clarification from the worker before answering the user, choose 'AskFollowUp'.
-   - In 'follow_up_prompt', specify the clear, targeted question for the worker in English.
-   - In 'user_status', provide a brief status notice in the user's language (e.g. 'Ställer en följdfråga till Coder för att reda ut detaljerna...').
-
-You MUST output ONLY a valid JSON object matching:
-{
-  \"decision\": \"SynthesizeResponse\" | \"AskFollowUp\",
-  \"response\": \"Direct answer to the user in their language (required if decision is SynthesizeResponse)\",
-  \"follow_up_prompt\": \"Follow-up question for the worker in English (required if decision is AskFollowUp)\",
-  \"user_status\": \"Brief status notice for the user (optional for AskFollowUp)\"
-}";
-
     let user_prompt = format!(
         "Original User Inquiry:\n\"{}\"\n\nSpecialist Worker [{}] Reply to Arbitrator:\n\"{}\"\n\nPlease output your evaluation JSON.",
         notice.user_inquiry, worker_tag, worker_reply
@@ -1160,7 +1180,7 @@ You MUST output ONLY a valid JSON object matching:
         model: String::new(),
         messages: vec![
             Message::System {
-                content: system_prompt.to_string(),
+                content: WORKER_REPLY_SYSTEM_PROMPT.to_string(),
             },
             Message::User {
                 content: user_prompt,

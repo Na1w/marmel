@@ -60,8 +60,9 @@
 //!   `src/agents/runner/execution.rs::build_specialist_context` charges the
 //!   advertised view at construction and
 //!   `src/agents/runner/execution.rs::sync_specialist_tool_schema` re-prices it
-//!   immediately before every budget decision (`execution.rs:1034`), the liveness
-//!   of that charge proved by `tests/test_specialist_schema_charge.rs`. A
+//!   immediately before every budget decision of the specialist turn loop; the
+//!   liveness of that charge is proved by
+//!   `tests/test_specialist_schema_charge.rs`. A
 //!   message-only engine (schema tokens `0`) is therefore only reachable from a
 //!   caller that declares nothing at all — which is what
 //!   `ContextEngineFactory::specialist_context()` hands out by design; it is a
@@ -385,7 +386,6 @@ pub fn repair_tool_call_pairs(messages: Vec<Message>) -> Vec<Message> {
     // any duplicate result for an id that is already accounted for).
     let messages = prune_orphan_tool_messages(messages);
 
-    // Index the surviving tool results by call id, keeping the first occurrence.
     let mut results: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for m in &messages {
         if let Message::Tool {
@@ -404,7 +404,6 @@ pub fn repair_tool_call_pairs(messages: Vec<Message>) -> Vec<Message> {
     let mut repaired: Vec<Message> = Vec::with_capacity(messages.len());
     for m in messages {
         match m {
-            // Tool results are re-emitted grouped under their assistant parent.
             Message::Tool { .. } => {}
             Message::Assistant {
                 content,
@@ -494,7 +493,6 @@ pub enum CompactionOutcome {
         pinned_tokens: usize,
         /// Number of pinned messages.
         pinned_messages: usize,
-        /// The unreachable 70% target.
         target: usize,
         /// Tokens counted before compaction.
         initial_tokens: usize,
@@ -513,7 +511,6 @@ impl CompactionOutcome {
         matches!(self, CompactionOutcome::Compacted { .. })
     }
 
-    /// Messages removed, measured on the final vector.
     pub fn messages_removed(&self) -> usize {
         match self {
             CompactionOutcome::Compacted {
@@ -525,7 +522,6 @@ impl CompactionOutcome {
         }
     }
 
-    /// Tokens reclaimed, measured on the final vector.
     pub fn tokens_reclaimed(&self) -> usize {
         match self {
             CompactionOutcome::Compacted {
@@ -537,7 +533,6 @@ impl CompactionOutcome {
         }
     }
 
-    /// The 70% target compaction aimed at.
     pub fn target(&self) -> usize {
         match self {
             CompactionOutcome::Compacted { target, .. }
@@ -643,7 +638,6 @@ impl ContextEngine {
         self.max_context_tokens
     }
 
-    /// The current token count of the transcript.
     pub fn token_count(&self) -> usize {
         count_tokens(&self.messages)
     }
@@ -701,12 +695,10 @@ impl ContextEngine {
             && self.request_token_count() > rebirth_advisory_threshold(self.max_context_tokens)
     }
 
-    /// Number of consecutive rebirth executions without other actions.
     pub fn consecutive_rebirths(&self) -> usize {
         self.consecutive_rebirths
     }
 
-    /// Reset the consecutive rebirth counter when other productive work is executed.
     pub fn reset_consecutive_rebirths(&mut self) {
         self.consecutive_rebirths = 0;
     }
@@ -725,7 +717,6 @@ impl ContextEngine {
         self.rebirth_advisory_emitted = false;
     }
 
-    /// Whether a rebirth advisory has already been emitted for this context generation.
     pub fn rebirth_advisory_emitted(&self) -> bool {
         self.rebirth_advisory_emitted
     }
@@ -762,9 +753,6 @@ impl ContextEngine {
         let initial_msgs = self.messages.len();
         let target = compaction_target(self.max_context_tokens);
 
-        // Always pin the first two messages (system and goal).
-        // If an active REBIRTH CHECKPOINT exists in messages[2..], pin up through the checkpoint
-        // so that distilled session state is never dropped during compaction.
         // M5: that pinned window is charged against the target — it can never
         // be dropped, so it decides whether the target is reachable at all.
         let prefix_end = pinned_prefix_end(&self.messages).min(self.messages.len());
@@ -772,8 +760,6 @@ impl ContextEngine {
         let pinned_tokens = count_tokens(&self.messages[..prefix_end]);
 
         if pinned_tokens > target {
-            // Unreachable by construction: trim every non-pinned message and
-            // report the failure instead of silently under-delivering.
             let trimmed = repair_tool_call_pairs(self.messages[..prefix_end].to_vec());
             self.messages = trimmed;
             let final_tokens = self.token_count();
@@ -812,14 +798,6 @@ impl ContextEngine {
         kept_tail.reverse();
         kept.extend(kept_tail);
 
-        // Enforce BOTH halves of the assistant `tool_calls` <-> `Tool` pairing
-        // invariant (bug H1) over the whole retained sequence: dropping old
-        // turns can orphan surviving `Tool` messages, and a surviving assistant
-        // can be missing results either because the results fell out of the
-        // window or because the tool loop was aborted upstream
-        // (`src/ui/session.rs`) so they were never produced. Running the repair
-        // over `kept` (and not just over `kept[prefix_end..]`) means the pinned
-        // window cannot smuggle a dangling `tool_calls` entry upstream either.
         let mut repaired = repair_tool_call_pairs(kept);
 
         // Synthesizing placeholder results adds a few tokens on top of the
@@ -849,9 +827,6 @@ impl ContextEngine {
 
         self.messages = repaired;
 
-        // M5b: the reclaimed counts are measured on the final vector, so they
-        // include everything the pruning, the placeholder synthesis and the
-        // re-trim actually did — not the pre-pruning window arithmetic.
         let final_tokens = self.token_count();
         let final_msgs = self.messages.len();
         let messages_removed = initial_msgs.saturating_sub(final_msgs);
@@ -1065,12 +1040,10 @@ pub struct ContextEngineFactory {
 }
 
 impl ContextEngineFactory {
-    /// Create a factory bound to a token budget for all produced engines.
     pub fn new(max_context_tokens: usize) -> Self {
         Self { max_context_tokens }
     }
 
-    /// The context budget applied to every produced engine.
     pub fn max_context_tokens(&self) -> usize {
         self.max_context_tokens
     }
@@ -1125,7 +1098,7 @@ impl ContextEngineFactory {
     /// `execution::build_specialist_context` calls this constructor and charges
     /// the advertised view right away, and
     /// `execution::sync_specialist_tool_schema` re-prices it immediately before
-    /// every budget decision (`execution.rs:1034`) — liveness proved by
+    /// every budget decision of the specialist turn loop — liveness proved by
     /// `tests/test_specialist_schema_charge.rs`.
     ///
     /// Only an engine that never goes through one of those declarers — i.e. built

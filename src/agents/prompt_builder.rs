@@ -391,7 +391,7 @@ impl PromptBuilder {
         let parsed: ArchitectOutput = serde_json::from_str(json_text)
             .with_context(|| format!("parsing architect output: {json_text}"))?;
 
-        // Sanitize tools: ensure rebirth is present if non-trivial tools are included
+        // Same rebirth guarantee as the offline synthesis: always present.
         let mut tools = parsed.allowed_tools;
         if !tools.iter().any(|t| t == TOOL_REBIRTH) {
             tools.push(TOOL_REBIRTH.to_string());
@@ -444,7 +444,6 @@ impl PromptBuilder {
             }
         }
 
-        // Domain keyword heuristics
         let is_debug = prompt_lower.contains("bug")
             || prompt_lower.contains("crash")
             || prompt_lower.contains("error")
@@ -484,7 +483,6 @@ impl PromptBuilder {
             selected_skills.push("clean_code".to_string());
         }
 
-        // Gather allowed tools from selected skills and archetype
         let mut allowed_tools = Vec::new();
         if let Some(arch) = archetype {
             for t in &arch.default_tools {
@@ -508,7 +506,6 @@ impl PromptBuilder {
             allowed_tools.push(TOOL_REBIRTH.to_string());
         }
 
-        // Assemble synthesized prompt
         let role_name = format!("{}_specialist", req.agent_name.as_str());
         let mut system_prompt = format!(
             "# Marmel: {}\n\n**Mission:** You are a dynamically synthesized specialist dedicated to executing the delegated task with surgical precision.\n\n",
@@ -622,7 +619,6 @@ impl PromptBuilder {
                 recursion_granted: false,
             };
 
-            // 1. Worker prompt
             let worker_bp = Self::synthesize_offline(catalog, &req);
             if let Ok(path) = worker_bp.save_to_disk(prompts_dir) {
                 generated.push(
@@ -633,7 +629,6 @@ impl PromptBuilder {
                 );
             }
 
-            // 2. Validation prompt (optional)
             let desc_lower = item.description.to_ascii_lowercase();
             let is_doc_or_config = desc_lower.contains("readme")
                 || desc_lower.contains("docs")
@@ -877,7 +872,6 @@ mod tests {
         assert!(!blueprint.system_prompt.contains("Active Domain Skills"));
     }
 
-    // -----------------------------------------------------------------
     // Gate t-055 — the two prompt WRITE sites.
     //
     // `AgentBlueprint::prompt_file_stem` (which owns `<task_id>.md`) and
@@ -888,7 +882,6 @@ mod tests {
     // write outside the prompts directory and never a substitute name derived
     // from the rejected id, so the downstream prompt/verdict lookups degrade
     // exactly like a missing file.
-    // -----------------------------------------------------------------
 
     /// Task-id spellings that must never become a file name, each with the
     /// variant the grammar authority is expected to report.

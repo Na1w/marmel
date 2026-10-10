@@ -233,7 +233,6 @@ fn message_line_caching_matches_reference() {
     assert_eq!(r.cached_total_message_lines.get(), 4);
     assert_eq!(r.cached_message_lines.borrow().len(), 2);
 
-    // Appending via append_steer_sentence.
     r.append_steer_sentence("New steer sentence.");
     let lines_after_steer = r.estimated_chat_lines(80);
     assert_eq!(lines_after_steer, 5);
@@ -339,21 +338,17 @@ fn delegation_started_tracks_live_thinking_content_logs() {
         },
     ));
 
-    // The subagent entry exists and is active.
     assert_eq!(r.subagents.len(), 1);
     assert_eq!(r.subagents[0].name, "coder-t-9");
     assert!(r.subagents[0].is_active);
     assert_eq!(r.active_agent, "coder-t-9");
 
-    // Live thinking streams into the subagent's thinking field.
     r.on_event(&Event::Thinking("reasoning...".to_string()));
     assert_eq!(r.subagents[0].thinking, "reasoning...");
 
-    // Live content streams into the subagent's content field.
     r.on_event(&Event::Message("final answer".to_string()));
     assert_eq!(r.subagents[0].content, "final answer");
 
-    // Status updates append to the subagent's logs.
     r.on_event(&Event::Status("calling backend".to_string()));
     assert!(r.subagents[0].logs.iter().any(|l| l == "calling backend"));
 }
@@ -383,7 +378,6 @@ fn delegation_completed_marks_idle_and_stops_routing() {
     assert!(!r.subagents[0].is_active);
     assert_eq!(r.active_agent, "Manager");
 
-    // After completion, live content no longer routes into the subagent.
     r.on_event(&Event::Message("manager content".to_string()));
     assert_eq!(r.subagents[0].content, "");
 }
@@ -763,14 +757,12 @@ fn test_chat_scrolling_renders_windowed_view() {
     let total_lines = r.estimated_chat_lines(80);
     assert_eq!(total_lines, 50);
 
-    // Scroll to bottom
     r.scroll_to_bottom();
     assert_eq!(r.chat_scroll, 42); // 50 - 8
 
     let backend = ratatui::backend::TestBackend::new(80, 10);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
 
-    // 1. Render bottom view
     terminal
         .draw(|frame| {
             let area = ratatui::layout::Rect::new(0, 0, 80, 10);
@@ -790,7 +782,6 @@ fn test_chat_scrolling_renders_windowed_view() {
     assert!(bottom_text.contains("Message line 49"));
     assert!(!bottom_text.contains("Message line 0"));
 
-    // 2. Scroll up to top
     r.scroll_to_top();
     assert_eq!(r.chat_scroll, 0);
 
@@ -813,7 +804,6 @@ fn test_chat_scrolling_renders_windowed_view() {
     assert!(top_text.contains("Message line 0"));
     assert!(!top_text.contains("Message line 49"));
 
-    // 3. Scroll down by 5 lines
     r.scroll_down(5);
     assert_eq!(r.chat_scroll, 5);
 }
@@ -831,19 +821,15 @@ fn test_plan_scrolling_with_wrapped_lines() {
     r.plan_max_scroll = total_lines.saturating_sub(5) as u16;
     assert!(r.plan_max_scroll > 0);
 
-    // Scroll down
     r.scroll_down(2);
     assert_eq!(r.plan_scroll, 2);
 
-    // Scroll up
     r.scroll_up(1);
     assert_eq!(r.plan_scroll, 1);
 
-    // Scroll to top
     r.scroll_to_top();
     assert_eq!(r.plan_scroll, 0);
 
-    // Scroll to bottom
     r.scroll_to_bottom();
     assert_eq!(r.plan_scroll, r.plan_max_scroll);
 }
@@ -897,7 +883,6 @@ fn test_plan_auto_scrolls_to_started_task() {
     let plan_text = "# Plan\n## Phase 1\n- [x] [t-001] Task 1\n- [x] [t-002] Task 2\n- [x] [t-003] Task 3\n- [ ] [t-004] Task 4\n- [ ] [t-005] Task 5\n- [ ] [t-006] Task 6\n- [ ] [t-007] Task 7\n- [ ] [t-008] Task 8\n- [ ] [t-009] Task 9\n- [ ] [t-010] Task 10\n";
     r.plan_content = plan_text.to_string();
 
-    // Start task t-008
     r.on_event(&crate::ui::Event::Delegation(
         crate::orchestrator::DelegationEvent::Started {
             agent: crate::agents::Agent::Coder,
@@ -1099,15 +1084,12 @@ fn test_subagent_scrolling_and_focus() {
     r.subagent_width.set(40);
     r.subagent_height.set(5);
 
-    // Scroll down in subagents pane
     r.scroll_down(3);
     assert_eq!(r.subagent_scroll, 3);
 
-    // Scroll up
     r.scroll_up(2);
     assert_eq!(r.subagent_scroll, 1);
 
-    // Scroll to bottom
     r.scroll_to_bottom();
     let max = r.estimated_subagent_lines(40).saturating_sub(5) as u16;
     assert_eq!(r.subagent_scroll, max);
@@ -1184,7 +1166,6 @@ fn test_subagent_switch_scrolls_to_bottom_and_autoscrolls() {
     r.subagent_width.set(40);
     r.subagent_height.set(4);
 
-    // Manually scroll up
     r.focused_panel = FocusedPanel::Subagents;
     r.scroll_up(5);
     assert!(!r.subagent_autoscroll);
@@ -1225,23 +1206,19 @@ fn test_input_cursor_stepping_left_and_right() {
     r.input_text = "hello world".to_string();
     r.cursor = "hello world".len();
 
-    // Step left 5 times
     for _ in 0..5 {
         r.cursor_left();
     }
     assert_eq!(r.cursor, "hello ".len());
 
-    // Insert character at cursor
     r.insert_char('X');
     assert_eq!(r.input_text, "hello Xworld");
     assert_eq!(r.cursor, "hello X".len());
 
-    // Step right 2 times
     r.cursor_right();
     r.cursor_right();
     assert_eq!(r.cursor, "hello Xwo".len());
 
-    // Delete backward
     r.delete_backward();
     assert_eq!(r.input_text, "hello Xwrld");
 }
@@ -1557,7 +1534,6 @@ fn test_status_bar_prefers_plan_start_time() {
     // No plan start yet -> None (only counts when actively working on a plan)
     assert!(r.total_project_elapsed().is_none());
 
-    // Now record plan start locally on renderer
     r.plan_start_time = Some(std::time::Instant::now());
     assert!(r.total_project_elapsed().is_some());
 }
@@ -1604,7 +1580,6 @@ fn test_delegation_completed_emits_task_id_completed_in_chat() {
         Some("[t-007] completed.")
     );
 
-    // Style verification
     let (style, special) = message_style("[t-007] completed.");
     assert!(special);
     assert_eq!(style.fg, Some(ratatui::style::Color::Green));
@@ -2052,13 +2027,11 @@ fn test_set_subagents_preserves_manager_active_agent() {
 fn test_ansi_and_markdown() {
     use ansi_to_tui::IntoText;
 
-    // Test ANSI parsing
     let ansi_bytes = b"\x1b[32mok\x1b[0m \x1b[31mFAILED\x1b[0m";
     let text = ansi_bytes.into_text().expect("ansi parsing should succeed");
     assert_eq!(text.lines.len(), 1);
     assert!(text.lines[0].spans.len() >= 2);
 
-    // Test Markdown parsing
     let md = "# Title\n\n```rust\nfn main() {}\n```";
     let md_text = tui_markdown::from_str(md);
     assert!(!md_text.lines.is_empty());

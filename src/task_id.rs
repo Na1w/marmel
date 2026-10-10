@@ -72,7 +72,6 @@ pub const MAX_TASK_ID_LEN: usize = 64;
 /// id tripped instead of guessing from a generic "invalid task id".
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TaskIdError {
-    /// The id is empty, or nothing but whitespace.
     #[error("task id is empty")]
     Empty,
     /// The id is longer than [`MAX_TASK_ID_LEN`] characters.
@@ -482,9 +481,7 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------------
     // Gate t-046: the canonical task-id validator behind every id-derived path.
-    // ---------------------------------------------------------------------
 
     /// Ids that must pass [`validate_task_id`] unchanged — the shapes actually
     /// used in this repository.

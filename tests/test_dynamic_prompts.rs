@@ -74,7 +74,6 @@ async fn test_plan_creation_pregenerates_prompt_pairs_on_disk() {
             "t-001-validation.md must NOT be generated for pure research"
         );
 
-        // Verify content and frontmatter of pregenerated prompts
         let bp_coder = AgentBlueprint::load_from_disk(&prompts_dir.join("t-002.md")).unwrap();
         assert_eq!(bp_coder.role_name, "coder_specialist");
         assert!(bp_coder.allowed_tools.contains(&"write_file".to_string()));
@@ -188,16 +187,13 @@ tools: read_file, run_command, grep_search, glob, rebirth
 "#;
     std::fs::write(tmp.path().join("AGENTS.md"), custom_agents).unwrap();
 
-    // 3. Discover catalog
     let catalog = Catalog::discover(tmp.path());
 
-    // Verify skill discovered
     let skill = catalog
         .get_skill("distributed_systems")
         .expect("custom skill loaded");
     assert_eq!(skill.name, "Distributed Systems Patterns");
 
-    // Verify custom archetype discovered
     let arch = catalog
         .get_agent("site_reliability_engineer")
         .expect("custom archetype loaded");

@@ -12,7 +12,7 @@
 //! 1. **The advertised list was never charged to the specialist engine.** No
 //!    `set_tools` / `charge_engine_tool_schema` call existed anywhere in
 //!    `execution.rs`, while `build_turn_request(&model, &engine, &tools, …)`
-//!    (`execution.rs:345`) puts that very list on the wire. `request_token_count()`
+//!    (`fix_loop::build_turn_request`) puts that very list on the wire. `request_token_count()`
 //!    was therefore the message-only number that `context.rs` honestly documents
 //!    as a *lower bound*, and `should_compact()` / `should_advise_rebirth()`
 //!    under-priced every specialist request by the whole schema payload — a real

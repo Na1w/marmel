@@ -74,7 +74,7 @@ const GENERIC_PREVIEW_BUDGET: usize = 30;
 /// Character budget for the serialized argument text in the decorated preview.
 const DECORATED_BUDGET: usize = 60;
 
-// ---- sleep-duration authority (dedup gate t-044 sweep C) -------------------
+// Sleep-duration authority (dedup gate t-044 sweep C)
 
 /// Fallback sleep duration (seconds) when no duration key is present or the
 /// value is not a usable duration. Single owner of the default/clamp trio **for
@@ -190,12 +190,9 @@ pub fn full_tool_args(name: &str, args: &Value) -> String {
     }
 }
 
-/// Canonical search-pattern key for the grep/search tool.
-///
-/// The schema ([`crate::types::tools`]) and the executor
-/// ([`crate::harness::search::grep_search`]) both use `pattern`; `query` is kept
-/// only as a trailing alias because the XML rescue path still emits it and
-/// [`crate::harness::fs::str_arg`] tolerates it at execution time.
+/// Canonical search-pattern key for the grep/search tool: the schema and the
+/// executor both use `pattern`, and `query` is accepted only as a trailing alias
+/// (see "Argument-key authority" in the module docs).
 pub fn search_pattern(args: &Value) -> &str {
     first_str(args, &["pattern", "query"])
 }
@@ -309,12 +306,11 @@ fn parse_secs_value(value: &Value) -> Option<u64> {
     }
     // Fractional durations: only floats already inside the tool's own range are
     // accepted, truncated toward zero (`2.5` -> `2`, `299.9` -> `299`).
-    // Out-of-range floats (`0.5`, `300.9`, `1e9`, `f64::MAX`) are treated as
-    // unusable and fall back to the default — which is exactly what every
-    // pre-existing copy did, since `serde_json` never reported a float through
-    // `as_u64`/`as_i64`. Accepting them and clamping them up to the ceiling
-    // would make a malformed float sleep 60x longer than the default, i.e.
-    // strictly *less* safe than the behaviour being replaced.
+    // Out-of-range floats stay unusable, exactly as in every pre-existing copy
+    // (`serde_json` never reported a float through `as_u64`/`as_i64`); clamping
+    // them up to the ceiling instead would make a malformed float sleep 60x
+    // longer than the default, i.e. strictly *less* safe than the behaviour
+    // being replaced.
     if let Some(secs) = value.as_f64() {
         return if secs.is_finite() && secs >= SLEEP_MIN_SECS as f64 && secs <= SLEEP_MAX_SECS as f64
         {
@@ -356,8 +352,6 @@ fn clip(s: &str, budget: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    // ---- grep/search reads the schema key `pattern` (bug regression) ------
 
     #[test]
     fn tool_args_grep_preview_is_non_empty_with_pattern_key() {
@@ -407,8 +401,6 @@ mod tests {
         assert_eq!(full_tool_args(TOOL_GLOB, &args), "**/*.rs");
     }
 
-    // ---- unknown tool fallback -------------------------------------------
-
     #[test]
     fn tool_args_unknown_tool_falls_back_to_serialized_args() {
         let args = json!({ "k": 1 });
@@ -429,8 +421,6 @@ mod tests {
             "pty_spawn({\"command\":\"gdb ./app\",\"id\":\"dbg-1\"})"
         );
     }
-
-    // ---- empty / invalid / missing arguments ------------------------------
 
     #[test]
     fn tool_args_empty_and_invalid_args_render_without_panic() {
@@ -487,8 +477,6 @@ mod tests {
             "{\"content\":\"x\"}"
         );
     }
-
-    // ---- long-argument truncation ----------------------------------------
 
     #[test]
     fn tool_args_truncates_long_run_command_preview() {
@@ -565,8 +553,6 @@ mod tests {
         assert!(!clipped.contains('\u{fffd}'));
     }
 
-    // ---- remaining per-tool renders kept from both original copies --------
-
     #[test]
     fn tool_args_delegate_task_renders_agent_and_task_id() {
         let full = json!({ "agent_name": "debugger", "task_id": "t-042", "prompt": "fix it" });
@@ -603,7 +589,6 @@ mod tests {
             preview_tool_call(TOOL_CREATE_PLAN, &swe),
             "create_plan(plan_markdown: 6 chars)"
         );
-        // Missing payload reports zero.
         assert_eq!(
             preview_tool_call(TOOL_CREATE_PLAN, &json!({})),
             "create_plan(plan_markdown: 0 chars)"
@@ -633,7 +618,7 @@ mod tests {
         );
     }
 
-    // ---- sleep-argument extraction owner (dedup gate t-044, sweep C) ------
+    // Sleep-argument extraction owner (dedup gate t-044, sweep C)
 
     /// The single owner's contract: key precedence, every JSON number shape,
     /// the fallback default and one clamp pair.

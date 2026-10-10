@@ -534,7 +534,6 @@ pub fn write_file(args: &Value) -> Result<ToolResult, ToolError> {
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent).map_err(anyhow::Error::from)?;
-        // Ensure 0o755 permissions on the newly created parents.
         set_dir_permissions_755(parent);
     }
     write_file_atomic(&safe_path, content.as_bytes())?;

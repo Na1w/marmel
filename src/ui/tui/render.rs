@@ -15,8 +15,8 @@ use std::io;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 impl TuiRenderer {
-    /// Ensure the per-message wrapped-line cache is up to date for `width`
-    /// (reference §11.3). Performs a full recompute when the width or
+    /// Ensure the per-message wrapped-line cache is up to date for `width`.
+    /// Performs a full recompute when the width or
     /// `show_thought` changes, an incremental append when new messages are
     /// added, and a truncate when messages are removed.
     pub(crate) fn ensure_message_cache(&self, width: usize) {
@@ -31,7 +31,6 @@ impl TuiRenderer {
             || cached_lines.len() != rendered.len()
         {
             if cached_w != width || cached_st != self.show_thought {
-                // Full recompute.
                 self.cached_chat_width.set(width);
                 self.cached_show_thought.set(self.show_thought);
                 cached_lines.clear();
@@ -43,7 +42,6 @@ impl TuiRenderer {
                 }
                 self.cached_total_message_lines.set(total);
             } else if cached_lines.len() < rendered.len() {
-                // Incremental append (new messages added).
                 let start = cached_lines.len();
                 let mut total = self.cached_total_message_lines.get();
                 for msg_lines in &rendered[start..] {
@@ -53,7 +51,6 @@ impl TuiRenderer {
                 }
                 self.cached_total_message_lines.set(total);
             } else if cached_lines.len() > rendered.len() {
-                // Truncate (messages removed).
                 cached_lines.truncate(rendered.len());
                 let total: usize = cached_lines.iter().sum();
                 self.cached_total_message_lines.set(total);
@@ -62,8 +59,7 @@ impl TuiRenderer {
     }
 
     /// Recompute only the last message's line count (used when a `Marmennill:`
-    /// message is appended to during steer streaming) and update the total
-    /// (reference §11.4).
+    /// message is appended to during steer streaming) and update the total.
     pub(crate) fn invalidate_last_message_cache(&self) {
         let last_idx = match self.messages.len().checked_sub(1) {
             Some(i) => i,
@@ -200,8 +196,8 @@ impl TuiRenderer {
         lines
     }
 
-    /// Estimate the total wrapped line count of the chat transcript at `width`
-    /// (reference §11.5), including streaming buffers.
+    /// Estimate the total wrapped line count of the chat transcript at `width`,
+    /// including streaming buffers.
     pub(crate) fn estimated_chat_lines(&self, width: usize) -> usize {
         self.ensure_message_cache(width);
         let mut n = self.cached_total_message_lines.get();
@@ -221,7 +217,7 @@ impl TuiRenderer {
     }
 
     /// Estimate the total wrapped line count of the selected subagent's
-    /// details pane at `width` (reference §11.6).
+    /// details pane at `width`.
     pub(crate) fn estimated_subagent_lines(&self, width: usize) -> usize {
         if let Some(sa) = self.subagents.get(self.selected_subagent_idx) {
             let mut n = 1; // "=== Details for ... ==="
@@ -263,7 +259,6 @@ impl TuiRenderer {
         }
     }
 
-    /// Draw one complete frame using the current buffer state.
     pub(crate) fn draw(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -326,7 +321,6 @@ impl TuiRenderer {
             }
         }
 
-        // Auto-scroll targets (reference §11.5 / §11.6).
         if self.chat_auto_scroll {
             let w = self.chat_width.get();
             let n = self.estimated_chat_lines(w);
@@ -453,7 +447,6 @@ impl TuiRenderer {
             }
         }
 
-        // Streaming thoughts (reference §4.4.1).
         if self.show_thought && !self.current_thought.is_empty() {
             chat_lines.extend(self.render_streaming_thought());
         }
@@ -659,7 +652,6 @@ impl TuiRenderer {
             .constraints([Constraint::Length(list_len), Constraint::Min(3)])
             .split(inner_area);
 
-        // Subagent list.
         let mut list_lines = Vec::new();
         for (i, sa) in self.subagents.iter().enumerate() {
             let prefix = if i == self.selected_subagent_idx {
@@ -720,8 +712,7 @@ impl TuiRenderer {
             list_lines.push(Line::raw("No subagents."));
         }
 
-        // Auto-adjust list scroll to keep the selected subagent visible
-        // (reference §6.3).
+        // Auto-adjust list scroll to keep the selected subagent visible.
         let list_height = subagent_chunks[0].height as usize;
         let mut list_scroll = self.subagent_list_scroll as usize;
         if list_height > 0 {
@@ -744,12 +735,10 @@ impl TuiRenderer {
             .scroll((list_scroll as u16, 0));
         frame.render_widget(list_paragraph, subagent_chunks[0]);
 
-        // Separator.
         let separator = Block::default()
             .borders(Borders::TOP)
             .border_style(Style::default().fg(Color::DarkGray));
 
-        // Subagent details and bottom status bar.
         let sa_opt = self.subagents.get(self.selected_subagent_idx);
         let show_status_bar = if let Some(sa) = sa_opt {
             sa.is_active || !sa.thinking.is_empty()

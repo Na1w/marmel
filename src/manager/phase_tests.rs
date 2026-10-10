@@ -38,7 +38,6 @@ fn test_plan_exists_tracks_the_plan_file() {
     let dir = temp_marmel();
     let plan = Plan::at(&dir);
 
-    // No plan on disk -> nothing is executable yet.
     assert!(!plan.exists());
 
     // Writing a plan makes it the live plan.
@@ -71,7 +70,8 @@ fn test_plan_exists_tracks_the_plan_file() {
 /// `.marmel/execution_plan.md`, toggling `- [ ] [t-001]` to `- [x] [t-001]`.
 ///
 /// The live gate is the **structured** `ToolResult::is_error` flag at the call
-/// site (`src/ui/session.rs:707` / `:1091`), never a re-classification of the
+/// site in `src/ui/session.rs` (the tool-dispatch loop), never a
+/// re-classification of the
 /// output prose: the substring heuristic `output_is_success` that used to back
 /// this is deleted (recon M9 + `docs/decision_dead_code_manager.md` §6 hand-off
 /// 3). The witness below proves that heuristic really mis-judged successful
@@ -82,7 +82,6 @@ fn test_agent_auto_plan_checkoff() {
     let plan = Plan::at(&dir);
     plan.create(PLAN_MD).unwrap();
 
-    // Initially all three tasks are pending.
     assert_eq!(
         plan.pending_tasks(),
         vec![
@@ -779,7 +778,6 @@ fn test_archive_noop_when_incomplete() {
     plan.create("# Plan\n- [ ] [t-001] Step 1\n- [ ] [t-002] Step 2\n")
         .unwrap();
 
-    // Sanity: not complete (has unchecked boxes).
     assert!(!plan.is_complete());
 
     let result = plan.archive().unwrap();
@@ -930,7 +928,6 @@ fn test_check_off_does_not_flip_task_mentioned_in_other_description() {
 - [ ] [t-011] Produce report summarizing (t-006...t-008)\n";
     plan.create(plan_content).unwrap();
 
-    // Check off t-006 the first time
     assert!(plan.check_off("t-006").unwrap());
     // Checking off t-006 a second time must NOT check off t-011
     assert!(!plan.check_off("t-006").unwrap());
@@ -946,25 +943,23 @@ fn test_check_off_does_not_flip_task_mentioned_in_other_description() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-// ---------------------------------------------------------------------------
 // H6 regression guards (`docs/recon_bugs_manager.md` H6, retargeted by
 // `docs/decision_dead_code_manager.md` §6 item 3 to this file).
 //
 // The two H6 defects lived in the `AgentLoop` executor that has since been
 // deleted:
-//   * `extract_task_id` (`loop.rs:121-140`) fell back to scanning the whole
-//     serialized arguments JSON with `\(?\[?(t-[A-Za-z0-9_-]+)\]?\)?`, so an
-//     unrelated successful tool whose *path* happened to contain a `t-…`
-//     substring checked a plan line off;
-//   * the check-off gate was fed the canned literal `"ok"`
-//     (`loop.rs:524`: `plan.check_off_on_success(task, "ok")`), i.e. the
-//     decision never looked at real deliverable text.
+//   * `extract_task_id` fell back to scanning the whole serialized arguments
+//     JSON with `\(?\[?(t-[A-Za-z0-9_-]+)\]?\)?`, so an unrelated successful
+//     tool whose *path* happened to contain a `t-…` substring checked a plan
+//     line off;
+//   * the check-off gate was fed the canned literal `"ok"` by the deleted
+//     `Plan::check_off_on_success` call site, i.e. the decision never looked at
+//     real deliverable text.
 //
 // The witnesses below re-state those two deleted behaviours *inside the test*
 // (the same technique `src/markers.rs` uses for its `legacy_substring_first_parse`
 // witness) so every guard here is provably non-vacuous: the legacy rule would
 // have flipped the box, the live path refuses.
-// ---------------------------------------------------------------------------
 
 /// Witness of the deleted `loop.rs::extract_task_id` fallback: a regex scan over
 /// an arbitrary blob (the serialized tool arguments, or any deliverable prose).
@@ -976,8 +971,9 @@ fn legacy_blob_scan_task_id(blob: &str) -> Option<String> {
 }
 
 /// Witness of the deleted check-off gate: `output_is_success` was a substring
-/// heuristic, and `loop.rs:524` handed it the literal `"ok"`, so the gate was
-/// satisfied unconditionally for any canned success token.
+/// heuristic, and the deleted `Plan::check_off_on_success` call site handed it
+/// the literal `"ok"`, so the gate was satisfied unconditionally for any canned
+/// success token.
 fn legacy_canned_token_passes_gate(token: &str) -> bool {
     let upper = token.to_ascii_uppercase();
     !(upper.contains(MARKER_REPLAN) || upper.contains("ERROR") || upper.contains(MARKER_FAILED))
@@ -1004,8 +1000,9 @@ fn legacy_substring_says_failure(output: &str) -> bool {
     sanitized.contains("ERROR") || sanitized.contains(MARKER_FAILED)
 }
 
-/// Witness of the pre-C3 `Plan::check_off` grammar (recorded verbatim in
-/// `src/plan_parse.rs:10`): `^\s*(?:[-*]|\d+\.)\s*\[\s*\]\s*\*{0,2}\[?<tid>\]?\*{0,2}\b`
+/// Witness of the pre-C3 `Plan::check_off` grammar (recorded verbatim in the
+/// drift table of the `src/plan_parse` module doc):
+/// `^\s*(?:[-*]|\d+\.)\s*\[\s*\]\s*\*{0,2}\[?<tid>\]?\*{0,2}\b`
 /// — it only ever accepted a *square-bracket* id, so a parenthesised plan line
 /// `- [ ] (t-002) migrate schema` could never be checked off.
 fn legacy_check_off_line(line: &str, task_id: &str) -> Option<String> {
@@ -1022,8 +1019,8 @@ fn legacy_check_off_line(line: &str, task_id: &str) -> Option<String> {
 
 /// H6 guard (i): a deliverable that merely *mentions* a path whose name contains
 /// a `t-…` substring must never check off the task whose id that substring
-/// spells. `src/chart-notes.md` → `t-notes` is the exact fixture recorded in
-/// `docs/recon_bugs_manager.md:60`.
+/// spells. `src/chart-notes.md` → `t-notes` is the exact fixture recorded under
+/// **H6** in `docs/recon_bugs_manager.md`.
 #[test]
 fn test_path_substring_never_becomes_a_checked_off_task_id() {
     let dir = temp_marmel();
@@ -1291,7 +1288,6 @@ fn test_parenthesised_task_id_flips_through_the_live_path() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-// ---------------------------------------------------------------------------
 // M8 — an execution plan that cannot be read must never look like
 // "nothing pending" / "plan complete" (`docs/recon_bugs_manager.md` M8).
 //
@@ -1299,7 +1295,6 @@ fn test_parenthesised_task_id_flips_through_the_live_path() {
 // the `_` arm swallowed the `Err` from `fs::read_to_string` and returned an
 // empty list, which the Silent Dispatcher (`src/orchestrator/mod.rs::run_executing`)
 // and the UI auto-nudge (`src/ui/session.rs`) read as "the plan is finished".
-// ---------------------------------------------------------------------------
 
 /// M8: `try_pending_tasks` / `try_all_tasks` distinguish "no plan file" from
 /// "plan file cannot be read", while `is_complete` can never report completion
@@ -1423,11 +1418,9 @@ fn test_try_all_tasks_lists_checked_ids_while_try_pending_tasks_omits_them() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-// ---------------------------------------------------------------------------
 // M9 — the success/failure decision behind check-off has exactly one owner:
 // `crate::markers` (`MissionMarker::resolve`, `has_failure_marker`,
 // `has_replan_marker`). `src/manager/phase.rs` must not carry a second matcher.
-// ---------------------------------------------------------------------------
 
 /// M9: every check-off decision is taken by the single marker matcher, including
 /// the payloads that fooled the deleted substring matcher pair: a benign
@@ -1541,10 +1534,8 @@ fn test_m9_checkoff_is_decided_by_the_single_marker_matcher() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // t-035a — check-off integrity: one marker gate, one task id, and a plan that
 // cannot be read/parsed never reports itself as finished.
-// ---------------------------------------------------------------------------
 
 /// t-035a: a completion marker that names a **different** plan task than the id
 /// the caller bound aborts the check-off instead of silently preferring either

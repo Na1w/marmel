@@ -12,7 +12,6 @@ struct CliArgs {
     raw: bool,
     /// Detailed debug logging to debug.log.
     debug: bool,
-    /// Optional initial prompt to start the session.
     prompt: Option<String>,
 }
 
@@ -48,7 +47,6 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
 
-    // Boot MCP servers if configured
     if !cfg.mcp_servers.is_empty()
         && let Ok(mcp_mgr) = rt.block_on(mcp::McpManager::boot(&cfg.mcp_servers))
     {

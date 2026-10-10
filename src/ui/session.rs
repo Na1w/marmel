@@ -967,8 +967,7 @@ pub async fn run_session_with_bounds_report(
                         break;
                     }
                     let mut handle = &mut handles[idx];
-                    // Attribute this join result to the unit of work that produced
-                    // it (`failure_keys` is index-aligned with `handles`).
+                    // Attribute this join result to the unit of work that produced it.
                     let failure_key = failure_keys[idx].clone();
                     if renderer.user_exit_requested() {
                         break;
@@ -1319,8 +1318,6 @@ pub async fn run_session_with_bounds_report(
                         None
                     };
 
-                    // H5 failure budget: one identity per repeated unit of work
-                    // (plan task id for delegations, tool signature otherwise).
                     let failure_key = failure_key_for(&name, &args_val, delegated_task.as_deref());
 
                     if let Some(agent) = delegated_agent {
@@ -1979,9 +1976,7 @@ pub async fn run_session_with_bounds_report(
     })
 }
 
-// ---------------------------------------------------------------------------
 // H5 execution-bound helpers
-// ---------------------------------------------------------------------------
 
 /// Stable identity for a repeated unit of work inside one session.
 ///
@@ -2027,9 +2022,7 @@ fn failure_refusal_message(key: &str, count: u32) -> String {
     )
 }
 
-// ---------------------------------------------------------------------------
 // REQ-PLAN-002: plan check-off + plan-state helpers (shared by both live loops)
-// ---------------------------------------------------------------------------
 
 /// What the session is allowed to conclude about the on-disk execution plan.
 ///

@@ -11,7 +11,6 @@ pub struct ToolInvocation {
 #[derive(Debug, Clone)]
 pub struct ToolResult {
     pub content: String,
-    /// Whether this was an error result.
     pub is_error: bool,
 }
 
@@ -94,7 +93,6 @@ impl HarnessStats {
 /// The role requesting a tool execution, used to enforce the orchestration tool policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolCaller {
-    /// The Manager.
     Manager,
     /// A specialist identified by its role, using default registry allowlist.
     Specialist(crate::agents::Agent),

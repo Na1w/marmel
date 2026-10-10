@@ -10,7 +10,7 @@
 //! **Consumers (cluster C2, see `docs/recon_duplication_net.md`):**
 //! `crate::llm::client::ChatClient::chat_stream` and — since the MCP
 //! unification — both MCP HTTP/SSE request paths,
-//! `crate::mcp::http::HttpSseConnection::post` and
+//! `crate::mcp::http::HttpSseConnection::send_request` and
 //! `HttpSseConnection::send_notification`.
 
 use std::time::Duration;

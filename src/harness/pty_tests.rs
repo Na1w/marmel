@@ -114,19 +114,17 @@ async fn test_interactive_pty_manager_lifecycle() {
     #[cfg(windows)]
     let shell = "cmd.exe";
 
-    // Spawn a shell
     let init_out = mgr
         .spawn(session_id, shell, &cwd, 24, 80)
         .await
         .expect("spawn session");
-    assert!(init_out.is_empty() || !init_out.is_empty()); // Shell banner or prompt
+    assert!(init_out.is_empty() || !init_out.is_empty());
 
     #[cfg(unix)]
     let (input, wait_ms) = ("echo hello_interactive_pty\n", 400);
     #[cfg(windows)]
     let (input, wait_ms) = ("echo hello_interactive_pty\r\n", 800);
 
-    // Write a command
     let (mut out, alive) = mgr
         .write(session_id, input, wait_ms)
         .await
@@ -151,12 +149,10 @@ async fn test_interactive_pty_manager_lifecycle() {
         "output should contain echoed string, got: {out:?}"
     );
 
-    // List sessions
     let list = mgr.list().await;
     assert_eq!(list.len(), 1);
     assert_eq!(list[0]["session_id"], session_id);
 
-    // Close session
     let closed = mgr.close(session_id).await;
     assert!(closed, "session should be closed");
 
@@ -188,11 +184,9 @@ async fn test_run_command_pty_cancelled_by_worker_token() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Bug P1 (zombie children) — reap state machine, tested as pure logic.
 // None of these tests need a real `/dev/pts`: they drive the `ChildHandle`
 // seam with a fake and with a plain `std::process::Child`.
-// ---------------------------------------------------------------------------
 
 use std::io;
 use std::sync::Arc;
@@ -304,7 +298,8 @@ impl ChildHandle for FakeChild {
 }
 
 /// Adapter that lets the reaper manage a plain `std::process::Child`, i.e. a
-/// real OS child spawned **without** a pty (`/bin/true`, `/bin/sleep`).
+/// real OS child spawned **without** a pty (a `true`-like and a `sleep`-like
+/// program resolved through `PATH`).
 struct StdChild(std::process::Child);
 
 impl ChildHandle for StdChild {
@@ -330,14 +325,72 @@ fn waitpid_nowait(pid: i32) -> (i32, i32) {
     (ret, io::Error::last_os_error().raw_os_error().unwrap_or(0))
 }
 
+/// Spawn spec (program + args) for a child that exits successfully right away.
+///
+/// The program is deliberately **not** an absolute path: coreutils sit in the
+/// root `bin` directory on Linux but under `/usr` on macOS, so hard-coding the
+/// absolute location of `true` fails on the latter with `NotFound (os error 2)`.
+/// Letting the OS resolve `true` through `PATH` works on both; `cmd /C exit 0`
+/// is the equivalent short-lived process on Windows.
+fn short_lived_child_spec() -> (&'static str, &'static [&'static str]) {
+    if cfg!(windows) {
+        ("cmd", &["/C", "exit 0"])
+    } else {
+        ("true", &[])
+    }
+}
+
+/// Spawn spec (program + args) for a child that keeps running until killed.
+///
+/// `sleep 30` on unix; `cmd /C ping -n 30 127.0.0.1` on Windows, because
+/// `timeout` requires a real console while `ping` runs headless.
+fn long_running_child_spec() -> (&'static str, &'static [&'static str]) {
+    if cfg!(windows) {
+        ("cmd", &["/C", "ping -n 30 127.0.0.1"])
+    } else {
+        // The sleep program is resolved by the OS through `PATH` here — no
+        // absolute path, whose location differs between Unix runners.
+        ("sleep", &["30"])
+    }
+}
+
+/// Spawn a real OS child (no pty involved) from a platform spawn spec.
+fn spawn_real_child(spec: (&str, &[&str])) -> std::process::Child {
+    let (program, args) = spec;
+    std::process::Command::new(program)
+        .args(args)
+        .spawn()
+        .unwrap_or_else(|err| {
+            panic!(
+                "spawn `{program} {}` (resolved via PATH) without a pty: {err}",
+                args.join(" ")
+            )
+        })
+}
+
+/// Zombie check on unix: after the reaper ran, the pid must be gone from the
+/// process table. Stays `cfg(unix)` because `waitpid`/`libc` are unix-only.
+#[cfg(unix)]
+fn assert_gone_from_process_table(pid: i32, label: &str) {
+    let (ret, errno) = waitpid_nowait(pid);
+    assert_eq!(
+        (ret, errno),
+        (-1, libc::ECHILD),
+        "{label} {pid} was left as a <defunct> zombie"
+    );
+}
+
+/// Windows exposes no `waitpid` equivalent: the reaper having `wait()`ed the
+/// `std::process::Child` (asserted by the caller) is the strongest available
+/// no-zombie guarantee, so nothing further is asserted there.
+#[cfg(not(unix))]
+fn assert_gone_from_process_table(_pid: i32, _label: &str) {}
+
 /// Regression (P1): a reaped child must leave nothing in the process table.
 /// Spawned with `std::process::Command`, so no `/dev/pts` is involved.
 #[test]
-#[cfg(unix)]
 fn test_reap_removes_real_child_from_process_table() {
-    let child = std::process::Command::new("/bin/true")
-        .spawn()
-        .expect("spawn /bin/true without a pty");
+    let child = spawn_real_child(short_lived_child_spec());
     let pid = child.id() as i32;
 
     let mut reaper = ChildReaper::new(StdChild(child), None);
@@ -347,23 +400,14 @@ fn test_reap_removes_real_child_from_process_table() {
     assert!(outcome.status.is_some(), "exit status must be recorded");
     assert!(reaper.is_reaped());
 
-    let (ret, errno) = waitpid_nowait(pid);
-    assert_eq!(
-        (ret, errno),
-        (-1, libc::ECHILD),
-        "child {pid} was left as a <defunct> zombie"
-    );
+    assert_gone_from_process_table(pid, "child");
 }
 
 /// Regression (P1): a long-running child is killed **and** reaped, so a
 /// `run_command` that times out cannot accumulate zombies.
 #[test]
-#[cfg(unix)]
 fn test_reap_kills_and_reaps_real_long_running_child() {
-    let child = std::process::Command::new("/bin/sleep")
-        .arg("30")
-        .spawn()
-        .expect("spawn /bin/sleep without a pty");
+    let child = spawn_real_child(long_running_child_spec());
     let pid = child.id() as i32;
 
     let mut reaper = ChildReaper::new(StdChild(child), None);
@@ -376,12 +420,7 @@ fn test_reap_kills_and_reaps_real_long_running_child() {
         "a SIGKILLed child must not report success"
     );
 
-    let (ret, errno) = waitpid_nowait(pid);
-    assert_eq!(
-        (ret, errno),
-        (-1, libc::ECHILD),
-        "killed child {pid} was left as a <defunct> zombie"
-    );
+    assert_gone_from_process_table(pid, "killed child");
 }
 
 /// Negative control proving the `ECHILD` assertions above are meaningful: a
@@ -389,10 +428,7 @@ fn test_reap_kills_and_reaps_real_long_running_child() {
 #[test]
 #[cfg(unix)]
 fn test_unreaped_killed_child_is_visible_as_zombie() {
-    let mut child = std::process::Command::new("/bin/sleep")
-        .arg("30")
-        .spawn()
-        .expect("spawn /bin/sleep without a pty");
+    let mut child = spawn_real_child(long_running_child_spec());
     let pid = child.id() as i32;
     child.kill().expect("SIGKILL the child");
 
@@ -580,10 +616,8 @@ fn test_deferred_reap_queue_reaps_inline_and_stays_bounded() {
     assert_eq!(queue.len(), DEFERRED_REAP_QUEUE_CAP);
 }
 
-// ---------------------------------------------------------------------------
 // Bug P3 (unbounded interactive buffer) — ring buffer + truncation accounting,
 // pure logic on `SharedBuffer`.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_shared_buffer_cap_constant_is_documented() {
@@ -750,13 +784,11 @@ fn test_is_utf8_lead_byte_classifies_lead_and_continuation_bytes() {
     assert!(!is_utf8_lead_byte(0xA4)); // second byte of `ä`
 }
 
-// ---------------------------------------------------------------------------
 // Bug (t-034b) — the Landlock gate must NEVER depend on the executable NAME.
 // These tests drive [`should_apply_sandbox`] / [`sandbox_command_argv`] as pure
 // logic with injected inputs: no Landlock availability, no `/dev/pts`, no
 // `current_exe()`, no environment mutation, so they are deterministic
 // everywhere (including sandboxes where `openpty` yields EACCES).
-// ---------------------------------------------------------------------------
 
 use std::path::{Path, PathBuf};
 
@@ -876,7 +908,9 @@ fn test_sandbox_gate_executable_name_has_zero_influence() {
     }
     // And an unrelated program that merely *happens* to be named `marmel` is
     // treated like any other host of this code (also sandboxed).
-    let coincidental = Path::new("/usr/local/bin/marmel");
+    // Arbitrary install prefix (the fixture binary is only defined by its name;
+    // the directory it sits in is never an input to the decision).
+    let coincidental = Path::new("/usr/local/libexec/marmel");
     assert!(matches!(
         should_apply_sandbox(&production_inputs(coincidental)),
         SandboxDecision::Apply { .. }
@@ -907,7 +941,9 @@ fn test_sandbox_gate_source_has_no_executable_name_heuristic() {
 /// the resolved exe, and the fact that the command is unsandboxed.
 #[test]
 fn test_sandbox_gate_explicit_opt_out_disables_and_is_warned() {
-    let exe = Path::new("/opt/marmel/bin/marmel-dev");
+    // Arbitrary resolved-exe fixture (the directory it sits in is never an
+    // input to the decision); the log assertion below must name the same path.
+    let exe = Path::new("/opt/marmel/libexec/marmel-dev");
     let inputs = SandboxInputs {
         opt_out: OptOut::Explicit {
             setting: format!("{SANDBOX_OPTOUT_ENV}=1"),
@@ -935,7 +971,7 @@ fn test_sandbox_gate_explicit_opt_out_disables_and_is_warned() {
         "the warn must name the setting that disabled it, got {logs:?}"
     );
     assert!(
-        logs.contains("/opt/marmel/bin/marmel-dev") && logs.contains("unsandboxed"),
+        logs.contains("/opt/marmel/libexec/marmel-dev") && logs.contains("unsandboxed"),
         "the warn must state the resolved exe and the chosen mode, got {logs:?}"
     );
 

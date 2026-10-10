@@ -106,7 +106,6 @@ fn test_decided_when_arbitrator_available() {
 
 #[test]
 fn test_three_decision_branches_roundtrip() {
-    // Serialize + deserialize each of the three core branches.
     for (decision_name, response) in [
         ("RespondDirectly", Some("reply_text")),
         ("AbortImmediately", None),
@@ -138,7 +137,6 @@ fn test_streaming_response_extractor_basic() {
     assert_eq!(out3, "ready.");
     assert!(finished3);
 
-    // After finished, nothing more is emitted
     let (out4, finished4) = extractor.push_chunk(" extra stuff");
     assert_eq!(out4, "");
     assert!(!finished4);
@@ -375,7 +373,6 @@ async fn test_arbitrate_steer_context_stream_parses_sleep_tool_call() {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
-    // Mock SSE response returning a sleep tool call instead of raw JSON
     let tool_call_chunk = "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_sleep_1\",\"type\":\"function\",\"function\":{\"name\":\"sleep\",\"arguments\":\"{\\\"seconds\\\": 7, \\\"reason\\\": \\\"wait for build\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -524,7 +521,6 @@ async fn test_arbitrate_steer_context_stream_plain_text_fallback() {
 
     assert!(decision.is_some());
     let d = decision.unwrap();
-    // Non-JSON plain text response should fall back to RespondDirectly
     assert_eq!(d.decision, "RespondDirectly");
     assert!(
         d.response
@@ -534,7 +530,7 @@ async fn test_arbitrate_steer_context_stream_plain_text_fallback() {
     );
 }
 
-// ---- H3: one shared normalizer for the subtask `action` vocabulary ----
+// H3: one shared normalizer for the subtask `action` vocabulary
 
 /// Every spelling of a known action must fold onto the same canonical action,
 /// and therefore drive the same branch everywhere it is consumed.
@@ -594,7 +590,6 @@ fn test_steer_subtask_action_spelling_table() {
         );
     }
 
-    // Behavioural equality: all spellings of one action share one canonical name.
     for group in [
         &[
             "Cancel",
@@ -890,7 +885,7 @@ fn sleep_tool_aliases_resolve_identically_on_the_harness_and_steer_paths() {
     }
 }
 
-// ---- gate t-068: the steered sleep duration belongs to the sleep owner ----
+// gate t-068: the steered sleep duration belongs to the sleep owner
 
 /// Every `sleep`-argument shape a steered sleep can arrive with, and the number
 /// of seconds the single owner resolves it to.

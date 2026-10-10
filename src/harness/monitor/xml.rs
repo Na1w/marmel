@@ -103,7 +103,6 @@ fn find_next_tool_call_block(text: &str, from: usize) -> Option<(usize, usize)> 
     }
 
     // Legacy SPEC style: `tool_call <function=NAME>...</function> tool_call`.
-    // Search for `tool_call <function=` after the current position.
     let mut search = from;
     loop {
         let rest2 = &text[search..];
@@ -120,7 +119,6 @@ fn find_next_tool_call_block(text: &str, from: usize) -> Option<(usize, usize)> 
             .sum::<usize>();
         let after_ws_pos = after + ws_len;
         if text[after_ws_pos..].starts_with("<function=") {
-            // Find the closing `</function>`.
             if let Some(fc_rel) = text[after_ws_pos..].find("</function>") {
                 let end = after_ws_pos + fc_rel + "</function>".len();
                 return Some((candidate, end));
@@ -131,9 +129,7 @@ fn find_next_tool_call_block(text: &str, from: usize) -> Option<(usize, usize)> 
     }
 }
 
-// ---------------------------------------------------------------------------
 // Fence awareness (backtick / tilde code fences)
-// ---------------------------------------------------------------------------
 
 /// Fence state used by [`fenced_spans`].
 ///
@@ -429,6 +425,4 @@ fn uuid_v4() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-// ---------------------------------------------------------------------------
-// Tool repetition & cycle detector (REQ-HARN-002)
-// ---------------------------------------------------------------------------
+// Tool repetition & cycle detector (REQ-HARN-002): see `repetition.rs`.

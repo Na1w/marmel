@@ -8,6 +8,72 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+// ── Windows-safe path comparison ───────────────────────────────────────────
+//
+// The tools build their answer out of `Path::to_string_lossy()`
+// (`src/harness/search.rs`: `strip_prefix(root).to_string_lossy()` for glob
+// entries, walker paths for grep lines). On Windows that spelling can carry a
+// verbatim / device-namespace prefix (`\\?\`, `\\.\`, `\\localhost\`) and `\`
+// separators, while the contract asserted here is written with `/`. Comparing
+// the raw platform spelling against those literals is what breaks these tests
+// on Windows.
+//
+// `normalize_for_compare` canonicalises the *spelling* of what is compared —
+// never the assertion strength: the same file set, the same order, the same
+// counts and the same truncation markers are still required.
+//
+// `dunce` is present in `Cargo.lock` only as a *transitive* dependency (it is
+// not a direct dependency in `Cargo.toml`), so the verbatim prefix is trimmed
+// here instead of adding a dependency for one test helper.
+
+/// Windows verbatim / device-namespace prefixes that `Path::canonicalize()` can
+/// introduce (`\\?\`, `\\.\`, `\\localhost\`, and their `/` spellings). Every
+/// entry is ASCII, so a prefix match always ends on a `char` boundary.
+const WINDOWS_PATH_PREFIXES: &[&str] = &[
+    "\\\\?\\",
+    "\\\\.\\",
+    "\\\\localhost\\",
+    "//?/",
+    "//./",
+    "//localhost/",
+];
+
+/// Canonical spelling of a path-ish string for comparison: drops a Windows
+/// verbatim/device prefix and renders `\` as `/`.
+///
+/// **No-op on Unix**: under `cfg!(unix)` the input is returned untouched, byte
+/// for byte, so a Unix run compares exactly the strings it always compared.
+fn normalize_for_compare(raw: &str) -> String {
+    if cfg!(unix) {
+        return raw.to_owned();
+    }
+    strip_windows_path_prefix(raw).replace('\\', "/")
+}
+
+/// Drop a leading [`WINDOWS_PATH_PREFIXES`] entry, case-insensitively.
+fn strip_windows_path_prefix(raw: &str) -> &str {
+    let bytes = raw.as_bytes();
+    for prefix in WINDOWS_PATH_PREFIXES {
+        let p = prefix.as_bytes();
+        if bytes.len() >= p.len() && bytes[..p.len()].eq_ignore_ascii_case(p) {
+            return &raw[p.len()..];
+        }
+    }
+    raw
+}
+
+/// `matches`-list flavour of [`normalize_for_compare`]: element-by-element, so
+/// the expected list keeps asserting the exact same set in the exact same order.
+fn normalize_paths(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| normalize_for_compare(path))
+        .collect()
+}
+
+/// The temp dir handed to the tools is a plain, non-canonicalized path, exactly
+/// what a caller would pass; only the *returned* strings are normalized for
+/// comparison (see [`normalize_for_compare`]).
 fn temp_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "marmel_search_{}_{}",
@@ -86,7 +152,7 @@ fn test_harness_glob_sorting() {
 
     let outcome = glob_in_root("*.rs", &dir, GLOB_HARD_CAP).unwrap();
     assert_eq!(
-        outcome.matches,
+        normalize_paths(&outcome.matches),
         vec!["alpha.rs", "beta.rs", "zeta.rs"],
         "sorted"
     );
@@ -199,7 +265,7 @@ fn grep_and_glob_truncation_is_deterministic_across_runs() {
         first
             .lines()
             .next()
-            .is_some_and(|l| l.contains("adir/first.txt")),
+            .is_some_and(|l| normalize_for_compare(l).contains("adir/first.txt")),
         "documented order: siblings sorted by path, so adir/ comes first, got:\n{first}"
     );
     assert!(
@@ -213,7 +279,7 @@ fn grep_and_glob_truncation_is_deterministic_across_runs() {
     assert_eq!(a.matches.len(), 5, "cap respected");
     assert_eq!(a.total_matches, 14, "exact total across both alternatives");
     assert_eq!(
-        a.matches,
+        normalize_paths(&a.matches),
         vec![
             "adir/first.txt",
             "extra000.md",
@@ -362,7 +428,11 @@ fn glob_brace_pattern_matches_every_extension_without_duplicates() {
     // Through the real tool, exactly the shape from the bug report.
     let via_tool = glob_at(&dir, serde_json::json!({"pattern": "src/**/*.{rs,md}"})).unwrap();
     assert_eq!(
-        via_tool.content.lines().collect::<Vec<_>>(),
+        via_tool
+            .content
+            .lines()
+            .map(normalize_for_compare)
+            .collect::<Vec<_>>(),
         vec!["src/a.md", "src/a.rs", "src/deep/b.md", "src/deep/b.rs"],
         "the brace pattern must match both extensions"
     );
@@ -370,7 +440,7 @@ fn glob_brace_pattern_matches_every_extension_without_duplicates() {
     let outcome = glob_in_root("**/*.{rs,md}", &dir, GLOB_HARD_CAP).unwrap();
     assert_eq!(outcome.alternatives, 2, "two alternative patterns");
     assert_eq!(
-        outcome.matches,
+        normalize_paths(&outcome.matches),
         vec![
             "src/a.md",
             "src/a.rs",
@@ -397,16 +467,18 @@ fn glob_brace_pattern_matches_every_extension_without_duplicates() {
 
     let toml = glob_in_root("*.toml", &dir, GLOB_HARD_CAP).unwrap();
     assert_eq!(
-        toml.matches,
+        normalize_paths(&toml.matches),
         vec!["top.toml"],
         "control: the third extension exists in the tree"
     );
     // The pre-fix behaviour this test defends against: braces escaped literally.
     assert!(
-        !glob_in_root("**/*.rs", &dir, GLOB_HARD_CAP)
-            .unwrap()
-            .matches
-            .contains(&"top.md".to_string()),
+        !normalize_paths(
+            &glob_in_root("**/*.rs", &dir, GLOB_HARD_CAP)
+                .unwrap()
+                .matches
+        )
+        .contains(&"top.md".to_string()),
         "a brace-free pattern must not be treated as a brace pattern"
     );
 
@@ -463,7 +535,10 @@ fn glob_nested_braces_expand_left_to_right_and_match_the_union() {
         fs::write(dir.join(name), "x\n").unwrap();
     }
     let outcome = glob_in_root("{x,{y,z}}*.txt", &dir, GLOB_HARD_CAP).unwrap();
-    assert_eq!(outcome.matches, vec!["x1.txt", "y1.txt", "z1.txt"]);
+    assert_eq!(
+        normalize_paths(&outcome.matches),
+        vec!["x1.txt", "y1.txt", "z1.txt"]
+    );
     assert_eq!(outcome.alternatives, 3);
     assert_eq!(outcome.total_matches, 3);
 
@@ -598,7 +673,10 @@ fn grep_search_reads_the_pattern_key_and_never_echoes_query() {
     let out = grep_search(&serde_json::json!({"pattern": "needle", "path": dir.to_string_lossy()}))
         .unwrap()
         .content;
-    assert!(out.contains("notes.txt:1: needle line"), "got:\n{out}");
+    assert!(
+        normalize_for_compare(&out).contains("notes.txt:1: needle line"),
+        "got:\n{out}"
+    );
     assert!(
         !out.contains("query"),
         "the legacy preview key must not leak into results:\n{out}"
@@ -619,24 +697,65 @@ fn glob_translates_star_question_and_escapes_as_documented() {
     fs::write(dir.join("{literal}.rs"), "x\n").unwrap();
 
     assert_eq!(
-        glob_in_root("**/odd.rs", &dir, GLOB_HARD_CAP)
-            .unwrap()
-            .matches,
+        normalize_paths(
+            &glob_in_root("**/odd.rs", &dir, GLOB_HARD_CAP)
+                .unwrap()
+                .matches
+        ),
         vec!["nested/dir/odd.rs"]
     );
     assert_eq!(
-        glob_in_root("nested/a?.rs", &dir, GLOB_HARD_CAP)
-            .unwrap()
-            .matches,
+        normalize_paths(
+            &glob_in_root("nested/a?.rs", &dir, GLOB_HARD_CAP)
+                .unwrap()
+                .matches
+        ),
         vec!["nested/a1.rs"]
     );
     assert_eq!(
-        glob_in_root("\\{literal\\}.rs", &dir, GLOB_HARD_CAP)
-            .unwrap()
-            .matches,
+        normalize_paths(
+            &glob_in_root("\\{literal\\}.rs", &dir, GLOB_HARD_CAP)
+                .unwrap()
+                .matches
+        ),
         vec!["{literal}.rs"],
         "escaped braces match a literal brace in the name"
     );
 
     fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The comparison helper itself: a byte-identical passthrough on Unix, and a
+/// verbatim-prefix + separator canonicalisation on Windows. Each half is
+/// asserted under its own platform, so the guard can never weaken the other.
+#[test]
+fn normalize_for_compare_is_identity_on_unix_and_canonical_on_windows() {
+    if cfg!(unix) {
+        // Exactly the bytes the Unix assertions have always compared — no
+        // separator rewriting, no prefix trimming.
+        assert_eq!(
+            normalize_for_compare("/tmp/marmel_search_1/adir/first.txt"),
+            "/tmp/marmel_search_1/adir/first.txt"
+        );
+        assert_eq!(normalize_for_compare("src/a.md"), "src/a.md");
+        assert_eq!(
+            normalize_for_compare("\\\\?\\C:\\x\\a.md"),
+            "\\\\?\\C:\\x\\a.md"
+        );
+    }
+    if cfg!(windows) {
+        assert_eq!(
+            normalize_for_compare(r"\\?\C:\Users\tmp\adir\first.txt"),
+            "C:/Users/tmp/adir/first.txt"
+        );
+        assert_eq!(normalize_for_compare(r"\\.\C:\tmp\x"), "C:/tmp/x");
+        assert_eq!(
+            normalize_for_compare(r"\\localhost\C$\tmp\a.md"),
+            "C$/tmp/a.md"
+        );
+        assert_eq!(normalize_for_compare(r"C:\tmp\src\a.md"), "C:/tmp/src/a.md");
+    }
+    // Root-relative entries keep the exact literals the seeded tree asserts.
+    assert_eq!(normalize_for_compare("adir/first.txt"), "adir/first.txt");
+    assert_eq!(normalize_for_compare("{literal}.rs"), "{literal}.rs");
 }

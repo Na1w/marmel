@@ -917,8 +917,6 @@ fn dispatch_manager(
     mut engine: Option<&mut crate::manager::ContextEngine>,
 ) -> Result<ToolResult, ToolError> {
     let name = tool.name.as_str();
-    // t-034c: no MCP pre-lookup. Built-in names are matched first and MCP is
-    // consulted only in the fall-through arm, through the registration gate.
     if name != TOOL_REBIRTH
         && let Some(ref mut eng) = engine
     {
@@ -957,8 +955,6 @@ fn dispatch_manager(
         // canonical-only, but the sleep vocabulary comes from the shared table.
         n if is_sleep_tool_name(n) => handle_sleep(&tool.arguments),
         TOOL_REPLY_TO_ARBITRATOR => handle_reply_to_arbitrator("Manager", &tool.arguments),
-        // Built-in match exhausted: MCP is consulted last, and only through the
-        // registration gate (t-034c ordering).
         other => match dispatch_mcp_sync(tool) {
             Some(mcp_res) => mcp_res,
             None => Err(ToolError::Forbidden {
@@ -1034,12 +1030,8 @@ fn dispatch_specialist(
         });
     }
 
-    // t-034c ordering: `mcp_route` refuses any name the built-in dispatcher owns
-    // (verbatim or via alias normalization), so a built-in handler can never be
-    // shadowed by an MCP server. Names the built-ins do not own are served by the
-    // MCP tool only if it survived the registration policy
-    // (`set_mcp_manager` -> `McpDispatchGate`), and stay reachable for specialists
-    // exactly as before.
+    // t-034c ordering — the authoritative statement is on `dispatch`; the same
+    // rule governs this synchronous path.
     if let Some(mcp) = mcp_route(name) {
         let mcp_res = block_on_safe(mcp.call_tool(name, &tool.arguments));
         return match mcp_res {
@@ -1096,10 +1088,7 @@ fn dispatch_specialist(
         TOOL_PTY_READ => pty::pty_read(&tool.arguments),
         TOOL_PTY_CLOSE => pty::pty_close(&tool.arguments),
         TOOL_PTY_LIST => pty::pty_list(&tool.arguments),
-        // The verdict vocabulary is owned by `crate::agents::validation`, not by the
-        // tool-alias table, so this arm keeps matching the wire name.
         _ if crate::agents::validation::is_leave_verdict_tool(name) => {
-            // t-051: the allowlist admitted this call; the identity rule may not.
             verdict_role_gate(name, &caller)?;
             let (approved, comments) = crate::agents::validation::parse_verdict_args(
                 &tool.arguments,
@@ -1254,7 +1243,6 @@ mod tests {
         let _ = dispatch_with_engine(&inv, &mut engine);
         assert_eq!(engine.consecutive_rebirths(), 0);
 
-        // Now rebirth succeeds again
         let result3 = handle_rebirth(&mut engine, &args).unwrap();
         assert!(!result3.is_error);
     }

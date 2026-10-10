@@ -31,8 +31,8 @@ impl ToolCallRecord {
 pub enum Intervention {
     /// No intervention; the call is allowed to proceed.
     None,
-    /// The call was an identical repetition ≥3 times: execution is blocked.
+    /// The call was an identical repetition ≥5 times (default threshold): execution is blocked.
     Block,
-    /// An alternating cycle repeated ≥3 times: execution is cut.
+    /// An alternating cycle repeated ≥5 times (default threshold): execution is cut.
     Cut,
 }

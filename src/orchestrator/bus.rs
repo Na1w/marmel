@@ -82,11 +82,7 @@ pub fn set_status_sender(tx: tokio::sync::mpsc::UnboundedSender<String>) {
 
 /// Register an unbounded channel to receive real-time UI events across all agents and specialists.
 ///
-/// Intentionally a swap (not a once-only `OnceLock`): the single call site
-/// (`src/ui/session.rs`, `run_session`) is reachable multiple times per process
-/// lifetime (UI restart / reconnect re-runs `run_session` and re-registers the
-/// senders). The write guard is held only for the swap itself and dropped
-/// before any other operation.
+/// Same swap pattern as [`set_status_sender`].
 pub fn set_event_sender(tx: tokio::sync::mpsc::UnboundedSender<crate::ui::Event>) {
     if let Ok(mut lock) = EVENT_SENDER.write() {
         *lock = Some(tx);
@@ -108,10 +104,7 @@ pub fn emit_status(msg: impl Into<String>) {
 
 /// Emit a UI event directly to the active UI renderer.
 ///
-/// Contention-free pattern: clone the sender out under the read lock, drop the
-/// guard, and only then perform the channel send with NO lock held. The send
-/// must never happen while the guard is alive, so emitters never block behind
-/// (or hold up) each other or behind the setter's write lock.
+/// Same contention-free pattern as [`emit_status`].
 pub fn emit_event(ev: crate::ui::Event) {
     let tx = EVENT_SENDER.read().ok().and_then(|guard| guard.clone());
     if let Some(tx) = tx {

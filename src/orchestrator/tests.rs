@@ -45,18 +45,13 @@ async fn test_orchestr_context_isolation() {
         recursion_granted: false,
     };
     let d = m.delegate(req.clone()).await.expect("delegation succeeds");
-    // The deliverable's content must reference the isolated role/brief and
-    // never contain any "Manager transcript" (there is none to leak).
     assert!(matches!(d.marker, MissionMarker::Complete { .. }));
     assert!(d.content.contains("Implement the widget parser."));
 
-    // Build the exact engine the specialist would receive from this request
-    // and prove the isolation invariant at the message level.
     let entry = m.registry.resolve(req.agent_name).unwrap();
     let ctx = IsolatedContext::from_request(m.role_prompt_for(entry.agent), &req);
     let engine = ctx.into_engine(4096);
     let msgs = engine.messages();
-    // Exactly two messages: the specialist's role system prompt and the brief.
     assert_eq!(msgs.len(), 2, "isolated context has exactly 2 messages");
     match &msgs[0] {
         crate::types::Message::System { content } => {
@@ -106,7 +101,6 @@ async fn test_orchestr_task_checkoff_failed_leaves_unchecked() {
     let m = test_manager(&tmp);
     m.create_plan("- [ ] [t-200] Do the thing.\n").unwrap();
 
-    // Simulate a deliverable that parses to FAILED.
     let d = Deliverable {
         marker: MissionMarker::Failed {
             reason: "blocked".to_string(),
@@ -128,7 +122,6 @@ async fn test_orchestr_task_checkoff_replan_leaves_unchecked() {
     m.create_plan("- [ ] [t-300] Re-architect the module.\n")
         .unwrap();
 
-    // Simulate a deliverable that parses to REPLAN REQUIRED.
     let d = Deliverable {
         marker: MissionMarker::Replan {
             reason: "goal needs revisiting".to_string(),
@@ -197,7 +190,6 @@ async fn test_orchestr_apply_checkoff_only_checks_on_genuine_complete() {
     m.create_plan("- [ ] [t-501] Step one\n- [ ] [t-502] Step two\n")
         .unwrap();
 
-    // Genuine Complete marker + body marker -> checked off.
     let d = Deliverable {
         marker: MissionMarker::Complete { task_id: None },
         content: "all done MISSION COMPLETE (t-501)".to_string(),
@@ -233,8 +225,6 @@ async fn test_orchestr_apply_checkoff_rejected_retains_critique_content() {
     let m = test_manager(&tmp);
     m.create_plan("- [ ] [t-601] Verify module\n").unwrap();
 
-    // A REJECTED deliverable: Failed marker, body carries the structured
-    // VALIDATOR REJECTION block produced by the validator feedback loop.
     let critique = "VALIDATOR REJECTION: assertions failed on line 12\n---------------\nlast revision body MISSION COMPLETE REVOKED";
     let d = Deliverable {
         marker: MissionMarker::Failed {
@@ -244,7 +234,6 @@ async fn test_orchestr_apply_checkoff_rejected_retains_critique_content() {
         task_id: Some("t-601".to_string()),
     };
     let d = m.apply_check_off(d, Some("t-601".to_string()));
-    // The returned deliverable retains the FULL critique block verbatim.
     assert!(d.content.contains("VALIDATOR REJECTION"));
     assert!(d.content.contains("assertions failed on line 12"));
     // And the REJECTED marker leaves the task unchecked (parity with t-302 a).
@@ -308,7 +297,7 @@ fn test_orchestr_synthesize_joins_deliverables() {
     assert!(out.contains("second"));
 }
 
-// --- REQ-ORCH-005: `handle_delegate_task` handler-level tests ---
+// REQ-ORCH-005: `handle_delegate_task` handler-level tests
 
 /// REQ-ORCH-005 canonical signature: `handle_delegate_task` accepts the full
 /// payload `(agent_name, prompt, snippets, task_id?, image_urls?, audio_urls?)`
@@ -422,7 +411,6 @@ fn test_orchestr_guard_rejects_domain_module() {
     let err = m.guard_no_domain_work().expect_err("agent module rejected");
     assert!(err.to_string().contains("domain"));
 
-    // Correct orchestrator module passes.
     m.orchestration.manager_module = "src/orchestrator/mod.rs".to_string();
     m.guard_no_domain_work()
         .expect("orchestrator module is fine");
@@ -439,11 +427,11 @@ async fn test_orchestr_run_executing_rejects_domain_module() {
     assert!(res.is_err());
 }
 
-// --- M8: the Silent Dispatcher must never read "the plan could not be read" as
-//     "the mission is finished" (`docs/recon_bugs_manager.md` M8). The gate now
-//     uses the fallible plan API added in t-031h (`Plan::try_pending_tasks`), so
-//     a read failure is an Err, a successfully-read empty pending list is the
-//     only completion signal, and dispatch of real pending tasks is unchanged.
+// M8: the Silent Dispatcher must never read "the plan could not be read" as
+// "the mission is finished" (`docs/recon_bugs_manager.md` M8). The gate now uses
+// the fallible plan API added in t-031h (`Plan::try_pending_tasks`), so a read
+// failure is an Err, a successfully-read empty pending list is the only
+// completion signal, and dispatch of real pending tasks is unchanged.
 
 /// Minimal ERROR-level log capture (same shape as the WARN counter in
 /// `steer_tests.rs`): proves the plan-read failure is *logged* loudly, not only
@@ -732,11 +720,9 @@ fn test_active_worker_context_tokens_rebirth_reduction() {
         "coder".to_string(),
         "Do large work".to_string(),
     );
-    // Before rebirth: large context
     update_active_worker_context(&guard.0, 8500);
     assert_eq!(get_active_worker_tokens("coder-t-456"), Some(8500));
 
-    // After rebirth or compaction: context count drops
     update_active_worker_context(&guard.0, 450);
     assert_eq!(get_active_worker_tokens("coder-t-456"), Some(450));
 }
@@ -943,12 +929,12 @@ fn walk_src_for(dir: &Path, needle: &str, out: &mut Vec<(String, usize)>) {
     }
 }
 
-// --- Gate t-055: the disk-first prompt lookup in `OrchestratorManager::delegate`
-//     (`saved_prompt_path_for_task`) is grammar-gated by
-//     `crate::task_id::validate_task_id` — the single grammar authority for task
-//     ids. A rejected id is a typed refusal, so the join never happens, the read
-//     is never attempted, and the delegation degrades exactly like a missing
-//     prompt file: JIT prompt synthesis.
+// Gate t-055: the disk-first prompt lookup in `OrchestratorManager::delegate`
+// (`saved_prompt_path_for_task`) is grammar-gated by
+// `crate::task_id::validate_task_id` — the single grammar authority for task
+// ids. A rejected id is a typed refusal, so the join never happens, the read
+// is never attempted, and the delegation degrades exactly like a missing
+// prompt file: JIT prompt synthesis.
 
 /// WARN-level capture for the rejected-task-id boundary (same shape as
 /// [`ErrorLogCapture`] above, at WARN instead of ERROR).

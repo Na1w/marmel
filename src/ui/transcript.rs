@@ -46,34 +46,28 @@ pub struct UiTranscript {
 }
 
 impl UiTranscript {
-    /// Create an empty transcript.
     pub fn new() -> Self {
         Self {
             records: Vec::new(),
         }
     }
 
-    /// Access the underlying records slice.
     pub fn records(&self) -> &[UiRecord] {
         &self.records
     }
 
-    /// Check if the transcript has no records.
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
 
-    /// Number of records in the transcript.
     pub fn len(&self) -> usize {
         self.records.len()
     }
 
-    /// Append a single record to the transcript.
     pub fn append(&mut self, record: UiRecord) {
         self.records.push(record);
     }
 
-    /// Clear all records.
     pub fn clear(&mut self) {
         self.records.clear();
     }
@@ -108,6 +102,14 @@ impl UiTranscript {
     ///
     /// Ignores synthetic internal messages and pairs each user prompt with
     /// subsequent `SteerResponse`s, updating pending decisions when resolution occurs.
+    ///
+    /// "Is this entry still pending?" is **not** decided here: it is delegated to
+    /// [`crate::orchestrator::steer::steering_entry_is_pending`], the predicate the
+    /// live steering-history owner (`orchestrator::bus::record_steering_exchange`)
+    /// applies to the very same text. One vocabulary therefore governs both the
+    /// live history and this journal replay, and none of its markers is tied to a
+    /// natural language (t-013 removed the Swedish marker that used to sit here,
+    /// which only matched a Swedish production prompt).
     pub fn extract_steering_history(&self) -> Vec<(String, String)> {
         let mut history: Vec<(String, String)> = Vec::new();
         let mut current_user: Option<String> = None;
@@ -141,11 +143,7 @@ impl UiTranscript {
                         if let Some((last_q, last_resp)) = history.last_mut()
                             && last_q == user_q
                         {
-                            if last_resp.contains("awaiting specialist reply")
-                                || last_resp.starts_with("Decision:")
-                                || last_resp.contains("följdfråga")
-                                || last_resp.contains("follow-up")
-                            {
+                            if crate::orchestrator::steer::steering_entry_is_pending(last_resp) {
                                 *last_resp = clean_resp;
                             } else {
                                 last_resp.push('\n');
@@ -372,7 +370,6 @@ mod tests {
                     "(User steering resulted in subtask 't-1' executed by specialist 'coder'.)"
                         .to_string(),
             },
-            // Rebirth checkpoint:
             crate::types::Message::System {
                 content: "(SYSTEM: REBIRTH CHECKPOINT: Completed auth refactor)".to_string(),
             },
@@ -426,9 +423,11 @@ mod tests {
             thinking: None,
         });
 
-        // User asks steering question
+        // The pending placeholder below is what makes the merge arm fire: the
+        // resolved answer that follows replaces it, so the question keeps a
+        // single history entry.
         transcript.append(UiRecord::User {
-            text: "Hur går det för codern?".to_string(),
+            text: "How is the coder doing?".to_string(),
         });
         transcript.append(UiRecord::SteerResponse {
             text:
@@ -436,7 +435,6 @@ mod tests {
                     .to_string(),
         });
 
-        // Intermediate tool logs while worker is working
         transcript.append(UiRecord::ToolCall {
             display: "run_command(ctest)".to_string(),
         });
@@ -444,29 +442,98 @@ mod tests {
             display: "7/7 tests passed".to_string(),
         });
 
-        // Specialist reply synthesized for the user
         transcript.append(UiRecord::SteerResponse {
-            text: "\n[Arbitrator]: Codern har tagit bort jit_invalidate_all och alla 7 tester passerar.\n"
+            text: "\n[Arbitrator]: The coder removed jit_invalidate_all and all 7 tests pass.\n"
                 .to_string(),
         });
 
-        // Second steering turn
         transcript.append(UiRecord::User {
-            text: "Vad är nästa steg?".to_string(),
+            text: "What is the next step?".to_string(),
         });
         transcript.append(UiRecord::SteerResponse {
-            text: "Kör real-ROM-test med timeout.".to_string(),
+            text: "Run the real-ROM test with a timeout.".to_string(),
         });
 
         let history = transcript.extract_steering_history();
         assert_eq!(history.len(), 2);
-        assert_eq!(history[0].0, "Hur går det för codern?");
+        assert_eq!(history[0].0, "How is the coder doing?");
         assert_eq!(
             history[0].1,
-            "Codern har tagit bort jit_invalidate_all och alla 7 tester passerar."
+            "The coder removed jit_invalidate_all and all 7 tests pass."
         );
-        assert_eq!(history[1].0, "Vad är nästa steg?");
-        assert_eq!(history[1].1, "Kör real-ROM-test med timeout.");
+        assert_eq!(history[1].0, "What is the next step?");
+        assert_eq!(history[1].1, "Run the real-ROM test with a timeout.");
+    }
+
+    /// Pin (t-013): the pending-decision merge keys off the orchestrator's
+    /// language-neutral marker vocabulary, not off a wording. The placeholder fed
+    /// in here is the `user_status` example that the arbitrator prompt in
+    /// `orchestrator::notice` actually invites the model to emit, read back off
+    /// that prompt — producer and consumer are pinned together, so re-wording the
+    /// prompt out of the vocabulary fails here instead of silently duplicating
+    /// steering-history entries.
+    #[test]
+    fn test_extract_steering_history_merges_the_pending_status_the_prompt_invites() {
+        let pending = crate::orchestrator::notice::worker_reply_user_status_example();
+        assert!(
+            crate::orchestrator::steer::steering_entry_is_pending(pending),
+            "the prompt's own user_status example must read as a pending decision"
+        );
+
+        let mut transcript = UiTranscript::new();
+        transcript.append(UiRecord::User {
+            text: "Is the file-format migration safe?".to_string(),
+        });
+        transcript.append(UiRecord::SteerResponse {
+            text: format!("\n[Arbitrator]: {pending}\n"),
+        });
+        transcript.append(UiRecord::SteerResponse {
+            text: "\n[Arbitrator]: The coder confirmed older files still parse.\n".to_string(),
+        });
+
+        let history = transcript.extract_steering_history();
+        assert_eq!(history.len(), 1, "one question keeps one entry");
+        assert_eq!(history[0].0, "Is the file-format migration safe?");
+        assert_eq!(
+            history[0].1, "The coder confirmed older files still parse.",
+            "the resolved answer replaces the pending placeholder"
+        );
+    }
+
+    /// Regression (t-013): the merge used to fire on a Swedish literal in the
+    /// arbitrator status line. The vocabulary is language-neutral now, so a
+    /// Swedish-only placeholder is no longer treated as pending and the two
+    /// answers are concatenated instead — the accepted, cosmetic cost of dropping
+    /// that arm, pinned so it cannot silently widen.
+    ///
+    /// The Swedish is spelled with `\u{…}` escapes so this file stays free of
+    /// non-ASCII literals; the escapes compile to the same byte string.
+    #[test]
+    fn test_extract_steering_history_does_not_merge_a_swedish_only_pending_status() {
+        let pending =
+            "St\u{e4}ller en f\u{f6}ljdfra\u{e5}ga till Coder f\u{f6}r att reda ut detaljerna...";
+        assert!(
+            !crate::orchestrator::steer::steering_entry_is_pending(pending),
+            "the pending vocabulary must not match Swedish prose"
+        );
+
+        let mut transcript = UiTranscript::new();
+        transcript.append(UiRecord::User {
+            text: "Is the file-format migration safe?".to_string(),
+        });
+        transcript.append(UiRecord::SteerResponse {
+            text: format!("\n[Arbitrator]: {pending}\n"),
+        });
+        transcript.append(UiRecord::SteerResponse {
+            text: "\n[Arbitrator]: The coder confirmed older files still parse.\n".to_string(),
+        });
+
+        let history = transcript.extract_steering_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].1,
+            format!("{pending}\nThe coder confirmed older files still parse.")
+        );
     }
 
     /// Regression (gate t-030): the delegated-result summary tested the first

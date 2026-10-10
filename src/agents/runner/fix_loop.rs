@@ -1,6 +1,6 @@
 //! Shared validator/fix-loop driver.
 //!
-//! **Consolidation (duplicates.md §6b):** three near-identical copies of the
+//! **Consolidation (one shared driver):** three near-identical copies of the
 //! "LLM turn → tool dispatch → verdict" loop existed:
 //! `run_automated_validation_inner` and `run_plan_validation_inner`
 //! (validation.rs) plus the specialist streaming turn in `runner/execution.rs`.
@@ -320,7 +320,7 @@ pub fn build_turn_request(
 /// never from this list. This constant survives only as the compile-time mirror of
 /// the two canonical spellings for callers that need a `&'static [&'static str]`
 /// (it is asserted to be a subset of the owner's spelling family by
-/// `verdict_recording_tool_spellings_are_owned_by_tool_names` below).
+/// `verdict_recording_spellings_have_a_single_owner_in_tool_names` below).
 pub const VERDICT_RECORDING_TOOLS: &[&str] = &[
     tool_names::TOOL_LEAVE_VERDICT,
     tool_names::TERMINAL_LEAVE_VERDICT,
@@ -878,8 +878,7 @@ pub async fn run_fix_loop(
         update_active_worker_context(&p.worker_key, p.engine.token_count());
         emit_status(format!("{} (turn {turn})", p.status_template));
 
-        // Turn-start notice drain — rendered by the crate's single notice
-        // renderer (see `inject_worker_notices_at_turn_start`).
+        // Turn-start notice drain — rendered by the crate's single notice renderer.
         inject_worker_notices_at_turn_start(p.engine, &p.worker_key);
 
         let req = build_turn_request(&p.model, p.engine, &advertised, p.cfg, p.temperature);
@@ -1779,7 +1778,7 @@ mod tests {
         }
     }
 
-    /// Work item 3 — the `dispatch_verdict_tools` decision.
+    /// Work item 3 — the removed verdict-dispatch allow/deny switch.
     ///
     /// The verdict tool is terminal-only: the shared driver consumes it and ends
     /// the run, and it never hands the call to the tool dispatcher — not even for

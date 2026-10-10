@@ -101,8 +101,8 @@ pub const ULIMIT_FILE_BLOCKS_FALLBACK: &str = "2097152";
 
 /// Strip OSC sequences and other non-printable terminal artifacts from output.
 ///
-/// This is the exact implementation used by marmennill-cli's local tool execution
-/// (`caesar/marmennill-cli/src/main.rs` and `caesar/src/agent/types.rs`):
+/// This mirrors the stripping applied by the standalone marmennill CLI during its
+/// own local tool execution:
 /// - OSC sequences (`ESC ] <n> ; ... BEL` or `ESC ] <n> ; ... ESC \`) are removed.
 /// - Bell (`\x07`) and backspace (`\x08`) are removed.
 /// - Other control characters below ` ` (0x20) are removed, except `\n`, `\r`,
@@ -123,9 +123,7 @@ pub fn sanitize_terminal_output(text: &str) -> String {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
 // Child reaping — every spawned child is `wait()`ed exactly once
-// ---------------------------------------------------------------------------
 
 /// The wait/kill surface the reaper needs from a spawned child.
 ///
@@ -440,7 +438,6 @@ pub struct PtySession {
     pub pid: i32,
 }
 
-// ---------------------------------------------------------------------------
 // Sandbox gating — decided from authoritative inputs, never from the
 // executable's NAME (t-034b)
 //
@@ -457,14 +454,11 @@ pub struct PtySession {
 // reached by renaming anything, and is logged as a warning like every other
 // skip. Follow-up (hand-off): apply Landlock in-process via `pre_exec` so no
 // self-exec is needed at all.
-// ---------------------------------------------------------------------------
 
 /// argv sentinel understood by `src/main.rs`: re-executing the **same resolved
 /// binary** with it applies Landlock in the child and then execs `sh -c <cmd>`.
-///
-/// HAND-OFF (`src/main.rs` is outside this task's file ownership): `main.rs`
-/// still spells this literal out; it should reference [`SANDBOX_EXEC_ARG`] so
-/// the two ends of the protocol can never drift apart.
+/// `main.rs` matches it through [`SANDBOX_EXEC_ARG`], so the two ends of the
+/// protocol cannot drift apart.
 pub const SANDBOX_EXEC_ARG: &str = "--internal-sandbox-exec";
 
 /// The environment fallback for the Landlock sandbox opt-out, deliberately strict.
@@ -967,9 +961,7 @@ pub fn run_command_pty(command: &str, timeout: Duration) -> Result<String, ToolE
         .to_string())
 }
 
-// ---------------------------------------------------------------------------
 // Interactive Multi-Turn PTY Manager
-// ---------------------------------------------------------------------------
 
 /// `true` when `byte` may begin a UTF-8 code point, i.e. it is **not** a
 /// `10xxxxxx` continuation byte.

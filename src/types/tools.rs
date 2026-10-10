@@ -415,11 +415,9 @@ impl ToolDef {
             serde_json::Value::Object(map) => {
                 let mut cleaned = serde_json::Map::new();
                 for (k, v) in map {
-                    // Strip unnecessary schema metadata
                     if k == "$schema" || k == "$id" || k == "title" {
                         continue;
                     }
-                    // Strip empty $defs / definitions
                     if (k == "$defs" || k == "definitions")
                         && v.as_object().is_some_and(|o| o.is_empty())
                     {

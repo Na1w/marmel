@@ -224,9 +224,9 @@ pub trait Specialist: Send + Sync + fmt::Debug {
     }
 }
 
-/// Shared assertion helper for per-specialist role/namespace tests
-/// (duplicates.md §6a): the six specialist files previously each embedded a
-/// near-identical `#[cfg(test)]` block; they now delegate to this helper.
+/// Shared assertion helper for per-specialist role/namespace tests: the six
+/// specialist files previously each embedded a near-identical `#[cfg(test)]`
+/// block; they now delegate to this helper.
 #[cfg(test)]
 pub(crate) fn assert_specialist_role(
     agent: &dyn Specialist,
@@ -276,10 +276,7 @@ mod tests {
         assert_eq!(Agent::from_str("unknown"), None);
     }
 
-    /// Dedup cluster C4: the agents layer no longer owns a `MissionMarker`
-    /// copy — `crate::agents::MissionMarker`, `crate::markers::MissionMarker`
-    /// and `crate::manager::phase::MissionMarker` are one and the same type,
-    /// so the plan layer and the specialist layer can never drift apart again.
+    /// Dedup cluster C4: one `MissionMarker` type, shared by both layers.
     #[test]
     fn mission_marker_has_one_owner_reexported_by_both_layers() {
         let agents_side: MissionMarker = MissionMarker::Complete { task_id: None };

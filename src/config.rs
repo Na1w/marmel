@@ -87,11 +87,9 @@ impl Default for MonitoringConfig {
 #[serde(default)]
 #[derive(Default)]
 pub struct SpecialistConfig {
-    /// Source module path.
     pub module: String,
     /// Allowed tool namespaces.
     pub tools: Vec<String>,
-    /// Optional model override for this specialist.
     pub model: Option<String>,
     /// Optional backend URL override for this specialist.
     pub backend_url: Option<String>,
@@ -159,7 +157,6 @@ pub struct Config {
     pub max_thinking_tokens: usize,
     /// Resilience harness thresholds.
     pub monitoring: Option<MonitoringConfig>,
-    /// Orchestration block.
     pub orchestration: OrchestrationConfig,
     /// Configured external MCP servers (`[mcp_servers.<name>]`).
     pub mcp_servers: HashMap<String, crate::mcp::McpServerConfig>,
@@ -197,7 +194,6 @@ impl Default for Config {
 
 static ACTIVE_CONFIG: std::sync::RwLock<Option<Config>> = std::sync::RwLock::new(None);
 
-/// Set the globally active configuration.
 pub fn set_active(cfg: Config) {
     if let Ok(mut lock) = ACTIVE_CONFIG.write() {
         *lock = Some(cfg);
@@ -751,14 +747,12 @@ mod tests {
         assert!(cfg.base_prompt.is_none());
     }
 
-    // -----------------------------------------------------------------------
     // t-035d — typed knobs that the harness actually reads:
     //   * `command_timeout_secs` used to be parsed and merged but never read, so
     //     every command ran with the built-in default;
     //   * the sandbox had no typed knob at all (env-only opt-out).
     // These tests are pty-free: the sandbox outcome is asserted through
     // `should_apply_sandbox(&SandboxInputs)`, never by executing a command.
-    // -----------------------------------------------------------------------
 
     /// Install a config as the process-global active config and restore the
     /// previous state (including "none active") when the guard is dropped, so a
@@ -855,7 +849,6 @@ mod tests {
             !partial_from("sandbox_disabled = false\n").sandbox_disabled,
             "an explicit false stays false"
         );
-        // No active config ⇒ knob off.
         let previous = get_active();
         clear_active();
         let observed = sandbox_disabled();

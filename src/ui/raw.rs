@@ -46,7 +46,7 @@ pub fn restore() -> std::io::Result<()> {
 pub struct RawRenderer {
     /// Buffered lines awaiting a flush.
     buffer: Vec<u8>,
-    /// Shared abort / user-exit flags (trait-default abort surface).
+    /// Abort / user-exit flags (the `Renderer` trait's abort surface).
     input_state: InputState,
 }
 

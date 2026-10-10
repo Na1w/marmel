@@ -182,7 +182,6 @@ static PLAN_STARTED_AT: std::sync::LazyLock<std::sync::RwLock<Option<PlanStartTi
 static PLAN_COMPLETED_AT: std::sync::LazyLock<std::sync::RwLock<Option<std::time::Instant>>> =
     std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
 
-/// Record that an execution plan started right now.
 pub fn record_plan_start() {
     record_plan_start_at(std::time::Instant::now());
 }
@@ -197,7 +196,6 @@ pub fn record_plan_start_at(inst: std::time::Instant) {
     }
 }
 
-/// Record that an execution plan completed all tasks right now.
 pub fn record_plan_completed() {
     if let Ok(mut g) = PLAN_COMPLETED_AT.write()
         && g.is_none()
@@ -280,12 +278,10 @@ impl Plan {
         Self { dir: dir.into() }
     }
 
-    /// The absolute path of the marmel directory.
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
-    /// The absolute path of the execution plan file.
     pub fn plan_path(&self) -> PathBuf {
         self.dir.join(PLAN_FILE)
     }
@@ -299,12 +295,10 @@ impl Plan {
         self.dir.join(FORCED_PHASE_FILE)
     }
 
-    /// The absolute path of the session transcript file.
     pub fn transcript_path(&self) -> PathBuf {
         self.dir.join(TRANSCRIPT_FILE)
     }
 
-    /// The absolute path of the UI transcript file.
     pub fn ui_transcript_path(&self) -> PathBuf {
         self.dir.join(UI_TRANSCRIPT_FILE)
     }
@@ -379,7 +373,6 @@ impl Plan {
         Ok(None)
     }
 
-    /// Returns `true` when a plan file exists on disk.
     pub fn exists(&self) -> bool {
         self.plan_path().exists()
     }
@@ -528,11 +521,9 @@ impl Plan {
                 return false;
             }
         };
-        // If there are ANY unchecked checkboxes (`[ ]` or `( )`) anywhere in the plan, it is NOT complete!
         if crate::plan_parse::has_unchecked_box(&content) {
             return false;
         }
-        // Must contain at least one completed checkbox ([x] or (x))
         crate::plan_parse::has_checked_box(&content)
     }
 
@@ -670,8 +661,9 @@ impl Plan {
     /// Callers that already hold the structured verdict should prefer
     /// [`Plan::check_plan_on_deliverable`], which never re-parses the body.
     ///
-    /// The task id is resolved from the marker when present (`task_id_override`
-    /// may be `None`); callers that already bound a `task_id` (REQ-ORCH-005
+    /// The task id is resolved from the marker when present (the optional
+    /// `task_id` argument may be `None`); callers that already bound a
+    /// `task_id` (REQ-ORCH-005
     /// `delegate_task` binding) may pass it explicitly so check-off still works
     /// even if the subagent omitted the parenthesized id. Passing `None` for
     /// both means the id has to be recovered from the deliverable itself, which

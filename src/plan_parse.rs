@@ -10,7 +10,7 @@
 //! | `manager::phase::check_off` | built per call: `^\s*(?:[-*]|\d+\.)\s*\[\s*\]\s*\*{0,2}\[?<tid>\]?\*{0,2}\b` | `[ ]` only | `[t-001]`, bare | `- * 1.` |
 //! | `orchestrator::delegate` (checked-off guard + `brief_for_task`) | `^\s*-\s*\[\s*[ xX]?\s*\]\s*\[(t-…)\]\s*(.*)$` | `[ ] [x] [X]` | **`[t-001]` only** | `-` only |
 //! | `orchestrator::plan_summary` | three loose regexes (`t-…` anywhere, `\[[xX]\]`, `\[\s*\]|\(\s*\)`) | `[x]` **but not `(x)`** | any `t-…` token anywhere | none (string trim) |
-//! | `agents::prompt_builder::PLAN_TASK_RE` | phase's plus `\s*(.*?)$` | `[ ]` | `[t-001]`, bare | `- *` |
+//! | `agents::prompt_builder` (its old private task-line regex) | phase's plus `\s*(.*?)$` | `[ ]` | `[t-001]`, bare | `- *` |
 //! | `ui::tui::formatting` | checkbox + adjacent-token + bracketed fallback | `[ ] [x] [X] ( ) (x) (X)` | `[t-001]`, `(t-001)`, bare, bold, backtick | `- * + 1. 1)` |
 //!
 //! The drift was a real bug (`docs/recon_bugs_harness_llm_ui.md` §3 C1/C2): a
@@ -55,7 +55,6 @@ pub enum CheckboxState {
 /// index within the document the line came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskLine {
-    /// Whether the checkbox is ticked.
     pub checkbox: CheckboxState,
     /// Task id of this line with `[`/`]`/`(`/`)`/`"`/`'` decoration stripped
     /// (via [`crate::task_id::normalize_task_id_ref`]), case preserved as spelled
@@ -1043,9 +1042,7 @@ mod tests {
         assert_eq!(strip_list_marker("  * [ ] t-003 Task"), "[ ] t-003 Task");
     }
 
-    // ---------------------------------------------------------------------
     // Recon L9 — fenced code blocks are documentation, not tasks.
-    // ---------------------------------------------------------------------
 
     /// A plan that documents its own checklist format inside a fenced block.
     /// The fenced lines look exactly like real task lines (both spellings of
@@ -1196,9 +1193,7 @@ The plan format is:
         assert!(!has_checked_box("- [ ] [t-001] a"));
     }
 
-    // ---------------------------------------------------------------------
     // Cross-site agreement + on-disk regression guards.
-    // ---------------------------------------------------------------------
 
     /// One fixture plan exercising the drifted forms, shared by the agreement
     /// tests below.

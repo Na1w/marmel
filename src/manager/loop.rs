@@ -144,7 +144,6 @@ pub struct TurnWatchdog {
 }
 
 impl TurnWatchdog {
-    /// Arm a watchdog with the given idle / absolute bounds.
     pub fn new(idle_limit: Duration, hard_limit: Duration) -> Self {
         Self::at(Instant::now(), idle_limit, hard_limit)
     }
@@ -159,7 +158,6 @@ impl TurnWatchdog {
         }
     }
 
-    /// Start timing a new turn.
     pub fn rearm(&mut self) {
         self.rearm_at(Instant::now());
     }
@@ -212,7 +210,6 @@ impl TurnWatchdog {
         now.saturating_duration_since(self.started)
     }
 
-    /// Idle time since the last observed progress.
     pub fn idle(&self) -> Duration {
         self.idle_at(Instant::now())
     }
@@ -298,12 +295,10 @@ impl FailureBudget {
         }
     }
 
-    /// The effective escalation threshold.
     pub fn threshold(&self) -> u32 {
         self.threshold
     }
 
-    /// Recorded failure count for `key`.
     pub fn count(&self, key: &str) -> u32 {
         self.counts.get(key).copied().unwrap_or(0)
     }
@@ -469,7 +464,6 @@ mod tests {
         let mut wd = TurnWatchdog::at(start, Duration::from_secs(5), Duration::from_secs(6));
         // The previous turn had already burned 5 s when the loop re-armed.
         wd.rearm_at(start + Duration::from_secs(5));
-        // Nothing is carried over into the new turn.
         assert_eq!(
             wd.elapsed_at(start + Duration::from_secs(6)),
             Duration::from_secs(1)
@@ -504,7 +498,6 @@ mod tests {
         assert_eq!(budget.record(key), FailureVerdict::Continue { count: 1 });
         assert!(budget.retry_allowed(key));
         assert_eq!(budget.record(key), FailureVerdict::Escalate { count: 2 });
-        // Threshold reached: no further unchanged attempt may be dispatched.
         assert!(!budget.retry_allowed(key));
         assert_eq!(budget.count(key), 2);
     }

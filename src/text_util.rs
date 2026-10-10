@@ -54,14 +54,14 @@ mod tests {
     #[test]
     fn truncate_chars_ascii_shorter_equal_longer() {
         assert_eq!(truncate_chars("abc", 10), "abc");
-        assert_eq!(truncate_chars("abc", 3), "abc"); // equal to the limit
+        assert_eq!(truncate_chars("abc", 3), "abc");
         assert_eq!(truncate_chars("abcdef", 3), "abc");
     }
 
     #[test]
     fn truncate_with_ellipsis_ascii_shorter_equal_longer() {
         assert_eq!(truncate_with_ellipsis("abc", 10), "abc");
-        assert_eq!(truncate_with_ellipsis("abcdefghi", 9), "abcdefghi"); // equal
+        assert_eq!(truncate_with_ellipsis("abcdefghi", 9), "abcdefghi");
         assert_eq!(truncate_with_ellipsis("abcdefghij", 9), "abcdef..."); // longer: 6 + "..." = 9 chars
         // Regression for the workers.rs twin shape (300 cap -> 297 chars + "...").
         let long = "x".repeat(301);

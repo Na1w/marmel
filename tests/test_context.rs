@@ -17,7 +17,6 @@ fn test_integration_context_engine_lifecycle() {
     // Initial messages: system prompt + goal prompt
     assert_eq!(engine.messages().len(), 2);
 
-    // Add user and assistant messages
     engine.append(Message::User {
         content: "Please check the rocket engine.".to_string(),
     });
@@ -49,13 +48,10 @@ fn test_integration_context_engine_lifecycle() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // H1 — the compacted transcript must always be a valid OpenAI-compatible chat
 // request: every assistant `tool_calls` entry is followed by exactly one `Tool`
 // message per call id, and every `Tool` message has a surviving parent.
-// ---------------------------------------------------------------------------
 
-/// Assistant message carrying the given tool call ids.
 fn assistant_with_tool_calls(ids: &[&str]) -> Message {
     Message::Assistant {
         content: Some("calling tools".to_string()),
@@ -259,10 +255,8 @@ fn test_integration_repair_tool_call_pairs_helper() {
     ));
 }
 
-// ---------------------------------------------------------------------------
 // M5 — compaction must fail loudly when the 70% target is unreachable, and the
 // pinned prefix must be part of the budget arithmetic.
-// ---------------------------------------------------------------------------
 
 /// Long enough that the pinned prefix alone can exceed a small budget.
 const LONG_SYSTEM_PROMPT: &str = "You are the manager. You must read files before editing them. You must verify every change with the available test commands. Never guess at file contents. Always report findings precisely with file paths and line numbers. You must delegate implementation work to specialists. You must keep the plan file on disk up to date and never output conversational filler. You must keep the plan file on disk up to date and never output conversational filler.";

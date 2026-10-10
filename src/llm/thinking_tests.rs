@@ -112,12 +112,10 @@ fn test_llm_recovery_defaults_when_absent() {
     assert_eq!(recovered.temperature, Some(0.8)); // 0.7 default + 0.1
 }
 
-// ---------------------------------------------------------------------------
 // t-035d — recovery parameters must be clamped into the documented ranges.
 // Before the fix `frequency_penalty = 2.0` became `2.5` and `temperature = 2.0`
 // became `2.1`, both of which the provider rejects with HTTP 400, so the
 // recovery turn could never recover.
-// ---------------------------------------------------------------------------
 
 fn approx_eq(a: f32, b: f32) -> bool {
     (a - b).abs() < 1e-3

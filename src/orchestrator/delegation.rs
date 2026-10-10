@@ -17,7 +17,6 @@ pub struct OrchestrationConfig {
     pub max_recursion_depth: usize,
     /// The Manager module path (e.g. `src/orchestrator/mod.rs`).
     pub manager_module: String,
-    /// Specialists table: role id -> allowed tool namespaces.
     pub specialists: std::collections::BTreeMap<String, Vec<String>>,
 }
 
@@ -80,7 +79,6 @@ pub enum DelegationEvent {
 pub struct RecursionDepth(pub usize);
 
 impl RecursionDepth {
-    /// The root depth (the Manager).
     pub fn root() -> Self {
         RecursionDepth(0)
     }
@@ -102,7 +100,6 @@ impl RecursionDepth {
 pub struct Delegation {
     pub agent: Agent,
     pub request: DelegationRequest,
-    /// The depth at which this delegation is executing.
     pub depth: RecursionDepth,
     pub result: Option<Deliverable>,
 }

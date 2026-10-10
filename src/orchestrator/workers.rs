@@ -651,9 +651,7 @@ pub fn get_active_subtasks_str() -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
 // Exact worker identity (t-065) — the notice router's model, reused verbatim.
-// ---------------------------------------------------------------------------
 
 /// The **exact routing identity** of a registered worker.
 ///
@@ -887,13 +885,11 @@ mod tests {
         assert!(!token1.is_cancelled());
         assert!(!token2.is_cancelled());
 
-        // Cancel specific worker by task_id
         let cancelled = cancel_active_worker(None, Some("t-001"));
         assert!(cancelled);
         assert!(token1.is_cancelled());
         assert!(!token2.is_cancelled());
 
-        // Cancel remaining workers with cancel_all_active_workers
         let count = cancel_all_active_workers();
         assert!(count >= 1);
         assert!(token2.is_cancelled());
@@ -996,9 +992,7 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
     // Recon H5 — unique worker ids + registry entries are never clobbered.
-    // ------------------------------------------------------------------
 
     /// Live (active) registry entries whose key starts with `prefix`.
     fn active_entries_with_prefix(prefix: &str) -> Vec<String> {
@@ -1022,9 +1016,9 @@ mod tests {
 
     /// (i) Two workers registered back-to-back with **no task id** — the exact
     /// shape that produced identical keys pre-fix, because the pseudo-id was
-    /// `Instant::now().elapsed().as_nanos()` (`workers.rs:165` pre-fix), a
-    /// near-constant reading (measured 202/33/41/39/40). They must get distinct,
-    /// monotonic ids and BOTH must be reachable by the cancel path.
+    /// `Instant::now().elapsed().as_nanos()`, a near-constant reading (measured
+    /// 202/33/41/39/40). They must get distinct, monotonic ids and BOTH must be
+    /// reachable by the cancel path.
     #[test]
     fn test_same_tick_taskless_workers_get_distinct_ids_and_are_both_cancellable() {
         let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -1527,9 +1521,7 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------
     // Teardown inbox reclaim (t-048)
-    // ---------------------------------------------------------------------
 
     /// `ActiveWorkerGuard::drop` reclaims the finished worker's **empty** notice
     /// inbox. "Empty but present" is the real leak shape: a resolved notice drops
@@ -1682,7 +1674,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
     // Gate t-055 — the per-worker `.marmel/prompts/<task_id>.md` READ site.
     //
     // `worker_prompt_path` is the only join for this read and it routes the
@@ -1691,7 +1682,6 @@ mod tests {
     // rejected id is never read, never mended into a different file name, and
     // renders exactly like a missing prompt file (JIT synthesis stays the
     // fallback), with a WARN naming the rejected id and the reason.
-    // -----------------------------------------------------------------
 
     /// A task id with accepted grammar but above `MAX_TASK_ID_LEN`.
     fn overlong_worker_task_id() -> String {
@@ -1926,12 +1916,10 @@ mod tests {
         }));
     }
 
-    // ------------------------------------------------------------------
     // t-065 — cancel and diagnostic targeting address a worker by its exact
     // routing identity, never by a substring of a key, a task id or a prompt.
     // Fixtures mirror the `worker_routing_identity` / `routes()` identity tests
     // in `notice_tests`.
-    // ------------------------------------------------------------------
 
     /// An [`ActiveWorkerInfo`] that never touches the global registry, so the
     /// matcher itself can be asserted directly.

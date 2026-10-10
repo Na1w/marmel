@@ -93,7 +93,6 @@ fn test_subagent_history_message_sequence() {
         tool_calls: vec![tc1.clone()],
     });
 
-    // Tool response
     engine.append(Message::Tool {
         tool_call_id: tc1.id.clone(),
         content: "fn main() {}".to_string(),

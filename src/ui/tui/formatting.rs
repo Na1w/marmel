@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-/// Choose the message-level style by prefix matching (reference §4.3).
+/// Choose the message-level style by prefix matching.
 /// Returns `(style, has_special_style)`.
 pub fn message_style(msg: &str) -> (Style, bool) {
     let first = msg.lines().next().unwrap_or("");
@@ -82,7 +82,6 @@ pub fn parse_line_segments<'a>(line: &'a str, in_think: &mut bool) -> Vec<LineSe
     let mut cursor = 0;
     while cursor < line.len() {
         if *in_think {
-            // Looking for close tag: </think> or </thought>
             let close_tag = [("</think>", 8), ("</thought>", 10)]
                 .iter()
                 .filter_map(|(tag, len)| line[cursor..].find(tag).map(|idx| (cursor + idx, *len)))
@@ -103,7 +102,6 @@ pub fn parse_line_segments<'a>(line: &'a str, in_think: &mut bool) -> Vec<LineSe
                 break;
             }
         } else {
-            // Looking for open tag: <think> or <thought>
             let open_tag = [("<think>", 7), ("<thought>", 9)]
                 .iter()
                 .filter_map(|(tag, len)| line[cursor..].find(tag).map(|idx| (cursor + idx, *len)))
@@ -128,7 +126,6 @@ pub fn parse_line_segments<'a>(line: &'a str, in_think: &mut bool) -> Vec<LineSe
     segments
 }
 
-/// Strip XML thinking tags from a rendered line.
 pub fn strip_think_tags(line: &str) -> String {
     line.replace("<think>", "")
         .replace("</think>", "")
@@ -478,7 +475,6 @@ pub fn render_message_lines(msg: &str, show_thought: bool) -> Vec<Line<'static>>
                     } else if cleaned.contains('\x1b') {
                         chat_lines.extend(parse_ansi_lines(&cleaned));
                     } else {
-                        // Orchestrator / Model content: WHITE
                         chat_lines.push(Line::from(Span::styled(
                             cleaned,
                             Style::default().fg(Color::White),
@@ -508,7 +504,7 @@ pub fn count_wrapped_rendered_lines(lines: &[Line<'_>], width: usize) -> usize {
     total
 }
 
-/// Grapheme-aware word-wrap line counter (reference §11.1).
+/// Grapheme-aware word-wrap line counter.
 ///
 /// - `width == 0` → returns the raw line count (no wrapping).
 /// - Tabs → 4 spaces; trailing spaces trimmed.
@@ -710,7 +706,7 @@ pub fn visual_line_offset_of_task(text: &str, task_id: &str, width: usize) -> Op
     candidate_offset
 }
 
-/// Extract complete sentences from a streaming buffer (reference §10).
+/// Extract complete sentences from a streaming buffer.
 ///
 /// Splits on newlines or on sentence-ending punctuation (`.`, `!`, `?`)
 /// followed by whitespace. Trailing punctuation and delimiters are preserved

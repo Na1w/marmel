@@ -26,8 +26,6 @@ mod protocol;
 pub use client::{McpClient, McpManager, McpServerConfig, McpTool};
 pub use http::HttpSseConnection;
 
-// ── Name policy ────────────────────────────────────────────────────────────
-
 /// The separator used to compose an MCP server name with a raw tool name
 /// (`{server_name}{NAME_SEPARATOR}{raw_tool_name}`).
 pub const NAME_SEPARATOR: &str = "__";

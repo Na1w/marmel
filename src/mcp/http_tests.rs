@@ -38,9 +38,7 @@ mod tests {
             .replace("@VERSION@", env!("CARGO_PKG_VERSION"))
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
     // Protocol guards — these call production code (`crate::mcp::protocol`).
-    // ──────────────────────────────────────────────────────────────────────────
 
     /// The request envelope keeps the wire shape both transports have always
     /// sent: `jsonrpc`, `id`, `method`, and `params` omitted entirely when there
@@ -174,9 +172,7 @@ mod tests {
         );
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
     // Mock MCP endpoint.
-    // ──────────────────────────────────────────────────────────────────────────
 
     /// How the mock MCP endpoint answers.
     #[derive(Clone, Copy)]
@@ -339,9 +335,7 @@ mod tests {
         .expect("initialize handshake should succeed")
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
     // C7: both transports speak the protocol layer's envelopes on the wire.
-    // ──────────────────────────────────────────────────────────────────────────
 
     /// The HTTP transport puts exactly the envelopes `crate::mcp::protocol`
     /// builds — nothing of its own: same `jsonrpc`, same method strings, same
@@ -387,7 +381,7 @@ mod tests {
         let mut conn = connect_mock(&server, Duration::from_secs(5)).await;
         conn.call_tool("alpha", &json!({"city": "Oslo"}))
             .await
-            .expect("tools/call");
+            .expect(METHOD_TOOLS_CALL);
 
         let sent = bodies.lock().expect("recorder lock").clone();
         assert_eq!(sent.len(), 3);
@@ -400,10 +394,8 @@ mod tests {
         );
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
     // C3 + C4 + C2 wiring: shared reqwest builder, shared SSE pump, shared
     // retry policy (see docs/recon_duplication_net.md).
-    // ──────────────────────────────────────────────────────────────────────────
 
     /// Cluster C3: the transport must construct its `reqwest::Client` through
     /// the shared builder — never with a hand-rolled `reqwest::Client::builder()`
@@ -505,7 +497,7 @@ mod tests {
         }
 
         let server = "srv".to_string();
-        let method = "tools/call".to_string();
+        let method = METHOD_TOOLS_CALL.to_string();
         assert!(
             McpError::HttpStatus {
                 server: server.clone(),
@@ -556,7 +548,7 @@ mod tests {
     #[test]
     fn mcp_stream_failures_retry_only_before_the_first_event() {
         let server = "srv".to_string();
-        let method = "tools/call".to_string();
+        let method = METHOD_TOOLS_CALL.to_string();
 
         assert!(
             McpError::SseClosed {

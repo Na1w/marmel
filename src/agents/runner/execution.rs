@@ -221,7 +221,7 @@ async fn run_specialist_live_inner(
             agent.as_str()
         )
     })?;
-    // Shared tool-assembly helper (duplicates.md §6b): default tools filtered
+    // Shared tool-assembly helper (single owner): default tools filtered
     // by blueprint allow-list / registry namespaces + MCP fan-out, then made
     // role-aware for advertising (gate t-056): the verdict class is never even
     // *offered* to a caller [`may_record_verdict`] refuses — not via a prompt
@@ -394,14 +394,13 @@ async fn run_specialist_live_inner(
         );
         crate::orchestrator::update_active_worker_context(&_active_guard.0, engine.token_count());
 
-        // Turn-start notice drain — rendered by the crate's single notice
-        // renderer (see `inject_worker_notices_at_turn_start`).
+        // Turn-start notice drain — rendered by the crate's single notice renderer.
         super::fix_loop::inject_worker_notices_at_turn_start(&mut engine, &_active_guard.0);
 
         crate::orchestrator::emit_status(format!(
             "{agent_tag}: thinking / calling model ({specialist_model})..."
         ));
-        // Shared turn-request builder + shared streaming plumbing (duplicates.md §6b).
+        // Shared turn-request builder + shared streaming plumbing (one owner in `fix_loop`).
         let req = super::fix_loop::build_turn_request(
             &specialist_model,
             &engine,
@@ -931,7 +930,7 @@ async fn run_specialist_live_inner(
                 break;
             }
 
-            // Shared tool-dispatch core (duplicates.md §6b): monitor intervention
+            // Shared tool-dispatch core (one owner in `fix_loop`): monitor intervention
             // check → cancellation check → dispatch. `None` means aborted.
             // The caller is the very identity the advertised tool list was built
             // from (gate t-056), so no tool can be offered that dispatch would

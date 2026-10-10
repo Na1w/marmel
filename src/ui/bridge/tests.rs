@@ -5,7 +5,6 @@ use crate::ui::{Event, Renderer, SubagentDetail};
 
 struct TestRenderer {
     events: Vec<Event>,
-    /// Shared abort / user-exit flags (trait-default abort surface).
     input_state: crate::ui::InputState,
 }
 impl TestRenderer {
@@ -93,12 +92,10 @@ fn test_drain_steer_delegation_events_updates_ui_and_queue() {
         Some(&mut subagents),
     );
 
-    // Subagents lifecycle should have updated
     assert_eq!(subagents.len(), 1);
     assert_eq!(subagents[0].name, "coder-steer-task-1");
     assert!(!subagents[0].is_active);
 
-    // Steer queue should receive the deliverable summary
     assert_eq!(steer_queue.len(), 1);
     assert!(steer_queue[0].contains("All files inspected cleanly."));
     assert!(steer_queue[0].contains("steer-task-1"));
@@ -131,7 +128,6 @@ fn test_drain_steer_delegation_events_updates_ui_and_queue() {
         }
     ));
 
-    // Delivered message should be visible to user
     assert!(renderer.events.iter().any(|e| matches!(
         e,
         Event::Message(m) if m.contains("All files inspected cleanly.")
@@ -151,7 +147,6 @@ fn test_drain_steer_queue_and_continue_with_streamed_response() {
     ))
     .unwrap();
 
-    // Then completes with QueueAndContinue decision
     tx.send(SteerArbEvent::Finished {
         decision: Some(crate::orchestrator::SteerDecision {
             decision: "QueueAndContinue".to_string(),
@@ -176,7 +171,6 @@ fn test_drain_steer_queue_and_continue_with_streamed_response() {
     assert_eq!(steer_queue, vec!["add an extra feature later".to_string()]);
     assert!(!steer_abort);
 
-    // Verify the explanation was sent to the renderer as SteerResponse
     let steer_responses: Vec<_> = renderer
         .events
         .iter()
@@ -187,7 +181,6 @@ fn test_drain_steer_queue_and_continue_with_streamed_response() {
         .collect();
     assert_eq!(steer_responses, vec!["Instruction queued for next turn."]);
 
-    // Verify status was also emitted
     assert!(renderer.events.iter().any(|e| matches!(
         e,
         Event::Status(s) if s.contains("Instruction queued for next turn")
@@ -201,7 +194,6 @@ fn test_drain_steer_queue_and_continue_fallback_response_when_none() {
     let mut steer_queue = Vec::new();
     let mut steer_abort = false;
 
-    // Model returned QueueAndContinue without a response field (null)
     tx.send(SteerArbEvent::Finished {
         decision: Some(crate::orchestrator::SteerDecision {
             decision: "QueueAndContinue".to_string(),
@@ -226,7 +218,6 @@ fn test_drain_steer_queue_and_continue_fallback_response_when_none() {
     assert_eq!(steer_queue, vec!["fix docs later".to_string()]);
     assert!(!steer_abort);
 
-    // Fallback SteerResponse should be emitted informing the user
     let steer_responses: Vec<_> = renderer
         .events
         .iter()
@@ -238,7 +229,6 @@ fn test_drain_steer_queue_and_continue_fallback_response_when_none() {
     assert_eq!(steer_responses.len(), 1);
     assert!(steer_responses[0].contains("Instruction queued for next turn"));
 
-    // Status line was also emitted
     assert!(renderer.events.iter().any(|e| matches!(
         e,
         Event::Status(s) if s.contains("Instruction queued for next turn")
@@ -530,9 +520,7 @@ fn test_drain_steer_abort_cancels_all_active_workers() {
     crate::orchestrator::reset_cancellation();
 }
 
-// ---------------------------------------------------------------------------
 // `arbiter` — the single owner of the steer-arbitration round machine
-// ---------------------------------------------------------------------------
 
 /// Wake-up notice wording, pinned here so the single-source helper
 /// (`arbiter::wake_up_notice`) used by both hosts cannot drift silently.
@@ -992,10 +980,8 @@ fn test_arbiter_entry_reports_cancelled_sleep_and_stops_rounds() {
     });
 }
 
-// ---------------------------------------------------------------------------
 // t-035c — one action vocabulary for both layers, durable steering around Sleep,
 // a capped chained-sleep budget, and observable inbox-capacity drops
-// ---------------------------------------------------------------------------
 
 /// One subtask decision with a raw (possibly non-canonical) action spelling.
 fn subtask_with(
@@ -1502,14 +1488,12 @@ fn test_bridge_sleep_budget_deadline_cap_and_host_clamp_are_deterministic() {
     assert_eq!(stopped.host_sleep_secs(30), None);
 }
 
-// ---------------------------------------------------------------------------
 // t-076 — a **sub-second** remainder of the cumulative sleep budget is an
 // exhausted budget, not a zero-length sleep. `remaining.is_zero()` is false but
 // `remaining.as_secs()` is `0`, so the old `Ok(remaining.as_secs())` returned
 // `Ok(0)`, the round machine slept nothing and re-asked the arbitrator
 // immediately — the very hot-loop the `SLEEP_MIN_SECS` floor removed, re-created
 // because the floor was applied *before* the budget clamp.
-// ---------------------------------------------------------------------------
 
 /// A [`arbiter::SleepBudget`] with exactly `remaining` left of the cumulative cap
 /// (injectable clock, so this is deterministic and pty-free).
@@ -1844,12 +1828,10 @@ fn test_bridge_notice_capacity_drop_is_observable_and_inbox_stays_bounded() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // t-072 — the paused-stream host (`sink.rs`) resolves a `Sleep` duration through
 // the single owner (`arbiter::clamped_sleep_secs`), never with its own default
 // and clamp. Host and arbitrator must agree on the number, in the value slept
 // *and* in the text the user is shown.
-// ---------------------------------------------------------------------------
 
 /// Parse every sleep duration announced in rendered host text, e.g.
 /// "Steering arbitrator sleeping for 3s..." / "... woke up after 3s — ...".
@@ -1916,8 +1898,9 @@ fn test_bridge_sink_host_sleep_duration_is_the_owners_clamped_value() {
         "the arbitrator's own upper budget knob still bounds the request"
     );
     // NOTE: `arbiter::MAX_SINGLE_SLEEP_SECONDS` and `tool_args::SLEEP_MAX_SECS`
-    // are deliberately separate knobs (see `arbiter_upper_budget_is_not_the_sleep
-    // _tool_ceiling`); the host may only ever consult the former — pinned by
+    // are deliberately separate knobs — see the source guard
+    // `arbitrator_upper_budget_is_not_the_sleep_tool_ceiling` in `arbiter.rs`.
+    // The host may only ever consult the former, pinned by
     // `test_bridge_sink_sleep_site_redeclares_no_default_and_no_clamp`.
 }
 
@@ -2093,7 +2076,7 @@ fn test_bridge_sink_host_and_arbitrator_agree_on_a_steered_zero_second_sleep() {
 }
 
 /// (t-072 d) Source-level pin: the sink must **call** the owner instead of
-/// re-declaring the sleep resolution. Needsles are assembled at runtime so this
+/// re-declaring the sleep resolution. Needles are assembled at runtime so this
 /// test cannot satisfy its own forbidden patterns.
 #[test]
 fn test_bridge_sink_sleep_site_redeclares_no_default_and_no_clamp() {

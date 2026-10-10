@@ -48,7 +48,6 @@ pub fn is_enabled() -> bool {
     DEBUG_LOG_ENABLED.load(Ordering::Relaxed)
 }
 
-/// Explicitly enable or disable debug logging.
 pub fn set_enabled(enabled: bool) {
     DEBUG_LOG_ENABLED.store(enabled, Ordering::SeqCst);
 }
@@ -58,7 +57,6 @@ pub fn debug_log_path() -> Option<&'static Path> {
     DEBUG_LOG_PATH.get().map(|p| p.as_path())
 }
 
-/// Write raw text safely to the debug log file.
 pub fn log_raw(text: &str) {
     if !is_enabled() {
         return;
@@ -71,7 +69,6 @@ pub fn log_raw(text: &str) {
     }
 }
 
-/// Log an outgoing LLM request with full payload.
 pub fn log_llm_request<T: serde::Serialize>(url: &str, model: &str, payload: &T) {
     if !is_enabled() {
         return;
@@ -312,7 +309,6 @@ pub fn log_plan_update(action: &str, details: &str) {
     log_raw(&entry);
 }
 
-/// Log an outgoing JSON-RPC request to an MCP server.
 pub fn log_mcp_request(server: &str, method: &str, params: Option<&serde_json::Value>) {
     if !is_enabled() {
         return;
@@ -329,7 +325,6 @@ pub fn log_mcp_request(server: &str, method: &str, params: Option<&serde_json::V
     log_raw(&entry);
 }
 
-/// Log an incoming JSON-RPC response from an MCP server.
 pub fn log_mcp_response(server: &str, method: &str, elapsed_ms: u128, result: &str, is_err: bool) {
     if !is_enabled() {
         return;
@@ -344,7 +339,6 @@ pub fn log_mcp_response(server: &str, method: &str, elapsed_ms: u128, result: &s
     log_raw(&entry);
 }
 
-/// Log an arbitrary custom debug entry.
 pub fn log_custom(tag: &str, message: &str) {
     if !is_enabled() {
         return;

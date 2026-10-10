@@ -267,7 +267,7 @@ async fn plan_parse_errors_are_surfaced_and_never_mean_complete() {
     marmennill::harness::with_workspace_root(root.clone(), async move {
         let plan = plan_at(&root);
 
-        // --- unreadable plan: invalid UTF-8 where the plan file lives -------
+        // unreadable plan: invalid UTF-8 where the plan file lives
         std::fs::create_dir_all(root.join(".marmel")).expect("marmel dir");
         std::fs::write(
             plan.plan_path(),
@@ -311,7 +311,7 @@ async fn plan_parse_errors_are_surfaced_and_never_mean_complete() {
             "the plan layer reports the read failure instead of a silent success"
         );
 
-        // --- readable but unparseable plan ---------------------------------
+        // readable but unparseable plan
         std::fs::write(plan.plan_path(), "# Notes\n\nprose only, no task boxes\n")
             .expect("rewrite plan");
         match read_plan_gate(&plan) {
@@ -346,7 +346,7 @@ async fn plan_parse_errors_are_surfaced_and_never_mean_complete() {
             "the warning must refuse the completion reading: {warning}"
         );
 
-        // --- control: a well-formed plan reads normally ---------------------
+        // control: a well-formed plan reads normally
         plan.create(PLAN_MD).expect("create plan");
         match read_plan_gate(&plan) {
             PlanGate::Read { pending, complete } => {

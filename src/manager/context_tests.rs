@@ -5,7 +5,6 @@ use crate::types::ToolCall;
 /// small transcript's 70% target, so the retention window breaks exactly there.
 const VERBOSE_OVER_BUDGET_REPLY: &str = "Let me first map every call site of the parser, then re-read the tokenizer entry points, then check the regression suite output line by line before touching anything at all, because a blind edit here would silently break the manager budget model.";
 
-/// Build a tool-response message tied to a tool call id.
 fn tool_response(id: &str) -> Message {
     Message::Tool {
         tool_call_id: id.to_string(),
@@ -43,7 +42,7 @@ fn test_context_locking() {
         _ => panic!("messages[1] should be User goal"),
     };
 
-    // Append a few messages; pins must survive.
+    // Pins must survive.
     engine.append(Message::User {
         content: "one more turn".to_string(),
     });
@@ -291,7 +290,6 @@ fn test_context_rebirth_reconstruction() {
     // t-031a pairing invariant: a collapsed transcript is a valid request.
     assert_valid_openai_pairing(msgs);
 
-    // The session_rebirths counter must be incremented.
     assert_eq!(
         stats
             .session_rebirths
@@ -396,7 +394,6 @@ fn test_rebirth_advisory_at_80_percent_and_compaction_at_90_percent() {
     assert!(!engine.should_advise_rebirth());
     assert!(!engine.should_compact());
 
-    // Fill until the transcript passes the 80% advisory threshold.
     while engine.token_count() <= advisory_thresh {
         engine.append(Message::User {
             content: "Step in the plan with some text to consume tokens.".to_string(),
@@ -435,7 +432,6 @@ fn test_rebirth_advisory_at_80_percent_and_compaction_at_90_percent() {
         "the injected advisory must be the newest message"
     );
 
-    // Now fill further until token count exceeds 90%
     while engine.token_count() <= compact_thresh {
         engine.append(Message::User {
             content: "Additional instruction with more words to push tokens over 90% threshold."
@@ -490,7 +486,6 @@ fn test_rebirth_advisory_reset_on_perform_rebirth() {
     engine.inject_rebirth_advisory();
     assert!(engine.rebirth_advisory_emitted());
 
-    // Agent executes rebirth
     engine.perform_rebirth("Finished preliminary tasks, ready for next phase.");
     assert_eq!(engine.messages().len(), 4);
     assert!(
@@ -589,14 +584,12 @@ fn test_compaction_preserves_rebirth_checkpoint() {
         "transcript should exceed 90% budget"
     );
 
-    // Perform automatic compaction.
     let outcome = engine.compact();
     assert!(
         outcome.succeeded(),
         "the pinned prefix of this fixture is far below the target, so compaction must succeed"
     );
 
-    // Verify budget target:
     let target = compaction_target(budget);
     assert!(
         engine.token_count() <= target,
@@ -604,7 +597,6 @@ fn test_compaction_preserves_rebirth_checkpoint() {
     );
     assert_eq!(outcome.final_tokens(), engine.token_count());
 
-    // Verify pins: [0] system prompt, [1] user goal.
     assert!(matches!(engine.messages()[0], Message::System { .. }));
     assert!(matches!(engine.messages()[1], Message::User { .. }));
 
@@ -718,7 +710,6 @@ fn test_count_tokens_reuses_count_text_tokens() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // H1 — assistant `tool_calls` <-> `Tool` pairing invariant
 //
 // Invariant enforced by `compact()` (bug H1, `docs/recon_bugs_manager.md`):
@@ -730,7 +721,6 @@ fn test_count_tokens_reuses_count_text_tokens() {
 //
 // Missing results are synthesized as `Message::Tool { content: ABORTED_TOOL_RESULT }`
 // (option (a) — see the comment on `repair_tool_call_pairs`).
-// ---------------------------------------------------------------------------
 
 /// Build an assistant message carrying N tool calls with the given ids.
 fn assistant_with_tool_calls(ids: &[&str]) -> Message {
@@ -1232,7 +1222,6 @@ fn test_repair_tool_call_pairs_helper() {
     );
 }
 
-/// Build a tool result with explicit content.
 fn tool_response_dup_content(id: &str, content: &str) -> Message {
     Message::Tool {
         tool_call_id: id.to_string(),
@@ -1383,7 +1372,6 @@ fn test_compaction_budget_target_holds_after_placeholder_synthesis() {
     assert_valid_openai_pairing(msgs);
 }
 
-// ---------------------------------------------------------------------------
 // M5 / M5b — compaction must be target-safe and must account truthfully
 // (`docs/recon_bugs_manager.md`, items M5 + M5b).
 //
@@ -1401,10 +1389,9 @@ fn test_compaction_budget_target_holds_after_placeholder_synthesis() {
 //
 // M5b: the reclaimed counts are measured on the FINAL vector.
 // RED-before evidence: the pre-pruning arithmetic
-// `initial_len - (prefix_end + kept_tail)` (git HEAD `compact_to_target`,
-// context.rs:530-539) reported `0` for a pruning-only pass in which the final
-// vector actually dropped 1 message.
-// ---------------------------------------------------------------------------
+// `initial_len - (prefix_end + kept_tail)` (the pre-fix `compact_to_target`,
+// since deleted from `context.rs`) reported `0` for a pruning-only pass in
+// which the final vector actually dropped 1 message.
 
 /// System prompt long enough that the pinned prefix alone exceeds the target.
 const OVER_TARGET_SYSTEM_PROMPT: &str = "You are a meticulous engineering agent. You must read files before editing them. You must verify every change with the available test commands. Never guess at file contents. Always report findings precisely with file paths and line numbers. You are a meticulous engineering agent. You must read files before editing them. You must verify every change with the available test commands. Never guess at file contents. Always report findings precisely with file paths and line numbers. ";
@@ -1416,8 +1403,8 @@ fn pinned_tokens_of(messages: &[Message]) -> usize {
 }
 
 /// The pre-pruning window arithmetic that the old `compact_to_target` reported
-/// as `removed` (git HEAD `src/manager/context.rs:518-539`), replicated here to
-/// prove the reported number is stale.
+/// as `removed` (since deleted from `src/manager/context.rs`), replicated here
+/// to prove the reported number is stale.
 fn stale_removed_before_pruning(messages: &[Message], target: usize) -> usize {
     let end = pinned_prefix_end(messages).min(messages.len());
     let mut total = count_tokens(&messages[..end]);
@@ -1687,7 +1674,6 @@ fn test_compaction_removed_count_covers_pruning_beyond_the_retention_window() {
     assert_valid_openai_pairing(engine.messages());
 }
 
-// ---------------------------------------------------------------------------
 // M6 / M12 — `perform_rebirth()` must summarize the real history, not the
 // runtime's own injected boilerplate, must not emit a second `system` turn, and
 // must not duplicate the pinned goal (`docs/recon_bugs_manager.md`).
@@ -1698,7 +1684,6 @@ fn test_compaction_removed_count_covers_pruning_beyond_the_retention_window() {
 //   the checkpoint was `Message::System` -> `role() == "system"`;
 //   with no distinct instruction the goal was emitted verbatim at [1] AND [2]
 //   (2 copies).
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_rebirth_slot2_excludes_injected_advisory_messages() {
@@ -1747,7 +1732,6 @@ fn test_rebirth_slot2_excludes_injected_advisory_messages() {
             );
         }
     }
-    // The advisory flag machinery is untouched.
     assert!(!engine.rebirth_advisory_emitted());
     assert_valid_openai_pairing(msgs);
 }
@@ -1868,10 +1852,8 @@ fn test_rebirth_does_not_duplicate_the_pinned_goal() {
     assert_valid_openai_pairing(msgs2);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // M7 — the context budget model must account for the tool schemas that ride on
 // every request (`ChatRequest.tools`), not only for the message array.
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Filler turn used to grow a transcript to a target token window.
 const M7_FILLER: &str = "Verbose manager turn padding the transcript with plenty of tokens.";

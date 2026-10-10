@@ -73,9 +73,7 @@ fn sse_delta(content: &str) -> String {
     )
 }
 
-// ---------------------------------------------------------------------------
 // 1. Reply targeting
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn test_reply_naming_another_workers_notice_is_rejected_and_stays_pending() {
@@ -266,9 +264,7 @@ async fn test_reply_to_an_unknown_notice_id_is_rejected_without_state_change() {
     assert!(get_worker_reply("notice-t051-never-posted").is_none());
 }
 
-// ---------------------------------------------------------------------------
 // 2. Verdict identity rule at the dispatch layer
-// ---------------------------------------------------------------------------
 
 fn verdict_invocation() -> ToolInvocation {
     ToolInvocation {
@@ -374,9 +370,7 @@ async fn test_async_dispatch_applies_the_same_verdict_identity_rule() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // 3. `read_file` truncation report vs the generic tool-output clip
-// ---------------------------------------------------------------------------
 
 /// A `read_file` truncation report in the exact shape the reader appends.
 fn read_file_report() -> String {

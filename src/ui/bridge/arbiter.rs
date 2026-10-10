@@ -40,7 +40,7 @@ pub(crate) const MAX_ARBITRATION_ROUNDS: usize = 5;
 /// single arbitration (sleep → wake → re-evaluate → sleep again counts as one extension per
 /// sleep).
 ///
-/// Without this bound a arbitrator that keeps answering `Sleep` extends its own sleep budget
+/// Without this bound an arbitrator that keeps answering `Sleep` extends its own sleep budget
 /// indefinitely and stalls the fix loop: each extension is up to 300 s
 /// ([`arbitrate_steering`] clamps a single sleep to that), so the round bound alone still allows
 /// hours of sleeping. Reaching the cap is deterministic and observable — see [`SleepStop`] and

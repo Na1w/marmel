@@ -60,7 +60,7 @@ pub struct TuiRenderer {
     pub(crate) abort_armed_at: Option<std::time::Instant>,
     /// Whether UI state has changed and needs a flush/redraw.
     pub(crate) dirty: bool,
-    /// Shared abort / user-exit flags (trait-default abort surface).
+    /// Abort / user-exit flags (the `Renderer` trait's abort surface).
     pub(crate) input_state: crate::ui::InputState,
     /// Frame counter for animations (e.g. status spinner).
     pub(crate) frame_counter: u64,
@@ -80,9 +80,8 @@ pub struct TuiRenderer {
     pub(crate) show_thought: bool,
     /// Whether the subagents panel is visible. Defaults to `false`.
     pub(crate) show_subagent_panel: bool,
-    /// List of active specialist subagents.
     pub(crate) subagents: Vec<SubagentDetail>,
-    /// Index of the currently selected subagent. Defaults to `0`.
+    /// Defaults to `0`.
     pub(crate) selected_subagent_idx: usize,
     /// Scroll offset of the subagent details pane.
     pub(crate) subagent_scroll: u16,

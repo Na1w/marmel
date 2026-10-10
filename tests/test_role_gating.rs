@@ -350,9 +350,7 @@ async fn test_prompt_based_tool_gating() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // t-033b — the verdict tool (`leave_verdict`) is validator-only
-// ---------------------------------------------------------------------------
 //
 // Two enforcement layers exist and they are deliberately different:
 //
@@ -847,9 +845,7 @@ async fn validator_may_record_an_explicit_approval() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // t-033e — the fix-loop tool blueprint is role-aware
-// ---------------------------------------------------------------------------
 //
 // `run_fix_loop` (`src/agents/runner/fix_loop.rs`) is the shared driver behind
 // the deliverable validator and the plan auditor. Its *blueprint* is the
@@ -877,7 +873,6 @@ use marmennill::agents::runner::fix_loop::{
 };
 use marmennill::types::ToolDef;
 
-/// Names of the tools in an assembled list.
 fn tool_names_of(tools: &[ToolDef]) -> Vec<String> {
     tools.iter().map(|t| t.function.name.clone()).collect()
 }

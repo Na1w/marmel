@@ -156,7 +156,6 @@ impl OrchestratorManager {
         self.cancellation_token.cancel();
     }
 
-    /// Check whether this manager has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.cancellation_token.is_cancelled()
     }
@@ -204,12 +203,12 @@ impl OrchestratorManager {
             .ok_or_else(|| anyhow::anyhow!("unknown specialist: {}", req.agent_name))?;
 
         // 2. Fractal depth gate (REQ-ORCH-001): nested delegation beyond the
-        //    bound is rejected. This mirrors caesar's `Orchestrator` gate
-        //    (tools_manager.rs:914) which is UNCONDITIONAL — the recursion
-        //    bound is enforced regardless of `recursion_granted`, so a request
-        //    that would exceed the bound is rejected before any worker is
-        //    spawned and before any `Started` event is surfaced (a rejected
-        //    delegation must not emit a spurious lifecycle event).
+        //    bound is rejected. This mirrors caesar's `Orchestrator` recursion
+        //    gate, which is UNCONDITIONAL — the bound is enforced regardless of
+        //    `recursion_granted`, so a request that would exceed the bound is
+        //    rejected before any worker is spawned and before any `Started`
+        //    event is surfaced (a rejected delegation must not emit a spurious
+        //    lifecycle event).
         if self
             .depth
             .step(self.orchestration.max_recursion_depth)
@@ -342,7 +341,6 @@ impl OrchestratorManager {
             &deliverable.content,
         );
 
-        // Surface the delegation completion to the UI.
         if let Ok(mut ev) = self.delegation_events.lock() {
             if matches!(deliverable.marker, MissionMarker::Failed { .. }) {
                 let reason = match &deliverable.marker {
@@ -366,7 +364,6 @@ impl OrchestratorManager {
             }
         }
 
-        // Bind task_id & auto check-off.
         Ok(self.apply_check_off(deliverable, req.task_id.clone()))
     }
 
@@ -488,7 +485,6 @@ impl OrchestratorManager {
             }
             attempts += 1;
             for task_id in &pending {
-                // Resolve the right specialist for this task.
                 let agent = scheduler(task_id);
                 let brief = brief_for_task(&self.plan, task_id);
                 let req = DelegationRequest {

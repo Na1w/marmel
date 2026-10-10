@@ -516,15 +516,12 @@ mod tests {
     async fn test_preempt_and_resume_flow() {
         let mut sink = PreemptibleStreamSink::register("coder", "model-test-flow");
 
-        // Initially no pause requested
         assert_eq!(sink.poll_control(), StreamControl::Continue);
 
-        // Preempt on matching model
         let handle_task = tokio::spawn(async {
             preempt_conflicting_stream("model-test-flow", "status check").await
         });
 
-        // Loop poll_control until Pause is received
         let user_input = loop {
             if let StreamControl::Pause { user_input } = sink.poll_control() {
                 break user_input;
@@ -533,17 +530,13 @@ mod tests {
         };
         assert_eq!(user_input, "status check");
 
-        // Subagent calls on_pause in a task
         let pause_task = tokio::spawn(async move { sink.on_pause("status check").await });
 
-        // Preempt handle resolves
         let handle = handle_task.await.unwrap();
         assert!(matches!(handle, PreemptHandle::Active(_)));
 
-        // Arbitrator finishes and resumes
         handle.complete_all(PauseAction::Resume);
 
-        // Subagent resumes
         let action = pause_task.await.unwrap();
         assert_eq!(action, PauseAction::Resume);
     }
@@ -556,7 +549,6 @@ mod tests {
             preempt_conflicting_stream("model-test-cancel", "cancel coder").await
         });
 
-        // Loop poll_control until Pause is received
         loop {
             if let StreamControl::Pause { .. } = sink.poll_control() {
                 break;
@@ -763,7 +755,6 @@ mod tests {
             preempt_conflicting_stream("model-test-task-cancel", "stalled agent check").await
         });
 
-        // Loop poll_control until Pause is received
         loop {
             if let StreamControl::Pause { .. } = sink.poll_control() {
                 break;
@@ -818,7 +809,7 @@ mod tests {
         );
     }
 
-    // ---- H2: bounded acknowledgement, non-acking streams get cancelled ----
+    // H2: bounded acknowledgement, non-acking streams get cancelled
 
     /// A preemption stream that never acknowledges must be cancelled, not left
     /// running until the turn ends (H2).
@@ -999,7 +990,7 @@ mod tests {
         );
     }
 
-    // ---- H3: subtask `action` normalization at the preemption call site ----
+    // H3: subtask `action` normalization at the preemption call site
 
     /// Every spelling of a known `Cancel` action must reach the same branch.
     #[tokio::test]

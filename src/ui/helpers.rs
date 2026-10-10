@@ -140,8 +140,6 @@ pub(crate) fn load_system_prompt_with_plan_and_warning(
     Ok((prompt, warning))
 }
 
-/// One-line decorated `name(args)` rendering for the tool-call row and transcript.
-///
 /// The argument knowledge and clipping live in [`crate::tool_args`] (single
 /// owner, shared with the specialist runner preview); this is a thin wrapper so
 /// the UI keeps a stable local name.
@@ -406,12 +404,12 @@ pub fn extract_failure_reason(text: &str) -> String {
         }
     }
 
-    // 2-4. The marker-shaped verdicts (`REPLAN REQUIRED (<task>): …`,
-    //      `FAILED (<reason>)`, `FAILED: <reason>`) are parsed by their single
-    //      owner, `crate::markers`, which walks one failure-prefix table
-    //      (gate t-059 — this site used to hand-roll three literal `find`s).
-    //      The 120-char budget stays here: truncation is presentation, not
-    //      grammar, and the rendered bytes are unchanged.
+    // 2. The marker-shaped verdicts (`REPLAN REQUIRED (<task>): …`,
+    //    `FAILED (<reason>)`, `FAILED: <reason>`) are parsed by their single
+    //    owner, `crate::markers`, which walks one failure-prefix table
+    //    (gate t-059 — this site used to hand-roll three literal `find`s).
+    //    The 120-char budget stays here: truncation is presentation, not
+    //    grammar, and the rendered bytes are unchanged.
     if let Some(reason) = crate::markers::failure_reason(trimmed) {
         return truncate_reason(reason, 120);
     }
@@ -434,7 +432,7 @@ pub fn extract_failure_reason(text: &str) -> String {
         }
     }
 
-    // 7. Fallback: first non-empty line
+    // 5. Fallback: first non-empty line
     let first_line = trimmed
         .lines()
         .find(|l| !l.trim().is_empty())
@@ -702,7 +700,7 @@ mod tests {
     #[test]
     fn test_load_system_prompt_with_base_prompt() {
         let cfg = Config {
-            base_prompt: Some("Schemalägg inga tasks parallellt.".to_string()),
+            base_prompt: Some("Do not schedule any tasks in parallel.".to_string()),
             ..Default::default()
         };
         let plan = crate::manager::phase::Plan::default();
@@ -710,7 +708,7 @@ mod tests {
             .map(|(prompt, _warning)| prompt)
             .expect("load success");
         assert!(prompt.contains("## Machine Specific Guidance"));
-        assert!(prompt.contains("Schemalägg inga tasks parallellt."));
+        assert!(prompt.contains("Do not schedule any tasks in parallel."));
     }
 
     #[test]
@@ -778,19 +776,17 @@ mod tests {
         assert!(find_subagent_mut(&mut subs, "coder", Some("[]")).is_none());
     }
 
-    // ---------------------------------------------------------------------
     // t-054 — the system prompt must read the plan fail-closed
     // (regression guard for the swallowed `if let Ok(Some(..))` read).
     //
     // Every test below roots its plan in a private temporary workspace through
     // `harness::with_workspace_root`, so the repository's real `.marmel/` is
     // never touched, and none of them asserts on a process-global counter.
-    // ---------------------------------------------------------------------
 
     /// A two-task plan with multi-byte text, nested markdown and a tab-indented
     /// line: used to prove the readable-plan path embeds the body byte for byte.
     const PLAN_MD: &str = "# Execution Plan\n\
-- [x] [t-001] Normalisera plan-läsningen — `åäö` ✅\n\
+- [x] [t-001] Normalize plan reading — `åäö` ✅\n\
 - [ ] [t-002] Surface plan-read errors\n\
 \n\tindented\ttab + trailing spaces   \n";
 

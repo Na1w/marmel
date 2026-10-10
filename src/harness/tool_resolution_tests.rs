@@ -86,7 +86,10 @@ fn scripted_server(tools: &[&str]) -> ScriptedServer {
     ScriptedServer {
         _dir: dir,
         config: McpServerConfig {
-            command: Some("/bin/sh".to_string()),
+            // `sh` resolved through PATH — its absolute location differs between
+            // runners (it lives in `/usr/bin` on macOS), and the `cat` plus
+            // `sleep` in the script are resolved the same way by the shell.
+            command: Some("sh".to_string()),
             args: vec![
                 "-c".to_string(),
                 format!("cat '{}' ; sleep 30", path.display()),

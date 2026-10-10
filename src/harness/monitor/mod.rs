@@ -27,9 +27,7 @@ pub use common::{Intervention, ToolCallRecord};
 pub use repetition::{RepetitionDetector, ToolRepetitionDetector, semantic_json_eq};
 pub use xml::XMLToolRescue;
 
-// ---------------------------------------------------------------------------
 // Orphan tool-message pruning (Part 7 checklist item 5)
-// ---------------------------------------------------------------------------
 
 /// Prune orphaned `role:"tool"` messages that have no matching assistant
 /// tool_call_id.
@@ -52,9 +50,7 @@ pub fn prune_orphan_tool_messages(messages: Vec<Message>) -> Vec<Message> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
 // Composed resilience monitor (runtime entry point)
-// ---------------------------------------------------------------------------
 
 /// Composed harness monitor binding all three detectors to a shared stats
 /// registry, so the loop calls ONE object for every resilience intervention.
@@ -70,13 +66,11 @@ pub fn prune_orphan_tool_messages(messages: Vec<Message>) -> Vec<Message> {
 ///   structured [`ToolCall`] JSON with `call_text_{uuid}` ids; increments
 ///   `xml_tool_rescues`.
 /// * [`HarnessMonitor::observe_tool`] — REQ-HARN-002. Run *before* a tool
-///   executes so a ≥3 identical repetition blocks, or an ≥3 alternating cycle
+///   executes so a ≥5 identical repetition blocks, or an ≥5 alternating cycle
 ///   cuts, the call; the returned [`Intervention`] drives the SPEC error text.
 /// * [`HarnessMonitor::feed_text`] — REQ-HARN-003. Feed streamed assistant
-///   output into the 1000-char rolling buffer; returns `true` (terminating the
-///   stream) when a ≥5-length pattern repeats ≥5 times, and truncates the
-///   repeated block back to a single instance while incrementing
-///   `repetition_breaks`.
+///   output into the rolling text buffer; the firing rule, the truncation and
+///   the exactly-once counter are documented on the method itself.
 ///
 /// Who owns a monitor instance in the live runtime: the Manager-side monitor
 /// is the local `monitor` in `run_session` (`src/ui/session.rs`), rooted at the
@@ -148,8 +142,8 @@ impl HarnessMonitor {
     }
 
     /// REQ-HARN-002: record a tool call (by name + JSON arguments) and return
-    /// the intervention. Call this immediately before dispatching so a ≥3
-    /// identical repetition returns [`Intervention::Block`] and an ≥3
+    /// the intervention. Call this immediately before dispatching so a ≥5
+    /// identical repetition returns [`Intervention::Block`] and an ≥5
     /// alternating cycle returns [`Intervention::Cut`]. The caller maps the
     /// intervention to the exact SPEC error string.
     pub fn observe_tool(&mut self, name: &str, arguments: &serde_json::Value) -> Intervention {
@@ -191,7 +185,7 @@ impl HarnessMonitor {
     }
 
     /// REQ-HARN-003: feed a chunk of streamed assistant output into the rolling
-    /// 1000-char buffer. Returns `true` when the stream must be terminated
+    /// 16384-char buffer. Returns `true` when the stream must be terminated
     /// because a pattern of length ≥5 repeated ≥5 times continuously at the
     /// tail. When it fires, the repeated block is truncated back to a single
     /// instance (buffer reset) and `repetition_breaks` is incremented exactly
@@ -229,13 +223,9 @@ impl HarnessMonitor {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Unit tests (Phase B checkpoint: `cargo test --lib test_monitor_`)
-// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Unit tests (Phase B checkpoint: `cargo test --lib test_monitor_`)
-// ---------------------------------------------------------------------------
+// The suite itself lives in `monitor_tests.rs`, included below.
 
 #[cfg(test)]
 #[path = "monitor_tests.rs"]

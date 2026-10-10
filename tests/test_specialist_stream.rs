@@ -123,7 +123,6 @@ async fn test_mock_specialist_live_execution_streams_thinking_and_content_to_ui(
         statuses.push(st);
     }
 
-    // Assert that the specialist's thinking tokens were delivered to the UI event bus tagged for coder-t-001
     let has_thinking = events.iter().any(|ev| {
         matches!(ev, marmennill::ui::Event::SubagentThinking { agent_tag, text } if agent_tag == "coder-t-001" && text.contains("Analyzing codebase structure."))
     });
@@ -133,7 +132,6 @@ async fn test_mock_specialist_live_execution_streams_thinking_and_content_to_ui(
         events
     );
 
-    // Assert that the specialist's content tokens were delivered to the UI event bus tagged for coder-t-001
     let has_message = events.iter().any(|ev| {
         matches!(ev, marmennill::ui::Event::SubagentMessage { agent_tag, text } if agent_tag == "coder-t-001" && text.contains("Implementing file write now."))
     });
@@ -143,7 +141,6 @@ async fn test_mock_specialist_live_execution_streams_thinking_and_content_to_ui(
         events
     );
 
-    // Assert that status updates were emitted for the specialist lifecycle
     let has_status = statuses.iter().any(|st| st.contains("coder-t-001"));
     assert!(
         has_status,
@@ -158,10 +155,8 @@ async fn test_mock_specialist_live_execution_streams_thinking_and_content_to_ui(
 async fn test_specialist_consecutive_thinking_nudges_triggers_replan_required() {
     let _guard = TEST_BUS_MUTEX.lock().await;
 
-    // Hermeticity (t-033b): scope this run to an isolated temporary workspace
-    // root. Without this scoping the suite resolves `.marmel/prompts/` from the
-    // repository working directory and would read (and assert against) the real
-    // per-task prompt/verdict files of the checkout.
+    // Hermeticity (t-033b): isolated temporary workspace root — see the
+    // rationale on the first test of this file.
     let tmp = tempfile::tempdir().expect("isolated temporary workspace root");
     marmennill::harness::with_workspace_root(tmp.path().to_path_buf(), async move {
 
@@ -233,10 +228,8 @@ async fn test_specialist_consecutive_thinking_nudges_triggers_replan_required() 
 async fn test_specialist_thinking_nudges_reset_when_thinking_within_budget() {
     let _guard = TEST_BUS_MUTEX.lock().await;
 
-    // Hermeticity (t-033b): scope this run to an isolated temporary workspace
-    // root. Without this scoping the suite resolves `.marmel/prompts/` from the
-    // repository working directory and would read (and assert against) the real
-    // per-task prompt/verdict files of the checkout.
+    // Hermeticity (t-033b): isolated temporary workspace root — see the
+    // rationale on the first test of this file.
     let tmp = tempfile::tempdir().expect("isolated temporary workspace root");
     marmennill::harness::with_workspace_root(tmp.path().to_path_buf(), async move {
 
@@ -340,10 +333,8 @@ async fn test_specialist_thinking_nudges_reset_when_thinking_within_budget() {
 async fn test_specialist_truncated_tool_call_feedback_and_recovery() {
     let _guard = TEST_BUS_MUTEX.lock().await;
 
-    // Hermeticity (t-033b): scope this run to an isolated temporary workspace
-    // root. Without this scoping the suite resolves `.marmel/prompts/` from the
-    // repository working directory and would read (and assert against) the real
-    // per-task prompt/verdict files of the checkout.
+    // Hermeticity (t-033b): isolated temporary workspace root — see the
+    // rationale on the first test of this file.
     let tmp = tempfile::tempdir().expect("isolated temporary workspace root");
     marmennill::harness::with_workspace_root(tmp.path().to_path_buf(), async move {
 
@@ -431,10 +422,8 @@ async fn test_specialist_truncated_tool_call_feedback_and_recovery() {
 async fn test_specialist_repeated_malformed_tool_calls_triggers_replan() {
     let _guard = TEST_BUS_MUTEX.lock().await;
 
-    // Hermeticity (t-033b): scope this run to an isolated temporary workspace
-    // root. Without this scoping the suite resolves `.marmel/prompts/` from the
-    // repository working directory and would read (and assert against) the real
-    // per-task prompt/verdict files of the checkout.
+    // Hermeticity (t-033b): isolated temporary workspace root — see the
+    // rationale on the first test of this file.
     let tmp = tempfile::tempdir().expect("isolated temporary workspace root");
     marmennill::harness::with_workspace_root(tmp.path().to_path_buf(), async move {
 
@@ -503,10 +492,8 @@ async fn test_specialist_repeated_malformed_tool_calls_triggers_replan() {
 async fn test_specialist_malformed_tool_calls_reset_on_successful_tool_call() {
     let _guard = TEST_BUS_MUTEX.lock().await;
 
-    // Hermeticity (t-033b): scope this run to an isolated temporary workspace
-    // root. Without this scoping the suite resolves `.marmel/prompts/` from the
-    // repository working directory and would read (and assert against) the real
-    // per-task prompt/verdict files of the checkout.
+    // Hermeticity (t-033b): isolated temporary workspace root — see the
+    // rationale on the first test of this file.
     let tmp = tempfile::tempdir().expect("isolated temporary workspace root");
     marmennill::harness::with_workspace_root(tmp.path().to_path_buf(), async move {
 
@@ -597,9 +584,7 @@ async fn test_specialist_malformed_tool_calls_reset_on_successful_tool_call() {
     .await;
 }
 
-// ---------------------------------------------------------------------------
 // t-033b — hermetic workspace scoping + unconditional missing-verdict failure
-// ---------------------------------------------------------------------------
 
 /// Minimal SSE fixture: a single tool call.
 fn tool_call_sse(call_id: &str, tool_name: &str, args_json: &str) -> String {

@@ -1,13 +1,13 @@
 //! Steer Arbitrator — fast, real-time user steering & inquiry handler during execution.
 //!
-//! Aligned with Marmennill's `call_steer_arbitrator` contract
-//! (REFERENCE_ORCHESTRATION_CONTRACT.md §5): when a user sends a message
-//! mid-flight while subagents or tools are running, the Steer Arbitrator
-//! evaluates the user's intent in real time against the active execution plan,
-//! current goal, and running subtasks, and returns a `SteerDecision` JSON
-//! matching the caesar `SteerDecisionResponse` shape.
+//! When a user sends a message mid-flight while subagents or tools are running,
+//! the Steer Arbitrator evaluates the user's intent in real time against the
+//! active execution plan, current goal, and running subtasks, and returns a
+//! `SteerDecision` JSON matching the caesar `SteerDecisionResponse` shape.
+//! [`arbitrate_steer_context_stream`] is the entry point the arbitration path
+//! drives; [`arbitrate_steer_stream`] / [`arbitrate_steer`] are its wrappers.
 //!
-//! The decision vocabulary (caesar §5.1) is `RespondDirectly`,
+//! The decision vocabulary is `RespondDirectly`,
 //! `AbortImmediately`, `QueueAndContinue`, `ForwardToWorker`, `ApprovePlan`,
 //! `RejectPlan`, `DelegateTask`, `SwitchTier`, `SwitchModel`. This module
 //! focuses on the three core branches (`RespondDirectly`, `AbortImmediately`,
@@ -64,16 +64,16 @@ pub struct SteerDecision {
 }
 
 /// Outcome of a steer arbitration, including the unavailable-arbitrator
-/// fallback (caesar §5.3).
+/// fallback.
 #[derive(Debug, Clone)]
 pub enum SteerOutcome {
     /// The arbitrator produced a decision.
     Decided(SteerDecision),
     /// The arbitrator was unavailable and active subtasks are running: queue
-    /// the instruction to preserve ongoing jobs (caesar §5.3).
+    /// the instruction to preserve ongoing jobs.
     QueueInstruction,
     /// The arbitrator was unavailable and no subtasks are active: steer the
-    /// orchestrator immediately (caesar §5.3).
+    /// orchestrator immediately.
     SteerImmediately,
 }
 
@@ -241,7 +241,6 @@ where
         raw = raw_stream_accum.trim().to_string();
     }
 
-    // Strip markdown code fences if present
     let json_text = if let Some(stripped) = raw.strip_prefix("```json") {
         stripped.trim_end_matches("```").trim()
     } else if let Some(stripped) = raw.strip_prefix("```") {
@@ -592,7 +591,7 @@ pub async fn arbitrate_steer(
 }
 
 /// Resolve the steer outcome from an optional arbitrator decision and the
-/// active-subtask state. This is the pure fallback logic (caesar §5.3),
+/// active-subtask state. This is the pure fallback logic,
 /// factored out so it can be unit-tested without an LLM backend.
 pub fn resolve_steer_outcome(
     decision: Option<SteerDecision>,
@@ -605,7 +604,7 @@ pub fn resolve_steer_outcome(
     }
 }
 
-/// Steer with streaming delta callback and the unavailable-arbitrator fallback (caesar §5.3).
+/// Steer with streaming delta callback and the unavailable-arbitrator fallback.
 pub async fn arbitrate_steer_stream_with_fallback<F>(
     client: &ChatClient,
     stats: &HarnessStats,
@@ -620,7 +619,7 @@ where
     resolve_steer_outcome(decision, has_active_subtasks)
 }
 
-/// Steer with the unavailable-arbitrator fallback (caesar §5.3): if the
+/// Steer with the unavailable-arbitrator fallback: if the
 /// arbitrator is unavailable and active subtasks are running, the instruction
 /// is queued to preserve ongoing jobs.
 pub async fn arbitrate_steer_with_fallback(

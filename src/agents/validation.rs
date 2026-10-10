@@ -70,7 +70,6 @@ pub const NO_EXPLICIT_APPROVAL_REASON: &str = "No explicit verdict recorded: the
 /// [`NO_EXPLICIT_APPROVAL_REASON`]. It never returns `None`, so callers cannot
 /// paper over a missing verdict with an `unwrap_or(true)`-style default.
 pub fn parse_verdict_args(args: &serde_json::Value) -> Option<(bool, String)> {
-    // 1. Try to extract approval status from string/boolean fields
     let approved_opt = if let Some(v_str) = args
         .get("verdict")
         .or_else(|| args.get("status"))
@@ -107,7 +106,6 @@ pub fn parse_verdict_args(args: &serde_json::Value) -> Option<(bool, String)> {
             .and_then(serde_json::Value::as_bool)
     };
 
-    // 2. Extract comments / critique
     let comments = args
         .get("comments")
         .or_else(|| args.get("comment"))
@@ -123,12 +121,12 @@ pub fn parse_verdict_args(args: &serde_json::Value) -> Option<(bool, String)> {
         .trim()
         .to_string();
 
-    // 3. Fail-closed verdict resolution (gate t-033b). An explicit verdict field
-    //    wins; otherwise explicit approval/rejection wording inside the comments
-    //    is honoured; otherwise NO verdict was recorded and the deliverable is
-    //    not approved. The historical fallback defaulted to `true` ("assume
-    //    approved if no rejection indicated"), which turned an absent, ambiguous
-    //    or unparseable verdict marker into evidence of success.
+    // Fail-closed verdict resolution (gate t-033b): an explicit verdict field
+    // wins; otherwise explicit approval/rejection wording inside the comments
+    // is honoured; otherwise NO verdict was recorded and the deliverable is
+    // not approved. The historical fallback defaulted to `true` ("assume
+    // approved if no rejection indicated"), which turned an absent, ambiguous
+    // or unparseable verdict marker into evidence of success.
     let upper = comments.to_ascii_uppercase();
     // The failure cues come from the marker owner's table (gate t-059); the
     // approval side of the wording stays local to the validator.
@@ -512,9 +510,9 @@ async fn run_plan_validation_inner(
             Ok((false, reason))
         }
         Ok(FixLoopResult::Aborted) => {
-            // Strict abort semantics: cancellation is a failure, not a verdict.
-            // (Previously returned Ok((false, …)) — a soft rejection that
-            // downstream consumers could mistake for an auditor verdict.)
+            // Cancellation is a failure, not a verdict. (Previously returned
+            // Ok((false, …)), a soft rejection that downstream consumers could
+            // mistake for an auditor verdict.)
             Err(anyhow::anyhow!(
                 "Plan validation aborted by cancellation signal."
             ))

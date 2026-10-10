@@ -490,7 +490,6 @@ async fn test_specialist_stream_preemption_and_resumption_on_shared_model() {
     let (first_chunk_sent_tx, first_chunk_sent_rx) = tokio::sync::oneshot::channel();
     let (preempt_done_tx, preempt_done_rx) = tokio::sync::oneshot::channel();
 
-    // Spawn mock streaming server
     tokio::spawn(async move {
         // First connection: initial specialist stream
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -500,7 +499,6 @@ async fn test_specialist_stream_preemption_and_resumption_on_shared_model() {
         let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
         stream.write_all(headers.as_bytes()).await.unwrap();
 
-        // Send chunk 1
         let chunk1_data =
             "data: {\"choices\":[{\"delta\":{\"content\":\"Specialist part 1...\"}}]}\n\n";
         let chunk1 = format!("{:x}\r\n{}\r\n", chunk1_data.len(), chunk1_data);
@@ -509,7 +507,6 @@ async fn test_specialist_stream_preemption_and_resumption_on_shared_model() {
         // Give client time to read and parse chunk 1
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
-        // Notify test that first chunk was sent
         let _ = first_chunk_sent_tx.send(());
 
         // Wait until steer preemption has been registered
@@ -656,7 +653,6 @@ async fn test_steering_conversation_history_accumulates_and_passes_to_arbitrator
         Some(Arc::clone(&steering_history)),
     );
 
-    // Wait for first arbitration to finish
     loop {
         if let Some(event) = arb_rx.recv().await
             && matches!(
@@ -668,7 +664,6 @@ async fn test_steering_conversation_history_accumulates_and_passes_to_arbitrator
         }
     }
 
-    // Verify history now contains turn 1
     {
         let hist = steering_history.read().unwrap();
         assert_eq!(hist.len(), 1);
@@ -688,7 +683,6 @@ async fn test_steering_conversation_history_accumulates_and_passes_to_arbitrator
         Some(Arc::clone(&steering_history)),
     );
 
-    // Wait for second arbitration to finish
     loop {
         if let Some(event) = arb_rx.recv().await
             && matches!(
@@ -700,7 +694,6 @@ async fn test_steering_conversation_history_accumulates_and_passes_to_arbitrator
         }
     }
 
-    // Verify history now contains turn 1 AND turn 2
     {
         let hist = steering_history.read().unwrap();
         assert_eq!(hist.len(), 2);
@@ -708,7 +701,6 @@ async fn test_steering_conversation_history_accumulates_and_passes_to_arbitrator
         assert!(hist[1].1.contains("There are 2 tests remaining."));
     }
 
-    // Verify that the second request payload sent to the mock server actually contained the history!
     let bodies = received_bodies.lock().unwrap();
     assert!(bodies.len() >= 2);
     let second_req = &bodies[1];
@@ -737,17 +729,17 @@ async fn test_steering_conversation_history_accumulates_worker_reply_to_arbitrat
             if body.contains("Original User Inquiry") {
                 // Evaluation of worker reply
                 ResponseTemplate::new(200).set_body_string(
-                    "data: {\"id\":\"c_eval\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"SynthesizeResponse\\\", \\\"response\\\": \\\"Codern har tagit bort jit_invalidate_all()-anropen och ctest 7/7 passerar.\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+                    "data: {\"id\":\"c_eval\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"SynthesizeResponse\\\", \\\"response\\\": \\\"The coder removed the jit_invalidate_all() calls and ctest passes 7/7.\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
                 )
-            } else if body.contains("Hur gick testet?") {
+            } else if body.contains("How did the test go?") {
                 // Turn 2: user asks follow-up
                 ResponseTemplate::new(200).set_body_string(
-                    "data: {\"id\":\"c2\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"RespondDirectly\\\", \\\"response\\\": \\\"Testet gick bra.\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+                    "data: {\"id\":\"c2\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"RespondDirectly\\\", \\\"response\\\": \\\"The test went fine.\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
                 )
             } else {
-                // Turn 1: user asks "Hur går det för codern?" -> ForwardToWorker
+                // Turn 1: user asks "How is the coder doing?" -> ForwardToWorker
                 ResponseTemplate::new(200).set_body_string(
-                    "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"ForwardToWorker\\\", \\\"subtasks\\\": [{\\\"tool_call_id\\\": \\\"call_1\\\", \\\"action\\\": \\\"ForwardNotice\\\", \\\"agent_name\\\": \\\"coder\\\", \\\"message\\\": \\\"Hur går det för codern?\\\"}]}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+                    "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"ForwardToWorker\\\", \\\"subtasks\\\": [{\\\"tool_call_id\\\": \\\"call_1\\\", \\\"action\\\": \\\"ForwardNotice\\\", \\\"agent_name\\\": \\\"coder\\\", \\\"message\\\": \\\"How is the coder doing?\\\"}]}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
                 )
             }
         })
@@ -771,19 +763,18 @@ async fn test_steering_conversation_history_accumulates_worker_reply_to_arbitrat
     let steering_history = Arc::new(std::sync::RwLock::new(Vec::<(String, String)>::new()));
     marmennill::orchestrator::set_steering_history(Arc::clone(&steering_history));
 
-    // Turn 1: user asks "Hur går det för codern?"
+    // Turn 1: user asks "How is the coder doing?"
     marmennill::ui::bridge::spawn_steer_arbitration(
         &client,
         stats.clone(),
         "build PPC JIT",
         &[],
-        "Hur går det för codern?".to_string(),
+        "How is the coder doing?".to_string(),
         &arb_tx,
         &mut renderer,
         Some(Arc::clone(&steering_history)),
     );
 
-    // Wait for first arbitration to finish
     loop {
         if let Some(event) = arb_rx.recv().await
             && matches!(
@@ -799,7 +790,7 @@ async fn test_steering_conversation_history_accumulates_worker_reply_to_arbitrat
     let notice_id = {
         let hist = steering_history.read().unwrap();
         assert_eq!(hist.len(), 1);
-        assert_eq!(hist[0].0, "Hur går det för codern?");
+        assert_eq!(hist[0].0, "How is the coder doing?");
         assert!(hist[0].1.contains("awaiting specialist reply"));
         // Extract notice id from recorded text (e.g. "Forwarded notice notice-1 to coder...")
         let text = &hist[0].1;
@@ -814,7 +805,7 @@ async fn test_steering_conversation_history_accumulates_worker_reply_to_arbitrat
     // Specialist worker replies via handle_reply_to_arbitrator_async
     let args = serde_json::json!({
         "notice_id": notice_id,
-        "message": "Status: tagit bort de två jit_invalidate_all()-anropen och ctest 7/7 passerar."
+        "message": "Status: removed the two jit_invalidate_all() calls and ctest passes 7/7."
     });
     let reply_res = marmennill::harness::handle_reply_to_arbitrator_async("coder", &args).await;
     assert!(reply_res.is_ok());
@@ -823,21 +814,23 @@ async fn test_steering_conversation_history_accumulates_worker_reply_to_arbitrat
     {
         let hist = steering_history.read().unwrap();
         assert_eq!(hist.len(), 1);
-        assert_eq!(hist[0].0, "Hur går det för codern?");
-        assert!(hist[0].1.contains(
-            "Codern har tagit bort jit_invalidate_all()-anropen och ctest 7/7 passerar."
-        ));
+        assert_eq!(hist[0].0, "How is the coder doing?");
+        assert!(
+            hist[0]
+                .1
+                .contains("The coder removed the jit_invalidate_all() calls and ctest passes 7/7.")
+        );
         assert!(hist[0].1.contains("[Specialist coder]:"));
         assert!(!hist[0].1.contains("awaiting specialist reply"));
     }
 
-    // Turn 2: user asks "Hur gick testet?"
+    // Turn 2: user asks "How did the test go?"
     marmennill::ui::bridge::spawn_steer_arbitration(
         &client,
         stats.clone(),
         "build PPC JIT",
         &[],
-        "Hur gick testet?".to_string(),
+        "How did the test go?".to_string(),
         &arb_tx,
         &mut renderer,
         Some(Arc::clone(&steering_history)),
@@ -854,15 +847,14 @@ async fn test_steering_conversation_history_accumulates_worker_reply_to_arbitrat
         }
     }
 
-    // Verify that the prompt sent to the model for turn 2 contained the specialist's reply in steering history!
     let bodies = received_bodies.lock().unwrap();
     let turn2_req = bodies
         .iter()
-        .find(|b| b.contains("Hur gick testet?"))
+        .find(|b| b.contains("How did the test go?"))
         .expect("Turn 2 request must exist");
     assert!(
         turn2_req
-            .contains("Codern har tagit bort jit_invalidate_all()-anropen och ctest 7/7 passerar."),
+            .contains("The coder removed the jit_invalidate_all() calls and ctest passes 7/7."),
         "Turn 2 request must contain the specialist reply from steering history! Request was: {turn2_req}"
     );
 }
@@ -1017,7 +1009,6 @@ async fn test_steering_arbitrator_sleep_re_invokes_after_delay() {
         Some("Tests have now completed without errors.")
     );
 
-    // Verify conversation history recorded the progression
     let hist = steering_history.read().unwrap();
     assert_eq!(hist.len(), 2);
     assert!(hist[0].1.contains("slept for 1s"));
@@ -1067,7 +1058,6 @@ async fn test_ui_session_saves_ui_transcript_to_disk() {
         .await
         .expect("session succeeds");
 
-    // Assert that .ui_transcript.json was created on disk
     let ui_transcript_path = plan.ui_transcript_path();
     assert!(
         ui_transcript_path.exists(),
@@ -1166,7 +1156,6 @@ async fn test_ui_session_starts_fresh_and_still_saves_transcript() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // t-031b — DEFECT CLASS H2 (live executor): leaked in-flight round work on a
 // hard error path.
 //
@@ -1175,21 +1164,20 @@ async fn test_ui_session_starts_fresh_and_still_saves_transcript() {
 // `tokio::task::spawn_blocking` handles and then joined one by one. Every
 // *abort* exit of that join loop calls `crate::orchestrator::cancel_all()`
 // first, which (i) cancels the global cancellation token that in-flight PTY
-// command loops poll (`src/harness/pty.rs:253` -> `session.teardown()` ->
+// command loops poll (`src/harness/pty.rs` `teardown()` -> `kill_and_reap()` ->
 // `kill_process_group`) and (ii) cancels every registered worker token via
-// `cancel_all_active_workers()` (`src/orchestrator/workers.rs:527`).
+// `cancel_all_active_workers()` (`src/orchestrator/workers.rs`).
 //
 // A *hard error* raised inside the round (here: a renderer write failure, the
-// `renderer.flush()?` at `src/ui/session.rs:506`/`:705`) used to propagate out
+// `renderer.flush()?` in `src/ui/session.rs`) used to propagate out
 // of `run_session` with `?` and simply **detach** the remaining handles — no
 // `cancel_all()`, so the delegated/parallel work kept running after the session
 // aborted.
 //
 // The test is fully hermetic: no `openpty`, no real specialist. The in-flight
 // work is modelled the same way `OrchestratorManager::delegate` models it
-// (`src/orchestrator/mod.rs:276-281`): a worker registered in the live registry
+// (`src/orchestrator/mod.rs`, `delegate`): a worker registered in the live registry
 // with an explicit cancellation token, kept active until the round aborts.
-// ---------------------------------------------------------------------------
 
 /// SSE body with TWO read-only tool calls -> forces the parallel fan-out branch.
 fn two_parallel_tool_calls_sse() -> String {
@@ -1250,7 +1238,7 @@ impl Renderer for RoundHardErrorRenderer {
     fn set_subagents(&mut self, _subagents: Vec<marmennill::ui::SubagentDetail>) {}
     fn flush(&mut self) -> anyhow::Result<()> {
         // The fan-out loop emits one `ToolCall` event per parallel call and then
-        // flushes once every handle has been spawned (`src/ui/session.rs:506`).
+        // flushes once every handle has been spawned (`src/ui/session.rs`).
         if self.tool_call_events >= 2 && !self.fired {
             self.fired = true;
             self.cancelled_when_raised = Some(marmennill::orchestrator::is_globally_cancelled());
@@ -1348,7 +1336,6 @@ async fn test_ui_session_hard_error_mid_round_cancels_inflight_work() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // H5 — execution bounds (recon H5: "no failure budget, no wall-clock bound")
 //
 // The live session loop used to be bounded by nothing but a turn counter
@@ -1357,7 +1344,6 @@ async fn test_ui_session_hard_error_mid_round_cancels_inflight_work() {
 // tests drive the *real* loop (no openpty, wiremock backend only) with small
 // injected bounds to prove the wall-clock bound and the repeated-failure budget
 // actually fire.
-// ---------------------------------------------------------------------------
 
 /// Renderer standing in for a session that has in-flight delegated work.
 ///
@@ -1832,9 +1818,7 @@ async fn test_ui_session_stalled_turn_watchdog_cancels_inflight_tool_call() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // t-057: a fail-closed plan verdict must reach the *user*, not only the prompt.
-// ---------------------------------------------------------------------------
 
 /// Guard for the UNKNOWN-plan surfacing path wired into
 /// `src/ui/session.rs::run_session_with_bounds` (t-057).
@@ -2010,7 +1994,6 @@ async fn test_ui_session_unknown_plan_state_surfaces_status() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // t-063 (manager gate item B): the assistant `tool_calls` <-> `role:"tool"` pair
 // invariant must hold on the **live** abort/bound path, not only inside
 // `compact()`.
@@ -2026,7 +2009,6 @@ async fn test_ui_session_unknown_plan_state_surfaces_status() {
 // These tests drive the *real* session loop: scripted in-memory renderer,
 // wiremock backend, `harness::with_workspace_root` — pty-free, and the
 // repository's real `.marmel/` is never reachable.
-// ---------------------------------------------------------------------------
 
 /// SSE body whose assistant turn carries **three** tool calls: a long `sleep`
 /// followed by two reads. The mixed names force the *sequential* dispatch branch

@@ -269,7 +269,6 @@ pub fn contains_failed_marker(upper: &str) -> bool {
     sanitize_failure_counters(upper).contains(FAILED_UPPER)
 }
 
-// ---------------------------------------------------------------------------
 // Vocabulary API (gate t-030)
 //
 // Everything production code is allowed to do with a marker: test for one,
@@ -277,7 +276,6 @@ pub fn contains_failed_marker(upper: &str) -> bool {
 // touch a marker outside this module, which is what keeps the precedence table
 // above single-owner: a call site can never invent its own spelling, its own
 // casing rule or its own decoration.
-// ---------------------------------------------------------------------------
 
 /// Token written over a completion marker when a deliverable is revoked
 /// (`agents::runner::assembly`), replacing the hard-coded `"REVOKED"` spelling.
@@ -374,7 +372,6 @@ pub fn starts_with_complete(text: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(COMPLETE_UPPER))
 }
 
-// ---------------------------------------------------------------------------
 // Failure-verdict vocabulary (gate t-059, dedup sweep A / t-044)
 //
 // The grammar does not stop at "is a marker present". The *shapes* a verdict is
@@ -386,7 +383,6 @@ pub fn starts_with_complete(text: &str) -> bool {
 // `src/ui/raw.rs` and `src/ui/transcript.rs`; they live here now, in one table
 // each, so the marker owner — and only the marker owner — decides what a
 // failure looks like. There is deliberately no second parser module.
-// ---------------------------------------------------------------------------
 
 /// Prefix of the parenthesised verdict shape: `FAILED (<reason>)`.
 pub const FAILED_PAREN_PREFIX: &str = "FAILED (";
@@ -963,9 +959,10 @@ mod tests {
             .map(|c| c[1].to_string())
     }
 
-    /// The parser that used to live in `src/agents/mod.rs:122-136` and
-    /// (character-for-character) in `src/manager/phase.rs:222-243`, kept here
-    /// under `cfg(test)` only as a witness: it tests `MISSION COMPLETE` as a
+    /// The parser that used to live in `crate::agents` and, character for
+    /// character, in `crate::manager::phase` (which now only re-exports this
+    /// module's `MissionMarker`), kept here under `cfg(test)` only as a witness:
+    /// it tests `MISSION COMPLETE` as a
     /// substring *before* `FAILED`, so it cannot see that a failure verdict and
     /// a quoted completion mention are different things.
     fn legacy_substring_first_parse(text: &str) -> Option<MissionMarker> {
@@ -1560,7 +1557,8 @@ mod tests {
     /// grow, and every entry named a file owned by somebody else that session.
     ///
     /// The list is EMPTY: gate t-068 routed the last entry
-    /// (`src/orchestrator/mod.rs:315`, which hand-built `"…\n\nFAILED (aborted)"`)
+    /// (the abort site in `src/orchestrator/mod.rs`, which hand-built
+    /// `"…\n\nFAILED (aborted)"`)
     /// through the vocabulary API, and gate t-070 made that file — and every
     /// other abort site — call the single body owner
     /// [`aborted_deliverable`](crate::markers::aborted_deliverable). No
@@ -1600,8 +1598,8 @@ mod tests {
     }
 
     /// `true` when `bytes[from..to]` is a whole identifier/word (used to find
-    /// real references to the `MARKER_*` constants, ignoring e.g.
-    /// `LEGACY_MARKER_COMPLETE`).
+    /// real references to the `MARKER_*` constants, and to skip occurrences
+    /// glued to a longer identifier run).
     fn is_identifier_occurrence(bytes: &[u8], from: usize, to: usize) -> bool {
         let glued = |i: usize| bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_';
         !(from > 0 && glued(from - 1)) && !(to < bytes.len() && glued(to))

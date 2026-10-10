@@ -103,11 +103,10 @@ async fn test_sleep_execution_and_cancellation() {
     assert!(cancel_res.is_error);
     assert!(cancel_res.content.contains("interrupted by cancellation"));
 
-    // Reset cancellation token after test
     marmennill::orchestrator::reset_cancellation();
 }
 
-// ---- read_file byte ceiling (recon bug H2) --------------------------------
+// read_file byte ceiling (recon bug H2)
 
 /// The `.`-prefixed staging leftovers currently inside `dir`.
 fn staging_leftovers(dir: &std::path::Path) -> Vec<String> {
@@ -128,9 +127,9 @@ fn staging_leftovers(dir: &std::path::Path) -> Vec<String> {
 fn read_file_oversized_returns_truncated_report_and_never_splits_utf8() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path().join("huge_multibyte.txt");
-    // 21 bytes per repetition, one of them inside a 4-byte emoji, so the
+    // 18 bytes per repetition, one of them inside a 4-byte emoji, so the
     // 262 144-byte cap lands in the middle of a character.
-    let payload = "🦀 åäö αβγ".repeat(30_000); // 630 000 bytes > READ_FILE_MAX_BYTES
+    let payload = "🦀 åäö αβγ".repeat(30_000); // 540 000 bytes > READ_FILE_MAX_BYTES
     assert!(payload.len() > READ_FILE_MAX_BYTES);
     std::fs::write(&path, &payload).expect("write oversized fixture");
 
@@ -281,7 +280,7 @@ fn read_file_truncation_report_survives_dispatch() {
     assert!(res.content.contains("truncated: true"));
 }
 
-// ---- collision-proof staging + atomic rename (recon bug H4) ---------------
+// collision-proof staging + atomic rename (recon bug H4)
 
 /// (c) Eight `replace` calls racing on the SAME target: none may error, none may
 /// collide on a staging name, no edit may be lost, and no `.`-prefixed staging
@@ -463,7 +462,7 @@ fn atomic_write_staging_create_failure_is_explicit_and_leaves_nothing() {
     assert!(!target.exists());
 }
 
-// ---- search truncation contract + brace globs (recon bugs H8 and H10) ----
+// search truncation contract + brace globs (recon bugs H8 and H10)
 
 /// A capped `grep_search` answer carries the machine-visible truncation report
 /// through the real dispatch/role plumbing; a complete answer carries neither
@@ -570,7 +569,6 @@ async fn glob_brace_pattern_and_truncation_survive_dispatch() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Gate t-046 — task ids may never escape the directory they are joined onto.
 //
 // Every on-disk path derived from a task id (synthesized prompt files, per-task
@@ -578,7 +576,6 @@ async fn glob_brace_pattern_and_truncation_survive_dispatch() {
 // validator in `src/task_id.rs`. These tests run against a temp workspace via
 // `harness::with_workspace_root` and never touch the repository's real
 // `.marmel/`.
-// ---------------------------------------------------------------------------
 
 /// SSE body carrying one tool call, shaped like the OpenAI stream the client
 /// parses (local helper for the t-046 end-to-end test).

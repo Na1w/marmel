@@ -20,8 +20,7 @@ pub(super) const TAIL_SCAN_WINDOW: usize = 4096;
 /// Hard bound on how many recent lines the line/bigram rules keep in their
 /// rolling window.
 pub(super) const LINE_WINDOW: usize = 256;
-/// Hard bound on how many recent words the word 4-gram rule keeps in its
-/// rolling window.
+/// Hard bound on how many recent words the word 4-gram rule keeps in its window.
 pub(super) const WORD_WINDOW: usize = 512;
 /// Default minimum pattern length considered for text repetition detection
 /// (caesar `min_pattern_len` default).
@@ -44,7 +43,7 @@ pub(crate) fn pagination_only_differs(a: &serde_json::Value, b: &serde_json::Val
 }
 
 /// Decide whether `prev` followed by `record` constitutes a consecutive repeat
-/// for the ≥3-block threshold. Pagination-only variation is exempt.
+/// counted against the ≥`threshold` rule (default 5). Pagination-only variation is exempt.
 fn is_consecutive_repeat(prev: &ToolCallRecord, record: &ToolCallRecord) -> bool {
     if prev.name != record.name {
         return false;
@@ -95,9 +94,7 @@ pub fn semantic_json_eq(a: &str, b: &str) -> bool {
     norm(a) == norm(b)
 }
 
-// ---------------------------------------------------------------------------
 // Tool-call repetition detector (REQ-HARN-002)
-// ---------------------------------------------------------------------------
 
 /// Semantic repetition guard over the recent tool-call window (REQ-HARN-002).
 #[derive(Debug, Clone)]
@@ -227,9 +224,7 @@ impl ToolRepetitionDetector {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Text repetition detector (REQ-HARN-003)
-// ---------------------------------------------------------------------------
 
 /// Detects text repetition in a rolling buffer of streamed assistant output.
 /// If a pattern of length ≥`min_len` repeats ≥`threshold` times consecutively

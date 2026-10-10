@@ -86,7 +86,7 @@ pub fn terminal_tool(bare: &str) -> String {
     format!("{TERMINAL_PREFIX}{bare}")
 }
 
-// ── the one canonical tool-alias vocabulary (dedup gate t-044, sweep B) ──────
+// The one canonical tool-alias vocabulary (dedup gate t-044, sweep B)
 //
 // Before this table existed, the same tool had *two* vocabularies: the harness
 // dispatcher spelled sleep `sleep | terminal__sleep | wait`, while the steer
@@ -128,9 +128,9 @@ pub const CANONICAL_TOOL_NAMES: &[&str] = &[
     TERMINAL_GREP_SEARCH,
     TOOL_GLOB,
     TERMINAL_GLOB,
-    // `list_directory` / `terminal__list_directory` are NOT listed here: no dispatch
-    // arm implements them, so claiming them here is what made them
-    // claimed-but-unresolved (t-069 decision b — see the note on the constants).
+    // `list_directory` / `terminal__list_directory` are NOT listed here: claiming a
+    // name with no dispatch arm made them claimed-but-unresolved (t-069 decision b,
+    // see the note on the constants).
     TOOL_SLEEP,
     TERMINAL_SLEEP,
     TOOL_REBIRTH,
@@ -194,25 +194,20 @@ pub const TOOL_ALIAS_TABLE: &[(&str, &str)] = &[
     ("waitseconds", TERMINAL_SLEEP),
     ("pause", TERMINAL_SLEEP),
     // verdict family — the spellings `agents::validation::is_leave_verdict_tool`
-    // used to enumerate privately (t-069). The table owns them now and the matcher
-    // is a thin wrapper over [`is_leave_verdict_tool_name`], so there is exactly one
-    // place where verdict-name spellings are enumerated. Namespaced spellings
-    // (`validator__leave_verdict`, …) are *not* rows: they are covered by the one
-    // suffix rule in [`LEAVE_VERDICT_NAME_SUFFIXES`] instead of by a row per
-    // (hypothetical) namespace prefix.
+    // used to enumerate privately (t-069); the table owns them now (see the section
+    // note). Namespaced spellings are *not* rows: the single suffix rule in
+    // [`LEAVE_VERDICT_NAME_SUFFIXES`] covers them instead of a row per prefix.
     (TOOL_LEAVE_VERDICT, TERMINAL_LEAVE_VERDICT),
     ("leaveVerdict", TERMINAL_LEAVE_VERDICT),
     ("leave_verdict_tool", TERMINAL_LEAVE_VERDICT),
     // list_directory family — **removed** (t-069, decision b). No dispatch arm in
     // `src/harness/mod.rs` implements `list_directory`, `terminal__list_directory`,
-    // `ls` or `list_files` (the only spelling ever mentioned there was a
-    // normalization arm; the handler itself has never existed). A row here claims
+    // `ls` or `list_files` (the handler itself has never existed). A row here claims
     // the name for the built-in dispatcher *and* reserves it against MCP
     // registration, so every one of these spellings resolved to neither: the call
     // fell through MCP and came back `ToolError::UnknownTool`. Claiming a name no
-    // handler serves is strictly worse than not claiming it, so the rows are gone;
-    // an MCP server is now free to publish the name, and a call that nobody serves
-    // is reported as unknown instead of being blocked by a phantom built-in claim.
+    // handler serves is strictly worse than not claiming it, so the rows are gone and
+    // an MCP server is now free to publish the name.
     // pty family — the `pty__` spelling was accepted by the dispatcher arms and
     // by the built-in name table, but was missing from the normalizer, so it
     // could not pass the specialist allowlist gate. Same defect, same fix.
@@ -297,7 +292,7 @@ pub fn is_sleep_tool_grammar_spelling(name: &str) -> bool {
             .any(|(alias, target)| *target == TERMINAL_SLEEP && fold_tool_spelling(alias) == key)
 }
 
-// ── the verdict family (t-069) ──────────────────────────────────────────────
+// The verdict family (t-069)
 //
 // The **one** place verdict-name spellings are enumerated: the exact spellings are
 // the verdict rows of [`TOOL_ALIAS_TABLE`], and the only structural rule the
@@ -452,9 +447,7 @@ mod tests {
                 BUILTIN_TOOL_NAME_TABLE.contains(name),
                 "'{name}' must be claimed by BUILTIN_TOOL_NAME_TABLE"
             );
-            // A canonical tool always names itself through the sleep helper only
-            // for the sleep family; for the others the resolved spelling must be
-            // a name the dispatcher claims verbatim.
+            // Whatever it resolves to, that spelling must itself be claimed verbatim.
             let resolved = resolved.unwrap_or(name);
             assert!(
                 BUILTIN_TOOL_NAME_TABLE.contains(&resolved),

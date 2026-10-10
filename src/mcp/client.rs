@@ -521,7 +521,6 @@ mod tests {
         let none = manager.tools_for_servers(&["gamma".to_string()]);
         assert!(none.is_empty());
 
-        // Empty input list yields an empty result.
         let empty = manager.tools_for_servers(&[]);
         assert!(empty.is_empty());
     }
@@ -554,15 +553,20 @@ mod tests {
 
     // ── net-C4: the stdio transport reads responses through the shared pump ──
 
-    /// `/bin/cat` echoes every line written to it, which is enough to drive the
-    /// `initialize` handshake and a `tools/list` round-trip through
-    /// `crate::net::pump_future` — the shared replacement for the hand-rolled
-    /// `tokio::time::timeout` around `read_line`.
+    /// `cat` — looked up on `PATH` instead of hard-coding its absolute path,
+    /// which differs between runners (`/usr/bin` on macOS) — echoes every line
+    /// written to it, which is enough to drive the `initialize` handshake and a
+    /// `tools/list` round-trip through `crate::net::pump_future` — the shared
+    /// replacement for the hand-rolled `tokio::time::timeout` around `read_line`.
+    ///
+    /// Keeps the `cfg(unix)` gate: the point of the test is the echoed byte
+    /// stream, and Windows has no equivalent that mirrors a piped stdin back out
+    /// (`more` paginates and buffers instead of echoing).
     #[cfg(unix)]
     #[tokio::test]
     async fn stdio_response_is_read_through_the_shared_pump() {
         let cfg = McpServerConfig {
-            command: Some("/bin/cat".to_string()),
+            command: Some("cat".to_string()),
             ..Default::default()
         };
 
@@ -581,13 +585,28 @@ mod tests {
     }
 
     /// The pump's idle deadline still surfaces the transport's own timeout error.
-    #[cfg(unix)]
+    ///
+    /// Made cross-platform deliberately: the only requirement is a child that
+    /// stays alive and never writes to stdout, so on Windows `cmd /C ping …`
+    /// (output sent to `NUL`) stands in for `sleep`. Program names come from
+    /// `PATH` — the previously hard-coded absolute path is missing on macOS
+    /// runners, where the binary lives in `/usr/bin` instead.
     #[tokio::test]
     async fn stdio_read_hits_the_shared_pump_deadline() {
         // A "server" that never writes anything back.
+        let (command, args) = if cfg!(windows) {
+            (
+                "cmd".to_string(),
+                vec!["/C".to_string(), "ping -n 30 127.0.0.1 > NUL".to_string()],
+            )
+        } else {
+            // The sleep program is looked up through `PATH` here — no absolute
+            // path, whose location differs between Unix runners.
+            ("sleep".to_string(), vec!["30".to_string()])
+        };
         let cfg = McpServerConfig {
-            command: Some("/bin/sleep".to_string()),
-            args: vec!["30".to_string()],
+            command: Some(command),
+            args,
             ..Default::default()
         };
 
@@ -636,6 +655,10 @@ mod tests {
 
     /// A scripted "server" on stdout: emits the lines and then idles so its
     /// stdout stays open while the transport drives a round-trip.
+    ///
+    /// Keeps the `cfg(unix)` gate: the script is POSIX shell (`printf` +
+    /// `sleep`). `sh` is resolved through `PATH` rather than hard-coding its
+    /// absolute location, which differs between Unix runners.
     #[cfg(unix)]
     fn scripted_server(lines: &[&str]) -> McpServerConfig {
         let mut script = String::from("printf '%s\\n'");
@@ -646,7 +669,7 @@ mod tests {
         }
         script.push_str("; sleep 30");
         McpServerConfig {
-            command: Some("/bin/sh".to_string()),
+            command: Some("sh".to_string()),
             args: vec!["-c".to_string(), script],
             ..Default::default()
         }
@@ -657,12 +680,17 @@ mod tests {
     /// HTTP/SSE transport sends (see `http_wire_bodies_are_the_protocol_layers_envelopes`
     /// in `mcp::http_tests`), which is what makes this one protocol layer and
     /// not two.
+    ///
+    /// Keeps the `cfg(unix)` gate: the capture needs a real `tee` (stdin mirrored
+    /// to both the capture file and the pipe back to us), and Windows ships no
+    /// such program. `tee` is resolved through `PATH`, so the test no longer
+    /// hard-codes its absolute location.
     #[cfg(unix)]
     #[tokio::test]
     async fn stdio_wire_bodies_are_the_protocol_layers_envelopes() {
         let capture = tempfile::NamedTempFile::new().expect("capture file");
         let cfg = McpServerConfig {
-            command: Some("/bin/tee".to_string()),
+            command: Some("tee".to_string()),
             args: vec![capture.path().to_string_lossy().into_owned()],
             ..Default::default()
         };
@@ -788,11 +816,14 @@ mod tests {
     /// The transport seam is implemented (not shadowed) by both transports, and
     /// the two share the protocol layer's id policy: a fresh connection starts at
     /// the first request id, and the handshake does not consume one.
+    ///
+    /// Keeps the `cfg(unix)` gate (the echo-backed `cat` server above): `cat` is
+    /// looked up on `PATH` rather than pinned to an absolute path.
     #[cfg(unix)]
     #[tokio::test]
     async fn both_transports_share_the_protocols_id_allocator_policy() {
         let cfg = McpServerConfig {
-            command: Some("/bin/cat".to_string()),
+            command: Some("cat".to_string()),
             ..Default::default()
         };
         let conn =

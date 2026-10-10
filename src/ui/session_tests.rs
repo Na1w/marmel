@@ -158,7 +158,7 @@ struct RecordingRenderer {
     delegation_events: Vec<DelegationEvent>,
     events: Vec<Event>,
     input_queue: std::collections::VecDeque<String>,
-    /// Shared abort / user-exit flags (trait-default abort surface).
+    /// Abort / user-exit flags (the `Renderer` trait's abort surface).
     input_state: crate::ui::InputState,
 }
 

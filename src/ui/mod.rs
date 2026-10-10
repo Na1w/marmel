@@ -28,9 +28,7 @@ pub struct SubagentDetail {
     pub last_activity_at: Option<std::time::Instant>,
     /// Ordered log lines for this subagent (status / tool activity).
     pub logs: Vec<String>,
-    /// Streaming "thinking" block for this subagent.
     pub thinking: String,
-    /// Streaming final-answer content for this subagent.
     pub content: String,
     /// Whether this subagent is currently running (between Started/Completed).
     pub is_active: bool,
@@ -45,19 +43,23 @@ pub enum Event {
     Message(String),
     /// A steer response chunk or completed message.
     SteerResponse(String),
-    /// A chunk of reasoning / thinking-channel content.
     Thinking(String),
     /// A chunk of visible content from a specific subagent/specialist.
-    SubagentMessage { agent_tag: String, text: String },
+    SubagentMessage {
+        agent_tag: String,
+        text: String,
+    },
     /// A chunk of reasoning/thinking from a specific subagent/specialist.
-    SubagentThinking { agent_tag: String, text: String },
+    SubagentThinking {
+        agent_tag: String,
+        text: String,
+    },
     /// A tool invocation (rendered as `name(arguments)`).
     ToolCall(String),
     /// The textual result of a tool execution.
     ToolResult(String),
     /// A status / phase update (e.g. "calling backend…", "aborting…").
     Status(String),
-    /// A delegation lifecycle event.
     Delegation(DelegationEvent),
     /// The session has finished.
     Done,
@@ -98,15 +100,12 @@ pub trait Renderer: Send {
     fn read_input(&mut self) -> Option<String> {
         None
     }
-    /// Set the shared abort flag.
     fn request_abort(&mut self) {
         self.input_state().aborted = true;
     }
-    /// Whether an abort was requested.
     fn aborted(&self) -> bool {
         self.input_state_shared().aborted
     }
-    /// Clear the shared abort flag.
     fn clear_abort(&mut self) {
         let state = self.input_state();
         state.aborted = false;

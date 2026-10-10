@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 
 use super::tools::ToolDef;
 
-/// A message in the chat transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum Message {
@@ -134,7 +133,6 @@ impl ToolCall {
         }
     }
 
-    /// Ensure the arguments field is valid JSON so OpenAI backends never fail on conversation history.
     pub fn sanitize_arguments(&mut self) {
         let (valid_args, _) = ensure_valid_json_arguments(&self.function.arguments);
         self.function.arguments = valid_args;

@@ -1,7 +1,7 @@
 //! Centralized handling of the `.marmel` workspace directory.
 //!
-//! CODE_REVIEW #4 (Beroende av `.marmel` katalogens existens): previously the
-//! `.marmel` directory was created ad-hoc via scattered
+//! CODE_REVIEW #4 (Dependence on the existence of the `.marmel` directory):
+//! previously the `.marmel` directory was created ad-hoc via scattered
 //! `std::fs::create_dir_all(".marmel")` calls, risking race conditions and
 //! confusing permissions errors on a read-only filesystem. This module owns the
 //! workspace directory: [`Workspace::new`] creates it and validates write

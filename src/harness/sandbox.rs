@@ -499,10 +499,8 @@ mod tests {
     use crate::harness::pty::SANDBOX_EXEC_ARG;
     use std::path::PathBuf;
 
-    // -----------------------------------------------------------------------
     // Log capture: "an enforcement failure is never silent" is asserted, not
     // promised.
-    // -----------------------------------------------------------------------
     thread_local! {
         static CAPTURED: std::cell::RefCell<Vec<String>> =
             const { std::cell::RefCell::new(Vec::new()) };
@@ -546,10 +544,8 @@ mod tests {
         (result, text)
     }
 
-    // -----------------------------------------------------------------------
     // The error contract, driven by injected outcomes (no Landlock kernel, no
     // PTY, no `/dev/pts`).
-    // -----------------------------------------------------------------------
 
     /// `Ok(())` is reserved for an established ruleset: every other attempt must be an
     /// error. This is the exact hole t-052 closes.
@@ -669,9 +665,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // The re-entry decision: exit over exec.
-    // -----------------------------------------------------------------------
 
     fn apply_decision() -> SandboxDecision {
         SandboxDecision::Apply {
@@ -809,9 +803,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // Source guards.
-    // -----------------------------------------------------------------------
 
     /// The re-entry path in `main.rs` must never discard the enforcement result and
     /// must never re-spell the protocol literal: both were the fail-open in t-052.
@@ -899,9 +891,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // Landlock integration: the real re-entry protocol, driven end to end.
-    // -----------------------------------------------------------------------
 
     /// Locate the executable that implements the re-entry protocol **without any
     /// assumption about its file name or layout** (renaming the bin target, a hashed
