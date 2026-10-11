@@ -673,6 +673,12 @@ fn test_unknown_steer_subtask_action_rejection_is_logged() {
     }
 
     impl tracing::field::Visit for MessageVisitor<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                *self.found = Some(value.to_string());
+            }
+        }
+
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
             if field.name() == "message" {
                 *self.found = Some(format!("{value:?}"));
@@ -682,7 +688,18 @@ fn test_unknown_steer_subtask_action_rejection_is_logged() {
 
     impl tracing::Subscriber for RejectionLogCounter {
         fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-            metadata.level() == &tracing::Level::WARN
+            metadata.level() <= &tracing::Level::WARN
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::WARN)
+        }
+
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
         }
 
         fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -713,7 +730,9 @@ fn test_unknown_steer_subtask_action_rejection_is_logged() {
     }
 
     let counter = Arc::new(AtomicUsize::new(0));
+    tracing::callsite::rebuild_interest_cache();
     tracing::subscriber::with_default(RejectionLogCounter(counter.clone()), || {
+        tracing::callsite::rebuild_interest_cache();
         for raw in [
             "Cancel",
             "cancel_task",
@@ -735,6 +754,7 @@ fn test_unknown_steer_subtask_action_rejection_is_logged() {
             "an unrecognized action must log exactly one explicit rejection"
         );
     });
+    tracing::callsite::rebuild_interest_cache();
 }
 
 /// Every spelling of `DelegateTask` produces the same delegation, at the consumer.

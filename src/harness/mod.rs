@@ -1254,7 +1254,7 @@ mod tests {
             arguments: serde_json::json!({
                 "agent_name": "coder",
                 "prompt": "write hello world",
-                "task_id": "t-001"
+                "task_id": "t-del-999"
             }),
         };
         let res = dispatch_for(&invocation, ToolCaller::Manager).unwrap();

@@ -923,6 +923,12 @@ struct MessageVisitor<'a> {
 }
 
 impl tracing::field::Visit for MessageVisitor<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            *self.found = Some(value.to_string());
+        }
+    }
+
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
             *self.found = Some(format!("{value:?}"));
@@ -932,7 +938,18 @@ impl tracing::field::Visit for MessageVisitor<'_> {
 
 impl tracing::Subscriber for WarnMessageCounter {
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        metadata.level() == &tracing::Level::WARN
+        metadata.level() <= &tracing::Level::WARN
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::WARN)
+    }
+
+    fn register_callsite(
+        &self,
+        _metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::always()
     }
 
     fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {

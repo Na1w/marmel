@@ -1,0 +1,57 @@
+# config/gate_targets.txt — the single shared cross-platform gate target list.
+#
+# Read by BOTH:
+#   * scripts/cross_platform_check.sh  (the local parity gate on this Linux box), and
+#   * .github/workflows/ci.yml         (CI; see docs/cross_platform_gating.md §D,
+#     "keep one shared list in the repo … so adding a target is a single edit").
+#
+# FORMAT — exactly two whitespace-separated fields per line, no quoting:
+#
+#       <rustc target triple> <scope>
+#
+#   <scope> is one of:
+#       local  -> scripts/cross_platform_check.sh runs `cargo check` AND `cargo clippy`
+#                 (-D warnings) for this triple on this host
+#       ci     -> covered only by a CI job; the script prints it as an explicit, named
+#                 gap instead of pretending it was checked
+#       both   -> covered by the local gate script AND by a CI job
+#
+# Blank lines and `#` comments are ignored. A line that does not parse as
+# `<triple> <scope>` (or carries an unknown scope) is a hard error: the gate fails
+# closed on an unparseable list, so "green" can never mean "the list was misread".
+#
+# WHY THESE SCOPES (all measured; docs/cross_platform_gating.md §3.1–§3.3, §D):
+#
+#   x86_64-unknown-linux-gnu  host triple. Covered locally by the host legs
+#                             (fmt, clippy --all-targets --all-features -D warnings,
+#                             test suite, doc tests) and in CI by job `test`
+#                             (Test (ubuntu-latest)). The script recognizes the host
+#                             triple and does NOT re-run a redundant cross leg for it.
+#   x86_64-pc-windows-gnu     MANDATORY locally. The `windows` cfg class is
+#                             cross-checkable from Linux because onig_sys/aws-lc-sys
+#                             build with the installed x86_64-w64-mingw32-gcc (§3.1,
+#                             exit 0). Also serves as the cfg-class proxy that CI's
+#                             §C "cross-check" job would run on ubuntu-latest.
+#   aarch64-apple-darwin      Listed in the local scope on purpose: the script must
+#                             ATTEMPT it and fail closed when the rust-std is absent
+#                             (§A, Residual risk 4). On this box `rustup target add
+#                             aarch64-apple-darwin` is impossible (~/.rustup is
+#                             read-only, §3.3), so the ONLY way to get a green gate is
+#                             to state the gap explicitly:
+#                                 --allow-missing-target aarch64-apple-darwin
+#                             CI job `test` (Test (macos-latest)) is load-bearing:
+#                             Apple compile+test parity is a CI-only guarantee here.
+#   x86_64-pc-windows-msvc    CI only. Cross-compiling from Linux is proven red
+#                             locally (onig_sys: "GNU compiler is not supported for
+#                             this target"; aws-lc-sys cc-rs failure, §3.2) and the
+#                             gate must not iterate it. CI job `test`
+#                             (Test (windows-latest)) covers the msvc ABI natively.
+#
+# Reconciliation rule (docs/cross_platform_gating.md §D): the gate is defined over
+# cfg CLASSES, not ABIs — windows = x86_64-pc-windows-gnu locally/in CI cross-check
+# PLUS x86_64-pc-windows-msvc natively on windows-latest; apple-darwin = native
+# macos-latest only; linux = host + ubuntu-latest.
+x86_64-unknown-linux-gnu  both
+x86_64-pc-windows-gnu     both
+aarch64-apple-darwin      both
+x86_64-pc-windows-msvc    ci

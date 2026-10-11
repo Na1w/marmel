@@ -1712,6 +1712,12 @@ mod tests {
     }
 
     impl tracing::field::Visit for WarnMessageVisitor<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                *self.found = Some(value.to_string());
+            }
+        }
+
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
             if field.name() == "message" {
                 *self.found = Some(format!("{value:?}"));
@@ -1721,7 +1727,18 @@ mod tests {
 
     impl tracing::Subscriber for RejectTaskIdWarns {
         fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-            metadata.level() == &tracing::Level::WARN
+            metadata.level() <= &tracing::Level::WARN
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::WARN)
+        }
+
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
         }
 
         fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -1820,7 +1837,9 @@ mod tests {
             );
             let key = guard.0.clone();
             let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            tracing::callsite::rebuild_interest_cache();
             tracing::subscriber::with_default(RejectTaskIdWarns(counter.clone()), || {
+                tracing::callsite::rebuild_interest_cache();
                 let section = section_for_worker(&get_active_subtasks_str(), &key);
                 assert!(
                     section.contains("Subagent: hostileagent"),
@@ -1835,6 +1854,7 @@ mod tests {
                     "the blueprint outside the prompts dir must never surface: {section}"
                 );
             });
+            tracing::callsite::rebuild_interest_cache();
             assert!(
                 counter.load(std::sync::atomic::Ordering::Relaxed) >= 1,
                 "the rejection must be reported with a tracing::warn! naming the id"

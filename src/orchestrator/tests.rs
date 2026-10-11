@@ -946,6 +946,12 @@ struct WarnMessageVisitor<'a> {
 }
 
 impl tracing::field::Visit for WarnMessageVisitor<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            *self.found = Some(value.to_string());
+        }
+    }
+
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
             *self.found = Some(format!("{value:?}"));
@@ -955,7 +961,18 @@ impl tracing::field::Visit for WarnMessageVisitor<'_> {
 
 impl tracing::Subscriber for RejectedTaskIdWarns {
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        metadata.level() == &tracing::Level::WARN
+        metadata.level() <= &tracing::Level::WARN
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::WARN)
+    }
+
+    fn register_callsite(
+        &self,
+        _metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::always()
     }
 
     fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -1112,11 +1129,14 @@ fn test_delegate_with_rejected_task_id_falls_back_to_jit_and_warns() {
         .build()
         .unwrap();
     let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    tracing::callsite::rebuild_interest_cache();
     let deliverable =
         tracing::subscriber::with_default(RejectedTaskIdWarns(counter.clone()), || {
+            tracing::callsite::rebuild_interest_cache();
             rt.block_on(m.delegate(req))
         })
         .expect("a rejected task id must not fail the delegation: JIT synthesis is the fallback");
+    tracing::callsite::rebuild_interest_cache();
     assert_eq!(
         deliverable.task_id.as_deref(),
         Some("../escape"),
