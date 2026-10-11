@@ -20,7 +20,16 @@ use std::path::{Path, PathBuf};
 //
 // `normalize_for_compare` canonicalises the *spelling* of what is compared —
 // never the assertion strength: the same file set, the same order, the same
-// counts and the same truncation markers are still required.
+// counts and the same truncation markers are still required. It is applied to
+// **both** sides of a comparison (`normalize_paths` for collected paths,
+// `normalize_expected` for the asserted literals), so neither side carries a
+// platform-spelling advantage.
+//
+// For `glob` this is defence in depth only: production already canonicalises
+// every collected path (`src/harness/search.rs`: `normalize_glob_path` with
+// `NATIVE_PATH_SEPARATOR`) before it is matched or reported, which is what
+// makes a `/`-spelled pattern match at all on Windows. The helpers stay
+// load-bearing for `grep_search`, whose lines carry the absolute walker path.
 //
 // `dunce` is present in `Cargo.lock` only as a *transitive* dependency (it is
 // not a direct dependency in `Cargo.toml`), so the verbatim prefix is trimmed
@@ -65,6 +74,18 @@ fn strip_windows_path_prefix(raw: &str) -> &str {
 /// `matches`-list flavour of [`normalize_for_compare`]: element-by-element, so
 /// the expected list keeps asserting the exact same set in the exact same order.
 fn normalize_paths(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| normalize_for_compare(path))
+        .collect()
+}
+
+/// The *expected*-list flavour of [`normalize_for_compare`]: the literals a test
+/// asserts are canonicalised with the same rule as the collected paths, so
+/// neither side of a comparison carries a platform-spelling advantage. On Unix
+/// this is an identity mapping — the asserted set, order and counts are exactly
+/// what they always were.
+fn normalize_expected(paths: &[&str]) -> Vec<String> {
     paths
         .iter()
         .map(|path| normalize_for_compare(path))
@@ -433,7 +454,7 @@ fn glob_brace_pattern_matches_every_extension_without_duplicates() {
             .lines()
             .map(normalize_for_compare)
             .collect::<Vec<_>>(),
-        vec!["src/a.md", "src/a.rs", "src/deep/b.md", "src/deep/b.rs"],
+        normalize_expected(&["src/a.md", "src/a.rs", "src/deep/b.md", "src/deep/b.rs"]),
         "the brace pattern must match both extensions"
     );
 
@@ -441,14 +462,14 @@ fn glob_brace_pattern_matches_every_extension_without_duplicates() {
     assert_eq!(outcome.alternatives, 2, "two alternative patterns");
     assert_eq!(
         normalize_paths(&outcome.matches),
-        vec![
+        normalize_expected(&[
             "src/a.md",
             "src/a.rs",
             "src/deep/b.md",
             "src/deep/b.rs",
             "top.md",
             "top.rs"
-        ],
+        ]),
         "both extensions, lexicographically sorted, no duplicates"
     );
     assert_eq!(
@@ -702,7 +723,7 @@ fn glob_translates_star_question_and_escapes_as_documented() {
                 .unwrap()
                 .matches
         ),
-        vec!["nested/dir/odd.rs"]
+        normalize_expected(&["nested/dir/odd.rs"])
     );
     assert_eq!(
         normalize_paths(
@@ -710,7 +731,7 @@ fn glob_translates_star_question_and_escapes_as_documented() {
                 .unwrap()
                 .matches
         ),
-        vec!["nested/a1.rs"]
+        normalize_expected(&["nested/a1.rs"])
     );
     assert_eq!(
         normalize_paths(
@@ -718,7 +739,7 @@ fn glob_translates_star_question_and_escapes_as_documented() {
                 .unwrap()
                 .matches
         ),
-        vec!["{literal}.rs"],
+        normalize_expected(&["{literal}.rs"]),
         "escaped braces match a literal brace in the name"
     );
 
@@ -728,6 +749,11 @@ fn glob_translates_star_question_and_escapes_as_documented() {
 /// The comparison helper itself: a byte-identical passthrough on Unix, and a
 /// verbatim-prefix + separator canonicalisation on Windows. Each half is
 /// asserted under its own platform, so the guard can never weaken the other.
+///
+/// The tail of the test pins the **production-side** separator normalization
+/// (`search.rs::normalize_glob_path` + `NATIVE_PATH_SEPARATOR`) on every
+/// platform, so the Windows half of the fix is regression-guarded even when the
+/// suite runs on Linux or macOS.
 #[test]
 fn normalize_for_compare_is_identity_on_unix_and_canonical_on_windows() {
     if cfg!(unix) {
@@ -758,4 +784,86 @@ fn normalize_for_compare_is_identity_on_unix_and_canonical_on_windows() {
     // Root-relative entries keep the exact literals the seeded tree asserts.
     assert_eq!(normalize_for_compare("adir/first.txt"), "adir/first.txt");
     assert_eq!(normalize_for_compare("{literal}.rs"), "{literal}.rs");
+
+    // ── Production-side regression, asserted on *every* platform ───────────
+    //
+    // The reported Windows failure was that a `/`-spelled pattern matched
+    // nothing at all, because the walker spells a root-relative path with `\`
+    // and `glob_to_regex` treats `/` as the only separator. The production
+    // helper `normalize_glob_path` (called from `glob_in_root` with
+    // `NATIVE_PATH_SEPARATOR`) is fed a synthesized Windows spelling here, so
+    // the fix itself — not just the comparison helper — is regression-guarded
+    // on Linux and macOS too.
+    const WINDOWS_SEPARATOR: char = '\\';
+    let windows_brace_path = normalize_glob_path(r"src\deep\b.md", WINDOWS_SEPARATOR);
+    assert_eq!(
+        windows_brace_path, "src/deep/b.md",
+        "production must re-render the Windows walker spelling with `/`"
+    );
+    let brace_matchers: Vec<_> = expand_braces("src/**/*.{rs,md}")
+        .expect("valid brace pattern")
+        .iter()
+        .map(|alternative| glob_to_regex(alternative).expect("valid alternative"))
+        .collect();
+    assert_eq!(
+        brace_matchers.len(),
+        2,
+        "the brace pattern must compile to one matcher per extension"
+    );
+    assert!(
+        brace_matchers
+            .iter()
+            .any(|re| re.is_match(&windows_brace_path)),
+        "the `/`-based brace grammar must match the normalized Windows path"
+    );
+    assert!(
+        !brace_matchers
+            .iter()
+            .any(|re| re.is_match(r"src\deep\b.md")),
+        "the raw `\\` spelling matches nothing — that is exactly the reported bug"
+    );
+
+    // Same for the wildcard grammar (`**/` → `(?:.*/)?`, `*` → `[^/]*`).
+    let wildcard = glob_to_regex("**/odd.rs").expect("valid pattern");
+    assert!(
+        wildcard.is_match(&normalize_glob_path(
+            r"nested\dir\odd.rs",
+            WINDOWS_SEPARATOR
+        )),
+        "`**/odd.rs` must match the normalized Windows path"
+    );
+    assert!(
+        !wildcard.is_match(r"nested\dir\odd.rs"),
+        "`**/odd.rs` must not match the raw `\\` spelling"
+    );
+
+    // The rule applied to the running platform: a `/`-based platform is left
+    // byte-identical, so a Unix file name containing a literal `\` is never
+    // rewritten by the production normalization.
+    if cfg!(not(windows)) {
+        assert_eq!(
+            normalize_glob_path(r"weird\name.rs", NATIVE_PATH_SEPARATOR),
+            r"weird\name.rs",
+            "a Unix file name holding a literal `\\` must survive untouched"
+        );
+    }
+
+    // End-to-end through the real tool: production output is already
+    // `/`-separated and root-relative on every platform, which is why
+    // `normalize_paths` is never load-bearing for a passing glob run.
+    let dir = temp_dir();
+    fs::create_dir_all(dir.join("nested/dir")).unwrap();
+    fs::write(dir.join("nested/dir/odd.rs"), "x\n").unwrap();
+    let outcome = glob_in_root("**/odd.rs", &dir, GLOB_HARD_CAP).expect("pattern compiles");
+    assert_eq!(
+        outcome.matches,
+        vec!["nested/dir/odd.rs"],
+        "glob_in_root must match and report `/`-separated paths on every platform"
+    );
+    assert_eq!(
+        normalize_paths(&outcome.matches),
+        outcome.matches,
+        "the comparison helper must be a no-op on real production output"
+    );
+    fs::remove_dir_all(&dir).unwrap();
 }

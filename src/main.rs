@@ -372,6 +372,9 @@ mod tests {
 
     /// The re-entry cwd is derived canonically, so a symlinked or relative root is
     /// resolved once instead of re-derived per side of the protocol.
+    /// Both sides of the comparison are canonicalized so the assertion is platform
+    /// neutral: on macOS `tempdir()` sits under `/var/folders/...` and `canonicalize`
+    /// resolves the `/var` symlink to `/private/var`.
     #[cfg(unix)]
     #[test]
     fn test_canonical_sandbox_cwd_resolves_symlinks() {
@@ -381,7 +384,14 @@ mod tests {
         let link = temp.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        assert_eq!(canonical_sandbox_cwd(&link.to_string_lossy()), real);
+        let resolved = canonical_sandbox_cwd(&link.to_string_lossy());
+        // The expectation has to go through the same canonicalization, otherwise the
+        // comparison only passes on platforms without symlinked temp roots.
+        let expected = std::fs::canonicalize(&real).unwrap();
+
+        assert_eq!(resolved, expected);
+        // Not vacuous: the returned path must be the resolved target, never the symlink.
+        assert_ne!(resolved, link);
     }
 
     /// Documented fallback: an unresolvable path is kept as given (and reported), and

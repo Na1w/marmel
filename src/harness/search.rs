@@ -243,7 +243,8 @@ pub fn glob(args: &Value) -> Result<ToolResult, ToolError> {
 
 /// Glob expansion rooted at `root`, returning root-relative paths that are
 /// de-duplicated and sorted lexicographically, keeping the first `max_results`
-/// of that sorted set while counting every distinct match found.
+/// of that sorted set while counting every distinct match found. Returned
+/// paths are always `/`-separated, the spelling the pattern grammar uses.
 ///
 /// Returns `BadArguments` when the pattern cannot be honoured (unbalanced or
 /// empty brace group, too many alternatives, over-nested braces, a regex the
@@ -290,6 +291,10 @@ pub(crate) fn glob_in_root(
             .unwrap_or(p)
             .to_string_lossy()
             .to_string();
+        // Match and report the `/` spelling the glob grammar is built on, so a
+        // pattern written with `/` behaves identically on every platform
+        // (see [`normalize_glob_path`]).
+        let rel = normalize_glob_path(&rel, NATIVE_PATH_SEPARATOR);
         let rel = rel.trim_start_matches("./").to_string();
         if regexes.iter().any(|re| re.is_match(&rel)) {
             total_matches += 1;
@@ -492,6 +497,31 @@ fn split_alternatives(body: &[char]) -> Vec<String> {
     }
     parts.push(current);
     parts
+}
+
+/// The separator the walker actually emits inside a root-relative path: `\` on
+/// Windows, `/` everywhere else.
+const NATIVE_PATH_SEPARATOR: char = if cfg!(windows) { '\\' } else { '/' };
+
+/// Render a root-relative walker path in the `/`-based spelling of the glob
+/// grammar implemented by [`glob_to_regex`] (`/` → literal `/`, `*` → `[^/]*`,
+/// `?` → `[^/]`, `**/` → `(?:.*/)?`).
+///
+/// The matcher and the reported list must speak the same spelling, otherwise a
+/// pattern written with `/` (`src/**/*.rs`) matches *nothing* on Windows, where
+/// the walker spells the same path with `\` (possibly mixed when the caller
+/// passed `/` inside a path component). Canonicalising **before** matching and
+/// before insertion into the ordered set keeps matching, the returned paths and
+/// the "lexicographically first `max_results`" cap aligned with the documented
+/// root-relative contract on every platform.
+///
+/// A platform whose native separator is already `/` is returned byte-identical,
+/// so a Unix file name containing a literal `\` is never rewritten.
+fn normalize_glob_path(rel: &str, native_separator: char) -> String {
+    if native_separator == '/' {
+        return rel.to_owned();
+    }
+    rel.replace(native_separator, "/")
 }
 
 /// Translate a glob pattern into an anchored regex.

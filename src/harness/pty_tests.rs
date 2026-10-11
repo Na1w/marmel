@@ -1082,9 +1082,25 @@ fn test_sandbox_gate_unresolved_exe_fails_closed_and_is_logged() {
     );
 }
 
+/// Expected shell argv prefix of `build_sandboxed_command` on this platform,
+/// following the same platform spawn-spec idiom as
+/// `short_lived_child_spec`/`long_running_child_spec` above.
+///
+/// Grounded in the production builder: Windows takes its own branch and emits
+/// the bare `cmd` token plus `/C` (`pty.rs:779-780` — portable-pty keeps argv0
+/// verbatim, the OS resolves `cmd` to `cmd.exe` only at spawn time), while every
+/// unix skip emits `sh` plus `-c` (`pty.rs:742`).
+fn expected_sandbox_shell() -> (&'static str, &'static str) {
+    if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    }
+}
+
 /// End-to-end wiring at the decision point, PTY-free: in a test-harness binary
 /// the builder skips (and warns) instead of exec-ing a binary that cannot
-/// re-enter, and the t-034a `stty`/`ulimit` preamble survives either way.
+/// re-enter, and the command payload survives either way.
 #[test]
 fn test_build_sandboxed_command_logs_its_choice_and_keeps_the_wrapper() {
     let (built, logs) = capture_logs(|| build_sandboxed_command("echo hi", Path::new("/tmp")));
@@ -1092,22 +1108,43 @@ fn test_build_sandboxed_command_logs_its_choice_and_keeps_the_wrapper() {
     let argv = cmd.get_argv();
     assert!(!argv.is_empty(), "the builder must have a program");
 
-    // In a test binary the re-entry is skipped, so this is `sh -c <wrapped>`;
-    // either way the command was chosen by a decision that was logged.
+    // In a test binary the re-entry is skipped, so unix builds `sh -c <wrapped>`;
+    // Windows has no Landlock at all and takes its own `cmd /C <command>` branch.
+    // Either way the command was chosen by a decision that was logged.
     if cfg!(test) {
-        assert_eq!(argv[0].to_string_lossy(), "sh");
-        assert_eq!(argv[1].to_string_lossy(), "-c");
+        let (program, shell_flag) = expected_sandbox_shell();
+        assert_eq!(argv[0].to_string_lossy(), program);
+        assert_eq!(argv[1].to_string_lossy(), shell_flag);
+        // Both platforms warn, but from different call sites: the unix skip runs
+        // through `log_sandbox_decision` (`pty.rs:662`, debug line `pty sandbox
+        // decision` + the `SKIPPED` warn), while the Windows branch warns
+        // directly from `build_sandboxed_command` (`pty.rs:768`) and never emits
+        // that debug line. Only the shared wording is asserted on Windows.
+        let marker = if cfg!(windows) {
+            "SKIPPED"
+        } else {
+            "pty sandbox decision"
+        };
         assert!(
-            logs.contains("WARN") && logs.contains("pty sandbox decision"),
+            logs.contains("WARN") && logs.contains(marker),
             "every skip must leave a visible trace, got {logs:?}"
         );
     }
-    let wrapped = argv.last().expect("the wrapped command").to_string_lossy();
-    assert!(
-        wrapped.starts_with("stty -echo 2>/dev/null || true; ulimit -f 4194304"),
-        "REQ-TOOL-001 preamble must survive the sandbox rewrite, got {wrapped:?}"
-    );
-    assert!(wrapped.ends_with("echo hi"));
+    let payload = argv.last().expect("the command payload").to_string_lossy();
+    if cfg!(windows) {
+        // `stty`/`ulimit` are POSIX shell builtins, so the Windows builder hands
+        // the command to `cmd /C` verbatim instead of prefixing the preamble.
+        assert_eq!(
+            payload, "echo hi",
+            "the Windows builder must not rewrite the command, got {payload:?}"
+        );
+    } else {
+        assert!(
+            payload.starts_with("stty -echo 2>/dev/null || true; ulimit -f 4194304"),
+            "REQ-TOOL-001 preamble must survive the sandbox rewrite, got {payload:?}"
+        );
+        assert!(payload.ends_with("echo hi"));
+    }
 }
 
 /// The re-entry argv is exactly `<resolved exe> --internal-sandbox-exec <cwd> <wrapped>`:

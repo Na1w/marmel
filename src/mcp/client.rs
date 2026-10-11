@@ -629,6 +629,7 @@ mod tests {
 
     // ── net-C7: the stdio transport speaks the shared protocol layer ────────
 
+    #[cfg(unix)]
     use crate::mcp::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcTransport};
 
     /// Read `path` until it holds at least `want` lines, bounded so a server

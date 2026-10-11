@@ -534,21 +534,91 @@ impl Config {
 }
 
 pub(crate) fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from).or_else(|| {
-        #[cfg(unix)]
-        {
-            let pw = unsafe { libc::getpwuid(libc::getuid()) };
-            if pw.is_null() {
-                return None;
+    // `HOME` wins when it is set. The fallback is written as an early return and
+    // not as an `or_else` closure: on non-unix targets the closure body degenerates
+    // into a plain `None`, which makes clippy raise
+    // `clippy::unnecessary_lazy_evaluations` on the windows target only
+    // (`docs/cross_platform_gating.md:94`, `docs/nonlinux_unused_inventory.md:47`),
+    // and a cross-target `-D warnings` gate must stay green. Semantics are
+    // unchanged: `HOME` first, platform fallback second.
+    if let Some(home) = std::env::var_os("HOME") {
+        return Some(PathBuf::from(home));
+    }
+
+    #[cfg(unix)]
+    {
+        // SAFETY: `getpwuid` returns a pointer to a libc-owned static passwd entry
+        // for the real uid, or null when there is no such entry; the pointee is read
+        // immediately and no other passwd call happens in between.
+        let pw = unsafe { libc::getpwuid(libc::getuid()) };
+        if pw.is_null() {
+            return None;
+        }
+        let dir = unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) };
+        Some(PathBuf::from(dir.to_string_lossy().into_owned()))
+    }
+    #[cfg(not(unix))]
+    {
+        // No passwd database to fall back on: `HOME` is the only source.
+        None
+    }
+}
+
+/// Test-only serialization lock for **every** test in this binary that touches a
+/// process global: the `MARMEL_DISABLE_SANDBOX` environment key (written through
+/// `tests::SandboxEnvGuard`) and [`ACTIVE_CONFIG`] (written through
+/// `tests::ActiveConfigTestGuard`, [`set_active`] and [`clear_active`]).
+///
+/// Rust 2024 makes `std::env::set_var`/`remove_var` `unsafe` precisely because a
+/// concurrent env read on another thread races with them, and libtest runs tests
+/// concurrently by default — CI never passes `--test-threads=1`
+/// (`.github/workflows/ci.yml`; see `docs/windows_failures_analysis.md` "Site 1",
+/// measured 33/40 failures in parallel vs 0/5 serialized). This lock, not the
+/// thread count, is the gate that makes those writes sound.
+///
+/// `pub(crate)` so the other test modules that mutate `ACTIVE_CONFIG`
+/// (`src/orchestrator/notice_tests.rs`, `src/harness/dispatch_integrity_tests.rs`)
+/// can take the same lock.
+#[cfg(test)]
+pub(crate) static SANDBOX_ENV_TEST_SERIAL: std::sync::Mutex<()> =
+    const { std::sync::Mutex::new(()) };
+
+/// Take [`SANDBOX_ENV_TEST_SERIAL`] for the remainder of the calling test.
+///
+/// Not reentrant: a test must hold it exactly once. Both
+/// `tests::SandboxEnvGuard` and `tests::ActiveConfigTestGuard` take it, so one test
+/// must not construct both — drive the second concern through a pure seam instead
+/// (`crate::harness::sandbox::opt_out_from_value`, [`merge_sandbox_opt_out`]).
+#[cfg(test)]
+#[must_use = "the guard is what serializes the process-global test state; hold it for the whole test"]
+pub(crate) fn sandbox_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    // Poisoning is swallowed on purpose: one failing assertion must not cascade
+    // into every later config test of this binary.
+    //
+    // `try_lock` in a bounded spin instead of a blocking `lock()` so that an
+    // accidental second acquisition on the same thread (the lock is not
+    // reentrant) fails loudly instead of hanging the whole test binary. The
+    // budget (~1 s) is orders of magnitude above any real wait: the sections
+    // guarded by this lock assign a `Config` and set or remove one env key.
+    for attempt in 0..1_000_u32 {
+        match SANDBOX_ENV_TEST_SERIAL.try_lock() {
+            Ok(guard) => return guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if attempt < 500 {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
             }
-            let dir = unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) };
-            Some(PathBuf::from(dir.to_string_lossy().into_owned()))
         }
-        #[cfg(not(unix))]
-        {
-            None
-        }
-    })
+    }
+    panic!(
+        "`SANDBOX_ENV_TEST_SERIAL` stayed busy for a full second: a test almost \
+         certainly took the (non-reentrant) process-global lock twice. Keep exactly \
+         one guard chain per test and route the other concern through a pure seam \
+         (`harness::sandbox::opt_out_from_value` / `config::merge_sandbox_opt_out`).",
+    );
 }
 
 #[cfg(test)]
@@ -695,7 +765,10 @@ mod tests {
             backend_url: "http://custom:1234/v1".to_string(),
             ..Default::default()
         };
-        set_active(custom.clone());
+        // The guard both serializes the write against the other tests that use
+        // `ACTIVE_CONFIG` and restores the previous state afterwards, so this test
+        // can neither race with nor leak into its neighbours.
+        let _guard = ActiveConfigTestGuard::install(custom.clone());
 
         let retrieved = get_active().expect("active config should be present");
         assert_eq!(retrieved.model, "test-custom-model-123");
@@ -757,15 +830,27 @@ mod tests {
     /// Install a config as the process-global active config and restore the
     /// previous state (including "none active") when the guard is dropped, so a
     /// failing assertion cannot leak config state into another test.
+    ///
+    /// `ACTIVE_CONFIG` is process-global, so the guard also holds
+    /// [`SANDBOX_ENV_TEST_SERIAL`] for the whole test: without it a sibling test's
+    /// `install` can replace the config between `set_active` and the assertion
+    /// (libtest runs tests concurrently and CI does not serialize them).
     struct ActiveConfigTestGuard {
+        /// Dropped after `Drop::drop` runs, so the lock is held while the previous
+        /// config is restored.
+        _serial: std::sync::MutexGuard<'static, ()>,
         previous: Option<Config>,
     }
 
     impl ActiveConfigTestGuard {
         fn install(cfg: Config) -> Self {
+            let serial = sandbox_env_test_lock();
             let previous = get_active();
             set_active(cfg);
-            Self { previous }
+            Self {
+                _serial: serial,
+                previous,
+            }
         }
     }
 
@@ -778,29 +863,75 @@ mod tests {
         }
     }
 
-    /// Set `MARMEL_DISABLE_SANDBOX` for one test and restore the environment
-    /// afterwards.
+    /// Set or clear `MARMEL_DISABLE_SANDBOX` for one test and restore the state
+    /// that was there before — including "unset" — on drop.
+    ///
+    /// The previous state is restored with `set_var`/`remove_var` (never with
+    /// `set_var(key, "")`): on Windows an empty value *is* a delete
+    /// (`SetEnvironmentVariableW`), so an "empty restore" would silently turn into
+    /// a delete and leak a changed environment into the next test.
     struct SandboxEnvGuard {
+        /// Held for the whole test. This is what makes the `unsafe` env writes
+        /// below sound: no other test in this binary can read or write the key
+        /// while it is mutated.
+        _serial: std::sync::MutexGuard<'static, ()>,
         previous: Option<std::ffi::OsString>,
     }
 
     impl SandboxEnvGuard {
+        /// Set the key to a non-empty value for one test.
+        ///
+        /// The empty value is rejected on purpose: it is indistinguishable from
+        /// "unset" on Windows, so the "present but empty is not an opt-out"
+        /// contract must be asserted through the pure parser
+        /// (`crate::harness::sandbox::opt_out_from_value(Some(""))`).
         fn set(value: &str) -> Self {
+            assert!(
+                !value.is_empty(),
+                "an empty env value is not representable on Windows — assert it through \
+                 crate::harness::sandbox::opt_out_from_value(Some(\"\")) instead"
+            );
+            Self::with_env(Some(value))
+        }
+
+        /// Remove the key for one test (the "env absent" case), so a test can never
+        /// depend on an ambient value inherited from the runner or from an earlier
+        /// test.
+        fn clear() -> Self {
+            Self::with_env(None)
+        }
+
+        fn with_env(value: Option<&str>) -> Self {
+            let serial = sandbox_env_test_lock();
             let previous = std::env::var_os(crate::harness::pty::SANDBOX_OPTOUT_ENV);
-            // SAFETY: these tests are gated with `--test-threads=1`, and the key
-            // is read by nothing else in this binary while it is set; the guard
-            // restores the original state on drop.
+            // SAFETY: the invariant is process-global test state, not thread count.
+            // `SANDBOX_ENV_TEST_SERIAL` is held from just before this write until
+            // after the enclosing test's last assertion (and until the restore in
+            // `Drop`), and every test in this binary that reads or writes this key
+            // takes the same lock, so no env read can race with this mutation.
             unsafe {
-                std::env::set_var(crate::harness::pty::SANDBOX_OPTOUT_ENV, value);
+                match value {
+                    Some(value) => {
+                        std::env::set_var(crate::harness::pty::SANDBOX_OPTOUT_ENV, value);
+                    }
+                    None => {
+                        std::env::remove_var(crate::harness::pty::SANDBOX_OPTOUT_ENV);
+                    }
+                }
             }
-            Self { previous }
+            Self {
+                _serial: serial,
+                previous,
+            }
         }
     }
 
     impl Drop for SandboxEnvGuard {
         fn drop(&mut self) {
-            // SAFETY: as above — single-threaded test run, restoring the previous
-            // value of a key no other test in this binary depends on.
+            // SAFETY: `SANDBOX_ENV_TEST_SERIAL` is still held — the `_serial` field
+            // drops after this body runs — so this restore cannot race with another
+            // test's read or write of the key. `previous == None` means "the key was
+            // absent", which is restored by removing it again.
             unsafe {
                 match self.previous.take() {
                     Some(previous) => {
@@ -849,6 +980,9 @@ mod tests {
             !partial_from("sandbox_disabled = false\n").sandbox_disabled,
             "an explicit false stays false"
         );
+        // "No active config" is a process-global state, so it is taken and restored
+        // under the same lock the config guards use.
+        let _serial = sandbox_env_test_lock();
         let previous = get_active();
         clear_active();
         let observed = sandbox_disabled();
@@ -887,9 +1021,12 @@ mod tests {
         assert!(cfg.sandbox_disabled);
 
         let _guard = ActiveConfigTestGuard::install(cfg);
-        // Env unset: the env parser contributes `None`, so only the knob can opt out.
-        let _env = SandboxEnvGuard::set("");
-        let env_opt_out = crate::harness::sandbox::opt_out_from_env();
+        // Env absent/empty: the env parser contributes `None`, so only the knob can
+        // opt out. Driven through the pure parser instead of the process env: the
+        // env is process-global state that sibling tests read and write, and on
+        // Windows `set_var(key, "")` cannot even express "present but empty" (it
+        // deletes the key), so the env round-trip would test the wrong thing there.
+        let env_opt_out = crate::harness::sandbox::opt_out_from_value(Some(""));
         assert_eq!(
             env_opt_out,
             crate::harness::pty::OptOut::None,
@@ -917,16 +1054,19 @@ mod tests {
         );
     }
 
-    /// (b) direction 1: knob OFF + env set ⇒ the env opt-out still applies.
+    /// (b) direction 1: knob OFF + env opt-out ⇒ the env opt-out still applies.
     #[test]
     fn sandbox_env_opt_out_wins_independently_of_the_knob() {
         let _guard = ActiveConfigTestGuard::install(Config {
             sandbox_disabled: false,
             ..Config::default()
         });
-        let _env = SandboxEnvGuard::set("1");
-
-        let env_opt_out = crate::harness::sandbox::opt_out_from_env();
+        // The env *value* is fed to the pure parser (`sandbox_opt_out` then reads the
+        // config knob from the installed config). The env *round-trip* — the key
+        // really being read from the process environment — is covered by
+        // `sandbox_opt_out_env_round_trip_is_explicit_and_restored` below and by the
+        // child-process tests in `src/harness/sandbox.rs`.
+        let env_opt_out = crate::harness::sandbox::opt_out_from_value(Some("1"));
         assert_eq!(
             env_opt_out,
             crate::harness::pty::OptOut::Explicit {
@@ -955,17 +1095,23 @@ mod tests {
         );
     }
 
-    /// (b) direction 2: knob ON + env unset ⇒ Skip; and with both set the outcome
-    /// is the same Skip (never an AND of the two sources).
+    /// (b) direction 2: knob ON + an env value that is not an opt-out ⇒ Skip; with
+    /// both set the outcome is the same Skip (never an AND of the two sources); with
+    /// nothing opted out the sandbox stays on.
+    ///
+    /// The env side is asserted through the pure parser
+    /// (`crate::harness::sandbox::opt_out_from_value`), the config side through the
+    /// installed active config, so nothing in this test mutates process-global state
+    /// that a sibling test could rewrite mid-assertion.
     #[test]
     fn sandbox_knob_opts_out_without_the_env_var() {
         let _guard = ActiveConfigTestGuard::install(Config {
             sandbox_disabled: true,
             ..Config::default()
         });
-        let _env = SandboxEnvGuard::set("0"); // present but falsy: not an env opt-out
 
-        let env_opt_out = crate::harness::sandbox::opt_out_from_env();
+        // Present but falsy: not an env opt-out.
+        let env_opt_out = crate::harness::sandbox::opt_out_from_value(Some("0"));
         assert_eq!(env_opt_out, crate::harness::pty::OptOut::None);
 
         let opt_out = sandbox_opt_out(env_opt_out.clone());
@@ -984,8 +1130,7 @@ mod tests {
         ));
 
         // Both sources at once: still a Skip, attributed to the env variable.
-        let _both = SandboxEnvGuard::set("yes");
-        let both = sandbox_opt_out(crate::harness::sandbox::opt_out_from_env());
+        let both = sandbox_opt_out(crate::harness::sandbox::opt_out_from_value(Some("yes")));
         assert_eq!(
             both,
             crate::harness::pty::OptOut::Explicit {
@@ -993,15 +1138,61 @@ mod tests {
             }
         );
 
-        // And with the knob off and nothing in the env, the sandbox is ON.
-        let _off = ActiveConfigTestGuard::install(Config::default());
-        let _none = SandboxEnvGuard::set("");
+        // And with the knob off and nothing in the env, the sandbox is ON. Expressed
+        // through the pure merge (`false` = knob off) instead of installing a second
+        // config inside the same test.
         assert_eq!(
-            sandbox_decision_for(sandbox_opt_out(crate::harness::sandbox::opt_out_from_env())),
+            sandbox_decision_for(merge_sandbox_opt_out(
+                crate::harness::sandbox::opt_out_from_value(None),
+                false,
+            )),
             crate::harness::pty::SandboxDecision::Apply {
                 resolved_exe: std::path::PathBuf::from("/usr/local/bin/marmel-dev")
             },
             "nothing opted out ⇒ Landlock re-entry (fail-closed default)"
+        );
+    }
+
+    /// The env half of the contract end to end: the key really is read from the
+    /// process environment, and it is read fail-closed when it is absent.
+    ///
+    /// This is the **only** test in this binary that mutates
+    /// `MARMEL_DISABLE_SANDBOX`. `SandboxEnvGuard` holds
+    /// [`SANDBOX_ENV_TEST_SERIAL`] for the whole body (so the write cannot race with
+    /// another test's read), sets the value explicitly (so the test never depends on
+    /// an ambient value from the runner) and restores the previous state — including
+    /// "unset" — on drop (so nothing leaks into the next test either, on any
+    /// platform).
+    #[test]
+    fn sandbox_opt_out_env_round_trip_is_explicit_and_restored() {
+        let set = SandboxEnvGuard::set("1");
+        assert_eq!(
+            crate::harness::sandbox::opt_out_from_env(),
+            crate::harness::pty::OptOut::Explicit {
+                setting: format!("{}=1", crate::harness::pty::SANDBOX_OPTOUT_ENV)
+            },
+            "`MARMEL_DISABLE_SANDBOX=1` must reach the env reader"
+        );
+        assert_eq!(
+            merge_sandbox_opt_out(crate::harness::sandbox::opt_out_from_env(), false),
+            crate::harness::pty::OptOut::Explicit {
+                setting: format!("{}=1", crate::harness::pty::SANDBOX_OPTOUT_ENV)
+            },
+            "an env opt-out keeps its attribution whatever the config knob says"
+        );
+        drop(set);
+
+        let _cleared = SandboxEnvGuard::clear();
+        assert_eq!(
+            crate::harness::sandbox::opt_out_from_env(),
+            crate::harness::pty::OptOut::None,
+            "a cleared key must read as no env opt-out (fail-closed), never as a \
+             value left behind by another test or by the runner"
+        );
+        assert_eq!(
+            merge_sandbox_opt_out(crate::harness::sandbox::opt_out_from_env(), false),
+            crate::harness::pty::OptOut::None,
+            "neither source opted out ⇒ the sandbox stays on"
         );
     }
 
@@ -1022,9 +1213,14 @@ mod tests {
 
         // A per-call override still wins over the configured default.
         assert_eq!(effective_command_timeout_secs(Some(42)), 42);
+    }
 
-        // No config loaded at all ⇒ the documented built-in default.
-        let _clear = ActiveConfigTestGuard::install(Config::default());
+    /// The default config keeps the documented built-in timeout. A separate test:
+    /// installing a second active config inside the test above would take the
+    /// process-global test lock a second time on one thread.
+    #[test]
+    fn default_config_keeps_the_builtin_command_timeout() {
+        let _guard = ActiveConfigTestGuard::install(Config::default());
         assert_eq!(
             active_command_timeout_secs(),
             DEFAULT_COMMAND_TIMEOUT_SECS,
@@ -1034,6 +1230,9 @@ mod tests {
 
     #[test]
     fn command_timeout_secs_default_when_no_config_is_active() {
+        // "No active config" is process-global state: serialized with the other
+        // tests that read or write `ACTIVE_CONFIG`.
+        let _serial = sandbox_env_test_lock();
         let previous = get_active();
         clear_active();
         let applied = effective_command_timeout_secs(None);

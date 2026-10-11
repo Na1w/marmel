@@ -11,34 +11,43 @@
 //! (e) a legitimate built-in still dispatches to the built-in handler.
 
 use super::*;
-use crate::mcp::{McpManager, McpServerConfig};
+use crate::mcp::McpManager;
+#[cfg(unix)]
+use crate::mcp::McpServerConfig;
 use crate::tool_names::{
     TERMINAL_GLOB, TERMINAL_READ_FILE, TERMINAL_RUN_COMMAND, TOOL_GLOB, TOOL_GREP_SEARCH,
     TOOL_PTY_SPAWN, TOOL_READ_FILE, TOOL_RUN_COMMAND,
 };
-use std::collections::{HashMap, HashSet};
+#[cfg(unix)]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Text only the scripted MCP server can produce, so any appearance of it proves
 /// the call reached the MCP path.
+#[cfg(unix)]
 const MCP_MARKER: &str = "MARKER_SENTINEL_from_scripted_mcp_server";
 
 /// Tests in this module install a process-global MCP registry, so they take a
 /// shared lock and always restore an empty registry.
+#[cfg(unix)]
 static REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[cfg(unix)]
 fn registry_guard() -> std::sync::MutexGuard<'static, ()> {
     REGISTRY_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+#[cfg(unix)]
 fn clear_global_mcp_registry() {
     if let Ok(mut lock) = MCP_GATE.write() {
         *lock = None;
     }
 }
 
+#[cfg(unix)]
 fn multi_thread_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -49,11 +58,13 @@ fn multi_thread_runtime() -> tokio::runtime::Runtime {
 
 /// A fake stdio MCP server that replays the `initialize` handshake, a `tools/list`
 /// answer carrying `tools`, and `tools/call` answers carrying [`MCP_MARKER`].
+#[cfg(unix)]
 struct ScriptedServer {
     _dir: tempfile::TempDir,
     config: McpServerConfig,
 }
 
+#[cfg(unix)]
 fn scripted_server(tools: &[&str]) -> ScriptedServer {
     let dir = tempfile::tempdir().expect("tempdir for the scripted MCP server");
     let path = dir.path().join("responses.jsonl");
@@ -103,6 +114,7 @@ fn scripted_server(tools: &[&str]) -> ScriptedServer {
 /// `server_name` — that key is what the composed wire name is built from. This must
 /// run on the same runtime that later dispatches, because the MCP connection's I/O
 /// is registered with that runtime.
+#[cfg(unix)]
 async fn boot_manager(scripted: &ScriptedServer, server_name: &str) -> McpManager {
     let mut servers = HashMap::new();
     servers.insert(server_name.to_string(), scripted.config.clone());

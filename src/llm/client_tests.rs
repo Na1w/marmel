@@ -633,11 +633,13 @@ async fn test_cancellation_before_response_is_cancelled_not_empty_success() {
 
 /// A fake stdio MCP server replaying the `initialize` handshake and a
 /// `tools/list` answer carrying `tools`.
+#[cfg(unix)]
 struct ScriptedMcp {
     _dir: tempfile::TempDir,
     config: crate::mcp::McpServerConfig,
 }
 
+#[cfg(unix)]
 fn scripted_mcp(tools: &[&str]) -> ScriptedMcp {
     let dir = tempfile::tempdir().expect("tempdir for the scripted MCP server");
     let path = dir.path().join("responses.jsonl");
@@ -675,6 +677,7 @@ fn scripted_mcp(tools: &[&str]) -> ScriptedMcp {
 }
 
 /// This test swaps the process-global MCP registry, so it takes a lock of its own.
+#[cfg(unix)]
 static MCP_REGISTRY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The schema list handed to the model must be the policy-filtered MCP set: a

@@ -437,21 +437,132 @@ mod tests {
         );
     }
 
+    /// Does the scanned transport file carry its test code inline?
+    #[derive(Clone, Copy)]
+    enum InlineTests {
+        /// `client.rs:427-428` holds `#[cfg(test)] mod tests { … }`.
+        Yes,
+        /// `http.rs` has none: its tests are wired at `src/mcp/mod.rs` as
+        /// `mod http_tests;`, so every line of it is production code.
+        None,
+    }
+
+    /// The *production* half of a transport source file: CRLF-normalized and cut
+    /// at the point where the file's test code begins.
+    ///
+    /// Both halves of that job are load-bearing (`docs/windows_failures_analysis.md`,
+    /// Site 4). The old `src.split("#[cfg(test)]\nmod tests {")` anchor never
+    /// matched a `windows-latest` checkout, where `actions/checkout` yields
+    /// `\r\n` and this repo carries no `.gitattributes`; and its `unwrap_or(src)`
+    /// fallback turned that miss into a *silent* whole-file scan — inline test
+    /// module, and the wire literals its fixtures pin on purpose, included.
+    fn production_only(src: &str, file: &str, inline_tests: InlineTests) -> String {
+        let normalized = src.replace("\r\n", "\n");
+        // Anchor-free, layout-tolerant cut: `mod tests` matches the inline
+        // `mod tests {` of `client.rs:428` *and* the extracted
+        // `#[path = "x_tests.rs"] mod tests;` form this repo already uses
+        // (`src/llm/client.rs:1089`), at any indentation and whatever the line
+        // endings are. A renamed test module is still caught by the
+        // "`#[cfg(test)]` gates a `mod`" fallback.
+        let cut = normalized
+            .find("mod tests")
+            .or_else(|| cfg_gated_module(&normalized));
+        match cut {
+            Some(index) => normalized[..index].to_owned(),
+            None => {
+                // Fail closed, never open: the old `unwrap_or(src)` scanned the
+                // whole file, so a lost anchor surfaced as "the transport spells
+                // out 'initialize'" — a diagnosis of the test, not of the tree.
+                // A file known to carry an inline test module reports the lost
+                // cut point instead.
+                assert!(
+                    matches!(inline_tests, InlineTests::None),
+                    "{file}: no test-module cut point (`mod tests`, or `#[cfg(test)]` \
+                     gating a `mod`) — refusing to fall back to a whole-file scan"
+                );
+                normalized
+            }
+        }
+    }
+
+    /// Index of the first `#[cfg(test)]` gate that introduces a **module**
+    /// (doc comments and other attributes between gate and `mod` are tolerated),
+    /// or `None` when the file has no cfg-gated module at all.
+    ///
+    /// The gate has to be a *module* gate: a bare `#[cfg(test)]` item is not a
+    /// safe cut point, because `http.rs:366` is a cfg(test) test seam in the
+    /// middle of production code — cutting there would drop the real
+    /// `protocol::…` calls at `http.rs:390/566/571` out of the scan.
+    fn cfg_gated_module(text: &str) -> Option<usize> {
+        const GATE: &str = "#[cfg(test)]";
+        let mut from = 0usize;
+        while let Some(found) = text[from..].find(GATE) {
+            let gate = from + found;
+            let declares_module = text[gate + GATE.len()..]
+                .lines()
+                .map(str::trim_start)
+                .find(|line| {
+                    !line.is_empty()
+                        && !line.starts_with("///")
+                        && !line.starts_with("//!")
+                        && !line.starts_with('#')
+                })
+                .is_some_and(|line| {
+                    line.trim_start_matches("pub(crate) ")
+                        .trim_start_matches("pub ")
+                        .starts_with("mod ")
+                });
+            if declares_module {
+                return Some(gate);
+            }
+            from = gate + GATE.len();
+        }
+        None
+    }
+
     /// Cluster C7: the transport must not own a second copy of the protocol.
     /// Only the *production* half of each transport file is inspected — the test
     /// modules deliberately quote wire literals to pin them.
+    ///
+    /// The guard is stated in both directions: positively, every protocol call
+    /// goes through the shared layer in `src/mcp/protocol.rs`, and negatively, no
+    /// wire-level protocol text appears in production code. The positive half is
+    /// what makes the negative half meaningful — it proves the scanned slice is
+    /// real production code rather than a slice that was cut away entirely.
     #[test]
     fn mcp_http_transport_keeps_no_protocol_of_its_own() {
-        fn production_only(src: &str) -> &str {
-            src.split("#[cfg(test)]\nmod tests {").next().unwrap_or(src)
-        }
-        for src in [
-            production_only(include_str!("http.rs")),
-            production_only(include_str!("client.rs")),
+        for (source, file, inline_tests) in [
+            (include_str!("http.rs"), "http.rs", InlineTests::None),
+            (include_str!("client.rs"), "client.rs", InlineTests::Yes),
         ] {
+            let src = production_only(source, file, inline_tests);
+            assert!(
+                !src.is_empty(),
+                "{file}: the production half must not be empty"
+            );
+
+            // Positive: the transport delegates to the shared protocol layer
+            // (`src/mcp/protocol.rs`) — `client.rs:136/250/255` and
+            // `http.rs:390/566/571` today.
+            for seam in [
+                "protocol::initialize(",
+                "protocol::list_tools(",
+                "protocol::call_tool(",
+            ] {
+                assert!(
+                    src.contains(seam),
+                    "{file}: the transport must delegate to the shared protocol \
+                     layer ({seam}); the scanned production half is {} bytes",
+                    src.len()
+                );
+            }
+
+            // Negative: no second protocol implementation. Every needle is
+            // derived from the constants in `src/mcp/protocol.rs`, so a rename
+            // there cannot silently weaken this guard.
             assert!(
                 !src.contains("jsonrpc:\"2.0\"") && !src.contains("jsonrpc: \"2.0\""),
-                "the transports must not build JSON-RPC envelopes themselves"
+                "{file}: the transports must not build JSON-RPC envelopes themselves"
             );
             for method in [
                 METHOD_INITIALIZE,
@@ -461,22 +572,80 @@ mod tests {
             ] {
                 assert!(
                     !src.contains(&format!("\"{method}\"")),
-                    "the transports must not spell out the method name '{method}'"
+                    "{file}: the transports must not spell out the method name '{method}'"
                 );
             }
             assert!(
                 !src.contains("MCP_PROTOCOL_VERSION") && !src.contains("2024-11-05"),
-                "the transports must not carry the initialize params"
+                "{file}: the transports must not carry the initialize params"
             );
             assert!(
                 !src.contains("AtomicU64"),
-                "the transports must not own a request-id allocator"
+                "{file}: the transports must not own a request-id allocator"
             );
             assert!(
                 !src.contains("\"inputSchema\"") && !src.contains("\"isError\""),
-                "the transports must not decode results themselves"
+                "{file}: the transports must not decode results themselves"
             );
         }
+    }
+
+    /// Site 4 regression guard: the production-half cut must be independent of
+    /// the checkout's line endings, and it must never widen the scan.
+    #[test]
+    fn production_only_cut_survives_crlf_line_endings() {
+        let lf = concat!(
+            "//! Doc comment quoting \"tools/list\" is production text too.\n",
+            "fn handshake() { protocol::initialize(); }\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    let pinned = r#\"{\"jsonrpc\":\"2.0\",\"method\":\"initialize\"}\"#;\n",
+            "    let _ = pinned;\n",
+            "}\n",
+        );
+        for (label, source) in [("LF", lf.to_owned()), ("CRLF", lf.replace('\n', "\r\n"))] {
+            let production = production_only(&source, "fixture.rs", InlineTests::Yes);
+            assert!(
+                production.contains("protocol::initialize("),
+                "{label}: the protocol seam must survive the cut"
+            );
+            assert!(
+                !production.contains("mod tests"),
+                "{label}: the cut must land on the test module"
+            );
+            assert!(
+                !production.contains("\"initialize\""),
+                "{label}: the test module's deliberately quoted wire literal must be \
+                 out of the scanned slice"
+            );
+        }
+
+        // A cfg(test) *item* that is not a module must not be used as a cut:
+        // that is the `http.rs:366` shape, and cutting there would delete real
+        // production code (and its seam calls) from the scan.
+        let seam_in_the_middle = concat!(
+            "fn a() { protocol::initialize(); }\n",
+            "#[cfg(test)]\npub(crate) fn test_seam() {}\n",
+            "fn b() { protocol::list_tools(); protocol::call_tool(); }\n",
+        );
+        assert_eq!(
+            production_only(seam_in_the_middle, "fixture.rs", InlineTests::None),
+            seam_in_the_middle,
+            "a file with no test module is production code end to end"
+        );
+    }
+
+    /// The cut used to fail *open* (`unwrap_or(src)`); it now fails loudly, so a
+    /// renamed or restructured test module can never turn this guard into a
+    /// whole-file scan of test fixtures.
+    #[test]
+    #[should_panic(expected = "no test-module cut point")]
+    fn production_only_refuses_to_scan_a_file_whole() {
+        production_only(
+            "fn f() {}\nmod renamed_tests { let pinned = \"initialize\"; }\n",
+            "fixture.rs",
+            InlineTests::Yes,
+        );
     }
 
     /// Cluster C2 retry classes: connection/timeout/5xx-class failures are

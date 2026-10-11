@@ -59,11 +59,26 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+          components: clippy
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+
+      # Per-OS lint/format parity (docs/cross_platform_gating.md §C.1). This is the real
+      # fix for the cross-platform gap: it is the only leg that sees the apple-darwin and
+      # windows-msvc cfg classes, because those cannot be cross-checked from Linux (§C.4,
+      # §3.2/§3.3). No `--target` here on purpose: on every matrix entry the runner host
+      # triple IS matrix.target, so the flag would be a no-op while changing artifact
+      # layout/linker selection for the native legs.
+      # Cargo.toml [lints.rust]/[lints.clippy] deny tables already escalate these
+      # commands; the explicit `-D warnings` is kept as defence in depth.
+      - name: Check code formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy for this target
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Build all targets
         run: cargo build --all-targets --all-features --verbose
@@ -73,6 +88,105 @@ jobs:
 
       - name: Run doc tests
         run: cargo test --doc
+
+  # Cheap pre-triage for the `windows` cfg class on a Linux runner
+  # (docs/cross_platform_gating.md §C.2): a windows-only lint / dead-code break is caught
+  # here in seconds instead of after a mac + windows round-trip. It is deliberately NOT a
+  # `needs:` of `test` or `release-build` (residual risk 7: apt or toolchain-image drift
+  # in this leg must never block a release); `lint` gates it, exactly like `test`.
+  cross-check:
+    name: Cross-target check (windows-gnu)
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # PARITY MECHANISM with scripts/cross_platform_check.sh: the triple is read from the
+      # single shared list config/gate_targets.txt (docs/cross_platform_gating.md §D,
+      # "keep one shared list in the repo … so adding a target is a single edit") instead
+      # of being hard-coded here. The parser is the same fail-closed one the script uses —
+      # `#` comments and blank lines ignored, exactly two fields per line, unknown scope =
+      # hard error — so a misread list can never produce a green leg.
+      # Filter: only the windows-gnu ABI is cross-compilable from ubuntu-latest
+      # (onig_sys/aws-lc-sys build against gcc-mingw-w64, §3.1; §C.4 forbids adding
+      # aarch64-apple-darwin or x86_64-pc-windows-msvc to a Linux leg), and this job runs
+      # exactly one triple — so the shared list is filtered to scope local|both AND the
+      # *-windows-gnu ABI, and anything other than exactly one hit fails the job.
+      - name: Resolve cross target from shared gate list
+        id: gate
+        shell: bash
+        run: |
+          list=config/gate_targets.txt
+          if [ ! -f "$list" ]; then
+            echo "::error file=$list::shared gate target list not found" >&2
+            exit 1
+          fi
+          targets=$(
+            awk '
+              { sub(/#.*/, "") }
+              NF == 0 { next }
+              NF != 2 {
+                printf "malformed line %d: expected <triple> <local|ci|both>, got: %s\n", NR, $0 > "/dev/stderr"
+                exit 1
+              }
+              $2 != "local" && $2 != "both" && $2 != "ci" {
+                printf "unknown scope \"%s\" on line %d (expected local|ci|both)\n", $2, NR > "/dev/stderr"
+                exit 1
+              }
+              $1 ~ /-windows-gnu$/ && ($2 == "local" || $2 == "both") { print $1 }
+            ' "$list"
+          ) || {
+            echo "::error file=$list::could not parse $list — failing closed instead of silently skipping the cross-check" >&2
+            exit 1
+          }
+          count=$(printf '%s\n' "$targets" | awk 'NF { n++ } END { print n + 0 }')
+          if [ "$count" -ne 1 ]; then
+            printf '::error::expected exactly 1 triple in %s with scope local|both and the cross-compilable windows-gnu ABI, found %s:\n' "$list" "$count" >&2
+            if [ -n "$targets" ]; then
+              while IFS= read -r hit; do
+                printf '  %s\n' "$hit" >&2
+              done <<<"$targets"
+            fi
+            exit 1
+          fi
+          target=$targets
+          # Same triple sanity check the local script applies, so a weird value can never
+          # be spliced into the cargo invocations below.
+          case $target in
+            '' | *[!A-Za-z0-9._-]*)
+              printf '::error file=%s::invalid target triple resolved from %s: "%s"\n' "$list" "$list" "$target" >&2
+              exit 1
+              ;;
+          esac
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+          echo "cross-check target resolved from $list: $target" >> "$GITHUB_STEP_SUMMARY"
+          echo "cross-check target: $target"
+
+      - name: Install mingw-w64 C toolchain (needed by onig_sys / aws-lc-sys build scripts)
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ steps.gate.outputs.target }}
+          components: clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: cross-${{ steps.gate.outputs.target }}
+
+      # BOTH legs are required, not one: docs/cross_platform_gating.md §3.1 measured four
+      # src/harness/sandbox.rs rustc dead-code/unused diagnostics under `cargo check
+      # --target x86_64-pc-windows-gnu` that `cargo clippy … --target … -- -D warnings`
+      # never replayed, while clippy alone caught the src/config.rs lint that check never
+      # sees. The two legs are not interchangeable.
+      - name: Run Clippy for the cross target
+        run: cargo clippy --all-targets --all-features --target ${{ steps.gate.outputs.target }} -- -D warnings
+
+      - name: Check all targets for the cross target
+        run: cargo check --all-targets --all-features --target ${{ steps.gate.outputs.target }}
 
   release-build:
     name: Release Build (${{ matrix.os }})

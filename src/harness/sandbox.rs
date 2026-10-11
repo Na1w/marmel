@@ -496,6 +496,7 @@ fn attempt_landlock(_workspace_root: &Path) -> SandboxAttempt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use crate::harness::pty::SANDBOX_EXEC_ARG;
     use std::path::PathBuf;
 
@@ -640,7 +641,6 @@ mod tests {
     /// Whether the host reports "no Landlock here" or "this rule could not be built"
     /// depends on the kernel; either way it must be an error with a reason, and it must
     /// be logged rather than swallowed.
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_apply_sandbox_fails_closed_on_an_unusable_workspace_root() {
         let tmp = tempfile::tempdir().expect("tempdir");
