@@ -80,6 +80,8 @@ validator_model = "gemma4:cloud"
 # validator_backend_url = "http://localhost:11434/v1"
 # validator_auth_token = ""
 max_validator_iterations = 5
+# Optional: maximum fix-loop rounds per validation pass (default: 200)
+# max_fix_loop_rounds = 200
 # Optional reasoning budget / max thinking tokens override for this specialist:
 # max_thinking_tokens = 8192
 

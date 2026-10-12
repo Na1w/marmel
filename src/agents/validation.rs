@@ -277,8 +277,9 @@ async fn run_automated_validation_inner(
          Instructions:\n\
          1. Inspect the workspace and examine files using available inspection tools (`read_file`, `grep_search`, `glob`) or interactive terminal sessions (`pty_*`).\n\
          2. You are an auditor: you cannot execute direct shell commands (`run_command`) or modify files (`write_file`, `replace`). Solely analyze, inspect, and provide feedback.\n\
-         3. When your verification is complete, you MUST call the `leave_verdict` tool with `verdict` ('APPROVED' or 'REJECTED') and detailed `comments`.\n\
-         4. If advised or when context usage is high (>= 80%), call the `rebirth` tool with your intermediate findings, inspected files, and current offsets/line numbers to preserve continuity without restarting.",
+         3. Keep your verification focused and swift: perform a targeted spot-check of key files and evidence (aim for 2-5 tool calls) rather than exhaustive codebase exploration.\n\
+         4. When your verification is complete (or sufficient evidence is gathered), you MUST call the `leave_verdict` tool with `verdict` ('APPROVED' or 'REJECTED') and detailed `comments`.\n\
+         5. If advised or when context usage is high (>= 80%), call the `rebirth` tool with your intermediate findings, inspected files, and current offsets/line numbers to preserve continuity without restarting.",
         task_brief, deliverable
     );
 
@@ -363,13 +364,20 @@ async fn run_automated_validation_inner(
         verdict_log_role: agent.as_str().to_string(),
         // Bounds of this validation pass (gate t-033c): the round cap and the
         // wall-clock deadline end the pass with an explicit failed outcome.
-        //
-        // `dispatch_verdict_tools` was removed by t-033c: the verdict tool is
-        // terminal-only and is consumed by the shared driver *before* dispatch,
-        // so this loop never dispatches it for any worker — and a switch here
-        // could only ever have widened the t-033b identity gate
-        // (`runner/execution.rs::may_record_verdict`).
-        bounds: FixLoopBounds::default(),
+        bounds: FixLoopBounds::new(
+            cfg.orchestration
+                .specialists
+                .get(agent.as_str())
+                .and_then(|sc| sc.max_fix_loop_rounds)
+                .or_else(|| {
+                    cfg.orchestration
+                        .specialists
+                        .get(Agent::Validator.as_str())
+                        .and_then(|vc| vc.max_fix_loop_rounds)
+                })
+                .or(cfg.max_fix_loop_rounds)
+                .unwrap_or(crate::agents::runner::fix_loop::MAX_FIX_LOOP_ROUNDS),
+        ),
         abort_log_prefix: format!("validator-{agent}"),
         emit_tool_status: true,
         rebirth_notice: "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. Do not call rebirth consecutively without making progress. Continue your validation inspection and submit your verdict via leave_verdict.)".to_string(),
@@ -484,12 +492,17 @@ async fn run_plan_validation_inner(
         temperature: 0.0,
         status_template: format!("{val_tag}: auditing execution plan structure & granularity..."),
         verdict_log_role: "planner".to_string(),
-        // Bounds of this audit pass (gate t-033c). The former
-        // `dispatch_verdict_tools: false` switch is gone: the shared driver
-        // always treats the verdict tool as terminal-only (consumed before any
-        // dispatch), so both call sites now behave identically — that difference
-        // used to be a documentation-only switch over dead code.
-        bounds: FixLoopBounds::default(),
+        // Bounds of this audit pass (gate t-033c).
+        bounds: FixLoopBounds::new(
+            planner_cfg
+                .and_then(|sc| sc.max_fix_loop_rounds)
+                .or_else(|| {
+                    validator_cfg
+                        .and_then(|vc| vc.max_fix_loop_rounds)
+                })
+                .or(cfg.max_fix_loop_rounds)
+                .unwrap_or(crate::agents::runner::fix_loop::MAX_FIX_LOOP_ROUNDS),
+        ),
         abort_log_prefix: val_tag.clone(),
         emit_tool_status: false,
         rebirth_notice: "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. Do not call rebirth consecutively without making progress. Continue your validation inspection and submit your verdict via leave_verdict.)".to_string(),

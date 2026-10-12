@@ -672,7 +672,7 @@ impl PromptBuilder {
                 };
                 let val_dest = prompts_dir.join(&val_filename);
                 let val_content = format!(
-                    "---\nrole_name: \"validator\"\ntask_id: \"{}\"\ntarget_brief: \"{}\"\ncreated_at: \"{}\"\nallowed_tools:\n  - \"read_file\"\n  - \"grep_search\"\n  - \"glob\"\n  - \"run_command\"\n  - \"leave_verdict\"\n  - \"rebirth\"\n---\n\n# Independent Quality Verification for {}\n\n**Mission:** Independently audit the deliverable for task `{}`.\n**Brief:** {}\n\n## Verification Protocol:\n1. Inspect created or modified files to verify correctness and conformance.\n2. Execute test suites or checks if applicable.\n3. Conclude by calling `leave_verdict(verdict=\"APPROVED\" | \"REJECTED\", comments=\"...\")`.\n",
+                    "---\nrole_name: \"validator\"\ntask_id: \"{}\"\ntarget_brief: \"{}\"\ncreated_at: \"{}\"\nallowed_tools:\n  - \"read_file\"\n  - \"grep_search\"\n  - \"glob\"\n  - \"run_command\"\n  - \"leave_verdict\"\n  - \"rebirth\"\n---\n\n# Independent Quality Verification for {}\n\n**Mission:** Independently audit the deliverable for task `{}`.\n**Brief:** {}\n\n## Verification Protocol:\n1. Inspect created or modified files to verify correctness and conformance. Keep inspection targeted and concise (aim for 2–5 inspection tool calls; avoid exhaustive codebase exploration).\n2. Execute test suites or checks if applicable.\n3. Conclude promptly by calling `leave_verdict(verdict=\"APPROVED\" | \"REJECTED\", comments=\"...\")`.\n",
                     item.task_id,
                     item.description.replace('"', "\\\""),
                     chrono::Utc::now().to_rfc3339(),

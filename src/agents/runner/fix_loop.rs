@@ -98,10 +98,9 @@ pub enum FixLoopResult {
 /// or any other [`run_fix_loop`] driver).
 ///
 /// A validator pass normally concludes in a handful of rounds (inspection tools +
-/// one verdict); 40 leaves generous headroom for a legitimate deep inspection
-/// while making an unbounded inner loop impossible. Deliberately a constant
-/// rather than a config knob: it is a runaway guard, not a tuning surface.
-pub const MAX_FIX_LOOP_ROUNDS: usize = 40;
+/// one verdict); 200 leaves generous headroom for deep inspection and complex tasks
+/// while making an unbounded inner loop impossible.
+pub const MAX_FIX_LOOP_ROUNDS: usize = 200;
 
 /// How many verdict reminders a validator gets before the run is concluded
 /// **without** a verdict (fail-closed, gate t-033c).
@@ -1135,6 +1134,19 @@ pub async fn run_fix_loop(
         // request instead of rotting in its inbox until the TTL sweep drops it.
         let notices_injected = inject_worker_notices_mid_turn(p.engine, &p.worker_key);
 
+        // Periodic inspection reminder for validators (auditors) to avoid endless
+        // investigation rabbit-holes without recording a verdict.
+        if verdict_authority
+            && turn_had_successful_tool_call
+            && (turn == 6 || turn == 10 || turn == 15 || (turn >= 20 && turn.is_multiple_of(10)))
+        {
+            let reminder = format!(
+                "SYSTEM NOTICE: You have completed {turn} inspection turns. Please wrap up your analysis. Unless critical unverified points remain, call the '{}' tool immediately with verdict ('APPROVED' or 'REJECTED') and comments.",
+                tool_names::TOOL_LEAVE_VERDICT
+            );
+            p.engine.append(Message::User { content: reminder });
+        }
+
         // Wall-clock progress (gate t-033c): observable forward progress — a tool
         // call that actually completed, or a steering notice that reached this
         // worker — refreshes the stalled-run window of the deadline. A run that
@@ -1647,7 +1659,7 @@ mod tests {
     /// both deadline kinds are distinguishable.
     #[test]
     fn fix_loop_bounds_reuse_the_crate_deadline_machinery() {
-        assert_eq!(MAX_FIX_LOOP_ROUNDS, 40, "the documented round cap");
+        assert_eq!(MAX_FIX_LOOP_ROUNDS, 200, "the documented round cap");
         assert_eq!(
             FIX_LOOP_IDLE_LIMIT_SECS, TURN_WATCHDOG_SECS,
             "the fix loop must reuse the crate's watchdog bound, not invent one"
@@ -2210,5 +2222,108 @@ mod tests {
                 "{notice} must carry the counter {number}"
             );
         }
+    }
+
+    /// The fix loop periodically injects a wrap-up reminder for validators running
+    /// multiple tool-calling turns so they do not get trapped in endless inspection.
+    #[tokio::test]
+    async fn validator_receives_inspection_nudge_after_multiple_tool_turns() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        std::fs::write(root.join("test.rs"), "fn main() {}").unwrap();
+
+        crate::harness::with_workspace_root(root, async {
+            let read_call = sse_tool_calls(&[(
+                "call_read",
+                TOOL_READ_FILE,
+                serde_json::json!({"path": "test.rs"}),
+            )]);
+            let verdict_call = sse_tool_calls(&[(
+                "call_verdict",
+                TOOL_LEAVE_VERDICT,
+                serde_json::json!({"verdict": "APPROVED", "comments": "inspection verified"}),
+            )]);
+
+            // 6 turns of read_file, followed by a verdict call on turn 7
+            let turns = vec![
+                read_call.clone(),
+                read_call.clone(),
+                read_call.clone(),
+                read_call.clone(),
+                read_call.clone(),
+                read_call.clone(),
+                verdict_call,
+            ];
+            let (server, counter) = mock_turns(turns).await;
+
+            let cfg = Config::default();
+            let mon_cfg = MonitoringConfig::default();
+            let backend = format!("{}/v1", server.uri());
+            let client =
+                crate::llm::ChatClient::new_with_token(&backend, "test-model", "test-token");
+            let token = CancellationToken::new();
+            let guard = register_loop_worker(
+                Some("t-nudge".to_string()),
+                "validator-coder".to_string(),
+                "nudge test".to_string(),
+                &token,
+            );
+            let mut engine = ContextEngineFactory::new(64_000)
+                .specialist_context("validator role prompt".to_string(), "brief".to_string());
+            let mut params = LoopParams {
+                client: &client,
+                model: "test-model".to_string(),
+                tag: "validator-coder-nudge".to_string(),
+                worker_name: "validator-coder".to_string(),
+                task_id: Some("t-nudge".to_string()),
+                worker_key: guard.0.clone(),
+                engine: &mut engine,
+                tools: Vec::new(),
+                token: &token,
+                mon_cfg: &mon_cfg,
+                cfg: &cfg,
+                temperature: 0.0,
+                status_template: "evaluating deliverable...".to_string(),
+                verdict_log_role: "coder".to_string(),
+                bounds: FixLoopBounds::default(),
+                abort_log_prefix: "validator-coder-nudge".to_string(),
+                emit_tool_status: false,
+                rebirth_notice: format!("({TOOL_REBIRTH} checkpoint accepted)"),
+            };
+            let mut monitor = HarnessMonitor::new_with_config(
+                std::sync::Arc::new(crate::harness::HarnessStats::new()),
+                &mon_cfg,
+            );
+            let outcome = run_fix_loop(
+                &mut params,
+                &mut monitor,
+                crate::harness::ToolCaller::Specialist(Agent::Validator),
+            )
+            .await
+            .expect("should complete successfully");
+
+            assert_eq!(counter.load(Ordering::SeqCst), 7);
+            match outcome {
+                FixLoopResult::Verdict { approved, critique } => {
+                    assert!(approved);
+                    assert_eq!(critique, "inspection verified");
+                }
+                other => panic!("expected approved verdict, got {other:?}"),
+            }
+
+            // Verify that the wrap-up nudge was injected into the engine's message history
+            let has_nudge = engine.messages().iter().any(|m| match m {
+                crate::types::Message::User { content } => {
+                    content.contains("You have completed 6 inspection turns")
+                        && content.contains(crate::tool_names::TOOL_LEAVE_VERDICT)
+                }
+                _ => false,
+            });
+            assert!(
+                has_nudge,
+                "engine must contain the wrap-up reminder injected after turn 6"
+            );
+        })
+        .await;
     }
 }

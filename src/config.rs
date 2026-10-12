@@ -103,6 +103,8 @@ pub struct SpecialistConfig {
     pub validator_auth_token: Option<String>,
     /// Optional max validation iterations.
     pub max_validator_iterations: Option<usize>,
+    /// Optional max fix-loop rounds per validation pass (defaults to MAX_FIX_LOOP_ROUNDS = 200).
+    pub max_fix_loop_rounds: Option<usize>,
     /// Whether automated validation is enabled for this specialist (default: true).
     #[serde(alias = "auto_validate", alias = "enable_validation")]
     pub enable_validator: Option<bool>,
@@ -162,6 +164,8 @@ pub struct Config {
     pub mcp_servers: HashMap<String, crate::mcp::McpServerConfig>,
     /// Optional base prompt appended to the orchestrator system prompt.
     pub base_prompt: Option<String>,
+    /// Optional global cap on fix-loop rounds per validation pass (defaults to MAX_FIX_LOOP_ROUNDS = 200).
+    pub max_fix_loop_rounds: Option<usize>,
 }
 
 impl Default for Config {
@@ -188,6 +192,7 @@ impl Default for Config {
             orchestration: OrchestrationConfig::default_depth(),
             mcp_servers: HashMap::new(),
             base_prompt: None,
+            max_fix_loop_rounds: None,
         }
     }
 }

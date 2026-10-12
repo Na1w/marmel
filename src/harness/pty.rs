@@ -1159,51 +1159,53 @@ impl PtyManager {
 
         let sessions_clone = mgr.sessions.clone();
         let deferred_clone = mgr.deferred_reaps.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                {
-                    let mut map = sessions_clone.lock().await;
-                    let now = std::time::Instant::now();
-                    map.retain(|key, session| {
-                        // Reap children that exited on their own right away, so
-                        // they do not sit in the process table as `<defunct>`
-                        // until the session is closed.
-                        if let Some(status) = session.reaper.reap_if_exited() {
-                            tracing::debug!("pty session '{key}' child exited: {status}");
-                        }
-                        let idle_time = {
-                            let buf = session
-                                .shared_buf
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            now.duration_since(buf.last_activity)
-                        };
-                        if idle_time > Duration::from_secs(300) {
-                            tracing::warn!(
-                                "PTY session '{}' timed out after 300s of inactivity. Reaping.",
-                                key
-                            );
-                            false
-                        } else {
-                            true
-                        }
-                    });
-                }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    {
+                        let mut map = sessions_clone.lock().await;
+                        let now = std::time::Instant::now();
+                        map.retain(|key, session| {
+                            // Reap children that exited on their own right away, so
+                            // they do not sit in the process table as `<defunct>`
+                            // until the session is closed.
+                            if let Some(status) = session.reaper.reap_if_exited() {
+                                tracing::debug!("pty session '{key}' child exited: {status}");
+                            }
+                            let idle_time = {
+                                let buf = session
+                                    .shared_buf
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                now.duration_since(buf.last_activity)
+                            };
+                            if idle_time > Duration::from_secs(300) {
+                                tracing::warn!(
+                                    "PTY session '{}' timed out after 300s of inactivity. Reaping.",
+                                    key
+                                );
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                    }
 
-                // Same single task reaps the deferred handles: no extra threads.
-                let reaped = {
-                    let mut queue = deferred_clone
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    queue.drain()
-                };
-                if reaped > 0 {
-                    tracing::debug!("reaped {reaped} deferred pty child(ren)");
+                    // Same single task reaps the deferred handles: no extra threads.
+                    let reaped = {
+                        let mut queue = deferred_clone
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        queue.drain()
+                    };
+                    if reaped > 0 {
+                        tracing::debug!("reaped {reaped} deferred pty child(ren)");
+                    }
                 }
-            }
-        });
+            });
+        }
 
         mgr
     }
