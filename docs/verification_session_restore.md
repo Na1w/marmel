@@ -382,3 +382,80 @@ AC-C1–4, AC-S1–4, AC-T1–2, AC-A1–3, AC-D1–7 is proven by an executed, 
 (capture side), AC-C3 branch 2 and AC-T2, which were the four open gaps in the scaffold and are no longer ignored or
 red.** The scoped `rustfmt` pass is a no-op on the mission's 27 files; 25 pre-existing repo-wide fmt hunks remain, by
 design. No source or test file was edited by t-036, no commit was made, and `cargo fmt` was never run in write mode.
+
+---
+
+## 8. SHIP — t-029 commit record (measured on this tree, shell available)
+
+### 8.1 The commit
+
+| Field | Value |
+|---|---|
+| Commit | **`d8411e61a377e0daed17bf67ccdb24d1f8229610`** (`d8411e6`) |
+| Subject | `feat: exact session restore after abort/crash` |
+| Branch / parent | `1.0.0-refactor` / `bbfb8933d7b196ffc901fcc0898b8db21a041687` (`bbfb893`) |
+| Content | **89 files changed, 47 015 insertions(+), 841 deletions(-)** — **68 added** (`src/session/**` ×12, the 10 mission test targets, `docs/**` ×46) and **21 modified** (18 under `src/`: `src/ui/**`, `src/manager/**`, `src/agents/**`, `src/orchestrator/{notice,workers}.rs`, `src/config.rs`, `src/lib.rs`, `src/main.rs`; plus `tests/test_ui_session.rs`, `README.md`, `marmel.toml.example`). `src/tool_names.rs` and `tests/test_tool_name_literals.rs` are tracked and byte-identical at `bbfb893`, so they contribute no diff |
+| Not pushed | correct — no push, no amend; `git log` is local-only from here |
+
+**Deliberately excluded from the commit** (working tree, untracked): `.marmel.old/`, `.marmel.old2/`,
+`.marmel.old.3/` (309 files / ~44 MB of stale `.marmel/`-family workspace metadata, including `marmel.log` and old
+per-task prompts) and `marmel.toml.df` (machine-local config; `.gitignore:41-43` already excludes `marmel.toml` and
+`marmel.toml.cloud` as "Local (machine-specific) configs"). None of them is mission content, and committing a 44 MB log
+tree is not reversible, so `git add -A` was scoped to `README.md marmel.toml.example src tests docs`. A follow-up task
+should add `.marmel.old*/` to `.gitignore`; `git status --short` is otherwise empty after the commit.
+This SHIP section lands in the immediately following docs-only commit (`git log --oneline -2`), whose own hash cannot be
+self-referenced here.
+
+### 8.2 STEP 1 — scoped formatting (no repo-wide fmt, no `cargo fmt` in write mode)
+
+`rustfmt --edition 2024 --config skip_children=true <file>` (edition from `Cargo.toml:4`) on exactly the 27 listed
+files — **all 27 exist, 0 were rewritten** (byte-identical `cmp` against pre-run copies). Re-running the same 27 with
+`--check`: **27/27 exit 0, 0 diff output** → formatting is provably a no-op on the mission set. The repo-wide drift was
+left untouched, by design (t-029 is not authorized to format anything outside the 27 listed files), and re-measured
+read-only: `cargo fmt --all -- --check` → **exit 1, exactly 25 hunks**, all of them in two files **outside** the authorized
+scope — `src/ui/tui/tests.rs` ×18 and `src/ui/raw.rs` ×7. **Correction to §6.2 for the record:** that drift is *not*
+inherited from `bbfb893` — `rustfmt --check` on `git show bbfb893:src/ui/raw.rs` and
+`git show bbfb893:src/ui/tui/tests.rs` reports **0 hunks each**, so the 25 hunks were introduced by the mission's edits to
+those two files. They are cosmetic-only (whitespace/line-break hunks in files that compile, clippy-clean and test-green),
+they were shipped as-is because formatting them was outside the t-029 authorization, and a follow-up task can run
+`rustfmt` on exactly those two files. `src/tool_names.rs` and `tests/test_tool_name_literals.rs`
+were already tracked and clean, so they contribute no diff.
+
+### 8.3 STEP 2 — re-prove gate ledger (t-029, this session)
+
+| # | Gate | Exit | Result |
+|---|---|---|---|
+| 1 | `cargo check --all-targets` | **0** | clean, 0 warnings |
+| 2 | `cargo clippy --all-targets --all-features -- -D warnings` | **0** | 0 warnings (`clippy 0.1.98`) |
+| 3 | `cargo test --test test_session_restore_panel_abort -- --test-threads=1` | **0** | **10 / 0 / 0** |
+| 4 | `cargo test --test test_session_restore_ui` | **0** | **9 / 0 / 0** |
+| 5 | `cargo test --test test_session_config` | **0** | **35 / 0 / 0** |
+| 6 | `--lib session::` / `ui::` / `manager::` / `agents::` | **0/0/0/0** | **66 / 196 / 76 / 60**, all 0 failed 0 ignored |
+| 7 | `cargo test --test test_role_gating` | 101 | **24 / 1 / 0**, the single failure is exactly `test_prompt_based_tool_gating` (`tests/test_role_gating.rs:312`) |
+| 8 | `cargo test --no-fail-fast` (run A) | 101 | **1217 / 7 / 0** over 29 targets |
+| 8b | `cargo test --no-fail-fast` (run B, re-sample, 71 s) | 101 | **1218 / 6 / 0** |
+
+### 8.4 Failure-set comparison (the t-036 caveat, exercised for real)
+
+Run A (7): 4× `harness::pty::tests::{test_harness_pty_process_group_kill, test_interactive_pty_manager_lifecycle,
+test_run_command_parses_timeout_seconds_argument, test_run_command_pty_cancelled_by_worker_token}` +
+`orchestrator::notice_tests::test_task_id_address_matches_exact_task_id_only` +
+`test_role_gating::test_prompt_based_tool_gating` + **`test_session_commit::throttled_triggers_coalesce_and_mandatory_triggers_ignore_the_floor`**.
+In run A, `orchestrator::notice_tests::test_handle_reply_to_arbitrator_success_and_validation` (registered flake #5)
+**passed**. Run B (6) = 4× PTY + `test_handle_reply_to_arbitrator_success_and_validation` + `test_prompt_based_tool_gating`
+— i.e. **all 6 are inside the accepted baseline set**, and the extra run-A name did not recur.
+
+The one run-A-only name was isolated per the brief: `cargo test --test test_session_commit -- --exact
+throttled_triggers_coalesce_and_mandatory_triggers_ignore_the_floor` → **passes 3/3**; `cargo test --test
+test_session_commit` → **9 / 0 / 0** twice (default parallel and `--test-threads=1`). Its assertion is a bundle member
+count (`tests/test_session_commit.rs:330`, expected `manifest + manager + ui` = 3, saw 4). Every test in that target holds
+the same `TEST_MUTEX` (`tests/test_session_commit.rs:44`), so the extra member can only come from process-global
+worker-registry/journal state that outlives an adjacent test under whole-tree load — **stated as inference, not as a
+proven root cause**; what is measured is the isolation verdict. It belongs to the shared-global-guard family §5 documents
+(test hygiene in the global test guards, **not** a defect in `src/session/` and not a failed session-restore criterion).
+Verdict: **ordering flake, not a regression**.
+t-036's flake #6 (`orchestrator::workers::tests::test_restore_installer_keeps_keys_and_closes_through_completed_seq`)
+**did not fire in either run**. **Zero failures attributable to the session-restore work in either run.**
+
+**SHIP verdict: PASS.** The mission is committed at `d8411e6`; t-029 changed no source and no test semantics — the only
+t-029 writes were the scoped `rustfmt` invocations (all no-ops), `git add`, `git commit`, and this section.
