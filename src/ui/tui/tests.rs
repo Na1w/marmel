@@ -2298,7 +2298,9 @@ fn capture_and_restore_round_trip_every_subagent_panel_field() {
         (0.11..0.6).contains(&age),
         "restored started_at should keep its ~0.12s age, got {age}s"
     );
-    let restored_last = restored.last_activity_at.expect("last_activity_at restored");
+    let restored_last = restored
+        .last_activity_at
+        .expect("last_activity_at restored");
     let last_age = std::time::Instant::now()
         .saturating_duration_since(restored_last)
         .as_secs_f64();
@@ -2476,7 +2478,9 @@ fn source_section_with_one_line() -> crate::session::format::UiSection {
 fn capture_records_budgets_as_a_sorted_witness_and_restore_never_adopts_them() {
     let mut source = TuiRenderer::new();
     source.thinking_budgets.insert("coder".to_string(), 12_000);
-    source.thinking_budgets.insert("researcher".to_string(), 4_000);
+    source
+        .thinking_budgets
+        .insert("researcher".to_string(), 4_000);
     source.default_thinking_budget = 8_000;
 
     let section = source.capture_ui();
@@ -2529,9 +2533,13 @@ fn announce_restore_surfaces_every_report_field_in_the_ui() {
     r.announce_restore(&report);
 
     let joined = r.messages.join("\n");
-    assert!(joined.contains("[CLI] Not restorable after restart [JoinHandle] coder: no task exists to join or abort"));
+    assert!(joined.contains(
+        "[CLI] Not restorable after restart [JoinHandle] coder: no task exists to join or abort"
+    ));
     assert!(joined.contains("[CLI] Restore warning: thinking budget drifted: 8000 -> 4000"));
-    assert!(joined.contains("[CLI] Worker coder-t-1 history normalized: 10 -> 8 message(s) (N1 orphan prune)"));
+    assert!(joined.contains(
+        "[CLI] Worker coder-t-1 history normalized: 10 -> 8 message(s) (N1 orphan prune)"
+    ));
     assert_eq!(
         r.status_line,
         "Session restored: 42 pane line(s), 3 worker(s) — 1 capability(s) lost"
@@ -2605,7 +2613,10 @@ fn capture_records_the_plan_pane_and_restore_puts_its_text_back() {
     assert_eq!(section.active_plan_task.as_deref(), Some("t-020"));
     // The timer is the D5 projection, not a re-anchored lie (A §3.9).
     let start = section.plan_start.clone().expect("plan start recorded");
-    let done = section.plan_completed.clone().expect("plan completion recorded");
+    let done = section
+        .plan_completed
+        .clone()
+        .expect("plan completion recorded");
     assert!(start.is_sane() && done.is_sane());
     assert!(
         start.elapsed_secs >= 0.0 && start.elapsed_secs < 5.0,
@@ -2633,7 +2644,11 @@ fn capture_records_the_plan_pane_and_restore_puts_its_text_back() {
     // terminal's derived maximum (`clamp_scrolls`, `events.rs:472`, which uses the
     // per-frame `plan_max_scroll` U5 refuses to persist): before the first draw
     // that maximum is 0, so the offset is legitimately pulled back (I-U6).
-    assert!(target.plan_scroll <= 4, "plan scroll {}", target.plan_scroll);
+    assert!(
+        target.plan_scroll <= 4,
+        "plan scroll {}",
+        target.plan_scroll
+    );
     // The restored timers keep their age and their order in the new process
     // (D5 T2), so the plan border draws the same elapsed figure as the old pane.
     let restored_start = target
@@ -2763,10 +2778,13 @@ fn subagent_thinking_state_round_trips_with_its_panel() {
         subagent_without_instants("coder"),
         subagent_without_instants("researcher"),
     ];
+    source.subagent_turn_thinking.insert(
+        "coder".to_string(),
+        "coder's in-flight reasoning".to_string(),
+    );
     source
-        .subagent_turn_thinking
-        .insert("coder".to_string(), "coder's in-flight reasoning".to_string());
-    source.subagent_is_thinking.insert("coder".to_string(), true);
+        .subagent_is_thinking
+        .insert("coder".to_string(), true);
     // An entry holding "" is a DIFFERENT pane state from no entry at all
     // (`render.rs:864-878` falls back to `thinking` only when the entry is
     // absent), so the mirror must keep the distinction.
@@ -2783,18 +2801,27 @@ fn subagent_thinking_state_round_trips_with_its_panel() {
         Some("coder's in-flight reasoning")
     );
     assert_eq!(section.subagent_panels[0].is_thinking, Some(true));
-    assert_eq!(section.subagent_panels[1].turn_thinking.as_deref(), Some(""));
+    assert_eq!(
+        section.subagent_panels[1].turn_thinking.as_deref(),
+        Some("")
+    );
     assert_eq!(section.subagent_panels[1].is_thinking, Some(false));
 
     let mut target = TuiRenderer::new();
     target.restore_panes(&section);
     assert_eq!(
-        target.subagent_turn_thinking.get("coder").map(String::as_str),
+        target
+            .subagent_turn_thinking
+            .get("coder")
+            .map(String::as_str),
         Some("coder's in-flight reasoning")
     );
     assert_eq!(target.subagent_is_thinking.get("coder"), Some(&true));
     assert_eq!(
-        target.subagent_turn_thinking.get("researcher").map(String::as_str),
+        target
+            .subagent_turn_thinking
+            .get("researcher")
+            .map(String::as_str),
         Some("")
     );
     assert_eq!(target.subagent_is_thinking.get("researcher"), Some(&false));
@@ -2816,7 +2843,9 @@ fn a_panel_with_no_thinking_entry_restores_to_no_entry() {
     target
         .subagent_turn_thinking
         .insert("coder".to_string(), "stale local thinking".to_string());
-    target.subagent_is_thinking.insert("coder".to_string(), true);
+    target
+        .subagent_is_thinking
+        .insert("coder".to_string(), true);
     target.restore_panes(&section);
     assert!(target.subagent_turn_thinking.is_empty());
     assert!(target.subagent_is_thinking.is_empty());
@@ -2852,7 +2881,10 @@ fn token_counters_are_captured_as_a_witness_and_never_adopted() {
     assert!(warnings[2].contains("orchestrator_context_tokens witness 12345"));
     // …and it is said out loud in the pane too (A §8.4: loud, never a swallow).
     let joined = target.messages.join("\n");
-    assert!(joined.contains("[CLI] Restore warning: tokens_in witness 12345 != this process's live 100"));
+    assert!(
+        joined
+            .contains("[CLI] Restore warning: tokens_in witness 12345 != this process's live 100")
+    );
     assert!(joined.contains("[CLI] Restore warning: tokens_out witness 6900"));
     assert!(joined.contains("[CLI] Restore warning: orchestrator_context_tokens witness 12345"));
     // A capture of the restored renderer still reports the live numbers: the
@@ -2886,7 +2918,10 @@ fn an_armed_abort_is_recorded_but_never_re_armed() {
 
     let section = source.capture_ui();
     assert!(section.abort_armed);
-    let armed_at = section.abort_armed_at.clone().expect("armed instant recorded");
+    let armed_at = section
+        .abort_armed_at
+        .clone()
+        .expect("armed instant recorded");
     assert!(armed_at.is_sane());
     assert_eq!(section.structural_violations(), Vec::<String>::new());
 
@@ -2940,7 +2975,11 @@ fn a_scroll_offset_the_live_clamp_moved_is_named_with_both_values() {
     };
 
     let warnings = clamp_report(&target, &section);
-    assert_eq!(warnings.len(), 5, "every fixture offset moved: {warnings:?}");
+    assert_eq!(
+        warnings.len(),
+        5,
+        "every fixture offset moved: {warnings:?}"
+    );
     for (warning, name, stored, live) in [
         (warnings[0].as_str(), "chat_scroll", 9_000u64, 0u64),
         (warnings[1].as_str(), "plan_scroll", 12u64, 0u64),
@@ -2970,7 +3009,10 @@ fn a_scroll_offset_the_live_clamp_moved_is_named_with_both_values() {
     // number the panes ended on, whatever the clamp did to it.
     let mut r = TuiRenderer::new();
     r.restore_panes(&section);
-    assert!(r.chat_scroll < 9_000, "the clamp still clamps, nothing is adopted");
+    assert!(
+        r.chat_scroll < 9_000,
+        "the clamp still clamps, nothing is adopted"
+    );
     let reported = clamp_report(&r, &section);
     assert!(
         reported.iter().any(|line| {
@@ -2997,8 +3039,16 @@ fn a_scroll_offset_the_live_clamp_moved_is_named_with_both_values() {
 /// exactly the drift I-U6's notice must never hide.
 fn clamp_report(target: &TuiRenderer, stored: &crate::session::format::UiSection) -> Vec<String> {
     clamp_warning_sentences(&[
-        ("chat_scroll", u64::from(stored.view.chat_scroll), u64::from(target.chat_scroll)),
-        ("plan_scroll", u64::from(stored.view.plan_scroll), u64::from(target.plan_scroll)),
+        (
+            "chat_scroll",
+            u64::from(stored.view.chat_scroll),
+            u64::from(target.chat_scroll),
+        ),
+        (
+            "plan_scroll",
+            u64::from(stored.view.plan_scroll),
+            u64::from(target.plan_scroll),
+        ),
         (
             "subagent_scroll",
             u64::from(stored.view.subagent_scroll),
@@ -3082,7 +3132,9 @@ fn every_new_field_survives_the_json_round_trip() {
     source
         .subagent_turn_thinking
         .insert("coder".to_string(), "in-flight".to_string());
-    source.subagent_is_thinking.insert("coder".to_string(), true);
+    source
+        .subagent_is_thinking
+        .insert("coder".to_string(), true);
 
     let section = source.capture_ui();
     let json = serde_json::to_string(&section).expect("the section serializes");
@@ -3097,7 +3149,13 @@ fn every_new_field_survives_the_json_round_trip() {
     assert_eq!(target.current_content, "answer…");
     assert_eq!(target.active_agent, "coder-t-020");
     assert_eq!(target.steer_sentence_buffer, "half a steer");
-    assert_eq!(target.subagent_turn_thinking.get("coder").map(String::as_str), Some("in-flight"));
+    assert_eq!(
+        target
+            .subagent_turn_thinking
+            .get("coder")
+            .map(String::as_str),
+        Some("in-flight")
+    );
     assert_eq!(target.subagent_is_thinking.get("coder"), Some(&true));
     // Witness-only: the counters came back in the JSON, they were not adopted.
     assert_eq!(back.tokens_in, 11);
@@ -3267,7 +3325,9 @@ fn the_hooks_are_object_safe_and_need_no_sync() {
             .spawn(move || {
                 let mut renderer = boxed;
                 let mut section = renderer.capture_ui();
-                section.chat_messages.push("from the session thread".to_string());
+                section
+                    .chat_messages
+                    .push("from the session thread".to_string());
                 renderer.restore_panes(&section);
                 renderer.capture_ui()
             })

@@ -282,7 +282,10 @@ impl Renderer for RawRenderer {
                 ),
             );
         }
-        if section.active_agent.as_deref().is_some_and(|agent| !agent.is_empty())
+        if section
+            .active_agent
+            .as_deref()
+            .is_some_and(|agent| !agent.is_empty())
             || section
                 .steer_sentence_buffer
                 .as_deref()
@@ -301,7 +304,9 @@ impl Renderer for RawRenderer {
                 ),
             );
         }
-        if section.tokens_in != 0 || section.tokens_out != 0 || section.orchestrator_context_tokens != 0
+        if section.tokens_in != 0
+            || section.tokens_out != 0
+            || section.orchestrator_context_tokens != 0
         {
             self.push_line(
                 "restore-skipped",
@@ -336,10 +341,7 @@ impl Renderer for RawRenderer {
         for notice in &report.notices {
             self.push_line(
                 "restore-lost",
-                &format!(
-                    "{:?}: {}: {}",
-                    notice.kind, notice.subject, notice.detail
-                ),
+                &format!("{:?}: {}: {}", notice.kind, notice.subject, notice.detail),
             );
         }
         for warning in &report.warnings {
@@ -424,9 +426,15 @@ mod tests {
         assert!(section.status_line.is_empty());
         assert!(section.subagent_panels.is_empty());
         assert!(section.journal.is_empty());
-        assert_eq!(section.composer, crate::session::format::ComposerState::default());
+        assert_eq!(
+            section.composer,
+            crate::session::format::ComposerState::default()
+        );
         assert_eq!(section.view, crate::session::format::ViewState::default());
-        assert_eq!(section.budgets, crate::session::format::BudgetWitness::default());
+        assert_eq!(
+            section.budgets,
+            crate::session::format::BudgetWitness::default()
+        );
         // t-020: every group added for pane coverage is unclaimed too, because
         // raw mode holds none of it (no plan box, no streaming region, no agent
         // identity, no counters, no armed abort window).
@@ -493,12 +501,17 @@ mod tests {
             buffered.starts_with("[status] pre-existing\n"),
             "the pending stream keeps its order: {buffered:?}"
         );
-        assert!(buffered.contains("[restore] raw mode has no panes: replaying 3 stored pane line(s)"));
+        assert!(
+            buffered.contains("[restore] raw mode has no panes: replaying 3 stored pane line(s)")
+        );
         assert!(buffered.contains("[restored] User: héllo wörld 🎉\n"));
         // U2: the empty pane line survives as its own line.
         assert!(buffered.contains("[restored]\n"));
         assert!(buffered.contains("[restored] Marmennill: done\n"));
-        assert!(buffered.contains("[restore-skipped] subagent coder (1 log line(s)) has no raw-mode pane"));
+        assert!(
+            buffered
+                .contains("[restore-skipped] subagent coder (1 log line(s)) has no raw-mode pane")
+        );
         // The stream contract and the abort surface are untouched.
         assert!(!buffered.contains("[done]"));
         assert_eq!(r.input_state.aborted, state_before.aborted);
@@ -591,8 +604,12 @@ mod tests {
         };
         r.announce_restore(&report);
         let buffered = String::from_utf8(r.buffer.clone()).expect("buffer is valid utf-8");
-        assert!(buffered.contains("[restore] session restored: 7 pane line(s), 2 worker(s), 1 unrecoverable worker(s)"));
-        assert!(buffered.contains("[restore-lost] JoinHandle: coder: no task exists to join or abort"));
+        assert!(buffered.contains(
+            "[restore] session restored: 7 pane line(s), 2 worker(s), 1 unrecoverable worker(s)"
+        ));
+        assert!(
+            buffered.contains("[restore-lost] JoinHandle: coder: no task exists to join or abort")
+        );
         assert!(buffered.contains("[restore-warning] thinking budget drifted: 8000 -> 4000"));
     }
 }
