@@ -85,6 +85,9 @@
 use std::sync::Arc;
 
 use crate::harness::HarnessStats;
+use crate::session::format::{
+    DanglingToolCallState, ManagerSection, MessageRecord, PinWitness, SESSION_RESTORE_NOTICE_PREFIX,
+};
 use crate::types::Message;
 
 /// The exact system checkpoint content injected at `messages[3]` on rebirth
@@ -265,8 +268,10 @@ pub fn manager_wire_tools(mcp_servers: &[String]) -> Vec<crate::types::ToolDef> 
 ///
 /// The checkpoint is matched on its **content marker**, not its role:
 /// `perform_rebirth` emits it as a `User` message (bug M12) while transcripts
-/// reloaded from disk ([`ContextEngine::load_transcript`]) can still carry the
-/// historic `System` variant.
+/// restored from a session bundle (installed wholesale by
+/// [`ContextEngine::install_restored_messages`]) can still carry the historic
+/// `System` variant. The window is therefore pinned by content, and the restored
+/// bytes MUST NOT be re-role'd or re-ordered (A §4 R-PIN-3).
 fn pinned_prefix_end(messages: &[Message]) -> usize {
     messages
         .iter()
@@ -284,6 +289,51 @@ fn pinned_prefix_end(messages: &[Message]) -> usize {
         .unwrap_or(2)
 }
 
+/// R-PIN-2 guard (**test-only**): how many writes have gone through a *by-index*
+/// pin setter — [`ContextEngine::set_system_prompt`] or [`ContextEngine::set_goal`].
+///
+/// A restore installs its vector wholesale through
+/// [`ContextEngine::install_restored_messages`] and MUST NOT route through either
+/// setter: both write `messages[0]`/`messages[1]` **by index**, so a restore that
+/// let them run would replace the pinned bytes with the freshly composed prompt
+/// and goal (the concrete clobber path `docs/design_session_restore_data.md` §4
+/// R-PIN-2 documents). The restore tests snapshot this witness around
+/// `install_restored_messages` and require it to stay `0`, which turns the
+/// clobber path into a test failure instead of a silent loss of REQ-CORE-001 /
+/// REQ-CORE-002.
+#[cfg(test)]
+fn note_pin_setter_write(engine: &ContextEngine) {
+    engine
+        .pin_setter_calls
+        .set(engine.pin_setter_calls.get() + 1);
+}
+
+/// Byte-length witnesses of the two pinned messages (A §3.5 `PinWitness`,
+/// R-PIN-1): `messages[0]` is the system prompt (REQ-CORE-001), `messages[1]`
+/// the immutable goal (REQ-CORE-002).
+///
+/// Lengths, not hashes — cheap, and enough to name *which* pin broke instead of
+/// "the transcript differs". The measurement is identical to
+/// `session::format::restore::witness_of`, which measures the same pair on the
+/// durable `MessageRecord` form: the two MUST agree, or the capture side would
+/// witness numbers its own loader cannot reproduce. A transcript that does not
+/// carry `System` at `[0]` / `User` at `[1]` witnesses `0`/`0` — capture stays
+/// total, and the loader refuses the vector (R-PIN-5 steps 2 and 3).
+fn pin_witness_of(messages: &[Message]) -> PinWitness {
+    let system_prompt_len = match messages.first() {
+        Some(Message::System { content }) => content.len(),
+        _ => 0,
+    };
+    let goal_len = match messages.get(1) {
+        Some(Message::User { content }) => content.len(),
+        _ => 0,
+    };
+    PinWitness {
+        system_prompt_len: system_prompt_len as u32,
+        goal_len: goal_len as u32,
+    }
+}
+
 /// Content markers that identify an **injected** advisory/notice message — a
 /// `Message::User` the runtime put in the transcript itself rather than a turn
 /// the user or the model produced. All of them are synthesized by this crate
@@ -299,14 +349,27 @@ fn pinned_prefix_end(messages: &[Message]) -> usize {
 ///   `src/agents/validation.rs`).
 /// - [`REBIRTH_CHECKPOINT_PREFIX`] — the rebirth checkpoint itself, which must
 ///   never be summarized as if it were a user instruction.
+/// - [`SESSION_RESTORE_NOTICE_PREFIX`] — the one synthetic restore notice a
+///   rehydrated session appends ([`ContextEngine::append_restore_notice`],
+///   flow §2.4). Registered here so `perform_rebirth` can never promote it into
+///   the `messages[2]` slot instead of the last genuine instruction.
 ///
 /// Used by [`ContextEngine::perform_rebirth`] so the rebirth `messages[2]` slot
 /// carries the last **genuine** instruction (bug M6, `docs/recon_bugs_manager.md`).
+///
+/// **The text of these markers is load-bearing** (A §4 R-PIN-4):
+/// [`is_injected_advisory`] is a pure `starts_with` scan, and the pinned window
+/// ([`pinned_prefix_end`]) is found by a content match on
+/// [`REBIRTH_CHECKPOINT_PREFIX`]. Trimming, re-wrapping, normalizing, rewording
+/// or translating one of these prefixes silently moves the pinned window and
+/// makes a runtime notice look like a genuine user instruction. A restore loader
+/// MUST treat them as opaque bytes.
 pub const INJECTED_ADVISORY_PREFIXES: &[&str] = &[
     "(SYSTEM: CONTEXT BUDGET ADVISORY",
     "(SYSTEM: CONTEXT LIMIT EXCEEDED",
     "(SYSTEM: Rebirth checkpoint accepted",
     REBIRTH_CHECKPOINT_PREFIX,
+    SESSION_RESTORE_NOTICE_PREFIX,
 ];
 
 /// Whether `content` is one of the runtime-injected advisory/notice messages
@@ -568,6 +631,11 @@ pub struct ContextEngine {
     /// requests (bug M7). `0` means "no tool payload accounted for", which
     /// reproduces the pre-M7 numbers exactly.
     tool_schema_tokens: usize,
+    /// Test-only witness for A §4 R-PIN-2: counts every write that went through a
+    /// by-index pin setter (`set_system_prompt` / `set_goal`). See
+    /// [`ContextEngine::pin_setter_calls`].
+    #[cfg(test)]
+    pin_setter_calls: std::cell::Cell<u64>,
 }
 
 impl ContextEngine {
@@ -579,6 +647,8 @@ impl ContextEngine {
             rebirth_advisory_emitted: false,
             consecutive_rebirths: 0,
             tool_schema_tokens: 0,
+            #[cfg(test)]
+            pin_setter_calls: std::cell::Cell::new(0),
         }
     }
 
@@ -588,8 +658,26 @@ impl ContextEngine {
         self.stats = Some(stats);
     }
 
+    /// How many writes this engine has taken through a by-index pin setter
+    /// (`set_system_prompt` / `set_goal`).
+    ///
+    /// Test-only R-PIN-2 witness: a capture→restore round trip must leave this at
+    /// the value it had before [`ContextEngine::install_restored_messages`] ran,
+    /// i.e. the restore seam must never route through a pin setter.
+    #[cfg(test)]
+    pub fn pin_setter_calls(&self) -> u64 {
+        self.pin_setter_calls.get()
+    }
+
     /// Lock the system prompt at `messages[0]` (REQ-CORE-001).
+    ///
+    /// A **by-index write**: it belongs to the fresh-boot path only. The restore
+    /// path MUST NOT call it — see the test-only `pin_setter_calls` witness, which
+    /// counts every call so the restore tests can prove the seam never routes
+    /// through here (A §4 R-PIN-2).
     pub fn set_system_prompt(&mut self, prompt: String) {
+        #[cfg(test)]
+        note_pin_setter_write(self);
         if self.messages.is_empty() {
             self.messages.push(Message::System { content: prompt });
         } else {
@@ -601,7 +689,14 @@ impl ContextEngine {
     ///
     /// If the transcript has no system prompt yet, a placeholder is inserted
     /// first to keep `messages[0]`/`messages[1]` indexing stable.
+    ///
+    /// Both halves are forbidden on the restore branch (A §4 R-PIN-2): the write
+    /// is by index, and the empty-`System` padding would paper over what the
+    /// loader is required to refuse — a restored transcript with no real system
+    /// prompt is a `Refused(PinViolation)`, not something to pad.
     pub fn set_goal(&mut self, goal: String) {
+        #[cfg(test)]
+        note_pin_setter_write(self);
         if self.messages.is_empty() {
             self.messages.push(Message::System {
                 content: String::new(),
@@ -984,37 +1079,159 @@ impl ContextEngine {
         }
     }
 
-    /// Save the full message transcript to disk as JSON.
-    pub fn save_transcript(&self, path: &std::path::Path) -> anyhow::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    // ---------------------------------------------------------------------
+    // Session capture / restore seams (flow §4.6, Design A §3.5 / §4)
+    // ---------------------------------------------------------------------
+
+    /// CAPTURE — the exact `ManagerSection` snapshot of this engine
+    /// (A §3.5, flow §4.6): the transcript **verbatim and in order**, plus the
+    /// scalars that change the next request and the witnesses a restore verifies.
+    ///
+    /// A pure read: it never mutates, repairs, prunes, truncates, re-roles or
+    /// re-orders `messages()` (R-PIN-1/R-PIN-3). The transcript is mapped through
+    /// [`MessageRecord::from_wire`] field by field — never through a JSON
+    /// round-trip of the wire type, because
+    /// `types::wire::serialize_assistant_content` (`src/types/wire.rs:30-41`)
+    /// writes `content: None` as `""`, which would erase the difference between
+    /// "the model produced no content" and "the model produced an empty string".
+    /// `reasoning_content` and the verbatim `ToolCall.function.arguments` ride
+    /// along unchanged: arguments are opaque bytes here, never re-serialized and
+    /// never run through `ensure_valid_json_arguments` (that would *rewrite*
+    /// history with `{"_error":"malformed_arguments",…}`).
+    ///
+    /// `pinned_prefix_end` and `pin_witness` are witnesses computed from the very
+    /// same vector, so a restore can prove it installed the transcript that was
+    /// captured rather than a re-composition of it.
+    pub fn capture_manager_section(&self) -> ManagerSection {
+        let messages: Vec<MessageRecord> =
+            self.messages.iter().map(MessageRecord::from_wire).collect();
+        let pinned_prefix_end = pinned_prefix_end(&self.messages);
+        let pin_witness = pin_witness_of(&self.messages);
+        let dangling = DanglingToolCallState::observe(&messages);
+        ManagerSection {
+            messages,
+            // `2` for an engine shorter than the pinned pair: the loader refuses
+            // such a transcript (R-PIN-5 step 1) rather than inventing a window.
+            pinned_prefix_end: pinned_prefix_end as u32,
+            pin_witness,
+            max_context_tokens: self.max_context_tokens,
+            rebirth_advisory_emitted: self.rebirth_advisory_emitted,
+            consecutive_rebirths: self.consecutive_rebirths,
+            dangling,
         }
-        let json = serde_json::to_string_pretty(&self.messages)?;
-        std::fs::write(path, json)?;
-        Ok(())
     }
 
-    /// Load the message transcript from disk if it exists and contains at least 2 messages (system + goal).
-    pub fn load_transcript(&mut self, path: &std::path::Path) -> anyhow::Result<bool> {
-        if !path.exists() {
-            return Ok(false);
+    /// RESTORE — install a restored transcript **wholesale** (A §4 R-PIN-2).
+    ///
+    /// This is the only sanctioned way a persisted manager transcript enters the
+    /// engine, and it deliberately does **not** go through
+    /// [`ContextEngine::set_system_prompt`] or [`ContextEngine::set_goal`]: both
+    /// write **by index**, and the boot path calls them unconditionally
+    /// (`src/ui/session.rs`: `build_manager_context` → `set_system_prompt`, then
+    /// `set_goal` once a goal exists). A restore routed through them therefore
+    /// clobbers the two pins with freshly composed bytes — load-then-set
+    /// overwrites `[0]`/`[1]` with the new system prompt and the CLI/typed input,
+    /// set-then-load throws away the just-restored vector — which silently kills
+    /// REQ-CORE-001 (KV-cache prefix identity) and REQ-CORE-002 (immutable goal)
+    /// while every pane still looks right.
+    ///
+    /// The vector is installed **as-is**: no role is changed, nothing is
+    /// re-ordered, nothing is padded, and no advisory or checkpoint text is
+    /// rewritten. [`pinned_prefix_end`] identifies the pinned window by a
+    /// content match on [`REBIRTH_CHECKPOINT_PREFIX`], and `compact()` keeps
+    /// `messages[..pinned_prefix_end]` unconditionally — so a re-role or a
+    /// re-order would silently move the window and change which turns survive
+    /// the next compaction, while `perform_rebirth` re-reads `[0]`/`[1]`
+    /// positionally and would collapse to a system-less, goal-less transcript.
+    ///
+    /// Panics when `messages` holds fewer than two records: that is a caller bug,
+    /// because `session::restore` refuses such a bundle before anything is
+    /// installed (R-PIN-5 step 1). The panic is the last line of that rule, not a
+    /// substitute for it.
+    pub fn install_restored_messages(&mut self, messages: Vec<MessageRecord>) {
+        assert!(
+            messages.len() >= 2,
+            "install_restored_messages: a manager transcript must carry at least the pinned \
+             pair (system prompt + goal); the loader refuses anything shorter (A §4 R-PIN-5), \
+             got {} record(s)",
+            messages.len()
+        );
+        self.messages = messages.into_iter().map(MessageRecord::into_wire).collect();
+    }
+
+    /// Restore the non-message engine scalars captured by
+    /// [`ContextEngine::capture_manager_section`] (A §3.5).
+    ///
+    /// Direct field assignment on purpose: [`ContextEngine::inject_rebirth_advisory`]
+    /// appends a message and [`ContextEngine::reset_rebirth_advisory`] /
+    /// [`ContextEngine::reset_consecutive_rebirths`] change behaviour the stored
+    /// state said was already spent. Without the latch the rebirth advisory
+    /// re-fires on a rehydrated session that had already been advised.
+    pub fn restore_engine_flags(
+        &mut self,
+        rebirth_advisory_emitted: bool,
+        consecutive_rebirths: usize,
+    ) {
+        self.rebirth_advisory_emitted = rebirth_advisory_emitted;
+        self.consecutive_rebirths = consecutive_rebirths;
+    }
+
+    /// The exclusive end index of this engine's pinned window — the private
+    /// [`pinned_prefix_end`] rule exposed for capture, for the loader's N3/N6
+    /// cross-checks, and for `RepairReport::pinned_prefix_end_{expected,actual}`.
+    pub fn pinned_prefix_end(&self) -> usize {
+        pinned_prefix_end(&self.messages)
+    }
+
+    /// Byte-length witnesses of the two pins (A §3.5 `PinWitness`). Same
+    /// measurement the loader recomputes, so a mismatch names *which* pin moved.
+    pub fn pin_witness(&self) -> PinWitness {
+        pin_witness_of(&self.messages)
+    }
+
+    /// The assistant `tool_calls` ↔ `Tool` pairing state of the transcript at
+    /// this instant, as the durable `DanglingToolCallState` (A §3.9). Computed by
+    /// the same observer the loader cross-checks (N6) — no second pairing rule
+    /// (A D1) — and purely read-only: capture never heals.
+    pub fn dangling_state(&self) -> DanglingToolCallState {
+        let records: Vec<MessageRecord> =
+            self.messages.iter().map(MessageRecord::from_wire).collect();
+        DanglingToolCallState::observe(&records)
+    }
+
+    /// Append the one synthetic restore notice (flow §2.4) to the transcript.
+    ///
+    /// This is the **only** place the notice is added, and it is added as a
+    /// `Message::User` at index `>= 2`, which is what keeps the pins untouched:
+    /// nothing at `[0]`/`[1]` is read or written, and the vector is only
+    /// extended. `SESSION_RESTORE_NOTICE_PREFIX` is a member of
+    /// [`INJECTED_ADVISORY_PREFIXES`], so `perform_rebirth` can never promote the
+    /// notice into the `messages[2]` slot instead of the last genuine
+    /// instruction (bug M6).
+    ///
+    /// The text is stored verbatim — never trimmed, wrapped or re-rendered
+    /// (R-PIN-4). A transcript without the pinned pair gets a `tracing::warn!`
+    /// and no append: a notice is never allowed to *become* a pin.
+    pub fn append_restore_notice(&mut self, notice: &str) {
+        if self.messages.len() < 2 {
+            tracing::warn!(
+                "append_restore_notice: transcript holds {} message(s), so the pinned pair is \
+                 absent — the restore notice is NOT appended (a rehydrated session must be \
+                 installed through install_restored_messages first)",
+                self.messages.len()
+            );
+            return;
         }
-        let data = std::fs::read_to_string(path)?;
-        let msgs: Vec<Message> = match serde_json::from_str(&data) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to deserialize session transcript from {}: {e}",
-                    path.display()
-                );
-                return Ok(false);
-            }
-        };
-        if msgs.len() < 2 {
-            return Ok(false);
+        if !notice.starts_with(SESSION_RESTORE_NOTICE_PREFIX) {
+            tracing::warn!(
+                "append_restore_notice: notice does not start with \
+                 {SESSION_RESTORE_NOTICE_PREFIX:?}, so the runtime's advisory grammar \
+                 ([INJECTED_ADVISORY_PREFIXES]) will not recognize it as injected"
+            );
         }
-        self.messages = msgs;
-        Ok(true)
+        self.messages.push(Message::User {
+            content: notice.to_string(),
+        });
     }
 }
 

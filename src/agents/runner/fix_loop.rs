@@ -67,6 +67,7 @@ use crate::orchestrator::{
     ActiveWorkerGuard, PreemptibleStreamSink, emit_status, is_current_or_global_cancelled,
     register_active_worker_with_token, update_active_worker_context,
 };
+use crate::session::worker_journal::{mirror_append_here, mirror_collapse_here};
 use crate::types::{ChatRequest, Message, ToolCall, ToolDef};
 use crate::{harness, llm, tool_names};
 use std::time::Duration;
@@ -733,14 +734,20 @@ pub fn append_tool_result(
 ) {
     let is_rebirth = tc.function.name == tool_names::TOOL_REBIRTH;
     if is_rebirth && execution_succeeded {
-        engine.append(Message::User {
-            content: rebirth_notice.to_string(),
-        });
+        mirror_append_here(
+            engine,
+            Message::User {
+                content: rebirth_notice.to_string(),
+            },
+        );
     } else {
-        engine.append(Message::Tool {
-            tool_call_id: tc.id.clone(),
-            content,
-        });
+        mirror_append_here(
+            engine,
+            Message::Tool {
+                tool_call_id: tc.id.clone(),
+                content,
+            },
+        );
     }
 }
 
@@ -774,9 +781,12 @@ fn inject_drained_notices(
 ) -> usize {
     let injected = notices.len();
     for notice in notices {
-        engine.append(Message::User {
-            content: crate::orchestrator::render_notice_for_worker(&notice),
-        });
+        mirror_append_here(
+            engine,
+            Message::User {
+                content: crate::orchestrator::render_notice_for_worker(&notice),
+            },
+        );
     }
     injected
 }
@@ -951,15 +961,18 @@ pub async fn run_fix_loop(
             }
         }
 
-        p.engine.append(Message::Assistant {
-            content: Some(reply.content.clone()),
-            reasoning_content: if reply.reasoning.is_empty() {
-                None
-            } else {
-                Some(reply.reasoning.clone())
+        mirror_append_here(
+            p.engine,
+            Message::Assistant {
+                content: Some(reply.content.clone()),
+                reasoning_content: if reply.reasoning.is_empty() {
+                    None
+                } else {
+                    Some(reply.reasoning.clone())
+                },
+                tool_calls: tool_calls.clone(),
             },
-            tool_calls: tool_calls.clone(),
-        });
+        );
 
         for tc in &tool_calls {
             if is_leave_verdict_tool(&tc.function.name) {
@@ -1043,7 +1056,7 @@ pub async fn run_fix_loop(
                         tool_names::TOOL_LEAVE_VERDICT,
                     )
                 };
-                p.engine.append(Message::User { content: notice });
+                mirror_append_here(p.engine, Message::User { content: notice });
                 continue;
             } else {
                 // **Fail-closed (contract change, gate t-033c).** This branch used
@@ -1144,7 +1157,7 @@ pub async fn run_fix_loop(
                 "SYSTEM NOTICE: You have completed {turn} inspection turns. Please wrap up your analysis. Unless critical unverified points remain, call the '{}' tool immediately with verdict ('APPROVED' or 'REJECTED') and comments.",
                 tool_names::TOOL_LEAVE_VERDICT
             );
-            p.engine.append(Message::User { content: reminder });
+            mirror_append_here(p.engine, Message::User { content: reminder });
         }
 
         // Wall-clock progress (gate t-033c): observable forward progress — a tool
@@ -1180,6 +1193,8 @@ pub async fn run_fix_loop(
             // the orchestrator status channel (the worker line the UI already
             // reads) plus `tracing::warn!`.
             let outcome = p.engine.compact();
+            // The mirror collapses with the engine (A §5.5 point 4).
+            mirror_collapse_here(p.engine);
             tracing::info!("{}: automatic context compaction: {outcome:?}", p.tag);
             if let Some(notice) = fix_loop_compaction_notice(&p.tag, &outcome) {
                 tracing::warn!("{notice}");
@@ -1187,6 +1202,7 @@ pub async fn run_fix_loop(
             }
         } else if p.engine.should_advise_rebirth() {
             p.engine.inject_rebirth_advisory();
+            mirror_collapse_here(p.engine);
         }
     }
 }
@@ -1281,12 +1297,14 @@ pub fn register_loop_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::{inject_worker_notices_at_turn_start, inject_worker_notices_mid_turn};
+    use super::{
+        append_tool_result, inject_worker_notices_at_turn_start, inject_worker_notices_mid_turn,
+    };
     use crate::manager::{ContextEngine, ContextEngineFactory};
     use crate::orchestrator::notice::{TEST_NOTICE_MUTEX, has_worker_inbox, worker_inbox_len};
     use crate::orchestrator::{post_notice_to_worker, render_notice_for_worker};
-    use crate::tool_names::TOOL_REPLY_TO_ARBITRATOR;
-    use crate::types::Message;
+    use crate::tool_names::{TOOL_REPLY_TO_ARBITRATOR, TOOL_RUN_COMMAND};
+    use crate::types::{Message, ToolCall, ToolFunction};
 
     fn specialist_engine() -> ContextEngine {
         ContextEngineFactory::new(64_000)
@@ -1302,6 +1320,95 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// t-010 wiring: the fix loop owns engine mutations the runner cannot see
+    /// (`append_tool_result`, both notice injectors, compaction). They mirror
+    /// out through the task-local handle — the same way `CURRENT_WORKER_TOKEN`
+    /// reaches this module — and stay a no-op when no journal is scoped.
+    #[tokio::test]
+    async fn every_fix_loop_engine_mutation_is_mirrored_through_the_task_local() {
+        let _notice_lock = TEST_NOTICE_MUTEX.lock().await;
+        let key = "mirroredfix-t-1";
+        let posted = post_notice_to_worker(key, "mirror me", Some("notice-mirror-1"));
+
+        let journal = crate::session::worker_journal::open(key, 1, 64);
+        let mut engine = specialist_engine();
+        journal.record_seed(
+            &engine,
+            &crate::session::worker_journal::WorkerSeed::default(),
+        );
+
+        crate::session::worker_journal::with_journal(&journal, || {
+            append_tool_result(
+                &mut engine,
+                &ToolCall {
+                    id: "call-mirror-1".to_string(),
+                    kind: "function".to_string(),
+                    function: ToolFunction {
+                        name: TOOL_RUN_COMMAND.to_string(),
+                        arguments: "{\"command\":\"ls\"".to_string(),
+                    },
+                },
+                "tool output".to_string(),
+                true,
+                "(context advisory)",
+            );
+            inject_worker_notices_at_turn_start(&mut engine, key);
+        });
+
+        let mirrored: Vec<crate::session::format::messages::MessageRecord> = engine
+            .messages()
+            .iter()
+            .map(crate::session::format::messages::MessageRecord::from_wire)
+            .collect();
+        assert_eq!(
+            journal.snapshot(),
+            mirrored,
+            "the mirror must equal the engine after every fix-loop mutation"
+        );
+        assert!(
+            journal
+                .snapshot()
+                .iter()
+                .any(|record| matches!(record, crate::session::format::messages::MessageRecord::Tool { content, .. } if content == "tool output")),
+            "the tool result must be mirrored, not only appended"
+        );
+        assert!(
+            user_texts(&engine)
+                .iter()
+                .any(|text| text == &render_notice_for_worker(&posted)),
+            "the injected notice must reach the transcript"
+        );
+        assert_eq!(
+            journal.history_source(),
+            crate::session::format::HistorySource::LiveMirror
+        );
+
+        // Unscoped: the engine still mutates, the mirror stays frozen — the
+        // mirror can never change what the worker does.
+        append_tool_result(
+            &mut engine,
+            &ToolCall {
+                id: "call-mirror-2".to_string(),
+                kind: "function".to_string(),
+                function: ToolFunction {
+                    name: TOOL_RUN_COMMAND.to_string(),
+                    arguments: "{}".to_string(),
+                },
+            },
+            "unscoped output".to_string(),
+            true,
+            "(context advisory)",
+        );
+        assert_eq!(
+            journal.len() + 1,
+            engine.messages().len(),
+            "an unscoped mutation must not be mirrored"
+        );
+
+        journal.close();
+        crate::session::worker_journal::unregister(key);
     }
 
     /// The mid-turn seam (t-048): a notice posted while a turn is in flight is

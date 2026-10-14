@@ -158,6 +158,46 @@ fn completion_sse(text: &str) -> String {
     )
 }
 
+// ── Durable-state witnesses (t-025b) ──────────────────────────────────────────
+//
+// The session bundle at `Plan::session_bundle_path()` is the ONLY durable session
+// state. t-025b deleted the superseded UI journal's persistence owner
+// (`UiTranscript::save`/`load` and the `.ui_transcript.json` file name), so every
+// "still visible after the fact" witness in this file reads the bundle off disk —
+// and pins that the legacy journal is never written again.
+
+/// The committed bundle's member list, read straight off disk (never from the
+/// in-process commit cache), so these witnesses prove the bytes are there.
+fn bundle_members(bundle: &std::path::Path) -> Vec<String> {
+    let text = std::fs::read_to_string(bundle.join(marmennill::session::MANIFEST_FILE))
+        .unwrap_or_else(|err| {
+            panic!(
+                "{} must exist after a committed session ({}): {err}",
+                marmennill::session::MANIFEST_FILE,
+                bundle.display()
+            )
+        });
+    let manifest: serde_json::Value = serde_json::from_str(&text).expect("manifest.json is JSON");
+    manifest["members"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|member| member["rel_path"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// One bundle member read as text.
+fn bundle_member(bundle: &std::path::Path, rel: &str) -> String {
+    std::fs::read_to_string(bundle.join(rel))
+        .unwrap_or_else(|err| panic!("{rel} must exist in {}: {err}", bundle.display()))
+}
+
+/// Path of the superseded UI journal — the file the session SHALL NOT write again.
+fn legacy_ui_journal(plan: &marmennill::manager::phase::Plan) -> std::path::PathBuf {
+    plan.dir().join(".ui_transcript.json")
+}
+
 /// The reproduction test (t-rpr1).
 ///
 /// Asserts the *required* behaviour: the loop must NOT terminate after a single
@@ -1019,13 +1059,17 @@ async fn test_steering_arbitrator_sleep_re_invokes_after_delay() {
     );
 }
 
-/// Verify that an interactive session persists its visible chat history to
-/// `.ui_transcript.json` (the persisted UI transcript) so it can be loaded back
-/// from disk with `UiTranscript::load`.
+/// Verify that an interactive session persists what the user saw in the ONE durable
+/// session format: the bundle at `Plan::session_bundle_path()`.
+///
+/// The witness used to be `.ui_transcript.json` read back with `UiTranscript::load`.
+/// t-025b deleted that persistence owner, so the same two records of the visible
+/// turn — the user goal and the assistant reply — are pinned here in the member a
+/// `--resume` reads (`manager.json`), the manifest must list both mandatory members,
+/// and the superseded UI journal must not be written again on the way out.
 #[tokio::test]
-async fn test_ui_session_saves_ui_transcript_to_disk() {
+async fn test_ui_session_persists_the_visible_turn_to_the_bundle() {
     let _lock = TEST_MUTEX.lock().await;
-    use marmennill::ui::{UiRecord, UiTranscript};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1058,38 +1102,51 @@ async fn test_ui_session_saves_ui_transcript_to_disk() {
         .await
         .expect("session succeeds");
 
-    let ui_transcript_path = plan.ui_transcript_path();
+    let bundle = plan.session_bundle_path();
+    let members = bundle_members(&bundle);
     assert!(
-        ui_transcript_path.exists(),
-        "ui_transcript.json must be persisted"
+        members.contains(&marmennill::session::MANAGER_FILE.to_string()),
+        "the aborted session must commit a bundle carrying the member a --resume \
+         reads; members: {members:?}"
+    );
+    assert!(
+        members.contains(&marmennill::session::UI_FILE.to_string()),
+        "the aborted session must commit a bundle carrying the ui member; \
+         members: {members:?}"
     );
 
-    let loaded = UiTranscript::load(&ui_transcript_path).expect("must load ui_transcript.json");
-    assert_eq!(loaded.records().len(), 2);
-    assert_eq!(
-        loaded.records()[0],
-        UiRecord::User {
-            text: "First goal".to_string()
-        }
+    let durable = bundle_member(&bundle, marmennill::session::MANAGER_FILE);
+    assert!(
+        durable.contains("First goal"),
+        "the user goal of the visible turn must be in the durable bundle member; \
+         got: {durable}"
     );
-    assert_eq!(
-        loaded.records()[1],
-        UiRecord::Assistant {
-            content: Some("First assistant reply.".to_string()),
-            thinking: None,
-        }
+    assert!(
+        durable.contains("First assistant reply."),
+        "the assistant reply of the visible turn must be in the durable bundle member; \
+         got: {durable}"
+    );
+
+    // The superseded journal stays superseded: nothing in the session loop may
+    // re-create it.
+    assert!(
+        !legacy_ui_journal(&plan).exists(),
+        "the session must not write the superseded `.ui_transcript.json` again"
     );
 }
 
-/// Verify that every session starts from a clean slate and still persists state:
-/// 1. Startup loads no prior on-disk state — the scripted line becomes the goal.
-/// 2. A stale `.ui_transcript.json` from an earlier run is not carried into the
-///    transcript written by the new session.
-/// 3. Saving the UI transcript still happens during the session.
+/// Verify that every session starts from a clean slate and still leaves durable
+/// state:
+/// 1. Startup loads no prior on-disk state — the scripted line becomes the goal, and
+///    that goal is what the committed bundle carries.
+/// 2. A stale `.ui_transcript.json` left on disk by an older release is NOT carried
+///    into the session's durable state.
+/// 3. Nothing touches that stale file any more: it is not rewritten, because its
+///    persistence owner (`UiTranscript::save`/`load` and the file-name constant) was
+///    deleted by t-025b — the bundle is the sole persistence owner.
 #[tokio::test]
-async fn test_ui_session_starts_fresh_and_still_saves_transcript() {
+async fn test_ui_session_starts_fresh_and_persists_a_bundle_not_the_legacy_journal() {
     let _lock = TEST_MUTEX.lock().await;
-    use marmennill::ui::{UiRecord, UiTranscript};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1107,14 +1164,14 @@ async fn test_ui_session_starts_fresh_and_still_saves_transcript() {
     plan.create("# Plan\n- [ ] [t-001] old pending task\n")
         .expect("plan created");
 
-    // Pre-create a stale UI transcript left behind by an earlier run.
-    let mut old_ui_transcript = UiTranscript::new();
-    old_ui_transcript.append(UiRecord::User {
-        text: "Old user goal from yesterday".to_string(),
-    });
-    old_ui_transcript
-        .save(plan.ui_transcript_path())
-        .expect("old transcript saved");
+    // Pre-create a stale UI transcript left behind by an older release. Nothing in
+    // this crate can write that file any more (t-025b deleted its writer), so the
+    // fixture spells the stale bytes by hand — that IS the leftover case the session
+    // has to live with.
+    let stale_journal = legacy_ui_journal(&plan);
+    let stale_bytes =
+        br#"{"records":[{"type":"User","text":"Old user goal from yesterday"}]}"#.to_vec();
+    std::fs::write(&stale_journal, &stale_bytes).expect("stale legacy journal written");
 
     let cfg = Config {
         backend_url: format!("{}/v1", server.uri()),
@@ -1137,22 +1194,35 @@ async fn test_ui_session_starts_fresh_and_still_saves_transcript() {
         .await
         .expect("session runs cleanly");
 
-    // 1. A new session writes its own transcript to disk.
-    let saved = UiTranscript::load(plan.ui_transcript_path()).expect("must load ui_transcript");
-    let has_fresh_goal = saved.records().iter().any(|r| match r {
-        UiRecord::User { text } => text == "Brand new goal",
-        _ => false,
-    });
-    assert!(has_fresh_goal, "New session must still save transcripts");
-
-    // 2. The stale transcript from the earlier run is not carried over.
-    let stale_carried_over = saved.records().iter().any(|r| match r {
-        UiRecord::User { text } => text == "Old user goal from yesterday",
-        _ => false,
-    });
+    // 1. A new session leaves durable state of its OWN: the bundle it commits on the
+    //    way out carries this run's goal in the member a `--resume` reads.
+    let bundle = plan.session_bundle_path();
+    let members = bundle_members(&bundle);
     assert!(
-        !stale_carried_over,
-        "New session must start from an empty transcript, not from disk state"
+        members.contains(&marmennill::session::MANAGER_FILE.to_string()),
+        "the aborted session must commit a bundle carrying the member a --resume \
+         reads; members: {members:?}"
+    );
+    let durable = bundle_member(&bundle, marmennill::session::MANAGER_FILE);
+    assert!(
+        durable.contains("Brand new goal"),
+        "a new session must persist its own goal to the bundle; got: {durable}"
+    );
+
+    // 2. The stale journal from the older release is not carried over into the
+    //    session's durable state.
+    assert!(
+        !durable.contains("Old user goal from yesterday"),
+        "a new session must start from an empty journal, not from the stale \
+         `.ui_transcript.json` on disk; got: {durable}"
+    );
+
+    // 3. And nothing rewrites that stale file: its owner is gone, so the bytes the
+    //    fixture left behind are exactly the bytes still on disk.
+    let still_on_disk = std::fs::read(&stale_journal).expect("stale legacy journal still there");
+    assert_eq!(
+        still_on_disk, stale_bytes,
+        "the superseded `.ui_transcript.json` is swept or named, never written again"
     );
 }
 
@@ -1836,8 +1906,10 @@ async fn test_ui_session_stalled_turn_watchdog_cancels_inflight_tool_call() {
 /// 1. the renderer received an `Event::Status` carrying the plan-state warning
 ///    **before the first assistant turn** (the wiring at the top of the session
 ///    loop, not the end-of-turn plan gate);
-/// 2. the UI transcript journal's **first** record is that `UiRecord::Status`
-///    (so it is still visible after a restart);
+/// 2. that `Event::Status` is the **first** status line the session surfaces (it
+///    comes from the prompt load, not from a later gate) — the durable trace of the
+///    session is its committed bundle, since t-025b deleted the superseded
+///    `.ui_transcript.json` owner;
 /// 3. the system prompt actually sent to the backend declares the plan state
 ///    UNKNOWN (fail-closed) and never presents the plan as active/complete.
 ///
@@ -1946,27 +2018,28 @@ async fn test_ui_session_unknown_plan_state_surfaces_status() {
         );
     }
 
-    // (2) The same warning is journaled as the **first** UI-transcript `Status`
-    //     record, so it is still visible after a restart.
-    let transcript = marmennill::ui::UiTranscript::load(plan.ui_transcript_path())
-        .expect("UI transcript should be readable");
-    let status_records: Vec<&String> = transcript
-        .records()
-        .iter()
-        .filter_map(|record| match record {
-            marmennill::ui::UiRecord::Status { text } => Some(text),
-            _ => None,
-        })
-        .collect();
+    // (2) The warning is a **session-start** surfacing, not the end-of-turn plan
+    //     gate: it is the FIRST `Status` line the session hands the renderer. (The
+    //     journal half of that surfacing stayed in memory, and t-025b deleted its
+    //     superseded on-disk owner, so the durable trace of this session is its
+    //     bundle and nothing else.)
+    let first_status = status_events
+        .first()
+        .unwrap_or_else(|| panic!("the session must surface at least one Status line"));
     assert!(
-        matches!(
-            transcript.records().first(),
-            Some(marmennill::ui::UiRecord::Status { text })
-                if text.contains("plan state is UNKNOWN")
-        ),
-        "the plan-state warning must be journaled as the first UI-transcript Status \
-         record (session start, not only at the end of the first turn); \
-         Status records: {status_records:?}"
+        first_status.contains("plan state is UNKNOWN"),
+        "the plan-state warning must be the first Status line of the session — it is \
+         surfaced when the prompt loads, not only by the end-of-turn plan gate; \
+         Status lines in order: {status_events:?}"
+    );
+    let bundle = plan.session_bundle_path();
+    assert!(
+        bundle_members(&bundle).contains(&marmennill::session::MANAGER_FILE.to_string()),
+        "the session's durable state is its committed bundle (manifest + members)"
+    );
+    assert!(
+        !legacy_ui_journal(&plan).exists(),
+        "the superseded `.ui_transcript.json` must not be written again"
     );
 
     // (3) Every prompt sent to the backend is fail-closed about the plan.
@@ -2170,7 +2243,6 @@ async fn test_ui_session_bound_mid_round_repairs_pairing_for_next_request() {
     let tmp = tempfile::tempdir().expect("tempdir");
     std::fs::write(tmp.path().join("notes.txt"), "note\n").expect("write notes.txt");
     let plan = marmennill::manager::phase::Plan::at(tmp.path());
-    let transcript_path = plan.transcript_path();
     let manager = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
         marmennill::llm::ChatClient::new(server.uri(), "marmel-manager"),
         plan,
@@ -2267,17 +2339,26 @@ async fn test_ui_session_bound_mid_round_repairs_pairing_for_next_request() {
         "the call that was actually torn down must keep its bound error as its result"
     );
 
-    // (4) The repair is persisted at the round boundary, not only applied to the
-    //     in-memory copy used to build the request: the transcript file the
-    //     session writes is what a rehydration would load.
-    let on_disk = std::fs::read_to_string(&transcript_path).expect("transcript on disk");
-    let on_disk: serde_json::Value =
-        serde_json::from_str(&on_disk).expect("transcript file is valid JSON");
-    let disk_defects = pairing_defects(&on_disk);
+    // (4) The repair is not confined to the in-memory copy that built the request:
+    //     the manager section the session **captured** at the round boundary is what
+    //     a rehydration would install. (The duplicate
+    //     `.marmel/.session_transcript.json` journal this assertion used to read is
+    //     deleted — A §1 D2, t-009 — and the capture is its successor.)
+    let captured = marmennill::session::manager_capture::last_capture()
+        .expect("the session must capture its manager section at the round boundary");
+    let persisted = serde_json::to_value(&captured.messages).expect("captured records serialize");
+    let persisted_defects = pairing_defects(&persisted);
     assert!(
-        disk_defects.is_empty(),
-        "the transcript left on disk after an aborted round must itself satisfy the \
-         pairing invariant; defects: {disk_defects:?}"
+        persisted_defects.is_empty(),
+        "the manager section captured after an aborted round must itself satisfy the \
+         pairing invariant; defects: {persisted_defects:?}"
+    );
+    assert!(
+        !tmp.path()
+            .join(".marmel")
+            .join(".session_transcript.json")
+            .exists(),
+        "the superseded manager journal must no longer be written (A §1 D2)"
     );
 
     // (5) The repair is not silent: it goes through the session's status channel.
@@ -2384,7 +2465,6 @@ async fn test_ui_session_user_exit_mid_round_persists_paired_transcript() {
     let tmp = tempfile::tempdir().expect("tempdir");
     std::fs::write(tmp.path().join("notes.txt"), "note\n").expect("write notes.txt");
     let plan = marmennill::manager::phase::Plan::at(tmp.path());
-    let transcript_path = plan.transcript_path();
     let manager = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
         marmennill::llm::ChatClient::new(server.uri(), "marmel-manager"),
         plan,
@@ -2413,9 +2493,20 @@ async fn test_ui_session_user_exit_mid_round_persists_paired_transcript() {
         captured.len()
     );
 
-    let on_disk = std::fs::read_to_string(&transcript_path).expect("transcript on disk");
-    let on_disk: serde_json::Value =
-        serde_json::from_str(&on_disk).expect("transcript file is valid JSON");
+    // The superseded `.session_transcript.json` journal this test used to read is
+    // deleted (A §1 D2, t-009). What an exited round must leave behind is the pairing
+    // witness the session captured in memory at the boundary — exactly what a
+    // rehydration would install.
+    let captured = marmennill::session::manager_capture::last_capture()
+        .expect("the session must capture its manager section on the user-exit boundary");
+    let on_disk = serde_json::to_value(&captured.messages).expect("captured records serialize");
+    assert!(
+        !tmp.path()
+            .join(".marmel")
+            .join(".session_transcript.json")
+            .exists(),
+        "the duplicate manager journal must no longer be written (A §1 D2)"
+    );
 
     assert_eq!(
         tool_call_ids(&on_disk),
@@ -2532,16 +2623,28 @@ async fn test_ui_session_surfaces_unreachable_compaction() {
         failures[0]
     );
 
-    // The same warning is journaled, so it is visible after the fact too.
-    let ui_transcript =
-        marmennill::ui::UiTranscript::load(plan.ui_transcript_path()).expect("UI transcript");
+    // The warning itself is live-only by design: the UI journal stayed in memory and
+    // t-025b deleted its superseded on-disk owner, so "after the fact" is pinned on
+    // the ONE durable artefact this session leaves — its committed bundle. An
+    // unreachable compaction has to be loud, and it must never damage the state the
+    // bundle keeps.
+    let bundle = plan.session_bundle_path();
+    let members = bundle_members(&bundle);
     assert!(
-        ui_transcript.records().iter().any(|record| matches!(
-            record,
-            marmennill::ui::UiRecord::Status { text }
-                if text.contains("could not reach its target")
-        )),
-        "the failed compaction must also be journaled in the UI transcript"
+        members.contains(&marmennill::session::MANAGER_FILE.to_string())
+            && members.contains(&marmennill::session::UI_FILE.to_string()),
+        "the session's durable state is its bundle, which must carry both mandatory \
+         members; members: {members:?}"
+    );
+    let durable = bundle_member(&bundle, marmennill::session::MANAGER_FILE);
+    assert!(
+        durable.contains("goal: tiny budget session"),
+        "a compaction that could not reach its target must not drop the session's own \
+         goal from the durable transcript; got: {durable}"
+    );
+    assert!(
+        !legacy_ui_journal(&plan).exists(),
+        "the superseded `.ui_transcript.json` must not be written again"
     );
 }
 
@@ -2624,7 +2727,6 @@ async fn test_ui_session_turn_cap_surfaces_observable_stop_reason() {
         .expect("write notes file");
     }
     let plan = marmennill::manager::phase::Plan::at(tmp.path());
-    let transcript_path = plan.transcript_path();
     let manager = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
         marmennill::llm::ChatClient::new(server.uri(), "marmel-manager"),
         plan.clone(),
@@ -2737,38 +2839,38 @@ async fn test_ui_session_turn_cap_surfaces_observable_stop_reason() {
         }
     );
 
-    // (4) And it must be journaled, so it is attributable after the fact too —
-    //     with the same machine-readable code the report carries.
-    let ui_transcript =
-        marmennill::ui::UiTranscript::load(plan.ui_transcript_path()).expect("UI transcript");
-    let journaled: Vec<String> = ui_transcript
-        .records()
-        .iter()
-        .filter_map(|record| match record {
-            marmennill::ui::UiRecord::Status { text } => Some(text.clone()),
-            _ => None,
-        })
-        .filter(|text| names_turn_cap(text))
-        .collect();
+    // (4) The line the operator was shown must be machine-readable as well as
+    //     human-readable: the session's surfacing helper hands the SAME text to the
+    //     renderer and to the (in-memory) journal, so the stable code the report
+    //     carries has to sit inside the line itself — a session summary may classify
+    //     the exit without parsing prose.
     assert!(
-        !journaled.is_empty(),
-        "the turn-cap exit must also be journaled as a `Status` record in the UI \
-         transcript (the same journaling the plan warnings and compaction failures \
-         use); journaled cap records: {journaled:?}"
+        cap_lines.iter().all(|text| text.contains("turn_cap")),
+        "the turn-cap line surfaced to the operator must carry the stable \
+         machine-readable code (`turn_cap`) that `SessionStopReport` reports; \
+         cap lines: {cap_lines:?}"
+    );
+    // (4b) And the durable trace of a capped session is its bundle — never the
+    //      superseded journal t-025b deleted.
+    let bundle = plan.session_bundle_path();
+    let members = bundle_members(&bundle);
+    assert!(
+        members.contains(&marmennill::session::MANAGER_FILE.to_string()),
+        "the turn-cap exit must leave a committed bundle carrying the member a --resume \
+         reads; members: {members:?}"
     );
     assert!(
-        journaled.iter().all(|text| text.contains("turn_cap")),
-        "the journaled cap line must carry the stable machine-readable code \
-         (`turn_cap`) so a session summary can classify the exit without parsing \
-         prose; journaled cap records: {journaled:?}"
+        !legacy_ui_journal(&plan).exists(),
+        "the superseded `.ui_transcript.json` must not be written again"
     );
 
-    // (5) The t-063 invariant still holds at this exit: the transcript left on
-    //     disk is a valid chat sequence, every assistant `tool_calls` entry has
-    //     exactly one matching tool result.
-    let on_disk = std::fs::read_to_string(&transcript_path).expect("transcript on disk");
-    let on_disk: serde_json::Value =
-        serde_json::from_str(&on_disk).expect("transcript file is valid JSON");
+    // (5) The t-063 invariant still holds at this exit: the manager state the
+    //     session captured is a valid chat sequence, every assistant `tool_calls`
+    //     entry has exactly one matching tool result. (The duplicate
+    //     `.session_transcript.json` journal is deleted — A §1 D2, t-009.)
+    let captured = marmennill::session::manager_capture::last_capture()
+        .expect("the session must capture its manager section at the turn-cap exit");
+    let on_disk = serde_json::to_value(&captured.messages).expect("captured records serialize");
     let defects = pairing_defects(&on_disk);
     assert!(
         defects.is_empty(),

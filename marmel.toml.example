@@ -42,6 +42,46 @@ enable_xml_rescue = true
 # UI mode: "tui" (ratatui) or "raw" (plain streaming).
 ui_mode = "tui"
 
+# ---------------------------------------------------------------------------
+# Session capture / restore (the `.marmel/session/` bundle: manifest.json —
+# written LAST, the commit point — plus manager.json, ui.json and
+# workers/<key>.json). All six keys are top-level, optional, and shown here at
+# their built-in defaults. See docs/session_restore.md.
+# ---------------------------------------------------------------------------
+#
+# Master switch for session capture (bool). Capture-on is the safety property:
+# the environment key MARMEL_SESSION_DISABLE is a ONE-WAY switch — `1`/`true`/
+# `yes`/`on` turns capture OFF, and no environment value can turn it on over an
+# explicit `session_enabled = false` here.
+# session_enabled = true
+#
+# Rehydrate the previous run from the bundle at boot (bool). Default false: a
+# fresh start is the normal behaviour. `--resume` on the command line, or
+# MARMEL_RESUME with a recognized boolean (`1`/`true`/`yes`/`on`), turns it on
+# for one run; `--fresh` always wins and is the escape hatch. A refused restore
+# exits 3 (`session::EXIT_RESTORE_REFUSED`) and starts nothing.
+# session_resume = false
+#
+# Floor in milliseconds between throttled commits (integer). A commit trigger
+# inside this interval is skipped. `MARMEL_SESSION_COMMIT_MIN_MS=<ms>` overrides
+# it for one run; a non-integer value is reported and ignored, never read as 0.
+# session_commit_min_interval_ms = 250
+#
+# Cap on the in-memory per-worker transcript mirror (integer message count).
+# Past the cap the oldest completed records are dropped first, and the number of
+# drops is reported on restore.
+# session_worker_mirror_max_messages = 4000
+#
+# Commit at every landed tool result (bool). `false` keeps the coarser triggers
+# (turn boundary, idle, abort, exit) and drops the per-result ones: fewer writes,
+# coarser crash granularity.
+# session_commit_on_tool_result = true
+#
+# Soft ceiling on total bundle member bytes in bytes (integer; 33554432 = 32 MiB).
+# Crossing it warns once and stops the throttled triggers; the load-bearing
+# commits (exit / abort / panic) still run.
+# session_max_bundle_bytes = 33554432
+
 # Monitoring & resilience harness (repetition detection & loop breaking)
 [monitoring]
 enabled = true

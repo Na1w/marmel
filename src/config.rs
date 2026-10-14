@@ -25,6 +25,30 @@ pub const MIN_COMMAND_TIMEOUT_SECS: u64 = 1;
 /// see [`effective_command_timeout_secs`].
 pub const MAX_COMMAND_TIMEOUT_SECS: u64 = 300;
 
+/// Default floor between throttled session commits
+/// (`session_commit_min_interval_ms`, flow §3.1).
+pub const DEFAULT_SESSION_COMMIT_MIN_INTERVAL_MS: u64 = 250;
+
+/// Default cap on the in-memory per-worker mirror
+/// (`session_worker_mirror_max_messages`, flow §1.3 R-TRIG-4).
+pub const DEFAULT_SESSION_WORKER_MIRROR_MAX_MESSAGES: usize = 4000;
+
+/// Default soft ceiling on total session-bundle member bytes
+/// (`session_max_bundle_bytes`, flow §3.1; A §7.1 C1 warn-once latch).
+pub const DEFAULT_SESSION_MAX_BUNDLE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Environment key that requests a session resume for one run
+/// (`1`/`true` ⇒ true). Equivalent to `--resume`; flow §3.2.
+pub const SESSION_RESUME_ENV: &str = "MARMEL_RESUME";
+
+/// Environment key that disables session capture. **One-way switch**: it can only
+/// turn capture off, never on, mirroring how `MARMEL_DISABLE_SANDBOX` ORs with
+/// [`Config::sandbox_disabled`]; flow §3.2.
+pub const SESSION_DISABLE_ENV: &str = "MARMEL_SESSION_DISABLE";
+
+/// Environment key that overrides the commit throttling floor (integer ms).
+pub const SESSION_COMMIT_MIN_MS_ENV: &str = "MARMEL_SESSION_COMMIT_MIN_MS";
+
 /// Config key that disables the Landlock sandbox, used verbatim in the
 /// attributable opt-out label that [`crate::harness::pty::log_sandbox_decision`]
 /// warns about (alongside the env fallback
@@ -166,6 +190,25 @@ pub struct Config {
     pub base_prompt: Option<String>,
     /// Optional global cap on fix-loop rounds per validation pass (defaults to MAX_FIX_LOOP_ROUNDS = 200).
     pub max_fix_loop_rounds: Option<usize>,
+    /// Session capture/rehydration master switch (Design A D2: replaces the
+    /// deleted `enable_rehydration`). Default `true`: a bundle is always written.
+    ///
+    /// One-way against the environment: `MARMEL_SESSION_DISABLE` can turn capture
+    /// **off**, never on — see [`session_env_overrides`].
+    pub session_enabled: bool,
+    /// Rehydrate from the bundle at boot. Default `false`: a fresh start is the
+    /// default behaviour; `--resume` / `MARMEL_RESUME` turn it on for one run.
+    pub session_resume: bool,
+    /// Floor between throttled commits (flow §1.3 R-TRIG-2). Default 250 ms.
+    pub session_commit_min_interval_ms: u64,
+    /// Cap on the in-memory per-worker mirror (flow §1.3 R-TRIG-4). Default 4000 records.
+    pub session_worker_mirror_max_messages: usize,
+    /// Commit at every landed tool result (flow T-3). `false` keeps T-1/T-2/T-6/T-9
+    /// and drops T-3/T-4: fewer writes, coarser crash granularity. Default `true`.
+    pub session_commit_on_tool_result: bool,
+    /// Soft ceiling on total member bytes before the committer stops writing
+    /// throttled triggers and warns once. Default 32 MiB.
+    pub session_max_bundle_bytes: u64,
 }
 
 impl Default for Config {
@@ -193,6 +236,12 @@ impl Default for Config {
             mcp_servers: HashMap::new(),
             base_prompt: None,
             max_fix_loop_rounds: None,
+            session_enabled: true,
+            session_resume: false,
+            session_commit_min_interval_ms: DEFAULT_SESSION_COMMIT_MIN_INTERVAL_MS,
+            session_worker_mirror_max_messages: DEFAULT_SESSION_WORKER_MIRROR_MAX_MESSAGES,
+            session_commit_on_tool_result: true,
+            session_max_bundle_bytes: DEFAULT_SESSION_MAX_BUNDLE_BYTES,
         }
     }
 }
@@ -332,8 +381,80 @@ pub fn load(explicit_path: Option<&str>) -> Result<Config> {
         cfg.model = m;
     }
 
+    // Session keys (flow §3.2): env beats file beats default, with the deliberate
+    // exception that `MARMEL_SESSION_DISABLE` is a one-way switch. Factored into
+    // [`apply_session_env`] so the precedence is testable without mutating the
+    // process environment.
+    cfg = apply_session_env(
+        cfg,
+        std::env::var(SESSION_RESUME_ENV).ok(),
+        std::env::var(SESSION_DISABLE_ENV).ok(),
+        std::env::var(SESSION_COMMIT_MIN_MS_ENV).ok(),
+    );
+
     cfg.expand_paths();
     Ok(cfg)
+}
+
+/// Tri-state reading of a `MARMEL_*` boolean: `1`/`true`/`yes`/`on` ⇒ `Some(true)`,
+/// `0`/`false`/`no`/`off` ⇒ `Some(false)`, anything else (including unset and
+/// unparseable junk) ⇒ `None`, which means "leave the file/default value alone".
+pub fn env_flag(value: Option<&String>) -> Option<bool> {
+    let raw = value.as_ref().map(|v| v.trim().to_ascii_lowercase())?;
+    match raw.as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Applies the three session environment overrides (flow §3.2) to `cfg`.
+///
+/// * `MARMEL_RESUME` — resume for this run; a recognized value overrides the file,
+///   an unrecognized one is reported and ignored.
+/// * `MARMEL_SESSION_DISABLE` — **one-way**: `true` turns capture off, and nothing
+///   this function does can turn it back on. Capture-on is the safety property the
+///   whole design rests on, so an env var must not override an explicit
+///   `session_enabled = false` in the file in the other direction.
+/// * `MARMEL_SESSION_COMMIT_MIN_MS` — integer ms floor; a non-integer is reported
+///   and ignored rather than silently treated as 0.
+pub fn apply_session_env(
+    mut cfg: Config,
+    resume: Option<String>,
+    disable: Option<String>,
+    min_ms: Option<String>,
+) -> Config {
+    match env_flag(resume.as_ref()) {
+        Some(value) => cfg.session_resume = value,
+        None if resume.is_some() => {
+            tracing::warn!(
+                "{SESSION_RESUME_ENV}={:?} is not a recognized boolean; keeping session_resume={}",
+                resume,
+                cfg.session_resume
+            );
+        }
+        None => {}
+    }
+    if matches!(env_flag(disable.as_ref()), Some(true)) {
+        cfg.session_enabled = false;
+    } else if disable.is_some() && env_flag(disable.as_ref()).is_none() {
+        tracing::warn!(
+            "{SESSION_DISABLE_ENV}={:?} is not a recognized boolean; capture stays enabled={}",
+            disable,
+            cfg.session_enabled
+        );
+    }
+    if let Some(raw) = min_ms.as_deref() {
+        match raw.trim().parse::<u64>() {
+            Ok(value) => cfg.session_commit_min_interval_ms = value,
+            Err(err) => tracing::warn!(
+                "{SESSION_COMMIT_MIN_MS_ENV}={raw:?} is not an integer number of milliseconds \
+                 ({err}); keeping session_commit_min_interval_ms={}",
+                cfg.session_commit_min_interval_ms
+            ),
+        }
+    }
+    cfg
 }
 
 fn resolve_config_path(explicit_path: Option<&str>) -> Option<PathBuf> {
@@ -392,6 +513,12 @@ struct PartialConfig {
     #[serde(default)]
     pub mcp_servers: HashMap<String, crate::mcp::McpServerConfig>,
     pub base_prompt: Option<String>,
+    pub session_enabled: Option<bool>,
+    pub session_resume: Option<bool>,
+    pub session_commit_min_interval_ms: Option<u64>,
+    pub session_worker_mirror_max_messages: Option<usize>,
+    pub session_commit_on_tool_result: Option<bool>,
+    pub session_max_bundle_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -474,6 +601,24 @@ fn merge(mut base: Config, partial: PartialConfig) -> Config {
     }
     if let Some(v) = partial.base_prompt {
         base.base_prompt = Some(v);
+    }
+    if let Some(v) = partial.session_enabled {
+        base.session_enabled = v;
+    }
+    if let Some(v) = partial.session_resume {
+        base.session_resume = v;
+    }
+    if let Some(v) = partial.session_commit_min_interval_ms {
+        base.session_commit_min_interval_ms = v;
+    }
+    if let Some(v) = partial.session_worker_mirror_max_messages {
+        base.session_worker_mirror_max_messages = v;
+    }
+    if let Some(v) = partial.session_commit_on_tool_result {
+        base.session_commit_on_tool_result = v;
+    }
+    if let Some(v) = partial.session_max_bundle_bytes {
+        base.session_max_bundle_bytes = v;
     }
 
     if let Some(p_mon) = partial.monitoring {
@@ -1304,6 +1449,224 @@ mod tests {
         assert!(
             src.contains("opt_out_from_env()"),
             "the env-only opt-out must keep working on its own"
+        );
+    }
+
+    // ------------------------------------------------------------ session keys
+    //
+    // `PartialConfig` has no `deny_unknown_fields`, so a `session_*` key that is
+    // missing from the mirror — or from `merge` — is dropped **silently** by
+    // `toml::from_str`. These tests are the only mechanism that catches that
+    // drift (flow §3.1 T-CFG-1/T-CFG-2; the existing `max_fix_loop_rounds` key is
+    // the in-repo proof that it happens).
+
+    fn merged(toml_str: &str) -> Config {
+        let partial: PartialConfig = toml::from_str(toml_str).expect("parses");
+        merge(Config::default(), partial)
+    }
+
+    #[test]
+    fn session_key_defaults() {
+        let cfg = Config::default();
+        assert!(cfg.session_enabled);
+        assert!(!cfg.session_resume);
+        assert_eq!(cfg.session_commit_min_interval_ms, 250);
+        assert_eq!(cfg.session_worker_mirror_max_messages, 4000);
+        assert!(cfg.session_commit_on_tool_result);
+        assert_eq!(cfg.session_max_bundle_bytes, 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn session_key_session_enabled_merges() {
+        let cfg = merged("session_enabled = false\n");
+        assert!(!cfg.session_enabled);
+        assert!(
+            merged("").session_enabled,
+            "an absent key keeps the default"
+        );
+    }
+
+    #[test]
+    fn session_key_session_resume_merges() {
+        assert!(merged("session_resume = true\n").session_resume);
+    }
+
+    #[test]
+    fn session_key_session_commit_min_interval_ms_merges() {
+        assert_eq!(
+            merged("session_commit_min_interval_ms = 0\n").session_commit_min_interval_ms,
+            0
+        );
+        assert_eq!(
+            merged("session_commit_min_interval_ms = 900\n").session_commit_min_interval_ms,
+            900
+        );
+    }
+
+    #[test]
+    fn session_key_session_worker_mirror_max_messages_merges() {
+        assert_eq!(
+            merged("session_worker_mirror_max_messages = 25\n").session_worker_mirror_max_messages,
+            25
+        );
+    }
+
+    #[test]
+    fn session_key_session_commit_on_tool_result_merges() {
+        assert!(!merged("session_commit_on_tool_result = false\n").session_commit_on_tool_result);
+    }
+
+    #[test]
+    fn session_key_session_max_bundle_bytes_merges() {
+        assert_eq!(
+            merged("session_max_bundle_bytes = 1024\n").session_max_bundle_bytes,
+            1024
+        );
+    }
+
+    #[test]
+    fn all_six_session_keys_merge_together() {
+        let cfg = merged(
+            r#"
+session_enabled = false
+session_resume = true
+session_commit_min_interval_ms = 500
+session_worker_mirror_max_messages = 10
+session_commit_on_tool_result = false
+session_max_bundle_bytes = 4096
+"#,
+        );
+        assert!(!cfg.session_enabled);
+        assert!(cfg.session_resume);
+        assert_eq!(cfg.session_commit_min_interval_ms, 500);
+        assert_eq!(cfg.session_worker_mirror_max_messages, 10);
+        assert!(!cfg.session_commit_on_tool_result);
+        assert_eq!(cfg.session_max_bundle_bytes, 4096);
+    }
+
+    /// T-CFG-2: every key must exist in all four places, or it is unsettable.
+    #[test]
+    fn every_session_key_exists_in_config_partial_merge_and_the_example() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/config.rs"))
+            .expect("src/config.rs must be readable");
+        let example =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/marmel.toml.example"))
+                .expect("marmel.toml.example must be readable");
+
+        let slice = |start: &str, end: &str| -> String {
+            let from = src
+                .find(start)
+                .unwrap_or_else(|| panic!("{start} must exist in src/config.rs"));
+            let rest = &src[from..];
+            let to = rest.find(end).unwrap_or(rest.len());
+            rest[..to].to_string()
+        };
+        let config_struct = slice("pub struct Config {", "impl Default for Config {");
+        let defaults = slice("impl Default for Config {", "static ACTIVE_CONFIG");
+        let partial_struct = slice("struct PartialConfig {", "struct PartialMonitoringConfig {");
+        let merge_body = slice("fn merge(mut base: Config", "impl Config {");
+
+        const KEYS: [&str; 6] = [
+            "session_enabled",
+            "session_resume",
+            "session_commit_min_interval_ms",
+            "session_worker_mirror_max_messages",
+            "session_commit_on_tool_result",
+            "session_max_bundle_bytes",
+        ];
+        for key in KEYS {
+            assert!(
+                config_struct.contains(&format!("pub {key}:")),
+                "Config must declare {key}"
+            );
+            assert!(
+                defaults.contains(key),
+                "impl Default for Config must set {key}"
+            );
+            assert!(
+                partial_struct.contains(&format!("pub {key}: Option<")),
+                "PartialConfig must mirror {key} as Option, otherwise the key is \
+                 silently dropped by toml"
+            );
+            assert!(
+                merge_body.contains(&format!("partial.{key}"))
+                    && merge_body.contains(&format!("base.{key} =")),
+                "merge must apply {key}"
+            );
+            assert!(
+                example.contains(&format!("# {key} =")),
+                "marmel.toml.example must document {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_flag_reads_the_documented_truthy_and_falsy_words_only() {
+        for truthy in ["1", "true", "TRUE", " yes ", "on"] {
+            assert_eq!(env_flag(Some(&truthy.to_string())), Some(true), "{truthy}");
+        }
+        for falsy in ["0", "false", "FALSE", " off ", "no"] {
+            assert_eq!(env_flag(Some(&falsy.to_string())), Some(false), "{falsy}");
+        }
+        assert_eq!(env_flag(None), None);
+        assert_eq!(env_flag(Some(&String::new())), None);
+        assert_eq!(env_flag(Some(&"maybe".to_string())), None);
+    }
+
+    #[test]
+    fn resume_env_overrides_the_file_value_both_ways() {
+        let file = merged("session_resume = true\n");
+        assert!(
+            !apply_session_env(file, Some("0".to_string()), None, None).session_resume,
+            "an explicit falsy MARMEL_RESUME means a fresh run"
+        );
+        let file = Config::default();
+        assert!(apply_session_env(file, Some("1".to_string()), None, None).session_resume);
+    }
+
+    #[test]
+    fn an_unrecognized_resume_value_keeps_the_file_value() {
+        let file = merged("session_resume = true\n");
+        let cfg = apply_session_env(file, Some("sure!".to_string()), None, None);
+        assert!(cfg.session_resume, "junk must not silently flip the key");
+    }
+
+    #[test]
+    fn session_disable_env_is_a_one_way_switch() {
+        let on = Config::default();
+        assert!(
+            !apply_session_env(on, None, Some("1".to_string()), None).session_enabled,
+            "MARMEL_SESSION_DISABLE must turn capture off"
+        );
+        let off = merged("session_enabled = false\n");
+        assert!(
+            !apply_session_env(off.clone(), None, Some("0".to_string()), None).session_enabled,
+            "MARMEL_SESSION_DISABLE must never turn capture back on"
+        );
+        let after = apply_session_env(off, None, Some("nonsense".to_string()), None);
+        assert!(
+            !after.session_enabled,
+            "junk must not change capture state either"
+        );
+    }
+
+    #[test]
+    fn commit_floor_env_beats_the_file_and_junk_is_ignored() {
+        let file = merged("session_commit_min_interval_ms = 700\n");
+        assert_eq!(
+            apply_session_env(file.clone(), None, None, Some("25".to_string()))
+                .session_commit_min_interval_ms,
+            25
+        );
+        assert_eq!(
+            apply_session_env(file.clone(), None, None, Some("fast".to_string()))
+                .session_commit_min_interval_ms,
+            700,
+            "a non-integer floor must not become 0"
+        );
+        assert_eq!(
+            apply_session_env(file, None, None, None).session_commit_min_interval_ms,
+            700
         );
     }
 }

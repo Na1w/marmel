@@ -1,14 +1,20 @@
-//! Persistent UI transcript journal for interactive sessions.
+//! In-memory UI transcript journal for interactive sessions.
 //!
 //! Separates the user-facing chat and event stream from internal LLM context
 //! mechanics (e.g. synthetic system prompts, auto-nudges).
-
-use anyhow::{Context, Result};
+//!
+//! t-025b deleted this journal's persistence owner: `UiTranscript::save`,
+//! `UiTranscript::load`, `UiTranscript::from_legacy_messages` and the
+//! `.ui_transcript.json` file name are gone, and nothing writes a UI journal file
+//! any more. The session bundle's `ui` member ([`crate::session::format::ui`]) is
+//! the only durable copy; this journal stays the live in-memory chat record and the
+//! steering-replay source. The serde derives survive because the bundle's
+//! `journal` section ([`crate::session::format::ui::UiJournalRecord`]) is the
+//! one-for-one persistence twin of [`UiRecord`].
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
-/// A single structured record persisted in the UI transcript journal.
+/// A single structured UI event in the journal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum UiRecord {
@@ -70,32 +76,6 @@ impl UiTranscript {
 
     pub fn clear(&mut self) {
         self.records.clear();
-    }
-
-    /// Load the transcript from a JSON file.
-    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = path.as_ref();
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("reading UI transcript from {}", path.display()))?;
-        let transcript: UiTranscript = serde_json::from_str(&content)
-            .with_context(|| format!("parsing UI transcript from {}", path.display()))?;
-        Ok(transcript)
-    }
-
-    /// Save the transcript to a JSON file.
-    pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating directory {}", parent.display()))?;
-        }
-        let json = serde_json::to_string_pretty(self).context("serializing UI transcript")?;
-        std::fs::write(path, json)
-            .with_context(|| format!("writing UI transcript to {}", path.display()))?;
-        Ok(())
     }
 
     /// Extract paired user steering queries and their corresponding arbitrator responses.
@@ -161,113 +141,6 @@ impl UiTranscript {
         }
         history
     }
-
-    /// Convert legacy LLM messages (`Message`) into `UiRecord`s for backward compatibility.
-    ///
-    /// This isolates legacy prefix checks and heuristic filtering into a single migration path.
-    pub fn from_legacy_messages(messages: &[crate::types::Message]) -> Self {
-        let mut records = Vec::new();
-        let delegated_call_ids: std::collections::HashSet<&str> = messages
-            .iter()
-            .filter_map(|m| match m {
-                crate::types::Message::Assistant { tool_calls, .. } => Some(tool_calls),
-                _ => None,
-            })
-            .flatten()
-            .filter(|call| call.function.name == crate::tool_names::TOOL_DELEGATE_TASK)
-            .map(|call| call.id.as_str())
-            .collect();
-
-        for msg in messages.iter().skip(1) {
-            match msg {
-                crate::types::Message::System { content } => {
-                    if content.starts_with("(SYSTEM: REBIRTH CHECKPOINT:") {
-                        let summary = content
-                            .strip_prefix("(SYSTEM: REBIRTH CHECKPOINT:")
-                            .unwrap_or(content)
-                            .trim_end_matches(')');
-                        records.push(UiRecord::Status {
-                            text: format!("Rebirth checkpoint:{summary}"),
-                        });
-                    }
-                }
-                crate::types::Message::User { content } => {
-                    let trimmed = content.trim_start();
-                    let is_synthetic = trimmed.starts_with("(SYSTEM NOTICE:")
-                        || trimmed.starts_with("(SYSTEM:")
-                        || trimmed.starts_with("SYSTEM:")
-                        || trimmed.starts_with("[System]")
-                        || trimmed.starts_with("(User steering resulted in subtask");
-                    if !is_synthetic {
-                        records.push(UiRecord::User {
-                            text: content.clone(),
-                        });
-                    }
-                }
-                crate::types::Message::Assistant {
-                    content,
-                    reasoning_content,
-                    tool_calls,
-                } => {
-                    let has_thought = reasoning_content
-                        .as_ref()
-                        .is_some_and(|r| !r.trim().is_empty());
-                    let has_content = content.as_ref().is_some_and(|c| !c.trim().is_empty());
-                    if has_thought || has_content {
-                        records.push(UiRecord::Assistant {
-                            content: content.clone(),
-                            thinking: reasoning_content.clone(),
-                        });
-                    }
-                    for call in tool_calls {
-                        let args_val =
-                            serde_json::from_str::<serde_json::Value>(&call.function.arguments)
-                                .unwrap_or_else(|_| {
-                                    serde_json::Value::String(call.function.arguments.clone())
-                                });
-                        records.push(UiRecord::ToolCall {
-                            display: crate::ui::helpers::format_tool_call_display(
-                                &call.function.name,
-                                &args_val,
-                            ),
-                        });
-                    }
-                }
-                crate::types::Message::Tool {
-                    tool_call_id,
-                    content,
-                } => {
-                    if delegated_call_ids.contains(tool_call_id.as_str()) {
-                        let summary = if let Some(first_line) = content.lines().next() {
-                            // Gate t-059: the failure heuristic is the marker
-                            // owner's stem table (`markers::has_failure_word`),
-                            // not a hand-typed substring, so it sits on the same
-                            // footing as `markers::starts_with_complete` next to
-                            // it. `error` is tooling vocabulary, not marker
-                            // vocabulary, so it stays local.
-                            if crate::markers::starts_with_complete(first_line)
-                                || first_line.to_lowercase().contains("error")
-                                || crate::markers::has_failure_word(first_line)
-                            {
-                                first_line.to_string()
-                            } else {
-                                "Task completed".to_string()
-                            }
-                        } else {
-                            "Task completed".to_string()
-                        };
-                        records.push(UiRecord::ToolResult { display: summary });
-                    } else {
-                        records.push(UiRecord::ToolResult {
-                            display: content.clone(),
-                        });
-                    }
-                }
-            }
-        }
-
-        Self { records }
-    }
 }
 
 #[cfg(test)]
@@ -316,98 +189,6 @@ mod tests {
             UiRecord::TaskFailed {
                 task_id: "t-legacy".to_string(),
                 reason: None,
-            }
-        );
-    }
-
-    #[test]
-    fn test_ui_transcript_save_and_load() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join(".marmel").join(".ui_transcript.json");
-
-        let mut transcript = UiTranscript::new();
-        transcript.append(UiRecord::User {
-            text: "Build feature".to_string(),
-        });
-        transcript.save(&path).unwrap();
-
-        assert!(path.exists());
-        let loaded = UiTranscript::load(&path).unwrap();
-        assert_eq!(transcript, loaded);
-    }
-
-    #[test]
-    fn test_from_legacy_messages_filters_synthetic_and_preserves_structure() {
-        let messages = vec![
-            crate::types::Message::System {
-                content: "system prompt".to_string(),
-            },
-            crate::types::Message::User {
-                content: "Refactor auth".to_string(),
-            },
-            crate::types::Message::Assistant {
-                content: Some("Looking into auth.".to_string()),
-                reasoning_content: Some("Checking directory.".to_string()),
-                tool_calls: vec![crate::types::ToolCall::new(
-                    "call-1",
-                    crate::tool_names::TOOL_GLOB,
-                    r#"{"pattern": "src/auth/*.rs"}"#,
-                )],
-            },
-            crate::types::Message::Tool {
-                tool_call_id: "call-1".to_string(),
-                content: "src/auth/mod.rs".to_string(),
-            },
-            // Synthetic system messages that should be filtered:
-            crate::types::Message::User {
-                content: "(SYSTEM NOTICE: Active execution plan detected...)".to_string(),
-            },
-            crate::types::Message::User {
-                content: "[System] User executed /reset.".to_string(),
-            },
-            crate::types::Message::User {
-                content:
-                    "(User steering resulted in subtask 't-1' executed by specialist 'coder'.)"
-                        .to_string(),
-            },
-            crate::types::Message::System {
-                content: "(SYSTEM: REBIRTH CHECKPOINT: Completed auth refactor)".to_string(),
-            },
-        ];
-
-        let transcript = UiTranscript::from_legacy_messages(&messages);
-        let records = transcript.records();
-
-        assert_eq!(records.len(), 5);
-        assert_eq!(
-            records[0],
-            UiRecord::User {
-                text: "Refactor auth".to_string()
-            }
-        );
-        assert_eq!(
-            records[1],
-            UiRecord::Assistant {
-                content: Some("Looking into auth.".to_string()),
-                thinking: Some("Checking directory.".to_string()),
-            }
-        );
-        assert_eq!(
-            records[2],
-            UiRecord::ToolCall {
-                display: "glob(src/auth/*.rs)".to_string()
-            }
-        );
-        assert_eq!(
-            records[3],
-            UiRecord::ToolResult {
-                display: "src/auth/mod.rs".to_string()
-            }
-        );
-        assert_eq!(
-            records[4],
-            UiRecord::Status {
-                text: "Rebirth checkpoint: Completed auth refactor".to_string()
             }
         );
     }
@@ -534,152 +315,5 @@ mod tests {
             history[0].1,
             format!("{pending}\nThe coder confirmed older files still parse.")
         );
-    }
-
-    /// Regression (gate t-030): the delegated-result summary tested the first
-    /// line against a hard-coded `"MISSION COMPLETE"` prefix, so every other
-    /// casing of the (case-insensitive) marker degraded to "Task completed".
-    /// The prefix test now comes from `crate::markers`.
-    #[test]
-    fn test_delegate_summary_recognises_any_casing_of_the_completion_marker() {
-        let marker = crate::markers::MARKER_COMPLETE;
-        for first_line in [
-            format!("{marker} (t-60)"),
-            format!("{} (t-60)", marker.to_lowercase()),
-            format!("{} (t-60)", "Mission Complete"),
-        ] {
-            let messages = vec![
-                crate::types::Message::System {
-                    content: "system prompt".to_string(),
-                },
-                crate::types::Message::Assistant {
-                    content: None,
-                    reasoning_content: None,
-                    tool_calls: vec![crate::types::ToolCall::new(
-                        "call-delegate",
-                        crate::tool_names::TOOL_DELEGATE_TASK,
-                        "{}",
-                    )],
-                },
-                crate::types::Message::Tool {
-                    tool_call_id: "call-delegate".to_string(),
-                    content: format!("{first_line}\nrest of the deliverable"),
-                },
-            ];
-            let transcript = UiTranscript::from_legacy_messages(&messages);
-            let summary = transcript
-                .records()
-                .iter()
-                .find_map(|record| match record {
-                    UiRecord::ToolResult { display } => Some(display.clone()),
-                    _ => None,
-                })
-                .expect("a tool result record");
-            assert_eq!(summary, first_line);
-        }
-
-        // A marker that is not on the first line keeps the generic summary.
-        let messages = vec![
-            crate::types::Message::System {
-                content: "system prompt".to_string(),
-            },
-            crate::types::Message::Assistant {
-                content: None,
-                reasoning_content: None,
-                tool_calls: vec![crate::types::ToolCall::new(
-                    "call-delegate",
-                    crate::tool_names::TOOL_DELEGATE_TASK,
-                    "{}",
-                )],
-            },
-            crate::types::Message::Tool {
-                tool_call_id: "call-delegate".to_string(),
-                content: format!("Work finished.\n\n{marker} (t-61)"),
-            },
-        ];
-        let transcript = UiTranscript::from_legacy_messages(&messages);
-        let summary = transcript
-            .records()
-            .iter()
-            .find_map(|record| match record {
-                UiRecord::ToolResult { display } => Some(display.clone()),
-                _ => None,
-            })
-            .expect("a tool result record");
-        assert_eq!(summary, "Task completed");
-    }
-
-    /// Gate t-059 byte-pin: the failure half of the delegated-result summary is
-    /// the marker owner's stem table (`crate::markers::has_failure_word`) rather
-    /// than a hand-typed substring, and the rendered summary is unchanged — a
-    /// failure-shaped first line is echoed verbatim, anything else collapses to
-    /// `"Task completed"`.
-    #[test]
-    fn test_delegate_summary_failure_heuristic_is_marker_owned_and_byte_pinned() {
-        let summary_for = |first_line: &str| -> String {
-            let messages = vec![
-                crate::types::Message::System {
-                    content: "system prompt".to_string(),
-                },
-                crate::types::Message::Assistant {
-                    content: None,
-                    reasoning_content: None,
-                    tool_calls: vec![crate::types::ToolCall::new(
-                        "call-delegate",
-                        crate::tool_names::TOOL_DELEGATE_TASK,
-                        "{}",
-                    )],
-                },
-                crate::types::Message::Tool {
-                    tool_call_id: "call-delegate".to_string(),
-                    content: format!("{first_line}\nrest of the deliverable"),
-                },
-            ];
-            UiTranscript::from_legacy_messages(&messages)
-                .records()
-                .iter()
-                .find_map(|record| match record {
-                    UiRecord::ToolResult { display } => Some(display.clone()),
-                    _ => None,
-                })
-                .expect("a tool result record")
-        };
-
-        // Failure- and error-shaped first lines are echoed byte-for-byte.
-        for first_line in [
-            "FAILED (aborted)",
-            "FAILED: build broke",
-            "The delegation failed after three retries",
-            "failure: validator rejected",
-            "ERROR: upstream transport closed",
-        ] {
-            assert_eq!(summary_for(first_line), first_line, "line: {first_line}");
-        }
-        // Anything else keeps the generic summary. A `REPLAN REQUIRED` verdict is
-        // one of them: this summary heuristic predates the marker grammar and only
-        // ever looked at the completion prefix, `error` and the `fail` stem, so
-        // widening it (e.g. to `markers::has_replan_marker`) would change rendered
-        // output and is deliberately out of scope here.
-        for first_line in [
-            "Task finished cleanly",
-            "Mission report",
-            "REPLAN REQUIRED: the decomposition is wrong",
-            "",
-        ] {
-            assert_eq!(
-                summary_for(first_line),
-                "Task completed",
-                "line: {first_line}"
-            );
-        }
-        // The transcript asks the *stem* predicate on purpose: it is weaker than
-        // the FAILED marker, and pinning the difference stops a later "cleanup"
-        // from swapping in `has_failure_marker` and changing this output.
-        assert!(crate::markers::has_failure_word(
-            "failure: validator rejected"
-        ));
-        assert!(!crate::markers::has_failure_marker(
-            "failure: validator rejected"
-        ));
     }
 }

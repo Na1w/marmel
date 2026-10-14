@@ -273,6 +273,13 @@ Internal session files are stored in `.marmel/` within the workspace root:
 | `.marmel/prompts/` | Synthesized agent prompts and tool grants (`<task_id>.md`). |
 | `.marmel/marmel.log` | Rotating application log (5MB limit, 3 backups kept). |
 | `.marmel/archive/` | Archived completed execution plans. |
+| `.marmel/session/` | The **session bundle**: the split-file snapshot that `--resume` reads back (see [Session Restore](docs/session_restore.md)). It is a directory, never a single file. |
+| `.marmel/session/manifest.json` | The bundle's root document and **commit point**: format/schema versions, session id, wall/monotonic anchors, how the previous process ended, the identity floors, and the member list with each member's byte length and fingerprint. It is written **LAST** — that rename *is* the commit — and it is the only file that names the member set. |
+| `.marmel/session/manager.json` | Manager member: the message history (pinned system prompt and goal preserved byte-for-byte), the pin witness, and the engine scalars. |
+| `.marmel/session/ui.json` | UI member: pane text (chat, subagents, plan panel), status line, composer text + caret + history, scroll / selection / focus, subagent panels, and the token witnesses. |
+| `.marmel/session/workers/<key>.json` | One member per subagent, named after its registry key with escaping (e.g. `coder-t-018%237.json`): full mirrored conversation history, status, counters, and pending/dangling tool-call state. |
+| `.marmel/.session_transcript.json` | **LEGACY.** Written by older releases only; never written again, never merged or upgraded into a bundle. It is named in the "legacy journals found, not restorable" report on a fresh boot, and swept by `/reset`, `Plan::clear()` and `Plan::archive()`. |
+| `.marmel/.ui_transcript.json` | **LEGACY.** Same handling as `.marmel/.session_transcript.json`: never written again, only named on a fresh boot, and deleted with the plan by `/reset`, `Plan::clear()` and `Plan::archive()`. |
 
 ---
 

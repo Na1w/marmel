@@ -199,11 +199,11 @@ pub(crate) fn handle_reset_command(
     renderer: &mut dyn Renderer,
     mut ctx: Option<&mut ContextEngine>,
 ) {
+    // `Plan::clear()` already sweeps the session state with the plan: the superseded
+    // `.session_transcript.json` journal (a stale copy only — t-009 deleted that
+    // writer), the session bundle that replaced it, and the in-memory manager
+    // capture. No separate transcript unlink here any more.
     let _ = plan.clear();
-    let transcript = plan.transcript_path();
-    if transcript.exists() {
-        let _ = std::fs::remove_file(&transcript);
-    }
     renderer.on_event(&Event::Message(
         "Execution plan has been cleared and reset by user.".to_string(),
     ));

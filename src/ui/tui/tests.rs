@@ -2119,3 +2119,1163 @@ fn test_line_matches_task_id_accepts_decorated_targets() {
     assert!(!line_matches_task_id("- [ ] [t-100] Do the thing", "[]"));
     assert!(!line_matches_task_id("- [ ] [t-100] Do the thing", ""));
 }
+
+// ============================================================================
+// Renderer rehydration hooks (t-011, flow §4.7, design A §6)
+// ============================================================================
+
+/// Build a panel with every field populated, so a round trip has something to
+/// lose if the projection is not field-for-field.
+fn rich_subagent(name: &str) -> SubagentDetail {
+    SubagentDetail {
+        name: name.to_string(),
+        task_id: Some(format!("t-{name}")),
+        prompt: format!("brief for {name}"),
+        started_at: Some(std::time::Instant::now() - std::time::Duration::from_secs(372)),
+        worked_duration: std::time::Duration::from_millis(372_125),
+        last_activity_at: Some(std::time::Instant::now()),
+        logs: vec![
+            "[Started]".to_string(),
+            "run_command: ls".to_string(),
+            String::new(),
+            "[Completed]".to_string(),
+        ],
+        thinking: "reasoning with é and 🎉".to_string(),
+        content: "output\nsecond line".to_string(),
+        is_active: true,
+        context_tokens: 18_431,
+    }
+}
+
+/// Same panel, minus the two `Instant`s: `TimePoint` re-anchoring is inherently
+/// process-relative (D5 T2), so a whole-section equality check must not carry
+/// instants. The instant projection itself is asserted below.
+fn subagent_without_instants(name: &str) -> SubagentDetail {
+    let mut detail = rich_subagent(name);
+    detail.started_at = None;
+    detail.last_activity_at = None;
+    detail
+}
+
+#[test]
+fn capture_ui_copies_the_pane_verbatim_including_empty_and_duplicate_entries() {
+    // U1-U3: the pane vector is the byte authority and is copied element by
+    // element, in order, unmodified.
+    let mut r = TuiRenderer::new();
+    r.messages = vec![
+        "User: first".to_string(),
+        String::new(),
+        "[Tool Call] run_command(\"ls\")".to_string(),
+        "Marmennill: a\nb\nc".to_string(),
+        "Marmennill: a\nb\nc".to_string(),
+        "[CLI] Thinking display: on".to_string(),
+    ];
+    r.status_line = "Active: coder | 6m12s".to_string();
+
+    let section = r.capture_ui();
+    assert_eq!(section.chat_messages, r.messages);
+    assert_eq!(section.status_line, r.status_line);
+    assert_eq!(section.chat_messages.len(), 6);
+    // A live renderer always captures a loadable section.
+    assert_eq!(section.structural_violations(), Vec::<String>::new());
+}
+
+#[test]
+fn capture_then_restore_leaves_the_pane_and_view_state_identical() {
+    let mut source = TuiRenderer::new();
+    source.messages = (0..40).map(|i| format!("pane line {i}")).collect();
+    source.status_line = "Active: coder | 3m".to_string();
+    source.show_thought = true;
+    source.show_subagent_panel = true;
+    source.chat_auto_scroll = false;
+    source.chat_scroll = 7;
+    source.focused_panel = FocusedPanel::Subagents;
+    source.subagents = vec![
+        subagent_without_instants("coder"),
+        subagent_without_instants("researcher"),
+    ];
+    source.selected_subagent_idx = 1;
+
+    let section = source.capture_ui();
+    assert_eq!(section.structural_violations(), Vec::<String>::new());
+
+    let mut target = TuiRenderer::new();
+    target.restore_panes(&section);
+
+    // The visible state is what was stored, before any draw (I-U2).
+    assert_eq!(target.messages, source.messages);
+    assert_eq!(target.status_line, source.status_line);
+    assert!(target.show_thought);
+    assert!(target.show_subagent_panel);
+    assert!(!target.chat_auto_scroll);
+    assert_eq!(target.chat_scroll, 7);
+    assert_eq!(target.focused_panel, FocusedPanel::Subagents);
+    assert_eq!(target.selected_subagent_idx, 1);
+    // Re-capturing the restored renderer reproduces the section exactly.
+    assert_eq!(target.capture_ui(), section);
+}
+
+#[test]
+fn restore_panes_invalidates_the_caches_so_no_stale_line_is_drawn() {
+    // The render caches are keyed by message count, so a wholesale replace of
+    // equal length MUST invalidate them or the next frame would draw the
+    // pre-restore bytes.
+    let mut r = TuiRenderer::new();
+    r.messages = vec!["short one".to_string(), "short two".to_string()];
+    assert_eq!(r.estimated_chat_lines(80), 2);
+
+    let section = crate::session::format::UiSection {
+        chat_messages: vec!["a\nb\nc\nd".to_string(), "e\nf".to_string()],
+        ..Default::default()
+    };
+    r.restore_panes(&section);
+
+    assert_eq!(r.messages, section.chat_messages);
+    assert_eq!(r.estimated_chat_lines(80), 6);
+    assert_eq!(r.cached_rendered_messages.borrow().len(), 2);
+    assert_eq!(r.cached_message_lines.borrow().as_slice(), &[4, 2]);
+    assert!(r.dirty);
+}
+
+#[test]
+fn capture_and_restore_round_trip_every_subagent_panel_field() {
+    // The process anchor is created on first use, so pin it BEFORE building the
+    // instants: a real subagent always starts after boot (see the pre-anchor
+    // test below for what happens when it does not).
+    let _ = crate::session::time::anchor();
+    let started = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    let last = std::time::Instant::now();
+
+    let mut first = rich_subagent("coder");
+    first.started_at = Some(started);
+    first.last_activity_at = Some(last);
+    let mut source = TuiRenderer::new();
+    source.subagents = vec![first, subagent_without_instants("researcher")];
+    source.selected_subagent_idx = 1;
+
+    let section = source.capture_ui();
+    assert_eq!(section.subagent_panels.len(), 2);
+    let panel = &section.subagent_panels[0];
+    assert_eq!(panel.name, "coder");
+    assert_eq!(panel.task_id.as_deref(), Some("t-coder"));
+    assert_eq!(panel.prompt, "brief for coder");
+    assert_eq!(panel.logs, source.subagents[0].logs);
+    assert_eq!(panel.thinking, "reasoning with é and 🎉");
+    assert_eq!(panel.content, "output\nsecond line");
+    assert!(panel.is_active);
+    assert_eq!(panel.context_tokens, 18_431);
+    assert!((panel.worked_duration_secs - 372.125).abs() < 1e-6);
+    assert!(panel.started_at.as_ref().is_some_and(|p| p.is_sane()));
+    assert!(panel.last_activity_at.as_ref().is_some_and(|p| p.is_sane()));
+    // Panel order is content (A §6.3): the selection index keeps its meaning.
+    assert_eq!(section.subagent_panels[1].name, "researcher");
+
+    let mut target = TuiRenderer::new();
+    target.restore_panes(&section);
+
+    let restored = &target.subagents[0];
+    assert_eq!(restored.logs, source.subagents[0].logs);
+    assert_eq!(restored.thinking, source.subagents[0].thinking);
+    assert_eq!(restored.content, source.subagents[0].content);
+    assert_eq!(restored.name, "coder");
+    assert_eq!(restored.task_id.as_deref(), Some("t-coder"));
+    assert_eq!(restored.prompt, "brief for coder");
+    assert_eq!(restored.context_tokens, 18_431);
+    // A §6.3: `is_active` comes back as it was, even though the task is gone.
+    assert!(restored.is_active);
+    // I-U3: the worked duration comes from the number, never from the instants.
+    assert!((restored.worked_duration.as_secs_f64() - 372.125).abs() < 1e-6);
+    assert_eq!(target.subagents[1].name, "researcher");
+    assert_eq!(target.selected_subagent_idx, 1);
+    // D5 T2: each `Instant` comes back as an instant of the same age, within the
+    // wall-clock sampling quantum (it is re-anchored, never replayed).
+    let restored_started = restored.started_at.expect("started_at restored");
+    let age = std::time::Instant::now()
+        .saturating_duration_since(restored_started)
+        .as_secs_f64();
+    assert!(
+        (0.11..0.6).contains(&age),
+        "restored started_at should keep its ~0.12s age, got {age}s"
+    );
+    let restored_last = restored.last_activity_at.expect("last_activity_at restored");
+    let last_age = std::time::Instant::now()
+        .saturating_duration_since(restored_last)
+        .as_secs_f64();
+    assert!(last_age < 0.6, "restored last_activity_at age {last_age}s");
+}
+
+/// The honest limit of the `Instant` projection (A §5.6): `elapsed_secs` has no
+/// negative offsets, so an instant from BEFORE this process's anchor cannot be
+/// re-anchored — its age is floored to 0.0. `SubagentDetail` cannot produce one
+/// in a real session, and t-012 must not assume the age survives anyway.
+#[test]
+fn an_instant_older_than_the_process_anchor_honestly_loses_its_age() {
+    let mut source = TuiRenderer::new();
+    let mut detail = rich_subagent("coder");
+    detail.started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(372));
+    source.subagents = vec![detail];
+
+    let section = source.capture_ui();
+    let panel = &section.subagent_panels[0];
+    assert_eq!(panel.started_at.as_ref().map(|p| p.elapsed_secs), Some(0.0));
+    assert!(panel.started_at.as_ref().is_some_and(|p| p.is_sane()));
+    // The duration number is unaffected: it never comes from the instants.
+    assert!((panel.worked_duration_secs - 372.125).abs() < 1e-6);
+    // The derived wall clock is floored to the process anchor, which is what
+    // makes the age unrecoverable in this one case.
+    assert_eq!(
+        panel.started_at.as_ref().map(|p| p.wall),
+        Some(crate::session::time::anchor_wall())
+    );
+
+    let mut r = TuiRenderer::new();
+    r.restore_panes(&section);
+    let restored = r.subagents[0].started_at.expect("still present");
+    let age = std::time::Instant::now()
+        .saturating_duration_since(restored)
+        .as_secs_f64();
+    assert!(
+        age < 60.0,
+        "a pre-anchor instant re-anchors near the process start, got {age}s"
+    );
+}
+
+#[test]
+fn restore_panes_degrades_a_corrupt_duration_without_panicking() {
+    // `Duration::from_secs_f64` panics on NaN/negative/infinite, so a hostile
+    // number must degrade to zero rather than take the UI down.
+    let mut r = TuiRenderer::new();
+    let mut section = crate::session::format::UiSection::default();
+    let mut panel = subagent_panel_from_detail(&rich_subagent("coder"));
+    panel.worked_duration_secs = f64::NAN;
+    section.subagent_panels.push(panel.clone());
+    panel.worked_duration_secs = -5.0;
+    section.subagent_panels.push(panel.clone());
+    panel.worked_duration_secs = f64::INFINITY;
+    section.subagent_panels.push(panel);
+
+    r.restore_panes(&section);
+    assert_eq!(r.subagents.len(), 3);
+    for detail in &r.subagents {
+        assert_eq!(detail.worked_duration, std::time::Duration::ZERO);
+        assert_eq!(detail.logs.len(), 4);
+    }
+}
+
+#[test]
+fn capture_and_restore_round_trip_the_composer_text_and_caret() {
+    let mut source = TuiRenderer::new();
+    source.input_text = "line one\nline deux 🎉\nthree".to_string();
+    source.ensure_textarea_in_sync();
+    let caret = source.input_text.find("eux").expect("marker present");
+    source.cursor = caret;
+    source.history = vec!["first command".to_string(), "second command".to_string()];
+    source.history_index = Some(1);
+    source.input_draft = "half-typed draft".to_string();
+
+    let section = source.capture_ui();
+    assert_eq!(section.structural_violations(), Vec::<String>::new());
+    assert_eq!(section.composer.input_text, source.input_text);
+    assert_eq!(section.composer.cursor, caret);
+
+    let mut target = TuiRenderer::new();
+    target.restore_panes(&section);
+
+    assert_eq!(target.input_text, source.input_text);
+    assert_eq!(target.cursor, caret);
+    assert_eq!(target.history, source.history);
+    assert_eq!(target.history_index, Some(1));
+    assert_eq!(target.input_draft, source.input_draft);
+    // The widget was rebuilt by the existing sync path and its caret sits on
+    // the restored byte offset (I-U5).
+    assert_eq!(target.textarea.lines().join("\n"), source.input_text);
+    assert_eq!(target.textarea.cursor(), (1, 6));
+    // Reading the widget back yields the same byte offset: no drift.
+    target.sync_input_from_textarea();
+    assert_eq!(target.cursor, caret);
+}
+
+#[test]
+fn restore_panes_clamps_a_caret_past_the_end_instead_of_trusting_it() {
+    // U-chk is the loader's precondition; the renderer still refuses to build a
+    // widget caret outside its own text.
+    let mut r = TuiRenderer::new();
+    let mut section = crate::session::format::UiSection::default();
+    section.composer.input_text = "abc".to_string();
+    section.composer.cursor = 99;
+    r.restore_panes(&section);
+    assert_eq!(r.cursor, 3);
+    assert_eq!(r.textarea.cursor(), (0, 3));
+}
+
+#[test]
+fn capture_and_restore_round_trip_scrolls_with_the_live_clamp() {
+    let mut source = TuiRenderer::new();
+    source.messages = (0..60).map(|i| format!("m{i}")).collect();
+    // The selected panel needs enough content for a non-zero scroll maximum;
+    // otherwise the live clamp legitimately pulls the offset back to 0 (I-U6).
+    let mut tall = subagent_without_instants("coder");
+    tall.content = (0..40)
+        .map(|i| format!("output line {i}"))
+        .collect::<Vec<String>>()
+        .join("\n");
+    source.subagents = vec![tall, subagent_without_instants("researcher")];
+    source.selected_subagent_idx = 0;
+    source.chat_scroll = 11;
+    source.plan_scroll = 4;
+    source.subagent_scroll = 2;
+    source.subagent_list_scroll = 1;
+    source.plan_auto_scroll = true;
+    source.subagent_autoscroll = false;
+    // Maxima are derived geometry (U5): a rendered plan panel would have set this.
+    source.plan_max_scroll = 20;
+
+    let section = source.capture_ui();
+    assert_eq!(section.view.chat_scroll, 11);
+    assert_eq!(section.view.plan_scroll, 4);
+    assert_eq!(section.view.subagent_scroll, 2);
+    assert_eq!(section.view.subagent_list_scroll, 1);
+    assert_eq!(section.view.focused_panel, "chat");
+
+    let mut target = TuiRenderer::new();
+    // Same derived geometry as the source, otherwise the live clamp (I-U6)
+    // legitimately moves the offsets.
+    target.plan_max_scroll = 20;
+    target.subagent_area = Rect::new(0, 0, 40, 4);
+    target.restore_panes(&section);
+
+    assert_eq!(target.chat_scroll, 11);
+    assert_eq!(target.plan_scroll, 4);
+    assert_eq!(target.subagent_scroll, 2);
+    assert_eq!(target.subagent_list_scroll, 1);
+    assert!(target.plan_auto_scroll);
+    assert!(!target.subagent_autoscroll);
+    assert_eq!(target.capture_ui(), section);
+}
+
+#[test]
+fn restore_panes_lets_the_existing_clamp_pull_back_an_impossible_offset() {
+    // I-U6: a restored offset that exceeds the restored content is clamped by
+    // the live resize path, not validated by new code.
+    let mut r = TuiRenderer::new();
+    let mut section = source_section_with_one_line();
+    section.view.chat_scroll = 9_000;
+    r.restore_panes(&section);
+    assert!(r.chat_scroll < 9_000);
+    assert_eq!(r.messages.len(), 1);
+}
+
+fn source_section_with_one_line() -> crate::session::format::UiSection {
+    let mut r = TuiRenderer::new();
+    r.messages = vec!["only line".to_string()];
+    r.capture_ui()
+}
+
+#[test]
+fn capture_records_budgets_as_a_sorted_witness_and_restore_never_adopts_them() {
+    let mut source = TuiRenderer::new();
+    source.thinking_budgets.insert("coder".to_string(), 12_000);
+    source.thinking_budgets.insert("researcher".to_string(), 4_000);
+    source.default_thinking_budget = 8_000;
+
+    let section = source.capture_ui();
+    assert_eq!(section.budgets.thinking_budgets.len(), 2);
+    assert_eq!(section.budgets.thinking_budgets["coder"], 12_000);
+    assert_eq!(section.budgets.default_thinking_budget, 8_000);
+    // A BTreeMap keeps the committed bytes deterministic (A §6.5).
+    let keys: Vec<&str> = section
+        .budgets
+        .thinking_budgets
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, ["coder", "researcher"]);
+
+    // A §6.5: witness only. `Config` owns the budgets, so restore keeps the live
+    // numbers untouched and reports the drift instead (see `announce_restore`).
+    let mut target = TuiRenderer::new();
+    target.thinking_budgets.insert("coder".to_string(), 1_000);
+    target.default_thinking_budget = 2_000;
+    target.restore_panes(&section);
+    assert_eq!(target.thinking_budgets["coder"], 1_000);
+    assert_eq!(target.thinking_budgets.len(), 1);
+    assert_eq!(target.default_thinking_budget, 2_000);
+}
+
+#[test]
+fn announce_restore_surfaces_every_report_field_in_the_ui() {
+    // A §8.4 / §10.7 rule 4: loud, no `let _ =` swallow.
+    let mut r = TuiRenderer::new();
+    let report = crate::session::format::RepairReport {
+        ui_lines_restored: 42,
+        workers_restored: 3,
+        workers_unrecoverable: vec!["coder-t-1".to_string()],
+        notices: vec![crate::session::format::NonRestorableNotice {
+            kind: crate::session::format::NonRestorableKind::JoinHandle,
+            subject: "coder".to_string(),
+            detail: "no task exists to join or abort".to_string(),
+        }],
+        warnings: vec!["thinking budget drifted: 8000 -> 4000".to_string()],
+        worker_counts: vec![crate::session::format::WorkerRepairCounts {
+            key: "coder-t-1".to_string(),
+            before: 10,
+            after: 8,
+            applied_rules: vec!["N1 orphan prune".to_string()],
+        }],
+        ..Default::default()
+    };
+
+    r.announce_restore(&report);
+
+    let joined = r.messages.join("\n");
+    assert!(joined.contains("[CLI] Not restorable after restart [JoinHandle] coder: no task exists to join or abort"));
+    assert!(joined.contains("[CLI] Restore warning: thinking budget drifted: 8000 -> 4000"));
+    assert!(joined.contains("[CLI] Worker coder-t-1 history normalized: 10 -> 8 message(s) (N1 orphan prune)"));
+    assert_eq!(
+        r.status_line,
+        "Session restored: 42 pane line(s), 3 worker(s) — 1 capability(s) lost"
+    );
+    assert!(r.dirty);
+}
+
+#[test]
+fn announce_restore_with_an_empty_report_still_states_the_restore() {
+    let mut r = TuiRenderer::new();
+    r.announce_restore(&crate::session::format::RepairReport::default());
+    assert_eq!(r.messages, Vec::<String>::new());
+    assert_eq!(
+        r.status_line,
+        "Session restored: 0 pane line(s), 0 worker(s)"
+    );
+}
+
+#[test]
+fn restore_keeps_the_current_focus_for_an_out_of_set_panel_spelling() {
+    // A §6.5 U-chk refuses an out-of-set `focused_panel`; the renderer must not
+    // invent a focus either.
+    let mut r = TuiRenderer::new();
+    r.focused_panel = FocusedPanel::Plan;
+    let mut section = crate::session::format::UiSection::default();
+    section.view.focused_panel = "subagent-panel".to_string();
+    r.restore_panes(&section);
+    assert_eq!(r.focused_panel, FocusedPanel::Plan);
+
+    let mut section = crate::session::format::UiSection::default();
+    section.view.focused_panel = "subagents".to_string();
+    r.restore_panes(&section);
+    assert_eq!(r.focused_panel, FocusedPanel::Subagents);
+    assert_eq!(r.capture_ui().view.focused_panel, "subagents");
+
+    let mut section = crate::session::format::UiSection::default();
+    section.view.focused_panel = "plan".to_string();
+    r.restore_panes(&section);
+    assert_eq!(r.capture_ui().view.focused_panel, "plan");
+}
+
+// ============================================================================
+// t-020 — pane-coverage gap: EVERY pane's text is restorable
+// ============================================================================
+
+#[test]
+fn capture_records_the_plan_pane_and_restore_puts_its_text_back() {
+    // The plan box was the biggest uncapturable pane: its text, its visibility,
+    // the in-flight task it flags, and the elapsed timer it draws.
+    // Pin the monotonic anchor BEFORE building the instants: a plan always
+    // starts inside the process, and an instant older than the anchor honestly
+    // floors at 0 s (`an_instant_older_than_the_process_anchor_honestly_loses_its_age`).
+    let _ = crate::session::time::anchor();
+    let started = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    let completed = std::time::Instant::now();
+
+    let mut source = TuiRenderer::new();
+    source.plan_content = "# Plan\n- [x] t-001 wire the hook\n- [ ] t-020 🎉 more\n".to_string();
+    source.show_plan_panel = true;
+    source.had_active_plan = true;
+    source.active_plan_task = Some("t-020".to_string());
+    source.plan_start_time = Some(started);
+    source.plan_completed_time = Some(completed);
+    source.plan_scroll = 4;
+
+    let section = source.capture_ui();
+    assert_eq!(section.plan_content, source.plan_content);
+    assert!(section.view.show_plan_panel);
+    assert!(section.had_active_plan);
+    assert_eq!(section.active_plan_task.as_deref(), Some("t-020"));
+    // The timer is the D5 projection, not a re-anchored lie (A §3.9).
+    let start = section.plan_start.clone().expect("plan start recorded");
+    let done = section.plan_completed.clone().expect("plan completion recorded");
+    assert!(start.is_sane() && done.is_sane());
+    assert!(
+        start.elapsed_secs >= 0.0 && start.elapsed_secs < 5.0,
+        "plan start position {start:?}"
+    );
+    // `elapsed_secs` is a position on the process timeline (A §3.9), so the
+    // completion sits AFTER the start, and the gap is the sleep above.
+    assert!(
+        done.elapsed_secs > start.elapsed_secs,
+        "completion {done:?} must sit after the start {start:?}"
+    );
+    // The gap is the sleep above: load-tolerant bounds rather than an exact pin,
+    // because a `sleep(120ms)` overshoots under scheduler pressure.
+    let gap = done.elapsed_secs - start.elapsed_secs;
+    assert!((0.11..2.0).contains(&gap), "start→completion gap {gap} s");
+    assert_eq!(section.structural_violations(), Vec::<String>::new());
+
+    let mut target = TuiRenderer::new();
+    target.restore_panes(&section);
+    assert_eq!(target.plan_content, source.plan_content);
+    assert!(target.show_plan_panel);
+    assert!(target.had_active_plan);
+    assert_eq!(target.active_plan_task.as_deref(), Some("t-020"));
+    // The plan offset is assigned verbatim, then re-clamped against the NEW
+    // terminal's derived maximum (`clamp_scrolls`, `events.rs:472`, which uses the
+    // per-frame `plan_max_scroll` U5 refuses to persist): before the first draw
+    // that maximum is 0, so the offset is legitimately pulled back (I-U6).
+    assert!(target.plan_scroll <= 4, "plan scroll {}", target.plan_scroll);
+    // The restored timers keep their age and their order in the new process
+    // (D5 T2), so the plan border draws the same elapsed figure as the old pane.
+    let restored_start = target
+        .plan_start_time
+        .expect("plan start re-anchored")
+        .elapsed()
+        .as_secs_f64();
+    let restored_done = target
+        .plan_completed_time
+        .expect("plan completion re-anchored")
+        .elapsed()
+        .as_secs_f64();
+    let stored_gap = done.elapsed_secs - start.elapsed_secs;
+    let restored_gap = restored_start - restored_done;
+    assert!(
+        (restored_gap - stored_gap).abs() < 0.5,
+        "restored start→completion gap {restored_gap} s (stored gap {stored_gap} s)"
+    );
+    assert!(
+        restored_done < restored_start,
+        "restored completion age {restored_done} vs start {restored_start}"
+    );
+    // Re-capture is byte-identical for every plan field.
+    let again = target.capture_ui();
+    assert_eq!(again.plan_content, section.plan_content);
+    assert_eq!(again.view.show_plan_panel, section.view.show_plan_panel);
+    assert_eq!(again.had_active_plan, section.had_active_plan);
+    assert_eq!(again.active_plan_task, section.active_plan_task);
+}
+
+#[test]
+fn restore_does_not_blank_a_plan_pane_for_a_bundle_that_stored_no_plan_text() {
+    // Every t-020 field has a serde default, so a pre-t-020 `ui.json` reads back
+    // as `plan_content: ""` + `show_plan_panel: false`. That is NOT a statement
+    // that the pane was blank: the plan box is disk-backed and `init`
+    // (`tui/mod.rs:417-424`) already filled it, so the restore must leave it.
+    let mut r = TuiRenderer::new();
+    r.plan_content = "# Plan read from .marmel/execution_plan.md".to_string();
+    r.show_plan_panel = true;
+    r.had_active_plan = true;
+    let section = crate::session::format::UiSection {
+        chat_messages: vec!["User: hello".to_string()],
+        ..Default::default()
+    };
+    r.restore_panes(&section);
+    assert_eq!(r.messages, section.chat_messages);
+    assert_eq!(r.plan_content, "# Plan read from .marmel/execution_plan.md");
+    assert!(r.show_plan_panel);
+    assert!(r.had_active_plan);
+    assert!(r.plan_start_time.is_none());
+}
+
+#[test]
+fn capture_and_restore_round_trip_the_streaming_partials() {
+    // The in-flight thinking/answer region of the chat pane used to be lost
+    // outright (A §10.2 called it deliberately unpersisted; the mission demands
+    // the visible bytes).
+    let mut source = TuiRenderer::new();
+    source.current_thought = "Let me consider é before answering…".to_string();
+    source.current_content = "partial answer\nstill streaming 🎉".to_string();
+
+    let section = source.capture_ui();
+    assert_eq!(section.current_thought, source.current_thought);
+    assert_eq!(section.current_content, source.current_content);
+    // Display-only: capture does NOT fold a half-turn into the pane vector or
+    // fabricate a transcript entry (A §10.2, U1).
+    assert!(section.chat_messages.is_empty());
+
+    let mut target = TuiRenderer::new();
+    target.restore_panes(&section);
+    assert_eq!(target.current_thought, source.current_thought);
+    assert_eq!(target.current_content, source.current_content);
+    assert!(target.messages.is_empty());
+    assert_eq!(target.capture_ui(), section);
+}
+
+#[test]
+fn capture_and_restore_round_trip_the_active_agent_and_steer_buffer() {
+    let mut source = TuiRenderer::new();
+    source.active_agent = "coder-t-020".to_string();
+    source.steer_sentence_buffer = "a half sentence that never got its newline".to_string();
+
+    let section = source.capture_ui();
+    assert_eq!(section.active_agent.as_deref(), Some("coder-t-020"));
+    assert_eq!(
+        section.steer_sentence_buffer.as_deref(),
+        Some("a half sentence that never got its newline")
+    );
+
+    let mut target = TuiRenderer::new();
+    target.restore_panes(&section);
+    assert_eq!(target.active_agent, "coder-t-020");
+    assert_eq!(
+        target.steer_sentence_buffer,
+        "a half sentence that never got its newline"
+    );
+    assert_eq!(target.capture_ui(), section);
+
+    // `None` / empty = nothing stored: keep what THIS process derived at boot
+    // instead of inventing `"Manager"`.
+    let mut other = TuiRenderer::new();
+    other.active_agent = "researcher-t-9".to_string();
+    other.steer_sentence_buffer = "live buffer".to_string();
+    let old = crate::session::format::UiSection {
+        active_agent: None,
+        steer_sentence_buffer: None,
+        ..Default::default()
+    };
+    other.restore_panes(&old);
+    assert_eq!(other.active_agent, "researcher-t-9");
+    assert_eq!(other.steer_sentence_buffer, "live buffer");
+
+    let blank = crate::session::format::UiSection {
+        active_agent: Some(String::new()),
+        ..Default::default()
+    };
+    other.restore_panes(&blank);
+    assert_eq!(other.active_agent, "researcher-t-9");
+}
+
+#[test]
+fn subagent_thinking_state_round_trips_with_its_panel() {
+    // The detail pane's spinner and "thinking n/budget" bar are driven by the two
+    // per-subagent maps (`tui/mod.rs:163`, `:165`), so they are pane state.
+    let mut source = TuiRenderer::new();
+    source.subagents = vec![
+        subagent_without_instants("coder"),
+        subagent_without_instants("researcher"),
+    ];
+    source
+        .subagent_turn_thinking
+        .insert("coder".to_string(), "coder's in-flight reasoning".to_string());
+    source.subagent_is_thinking.insert("coder".to_string(), true);
+    // An entry holding "" is a DIFFERENT pane state from no entry at all
+    // (`render.rs:864-878` falls back to `thinking` only when the entry is
+    // absent), so the mirror must keep the distinction.
+    source
+        .subagent_turn_thinking
+        .insert("researcher".to_string(), String::new());
+    source
+        .subagent_is_thinking
+        .insert("researcher".to_string(), false);
+
+    let section = source.capture_ui();
+    assert_eq!(
+        section.subagent_panels[0].turn_thinking.as_deref(),
+        Some("coder's in-flight reasoning")
+    );
+    assert_eq!(section.subagent_panels[0].is_thinking, Some(true));
+    assert_eq!(section.subagent_panels[1].turn_thinking.as_deref(), Some(""));
+    assert_eq!(section.subagent_panels[1].is_thinking, Some(false));
+
+    let mut target = TuiRenderer::new();
+    target.restore_panes(&section);
+    assert_eq!(
+        target.subagent_turn_thinking.get("coder").map(String::as_str),
+        Some("coder's in-flight reasoning")
+    );
+    assert_eq!(target.subagent_is_thinking.get("coder"), Some(&true));
+    assert_eq!(
+        target.subagent_turn_thinking.get("researcher").map(String::as_str),
+        Some("")
+    );
+    assert_eq!(target.subagent_is_thinking.get("researcher"), Some(&false));
+    assert_eq!(target.capture_ui(), section);
+}
+
+#[test]
+fn a_panel_with_no_thinking_entry_restores_to_no_entry() {
+    // Serde default (`None`) must not fabricate a map entry: the pane's fallback
+    // reads `thinking` in that case, and inventing `Some(false)` would change
+    // which bar is drawn.
+    let mut source = TuiRenderer::new();
+    source.subagents = vec![subagent_without_instants("coder")];
+    let section = source.capture_ui();
+    assert_eq!(section.subagent_panels[0].turn_thinking, None);
+    assert_eq!(section.subagent_panels[0].is_thinking, None);
+
+    let mut target = TuiRenderer::new();
+    target
+        .subagent_turn_thinking
+        .insert("coder".to_string(), "stale local thinking".to_string());
+    target.subagent_is_thinking.insert("coder".to_string(), true);
+    target.restore_panes(&section);
+    assert!(target.subagent_turn_thinking.is_empty());
+    assert!(target.subagent_is_thinking.is_empty());
+    assert_eq!(target.subagents[0].thinking, "reasoning with é and 🎉");
+}
+
+#[test]
+fn token_counters_are_captured_as_a_witness_and_never_adopted() {
+    // A §6.5 governs `budgets`; the same rule now covers the token counters. The
+    // live totals belong to this process's streams (`on_event`, `:433-444`).
+    let mut source = TuiRenderer::new();
+    source.on_event(&Event::TokensIn(12_345));
+    source.on_event(&Event::TokensOut(6_789));
+    source.on_event(&Event::TokensOut(111));
+
+    let section = source.capture_ui();
+    assert_eq!(section.tokens_in, 12_345);
+    assert_eq!(section.tokens_out, 6_900);
+    assert_eq!(section.orchestrator_context_tokens, 12_345);
+
+    let mut target = TuiRenderer::new();
+    target.on_event(&Event::TokensIn(100));
+    target.restore_panes(&section);
+    assert_eq!(target.tokens_in, 100);
+    assert_eq!(target.tokens_out, 0);
+    assert_eq!(target.orchestrator_context_tokens, 100);
+
+    // The drift is reportable as `RepairReport::warnings` sentences…
+    let warnings = target.token_witness_warnings(&section);
+    assert_eq!(warnings.len(), 3);
+    assert!(warnings[0].contains("tokens_in witness 12345 != this process's live 100"));
+    assert!(warnings[1].contains("tokens_out witness 6900 != this process's live 0"));
+    assert!(warnings[2].contains("orchestrator_context_tokens witness 12345"));
+    // …and it is said out loud in the pane too (A §8.4: loud, never a swallow).
+    let joined = target.messages.join("\n");
+    assert!(joined.contains("[CLI] Restore warning: tokens_in witness 12345 != this process's live 100"));
+    assert!(joined.contains("[CLI] Restore warning: tokens_out witness 6900"));
+    assert!(joined.contains("[CLI] Restore warning: orchestrator_context_tokens witness 12345"));
+    // A capture of the restored renderer still reports the live numbers: the
+    // witness never becomes the truth.
+    assert_eq!(target.capture_ui().tokens_in, 100);
+}
+
+#[test]
+fn matching_token_counters_emit_no_witness_noise() {
+    // Restoring into a renderer that already has the same counters must add no
+    // pane lines at all — the pane bytes stay exactly as stored.
+    let source = TuiRenderer::new();
+    let section = source.capture_ui();
+    let mut target = TuiRenderer::new();
+    target.restore_panes(&section);
+    assert!(target.token_witness_warnings(&section).is_empty());
+    assert_eq!(target.messages, Vec::<String>::new());
+    assert_eq!(target.capture_ui(), section);
+}
+
+#[test]
+fn an_armed_abort_is_recorded_but_never_re_armed() {
+    // A §6.5: a 3-second armed window has no meaning after a restart, and §10's
+    // closed inventory never re-arms it. The boolean survives as a witness; the
+    // live renderer stays unarmed so no keypress can abort a session the user
+    // never asked to abort.
+    let mut source = TuiRenderer::new();
+    source.confirm_abort = true;
+    source.abort_armed_at = Some(std::time::Instant::now());
+    assert!(source.is_abort_armed());
+
+    let section = source.capture_ui();
+    assert!(section.abort_armed);
+    let armed_at = section.abort_armed_at.clone().expect("armed instant recorded");
+    assert!(armed_at.is_sane());
+    assert_eq!(section.structural_violations(), Vec::<String>::new());
+
+    let mut target = TuiRenderer::new();
+    target.restore_panes(&section);
+    assert!(!target.confirm_abort);
+    assert!(target.abort_armed_at.is_none());
+    assert!(!target.is_abort_armed());
+    let joined = target.messages.join("\n");
+    assert!(joined.contains(
+        "[CLI] Not restorable after restart [Other] session: confirm-abort was armed when the session was captured"
+    ));
+    // The stored bytes are never rewritten to match the new process (N-R1).
+    assert!(section.abort_armed);
+}
+
+#[test]
+fn a_stale_abort_window_is_not_recorded_as_armed() {
+    // `is_abort_armed` already applies the 3-second rule, so an expired window
+    // never enters the bundle as `true`.
+    let mut source = TuiRenderer::new();
+    source.confirm_abort = true;
+    source.abort_armed_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(9));
+    assert!(!source.is_abort_armed());
+    assert!(!source.capture_ui().abort_armed);
+}
+
+#[test]
+fn a_scroll_offset_the_live_clamp_moved_is_named_with_both_values() {
+    // §6.6 I-U6 / §9.6 AC-C3 branch 2: `clamp_scrolls` (`events.rs:465-481`) may
+    // move a restored offset, but it may never do so SILENTLY. One sentence per
+    // moved offset, naming the field, the stored value and the live value, in
+    // the same machine-readable shape AC-C3 greps `RepairReport::warnings` for.
+    let mut target = TuiRenderer::new();
+    target.chat_scroll = 0;
+    target.plan_scroll = 0;
+    target.subagent_scroll = 28;
+    target.subagent_list_scroll = 3;
+    target.selected_subagent_idx = 1;
+
+    let section = crate::session::format::UiSection {
+        view: crate::session::format::ViewState {
+            chat_scroll: 9_000,
+            plan_scroll: 12,
+            subagent_scroll: 9_000,
+            subagent_list_scroll: 40,
+            selected_subagent_idx: 2,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let warnings = clamp_report(&target, &section);
+    assert_eq!(warnings.len(), 5, "every fixture offset moved: {warnings:?}");
+    for (warning, name, stored, live) in [
+        (warnings[0].as_str(), "chat_scroll", 9_000u64, 0u64),
+        (warnings[1].as_str(), "plan_scroll", 12u64, 0u64),
+        (warnings[2].as_str(), "subagent_scroll", 9_000u64, 28u64),
+        (warnings[3].as_str(), "subagent_list_scroll", 40u64, 3u64),
+        (warnings[4].as_str(), "selected_subagent_idx", 2u64, 1u64),
+    ] {
+        assert!(
+            warning.starts_with(&format!(
+                "{name} clamped by the live geometry: {stored} -> {live}:"
+            )),
+            "AC-C3/I-U6: {warning:?} must open with the field name and both values"
+        );
+    }
+
+    // Nothing moved ⇒ nothing said: an AC-C3 fixture whose offsets already fit
+    // the restored content must produce no scroll warning at all.
+    let unchanged = target.capture_ui();
+    assert_eq!(
+        clamp_report(&target, &unchanged),
+        Vec::<String>::new(),
+        "an offset that did not move must not be reported"
+    );
+
+    // The same sentence is what the boot wiring folds into `RepairReport::warnings`,
+    // read from the renderer's OWN end state — so the number it names is the
+    // number the panes ended on, whatever the clamp did to it.
+    let mut r = TuiRenderer::new();
+    r.restore_panes(&section);
+    assert!(r.chat_scroll < 9_000, "the clamp still clamps, nothing is adopted");
+    let reported = clamp_report(&r, &section);
+    assert!(
+        reported.iter().any(|line| {
+            line.starts_with(&format!(
+                "chat_scroll clamped by the live geometry: 9000 -> {}:",
+                r.chat_scroll
+            ))
+        }),
+        "the renderer must be able to name the offset it moved: {reported:?}"
+    );
+    // `restore_panes` itself stays silent: the sentence is drawn once, through the
+    // report path (`announce_restore`), so one moved offset never reads as two
+    // pane lines.
+    assert_eq!(r.messages, section.chat_messages);
+}
+
+/// The stored-vs-live comparison for a REAL renderer, mapped through the single
+/// sentence builder the boot wiring uses (`clamp_warning_sentences`).
+///
+/// `ui::session::boot` holds only a `&mut dyn Renderer`, so it compares the two
+/// `UiSection`s; this helper covers the other half of the same rule — each field
+/// name in the sentence belongs to the renderer field of that name, with that
+/// type. Rename or re-type a renderer offset and this stops compiling, which is
+/// exactly the drift I-U6's notice must never hide.
+fn clamp_report(target: &TuiRenderer, stored: &crate::session::format::UiSection) -> Vec<String> {
+    clamp_warning_sentences(&[
+        ("chat_scroll", u64::from(stored.view.chat_scroll), u64::from(target.chat_scroll)),
+        ("plan_scroll", u64::from(stored.view.plan_scroll), u64::from(target.plan_scroll)),
+        (
+            "subagent_scroll",
+            u64::from(stored.view.subagent_scroll),
+            u64::from(target.subagent_scroll),
+        ),
+        (
+            "subagent_list_scroll",
+            u64::from(stored.view.subagent_list_scroll),
+            u64::from(target.subagent_list_scroll),
+        ),
+        (
+            "selected_subagent_idx",
+            stored.view.selected_subagent_idx as u64,
+            target.selected_subagent_idx as u64,
+        ),
+    ])
+}
+
+#[test]
+fn a_hostile_time_point_is_refused_by_u_chk_and_never_panics_the_renderer() {
+    let mut r = TuiRenderer::new();
+    let section = crate::session::format::UiSection {
+        plan_content: "# Plan".to_string(),
+        plan_start: Some(crate::session::format::TimePoint {
+            elapsed_secs: f64::NAN,
+            wall: chrono::Local::now(),
+        }),
+        plan_completed: Some(crate::session::format::TimePoint {
+            elapsed_secs: -5.0,
+            wall: chrono::Local::now(),
+        }),
+        abort_armed_at: Some(crate::session::format::TimePoint {
+            elapsed_secs: f64::INFINITY,
+            wall: chrono::Local::now(),
+        }),
+        ..Default::default()
+    };
+
+    let violations = section.structural_violations();
+    assert!(
+        violations.iter().any(|v| v.contains("plan_start")),
+        "{violations:?}"
+    );
+    assert!(
+        violations.iter().any(|v| v.contains("plan_completed")),
+        "{violations:?}"
+    );
+    assert!(
+        violations.iter().any(|v| v.contains("abort_armed_at")),
+        "{violations:?}"
+    );
+    // The renderer still degrades instead of taking the UI down (`to_instant` is
+    // total, `session/time.rs:85-94`).
+    r.restore_panes(&section);
+    assert_eq!(r.plan_content, "# Plan");
+    assert!(r.plan_start_time.is_some());
+    assert!(r.plan_completed_time.is_some());
+    assert!(r.dirty);
+}
+
+#[test]
+fn every_new_field_survives_the_json_round_trip() {
+    // The on-disk shape, not just the in-memory one: capture → JSON → parse →
+    // restore must be lossless for the whole new field set.
+    let mut source = TuiRenderer::new();
+    source.plan_content = "# Plan\n- [ ] t-020 close the gap".to_string();
+    source.show_plan_panel = true;
+    source.had_active_plan = true;
+    source.active_plan_task = Some("t-020".to_string());
+    source.plan_start_time = Some(std::time::Instant::now());
+    source.current_thought = "thinking…".to_string();
+    source.current_content = "answer…".to_string();
+    source.active_agent = "coder-t-020".to_string();
+    source.steer_sentence_buffer = "half a steer".to_string();
+    source.tokens_in = 11;
+    source.tokens_out = 22;
+    source.orchestrator_context_tokens = 33;
+    source.confirm_abort = true;
+    source.abort_armed_at = Some(std::time::Instant::now());
+    source.subagents = vec![subagent_without_instants("coder")];
+    source
+        .subagent_turn_thinking
+        .insert("coder".to_string(), "in-flight".to_string());
+    source.subagent_is_thinking.insert("coder".to_string(), true);
+
+    let section = source.capture_ui();
+    let json = serde_json::to_string(&section).expect("the section serializes");
+    let back: crate::session::format::UiSection =
+        serde_json::from_str(&json).expect("the section parses back");
+    assert_eq!(back, section);
+
+    let mut target = TuiRenderer::new();
+    target.restore_panes(&back);
+    assert_eq!(target.plan_content, source.plan_content);
+    assert_eq!(target.current_thought, "thinking…");
+    assert_eq!(target.current_content, "answer…");
+    assert_eq!(target.active_agent, "coder-t-020");
+    assert_eq!(target.steer_sentence_buffer, "half a steer");
+    assert_eq!(target.subagent_turn_thinking.get("coder").map(String::as_str), Some("in-flight"));
+    assert_eq!(target.subagent_is_thinking.get("coder"), Some(&true));
+    // Witness-only: the counters came back in the JSON, they were not adopted.
+    assert_eq!(back.tokens_in, 11);
+    assert_eq!(target.tokens_in, 0);
+    assert_eq!(target.tokens_out, 0);
+    assert_eq!(target.orchestrator_context_tokens, 0);
+    assert!(!target.confirm_abort);
+}
+
+#[test]
+fn an_old_ui_json_without_any_t_020_field_still_loads() {
+    // The exact member bytes an older binary wrote (schema_version 1): no plan,
+    // streaming, identity, token or abort key anywhere, and no
+    // `turn_thinking`/`is_thinking` on the panel. `#[serde(default)]` is what
+    // keeps them loadable, which is why `SCHEMA_VERSION` stayed at 1.
+    const OLD_UI_JSON: &str = r#"{
+        "header": {
+            "format_version": 1,
+            "schema_version": 1,
+            "session_id": "session-1",
+            "kind": "ui",
+            "saved_wall": "2026-01-01T00:00:00+01:00",
+            "saved_elapsed_secs": 12.5,
+            "member_count": 2,
+            "member_index": 1
+        },
+        "section": {
+            "chat_messages": ["User: hello", "", "Marmennill: hi"],
+            "status_line": "Active: coder | 6m12s",
+            "subagent_panels": [{
+                "name": "coder",
+                "task_id": "t-011",
+                "prompt": "brief",
+                "logs": ["[Started]"],
+                "thinking": "thought",
+                "content": "output",
+                "is_active": true,
+                "context_tokens": 1234,
+                "worked_duration_secs": 12.5,
+                "started_at": null,
+                "last_activity_at": null
+            }],
+            "journal": [{ "type": "user", "text": "hello" }],
+            "composer": {
+                "input_text": "half-typed",
+                "cursor": 4,
+                "input_draft": "draft",
+                "history": ["first"],
+                "history_index": null
+            },
+            "view": {
+                "chat_scroll": 3,
+                "plan_scroll": 1,
+                "subagent_scroll": 0,
+                "subagent_list_scroll": 0,
+                "selected_subagent_idx": 0,
+                "focused_panel": "chat",
+                "show_thought": true,
+                "show_subagent_panel": true,
+                "chat_auto_scroll": true,
+                "subagent_autoscroll": false,
+                "plan_auto_scroll": true
+            },
+            "budgets": {
+                "thinking_budgets": { "coder": 12000 },
+                "default_thinking_budget": 8000
+            }
+        }
+    }"#;
+
+    let file: crate::session::format::UiFile =
+        serde_json::from_str(OLD_UI_JSON).expect("a pre-t-020 ui.json must still load");
+    let section = file.section;
+    assert_eq!(section.chat_messages.len(), 3);
+    assert_eq!(section.status_line, "Active: coder | 6m12s");
+    assert_eq!(section.journal.len(), 1);
+    // Every new field fell back to its serde default…
+    assert_eq!(section.plan_content, "");
+    assert!(!section.view.show_plan_panel);
+    assert!(!section.had_active_plan);
+    assert_eq!(section.active_plan_task, None);
+    assert_eq!(section.plan_start, None);
+    assert_eq!(section.plan_completed, None);
+    assert_eq!(section.current_thought, "");
+    assert_eq!(section.current_content, "");
+    assert_eq!(section.active_agent, None);
+    assert_eq!(section.steer_sentence_buffer, None);
+    assert_eq!(section.tokens_in, 0);
+    assert_eq!(section.tokens_out, 0);
+    assert_eq!(section.orchestrator_context_tokens, 0);
+    assert!(!section.abort_armed);
+    assert_eq!(section.abort_armed_at, None);
+    assert_eq!(section.subagent_panels[0].turn_thinking, None);
+    assert_eq!(section.subagent_panels[0].is_thinking, None);
+    // …and an old bundle is still a loadable one (U-chk refuses, never repairs).
+    assert_eq!(section.structural_violations(), Vec::<String>::new());
+
+    // Restoring it costs nothing the old build had: the pane text comes back, the
+    // disk-backed plan pane survives, and no witness noise is invented.
+    let mut r = TuiRenderer::new();
+    r.plan_content = "# Plan read from disk at init".to_string();
+    r.show_plan_panel = true;
+    r.restore_panes(&section);
+    assert_eq!(r.messages, section.chat_messages);
+    assert_eq!(r.status_line, "Active: coder | 6m12s");
+    assert_eq!(r.subagents.len(), 1);
+    assert_eq!(r.subagents[0].logs, vec!["[Started]".to_string()]);
+    assert_eq!(r.plan_content, "# Plan read from disk at init");
+    assert!(r.show_plan_panel);
+    assert_eq!(r.active_agent, "Manager");
+    assert_eq!(r.messages.len(), 3);
+}
+
+/// A renderer that implements ONLY the required trait methods: the three
+/// rehydration hooks must compile from their default bodies (flow §4.7), so an
+/// existing implementor is unaffected by the addition.
+#[derive(Default)]
+struct DefaultHookRenderer {
+    state: crate::ui::InputState,
+}
+
+impl crate::ui::Renderer for DefaultHookRenderer {
+    fn init(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn on_event(&mut self, _event: &crate::ui::Event) {}
+    fn flush(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn input_state(&mut self) -> &mut crate::ui::InputState {
+        &mut self.state
+    }
+    fn input_state_shared(&self) -> &crate::ui::InputState {
+        &self.state
+    }
+    fn shutdown(&mut self) {}
+}
+
+#[test]
+fn default_hook_bodies_compile_and_claim_nothing() {
+    let mut r = DefaultHookRenderer::default();
+    let section = r.capture_ui();
+    assert_eq!(section, crate::session::format::UiSection::default());
+    assert_eq!(section.structural_violations(), Vec::<String>::new());
+    r.restore_panes(&section);
+    r.announce_restore(&crate::session::format::RepairReport::default());
+}
+
+#[test]
+fn the_hooks_are_object_safe_and_need_no_sync() {
+    // `Renderer: Send` is the only bound; `TuiRenderer` holds `Cell`/`RefCell`
+    // and is NOT `Sync`, so capture/restore must (and do) work through the
+    // `&mut dyn Renderer` the session loop owns, on the session thread.
+    fn assert_send<T: Send>() {}
+    assert_send::<TuiRenderer>();
+    assert_send::<Box<dyn crate::ui::Renderer>>();
+
+    let mut boxed: Box<dyn crate::ui::Renderer> = Box::new(TuiRenderer::new());
+    let section = boxed.capture_ui();
+    boxed.restore_panes(&section);
+    boxed.announce_restore(&crate::session::format::RepairReport::default());
+
+    // And across a thread boundary, which is exactly the `Send` (not `Sync`)
+    // shape flow §4.3 relies on.
+    let moved = std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                let mut renderer = boxed;
+                let mut section = renderer.capture_ui();
+                section.chat_messages.push("from the session thread".to_string());
+                renderer.restore_panes(&section);
+                renderer.capture_ui()
+            })
+            .join()
+            .expect("session thread joined")
+    });
+    assert_eq!(
+        moved.chat_messages,
+        vec!["from the session thread".to_string()]
+    );
+}

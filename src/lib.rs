@@ -22,6 +22,11 @@ pub mod orchestrator;
 /// manager (on-disk authority), orchestrator, agents and UI layers.
 pub mod plan_parse;
 pub mod prompts;
+/// Session persistence core: the single owner of the durable session bundle format
+/// (manifest + manager/ui/worker members), its atomic commit (`manifest.json` last =
+/// the commit point) and the verify-before-parse loader that restores, repairs or
+/// refuses a bundle.
+pub mod session;
 /// Canonical task-identifier normalization shared by the agents, harness and manager layers.
 pub mod task_id;
 /// Char-boundary-safe truncation/ellipsis helpers shared across layers.

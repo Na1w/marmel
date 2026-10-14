@@ -113,10 +113,19 @@ pub const PLAN_FILE: &str = "execution_plan.md";
 /// survives because [`Plan::clear`] deletes a stale override left on disk by an
 /// older release, and `harness::Workspace` re-exports it as the canonical path.
 pub const FORCED_PHASE_FILE: &str = "forced_phase.txt";
-/// Session transcript file name inside the marmel directory.
-pub const TRANSCRIPT_FILE: &str = ".session_transcript.json";
-/// UI transcript file name inside the marmel directory.
-pub const UI_TRANSCRIPT_FILE: &str = ".ui_transcript.json";
+/// Name of the **superseded** manager journal — a re-export of the session-owned
+/// [`crate::session::manager_capture::LEGACY_TRANSCRIPT_FILE`], not a second copy.
+///
+/// t-009 deleted the journal itself (A §1 **D2**): `ContextEngine::save_transcript`,
+/// `ContextEngine::load_transcript`, `Plan::transcript_path()` and this module's own
+/// definition of the name are all gone, and nothing in the crate writes
+/// `.marmel/.session_transcript.json` any more. The name survives in exactly one
+/// form because two readers must still recognize a **stale** copy left by an older
+/// release and say so out loud rather than merge or upgrade it:
+/// [`crate::session::restore`]'s "legacy journals found, not restorable" outcome
+/// (A §7.4 — ignored must not mean invisible) and [`Plan::clear`]/[`Plan::archive`]
+/// deleting it with the plan. The same reasoning kept [`FORCED_PHASE_FILE`].
+pub use crate::session::manager_capture::LEGACY_TRANSCRIPT_FILE as TRANSCRIPT_FILE;
 
 // High-level mission phases.
 //
@@ -295,12 +304,93 @@ impl Plan {
         self.dir.join(FORCED_PHASE_FILE)
     }
 
-    pub fn transcript_path(&self) -> PathBuf {
+    /// Path of the **superseded** manager journal (A §1 **D2**).
+    ///
+    /// Nothing writes this file any more: `ContextEngine::save_transcript`,
+    /// `ContextEngine::load_transcript` and the public `Plan::transcript_path()`
+    /// were deleted by t-009, and the durable session state is the bundle at
+    /// [`Plan::session_bundle_path`]. The accessor stays private for one reason
+    /// only — [`Plan::clear`] and [`Plan::archive`] must still delete a **stale**
+    /// copy left on disk by an older release, exactly as [`FORCED_PHASE_FILE`]
+    /// survives for its stale override.
+    fn legacy_transcript_path(&self) -> PathBuf {
         self.dir.join(TRANSCRIPT_FILE)
     }
 
-    pub fn ui_transcript_path(&self) -> PathBuf {
-        self.dir.join(UI_TRANSCRIPT_FILE)
+    /// Path of the **superseded** UI journal (t-025b).
+    ///
+    /// Nothing writes this file any more: `UiTranscript::save`/`load`,
+    /// `UiTranscript::from_legacy_messages` and the public UI-journal file-name
+    /// constant are deleted, and the durable UI state is the `ui` member of the
+    /// bundle at [`Plan::session_bundle_path`]. The name therefore lives here as a
+    /// plain literal, and the accessor stays private for one reason only —
+    /// [`Plan::clear`] and [`Plan::archive`] must still delete a **stale** copy left
+    /// on disk by an older release, exactly as [`Self::legacy_transcript_path`] does
+    /// for [`TRANSCRIPT_FILE`].
+    fn legacy_ui_journal_path(&self) -> PathBuf {
+        self.dir.join(".ui_transcript.json")
+    }
+
+    /// Delete everything this plan owns as **session state**: the superseded
+    /// manager journal and the superseded UI journal (stale copies only), the
+    /// session bundle, and the in-memory manager capture the session holder keeps
+    /// for a committer.
+    ///
+    /// A plan sweep is `ProcessEnding::Reset` in the durable vocabulary: the
+    /// session MUST NOT be resurrected (A §3.4), so a bundle left behind next to a
+    /// cleared plan would be a bug — the next boot would load a session the user
+    /// just erased. The ending-marked deletion (`session::discard_bundle`, flow
+    /// §1.4/T-10) belongs to the trigger layer (t-011/t-013); until that exists, a
+    /// plain recursive delete is what keeps the promise, and it is loud on failure.
+    fn sweep_session_state(&self) {
+        crate::session::manager_capture::clear_capture();
+        let transcript = self.legacy_transcript_path();
+        if transcript.exists() {
+            tracing::warn!(
+                "Plan: deleting superseded manager journal at {}",
+                transcript.display()
+            );
+            let _ = std::fs::remove_file(&transcript);
+        }
+        let ui_journal = self.legacy_ui_journal_path();
+        if ui_journal.exists() {
+            tracing::warn!(
+                "Plan: deleting superseded UI journal at {}",
+                ui_journal.display()
+            );
+            let _ = std::fs::remove_file(&ui_journal);
+        }
+        let bundle = self.session_bundle_path();
+        if bundle.exists() {
+            tracing::warn!("Plan: deleting session bundle at {}", bundle.display());
+            if let Err(error) = std::fs::remove_dir_all(&bundle) {
+                tracing::warn!(
+                    "Plan: session bundle {} could not be deleted: {error}",
+                    bundle.display()
+                );
+            }
+        }
+    }
+
+    /// Root of the **session bundle** for this plan: `.marmel/session/`
+    /// (`docs/design_session_restore_data.md` §2, flow §4.2).
+    ///
+    /// This is the single path authority for the bundle: `session::commit` and
+    /// `session::restore` never re-derive it from [`MARMEL_DIR`], and callers must
+    /// not hardcode `.marmel/session`. The directory holds `manifest.json`,
+    /// `manager.json`, `ui.json` and `workers/<escaped-key>.json`; the manifest is
+    /// written **last**, which is what makes a bundle committed (A §7.1 C4).
+    ///
+    /// Since t-009 this is also the only durable **manager** journal: the
+    /// `.marmel/.session_transcript.json` file it used to sit next to is deleted
+    /// (A §1 D2), and only its name survives, in
+    /// [`crate::session::manager_capture::LEGACY_TRANSCRIPT_FILE`], so a stale copy
+    /// can still be named and swept. The superseded **UI** journal
+    /// (`.marmel/.ui_transcript.json`) is named and swept the same way — its
+    /// writer was deleted by t-025b, and the durable UI state is this bundle's
+    /// `ui` member.
+    pub fn session_bundle_path(&self) -> PathBuf {
+        self.dir.join(crate::session::format::BUNDLE_DIR_NAME)
     }
 
     /// REQ-PLAN-001: write the initial execution plan to `.marmel/execution_plan.md`,
@@ -404,22 +494,10 @@ impl Plan {
             );
             let _ = std::fs::remove_file(&forced);
         }
-        let transcript = self.transcript_path();
-        if transcript.exists() {
-            tracing::warn!(
-                "Plan::clear: deleting transcript file at {}",
-                transcript.display()
-            );
-            let _ = std::fs::remove_file(&transcript);
-        }
-        let ui_transcript = self.ui_transcript_path();
-        if ui_transcript.exists() {
-            tracing::warn!(
-                "Plan::clear: deleting UI transcript file at {}",
-                ui_transcript.display()
-            );
-            let _ = std::fs::remove_file(&ui_transcript);
-        }
+        // Session state: the superseded manager journal and the superseded UI
+        // journal (stale copies only), the session bundle that replaced both, plus
+        // the in-memory manager capture.
+        self.sweep_session_state();
         tracing::warn!("Execution plan CLEARED from disk (all plan files deleted).");
         Ok(())
     }
@@ -559,14 +637,10 @@ impl Plan {
         let latest = self.dir.join("execution_plan_archive.md");
         let _ = std::fs::write(&latest, &content);
         let _ = std::fs::remove_file(&path);
-        let transcript = self.transcript_path();
-        if transcript.exists() {
-            let _ = std::fs::remove_file(&transcript);
-        }
-        let ui_transcript = self.ui_transcript_path();
-        if ui_transcript.exists() {
-            let _ = std::fs::remove_file(&ui_transcript);
-        }
+        // An archived plan is a finished session: the superseded manager journal,
+        // the superseded UI journal and the session bundle go with it
+        // (A §3.4 `PlanArchived`).
+        self.sweep_session_state();
         clear_plan_start();
         tracing::warn!(
             "Execution plan completed and ARCHIVED to {} (active plan file {} removed from disk)",

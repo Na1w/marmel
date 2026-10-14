@@ -331,6 +331,26 @@ async fn run_automated_validation_inner(
         token,
     );
 
+    // t-010 (A §5.5): the validator's engine is a local of this function too, so
+    // its history is mirrored out under the live worker key. `run_fix_loop`
+    // mirrors through the task-local handle (flow §4.8), exactly like
+    // `CURRENT_WORKER_TOKEN` is threaded.
+    let journal = crate::session::worker_journal::open(
+        &_active_guard.0,
+        crate::orchestrator::workers::worker_state_snapshot(&_active_guard.0)
+            .map(|state| state.worker_id_seq_value)
+            .unwrap_or(0),
+        cfg.session_worker_mirror_max_messages,
+    );
+    journal.record_seed(
+        &engine,
+        &crate::session::worker_journal::WorkerSeed {
+            brief: format!("Auditing {agent} deliverable"),
+            ..Default::default()
+        },
+    );
+    let _journal_close = crate::session::worker_journal::JournalCloseGuard::new(journal.clone());
+
     let default_mon = crate::config::MonitoringConfig::default();
     let mon_cfg = cfg.monitoring.as_ref().unwrap_or(&default_mon);
     let mut monitor = crate::harness::monitor::HarnessMonitor::new_with_config(
@@ -383,7 +403,12 @@ async fn run_automated_validation_inner(
         rebirth_notice: "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. Do not call rebirth consecutively without making progress. Continue your validation inspection and submit your verdict via leave_verdict.)".to_string(),
     };
 
-    match run_fix_loop(&mut params, &mut monitor, caller).await {
+    match crate::session::worker_journal::with_journal_async(
+        &journal,
+        run_fix_loop(&mut params, &mut monitor, caller),
+    )
+    .await
+    {
         Ok(FixLoopResult::Verdict { approved, critique }) => Ok((approved, critique)),
         Ok(FixLoopResult::Exhausted { reason }) => {
             // The pass ran out of rounds or wall-clock budget without recording a
@@ -470,6 +495,23 @@ async fn run_plan_validation_inner(
         token,
     );
 
+    // t-010 (A §5.5): same mirror for the plan-audit loop.
+    let journal = crate::session::worker_journal::open(
+        &_active_guard.0,
+        crate::orchestrator::workers::worker_state_snapshot(&_active_guard.0)
+            .map(|state| state.worker_id_seq_value)
+            .unwrap_or(0),
+        cfg.session_worker_mirror_max_messages,
+    );
+    journal.record_seed(
+        &engine,
+        &crate::session::worker_journal::WorkerSeed {
+            brief: "Auditing execution plan".to_string(),
+            ..Default::default()
+        },
+    );
+    let _journal_close = crate::session::worker_journal::JournalCloseGuard::new(journal.clone());
+
     let default_mon = crate::config::MonitoringConfig::default();
     let mon_cfg = cfg.monitoring.as_ref().unwrap_or(&default_mon);
     let mut monitor = crate::harness::monitor::HarnessMonitor::new_with_config(
@@ -508,10 +550,13 @@ async fn run_plan_validation_inner(
         rebirth_notice: "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. Do not call rebirth consecutively without making progress. Continue your validation inspection and submit your verdict via leave_verdict.)".to_string(),
     };
 
-    match run_fix_loop(
-        &mut params,
-        &mut monitor,
-        crate::harness::ToolCaller::Specialist(Agent::Validator),
+    match crate::session::worker_journal::with_journal_async(
+        &journal,
+        run_fix_loop(
+            &mut params,
+            &mut monitor,
+            crate::harness::ToolCaller::Specialist(Agent::Validator),
+        ),
     )
     .await
     {

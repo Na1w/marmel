@@ -33,6 +33,23 @@ use crate::types::{ChatRequest, Message};
 
 static NEXT_NOTICE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Raise [`NEXT_NOTICE_ID`] to a restore floor (Design A §5.7 step 1).
+///
+/// `fetch_max`, never an assignment, so the counter can never go backwards: the
+/// floor asserts "every notice id below it was already issued", and ids are
+/// spelled `notice-{n}` with the origin at **1**. Returns the value before the
+/// raise so the caller can report the delta. Without this, the first notice
+/// issued after a restart aliases an id the previous process already used
+/// (A §5.7, `docs/research_restore_lifecycle.md` §5-8).
+pub fn seed_notice_id_floor(floor: u64) -> u64 {
+    NEXT_NOTICE_ID.fetch_max(floor.max(1), Ordering::SeqCst)
+}
+
+/// Current [`NEXT_NOTICE_ID`] state: every id below it has been issued.
+pub fn notice_id_floor() -> u64 {
+    NEXT_NOTICE_ID.load(Ordering::SeqCst)
+}
+
 /// Generate the next unique steering notice identifier.
 pub fn next_notice_id() -> String {
     let id = NEXT_NOTICE_ID.fetch_add(1, Ordering::SeqCst);
@@ -254,6 +271,23 @@ pub fn worker_inbox_len(worker_key: &str) -> usize {
 pub fn has_worker_inbox(worker_key: &str) -> bool {
     let key = worker_key.trim().to_ascii_lowercase();
     WORKER_INBOXES.contains_key(&key)
+}
+
+/// **Read-only** copy of the notices currently queued for `worker_key`, oldest
+/// first (normalised exactly like a post, so it agrees with
+/// [`worker_inbox_len`]).
+///
+/// This is the sampling seam for session capture (A §10.4, AC-A2): the queue
+/// lives in this process's memory, so a notice that was never delivered can only
+/// be named while the process is still alive. Nothing here drains, expires or
+/// reorders anything — capture must never cost a worker its steering (§7.3 L9),
+/// which is why [`drain_worker_notices`] is not usable from that path.
+pub fn peek_worker_inbox(worker_key: &str) -> Vec<SteerNotice> {
+    let key = worker_key.trim().to_ascii_lowercase();
+    WORKER_INBOXES
+        .get(&key)
+        .map(|entry| entry.notices.clone())
+        .unwrap_or_default()
 }
 
 /// Log one occurrence of a bounded lifecycle warning class.

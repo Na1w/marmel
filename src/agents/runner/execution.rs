@@ -7,6 +7,9 @@ use crate::agents::validation::{
 };
 use crate::agents::{Agent, IsolatedContext};
 use crate::markers::{MARKER_COMPLETE, MARKER_REPLAN, has_replan_marker, has_terminal_marker};
+use crate::session::worker_journal::{
+    self, WorkerSeed, mirror_append, mirror_collapse, mirror_replace_last,
+};
 use crate::tool_names::TOOL_LEAVE_VERDICT;
 
 const MAX_CONSECUTIVE_THINKING_NUDGES: u32 = 5;
@@ -270,6 +273,24 @@ async fn run_specialist_live_inner(
         Some(token.clone()),
     );
 
+    // t-010 (Design A §5.5): the engine above is a **local**, so nothing outside
+    // this function can read the worker's history once the run ends. The journal
+    // is an append-side *mirror* of it, opened under the live worker key and
+    // seeded with what the engine already holds (system prompt, brief, snippets
+    // block) plus the delegation seed. It is a shadow only — the engine stays
+    // authoritative for execution, the mirror never touches disk, and every
+    // mirrored step is a clone on this thread (flow §1.3).
+    let journal = worker_journal::open(
+        &_active_guard.0,
+        crate::orchestrator::workers::worker_state_snapshot(&_active_guard.0)
+            .map(|state| state.worker_id_seq_value)
+            .unwrap_or(0),
+        cfg.session_worker_mirror_max_messages,
+    );
+    journal.record_seed(&engine, &WorkerSeed::from_context(ctx));
+    // Frozen when the run ends, whichever of the many exit paths it takes.
+    let _journal_close = worker_journal::JournalCloseGuard::new(journal.clone());
+
     let default_mon = crate::config::MonitoringConfig::default();
     let mon_cfg = cfg.monitoring.as_ref().unwrap_or(&default_mon);
     let mut monitor = crate::harness::monitor::HarnessMonitor::new_with_config(
@@ -395,7 +416,11 @@ async fn run_specialist_live_inner(
         crate::orchestrator::update_active_worker_context(&_active_guard.0, engine.token_count());
 
         // Turn-start notice drain — rendered by the crate's single notice renderer.
-        super::fix_loop::inject_worker_notices_at_turn_start(&mut engine, &_active_guard.0);
+        // The injector mutates the engine, so it mirrors through the task-local
+        // handle (A §5.5).
+        worker_journal::with_journal(&journal, || {
+            super::fix_loop::inject_worker_notices_at_turn_start(&mut engine, &_active_guard.0);
+        });
 
         crate::orchestrator::emit_status(format!(
             "{agent_tag}: thinking / calling model ({specialist_model})..."
@@ -487,7 +512,7 @@ async fn run_specialist_live_inner(
             },
             tool_calls: tool_calls.clone(),
         };
-        engine.append(assistant_msg);
+        mirror_append(&mut engine, Some(&journal), assistant_msg);
 
         let is_repeating = rep_triggered || monitor.feed_text(&reply.content);
 
@@ -521,26 +546,34 @@ async fn run_specialist_live_inner(
                 crate::orchestrator::emit_status(format!(
                     "{agent_tag}: reasoning budget ({max_thinking_tokens} tokens) reached — nudging out of thinking"
                 ));
-                engine.replace_last(crate::types::Message::Assistant {
-                    content: if reply.content.trim().is_empty() {
-                        Some(format!(
-                            "[Reasoning budget reached: exceeded {max_thinking_tokens} token limit]"
-                        ))
-                    } else {
-                        Some(reply.content.clone())
+                mirror_replace_last(
+                    &mut engine,
+                    Some(&journal),
+                    crate::types::Message::Assistant {
+                        content: if reply.content.trim().is_empty() {
+                            Some(format!(
+                                "[Reasoning budget reached: exceeded {max_thinking_tokens} token limit]"
+                            ))
+                        } else {
+                            Some(reply.content.clone())
+                        },
+                        reasoning_content: if reply.reasoning.is_empty() {
+                            None
+                        } else {
+                            Some(reply.reasoning.clone())
+                        },
+                        tool_calls: Vec::new(),
                     },
-                    reasoning_content: if reply.reasoning.is_empty() {
-                        None
-                    } else {
-                        Some(reply.reasoning.clone())
+                );
+                mirror_append(
+                    &mut engine,
+                    Some(&journal),
+                    crate::types::Message::User {
+                        content: format!(
+                            "SYSTEM NOTICE: Maximum reasoning budget of {max_thinking_tokens} tokens reached for this turn. Stop internal thinking immediately. Proceed directly to output your deliverables or execute required tools (such as `read_file`, `write_file`, `replace`, `run_command`, etc.)."
+                        ),
                     },
-                    tool_calls: Vec::new(),
-                });
-                engine.append(crate::types::Message::User {
-                    content: format!(
-                        "SYSTEM NOTICE: Maximum reasoning budget of {max_thinking_tokens} tokens reached for this turn. Stop internal thinking immediately. Proceed directly to output your deliverables or execute required tools (such as `read_file`, `write_file`, `replace`, `run_command`, etc.)."
-                    ),
-                });
+                );
                 continue;
             }
 
@@ -549,18 +582,26 @@ async fn run_specialist_live_inner(
                 tracing::warn!(
                     "{agent_tag}: output budget exceeded — injecting corrective nudge ({nudge_count}/2)"
                 );
-                engine.replace_last(crate::types::Message::Assistant {
-                    content: Some(format!(
-                        "[Generation truncated: exceeded {max_tokens} token single-turn limit]"
-                    )),
-                    reasoning_content: None,
-                    tool_calls: Vec::new(),
-                });
-                engine.append(crate::types::Message::User {
-                    content: format!(
-                        "SYSTEM NOTICE: Your response exceeded the single-turn output budget limit ({max_tokens} tokens) and was truncated. Please be concise, call your required tools (such as `read_file`, `write_file`, `replace`, `run_command`, etc.) to perform the work, or conclude with '{MARKER_COMPLETE}'."
-                    ),
-                });
+                mirror_replace_last(
+                    &mut engine,
+                    Some(&journal),
+                    crate::types::Message::Assistant {
+                        content: Some(format!(
+                            "[Generation truncated: exceeded {max_tokens} token single-turn limit]"
+                        )),
+                        reasoning_content: None,
+                        tool_calls: Vec::new(),
+                    },
+                );
+                mirror_append(
+                    &mut engine,
+                    Some(&journal),
+                    crate::types::Message::User {
+                        content: format!(
+                            "SYSTEM NOTICE: Your response exceeded the single-turn output budget limit ({max_tokens} tokens) and was truncated. Please be concise, call your required tools (such as `read_file`, `write_file`, `replace`, `run_command`, etc.) to perform the work, or conclude with '{MARKER_COMPLETE}'."
+                        ),
+                    },
+                );
                 continue;
             }
 
@@ -570,22 +611,30 @@ async fn run_specialist_live_inner(
                     tracing::warn!(
                         "{agent_tag}: repetitive generation loop detected in specialist output — injecting corrective nudge ({nudge_count}/2)"
                     );
-                    engine.replace_last(crate::types::Message::Assistant {
-                        content: Some(
-                            "[Generation interrupted due to repetitive loop]".to_string(),
-                        ),
-                        reasoning_content: None,
-                        tool_calls: Vec::new(),
-                    });
+                    mirror_replace_last(
+                        &mut engine,
+                        Some(&journal),
+                        crate::types::Message::Assistant {
+                            content: Some(
+                                "[Generation interrupted due to repetitive loop]".to_string(),
+                            ),
+                            reasoning_content: None,
+                            tool_calls: Vec::new(),
+                        },
+                    );
                     rep_detector = crate::harness::monitor::RepetitionDetector::new(
                         mon_cfg.repetition_threshold,
                         mon_cfg.min_pattern_len,
                     );
-                    engine.append(crate::types::Message::User {
-                        content: format!(
-                            "SYSTEM NOTICE: Repetitive generation loop detected in your responses. Terminate conversational debate immediately and invoke your required tools (such as `read_file`, `write_file`, `run_command`, etc.) to perform the required work, or conclude with '{MARKER_COMPLETE}'."
-                        ),
-                    });
+                    mirror_append(
+                        &mut engine,
+                        Some(&journal),
+                        crate::types::Message::User {
+                            content: format!(
+                                "SYSTEM NOTICE: Repetitive generation loop detected in your responses. Terminate conversational debate immediately and invoke your required tools (such as `read_file`, `write_file`, `run_command`, etc.) to perform the required work, or conclude with '{MARKER_COMPLETE}'."
+                            ),
+                        },
+                    );
                     continue;
                 } else {
                     tracing::warn!(
@@ -610,7 +659,11 @@ async fn run_specialist_live_inner(
                             "SYSTEM NOTICE: You did not call any tools or output {MARKER_COMPLETE}. Do not output conversational prose. Immediately use your tools (such as `read_file`, `write_file`, `replace`, `run_command`, etc.) to perform the required work, create/update any requested files in the workspace, and conclude with '{MARKER_COMPLETE}'."
                         )
                     };
-                    engine.append(crate::types::Message::User { content: nudge_msg });
+                    mirror_append(
+                        &mut engine,
+                        Some(&journal),
+                        crate::types::Message::User { content: nudge_msg },
+                    );
                     continue;
                 } else {
                     tracing::warn!(
@@ -761,9 +814,13 @@ async fn run_specialist_live_inner(
                                      Please address all validator critique points, verify your work with available tools, and conclude with '{MARKER_COMPLETE}'.",
                                     feedback
                                 );
-                                engine.append(crate::types::Message::User {
-                                    content: feedback_msg,
-                                });
+                                mirror_append(
+                                    &mut engine,
+                                    Some(&journal),
+                                    crate::types::Message::User {
+                                        content: feedback_msg,
+                                    },
+                                );
                                 nudge_count = 0;
                                 continue;
                             }
@@ -866,13 +923,15 @@ async fn run_specialist_live_inner(
                         "[{agent_tag}] VERDICT REJECTED: only {} may record validation verdicts",
                         Agent::Validator.as_str()
                     ));
-                    super::fix_loop::append_tool_result(
-                        &mut engine,
-                        &tc,
-                        rejection,
-                        false,
-                        &rebirth_notice(),
-                    );
+                    worker_journal::with_journal(&journal, || {
+                        super::fix_loop::append_tool_result(
+                            &mut engine,
+                            &tc,
+                            rejection,
+                            false,
+                            &rebirth_notice(),
+                        );
+                    });
                     crate::orchestrator::update_active_worker_context(
                         &_active_guard.0,
                         engine.token_count(),
@@ -964,13 +1023,15 @@ async fn run_specialist_live_inner(
                     return Ok(aborted_deliverable());
                 }
             };
-            super::fix_loop::append_tool_result(
-                &mut engine,
-                &tc,
-                content,
-                execution_succeeded,
-                &rebirth_notice(),
-            );
+            worker_journal::with_journal(&journal, || {
+                super::fix_loop::append_tool_result(
+                    &mut engine,
+                    &tc,
+                    content,
+                    execution_succeeded,
+                    &rebirth_notice(),
+                );
+            });
             crate::orchestrator::update_active_worker_context(
                 &_active_guard.0,
                 engine.token_count(),
@@ -985,7 +1046,9 @@ async fn run_specialist_live_inner(
         // concludes on this turn can still be steered, instead of leaving the
         // notice queued until the TTL sweep drops it. Routing is exact-identity,
         // so a notice addressed to another worker is not injected here.
-        super::fix_loop::inject_worker_notices_mid_turn(&mut engine, &_active_guard.0);
+        worker_journal::with_journal(&journal, || {
+            super::fix_loop::inject_worker_notices_mid_turn(&mut engine, &_active_guard.0);
+        });
 
         if turn_had_malformed_tool_call {
             consecutive_malformed_tool_calls += 1;
@@ -1033,6 +1096,9 @@ async fn run_specialist_live_inner(
         sync_specialist_tool_schema(&mut engine, &tools);
         if engine.should_compact() {
             let outcome = engine.compact();
+            // The mirror must follow the engine's collapse, never re-expand the
+            // history the worker itself discarded (A §5.5 point 4).
+            mirror_collapse(&engine, Some(&journal));
             tracing::info!("{agent_tag}: automatic context compaction: {outcome:?}");
             if let Some(notice) = super::fix_loop::fix_loop_compaction_notice(&agent_tag, &outcome)
             {
@@ -1041,6 +1107,7 @@ async fn run_specialist_live_inner(
             }
         } else if engine.should_advise_rebirth() {
             engine.inject_rebirth_advisory();
+            mirror_collapse(&engine, Some(&journal));
         }
         if leave_verdict_called {
             tracing::info!(

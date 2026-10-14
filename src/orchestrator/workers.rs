@@ -71,6 +71,15 @@ pub struct WorkerState {
     pub completed_seq: Option<u64>,
     pub completed_at: Option<Instant>,
     pub completed_wall: Option<chrono::DateTime<chrono::Local>>,
+    /// The value this registration drew from [`WORKER_ID_SEQ`] (see
+    /// [`next_worker_id`]).
+    ///
+    /// Carried on the entry because the session capture path (Design A §5.3)
+    /// must persist it: a restored worker is inserted under its stored key and
+    /// never re-registers, so the id embedded in `{agent}-wN` / the `#N`
+    /// collision handle has to be readable without re-drawing it.
+    /// `0` marks a token-count placeholder entry, which is not a registration.
+    pub worker_id_seq_value: u64,
 }
 
 impl WorkerState {
@@ -170,26 +179,7 @@ impl Drop for ActiveWorkerGuard {
             entry.completed_wall = Some(chrono::Local::now());
         }
         // Bounded completed ring: evict oldest completed entries while over cap.
-        loop {
-            let mut completed: Vec<(String, u64)> = WORKERS
-                .iter()
-                .filter_map(|e| e.value().completed_seq.map(|s| (e.key().clone(), s)))
-                .collect();
-            if completed.len() <= MAX_RECENT_COMPLETED {
-                break;
-            }
-            completed.sort_by_key(|(_, s)| *s);
-            let to_remove = completed.len().saturating_sub(MAX_RECENT_COMPLETED);
-            let mut removed_any = false;
-            for (key, _) in completed.into_iter().take(to_remove) {
-                if WORKERS.remove(&key).is_some() {
-                    removed_any = true;
-                }
-            }
-            if !removed_any {
-                break;
-            }
-        }
+        evict_completed_ring();
         // Inbox hygiene on teardown (t-048): a finished worker must not leave an
         // empty notice-inbox entry behind in the notice store.
         //
@@ -207,7 +197,169 @@ impl Drop for ActiveWorkerGuard {
         //   a panic inside `Drop` while another panic is unwinding would abort
         //   the process.
         super::notice::reclaim_worker_inbox(&self.0);
+        // t-023 (flow T-5): freeze this worker's mirror so the next bundle
+        // commit writes a stable `workers/<key>.json`, and record that an edge
+        // happened. Both are infallible and touch **no disk**: `Drop` must never
+        // panic, and a worker thread is never a writer (R-TRIG-0) — the session
+        // thread harvests the registry at its next commit.
+        if let Some(journal) = crate::session::worker_journal::registry_get(&self.0) {
+            journal.close();
+        }
+        crate::ui::session::mark_worker_lifecycle_edge();
     }
+}
+
+/// Bounded completed ring: evict oldest-first completed entries past
+/// [`MAX_RECENT_COMPLETED`], returning how many entries were removed.
+///
+/// Shared by [`ActiveWorkerGuard::drop`] and by the session restore installer
+/// (Design A §5.7 step 3), so there is exactly one eviction policy. Keys are
+/// collected into a `Vec` before any removal: no map guard is ever alive while
+/// another lookup happens (the module's single-guard rule, and the reason the
+/// restore path — which may run where a panic would abort the process — can
+/// reuse this without a second implementation).
+fn evict_completed_ring() -> usize {
+    let mut removed_total = 0usize;
+    loop {
+        let mut completed: Vec<(String, u64)> = WORKERS
+            .iter()
+            .filter_map(|e| e.value().completed_seq.map(|s| (e.key().clone(), s)))
+            .collect();
+        if completed.len() <= MAX_RECENT_COMPLETED {
+            break;
+        }
+        completed.sort_by_key(|(_, s)| *s);
+        let to_remove = completed.len().saturating_sub(MAX_RECENT_COMPLETED);
+        let mut removed_any = false;
+        for (key, _) in completed.into_iter().take(to_remove) {
+            if WORKERS.remove(&key).is_some() {
+                removed_any = true;
+                removed_total += 1;
+            }
+        }
+        if !removed_any {
+            break;
+        }
+    }
+    removed_total
+}
+
+/// Raise [`WORKER_ID_SEQ`] to a restore floor (Design A §5.7 step 1).
+///
+/// `fetch_max`, never an assignment: the floor says "every id below `floor` has
+/// already been handed out", and the counter may legitimately be ahead of it (a
+/// worker registered in this process before the restore ran). Returns the
+/// counter value **before** the raise, so the caller can report the delta.
+pub fn seed_worker_id_seq_floor(floor: u64) -> u64 {
+    WORKER_ID_SEQ.fetch_max(floor, Ordering::SeqCst)
+}
+
+/// Current [`WORKER_ID_SEQ`] state: every id below it has been issued.
+pub fn worker_id_seq_floor() -> u64 {
+    WORKER_ID_SEQ.load(Ordering::SeqCst)
+}
+
+/// Raise [`COMPLETED_SEQ`] to a restore floor (A §5.7 step 1) — see
+/// [`seed_worker_id_seq_floor`] for the ordering rule.
+pub fn seed_completed_seq_floor(floor: u64) -> u64 {
+    COMPLETED_SEQ.fetch_max(floor, Ordering::SeqCst)
+}
+
+/// Current [`COMPLETED_SEQ`] state.
+pub fn completed_seq_floor() -> u64 {
+    COMPLETED_SEQ.load(Ordering::SeqCst)
+}
+
+/// Insert a **restored** worker under its stored registry key.
+///
+/// This is the installer A §5.7 step 2 requires and the only registry mutation
+/// the session loader is given: the key is written verbatim, `completed_seq` is
+/// carried verbatim, and no id is re-drawn. Deliberately **not**
+/// [`register_active_worker_with_token`] / [`claim_worker_slot`] — those draw a
+/// fresh `WORKER_ID_SEQ` id and may disambiguate the key, which is the identity
+/// drift A §5.7 exists to prevent.
+///
+/// Returns `false` (inserting nothing) when the key is currently held by a
+/// **live** entry: clobbering it would drop that worker's `CancellationToken`,
+/// the same refusal [`claim_worker_slot`] makes. The caller reports the
+/// collision; it never overwrites.
+pub fn install_restored_worker(worker_key: String, state: WorkerState) -> bool {
+    match WORKERS.entry(worker_key) {
+        Entry::Occupied(mut occupied) => {
+            if occupied.get().is_active() {
+                return false;
+            }
+            occupied.insert(state);
+            true
+        }
+        Entry::Vacant(vacant) => {
+            vacant.insert(state);
+            true
+        }
+    }
+}
+
+/// Enforce the completed-ring cap over a set of freshly re-inserted entries and
+/// report how many completed entries the live map could not hold (A §5.7 step 3:
+/// the files are the durable record, the map is the working set).
+pub fn enforce_completed_ring_cap() -> usize {
+    evict_completed_ring()
+}
+
+/// Close a restored record without an [`ActiveWorkerGuard`] (flow §2.5: the
+/// manager chose to retire / re-delegate / continue, so the open delegation
+/// must be closed the same way a real completion closes it).
+///
+/// Runs the *existing* teardown steps — draw `COMPLETED_SEQ`, flip the entry to
+/// completed, evict the ring, reclaim the notice inbox — and returns the drawn
+/// sequence (`Some(existing)` when the entry was already closed, `None` when the
+/// key is unknown). No guard is synthesized: the guard's `Drop` would report a
+/// completion the worker never had (flow §2.2 step 2).
+pub fn retire_restored_worker(worker_key: &str, status_label: &str) -> Option<u64> {
+    let seq = {
+        let mut entry = WORKERS.get_mut(worker_key)?;
+        if !entry.is_active() {
+            Some(entry.completed_seq.unwrap_or(0))
+        } else {
+            let seq = COMPLETED_SEQ.fetch_add(1, Ordering::SeqCst);
+            entry.last_tokens = entry.info.context_tokens;
+            entry.completed_seq = Some(seq);
+            entry.completed_at = Some(Instant::now());
+            entry.completed_wall = Some(chrono::Local::now());
+            entry.info.status = status_label.to_string();
+            Some(seq)
+        }
+    };
+    // Guards released above before any further lookup (single-guard rule).
+    evict_completed_ring();
+    super::notice::reclaim_worker_inbox(worker_key);
+    seq
+}
+
+/// Clone one registry entry (A §5.3: the capture side projects a live
+/// `WorkerState` into a `WorkerSection`; `WORKERS` is private to this module).
+pub fn worker_state_snapshot(worker_key: &str) -> Option<WorkerState> {
+    WORKERS.get(worker_key).map(|entry| entry.value().clone())
+}
+
+/// Snapshot every entry as `(key, state)`, no guard outliving the call. The
+/// committer walks this and joins it with [`crate::session::worker_journal`] to
+/// build the `workers/*.json` members (flow §1.3).
+pub fn live_worker_states() -> Vec<(String, WorkerState)> {
+    let mut out: Vec<(String, WorkerState)> = WORKERS
+        .iter()
+        .map(|e| (e.key().clone(), e.value().clone()))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Test-only: drop one entry from the table outright (no `COMPLETED_SEQ` draw,
+/// no ring eviction) so a restore test can leave the shared table exactly as it
+/// found it. Never used by production code paths.
+#[cfg(test)]
+pub fn remove_worker_entry_for_test(worker_key: &str) -> Option<WorkerState> {
+    WORKERS.remove(worker_key).map(|(_, state)| state)
 }
 
 /// Register a subagent worker as active with start timestamp and task prompt.
@@ -258,11 +410,17 @@ pub fn register_active_worker_with_token(
         prompt,
         effective_token,
         started_at,
+        worker_id,
     );
+    // T-5 (flow §1.1): a worker started. Only the edge is recorded here — the
+    // journal is opened by the runner and harvested/written by the session
+    // thread at its next commit (R-TRIG-0), never from this thread.
+    crate::ui::session::mark_worker_lifecycle_edge();
     ActiveWorkerGuard(key)
 }
 
 /// Build the fresh registry state written by [`claim_worker_slot`].
+#[allow(clippy::too_many_arguments)]
 fn new_worker_state(
     task_id: Option<String>,
     agent_name: &str,
@@ -270,6 +428,7 @@ fn new_worker_state(
     cancel_token: &Option<tokio_util::sync::CancellationToken>,
     started_at: Instant,
     initial_tokens: usize,
+    worker_id_seq_value: u64,
 ) -> WorkerState {
     WorkerState {
         info: ActiveWorkerInfo {
@@ -289,6 +448,7 @@ fn new_worker_state(
         completed_seq: None,
         completed_at: None,
         completed_wall: None,
+        worker_id_seq_value,
     }
 }
 
@@ -313,6 +473,7 @@ fn claim_worker_slot(
     prompt: String,
     cancel_token: Option<tokio_util::sync::CancellationToken>,
     started_at: Instant,
+    worker_id_seq_value: u64,
 ) -> String {
     let mut key = base_key.to_string();
     let mut retries: usize = 0;
@@ -351,6 +512,7 @@ fn claim_worker_slot(
                     &cancel_token,
                     started_at,
                     initial_tokens,
+                    worker_id_seq_value,
                 ));
                 return key;
             }
@@ -362,6 +524,7 @@ fn claim_worker_slot(
                     &cancel_token,
                     started_at,
                     0,
+                    worker_id_seq_value,
                 ));
                 return key;
             }
@@ -404,6 +567,9 @@ pub fn update_active_worker_context(key: &str, tokens: usize) {
                 completed_seq: Some(COMPLETED_SEQ.fetch_add(1, Ordering::SeqCst)),
                 completed_at: Some(Instant::now()),
                 completed_wall: Some(chrono::Local::now()),
+                // Not a registration: no id was drawn for it (A §5.3 keeps
+                // `worker_id_seq_value` meaningful for real registrations only).
+                worker_id_seq_value: 0,
             });
         }
     }
@@ -429,10 +595,20 @@ pub fn update_active_worker_progress(
 
 /// Set the descriptive status of an active specialist worker (e.g. "Approved", "Revising", "Failed", "Aborted").
 pub fn set_active_worker_status(key: &str, status: &str) {
-    if let Some(mut entry) = WORKERS.get_mut(key)
+    let updated = if let Some(mut entry) = WORKERS.get_mut(key)
         && entry.is_active()
     {
         entry.info.status = status.to_string();
+        true
+    } else {
+        false
+    };
+    // T-5 (flow §1.1): `status_label` is a persisted worker field, so a
+    // completion / failure / abort label is a lifecycle edge. The guard above is
+    // released before this call (A §5.7 step 4: no map guard across a step), and
+    // recording an edge is an atomic store — no disk, no commit (R-TRIG-0).
+    if updated {
+        crate::ui::session::mark_worker_lifecycle_edge();
     }
 }
 
@@ -828,6 +1004,116 @@ pub fn cancel_all_active_workers() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A §5.7 step 2/3: the restore installer writes the **stored** key and the
+    /// stored `completed_seq` verbatim, refuses to clobber a live entry (the
+    /// same refusal [`claim_worker_slot`] makes, so a cancellation token is
+    /// never dropped), and closing a restored record goes through the existing
+    /// `COMPLETED_SEQ` path — never a synthesized [`ActiveWorkerGuard`].
+    #[test]
+    fn test_restore_installer_keeps_keys_and_closes_through_completed_seq() {
+        let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let key = "restored-t-001";
+        let restored_key = remove_worker_entry_for_test(key);
+        assert!(restored_key.is_none(), "the fixture key must start free");
+
+        let base_completed = completed_seq_floor();
+        let base_ids = worker_id_seq_floor();
+        seed_worker_id_seq_floor(base_ids + 500);
+        seed_completed_seq_floor(base_completed + 500);
+
+        // A live worker owns the natural key of the registration below.
+        let guard = register_active_worker_with_token(
+            Some("t-collide".to_string()),
+            "restored".to_string(),
+            "Live worker".to_string(),
+            None,
+        );
+
+        let state = new_worker_state(
+            Some("t-001".to_string()),
+            "restored",
+            "Restored brief",
+            &None,
+            Instant::now(),
+            0,
+            base_ids + 3,
+        );
+        assert!(
+            install_restored_worker(key.to_string(), state.clone()),
+            "a free key installs verbatim"
+        );
+        assert!(
+            !install_restored_worker(guard.0.clone(), state.clone()),
+            "a key owned by a live worker must never be overwritten"
+        );
+        assert!(
+            worker_state_snapshot(key).as_ref().map(|s| s.is_active()) == Some(true),
+            "an interrupted record stays open so cancel/routing still see it"
+        );
+
+        // Nothing that registers after the floors were raised can re-issue an
+        // id the bundle already carried.
+        let fresh = register_active_worker_with_token(
+            None,
+            "floored".to_string(),
+            "Post-restore worker".to_string(),
+            None,
+        );
+        let fresh_state = worker_state_snapshot(&fresh.0).expect("fresh entry");
+        assert!(
+            fresh_state.worker_id_seq_value > base_ids + 3,
+            "fresh id {} must exceed the carried id {}",
+            fresh_state.worker_id_seq_value,
+            base_ids + 3
+        );
+        assert_eq!(
+            fresh.0,
+            format!("floored-w{}", fresh_state.worker_id_seq_value),
+            "the key must carry the raised id, not one the bundle already used"
+        );
+
+        let seq = retire_restored_worker(key, "Retired after restart").expect("closed");
+        assert!(
+            seq > base_completed + 500 - 1,
+            "the drawn sequence {seq} must sit above the restore floor"
+        );
+        let closed = worker_state_snapshot(key).expect("closed record");
+        assert_eq!(closed.completed_seq, Some(seq));
+        assert_eq!(closed.info.status, "Retired after restart");
+        assert!(!closed.is_active(), "a closed record is no longer a worker");
+        assert!(
+            !crate::orchestrator::notice::has_worker_inbox(key),
+            "retiring reclaims the worker's notice inbox"
+        );
+
+        remove_worker_entry_for_test(key);
+        remove_worker_entry_for_test(&fresh.0);
+        let live_key = guard.0.clone();
+        drop(guard);
+        remove_worker_entry_for_test(&live_key);
+    }
+
+    /// A §5.7 step 1: the floors move with `fetch_max`, never an assignment, so
+    /// a restore can never rewind an id counter and hand out a used id.
+    #[test]
+    fn test_restore_floors_move_up_only() {
+        let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let ids = worker_id_seq_floor();
+        assert_eq!(seed_worker_id_seq_floor(ids.saturating_sub(10)), ids);
+        assert_eq!(worker_id_seq_floor(), ids, "a lower floor changes nothing");
+        seed_worker_id_seq_floor(ids + 40);
+        assert_eq!(worker_id_seq_floor(), ids + 40);
+
+        let completed = completed_seq_floor();
+        assert_eq!(
+            seed_completed_seq_floor(completed.saturating_sub(10)),
+            completed
+        );
+        assert_eq!(completed_seq_floor(), completed);
+        seed_completed_seq_floor(completed + 40);
+        assert_eq!(completed_seq_floor(), completed + 40);
+    }
 
     #[test]
     fn test_worker_progress_and_completed_history() {

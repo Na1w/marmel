@@ -5,7 +5,7 @@ use super::bridge::{
     spawn_steer_arbitration,
 };
 use super::helpers::*;
-use super::{Event, Renderer, UiRecord, UiTranscript};
+use super::{Event, Renderer, SubagentDetail, UiRecord, UiTranscript};
 use crate::config::Config;
 use crate::llm::{ChatClient, StreamConfig, chat_client_turn};
 use crate::manager::context::{
@@ -13,9 +13,16 @@ use crate::manager::context::{
 };
 use crate::manager::r#loop::{DeadlineKind, FailureBudget, FailureVerdict, TurnWatchdog};
 use crate::orchestrator::OrchestratorManager;
+use crate::session::commit::{CapturePayload, CommitError, CommitLock, CommitPolicy};
+use crate::session::restore::RestoreRefused;
+use crate::session::{
+    DanglingToolCallState, IdentityFloors, NonRestorableKind, NonRestorableNotice, ProcessEnding,
+    RepairReport, RestoreOutcome, SubagentPanel, UiJournalRecord, UiSection, WorkerSection,
+};
 use crate::types::Message;
 use anyhow::Result;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Execution bounds applied to the live session loop (recon H5: "no failure
@@ -214,6 +221,1414 @@ pub fn sync_manager_tool_schema(ctx: &mut ContextEngine, cfg: &Config) -> usize 
     charged
 }
 
+// ---------------------------------------------------------------------------
+// Boot-time restore (t-012): the ONE exact restore pass (flow §4.9)
+// ---------------------------------------------------------------------------
+
+/// `--resume` as spelled on the command line (flow §3.3).
+///
+/// **Documented deviation from flow §3.3:** the design prefers an explicit
+/// parameter carried through `ui::tui::run` / `ui::raw::run` and explicitly
+/// rejects smuggling the trigger through `Config`. Both `run` entry points
+/// (`ui/tui/mod.rs:1602`, `ui/raw.rs:20`) and `CliArgs` itself belong to other
+/// tasks, so the only seam left is a one-shot handoff from `main` — the only place
+/// that ever sees `CliArgs` — to the module that owns the session loop. `main`
+/// calls [`set_resume_request`] exactly once, before either `run`; nothing else
+/// writes these statics, and they are read once per process at boot.
+static RESUME_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// The `--fresh` half of the [`RESUME_REQUESTED`] handoff.
+static FRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Hand the CLI's resume decision to the session loop (flow §3.3).
+pub fn set_resume_request(resume: bool, fresh: bool) {
+    RESUME_REQUESTED.store(resume, Ordering::SeqCst);
+    FRESH_REQUESTED.store(fresh, Ordering::SeqCst);
+}
+
+/// The resume trigger, resolved with the precedence flow §3.3 fixes:
+///
+/// ```text
+///   --fresh                    wins over everything else: never restore
+///   --resume                   restore
+///   MARMEL_RESUME=<bool>       restore (environment)
+///   session_resume = true      restore (config file)
+///   none of the above          fresh start — byte-for-byte today's behaviour
+/// ```
+///
+/// `MARMEL_RESUME` is already folded into `cfg.session_resume` by
+/// `config::apply_session_env` (`config.rs:423`), env beating the file, so those
+/// two spellings are a single read here and neither can outrank `--fresh`.
+/// `--resume --fresh` and `--resume` with capture disabled are usage errors that
+/// `main` exits `2` on (`main.rs:41`) long before this is consulted.
+pub fn resume_requested(cfg: &Config) -> bool {
+    (RESUME_REQUESTED.load(Ordering::SeqCst) || cfg.session_resume)
+        && !FRESH_REQUESTED.load(Ordering::SeqCst)
+}
+
+// ---------------------------------------------------------------------------
+// Session commit triggers (flow §1.1–§1.3, t-023)
+//
+// WHEN a bundle is written, and by whom. **R-TRIG-0**: only the thread that owns
+// `ctx`, `ui_transcript` and `renderer` may commit — `Renderer: Send` but **not**
+// `Sync`, so `capture_ui` is legal only here. Worker threads therefore never
+// write a file: [`mark_worker_lifecycle_edge`] records that a worker mirror
+// changed, and this pump turns that into a `workers/*.json` member on the
+// session thread.
+//
+// **Coalescing (R-TRIG-1…3)**: the 24 legacy `save_transcript` sites keep their
+// event semantics but only mirror in memory ([`manager_capture`]); a bundle is
+// written once per trigger, with T-4/T-5 throttled to
+// `Config::session_commit_min_interval_ms` and mandatory triggers (T-1, T-2,
+// T-3, T-9) never throttled.
+//
+// **t-024 added the interrupted-session half**: T-6/T-7 (`UserAbort`), T-8
+// (`PanicHook`, [`commit_from_panic`]) and T-10 (`Reset` / `PlanArchived`,
+// [`mark_ending_commit`] + [`confirm_bundle_swept`]). These are the endings that
+// make an INTERRUPTED run restorable, so none of them is ever throttled and none
+// of them may be skipped: an abort is frequently the last bundle a dying process
+// writes.
+// ---------------------------------------------------------------------------
+
+/// Why a commit was requested — flow §1.1 `T-n`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitTrigger {
+    /// T-1: one round of the turn loop ended, after the pairing repair.
+    ManagerTurnBoundary,
+    /// T-2: the assistant `tool_calls` batch is persisted, nothing dispatched yet.
+    PreDispatch,
+    /// T-3: a tool result landed.
+    ToolResult,
+    /// T-4: a UI-visible change (throttled).
+    UiEvent,
+    /// T-5: a worker lifecycle edge (throttled).
+    WorkerEdge,
+    /// T-9: the session loop reached its tail.
+    CleanTail,
+    /// T-6/T-7 (t-024): the user aborted — `/abort`, the two-stage Ctrl-C/Esc
+    /// confirm, or an abort the loop observed mid-round. Mandatory: this is
+    /// frequently the LAST bundle a dying process ever writes.
+    UserAbort,
+    /// T-10 (t-024): `/reset`. The ending is recorded first, then
+    /// `Plan::clear()`/`sweep_session_state()` deletes the bundle (A D3).
+    Reset,
+    /// T-10 (t-024): the plan was archived — the session is **finished**, which
+    /// is a different verdict from "interrupted".
+    PlanArchived,
+}
+
+impl CommitTrigger {
+    /// R-TRIG-2: only T-4/T-5 respect the rate floor; losing T-1/T-2/T-3/T-9
+    /// loses facts.
+    fn throttled(self) -> bool {
+        matches!(self, CommitTrigger::UiEvent | CommitTrigger::WorkerEdge)
+    }
+
+    /// The ending this trigger writes (flow §1.5). Every in-loop writer here
+    /// records `InProgress`; the loop tail records `CleanTail`, an abort records
+    /// `UserAbort` and a plan sweep records `Reset`/`PlanArchived`. That mapping
+    /// is what lets a later boot tell `CleanTail`, an honest abort and
+    /// `HardKillInferred` apart at all.
+    fn ending(self) -> ProcessEnding {
+        match self {
+            CommitTrigger::CleanTail => ProcessEnding::CleanTail,
+            CommitTrigger::UserAbort => ProcessEnding::UserAbort,
+            CommitTrigger::Reset => ProcessEnding::Reset,
+            CommitTrigger::PlanArchived => ProcessEnding::PlanArchived,
+            _ => ProcessEnding::InProgress,
+        }
+    }
+}
+
+/// What one request decided. Kept so a commit result is never discarded
+/// (A §7.1); it lands in [`session_commit_ledger`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitDecision {
+    /// A bundle was written; `members` counts the members actually renamed (C2).
+    Written { members: usize },
+    /// Inside the `session_commit_min_interval_ms` window: folded into the next commit.
+    Throttled,
+    /// Switched off by config (`session_commit_on_tool_result = false`, or the
+    /// bundle is already over `session_max_bundle_bytes`).
+    Suppressed,
+    /// `session_enabled = false`: nothing is written, ever.
+    Disabled,
+    /// Another commit holds the session commit lock (R-TRIG-1).
+    Busy,
+    /// The commit failed; the reason is logged, never swallowed.
+    Failed,
+}
+
+/// The process-wide capture ledger: every request and every decision, so a
+/// commit result is never thrown away and a test (or an operator) can tell how
+/// many bundles a run really wrote.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SessionCommitLedger {
+    pub requests: u64,
+    pub written: u64,
+    pub throttled: u64,
+    pub suppressed: u64,
+    pub disabled: u64,
+    pub busy: u64,
+    pub failed: u64,
+    pub pre_dispatch: u64,
+    pub turn_boundary: u64,
+    pub tool_result: u64,
+    pub ui_event: u64,
+    pub worker_edge: u64,
+    pub clean_tail: u64,
+    /// t-024: T-6/T-7 abort requests.
+    pub user_abort: u64,
+    /// t-024: T-10 `/reset` requests.
+    pub reset: u64,
+    /// t-024: T-10 plan-archive requests.
+    pub plan_archived: u64,
+    /// t-024: T-8 panic-hook flushes that reached the committer.
+    pub panic_hook: u64,
+    /// Successful commits whose manager member was **dangling** (the T-2 witness:
+    /// an assistant `tool_calls` batch persisted before its results existed).
+    pub dangling_commits: u64,
+    /// Dangling call count in the most recent successful commit.
+    pub last_dangling_calls: usize,
+    /// `ending` of the most recent successful commit.
+    pub last_ending: Option<ProcessEnding>,
+}
+
+static COMMIT_LEDGER: std::sync::LazyLock<std::sync::Mutex<SessionCommitLedger>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(SessionCommitLedger::default()));
+
+fn ledger() -> std::sync::MutexGuard<'static, SessionCommitLedger> {
+    COMMIT_LEDGER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A copy of the ledger (the counters a caller/tests read).
+pub fn session_commit_ledger() -> SessionCommitLedger {
+    ledger().clone()
+}
+
+/// A worker lifecycle edge is pending: set from `orchestrator::workers` — which
+/// may run on a **worker** thread — and consumed only here, on the session
+/// thread. Deliberately an atomic, never a write: R-TRIG-0.
+static WORKER_EDGE: AtomicBool = AtomicBool::new(false);
+
+/// Record that a worker started / completed / failed / was preempted, and that
+/// its journal must therefore be harvested into the next bundle.
+pub fn mark_worker_lifecycle_edge() {
+    WORKER_EDGE.store(true, Ordering::SeqCst);
+}
+
+/// Take the pending edge flag.
+pub fn take_worker_lifecycle_edge() -> bool {
+    WORKER_EDGE.swap(false, Ordering::SeqCst)
+}
+
+/// The worker members: every live registry entry joined with its mirror
+/// (A §5.3). Both sides are clones with no map guard outliving the call
+/// (A §5.7 step 4), so a harvest can never deadlock against a worker.
+fn harvest_worker_sections() -> Vec<WorkerSection> {
+    crate::orchestrator::workers::live_worker_states()
+        .into_iter()
+        .map(|(key, state)| {
+            let role = crate::agents::Agent::from_str(&state.info.agent_name)
+                .unwrap_or(crate::agents::Agent::Coder);
+            let journal = crate::session::worker_journal::registry_get(&key);
+            crate::session::worker_journal::project_worker_section(
+                &key,
+                &state,
+                role,
+                journal.as_deref(),
+            )
+        })
+        .collect()
+}
+
+/// The floors of the three identity counters, read at commit time (A §3.4).
+fn current_identity_floors() -> IdentityFloors {
+    IdentityFloors {
+        worker_id_seq_floor: crate::orchestrator::workers::worker_id_seq_floor(),
+        completed_seq_floor: crate::orchestrator::workers::completed_seq_floor(),
+        notice_id_floor: crate::orchestrator::notice::notice_id_floor(),
+    }
+}
+
+/// Mirror the manager state **and** request a commit — the pair every legacy
+/// `save_transcript` site becomes. The mirror is always cheap and in-memory; the
+/// commit is the pump's decision, so most calls write nothing at all.
+fn capture_and_request(
+    pump: &mut SessionCommitPump,
+    trigger: CommitTrigger,
+    ctx: &ContextEngine,
+    renderer: &dyn Renderer,
+) {
+    crate::session::manager_capture::capture_into_session_state(ctx);
+    pump.request(trigger, ctx, renderer);
+}
+
+/// The session-thread commit pump (flow §1.1/§1.3). One per session; it owns the
+/// throttle clock, the bundle identity and the [`CommitLock`].
+#[derive(Debug)]
+pub struct SessionCommitPump {
+    bundle: std::path::PathBuf,
+    session_id: String,
+    enabled: bool,
+    policy: CommitPolicy,
+    /// Shared with the panic hook ([`PANIC_TARGET`]) as an `Arc`, so a hook that
+    /// runs while this pump's thread is unwinding can still `try_guard` it and
+    /// never blocks on its owner (flow §1.8).
+    lock: Arc<CommitLock>,
+    last_commit: Option<std::time::Instant>,
+    /// A throttled request still owed a commit.
+    pending: bool,
+    /// The bundle went over `session_max_bundle_bytes`: stop issuing *throttled*
+    /// commits, keep the mandatory ones (the committer never truncates).
+    over_ceiling: bool,
+}
+
+impl SessionCommitPump {
+    /// `session_id` is the restored id when one exists (identity continuity,
+    /// A §4); a fresh session mints one, because the manifest, the member
+    /// headers and the L4/L5 cross-checks all require it.
+    pub fn new(plan: &crate::manager::phase::Plan, cfg: &Config, session_id: &str) -> Self {
+        let bundle = crate::session::bundle_dir(plan);
+        let session_id = if session_id.is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            session_id.to_string()
+        };
+        let policy = CommitPolicy {
+            min_interval: Duration::from_millis(cfg.session_commit_min_interval_ms),
+            max_bundle_bytes: cfg.session_max_bundle_bytes,
+            allow_throttled: cfg.session_commit_on_tool_result,
+        };
+        let lock = Arc::new(CommitLock::new());
+        if cfg.session_enabled {
+            // t-024 (flow §1.8): register what the panic hook may reach. Capture
+            // being switched off leaves the hook with nothing to flush, which is
+            // the honest answer — this run never wrote a bundle.
+            let mut slot = PANIC_TARGET
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot = Some(PanicFlushTarget {
+                bundle: bundle.clone(),
+                session_id: session_id.clone(),
+                policy: policy.clone(),
+                lock: Arc::clone(&lock),
+            });
+        }
+        SessionCommitPump {
+            bundle,
+            session_id,
+            enabled: cfg.session_enabled,
+            policy,
+            lock,
+            last_commit: None,
+            pending: false,
+            over_ceiling: false,
+        }
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// The pump's commit lock. Read-only access, for diagnostics and tests: the
+    /// panic hook holds the SAME `Arc` (it was handed one at construction) and
+    /// only ever *tries* it — nothing on that path may block (R-TRIG-1).
+    pub fn commit_lock(&self) -> &CommitLock {
+        &self.lock
+    }
+
+    pub fn bundle(&self) -> &std::path::Path {
+        &self.bundle
+    }
+
+    /// Has this pump actually written the bundle at least once? Ending markers for
+    /// an aborted run consult this: an abort at the goal prompt must not stamp a
+    /// previous run's bundle (which is what would be found at boot) with an empty
+    /// transcript and a `userAbort` ending it never earned.
+    pub fn has_committed(&self) -> bool {
+        self.last_commit.is_some()
+    }
+
+    /// Is a throttled request still owed a commit?
+    pub fn pending(&self) -> bool {
+        self.pending
+    }
+
+    /// One trigger request: mirror stays, bundle is written only at the throttle
+    /// boundary or when the trigger is mandatory.
+    pub fn request(
+        &mut self,
+        trigger: CommitTrigger,
+        ctx: &ContextEngine,
+        renderer: &dyn Renderer,
+    ) -> CommitDecision {
+        {
+            let mut slot = ledger();
+            slot.requests += 1;
+            match trigger {
+                CommitTrigger::PreDispatch => slot.pre_dispatch += 1,
+                CommitTrigger::ManagerTurnBoundary => slot.turn_boundary += 1,
+                CommitTrigger::ToolResult => slot.tool_result += 1,
+                CommitTrigger::UiEvent => slot.ui_event += 1,
+                CommitTrigger::WorkerEdge => slot.worker_edge += 1,
+                CommitTrigger::CleanTail => slot.clean_tail += 1,
+                CommitTrigger::UserAbort => slot.user_abort += 1,
+                CommitTrigger::Reset => slot.reset += 1,
+                CommitTrigger::PlanArchived => slot.plan_archived += 1,
+            }
+        }
+        if !self.enabled {
+            return decide(CommitDecision::Disabled);
+        }
+        // `session_commit_on_tool_result` gates T-3 entirely.
+        if trigger == CommitTrigger::ToolResult && !self.policy.allow_throttled {
+            return decide(CommitDecision::Suppressed);
+        }
+        if trigger.throttled() {
+            if self.over_ceiling {
+                return decide(CommitDecision::Suppressed);
+            }
+            if let Some(at) = self.last_commit
+                && at.elapsed() < self.policy.min_interval
+            {
+                self.pending = true;
+                return decide(CommitDecision::Throttled);
+            }
+        } else {
+            // R-TRIG-3: a mandatory trigger wins and cancels the pending one.
+            self.pending = false;
+        }
+        self.commit(trigger, ctx, renderer)
+    }
+
+    /// Write now. `ending` comes from the trigger, never guessed.
+    fn commit(
+        &mut self,
+        trigger: CommitTrigger,
+        ctx: &ContextEngine,
+        renderer: &dyn Renderer,
+    ) -> CommitDecision {
+        let manager = ctx.capture_manager_section();
+        let dangling = match &manager.dangling {
+            DanglingToolCallState::Dangling { calls } => calls.len(),
+            _ => 0,
+        };
+        let payload = CapturePayload {
+            manager,
+            ui: Some(renderer.capture_ui()),
+            workers: harvest_worker_sections(),
+            identity_floors: current_identity_floors(),
+        };
+        let outcome = crate::session::commit::write_bundle(
+            &self.bundle,
+            &self.session_id,
+            &payload,
+            trigger.ending(),
+            &self.policy,
+            &self.lock,
+        );
+        match outcome {
+            Ok(report) => {
+                self.last_commit = Some(std::time::Instant::now());
+                self.pending = false;
+                let total: u64 = crate::session::commit::last_manifest(&self.bundle)
+                    .map(|manifest| manifest.members.iter().map(|m| m.byte_len).sum())
+                    .unwrap_or(0);
+                if total > self.policy.max_bundle_bytes && !self.over_ceiling {
+                    self.over_ceiling = true;
+                    tracing::warn!(
+                        total_bytes = total,
+                        max_bundle_bytes = self.policy.max_bundle_bytes,
+                        "session bundle is over session_max_bundle_bytes: throttled triggers \
+                         stop committing, mandatory triggers (turn boundary, pre-dispatch, \
+                         clean tail) keep going"
+                    );
+                }
+                let mut slot = ledger();
+                slot.written += 1;
+                slot.last_dangling_calls = dangling;
+                slot.last_ending = Some(trigger.ending());
+                if dangling > 0 {
+                    slot.dangling_commits += 1;
+                }
+                drop(slot);
+                tracing::debug!(
+                    trigger = ?trigger,
+                    members = report.members_written.len(),
+                    skipped_identical = report.members_skipped_identical,
+                    orphans_removed = report.orphans_removed,
+                    "session bundle committed"
+                );
+                CommitDecision::Written {
+                    members: report.members_written.len(),
+                }
+            }
+            Err(CommitError::Locked) => decide(CommitDecision::Busy),
+            Err(err) => {
+                tracing::warn!("session commit failed: {err}");
+                decide(CommitDecision::Failed)
+            }
+        }
+    }
+}
+
+/// The ONLY thing a panic hook may reach about a session (flow §1.8, t-024): the
+/// bundle identity, the commit policy, and the session's [`CommitLock`] — never
+/// the renderer (`TuiRenderer: !Sync`) and never the engine (`ctx` lives on the
+/// session thread, R-TRIG-0).
+#[derive(Debug, Clone)]
+pub struct PanicFlushTarget {
+    pub bundle: std::path::PathBuf,
+    pub session_id: String,
+    pub policy: CommitPolicy,
+    pub lock: Arc<CommitLock>,
+}
+
+/// The live session's panic-flush target. Written by [`SessionCommitPump::new`]
+/// (one per session), read by [`commit_from_panic`] from whatever thread panicked.
+static PANIC_TARGET: std::sync::LazyLock<std::sync::Mutex<Option<PanicFlushTarget>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// Poison-tolerant, exactly like every other guard on this path: the payload is
+/// one `Option`, every mutation is a plain assignment, and a panicked holder left
+/// it consistent (precedent: `src/manager/phase.rs`, `commit::last_commit_lock`).
+fn panic_target() -> Option<PanicFlushTarget> {
+    PANIC_TARGET
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// What the hook in `main` may say when the flush itself unwound: which bundle was
+/// registered, if any. Read-only and poison-tolerant like everything else here.
+pub fn panic_target_bundle_hint() -> String {
+    panic_target()
+        .map(|target| target.bundle.display().to_string())
+        .unwrap_or_else(|| "no session bundle".to_string())
+}
+
+/// What the panic hook did, so it can never report success it did not earn
+/// (flow §1.8: "if the panic happened before any successful commit, T-8 SHALL
+/// write nothing and log why").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanicFlushOutcome {
+    /// `true` only when a manifest with `ending: panicHook` was renamed into
+    /// place (manifest-last, so the bundle really carries it).
+    pub written: bool,
+    /// Members the flush re-listed (0 is normal: an unchanged member keeps its
+    /// bytes, A §7.1 C2).
+    pub members_written: usize,
+    /// Plain English for the user and the log: what was written, or why nothing
+    /// could be.
+    pub detail: String,
+}
+
+/// T-8 (flow §1.8): the panic-hook flush. **Pure synchronous I/O** — no runtime,
+/// no `block_on`, no renderer, no engine, no allocation of a task. It rewrites
+/// the manifest of the last committed bundle with `ending: panicHook`, carrying
+/// the member bytes exactly as the last successful commit wrote them (A §7.2 C2
+/// says an unchanged member keeps its bytes; the manifest is the thing that
+/// changes).
+///
+/// Thread model: a panic runs the hook **on whichever thread panicked**. Nothing
+/// here touches session-thread-only state, so the flush is legal from any thread;
+/// what it honestly cannot do is capture a pane or a transcript that was never
+/// committed — that data does not exist, and this says so out loud instead of
+/// racing the session thread for it.
+pub fn commit_from_panic() -> PanicFlushOutcome {
+    let outcome = panic_flush_inner();
+    // A D6 forbids `let _ =` on a commit: the outcome is counted, logged and
+    // returned to `main`, which repeats it on stderr.
+    {
+        let mut slot = ledger();
+        slot.panic_hook += 1;
+        if outcome.written {
+            slot.written += 1;
+            slot.last_ending = Some(ProcessEnding::PanicHook);
+        } else {
+            slot.failed += 1;
+        }
+    }
+    if outcome.written {
+        tracing::warn!("panic hook: {}", outcome.detail);
+    } else {
+        tracing::error!("panic hook: {}", outcome.detail);
+    }
+    outcome
+}
+
+fn panic_flush_inner() -> PanicFlushOutcome {
+    let fail = |detail: String| PanicFlushOutcome {
+        written: false,
+        members_written: 0,
+        detail,
+    };
+    let Some(target) = panic_target() else {
+        return fail(
+            "no session bundle is registered in this process (the panic happened before any \
+             session started, or session capture is disabled), so nothing was written"
+                .to_string(),
+        );
+    };
+    let cached = crate::session::commit::LAST_COMMIT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(last) = cached.as_ref() else {
+        return fail(format!(
+            "no successful commit exists for {} yet, so a panic cannot write a bundle it has \
+             no bytes for: the session died before its first commit",
+            target.bundle.display()
+        ));
+    };
+    if last.bundle != target.bundle {
+        return fail(format!(
+            "the last successful commit was for {} but this session's bundle is {}: refusing \
+             to mark a bundle that is not this session's",
+            last.bundle.display(),
+            target.bundle.display()
+        ));
+    }
+    let payload = match payload_from_last_commit(last) {
+        Ok(payload) => payload,
+        Err(why) => {
+            return fail(format!(
+                "the members of the last successful commit could not be re-read ({why}), so the \
+                 panic hook wrote nothing"
+            ));
+        }
+    };
+    drop(cached);
+    match crate::session::commit::write_bundle(
+        &target.bundle,
+        &target.session_id,
+        &payload,
+        ProcessEnding::PanicHook,
+        &target.policy,
+        &target.lock,
+    ) {
+        Ok(report) => PanicFlushOutcome {
+            written: true,
+            members_written: report.members_written.len(),
+            detail: format!(
+                "the session bundle {} was marked panicHook (session id {}, {} member(s) \
+                 rewritten, the rest kept byte-identical from the last successful commit): a \
+                 later --resume will see an interrupted session",
+                target.bundle.display(),
+                target.session_id,
+                report.members_written.len()
+            ),
+        },
+        // R-TRIG-1: the session thread holds the commit lock (a panic *inside* a
+        // commit). Blocking here would deadlock the hook against the thread that
+        // is unwinding, so the flush degrades honestly: the last committed bundle
+        // survives with `inProgress`, and the next boot infers the hard kill.
+        Err(CommitError::Locked) => fail(format!(
+            "the session commit lock was already held while the panic was unwinding, so {} was \
+             left as it was last committed (ending inProgress): the next boot will classify this \
+             run as HardKillInferred rather than guess",
+            target.bundle.display()
+        )),
+        Err(err) => fail(format!(
+            "the panic-hook flush of {} failed: {err}",
+            target.bundle.display()
+        )),
+    }
+}
+
+/// Rebuild the payload the panic hook re-commits **from the commit cache alone**
+/// (flow §1.8: global state only). A member that will not deserialize is reported,
+/// not swallowed: the flush then writes nothing rather than a manifest that lists
+/// members it cannot vouch for.
+fn payload_from_last_commit(
+    last: &crate::session::commit::LastCommit,
+) -> Result<CapturePayload, String> {
+    let mut manager: Option<crate::session::ManagerSection> = None;
+    let mut ui: Option<UiSection> = None;
+    let mut workers: Vec<WorkerSection> = Vec::new();
+    for (rel_path, (_, _, bytes)) in &last.members {
+        // The cached bytes are the whole member **file** — header frame plus
+        // section, exactly what `write_file_atomic` was handed (F1) — so the
+        // frame is parsed and its section unwrapped, the same way
+        // `session::restore::parse_member` reads the file back off disk.
+        if rel_path == crate::session::MANAGER_FILE {
+            let file: crate::session::ManagerFile =
+                serde_json::from_slice(bytes).map_err(|err| format!("{rel_path}: {err}"))?;
+            manager = Some(file.section);
+        } else if rel_path == crate::session::UI_FILE {
+            let file: crate::session::UiFile =
+                serde_json::from_slice(bytes).map_err(|err| format!("{rel_path}: {err}"))?;
+            ui = Some(file.section);
+        } else {
+            let file: crate::session::WorkerFile =
+                serde_json::from_slice(bytes).map_err(|err| format!("{rel_path}: {err}"))?;
+            workers.push(file.section);
+        }
+    }
+    let manager = manager.ok_or_else(|| "manager.json is not in the last commit".to_string())?;
+    Ok(CapturePayload {
+        manager,
+        ui,
+        workers,
+        identity_floors: last.manifest.identity_floors,
+    })
+}
+
+/// T-10 step 1 (flow §1.5, t-024): record the ending of a session that is about
+/// to be **deleted** — `/reset` (`Reset`) or a plan archive (`PlanArchived`).
+/// Mandatory and never throttled: a crash between this commit and the sweep must
+/// leave a bundle that says `reset`, not one still claiming `inProgress` (which a
+/// later boot would report as a hard kill that never happened).
+pub fn mark_ending_commit(
+    pump: &mut SessionCommitPump,
+    trigger: CommitTrigger,
+    ctx: &ContextEngine,
+    renderer: &dyn Renderer,
+) -> CommitDecision {
+    crate::session::manager_capture::capture_into_session_state(ctx);
+    pump.request(trigger, ctx, renderer)
+}
+
+/// T-10 step 2 (flow §1.5, A D3/A §3.4): after `Plan::clear()` / `Plan::archive()`
+/// ran their sweep, confirm the bundle really is gone. A plan sweep means "this
+/// session MUST NOT be resurrected", so a bundle the sweep left behind is deleted
+/// here, on the session thread, loudly.
+///
+/// Returns `true` when the bundle is gone. If the delete itself is blocked
+/// (permissions, a busy mount) the surviving bundle is re-marked with the ending
+/// — the "marker file only if deletion is blocked" rule of A §7.4 — and `false`
+/// is returned.
+///
+/// The delete, not the marker, is the safety-critical half: `session::restore`
+/// does not refuse a `Reset`-marked bundle (that gate is not in this binary), so a
+/// bundle surviving a plan sweep could be resurrected. That is exactly why
+/// reaching the marker branch is logged at error level rather than treated as a
+/// clean resolution.
+pub fn confirm_bundle_swept(
+    pump: &mut SessionCommitPump,
+    trigger: CommitTrigger,
+    plan: &crate::manager::phase::Plan,
+    ctx: &ContextEngine,
+    renderer: &dyn Renderer,
+) -> bool {
+    let bundle = crate::session::bundle_dir(plan);
+    if !bundle.exists() {
+        return true;
+    }
+    tracing::warn!(
+        "a {end:?} session sweep left {} in place: deleting it here, because a session the user \
+         ended must never be resurrected (A D3)",
+        bundle.display(),
+        end = trigger.ending()
+    );
+    if std::fs::remove_dir_all(&bundle).is_ok() && !bundle.exists() {
+        return true;
+    }
+    tracing::error!(
+        "session bundle {} could not be deleted; its manifest is rewritten with ending {:?} so a \
+         later boot at least reads the truth about it (A §7.4 marker rule)",
+        bundle.display(),
+        trigger.ending()
+    );
+    mark_ending_commit(pump, trigger, ctx, renderer);
+    false
+}
+
+/// T-10 end to end (t-024): one `/reset`. Mark the bundle with `reset`, run the
+/// plan sweep (`Plan::clear()` → `sweep_session_state()`), then confirm the sweep
+/// really deleted the bundle.
+///
+/// The order is the contract: a crash between the mark and the sweep leaves a
+/// bundle that already says `reset` — never one still claiming `inProgress`, which
+/// a later boot would report as a hard kill that never happened. Every `/reset`
+/// call site in the loop goes through here so no site can forget half the pair.
+fn handle_reset_command_and_commit(
+    pump: &mut SessionCommitPump,
+    plan: &crate::manager::phase::Plan,
+    ctx: &mut ContextEngine,
+    renderer: &mut dyn Renderer,
+    ui_transcript: &mut UiTranscript,
+    steering_history: &Arc<std::sync::RwLock<Vec<(String, String)>>>,
+) {
+    mark_ending_commit(pump, CommitTrigger::Reset, ctx, &*renderer);
+    handle_reset_command(plan, renderer, Some(&mut *ctx));
+    ui_transcript.clear();
+    if let Ok(mut hist) = steering_history.write() {
+        hist.clear();
+    }
+    // The legacy `.ui_transcript.json` sweep stays: the boot path only NAMES a
+    // leftover legacy journal (`src/session/restore.rs:804`, `no_bundle`) and never
+    // deletes one, so this is the removal that guarantees `/reset` leaves none.
+    // Sourced locally from the plan directory because the journal is no longer
+    // written (and its path is no longer threaded) anywhere in the session loop.
+    let legacy_ui_journal = plan.dir().join(".ui_transcript.json");
+    if legacy_ui_journal.is_file() {
+        let _ = std::fs::remove_file(&legacy_ui_journal);
+    }
+    confirm_bundle_swept(pump, CommitTrigger::Reset, plan, ctx, &*renderer);
+}
+
+/// `true` when the plan file existed at the start of the round and is gone now
+/// **with an archive written in its place**: that is the fingerprint of
+/// `archive_plan` → `Plan::archive()` having run during this round (a tool, so it
+/// may have run on another thread; only this thread may commit).
+///
+/// `/reset` deliberately does not match: `Plan::clear()` deletes the plan *and*
+/// `execution_plan_archive.md` (`src/manager/phase.rs:455-497`), and it is handled
+/// where the user asked for it, in [`handle_reset_command_and_commit`]. The
+/// archive file name is spelled here as it is spelled in `phase.rs` — the plan
+/// module owns it, and this is the only read-side consumer.
+fn plan_archived_during_round(
+    plan: &crate::manager::phase::Plan,
+    plan_present_at_round_start: bool,
+) -> bool {
+    if !plan_present_at_round_start || plan.plan_path().exists() {
+        return false;
+    }
+    plan.plan_path()
+        .parent()
+        .is_some_and(|dir| dir.join("execution_plan_archive.md").is_file())
+}
+
+/// Count one non-write decision in the ledger and hand it back.
+fn decide(decision: CommitDecision) -> CommitDecision {
+    {
+        let mut slot = ledger();
+        match decision {
+            CommitDecision::Written { .. } => slot.written += 1,
+            CommitDecision::Throttled => slot.throttled += 1,
+            CommitDecision::Suppressed => slot.suppressed += 1,
+            CommitDecision::Disabled => slot.disabled += 1,
+            CommitDecision::Busy => slot.busy += 1,
+            CommitDecision::Failed => slot.failed += 1,
+        }
+    }
+    decision
+}
+
+/// The transcript half of the three loud destinations A §8.4 requires. Only the
+/// session loop owns a `UiTranscript`, so [`boot`] is handed that journal instead
+/// of owning one: every refusal, repair and loss sentence reaches the panes, the
+/// journaled `UiRecord::Status` and `tracing::warn!`, and none of the three may be
+/// a discarded `let _`.
+pub struct BootSink<'a> {
+    pub ui_transcript: &'a mut UiTranscript,
+}
+
+/// What the one boot pass did (flow §4.9). Nothing here is dropped: the caller
+/// prints it, the panes draw it, the journal records it and the log carries it.
+///
+/// The flow's field set is kept verbatim; the added fields are what lets the
+/// session **continue** from the restored state instead of starting over
+/// (flow §3.4: the goal, the subagent panes, the reconstructed journal).
+#[derive(Debug, Default)]
+pub struct BootReport {
+    /// `true` when live state was installed (engine vector, worker registry,
+    /// panes). `false` means the pass installed **nothing**: no bundle existed.
+    pub restored: bool,
+    /// `true` for `RestoreOutcome::PartiallyRestored` (A D6's one tolerated
+    /// `Unrecoverable` worker): the run continues, with the losses surfaced.
+    pub partial: bool,
+    pub manager_messages: usize,
+    pub workers_installed: usize,
+    pub interrupted_worker_keys: Vec<String>,
+    pub side_effect_risk_keys: Vec<String>,
+    /// N-MGR-1, the single synthetic manager notice (flow §2.4).
+    pub restore_notice: Option<String>,
+    pub ui_restored: bool,
+    pub session_id: String,
+    /// The restored pinned goal — `manager.messages[1]` verbatim (REQ-CORE-002).
+    /// Never re-typed, and `ContextEngine::set_goal` is never called for it.
+    pub goal: String,
+    pub subagent_panels: Vec<SubagentPanel>,
+    pub journal: Vec<UiJournalRecord>,
+    pub repair: RepairReport,
+    pub unrecoverable_workers: Vec<String>,
+    /// The ending the loader derived for the previous process (A D6: an
+    /// `InProgress` bundle is *reported* as `HardKillInferred`, never rewritten).
+    pub previous_ending: Option<ProcessEnding>,
+    /// Sentences naming the searched path and what was found instead, for the
+    /// loud fresh start flow §3.5 requires when there is no bundle.
+    pub no_bundle_lines: Vec<String>,
+}
+
+/// THE boot function (flow §4.9): one pass, on the session thread, in the fixed
+/// order `load_bundle` (L0–L9 verify, N0–N6 normalize) → identity floors +
+/// `WORKERS` → the engine → the panes → the loud report → `N-MGR-1`.
+///
+/// Every rule lives in the piece that already owns it; nothing is reimplemented
+/// here:
+/// * [`crate::session::restore::load_bundle`] — verify before parse, repair
+///   twice, refuse fail-closed, never touch live state or a byte of the bundle;
+/// * [`crate::session::install_restored_workers`] — the `fetch_max` floors, the
+///   `WORKERS` rebuild under the stored keys, restore-as-interrupted (P-R1: **no
+///   worker is ever relaunched**), the completed-ring cap;
+/// * [`ContextEngine::install_restored_messages`] / [`ContextEngine::restore_engine_flags`]
+///   — the wholesale install. **No pin writer runs on this path**: neither
+///   `set_system_prompt` nor `set_goal` may touch `[0]`/`[1]` of a restored
+///   transcript (A R-PIN-1/R-PIN-2), which is why the resume branch builds its
+///   engine through [`build_restored_context`] instead of
+///   [`build_manager_context`];
+/// * [`Renderer::restore_panes`] / [`Renderer::announce_restore`] — the pane bytes
+///   are assigned verbatim, never regenerated (A D4/U1).
+pub fn boot(
+    plan: &crate::manager::phase::Plan,
+    cfg: &Config,
+    ctx: &mut ContextEngine,
+    renderer: &mut dyn Renderer,
+    session_id: &mut String,
+    sink: &mut BootSink<'_>,
+) -> Result<BootReport, RestoreRefused> {
+    let bundle = crate::session::bundle_dir(plan);
+    let outcome = crate::session::restore::load_bundle(&bundle);
+    let (session, derived_ending, mut repair, unrecoverable_workers) = match outcome {
+        RestoreOutcome::NoBundle {
+            bundle,
+            legacy_journals,
+            orphan_members,
+        } => {
+            let report = no_bundle_report(&bundle, &legacy_journals, &orphan_members);
+            surface_restore_lines(renderer, sink, &report.no_bundle_lines);
+            return Ok(report);
+        }
+        RestoreOutcome::Refused { refusal, report } => {
+            // Fail-closed (A D6): the bundle was never read into live state, so
+            // there is nothing to un-install. The refusal is still printed through
+            // all three destinations before the typed error carries it out to
+            // `main`, which maps it to `session::EXIT_RESTORE_REFUSED` (3).
+            let mut lines = vec![
+                refusal.display(&bundle),
+                format!(
+                    "Session restore refused ({}): nothing was installed, and no fresh session is \
+                     started under a flag that asked for the old one — this run stops with exit \
+                     code {}.",
+                    refusal.code.label(),
+                    crate::session::EXIT_RESTORE_REFUSED
+                ),
+            ];
+            lines.extend(report.notices.iter().map(|notice| {
+                format!(
+                    "Not restorable after restart [{:?}] {}: {}",
+                    notice.kind, notice.subject, notice.detail
+                )
+            }));
+            lines.extend(
+                report
+                    .warnings
+                    .iter()
+                    .map(|warning| format!("Restore warning: {warning}")),
+            );
+            surface_restore_lines(renderer, sink, &lines);
+            return Err(RestoreRefused { refusal, bundle });
+        }
+        RestoreOutcome::Restored {
+            session,
+            ending,
+            report,
+        } => (session, ending, report, Vec::new()),
+        RestoreOutcome::PartiallyRestored {
+            session,
+            ending,
+            unrecoverable_workers,
+            report,
+        } => (session, ending, report, unrecoverable_workers),
+    };
+
+    // ---------------------------------------------------------------- 1. floors + WORKERS
+    // Before the engine, so no id, `completed_seq` or notice id can be re-issued
+    // under a floor the bundle already spent (A §5.7).
+    let worker_report =
+        crate::session::install_restored_workers(&session.workers, &session.identity_floors);
+    repair.workers_restored = worker_report.installed;
+    repair.completed_dropped_by_ring_cap = worker_report.completed_dropped_by_ring_cap;
+    for notice in &worker_report.notices {
+        push_repair_notice(&mut repair, notice.clone());
+    }
+    for warning in &worker_report.warnings {
+        push_repair_warning(&mut repair, warning.clone());
+    }
+
+    // The capture-side losses are part of the worker sections: the loader cannot
+    // read the dead process's notice store, so the boot wiring supplies the
+    // queued-notice count (flow §2.2 step 3) and merges every other recorded loss.
+    for section in &session.workers {
+        let mut queued = 0usize;
+        for notice in &section.non_restorable {
+            if notice.kind == NonRestorableKind::PendingNotice {
+                queued += 1;
+            } else {
+                push_repair_notice(&mut repair, notice.clone());
+            }
+        }
+        if queued > 0 {
+            for notice in
+                crate::session::worker_journal::queued_notice_notices(&section.worker_key, queued)
+            {
+                push_repair_notice(&mut repair, notice);
+            }
+        }
+    }
+    // Two losses the previous process always takes with it (A §3.11, flow §3.4):
+    // the MCP view is re-advertised, and the intervention counters restart.
+    push_repair_notice(
+        &mut repair,
+        NonRestorableNotice {
+            kind: NonRestorableKind::ToolSchemaCharge,
+            subject: "session".to_string(),
+            detail: format!(
+                "the previous process's tool-schema token charge did not survive: this process \
+                 re-declared the advertised Manager tool list and re-priced it to {} token(s)",
+                ctx.tool_schema_tokens()
+            ),
+        },
+    );
+    push_repair_notice(
+        &mut repair,
+        NonRestorableNotice {
+            kind: NonRestorableKind::HarnessStats,
+            subject: "session".to_string(),
+            detail: "the previous process's harness intervention counters did not survive: this \
+                     process starts from zero, so a repeated intervention may need to be seen \
+                     again before it is escalated"
+                .to_string(),
+        },
+    );
+
+    // ---------------------------------------------------------------- 2. the engine
+    let manager_messages = session.manager.messages.len();
+    ctx.install_restored_messages(session.manager.messages.clone());
+    ctx.restore_engine_flags(
+        session.manager.rebirth_advisory_emitted,
+        session.manager.consecutive_rebirths,
+    );
+    // flow §3.4: the prompt this Config would have composed is deliberately not
+    // installed; the difference is a reported deviation, never a silent re-pin.
+    push_repair_warning(
+        &mut repair,
+        format!(
+            "the system prompt this process composed was NOT installed: [0]/[1] keep the restored \
+             bytes (pin witness {} / {} byte(s), pinned window [0..{}) as stored)",
+            session.manager.pin_witness.system_prompt_len,
+            session.manager.pin_witness.goal_len,
+            session.manager.pinned_prefix_end
+        ),
+    );
+    if session.manager.max_context_tokens != cfg.max_context_tokens {
+        push_repair_warning(
+            &mut repair,
+            format!(
+                "max_context_tokens changed since the bundle was written: {} stored, {} in this \
+                 Config — this run budgets against the live value",
+                session.manager.max_context_tokens, cfg.max_context_tokens
+            ),
+        );
+    }
+
+    // ---------------------------------------------------------------- 3. the panes
+    // Captured BEFORE the assign: the token witnesses compare the stored counters
+    // against the ones THIS process owns, and the streams own those numbers
+    // (A §6.5) — a restore never adopts them.
+    let live_ui = renderer.capture_ui();
+    renderer.restore_panes(&session.ui);
+    // A renderer with no pane model gets a no-op `restore_panes`, so the subagent
+    // list is handed through the loop's own channel as well (flow §3.4).
+    let panels: Vec<SubagentDetail> = session
+        .ui
+        .subagent_panels
+        .iter()
+        .map(subagent_detail_from_panel)
+        .collect();
+    renderer.set_subagents(panels);
+    // §6.3 / §10.3 (AC-S4): a panel that was showing an in-flight subagent keeps
+    // its byte — `is_active: true` is never flipped (N-R1), because the pane must
+    // keep saying what the screen said. What died with the process is the task
+    // behind it, so the pane gets a `JoinHandle` notice of its own, keyed on the
+    // **panel name**: the worker-key notices from `install_restored_workers` name
+    // the registry entry, never the pane, and a bundle with an active panel and no
+    // worker section at all would otherwise announce nothing about the gone handle.
+    // Folded in BEFORE `announce_restore` so this loss reaches the same three
+    // destinations as every other one (panes, journaled `UiRecord::Status`,
+    // `tracing::warn!` via the announced report) and lands in
+    // `BootReport::repair.notices`.
+    for panel in &session.ui.subagent_panels {
+        if !panel.is_active {
+            continue;
+        }
+        push_repair_notice(
+            &mut repair,
+            NonRestorableNotice {
+                kind: NonRestorableKind::JoinHandle,
+                subject: panel.name.clone(),
+                detail: format!(
+                    "the subagent panel '{}' is drawn as active, but the task driving this \
+                     subagent ended with the previous process: its join handle did not survive \
+                     and no task exists for it, so it can be neither joined nor aborted and no \
+                     result will ever arrive; the panel is restored read-only, for its history \
+                     only, until this delegation is re-armed",
+                    panel.name
+                ),
+            },
+        );
+    }
+    // §6.6 I-U6 / §9.6 AC-C3 branch 2: a restored scroll offset that the live
+    // clamp moved is only legal when a `warnings` entry names the offset AND
+    // both values. This capture is taken AFTER `restore_panes` (whose last step
+    // is `clamp_scrolls`, `ui/tui/events.rs:465-481`) and after `set_subagents`
+    // (which re-clamps `selected_subagent_idx`, `ui/tui/mod.rs:1066-1068`), so
+    // the sentence names the number the panes actually ended on. Folded BEFORE
+    // `announce_restore` — the opposite of the token witnesses, which
+    // `restore_panes` draws itself — because nothing on the renderer side says
+    // this one: `announce_restore` is what puts it in the panes and the log, so
+    // a moved offset is stated exactly once.
+    let restored_ui = renderer.capture_ui();
+    for warning in scroll_clamp_warnings(&session.ui, &restored_ui) {
+        tracing::warn!("session restore (ui.json): {warning}");
+        push_repair_warning(&mut repair, warning);
+    }
+    renderer.announce_restore(&repair);
+
+    // **Documented deviation:** `TuiRenderer::token_witness_warnings`
+    // (`ui/tui/mod.rs:1581`) is an *inherent* method, so it is not reachable
+    // through `&mut dyn Renderer`. The same comparison lives here, and it is
+    // folded in **after** `announce_restore` on purpose: `TuiRenderer::restore_panes`
+    // already drew the identical sentence into the panes and logged it, so folding
+    // it in before would draw one disagreement as two pane lines.
+    for warning in token_witness_warnings(&session.ui, &live_ui) {
+        push_repair_warning(&mut repair, warning);
+    }
+    let ui_restored = !session.ui.chat_messages.is_empty() || !session.ui.journal.is_empty();
+
+    // The report, journaled (the third destination; the panes were served by
+    // `announce_restore`), and the legacy `.ui_transcript.json` re-seeded from the
+    // restored journal so the session's own visible history continues rather than
+    // starting blank (t-013 deletes this legacy path).
+    seed_restored_transcript(sink, &session.ui.journal);
+    let summary = format!(
+        "Session restored (session id {}, previous ending {:?}): {} manager message(s), {} \
+         worker(s), {} pane line(s){}.",
+        session.session_id,
+        derived_ending,
+        manager_messages,
+        worker_report.installed,
+        session.ui.chat_messages.len(),
+        if repair.notices.is_empty() {
+            String::new()
+        } else {
+            format!(" — {} capability(s) not restorable", repair.notices.len())
+        }
+    );
+    let mut journal_lines = vec![summary.clone()];
+    journal_lines.extend(repair.notices.iter().map(|notice| {
+        format!(
+            "Not restorable after restart [{:?}] {}: {}",
+            notice.kind, notice.subject, notice.detail
+        )
+    }));
+    journal_lines.extend(
+        repair
+            .warnings
+            .iter()
+            .map(|warning| format!("Restore warning: {warning}")),
+    );
+    journal_restore_lines(sink, &journal_lines);
+    // One status line only, and it carries no `[CLI]` prefix on purpose: a TUI
+    // `Status` event with that prefix would draw a second pane line for a report
+    // `announce_restore` already drew.
+    renderer.on_event(&Event::Status(summary));
+
+    // ---------------------------------------------------------------- 4. N-MGR-1 last
+    // After the normalized vector and before any new user input (A R-PIN-3): the
+    // manager is told once, in one message, what is interrupted and what is lost.
+    *session_id = session.session_id.clone();
+    let notice = crate::session::restore_notice(
+        session_id,
+        &session.manifest.ending,
+        &derived_ending,
+        &session.workers,
+        &worker_report,
+    );
+    ctx.append_restore_notice(&notice);
+
+    Ok(BootReport {
+        restored: true,
+        partial: !unrecoverable_workers.is_empty(),
+        manager_messages,
+        workers_installed: worker_report.installed,
+        interrupted_worker_keys: worker_report.interrupted_keys.clone(),
+        side_effect_risk_keys: worker_report.side_effect_risk_keys.clone(),
+        restore_notice: Some(notice),
+        ui_restored,
+        session_id: session.session_id.clone(),
+        goal: session
+            .manager
+            .messages
+            .get(1)
+            .and_then(|record| record.content())
+            .unwrap_or_default()
+            .to_string(),
+        subagent_panels: session.ui.subagent_panels.clone(),
+        journal: session.ui.journal.clone(),
+        repair,
+        unrecoverable_workers,
+        previous_ending: Some(derived_ending),
+        no_bundle_lines: Vec::new(),
+    })
+}
+
+/// The `--resume` gate (flow §3.3–§3.5). `Ok(None)` means the session continues as
+/// a fresh run — either nothing asked for a restore, or `--resume` was asked and
+/// there is no bundle, which flow §3.5 answers with a **loud** fresh start (exit
+/// `0`). `Err(RestoreRefused)` is the hard stop (exit `EXIT_RESTORE_REFUSED`).
+///
+/// **Caller contract:** `Ok(None)` while a resume was asked means the resume-branch
+/// engine ([`build_restored_context`], which deliberately carries no `[0]`) kept
+/// its empty transcript, so the caller MUST install the composed system prompt
+/// before pinning the goal — otherwise [`ContextEngine::set_goal`] pads
+/// `messages[0]` with an empty `System` and the Manager runs with no prompt at all.
+/// `src/ui/session.rs` does that immediately after this call.
+pub fn boot_if_requested(
+    resume_requested: bool,
+    plan: &crate::manager::phase::Plan,
+    cfg: &Config,
+    ctx: &mut ContextEngine,
+    renderer: &mut dyn Renderer,
+    session_id: &mut String,
+    sink: &mut BootSink<'_>,
+) -> Result<Option<BootReport>, RestoreRefused> {
+    if !resume_requested {
+        return Ok(None);
+    }
+    let report = boot(plan, cfg, ctx, renderer, session_id, sink)?;
+    if report.restored {
+        Ok(Some(report))
+    } else {
+        Ok(None)
+    }
+}
+
+/// The engine for a **restored** session: constructed exactly like
+/// [`build_manager_context`] — real budgets, and the live advertised tool list
+/// charged to the budget (gate t-064) — but with **no** `set_system_prompt`. The
+/// restored vector arrives wholesale through
+/// [`ContextEngine::install_restored_messages`] (flow §3.4, A R-PIN-2).
+pub fn build_restored_context(cfg: &Config) -> ContextEngine {
+    let mut ctx = ContextEngine::new(cfg.max_context_tokens);
+    sync_manager_tool_schema(&mut ctx, cfg);
+    ctx
+}
+
+/// L0 with a voice (flow §3.5): "no bundle" is a normal outcome, never silent.
+fn no_bundle_report(
+    bundle: &std::path::Path,
+    legacy_journals: &[std::path::PathBuf],
+    orphan_members: &[String],
+) -> BootReport {
+    let mut lines = vec![format!(
+        "No session bundle at {}: starting fresh.",
+        bundle.display()
+    )];
+    if !orphan_members.is_empty() {
+        lines.push(format!(
+            "{} member-looking file(s) sit under {} but no {} lists them, so none of them was \
+             read: {}",
+            orphan_members.len(),
+            bundle.display(),
+            crate::session::MANIFEST_FILE,
+            orphan_members.join(", ")
+        ));
+    }
+    for path in legacy_journals {
+        lines.push(format!(
+            "Legacy journal {} was found and is NOT restorable: it was not read, not merged and \
+             not upgraded; the session bundle is the only durable session format.",
+            path.display()
+        ));
+    }
+    for line in &lines {
+        tracing::warn!("{line}");
+    }
+    BootReport {
+        no_bundle_lines: lines,
+        ..BootReport::default()
+    }
+}
+
+/// Union of `NonRestorableNotice`s, deduplicated by `(kind, subject)` (A §11.3
+/// rule 1). `RepairReport` is a durable type owned by `session::format` and has no
+/// push helper, so the union rule lives with the wiring that performs the union.
+fn push_repair_notice(report: &mut RepairReport, notice: NonRestorableNotice) {
+    let key = notice.dedup_key();
+    if !report.notices.iter().any(|n| n.dedup_key() == key) {
+        report.notices.push(notice);
+    }
+}
+
+/// Same dedup rule for the human-readable deviation list.
+fn push_repair_warning(report: &mut RepairReport, warning: String) {
+    if !report.warnings.contains(&warning) {
+        report.warnings.push(warning);
+    }
+}
+
+/// Send sentences to the renderer and the journal (the two destinations the
+/// loader cannot reach). Status text carries no `[CLI]` prefix so a TUI never
+/// draws one refusal as two pane lines.
+fn surface_restore_lines(renderer: &mut dyn Renderer, sink: &mut BootSink<'_>, lines: &[String]) {
+    for line in lines {
+        renderer.on_event(&Event::Status(line.clone()));
+    }
+    journal_restore_lines(sink, lines);
+}
+
+/// The journaled half: one `UiRecord::Status` per sentence. The journal stays in
+/// memory — the session bundle's `ui` member is the only durable UI state
+/// (t-025a removed the superseded `.ui_transcript.json` writes).
+fn journal_restore_lines(sink: &mut BootSink<'_>, lines: &[String]) {
+    for line in lines {
+        sink.ui_transcript
+            .append(UiRecord::Status { text: line.clone() });
+    }
+}
+
+/// Seed the live in-memory `UiTranscript` from the restored `UiSection` journal
+/// (A §6.4's 1:1 mirror), so a resumed session keeps its visible chat history;
+/// the bundle's `ui` member is what persists that journal from here on (t-025a).
+fn seed_restored_transcript(sink: &mut BootSink<'_>, journal: &[UiJournalRecord]) {
+    for record in journal_records(journal) {
+        sink.ui_transcript.append(record);
+    }
+}
+
+/// `UiJournalRecord` → `UiRecord`: the two enums are the same closed set of eight
+/// variants by construction (A §6.4), so this is a rename, not a re-derivation.
+fn journal_records(journal: &[UiJournalRecord]) -> Vec<UiRecord> {
+    journal
+        .iter()
+        .map(|record| match record {
+            UiJournalRecord::User { text } => UiRecord::User { text: text.clone() },
+            UiJournalRecord::Assistant { content, thinking } => UiRecord::Assistant {
+                content: content.clone(),
+                thinking: thinking.clone(),
+            },
+            UiJournalRecord::SteerResponse { text } => {
+                UiRecord::SteerResponse { text: text.clone() }
+            }
+            UiJournalRecord::ToolCall { display } => UiRecord::ToolCall {
+                display: display.clone(),
+            },
+            UiJournalRecord::ToolResult { display } => UiRecord::ToolResult {
+                display: display.clone(),
+            },
+            UiJournalRecord::TaskCompleted { task_id } => UiRecord::TaskCompleted {
+                task_id: task_id.clone(),
+            },
+            UiJournalRecord::TaskFailed { task_id, reason } => UiRecord::TaskFailed {
+                task_id: task_id.clone(),
+                reason: reason.clone(),
+            },
+            UiJournalRecord::Status { text } => UiRecord::Status { text: text.clone() },
+        })
+        .collect()
+}
+
+/// The token-witness comparison behind `TuiRenderer::token_witness_warnings`
+/// (`ui/tui/mod.rs:1581`), phrased identically so a report reads the same
+/// whichever half produced it. See the call site for why it runs after
+/// `announce_restore`.
+fn token_witness_warnings(stored: &UiSection, live: &UiSection) -> Vec<String> {
+    [
+        ("tokens_in", stored.tokens_in, live.tokens_in),
+        ("tokens_out", stored.tokens_out, live.tokens_out),
+        (
+            "orchestrator_context_tokens",
+            stored.orchestrator_context_tokens,
+            live.orchestrator_context_tokens,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, stored, live)| stored != live)
+    .map(|(field, stored, live)| {
+        format!(
+            "{field} witness {stored} != this process's live {live}: kept the live counter (the \
+             streams own it) and reported the difference instead"
+        )
+    })
+    .collect()
+}
+
+/// The scroll-clamp comparison folded into `RepairReport::warnings` at boot,
+/// reached through the single shared sentence builder
+/// `crate::ui::tui::clamp_warning_sentences` so the report, the `tracing::warn!`
+/// and the pane line drawn by `announce_restore` say the same thing word for
+/// word. Unlike the token witnesses, `live` is captured AFTER the restore: the
+/// restore's own `clamp_scrolls()` and `set_subagents`' selection clamp are
+/// exactly what moved these numbers (§6.6 I-U6, §9.6 AC-C3 branch 2).
+fn scroll_clamp_warnings(stored: &UiSection, live: &UiSection) -> Vec<String> {
+    crate::ui::tui::clamp_warning_sentences(&[
+        (
+            "chat_scroll",
+            u64::from(stored.view.chat_scroll),
+            u64::from(live.view.chat_scroll),
+        ),
+        (
+            "plan_scroll",
+            u64::from(stored.view.plan_scroll),
+            u64::from(live.view.plan_scroll),
+        ),
+        (
+            "subagent_scroll",
+            u64::from(stored.view.subagent_scroll),
+            u64::from(live.view.subagent_scroll),
+        ),
+        (
+            "subagent_list_scroll",
+            u64::from(stored.view.subagent_list_scroll),
+            u64::from(live.view.subagent_list_scroll),
+        ),
+        (
+            "selected_subagent_idx",
+            stored.view.selected_subagent_idx as u64,
+            live.view.selected_subagent_idx as u64,
+        ),
+    ])
+}
+
+/// The inverse projection of [`SubagentPanel`] into the loop's own
+/// [`SubagentDetail`] model. Mirrors `ui::tui::subagent_detail_from_panel`
+/// (`ui/tui/mod.rs:1489`), which is private to a file this task does not own: the
+/// session loop needs the same projection because its `subagents` vector is the
+/// authority the next frame is built from (flow §3.4).
+fn subagent_detail_from_panel(panel: &SubagentPanel) -> SubagentDetail {
+    SubagentDetail {
+        name: panel.name.clone(),
+        task_id: panel.task_id.clone(),
+        prompt: panel.prompt.clone(),
+        started_at: panel.started_at.as_ref().map(|point| point.to_instant()),
+        worked_duration: duration_from_secs(panel.worked_duration_secs),
+        last_activity_at: panel
+            .last_activity_at
+            .as_ref()
+            .map(|point| point.to_instant()),
+        logs: panel.logs.clone(),
+        thinking: panel.thinking.clone(),
+        content: panel.content.clone(),
+        is_active: panel.is_active,
+        context_tokens: panel.context_tokens,
+    }
+}
+
+/// `Duration::from_secs_f64` panics on a negative/NaN/infinite input, so a corrupt
+/// number degrades to zero instead of taking a restored session down.
+fn duration_from_secs(secs: f64) -> Duration {
+    if secs.is_finite() && secs > 0.0 {
+        Duration::from_secs_f64(secs)
+    } else {
+        Duration::ZERO
+    }
+}
+
 /// Drive a full interactive session, dispatching events to `renderer`.
 /// This is the production entry point: it applies [`SessionBounds::default()`]
 /// (turn cap, per-turn wall-clock watchdog + hard cap, repeated-failure budget).
@@ -277,7 +1692,33 @@ pub async fn run_session_with_bounds_report(
     // Gate t-064 (offender E): the live Manager engine is built with the exact
     // advertised tool list charged to the budget, so `should_compact()` measures
     // the request that is really sent (transcript **+** tool schemas).
-    let mut ctx = build_manager_context(cfg, system.clone());
+    //
+    // t-012 (flow §3.3/§3.4): the resume trigger is resolved here because it
+    // decides **how** the engine is built. On the resume branch the engine is
+    // still constructed — same budgets, same live tool-schema charge — but no
+    // prompt is installed: `set_system_prompt` inside [`build_manager_context`]
+    // is one of the two writers that would overwrite a restored pin (A R-PIN-2),
+    // and the boot pass below installs the restored vector wholesale instead.
+    // The prompt is still *composed* here because the plan-gate warning half of
+    // [`load_system_prompt_with_plan_and_warning`] is unchanged for a resume, and
+    // the difference between the composed bytes and the restored `[0]` is reported
+    // as a `RepairReport::warnings` entry by the boot pass, never applied.
+    //
+    // **The resume branch must never be the only answer to a resume.** When the
+    // boot pass finds no bundle (flow §3.5's loud fresh start) it installs
+    // nothing, and an engine with no `[0]` would let the `ctx.set_goal` below pad
+    // `messages[0]` with an **empty** `System` (`manager/context.rs:697-706`) —
+    // the Manager would then run a whole session with no system prompt. The
+    // composed prompt is therefore installed right after the boot pass, in exactly
+    // the order a fresh boot installs it, so `--resume` / `MARMEL_RESUME=1` /
+    // `session_resume = true` with no bundle is byte-for-byte the fresh request
+    // (`session_tests.rs::resume_without_a_bundle_sends_the_same_request_as_a_fresh_start`).
+    let resume = resume_requested(cfg);
+    let mut ctx = if resume {
+        build_restored_context(cfg)
+    } else {
+        build_manager_context(cfg, system.clone())
+    };
 
     let stats = manager
         .as_ref()
@@ -296,9 +1737,6 @@ pub async fn run_session_with_bounds_report(
     crate::orchestrator::set_event_sender(event_tx);
     crate::orchestrator::set_steering_history(Arc::clone(&steering_history));
 
-    let ui_transcript_path = plan.ui_transcript_path();
-    let transcript_path = plan.transcript_path();
-
     let mut ui_transcript = UiTranscript::new();
 
     // t-057: an UNKNOWN plan state (unreadable / unparseable plan file) must reach
@@ -306,17 +1744,100 @@ pub async fn run_session_with_bounds_report(
     // warning in this loop: a renderer `Status` event plus a `Status` record in the
     // UI transcript, via the session's single surfacing helper.
     if let Some(warning) = plan_warning {
-        surface_plan_warning(
-            &mut *renderer,
-            &mut ui_transcript,
-            &ui_transcript_path,
-            warning,
-        );
+        surface_plan_warning(&mut *renderer, &mut ui_transcript, warning);
     }
+
+    // t-012 (flow §4.9): THE single restore pass, and the only place in the crate
+    // where a session bundle is read into live state. The position is load-bearing:
+    // the `Plan` exists (the bundle hangs off it), the transcript paths exist, and
+    // the boot pass runs **before** the manager loop, before `subagents` is seeded,
+    // and before any pin writer — the resume branch above already skipped
+    // `set_system_prompt`, and `set_goal` further down is skipped too, so the two
+    // clobber sites that used to follow every boot (`build_manager_context` and
+    // `ctx.set_goal`) cannot overwrite the restored pins (A R-PIN-1).
+    //
+    // One pass, fixed order. **Order note for the reviewer:** the task brief lists
+    // `load_bundle` → manager context → workers → panes → announce, while flow §4
+    // (`docs/design_session_restore_flow.md:902-903`) fixes the order as
+    // `verify (L0-L7) → normalize (L8) → floors → install WORKERS → install the
+    // engine → restore the panes → append N-MGR-1`, and the loader/installer that
+    // t-010 shipped implement exactly that (floors first, so no id/seq/notice can
+    // be re-issued below a floor *while* the registry is being rebuilt — A §5.7).
+    // This pass follows the flow §4 order, which is the superset constraint: the
+    // engine install is still the step that owns the transcript, and no worker can
+    // touch the engine before it exists, so the two orders differ only in that the
+    // floors are raised before the engine vector is swapped — never in what is
+    // installed or in what the Manager is finally shown.
+    let mut session_id = String::new();
+    let boot = {
+        let mut sink = BootSink {
+            ui_transcript: &mut ui_transcript,
+        };
+        boot_if_requested(
+            resume,
+            &plan,
+            cfg,
+            &mut ctx,
+            &mut *renderer,
+            &mut session_id,
+            &mut sink,
+        )
+    };
+    let boot = match boot {
+        Ok(report) => report,
+        Err(refused) => {
+            // A refusal installed **nothing**: `load_bundle` is fail-closed and
+            // never touched live state, so there is nothing half-installed to roll
+            // back. It is never papered over by starting a fresh session under a
+            // flag that asked for the old one (flow §3.5) either — `boot` already
+            // printed `refusal.display(bundle)`, the repair notices and the
+            // warnings through the renderer, the journaled `UiRecord::Status` and
+            // `tracing::warn!`, and this typed error is what `main` maps onto
+            // `session::EXIT_RESTORE_REFUSED` (3) after its teardown.
+            return Err(anyhow::Error::new(refused));
+        }
+    };
+
+    // Flow §3.5's loud fresh start re-joins the **fresh** engine contract, and the
+    // resume branch above built the engine *without* a system prompt on purpose (so
+    // a real restore never routes through a pin setter, A R-PIN-2). A real restore
+    // installs `[0]`/`[1]` verbatim; a **loud fresh start** installed nothing, and
+    // an empty engine would let the `ctx.set_goal` below pad `messages[0]` with an
+    // empty `Message::System` (`manager/context.rs:697-706`) — i.e. the Manager
+    // would run the whole session with no system prompt at all. So the composed
+    // prompt is installed here, in the same order a fresh boot installs it
+    // (`build_manager_context` → `set_system_prompt`, then `set_goal`). This is not
+    // the skipped clobber writer: there is no restored pin to overwrite, and
+    // `boot.is_some()` means bytes were restored, in which case this must stay a
+    // no-op (A R-PIN-1).
+    if resume && boot.is_none() {
+        ctx.set_system_prompt(system.clone());
+    }
+
+    // t-023 (flow §1.1): the ONE committer of this session. Built after the boot
+    // pass — so a resumed session keeps the restored `session_id` and its L4/L5
+    // cross-checks keep working — and before the turn loop, so every trigger
+    // below is served by the single writer the thread model allows (R-TRIG-0).
+    // `session_enabled = false` leaves it inert: requests are counted, nothing is
+    // ever written.
+    let mut commit_pump = SessionCommitPump::new(&plan, cfg, &session_id);
 
     let mut steer_queue = Vec::<String>::new();
     let mut steer_abort_requested = false;
-    let mut subagents = Vec::new();
+    // t-012 (flow §3.4): a resumed session adopts the restored subagent panes as
+    // the loop's authoritative list instead of starting from an empty one, so the
+    // subagent panes and the status line keep showing the interrupted delegations.
+    // Those delegations are open in the worker registry and were **not**
+    // relaunched (policy P-R1): the manager is told by N-MGR-1 and decides.
+    let mut subagents: Vec<SubagentDetail> = boot
+        .as_ref()
+        .map(|boot| {
+            boot.subagent_panels
+                .iter()
+                .map(subagent_detail_from_panel)
+                .collect()
+        })
+        .unwrap_or_default();
 
     // H5 execution bounds, alive for the whole session (not per request):
     //  * `watchdog` — the per-turn wall-clock bound, re-armed at every turn
@@ -339,47 +1860,90 @@ pub async fn run_session_with_bounds_report(
         Some(&mut ui_transcript),
     );
 
-    let goal = match initial {
-        Some(g) => {
-            crate::debug_log::log_user_input("initial_argument", &g);
-            g
+    // t-012 (flow §3.4): a resumed session already owns its goal — it is
+    // `messages[1]` of the restored vector, verbatim (REQ-CORE-002) — so the
+    // interactive prompt below is skipped on that branch: its early exits
+    // (`return Ok(SessionStopReport::default())`) would end a resumed session
+    // before its first turn, and a re-typed goal would re-write the pinned slot.
+    // The positional `PROMPT` of a `--resume` run is set aside first, because the
+    // goal match below moves `initial`: on a resume it becomes an ordinary user
+    // message *after* N-MGR-1 and must never become `messages[1]`.
+    let resume_prompt = boot.as_ref().and_then(|_| initial.clone());
+    let goal = match boot.as_ref().map(|boot| boot.goal.clone()) {
+        Some(goal) => {
+            crate::debug_log::log_user_input("restored_goal", &goal);
+            goal
         }
-        None => loop {
-            match renderer.read_input() {
-                Some(line) => {
-                    if is_abort_command(&line) {
-                        crate::debug_log::log_user_input("command", &line);
-                        renderer.request_user_exit();
+        None => match initial {
+            Some(g) => {
+                crate::debug_log::log_user_input("initial_argument", &g);
+                g
+            }
+            None => loop {
+                match renderer.read_input() {
+                    Some(line) => {
+                        if is_abort_command(&line) {
+                            crate::debug_log::log_user_input("command", &line);
+                            // t-024 (flow §1.9): an abort here is still an exit path and gets a
+                            // mandatory ending commit — but only if THIS run already wrote the
+                            // bundle. Marking unconditionally would stamp a previous run's bundle
+                            // (the one a `--resume` boot reads) with an empty transcript and a
+                            // `userAbort` ending this run never earned; leaving it alone keeps its
+                            // own ending honest (an `inProgress` there is a real hard kill).
+                            if commit_pump.has_committed() {
+                                capture_and_request(
+                                    &mut commit_pump,
+                                    CommitTrigger::UserAbort,
+                                    &ctx,
+                                    &*renderer,
+                                );
+                            }
+                            renderer.request_user_exit();
+                            renderer.shutdown();
+                            return Ok(SessionStopReport::default());
+                        }
+                        if is_reset_command(&line) {
+                            crate::debug_log::log_user_input("command", &line);
+                            handle_reset_command_and_commit(
+                                &mut commit_pump,
+                                &plan,
+                                &mut ctx,
+                                &mut *renderer,
+                                &mut ui_transcript,
+                                &steering_history,
+                            );
+                            continue;
+                        }
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            crate::debug_log::log_user_input("interactive_goal", trimmed);
+                            break trimmed.to_string();
+                        }
+                    }
+                    None => {
                         renderer.shutdown();
                         return Ok(SessionStopReport::default());
                     }
-                    if is_reset_command(&line) {
-                        crate::debug_log::log_user_input("command", &line);
-                        handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
-                        ui_transcript.clear();
-                        if let Ok(mut hist) = steering_history.write() {
-                            hist.clear();
-                        }
-                        let _ = std::fs::remove_file(&ui_transcript_path);
-                        continue;
-                    }
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        crate::debug_log::log_user_input("interactive_goal", trimmed);
-                        break trimmed.to_string();
-                    }
                 }
-                None => {
-                    renderer.shutdown();
-                    return Ok(SessionStopReport::default());
-                }
-            }
+            },
         },
     };
 
-    ctx.set_goal(goal.clone());
-    ui_transcript.append(UiRecord::User { text: goal.clone() });
-    let _ = ui_transcript.save(&ui_transcript_path);
+    if boot.is_some() {
+        // Resume: both pin writers are off this path. `ctx.set_goal` is the second
+        // clobber site and is never called, and the goal is not journaled again —
+        // the seeded transcript already carries it.
+        if let Some(prompt) = resume_prompt.filter(|prompt| !prompt.trim().is_empty()) {
+            crate::debug_log::log_user_input("resume_prompt", &prompt);
+            ctx.append(Message::User {
+                content: prompt.clone(),
+            });
+            ui_transcript.append(UiRecord::User { text: prompt });
+        }
+    } else {
+        ctx.set_goal(goal.clone());
+        ui_transcript.append(UiRecord::User { text: goal.clone() });
+    }
 
     // t-074: every bound exit is collected here so the caller gets the same
     // distinction the operator gets on screen — a turn-cap stop is recorded and
@@ -387,6 +1951,11 @@ pub async fn run_session_with_bounds_report(
     let mut session_stops: Vec<BoundStopReason> = Vec::new();
 
     crate::orchestrator::reset_cancellation();
+
+    // t-024 (flow §1.9): remember whether this round started with a plan file, so
+    // an archive that lands mid-round is detectable at the round boundary (only
+    // this thread may write the bundle — design R-TRIG-0).
+    let mut plan_present_at_round_start = plan.exists();
 
     while !renderer.aborted() {
         let mut had_events = false;
@@ -397,7 +1966,6 @@ pub async fn run_session_with_bounds_report(
         while let Ok(ev) = event_rx.try_recv() {
             if let Event::SteerResponse(ref text) = ev {
                 ui_transcript.append(UiRecord::SteerResponse { text: text.clone() });
-                let _ = ui_transcript.save(&ui_transcript_path);
             }
             renderer.on_event(&ev);
             had_events = true;
@@ -429,12 +1997,14 @@ pub async fn run_session_with_bounds_report(
             }
             if is_reset_command(&steer) {
                 crate::debug_log::log_user_input("command", &steer);
-                handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
-                ui_transcript.clear();
-                if let Ok(mut hist) = steering_history.write() {
-                    hist.clear();
-                }
-                let _ = std::fs::remove_file(&ui_transcript_path);
+                handle_reset_command_and_commit(
+                    &mut commit_pump,
+                    &plan,
+                    &mut ctx,
+                    &mut *renderer,
+                    &mut ui_transcript,
+                    &steering_history,
+                );
                 continue;
             }
             if !steer.trim().is_empty() {
@@ -442,7 +2012,6 @@ pub async fn run_session_with_bounds_report(
                 ui_transcript.append(UiRecord::User {
                     text: steer.clone(),
                 });
-                let _ = ui_transcript.save(&ui_transcript_path);
                 if crate::orchestrator::has_active_workers()
                     || subagents.iter().any(|s| s.is_active)
                 {
@@ -473,6 +2042,15 @@ pub async fn run_session_with_bounds_report(
         let mut bound_stop_reason: Option<BoundStopReason> = None;
         loop {
             turn_count += 1;
+
+            // T-5 (flow §1.1): a worker started / completed / failed / was
+            // preempted since this was last checked. The flag is set from
+            // `orchestrator::workers`, possibly on a worker thread — harvesting
+            // and writing happen HERE, on the session thread (R-TRIG-0).
+            if take_worker_lifecycle_edge() {
+                commit_pump.request(CommitTrigger::WorkerEdge, &ctx, &*renderer);
+            }
+
             // t-074 (residual defect 2 of the manager-cluster gate t-067, live
             // analogue of recon finding M2): this exit used to break silently.
             // The operator saw a session stop responding after `MAX_TURNS` turns
@@ -507,13 +2085,27 @@ pub async fn run_session_with_bounds_report(
                     &mut ctx,
                     &mut *renderer,
                     &mut ui_transcript,
-                    &ui_transcript_path,
-                    &transcript_path,
                 );
+
+                // T-1 at a top-of-loop exit: a capped session still ends with a
+                // committed round, not with a silently discarded one.
+                capture_and_request(
+                    &mut commit_pump,
+                    CommitTrigger::ManagerTurnBoundary,
+                    &ctx,
+                    &*renderer,
+                );
+
                 bound_stop_reason = Some(reason);
                 break;
             }
             if renderer.aborted() || renderer.user_exit_requested() {
+                // T-6 (flow §1.6.4, t-024): the abort commit must land BEFORE the
+                // `break`, while the round's facts and a live renderer are still
+                // reachable — this is the last bundle a session that the user
+                // stopped ever has to write, so it is mandatory and never
+                // throttled.
+                capture_and_request(&mut commit_pump, CommitTrigger::UserAbort, &ctx, &*renderer);
                 break;
             }
             // REQ-LOOP-002 (wall-clock half): bound ONE turn of the request.
@@ -555,12 +2147,7 @@ pub async fn run_session_with_bounds_report(
             if ctx.should_compact() {
                 let outcome = ctx.compact();
                 renderer.on_event(&Event::TokensIn(ctx.token_count()));
-                surface_compaction_outcome(
-                    &mut *renderer,
-                    &mut ui_transcript,
-                    &ui_transcript_path,
-                    &outcome,
-                );
+                surface_compaction_outcome(&mut *renderer, &mut ui_transcript, &outcome);
             } else if ctx.should_advise_rebirth() {
                 ctx.inject_rebirth_advisory();
                 renderer.on_event(&Event::Status(
@@ -584,8 +2171,6 @@ pub async fn run_session_with_bounds_report(
                 &mut ctx,
                 &mut *renderer,
                 &mut ui_transcript,
-                &ui_transcript_path,
-                &transcript_path,
             );
 
             let msgs = ctx.messages().to_vec();
@@ -687,7 +2272,12 @@ pub async fn run_session_with_bounds_report(
             };
 
             ctx.append(assistant);
-            let _ = ctx.save_transcript(&transcript_path);
+            let round_trigger = if tool_calls.is_empty() {
+                CommitTrigger::ManagerTurnBoundary
+            } else {
+                CommitTrigger::PreDispatch
+            };
+            capture_and_request(&mut commit_pump, round_trigger, &ctx, &*renderer);
             if let Some(Message::Assistant {
                 content,
                 reasoning_content,
@@ -704,7 +2294,6 @@ pub async fn run_session_with_bounds_report(
                         content: c,
                         thinking: r,
                     });
-                    let _ = ui_transcript.save(&ui_transcript_path);
                 }
             }
             renderer.flush()?;
@@ -714,17 +2303,12 @@ pub async fn run_session_with_bounds_report(
                 sync_manager_tool_schema(&mut ctx, cfg);
                 if ctx.should_compact() {
                     let outcome = ctx.compact();
-                    let _ = ctx.save_transcript(&transcript_path);
+                    capture_and_request(&mut commit_pump, CommitTrigger::UiEvent, &ctx, &*renderer);
                     renderer.on_event(&Event::TokensIn(ctx.token_count()));
-                    surface_compaction_outcome(
-                        &mut *renderer,
-                        &mut ui_transcript,
-                        &ui_transcript_path,
-                        &outcome,
-                    );
+                    surface_compaction_outcome(&mut *renderer, &mut ui_transcript, &outcome);
                 } else if ctx.should_advise_rebirth() {
                     ctx.inject_rebirth_advisory();
-                    let _ = ctx.save_transcript(&transcript_path);
+                    capture_and_request(&mut commit_pump, CommitTrigger::UiEvent, &ctx, &*renderer);
                     renderer.on_event(&Event::Status(
                         "context advisory: rebirth recommended (>= 80% budget)".to_string(),
                     ));
@@ -743,12 +2327,7 @@ pub async fn run_session_with_bounds_report(
                 let pending = match read_plan_gate(&current_plan) {
                     PlanGate::Read { pending, .. } => pending,
                     PlanGate::Unknown { warning } => {
-                        surface_plan_warning(
-                            &mut *renderer,
-                            &mut ui_transcript,
-                            &ui_transcript_path,
-                            warning,
-                        );
+                        surface_plan_warning(&mut *renderer, &mut ui_transcript, warning);
                         Vec::new()
                     }
                 };
@@ -841,7 +2420,6 @@ pub async fn run_session_with_bounds_report(
                         let display = format_tool_call_display(&name, &args_val);
                         renderer.on_event(&Event::ToolCall(display.clone()));
                         ui_transcript.append(UiRecord::ToolCall { display });
-                        let _ = ui_transcript.save(&ui_transcript_path);
                     }
 
                     if call.is_malformed() {
@@ -950,11 +2528,23 @@ pub async fn run_session_with_bounds_report(
                     // t-063: this round has been fanned out but never joined, so
                     // the assistant `tool_calls` already in the transcript have no
                     // results at all. The hard error ends the session, but the
-                    // transcript was written to disk turn by turn and can be
-                    // reloaded — close the invariant and persist it before leaving.
-                    if ctx.ensure_tool_call_pairs() {
-                        let _ = ctx.save_transcript(&transcript_path);
-                    }
+                    // manager state is captured turn by turn and a rehydration would
+                    // install the newest capture — close the invariant and record it
+                    // before leaving.
+                    //
+                    // t-024: "record it" is now a REAL commit, not a mirror. A flush
+                    // failure ends the session HERE, so the loop tail (T-9) never
+                    // runs and this is the last chance the round has to reach disk.
+                    // The ending stays `inProgress`: no terminal marker was reached,
+                    // so a later boot infers the death (`HardKillInferred`) instead of
+                    // being told this exit was clean.
+                    ctx.ensure_tool_call_pairs();
+                    capture_and_request(
+                        &mut commit_pump,
+                        CommitTrigger::ManagerTurnBoundary,
+                        &ctx,
+                        &*renderer,
+                    );
                     return Err(e);
                 }
 
@@ -982,7 +2572,6 @@ pub async fn run_session_with_bounds_report(
                             if let Event::SteerResponse(ref text) = ev {
                                 ui_transcript
                                     .append(UiRecord::SteerResponse { text: text.clone() });
-                                let _ = ui_transcript.save(&ui_transcript_path);
                             }
                             renderer.on_event(&ev);
                             had_events = true;
@@ -1006,6 +2595,17 @@ pub async fn run_session_with_bounds_report(
                             Some(&mut ui_transcript),
                         );
                         if renderer.user_exit_requested() {
+                            // T-6 (flow §1.6.4, t-024): the abort commit lands
+                            // BEFORE `cancel_all()` and before the in-flight
+                            // handle is torn down by the round's teardown, so a
+                            // session stopped mid-round leaves a bundle that says
+                            // so instead of one that claims `inProgress`.
+                            capture_and_request(
+                                &mut commit_pump,
+                                CommitTrigger::UserAbort,
+                                &ctx,
+                                &*renderer,
+                            );
                             crate::orchestrator::cancel_all();
                             break (
                                 String::new(),
@@ -1075,7 +2675,6 @@ pub async fn run_session_with_bounds_report(
                                     if let Event::SteerResponse(ref text) = ev {
                                         ui_transcript
                                             .append(UiRecord::SteerResponse { text: text.clone() });
-                                        let _ = ui_transcript.save(&ui_transcript_path);
                                     }
                                     renderer.on_event(&ev);
                                     had_events = true;
@@ -1103,12 +2702,14 @@ pub async fn run_session_with_bounds_report(
                                         crate::debug_log::log_user_input("command", &input);
                                         renderer.request_user_exit();
                                     } else if is_reset_command(&input) {
-                                        handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
-                                        ui_transcript.clear();
-                                        if let Ok(mut hist) = steering_history.write() {
-                                            hist.clear();
-                                        }
-                                        let _ = std::fs::remove_file(&ui_transcript_path);
+                                        handle_reset_command_and_commit(
+                                            &mut commit_pump,
+                                            &plan,
+                                            &mut ctx,
+                                            &mut *renderer,
+                                            &mut ui_transcript,
+                                            &steering_history,
+                                        );
                                     } else if !input.trim().is_empty() {
                                         spawn_steer_arbitration(
                                             &client,
@@ -1123,6 +2724,14 @@ pub async fn run_session_with_bounds_report(
                                     }
                                 }
                                 if renderer.user_exit_requested() {
+                                    // T-6 (t-024): same rule one level deeper —
+                                    // the round is still in flight here too.
+                                    capture_and_request(
+                                        &mut commit_pump,
+                                        CommitTrigger::UserAbort,
+                                        &ctx,
+                                        &*renderer,
+                                    );
                                     crate::orchestrator::cancel_all();
                                     break (
                                         String::new(),
@@ -1191,7 +2800,6 @@ pub async fn run_session_with_bounds_report(
                                     surface_plan_warning(
                                         &mut *renderer,
                                         &mut ui_transcript,
-                                        &ui_transcript_path,
                                         warning,
                                     );
                                 }
@@ -1201,14 +2809,12 @@ pub async fn run_session_with_bounds_report(
                             ));
                             ui_transcript.append(UiRecord::TaskCompleted { task_id: tid });
                         }
-                        let _ = ui_transcript.save(&ui_transcript_path);
                         renderer.set_subagents(subagents.clone());
                     } else {
                         renderer.on_event(&Event::ToolResult(result_content.clone()));
                         ui_transcript.append(UiRecord::ToolResult {
                             display: result_content.clone(),
                         });
-                        let _ = ui_transcript.save(&ui_transcript_path);
                     }
                     drain_delegation_events_with_transcript(
                         manager.as_deref(),
@@ -1221,7 +2827,12 @@ pub async fn run_session_with_bounds_report(
                         tool_call_id: call_id,
                         content: result_content,
                     });
-                    let _ = ctx.save_transcript(&transcript_path);
+                    capture_and_request(
+                        &mut commit_pump,
+                        CommitTrigger::ToolResult,
+                        &ctx,
+                        &*renderer,
+                    );
 
                     // H5 repeated-failure accounting: an abort/cancel result is not
                     // the tool's own failure, so it must not consume the budget.
@@ -1246,7 +2857,6 @@ pub async fn run_session_with_bounds_report(
                                     failure_label(&failure_key)
                                 )));
                                 ui_transcript.append(UiRecord::Status { text: note });
-                                let _ = ui_transcript.save(&ui_transcript_path);
                             }
                         }
                     } else if !is_error {
@@ -1266,11 +2876,20 @@ pub async fn run_session_with_bounds_report(
                         }
                         // t-063: the tail of the round is torn down here, so the
                         // calls after `idx` never get a `Message::Tool`. Repair and
-                        // persist before propagating, so the transcript left on disk
-                        // is a valid chat request.
-                        if ctx.ensure_tool_call_pairs() {
-                            let _ = ctx.save_transcript(&transcript_path);
-                        }
+                        // capture before propagating, so the manager state a
+                        // rehydration would install is a valid chat request.
+                        //
+                        // t-024: the capture became a REAL commit — this return
+                        // leaves the loop entirely, so without it the joined half of
+                        // the round (already a completed deliverable) would exist
+                        // only in memory.
+                        ctx.ensure_tool_call_pairs();
+                        capture_and_request(
+                            &mut commit_pump,
+                            CommitTrigger::ManagerTurnBoundary,
+                            &ctx,
+                            &*renderer,
+                        );
                         return Err(e);
                     }
 
@@ -1344,7 +2963,6 @@ pub async fn run_session_with_bounds_report(
                         let display = format_tool_call_display(&name, &args_val);
                         renderer.on_event(&Event::ToolCall(display.clone()));
                         ui_transcript.append(UiRecord::ToolCall { display });
-                        let _ = ui_transcript.save(&ui_transcript_path);
                     }
                     renderer.flush()?;
 
@@ -1367,8 +2985,12 @@ pub async fn run_session_with_bounds_report(
                                     ui_transcript.append(UiRecord::Status {
                                         text: format!("Rebirth checkpoint applied: {}", r.content),
                                     });
-                                    let _ = ui_transcript.save(&ui_transcript_path);
-                                    let _ = ctx.save_transcript(&transcript_path);
+                                    capture_and_request(
+                                        &mut commit_pump,
+                                        CommitTrigger::UiEvent,
+                                        &ctx,
+                                        &*renderer,
+                                    );
                                     renderer.on_event(&Event::TokensIn(ctx.token_count()));
                                     renderer.on_event(&Event::Status(
                                         "rebirth checkpoint applied".to_string(),
@@ -1387,7 +3009,6 @@ pub async fn run_session_with_bounds_report(
                                             surface_plan_warning(
                                                 &mut *renderer,
                                                 &mut ui_transcript,
-                                                &ui_transcript_path,
                                                 warning,
                                             );
                                             Vec::new()
@@ -1404,13 +3025,23 @@ pub async fn run_session_with_bounds_report(
                                     ctx.append(Message::User {
                                         content: continuation_msg,
                                     });
-                                    let _ = ctx.save_transcript(&transcript_path);
+                                    capture_and_request(
+                                        &mut commit_pump,
+                                        CommitTrigger::UiEvent,
+                                        &ctx,
+                                        &*renderer,
+                                    );
                                 } else {
                                     ctx.append(Message::Tool {
                                         tool_call_id: call.id.clone(),
                                         content: format!("ERROR: {}", r.content),
                                     });
-                                    let _ = ctx.save_transcript(&transcript_path);
+                                    capture_and_request(
+                                        &mut commit_pump,
+                                        CommitTrigger::ToolResult,
+                                        &ctx,
+                                        &*renderer,
+                                    );
                                 }
                             }
                             Err(e) => {
@@ -1419,7 +3050,12 @@ pub async fn run_session_with_bounds_report(
                                     tool_call_id: call.id.clone(),
                                     content: format!("ERROR: {e}"),
                                 });
-                                let _ = ctx.save_transcript(&transcript_path);
+                                capture_and_request(
+                                    &mut commit_pump,
+                                    CommitTrigger::ToolResult,
+                                    &ctx,
+                                    &*renderer,
+                                );
                             }
                         }
                         renderer.flush()?;
@@ -1438,7 +3074,12 @@ pub async fn run_session_with_bounds_report(
                             tool_call_id: call.id.clone(),
                             content: err_msg,
                         });
-                        let _ = ctx.save_transcript(&transcript_path);
+                        capture_and_request(
+                            &mut commit_pump,
+                            CommitTrigger::ToolResult,
+                            &ctx,
+                            &*renderer,
+                        );
                         continue;
                     }
 
@@ -1457,7 +3098,12 @@ pub async fn run_session_with_bounds_report(
                             tool_call_id: call.id.clone(),
                             content: err_msg,
                         });
-                        let _ = ctx.save_transcript(&transcript_path);
+                        capture_and_request(
+                            &mut commit_pump,
+                            CommitTrigger::ToolResult,
+                            &ctx,
+                            &*renderer,
+                        );
                         continue;
                     }
                     let intervention = monitor.observe_tool(&name, &args_val);
@@ -1482,7 +3128,12 @@ pub async fn run_session_with_bounds_report(
                             tool_call_id: call.id.clone(),
                             content: format!("ERROR: {err_msg}"),
                         });
-                        let _ = ctx.save_transcript(&transcript_path);
+                        capture_and_request(
+                            &mut commit_pump,
+                            CommitTrigger::ToolResult,
+                            &ctx,
+                            &*renderer,
+                        );
                         continue;
                     }
 
@@ -1508,7 +3159,6 @@ pub async fn run_session_with_bounds_report(
                             if let Event::SteerResponse(ref text) = ev {
                                 ui_transcript
                                     .append(UiRecord::SteerResponse { text: text.clone() });
-                                let _ = ui_transcript.save(&ui_transcript_path);
                             }
                             renderer.on_event(&ev);
                             had_events = true;
@@ -1532,6 +3182,14 @@ pub async fn run_session_with_bounds_report(
                             Some(&mut ui_transcript),
                         );
                         if renderer.user_exit_requested() {
+                            // T-6 (t-024): the sequential branch breaks out of a
+                            // live call; the abort must still be recorded first.
+                            capture_and_request(
+                                &mut commit_pump,
+                                CommitTrigger::UserAbort,
+                                &ctx,
+                                &*renderer,
+                            );
                             crate::orchestrator::cancel_all();
                             break Err(crate::harness::ToolError::Execution(anyhow::anyhow!(
                                 "aborted by user"
@@ -1587,7 +3245,6 @@ pub async fn run_session_with_bounds_report(
                                     if let Event::SteerResponse(ref text) = ev {
                                         ui_transcript
                                             .append(UiRecord::SteerResponse { text: text.clone() });
-                                        let _ = ui_transcript.save(&ui_transcript_path);
                                     }
                                     renderer.on_event(&ev);
                                     had_events = true;
@@ -1615,12 +3272,14 @@ pub async fn run_session_with_bounds_report(
                                         crate::debug_log::log_user_input("command", &input);
                                         renderer.request_user_exit();
                                     } else if is_reset_command(&input) {
-                                        handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
-                                        ui_transcript.clear();
-                                        if let Ok(mut hist) = steering_history.write() {
-                                            hist.clear();
-                                        }
-                                        let _ = std::fs::remove_file(&ui_transcript_path);
+                                        handle_reset_command_and_commit(
+                                            &mut commit_pump,
+                                            &plan,
+                                            &mut ctx,
+                                            &mut *renderer,
+                                            &mut ui_transcript,
+                                            &steering_history,
+                                        );
                                     } else if !input.trim().is_empty() {
                                         spawn_steer_arbitration(
                                             &client,
@@ -1635,6 +3294,13 @@ pub async fn run_session_with_bounds_report(
                                     }
                                 }
                                 if renderer.user_exit_requested() {
+                                    // T-6 (t-024): mandatory, mid-call.
+                                    capture_and_request(
+                                        &mut commit_pump,
+                                        CommitTrigger::UserAbort,
+                                        &ctx,
+                                        &*renderer,
+                                    );
                                     crate::orchestrator::cancel_all();
                                     break Err(crate::harness::ToolError::Execution(
                                         anyhow::anyhow!("aborted by user"),
@@ -1696,7 +3362,6 @@ pub async fn run_session_with_bounds_report(
                                     surface_plan_warning(
                                         &mut *renderer,
                                         &mut ui_transcript,
-                                        &ui_transcript_path,
                                         warning,
                                     );
                                 }
@@ -1709,14 +3374,12 @@ pub async fn run_session_with_bounds_report(
                             ));
                             ui_transcript.append(UiRecord::TaskCompleted { task_id: tid });
                         }
-                        let _ = ui_transcript.save(&ui_transcript_path);
                         renderer.set_subagents(subagents.clone());
                     } else {
                         renderer.on_event(&Event::ToolResult(result_content.clone()));
                         ui_transcript.append(UiRecord::ToolResult {
                             display: result_content.clone(),
                         });
-                        let _ = ui_transcript.save(&ui_transcript_path);
                     }
                     renderer.flush()?;
 
@@ -1731,7 +3394,12 @@ pub async fn run_session_with_bounds_report(
                         tool_call_id: call.id.clone(),
                         content: result_content,
                     });
-                    let _ = ctx.save_transcript(&transcript_path);
+                    capture_and_request(
+                        &mut commit_pump,
+                        CommitTrigger::ToolResult,
+                        &ctx,
+                        &*renderer,
+                    );
 
                     // H5 repeated-failure accounting: an abort/cancel result is not
                     // the tool's own failure, so it must not consume the budget.
@@ -1756,7 +3424,6 @@ pub async fn run_session_with_bounds_report(
                                     failure_label(&failure_key)
                                 )));
                                 ui_transcript.append(UiRecord::Status { text: note });
-                                let _ = ui_transcript.save(&ui_transcript_path);
                             }
                         }
                     } else if !is_error {
@@ -1790,8 +3457,16 @@ pub async fn run_session_with_bounds_report(
                 &mut ctx,
                 &mut *renderer,
                 &mut ui_transcript,
-                &ui_transcript_path,
-                &transcript_path,
+            );
+
+            // T-1 (flow §1.1/§1.6.2): the turn boundary is committed AFTER the
+            // pairing repair, so the persisted manager transcript is already
+            // pair-valid and the loader never has to normalize a torn round.
+            capture_and_request(
+                &mut commit_pump,
+                CommitTrigger::ManagerTurnBoundary,
+                &ctx,
+                &*renderer,
             );
 
             // H5: the round was cut off by an execution bound -> end the turn; the
@@ -1807,17 +3482,12 @@ pub async fn run_session_with_bounds_report(
                 sync_manager_tool_schema(&mut ctx, cfg);
                 if ctx.should_compact() {
                     let outcome = ctx.compact();
-                    let _ = ctx.save_transcript(&transcript_path);
+                    capture_and_request(&mut commit_pump, CommitTrigger::UiEvent, &ctx, &*renderer);
                     renderer.on_event(&Event::TokensIn(ctx.token_count()));
-                    surface_compaction_outcome(
-                        &mut *renderer,
-                        &mut ui_transcript,
-                        &ui_transcript_path,
-                        &outcome,
-                    );
+                    surface_compaction_outcome(&mut *renderer, &mut ui_transcript, &outcome);
                 } else if ctx.should_advise_rebirth() {
                     ctx.inject_rebirth_advisory();
-                    let _ = ctx.save_transcript(&transcript_path);
+                    capture_and_request(&mut commit_pump, CommitTrigger::UiEvent, &ctx, &*renderer);
                     renderer.on_event(&Event::Status(
                         "context advisory: rebirth recommended (>= 80% budget)".to_string(),
                     ));
@@ -1834,21 +3504,44 @@ pub async fn run_session_with_bounds_report(
             // warning can never disagree because two reads saw two files.
             match read_plan_gate(&current_plan) {
                 PlanGate::Unknown { warning } => {
-                    surface_plan_warning(
-                        &mut *renderer,
-                        &mut ui_transcript,
-                        &ui_transcript_path,
-                        warning,
-                    );
+                    surface_plan_warning(&mut *renderer, &mut ui_transcript, warning);
                 }
                 PlanGate::Read { complete: true, .. } => {
                     ctx.append(Message::User {
                         content: "(SYSTEM NOTICE: All execution plan tasks are now COMPLETE [x]. Do NOT execute any more tools or re-delegate. Deliver your comprehensive final answer/synthesis to the user now.)".to_string(),
                     });
-                    let _ = ctx.save_transcript(&transcript_path);
+                    capture_and_request(&mut commit_pump, CommitTrigger::UiEvent, &ctx, &*renderer);
                 }
                 PlanGate::Read { .. } => {}
             }
+
+            // t-024 (flow §1.9): `archive_plan` runs as a tool, i.e. possibly on
+            // another thread, and it sweeps the bundle with it. The only thread
+            // allowed to write the bundle is this one, so the archive is detected
+            // here at the round boundary: the plan is committed with the
+            // `planArchived` ending first, then the sweep is confirmed.
+            if plan_archived_during_round(&current_plan, plan_present_at_round_start) {
+                tracing::warn!(
+                    "execution plan was archived during this round: committing the session with \
+                     ending planArchived before the bundle is swept (flow §1.9)"
+                );
+                if commit_pump.has_committed() {
+                    mark_ending_commit(
+                        &mut commit_pump,
+                        CommitTrigger::PlanArchived,
+                        &ctx,
+                        &*renderer,
+                    );
+                    confirm_bundle_swept(
+                        &mut commit_pump,
+                        CommitTrigger::PlanArchived,
+                        &current_plan,
+                        &ctx,
+                        &*renderer,
+                    );
+                }
+            }
+            plan_present_at_round_start = current_plan.plan_path().exists();
         }
 
         // H5: make the bound user-visible exactly once per turn, keep the session
@@ -1871,7 +3564,6 @@ pub async fn run_session_with_bounds_report(
             renderer.on_event(&Event::Message(format!("\n[Session bound] {text}\n")));
             renderer.on_event(&Event::Status(format!("{label} (Ready)")));
             ui_transcript.append(UiRecord::Status { text: text.clone() });
-            let _ = ui_transcript.save(&ui_transcript_path);
             // Surface the teardown *before* the cancellation state is reset, so the
             // report and the cancelled state are observed together (and so no
             // renderer write can be interleaved with a half-reset session).
@@ -1881,7 +3573,7 @@ pub async fn run_session_with_bounds_report(
                     "(SYSTEM NOTICE: the previous turn was terminated by a session execution bound: {text}. Do not repeat the same failing approach; report the blocker and ask for direction if no alternative strategy is available.)"
                 ),
             });
-            let _ = ctx.save_transcript(&transcript_path);
+            capture_and_request(&mut commit_pump, CommitTrigger::UiEvent, &ctx, &*renderer);
             if crate::orchestrator::is_globally_cancelled() {
                 crate::orchestrator::reset_cancellation();
             }
@@ -1913,7 +3605,7 @@ pub async fn run_session_with_bounds_report(
                 for steer in steer_queue.drain(..) {
                     ctx.append(Message::User { content: steer });
                 }
-                let _ = ctx.save_transcript(&transcript_path);
+                capture_and_request(&mut commit_pump, CommitTrigger::UiEvent, &ctx, &*renderer);
                 renderer.on_event(&Event::Status(
                     "Steering redirection: aborted current turn, starting next turn with updated context".to_string(),
                 ));
@@ -1929,7 +3621,12 @@ pub async fn run_session_with_bounds_report(
             for steer in steer_queue.drain(..) {
                 ctx.append(Message::User { content: steer });
             }
-            let _ = ctx.save_transcript(&transcript_path);
+            capture_and_request(
+                &mut commit_pump,
+                CommitTrigger::ManagerTurnBoundary,
+                &ctx,
+                &*renderer,
+            );
             continue;
         }
 
@@ -1942,12 +3639,14 @@ pub async fn run_session_with_bounds_report(
                 }
                 if is_reset_command(&line) {
                     crate::debug_log::log_user_input("command", &line);
-                    handle_reset_command(&plan, &mut *renderer, Some(&mut ctx));
-                    ui_transcript.clear();
-                    if let Ok(mut hist) = steering_history.write() {
-                        hist.clear();
-                    }
-                    let _ = std::fs::remove_file(&ui_transcript_path);
+                    handle_reset_command_and_commit(
+                        &mut commit_pump,
+                        &plan,
+                        &mut ctx,
+                        &mut *renderer,
+                        &mut ui_transcript,
+                        &steering_history,
+                    );
                     continue;
                 }
                 if !line.trim().is_empty() {
@@ -1955,9 +3654,8 @@ pub async fn run_session_with_bounds_report(
                     ctx.append(Message::User {
                         content: line.clone(),
                     });
-                    let _ = ctx.save_transcript(&transcript_path);
+                    capture_and_request(&mut commit_pump, CommitTrigger::UiEvent, &ctx, &*renderer);
                     ui_transcript.append(UiRecord::User { text: line });
-                    let _ = ui_transcript.save(&ui_transcript_path);
                 } else {
                     continue;
                 }
@@ -1967,6 +3665,21 @@ pub async fn run_session_with_bounds_report(
             }
         }
     }
+
+    // T-9 / T-6 at the tail (flow §1.1, §1.5, t-024): the last word of a session
+    // names HOW it ended, which is the only thing that lets a later boot tell
+    // `CleanTail` from `UserAbort` from `HardKillInferred`. An abort that broke out
+    // of the round still has `aborted` / `user_exit_requested` set here, and that
+    // is the truth the manifest must carry — a session the user stopped is not a
+    // session that finished. Mandatory either way: the throttle never skips the
+    // last word, and it runs BEFORE `shutdown()` (flow §1.6.5) because the UI
+    // capture needs a live renderer.
+    let tail_trigger = if renderer.aborted() || renderer.user_exit_requested() {
+        CommitTrigger::UserAbort
+    } else {
+        CommitTrigger::CleanTail
+    };
+    capture_and_request(&mut commit_pump, tail_trigger, &ctx, &*renderer);
 
     renderer.on_event(&Event::Done);
     renderer.flush().ok();
@@ -2109,13 +3822,11 @@ pub fn read_plan_gate(plan: &crate::manager::phase::Plan) -> PlanGate {
 fn surface_plan_warning(
     renderer: &mut dyn Renderer,
     ui_transcript: &mut UiTranscript,
-    ui_transcript_path: &std::path::Path,
     warning: String,
 ) {
     tracing::warn!("{warning}");
     renderer.on_event(&Event::Status(warning.clone()));
     ui_transcript.append(UiRecord::Status { text: warning });
-    let _ = ui_transcript.save(ui_transcript_path);
 }
 
 /// Wall-clock bound of one iteration of a tool-round join loop (t-063).
@@ -2155,22 +3866,21 @@ fn ensure_pairing_at_boundary(
     ctx: &mut ContextEngine,
     renderer: &mut dyn Renderer,
     ui_transcript: &mut UiTranscript,
-    ui_transcript_path: &std::path::Path,
-    transcript_path: &std::path::Path,
 ) {
     if !ctx.ensure_tool_call_pairs() {
         return;
     }
-    // The repaired transcript is what the next request is built from and what a
-    // rehydration would load, so it has to hit disk with the repair in it.
-    let _ = ctx.save_transcript(transcript_path);
+    // The repaired transcript is what the next request is built from, and the
+    // capture below is what a rehydration would install: the superseded
+    // `.session_transcript.json` journal is gone (A §1 D2), so the repaired state is
+    // recorded in memory instead of written to a second journal.
+    crate::session::manager_capture::capture_into_session_state(ctx);
     let note = format!(
         "tool-call pairing repaired ({site}): missing tool results synthesized as `{ABORTED_TOOL_RESULT}`"
     );
     tracing::warn!("{note}");
     renderer.on_event(&Event::Status(note.clone()));
     ui_transcript.append(UiRecord::Status { text: note });
-    let _ = ui_transcript.save(ui_transcript_path);
 }
 
 /// Report the outcome of an automatic compaction (t-063).
@@ -2187,7 +3897,6 @@ fn ensure_pairing_at_boundary(
 fn surface_compaction_outcome(
     renderer: &mut dyn Renderer,
     ui_transcript: &mut UiTranscript,
-    ui_transcript_path: &std::path::Path,
     outcome: &CompactionOutcome,
 ) {
     if outcome.succeeded() {
@@ -2204,7 +3913,6 @@ fn surface_compaction_outcome(
     tracing::warn!("{warning}");
     renderer.on_event(&Event::Status(warning.clone()));
     ui_transcript.append(UiRecord::Status { text: warning });
-    let _ = ui_transcript.save(ui_transcript_path);
 }
 
 /// Why a plan box did — or did not — flip, as decided by the single check-off
