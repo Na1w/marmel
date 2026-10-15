@@ -1123,20 +1123,21 @@ fn test_delegate_with_rejected_task_id_falls_back_to_jit_and_warns() {
         recursion_granted: false,
     };
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    tracing::callsite::rebuild_interest_cache();
+    let _tracing_lock = crate::orchestrator::workers::TEST_TRACING_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let deliverable =
         tracing::subscriber::with_default(RejectedTaskIdWarns(counter.clone()), || {
             tracing::callsite::rebuild_interest_cache();
             rt.block_on(m.delegate(req))
         })
         .expect("a rejected task id must not fail the delegation: JIT synthesis is the fallback");
-    tracing::callsite::rebuild_interest_cache();
+    drop(_tracing_lock);
     assert_eq!(
         deliverable.task_id.as_deref(),
         Some("../escape"),

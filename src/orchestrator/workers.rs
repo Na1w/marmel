@@ -152,6 +152,10 @@ const MAX_KEY_DISAMBIGUATION_RETRIES: usize = 16;
 pub static TEST_WORKERS_MUTEX: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
+#[cfg(test)]
+pub static TEST_TRACING_MUTEX: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
 /// RAII guard that automatically unregisters an active worker on drop and moves it to recently completed.
 ///
 /// The wrapped `String` is the **effective registry key** allocated for that
@@ -2123,7 +2127,10 @@ mod tests {
             );
             let key = guard.0.clone();
             let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            tracing::callsite::rebuild_interest_cache();
+            let _tracing_lock = TEST_TRACING_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            // Ensure the rejection warning callsite in get_active_subtasks_str is registered
+            // in CALLSITES before rebuilding interest for our test subscriber.
+            let _ = get_active_subtasks_str();
             tracing::subscriber::with_default(RejectTaskIdWarns(counter.clone()), || {
                 tracing::callsite::rebuild_interest_cache();
                 let section = section_for_worker(&get_active_subtasks_str(), &key);
@@ -2140,7 +2147,7 @@ mod tests {
                     "the blueprint outside the prompts dir must never surface: {section}"
                 );
             });
-            tracing::callsite::rebuild_interest_cache();
+            drop(_tracing_lock);
             assert!(
                 counter.load(std::sync::atomic::Ordering::Relaxed) >= 1,
                 "the rejection must be reported with a tracing::warn! naming the id"

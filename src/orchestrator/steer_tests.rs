@@ -730,7 +730,12 @@ fn test_unknown_steer_subtask_action_rejection_is_logged() {
     }
 
     let counter = Arc::new(AtomicUsize::new(0));
-    tracing::callsite::rebuild_interest_cache();
+    let _tracing_lock = crate::orchestrator::workers::TEST_TRACING_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // Ensure the rejection callsite is registered with the callsite registry before
+    // rebuilding the interest cache for our test subscriber.
+    let _ = normalize_steer_subtask_action("unknown_init", "tc-init");
     tracing::subscriber::with_default(RejectionLogCounter(counter.clone()), || {
         tracing::callsite::rebuild_interest_cache();
         for raw in [
@@ -754,7 +759,7 @@ fn test_unknown_steer_subtask_action_rejection_is_logged() {
             "an unrecognized action must log exactly one explicit rejection"
         );
     });
-    tracing::callsite::rebuild_interest_cache();
+    drop(_tracing_lock);
 }
 
 /// Every spelling of `DelegateTask` produces the same delegation, at the consumer.

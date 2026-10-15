@@ -1013,6 +1013,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let prompts = tmp.path().join("prompts");
 
+        let _tracing_lock = crate::orchestrator::workers::TEST_TRACING_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for (raw, expected) in hostile_prompt_task_ids() {
             let bp = blueprint_for(&raw);
             assert_eq!(
@@ -1024,6 +1027,7 @@ mod tests {
             let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let result =
                 tracing::subscriber::with_default(PromptWriteWarns(counter.clone()), || {
+                    tracing::callsite::rebuild_interest_cache();
                     bp.save_to_disk(&prompts)
                 });
             let err = result.expect_err("a hostile task id must never be persisted");
@@ -1037,6 +1041,7 @@ mod tests {
                 "the rejection of {raw:?} must be reported with a tracing::warn!"
             );
         }
+        drop(_tracing_lock);
 
         let outside = files_outside(tmp.path(), &prompts);
         assert!(

@@ -2618,9 +2618,11 @@ fn capture_records_the_plan_pane_and_restore_puts_its_text_back() {
         .clone()
         .expect("plan completion recorded");
     assert!(start.is_sane() && done.is_sane());
+    let (anchor_inst, _) = crate::session::time::anchor();
+    let expected_start = started.saturating_duration_since(anchor_inst).as_secs_f64();
     assert!(
-        start.elapsed_secs >= 0.0 && start.elapsed_secs < 5.0,
-        "plan start position {start:?}"
+        start.elapsed_secs >= 0.0 && (start.elapsed_secs - expected_start).abs() < 1.0,
+        "plan start position {start:?}, expected approx {expected_start}"
     );
     // `elapsed_secs` is a position on the process timeline (A §3.9), so the
     // completion sits AFTER the start, and the gap is the sleep above.
