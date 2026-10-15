@@ -580,6 +580,15 @@ fn boot_transcript() -> Vec<MessageRecord> {
     ]
 }
 
+fn boot_timepoint(elapsed_secs: f64) -> TimePoint {
+    TimePoint {
+        elapsed_secs,
+        wall: crate::session::time::anchor_wall()
+            .checked_add_signed(chrono::Duration::seconds(elapsed_secs as i64))
+            .expect("in range"),
+    }
+}
+
 fn boot_worker(key: &str) -> WorkerSection {
     WorkerSection {
         worker_key: key.to_string(),
@@ -588,7 +597,7 @@ fn boot_worker(key: &str) -> WorkerSection {
         task_id: Some("t-012".to_string()),
         status: WorkerStatus::InProgress,
         status_label: "running".to_string(),
-        started: TimePoint::now(),
+        started: boot_timepoint(1.0),
         completed: None,
         last_activity: None,
         worked_secs: 12.5,
@@ -632,7 +641,7 @@ fn boot_payload(workers: Vec<WorkerSection>) -> CapturePayload {
                 is_active: true,
                 context_tokens: 42,
                 worked_duration_secs: 5.0,
-                started_at: Some(TimePoint::now()),
+                started_at: Some(boot_timepoint(1.0)),
                 last_activity_at: None,
                 turn_thinking: Some("turn thinking".to_string()),
                 is_thinking: Some(true),
@@ -2041,7 +2050,7 @@ fn resume_boot_assigns_every_pane_string_verbatim_including_the_plan_pane() {
             is_active: true,
             context_tokens: 77,
             worked_duration_secs: 6.25,
-            started_at: Some(TimePoint::now()),
+            started_at: Some(boot_timepoint(1.0)),
             last_activity_at: None,
             turn_thinking: Some("turn thinking".to_string()),
             is_thinking: Some(true),
@@ -2086,7 +2095,7 @@ fn resume_boot_assigns_every_pane_string_verbatim_including_the_plan_pane() {
             .to_string(),
         had_active_plan: true,
         active_plan_task: Some("t-002".to_string()),
-        plan_start: Some(TimePoint::now()),
+        plan_start: Some(boot_timepoint(2.0)),
         plan_completed: None,
         current_thought: "a half-streamed thin".to_string(),
         current_content: "a half-streamed answ".to_string(),
@@ -2096,7 +2105,7 @@ fn resume_boot_assigns_every_pane_string_verbatim_including_the_plan_pane() {
         tokens_out: 22,
         orchestrator_context_tokens: 333,
         abort_armed: true,
-        abort_armed_at: Some(TimePoint::now()),
+        abort_armed_at: Some(boot_timepoint(3.0)),
     };
     let payload = t022_payload(
         boot_manager_section(boot_transcript()),
@@ -2250,7 +2259,7 @@ fn t022_worker(
     if completed_seq.is_some() {
         // A closed record carries its own completion instant; the installer
         // re-anchors it through the D5 projection rather than inventing one.
-        section.completed = Some(TimePoint::now());
+        section.completed = Some(boot_timepoint(2.0));
     }
     section.counters.implementation_turns = 4;
     section.counters.validation_rounds = 2;
@@ -3329,8 +3338,8 @@ fn ac_c3_panels() -> Vec<SubagentPanel> {
             is_active: false,
             context_tokens: 40 + i,
             worked_duration_secs: 12.5 + i as f64,
-            started_at: Some(TimePoint::now()),
-            last_activity_at: Some(TimePoint::now()),
+            started_at: Some(boot_timepoint(1.0)),
+            last_activity_at: Some(boot_timepoint(2.0)),
             turn_thinking: Some(format!("turn thinking of panel {i}")),
             is_thinking: Some(false),
         })
