@@ -1385,7 +1385,8 @@ fn ac_s3_panel_clocks_re_anchor_within_the_error_term_and_their_wall_bytes_are_e
             .unwrap_or_else(|| panic!("ui.json has no `subagent_panels[0].{field}.wall`: {raw}"));
         assert_eq!(
             stamp,
-            want.wall.to_rfc3339(),
+            want.wall
+                .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
             "AC-S3: the `{field}` wall stamp in ui.json is not the captured bytes"
         );
         let parsed = DateTime::parse_from_rfc3339(stamp)
@@ -1866,9 +1867,12 @@ fn ac_t1_every_restored_offset_is_measured_against_the_anchor_the_manifest_names
             Some(entry.rel_path.as_str()),
             "AC-T1: member {index} is listed out of the committed order"
         );
+        let expected_wall = entry
+            .saved_wall
+            .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
         assert_eq!(
             on_disk["saved_wall"].as_str(),
-            Some(entry.saved_wall.to_rfc3339().as_str()),
+            Some(expected_wall.as_str()),
             "AC-T1: member {index} `saved_wall` is not the committed stamp"
         );
         assert_eq!(
