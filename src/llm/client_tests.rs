@@ -838,3 +838,226 @@ async fn test_llm_recovery_request_body_stays_in_documented_ranges() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Pre-send wire normalization in `ChatClient::try_chat_once`: strict
+// OpenAI-compatible chat formats accept `role: "system"` only in the first
+// position and answer HTTP 400 for anything later, so every system message
+// after index 0 must leave as `user` with byte-identical content.
+// ---------------------------------------------------------------------------
+
+/// Like [`sse_mock`], but additionally records each request body as JSON so the
+/// assertions can be made on the payload that really went on the wire.
+async fn capturing_sse_mock(
+    server: &wiremock::MockServer,
+    sse: String,
+) -> Arc<Mutex<Vec<serde_json::Value>>> {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, Request, ResponseTemplate};
+
+    let bodies: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with({
+            let bodies = bodies.clone();
+            move |req: &Request| {
+                let sent: serde_json::Value =
+                    serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+                bodies.lock().unwrap().push(sent);
+                ResponseTemplate::new(200).set_body_string(sse.clone())
+            }
+        })
+        .mount(server)
+        .await;
+    bodies
+}
+
+/// The `role` of every message of a captured request body, in wire order.
+fn wire_roles(body: &serde_json::Value) -> Vec<String> {
+    body["messages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|msg| msg["role"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// The role of every message of an in-memory history: `Message` has no
+/// `PartialEq`, so roles are compared through the `role()` accessor.
+fn local_roles(messages: &[Message]) -> Vec<&'static str> {
+    messages.iter().map(|msg| msg.role()).collect()
+}
+
+fn system_msg(text: &str) -> Message {
+    Message::System {
+        content: text.to_string(),
+    }
+}
+
+fn user_msg(text: &str) -> Message {
+    Message::User {
+        content: text.to_string(),
+    }
+}
+
+/// The rebirth checkpoint spelled as the legacy `Message::System`, the variant
+/// that reaches the wire from restored older session bundles; `perform_rebirth`
+/// itself now emits the checkpoint as `Message::User`, and the request-boundary
+/// normalization covers both. Built from the real detector constant so the
+/// checkpoint bytes the normalization has to preserve are the ones under test.
+fn checkpoint_content() -> String {
+    format!(
+        "{prefix}1. demote mid-history system messages on the wire; 2. cover it with tests)",
+        prefix = crate::manager::context::REBIRTH_CHECKPOINT_PREFIX,
+    )
+}
+
+/// Send `messages` against a recording mock and hand back the body that reached
+/// the server (the last attempt's body — every attempt is normalized alike).
+async fn sent_body_for(messages: &[Message]) -> serde_json::Value {
+    let server = MockServer::start().await;
+    let bodies = capturing_sse_mock(&server, sse_body("normalized")).await;
+
+    let mut req = request();
+    req.messages = messages.to_vec();
+
+    let client = ChatClient::new(server.uri(), "test-model".to_string());
+    let reply = client.chat(&req).await.expect("request sent");
+    assert!(reply.is_success(), "the mock answers with a terminal frame");
+
+    let bodies = bodies.lock().unwrap();
+    // Normalization happens on every attempt, so the last attempt is the payload
+    // to inspect; attempt counts are pinned by the retry tests above.
+    assert!(
+        !bodies.is_empty(),
+        "the request body must have reached the mock server"
+    );
+    bodies.last().expect("non-empty").clone()
+}
+
+/// The regression itself: `[system, user, system]` — the shape a rebirth
+/// checkpoint leaves behind — must reach the wire as `["system","user","user"]`,
+/// and the demoted message must keep its content byte for byte.
+#[tokio::test]
+async fn test_llm_mid_history_system_message_is_demoted_to_user_on_the_wire() {
+    let checkpoint = checkpoint_content();
+    assert!(
+        checkpoint.starts_with("(SYSTEM: REBIRTH CHECKPOINT"),
+        "the fixture must really carry the checkpoint prefix, got {checkpoint}"
+    );
+    let history = vec![
+        system_msg("pinned system prompt"),
+        user_msg("implement the fix"),
+        Message::System {
+            content: checkpoint.clone(),
+        },
+    ];
+
+    let sent = sent_body_for(&history).await;
+    assert_eq!(
+        wire_roles(&sent),
+        vec!["system", "user", "user"],
+        "only index 0 may keep role `system` on the wire, got {sent}"
+    );
+    let demoted = &sent["messages"][2];
+    assert_eq!(
+        demoted["role"].as_str(),
+        Some("user"),
+        "the checkpoint must be demoted to a user turn, got {demoted}"
+    );
+    assert_eq!(
+        demoted["content"].as_str().unwrap_or_default().as_bytes(),
+        checkpoint.as_bytes(),
+        "the demoted message must be sent with byte-identical content"
+    );
+}
+
+/// Index 0 keeps whatever role it has: with a restored history that opens on a
+/// user turn, the later system message is still demoted but nothing else moves.
+#[tokio::test]
+async fn test_llm_first_position_keeps_its_role_when_it_is_not_system() {
+    let sent = sent_body_for(&[
+        user_msg("a history that opens on a user turn"),
+        system_msg("an instruction that arrived mid-history"),
+    ])
+    .await;
+
+    assert_eq!(
+        wire_roles(&sent),
+        vec!["user", "user"],
+        "index 0 keeps `user` and the later system message is demoted, got {sent}"
+    );
+    assert_eq!(
+        sent["messages"][1]["content"].as_str(),
+        Some("an instruction that arrived mid-history"),
+        "demotion must not touch content"
+    );
+}
+
+/// A pure multi-system history keeps exactly one system message: the first.
+#[tokio::test]
+async fn test_llm_only_the_first_of_consecutive_system_messages_stays_system() {
+    let sent = sent_body_for(&[
+        system_msg("prompt A"),
+        system_msg("prompt B"),
+        system_msg("prompt C"),
+    ])
+    .await;
+
+    assert_eq!(
+        wire_roles(&sent),
+        vec!["system", "user", "user"],
+        "consecutive system messages after index 0 are all demoted, got {sent}"
+    );
+    assert_eq!(sent["messages"][0]["content"].as_str(), Some("prompt A"));
+    assert_eq!(sent["messages"][1]["content"].as_str(), Some("prompt B"));
+    assert_eq!(sent["messages"][2]["content"].as_str(), Some("prompt C"));
+}
+
+/// The demotion happens on the cloned payload only: the caller's own history
+/// keeps its real roles (the rebirth/checkpoint detectors and
+/// `pinned_prefix_end` depend on that) and its content.
+#[tokio::test]
+async fn test_llm_system_demotion_mutates_only_the_cloned_payload_not_the_callers_history() {
+    let checkpoint = checkpoint_content();
+    let server = MockServer::start().await;
+    let bodies = capturing_sse_mock(&server, sse_body("normalized")).await;
+
+    let mut req = request();
+    req.messages = vec![
+        system_msg("pinned system prompt"),
+        user_msg("implement the fix"),
+        Message::System {
+            content: checkpoint.clone(),
+        },
+    ];
+
+    let client = ChatClient::new(server.uri(), "test-model".to_string());
+    let reply = client.chat(&req).await.expect("request sent");
+    assert!(reply.is_success(), "the mock answers with a terminal frame");
+
+    let sent = {
+        let guard = bodies.lock().unwrap();
+        assert!(
+            !guard.is_empty(),
+            "the request body must have reached the mock server"
+        );
+        guard.last().expect("non-empty").clone()
+    };
+    assert_eq!(
+        wire_roles(&sent),
+        vec!["system", "user", "user"],
+        "the wire payload must be normalized, got {sent}"
+    );
+    assert_eq!(
+        local_roles(&req.messages),
+        vec!["system", "user", "system"],
+        "the caller's history must never see the demotion"
+    );
+    assert_eq!(
+        req.messages[2].content(),
+        Some(checkpoint.as_str()),
+        "the in-memory checkpoint content must be untouched"
+    );
+}

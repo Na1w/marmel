@@ -537,7 +537,31 @@ impl ChatClient {
         if req_body.model.is_empty() {
             req_body.model = self.model.clone();
         }
-        for msg in &mut req_body.messages {
+        // Pre-send normalization of the cloned payload (never the caller's history):
+        // strict OpenAI-compatible chat formats accept `role: "system"` only in the
+        // first position and reject anything later with HTTP 400 ("System message
+        // must be at the beginning."). System messages mid-history come from
+        // compaction checkpoints (ContextEngine::perform_rebirth injects the
+        // "(SYSTEM: REBIRTH CHECKPOINT ...)" message) and from session bundles
+        // restored from older builds. Demote them to `user` on the wire, keeping the
+        // content byte-for-byte; the in-memory vector keeps its real roles so the
+        // rebirth/checkpoint detectors (REBIRTH_CHECKPOINT_PREFIX, pinned_prefix_end)
+        // keep matching. Runs before token counting, debug dumps and request logging
+        // so those reflect the real payload.
+        for (index, msg) in req_body.messages.iter_mut().enumerate() {
+            if index > 0 && matches!(msg, crate::types::Message::System { .. }) {
+                // `Message` has no `Default`, so swap the element out before reading it.
+                let demoted = std::mem::replace(
+                    msg,
+                    crate::types::Message::User {
+                        content: String::new(),
+                    },
+                );
+                *msg = crate::types::Message::User {
+                    content: demoted.content().unwrap_or_default().to_string(),
+                };
+                continue;
+            }
             if let crate::types::Message::Assistant {
                 content,
                 tool_calls,
