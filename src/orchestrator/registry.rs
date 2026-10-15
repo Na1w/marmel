@@ -13,14 +13,12 @@ use crate::tool_names::TERMINAL_PREFIX;
 /// Static descriptor for one registered specialist.
 #[derive(Debug, Clone)]
 pub struct SpecialistEntry {
-    /// The role enum.
     pub agent: Agent,
     /// Source module path (informational; e.g. "src/agents/coder.rs").
     pub module: String,
     /// Allowed tool namespaces (used to build the specialist tool schema and
     /// to gate `delegate_task` dispatch).
     pub tool_namespaces: Vec<String>,
-    /// Optional model override for this specialist.
     pub model: Option<String>,
 }
 

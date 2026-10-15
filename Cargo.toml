@@ -60,3 +60,14 @@ landlock = "0.4"
 [dev-dependencies]
 tempfile = "3.17"
 wiremock = "0.6"
+
+# Escalate target-specific unused/dead findings (only visible on some cfg branch)
+# into hard errors for this package on every platform, without RUSTFLAGS leaking
+# into path/registry dependencies. See docs/cross_platform_gating.md §B.
+[lints.rust]
+unused          = "deny"
+dead_code       = "deny"
+unused_imports  = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

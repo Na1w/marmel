@@ -28,9 +28,7 @@ pub struct SubagentDetail {
     pub last_activity_at: Option<std::time::Instant>,
     /// Ordered log lines for this subagent (status / tool activity).
     pub logs: Vec<String>,
-    /// Streaming "thinking" block for this subagent.
     pub thinking: String,
-    /// Streaming final-answer content for this subagent.
     pub content: String,
     /// Whether this subagent is currently running (between Started/Completed).
     pub is_active: bool,
@@ -45,19 +43,23 @@ pub enum Event {
     Message(String),
     /// A steer response chunk or completed message.
     SteerResponse(String),
-    /// A chunk of reasoning / thinking-channel content.
     Thinking(String),
     /// A chunk of visible content from a specific subagent/specialist.
-    SubagentMessage { agent_tag: String, text: String },
+    SubagentMessage {
+        agent_tag: String,
+        text: String,
+    },
     /// A chunk of reasoning/thinking from a specific subagent/specialist.
-    SubagentThinking { agent_tag: String, text: String },
+    SubagentThinking {
+        agent_tag: String,
+        text: String,
+    },
     /// A tool invocation (rendered as `name(arguments)`).
     ToolCall(String),
     /// The textual result of a tool execution.
     ToolResult(String),
     /// A status / phase update (e.g. "calling backend…", "aborting…").
     Status(String),
-    /// A delegation lifecycle event.
     Delegation(DelegationEvent),
     /// The session has finished.
     Done,
@@ -98,15 +100,12 @@ pub trait Renderer: Send {
     fn read_input(&mut self) -> Option<String> {
         None
     }
-    /// Set the shared abort flag.
     fn request_abort(&mut self) {
         self.input_state().aborted = true;
     }
-    /// Whether an abort was requested.
     fn aborted(&self) -> bool {
         self.input_state_shared().aborted
     }
-    /// Clear the shared abort flag.
     fn clear_abort(&mut self) {
         let state = self.input_state();
         state.aborted = false;
@@ -126,14 +125,52 @@ pub trait Renderer: Send {
     fn input_state_shared(&self) -> &InputState;
     fn shutdown(&mut self);
     fn set_subagents(&mut self, _subagents: Vec<SubagentDetail>) {}
-    fn rehydrate_ui(&mut self, _records: &[UiRecord]) {}
-    fn rehydrate_messages(&mut self, messages: &[crate::types::Message]) {
-        let transcript = UiTranscript::from_legacy_messages(messages);
-        self.rehydrate_ui(transcript.records());
-    }
-    fn rehydrate_subagents(&mut self, _subagents: &[SubagentDetail]) {}
     fn set_thinking_budgets(&mut self, _cfg: &crate::config::Config) {}
     fn reset_active_agent(&mut self) {}
+
+    // ---- session-rehydration hooks (flow §4.7, design A §6) ----
+    //
+    // All three have default bodies, so a renderer that keeps no pane model
+    // (`RawRenderer`, the test renderers) compiles and behaves unchanged.
+    //
+    // **Threading:** `Renderer: Send`, and `TuiRenderer` holds `Cell`/`RefCell`
+    // layout state, so `dyn Renderer` is `Send` but NOT `Sync`. `capture_ui`
+    // therefore takes `&self`, never `&dyn Renderer` handed to another thread:
+    // a capture/restore is legal only on the session thread, reached through the
+    // `&mut dyn Renderer` the session loop already owns (flow §4.3, §4.7).
+    // Nothing here requires `Sync`, and nothing may be added that would.
+
+    /// CAPTURE the pane model into the durable `UiSection` (A §6.1). `&self`
+    /// because a capture never mutates the UI.
+    ///
+    /// Pane strings are the **byte authority** for the display (A D4): the
+    /// returned `chat_messages` is the live pane buffer verbatim — embedded
+    /// newlines, prefixes the pane spells, empty and duplicate entries included
+    /// (U1–U3). The default body returns an **empty** section, which is what a
+    /// renderer with no pane model can honestly claim; it is a loadable section
+    /// (`UiSection::structural_violations()` is empty for it).
+    fn capture_ui(&self) -> crate::session::format::UiSection {
+        crate::session::format::UiSection::default()
+    }
+
+    /// REHYDRATE the panes from a stored section (A D4). Assign, never append,
+    /// never re-render, and never regenerate a line from a journal record — the
+    /// crate has no `UiRecord → pane line` formatter and adding one for the
+    /// restore path is prohibited (U1). Scroll/caret are re-clamped by the
+    /// renderer's own existing clamp after assignment, not validated here.
+    ///
+    /// The default body is a **no-op**: a renderer without a pane model has
+    /// nothing to rehydrate.
+    fn restore_panes(&mut self, _section: &crate::session::format::UiSection) {}
+
+    /// One-shot, loud surfacing of what the loader did and what it could not
+    /// restore (A §8.4: the report reaches the UI, the journaled UI record and
+    /// the log; discarding it is prohibited by D6).
+    ///
+    /// The default body is a no-op: the report itself is still logged/returned by
+    /// the caller, so a renderer that cannot draw one loses only the on-screen
+    /// copy.
+    fn announce_restore(&mut self, _report: &crate::session::format::RepairReport) {}
 }
 
 pub fn restore() {

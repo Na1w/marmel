@@ -32,7 +32,7 @@ pub const VALIDATOR_PLANNER_ROLE_PROMPT: &str = include_str!("../../prompts/vali
 
 /// Centralized per-specialist validator role-prompt mapping (static, compile-time
 /// prompts — see REQ-ORCH-002 role discipline). Previously duplicated as a
-/// `match agent { … }` inside the validation loops (duplicates.md §6b).
+/// `match agent { … }` inside each validation loop.
 pub fn role_prompt_for(agent: crate::agents::Agent) -> &'static str {
     match agent {
         crate::agents::Agent::Coder => VALIDATOR_CODER_ROLE_PROMPT,

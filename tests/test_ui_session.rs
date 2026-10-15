@@ -59,8 +59,6 @@ struct ScriptedRenderer {
     poll_cursor: usize,
     /// Shared abort / user-exit flags (trait-default abort surface).
     input_state: marmennill::ui::InputState,
-    rehydrated: Vec<marmennill::types::Message>,
-    rehydrated_ui: Vec<marmennill::ui::UiRecord>,
     subagents: Vec<marmennill::ui::SubagentDetail>,
     events: Vec<Event>,
 }
@@ -73,8 +71,6 @@ impl ScriptedRenderer {
             poll_script: Vec::new(),
             poll_cursor: 0,
             input_state: marmennill::ui::InputState::default(),
-            rehydrated: Vec::new(),
-            rehydrated_ui: Vec::new(),
             subagents: Vec::new(),
             events: Vec::new(),
         }
@@ -87,8 +83,6 @@ impl ScriptedRenderer {
             poll_script,
             poll_cursor: 0,
             input_state: marmennill::ui::InputState::default(),
-            rehydrated: Vec::new(),
-            rehydrated_ui: Vec::new(),
             subagents: Vec::new(),
             events: Vec::new(),
         }
@@ -102,19 +96,8 @@ impl Renderer for ScriptedRenderer {
     fn on_event(&mut self, event: &Event) {
         self.events.push(event.clone());
     }
-    fn rehydrate_ui(&mut self, records: &[marmennill::ui::UiRecord]) {
-        self.rehydrated_ui = records.to_vec();
-    }
-    fn rehydrate_messages(&mut self, messages: &[marmennill::types::Message]) {
-        self.rehydrated = messages.to_vec();
-        let transcript = marmennill::ui::UiTranscript::from_legacy_messages(messages);
-        self.rehydrated_ui = transcript.records().to_vec();
-    }
     fn set_subagents(&mut self, subagents: Vec<marmennill::ui::SubagentDetail>) {
         self.subagents = subagents;
-    }
-    fn rehydrate_subagents(&mut self, subagents: &[marmennill::ui::SubagentDetail]) {
-        self.subagents = subagents.to_vec();
     }
     fn flush(&mut self) -> anyhow::Result<()> {
         Ok(())
@@ -157,7 +140,6 @@ fn config_for_backend(backend: &str) -> Config {
         // Point at a real, loadable system prompt so `load_system_prompt` succeeds.
         system_prompt_path: PathBuf::from("prompts/system.md"),
         ui_mode: "tui".to_string(),
-        enable_rehydration: true,
         ..Config::default()
     }
 }
@@ -174,6 +156,46 @@ fn completion_sse(text: &str) -> String {
             }]
         })
     )
+}
+
+// ── Durable-state witnesses (t-025b) ──────────────────────────────────────────
+//
+// The session bundle at `Plan::session_bundle_path()` is the ONLY durable session
+// state. t-025b deleted the superseded UI journal's persistence owner
+// (`UiTranscript::save`/`load` and the `.ui_transcript.json` file name), so every
+// "still visible after the fact" witness in this file reads the bundle off disk —
+// and pins that the legacy journal is never written again.
+
+/// The committed bundle's member list, read straight off disk (never from the
+/// in-process commit cache), so these witnesses prove the bytes are there.
+fn bundle_members(bundle: &std::path::Path) -> Vec<String> {
+    let text = std::fs::read_to_string(bundle.join(marmennill::session::MANIFEST_FILE))
+        .unwrap_or_else(|err| {
+            panic!(
+                "{} must exist after a committed session ({}): {err}",
+                marmennill::session::MANIFEST_FILE,
+                bundle.display()
+            )
+        });
+    let manifest: serde_json::Value = serde_json::from_str(&text).expect("manifest.json is JSON");
+    manifest["members"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|member| member["rel_path"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// One bundle member read as text.
+fn bundle_member(bundle: &std::path::Path, rel: &str) -> String {
+    std::fs::read_to_string(bundle.join(rel))
+        .unwrap_or_else(|err| panic!("{rel} must exist in {}: {err}", bundle.display()))
+}
+
+/// Path of the superseded UI journal — the file the session SHALL NOT write again.
+fn legacy_ui_journal(plan: &marmennill::manager::phase::Plan) -> std::path::PathBuf {
+    plan.dir().join(".ui_transcript.json")
 }
 
 /// The reproduction test (t-rpr1).
@@ -508,7 +530,6 @@ async fn test_specialist_stream_preemption_and_resumption_on_shared_model() {
     let (first_chunk_sent_tx, first_chunk_sent_rx) = tokio::sync::oneshot::channel();
     let (preempt_done_tx, preempt_done_rx) = tokio::sync::oneshot::channel();
 
-    // Spawn mock streaming server
     tokio::spawn(async move {
         // First connection: initial specialist stream
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -518,7 +539,6 @@ async fn test_specialist_stream_preemption_and_resumption_on_shared_model() {
         let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
         stream.write_all(headers.as_bytes()).await.unwrap();
 
-        // Send chunk 1
         let chunk1_data =
             "data: {\"choices\":[{\"delta\":{\"content\":\"Specialist part 1...\"}}]}\n\n";
         let chunk1 = format!("{:x}\r\n{}\r\n", chunk1_data.len(), chunk1_data);
@@ -527,7 +547,6 @@ async fn test_specialist_stream_preemption_and_resumption_on_shared_model() {
         // Give client time to read and parse chunk 1
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
-        // Notify test that first chunk was sent
         let _ = first_chunk_sent_tx.send(());
 
         // Wait until steer preemption has been registered
@@ -628,333 +647,6 @@ async fn test_specialist_stream_preemption_and_resumption_on_shared_model() {
 }
 
 #[tokio::test]
-async fn test_ui_session_rehydrates_transcript_and_resumes_plan() {
-    let _lock = TEST_MUTEX.lock().await;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let server = MockServer::start().await;
-    let turn_counter = Arc::new(AtomicUsize::new(0));
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with({
-            let tc = turn_counter.clone();
-            move |req: &wiremock::Request| {
-                let n = tc.fetch_add(1, Ordering::SeqCst);
-                let body = String::from_utf8_lossy(&req.body);
-                if n == 0 {
-                    // Turn 1 of session 1: assistant emits a tool call
-                    ResponseTemplate::new(200).set_body_string(tool_call_sse(
-                        "call-glob-1",
-                        "glob",
-                        r#"{"pattern": "Cargo.toml"}"#,
-                    ))
-                } else if n == 1 {
-                    // Turn 1 part 2 of session 1: assistant finishes turn after tool result
-                    ResponseTemplate::new(200)
-                        .set_body_string(completion_sse("Found Cargo.toml, proceeding."))
-                } else {
-                    // Resumed session (session 2):
-                    // Verify that the prompt payload contains the EXECUTING phase notice and pending task t-102
-                    assert!(
-                        body.contains("t-102"),
-                        "resumed session must contain pending task t-102 in context"
-                    );
-                    assert!(
-                        body.contains("EXECUTING"),
-                        "resumed session must contain EXECUTING phase notice"
-                    );
-                    assert!(
-                        body.contains("Do NOT call `create_plan` again"),
-                        "resumed session must prohibit calling create_plan"
-                    );
-                    ResponseTemplate::new(200)
-                        .set_body_string(completion_sse("Resumed turn reply."))
-                }
-            }
-        })
-        .mount(&server)
-        .await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let plan = marmennill::manager::phase::Plan::at(tmp.path());
-    plan.create("# Execution Plan: Test Rehydration\n\n- [x] [t-101] First task\n- [ ] [t-102] Second task\n")
-        .unwrap();
-
-    let cfg = Config {
-        backend_url: format!("{}/v1", server.uri()),
-        system_prompt_path: PathBuf::from("prompts/system.md"),
-        ui_mode: "tui".to_string(),
-        enable_rehydration: true,
-        ..Config::default()
-    };
-
-    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
-        marmennill::llm::ChatClient::from_config(&cfg),
-        plan.clone(),
-        Arc::new(marmennill::harness::HarnessStats::new()),
-    ));
-
-    // Run session 1: user gives initial goal, does 1 turn with tool execution, then aborts
-    let mut renderer1 = ScriptedRenderer::new(vec!["/abort".to_string()]);
-    marmennill::ui::run_session(
-        &cfg,
-        &mut renderer1,
-        Some("Build feature X".to_string()),
-        Some(mgr.clone()),
-    )
-    .await
-    .expect("session 1 succeeds");
-
-    assert!(
-        plan.transcript_path().exists(),
-        "session transcript should be saved to disk"
-    );
-
-    // Run session 2: restarted with no initial argument, user presses Enter to resume
-    let mut renderer2 = ScriptedRenderer::new(vec!["".to_string(), "/abort".to_string()]);
-    marmennill::ui::run_session(&cfg, &mut renderer2, None, Some(mgr))
-        .await
-        .expect("session 2 succeeds");
-
-    // Verify that session 2 rehydrated past transcript records
-    assert!(
-        !renderer2.rehydrated_ui.is_empty(),
-        "renderer2 should have received rehydrated records from session 1"
-    );
-    // Verify that the rehydrated transcript contains the tool call from session 1
-    assert!(
-        renderer2.rehydrated_ui.iter().any(|r| matches!(r, marmennill::ui::UiRecord::ToolResult { display } if display.contains("Cargo.toml"))),
-        "rehydrated records should include tool result from session 1"
-    );
-    assert!(turn_counter.load(Ordering::SeqCst) >= 3);
-}
-
-#[tokio::test]
-async fn test_ui_session_recovers_frozen_and_injects_deliverable() {
-    let _lock = TEST_MUTEX.lock().await;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let server = MockServer::start().await;
-    let req_counter = Arc::new(AtomicUsize::new(0));
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with({
-            let rc = req_counter.clone();
-            move |req: &wiremock::Request| {
-                let n = rc.fetch_add(1, Ordering::SeqCst);
-                let body = String::from_utf8_lossy(&req.body);
-                if n == 0 {
-                    // Specialist worker running to complete the frozen task
-                    ResponseTemplate::new(200).set_body_string(completion_sse(
-                        "Recovered work completed.\n\nMISSION COMPLETE (t-801)",
-                    ))
-                } else {
-                    // Manager turn 1: verify that context received the recovered deliverable!
-                    assert!(
-                        body.contains("t-801"),
-                        "manager turn should contain the recovered task id t-801"
-                    );
-                    assert!(
-                        body.contains("Recovered work completed"),
-                        "manager turn should contain the recovered deliverable text"
-                    );
-                    ResponseTemplate::new(200)
-                        .set_body_string(completion_sse("Synthesis after recovery."))
-                }
-            }
-        })
-        .mount(&server)
-        .await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let plan = marmennill::manager::phase::Plan::at(tmp.path());
-    plan.create("# Execution Plan: Crash Recovery\n\n- [ ] [t-801] Interrupted task\n- [ ] [t-802] Next task\n")
-        .unwrap();
-
-    let cfg = Config {
-        backend_url: format!("{}/v1", server.uri()),
-        system_prompt_path: PathBuf::from("prompts/system.md"),
-        ui_mode: "tui".to_string(),
-        enable_rehydration: true,
-        ..Config::default()
-    };
-
-    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
-        marmennill::llm::ChatClient::from_config(&cfg),
-        plan.clone(),
-        Arc::new(marmennill::harness::HarnessStats::new()),
-    ));
-
-    // Simulate an interrupted task by manually creating a freeze snapshot
-    let frozen_req = marmennill::orchestrator::DelegationRequest {
-        agent_name: marmennill::agents::Agent::Generalist,
-        prompt: "Complete the interrupted task.".to_string(),
-        snippets: vec![],
-        task_id: Some("t-801".to_string()),
-        image_urls: None,
-        audio_urls: None,
-        recursion_granted: false,
-    };
-    let wid = mgr
-        .journal
-        .snapshot(marmennill::agents::Agent::Generalist, &frozen_req)
-        .unwrap();
-    assert!(mgr.journal.is_frozen());
-
-    // Boot run_session — should detect frozen task, recover it, check it off, and inject deliverable
-    let mut renderer = ScriptedRenderer::new(vec!["".to_string(), "/abort".to_string()]);
-    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr.clone()))
-        .await
-        .expect("recovery session succeeds");
-
-    // Frozen state must be cleared
-    assert!(
-        !mgr.journal.is_frozen(),
-        "frozen checkpoint must be cleared after recovery"
-    );
-
-    // Task t-801 must be checked off in plan
-    let plan_text = plan.read().unwrap().unwrap();
-    assert!(
-        plan_text.contains("- [x] [t-801]"),
-        "task t-801 should be checked off in plan after recovery"
-    );
-
-    // Renderer must have received the recovered task ToolResult event
-    assert!(
-        renderer
-            .events
-            .iter()
-            .any(|ev| matches!(ev, Event::ToolResult(r) if r.contains("[Recovered task t-801]"))),
-        "renderer should have received ToolResult for recovered task"
-    );
-
-    // Verify subagent was populated in renderer with recovered deliverable
-    let sa = renderer
-        .subagents
-        .iter()
-        .find(|s| s.task_id.as_deref() == Some("t-801"))
-        .expect("recovered specialist for t-801 should be present in subagents");
-    assert_eq!(sa.name, "generalist-t-801");
-    assert!(
-        !sa.is_active,
-        "recovered subagent should be marked inactive after completion"
-    );
-    assert!(
-        sa.content.contains("MISSION COMPLETE"),
-        "subagent should carry the recovered deliverable content"
-    );
-    assert!(
-        sa.logs.iter().any(|l| l.contains("completed task t-801")),
-        "logs should record completion"
-    );
-
-    let _ = wid;
-}
-
-#[tokio::test]
-async fn test_ui_session_rehydrates_subagents_and_populates_agent_pane() {
-    let _lock = TEST_MUTEX.lock().await;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let server = MockServer::start().await;
-    let turn_counter = Arc::new(AtomicUsize::new(0));
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with({
-            let tc = turn_counter.clone();
-            move |req: &wiremock::Request| {
-                let n = tc.fetch_add(1, Ordering::SeqCst);
-                let _body = String::from_utf8_lossy(&req.body);
-                if n == 0 {
-                    // Turn 1 of session 1: manager delegates task t-901 to coder
-                    ResponseTemplate::new(200).set_body_string(tool_call_sse(
-                        "call-del-901",
-                        "delegate_task",
-                        r#"{"agent_name": "coder", "task_id": "t-901", "prompt": "build feature A"}"#,
-                    ))
-                } else if n == 1 {
-                    // Turn 1 part 2 of session 1: manager finishes turn after delegation result
-                    ResponseTemplate::new(200)
-                        .set_body_string(completion_sse("Finished delegating t-901."))
-                } else {
-                    // Resumed turn
-                    ResponseTemplate::new(200)
-                        .set_body_string(completion_sse("Resumed turn reply."))
-                }
-            }
-        })
-        .mount(&server)
-        .await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let plan = marmennill::manager::phase::Plan::at(tmp.path());
-    plan.create("# Execution Plan\n\n- [ ] [t-901] First task\n- [ ] [t-902] Second task\n")
-        .unwrap();
-
-    let cfg = Config {
-        backend_url: format!("{}/v1", server.uri()),
-        system_prompt_path: PathBuf::from("prompts/system.md"),
-        ui_mode: "tui".to_string(),
-        enable_rehydration: true,
-        ..Config::default()
-    };
-
-    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
-        marmennill::llm::ChatClient::from_config(&cfg),
-        plan.clone(),
-        Arc::new(marmennill::harness::HarnessStats::new()),
-    ));
-
-    // Run session 1: user gives initial goal, manager delegates t-901, finishes turn, then aborts
-    let mut renderer1 = ScriptedRenderer::new(vec!["/abort".to_string()]);
-    marmennill::ui::run_session(
-        &cfg,
-        &mut renderer1,
-        Some("Build feature set".to_string()),
-        Some(mgr.clone()),
-    )
-    .await
-    .expect("session 1 succeeds");
-
-    assert!(plan.transcript_path().exists());
-
-    // Run session 2 (rehydration): restarted with no initial argument, user presses Enter to resume
-    let mut renderer2 = ScriptedRenderer::new(vec!["".to_string(), "/abort".to_string()]);
-    marmennill::ui::run_session(&cfg, &mut renderer2, None, Some(mgr))
-        .await
-        .expect("session 2 succeeds");
-
-    // Verify that session 2 rehydrated subagent list for the Agent pane
-    assert!(
-        !renderer2.subagents.is_empty(),
-        "renderer2 should have rehydrated subagents list for agent pane"
-    );
-    let sa = renderer2
-        .subagents
-        .iter()
-        .find(|s| s.task_id.as_deref() == Some("t-901"))
-        .expect("coder-t-901 should be present in rehydrated subagents");
-    assert_eq!(sa.name, "coder-t-901");
-    assert_eq!(sa.prompt, "build feature A");
-    assert!(!sa.is_active);
-    assert!(
-        sa.logs.iter().any(|l| l.contains("started task t-901")),
-        "logs should record task start"
-    );
-    assert!(
-        sa.logs.iter().any(|l| l.contains("completed task t-901")),
-        "logs should record task completion"
-    );
-}
-
-#[tokio::test]
 async fn test_steering_conversation_history_accumulates_and_passes_to_arbitrator() {
     let _lock = TEST_MUTEX.lock().await;
     use wiremock::matchers::{method, path};
@@ -1001,7 +693,6 @@ async fn test_steering_conversation_history_accumulates_and_passes_to_arbitrator
         Some(Arc::clone(&steering_history)),
     );
 
-    // Wait for first arbitration to finish
     loop {
         if let Some(event) = arb_rx.recv().await
             && matches!(
@@ -1013,7 +704,6 @@ async fn test_steering_conversation_history_accumulates_and_passes_to_arbitrator
         }
     }
 
-    // Verify history now contains turn 1
     {
         let hist = steering_history.read().unwrap();
         assert_eq!(hist.len(), 1);
@@ -1033,7 +723,6 @@ async fn test_steering_conversation_history_accumulates_and_passes_to_arbitrator
         Some(Arc::clone(&steering_history)),
     );
 
-    // Wait for second arbitration to finish
     loop {
         if let Some(event) = arb_rx.recv().await
             && matches!(
@@ -1045,7 +734,6 @@ async fn test_steering_conversation_history_accumulates_and_passes_to_arbitrator
         }
     }
 
-    // Verify history now contains turn 1 AND turn 2
     {
         let hist = steering_history.read().unwrap();
         assert_eq!(hist.len(), 2);
@@ -1053,7 +741,6 @@ async fn test_steering_conversation_history_accumulates_and_passes_to_arbitrator
         assert!(hist[1].1.contains("There are 2 tests remaining."));
     }
 
-    // Verify that the second request payload sent to the mock server actually contained the history!
     let bodies = received_bodies.lock().unwrap();
     assert!(bodies.len() >= 2);
     let second_req = &bodies[1];
@@ -1082,17 +769,17 @@ async fn test_steering_conversation_history_accumulates_worker_reply_to_arbitrat
             if body.contains("Original User Inquiry") {
                 // Evaluation of worker reply
                 ResponseTemplate::new(200).set_body_string(
-                    "data: {\"id\":\"c_eval\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"SynthesizeResponse\\\", \\\"response\\\": \\\"Codern har tagit bort jit_invalidate_all()-anropen och ctest 7/7 passerar.\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+                    "data: {\"id\":\"c_eval\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"SynthesizeResponse\\\", \\\"response\\\": \\\"The coder removed the jit_invalidate_all() calls and ctest passes 7/7.\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
                 )
-            } else if body.contains("Hur gick testet?") {
+            } else if body.contains("How did the test go?") {
                 // Turn 2: user asks follow-up
                 ResponseTemplate::new(200).set_body_string(
-                    "data: {\"id\":\"c2\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"RespondDirectly\\\", \\\"response\\\": \\\"Testet gick bra.\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+                    "data: {\"id\":\"c2\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"RespondDirectly\\\", \\\"response\\\": \\\"The test went fine.\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
                 )
             } else {
-                // Turn 1: user asks "Hur går det för codern?" -> ForwardToWorker
+                // Turn 1: user asks "How is the coder doing?" -> ForwardToWorker
                 ResponseTemplate::new(200).set_body_string(
-                    "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"ForwardToWorker\\\", \\\"subtasks\\\": [{\\\"tool_call_id\\\": \\\"call_1\\\", \\\"action\\\": \\\"ForwardNotice\\\", \\\"agent_name\\\": \\\"coder\\\", \\\"message\\\": \\\"Hur går det för codern?\\\"}]}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+                    "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"ForwardToWorker\\\", \\\"subtasks\\\": [{\\\"tool_call_id\\\": \\\"call_1\\\", \\\"action\\\": \\\"ForwardNotice\\\", \\\"agent_name\\\": \\\"coder\\\", \\\"message\\\": \\\"How is the coder doing?\\\"}]}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
                 )
             }
         })
@@ -1116,19 +803,18 @@ async fn test_steering_conversation_history_accumulates_worker_reply_to_arbitrat
     let steering_history = Arc::new(std::sync::RwLock::new(Vec::<(String, String)>::new()));
     marmennill::orchestrator::set_steering_history(Arc::clone(&steering_history));
 
-    // Turn 1: user asks "Hur går det för codern?"
+    // Turn 1: user asks "How is the coder doing?"
     marmennill::ui::bridge::spawn_steer_arbitration(
         &client,
         stats.clone(),
         "build PPC JIT",
         &[],
-        "Hur går det för codern?".to_string(),
+        "How is the coder doing?".to_string(),
         &arb_tx,
         &mut renderer,
         Some(Arc::clone(&steering_history)),
     );
 
-    // Wait for first arbitration to finish
     loop {
         if let Some(event) = arb_rx.recv().await
             && matches!(
@@ -1144,7 +830,7 @@ async fn test_steering_conversation_history_accumulates_worker_reply_to_arbitrat
     let notice_id = {
         let hist = steering_history.read().unwrap();
         assert_eq!(hist.len(), 1);
-        assert_eq!(hist[0].0, "Hur går det för codern?");
+        assert_eq!(hist[0].0, "How is the coder doing?");
         assert!(hist[0].1.contains("awaiting specialist reply"));
         // Extract notice id from recorded text (e.g. "Forwarded notice notice-1 to coder...")
         let text = &hist[0].1;
@@ -1159,7 +845,7 @@ async fn test_steering_conversation_history_accumulates_worker_reply_to_arbitrat
     // Specialist worker replies via handle_reply_to_arbitrator_async
     let args = serde_json::json!({
         "notice_id": notice_id,
-        "message": "Status: tagit bort de två jit_invalidate_all()-anropen och ctest 7/7 passerar."
+        "message": "Status: removed the two jit_invalidate_all() calls and ctest passes 7/7."
     });
     let reply_res = marmennill::harness::handle_reply_to_arbitrator_async("coder", &args).await;
     assert!(reply_res.is_ok());
@@ -1168,21 +854,23 @@ async fn test_steering_conversation_history_accumulates_worker_reply_to_arbitrat
     {
         let hist = steering_history.read().unwrap();
         assert_eq!(hist.len(), 1);
-        assert_eq!(hist[0].0, "Hur går det för codern?");
-        assert!(hist[0].1.contains(
-            "Codern har tagit bort jit_invalidate_all()-anropen och ctest 7/7 passerar."
-        ));
+        assert_eq!(hist[0].0, "How is the coder doing?");
+        assert!(
+            hist[0]
+                .1
+                .contains("The coder removed the jit_invalidate_all() calls and ctest passes 7/7.")
+        );
         assert!(hist[0].1.contains("[Specialist coder]:"));
         assert!(!hist[0].1.contains("awaiting specialist reply"));
     }
 
-    // Turn 2: user asks "Hur gick testet?"
+    // Turn 2: user asks "How did the test go?"
     marmennill::ui::bridge::spawn_steer_arbitration(
         &client,
         stats.clone(),
         "build PPC JIT",
         &[],
-        "Hur gick testet?".to_string(),
+        "How did the test go?".to_string(),
         &arb_tx,
         &mut renderer,
         Some(Arc::clone(&steering_history)),
@@ -1199,15 +887,14 @@ async fn test_steering_conversation_history_accumulates_worker_reply_to_arbitrat
         }
     }
 
-    // Verify that the prompt sent to the model for turn 2 contained the specialist's reply in steering history!
     let bodies = received_bodies.lock().unwrap();
     let turn2_req = bodies
         .iter()
-        .find(|b| b.contains("Hur gick testet?"))
+        .find(|b| b.contains("How did the test go?"))
         .expect("Turn 2 request must exist");
     assert!(
         turn2_req
-            .contains("Codern har tagit bort jit_invalidate_all()-anropen och ctest 7/7 passerar."),
+            .contains("The coder removed the jit_invalidate_all() calls and ctest passes 7/7."),
         "Turn 2 request must contain the specialist reply from steering history! Request was: {turn2_req}"
     );
 }
@@ -1362,7 +1049,6 @@ async fn test_steering_arbitrator_sleep_re_invokes_after_delay() {
         Some("Tests have now completed without errors.")
     );
 
-    // Verify conversation history recorded the progression
     let hist = steering_history.read().unwrap();
     assert_eq!(hist.len(), 2);
     assert!(hist[0].1.contains("slept for 1s"));
@@ -1373,162 +1059,17 @@ async fn test_steering_arbitrator_sleep_re_invokes_after_delay() {
     );
 }
 
+/// Verify that an interactive session persists what the user saw in the ONE durable
+/// session format: the bundle at `Plan::session_bundle_path()`.
+///
+/// The witness used to be `.ui_transcript.json` read back with `UiTranscript::load`.
+/// t-025b deleted that persistence owner, so the same two records of the visible
+/// turn — the user goal and the assistant reply — are pinned here in the member a
+/// `--resume` reads (`manager.json`), the manifest must list both mandatory members,
+/// and the superseded UI journal must not be written again on the way out.
 #[tokio::test]
-async fn test_ui_session_rehydrates_without_plan_if_transcript_exists() {
+async fn test_ui_session_persists_the_visible_turn_to_the_bundle() {
     let _lock = TEST_MUTEX.lock().await;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_string(completion_sse("Conversational reply.")),
-        )
-        .mount(&server)
-        .await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let plan = marmennill::manager::phase::Plan::at(tmp.path());
-    // NOTE: plan.exists() is FALSE! We do not create an execution plan file.
-    assert!(!plan.exists());
-
-    // Pre-create a transcript file (e.g. from previous conversational exchange)
-    let transcript_path = plan.transcript_path();
-    std::fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
-    let past_msgs = vec![
-        marmennill::types::Message::System {
-            content: "system prompt".to_string(),
-        },
-        marmennill::types::Message::User {
-            content: "What is this codebase?".to_string(),
-        },
-        marmennill::types::Message::Assistant {
-            content: Some("It is Marmel.".to_string()),
-            reasoning_content: None,
-            tool_calls: vec![],
-        },
-    ];
-    let json = serde_json::to_string(&past_msgs).unwrap();
-    std::fs::write(&transcript_path, json).unwrap();
-
-    let cfg = Config {
-        backend_url: format!("{}/v1", server.uri()),
-        system_prompt_path: PathBuf::from("prompts/system.md"),
-        ui_mode: "tui".to_string(),
-        enable_rehydration: true,
-        ..Config::default()
-    };
-
-    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
-        marmennill::llm::ChatClient::from_config(&cfg),
-        plan.clone(),
-        Arc::new(marmennill::harness::HarnessStats::new()),
-    ));
-
-    let mut renderer = ScriptedRenderer::new(vec!["/abort".to_string()]);
-    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr))
-        .await
-        .expect("session succeeds");
-
-    // Even though plan.exists() is false, past transcript should have been rehydrated from transcript_path
-    assert!(
-        !renderer.rehydrated.is_empty(),
-        "transcript should be rehydrated from disk even if plan.exists() is false"
-    );
-    assert_eq!(
-        renderer.rehydrated.get(1).and_then(|m| m.content()),
-        Some("What is this codebase?")
-    );
-    assert_eq!(
-        renderer.rehydrated.get(2).and_then(|m| m.content()),
-        Some("It is Marmel.")
-    );
-}
-
-#[tokio::test]
-async fn test_ui_session_recovered_deliverable_placed_after_rehydrated_transcript() {
-    let _lock = TEST_MUTEX.lock().await;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_string(completion_sse("Synthesis reply.")),
-        )
-        .mount(&server)
-        .await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let plan = marmennill::manager::phase::Plan::at(tmp.path());
-    plan.create("# Execution Plan\n\n- [ ] [t-701] Task 1\n- [ ] [t-702] Task 2\n")
-        .unwrap();
-
-    let transcript_path = plan.transcript_path();
-    let past_msgs = vec![
-        marmennill::types::Message::System {
-            content: "system prompt".to_string(),
-        },
-        marmennill::types::Message::User {
-            content: "Initial user goal".to_string(),
-        },
-    ];
-    let json = serde_json::to_string(&past_msgs).unwrap();
-    std::fs::write(&transcript_path, json).unwrap();
-
-    let cfg = Config {
-        backend_url: format!("{}/v1", server.uri()),
-        system_prompt_path: PathBuf::from("prompts/system.md"),
-        ui_mode: "tui".to_string(),
-        enable_rehydration: true,
-        ..Config::default()
-    };
-
-    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
-        marmennill::llm::ChatClient::from_config(&cfg),
-        plan.clone(),
-        Arc::new(marmennill::harness::HarnessStats::new()),
-    ));
-
-    // Manually snapshot a frozen task to simulate crash recovery
-    let frozen_req = marmennill::orchestrator::DelegationRequest {
-        agent_name: marmennill::agents::Agent::Generalist,
-        prompt: "Run task".to_string(),
-        snippets: vec![],
-        task_id: Some("t-701".to_string()),
-        image_urls: None,
-        audio_urls: None,
-        recursion_granted: false,
-    };
-    mgr.journal
-        .snapshot(marmennill::agents::Agent::Generalist, &frozen_req)
-        .unwrap();
-
-    let mut renderer = ScriptedRenderer::new(vec!["/abort".to_string()]);
-    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr))
-        .await
-        .expect("session succeeds");
-
-    // Verify transcript was rehydrated
-    assert!(!renderer.rehydrated.is_empty());
-    assert_eq!(
-        renderer.rehydrated.get(1).and_then(|m| m.content()),
-        Some("Initial user goal")
-    );
-
-    // Verify ToolResult for recovered deliverable was emitted in events
-    assert!(renderer.events.iter().any(|e| match e {
-        Event::ToolResult(text) => text.contains("Recovered task t-701"),
-        _ => false,
-    }));
-}
-
-#[tokio::test]
-async fn test_ui_session_saves_and_rehydrates_ui_transcript() {
-    let _lock = TEST_MUTEX.lock().await;
-    use marmennill::ui::{UiRecord, UiTranscript};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1547,486 +1088,65 @@ async fn test_ui_session_saves_and_rehydrates_ui_transcript() {
         backend_url: format!("{}/v1", server.uri()),
         system_prompt_path: PathBuf::from("prompts/system.md"),
         ui_mode: "tui".to_string(),
-        enable_rehydration: true,
         ..Config::default()
     };
 
-    // Session 1: Run with initial goal "First goal", then immediately "/abort" after the turn.
-    {
-        let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
-            marmennill::llm::ChatClient::from_config(&cfg),
-            plan.clone(),
-            Arc::new(marmennill::harness::HarnessStats::new()),
-        ));
-        let mut renderer =
-            ScriptedRenderer::new(vec!["First goal".to_string(), "/abort".to_string()]);
-        marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr))
-            .await
-            .expect("session 1 succeeds");
-
-        // Assert that .ui_transcript.json was created on disk
-        let ui_transcript_path = plan.ui_transcript_path();
-        assert!(
-            ui_transcript_path.exists(),
-            "ui_transcript.json must be persisted"
-        );
-
-        let loaded = UiTranscript::load(&ui_transcript_path).expect("must load ui_transcript.json");
-        assert_eq!(loaded.records().len(), 2);
-        assert_eq!(
-            loaded.records()[0],
-            UiRecord::User {
-                text: "First goal".to_string()
-            }
-        );
-        assert_eq!(
-            loaded.records()[1],
-            UiRecord::Assistant {
-                content: Some("First assistant reply.".to_string()),
-                thinking: None,
-            }
-        );
-    }
-
-    // Session 2: Resume/rehydrate session from disk on the same directory
-    {
-        let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
-            marmennill::llm::ChatClient::from_config(&cfg),
-            plan.clone(),
-            Arc::new(marmennill::harness::HarnessStats::new()),
-        ));
-        let mut renderer = ScriptedRenderer::new(vec!["/abort".to_string()]);
-        marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr))
-            .await
-            .expect("session 2 succeeds");
-
-        // Verified that rehydrate_ui was called directly with the saved records!
-        assert_eq!(renderer.rehydrated_ui.len(), 2);
-        assert_eq!(
-            renderer.rehydrated_ui[0],
-            UiRecord::User {
-                text: "First goal".to_string()
-            }
-        );
-        assert_eq!(
-            renderer.rehydrated_ui[1],
-            UiRecord::Assistant {
-                content: Some("First assistant reply.".to_string()),
-                thinking: None,
-            }
-        );
-        // And legacy rehydration was NOT called (rehydrated remains empty)
-        assert!(
-            renderer.rehydrated.is_empty(),
-            "clean ui_transcript rehydration bypasses legacy conversion"
-        );
-    }
-}
-
-#[tokio::test]
-async fn test_ui_session_migrates_legacy_transcript_to_ui_transcript() {
-    let _lock = TEST_MUTEX.lock().await;
-    use marmennill::ui::{UiRecord, UiTranscript};
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(completion_sse("Another reply.")))
-        .mount(&server)
-        .await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let plan = marmennill::manager::phase::Plan::at(tmp.path());
-    let cfg = Config {
-        backend_url: format!("{}/v1", server.uri()),
-        system_prompt_path: PathBuf::from("prompts/system.md"),
-        ui_mode: "tui".to_string(),
-        enable_rehydration: true,
-        ..Config::default()
-    };
-
-    // Pre-create ONLY legacy .session_transcript.json (no .ui_transcript.json)
-    let transcript_path = plan.transcript_path();
-    std::fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
-    let past_msgs = vec![
-        marmennill::types::Message::System {
-            content: "system prompt".to_string(),
-        },
-        marmennill::types::Message::User {
-            content: "Legacy user message".to_string(),
-        },
-        marmennill::types::Message::Assistant {
-            content: Some("Legacy assistant reply".to_string()),
-            reasoning_content: Some("Legacy thinking".to_string()),
-            tool_calls: vec![],
-        },
-    ];
-    let json = serde_json::to_string(&past_msgs).unwrap();
-    std::fs::write(&transcript_path, json).unwrap();
-    assert!(!plan.ui_transcript_path().exists());
-
+    // Run one turn with the goal "First goal", then end the session with "/abort".
     let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
         marmennill::llm::ChatClient::from_config(&cfg),
         plan.clone(),
         Arc::new(marmennill::harness::HarnessStats::new()),
     ));
-    let mut renderer = ScriptedRenderer::new(vec!["/abort".to_string()]);
+    let mut renderer = ScriptedRenderer::new(vec!["First goal".to_string(), "/abort".to_string()]);
     marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr))
         .await
         .expect("session succeeds");
 
-    // Check that .ui_transcript.json was migrated and saved
+    let bundle = plan.session_bundle_path();
+    let members = bundle_members(&bundle);
     assert!(
-        plan.ui_transcript_path().exists(),
-        "must migrate and create ui_transcript.json"
+        members.contains(&marmennill::session::MANAGER_FILE.to_string()),
+        "the aborted session must commit a bundle carrying the member a --resume \
+         reads; members: {members:?}"
     );
-    let migrated =
-        UiTranscript::load(plan.ui_transcript_path()).expect("load migrated ui_transcript");
-    assert_eq!(migrated.records().len(), 2);
-    assert_eq!(
-        migrated.records()[0],
-        UiRecord::User {
-            text: "Legacy user message".to_string()
-        }
-    );
-    assert_eq!(
-        migrated.records()[1],
-        UiRecord::Assistant {
-            content: Some("Legacy assistant reply".to_string()),
-            thinking: Some("Legacy thinking".to_string()),
-        }
+    assert!(
+        members.contains(&marmennill::session::UI_FILE.to_string()),
+        "the aborted session must commit a bundle carrying the ui member; \
+         members: {members:?}"
     );
 
-    // Check that renderer was rehydrated with the migrated records
-    assert_eq!(renderer.rehydrated_ui.len(), 2);
-    assert_eq!(
-        renderer.rehydrated_ui[0],
-        UiRecord::User {
-            text: "Legacy user message".to_string()
-        }
+    let durable = bundle_member(&bundle, marmennill::session::MANAGER_FILE);
+    assert!(
+        durable.contains("First goal"),
+        "the user goal of the visible turn must be in the durable bundle member; \
+         got: {durable}"
+    );
+    assert!(
+        durable.contains("First assistant reply."),
+        "the assistant reply of the visible turn must be in the durable bundle member; \
+         got: {durable}"
+    );
+
+    // The superseded journal stays superseded: nothing in the session loop may
+    // re-create it.
+    assert!(
+        !legacy_ui_journal(&plan).exists(),
+        "the session must not write the superseded `.ui_transcript.json` again"
     );
 }
 
+/// Verify that every session starts from a clean slate and still leaves durable
+/// state:
+/// 1. Startup loads no prior on-disk state — the scripted line becomes the goal, and
+///    that goal is what the committed bundle carries.
+/// 2. A stale `.ui_transcript.json` left on disk by an older release is NOT carried
+///    into the session's durable state.
+/// 3. Nothing touches that stale file any more: it is not rewritten, because its
+///    persistence owner (`UiTranscript::save`/`load` and the file-name constant) was
+///    deleted by t-025b — the bundle is the sole persistence owner.
 #[tokio::test]
-async fn test_ui_session_rehydrates_steering_history_from_ui_transcript() {
+async fn test_ui_session_starts_fresh_and_persists_a_bundle_not_the_legacy_journal() {
     let _lock = TEST_MUTEX.lock().await;
-    use marmennill::ui::{UiRecord, UiTranscript};
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_string(completion_sse("Assistant ready.")),
-        )
-        .mount(&server)
-        .await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let plan = marmennill::manager::phase::Plan::at(tmp.path());
-    let cfg = Config {
-        backend_url: format!("{}/v1", server.uri()),
-        system_prompt_path: PathBuf::from("prompts/system.md"),
-        ui_mode: "tui".to_string(),
-        enable_rehydration: true,
-        ..Config::default()
-    };
-
-    // Pre-populate UI transcript with user steering and arbitrator response
-    let mut initial_transcript = UiTranscript::new();
-    initial_transcript.append(UiRecord::User {
-        text: "Hur går det för codern?".to_string(),
-    });
-    initial_transcript.append(UiRecord::SteerResponse {
-        text: "\n[Arbitrator]: Codern har tagit bort jit_invalidate_all()-anropen och ctest 7/7 passerar.\n"
-            .to_string(),
-    });
-    initial_transcript.save(plan.ui_transcript_path()).unwrap();
-
-    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
-        marmennill::llm::ChatClient::from_config(&cfg),
-        plan.clone(),
-        Arc::new(marmennill::harness::HarnessStats::new()),
-    ));
-    let mut renderer = ScriptedRenderer::new(vec!["/abort".to_string()]);
-    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr))
-        .await
-        .expect("session rehydrates and succeeds");
-
-    // Verify steering history in orchestrator bus was restored from the transcript
-    let restored_hist = marmennill::orchestrator::get_steering_history()
-        .expect("steering history must be registered in orchestrator bus");
-    let hist = restored_hist.read().unwrap();
-    assert_eq!(hist.len(), 1);
-    assert_eq!(hist[0].0, "Hur går det för codern?");
-    assert_eq!(
-        hist[0].1,
-        "Codern har tagit bort jit_invalidate_all()-anropen och ctest 7/7 passerar."
-    );
-}
-
-/// Verify that during Deep-Freeze recovery of an interrupted task, user inquiries
-/// submitted via poll_input are arbitrated live by the Steer Arbitrator and streamed
-/// as SteerResponse events to the UI.
-#[tokio::test]
-async fn test_ui_session_recovery_arbitrates_user_input_and_streams_steer_response() {
-    let _lock = TEST_MUTEX.lock().await;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(|req: &wiremock::Request| {
-            let body_str = String::from_utf8_lossy(&req.body);
-            if body_str.contains("Steer Arbitrator") || body_str.contains("Arbitrate the user") {
-                let body = completion_sse(
-                    r#"{"decision": "RespondDirectly", "response": "Återställning pågår för t-001."}"#,
-                );
-                ResponseTemplate::new(200).set_body_string(body)
-            } else {
-                let body = completion_sse("Mock specialist recovery response.\n\nMISSION COMPLETE (t-001)");
-                ResponseTemplate::new(200).set_body_string(body)
-            }
-        })
-        .mount(&server)
-        .await;
-
-    let cfg = config_for_backend(&server.uri());
-    let tmp = tempfile::tempdir().unwrap();
-    let plan = marmennill::manager::phase::Plan::at(tmp.path());
-    plan.create("# Plan\n- [ ] [t-001] frozen task\n")
-        .expect("plan created");
-
-    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
-        marmennill::llm::ChatClient::from_config(&cfg),
-        plan.clone(),
-        Arc::new(marmennill::harness::HarnessStats::new()),
-    ));
-
-    // Freeze a delegation in the journal
-    let sub_req = marmennill::agents::DelegationRequest {
-        agent_name: marmennill::agents::Agent::Generalist,
-        prompt: "Perform recovery work".to_string(),
-        snippets: vec![],
-        task_id: Some("t-001".to_string()),
-        image_urls: None,
-        audio_urls: None,
-        recursion_granted: false,
-    };
-    mgr.journal
-        .snapshot(marmennill::agents::Agent::Generalist, &sub_req)
-        .expect("snapshot frozen");
-    assert!(mgr.journal.is_frozen());
-
-    // Scripted input: midflight poll_input during recovery asks a status question,
-    // then /abort at the resume prompt.
-    let mut renderer = ScriptedRenderer::with_poll(
-        vec!["/abort".to_string()],
-        vec!["Hur går det med återställningen?".to_string()],
-    );
-
-    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr.clone()))
-        .await
-        .expect("session recovers and terminates on abort");
-
-    // The journal should be cleared after recovery
-    assert!(!mgr.journal.is_frozen());
-
-    // Verify that SteerResponse was emitted to the renderer
-    let had_steer_response = renderer.events.iter().any(|ev| match ev {
-        marmennill::ui::Event::SteerResponse(text) => text.contains("Återställning pågår"),
-        _ => false,
-    });
-    assert!(
-        had_steer_response,
-        "Steering arbitrator response must be streamed to renderer during recovery"
-    );
-}
-
-/// Verify that when multiple tasks are frozen in .session_frozen.json,
-/// recover_frozen loops through and recovers all of them sequentially.
-#[tokio::test]
-async fn test_ui_session_recovers_multiple_frozen_tasks_sequentially() {
-    let _lock = TEST_MUTEX.lock().await;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(|_req: &wiremock::Request| {
-            let body = completion_sse("Mock task completed.\n\nMISSION COMPLETE");
-            ResponseTemplate::new(200).set_body_string(body)
-        })
-        .mount(&server)
-        .await;
-
-    let cfg = config_for_backend(&server.uri());
-    let tmp = tempfile::tempdir().unwrap();
-    let plan = marmennill::manager::phase::Plan::at(tmp.path());
-    plan.create("# Plan\n- [ ] [t-001] first\n- [ ] [t-002] second\n")
-        .expect("plan created");
-
-    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
-        marmennill::llm::ChatClient::from_config(&cfg),
-        plan.clone(),
-        Arc::new(marmennill::harness::HarnessStats::new()),
-    ));
-
-    // Freeze two tasks
-    let req1 = marmennill::agents::DelegationRequest {
-        agent_name: marmennill::agents::Agent::Generalist,
-        prompt: "Task 1".to_string(),
-        snippets: vec![],
-        task_id: Some("t-001".to_string()),
-        image_urls: None,
-        audio_urls: None,
-        recursion_granted: false,
-    };
-    let req2 = marmennill::agents::DelegationRequest {
-        agent_name: marmennill::agents::Agent::Coder,
-        prompt: "Task 2".to_string(),
-        snippets: vec![],
-        task_id: Some("t-002".to_string()),
-        image_urls: None,
-        audio_urls: None,
-        recursion_granted: false,
-    };
-    mgr.journal
-        .snapshot(marmennill::agents::Agent::Generalist, &req1)
-        .unwrap();
-    mgr.journal
-        .snapshot(marmennill::agents::Agent::Coder, &req2)
-        .unwrap();
-    assert_eq!(mgr.journal.frozen_all().unwrap().len(), 2);
-
-    let mut renderer = ScriptedRenderer::new(vec!["/abort".to_string()]);
-
-    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr.clone()))
-        .await
-        .expect("session recovers all tasks");
-
-    // All frozen checkpoints must be released
-    assert!(!mgr.journal.is_frozen());
-    assert_eq!(mgr.journal.frozen_all().unwrap().len(), 0);
-}
-
-/// Verify that when a user enters a steering instruction at the resume prompt
-/// and the arbitrator decides `AbortImmediately`, Marmel does NOT terminate/exit,
-/// but cancels previous plan tasks, clears the old plan file, and stays alive to execute
-/// the subsequent turn with the redirected user instruction.
-#[tokio::test]
-async fn test_ui_session_resume_prompt_steer_abort_immediately_continues_session() {
-    let _lock = TEST_MUTEX.lock().await;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let assistant_turns = Arc::new(AtomicUsize::new(0));
-    let arbitrator_calls = Arc::new(AtomicUsize::new(0));
-
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with({
-            let assistant_turns = assistant_turns.clone();
-            let arbitrator_calls = arbitrator_calls.clone();
-            move |req: &wiremock::Request| {
-                let body_str = String::from_utf8_lossy(&req.body);
-                if body_str.contains("Steer Arbitrator") || body_str.contains("Arbitrate the user") {
-                    arbitrator_calls.fetch_add(1, Ordering::SeqCst);
-                    let body = completion_sse(
-                        r#"{"decision": "AbortImmediately", "response": "Aborting old plan and redirecting to maciotwo trace."}"#,
-                    );
-                    ResponseTemplate::new(200).set_body_string(body)
-                } else {
-                    let n = assistant_turns.fetch_add(1, Ordering::SeqCst);
-                    let body = if n == 0 {
-                        // Manager receives the redirected steer instruction in context
-                        assert!(
-                            body_str.contains("Trace control flow at maciotwo"),
-                            "Manager request must contain the redirected user instruction"
-                        );
-                        completion_sse("Started planning around maciotwo trace.\n\nMISSION COMPLETE")
-                    } else {
-                        completion_sse("Finished subsequent turn.")
-                    };
-                    ResponseTemplate::new(200).set_body_string(body)
-                }
-            }
-        })
-        .mount(&server)
-        .await;
-
-    let cfg = config_for_backend(&server.uri());
-    let tmp = tempfile::tempdir().unwrap();
-    let plan = marmennill::manager::phase::Plan::at(tmp.path());
-    plan.create("# Plan\n- [ ] [t-001] old cuda task\n")
-        .expect("plan created");
-
-    // Create a previous UI transcript so has_rehydrated is true
-    let mut ui_transcript = marmennill::ui::UiTranscript::new();
-    ui_transcript.append(marmennill::ui::UiRecord::User {
-        text: "investigate cuda".to_string(),
-    });
-    ui_transcript
-        .save(plan.ui_transcript_path())
-        .expect("ui transcript saved");
-
-    let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
-        marmennill::llm::ChatClient::from_config(&cfg),
-        plan.clone(),
-        Arc::new(marmennill::harness::HarnessStats::new()),
-    ));
-
-    // User provides redirecting instruction at resume prompt, then /abort after the turn completes
-    let mut renderer = ScriptedRenderer::new(vec![
-        "Trace control flow at maciotwo.cpp".to_string(),
-        "/abort".to_string(),
-    ]);
-
-    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr.clone()))
-        .await
-        .expect("session must not exit on AbortImmediately, but continue executing");
-
-    assert_eq!(
-        arbitrator_calls.load(Ordering::SeqCst),
-        1,
-        "Steering arbitrator must be called for the user instruction"
-    );
-    assert!(
-        assistant_turns.load(Ordering::SeqCst) >= 1,
-        "Orchestrator must execute at least one turn for the redirected instruction"
-    );
-
-    // Old plan file should have been removed to allow replanning
-    assert!(
-        !plan.exists(),
-        "Old execution_plan.md must be removed on AbortImmediately to allow new plan creation"
-    );
-
-    let had_steer_response = renderer.events.iter().any(|ev| match ev {
-        marmennill::ui::Event::SteerResponse(text) => text.contains("Aborting old plan"),
-        _ => false,
-    });
-    assert!(
-        had_steer_response,
-        "Steering arbitrator response must be streamed to renderer"
-    );
-}
-
-/// Verify that when `enable_rehydration: false` (the default):
-/// 1. Past transcripts on disk are NOT loaded or rehydrated into the renderer.
-/// 2. Frozen journal checkpoints are NOT recovered on startup.
-/// 3. Startup prompts for a fresh user goal instead of resuming pending plans.
-/// 4. Saving transcripts and progress still occurs during the session.
-#[tokio::test]
-async fn test_ui_session_disabled_rehydration_starts_fresh_and_skips_recovery() {
-    let _lock = TEST_MUTEX.lock().await;
-    use marmennill::ui::{UiRecord, UiTranscript};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2044,24 +1164,21 @@ async fn test_ui_session_disabled_rehydration_starts_fresh_and_skips_recovery() 
     plan.create("# Plan\n- [ ] [t-001] old pending task\n")
         .expect("plan created");
 
-    // Pre-create old UI transcript
-    let mut old_ui_transcript = UiTranscript::new();
-    old_ui_transcript.append(UiRecord::User {
-        text: "Old user goal from yesterday".to_string(),
-    });
-    old_ui_transcript
-        .save(plan.ui_transcript_path())
-        .expect("old transcript saved");
+    // Pre-create a stale UI transcript left behind by an older release. Nothing in
+    // this crate can write that file any more (t-025b deleted its writer), so the
+    // fixture spells the stale bytes by hand — that IS the leftover case the session
+    // has to live with.
+    let stale_journal = legacy_ui_journal(&plan);
+    let stale_bytes =
+        br#"{"records":[{"type":"User","text":"Old user goal from yesterday"}]}"#.to_vec();
+    std::fs::write(&stale_journal, &stale_bytes).expect("stale legacy journal written");
 
-    // Config with enable_rehydration: false (default)
     let cfg = Config {
         backend_url: format!("{}/v1", server.uri()),
         system_prompt_path: PathBuf::from("prompts/system.md"),
         ui_mode: "tui".to_string(),
-        enable_rehydration: false,
         ..Config::default()
     };
-    assert!(!cfg.enable_rehydration);
 
     let mgr = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
         marmennill::llm::ChatClient::from_config(&cfg),
@@ -2069,53 +1186,1772 @@ async fn test_ui_session_disabled_rehydration_starts_fresh_and_skips_recovery() 
         Arc::new(marmennill::harness::HarnessStats::new()),
     ));
 
-    // Snapshot a frozen task
-    let frozen_req = marmennill::orchestrator::DelegationRequest {
-        agent_name: marmennill::agents::Agent::Generalist,
-        prompt: "Frozen task".to_string(),
-        snippets: vec![],
-        task_id: Some("t-999".to_string()),
-        image_urls: None,
-        audio_urls: None,
-        recursion_granted: false,
-    };
-    mgr.journal
-        .snapshot(marmennill::agents::Agent::Generalist, &frozen_req)
-        .unwrap();
-    assert!(mgr.journal.is_frozen());
-
-    // User provides a brand new goal; should not resume old pending plan
+    // The user provides a brand new goal; it becomes the goal of this session.
     let mut renderer =
         ScriptedRenderer::new(vec!["Brand new goal".to_string(), "/abort".to_string()]);
 
-    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr.clone()))
+    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr))
         .await
-        .expect("session runs cleanly without rehydration");
+        .expect("session runs cleanly");
 
-    // 1. Renderer did not rehydrate past transcript
+    // 1. A new session leaves durable state of its OWN: the bundle it commits on the
+    //    way out carries this run's goal in the member a `--resume` reads.
+    let bundle = plan.session_bundle_path();
+    let members = bundle_members(&bundle);
     assert!(
-        renderer.rehydrated_ui.is_empty(),
-        "UI records must not be rehydrated when enable_rehydration is false"
+        members.contains(&marmennill::session::MANAGER_FILE.to_string()),
+        "the aborted session must commit a bundle carrying the member a --resume \
+         reads; members: {members:?}"
+    );
+    let durable = bundle_member(&bundle, marmennill::session::MANAGER_FILE);
+    assert!(
+        durable.contains("Brand new goal"),
+        "a new session must persist its own goal to the bundle; got: {durable}"
+    );
+
+    // 2. The stale journal from the older release is not carried over into the
+    //    session's durable state.
+    assert!(
+        !durable.contains("Old user goal from yesterday"),
+        "a new session must start from an empty journal, not from the stale \
+         `.ui_transcript.json` on disk; got: {durable}"
+    );
+
+    // 3. And nothing rewrites that stale file: its owner is gone, so the bytes the
+    //    fixture left behind are exactly the bytes still on disk.
+    let still_on_disk = std::fs::read(&stale_journal).expect("stale legacy journal still there");
+    assert_eq!(
+        still_on_disk, stale_bytes,
+        "the superseded `.ui_transcript.json` is swept or named, never written again"
+    );
+}
+
+// t-031b — DEFECT CLASS H2 (live executor): leaked in-flight round work on a
+// hard error path.
+//
+// The live delegation round lives in `src/ui/session.rs`: every parallel
+// tool batch (`all_parallel && tool_calls.len() > 1`) is fanned out into
+// `tokio::task::spawn_blocking` handles and then joined one by one. Every
+// *abort* exit of that join loop calls `crate::orchestrator::cancel_all()`
+// first, which (i) cancels the global cancellation token that in-flight PTY
+// command loops poll (`src/harness/pty.rs` `teardown()` -> `kill_and_reap()` ->
+// `kill_process_group`) and (ii) cancels every registered worker token via
+// `cancel_all_active_workers()` (`src/orchestrator/workers.rs`).
+//
+// A *hard error* raised inside the round (here: a renderer write failure, the
+// `renderer.flush()?` in `src/ui/session.rs`) used to propagate out
+// of `run_session` with `?` and simply **detach** the remaining handles — no
+// `cancel_all()`, so the delegated/parallel work kept running after the session
+// aborted.
+//
+// The test is fully hermetic: no `openpty`, no real specialist. The in-flight
+// work is modelled the same way `OrchestratorManager::delegate` models it
+// (`src/orchestrator/mod.rs`, `delegate`): a worker registered in the live registry
+// with an explicit cancellation token, kept active until the round aborts.
+
+/// SSE body with TWO read-only tool calls -> forces the parallel fan-out branch.
+fn two_parallel_tool_calls_sse() -> String {
+    format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        serde_json::json!({
+            "id": "chatcmpl-h2",
+            "choices": [{
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_a",
+                            "type": "function",
+                            "function": { "name": "read_file", "arguments": "{\"path\": \"Cargo.toml\"}" }
+                        },
+                        {
+                            "index": 1,
+                            "id": "call_b",
+                            "type": "function",
+                            "function": { "name": "read_file", "arguments": "{\"path\": \"AGENTS.md\"}" }
+                        }
+                    ]
+                },
+                "finish_reason": null
+            }]
+        })
+    )
+}
+
+/// Scripted renderer that raises a hard write error at the exact instant the
+/// parallel round has been fanned out but not yet joined.
+struct RoundHardErrorRenderer {
+    read_script: Vec<String>,
+    read_cursor: usize,
+    input_state: marmennill::ui::InputState,
+    tool_call_events: usize,
+    fired: bool,
+    /// `is_globally_cancelled()` observed at the instant the hard error was raised.
+    cancelled_when_raised: Option<bool>,
+    /// Stands in for the round's in-flight delegated work: a live registry entry
+    /// plus the cancellation token the worker itself would hold.
+    inflight: Option<(
+        marmennill::orchestrator::ActiveWorkerGuard,
+        tokio_util::sync::CancellationToken,
+    )>,
+}
+
+impl Renderer for RoundHardErrorRenderer {
+    fn init(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn on_event(&mut self, event: &Event) {
+        if matches!(event, Event::ToolCall(_)) {
+            self.tool_call_events += 1;
+        }
+    }
+    fn set_subagents(&mut self, _subagents: Vec<marmennill::ui::SubagentDetail>) {}
+    fn flush(&mut self) -> anyhow::Result<()> {
+        // The fan-out loop emits one `ToolCall` event per parallel call and then
+        // flushes once every handle has been spawned (`src/ui/session.rs`).
+        if self.tool_call_events >= 2 && !self.fired {
+            self.fired = true;
+            self.cancelled_when_raised = Some(marmennill::orchestrator::is_globally_cancelled());
+            let token = marmennill::orchestrator::global_cancellation_token().child_token();
+            let guard = marmennill::orchestrator::register_active_worker_with_token(
+                Some("t-h2leak".to_string()),
+                "coder".to_string(),
+                "in-flight round work".to_string(),
+                Some(token.clone()),
+            );
+            self.inflight = Some((guard, token));
+            return Err(anyhow::anyhow!("simulated renderer write failure (EPIPE)"));
+        }
+        Ok(())
+    }
+    fn read_input(&mut self) -> Option<String> {
+        let line = self.read_script.get(self.read_cursor).cloned();
+        self.read_cursor += 1;
+        line
+    }
+    fn input_state(&mut self) -> &mut marmennill::ui::InputState {
+        &mut self.input_state
+    }
+    fn input_state_shared(&self) -> &marmennill::ui::InputState {
+        &self.input_state
+    }
+    fn shutdown(&mut self) {}
+}
+
+#[tokio::test]
+async fn test_ui_session_hard_error_mid_round_cancels_inflight_work() {
+    let _lock = TEST_MUTEX.lock().await;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(two_parallel_tool_calls_sse()))
+        .mount(&server)
+        .await;
+
+    let cfg = config_for_backend(&server.uri());
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
+    let manager = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::new(server.uri(), "marmel-manager"),
+        plan,
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    let mut renderer = RoundHardErrorRenderer {
+        read_script: vec!["goal: fan out two read calls".to_string()],
+        read_cursor: 0,
+        input_state: marmennill::ui::InputState::default(),
+        tool_call_events: 0,
+        fired: false,
+        cancelled_when_raised: None,
+        inflight: None,
+    };
+
+    let result = marmennill::ui::run_session(&cfg, &mut renderer, None, Some(manager)).await;
+
+    // The hard error must still surface (we are not swallowing it).
+    assert!(
+        result.is_err(),
+        "a renderer write failure inside the round must propagate as a hard error"
+    );
+
+    let (_, token) = renderer
+        .inflight
+        .as_ref()
+        .expect("the round must have been fanned out before the hard error");
+
+    assert_eq!(
+        renderer.cancelled_when_raised,
+        Some(false),
+        "precondition: nothing was cancelled at the instant the round hit the hard error"
+    );
+
+    // H2: the round's in-flight work must be cancelled, not detached.
+    assert!(
+        token.is_cancelled(),
+        "H2 leak: the hard error returned out of run_session while the round still \
+         had in-flight work registered in the worker registry; that work must be \
+         cancelled (cancel_all -> cancel_all_active_workers), otherwise delegated \
+         specialists keep writing files/running commands after the session aborted"
     );
     assert!(
-        renderer.rehydrated.is_empty(),
-        "Legacy messages must not be rehydrated when enable_rehydration is false"
+        marmennill::orchestrator::is_globally_cancelled(),
+        "H2 leak: the global cancellation token must be cancelled on the hard-error \
+         path so in-flight PTY command loops tear down their process groups \
+         (src/harness/pty.rs polls is_current_or_global_cancelled -> kill_process_group)"
+    );
+}
+
+// H5 — execution bounds (recon H5: "no failure budget, no wall-clock bound")
+//
+// The live session loop used to be bounded by nothing but a turn counter
+// (`MAX_TURNS`): a turn that hung, or a task that failed the same way forever,
+// kept the session alive and kept in-flight specialist work running. These two
+// tests drive the *real* loop (no openpty, wiremock backend only) with small
+// injected bounds to prove the wall-clock bound and the repeated-failure budget
+// actually fire.
+
+/// Renderer standing in for a session that has in-flight delegated work.
+///
+/// * `init()` registers a live worker plus the cancellation token that worker
+///   would poll — the same shape `src/orchestrator/workers.rs` gives a real
+///   delegated specialist.
+/// * `flush()` records the cancellation state at the first flush after the
+///   bound has been rendered, i.e. the moment the loop tears the turn down.
+struct BoundProbeRenderer {
+    read_script: Vec<String>,
+    read_cursor: usize,
+    input_state: marmennill::ui::InputState,
+    events: Vec<Event>,
+    inflight: Option<(
+        marmennill::orchestrator::ActiveWorkerGuard,
+        tokio_util::sync::CancellationToken,
+    )>,
+    /// `(globally_cancelled, worker_token_cancelled)` at the bound flush.
+    observed: Option<(bool, bool)>,
+}
+
+impl BoundProbeRenderer {
+    fn new(read_script: Vec<String>) -> Self {
+        Self {
+            read_script,
+            read_cursor: 0,
+            input_state: marmennill::ui::InputState::default(),
+            events: Vec::new(),
+            inflight: None,
+            observed: None,
+        }
+    }
+}
+
+impl Renderer for BoundProbeRenderer {
+    fn init(&mut self) -> anyhow::Result<()> {
+        let token = marmennill::orchestrator::global_cancellation_token().child_token();
+        let guard = marmennill::orchestrator::register_active_worker_with_token(
+            Some("t-h5bound".to_string()),
+            "coder".to_string(),
+            "in-flight specialist work".to_string(),
+            Some(token.clone()),
+        );
+        self.inflight = Some((guard, token));
+        Ok(())
+    }
+    fn on_event(&mut self, event: &Event) {
+        self.events.push(event.clone());
+    }
+    fn set_subagents(&mut self, _subagents: Vec<marmennill::ui::SubagentDetail>) {}
+    fn flush(&mut self) -> anyhow::Result<()> {
+        let bound_reported = self.events.iter().any(
+            |e| matches!(e, Event::Message(text) if text.contains("in-flight work cancelled")),
+        );
+        if bound_reported && self.observed.is_none() {
+            let worker_cancelled = self
+                .inflight
+                .as_ref()
+                .map(|(_, token)| token.is_cancelled())
+                .unwrap_or(false);
+            self.observed = Some((
+                marmennill::orchestrator::is_globally_cancelled(),
+                worker_cancelled,
+            ));
+        }
+        Ok(())
+    }
+    fn read_input(&mut self) -> Option<String> {
+        let line = self.read_script.get(self.read_cursor).cloned();
+        self.read_cursor += 1;
+        line
+    }
+    fn input_state(&mut self) -> &mut marmennill::ui::InputState {
+        &mut self.input_state
+    }
+    fn input_state_shared(&self) -> &marmennill::ui::InputState {
+        &self.input_state
+    }
+    fn request_user_exit(&mut self) {
+        self.input_state.user_exit = true;
+        self.input_state.aborted = true;
+    }
+    fn shutdown(&mut self) {}
+}
+
+/// Recon H5 / REQ-LOOP-002: a turn that blows its wall-clock bound is terminated
+/// with a user-visible reason **and** its in-flight work is cancelled.
+#[tokio::test]
+async fn test_ui_session_wall_clock_bound_terminates_runaway_turn() {
+    let _lock = TEST_MUTEX.lock().await;
+    use std::time::{Duration, Instant};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    // A backend that answers, but only after the injected hard cap has expired.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(completion_sse("still thinking, and thinking, and ..."))
+                .set_delay(Duration::from_millis(1_500)),
+        )
+        .mount(&server)
+        .await;
+
+    let cfg = config_for_backend(&server.uri());
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
+    let manager = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::new(server.uri(), "marmel-manager"),
+        plan,
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    let mut renderer = BoundProbeRenderer::new(vec!["goal: keep going forever".to_string()]);
+
+    // Idle bound deliberately far above the hard cap, so the *absolute* per-turn
+    // bound is what fires.
+    let bounds = marmennill::ui::session::SessionBounds {
+        turn_idle: Duration::from_secs(30),
+        turn_hard_cap: Duration::from_millis(300),
+        failure_threshold: 2,
+    };
+
+    let started = Instant::now();
+    let result = marmennill::ui::session::run_session_with_bounds(
+        &cfg,
+        &mut renderer,
+        None,
+        Some(manager),
+        bounds,
+    )
+    .await;
+    let took = started.elapsed();
+
+    assert!(
+        result.is_ok(),
+        "a wall-clock bound is an orderly stop, not a hard error: {result:?}"
     );
 
-    // 2. Frozen journal checkpoint was NOT recovered on startup
+    // (1) The reason must be user-visible, and must say it was a bound that also
+    //     cancelled in-flight work — not a silent break out of the loop.
+    let bound_lines: Vec<String> = renderer
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Message(text)
+                if text.contains("wall-clock bound") || text.contains("turn watchdog") =>
+            {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .collect();
     assert!(
-        mgr.journal.is_frozen(),
-        "Frozen checkpoint should remain untouched when startup recovery is disabled"
+        !bound_lines.is_empty(),
+        "the turn bound must be reported to the user; events: {:?}",
+        renderer.events.len()
+    );
+    assert!(
+        bound_lines
+            .iter()
+            .any(|text| text.contains("in-flight work cancelled")),
+        "the reported reason must state that in-flight work was cancelled: {bound_lines:?}"
     );
 
-    // 3. Saving still works: ui_transcript should have the new goal and reply
-    let saved = UiTranscript::load(plan.ui_transcript_path()).expect("must load ui_transcript");
-    let has_fresh_goal = saved.records().iter().any(|r| match r {
-        UiRecord::User { text } => text == "Brand new goal",
-        _ => false,
-    });
+    // (2) In-flight work must actually have been cancelled at that instant.
+    let (global_cancelled, worker_cancelled) = renderer
+        .observed
+        .expect("the bound must be reported to the user before the session ends");
     assert!(
-        has_fresh_goal,
-        "New session must still save transcripts even with rehydration disabled"
+        worker_cancelled,
+        "H5 leak: the bounded turn ended while a registered specialist worker was \
+         still active and uncancelled"
+    );
+    assert!(
+        global_cancelled,
+        "H5 leak: the global cancellation token must be cancelled so PTY command \
+         loops tear down their process groups"
+    );
+    let (_, token) = renderer
+        .inflight
+        .as_ref()
+        .expect("the probe worker must have been registered");
+    assert!(
+        token.is_cancelled(),
+        "the worker token must stay cancelled after the session ends"
+    );
+
+    // (3) It was the bound that ended the turn, not the backend answering.
+    assert!(
+        took < Duration::from_millis(1_400),
+        "the per-turn hard cap must cut the turn off before the 1.5 s backend \
+         response arrives (session took {took:?})"
+    );
+}
+
+/// Renderer for the repeated-failure budget: it records what the loop reported
+/// and asks for an orderly exit once the loop refuses to retry.
+struct FailureBudgetRenderer {
+    read_script: Vec<String>,
+    read_cursor: usize,
+    input_state: marmennill::ui::InputState,
+    events: Vec<Event>,
+}
+
+impl FailureBudgetRenderer {
+    fn new(read_script: Vec<String>) -> Self {
+        Self {
+            read_script,
+            read_cursor: 0,
+            input_state: marmennill::ui::InputState::default(),
+            events: Vec::new(),
+        }
+    }
+    fn tool_results(&self) -> Vec<String> {
+        self.events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ToolResult(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    fn statuses(&self) -> Vec<String> {
+        self.events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Status(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+impl Renderer for FailureBudgetRenderer {
+    fn init(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn on_event(&mut self, event: &Event) {
+        if let Event::ToolResult(text) = event
+            && text.contains("failure budget exhausted")
+        {
+            // The escalation worked: stop the session instead of watching the
+            // model retry the same failing call for `MAX_TURNS` turns.
+            self.request_user_exit();
+        }
+        self.events.push(event.clone());
+    }
+    fn set_subagents(&mut self, _subagents: Vec<marmennill::ui::SubagentDetail>) {}
+    fn flush(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn read_input(&mut self) -> Option<String> {
+        let line = self.read_script.get(self.read_cursor).cloned();
+        self.read_cursor += 1;
+        line
+    }
+    fn input_state(&mut self) -> &mut marmennill::ui::InputState {
+        &mut self.input_state
+    }
+    fn input_state_shared(&self) -> &marmennill::ui::InputState {
+        &self.input_state
+    }
+    fn request_user_exit(&mut self) {
+        self.input_state.user_exit = true;
+        self.input_state.aborted = true;
+    }
+    fn shutdown(&mut self) {}
+}
+
+/// Recon H5: the same failing task/tool call must escalate after a small
+/// threshold instead of being retried blindly for the whole session.
+#[tokio::test]
+async fn test_ui_session_repeated_failure_escalates_instead_of_retrying_forever() {
+    let _lock = TEST_MUTEX.lock().await;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Every backend turn returns the *identical* failing call: a read of a file
+    // that does not exist. Stable arguments => stable failure identity.
+    let failing_args = "{\"path\": \"definitely-missing-9f3a.txt\"}";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tool_call_sse(
+            "call_fail",
+            marmennill::tool_names::TOOL_READ_FILE,
+            failing_args,
+        )))
+        .mount(&server)
+        .await;
+
+    let cfg = config_for_backend(&server.uri());
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
+    let manager = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::new(server.uri(), "marmel-manager"),
+        plan,
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    let mut renderer = FailureBudgetRenderer::new(vec!["goal: read the missing file".to_string()]);
+
+    let bounds = marmennill::ui::session::SessionBounds {
+        turn_idle: std::time::Duration::from_secs(30),
+        turn_hard_cap: std::time::Duration::from_secs(300),
+        failure_threshold: 2,
+    };
+
+    let result = marmennill::ui::session::run_session_with_bounds(
+        &cfg,
+        &mut renderer,
+        None,
+        Some(manager),
+        bounds,
+    )
+    .await;
+    assert!(result.is_ok(), "session should stop orderly: {result:?}");
+
+    let results = renderer.tool_results();
+    let real_failures: Vec<&String> = results
+        .iter()
+        .filter(|text| !text.contains("failure budget exhausted"))
+        .collect();
+    let refusals: Vec<&String> = results
+        .iter()
+        .filter(|text| text.contains("failure budget exhausted"))
+        .collect();
+
+    // (1) The failing call is dispatched exactly `threshold` times, never more.
+    assert_eq!(
+        real_failures.len(),
+        2,
+        "the same failing call must be attempted exactly `failure_threshold` times; \
+         tool results: {results:?}"
+    );
+
+    // (2) After the threshold the loop refuses to re-dispatch it and says why.
+    assert!(
+        !refusals.is_empty(),
+        "the failure budget must refuse a third unchanged attempt; got: {results:?}"
+    );
+
+    // (3) The escalation is surfaced to the user, not just counted internally.
+    let statuses = renderer.statuses();
+    let escalations: Vec<&String> = statuses
+        .iter()
+        .filter(|text| text.contains("repeated failure"))
+        .collect();
+    assert!(
+        !escalations.is_empty(),
+        "repeated failures must be escalated visibly; statuses: {statuses:?}"
+    );
+
+    // (4) No runaway retry loop: the session stopped after a handful of turns
+    //     instead of grinding through `MAX_TURNS` (100).
+    let backend_calls = server
+        .received_requests()
+        .await
+        .expect("wiremock request log")
+        .len();
+    assert!(
+        backend_calls <= 4,
+        "the session must stop once the failure budget is spent, not keep asking \
+         the backend for another attempt (backend calls: {backend_calls})"
+    );
+}
+
+/// Recon H5 / REQ-LOOP-002: the *stalled* half of the wall-clock bound.
+///
+/// A tool call that produces no observable progress must not be able to hold the
+/// turn open indefinitely: the watchdog tears the turn down, cancels everything
+/// in flight (the running tool polls the same global token), and says so.
+#[tokio::test]
+async fn test_ui_session_stalled_turn_watchdog_cancels_inflight_tool_call() {
+    let _lock = TEST_MUTEX.lock().await;
+    use std::time::{Duration, Instant};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // A 60 s sleep is far longer than the injected idle bound and produces no
+    // progress events, which is exactly the stalled-turn shape.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tool_call_sse(
+            "call_sleep",
+            marmennill::tool_names::TOOL_SLEEP,
+            "{\"seconds\": 60}",
+        )))
+        .mount(&server)
+        .await;
+
+    let cfg = config_for_backend(&server.uri());
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
+    let manager = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::new(server.uri(), "marmel-manager"),
+        plan,
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    let mut renderer = BoundProbeRenderer::new(vec!["goal: wait around for an hour".to_string()]);
+
+    // Idle bound far *below* the hard cap, so the stalled watchdog is what fires.
+    let bounds = marmennill::ui::session::SessionBounds {
+        turn_idle: Duration::from_millis(400),
+        turn_hard_cap: Duration::from_secs(600),
+        failure_threshold: 2,
+    };
+
+    let started = Instant::now();
+    let result = marmennill::ui::session::run_session_with_bounds(
+        &cfg,
+        &mut renderer,
+        None,
+        Some(manager),
+        bounds,
+    )
+    .await;
+    let took = started.elapsed();
+
+    assert!(
+        result.is_ok(),
+        "an orderly bound stop must not be a hard error: {result:?}"
+    );
+
+    let watchdog_lines: Vec<String> = renderer
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Message(text) if text.contains("turn watchdog") => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !watchdog_lines.is_empty(),
+        "a turn with no observable progress must be stopped by the watchdog and \
+         reported; events: {:?}",
+        renderer.events.len()
+    );
+    assert!(
+        watchdog_lines
+            .iter()
+            .any(|text| text.contains("in-flight work cancelled")),
+        "the stalled reason must state that in-flight work was cancelled: {watchdog_lines:?}"
+    );
+
+    let (global_cancelled, worker_cancelled) = renderer
+        .observed
+        .expect("the stalled bound must be reported before the session ends");
+    assert!(
+        global_cancelled,
+        "the stalled watchdog must cancel the global token so in-flight tools and \
+         PTY process groups tear down"
+    );
+    assert!(
+        worker_cancelled,
+        "the stalled watchdog must cancel registered in-flight workers"
+    );
+
+    // The 60 s call was cancelled instead of being waited on.
+    assert!(
+        took < Duration::from_secs(10),
+        "a 60 s in-flight call must be cancelled by the 400 ms idle bound, not \
+         waited out (session took {took:?})"
+    );
+}
+
+// t-057: a fail-closed plan verdict must reach the *user*, not only the prompt.
+
+/// Guard for the UNKNOWN-plan surfacing path wired into
+/// `src/ui/session.rs::run_session_with_bounds` (t-057).
+///
+/// Setup: a temporary workspace root (`harness::with_workspace_root`) with a temp
+/// `.marmel/` holding an execution plan that **exists but holds no parseable
+/// `- [ ] [t-xxx]` task line** — exactly the shape that used to be read as
+/// "nothing pending / all complete". The body carries a `SENTINEL` line so the
+/// test can prove the unparseable body was never embedded in the system prompt as
+/// though it were an active plan. (A parse failure is used instead of a
+/// permission failure: `chmod`-based unreadability is not reproducible for every
+/// CI user, and both routes produce the same `PlanGate::Unknown` warning.)
+///
+/// Required behaviour asserted:
+/// 1. the renderer received an `Event::Status` carrying the plan-state warning
+///    **before the first assistant turn** (the wiring at the top of the session
+///    loop, not the end-of-turn plan gate);
+/// 2. that `Event::Status` is the **first** status line the session surfaces (it
+///    comes from the prompt load, not from a later gate) — the durable trace of the
+///    session is its committed bundle, since t-025b deleted the superseded
+///    `.ui_transcript.json` owner;
+/// 3. the system prompt actually sent to the backend declares the plan state
+///    UNKNOWN (fail-closed) and never presents the plan as active/complete.
+///
+/// Pty-free: scripted in-memory renderer + wiremock backend; the repository's
+/// real `.marmel/` is never touched.
+#[tokio::test]
+async fn test_ui_session_unknown_plan_state_surfaces_status() {
+    let _lock = TEST_MUTEX.lock().await;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let marmel_dir = tmp.path().join(".marmel");
+    std::fs::create_dir_all(&marmel_dir).expect("create temp .marmel dir");
+    // Non-empty plan text with zero task lines => the plan cannot be parsed.
+    std::fs::write(
+        marmel_dir.join("execution_plan.md"),
+        "# Execution Plan\n\nAll work finished, nothing pending.\nSENTINEL-UNPARSEABLE-PLAN-BODY\n",
+    )
+    .expect("write unparseable plan");
+
+    // Capture the request bodies: the system prompt is what the backend saw.
+    let bodies: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let bodies = Arc::clone(&bodies);
+            move |req: &wiremock::Request| {
+                bodies
+                    .lock()
+                    .expect("bodies lock")
+                    .push(String::from_utf8_lossy(&req.body).to_string());
+                ResponseTemplate::new(200).set_body_string(completion_sse("noted"))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let cfg = config_for_backend(&server.uri());
+    let plan = marmennill::manager::phase::Plan::at(&marmel_dir);
+    let manager = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::new(&cfg.backend_url, "test-model"),
+        plan.clone(),
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    let mut renderer = ScriptedRenderer::new(vec!["goal".to_string(), "/abort".to_string()]);
+
+    // Scope the workspace root so nothing in the session can resolve the
+    // repository's real `.marmel/` even by accident.
+    marmennill::harness::with_workspace_root(tmp.path(), async {
+        marmennill::ui::run_session(&cfg, &mut renderer, None, Some(manager)).await
+    })
+    .await
+    .expect("run_session should complete");
+
+    // (1) A renderer `Status` event carries the plan-state warning, and it is
+    //     emitted at **session start** — before any assistant output. (The
+    //     end-of-turn plan gate surfaces the same text; this ordering pins the
+    //     prompt-load surfacing wired at the top of `run_session_with_bounds`.)
+    let status_events: Vec<String> = renderer
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            marmennill::ui::Event::Status(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    let warning_pos = renderer
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                marmennill::ui::Event::Status(text) if text.contains("plan state is UNKNOWN")
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "an unparseable plan must be surfaced as a renderer Status event; \
+                 Status events seen: {status_events:?}"
+            )
+        });
+    let warning = &status_events[status_events
+        .iter()
+        .position(|text| text.contains("plan state is UNKNOWN"))
+        .expect("the plan warning counted above")];
+    assert!(
+        warning.contains("could not be parsed")
+            && warning.contains(marmennill::manager::phase::PLAN_FILE),
+        "the Status event must name the failing plan file and why it is unknown, got: {warning}"
+    );
+    if let Some(first_output_pos) = renderer.events.iter().position(|event| {
+        matches!(
+            event,
+            marmennill::ui::Event::Message(_) | marmennill::ui::Event::Done
+        )
+    }) {
+        assert!(
+            warning_pos < first_output_pos,
+            "the plan-state warning must be surfaced at session start, before the first \
+             assistant output — not only by the end-of-turn plan gate (warning at event \
+             index {warning_pos}, first assistant output at index {first_output_pos})"
+        );
+    }
+
+    // (2) The warning is a **session-start** surfacing, not the end-of-turn plan
+    //     gate: it is the FIRST `Status` line the session hands the renderer. (The
+    //     journal half of that surfacing stayed in memory, and t-025b deleted its
+    //     superseded on-disk owner, so the durable trace of this session is its
+    //     bundle and nothing else.)
+    let first_status = status_events
+        .first()
+        .unwrap_or_else(|| panic!("the session must surface at least one Status line"));
+    assert!(
+        first_status.contains("plan state is UNKNOWN"),
+        "the plan-state warning must be the first Status line of the session — it is \
+         surfaced when the prompt loads, not only by the end-of-turn plan gate; \
+         Status lines in order: {status_events:?}"
+    );
+    let bundle = plan.session_bundle_path();
+    assert!(
+        bundle_members(&bundle).contains(&marmennill::session::MANAGER_FILE.to_string()),
+        "the session's durable state is its committed bundle (manifest + members)"
+    );
+    assert!(
+        !legacy_ui_journal(&plan).exists(),
+        "the superseded `.ui_transcript.json` must not be written again"
+    );
+
+    // (3) Every prompt sent to the backend is fail-closed about the plan.
+    let bodies = bodies.lock().expect("bodies lock");
+    assert!(
+        !bodies.is_empty(),
+        "the session must have issued at least one chat completion request"
+    );
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body.contains("Execution Plan State: UNKNOWN")),
+        "the system prompt must state the plan state is UNKNOWN instead of leaving \
+         the plan out (which reads as 'no work pending / all complete')"
+    );
+    for body in bodies.iter() {
+        assert!(
+            !body.contains("SENTINEL-UNPARSEABLE-PLAN-BODY"),
+            "an unparseable plan body must never be replayed to the model as an active plan"
+        );
+        assert!(
+            !body.contains("## Active Execution Plan"),
+            "the prompt must not present an unparseable plan as an active execution plan"
+        );
+    }
+}
+
+// t-063 (manager gate item B): the assistant `tool_calls` <-> `role:"tool"` pair
+// invariant must hold on the **live** abort/bound path, not only inside
+// `compact()`.
+//
+// The repair used to be reachable only through `compact()`, which (a) is gated at
+// > 90% utilization and (b) sits *after* the `bound_stop_reason` /
+// `user_exit_requested` breaks that end a turn. A round cut off in the middle
+// therefore left the transcript holding the assistant with **all** its
+// `tool_calls` and no `role:"tool"` result for the skipped tail — and that
+// transcript is what the next turn re-sends verbatim (`src/ui/session.rs` builds
+// the request from `ctx.messages()`), which is a provider 400.
+//
+// These tests drive the *real* session loop: scripted in-memory renderer,
+// wiremock backend, `harness::with_workspace_root` — pty-free, and the
+// repository's real `.marmel/` is never reachable.
+
+/// SSE body whose assistant turn carries **three** tool calls: a long `sleep`
+/// followed by two reads. The mixed names force the *sequential* dispatch branch
+/// of the round, and the slow first call is what lets an execution bound or a
+/// user exit cut the tail of the round off after the assistant carrying all three
+/// calls was already appended to the transcript.
+fn three_tool_calls_sse(sleep_secs: u64) -> String {
+    format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        serde_json::json!({
+            "id": "chatcmpl-t063",
+            "choices": [{
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_slow",
+                            "type": "function",
+                            "function": {
+                                "name": marmennill::tool_names::TOOL_SLEEP,
+                                "arguments": format!("{{\"seconds\": {sleep_secs}}}")
+                            }
+                        },
+                        {
+                            "index": 1,
+                            "id": "call_b",
+                            "type": "function",
+                            "function": {
+                                "name": marmennill::tool_names::TOOL_READ_FILE,
+                                "arguments": "{\"path\": \"notes.txt\"}"
+                            }
+                        },
+                        {
+                            "index": 2,
+                            "id": "call_c",
+                            "type": "function",
+                            "function": {
+                                "name": marmennill::tool_names::TOOL_READ_FILE,
+                                "arguments": "{\"path\": \"AGENTS.md\"}"
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": null
+            }]
+        })
+    )
+}
+
+/// The `id` of every `tool_calls` entry in a message array (a captured chat
+/// request's `messages`, or a saved transcript file — both serialize with a
+/// `role` tag).
+fn tool_call_ids(messages: &serde_json::Value) -> Vec<String> {
+    messages
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| m.get("tool_calls").and_then(|c| c.as_array()).cloned())
+        .flatten()
+        .filter_map(|c| c.get("id").and_then(|i| i.as_str()).map(str::to_string))
+        .collect()
+}
+
+/// The `tool_call_id` of every `role:"tool"` message in a message array.
+fn tool_result_ids(messages: &serde_json::Value) -> Vec<String> {
+    messages
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .filter_map(|m| {
+            m.get("tool_call_id")
+                .and_then(|i| i.as_str())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// Every defect of the pairing invariant in a message array: a `tool_calls` entry
+/// with **no** result, one with duplicate results, or a result whose id belongs to
+/// no surviving `tool_calls` entry. Empty means the array is a valid
+/// OpenAI-compatible chat sequence.
+fn pairing_defects(messages: &serde_json::Value) -> Vec<String> {
+    let calls = tool_call_ids(messages);
+    let results = tool_result_ids(messages);
+    let mut defects = Vec::new();
+    for id in calls.iter() {
+        let n = results.iter().filter(|r| *r == id).count();
+        if n == 0 {
+            defects.push(format!("tool_call {id} has no tool result"));
+        } else if n > 1 {
+            defects.push(format!("tool_call {id} has {n} tool results"));
+        }
+    }
+    for id in results.iter() {
+        if !calls.contains(id) {
+            defects.push(format!("tool result {id} has no parent tool_call"));
+        }
+    }
+    defects
+}
+
+/// The content of the `role:"tool"` message answering `id` in a message array.
+fn tool_result_content(messages: &serde_json::Value, id: &str) -> Option<String> {
+    messages
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .find(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("tool")
+                && m.get("tool_call_id").and_then(|i| i.as_str()) == Some(id)
+        })
+        .and_then(|m| m.get("content").and_then(|c| c.as_str()))
+        .map(str::to_string)
+}
+
+/// Recon H5 bound + t-063: when the wall-clock bound cuts a round off, the calls
+/// in the skipped tail still need a result — the **next** request the session
+/// builds must be a valid chat sequence, not an assistant `tool_calls` list with
+/// holes in it.
+#[tokio::test]
+async fn test_ui_session_bound_mid_round_repairs_pairing_for_next_request() {
+    let _lock = TEST_MUTEX.lock().await;
+    use std::time::Duration;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let first_turn = Arc::new(AtomicUsize::new(0));
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let requests = Arc::clone(&requests);
+            let first_turn = Arc::clone(&first_turn);
+            move |req: &wiremock::Request| {
+                requests
+                    .lock()
+                    .expect("request capture lock")
+                    .push(serde_json::from_slice(&req.body).expect("chat request body is JSON"));
+                let body = if first_turn.fetch_add(1, Ordering::SeqCst) == 0 {
+                    three_tool_calls_sse(30)
+                } else {
+                    completion_sse("Reporting the blocker instead of repeating the call.")
+                };
+                ResponseTemplate::new(200).set_body_string(body)
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let cfg = config_for_backend(&server.uri());
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("notes.txt"), "note\n").expect("write notes.txt");
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
+    let manager = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::new(server.uri(), "marmel-manager"),
+        plan,
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    // read #1 is the goal; read #2 is the line the user types after the bound
+    // ended turn 1 — it is what makes a **second** request leave the session with
+    // the torn-off transcript attached.
+    let mut renderer = ScriptedRenderer::new(vec![
+        "goal: run the slow call, then read the files".to_string(),
+        "keep going, then report".to_string(),
+        "/abort".to_string(),
+    ]);
+
+    // Idle bound far below the 30 s call, hard cap far above it: the *stalled*
+    // half of the bound is what tears the round down.
+    let bounds = marmennill::ui::session::SessionBounds {
+        turn_idle: Duration::from_millis(300),
+        turn_hard_cap: Duration::from_secs(120),
+        failure_threshold: 5,
+    };
+
+    marmennill::harness::with_workspace_root(tmp.path(), async {
+        marmennill::ui::session::run_session_with_bounds(
+            &cfg,
+            &mut renderer,
+            None,
+            Some(manager),
+            bounds,
+        )
+        .await
+    })
+    .await
+    .expect("an execution bound is an orderly stop, not a hard error");
+
+    // (1) Precondition: the bound fired mid-round, and turn 2 really did put the
+    //     torn transcript back on the wire.
+    let captured = requests.lock().expect("request capture lock").clone();
+    assert!(
+        captured.len() >= 2,
+        "a bound must end the turn, not the session: the loop has to build a second \
+         request out of the transcript the round left behind (requests seen: {})",
+        captured.len()
+    );
+    let second = captured[1]
+        .get("messages")
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+    assert_eq!(
+        tool_call_ids(&second),
+        vec![
+            "call_slow".to_string(),
+            "call_b".to_string(),
+            "call_c".to_string()
+        ],
+        "precondition: the assistant carrying all three tool calls of the aborted \
+         round must be part of the next request"
+    );
+
+    // (2) The invariant: every one of those three calls is answered. This is the
+    //     regression under test — before the fix `call_b`/`call_c` had no result
+    //     at all and the provider rejects the request.
+    let defects = pairing_defects(&second);
+    assert!(
+        defects.is_empty(),
+        "every tool_call_id of the aborted round must have exactly one tool result \
+         in the next request; defects: {defects:?}; tool results present: \
+         {:?}; full request: {:#}",
+        tool_result_ids(&second),
+        captured[1]
+    );
+
+    // (3) The calls that were never dispatched get the engine's placeholder, the
+    //     joined one keeps its real (bound) error.
+    assert_eq!(
+        tool_result_content(&second, "call_b").as_deref(),
+        Some(marmennill::manager::context::ABORTED_TOOL_RESULT),
+        "a tool call that was skipped by the bound must be answered with the \
+         `{}` placeholder",
+        marmennill::manager::context::ABORTED_TOOL_RESULT
+    );
+    assert_eq!(
+        tool_result_content(&second, "call_c").as_deref(),
+        Some(marmennill::manager::context::ABORTED_TOOL_RESULT),
+        "a tool call that was skipped by the bound must be answered with the \
+         `{}` placeholder",
+        marmennill::manager::context::ABORTED_TOOL_RESULT
+    );
+    assert!(
+        tool_result_content(&second, "call_slow")
+            .map(|c| c.contains("turn watchdog"))
+            .unwrap_or(false),
+        "the call that was actually torn down must keep its bound error as its result"
+    );
+
+    // (4) The repair is not confined to the in-memory copy that built the request:
+    //     the manager section the session **captured** at the round boundary is what
+    //     a rehydration would install. (The duplicate
+    //     `.marmel/.session_transcript.json` journal this assertion used to read is
+    //     deleted — A §1 D2, t-009 — and the capture is its successor.)
+    let captured = marmennill::session::manager_capture::last_capture()
+        .expect("the session must capture its manager section at the round boundary");
+    let persisted = serde_json::to_value(&captured.messages).expect("captured records serialize");
+    let persisted_defects = pairing_defects(&persisted);
+    assert!(
+        persisted_defects.is_empty(),
+        "the manager section captured after an aborted round must itself satisfy the \
+         pairing invariant; defects: {persisted_defects:?}"
+    );
+    assert!(
+        !tmp.path()
+            .join(".marmel")
+            .join(".session_transcript.json")
+            .exists(),
+        "the superseded manager journal must no longer be written (A §1 D2)"
+    );
+
+    // (5) The repair is not silent: it goes through the session's status channel.
+    let statuses: Vec<String> = renderer
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Status(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        statuses.iter().any(|s| s.contains("pairing repaired")),
+        "a repaired tool-call pairing must be surfaced on the status line; \
+         statuses: {statuses:?}"
+    );
+}
+
+/// Renderer that exits the session **inside the round**: it requests the user
+/// exit the instant the first `ToolCall` event is rendered, i.e. while that call
+/// is still in flight. That is the deterministic shape of "the user typed
+/// `/abort` mid-round" — the still-undispatched tail of the round is skipped by
+/// the `renderer.aborted() || renderer.user_exit_requested()` break, and the
+/// in-flight call is torn down through `cancel_all()`.
+struct ExitOnFirstToolCallRenderer {
+    read_script: Vec<String>,
+    read_cursor: usize,
+    input_state: marmennill::ui::InputState,
+    events: Vec<Event>,
+    exit_fired: bool,
+}
+
+impl ExitOnFirstToolCallRenderer {
+    fn new(read_script: Vec<String>) -> Self {
+        Self {
+            read_script,
+            read_cursor: 0,
+            input_state: marmennill::ui::InputState::default(),
+            events: Vec::new(),
+            exit_fired: false,
+        }
+    }
+}
+
+impl Renderer for ExitOnFirstToolCallRenderer {
+    fn init(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn on_event(&mut self, event: &Event) {
+        self.events.push(event.clone());
+        if !self.exit_fired && matches!(event, Event::ToolCall(_)) {
+            self.exit_fired = true;
+            self.request_user_exit();
+        }
+    }
+    fn set_subagents(&mut self, _subagents: Vec<marmennill::ui::SubagentDetail>) {}
+    fn flush(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn read_input(&mut self) -> Option<String> {
+        let line = self.read_script.get(self.read_cursor).cloned();
+        self.read_cursor += 1;
+        line
+    }
+    fn input_state(&mut self) -> &mut marmennill::ui::InputState {
+        &mut self.input_state
+    }
+    fn input_state_shared(&self) -> &marmennill::ui::InputState {
+        &self.input_state
+    }
+    fn shutdown(&mut self) {}
+}
+
+/// t-063: a **user exit** in the middle of a round ends the session, so there is
+/// no next request to inspect — but the transcript the session leaves behind (and
+/// would rehydrate) must still satisfy the pairing invariant, with a placeholder
+/// for every call that was never dispatched.
+#[tokio::test]
+async fn test_ui_session_user_exit_mid_round_persists_paired_transcript() {
+    let _lock = TEST_MUTEX.lock().await;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let requests = Arc::clone(&requests);
+            move |req: &wiremock::Request| {
+                requests
+                    .lock()
+                    .expect("request capture lock")
+                    .push(serde_json::from_slice(&req.body).expect("chat request body is JSON"));
+                ResponseTemplate::new(200).set_body_string(three_tool_calls_sse(5))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let cfg = config_for_backend(&server.uri());
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("notes.txt"), "note\n").expect("write notes.txt");
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
+    let manager = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::new(server.uri(), "marmel-manager"),
+        plan,
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    // The exit is raised by the renderer itself, at the instant the first call of
+    // the round is announced — mid-round, with two calls of the round never
+    // dispatched.
+    let mut renderer = ExitOnFirstToolCallRenderer::new(vec![
+        "goal: run the slow call, then read the files".to_string(),
+    ]);
+
+    marmennill::harness::with_workspace_root(tmp.path(), async {
+        marmennill::ui::run_session(&cfg, &mut renderer, None, Some(manager)).await
+    })
+    .await
+    .expect("a user exit is an orderly stop, not a hard error");
+
+    let captured = requests.lock().expect("request capture lock").clone();
+    assert_eq!(
+        captured.len(),
+        1,
+        "precondition: the user exit must have ended the session inside the first \
+         round (requests seen: {})",
+        captured.len()
+    );
+
+    // The superseded `.session_transcript.json` journal this test used to read is
+    // deleted (A §1 D2, t-009). What an exited round must leave behind is the pairing
+    // witness the session captured in memory at the boundary — exactly what a
+    // rehydration would install.
+    let captured = marmennill::session::manager_capture::last_capture()
+        .expect("the session must capture its manager section on the user-exit boundary");
+    let on_disk = serde_json::to_value(&captured.messages).expect("captured records serialize");
+    assert!(
+        !tmp.path()
+            .join(".marmel")
+            .join(".session_transcript.json")
+            .exists(),
+        "the duplicate manager journal must no longer be written (A §1 D2)"
+    );
+
+    assert_eq!(
+        tool_call_ids(&on_disk),
+        vec![
+            "call_slow".to_string(),
+            "call_b".to_string(),
+            "call_c".to_string()
+        ],
+        "precondition: the transcript must still carry the assistant with all three \
+         tool calls of the exited round"
+    );
+    let defects = pairing_defects(&on_disk);
+    assert!(
+        defects.is_empty(),
+        "an exited round must not leave dangling tool_calls in the transcript; \
+         defects: {defects:?}; results: {:?}",
+        tool_result_ids(&on_disk)
+    );
+    let placeholders = ["call_b", "call_c"]
+        .iter()
+        .filter(|id| {
+            tool_result_content(&on_disk, id).as_deref()
+                == Some(marmennill::manager::context::ABORTED_TOOL_RESULT)
+        })
+        .count();
+    assert_eq!(
+        placeholders,
+        2,
+        "both never-dispatched calls must be answered with the `{}` placeholder",
+        marmennill::manager::context::ABORTED_TOOL_RESULT
+    );
+
+    let statuses: Vec<String> = renderer
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Status(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        statuses.iter().any(|s| s.contains("pairing repaired")),
+        "a repaired tool-call pairing must be surfaced on the status line even when \
+         the session is exiting; statuses: {statuses:?}"
+    );
+}
+
+/// t-063: `CompactionOutcome` must not be discarded on the live path. When the
+/// 70% target is unreachable (the pinned prefix alone is over budget) the session
+/// has to say so through its status channel instead of reporting
+/// "context compacted".
+#[tokio::test]
+async fn test_ui_session_surfaces_unreachable_compaction() {
+    let _lock = TEST_MUTEX.lock().await;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(completion_sse("all good")))
+        .mount(&server)
+        .await;
+
+    let mut cfg = config_for_backend(&server.uri());
+    // A budget far below the size of the pinned system prompt: the target is
+    // unreachable by construction, so `compact()` returns
+    // `CompactionOutcome::TargetUnreachable` on every gate.
+    cfg.max_context_tokens = 64;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
+    let manager = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::new(server.uri(), "marmel-manager"),
+        plan.clone(),
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    let mut renderer = ScriptedRenderer::new(vec![
+        "goal: tiny budget session".to_string(),
+        "/abort".to_string(),
+    ]);
+
+    marmennill::harness::with_workspace_root(tmp.path(), async {
+        marmennill::ui::run_session(&cfg, &mut renderer, None, Some(manager)).await
+    })
+    .await
+    .expect("run_session should complete");
+
+    let statuses: Vec<String> = renderer
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Status(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    let failures: Vec<&String> = statuses
+        .iter()
+        .filter(|s| s.contains("compaction") && s.contains("could not reach its target"))
+        .collect();
+    assert!(
+        !failures.is_empty(),
+        "a compaction that could not reach its target must be surfaced as a status \
+         warning; statuses: {statuses:?}"
+    );
+    assert!(
+        !statuses.iter().any(|s| s == "context compacted"),
+        "the session must not claim a compaction it did not achieve; statuses: {statuses:?}"
+    );
+    assert!(
+        failures[0].contains("64") || failures[0].contains("target"),
+        "the warning must name the budget it failed against; got: {:?}",
+        failures[0]
+    );
+
+    // The warning itself is live-only by design: the UI journal stayed in memory and
+    // t-025b deleted its superseded on-disk owner, so "after the fact" is pinned on
+    // the ONE durable artefact this session leaves — its committed bundle. An
+    // unreachable compaction has to be loud, and it must never damage the state the
+    // bundle keeps.
+    let bundle = plan.session_bundle_path();
+    let members = bundle_members(&bundle);
+    assert!(
+        members.contains(&marmennill::session::MANAGER_FILE.to_string())
+            && members.contains(&marmennill::session::UI_FILE.to_string()),
+        "the session's durable state is its bundle, which must carry both mandatory \
+         members; members: {members:?}"
+    );
+    let durable = bundle_member(&bundle, marmennill::session::MANAGER_FILE);
+    assert!(
+        durable.contains("goal: tiny budget session"),
+        "a compaction that could not reach its target must not drop the session's own \
+         goal from the durable transcript; got: {durable}"
+    );
+    assert!(
+        !legacy_ui_journal(&plan).exists(),
+        "the superseded `.ui_transcript.json` must not be written again"
+    );
+}
+
+// ── t-074: the Manager turn-cap exit must be observable (recon M2 live analogue) ──
+
+/// One `read_file` tool call on a **distinct** path per turn.
+///
+/// Distinct arguments are required: [`crate::harness::monitor::ToolRepetitionDetector`]
+/// blocks the third *semantically identical* call, which would end the turn
+/// through the repetition/ failure-budget machinery long before the turn budget
+/// is reached. Varying the path keeps every one of the `MAX_TURNS` turns a
+/// legitimate, successful round, so the **only** thing that can stop the loop is
+/// the turn budget itself.
+fn read_file_call_sse(turn: usize) -> String {
+    tool_call_sse(
+        &format!("call_t074_{turn:03}"),
+        marmennill::tool_names::TOOL_READ_FILE,
+        &format!("{{\"path\": \"notes-{turn:03}.txt\"}}"),
+    )
+}
+
+/// Does this user-visible line name the turn budget?
+fn names_turn_cap(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    (lower.contains("turn budget") || lower.contains("turn cap") || lower.contains("max turns"))
+        && lower.contains(&marmennill::manager::MAX_TURNS.to_string())
+}
+
+/// Residual defect 2 of the manager-cluster gate (t-067), the live analogue of
+/// recon finding **M2** (`docs/recon_bugs_manager.md`): the session loop breaks
+/// its turn loop when `turn_count > MAX_TURNS` **silently** — no status line, no
+/// journaled record, nothing that tells the operator (or the caller) that the
+/// request was cut off by the turn budget instead of finishing cleanly. The
+/// operator just watches a session stop responding, with no explanation.
+///
+/// Required behaviour, through the SAME channel every other session exit uses
+/// (renderer `Message`/`Status` event + a `Status` record in the UI transcript):
+/// the exit must be reported, must name the real limit and the turn count, and
+/// must leave the on-disk transcript pair-consistent (the t-063 invariant).
+#[tokio::test]
+async fn test_ui_session_turn_cap_surfaces_observable_stop_reason() {
+    let _lock = TEST_MUTEX.lock().await;
+    use std::time::Duration;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let turn = Arc::new(AtomicUsize::new(0));
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let requests = Arc::clone(&requests);
+            let turn = Arc::clone(&turn);
+            move |req: &wiremock::Request| {
+                requests
+                    .lock()
+                    .expect("request capture lock")
+                    .push(serde_json::from_slice(&req.body).expect("chat request body is JSON"));
+                let n = turn.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_string(read_file_call_sse(n))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let mut cfg = config_for_backend(&server.uri());
+    // Far above anything this session produces: compaction must never fire, so
+    // the turn budget is the only bound in play.
+    cfg.max_context_tokens = 200_000;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for n in 0..=marmennill::manager::MAX_TURNS + 2 {
+        std::fs::write(
+            tmp.path().join(format!("notes-{n:03}.txt")),
+            format!("note {n}\n"),
+        )
+        .expect("write notes file");
+    }
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
+    let manager = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::new(server.uri(), "marmel-manager"),
+        plan.clone(),
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    let mut renderer = ScriptedRenderer::new(vec![
+        "goal: keep reading until the session runs out of turns".to_string(),
+    ]);
+
+    // Wall-clock bounds far above anything this session can do (a stalled turn
+    // and a hard-cap teardown must never be what stops it), and a failure budget
+    // that cannot be reached: every tool call below succeeds.
+    let bounds = marmennill::ui::session::SessionBounds {
+        turn_idle: Duration::from_secs(3_600),
+        turn_hard_cap: Duration::from_secs(3_600),
+        failure_threshold: 10_000,
+    };
+
+    let report = marmennill::harness::with_workspace_root(tmp.path(), async {
+        marmennill::ui::session::run_session_with_bounds_report(
+            &cfg,
+            &mut renderer,
+            None,
+            Some(manager),
+            bounds,
+        )
+        .await
+    })
+    .await
+    .expect("hitting the turn budget is an orderly stop, not a hard error");
+
+    // (1) Precondition: the turn budget really is what ended the loop — exactly
+    //     `MAX_TURNS` successful rounds ran, and the next one was refused.
+    let captured = requests.lock().expect("request capture lock").clone();
+    assert_eq!(
+        captured.len(),
+        marmennill::manager::MAX_TURNS,
+        "precondition: the session must run exactly `MAX_TURNS` backend turns and \
+         refuse the next one (requests seen: {})",
+        captured.len()
+    );
+
+    // (2) The caller-visible machine-readable reason: the session reports the
+    //     budget exit instead of returning a bare `Ok` that looks like a clean
+    //     finish (this is the "indistinguishable from plan complete" half of
+    //     recon M2).
+    assert!(
+        report.turn_cap_reached(),
+        "the caller must be able to tell a turn-cap stop from a clean finish; \
+         report: {report:?}"
+    );
+    assert_eq!(
+        report.codes(),
+        vec!["turn_cap"],
+        "the turn budget must be the only bound hit in this session, reported with \
+         its stable machine-readable code; report: {report:?}"
+    );
+    let cap = report
+        .stops
+        .iter()
+        .find_map(|stop| match stop {
+            marmennill::ui::session::BoundStopReason::TurnCap { limit, turn } => {
+                Some((*limit, *turn))
+            }
+            _ => None,
+        })
+        .expect("a turn-cap stop must be recorded");
+    assert_eq!(
+        cap,
+        (
+            marmennill::manager::MAX_TURNS,
+            marmennill::manager::MAX_TURNS + 1
+        ),
+        "the recorded cap must carry the real limit and the refused turn number \
+         (`{}` turns ran, turn {} refused)",
+        marmennill::manager::MAX_TURNS,
+        marmennill::manager::MAX_TURNS + 1
+    );
+
+    // (3) The exit must be observable: a user-visible line naming the cap.
+    let cap_lines: Vec<String> = renderer
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Status(text) | Event::Message(text) => Some(text.clone()),
+            _ => None,
+        })
+        .filter(|text| names_turn_cap(text))
+        .collect();
+    assert!(
+        !cap_lines.is_empty(),
+        "the turn-cap exit must be reported to the operator through the session's \
+         status channel, naming the limit ({}) and the turn count; it must never be \
+         indistinguishable from a clean end-of-turn finish. Status/Message lines that \
+         mention the cap: {cap_lines:?}; distinct statuses seen: {:?}",
+        marmennill::manager::MAX_TURNS,
+        {
+            let mut distinct: Vec<String> = renderer
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Status(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect();
+            distinct.sort();
+            distinct.dedup();
+            distinct
+        }
+    );
+
+    // (4) The line the operator was shown must be machine-readable as well as
+    //     human-readable: the session's surfacing helper hands the SAME text to the
+    //     renderer and to the (in-memory) journal, so the stable code the report
+    //     carries has to sit inside the line itself — a session summary may classify
+    //     the exit without parsing prose.
+    assert!(
+        cap_lines.iter().all(|text| text.contains("turn_cap")),
+        "the turn-cap line surfaced to the operator must carry the stable \
+         machine-readable code (`turn_cap`) that `SessionStopReport` reports; \
+         cap lines: {cap_lines:?}"
+    );
+    // (4b) And the durable trace of a capped session is its bundle — never the
+    //      superseded journal t-025b deleted.
+    let bundle = plan.session_bundle_path();
+    let members = bundle_members(&bundle);
+    assert!(
+        members.contains(&marmennill::session::MANAGER_FILE.to_string()),
+        "the turn-cap exit must leave a committed bundle carrying the member a --resume \
+         reads; members: {members:?}"
+    );
+    assert!(
+        !legacy_ui_journal(&plan).exists(),
+        "the superseded `.ui_transcript.json` must not be written again"
+    );
+
+    // (5) The t-063 invariant still holds at this exit: the manager state the
+    //     session captured is a valid chat sequence, every assistant `tool_calls`
+    //     entry has exactly one matching tool result. (The duplicate
+    //     `.session_transcript.json` journal is deleted — A §1 D2, t-009.)
+    let captured = marmennill::session::manager_capture::last_capture()
+        .expect("the session must capture its manager section at the turn-cap exit");
+    let on_disk = serde_json::to_value(&captured.messages).expect("captured records serialize");
+    let defects = pairing_defects(&on_disk);
+    assert!(
+        defects.is_empty(),
+        "the transcript left on disk after the turn-cap exit must satisfy the \
+         tool-call pairing invariant; defects: {defects:?}"
+    );
+}
+
+/// The other half of the distinction t-074 has to provide: a session that stops
+/// **without** hitting a bound must not report one. Without this the
+/// machine-readable reason would be meaningless (a report that always says
+/// "turn cap" is as blind as a report that says nothing).
+#[tokio::test]
+async fn test_ui_session_clean_finish_reports_no_stop_reason() {
+    let _lock = TEST_MUTEX.lock().await;
+    use std::time::Duration;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let calls = Arc::clone(&calls);
+            move |_req: &wiremock::Request| {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                // A plain reply with no tool calls: the turn ends on its own.
+                ResponseTemplate::new(200).set_body_string(completion_sse(&format!("reply {n}")))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let cfg = config_for_backend(&server.uri());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
+    let manager = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::new(server.uri(), "marmel-manager"),
+        plan.clone(),
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+
+    let mut renderer = ScriptedRenderer::new(vec![
+        "goal: answer once and stop".to_string(),
+        "/abort".to_string(),
+    ]);
+
+    let report = marmennill::harness::with_workspace_root(tmp.path(), async {
+        marmennill::ui::session::run_session_with_bounds_report(
+            &cfg,
+            &mut renderer,
+            None,
+            Some(manager),
+            marmennill::ui::session::SessionBounds {
+                turn_idle: Duration::from_secs(30),
+                turn_hard_cap: Duration::from_secs(30),
+                failure_threshold: 5,
+            },
+        )
+        .await
+    })
+    .await
+    .expect("a clean finish is not an error");
+
+    assert!(
+        !report.turn_cap_reached(),
+        "a session that ended on its own must not report a turn-cap stop; report: {report:?}"
+    );
+    assert!(
+        report.codes().is_empty(),
+        "no execution bound fired, so no machine-readable stop reason may be recorded; \
+         report: {report:?}"
+    );
+    // And nothing turn-cap-shaped reached the operator either.
+    assert!(
+        !renderer.events.iter().any(|e| match e {
+            Event::Status(text) | Event::Message(text) => names_turn_cap(text),
+            _ => false,
+        }),
+        "a clean finish must not claim a turn-cap exit; events: {:?}",
+        renderer.events
     );
 }

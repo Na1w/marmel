@@ -717,7 +717,7 @@ impl TuiRenderer {
             let _ = self.tx.send(String::new());
             return;
         }
-        // Handle the `/thought` toggle locally (reference §13).
+        // Handle the `/thought` toggle locally.
         if line.trim().eq_ignore_ascii_case("/thought") {
             self.show_thought = !self.show_thought;
             let state = if self.show_thought { "ON" } else { "OFF" };
@@ -782,21 +782,17 @@ impl TuiRenderer {
         }
         self.history_index = None;
         self.input_draft.clear();
-        let user_tokens = tiktoken_rs::cl100k_base_singleton()
-            .encode_ordinary(&line)
-            .len();
+        let user_tokens = crate::manager::context::count_text_tokens(&line);
         self.tokens_in = self.tokens_in.saturating_add(user_tokens);
-        // Echo the user's line into the chat view.
         self.messages.push(format!("User: {trimmed}"));
         self.chat_auto_scroll = true;
         if is_abort(&line) {
             Renderer::request_user_exit(self);
         }
-        // Forward the line to the session loop.
         let _ = self.tx.send(line);
     }
 
-    /// Cycle focus: Chat → Plan → Subagents → Chat (reference §2).
+    /// Cycle focus: Chat → Plan → Subagents → Chat.
     pub(crate) fn cycle_focus(&mut self) {
         let has_plan = !self.plan_content.trim().is_empty() && self.show_plan_panel;
         let has_subagents = self.show_subagent_panel && !self.subagents.is_empty();
@@ -821,7 +817,7 @@ impl TuiRenderer {
         };
     }
 
-    /// Append a completed steer sentence as a `Marmennill: ` message (reference §10).
+    /// Append a completed steer sentence as a `Marmennill: ` message.
     pub(crate) fn append_steer_sentence(&mut self, chunk: &str) {
         if chunk.is_empty() {
             return;

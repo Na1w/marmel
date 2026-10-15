@@ -10,6 +10,7 @@ pub use execution::*;
 pub use formatting::*;
 
 use crate::agents::{Agent, IsolatedContext};
+use crate::markers::{MARKER_COMPLETE, MARKER_FAILED, failed_trailer};
 
 pub(crate) async fn run_specialist_llm(
     agent: Agent,
@@ -25,7 +26,7 @@ pub(crate) async fn run_specialist_llm(
         "Specialist role `{}` executed its isolated task to completion.\n\n\
          TASK BRIEF:\n{}\n\n\
          BOUNDED SNIPPETS ({count}):\n{snippet_block}\n\n\
-         MISSION COMPLETE",
+         {MARKER_COMPLETE}",
         ctx.role_system_prompt
             .trim()
             .lines()
@@ -51,7 +52,10 @@ pub(crate) async fn run_specialist_llm(
     if is_test_runner {
         canned
     } else {
-        "Specialist execution failed: configuration or LLM backend unavailable outside test environment.\n\nFAILED (config_error)".to_string()
+        format!(
+            "Specialist execution failed: configuration or LLM backend unavailable outside test environment.\n\n{}",
+            failed_trailer("config_error")
+        )
     }
 }
 
@@ -91,7 +95,7 @@ pub(crate) async fn try_run_specialist_live(
     let client = crate::llm::ChatClient::new_with_token(backend_url, model, auth_token);
     let res = match run_specialist_live(&client, agent, ctx, &cfg, token).await {
         Ok(s) => s,
-        Err(e) => format!("Specialist execution failed: {e}\n\nFAILED"),
+        Err(e) => format!("Specialist execution failed: {e}\n\n{MARKER_FAILED}"),
     };
     Some(res)
 }

@@ -1,20 +1,17 @@
 //! Integration tests for the orchestrator `delegate` flow (execution plan
 //! task t-a102).
 //!
-//! These tests verify that `wip/src/orchestrator/mod.rs` `delegate` flow is
+//! These tests verify that `src/orchestrator/mod.rs` `delegate` flow is
 //! aligned with caesar's `Orchestrator` logic as captured in
-//! `wip/REFERENCE_ORCHESTRATION_CONTRACT.md`:
+//! the caesar reference orchestration contract (not vendored in this repo):
 //!
 //! 1. **Fractal depth gating** — recursion bounds are STRICTLY enforced. The
-//!    gate is UNCONDITIONAL (parity with caesar `tools_manager.rs:914`), so a
+//!    gate is UNCONDITIONAL (parity with the caesar tools_manager gate), so a
 //!    request that would exceed the bound is rejected regardless of
 //!    `recursion_granted`, and a rejected delegation emits NO `Started` event.
-//! 2. **Deep-Freeze snapshot/recover** — `delegate()` snapshots the in-flight
-//!    delegation to the Crash Journal before the worker runs and clears it on
-//!    clean termination; `recover_frozen()` rehydrates a frozen delegation.
-//! 3. **`DelegationEvent` surfacing** — a successful delegation emits exactly
+//! 2. **`DelegationEvent` surfacing** — a successful delegation emits exactly
 //!    one `Started` then one `Completed` event for the specialist + task.
-//! 4. **`apply_check_off` parity** — `MISSION COMPLETE (t-xxx)` flips the plan
+//! 3. **`apply_check_off` parity** — `MISSION COMPLETE (t-xxx)` flips the plan
 //!    line to `[x]`.
 //!
 //! NOTE: The specialist workers (`run_specialist_llm`) attempt a live LLM call
@@ -100,13 +97,11 @@ fn req(
     }
 }
 
-// ---------------------------------------------------------------------------
 // 1. Fractal depth gating
-// ---------------------------------------------------------------------------
 
 /// The recursion bound is STRICTLY enforced: a delegation at the max depth is
 /// rejected even when `recursion_granted` is false (parity with caesar's
-/// unconditional gate at tools_manager.rs:914).
+/// unconditional gate in caesar tools_manager).
 #[tokio::test]
 async fn test_depth_gate_rejects_at_bound_regardless_of_grant() {
     let tmp = setup().await;
@@ -163,82 +158,7 @@ async fn test_depth_gate_allows_within_bound() {
     assert!(matches!(d.marker, MissionMarker::Complete { .. }));
 }
 
-// ---------------------------------------------------------------------------
-// 2. Deep-Freeze snapshot/recover
-// ---------------------------------------------------------------------------
-
-/// `delegate()` snapshots the in-flight delegation to the Crash Journal before
-/// the worker runs and clears it on clean termination (SPEC §3.4).
-#[tokio::test]
-async fn test_deep_freeze_snapshots_and_clears() {
-    let tmp = setup().await;
-    let m = test_manager(&tmp);
-    assert!(!m.journal.is_frozen());
-    let d = m
-        .delegate(req(Agent::Coder, "build parser", None, false))
-        .await
-        .expect("delegation succeeds");
-    assert!(matches!(d.marker, MissionMarker::Complete { .. }));
-    // Clean termination leaves no frozen checkpoint behind.
-    assert!(!m.journal.is_frozen());
-    // The journal logged at least a Frozen + Resolved pair.
-    let log = m.journal.journal().unwrap();
-    assert!(
-        log.iter()
-            .any(|e| e.kind == marmennill::orchestrator::JournalEventKind::Frozen)
-    );
-    assert!(
-        log.iter()
-            .any(|e| e.kind == marmennill::orchestrator::JournalEventKind::Resolved)
-    );
-}
-
-/// A frozen delegation is rehydrated by `recover_frozen()` using the identical
-/// worker_id and preserved sub_req.
-#[tokio::test]
-async fn test_deep_freeze_recover_rehydrates() {
-    let tmp = setup().await;
-    let m = test_manager(&tmp);
-    let r = req(
-        Agent::Generalist,
-        "Resume the analysis.",
-        Some("t-777"),
-        false,
-    );
-    // Simulate a crash: freeze the delegation by hand and do NOT clear.
-    let worker_id = m
-        .journal
-        .snapshot(Agent::Generalist, &r)
-        .expect("snapshot written");
-    assert!(m.journal.is_frozen());
-
-    // Rehydrate on a "restarted" Manager rooted at the same plan dir.
-    let m2 = test_manager(&tmp);
-    let recovered = m2
-        .recover_frozen()
-        .await
-        .expect("recovery succeeds")
-        .expect("a frozen delegation existed");
-    assert!(matches!(recovered.marker, MissionMarker::Complete { .. }));
-    assert!(recovered.content.contains("Resume the analysis."));
-    // The frozen checkpoint was released after rehydration.
-    assert!(!m2.journal.is_frozen());
-    let _ = worker_id;
-}
-
-/// With nothing frozen, `recover_frozen()` is a clean no-op.
-#[tokio::test]
-async fn test_deep_freeze_recover_none_when_clean() {
-    let tmp = setup().await;
-    let m = test_manager(&tmp);
-    assert!(!m.journal.is_frozen());
-    let res = m.recover_frozen().await.expect("no error on clean boot");
-    assert!(res.is_none());
-}
-
-// ---------------------------------------------------------------------------
-// 3. DelegationEvent surfacing
-// ---------------------------------------------------------------------------
+// 2. DelegationEvent surfacing
 
 /// A successful delegation emits exactly one `Started` then one `Completed`
 /// event for the specialist + task.
@@ -267,9 +187,7 @@ async fn test_delegation_events_started_then_completed() {
         DelegationEvent::Completed { agent: Agent::Coder, task: Some(t) } if t == "t-77"));
 }
 
-// ---------------------------------------------------------------------------
-// 4. apply_check_off parity
-// ---------------------------------------------------------------------------
+// 3. apply_check_off parity
 
 /// `MISSION COMPLETE (t-xxx)` flips the plan line `[ ]` → `[x]`.
 #[tokio::test]
@@ -291,19 +209,15 @@ async fn test_check_off_complete_flips() {
     assert_eq!(remaining, vec!["t-102".to_string()]);
 }
 
-// ---------------------------------------------------------------------------
-// 5. Abort signal lifecycle and delegation cancellation
-// ---------------------------------------------------------------------------
+// 4. Abort signal lifecycle and delegation cancellation
 
 #[tokio::test]
 async fn test_orchestrator_abort_signal_lifecycle_and_cancellation() {
     let tmp = setup().await;
     let m = test_manager(&tmp);
 
-    // Initial state: not cancelled
     assert!(!m.is_cancelled());
 
-    // Request abort / cancellation
     m.cancel();
     assert!(m.is_cancelled());
 

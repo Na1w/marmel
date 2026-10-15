@@ -2,7 +2,7 @@
 //!
 //! Verifies:
 //! 1. Plan creation pre-generates prompt pairs (`<task_id>.md` and optional `<task_id>-validation.md`) on disk.
-//! 2. Disk-first lookup in `delegate()` rehydrates exact saved prompt specifications.
+//! 2. Disk-first lookup in `delegate()` restores the exact saved prompt specifications.
 //! 3. Planner agent blueprint includes `AGENTS.md` archetypes and strictly zero micro-skills.
 //! 4. Project-level `skills/` and `AGENTS.md` override and augment catalog archetypes.
 //! 5. All tests run offline against deterministic mock/canned data.
@@ -74,7 +74,6 @@ async fn test_plan_creation_pregenerates_prompt_pairs_on_disk() {
             "t-001-validation.md must NOT be generated for pure research"
         );
 
-        // Verify content and frontmatter of pregenerated prompts
         let bp_coder = AgentBlueprint::load_from_disk(&prompts_dir.join("t-002.md")).unwrap();
         assert_eq!(bp_coder.role_name, "coder_specialist");
         assert!(bp_coder.allowed_tools.contains(&"write_file".to_string()));
@@ -188,16 +187,13 @@ tools: read_file, run_command, grep_search, glob, rebirth
 "#;
     std::fs::write(tmp.path().join("AGENTS.md"), custom_agents).unwrap();
 
-    // 3. Discover catalog
     let catalog = Catalog::discover(tmp.path());
 
-    // Verify skill discovered
     let skill = catalog
         .get_skill("distributed_systems")
         .expect("custom skill loaded");
     assert_eq!(skill.name, "Distributed Systems Patterns");
 
-    // Verify custom archetype discovered
     let arch = catalog
         .get_agent("site_reliability_engineer")
         .expect("custom archetype loaded");

@@ -24,7 +24,6 @@ impl StreamingResponseExtractor {
 
         if !self.in_response_field {
             self.buffer.push_str(chunk);
-            // Look for "response" : "
             if let Some(pos) = self.buffer.find("\"response\"") {
                 let rest = &self.buffer[pos + "\"response\"".len()..];
                 if let Some(colon_pos) = rest.find(':') {
@@ -58,7 +57,6 @@ impl StreamingResponseExtractor {
             return (String::new(), false);
         }
 
-        // Already in response field
         for ch in chunk.chars() {
             if self.process_char(ch, &mut output) {
                 just_finished = true;

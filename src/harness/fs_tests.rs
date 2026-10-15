@@ -81,7 +81,6 @@ fn test_harness_paginated_read() {
     );
     assert!(out.len() <= crate::harness::MAX_TOOL_OUTPUT_CHARS);
 
-    // Second page.
     let args = serde_json::json!({
         "path": path.to_string_lossy(),
         "offset": 8000,
@@ -97,7 +96,6 @@ fn test_harness_paginated_read() {
     );
     assert!(out.len() <= crate::harness::MAX_TOOL_OUTPUT_CHARS);
 
-    // Final page.
     let args = serde_json::json!({
         "path": path.to_string_lossy(),
         "offset": 16000,
@@ -239,7 +237,6 @@ fn test_harness_read_file_limit_clamping() {
 
 #[test]
 fn test_harness_path_confinement_sandbox() {
-    // Valid workspace path succeeds
     let valid = resolve_safe_path("Cargo.toml", crate::tool_names::TOOL_READ_FILE).unwrap();
     assert!(valid.ends_with("Cargo.toml"));
 

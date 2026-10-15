@@ -97,7 +97,6 @@ impl Catalog {
     }
 
     fn register_builtins(&mut self) {
-        // Built-in skills
         self.register_skill(Self::parse_skill_markdown(
             "clean_code",
             crate::prompts::SKILL_CLEAN_CODE,
@@ -124,7 +123,6 @@ impl Catalog {
             SkillSource::Builtin,
         ));
 
-        // Built-in baseline archetypes
         self.register_agent(AgentArchetype {
             id: "coder".to_string(),
             name: "Software Engineer".to_string(),

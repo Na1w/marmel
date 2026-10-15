@@ -7,6 +7,10 @@ use crate::agents::{DelegationRequest, Deliverable, MissionMarker};
 use crate::harness::{HarnessStats, ToolError, ToolResult};
 use crate::llm::ChatClient;
 use crate::manager::phase::Plan;
+use crate::markers::{
+    ABORT_REASON, MARKER_COMPLETE, MARKER_FAILED, MARKER_REPLAN, aborted_deliverable, decorated,
+    has_failure_marker, has_replan_marker,
+};
 use crate::tool_names::TOOL_DELEGATE_TASK;
 use std::sync::Arc;
 
@@ -50,10 +54,7 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
             detail: "`task_id` is mandatory: you must specify the execution_plan.md task id (e.g. 't-001') to delegate work".to_string(),
         });
     }
-    let clean_task_id = raw_task_id
-        .trim_matches(|c| c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\'')
-        .trim()
-        .to_string();
+    let clean_task_id = crate::task_id::normalize_task_id_ref(raw_task_id).to_string();
     if clean_task_id.is_empty() {
         return Err(ToolError::BadArguments {
             tool: TOOL_DELEGATE_TASK.to_string(),
@@ -69,26 +70,11 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
         if let Some(ref tid) = req.task_id
             && let Ok(Some(content)) = plan.read()
         {
-            let clean_tid = tid
-                .trim()
-                .trim_matches(|c| {
-                    c == '[' || c == ']' || c == '(' || c == ')' || c == '"' || c == '\''
-                })
-                .trim();
-            let tid_lower = clean_tid.to_ascii_lowercase();
-            let re_checked = regex::Regex::new(&format!(
-                r"(?i)^\s*(?:[-*]|\d+\.)\s*\[\s*[xX]\s*\]\s*\*{{0,2}}\[?{}\]?\*{{0,2}}\b",
-                regex::escape(&tid_lower)
-            ))
-            .ok();
-            let is_checked = content.lines().any(|line| match &re_checked {
-                Some(re) => re.is_match(line),
-                None => {
-                    let lower = line.to_ascii_lowercase();
-                    lower.contains(&format!("[{tid_lower}]"))
-                        && (line.contains("[x]") || line.contains("[X]"))
-                }
-            });
+            let clean_tid = crate::task_id::normalize_task_id_ref(tid);
+            // Same grammar as the on-disk check-off in `manager::phase`, so a
+            // plan written as `- [x] (t-002) …` is recognised here too
+            // (dedup cluster C3).
+            let is_checked = crate::plan_parse::is_checked_task(&content, clean_tid);
             if is_checked {
                 tracing::warn!("Rejecting re-delegation of already completed task [{clean_tid}]");
                 return Ok(ToolResult::err(format!(
@@ -118,9 +104,9 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
                 if crate::orchestrator::is_globally_cancelled() {
                     return Ok(Deliverable {
                         marker: MissionMarker::Failed {
-                            reason: "aborted".to_string(),
+                            reason: ABORT_REASON.to_string(),
                         },
-                        content: "Task aborted by user instruction.\n\nFAILED (aborted)".to_string(),
+                        content: aborted_deliverable("aborted by user instruction"),
                         task_id: req.task_id.clone(),
                     });
                 }
@@ -132,7 +118,9 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
                         marker: MissionMarker::Failed {
                             reason: "task interrupted or runtime shutting down".to_string(),
                         },
-                        content: "Task execution interrupted or runtime shutting down.\n\nFAILED (aborted)".to_string(),
+                        content: aborted_deliverable(
+                            "execution interrupted or runtime shutting down",
+                        ),
                         task_id: None,
                     })
                 })
@@ -145,7 +133,9 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
                 marker: MissionMarker::Failed {
                     reason: "task thread interrupted or runtime shutting down".to_string(),
                 },
-                content: "Task execution thread interrupted or runtime shutting down.\n\nFAILED (aborted)".to_string(),
+                content: aborted_deliverable(
+                    "execution thread interrupted or runtime shutting down",
+                ),
                 task_id: None,
             }),
         }
@@ -160,7 +150,7 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
     match &deliverable.marker {
         MissionMarker::Complete { .. } => {
             let mut res = deliverable.content.trim().to_string();
-            let complete_token = format!("MISSION COMPLETE ({tid})");
+            let complete_token = decorated(MARKER_COMPLETE, tid);
             if !res.contains(&complete_token) {
                 res.push_str("\n\n");
                 res.push_str(&complete_token);
@@ -169,19 +159,21 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
         }
         MissionMarker::Failed { reason } => {
             let content = deliverable.content.trim();
-            if content.contains("FAILED") {
+            if has_failure_marker(content) {
                 Ok(ToolResult::err(content.to_string()))
             } else {
-                Ok(ToolResult::err(format!("{content}\n\nFAILED: {reason}")))
+                Ok(ToolResult::err(format!(
+                    "{content}\n\n{MARKER_FAILED}: {reason}"
+                )))
             }
         }
         MissionMarker::Replan { reason } => {
             let content = deliverable.content.trim();
-            if content.contains("REPLAN REQUIRED") {
+            if has_replan_marker(content) {
                 Ok(ToolResult::err(content.to_string()))
             } else {
                 Ok(ToolResult::err(format!(
-                    "{content}\n\nREPLAN REQUIRED: {reason}"
+                    "{content}\n\n{MARKER_REPLAN}: {reason}"
                 )))
             }
         }
@@ -205,33 +197,76 @@ pub fn caller_allows_tool(agent: Agent, tool: &str, registry: &SpecialistRegistr
 // NOTE: `brief_for_task` reads a plan line's text to build a delegation brief
 // (REQ-ORCH-005 one-task-per-call: the brief is self-contained so the subagent
 // does not need the Manager's context). It is `pub` so the Manager turn loop in
-// `src/agent/loop.rs` reuses the same plan-line → brief builder.
-/// Regex matching a plan task line in the `- [ ] [t-xxx] description` format.
-/// Compiled exactly once via `OnceLock` (CODE_REVIEW Point 2).
-static TASK_LINE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-
+// `src/manager/loop.rs` reuses the same plan-line → brief builder.
+//
+// The old private `TASK_LINE_RE` (a sixth copy of the plan grammar, restricted
+// to `- [ ] [t-xxx] ` with a *mandatory* bracket around the id) is gone: the
+// lookup now goes through [`crate::plan_parse`], so plans written as
+// `- [ ] (t-002) …`, `* [x] [t-003] …` or `- [X] t-004 …` yield a real brief
+// instead of the generic fallback text.
 pub fn brief_for_task(plan: &Plan, task_id: &str) -> String {
     // Read-only diagnostic: build a self-contained brief from the plan task
     // text. If the plan line is present, its descriptive text becomes the
     // brief; otherwise fall back to a deterministic generic instruction.
-    if let Ok(Some(content)) = plan.read() {
-        let re = TASK_LINE_RE.get_or_init(|| {
-            regex::Regex::new(r"(?m)^\s*-\s*\[\s*[ xX]?\s*\]\s*\[(t-[A-Za-z0-9_-]+)\]\s*(.*)$")
-                .expect("valid task line regex")
-        });
-        for caps in re.captures_iter(&content) {
-            if &caps[1] == task_id {
-                let desc = caps[2].trim();
-                if !desc.is_empty() {
-                    return format!(
-                        "{desc}\n\nExecute this delegated task to completion and return your \
-                         deliverable, ending with MISSION COMPLETE ({task_id})."
-                    );
-                }
-            }
-        }
+    if let Ok(Some(content)) = plan.read()
+        && let Some(task) = crate::plan_parse::find_task_line(&content, task_id)
+        && !task.description.trim().is_empty()
+    {
+        let desc = task.description.trim();
+        return format!(
+            "{desc}\n\nExecute this delegated task to completion and return your \
+             deliverable, ending with {MARKER_COMPLETE} ({task_id})."
+        );
     }
-    "Execute the delegated task described by the plan line, producing the
-deliverable and ending with MISSION COMPLETE (task-id)."
-        .to_string()
+    format!(
+        "Execute the delegated task described by the plan line, producing the\ndeliverable and ending with {MARKER_COMPLETE} (task-id)."
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The brief must come from the plan line for every accepted spelling, and
+    /// must keep the historical generic fallback for unknown ids.
+    #[test]
+    fn brief_for_task_reads_every_accepted_task_line_form() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let plan = Plan::at(dir.path());
+        let content = "\
+# Execution Plan
+- [ ] [t-c3del-1] Build the parser
+- [ ] (t-c3del-2) Migrate schema
+* [ ] t-c3del-3 Add tests
+- [x] **[t-c3del-4]** Docs refreshed
+";
+        plan.create(content).expect("create plan");
+
+        assert!(brief_for_task(&plan, "t-c3del-1").starts_with("Build the parser"));
+        assert!(brief_for_task(&plan, "t-c3del-2").starts_with("Migrate schema"));
+        assert!(brief_for_task(&plan, "t-c3del-3").starts_with("Add tests"));
+        assert!(brief_for_task(&plan, "t-c3del-4").starts_with("Docs refreshed"));
+        assert!(
+            brief_for_task(&plan, "[t-c3del-2]").starts_with("Migrate schema"),
+            "decorated task ids must resolve"
+        );
+        assert!(
+            brief_for_task(&plan, "t-c3del-404")
+                .starts_with("Execute the delegated task described by the plan line"),
+            "unknown ids keep the generic fallback brief"
+        );
+    }
+
+    /// A plan line that is already checked off still yields its own brief (the
+    /// guard against re-delegation is separate, see `handle_delegate_task`).
+    #[test]
+    fn re_delegation_guard_uses_the_shared_grammar() {
+        let content = "# Execution Plan\n- [x] (t-c3del-9) Done in paren form\n";
+        assert!(crate::plan_parse::is_checked_task(content, "t-c3del-9"));
+        assert!(crate::plan_parse::is_checked_task(content, "[t-c3del-9]"));
+        assert!(!crate::plan_parse::is_checked_task(content, "t-c3del-8"));
+        let pending = "# Execution Plan\n- [ ] (t-c3del-7) Not done\n";
+        assert!(!crate::plan_parse::is_checked_task(pending, "t-c3del-7"));
+        assert!(crate::plan_parse::is_pending_task(pending, "t-c3del-7"));
+    }
 }

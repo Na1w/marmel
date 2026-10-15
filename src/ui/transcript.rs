@@ -1,13 +1,20 @@
-//! Persistent UI transcript journal for interactive sessions.
+//! In-memory UI transcript journal for interactive sessions.
 //!
 //! Separates the user-facing chat and event stream from internal LLM context
-//! mechanics (e.g. synthetic system prompts, auto-nudges, deep-freeze prompts).
+//! mechanics (e.g. synthetic system prompts, auto-nudges).
+//!
+//! t-025b deleted this journal's persistence owner: `UiTranscript::save`,
+//! `UiTranscript::load`, `UiTranscript::from_legacy_messages` and the
+//! `.ui_transcript.json` file name are gone, and nothing writes a UI journal file
+//! any more. The session bundle's `ui` member ([`crate::session::format::ui`]) is
+//! the only durable copy; this journal stays the live in-memory chat record and the
+//! steering-replay source. The serde derives survive because the bundle's
+//! `journal` section ([`crate::session::format::ui::UiJournalRecord`]) is the
+//! one-for-one persistence twin of [`UiRecord`].
 
-use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
-/// A single structured record persisted in the UI transcript journal.
+/// A single structured UI event in the journal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum UiRecord {
@@ -45,73 +52,44 @@ pub struct UiTranscript {
 }
 
 impl UiTranscript {
-    /// Create an empty transcript.
     pub fn new() -> Self {
         Self {
             records: Vec::new(),
         }
     }
 
-    /// Access the underlying records slice.
     pub fn records(&self) -> &[UiRecord] {
         &self.records
     }
 
-    /// Mutable access to the underlying records.
-    pub fn records_mut(&mut self) -> &mut Vec<UiRecord> {
-        &mut self.records
-    }
-
-    /// Check if the transcript has no records.
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
 
-    /// Number of records in the transcript.
     pub fn len(&self) -> usize {
         self.records.len()
     }
 
-    /// Append a single record to the transcript.
     pub fn append(&mut self, record: UiRecord) {
         self.records.push(record);
     }
 
-    /// Clear all records.
     pub fn clear(&mut self) {
         self.records.clear();
-    }
-
-    /// Load the transcript from a JSON file.
-    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = path.as_ref();
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("reading UI transcript from {}", path.display()))?;
-        let transcript: UiTranscript = serde_json::from_str(&content)
-            .with_context(|| format!("parsing UI transcript from {}", path.display()))?;
-        Ok(transcript)
-    }
-
-    /// Save the transcript to a JSON file.
-    pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating directory {}", parent.display()))?;
-        }
-        let json = serde_json::to_string_pretty(self).context("serializing UI transcript")?;
-        std::fs::write(path, json)
-            .with_context(|| format!("writing UI transcript to {}", path.display()))?;
-        Ok(())
     }
 
     /// Extract paired user steering queries and their corresponding arbitrator responses.
     ///
     /// Ignores synthetic internal messages and pairs each user prompt with
     /// subsequent `SteerResponse`s, updating pending decisions when resolution occurs.
+    ///
+    /// "Is this entry still pending?" is **not** decided here: it is delegated to
+    /// [`crate::orchestrator::steer::steering_entry_is_pending`], the predicate the
+    /// live steering-history owner (`orchestrator::bus::record_steering_exchange`)
+    /// applies to the very same text. One vocabulary therefore governs both the
+    /// live history and this journal replay, and none of its markers is tied to a
+    /// natural language (t-013 removed the Swedish marker that used to sit here,
+    /// which only matched a Swedish production prompt).
     pub fn extract_steering_history(&self) -> Vec<(String, String)> {
         let mut history: Vec<(String, String)> = Vec::new();
         let mut current_user: Option<String> = None;
@@ -145,11 +123,7 @@ impl UiTranscript {
                         if let Some((last_q, last_resp)) = history.last_mut()
                             && last_q == user_q
                         {
-                            if last_resp.contains("awaiting specialist reply")
-                                || last_resp.starts_with("Decision:")
-                                || last_resp.contains("följdfråga")
-                                || last_resp.contains("follow-up")
-                            {
+                            if crate::orchestrator::steer::steering_entry_is_pending(last_resp) {
                                 *last_resp = clean_resp;
                             } else {
                                 last_resp.push('\n');
@@ -166,107 +140,6 @@ impl UiTranscript {
             }
         }
         history
-    }
-
-    /// Convert legacy LLM messages (`Message`) into `UiRecord`s for backward compatibility.
-    ///
-    /// This isolates legacy prefix checks and heuristic filtering into a single migration path.
-    pub fn from_legacy_messages(messages: &[crate::types::Message]) -> Self {
-        let mut records = Vec::new();
-        let delegated_call_ids: std::collections::HashSet<&str> = messages
-            .iter()
-            .filter_map(|m| match m {
-                crate::types::Message::Assistant { tool_calls, .. } => Some(tool_calls),
-                _ => None,
-            })
-            .flatten()
-            .filter(|call| call.function.name == crate::tool_names::TOOL_DELEGATE_TASK)
-            .map(|call| call.id.as_str())
-            .collect();
-
-        for msg in messages.iter().skip(1) {
-            match msg {
-                crate::types::Message::System { content } => {
-                    if content.starts_with("(SYSTEM: REBIRTH CHECKPOINT:") {
-                        let summary = content
-                            .strip_prefix("(SYSTEM: REBIRTH CHECKPOINT:")
-                            .unwrap_or(content)
-                            .trim_end_matches(')');
-                        records.push(UiRecord::Status {
-                            text: format!("Rebirth checkpoint:{summary}"),
-                        });
-                    }
-                }
-                crate::types::Message::User { content } => {
-                    let trimmed = content.trim_start();
-                    let is_synthetic = trimmed.starts_with("(SYSTEM NOTICE:")
-                        || trimmed.starts_with("(SYSTEM:")
-                        || trimmed.starts_with("SYSTEM:")
-                        || trimmed.starts_with("[System]")
-                        || trimmed.starts_with("(User steering resulted in subtask");
-                    if !is_synthetic {
-                        records.push(UiRecord::User {
-                            text: content.clone(),
-                        });
-                    }
-                }
-                crate::types::Message::Assistant {
-                    content,
-                    reasoning_content,
-                    tool_calls,
-                } => {
-                    let has_thought = reasoning_content
-                        .as_ref()
-                        .is_some_and(|r| !r.trim().is_empty());
-                    let has_content = content.as_ref().is_some_and(|c| !c.trim().is_empty());
-                    if has_thought || has_content {
-                        records.push(UiRecord::Assistant {
-                            content: content.clone(),
-                            thinking: reasoning_content.clone(),
-                        });
-                    }
-                    for call in tool_calls {
-                        let args_val =
-                            serde_json::from_str::<serde_json::Value>(&call.function.arguments)
-                                .unwrap_or_else(|_| {
-                                    serde_json::Value::String(call.function.arguments.clone())
-                                });
-                        records.push(UiRecord::ToolCall {
-                            display: crate::ui::helpers::format_tool_call_display(
-                                &call.function.name,
-                                &args_val,
-                            ),
-                        });
-                    }
-                }
-                crate::types::Message::Tool {
-                    tool_call_id,
-                    content,
-                } => {
-                    if delegated_call_ids.contains(tool_call_id.as_str()) {
-                        let summary = if let Some(first_line) = content.lines().next() {
-                            if first_line.starts_with("MISSION COMPLETE")
-                                || first_line.to_lowercase().contains("error")
-                                || first_line.to_lowercase().contains("fail")
-                            {
-                                first_line.to_string()
-                            } else {
-                                "Task completed".to_string()
-                            }
-                        } else {
-                            "Task completed".to_string()
-                        };
-                        records.push(UiRecord::ToolResult { display: summary });
-                    } else {
-                        records.push(UiRecord::ToolResult {
-                            display: content.clone(),
-                        });
-                    }
-                }
-            }
-        }
-
-        Self { records }
     }
 }
 
@@ -321,99 +194,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ui_transcript_save_and_load() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join(".marmel").join(".ui_transcript.json");
-
-        let mut transcript = UiTranscript::new();
-        transcript.append(UiRecord::User {
-            text: "Build feature".to_string(),
-        });
-        transcript.save(&path).unwrap();
-
-        assert!(path.exists());
-        let loaded = UiTranscript::load(&path).unwrap();
-        assert_eq!(transcript, loaded);
-    }
-
-    #[test]
-    fn test_from_legacy_messages_filters_synthetic_and_preserves_structure() {
-        let messages = vec![
-            crate::types::Message::System {
-                content: "system prompt".to_string(),
-            },
-            crate::types::Message::User {
-                content: "Refactor auth".to_string(),
-            },
-            crate::types::Message::Assistant {
-                content: Some("Looking into auth.".to_string()),
-                reasoning_content: Some("Checking directory.".to_string()),
-                tool_calls: vec![crate::types::ToolCall::new(
-                    "call-1",
-                    crate::tool_names::TOOL_GLOB,
-                    r#"{"pattern": "src/auth/*.rs"}"#,
-                )],
-            },
-            crate::types::Message::Tool {
-                tool_call_id: "call-1".to_string(),
-                content: "src/auth/mod.rs".to_string(),
-            },
-            // Synthetic system messages that should be filtered:
-            crate::types::Message::User {
-                content: "(SYSTEM NOTICE: Active execution plan detected...)".to_string(),
-            },
-            crate::types::Message::User {
-                content: "[System] User executed /reset.".to_string(),
-            },
-            crate::types::Message::User {
-                content:
-                    "(User steering resulted in subtask 't-1' executed by specialist 'coder'.)"
-                        .to_string(),
-            },
-            // Rebirth checkpoint:
-            crate::types::Message::System {
-                content: "(SYSTEM: REBIRTH CHECKPOINT: Completed auth refactor)".to_string(),
-            },
-        ];
-
-        let transcript = UiTranscript::from_legacy_messages(&messages);
-        let records = transcript.records();
-
-        assert_eq!(records.len(), 5);
-        assert_eq!(
-            records[0],
-            UiRecord::User {
-                text: "Refactor auth".to_string()
-            }
-        );
-        assert_eq!(
-            records[1],
-            UiRecord::Assistant {
-                content: Some("Looking into auth.".to_string()),
-                thinking: Some("Checking directory.".to_string()),
-            }
-        );
-        assert_eq!(
-            records[2],
-            UiRecord::ToolCall {
-                display: "glob(src/auth/*.rs)".to_string()
-            }
-        );
-        assert_eq!(
-            records[3],
-            UiRecord::ToolResult {
-                display: "src/auth/mod.rs".to_string()
-            }
-        );
-        assert_eq!(
-            records[4],
-            UiRecord::Status {
-                text: "Rebirth checkpoint: Completed auth refactor".to_string()
-            }
-        );
-    }
-
-    #[test]
     fn test_extract_steering_history_pairs_and_resolves_pending() {
         let mut transcript = UiTranscript::new();
         transcript.append(UiRecord::User {
@@ -424,9 +204,11 @@ mod tests {
             thinking: None,
         });
 
-        // User asks steering question
+        // The pending placeholder below is what makes the merge arm fire: the
+        // resolved answer that follows replaces it, so the question keeps a
+        // single history entry.
         transcript.append(UiRecord::User {
-            text: "Hur går det för codern?".to_string(),
+            text: "How is the coder doing?".to_string(),
         });
         transcript.append(UiRecord::SteerResponse {
             text:
@@ -434,7 +216,6 @@ mod tests {
                     .to_string(),
         });
 
-        // Intermediate tool logs while worker is working
         transcript.append(UiRecord::ToolCall {
             display: "run_command(ctest)".to_string(),
         });
@@ -442,28 +223,97 @@ mod tests {
             display: "7/7 tests passed".to_string(),
         });
 
-        // Specialist reply synthesized for the user
         transcript.append(UiRecord::SteerResponse {
-            text: "\n[Arbitrator]: Codern har tagit bort jit_invalidate_all och alla 7 tester passerar.\n"
+            text: "\n[Arbitrator]: The coder removed jit_invalidate_all and all 7 tests pass.\n"
                 .to_string(),
         });
 
-        // Second steering turn
         transcript.append(UiRecord::User {
-            text: "Vad är nästa steg?".to_string(),
+            text: "What is the next step?".to_string(),
         });
         transcript.append(UiRecord::SteerResponse {
-            text: "Kör real-ROM-test med timeout.".to_string(),
+            text: "Run the real-ROM test with a timeout.".to_string(),
         });
 
         let history = transcript.extract_steering_history();
         assert_eq!(history.len(), 2);
-        assert_eq!(history[0].0, "Hur går det för codern?");
+        assert_eq!(history[0].0, "How is the coder doing?");
         assert_eq!(
             history[0].1,
-            "Codern har tagit bort jit_invalidate_all och alla 7 tester passerar."
+            "The coder removed jit_invalidate_all and all 7 tests pass."
         );
-        assert_eq!(history[1].0, "Vad är nästa steg?");
-        assert_eq!(history[1].1, "Kör real-ROM-test med timeout.");
+        assert_eq!(history[1].0, "What is the next step?");
+        assert_eq!(history[1].1, "Run the real-ROM test with a timeout.");
+    }
+
+    /// Pin (t-013): the pending-decision merge keys off the orchestrator's
+    /// language-neutral marker vocabulary, not off a wording. The placeholder fed
+    /// in here is the `user_status` example that the arbitrator prompt in
+    /// `orchestrator::notice` actually invites the model to emit, read back off
+    /// that prompt — producer and consumer are pinned together, so re-wording the
+    /// prompt out of the vocabulary fails here instead of silently duplicating
+    /// steering-history entries.
+    #[test]
+    fn test_extract_steering_history_merges_the_pending_status_the_prompt_invites() {
+        let pending = crate::orchestrator::notice::worker_reply_user_status_example();
+        assert!(
+            crate::orchestrator::steer::steering_entry_is_pending(pending),
+            "the prompt's own user_status example must read as a pending decision"
+        );
+
+        let mut transcript = UiTranscript::new();
+        transcript.append(UiRecord::User {
+            text: "Is the file-format migration safe?".to_string(),
+        });
+        transcript.append(UiRecord::SteerResponse {
+            text: format!("\n[Arbitrator]: {pending}\n"),
+        });
+        transcript.append(UiRecord::SteerResponse {
+            text: "\n[Arbitrator]: The coder confirmed older files still parse.\n".to_string(),
+        });
+
+        let history = transcript.extract_steering_history();
+        assert_eq!(history.len(), 1, "one question keeps one entry");
+        assert_eq!(history[0].0, "Is the file-format migration safe?");
+        assert_eq!(
+            history[0].1, "The coder confirmed older files still parse.",
+            "the resolved answer replaces the pending placeholder"
+        );
+    }
+
+    /// Regression (t-013): the merge used to fire on a Swedish literal in the
+    /// arbitrator status line. The vocabulary is language-neutral now, so a
+    /// Swedish-only placeholder is no longer treated as pending and the two
+    /// answers are concatenated instead — the accepted, cosmetic cost of dropping
+    /// that arm, pinned so it cannot silently widen.
+    ///
+    /// The Swedish is spelled with `\u{…}` escapes so this file stays free of
+    /// non-ASCII literals; the escapes compile to the same byte string.
+    #[test]
+    fn test_extract_steering_history_does_not_merge_a_swedish_only_pending_status() {
+        let pending =
+            "St\u{e4}ller en f\u{f6}ljdfra\u{e5}ga till Coder f\u{f6}r att reda ut detaljerna...";
+        assert!(
+            !crate::orchestrator::steer::steering_entry_is_pending(pending),
+            "the pending vocabulary must not match Swedish prose"
+        );
+
+        let mut transcript = UiTranscript::new();
+        transcript.append(UiRecord::User {
+            text: "Is the file-format migration safe?".to_string(),
+        });
+        transcript.append(UiRecord::SteerResponse {
+            text: format!("\n[Arbitrator]: {pending}\n"),
+        });
+        transcript.append(UiRecord::SteerResponse {
+            text: "\n[Arbitrator]: The coder confirmed older files still parse.\n".to_string(),
+        });
+
+        let history = transcript.extract_steering_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].1,
+            format!("{pending}\nThe coder confirmed older files still parse.")
+        );
     }
 }

@@ -238,6 +238,4 @@ pub(crate) fn is_markdown_divider(s: &str) -> bool {
         .all(|c| c == '-' || c == '=' || c == '*' || c == '`' || c == '#' || c == '_')
 }
 
-// ---------------------------------------------------------------------------
-// Orphan tool-message pruning (Part 7 checklist item 5)
-// ---------------------------------------------------------------------------
+// Orphan tool-message pruning (Part 7 checklist item 5): see `mod.rs`.
