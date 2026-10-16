@@ -7,8 +7,7 @@
 //! `Mcp-Session-Id` header is captured on `initialize` and echoed back on every
 //! subsequent request.
 //!
-//! The transport shares its network plumbing with the LLM chat client
-//! (`docs/recon_duplication_net.md`, clusters C3/C4/C2):
+//! The transport shares its network plumbing with the LLM chat client:
 //! * the reqwest client comes from [`build_http_client_with`], fed with the
 //!   transport's own [`HttpClientOptions`] by `http_client_options`;
 //! * the SSE read loop is the shared pump skeleton [`pump_next`];
@@ -16,11 +15,11 @@
 //!   with the crate-internal `McpError` carrying the per-transport
 //!   retryability classification.
 //!
-//! Since cluster C7 the transport owns *no* protocol knowledge: envelopes,
-//! request ids, method names, param shapes and the error/result decoding all
-//! come from [`super::protocol`], which it consumes through its
-//! [`JsonRpcTransport`] implementation. What is left here is the HTTP/SSE wire:
-//! the client, the headers, the session id, the SSE pump and the retry policy.
+//! The transport owns *no* protocol knowledge: envelopes, request ids, method
+//! names, param shapes and the error/result decoding all come from
+//! [`super::protocol`], which it consumes through its [`JsonRpcTransport`]
+//! implementation. What is left here is the HTTP/SSE wire: the client, the
+//! headers, the session id, the SSE pump and the retry policy.
 
 use anyhow::{Context, Result, anyhow};
 use eventsource_stream::Eventsource;
@@ -39,16 +38,15 @@ use crate::net::{
 
 /// Flat request/response deadline of the MCP transports: the per-event SSE
 /// timeout of this transport and the per-line read timeout of the stdio
-/// transport. Hoisted out of both hand-rolled poll loops so there is one
-/// number to tune (cluster C4).
+/// transport.
 pub(crate) const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Options the MCP transport hands to the shared client builder (cluster C3).
+/// Options the MCP transport hands to the shared client builder.
 ///
-/// These are exactly the client settings the transport used to hand-roll: a
-/// total request timeout of [`MCP_REQUEST_TIMEOUT`] and no connect timeout.
-/// Request-scoped headers (`Content-Type`, `Accept`, `Mcp-Session-Id`) are
-/// intentionally *not* client options — they are set per request.
+/// The client-level settings it needs: a total request timeout of
+/// [`MCP_REQUEST_TIMEOUT`] and no connect timeout. Request-scoped headers
+/// (`Content-Type`, `Accept`, `Mcp-Session-Id`) are intentionally *not* client
+/// options — they are set per request.
 pub(crate) fn http_client_options(request_timeout: Duration) -> HttpClientOptions {
     HttpClientOptions {
         connect_timeout: None,
@@ -72,8 +70,8 @@ pub(crate) fn is_retryable_status(status: reqwest::StatusCode) -> bool {
 ///
 /// It exists to carry the retryability classification consumed by [`Retryable`]
 /// (the shared policy in `crate::net::retry`). Every variant is converted back
-/// into `anyhow::Error` at the transport's public boundary, with the same
-/// message text the transport produced before, so MCP consumers are unaffected.
+/// into `anyhow::Error` at the transport's public boundary, so the message text
+/// MCP consumers see is the variant's own.
 #[derive(Debug)]
 pub(crate) enum McpError {
     /// The POST never produced response headers: DNS/connect refused/reset, or
@@ -300,12 +298,12 @@ impl JsonRpcTransport for HttpSseConnection {
     /// body or from an SSE stream).
     ///
     /// The wire-level attempt ([`Self::post_once`]) runs through the shared
-    /// retry policy in `crate::net::retry` (cluster C2): connection failures,
-    /// reqwest timeouts, 5xx/408/429 statuses and stream failures that happen
-    /// before the first SSE event are retried with the shared linear backoff.
-    /// Anything else — 4xx statuses, JSON-RPC application errors, undecodable
-    /// payloads — fails immediately, as does any stream failure once an event
-    /// has already been consumed (no partial-stream replay).
+    /// retry policy in `crate::net::retry`: connection failures, reqwest
+    /// timeouts, 5xx/408/429 statuses and stream failures that happen before the
+    /// first SSE event are retried with the shared linear backoff. Anything else
+    /// — 4xx statuses, JSON-RPC application errors, undecodable payloads — fails
+    /// immediately, as does any stream failure once an event has already been
+    /// consumed (no partial-stream replay).
     async fn send_request(&mut self, request: &JsonRpcRequest) -> Result<Value> {
         let tag = format!(
             "MCP call to '{}' for '{}'",
@@ -372,8 +370,8 @@ impl HttpSseConnection {
         Self::establish(server_name, url, request_timeout).await
     }
 
-    /// Build the reqwest client through the shared builder (cluster C3) and run
-    /// the `initialize` handshake through the shared protocol layer.
+    /// Build the reqwest client through the shared builder and run the
+    /// `initialize` handshake through the shared protocol layer.
     async fn establish(server_name: &str, url: &str, request_timeout: Duration) -> Result<Self> {
         let client = build_http_client_with(http_client_options(request_timeout))
             .with_context(|| format!("failed to build HTTP client for '{server_name}'"))?;
@@ -444,8 +442,7 @@ impl HttpSseConnection {
     }
 
     /// The POST every MCP envelope travels on: the request-scoped headers plus
-    /// the session id echo. Requests and notifications share it (cluster C7
-    /// removed the second, hand-copied version of these headers).
+    /// the session id echo. Requests and notifications share it.
     fn post_builder(&self) -> reqwest::RequestBuilder {
         let mut builder = self
             .client
@@ -471,14 +468,13 @@ impl HttpSseConnection {
     }
 
     /// Read a JSON-RPC response out of a Server-Sent Events stream using the
-    /// shared pump skeleton (cluster C4).
+    /// shared pump skeleton.
     ///
-    /// The deadline is recomputed per event, which keeps the transport's
-    /// existing flat *per-event* request timeout (`tokio::time::timeout
-    /// (self.request_timeout, stream.next())` was exactly this). `saw_event`
-    /// gates replayability: once an event has been consumed the request is never
-    /// resent. Which event answers this request (and which is somebody else's)
-    /// is decided by the protocol layer's [`decode_reply`].
+    /// The deadline is recomputed per event, which keeps the transport's flat
+    /// *per-event* request timeout. `saw_event` decides replayability: once an
+    /// event has been consumed the request is never resent. Which event answers
+    /// this request (and which is somebody else's) is decided by the protocol
+    /// layer's [`decode_reply`].
     async fn read_sse_response(
         &mut self,
         resp: reqwest::Response,

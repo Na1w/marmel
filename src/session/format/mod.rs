@@ -1,16 +1,15 @@
 //! The durable session vocabulary — the only place in the crate that names a
-//! session file or declares a session `Serialize`/`Deserialize` type (Design A
-//! §1 D1, §3).
+//! session file or declares a session `Serialize`/`Deserialize` type.
 //!
 //! Wire encoding is `serde_json` with 2-space pretty printing, so a bundle is
-//! human-inspectable and diff-able: inspection is part of "loudly reported"
-//! (A §3 preamble). `#[serde(deny_unknown_fields)]` appears on every durable
+//! human-inspectable and diff-able: inspection is part of "loudly reported".
+//! `#[serde(deny_unknown_fields)]` appears on every durable
 //! struct — a bundle written by a *newer* release MUST be refused, never
-//! partially read (A D6). Forward tolerance comes from `FORMAT_VERSION` /
+//! partially read. Forward tolerance comes from `FORMAT_VERSION` /
 //! `SCHEMA_VERSION` gating, not from silently ignoring fields.
 //!
 //! The file split below is internal; every type is re-exported here so callers
-//! see exactly the §3 names.
+//! see one flat set of names.
 
 pub mod envelope;
 pub mod messages;
@@ -41,14 +40,14 @@ use serde::{Deserialize, Serialize};
 
 /// Bump on any change to the **envelope/frame** rules (bundle layout, manifest
 /// semantics, atomicity point). A reader that does not implement the file's
-/// `format_version` MUST refuse (A D6) rather than read a subset.
+/// `format_version` MUST refuse rather than read a subset.
 pub const FORMAT_VERSION: u32 = 1;
 
 /// Bump on any change to the **field-level** shape of the types in this module
 /// (`Manifest`, `ManagerSection`, `WorkerSection`, `UiSection`, `MessageRecord`…).
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// Directory name under `Plan::session_bundle_path()` (A §1 D3). The bundle is a
+/// Directory name under `Plan::session_bundle_path()`. The bundle is a
 /// directory, never a single file — the manifest-last commit needs several
 /// independently atomic renames.
 pub const BUNDLE_DIR_NAME: &str = "session";
@@ -63,21 +62,19 @@ pub const WORKERS_DIR_NAME: &str = "workers";
 /// compile-time equality assertion below.
 pub const ABORTED_TOOL_RESULT: &str = "(aborted)";
 
-/// The marker the one synthetic restore notice (`N-MGR-1`, flow §2.4) starts
-/// with. Registering it in the manager's advisory grammar is t-009's job; the
+/// The marker the one synthetic restore notice (`N-MGR-1`) starts
+/// with. Registering it in the manager's advisory grammar is the manager's job; the
 /// **constant** is owned here so the loader and the manager grammar cannot
 /// drift apart.
 pub const SESSION_RESTORE_NOTICE_PREFIX: &str = "(SYSTEM: SESSION RESTORED";
 
-/// The FNV-1a 64-bit fingerprint over a member file's exact bytes (A §7.2).
+/// The FNV-1a 64-bit fingerprint over a member file's exact bytes.
 ///
-/// Hand-rolled on purpose (F2): `fnv` is only a transitive dependency, and the
-/// same two constants already exist in the crate at `harness/fs.rs:353-356`
-/// (`hash_path`, which is a private shard selector and NOT a reuse candidate —
-/// F3). A unit test pins the parity with `hash_path`'s constants.
-///
-/// F5: the fingerprint covers the whole member file, header included. There is
-/// no partial/canonicalized fingerprint and no hash of the *parsed* value.
+/// Hand-rolled on purpose: `fnv` is only a transitive dependency, and the same two
+/// constants already exist in the crate (`harness::fs::hash_path`, which is a
+/// private shard selector and not a reuse candidate). A unit test pins the parity.
+/// The fingerprint covers the whole member file, header included: there is no
+/// partial or canonicalized fingerprint and no hash of the *parsed* value.
 pub fn fingerprint(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
     for byte in bytes {
@@ -87,7 +84,7 @@ pub fn fingerprint(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Durable projection of one `std::time::Instant` (A §3.9, D5).
+/// Durable projection of one `std::time::Instant`.
 ///
 /// `session::time` is the only module allowed to build or read the *instant*
 /// half of this pair (the math lives there as an `impl` block); the struct is
@@ -99,23 +96,23 @@ pub struct TimePoint {
     /// wall-clock position is `Manifest::anchor_wall`). Monotonic within one
     /// process; the only reliable ordering witness.
     pub elapsed_secs: f64,
-    /// Absolute wall clock sampled together with `elapsed_secs`. Used to
-    /// re-anchor an `Instant` in the new process, following the sanctioned
-    /// precedent `Plan::get_plan_start_time()`, and to print an honest
+    /// Absolute wall clock sampled together with `elapsed_secs`. It re-anchors an
+    /// `Instant` in the new process, following the sanctioned
+    /// precedent `manager::phase::get_plan_start_time`, and prints an honest
     /// timestamp.
     pub wall: DateTime<Local>,
 }
 
 impl TimePoint {
-    /// A §5.6 last rule: a `TimePoint` whose `elapsed_secs` is negative, NaN or
+    /// The last clock rule: a `TimePoint` whose `elapsed_secs` is negative, NaN or
     /// infinite is a structural violation ⇒ `Refused`. No defaulting to "now".
     pub fn is_sane(&self) -> bool {
         self.elapsed_secs.is_finite() && self.elapsed_secs >= 0.0
     }
 }
 
-/// Compile-time pin: the session placeholder must be the manager's placeholder.
-/// A §3.1 requires this so the capture side and the load side can never spell
+/// Compile-time pin: the session placeholder must be the manager's placeholder,
+/// so the capture side and the load side can never spell
 /// the aborted result differently.
 const _: () = assert!(str_eq(
     ABORTED_TOOL_RESULT,
@@ -144,8 +141,8 @@ mod tests {
 
     #[test]
     fn fingerprint_matches_the_harness_fnv_constants() {
-        // A §7.2 F2: the constants are a copy of `harness::fs::hash_path`'s
-        // (fs.rs:353-356). Pinning the parity means a future edit to either
+        // The constants are a copy of `harness::fs::hash_path`'s.
+        // Pinning the parity means a future edit to either
         // constant has to be a deliberate, attributed decision.
         let mut reference: u64 = 0xcbf2_9ce4_8422_2325;
         for byte in b"manager.json" {
@@ -196,9 +193,9 @@ mod tests {
 
     #[test]
     fn every_member_type_carries_deny_unknown_fields() {
-        // Behavioural counterpart of A §3.1: an extra field is a parse error, not
-        // a silently ignored key. One probe per frame is enough to prove the
-        // attribute is on the envelope (T-CFG-3 in the flow doc).
+        // Behavioural counterpart of the version pin: an extra field is a parse
+        // error, not a silently ignored key. One probe per frame is enough to
+        // prove the attribute is on the envelope.
         let err = serde_json::from_str::<ManifestMember>(
             r#"{"kind":"manager","rel_path":"manager.json","byte_len":1,"fingerprint":1,
                 "saved_wall":"2025-01-01T00:00:00+01:00","saved_elapsed_secs":0.0,"future":true}"#,

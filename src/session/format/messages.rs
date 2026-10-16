@@ -1,7 +1,7 @@
-//! The loss-proof transcript record (Design A §3.7).
+//! The loss-proof transcript record.
 //!
 //! The wire type `types::wire::Message` is **not** reusable for persistence:
-//! `serialize_assistant_content` (`src/types/wire.rs:30-41`) writes `None` as
+//! `serialize_assistant_content` (`src/types/wire.rs`) writes `None` as
 //! `""`, and `""` reads back as `Some("")`, so a tool-only assistant turn cannot
 //! survive a JSON round-trip through it. `MessageRecord` mirrors the wire tag
 //! layout (`#[serde(tag = "role", rename_all = "lowercase")]`) but serializes
@@ -38,7 +38,7 @@ pub enum MessageRecord {
     },
 }
 
-/// Verbatim mirror of `ToolCall` (`src/types/wire.rs:73-80`).
+/// Verbatim mirror of `ToolCall` (`src/types/wire.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolCallRecord {
@@ -54,7 +54,7 @@ fn default_tool_type() -> String {
     "function".to_string()
 }
 
-/// `arguments` is an **opaque JSON string** (`src/types/wire.rs:154-159`) and is
+/// `arguments` is an **opaque JSON string** (`src/types/wire.rs`) and is
 /// persisted verbatim. Two prohibited operations, both of which silently rewrite
 /// history: `serde_json::from_str` → re-serialize (re-canonicalizes), and any
 /// route through `ensure_valid_json_arguments` / `ToolCall::sanitize_arguments`,
@@ -100,7 +100,7 @@ impl MessageRecord {
     }
 
     /// Reverse conversion for the request builder. `None` stays `None`, so the
-    /// wire bytes a restored session sends are the bytes the pre-crash process
+    /// wire bytes a restored session sends are the bytes the interrupted process
     /// would have sent. Arguments are copied verbatim — no sanitizing, no
     /// re-canonicalizing (`ensure_valid_json_arguments` mutates history).
     pub fn into_wire(self) -> Message {
@@ -177,7 +177,7 @@ impl ToolCallRecord {
 
     /// `true` when the arguments carry the `{"_error":"malformed_arguments",…}`
     /// payload. A **read-out**, never a repair: a record that already carries it
-    /// keeps it unchanged (A §3.7).
+    /// keeps it unchanged.
     pub fn is_malformed(&self) -> bool {
         match serde_json::from_str::<serde_json::Value>(&self.function.arguments) {
             Ok(serde_json::Value::Object(map)) => {
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn unknown_field_is_a_hard_parse_error() {
-        // A §7.3 L3: `deny_unknown_fields` on every durable struct means a
+        // `deny_unknown_fields` on every durable struct means a
         // bundle written by a newer release is refused, never partially read.
         let bad = r#"{"role":"user","content":"hi","extra":1}"#;
         let err = serde_json::from_str::<MessageRecord>(bad)

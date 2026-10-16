@@ -223,10 +223,10 @@ fn test_stream_config_thinking_budget_defaults() {
     assert_eq!(stream_cfg2.max_thinking_tokens, 4096);
 }
 
-// Cluster net-C11 guard: the single finalize helper shared by every successful
-// exit site of `ChatClient::try_chat_once` (`ReplyAccumulator::finalize`).
-// These tests pin content assembly, tool-call order, token accounting and the
-// per-terminal-site logging difference.
+// The single finalize helper shared by every successful exit site of
+// `ChatClient::try_chat_once` (`ReplyAccumulator::finalize`): these tests pin
+// content assembly, tool-call order, token accounting and the per-terminal-site
+// logging difference.
 
 use crate::llm::client::ReplyAccumulator;
 use crate::llm::get_global_token_counts;
@@ -426,8 +426,8 @@ fn test_finalize_helper_terminal_reasons_agree_on_payload() {
     // Both terminal reasons must record output tokens.
     assert!(get_global_token_counts().1 >= before + stopped_tokens * 2);
 
-    // Pre-stream aborts stay outside the finalize helper: an empty reply is
-    // never a success, whatever its content looks like.
+    // Aborts before the stream starts stay outside the finalize helper: an empty
+    // reply is never a success, whatever its content looks like.
     let aborted = StreamedReply::default();
     assert!(aborted.content.is_empty());
     assert!(aborted.reasoning.is_empty());

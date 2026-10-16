@@ -1,5 +1,5 @@
 //! Specialist Registry — maps an `agent_name` role to a concrete worker and
-//! its tool namespace (REQ-ORCH-002).
+//! its tool namespace.
 //!
 //! The registry is the single authority on which role ids are resolvable at
 //! runtime. The Manager resolves every `delegate_task` against it.
@@ -16,8 +16,8 @@ pub struct SpecialistEntry {
     pub agent: Agent,
     /// Source module path (informational; e.g. "src/agents/coder.rs").
     pub module: String,
-    /// Allowed tool namespaces (used to build the specialist tool schema and
-    /// to gate `delegate_task` dispatch).
+    /// Allowed tool namespaces: they define the specialist tool schema and
+    /// decide which `delegate_task` calls this role may make.
     pub tool_namespaces: Vec<String>,
     pub model: Option<String>,
 }
@@ -31,8 +31,8 @@ pub struct SpecialistRegistry {
 }
 
 impl SpecialistRegistry {
-    /// Build the canonical registry (REQ-ORCH-002). The five canonical roles
-    /// MUST be present; the Manager validates against this set.
+    /// Build the canonical registry. The canonical roles MUST be present; the
+    /// Manager validates against this set.
     pub fn canonical() -> Self {
         let mut reg = Self::default();
         let canonical_specs: [(Agent, &str); 6] = [
@@ -101,7 +101,7 @@ impl SpecialistRegistry {
 
 impl SpecialistEntry {
     /// Whether this specialist is allowed to call a given tool, per its
-    /// allowlist (REQ-ORCH-002). A `"*"` namespace grants every tool. Namespace
+    /// allowlist. A `"*"` namespace grants every tool. Namespace
     /// prefixes match by `<ns>*` (e.g. `terminal__*`); a bare exact tool name
     /// matches directly.
     pub fn allows(&self, tool: &str) -> bool {
@@ -157,10 +157,10 @@ mod tests {
             let worker = reg.worker(role);
             assert_eq!(worker.name(), role);
 
-            // REQ-ORCH-002: the registry entry's allowlist MUST be the SAME as
-            // the worker's declared `tool_namespaces()` — the registry is the
+            // The registry entry's allowlist MUST be the SAME as the worker's
+            // declared `tool_namespaces()` — the registry is the
             // single authority the Manager routes against, so a divergence would
-            // let a dispatched worker use tools the registry would gate.
+            // let a dispatched worker call tools the registry forbids.
             let worker_ns: Vec<&str> = worker.tool_namespaces().to_vec();
             let entry_ns: Vec<&str> = entry.tool_namespaces.iter().map(|s| s.as_str()).collect();
             assert_eq!(
@@ -172,7 +172,7 @@ mod tests {
         assert_eq!(reg.agent_ids().len(), 6);
     }
 
-    /// REQ-ORCH-002: `SpecialistEntry::allows` honors the tool allowlist —
+    /// `SpecialistEntry::allows` honors the tool allowlist —
     /// matching bare and namespaced tools, and `*` grants everything.
     #[test]
     fn test_orchestr_registry_allowlist_enforces_namespace() {

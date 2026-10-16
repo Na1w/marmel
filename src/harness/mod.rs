@@ -79,14 +79,12 @@ pub fn get_workspace_root() -> std::path::PathBuf {
 
 /// Every wire name the built-in dispatcher claims: the canonical spellings and
 /// every alias spelling of the **one** tool-alias vocabulary
-/// ([`crate::tool_names::TOOL_ALIAS_TABLE`]).
-///
-/// This is a re-export of a table *derived* from that vocabulary
+/// ([`crate::tool_names::TOOL_ALIAS_TABLE`]). The table itself is re-exported
+/// *derived* from that vocabulary
 /// ([`crate::tool_names::BUILTIN_TOOL_NAME_TABLE`] = canonical names ∪ alias
-/// keys), so the dispatcher arms, the alias normalizer and the MCP name policy can
-/// no longer disagree about which names are built-ins (security t-034c; vocabulary
-/// dedup t-061). The MCP name policy consults this table so no MCP server can
-/// publish a name that a built-in handler would answer to.
+/// keys): the dispatcher arms, the alias normalizer and the MCP name policy all
+/// read one set, so no MCP server can publish a name a built-in handler would
+/// answer to.
 pub const BUILTIN_TOOL_NAMES: &[&str] = crate::tool_names::BUILTIN_TOOL_NAME_TABLE;
 
 /// Resolve a wire tool name to the canonical spelling the dispatch arms below
@@ -104,21 +102,19 @@ pub fn is_builtin_tool_name(name: &str) -> bool {
 
 /// `true` when the built-in dispatcher would claim `name` — either verbatim or
 /// after alias normalization (`normalize_tool_name` maps every accepted alias onto
-/// its canonical form). Anything this predicate accepts must never be routed to an
-/// MCP tool (t-034c: built-ins resolve first).
+/// its canonical form). Anything this predicate accepts is never routed to an MCP
+/// tool: built-ins resolve first.
 pub fn resolves_to_builtin_handler(name: &str) -> bool {
     is_builtin_tool_name(name) || is_builtin_tool_name(&normalize_tool_name(name))
 }
 
-/// Registration-time verdict for one discovered MCP tool (t-034c).
+/// Registration-time verdict for one discovered MCP tool.
 ///
 /// Layer 1 — the MCP name grammar plus the built-in namespace prefix check
-/// ([`crate::mcp::validate_composed_registration`]).
-/// Layer 2 — alias normalization: a composed name that *normalizes* onto a built-in
-/// name is refused too, even when it is not spelled in the table.
-///
-/// Returns the composed wire name on success, or the reason for refusal. Nothing is
-/// ever renamed or sanitized silently.
+/// ([`crate::mcp::validate_composed_registration`]). Layer 2 — alias normalization:
+/// a composed name that *normalizes* onto a built-in name is also refused, even when
+/// it is not spelled in the table. Returns the composed wire name, or the reason for
+/// refusal; nothing is renamed or sanitized silently.
 pub fn mcp_registration_verdict(
     server_name: &str,
     raw_tool_name: &str,
@@ -142,7 +138,7 @@ pub struct McpToolRejection {
 }
 
 /// The dispatch-visible view of the MCP registry: only names that survived the name
-/// policy can be routed (t-034c).
+/// policy can be routed.
 pub struct McpDispatchGate {
     manager: Arc<crate::mcp::McpManager>,
     allowed: HashSet<String>,
@@ -160,9 +156,9 @@ impl std::fmt::Debug for McpDispatchGate {
 }
 
 impl McpDispatchGate {
-    /// Build the gate from a booted manager, refusing every tool whose name the
-    /// policy rejects. Refusals are recorded (and logged by [`set_mcp_manager`]),
-    /// never renamed.
+    /// Build the dispatch view from a booted manager, refusing every tool whose
+    /// name the policy rejects. Refusals are recorded (and logged by
+    /// [`set_mcp_manager`]), never renamed.
     fn build(manager: &Arc<crate::mcp::McpManager>) -> Self {
         let mut allowed = HashSet::new();
         let mut rejected = Vec::new();
@@ -187,9 +183,8 @@ impl McpDispatchGate {
     /// Route `name` to the MCP manager, if the policy allows it.
     ///
     /// Built-in names always lose: a name the built-in dispatcher claims is never
-    /// routed to MCP, even if it somehow reached the allowed set. That is the
-    /// dispatch-time half of the t-034c defence; [`set_mcp_manager`] is the primary,
-    /// registration-time half.
+    /// routed to MCP, even if it somehow reached the allowed set. [`set_mcp_manager`]
+    /// refuses such names at registration; this is the dispatch-time half.
     pub fn route(&self, name: &str) -> Option<&Arc<crate::mcp::McpManager>> {
         if resolves_to_builtin_handler(name) {
             if self.manager.has_tool(name) {
@@ -220,9 +215,9 @@ impl McpDispatchGate {
 
 /// Register the global MCP manager for tool dispatch.
 ///
-/// Registration is the primary t-034c defence: every discovered tool is checked
-/// against the MCP name policy and against the built-in tool namespace. Refused
-/// tools are reported with `tracing::warn!` and are never dispatchable — they are
+/// Registration is the primary defence: every discovered tool is checked against
+/// the MCP name policy and against the built-in tool namespace. Refusals are
+/// reported with `tracing::warn!` and are never dispatchable — such a tool is
 /// rejected outright, never silently renamed.
 pub fn set_mcp_manager(manager: Arc<crate::mcp::McpManager>) {
     let gate = Arc::new(McpDispatchGate::build(&manager));
@@ -252,7 +247,7 @@ pub fn get_mcp_gate() -> Option<Arc<McpDispatchGate>> {
 ///
 /// Tool *advertising* (the schema list handed to a model) should prefer this over
 /// `McpManager::tools_for_servers`, so a name the policy refused is never even
-/// offered to a model, let alone dispatched (t-034c).
+/// offered to a model, let alone dispatched.
 pub fn allowed_mcp_tools(servers: &[String]) -> Vec<crate::mcp::McpTool> {
     let Some(gate) = get_mcp_gate() else {
         return Vec::new();
@@ -316,17 +311,13 @@ where
 
 /// The primary dispatcher entry point, shared by the Manager and specialists.
 ///
-/// Resolution order (t-034c): the built-in match runs FIRST. MCP tools are consulted
-/// only for names the built-in dispatcher does not own, and only through the
-/// registration gate ([`McpDispatchGate::route`]), so an MCP server can never claim
-/// a built-in name and bypass the sandboxed built-in handlers.
-///
-/// Name resolution (t-061): the wire name is folded through the **one** tool-alias
-/// vocabulary ([`crate::tool_names::TOOL_ALIAS_TABLE`]) by
-/// [`canonical_dispatch_name`], and the arms below name canonical spellings only.
-/// The alias arms that used to be re-typed in this function, in
-/// `dispatch_specialist_async` and in `dispatch_specialist` are gone: one table,
-/// three call sites.
+/// Resolution order: the built-in match runs FIRST. MCP tools are consulted only
+/// for names the built-in dispatcher does not own, and only through the
+/// registration policy ([`McpDispatchGate::route`]), so an MCP server can never
+/// claim a built-in name and bypass the sandboxed built-in handlers. The wire name
+/// is folded through the **one** tool-alias vocabulary
+/// ([`crate::tool_names::TOOL_ALIAS_TABLE`]) by [`canonical_dispatch_name`], and the
+/// arms below name canonical spellings only: one table, three call sites.
 pub fn dispatch(tool: &ToolInvocation) -> Result<ToolResult, ToolError> {
     let name = canonical_dispatch_name(&tool.name);
     let res = match name {
@@ -364,9 +355,8 @@ pub fn dispatch(tool: &ToolInvocation) -> Result<ToolResult, ToolError> {
             detail: "rebirth requires a live ContextEngine; use dispatch_with_engine".to_string(),
         }),
         // Built-in match exhausted: only now is MCP consulted, and only for names
-        // the built-in dispatcher does not own (t-034c ordering). The *wire* name is
-        // reported, never the normalized spelling, so callers keep the exact error
-        // text they got before.
+        // the built-in dispatcher does not own. The *wire* name is reported, never
+        // the normalized spelling, so callers keep the exact error text they got.
         _ => match dispatch_mcp_sync(tool) {
             Some(mcp_res) => return mcp_res,
             None => Err(ToolError::UnknownTool(tool.name.clone())),
@@ -411,17 +401,13 @@ pub fn dispatch_with_engine(
 
 pub const MAX_TOOL_OUTPUT_CHARS: usize = 10_000;
 
-/// Clip an oversized tool result to a head + tail window (t-051 ordering note).
-///
-/// The cut keeps the **first** [`MAX_TOOL_OUTPUT_CHARS`]-ish window head and the
-/// **last** 2 000 characters, so a footer that `read_file` appends when it hits
-/// its byte ceiling — [`crate::harness::fs::READ_FILE_TRUNCATION_MARKER`] with
-/// `truncated: true`, the offsets, and the re-run hint — always survives the
-/// generic clip: it is at the very end of the payload and is far shorter than the
-/// tail window. The guarantee is made structural rather than incidental: if a
-/// footer ever starts inside the region that would be dropped, the tail window is
-/// widened to begin at the marker, so the *reason* a result was clipped can never
-/// be the first thing the model loses.
+/// Clip an oversized tool result to a head + tail window. The cut keeps the
+/// **first** [`MAX_TOOL_OUTPUT_CHARS`]-ish head and the **last** 2 000 characters,
+/// so a footer that `read_file` appends when it hits its byte ceiling —
+/// [`crate::harness::fs::READ_FILE_TRUNCATION_MARKER`] with `truncated: true`, the
+/// offsets and the re-run hint — always survives at the very end of the payload. If
+/// a footer ever starts inside the dropped region, the tail window widens to begin
+/// at the marker, so the clip never swallows the *reason* a result was clipped.
 pub fn apply_tool_output_length_limit(mut result: ToolResult) -> ToolResult {
     // If this is an execution plan, do NOT truncate so the orchestrator can read it
     let upper = result.content.to_ascii_uppercase();
@@ -559,8 +545,8 @@ async fn dispatch_manager_async(
     mut engine: Option<&mut crate::manager::ContextEngine>,
 ) -> Result<ToolResult, ToolError> {
     let name = tool.name.as_str();
-    // t-034c: no MCP pre-lookup. Built-in names are matched first and MCP is
-    // consulted only in the fall-through arm, through the registration gate.
+    // No MCP lookup ahead of the built-in match: built-in names are matched first
+    // and MCP is consulted only in the fall-through arm, through the policy.
     if name != TOOL_REBIRTH
         && let Some(ref mut eng) = engine
     {
@@ -596,14 +582,14 @@ async fn dispatch_manager_async(
         TOOL_GREP_SEARCH => search::grep_search(&tool.arguments),
         TOOL_GLOB => search::glob(&tool.arguments),
         // The Manager path advertises bare canonical names only, so its arms are
-        // intentionally not alias-folded; its sleep arm still asks the shared
-        // alias table, so the sleep vocabulary is identical on every path (t-061).
+        // intentionally not alias-folded; its sleep arm still asks the shared alias
+        // table, so the sleep vocabulary is identical on every path.
         n if is_sleep_tool_name(n) => handle_sleep_async(&tool.arguments).await,
         TOOL_REPLY_TO_ARBITRATOR => {
             handle_reply_to_arbitrator_async("Manager", &tool.arguments).await
         }
         // Built-in match exhausted: MCP is consulted last, and only through the
-        // registration gate (t-034c ordering).
+        // registration policy.
         other => match dispatch_mcp_async(tool).await {
             Some(mcp_res) => mcp_res,
             None => Err(ToolError::Forbidden {
@@ -628,12 +614,11 @@ async fn dispatch_specialist_async(
         });
     }
 
-    // t-034c ordering: `mcp_route` refuses any name the built-in dispatcher owns
-    // (verbatim or via alias normalization), so a built-in handler can never be
-    // shadowed by an MCP server. Names the built-ins do not own are served by the
-    // MCP tool only if it survived the registration policy
-    // (`set_mcp_manager` -> `McpDispatchGate`), and stay reachable for specialists
-    // exactly as before.
+    // `mcp_route` refuses any name the built-in dispatcher owns (verbatim or via
+    // alias normalization), so a built-in handler can never be shadowed by an MCP
+    // server. Names the built-ins do not own are served by the MCP tool only if it
+    // survived the registration policy (`set_mcp_manager` -> `McpDispatchGate`), and
+    // stay reachable for specialists.
     if let Some(mcp) = mcp_route(name) {
         return match mcp.call_tool(name, &tool.arguments).await {
             Ok(content) => Ok(ToolResult::ok(content)),
@@ -673,8 +658,8 @@ async fn dispatch_specialist_async(
         eng.reset_consecutive_rebirths();
     }
 
-    // t-061: the arms below are matched on the canonical spelling produced by the
-    // one shared alias table, never on re-typed alias arms.
+    // The arms below are matched on the canonical spelling produced by the one
+    // shared alias table, never on re-typed alias arms.
     let canon = canonical_dispatch_name(name);
     match canon {
         TOOL_READ_FILE | TERMINAL_READ_FILE => fs::read_file(&tool.arguments),
@@ -692,7 +677,7 @@ async fn dispatch_specialist_async(
         // The verdict vocabulary is owned by `crate::agents::validation`, not by the
         // tool-alias table, so this arm keeps matching the wire name.
         _ if crate::agents::validation::is_leave_verdict_tool(name) => {
-            // t-051: the allowlist admitted this call; the identity rule may not.
+            // The allowlist admitted this call; the identity rule may not.
             verdict_role_gate(name, &caller)?;
             let (approved, comments) = crate::agents::validation::parse_verdict_args(
                 &tool.arguments,
@@ -708,7 +693,7 @@ async fn dispatch_specialist_async(
             )))
         }
         // One arm covers every accepted sleep spelling: the shared table maps them
-        // all onto `TERMINAL_SLEEP` (t-061).
+        // all onto `TERMINAL_SLEEP`.
         TOOL_SLEEP | TERMINAL_SLEEP => handle_sleep_async(&tool.arguments).await,
         TOOL_REPLY_TO_ARBITRATOR => {
             handle_reply_to_arbitrator_async(&caller_str, &tool.arguments).await
@@ -728,52 +713,28 @@ async fn dispatch_specialist_async(
     }
 }
 
-/// The worker identity a specialist reply is attributed to (t-051).
-///
-/// The notice store accepts **both** spellings of one worker's identity and
-/// resolves them with the same routing rules used for delivery
-/// ([`crate::orchestrator::notice_addresses_worker`]): the effective registry key
-/// carried by `ActiveWorkerGuard` (`coder-t-001`, or the collision-resolved
-/// `coder-t-001#7`) and the bare role name the harness can see (`coder`), judged
-/// in both directions.
-///
-/// **Reported accessor gap (t-051):** dispatch is handed a [`ToolCaller`] — a
-/// role, never a registry key — and `crate::orchestrator::workers` keeps its
-/// registry (`WORKERS`) private while exposing only key-*in* readers
+/// The worker identity a specialist reply is attributed to: the caller's role name,
+/// judged in both directions by [`crate::orchestrator::notice_addresses_worker`]
+/// against either spelling of that worker — the `ActiveWorkerGuard` registry key
+/// (`coder-t-001`, or the collision-resolved `coder-t-001#7`) or the bare role name
+/// (`coder`). Never a substring match. Dispatch sees only a [`ToolCaller`] (a role,
+/// not a key) and the worker registry stays private behind key-*in* readers
 /// ([`crate::orchestrator::get_active_worker_tokens`],
-/// [`crate::orchestrator::set_active_worker_status`],
-/// `update_active_worker_context`) plus two *display-string* formatters
-/// ([`crate::orchestrator::get_active_subtasks_str`],
-/// `get_active_specialist_context_str`). There is **no public accessor that
-/// enumerates active worker keys or maps a role to its effective
-/// `ActiveWorkerGuard` key**, and `crate::orchestrator::bus` only carries a
-/// task-local cancellation token (`CURRENT_WORKER_TOKEN`), not a key. The
-/// harness therefore uses the best available identity — the caller's role name —
-/// and relies on the notice layer's bidirectional routing to match it against
-/// the addressed key. If a public `active_worker_key_for_role(role)` accessor is
-/// ever added to `orchestrator::workers`, this is the single place to adopt it;
-/// nothing else in the reply path depends on the spelling.
+/// [`crate::orchestrator::set_active_worker_status`]) and display formatters
+/// ([`crate::orchestrator::get_active_subtasks_str`]), so the role name is the best
+/// available identity.
 fn reply_worker_identity(caller: &str) -> String {
     caller.trim().to_string()
 }
 
-/// Handle one `reply_to_arbitrator` call under the strict reply contract (t-051).
-///
-/// A reply must name the notice it answers, and that notice must address the
-/// replying worker. The record is made by
-/// [`crate::orchestrator::record_worker_reply_for_notice`], and **every**
-/// rejection ([`crate::orchestrator::NoticeReplyRejection`]) is propagated to the
-/// calling specialist as a `ToolError` whose text names the rejection kind: the
-/// specialist sees why its reply was refused and can re-send with the right id.
-///
-/// The historical `Err(_)` branch here re-read `get_pending_notice(notice_id)` and,
-/// when that missed, **synthesized a `SteerNotice`** from the caller and the raw
-/// id — reintroducing exactly the guess-the-notice behaviour t-032d deleted at the
-/// notice layer (a reply could be answered against a notice nobody named, and the
-/// arbitrator could then synthesize a user-facing answer from an unrelated
-/// `user_inquiry`). That branch is gone: a rejected reply records nothing,
-/// resolves nothing, emits no `Event::SteerResponse`, and never reaches the
-/// arbitrator.
+/// Handle one `reply_to_arbitrator` call under the strict reply contract: a reply
+/// must name the notice it answers, and that notice must address the replying
+/// worker. [`crate::orchestrator::record_worker_reply_for_notice`] makes the record,
+/// and **every** rejection ([`crate::orchestrator::NoticeReplyRejection`]) is
+/// propagated to the calling specialist as a `ToolError` naming the rejection kind, so
+/// it can re-send with the right id. There is no fallback lookup and no synthesized
+/// notice: a rejected reply records nothing, resolves nothing, emits no
+/// `Event::SteerResponse` and never reaches the arbitrator — a notice id is never guessed.
 pub async fn handle_reply_to_arbitrator_async(
     caller: &str,
     args: &serde_json::Value,
@@ -965,38 +926,28 @@ fn dispatch_manager(
     }
 }
 
-/// Fold a tool name onto the spelling the dispatch **gate** compares against.
+/// Fold a tool name onto the spelling the dispatcher compares against.
 ///
-/// t-061: this is no longer a hand-typed copy of the alias vocabulary — it is the
-/// single table in [`crate::tool_names::TOOL_ALIAS_TABLE`]. Every site that needs
-/// "which tool does this spelling mean" now asks that table, which is what keeps
-/// the harness dispatcher, the specialist allowlist gate, the MCP name policy and
-/// the steer grammar in agreement. Unknown names (MCP composed names, typos) are
-/// returned verbatim, exactly as before.
+/// The single source is the table in [`crate::tool_names::TOOL_ALIAS_TABLE`]: every
+/// site that needs "which tool does this spelling mean" — the harness dispatcher, the
+/// specialist allowlist, the MCP name policy and the steer grammar — asks that table.
+/// Unknown names (MCP composed names, typos) are returned verbatim.
 pub(crate) fn normalize_tool_name(name: &str) -> String {
     crate::tool_names::normalize_tool_alias(name)
         .unwrap_or(name)
         .to_string()
 }
 
-/// Verdict identity rule at the **dispatch** layer (t-051).
-///
-/// The allowlist is an authority on *which tools a role may touch*, not on *who
-/// may certify a deliverable*: the generalist's registry namespace is literally
-/// `"*"` ([`crate::orchestrator::registry`] / `Generalist::tool_namespaces`), so
-/// the allowlist check in [`dispatch_specialist`] admits `leave_verdict` for a
-/// Generalist, and a prompt/blueprint allowlist (`SpecialistWithTools`) admits it
-/// for any role the model was told about. Left alone, that let a worker approve
-/// its own deliverable **through dispatch** even though the agent loop refuses
-/// the same call.
-///
-/// The rule mirrors the agent loop's verdict role gate: it calls the existing
-/// `pub` predicate [`crate::agents::runner::may_record_verdict`] (gate t-033b,
-/// `src/agents/runner/execution.rs`, re-exported by `pub use execution::*`) rather
-/// than restating its logic, so the identity rule lives in exactly one place.
-/// A refusal is a `ToolError::Forbidden` plus a `tracing::warn!`, raised *before*
-/// the verdict arguments are parsed or any verdict state is touched — there is no
-/// partial write and no silent success.
+/// Verdict identity rule at the **dispatch** layer. The allowlist decides *which
+/// tools a role may touch*, not *who may certify a deliverable*: the generalist's
+/// registry namespace is literally `"*"` ([`crate::orchestrator::registry`]), so the
+/// allowlist check in [`dispatch_specialist`] admits `leave_verdict` for a Generalist,
+/// and a prompt/blueprint allowlist admits it for any role the model was told about.
+/// This rule mirrors the agent loop's verdict check by calling the existing `pub`
+/// predicate [`crate::agents::runner::may_record_verdict`], so the identity rule lives
+/// in one place. A refusal is a `ToolError::Forbidden` plus a `tracing::warn!`, raised
+/// *before* verdict arguments are parsed or any verdict state is touched — no partial
+/// write, no silent success.
 fn verdict_role_gate(name: &str, caller: &ToolCaller) -> Result<(), ToolError> {
     let registry = crate::orchestrator::SpecialistRegistry::canonical();
     let permitted = caller
@@ -1030,8 +981,7 @@ fn dispatch_specialist(
         });
     }
 
-    // t-034c ordering — the authoritative statement is on `dispatch`; the same
-    // rule governs this synchronous path.
+    // Resolution order is the one stated on `dispatch`: built-ins first, MCP last.
     if let Some(mcp) = mcp_route(name) {
         let mcp_res = block_on_safe(mcp.call_tool(name, &tool.arguments));
         return match mcp_res {
@@ -1072,8 +1022,7 @@ fn dispatch_specialist(
         eng.reset_consecutive_rebirths();
     }
 
-    // t-061: canonical spelling from the one shared alias table — this block used
-    // to be a third hand-typed copy of the alias arms.
+    // Canonical spelling from the one shared alias table.
     let canon = canonical_dispatch_name(name);
     match canon {
         TOOL_DELEGATE_TASK => crate::orchestrator::handle_delegate_task(&tool.arguments),
@@ -1103,7 +1052,7 @@ fn dispatch_specialist(
                 "Verdict recorded via leave_verdict: {verdict} with comments: {comments}"
             )))
         }
-        // One arm covers every accepted sleep spelling (t-061).
+        // One arm covers every accepted sleep spelling.
         TOOL_SLEEP | TERMINAL_SLEEP => handle_sleep(&tool.arguments),
         TOOL_REPLY_TO_ARBITRATOR => handle_reply_to_arbitrator(&caller_str, &tool.arguments),
         TOOL_REBIRTH => {
@@ -1117,8 +1066,8 @@ fn dispatch_specialist(
                 })
             }
         }
-        // The *wire* name is reported, never the normalized spelling (t-061 keeps
-        // error text byte-identical for names that never resolved).
+        // The *wire* name is reported, never the normalized spelling, so error text
+        // for names that never resolved stays byte-identical.
         _ => Err(ToolError::UnknownTool(tool.name.clone())),
     }
 }
@@ -1165,8 +1114,8 @@ mod tests {
         });
         // First rebirth succeeds. This engine carries only the pinned system
         // prompt and the pinned goal — there is no distinct user instruction —
-        // so the corrected M12 shape collapses to THREE messages: the `[2]`
-        // instruction slot is omitted rather than filled with a copy of the goal.
+        // so the collapse is to THREE messages: the `[2]` instruction slot is
+        // omitted rather than filled with a copy of the goal.
         let result1 = handle_rebirth(&mut engine, &args).unwrap();
         assert!(!result1.is_error);
         assert_eq!(engine.messages().len(), 3);

@@ -324,9 +324,9 @@ fn cycle_focus_obeys_panel_visibility() {
     assert_eq!(r.focused_panel, FocusedPanel::Chat);
 }
 
-/// t-c304: a `Delegation(Started)` event creates an active subagent entry
-/// and routes subsequent `Thinking`/`Message`/`Status` events into its
-/// live thinking/content/logs fields.
+/// A `Delegation(Started)` event creates an active subagent entry and routes
+/// subsequent `Thinking`/`Message`/`Status` events into its live
+/// thinking/content/logs fields.
 #[test]
 fn delegation_started_tracks_live_thinking_content_logs() {
     let mut r = TuiRenderer::new();
@@ -353,8 +353,8 @@ fn delegation_started_tracks_live_thinking_content_logs() {
     assert!(r.subagents[0].logs.iter().any(|l| l == "calling backend"));
 }
 
-/// t-c304: a `Delegation(Completed)` event marks the subagent idle and
-/// stops routing live content into it.
+/// A `Delegation(Completed)` event marks the subagent idle and stops routing
+/// live content into it.
 #[test]
 fn delegation_completed_marks_idle_and_stops_routing() {
     let mut r = TuiRenderer::new();
@@ -424,8 +424,8 @@ fn test_delegation_failed_renders_reason_in_chatlog() {
     assert_eq!(r.messages[1], "[t-002] failed.");
 }
 
-/// t-c304: `set_subagents` adopts the session-loop's authoritative list,
-/// preserving locally-streamed thinking/content and dropping stale entries.
+/// `set_subagents` adopts the session-loop's authoritative list, preserving
+/// locally-streamed thinking/content and dropping stale entries.
 #[test]
 fn set_subagents_adopts_authoritative_list() {
     let mut r = TuiRenderer::new();
@@ -903,7 +903,8 @@ fn test_plan_auto_scrolls_to_started_task() {
         })
         .unwrap();
 
-    // Line offset of t-008 is 9, leaving 1 line of context above -> desired scroll is 8
+    // The focused task's plan line sits at line offset 9, leaving 1 line of
+    // context above it -> desired scroll is 8
     assert_eq!(r.plan_scroll, 8);
 }
 
@@ -952,12 +953,12 @@ fn test_line_matches_task_id_exact_and_boundary() {
     assert!(line_matches_task_id(line_100, "t-100"));
     assert!(line_matches_task_id(line_1, "t-1"));
 
-    // Crucial bugfix: t-100 must NOT match t-100a1, even though t-100 is a substring!
+    // A task id must never match a longer id that merely starts with it!
     assert!(!line_matches_task_id(line_a1, "t-100"));
     assert!(!line_matches_task_id(line_a1, "t-1"));
     assert!(!line_matches_task_id(line_a1, "t-10"));
 
-    // t-1 must NOT match t-100
+    // The same rule in reverse: the short id must not match the longer id
     assert!(!line_matches_task_id(line_100, "t-1"));
     assert!(!line_matches_task_id(line_100, "t-10"));
     assert!(!line_matches_task_id(line_100, "t-100a1"));
@@ -976,7 +977,8 @@ fn test_render_plan_highlights_all_concurrent_active_tasks_and_avoids_substring_
 ";
     r.plan_content = plan_text.to_string();
 
-    // Two agents active in parallel: coder on t-100, and researcher on t-200
+    // Two agents active in parallel: the coder on the first task, the
+    // researcher on the second
     r.subagents = vec![
         SubagentDetail {
             name: "coder-t-100".to_string(),
@@ -993,7 +995,7 @@ fn test_render_plan_highlights_all_concurrent_active_tasks_and_avoids_substring_
             ..Default::default()
         },
     ];
-    // active_plan_task records the latest started task (t-200)
+    // active_plan_task records the latest started task
     r.active_plan_task = Some("t-200".to_string());
 
     let backend = ratatui::backend::TestBackend::new(80, 10);
@@ -1025,7 +1027,7 @@ fn test_render_plan_highlights_all_concurrent_active_tasks_and_avoids_substring_
         None
     };
 
-    // Both active tasks (t-100 and t-200) MUST be highlighted in Yellow
+    // Both active tasks MUST be highlighted in Yellow
     assert_eq!(
         find_line_fg("[t-100]"),
         Some(Color::Yellow),
@@ -1037,7 +1039,8 @@ fn test_render_plan_highlights_all_concurrent_active_tasks_and_avoids_substring_
         "Active task t-200 must be highlighted in Yellow"
     );
 
-    // Inactive tasks sharing substring (t-100a1 and t-100b) MUST NOT be Yellow (must be LightRed)
+    // Inactive tasks sharing a substring with an active one MUST NOT be Yellow
+    // (must be LightRed)
     assert_eq!(
         find_line_fg("[t-100a1]"),
         Some(Color::LightRed),
@@ -1049,7 +1052,7 @@ fn test_render_plan_highlights_all_concurrent_active_tasks_and_avoids_substring_
         "Inactive task t-100b must be LightRed, not Yellow"
     );
 
-    // Completed task [t-050] must be Green
+    // The completed task must be Green
     assert_eq!(
         find_line_fg("[t-050]"),
         Some(Color::Green),
@@ -1567,7 +1570,7 @@ fn test_delegation_completed_emits_task_id_completed_in_chat() {
         "validator approval should be recorded in subagent logs"
     );
 
-    // Delegation completion pushes "[t-007] completed." to chat
+    // Delegation completion pushes a completed-task line to the chat
     r.on_event(&Event::Delegation(
         crate::orchestrator::DelegationEvent::Completed {
             agent: crate::agents::Agent::Coder,
@@ -1664,11 +1667,11 @@ fn test_parallel_specialist_streaming_routes_to_correct_subagents() {
         .find(|s| s.name == "coder-t-003")
         .unwrap();
 
-    // coder-t-002 only received its own chunks
+    // The first specialist only received its own chunks
     assert_eq!(s2.thinking, "Thinking about Cartridge...");
     assert_eq!(s2.content, "Cartridge code written.");
 
-    // coder-t-003 only received its own chunks
+    // The second specialist only received its own chunks
     assert_eq!(s3.thinking, "Thinking about 6502 CPU...");
     assert_eq!(s3.content, "CPU instructions written.");
 
@@ -2078,8 +2081,8 @@ fn test_submit_multiline_input() {
 
 #[test]
 fn test_clean_task_id_delegates_to_task_id_normalizer() {
-    // Dedup cluster C1 part 2: this borrowed UI seam must stay a pure delegation
-    // to `crate::task_id`; re-spelling the trimming chain here fails this test.
+    // This borrowed UI seam must stay a pure delegation to `crate::task_id`:
+    // re-spelling the trimming chain here fails this test.
     for raw in [
         "[t-001]",
         "\"t-001\"",
@@ -2102,7 +2105,7 @@ fn test_clean_task_id_delegates_to_task_id_normalizer() {
 
 #[test]
 fn test_line_matches_task_id_accepts_decorated_targets() {
-    // The plan-line matcher consumes the delegated seam: decoration on the target
+    // The plan-line matcher consumes the same seam: decoration on the target
     // must not change matching, and empty targets must never match.
     assert!(line_matches_task_id(
         "- [ ] [t-100] Do the thing",
@@ -2121,7 +2124,7 @@ fn test_line_matches_task_id_accepts_decorated_targets() {
 }
 
 // ============================================================================
-// Renderer rehydration hooks (t-011, flow §4.7, design A §6)
+// Renderer rehydration hooks
 // ============================================================================
 
 /// Build a panel with every field populated, so a round trip has something to
@@ -2148,8 +2151,8 @@ fn rich_subagent(name: &str) -> SubagentDetail {
 }
 
 /// Same panel, minus the two `Instant`s: `TimePoint` re-anchoring is inherently
-/// process-relative (D5 T2), so a whole-section equality check must not carry
-/// instants. The instant projection itself is asserted below.
+/// process-relative, so a whole-section equality check must not carry instants.
+/// The instant projection itself is asserted below.
 fn subagent_without_instants(name: &str) -> SubagentDetail {
     let mut detail = rich_subagent(name);
     detail.started_at = None;
@@ -2159,8 +2162,8 @@ fn subagent_without_instants(name: &str) -> SubagentDetail {
 
 #[test]
 fn capture_ui_copies_the_pane_verbatim_including_empty_and_duplicate_entries() {
-    // U1-U3: the pane vector is the byte authority and is copied element by
-    // element, in order, unmodified.
+    // The pane vector is the byte authority and is copied element by element,
+    // in order, unmodified.
     let mut r = TuiRenderer::new();
     r.messages = vec![
         "User: first".to_string(),
@@ -2202,7 +2205,7 @@ fn capture_then_restore_leaves_the_pane_and_view_state_identical() {
     let mut target = TuiRenderer::new();
     target.restore_panes(&section);
 
-    // The visible state is what was stored, before any draw (I-U2).
+    // The visible state is what was stored, before any draw.
     assert_eq!(target.messages, source.messages);
     assert_eq!(target.status_line, source.status_line);
     assert!(target.show_thought);
@@ -2218,8 +2221,7 @@ fn capture_then_restore_leaves_the_pane_and_view_state_identical() {
 #[test]
 fn restore_panes_invalidates_the_caches_so_no_stale_line_is_drawn() {
     // The render caches are keyed by message count, so a wholesale replace of
-    // equal length MUST invalidate them or the next frame would draw the
-    // pre-restore bytes.
+    // equal length MUST invalidate them or the next frame would draw stale bytes.
     let mut r = TuiRenderer::new();
     r.messages = vec!["short one".to_string(), "short two".to_string()];
     assert_eq!(r.estimated_chat_lines(80), 2);
@@ -2240,8 +2242,8 @@ fn restore_panes_invalidates_the_caches_so_no_stale_line_is_drawn() {
 #[test]
 fn capture_and_restore_round_trip_every_subagent_panel_field() {
     // The process anchor is created on first use, so pin it BEFORE building the
-    // instants: a real subagent always starts after boot (see the pre-anchor
-    // test below for what happens when it does not).
+    // instants: a real subagent always starts after boot (see
+    // `an_instant_older_than_the_process_anchor_honestly_loses_its_age` below).
     let _ = crate::session::time::anchor();
     let started = std::time::Instant::now();
     std::thread::sleep(std::time::Duration::from_millis(120));
@@ -2268,7 +2270,7 @@ fn capture_and_restore_round_trip_every_subagent_panel_field() {
     assert!((panel.worked_duration_secs - 372.125).abs() < 1e-6);
     assert!(panel.started_at.as_ref().is_some_and(|p| p.is_sane()));
     assert!(panel.last_activity_at.as_ref().is_some_and(|p| p.is_sane()));
-    // Panel order is content (A §6.3): the selection index keeps its meaning.
+    // Panel order is content: the selection index keeps its meaning.
     assert_eq!(section.subagent_panels[1].name, "researcher");
 
     let mut target = TuiRenderer::new();
@@ -2282,13 +2284,13 @@ fn capture_and_restore_round_trip_every_subagent_panel_field() {
     assert_eq!(restored.task_id.as_deref(), Some("t-coder"));
     assert_eq!(restored.prompt, "brief for coder");
     assert_eq!(restored.context_tokens, 18_431);
-    // A §6.3: `is_active` comes back as it was, even though the task is gone.
+    // `is_active` comes back as it was, even though the run has finished.
     assert!(restored.is_active);
-    // I-U3: the worked duration comes from the number, never from the instants.
+    // The worked duration comes from the number, never from the instants.
     assert!((restored.worked_duration.as_secs_f64() - 372.125).abs() < 1e-6);
     assert_eq!(target.subagents[1].name, "researcher");
     assert_eq!(target.selected_subagent_idx, 1);
-    // D5 T2: each `Instant` comes back as an instant of the same age, within the
+    // Each `Instant` comes back as an instant of the same age, within the
     // wall-clock sampling quantum (it is re-anchored, never replayed).
     let restored_started = restored.started_at.expect("started_at restored");
     let age = std::time::Instant::now()
@@ -2307,10 +2309,10 @@ fn capture_and_restore_round_trip_every_subagent_panel_field() {
     assert!(last_age < 0.6, "restored last_activity_at age {last_age}s");
 }
 
-/// The honest limit of the `Instant` projection (A §5.6): `elapsed_secs` has no
-/// negative offsets, so an instant from BEFORE this process's anchor cannot be
+/// The honest limit of the `Instant` projection: `elapsed_secs` has no negative
+/// offsets, so an instant from BEFORE this process's anchor cannot be
 /// re-anchored — its age is floored to 0.0. `SubagentDetail` cannot produce one
-/// in a real session, and t-012 must not assume the age survives anyway.
+/// in a real session.
 #[test]
 fn an_instant_older_than_the_process_anchor_honestly_loses_its_age() {
     let mut source = TuiRenderer::new();
@@ -2390,7 +2392,7 @@ fn capture_and_restore_round_trip_the_composer_text_and_caret() {
     assert_eq!(target.history_index, Some(1));
     assert_eq!(target.input_draft, source.input_draft);
     // The widget was rebuilt by the existing sync path and its caret sits on
-    // the restored byte offset (I-U5).
+    // the restored byte offset.
     assert_eq!(target.textarea.lines().join("\n"), source.input_text);
     assert_eq!(target.textarea.cursor(), (1, 6));
     // Reading the widget back yields the same byte offset: no drift.
@@ -2400,8 +2402,8 @@ fn capture_and_restore_round_trip_the_composer_text_and_caret() {
 
 #[test]
 fn restore_panes_clamps_a_caret_past_the_end_instead_of_trusting_it() {
-    // U-chk is the loader's precondition; the renderer still refuses to build a
-    // widget caret outside its own text.
+    // The loader validates the caret upstream; the renderer still refuses to
+    // build a widget caret outside its own text.
     let mut r = TuiRenderer::new();
     let mut section = crate::session::format::UiSection::default();
     section.composer.input_text = "abc".to_string();
@@ -2416,7 +2418,7 @@ fn capture_and_restore_round_trip_scrolls_with_the_live_clamp() {
     let mut source = TuiRenderer::new();
     source.messages = (0..60).map(|i| format!("m{i}")).collect();
     // The selected panel needs enough content for a non-zero scroll maximum;
-    // otherwise the live clamp legitimately pulls the offset back to 0 (I-U6).
+    // otherwise the live clamp legitimately pulls the offset back to 0.
     let mut tall = subagent_without_instants("coder");
     tall.content = (0..40)
         .map(|i| format!("output line {i}"))
@@ -2430,7 +2432,7 @@ fn capture_and_restore_round_trip_scrolls_with_the_live_clamp() {
     source.subagent_list_scroll = 1;
     source.plan_auto_scroll = true;
     source.subagent_autoscroll = false;
-    // Maxima are derived geometry (U5): a rendered plan panel would have set this.
+    // Maxima are derived geometry: a rendered plan panel would have set this.
     source.plan_max_scroll = 20;
 
     let section = source.capture_ui();
@@ -2441,7 +2443,7 @@ fn capture_and_restore_round_trip_scrolls_with_the_live_clamp() {
     assert_eq!(section.view.focused_panel, "chat");
 
     let mut target = TuiRenderer::new();
-    // Same derived geometry as the source, otherwise the live clamp (I-U6)
+    // Same derived geometry as the source, otherwise the live clamp
     // legitimately moves the offsets.
     target.plan_max_scroll = 20;
     target.subagent_area = Rect::new(0, 0, 40, 4);
@@ -2458,7 +2460,7 @@ fn capture_and_restore_round_trip_scrolls_with_the_live_clamp() {
 
 #[test]
 fn restore_panes_lets_the_existing_clamp_pull_back_an_impossible_offset() {
-    // I-U6: a restored offset that exceeds the restored content is clamped by
+    // A restored offset that exceeds the restored content is clamped by
     // the live resize path, not validated by new code.
     let mut r = TuiRenderer::new();
     let mut section = source_section_with_one_line();
@@ -2487,7 +2489,7 @@ fn capture_records_budgets_as_a_sorted_witness_and_restore_never_adopts_them() {
     assert_eq!(section.budgets.thinking_budgets.len(), 2);
     assert_eq!(section.budgets.thinking_budgets["coder"], 12_000);
     assert_eq!(section.budgets.default_thinking_budget, 8_000);
-    // A BTreeMap keeps the committed bytes deterministic (A §6.5).
+    // A BTreeMap keeps the committed bytes deterministic.
     let keys: Vec<&str> = section
         .budgets
         .thinking_budgets
@@ -2496,8 +2498,8 @@ fn capture_records_budgets_as_a_sorted_witness_and_restore_never_adopts_them() {
         .collect();
     assert_eq!(keys, ["coder", "researcher"]);
 
-    // A §6.5: witness only. `Config` owns the budgets, so restore keeps the live
-    // numbers untouched and reports the drift instead (see `announce_restore`).
+    // Witness only: `Config` owns the budgets, so restore keeps the live numbers
+    // untouched and reports the drift instead (see `announce_restore`).
     let mut target = TuiRenderer::new();
     target.thinking_budgets.insert("coder".to_string(), 1_000);
     target.default_thinking_budget = 2_000;
@@ -2509,7 +2511,7 @@ fn capture_records_budgets_as_a_sorted_witness_and_restore_never_adopts_them() {
 
 #[test]
 fn announce_restore_surfaces_every_report_field_in_the_ui() {
-    // A §8.4 / §10.7 rule 4: loud, no `let _ =` swallow.
+    // Loud, reported in the panes: no `let _ =` swallow.
     let mut r = TuiRenderer::new();
     let report = crate::session::format::RepairReport {
         ui_lines_restored: 42,
@@ -2560,8 +2562,8 @@ fn announce_restore_with_an_empty_report_still_states_the_restore() {
 
 #[test]
 fn restore_keeps_the_current_focus_for_an_out_of_set_panel_spelling() {
-    // A §6.5 U-chk refuses an out-of-set `focused_panel`; the renderer must not
-    // invent a focus either.
+    // An out-of-set `focused_panel` is refused by the loader; the renderer must
+    // not invent a focus either.
     let mut r = TuiRenderer::new();
     r.focused_panel = FocusedPanel::Plan;
     let mut section = crate::session::format::UiSection::default();
@@ -2582,13 +2584,13 @@ fn restore_keeps_the_current_focus_for_an_out_of_set_panel_spelling() {
 }
 
 // ============================================================================
-// t-020 — pane-coverage gap: EVERY pane's text is restorable
+// Every pane's text is restorable
 // ============================================================================
 
 #[test]
 fn capture_records_the_plan_pane_and_restore_puts_its_text_back() {
-    // The plan box was the biggest uncapturable pane: its text, its visibility,
-    // the in-flight task it flags, and the elapsed timer it draws.
+    // The plan box carries its text, its visibility, the in-flight task it
+    // flags, and the elapsed timer it draws.
     // Pin the monotonic anchor BEFORE building the instants: a plan always
     // starts inside the process, and an instant older than the anchor honestly
     // floors at 0 s (`an_instant_older_than_the_process_anchor_honestly_loses_its_age`).
@@ -2611,7 +2613,7 @@ fn capture_records_the_plan_pane_and_restore_puts_its_text_back() {
     assert!(section.view.show_plan_panel);
     assert!(section.had_active_plan);
     assert_eq!(section.active_plan_task.as_deref(), Some("t-020"));
-    // The timer is the D5 projection, not a re-anchored lie (A §3.9).
+    // The timer is projected onto the process timeline, never re-anchored away.
     let start = section.plan_start.clone().expect("plan start recorded");
     let done = section
         .plan_completed
@@ -2624,8 +2626,8 @@ fn capture_records_the_plan_pane_and_restore_puts_its_text_back() {
         start.elapsed_secs >= 0.0 && (start.elapsed_secs - expected_start).abs() < 1.0,
         "plan start position {start:?}, expected approx {expected_start}"
     );
-    // `elapsed_secs` is a position on the process timeline (A §3.9), so the
-    // completion sits AFTER the start, and the gap is the sleep above.
+    // `elapsed_secs` is a position on the process timeline, so the completion
+    // sits AFTER the start, and the gap is the sleep above.
     assert!(
         done.elapsed_secs > start.elapsed_secs,
         "completion {done:?} must sit after the start {start:?}"
@@ -2643,16 +2645,16 @@ fn capture_records_the_plan_pane_and_restore_puts_its_text_back() {
     assert!(target.had_active_plan);
     assert_eq!(target.active_plan_task.as_deref(), Some("t-020"));
     // The plan offset is assigned verbatim, then re-clamped against the NEW
-    // terminal's derived maximum (`clamp_scrolls`, `events.rs:472`, which uses the
-    // per-frame `plan_max_scroll` U5 refuses to persist): before the first draw
-    // that maximum is 0, so the offset is legitimately pulled back (I-U6).
+    // terminal's derived maximum (`clamp_scrolls`, which uses the per-frame
+    // `plan_max_scroll` that is never persisted): before the first draw that
+    // maximum is 0, so the offset is legitimately pulled back.
     assert!(
         target.plan_scroll <= 4,
         "plan scroll {}",
         target.plan_scroll
     );
-    // The restored timers keep their age and their order in the new process
-    // (D5 T2), so the plan border draws the same elapsed figure as the old pane.
+    // The restored timers keep their age and their order in the new process,
+    // so the plan border draws the same elapsed figure as the old pane.
     let restored_start = target
         .plan_start_time
         .expect("plan start re-anchored")
@@ -2683,10 +2685,10 @@ fn capture_records_the_plan_pane_and_restore_puts_its_text_back() {
 
 #[test]
 fn restore_does_not_blank_a_plan_pane_for_a_bundle_that_stored_no_plan_text() {
-    // Every t-020 field has a serde default, so a pre-t-020 `ui.json` reads back
-    // as `plan_content: ""` + `show_plan_panel: false`. That is NOT a statement
-    // that the pane was blank: the plan box is disk-backed and `init`
-    // (`tui/mod.rs:417-424`) already filled it, so the restore must leave it.
+    // Every new field has a serde default, so an older `ui.json` reads back as
+    // `plan_content: ""` + `show_plan_panel: false`. That is NOT a statement
+    // that the pane was blank: the plan box is disk-backed and `init` already
+    // filled it, so the restore must leave it.
     let mut r = TuiRenderer::new();
     r.plan_content = "# Plan read from .marmel/execution_plan.md".to_string();
     r.show_plan_panel = true;
@@ -2705,9 +2707,8 @@ fn restore_does_not_blank_a_plan_pane_for_a_bundle_that_stored_no_plan_text() {
 
 #[test]
 fn capture_and_restore_round_trip_the_streaming_partials() {
-    // The in-flight thinking/answer region of the chat pane used to be lost
-    // outright (A §10.2 called it deliberately unpersisted; the mission demands
-    // the visible bytes).
+    // The in-flight thinking/answer region of the chat pane is captured as the
+    // visible bytes rather than left unpersisted.
     let mut source = TuiRenderer::new();
     source.current_thought = "Let me consider é before answering…".to_string();
     source.current_content = "partial answer\nstill streaming 🎉".to_string();
@@ -2716,7 +2717,7 @@ fn capture_and_restore_round_trip_the_streaming_partials() {
     assert_eq!(section.current_thought, source.current_thought);
     assert_eq!(section.current_content, source.current_content);
     // Display-only: capture does NOT fold a half-turn into the pane vector or
-    // fabricate a transcript entry (A §10.2, U1).
+    // fabricate a transcript entry.
     assert!(section.chat_messages.is_empty());
 
     let mut target = TuiRenderer::new();
@@ -2773,8 +2774,8 @@ fn capture_and_restore_round_trip_the_active_agent_and_steer_buffer() {
 
 #[test]
 fn subagent_thinking_state_round_trips_with_its_panel() {
-    // The detail pane's spinner and "thinking n/budget" bar are driven by the two
-    // per-subagent maps (`tui/mod.rs:163`, `:165`), so they are pane state.
+    // The detail pane's spinner and "thinking n/budget" bar are driven by the
+    // two per-subagent maps, so they are pane state.
     let mut source = TuiRenderer::new();
     source.subagents = vec![
         subagent_without_instants("coder"),
@@ -2787,9 +2788,9 @@ fn subagent_thinking_state_round_trips_with_its_panel() {
     source
         .subagent_is_thinking
         .insert("coder".to_string(), true);
-    // An entry holding "" is a DIFFERENT pane state from no entry at all
-    // (`render.rs:864-878` falls back to `thinking` only when the entry is
-    // absent), so the mirror must keep the distinction.
+    // An entry holding "" is a DIFFERENT pane state from no entry at all (the
+    // pane falls back to `thinking` only when the entry is absent), so the
+    // mirror must keep the distinction.
     source
         .subagent_turn_thinking
         .insert("researcher".to_string(), String::new());
@@ -2856,8 +2857,8 @@ fn a_panel_with_no_thinking_entry_restores_to_no_entry() {
 
 #[test]
 fn token_counters_are_captured_as_a_witness_and_never_adopted() {
-    // A §6.5 governs `budgets`; the same rule now covers the token counters. The
-    // live totals belong to this process's streams (`on_event`, `:433-444`).
+    // The witness rule that covers `budgets` covers the token counters too: the
+    // live totals belong to this process's streams (`on_event`).
     let mut source = TuiRenderer::new();
     source.on_event(&Event::TokensIn(12_345));
     source.on_event(&Event::TokensOut(6_789));
@@ -2881,7 +2882,7 @@ fn token_counters_are_captured_as_a_witness_and_never_adopted() {
     assert!(warnings[0].contains("tokens_in witness 12345 != this process's live 100"));
     assert!(warnings[1].contains("tokens_out witness 6900 != this process's live 0"));
     assert!(warnings[2].contains("orchestrator_context_tokens witness 12345"));
-    // …and it is said out loud in the pane too (A §8.4: loud, never a swallow).
+    // …and it is said out loud in the pane too: loud, never a swallow.
     let joined = target.messages.join("\n");
     assert!(
         joined
@@ -2909,10 +2910,10 @@ fn matching_token_counters_emit_no_witness_noise() {
 
 #[test]
 fn an_armed_abort_is_recorded_but_never_re_armed() {
-    // A §6.5: a 3-second armed window has no meaning after a restart, and §10's
-    // closed inventory never re-arms it. The boolean survives as a witness; the
-    // live renderer stays unarmed so no keypress can abort a session the user
-    // never asked to abort.
+    // A 3-second armed window has no meaning after a restart, and the closed
+    // inventory never re-arms it. The boolean survives as a witness; the live
+    // renderer stays unarmed so no keypress can abort a session the user never
+    // asked to abort.
     let mut source = TuiRenderer::new();
     source.confirm_abort = true;
     source.abort_armed_at = Some(std::time::Instant::now());
@@ -2936,7 +2937,7 @@ fn an_armed_abort_is_recorded_but_never_re_armed() {
     assert!(joined.contains(
         "[CLI] Not restorable after restart [Other] session: confirm-abort was armed when the session was captured"
     ));
-    // The stored bytes are never rewritten to match the new process (N-R1).
+    // The stored bytes are never rewritten to match the new process.
     assert!(section.abort_armed);
 }
 
@@ -2953,10 +2954,10 @@ fn a_stale_abort_window_is_not_recorded_as_armed() {
 
 #[test]
 fn a_scroll_offset_the_live_clamp_moved_is_named_with_both_values() {
-    // §6.6 I-U6 / §9.6 AC-C3 branch 2: `clamp_scrolls` (`events.rs:465-481`) may
-    // move a restored offset, but it may never do so SILENTLY. One sentence per
-    // moved offset, naming the field, the stored value and the live value, in
-    // the same machine-readable shape AC-C3 greps `RepairReport::warnings` for.
+    // `clamp_scrolls` may move a restored offset, but it may never do so
+    // SILENTLY: one sentence per moved offset, naming the field, the stored
+    // value and the live value, in the same machine-readable shape that
+    // `RepairReport::warnings` carries.
     let mut target = TuiRenderer::new();
     target.chat_scroll = 0;
     target.plan_scroll = 0;
@@ -2997,8 +2998,8 @@ fn a_scroll_offset_the_live_clamp_moved_is_named_with_both_values() {
         );
     }
 
-    // Nothing moved ⇒ nothing said: an AC-C3 fixture whose offsets already fit
-    // the restored content must produce no scroll warning at all.
+    // Nothing moved means nothing said: offsets that already fit the restored
+    // content must produce no scroll warning at all.
     let unchanged = target.capture_ui();
     assert_eq!(
         clamp_report(&target, &unchanged),
@@ -3006,9 +3007,9 @@ fn a_scroll_offset_the_live_clamp_moved_is_named_with_both_values() {
         "an offset that did not move must not be reported"
     );
 
-    // The same sentence is what the boot wiring folds into `RepairReport::warnings`,
-    // read from the renderer's OWN end state — so the number it names is the
-    // number the panes ended on, whatever the clamp did to it.
+    // The same sentence is what the boot wiring folds into
+    // `RepairReport::warnings`, read from the renderer's OWN end state — so the
+    // number it names is the number the panes ended on, whatever the clamp did.
     let mut r = TuiRenderer::new();
     r.restore_panes(&section);
     assert!(
@@ -3038,7 +3039,7 @@ fn a_scroll_offset_the_live_clamp_moved_is_named_with_both_values() {
 /// `UiSection`s; this helper covers the other half of the same rule — each field
 /// name in the sentence belongs to the renderer field of that name, with that
 /// type. Rename or re-type a renderer offset and this stops compiling, which is
-/// exactly the drift I-U6's notice must never hide.
+/// exactly the drift a restore notice must never hide.
 fn clamp_report(target: &TuiRenderer, stored: &crate::session::format::UiSection) -> Vec<String> {
     clamp_warning_sentences(&[
         (
@@ -3103,7 +3104,7 @@ fn a_hostile_time_point_is_refused_by_u_chk_and_never_panics_the_renderer() {
         "{violations:?}"
     );
     // The renderer still degrades instead of taking the UI down (`to_instant` is
-    // total, `session/time.rs:85-94`).
+    // total).
     r.restore_panes(&section);
     assert_eq!(r.plan_content, "# Plan");
     assert!(r.plan_start_time.is_some());
@@ -3252,7 +3253,7 @@ fn an_old_ui_json_without_any_t_020_field_still_loads() {
     assert_eq!(section.abort_armed_at, None);
     assert_eq!(section.subagent_panels[0].turn_thinking, None);
     assert_eq!(section.subagent_panels[0].is_thinking, None);
-    // …and an old bundle is still a loadable one (U-chk refuses, never repairs).
+    // …and an old bundle is still a loadable one (the loader refuses, never repairs).
     assert_eq!(section.structural_violations(), Vec::<String>::new());
 
     // Restoring it costs nothing the old build had: the pane text comes back, the
@@ -3272,8 +3273,8 @@ fn an_old_ui_json_without_any_t_020_field_still_loads() {
 }
 
 /// A renderer that implements ONLY the required trait methods: the three
-/// rehydration hooks must compile from their default bodies (flow §4.7), so an
-/// existing implementor is unaffected by the addition.
+/// rehydration hooks must compile from their default bodies, so an existing
+/// implementor is unaffected by the addition.
 #[derive(Default)]
 struct DefaultHookRenderer {
     state: crate::ui::InputState,
@@ -3321,7 +3322,7 @@ fn the_hooks_are_object_safe_and_need_no_sync() {
     boxed.announce_restore(&crate::session::format::RepairReport::default());
 
     // And across a thread boundary, which is exactly the `Send` (not `Sync`)
-    // shape flow §4.3 relies on.
+    // shape the session loop relies on.
     let moved = std::thread::scope(|scope| {
         scope
             .spawn(move || {

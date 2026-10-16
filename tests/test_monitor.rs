@@ -1,4 +1,4 @@
-//! Phase B integration tests (monitor / XML rescue fixtures).
+//! Integration tests for the monitor and the XML rescue fixtures.
 
 use marmennill::harness::monitor::{HarnessMonitor, Intervention};
 use serde_json::json;

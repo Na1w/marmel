@@ -1,59 +1,51 @@
-//! t-014c — the two acceptance families of `docs/design_session_restore_data.md`
-//! that decide whether the *workers* and the *identities* of a session survive
-//! the restart:
+//! Session-restore coverage for the *workers* and the *identities* of a session
+//! across a restart.
 //!
-//! * **§9.3 AC-W1 … AC-W4 — the worker section round-trips exactly**
-//!   (AC-W1 the committed `worker_key` set modulo the completed-ring cap, with
-//!   the drop count equal to the difference; AC-W2 element-by-element `history`
-//!   equality gated on `history_source == LiveMirror`, with a `SeedOnly` fixture
-//!   refused the claim and reported as the documented partial; AC-W3 every
-//!   declared field verbatim, an unrecognized `status_label` kept byte-for-byte
-//!   under `status == Unknown`; AC-W4 the live `WORKERS` map carrying each
-//!   restored key with its stored `completed_seq`, `is_active()` ⇔
-//!   `completed_seq == None`);
-//! * **§9.4 AC-I1 … AC-I4 — identity continuity across the restart**
-//!   (AC-I1 no worker id below `identity_floors.worker_id_seq_floor` is ever
-//!   re-issued and no restored key is re-disambiguated with a `#N` suffix;
-//!   AC-I2 a completion in the new process draws `completed_seq` strictly above
-//!   every restored one while the restored relative order survives; AC-I3 a
-//!   notice issued after restore can never alias a pre-crash `notice-<n>`;
-//!   AC-I4 `Manifest.session_id` is never re-minted).
+//! * the **worker section round-trips exactly**: the committed `worker_key` set is
+//!   restored modulo the completed-ring cap, with the drop count equal to the
+//!   difference; `history` is equal element-by-element and conditional on
+//!   `history_source == LiveMirror`, with a `SeedOnly` fixture refused the claim
+//!   and reported as the documented partial; every declared field comes back
+//!   verbatim and an unrecognized `status_label` is kept byte-for-byte under
+//!   `status == Unknown`; the live `WORKERS` map carries each restored key with its
+//!   stored `completed_seq`, `is_active()` ⇔ `completed_seq == None`;
+//! * **identity continues across the restart**: no worker id below
+//!   `identity_floors.worker_id_seq_floor` is ever re-issued and no restored key is
+//!   re-disambiguated with a `#N` suffix; a completion in the new process draws
+//!   `completed_seq` strictly above every restored one while the restored relative
+//!   order survives; a notice issued after restore can never alias a `notice-<n>`
+//!   issued before the crash; `Manifest.session_id` is never re-minted.
 //!
 //! Fixture idiom is the one already used by `tests/test_session_bundle.rs` and
 //! `tests/test_session_restore_dangling.rs`: build a `CapturePayload`, commit it
-//! with `session::commit::write_bundle` into a private temp directory
-//! (`<temp>/marmel-t014c-<tag>-<pid>-<nanos>/.marmel/session`), read it back
-//! through `session::restore::load_bundle`, and — where the criterion is about
-//! the *live* process — install it through the same two seams production uses:
-//! `session::install_restored_workers` (the installer `A §5.7` requires) and, for
-//! AC-W1 and AC-I4, the whole boot pass `ui::session::boot` so the assertions
-//! land on `RepairReport` / `BootReport` as the operator sees them
-//! (`src/ui/session.rs:1143-1145` is where `worker_report` is copied into
-//! `RepairReport`, which is why AC-W1 asserts on the criterion's own field).
+//! with `session::commit::write_bundle` into a private temp directory, read it
+//! back through `session::restore::load_bundle`, and — where the claim is about the
+//! *live* process — install it through the seams production uses:
+//! `session::install_restored_workers` and, for the ring-cap and session-id rules,
+//! the whole boot pass `ui::session::boot`, so the assertions land on
+//! `RepairReport` / `BootReport` as the operator sees them (the boot pass copies
+//! `worker_report` into `RepairReport`).
 //!
 //! Two rules this file never breaks:
 //!
-//! * **no weakened assertion.** Where a criterion and the implementation could
-//!   disagree, the test keeps the criterion's wording, pins the implementation's
-//!   exact value alongside it, and says so — nothing is relaxed to make a test
-//!   pass;
+//! * **no weakened assertion.** Where the stated contract and the implementation
+//!   could disagree, the test keeps the contract's wording, pins the
+//!   implementation's exact value alongside it, and says so — nothing is relaxed to
+//!   make a test pass;
 //! * **order independence.** The `WORKERS` map, `WORKER_ID_SEQ`, `COMPLETED_SEQ`
-//!   and `NEXT_NOTICE_ID` are process-global and `remove_worker_entry_for_test`
-//!   is `#[cfg(test)]`-only (invisible to an integration test), so this file
-//!   never cleans the registry and never counts it absolutely. Every
-//!   registry-touching test (a) holds one local mutex across commit → install →
-//!   assert so no two of them interleave, (b) uses a private key prefix, and
-//!   (c) states its expectations *relative to the live counters it reads at
-//!   runtime* (`live_completed_count()`, `worker_id_seq_floor()`,
-//!   `notice_id_floor()`) — and derives its own `completed_seq` values from
-//!   `completed_seq_floor() + 1_000_000`, because `COMPLETED_SEQ` is advanced past
-//!   every value it hands out, so those values are guaranteed to be the newest in
-//!   the process and the ring can only ever evict other tests' leftovers. AC-W1 is
-//!   the deliberate exception: it wants the cap to bite, so it commits the lowest
-//!   seq values in the file (`1..=14`) and states the expected survivor set in
-//!   terms of how many completed entries it found in the map beforehand.
-//!   `#[test]` order therefore cannot change a result, and
-//!   the file is gated three times (§ GATES below).
+//!   and `NEXT_NOTICE_ID` are process-global, and `remove_worker_entry_for_test`
+//!   is `#[cfg(test)]`-only (invisible to an integration test), so this file never
+//!   cleans the registry and never counts it absolutely: every registry-touching
+//!   test holds one local mutex across commit → install → assert, uses a private
+//!   key prefix, and states its expectations relative to the live counters it
+//!   reads at runtime (`live_completed_count()`, `worker_id_seq_floor()`,
+//!   `notice_id_floor()`), deriving its own `completed_seq` values from
+//!   `completed_seq_floor() + 1_000_000` so they are the newest in the process and
+//!   the ring can only evict other tests' leftovers. The ring-cap test is the
+//!   deliberate exception: it wants the cap to bite, so it commits the lowest seq
+//!   values in the file (`1..=14`) and states the survivor set in terms of how many
+//!   completed entries it found in the map beforehand. `#[test]` order therefore
+//!   cannot change a result.
 //!
 //! Hermetic: one unique temp directory per test, deleted at the end; no network,
 //! no PTY, no sleeps, no reading of another test's leftovers as fact.
@@ -84,15 +76,15 @@ use marmennill::session::{
 // ----------------------------------------------------------------- constants
 
 /// `orchestrator::workers::MAX_RECENT_COMPLETED` (`src/orchestrator/workers.rs`).
-/// Private to that module, and `A §5.7` step 3 states the number, so the fixture
-/// is built around it rather than re-derived from a map length.
+/// Private to that module, and its value is stated there, so the fixture is built
+/// around it rather than re-derived from a map length.
 const RING_CAP: usize = 10;
 
-/// Pinned system prompt carried by every fixture bundle (REQ-CORE-001).
+/// Pinned system prompt carried by every fixture bundle.
 const PIN_TEXT: &str =
     "PINNED SYSTEM PROMPT (REQ-CORE-001): bytes the previous process sent first.";
 
-/// Pinned goal carried by every fixture bundle (REQ-CORE-002).
+/// Pinned goal carried by every fixture bundle.
 const GOAL_TEXT: &str = "PINNED GOAL (REQ-CORE-002): the same worker identities after the restart.";
 
 /// Budget the fixtures commit with.
@@ -102,11 +94,11 @@ const COMMITTED_BUDGET: usize = 1234;
 /// could never be mistaken for a restoration.
 const LIVE_BUDGET: usize = 4321;
 
-/// `#` — `KEY_DISAMBIGUATOR` (`src/orchestrator/workers.rs`), the collision
-/// handle AC-I1 forbids on a restored key.
+/// `#` — `KEY_DISAMBIGUATOR` (`src/orchestrator/workers.rs`), the collision handle
+/// a restored key must never acquire.
 const DISAMBIGUATOR: char = '#';
 
-// ------------------------------------------------------------------- gating
+// -------------------------------------------------------------- serializing
 
 /// Serializes every test in this file that mutates the process-global `WORKERS`
 /// map or the process-global identity counters. Without it, two tests would see
@@ -226,7 +218,7 @@ fn manager_section(messages: Vec<MessageRecord>) -> ManagerSection {
 }
 
 /// The manager transcript every fixture commits: the pinned pair plus one
-/// settled round. Never touched by these criteria, but a bundle must carry it.
+/// settled round. Nothing here asserts on it, but a bundle must carry it.
 fn manager_transcript() -> Vec<MessageRecord> {
     let mut messages = pinned_pair();
     messages.push(assistant(
@@ -240,7 +232,7 @@ fn manager_transcript() -> Vec<MessageRecord> {
 
 // ----------------------------------------------------------- worker fixtures
 
-/// Everything a fixture worker states that the criteria read. Every other
+/// Everything a fixture worker states that these tests read. Every other
 /// `WorkerSection` field is filled with a distinctive, non-default value so an
 /// accidentally-dropped field is caught instead of coincidentally matched.
 struct Spec {
@@ -297,7 +289,7 @@ fn worker(spec: &Spec, history: Vec<MessageRecord>) -> WorkerSection {
     } else {
         // The capture side records this loss in the section itself
         // (`worker_journal::project_worker_section`), so a faithful fixture does
-        // too — AC-W2 asserts that it survives the round trip.
+        // too, and the round trip must carry it back.
         vec![NonRestorableNotice {
             kind: NonRestorableKind::WorkerHistory,
             subject: spec.key.clone(),
@@ -461,8 +453,8 @@ struct BootRenderer {
 }
 
 impl BootRenderer {
-    /// The status lines the boot pass announced (A §8.4: repair and loss are never
-    /// silent).
+    /// The status lines the boot pass announced: repair and loss are never
+    /// silent.
     fn statuses(&self) -> Vec<String> {
         self.events
             .iter()
@@ -499,14 +491,14 @@ struct Booted {
     engine: marmennill::manager::ContextEngine,
     session_id: String,
     plan: Plan,
-    /// The status lines the boot pass surfaced: §8.4 forbids a silent repair, so
+    /// The status lines the boot pass surfaced: a silent repair is forbidden, so
     /// "the operator was told" is checkable.
     statuses: Vec<String>,
 }
 
-/// THE boot path (`ui::session::boot`, flow §4.9): `load_bundle` → floors +
-/// `WORKERS` → the engine → the panes → the loud report. Used where a criterion
-/// names a `RepairReport` field (AC-W1) or the session identity (AC-I4).
+/// THE boot path (`ui::session::boot`): `load_bundle` → floors + `WORKERS` → the
+/// engine → the panes → the loud report. Used where a claim is about a
+/// `RepairReport` field or about the session identity.
 fn boot_bundle(bundle: &Path) -> Booted {
     let cfg = Config {
         max_context_tokens: LIVE_BUDGET,
@@ -564,9 +556,9 @@ fn live_completed_count() -> usize {
         .count()
 }
 
-/// Every live key under a fixture's private prefix. Prefix filtering is only ever
-/// used here to isolate one test's own entries from another test's leftovers; it
-/// is never used to reason about a worker's identity.
+/// Every live key under a fixture's private prefix. Prefix filtering isolates one
+/// test's own entries from another test's leftovers; it is never a basis for
+/// reasoning about a worker's identity.
 fn live_keys_with_prefix(prefix: &str) -> BTreeSet<String> {
     workers::live_worker_states()
         .into_iter()
@@ -592,12 +584,11 @@ fn completed_pairs(sections: &[WorkerSection]) -> Vec<(u64, String)> {
 }
 
 // ==========================================================================
-// §9.3 — the worker section (AC-W1 … AC-W4)
+// The worker section
 // ==========================================================================
 
-/// **AC-W1** — the restored `worker_key` set equals the committed set modulo the
-/// completed-ring cap, with `RepairReport.completed_dropped_by_ring_cap` equal to
-/// the difference (§5.8 I-W1).
+/// The restored `worker_key` set equals the committed set modulo the completed-ring
+/// cap, with `RepairReport.completed_dropped_by_ring_cap` equal to the difference.
 ///
 /// The fixture commits **16** workers: 14 completed (with 14 distinct
 /// `completed_seq` values) and 2 in flight. 14 > `RING_CAP`, so the cap must
@@ -606,16 +597,16 @@ fn completed_pairs(sections: &[WorkerSection]) -> Vec<(u64, String)> {
 /// 1. **the loader** returns all 16 keys — the files are the durable record and
 ///    the cap is a live-map property, never a loader one;
 /// 2. **the live `WORKERS` map** (after the real boot pass, so the number is the
-///    criterion's own `RepairReport` field, copied at `src/ui/session.rs:1145`)
-///    holds the committed set minus exactly the entries the ring evicted, and
+///    `RepairReport` field the boot pass copies there) holds the committed set minus
+///    exactly the entries the ring evicted, and
 ///    `completed_dropped_by_ring_cap == committed − present`.
 ///
 /// Order independence: the live map may already hold `K` completed entries left
 /// by an earlier test in this binary, so the expectation is stated in terms of
 /// `K`, read at runtime. The fixture's own `completed_seq` values (`1..=14`) are
 /// the lowest in the binary on purpose, so the eviction always lands on this
-/// test's entries and `dropped == difference` is the criterion's exact claim
-/// rather than a count polluted by other tests' leftovers.
+/// test's entries and `dropped == difference` is the exact claim rather than a
+/// count polluted by other tests' leftovers.
 #[test]
 fn ac_w1_the_restored_key_set_equals_the_committed_set_modulo_the_completed_ring_cap() {
     let _registry = registry_lock();
@@ -714,7 +705,7 @@ fn ac_w1_the_restored_key_set_equals_the_committed_set_modulo_the_completed_ring
     );
 
     // The survivors are exactly the highest-seq committed completed entries: the
-    // pre-existing `K` entries (higher seq) fill the ring first, so exactly
+    // `K` entries already in the map (higher seq) fill the ring first, so
     // `RING_CAP - K` of this fixture's own entries can remain.
     let mut ordered = completed_pairs(&sections);
     ordered.sort();
@@ -748,7 +739,7 @@ fn ac_w1_the_restored_key_set_equals_the_committed_set_modulo_the_completed_ring
         );
     }
 
-    // §8.4: a drop this visible is never silent — the boot pass announced the
+    // A drop this visible is never silent — the boot pass announced the
     // restore rather than swallowing the difference.
     assert!(
         !booted.statuses.is_empty(),
@@ -759,9 +750,9 @@ fn ac_w1_the_restored_key_set_equals_the_committed_set_modulo_the_completed_ring
     cleanup(&bundle);
 }
 
-/// **AC-W2** — per worker, `history` is element-by-element equal **and**
-/// `history_source == LiveMirror`; a `SeedOnly` fixture must NOT satisfy AC-W2
-/// and must instead produce the reported partial (§5.5 rule 5, §5.8 I-W4).
+/// Per worker, `history` is element-by-element equal **and**
+/// `history_source == LiveMirror`; a `SeedOnly` fixture must NOT satisfy that
+/// conjunction and must instead produce the reported partial.
 ///
 /// Three things are asserted, and none of them is a re-statement of another:
 ///
@@ -769,9 +760,9 @@ fn ac_w1_the_restored_key_set_equals_the_committed_set_modulo_the_completed_ring
 ///   including `content: null` vs `Some("")`, `reasoning_content`, and
 ///   `arguments` that is not valid JSON (kept verbatim);
 /// * the `SeedOnly` worker is **not** presented as an exact history: its
-///   `history_source` stays `SeedOnly` (so AC-W2's conjunction fails by the
-///   provenance term, exactly as the criterion demands) and its `history` is the
-///   empty vector the capture side wrote;
+///   `history_source` stays `SeedOnly` (so the conjunction fails by the provenance
+///   term, exactly as required) and its `history` is the empty vector the capture
+///   side wrote;
 /// * the partial is *reported*, twice over: the capture-side `NonRestorableNotice
 ///   { kind: WorkerHistory }` survives the round trip inside the section, and the
 ///   installer re-states it for the live projection — while the `LiveMirror`
@@ -830,7 +821,7 @@ fn ac_w2_history_is_element_by_element_equal_only_for_a_live_mirror_and_a_seed_o
         .find(|w| w.worker_key == seed_key)
         .expect("the SeedOnly worker must be restored");
 
-    // ---- provenance is the gate, and it survives the round trip -------------
+    // ---- provenance decides, and it survives the round trip --------------
     assert_eq!(
         mirror.history_source,
         HistorySource::LiveMirror,
@@ -863,7 +854,7 @@ fn ac_w2_history_is_element_by_element_equal_only_for_a_live_mirror_and_a_seed_o
              (restored {given:?} vs committed {committed:?})"
         );
     }
-    // The awkward shapes the criterion's "element-by-element" wording is about,
+    // The awkward shapes the "element-by-element" wording is about,
     // named out loud so a passing test cannot be a coincidence.
     assert_eq!(
         mirror.history[2].content(),
@@ -954,11 +945,11 @@ fn ac_w2_history_is_element_by_element_equal_only_for_a_live_mirror_and_a_seed_o
     cleanup(&bundle);
 }
 
-/// **AC-W3** — per worker: `role`, `task_id`, `status`, `status_label`,
+/// Per worker: `role`, `task_id`, `status`, `status_label`,
 /// `context_tokens`, `last_tokens`, `counters.*`, `brief`, `snippets`,
 /// `image_urls`, `audio_urls`, `recursion_granted` all equal, and an
 /// unrecognized `status_label` keeps the label verbatim with
-/// `status == Unknown` (§5.3, §5.8 I-W5).
+/// `status == Unknown`.
 ///
 /// Both directions are covered, because "unrecognized" is decided by the capture
 /// side and only *stored* by the loader:
@@ -1027,7 +1018,7 @@ fn ac_w3_every_declared_field_is_restored_verbatim_and_an_unrecognized_label_kee
                 )
             });
 
-        // Every field AC-W3 names, asserted one at a time so a failure names the
+        // Every declared field, asserted one at a time so a failure names the
         // field instead of dumping two sections.
         assert_eq!(
             got.worker_key, committed.worker_key,
@@ -1112,8 +1103,8 @@ fn ac_w3_every_declared_field_is_restored_verbatim_and_an_unrecognized_label_kee
             committed.worker_key
         );
 
-        // §5.6 clocks, asserted alongside the fields that are displayed next to
-        // them: they must round-trip too, and are never recomputed (T3).
+        // The clock points, asserted alongside the fields displayed next to
+        // them: they must round-trip too, and are never recomputed.
         assert_eq!(
             got.worked_secs, committed.worked_secs,
             "AC-W3/§5.6 T3: worked_secs is a stored number, never a difference"
@@ -1206,9 +1197,9 @@ fn ac_w3_every_declared_field_is_restored_verbatim_and_an_unrecognized_label_kee
     cleanup(&bundle);
 }
 
-/// **AC-W4** — the live `WORKERS` map contains an entry under each restored key
-/// with `completed_seq` equal to the stored value, and `is_active()` ⇔
-/// `completed_seq == None` (§5.8 I-W5).
+/// The live `WORKERS` map contains an entry under each restored key with
+/// `completed_seq` equal to the stored value, and `is_active()` ⇔
+/// `completed_seq == None`.
 ///
 /// The fixture mixes the three terminal classes (each carrying a stored
 /// `completed_seq`) with three open records (`completed_seq: None`: two
@@ -1225,7 +1216,7 @@ fn ac_w4_the_live_registry_holds_each_restored_key_with_its_stored_completed_seq
     // The completed ring (`MAX_RECENT_COMPLETED`) is process-global, so a fixture
     // that hard-codes its `completed_seq` values can have its *own* entries evicted
     // by whatever another test in this binary installed first — and then the
-    // criterion ("the live map holds the stored value") is testing nothing.
+    // claim ("the live map holds the stored value") is testing nothing.
     // `COMPLETED_SEQ` is advanced past every value it hands out, so every entry
     // already in the map carries a seq strictly below `completed_seq_floor()`:
     // deriving this fixture's seqs from that floor makes them the newest in the
@@ -1377,7 +1368,7 @@ fn ac_w4_the_live_registry_holds_each_restored_key_with_its_stored_completed_seq
 
     // The open records (`completed_seq: None`) are the ones the restore keeps
     // open, so cancel and routing still see them, and they come back labelled by
-    // the documented flow §2.2 label — the one label change this build reports
+    // the documented interrupted label — the one label change this build reports
     // rather than hides.
     let open_keys: Vec<String> = sections
         .iter()
@@ -1403,8 +1394,7 @@ fn ac_w4_the_live_registry_holds_each_restored_key_with_its_stored_completed_seq
     // `InProgress` record lands in `interrupted_keys`, an `Unknown` one (the
     // unrecognized label) is installed as an open delegation too — fresh token,
     // no join handle, no completion guard — but is surfaced through an explicit
-    // warning naming the kept-verbatim label instead of through that list
-    // (`src/session/worker_journal.rs:861-873`).
+    // warning naming the kept-verbatim label instead of through that list.
     let mut reported_interrupted = install.interrupted_keys.clone();
     reported_interrupted.sort();
     let mut in_progress_keys: Vec<String> = sections
@@ -1445,32 +1435,33 @@ fn ac_w4_the_live_registry_holds_each_restored_key_with_its_stored_completed_seq
 }
 
 // ==========================================================================
-// §9.4 — identity continuity (AC-I1 … AC-I4)
+// Identity continuity across the restart
 // ==========================================================================
 
-/// **AC-I1** — after restore, `next_worker_id()`-equivalent draws are above
+/// After restore, a fresh worker-id draw is at or above
 /// `identity_floors.worker_id_seq_floor`; every restored `worker_id_seq_value`
-/// is below the floor (§5.8 I-W2), and **no restored key is re-disambiguated
+/// is below the floor, and **no restored key is re-disambiguated
 /// with a `#N` suffix** (the key set is compared literally).
 ///
 /// One wording point, pinned rather than papered over: the crate defines a floor
 /// as "every id strictly below it has already been handed out"
-/// (`src/orchestrator/workers.rs:256-262`, and `IdentityFloors`' own doc at
-/// `src/session/format/envelope.rs:145-152`), so the floor value itself is the
+/// (`orchestrator::workers`, and `IdentityFloors`' own doc in
+/// `src/session/format/envelope.rs`), so the floor value itself is the
 /// *first legal* draw. A draw is therefore `>= floor` (never below it), and only
 /// from the second draw onward is it strictly `> floor`. Both numbers are
 /// asserted, together with the exact expected draw, so the difference between the
-/// AC's phrasing and the documented convention is visible in the gate output —
-/// the assertion is not relaxed to whichever form happens to pass.
+/// literal `> floor` wording and the documented convention is visible in the
+/// failure output — the assertion is not relaxed to whichever form happens to
+/// pass.
 #[test]
 fn ac_i1_no_id_below_the_worker_id_floor_is_re_issued_and_no_restored_key_is_re_disambiguated() {
     let _registry = registry_lock();
     let bundle = bundle_dir("ac-i1");
     const PREFIX: &str = "coder-ac-i1";
     const ID_FLOOR: u64 = 5_000_100;
-    // See AC-W4: completed_seq values are derived from the live counter so this
-    // fixture's own entries are always the newest in the ring and can never be
-    // evicted by another test's leftovers (order independence, not luck).
+    // As in the live-map test: completed_seq values are derived from the live
+    // counter so this fixture's own entries are always the newest in the ring and
+    // can never be evicted by another test's leftovers (order independence).
     let seq_base = workers::completed_seq_floor() + 1_000_000;
 
     // The natural key of the worker this process will register after the restore.
@@ -1592,7 +1583,7 @@ fn ac_i1_no_id_below_the_worker_id_floor_is_re_issued_and_no_restored_key_is_re_
     // ---- a worker registered after the restore draws above the floor --------
     // Its natural key is the live restored key, so `claim_worker_slot` must
     // disambiguate the NEW worker and leave the restored one untouched — the
-    // identity drift A §5.7 / research §5-8 exists to prevent.
+    // identity drift the floor rule exists to prevent.
     let first_draw_expected = counter_before.max(ID_FLOOR);
     let first = workers::register_active_worker(
         Some(collision_task.to_string()),
@@ -1636,8 +1627,8 @@ fn ac_i1_no_id_below_the_worker_id_floor_is_re_issued_and_no_restored_key_is_re_
         );
     }
 
-    // The second draw is strictly above the floor — the criterion's literal
-    // `> floor` holds for every draw once the floor's own first value is spent.
+    // The second draw is strictly above the floor — the strict `> floor` wording
+    // holds for every draw once the floor's own first value is spent.
     let second = workers::register_active_worker(
         Some("ac-i1-second".to_string()),
         Agent::Coder.as_str().to_string(),
@@ -1675,18 +1666,18 @@ fn ac_i1_no_id_below_the_worker_id_floor_is_re_issued_and_no_restored_key_is_re_
     cleanup(&bundle);
 }
 
-/// **AC-I2** — a completion in the new process draws `completed_seq` strictly
-/// above `max(all restored completed_seq)`, and restored completed entries keep
-/// their relative order (§5.8 I-W3).
+/// A completion in the new process draws `completed_seq` strictly above
+/// `max(all restored completed_seq)`, and restored completed entries keep their
+/// relative order.
 #[test]
 fn ac_i2_a_completion_in_the_new_process_draws_above_every_restored_completed_seq_and_order_holds()
 {
     let _registry = registry_lock();
     let bundle = bundle_dir("ac-i2");
     const PREFIX: &str = "coder-ac-i2";
-    // Seq values are derived from the live counter (see AC-W4): four completed
-    // records must all survive the ring cap so their relative order can be
-    // compared, whatever ran before this test in the same binary.
+    // Seq values are derived from the live counter (as in the live-map test):
+    // four completed records must all survive the ring cap so their relative
+    // order can be compared, whatever ran before this test in the same binary.
     let seq_base = workers::completed_seq_floor() + 1_000_000;
 
     let in_flight_key = format!("{PREFIX}-flight");
@@ -1830,12 +1821,13 @@ fn ac_i2_a_completion_in_the_new_process_draws_above_every_restored_completed_se
     cleanup(&bundle);
 }
 
-/// **AC-I3** — a notice issued after restore has `NEXT_NOTICE_ID` strictly above
-/// `identity_floors.notice_id_floor`, and no new id matches a pre-crash
-/// `notice-<n>` (`src/orchestrator/notice.rs:34-39`).
+/// A notice issued after restore has `NEXT_NOTICE_ID` strictly above
+/// `identity_floors.notice_id_floor`, and no new id matches a `notice-<n>` that
+/// was handed out before the crash (`orchestrator::notice::next_notice_id` spells it
+/// that way).
 ///
 /// The bundle's `notice_id_floor` is read from the live counter at fixture time,
-/// so "pre-crash ids" are exactly `notice-1 .. notice-{floor-1}` — the ids the
+/// so the ids issued before the crash are exactly `notice-1 .. notice-{floor-1}` — the
 /// floor claims were already handed out. The test asserts the issued id, the
 /// counter after issuing, and the absence of any alias, without depending on how
 /// far this binary had already advanced the counter (the mutex guarantees no
@@ -1938,7 +1930,7 @@ fn ac_i3_a_notice_issued_after_restore_never_aliases_a_pre_crash_notice_id() {
     cleanup(&bundle);
 }
 
-/// **AC-I4** — `Manifest.session_id` is unchanged by a restore, and the next
+/// `Manifest.session_id` is unchanged by a restore, and the next
 /// commit writes the same `session_id` (no re-minting).
 ///
 /// Asserted on the whole identity chain, because "the same session" is what a

@@ -3,14 +3,12 @@
 //! Separates the user-facing chat and event stream from internal LLM context
 //! mechanics (e.g. synthetic system prompts, auto-nudges).
 //!
-//! t-025b deleted this journal's persistence owner: `UiTranscript::save`,
-//! `UiTranscript::load`, `UiTranscript::from_legacy_messages` and the
-//! `.ui_transcript.json` file name are gone, and nothing writes a UI journal file
-//! any more. The session bundle's `ui` member ([`crate::session::format::ui`]) is
-//! the only durable copy; this journal stays the live in-memory chat record and the
-//! steering-replay source. The serde derives survive because the bundle's
-//! `journal` section ([`crate::session::format::ui::UiJournalRecord`]) is the
-//! one-for-one persistence twin of [`UiRecord`].
+//! Nothing here is written to a file of its own: the session bundle's `ui` member
+//! ([`crate::session::format::ui`]) is the only durable copy, and this journal is
+//! the live in-memory chat record and the steering-replay source. The serde
+//! derives exist because the bundle's `journal` section
+//! ([`crate::session::format::ui::UiJournalRecord`]) is the one-for-one
+//! persistence twin of [`UiRecord`].
 
 use serde::{Deserialize, Serialize};
 
@@ -86,10 +84,9 @@ impl UiTranscript {
     /// "Is this entry still pending?" is **not** decided here: it is delegated to
     /// [`crate::orchestrator::steer::steering_entry_is_pending`], the predicate the
     /// live steering-history owner (`orchestrator::bus::record_steering_exchange`)
-    /// applies to the very same text. One vocabulary therefore governs both the
-    /// live history and this journal replay, and none of its markers is tied to a
-    /// natural language (t-013 removed the Swedish marker that used to sit here,
-    /// which only matched a Swedish production prompt).
+    /// applies to the very same text, so one vocabulary governs both the live
+    /// history and this journal replay, and none of its markers is tied to a
+    /// natural language.
     pub fn extract_steering_history(&self) -> Vec<(String, String)> {
         let mut history: Vec<(String, String)> = Vec::new();
         let mut current_user: Option<String> = None;
@@ -246,13 +243,11 @@ mod tests {
         assert_eq!(history[1].1, "Run the real-ROM test with a timeout.");
     }
 
-    /// Pin (t-013): the pending-decision merge keys off the orchestrator's
-    /// language-neutral marker vocabulary, not off a wording. The placeholder fed
-    /// in here is the `user_status` example that the arbitrator prompt in
-    /// `orchestrator::notice` actually invites the model to emit, read back off
-    /// that prompt — producer and consumer are pinned together, so re-wording the
-    /// prompt out of the vocabulary fails here instead of silently duplicating
-    /// steering-history entries.
+    /// The pending-decision merge keys off the orchestrator's language-neutral
+    /// marker vocabulary, not off a wording: the placeholder fed in here is the
+    /// `user_status` example that the arbitrator prompt in
+    /// `orchestrator::notice` invites the model to emit, so producer and consumer
+    /// are pinned together.
     #[test]
     fn test_extract_steering_history_merges_the_pending_status_the_prompt_invites() {
         let pending = crate::orchestrator::notice::worker_reply_user_status_example();
@@ -281,11 +276,10 @@ mod tests {
         );
     }
 
-    /// Regression (t-013): the merge used to fire on a Swedish literal in the
-    /// arbitrator status line. The vocabulary is language-neutral now, so a
-    /// Swedish-only placeholder is no longer treated as pending and the two
-    /// answers are concatenated instead — the accepted, cosmetic cost of dropping
-    /// that arm, pinned so it cannot silently widen.
+    /// The pending vocabulary is language-neutral, so a Swedish-only placeholder
+    /// is not treated as pending and the two answers are concatenated instead —
+    /// the accepted, cosmetic cost of that rule, pinned so it cannot silently
+    /// widen.
     ///
     /// The Swedish is spelled with `\u{…}` escapes so this file stays free of
     /// non-ASCII literals; the escapes compile to the same byte string.

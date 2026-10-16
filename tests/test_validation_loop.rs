@@ -179,12 +179,9 @@ async fn test_specialist_validation_rejection_and_revision_loop() {
         // Verify deliverable indicates completion and no failure/rejection
         assert!(result.contains("MISSION COMPLETE (task-t-001)"));
         assert!(!result.contains("FAILED"));
-        // H6 (hand-off after t-031d): the id bound to a marker must be a
-        // boundary-safe `t-…` **token** sitting on the marker's own line. The
-        // decoration here carries `task-t-001`, which is one longer token — the
-        // deleted unbounded pattern used to cut `t-001` out of it (the exact
-        // mis-derivation that checked off work nobody did), so the correct
-        // verdict now carries no id, and the caller must pass the bound id
+        // The id bound to a marker must be a boundary-safe `t-…` **token** on the
+        // marker's own line. The decoration here carries `task-t-001`, one longer
+        // token, so the verdict carries no id and the caller passes the bound id
         // explicitly (`check_plan_on_deliverable`'s `task_id` argument).
         assert_eq!(
             marmennill::agents::MissionMarker::parse(&result),
@@ -370,9 +367,9 @@ async fn test_specialist_recovers_after_repetition_nudge_and_succeeds() {
 
         assert!(result.contains("MISSION COMPLETE (task-t-003)"));
         assert!(!result.contains("FAILED"));
-        // H6: `task-t-003` is one token; cutting `t-003` out of it was the
-        // substring mis-derivation that is now gone (see the guard in
-        // `markers::bound_task_id`). Boundary-safe spellings still bind.
+        // `task-t-003` is a single token, so no id is derived from it; only
+        // boundary-safe spellings bind (see the guard in
+        // `markers::bound_task_id`).
         assert_eq!(
             marmennill::agents::MissionMarker::parse(&result),
             Some(marmennill::agents::MissionMarker::Complete { task_id: None })
@@ -494,29 +491,14 @@ async fn test_specialist_revision_recovers_after_repetition_nudge_and_succeeds()
     }).await;
 }
 
-// Gate t-033c — repair of a broken fixture (work item 4).
-//
-// This fixture used to be called
-// `test_specialist_approved_without_explicit_mission_complete` and asserted
-// that a specialist reply carrying *no terminal marker* still ended up
-// "MISSION COMPLETE" and not "FAILED", because the mock queued "turn 2 = the
-// validator approves". It was only ever green because the fixture *was* the
-// vulnerability: a marker-less coder reply is never validated — production
-// nudges it — so the response staged as "the validator's approval" was in fact
-// served to the CODER, which then recorded its own verdict. Self-approval,
-// dressed up as a validation loop.
-//
-// With the t-033b identity gate (`runner/execution.rs::may_record_verdict`
-// refuses a verdict from a non-validator) the coder's verdict call is refused,
-// the mock falls through to `Unexpected call`, nudge exhaustion ends the run
-// with `FAILED (Task incomplete or terminated prematurely)` and the fixture
-// went RED. Nothing in production regressed: the fixture lost the only path
-// that could certify a deliverable without a validator ever having seen it.
-//
-// Re-shaped honestly: the coder is served a nudge, then a real terminal reply,
-// and it is the VALIDATOR turn that receives the `leave_verdict` APPROVED
-// response. The request bodies are asserted so a future regression that again
-// routes a verdict to the wrong agent cannot pass silently.
+// A marker-less specialist reply is never validated — production nudges it — so a
+// `leave_verdict` response must be routed to the VALIDATOR turn and never to the
+// coder: `runner/execution.rs::may_record_verdict` refuses a verdict from a
+// non-validator, and a deliverable is never certified by an agent that is not a
+// validator. The coder here is served a nudge and then a real terminal reply, and
+// the VALIDATOR turn receives the `leave_verdict` APPROVED response; the request
+// bodies are asserted so a regression that routes a verdict to the wrong agent
+// cannot pass silently.
 #[tokio::test]
 async fn test_specialist_without_marker_is_nudged_then_approved_by_validator() {
     let tmp = tempfile::tempdir().unwrap();
@@ -602,21 +584,12 @@ async fn test_specialist_without_marker_is_nudged_then_approved_by_validator() {
     .await;
 }
 
-// INTENTIONAL CONTRACT CHANGE (gate t-033c, work item 2).
-//
-// This test used to be named `test_validator_reminded_3_times_and_assumed_
-// approved` and pinned the previous fail-OPEN contract: after three reminders
-// and still no `leave_verdict` call, the fix loop ended the run with
-// `approved = true` ("assumed approved"). A deliverable was therefore
-// certified — and its plan line checked off — by a validator that had recorded
-// no verdict at all.
-//
-// The contract is now deliberately fail-CLOSED: the absence of a verdict is not
-// a verdict. The run ends with an explicit failed outcome, the deliverable is
-// reported as rejected (VALIDATOR REJECTION + FAILED trailer), its completion
-// marker is revoked, and the `- [ ] [t-006]` plan line stays unchecked. The
-// rewrite below is not a regression caught by accident: it is the new contract,
-// on purpose.
+// Fail-closed validator contract: three reminders and still no `leave_verdict`
+// call is not a verdict. The run ends with an explicit failed outcome, the
+// deliverable is reported as rejected (VALIDATOR REJECTION + FAILED trailer), its
+// completion marker is revoked, and the `- [ ] [t-006]` plan line stays
+// unchecked. Only `max_validator_iterations = 0` / `enable_validator = false`
+// opt out of validation.
 #[tokio::test]
 async fn test_validator_reminded_3_times_and_fails_closed_without_verdict() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1009,12 +982,10 @@ async fn test_delegated_validator_skips_subsequent_tools_in_same_turn_after_leav
     .await;
 }
 
-// Gate t-033a — a missing / unreadable / blank per-task validation verdict file
-// (`.marmel/prompts/{task_id}-validation.md`) must be a HARD validation failure.
-// Before the fix the absence of that file *skipped* validation and started the
-// run with `validation_passed = true`, so the deliverable was reported as
-// validated and its plan line checked off although no validator ever ran
-// (H1/H4 in docs/recon_bugs_agents_monitor.md).
+// Fail-closed verdict contract: a missing / unreadable / blank per-task validation
+// verdict file (`.marmel/prompts/{task_id}-validation.md`) is a HARD validation
+// failure — its absence never skips validation, so a deliverable is never
+// reported as validated when no validator ran.
 
 /// Mount a mock backend that replays `turns` in order (falling back to a
 /// sentinel reply) and records every request body, so a test can prove which
@@ -1129,7 +1100,7 @@ async fn test_missing_validation_verdict_file_fails_and_leaves_plan_unchecked() 
     let tmp_path = tmp.path().to_path_buf();
 
     marmennill::harness::with_workspace_root(tmp_path.clone(), async move {
-        // A pre-generated prompt workspace whose verdict file for t-701 is absent.
+        // A prompt workspace created in advance; its verdict file for t-701 is absent.
         std::fs::create_dir_all(prompts_dir_of(&tmp_path)).expect("prompts dir");
         let plan = seed_plan(&tmp_path, "t-701");
 
@@ -1231,7 +1202,7 @@ async fn test_present_validation_verdict_with_explicit_approval_still_succeeds()
             "the recorded verdict file must still drive the validator prompt"
         );
 
-        // Success path is unchanged by the fix.
+        // The approved path still succeeds end to end.
         assert!(
             result.contains("MISSION COMPLETE (t-702)"),
             "an explicitly approved verdict must still succeed, got: {result}"

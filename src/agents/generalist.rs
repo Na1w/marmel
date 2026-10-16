@@ -1,6 +1,6 @@
 //! Specialist: **Generalist** — Supreme Polymath & Cross-Domain Intelligence.
 //!
-//! REQ-ORCH-002: granted the universal `"*"` tool namespace, enabling it to
+//! Role discipline: granted the universal `"*"` tool namespace, enabling it to
 //! orchestrate tools across all available domains (files, commands, PTY, search).
 
 use crate::agents::{Agent, Specialist};

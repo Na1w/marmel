@@ -1,4 +1,4 @@
-//! Per-worker section types (Design A §3.8, §3.9).
+//! Per-worker section types.
 
 use serde::{Deserialize, Serialize};
 
@@ -9,7 +9,7 @@ use super::restore::NonRestorableNotice;
 use super::{SectionHeader, TimePoint};
 
 /// On-disk shape of `workers/<key>.json`. One file per worker, one worker per
-/// file — never an array, so a single corrupt worker can be isolated (A D6).
+/// file — never an array, so a single corrupt worker can be isolated.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerFile {
@@ -23,15 +23,15 @@ pub struct WorkerFile {
 #[serde(deny_unknown_fields)]
 pub struct WorkerSection {
     /// The **exact** registry key, including any `#…` disambiguator. This field,
-    /// not the filename, is the authority; the filename is an escaped handle
-    /// (A §5.2). Restore inserts under this key and never re-registers.
+    /// not the filename, is the authority; the filename is an escaped handle.
+    /// Restore inserts under this key and never re-registers.
     pub worker_key: String,
     /// The value drawn from `WORKER_ID_SEQ` when this worker registered,
     /// recorded so `{agent}-wN` keys and disambiguators reproduce exactly.
     pub worker_id_seq_value: u64,
     /// Agent role. Reuses the crate's role vocabulary (`agents::Agent`,
     /// `#[serde(rename_all = "snake_case")]`) — role names are a shared
-    /// vocabulary, not a session format, so A D1 does not fork them.
+    /// vocabulary, not a session format, so they are not forked here.
     pub role: Agent,
     /// Normalized task id binding (`Option`; `None` for task-less workers, whose
     /// key is `{agent}-wN`).
@@ -44,14 +44,14 @@ pub struct WorkerSection {
     /// subagent list renders.
     pub status_label: String,
 
-    /// Clocks (A D5). `started` mirrors `started_at`/`started_wall`; `completed`
+    /// Clocks. `started` mirrors `started_at`/`started_wall`; `completed`
     /// mirrors `completed_at`/`completed_wall`; `last_activity` mirrors
     /// `SubagentDetail::last_activity_at`.
     pub started: TimePoint,
     pub completed: Option<TimePoint>,
     pub last_activity: Option<TimePoint>,
     /// Accumulated working time as an explicit number of seconds, so it never
-    /// has to be computed as a difference of two re-anchored instants (D5 T3).
+    /// has to be computed as a difference of two re-anchored instants.
     pub worked_secs: f64,
 
     /// Completed-ring identity (`WorkerState::completed_seq`); `None` ⇔ active.
@@ -72,19 +72,19 @@ pub struct WorkerSection {
     pub audio_urls: Vec<String>,
     pub recursion_granted: bool,
 
-    /// The worker's **full** conversation, in order (A §5.5). Not the seed.
+    /// The worker's **full** conversation, in order. Not the seed.
     pub history: Vec<MessageRecord>,
     /// Provenance of `history`: whether it was mirrored from the live engine or
     /// is only the seed. A `SeedOnly` history is reported, never presented as an
-    /// exact restoration (A D6 "loudly").
+    /// exact restoration.
     pub history_source: HistorySource,
 
     /// Where the worker's tool-call pairing stood at the capture instant.
     pub dangling: DanglingToolCallState,
 
-    /// Populated iff `status == Unrecoverable` (A D6's only tolerated partial).
+    /// Populated iff `status == Unrecoverable` — the only tolerated partial.
     pub unrecoverable_reason: Option<String>,
-    /// Projections that lost a capability for this worker (A D5): its
+    /// Projections that lost a capability for this worker: its
     /// cancellation token, its task handle, its live PTY, its guard, its queued
     /// notices.
     pub non_restorable: Vec<NonRestorableNotice>,
@@ -92,11 +92,11 @@ pub struct WorkerSection {
 
 /// Lifecycle class. Deliberately orthogonal to `status_label`: the label is
 /// display bytes, this is control state. `Unrecoverable` is produced only by the
-/// loader (A D6) and never written by a healthy capture.
+/// loader and never written by a healthy capture.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum WorkerStatus {
-    /// Active in the pre-crash process (`completed_seq == None`).
+    /// Active in the session at capture instant (`completed_seq == None`).
     InProgress,
     Completed,
     Failed,
@@ -105,7 +105,7 @@ pub enum WorkerStatus {
     /// `status_label`; never coerced into one of the four known classes.
     Unknown,
     /// Loader verdict: this worker's file failed verification and was the only
-    /// corrupt member (A D6). Its history is gone; it is reported loudly and its
+    /// corrupt member. Its history is unavailable; it is reported loudly and its
     /// pane identity is kept so the UI still shows *that it existed*.
     Unrecoverable,
 }
@@ -123,7 +123,7 @@ pub struct WorkerCounters {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum HistorySource {
-    /// Mirrored out of the live engine turn by turn (A §5.5). Exactly restorable.
+    /// Mirrored out of the live engine turn by turn. Exactly restorable.
     LiveMirror,
     /// Only the seed was recoverable (a worker that never reached the first
     /// mirror point). Reported, never silently upgraded to a "history".
@@ -147,7 +147,7 @@ pub enum DanglingToolCallState {
     /// `dispatched` says whether the tool began (its result may exist elsewhere,
     /// e.g. in a PTY whose process survived the kill).
     Dangling { calls: Vec<DanglingCall> },
-    /// `role:"tool"` results whose parent is gone. The prune pass removes them
+    /// `role:"tool"` results whose parent is missing. The prune pass removes them
     /// at load; the ids are reported.
     OrphanedResults { tool_call_ids: Vec<String> },
     /// Capture already applied the `ABORTED_TOOL_RESULT` placeholder, recording
@@ -169,10 +169,10 @@ pub struct DanglingCall {
 
 impl DanglingToolCallState {
     /// The pairing state a capture *observes* for `messages`, computed with the
-    /// same vocabulary the repair pass uses (no second pairing rule — A D1).
+    /// same vocabulary the repair pass uses (there is exactly one pairing rule).
     ///
-    /// Used by the capture seam (t-009) and asserted on by the loader's N6
-    /// cross-check, which reports a disagreement and never reconciles it.
+    /// Used by the capture seam and asserted on by the loader's cross-check,
+    /// which reports a disagreement and never silently fixes it.
     pub fn observe(messages: &[MessageRecord]) -> Self {
         let mut parents: Vec<(String, String, String)> = Vec::new();
         let mut results: Vec<String> = Vec::new();

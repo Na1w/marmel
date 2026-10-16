@@ -21,7 +21,7 @@ static GLOBAL_CANCELLATION_TOKEN: std::sync::LazyLock<
 ///
 /// Clone-and-drop: the read guard is held only for the `clone()` and is
 /// dropped before this function returns; no nested locks are ever taken while
-/// a guard is held. Reset/clone semantics are intentionally untouched here.
+/// a guard is held.
 pub fn global_cancellation_token() -> tokio_util::sync::CancellationToken {
     GLOBAL_CANCELLATION_TOKEN
         .read()
@@ -70,10 +70,8 @@ pub fn reset_cancellation() {
 /// Register an unbounded channel to receive real-time status updates across all agents and specialists.
 ///
 /// Intentionally a swap (not a once-only `OnceLock`): the single call site
-/// (`src/ui/session.rs`, `run_session`) is reachable multiple times per process
-/// lifetime (UI restart / reconnect re-runs `run_session` and re-registers the
-/// senders). The write guard is held only for the swap itself and dropped
-/// before any other operation.
+/// (`run_session` in `src/ui/session.rs`) is reachable multiple times per
+/// process lifetime, and the write guard is held only for the swap itself.
 pub fn set_status_sender(tx: tokio::sync::mpsc::UnboundedSender<String>) {
     if let Ok(mut lock) = STATUS_SENDER.write() {
         *lock = Some(tx);
@@ -115,7 +113,7 @@ pub fn emit_event(ev: crate::ui::Event) {
 /// Register the shared steering conversation history for the active session.
 ///
 /// Follows the same swap pattern as `set_status_sender` and `set_event_sender`:
-/// reachable multiple times across session reconnects/restarts.
+/// reachable multiple times across session restarts.
 pub fn set_steering_history(hist: SharedSteeringHistory) {
     if let Ok(mut lock) = STEERING_HISTORY.write() {
         *lock = Some(hist);
@@ -137,29 +135,12 @@ pub fn clear_steering_history() {
 
 /// Record or update a steering exchange in the active session's steering history.
 ///
-/// A recorded entry is addressed by an **identity key**, never by a substring of
-/// one (recon M3, task t-071). The correlation stages are:
-///
-/// 1. `notice_id` — the most recent pending entry whose recorded arbitrator text
-///    names that very id as a whole identifier token (`entry_names_notice_id`).
-/// 2. `user_inquiry` — the most recent pending entry whose recorded inquiry is
-///    the **same inquiry** (`same_steering_inquiry`: trim + ASCII case-fold, then
-///    whole-string equality).
-/// 3. Otherwise the exchange is appended as its own entry.
-///
-/// Deliberately removed (behaviour change is the point):
-/// * the bidirectional substring test `inq.contains(q) || q.contains(inq)`, which
-///   let a lookup for `t-1` address the `t-10` entry (and an empty inquiry match
-///   every entry), and
-/// * the "rewrite the most recent pending entry whatever it was" fallback, which
-///   re-attributed an answer to an unrelated steer and erased that entry's
-///   `awaiting specialist reply` marker — after which the specialist's own
-///   `reply_to_arbitrator` could no longer be correlated and got appended as a
-///   duplicate entry.
-///
-/// Same exact-identity discipline as worker routing
-/// (`WorkerRoutingIdentity::routes` in `orchestrator::notice`, `worker_matches`
-/// in `orchestrator::workers`): no substring fallback anywhere.
+/// An entry is addressed by an **identity key**, never by a substring of one —
+/// the same exact-identity discipline as worker routing. Correlation: the most
+/// recent pending entry whose recorded arbitrator text names the `notice_id` as
+/// a whole identifier token (`entry_names_notice_id`); else the entry whose
+/// recorded inquiry equals the query (`same_steering_inquiry`: trim + ASCII
+/// case-fold, then whole-string equality); else the exchange is appended.
 pub fn record_steering_exchange(
     notice_id: Option<&str>,
     user_inquiry: &str,

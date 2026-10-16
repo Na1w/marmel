@@ -1,28 +1,19 @@
-//! The in-memory Manager capture holder (t-009).
+//! The in-memory Manager capture holder: the session's newest manager snapshot.
 //!
-//! Design A §1 **D2** deleted the second journal: `ContextEngine::save_transcript`
-//! used to write a whole second transcript to `.marmel/.session_transcript.json`,
-//! alongside the UI transcript. Two independent journals of overlapping state is
-//! exactly the failure D2 removes, and `session/` is the only owner of durable
-//! session state (D1). So the legacy save sites in `src/ui/session.rs` no longer
-//! write a file: each one calls [`capture_into_session_state`], which snapshots the
-//! live engine into the **durable vocabulary** ([`ManagerSection`]) and keeps that
-//! snapshot as the session's in-memory manager state.
+//! `session/` is the only owner of durable session state, so each capture site in
+//! `src/ui/session.rs` calls [`capture_into_session_state`] instead of writing a
+//! journal of its own: it snapshots the live engine into the **durable
+//! vocabulary** ([`ManagerSection`]) and keeps that snapshot as the session's
+//! in-memory manager state. Every call site keeps its event semantics — it marks
+//! a boundary where the manager state is worth remembering — and only its sink
+//! changes. A committer reads the newest snapshot through [`last_capture`] and
+//! hands it to [`session::commit::write_bundle`].
 //!
-//! That is the point of the holder: the manager transcript survives the deletion of
-//! its journal without losing what the journal was for. Every call site keeps its
-//! event semantics — it marks a boundary where the manager state is worth
-//! remembering — and only its sink changes. The capture-trigger surface and the
-//! bundle commit (flow §4.3, t-011/t-012/t-013) replace this holder with
-//! [`session::commit::write_bundle`] calls; until then, a committer reads the
-//! newest snapshot through [`last_capture`].
-//!
-//! Capture is a **read** (flow R-TRIG-0): [`capture_into_session_state`] takes
-//! `&ContextEngine`, and [`ContextEngine::capture_manager_section`] never mutates,
-//! repairs, prunes, re-roles or re-orders the transcript. The pairing grammar is
-//! not re-implemented here — the `dangling` witness is
-//! [`DanglingToolCallState::observe`], the same observer the loader cross-checks
-//! (A D1, §8.2 N6).
+//! Capture is a **read**: [`capture_into_session_state`] takes `&ContextEngine`,
+//! and [`ContextEngine::capture_manager_section`] never mutates, repairs, prunes,
+//! re-roles or re-orders the transcript. The pairing grammar is not
+//! re-implemented here — the `dangling` witness is
+//! [`DanglingToolCallState::observe`], the same observer the loader cross-checks.
 //!
 //! Like [`session::commit::LAST_COMMIT`], the holder is process-global by design:
 //! there is one live manager transcript per process, and it holds the **newest**
@@ -34,15 +25,14 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 use crate::manager::ContextEngine;
 use crate::session::format::ManagerSection;
 
-/// Name of the **superseded** manager journal (A §1 D2).
+/// Name of the **legacy** manager journal.
 ///
-/// `ContextEngine::save_transcript` and `Plan::transcript_path()` are gone: this
-/// binary neither writes nor reads that file. The name survives only so the two
-/// places that must still recognize a stale copy can name it honestly —
-/// `session::restore`'s "legacy journals found, not restorable" warning (A §7.4:
-/// ignored must not mean invisible) and `Plan::clear`'s file sweep for a leftover
-/// from an older release. It lives in `session/` because D1 makes this module the
-/// only place in the crate that names a session file.
+/// This binary neither writes nor reads that file: the name survives only so the
+/// two places that must still recognize a stale copy can name it honestly — the
+/// loader's warning that legacy journals were found and are not restorable
+/// (ignored must not mean invisible), and `Plan::clear` removing a leftover from
+/// an older release. It lives in `session/` because this module is the only
+/// place in the crate that names a session file.
 pub const LEGACY_TRANSCRIPT_FILE: &str = ".session_transcript.json";
 
 /// The newest Manager capture of this process.
@@ -66,7 +56,7 @@ fn capture_lock() -> MutexGuard<'static, Option<ManagerSection>> {
 /// Snapshot `engine` into the durable vocabulary and make it the session's
 /// in-memory manager state.
 ///
-/// The one call the legacy `save_transcript` sites use. It cannot fail: capture is
+/// The one call the legacy capture sites use. It cannot fail: capture is
 /// a read of a live engine, and no I/O is involved.
 pub fn capture_into_session_state(engine: &ContextEngine) {
     record_capture(engine.capture_manager_section());
@@ -96,7 +86,7 @@ pub fn capture_count() -> u64 {
 }
 
 /// Drop the held snapshot: a `/reset`, whose ending says the session MUST NOT be
-/// resurrected (A §3.4 `ProcessEnding::Reset`).
+/// resurrected (`ProcessEnding::Reset`).
 pub fn clear_capture() {
     *capture_lock() = None;
 }
@@ -121,9 +111,9 @@ mod tests {
     /// binary runs tests on parallel threads.
     static HOLDER_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-    /// The four markers that existed before t-009, spelled out again **on
-    /// purpose**: requirement (d) is that their text is untouched, so the
-    /// expectation must not be derived from the constant it checks.
+    /// The four legacy markers, spelled out again **on purpose**: the requirement
+    /// is that their text is untouched, so the expectation must not be derived
+    /// from the constant it checks.
     const PRE_EXISTING_ADVISORY_PREFIXES: &[&str] = &[
         "(SYSTEM: CONTEXT BUDGET ADVISORY",
         "(SYSTEM: CONTEXT LIMIT EXCEEDED",
@@ -136,7 +126,7 @@ Summarized progress: ",
     /// assistant with `content: None`, an assistant with `content: Some("")`,
     /// `reasoning_content`, verbatim (malformed, unsorted) tool arguments, an
     /// `"(aborted)"` tool result, a rebirth checkpoint in the **historic `System`
-    /// spelling**, and a legacy advisory this binary no longer emits.
+    /// spelling**, and a legacy advisory this binary never emits.
     fn live_engine() -> ContextEngine {
         let mut ctx = ContextEngine::new(8_000);
         ctx.set_system_prompt("SYSTEM PROMPT — pinned bytes (REQ-CORE-001)".to_string());
@@ -305,7 +295,7 @@ Summarized progress: ",
     fn restored_pins_are_byte_identical_and_the_window_still_resolves() {
         let engine = live_engine();
         let section = engine.capture_manager_section();
-        // A capture must be something the loader accepts (A §4 R-PIN-5).
+        // A capture must be something the loader accepts.
         verify_pins(&section, PinStage::Stored).expect("a capture must satisfy the pin rules");
         assert_eq!(
             witness_of(&section.messages),
@@ -356,7 +346,7 @@ Summarized progress: ",
         );
     }
 
-    /// The scalars that change the next request round-trip as well (A §3.5), and a
+    /// The scalars that change the next request round-trip as well, and a
     /// restore must not re-arm a latch the stored state said was spent.
     #[test]
     fn the_engine_scalars_round_trip() {
@@ -456,7 +446,7 @@ Summarized progress: ",
 
     // ------------------------------------------------- (c) no pin-setter clobber
 
-    /// The restore seam never routes through a pin setter (A §4 R-PIN-2): both
+    /// The restore seam never routes through a pin setter: both
     /// setters write **by index**, and the boot path calls them unconditionally, so
     /// a restore that used either one would clobber the pins with the freshly
     /// composed prompt and goal.
@@ -481,8 +471,8 @@ Summarized progress: ",
             2,
             "install_restored_messages must never call set_system_prompt / set_goal"
         );
-        // The observable consequence (AC-P4): the installed pins are the STORED
-        // bytes, not the freshly composed ones.
+        // Observable consequence: the installed pins are the STORED bytes, not
+        // the freshly composed ones.
         assert_eq!(
             restored.messages()[0].content(),
             Some("SYSTEM PROMPT — pinned bytes (REQ-CORE-001)"),
@@ -541,7 +531,7 @@ Summarized progress: ",
     }
 
     /// A vector without the pinned pair is a caller bug, not something to pad: the
-    /// loader already refused it (R-PIN-5 step 1).
+    /// loader already refused it.
     #[test]
     #[should_panic(expected = "at least the pinned pair")]
     fn installing_a_vector_without_the_pinned_pair_panics() {
@@ -577,9 +567,8 @@ Summarized progress: ",
 
     // ------------------------------------------------- (d) advisory grammar
 
-    /// The injected-advisory text keeps its exact bytes, before and after a restore
-    /// (A §4 R-PIN-4: the pinned window is found by a content match on these
-    /// markers).
+    /// The injected-advisory text keeps its exact bytes, before and after a
+    /// restore: the pinned window is found by a content match on these markers.
     #[test]
     fn injected_advisory_prefix_text_survives_untouched() {
         for marker in PRE_EXISTING_ADVISORY_PREFIXES {
@@ -628,9 +617,9 @@ Summarized progress: ",
         );
     }
 
-    /// The restore notice is registered in the advisory grammar, so `perform_rebirth`
-    /// can never promote it into the `messages[2]` instruction slot (bug M6), and it
-    /// is always a `User` turn at index `>= 2` (bug M12).
+    /// The restore notice is registered in the advisory grammar, so
+    /// `perform_rebirth` can never promote it into the `messages[2]` instruction
+    /// slot, and it is always a `User` turn at index `>= 2`.
     #[test]
     fn a_restore_notice_is_never_promoted_to_the_instruction_slot() {
         assert!(
@@ -809,8 +798,8 @@ Summarized progress: ",
         clear_capture();
     }
 
-    /// The superseded journal name is shared, not re-derived: it lives in
-    /// `session/` (A §1 D1) and `manager::phase` only re-exports it for the readers
+    /// The legacy journal name is shared, not re-derived: it lives in
+    /// `session/` and `manager::phase` only re-exports it for the readers
     /// that must still recognize a stale file.
     #[test]
     fn the_legacy_journal_name_is_shared_not_rederived() {

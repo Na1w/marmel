@@ -90,7 +90,7 @@ impl HarnessStats {
     }
 }
 
-/// The role requesting a tool execution, used to enforce the orchestration tool policy.
+/// The role requesting a tool execution, which the orchestration tool policy enforces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolCaller {
     Manager,

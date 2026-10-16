@@ -96,7 +96,7 @@ impl TuiRenderer {
         render_message_lines(msg, self.show_thought)
     }
 
-    /// Ensure the pre-rendered message cache is up to date for current `messages` and `show_thought`.
+    /// Keep the rendered-message cache up to date for the current `messages` and `show_thought`.
     pub(crate) fn ensure_rendered_message_cache(&self) {
         let cached_st = self.cached_rendered_show_thought.get();
         let mut cached = self.cached_rendered_messages.borrow_mut();
@@ -474,7 +474,7 @@ impl TuiRenderer {
             .scroll((self.chat_scroll, 0));
         frame.render_widget(chat_paragraph, area);
 
-        // F4: vertical scrollbar on the chat pane.
+        // Vertical scrollbar on the chat pane.
         if max_scroll > 0 {
             let inner = Rect {
                 x: area.x + 1,
@@ -605,7 +605,7 @@ impl TuiRenderer {
             .scroll((scroll_y, 0));
         frame.render_widget(paragraph, area);
 
-        // F4: vertical scrollbar on the plan pane.
+        // Vertical scrollbar on the plan pane.
         if self.plan_max_scroll > 0 {
             let inner = Rect {
                 x: area.x + 1,
@@ -922,7 +922,7 @@ impl TuiRenderer {
             frame.render_widget(status_p, status_area);
         }
 
-        // F4: vertical scrollbar on the subagent-details pane.
+        // Vertical scrollbar on the subagent-details pane.
         if max_scroll > 0 {
             let inner = Rect {
                 x: details_area.x,
@@ -963,7 +963,7 @@ impl TuiRenderer {
     }
 
     pub(crate) fn render_status(&self, frame: &mut ratatui::Frame, area: Rect) {
-        // F8: always surface the live running-subagent count, independent of
+        // Always surface the live running-subagent count, independent of
         // `status_line`, whenever any specialist is active.
         let active_agents: Vec<&str> = self
             .subagents
@@ -984,7 +984,7 @@ impl TuiRenderer {
             );
             status_str.push_str(&count_suffix);
         }
-        // F3: animated activity indicator. When the status line indicates an
+        // Animated activity indicator. When the status line indicates an
         // active phase, append a cycling suffix derived from `session_start`.
         let active_phase = [
             "Running",

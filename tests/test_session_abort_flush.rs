@@ -1,27 +1,23 @@
-//! t-024 — the paths that make an **interrupted** session restorable.
+//! The paths that make an **interrupted** session restorable: what a session leaves
+//! behind when it does **not** finish normally, pinned off the disk, never a cache.
 //!
-//! Flow `docs/design_session_restore_flow.md` §1.5–§1.9 pins what a session must
-//! leave behind when it does **not** finish normally. This file pins those four
-//! paths end to end, off the disk (never off an in-process cache):
-//!
-//! * **(a) T-6/T-7 user abort** — a user exit taken *inside* a round still gets a
+//! * **(a) user exit** — a user exit taken *inside* a round still gets a
 //!   **mandatory** (never throttled) bundle commit whose manifest says
 //!   `ending.kind == "userAbort"`;
-//! * **T-8 panic** — a panic anywhere in the process (session thread **or** another
-//!   thread) leaves the last committed bundle readable and re-marked
-//!   `panicHook`, with the member bytes kept from the last successful commit; if
-//!   the flush cannot be honest it writes **nothing** and says why;
-//! * **(c) hard-kill inference** — a bundle whose last manifest says `InProgress`
-//!   (the writer never recorded its own death) is classified
-//!   `HardKillInferred` by the next boot **and said out loud** (status line,
-//!   journal, N-MGR-1 notice), while the bundle bytes stay `inProgress` (A D6);
-//! * **(d) T-10 `/reset`** — the bundle is marked `reset` **before** the plan sweep
-//!   runs, `Plan::clear()` → `sweep_session_state()` deletes it, and the
-//!   post-sweep confirmation reports the truth.
+//! * **(b) panic hook** — a panic on the session thread **or** another thread
+//!   leaves the last committed bundle readable and re-marked `panicHook`; a flush
+//!   that cannot be honest about its bytes writes **nothing** and says why;
+//! * **(c) hard-kill inference** — a manifest still saying `InProgress` (its
+//!   writer never recorded its own death) is classified `HardKillInferred` by the
+//!   next boot **and said out loud** (status line, journal, manager notice); the
+//!   bundle bytes stay `inProgress`;
+//! * **(d) `/reset`** — the bundle is marked `reset` **before** `Plan::clear()` →
+//!   `sweep_session_state()` deletes it, and the confirmation that follows reports
+//!   the truth.
 //!
 //! State discipline: the commit ledger, the commit-diff cache and the panic-flush
-//! target are process-global, so every case takes the mutex, and the ledger
-//! assertions are **deltas**.
+//! target are process-global, so every case takes the mutex and asserts ledger
+//! **deltas**.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -164,7 +160,7 @@ impl Renderer for ExitOnFirstToolCallRenderer {
 }
 
 /// A minimal but legal transcript: the pinned `[0]`/`[1]` pair every member
-/// header and every L1–L2 gate expects.
+/// header and every L1–L2 loader check expects.
 fn engine() -> ContextEngine {
     let mut ctx = ContextEngine::new(200_000);
     ctx.append(Message::System {
@@ -250,7 +246,7 @@ fn one_tool_call_sse() -> String {
     }))
 }
 
-// --------------------------------------------------------- (a) T-6/T-7 abort
+// ---------------------------------------------------------- (a) user exit
 
 /// A whole session that the user stops mid-round: the abort break must still run
 /// a **mandatory** commit, and the manifest on disk must name the ending.
@@ -330,7 +326,7 @@ async fn a_user_abort_mid_round_leaves_a_manifest_marked_user_abort() {
     );
 }
 
-// ------------------------------------------------------------------- T-8 panic
+// ---------------------------------------------------------------- panic hook
 
 /// A crash leaves a bundle a later `--resume` can open — marked `panicHook`, from
 /// a panic on the session thread **and** from a panic on another thread — and an
@@ -354,7 +350,8 @@ async fn a_panic_re_marks_the_last_committed_bundle_panic_hook() {
     let bundle = bundle_in(tmp.path());
     assert_eq!(ending_on_disk(&bundle), "inProgress");
 
-    // The hook `src/main.rs` installs, minus the default printer: flush, never
+    // The hook `main` installs, minus the default printer: flush, never
+    // block, never build a runtime.
     // block, never build a runtime.
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_info| {
@@ -455,7 +452,7 @@ async fn a_panic_re_marks_the_last_committed_bundle_panic_hook() {
     );
 }
 
-// ------------------------------------------- T-8 degradation: lock already held
+// ---------------------------------------- panic-flush degradation: lock held
 
 /// The one case the hook must never turn into a hang: the panic unwound *inside*
 /// a commit, so the session thread already holds the commit lock. The hook tries
@@ -522,7 +519,7 @@ async fn a_panic_while_the_commit_lock_is_held_degrades_instead_of_blocking() {
 /// The SIGKILL shape: the repo installs no signal handler, so the only trace of a
 /// killed run is a manifest still saying `InProgress`. The next boot must classify
 /// that as `HardKillInferred` and **say so in all three places** — while the
-/// bundle bytes keep the ending the writer actually wrote (A D6).
+/// bundle bytes keep the ending the writer actually wrote.
 #[tokio::test]
 async fn a_run_left_in_progress_is_classified_hard_kill_and_said_out_loud() {
     let _lock = TEST_MUTEX.lock().await;
@@ -578,7 +575,7 @@ async fn a_run_left_in_progress_is_classified_hard_kill_and_said_out_loud() {
             .any(|line| line.contains("HardKillInferred")),
         "the status line must say it: {statuses:?}"
     );
-    // Loud #2 — the journaled transcript (third destination of A §8.4).
+    // Loud #2 — the journaled transcript (the third loud destination).
     let journaled: Vec<String> = transcript
         .records()
         .iter()
@@ -601,7 +598,7 @@ async fn a_run_left_in_progress_is_classified_hard_kill_and_said_out_loud() {
         "the manager is told derived + stored ending, not a guess: {notice}"
     );
 
-    // A D6: inferring is reporting, never rewriting. The bundle still carries the
+    // Inferring is reporting, never rewriting: the bundle still carries the
     // ending its own writer recorded.
     assert_eq!(
         ending_on_disk(&bundle),
@@ -611,11 +608,11 @@ async fn a_run_left_in_progress_is_classified_hard_kill_and_said_out_loud() {
     assert_eq!(session_id, report.session_id, "identity continuity");
 }
 
-// ------------------------------------------------------------- (d) T-10 reset
+// --------------------------------------------------------------- (d) reset
 
 /// `/reset` is the one ending that must **not** be restorable. The order is the
-/// contract: mark the bundle, then let the plan sweep delete it, then confirm the
-/// delete really happened.
+/// contract: mark the bundle, then let `sweep_session_state()` delete it, then
+/// confirm the delete really happened.
 #[tokio::test]
 async fn reset_marks_the_bundle_and_the_plan_sweep_sweeps_it_away() {
     let _lock = TEST_MUTEX.lock().await;
@@ -635,8 +632,8 @@ async fn reset_marks_the_bundle_and_the_plan_sweep_sweeps_it_away() {
     let bundle = bundle_in(tmp.path());
     assert!(bundle.is_dir(), "there is a bundle to end");
 
-    // Step 1 — mark BEFORE the sweep, so a crash in between leaves a bundle that
-    // already says `reset`, never one still claiming `inProgress`.
+    // Step 1 — mark BEFORE `sweep_session_state()` runs, so a crash in between
+    // leaves a bundle that already says `reset`, never one still claiming `inProgress`.
     let decision = marmennill::ui::session::mark_ending_commit(
         &mut pump,
         CommitTrigger::Reset,
@@ -654,7 +651,8 @@ async fn reset_marks_the_bundle_and_the_plan_sweep_sweeps_it_away() {
     );
     assert_eq!(ledger().last_ending, Some(ProcessEnding::Reset));
 
-    // Step 2 — the plan sweep the loop runs for `/reset`.
+    // Step 2 — the cleanup the loop runs for `/reset`: `Plan::clear()` →
+    // `sweep_session_state()`.
     plan.create("# Plan\n\n- [ ] [t-999] prove the reset sweep\n")
         .expect("plan create");
     plan.clear().expect("Plan::clear");
@@ -667,7 +665,7 @@ async fn reset_marks_the_bundle_and_the_plan_sweep_sweeps_it_away() {
         "sweep_session_state must delete the bundle (A D3: a reset session is gone)"
     );
 
-    // Step 3 — the confirmation the loop runs after the sweep.
+    // Step 3 — `confirm_bundle_swept` is the loop's post-delete confirmation.
     assert!(
         marmennill::ui::session::confirm_bundle_swept(
             &mut pump,
@@ -719,12 +717,13 @@ async fn reset_marks_the_bundle_and_the_plan_sweep_sweeps_it_away() {
     );
 }
 
-// ------------------------------------------------------- plan archive (T-6)
+// ---------------------------------------------------------- plan archive
 
-/// `archive_plan` runs as a **tool**, possibly on another thread, and it sweeps
-/// the bundle with the plan. Only the session thread may write, so the loop
-/// detects the archive at the round boundary and does the same ordered pair:
-/// mark `planArchived`, then confirm the sweep.
+/// `archive_plan` runs as a **tool**, possibly on another thread, and it removes
+/// the bundle along with the plan via `sweep_session_state()`. Only the session
+/// thread may write, so the loop detects the archive at the round boundary and
+/// does the same ordered pair: mark `planArchived`, then confirm the removal with
+/// `confirm_bundle_swept`.
 #[tokio::test]
 async fn an_archived_plan_ends_the_session_bundle_with_plan_archived() {
     let _lock = TEST_MUTEX.lock().await;
@@ -744,7 +743,7 @@ async fn an_archived_plan_ends_the_session_bundle_with_plan_archived() {
     let bundle = bundle_in(tmp.path());
     assert!(bundle.is_dir());
 
-    // The plan is complete, so `archive()` really archives (t-203: an incomplete
+    // The plan is complete, so `archive()` really archives (an incomplete
     // plan is the working checkpoint and is never archived).
     plan.create("# Plan\n\n- [x] [t-998] prove the archive ending\n")
         .expect("plan create");

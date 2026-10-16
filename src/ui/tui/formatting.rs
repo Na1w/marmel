@@ -638,8 +638,8 @@ pub fn wrapped_lines(text: &str, width: usize) -> usize {
 /// in the execution plan text. Returns `None` if no uncompleted task is present.
 ///
 /// "What counts as an uncompleted task line" is decided by
-/// [`crate::plan_parse`] (dedup cluster C3) — the same rule the on-disk plan
-/// authority uses — and only the wrapped-line arithmetic stays here.
+/// [`crate::plan_parse`] — the same rule the on-disk plan authority uses — and
+/// only the wrapped-line arithmetic stays here.
 pub fn visual_line_offset_of_first_pending(text: &str, width: usize) -> Option<usize> {
     let target = crate::plan_parse::first_unchecked_line_index(text)?;
     let mut visual_offset = 0;
@@ -659,9 +659,9 @@ pub fn clean_task_id(tid: &str) -> &str {
 
 /// Extracts the task ID for a checklist item line in an execution plan.
 ///
-/// The grammar lives in [`crate::plan_parse::task_id_of_line`] (dedup cluster
-/// C3) so the plan panel, the delegation guard and the on-disk check-off all
-/// agree. Recognized formats include:
+/// The grammar lives in [`crate::plan_parse::task_id_of_line`] so the plan
+/// panel, the delegation guard and the on-disk check-off all agree. Recognized
+/// formats include:
 /// - `- [ ] [t-001] Description`
 /// - `- [ ] [t-100a1] Description`
 /// - `- [ ] **[t-001]** Description`
@@ -680,8 +680,8 @@ pub fn line_matches_task_id(line: &str, task_id: &str) -> bool {
     crate::plan_parse::line_matches_task_id(line, task_id)
 }
 
-/// Compute the visual (wrapped) line offset of a specific task in the execution plan text (e.g. `t-001`).
-/// Returns `None` if the task ID is not found.
+/// Compute the visual (wrapped) line offset of a specific task in the execution
+/// plan text. Returns `None` if the task ID is not found.
 pub fn visual_line_offset_of_task(text: &str, task_id: &str, width: usize) -> Option<usize> {
     let clean_tid = clean_task_id(task_id);
     if clean_tid.is_empty() {
@@ -840,7 +840,7 @@ mod tests {
     use super::*;
 
     /// The UI seams must report exactly what the single grammar owner reports,
-    /// including the parenthesised task id form the plan panel used to miss.
+    /// including the parenthesised task-id form.
     #[test]
     fn plan_line_seams_delegate_to_plan_parse() {
         const PAREN: &str = "- [ ] (t-c3ui-2) Migrate schema";

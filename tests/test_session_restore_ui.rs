@@ -1,46 +1,23 @@
-//! t-014d — the two acceptance families of `docs/design_session_restore_data.md`
-//! that decide whether a resumed run shows **the same screen**:
+//! Whether a resumed session comes back showing **the same screen**: pane bytes,
+//! composer text and view state.
 //!
-//! * **§9.5 AC-U1 … AC-U4 — the pane bytes are the authority (D4)**:
-//!   `renderer.messages == committed_ui.chat_messages` element-by-element,
-//!   asserted *before the first draw* (I-U1/I-U2, including embedded `\n`, empty
-//!   and duplicate entries); the status bar is the committed string and not
-//!   `"Ready"`; no pane line is derived from the journal — both authorities come
-//!   back unchanged and `extract_steering_history()` still yields the committed
-//!   pairs; a `[CLI] …` line only the TUI ever spelled survives, although the
-//!   journal has no record of it.
-//! * **§9.6 AC-C1 … AC-C4 — the composer and the view come back**: composer text
-//!   + caret (multi-line, multi-byte), `history` / `history_index` /
-//!     `input_draft`, every scroll offset and toggle (or a clamp difference named
-//!     in `warnings`), and a U-chk violation is a refusal of `ui.json` that leaves
-//!     every bundle byte where it was.
+//! * **pane bytes are the authority** — `renderer.messages` equals
+//!   `committed_ui.chat_messages` element-by-element, asserted *before the first
+//!   draw* (embedded `\n`, empty and duplicate entries included); the status bar
+//!   is the committed string and not `"Ready"`; no pane line is derived from the
+//!   journal; `extract_steering_history()` still yields the committed pairs; a
+//!   `[CLI] …` line only the TUI spelled survives though the journal has none.
+//! * **composer and view come back** — composer text + caret (multi-line,
+//!   multi-byte), `history` / `history_index` / `input_draft`, every scroll offset
+//!   and toggle (or a clamp difference named in `warnings`), and a `ui.json`
+//!   refusal that leaves every bundle byte exactly where it was.
 //!
-//! ## How "before the first draw" is observed
-//!
-//! `TuiRenderer`'s pane fields are `pub(crate)`, so an integration test reads the
-//! pane model back through the crate's own public mirror [`Renderer::capture_ui`]
-//! — the seam [`Renderer::restore_panes`] was written to mirror
-//! (`src/ui/tui/mod.rs:1085` / `:1196`, a pure field transfer in both
-//! directions). The renderer under test is a **real `TuiRenderer`** wrapped in
-//! [`PaneWitness`], which snapshots the pane model *inside* `restore_panes` —
-//! immediately after the assign, before `announce_restore` runs — and counts
-//! every `flush` it was asked to do. That is the instant I-U2 means: the real
-//! boot pass (`ui::session::boot`) has assigned the panes and nothing has been
-//! drawn yet (`flushes == 0`).
-//!
-//! Two rules this file never breaks:
-//!
-//! * **one hasher.** Every "the bytes did not change" witness re-uses the crate's
-//!   own `session::commit::fingerprint` (§7.2) — members and `manifest.json`
-//!   alike (§7.3 L9), no second hash function;
-//! * **no weakened assertion.** Where a criterion and the implementation
-//!   disagree, the test keeps the criterion's wording instead of relaxing the
-//!   comparison — and no test in this file is `#[ignore]`d.
-//!
-//! Hermetic: one unique temp directory per test
-//! (`<tmp>/marmel-t014d-<tag>-<pid>-<nanos>/.marmel/session`), removed at the
-//! end; no network, no PTY, no terminal, no sleeps. `boot` never calls
-//! `init()`/`flush()`, so the TUI is never entered. Fixture ids are `t014d-`.
+//! `TuiRenderer`'s pane fields are `pub(crate)`, so the pane model is read back
+//! through the crate's own public mirror [`Renderer::capture_ui`] — the seam
+//! [`Renderer::restore_panes`] was written to mirror, a pure field transfer both
+//! ways. The renderer under test is a **real `TuiRenderer`** wrapped in
+//! [`PaneWitness`]: it snapshots the pane model inside `restore_panes` and counts
+//! flushes, so `flushes == 0` pins the instant before the first draw.
 
 use std::path::{Path, PathBuf};
 
@@ -63,7 +40,7 @@ use marmennill::ui::{Event, InputState, Renderer, SubagentDetail, UiRecord, UiTr
 /// The budget the fixture commits with, and the budget this process boots with.
 /// They differ on purpose: the resulting report warning is what proves a loud
 /// `[CLI] Restore warning:` line is an *appended report line* and never a
-/// re-derivation of the committed pane bytes (AC-U1).
+/// re-derivation of the committed pane bytes.
 const COMMITTED_BUDGET: usize = 1234;
 const LIVE_BUDGET: usize = 4321;
 
@@ -101,7 +78,7 @@ fn cleanup(bundle: &Path) {
 // ------------------------------------------------------------- manager fixture
 
 /// The pinned pair plus one settled turn. `[0]`/`[1]` are the two pins the loader
-/// insists on (§4); this file is about the panes.
+/// insists on; this file is about the panes.
 fn manager_transcript() -> Vec<MessageRecord> {
     vec![
         MessageRecord::System {
@@ -148,8 +125,8 @@ fn payload(ui: UiSection) -> CapturePayload {
 }
 
 /// The public commit seam, unthrottled. The committer does NOT validate the UI
-/// section (§7 C1–C4), which is what lets AC-C4 commit a section the loader must
-/// then refuse.
+/// section, which is what lets a later test commit a section the loader must then
+/// refuse.
 fn write(bundle: &Path, session_id: &str, ui: UiSection) {
     let policy = CommitPolicy {
         min_interval: std::time::Duration::from_millis(0),
@@ -192,8 +169,8 @@ fn explain(outcome: &RestoreOutcome) -> String {
 }
 
 /// The committed `ui.json` read back through the loader: the authority every
-/// AC-U*/AC-C* comparison is made against, so no test compares the boot pass with
-/// a fixture it merely built in memory.
+/// comparison is made against, so no test compares the boot pass with a fixture it
+/// merely built in memory.
 fn committed_section(bundle: &Path) -> UiSection {
     let outcome = load_bundle(bundle);
     let RestoreOutcome::Restored { session, .. } = &outcome else {
@@ -231,7 +208,7 @@ fn member_paths(bundle: &Path) -> Vec<String> {
 }
 
 /// `(rel_path, fingerprint)` for every member plus `manifest.json`, hashed with
-/// the crate's own §7.2 hasher — never a second one.
+/// the crate's own hasher — never a second one.
 fn fingerprints(bundle: &Path) -> Vec<(String, u64)> {
     let mut table: Vec<(String, u64)> = member_paths(bundle)
         .into_iter()
@@ -255,13 +232,13 @@ fn assert_bundle_bytes_unchanged(bundle: &Path, before: &[(String, u64)]) {
 
 /// A **real** `TuiRenderer` behind a recording `Renderer`, so the boot pass runs
 /// its own hook order and the test can read the pane model at the exact instant
-/// §6.6 I-U2 means: after `restore_panes` assigned, before anything was drawn.
+/// that matters: after `restore_panes` assigned, before anything was drawn.
 struct PaneWitness {
     tui: TuiRenderer,
     /// Captured inside `restore_panes`, immediately after delegating the assign.
     after_restore: Option<UiSection>,
     /// The `flush` count at the moment of that snapshot — the "before the first
-    /// draw" witness (I-U2).
+    /// draw" witness.
     draws_at_snapshot: usize,
     flushes: usize,
     events: Vec<Event>,
@@ -285,15 +262,14 @@ impl PaneWitness {
         self.tui.capture_ui()
     }
 
-    /// The pane model at the post-assign, pre-draw instant.
+    /// The pane model at the instant after the assign and before any draw.
     fn snapshot(&self) -> &UiSection {
         self.after_restore
             .as_ref()
             .expect("`restore_panes` must have been called by the boot pass")
     }
 
-    /// The status sentences the pass sent to the renderer (D6: loud, never
-    /// silent).
+    /// The status sentences the pass sent to the renderer (loud, never silent).
     fn status_events(&self) -> Vec<String> {
         self.events
             .iter()
@@ -362,9 +338,9 @@ struct Booted {
     session_id: String,
 }
 
-/// THE boot path (`ui::session::boot`, flow §4.9) driven end to end with a real
-/// TUI renderer: `load_bundle` → floors + `WORKERS` → the engine → the panes →
-/// the loud report → `N-MGR-1`.
+/// THE boot path (`ui::session::boot`) driven end to end with a real TUI renderer:
+/// `load_bundle` → floors + `WORKERS` → the engine → the panes → the loud report →
+/// the manager notice.
 fn boot_with_panes(bundle: &Path) -> Booted {
     let cfg = Config {
         max_context_tokens: LIVE_BUDGET,
@@ -417,16 +393,16 @@ fn boot_with_panes(bundle: &Path) -> Booted {
 
 // --------------------------------------------------------------- UI fixtures
 
-/// The status bar the captured screen was showing. Not `"Ready"` (AC-U2), and free
-/// of the two spellings `set_subagents` resets to `"Ready"`
-/// (`src/ui/tui/mod.rs:1057-1061`), so a later `"Ready"` is a finding, not noise.
+/// The status bar the captured screen was showing. Not `"Ready"`, and free of the
+/// two spellings `set_subagents` resets to `"Ready"`, so a later `"Ready"` is a
+/// finding, not noise.
 fn committed_status_line() -> String {
     "Running (t014d-model) — 2 task(s) in flight".to_string()
 }
 
-/// The pane vector AC-U1 names, holding every awkward shape it lists: an entry
-/// with embedded `\n`, an empty entry, a whitespace-only entry, an adjacent
-/// duplicate pair, and a repeat of the first entry at the end.
+/// The pane vector under test, holding every awkward shape: an entry with embedded
+/// `\n`, an empty entry, a whitespace-only entry, an adjacent duplicate pair, and a
+/// repeat of the first entry at the end.
 fn pane_lines_awkward() -> Vec<String> {
     vec![
         "User: keep the pane bytes, never a replay".to_string(),
@@ -443,7 +419,7 @@ fn pane_lines_awkward() -> Vec<String> {
 }
 
 /// The journal mirror of that screen — a *different* set of strings from the pane
-/// (that is the point of D4), holding no `[CLI]` record at all (AC-U4).
+/// (that is the point), holding no `[CLI]` record at all.
 fn journal_awkward() -> Vec<UiJournalRecord> {
     vec![
         UiJournalRecord::User {
@@ -478,9 +454,9 @@ fn journal_text(record: &UiJournalRecord) -> Option<&str> {
     }
 }
 
-/// The section AC-U1 / AC-U2 / AC-U4 commit. Every token witness is `0`, matching
-/// a fresh process, so `restore_panes` has nothing to say out loud about counters
-/// and the pane vector stays exactly as committed.
+/// The section the pane comparisons commit. Every token witness is `0`, matching a
+/// fresh process, so `restore_panes` has nothing to say out loud about counters and
+/// the pane vector stays exactly as committed.
 fn section_for_panes(pane: Vec<String>, journal: Vec<UiJournalRecord>) -> UiSection {
     UiSection {
         chat_messages: pane,
@@ -499,8 +475,8 @@ fn section_for_panes(pane: Vec<String>, journal: Vec<UiJournalRecord>) -> UiSect
         current_content: "half-streamed answer, still on screen".to_string(),
         active_agent: Some("Manager".to_string()),
         // Empty on purpose: a non-empty half-sentence is folded into the pane by
-        // the next `Status` event (`tui/mod.rs:657-660`), which would mix an
-        // unrelated line into the "only report lines were appended" witness.
+        // the next `Status` event, which would mix an unrelated line into the
+        // "only report lines were appended" witness.
         steer_sentence_buffer: Some(String::new()),
         tokens_in: 0,
         tokens_out: 0,
@@ -511,18 +487,17 @@ fn section_for_panes(pane: Vec<String>, journal: Vec<UiJournalRecord>) -> UiSect
 }
 
 /// `count` single-line pane entries, so a restored scroll offset sits inside what
-/// the live clamp (`src/ui/tui/events.rs:465-481`) allows instead of being pulled
-/// back by it.
+/// the live clamp allows instead of being pulled back by it.
 fn pane_lines_tall(count: usize) -> Vec<String> {
     (1..=count)
         .map(|i| format!("[Tool Result] pane line {i}"))
         .collect()
 }
 
-/// Four inactive panels: `is_active: false` keeps `set_subagents`
-/// (`tui/mod.rs:986-1069`) from flipping `show_subagent_panel` or re-selecting, so
-/// what AC-C3 reads is what the restore assigned. Panel 2 carries long content so
-/// its details-pane offset is inside the clamp too.
+/// Four inactive panels: `is_active: false` keeps `set_subagents` from flipping
+/// `show_subagent_panel` or re-selecting, so what the test reads is what the
+/// restore assigned. Panel 2 carries long content so its details-pane offset is
+/// inside the clamp too.
 fn panels_four() -> Vec<SubagentPanel> {
     (0..4)
         .map(|i| SubagentPanel {
@@ -553,7 +528,7 @@ fn panels_four() -> Vec<SubagentPanel> {
 }
 
 /// Does the live journal hold this committed record, byte for byte? The two enums
-/// are the same closed set of eight variants (A §6.4), so this is a rename.
+/// are the same closed set of eight variants, so this is a rename.
 fn transcript_holds(transcript: &UiTranscript, record: &UiJournalRecord) -> bool {
     let mirror = match record {
         UiJournalRecord::User { text } => UiRecord::User { text: text.clone() },
@@ -581,18 +556,17 @@ fn transcript_holds(transcript: &UiTranscript, record: &UiJournalRecord) -> bool
 }
 
 // ==========================================================================
-// §9.5 — the pane bytes are the authority (AC-U1 … AC-U4)
+// The pane bytes are the authority
 // ==========================================================================
 
-/// **AC-U1** — `renderer.messages == committed_ui.chat_messages`,
-/// element-by-element, asserted **before the first draw**.
+/// `renderer.messages == committed_ui.chat_messages`, element-by-element,
+/// asserted **before the first draw**.
 ///
 /// The snapshot is taken inside `Renderer::restore_panes` on the real boot path
 /// (see [`PaneWitness`]): the assign has happened, and no `flush` has ever been
-/// requested — which is what §6.6 I-U1/I-U2 ask for. The whole vector is compared,
-/// then every element again by index so a failure names the entry, then the
-/// awkward shapes the criterion names individually (a `Vec<String>` "same length"
-/// pass could hide all of them).
+/// requested. The whole vector is compared, then every element again by index so a
+/// failure names the entry, then the awkward shapes individually — a `Vec<String>`
+/// "same length" pass could hide all of them.
 #[test]
 fn ac_u1_pane_vector_equals_the_committed_vector_element_by_element_before_the_first_draw() {
     let bundle = bundle_dir("ac-u1");
@@ -640,7 +614,7 @@ fn ac_u1_pane_vector_equals_the_committed_vector_element_by_element_before_the_f
         );
     }
 
-    // The awkward shapes named by the criterion, pinned individually.
+    // The awkward shapes, pinned individually.
     assert_eq!(
         snapshot.chat_messages[1],
         "Marmennill: I will read the design doc,\nthen write the acceptance tests,\nthen run cargo test.",
@@ -671,8 +645,8 @@ fn ac_u1_pane_vector_equals_the_committed_vector_element_by_element_before_the_f
     );
 
     // Still true after the whole pass: the committed vector is a strict prefix of
-    // the live pane, and everything behind it is a D6 report line the loader
-    // spelled — never a journal or model line.
+    // the live pane, and everything behind it is a report line the loader spelled
+    // — never a journal or model line.
     let live = booted.renderer.live();
     assert!(
         live.chat_messages.starts_with(&committed.chat_messages),
@@ -700,13 +674,12 @@ fn ac_u1_pane_vector_equals_the_committed_vector_element_by_element_before_the_f
     cleanup(&bundle);
 }
 
-/// **AC-U2** — `renderer.status_line == committed_ui.status_line`, and the bar is
-/// **not** `"Ready"`.
+/// `renderer.status_line == committed_ui.status_line`, and the bar is **not**
+/// `"Ready"`.
 ///
 /// The default is spelled first so this cannot be a tautology: a fresh
-/// `TuiRenderer` really does open on `"Ready"` (`tui/mod.rs:188`), so if the
-/// restore had skipped the field the equality below would fail against a real
-/// default.
+/// `TuiRenderer` really does open on `"Ready"`, so if the restore had skipped the
+/// field the equality below would fail against a real default.
 #[test]
 fn ac_u2_status_line_is_the_committed_bar_and_never_the_default_ready() {
     let bundle = bundle_dir("ac-u2");
@@ -766,14 +739,14 @@ fn ac_u2_status_line_is_the_committed_bar_and_never_the_default_ready() {
     cleanup(&bundle);
 }
 
-/// **AC-U3** — no pane line is produced from the journal.
+/// No pane line is produced from the journal.
 ///
 /// The fixture makes the two authorities disagree on purpose: the journal says the
 /// operator asked for the FIRST wording, the pane says `"User: … SECOND wording"`.
 /// Both must come back unchanged, the pane must contain neither the journal's text
 /// nor the journal text dressed in the pane's `"User: "` prefix, and the journal
 /// half must still be live: the re-seeded `UiTranscript` yields the committed
-/// steering pairs through `extract_steering_history()` (`src/ui/transcript.rs:113`).
+/// steering pairs through `extract_steering_history()`.
 #[test]
 fn ac_u3_no_pane_line_is_derived_from_the_journal_and_the_steering_pairs_survive() {
     let pane = vec![
@@ -861,7 +834,7 @@ fn ac_u3_no_pane_line_is_derived_from_the_journal_and_the_steering_pairs_survive
 
     // (d) `extract_steering_history()` still returns the committed pairs. The
     // `[Arbitrator]:` prefix is the journal's own rendering, which the extractor
-    // strips (`transcript.rs:113`); everything else is byte-for-byte.
+    // strips; everything else is byte-for-byte.
     let expected = vec![
         (
             "the journal says the operator asked for the FIRST wording".to_string(),
@@ -899,9 +872,9 @@ fn ac_u3_no_pane_line_is_derived_from_the_journal_and_the_steering_pairs_survive
     cleanup(&bundle);
 }
 
-/// **AC-U4** — a `"[CLI] …"` line the TUI produced by itself (`/help`, `/thought`)
-/// is present after the restore although the journal has no record of it. That is
-/// the whole point of D4: a journal replay could not have shown it.
+/// A `"[CLI] …"` line the TUI produced by itself (`/help`, `/thought`) is present
+/// after the restore although the journal has no record of it: a journal replay
+/// could not have shown it.
 #[test]
 fn ac_u4_cli_only_lines_survive_restore_although_the_journal_never_recorded_them() {
     let pane = vec![
@@ -1002,10 +975,10 @@ fn ac_u4_cli_only_lines_survive_restore_although_the_journal_never_recorded_them
 }
 
 // ==========================================================================
-// §9.6 — composer, caret, scroll, selection (AC-C1 … AC-C4)
+// Composer, caret, scroll, selection
 // ==========================================================================
 
-/// The composer AC-C1 names: three lines, a 2-byte `é` and a 4-byte `☕`, and a
+/// The composer under test: three lines, a 2-byte `é` and a 4-byte `☕`, and a
 /// caret sitting mid-document on a char boundary the restore has to land on.
 fn composer_multiline() -> ComposerState {
     let input_text =
@@ -1029,9 +1002,9 @@ fn composer_multiline() -> ComposerState {
     }
 }
 
-/// **AC-C1** — `renderer.input_text == committed.composer.input_text`, multi-line
-/// included, and `renderer.cursor == committed.composer.cursor`: the caret lands
-/// on the same char boundary (§6.5 U-chk).
+/// `renderer.input_text == committed.composer.input_text`, multi-line included,
+/// and `renderer.cursor == committed.composer.cursor`: the caret lands on the same
+/// char boundary.
 #[test]
 fn ac_c1_composer_text_and_caret_come_back_on_the_same_char_boundary() {
     let bundle = bundle_dir("ac-c1");
@@ -1108,7 +1081,7 @@ fn ac_c1_composer_text_and_caret_come_back_on_the_same_char_boundary() {
     cleanup(&bundle);
 }
 
-/// **AC-C2** — `history`, `history_index` and `input_draft` match.
+/// `history`, `history_index` and `input_draft` match.
 #[test]
 fn ac_c2_composer_history_history_index_and_input_draft_match() {
     let bundle = bundle_dir("ac-c2");
@@ -1177,16 +1150,14 @@ fn ac_c2_composer_history_history_index_and_input_draft_match() {
     cleanup(&bundle);
 }
 
-/// **AC-C3** — the matching half of the criterion: every restored view value is
-/// identical.
+/// The matching half: every restored view value is identical.
 ///
 /// `chat_scroll`, `subagent_scroll`, `subagent_list_scroll` and
-/// `selected_subagent_idx` are chosen inside what the live clamp
-/// (`src/ui/tui/events.rs:465-481`) allows on a fresh renderer, so this is the
-/// criterion's first branch. `plan_scroll` is `0` here for one honest reason: that
-/// clamp's upper bound is `plan_max_scroll`, which is derived per frame
-/// (`render.rs:578`) and is therefore `0` in a process that has not drawn — so a
-/// stored non-zero plan offset is precisely the clamp-difference case, asserted in
+/// `selected_subagent_idx` are chosen inside what the live clamp allows on a fresh
+/// renderer. `plan_scroll` is `0` here for one honest reason: that clamp's upper
+/// bound, `plan_max_scroll`, is derived per frame and is therefore `0` in a
+/// process that has not drawn — so a stored non-zero plan offset is exactly the
+/// clamp-difference case, asserted in
 /// [`ac_c3_scroll_offsets_that_the_live_clamp_moved_are_reported_as_warnings`].
 #[test]
 fn ac_c3_view_offsets_selection_and_toggles_match_the_committed_view() {
@@ -1222,7 +1193,7 @@ fn ac_c3_view_offsets_selection_and_toggles_match_the_committed_view() {
     let got = &snapshot.view;
     let want = &committed.view;
 
-    // Field by field, so a failure names the field the criterion lists.
+    // Field by field, so a failure names the field.
     for (field, stored, restored) in [
         (
             "chat_scroll",
@@ -1315,17 +1286,14 @@ fn ac_c3_view_offsets_selection_and_toggles_match_the_committed_view() {
     cleanup(&bundle);
 }
 
-/// **AC-C3** — the criterion's second branch, kept honest: an offset the live
-/// clamp moved is only legal when a `warnings` entry names the offset **and both
-/// values** (§6.6 I-U6).
+/// The second branch, kept honest: an offset the live clamp moved is only legal
+/// when a `warnings` entry names the offset **and both values**.
 ///
-/// The clamp does run — `clamp_scrolls()` is the last thing `restore_panes` does
-/// (`tui/mod.rs`, `events.rs:465-481`) — so these offsets really do move. The
-/// sentence naming both values is produced by `clamp_warning_sentences`
-/// (`tui/mod.rs`), folded into `RepairReport::warnings` at the boot call site
-/// (`ui/session.rs`, before `announce_restore`) and logged, with its wording
-/// pinned by the lib unit test
-/// `a_scroll_offset_the_live_clamp_moved_is_named_with_both_values`.
+/// The clamp does run — `clamp_scrolls()` is the last thing `restore_panes` does,
+/// so these offsets really do move. The sentence naming both values comes from
+/// `clamp_warning_sentences`, folded into `RepairReport::warnings` at the boot
+/// call site before `announce_restore`, with its wording pinned by the lib unit
+/// test `a_scroll_offset_the_live_clamp_moved_is_named_with_both_values`.
 #[test]
 fn ac_c3_scroll_offsets_that_the_live_clamp_moved_are_reported_as_warnings() {
     let bundle = bundle_dir("ac-c3-clamp");
@@ -1403,15 +1371,15 @@ fn ac_c3_scroll_offsets_that_the_live_clamp_moved_are_reported_as_warnings() {
     cleanup(&bundle);
 }
 
-// --------------------------------------------------------------------- AC-C4
+// -------------------------------------------------- a bad ui.json is refused
 
-/// **AC-C4** — every U-chk violation (§6.5) is a refusal of the member `ui.json`
+/// Every composer or selection violation is a refusal of the member `ui.json`
 /// with code `headerManifestDisagreement`, and the file bytes are untouched. These
 /// are preconditions, not repairs: the loader never "fixes" a caret or a
 /// selection, installs nothing into the live renderer, and rewrites nothing.
 #[test]
 fn ac_c4_out_of_range_caret_selection_or_unknown_panel_refuses_and_leaves_bytes_untouched() {
-    // The caret cases break the rule in the two ways the criterion names: past the
+    // The caret cases break the rule in the two ways it is spelled: past the
     // end of `input_text`, and off a char boundary.
     let text = "café ☕ note".to_string();
     let inside_e = text
@@ -1542,8 +1510,8 @@ fn ac_c4_out_of_range_caret_selection_or_unknown_panel_refuses_and_leaves_bytes_
             "AC-C4 ({label}): a refused restore adopted a session id"
         );
 
-        // The file bytes are where they were, hashed with the crate's own §7.2
-        // hasher before and after.
+        // The file bytes are where they were, hashed with the crate's own hasher
+        // before and after.
         assert_bundle_bytes_unchanged(&bundle, &before);
         cleanup(&bundle);
     }

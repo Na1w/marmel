@@ -53,11 +53,9 @@ pub(crate) async fn write_plan_internal(
             Err(e) => {
                 let msg = e.to_string();
                 if token.is_cancelled() || msg.contains("aborted by cancellation") {
-                    // Strict abort semantics (fix_loop module docs): an aborted
-                    // validation now surfaces as `Err` (never the old
-                    // `Ok((false, …))` soft rejection). To preserve the
-                    // pre-consolidation observable output, the abort is
-                    // reported through the same auditor-rejection message.
+                    // Strict abort semantics: an aborted validation surfaces as
+                    // `Err`, never as an `Ok((false, …))` soft rejection. The abort
+                    // is reported through the same auditor-rejection message.
                     tracing::warn!("create_plan aborted during plan validation: {msg}");
                     return Ok(ToolResult::err(format!(
                         "Execution plan rejected by Strategic Plan Auditor:\n{msg}"

@@ -1,10 +1,8 @@
 //! Shared network plumbing for the LLM chat client and the MCP HTTP/SSE transport.
 //!
-//! Extracted from `src/llm/client.rs` and `src/mcp/http.rs` per
-//! `docs/recon_duplication_net.md` §2 (clusters C1–C4): the SSE pump skeleton
-//! (50 ms poll + idle-watchdog + abort hook), the generic retry-with-backoff
-//! policy, and the reqwest client builder previously existed in two divergent
-//! copies.
+//! Single home for the SSE pump skeleton (50 ms poll + idle-watchdog + abort
+//! hook), the generic retry-with-backoff policy, and the reqwest client
+//! builder.
 
 pub mod http;
 pub mod retry;

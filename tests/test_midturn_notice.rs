@@ -1,4 +1,4 @@
-//! Mid-turn steering-notice drain (task t-048).
+//! Mid-turn steering-notice drain.
 //!
 //! A steering notice posted **while a worker turn is in flight** must be drained
 //! and injected inside that SAME turn — after the tool round, before compaction
@@ -179,9 +179,9 @@ async fn test_notice_posted_mid_turn_reaches_the_same_turns_next_request() {
             "the notice posted mid-turn must be injected, byte-identical to the single \
              renderer's output, in the SAME turn's next request; got: {bodies:?}"
         );
-        // Consolidation evidence: the removed inline copy of the rendering told
-        // the worker to reply with a single-quoted tool name and never pinned the
-        // notice id; only the canonical renderer may appear.
+        // Only the canonical renderer may reach the model: its output pins the
+        // notice id and never uses the single-quoted tool-name phrasing asserted
+        // absent below.
         let stale_contract = format!("invoke the '{}' tool", marmennill::tool_names::TOOL_REPLY_TO_ARBITRATOR);
         assert!(
             !bodies[1].contains(&stale_contract),
@@ -194,7 +194,7 @@ async fn test_notice_posted_mid_turn_reaches_the_same_turns_next_request() {
 /// The stronger same-turn claim: a turn that ENDS at its tool round (a validator
 /// role concluding with the verdict tool) never runs another turn-start drain, so
 /// a notice posted during that turn can only have been injected by the mid-turn
-/// drain. Before t-048 such a notice stayed queued until the TTL sweep dropped it.
+/// drain.
 #[tokio::test]
 async fn test_notice_posted_mid_turn_is_injected_before_a_verdict_turn_can_conclude() {
     let _run = run_lock().await;

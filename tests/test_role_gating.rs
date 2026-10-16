@@ -1,22 +1,20 @@
-//! Integration tests for the role-gated `dispatch_for`/`ToolCaller` path
-//! (execution plan task t-d401).
+//! Integration tests for the role-aware `dispatch_for`/`ToolCaller` path.
 //!
-//! These tests prove that the orchestration tool policy (REQ-ORCH-001
-//! Manager-only vs REQ-ORCH-002 per-specialist allowlist) is enforced in
-//! production routing — i.e. that a tool invoked through the *incorrect* role
-//! is rejected with `ToolError::Forbidden`, while the same tool invoked through
-//! its *correct* role succeeds.
+//! The orchestration tool policy — Manager-only tools versus the per-specialist
+//! allowlist — is enforced in production routing: a tool invoked through the
+//! *incorrect* role is rejected with `ToolError::Forbidden`, while the same tool
+//! invoked through its *correct* role succeeds.
 //!
-//! They exercise the public `dispatch_for` entry point exactly as the
-//! production call sites (`ui/mod.rs`, `agents/mod.rs`, `agent/loop.rs`) do,
-//! so a regression in the gating logic is caught at the integration boundary.
+//! The public `dispatch_for` entry point is exercised exactly as the production
+//! call sites (`ui/mod.rs`, `agents/mod.rs`) do, so a regression in role
+//! enforcement is caught at the integration boundary.
 
 use marmennill::agents::Agent;
 use marmennill::harness::{ToolCaller, ToolError, ToolInvocation, dispatch_for};
 
-/// REQ-ORCH-001: the Manager is forbidden from domain tools (`write_file`,
-/// `replace`, `run_command`) — a domain tool invoked through the Manager role
-/// must be rejected with `Forbidden`.
+/// The Manager is forbidden from domain tools (`write_file`, `replace`,
+/// `run_command`) — a domain tool invoked through the Manager role must be
+/// rejected with `Forbidden`.
 #[test]
 fn manager_forbidden_from_domain_tools() {
     for name in ["write_file", "replace", "run_command"] {
@@ -34,12 +32,12 @@ fn manager_forbidden_from_domain_tools() {
     }
 }
 
-/// REQ-ORCH-001: the Manager IS permitted `delegate_task`, plan management
+/// The Manager IS permitted `delegate_task`, plan management
 /// (`create_plan`, `archive_current_plan`), `rebirth`, and read-only
 /// diagnostics (`read_file`, `grep_search`, `glob`).
 #[test]
 fn manager_permitted_planning_and_readonly_diagnostics() {
-    // delegate_task is Manager-permitted (REQ-ORCH-005).
+    // delegate_task is Manager-permitted.
     let delegate = ToolInvocation {
         name: "delegate_task".to_string(),
         arguments: serde_json::json!({
@@ -64,9 +62,9 @@ fn manager_permitted_planning_and_readonly_diagnostics() {
     );
 }
 
-/// REQ-ORCH-002: a specialist may NOT call a tool outside its registry
-/// allowlist. Researcher has no `gedcom__*` namespace (only Validator does), so
-/// a genealogy tool invoked through the Researcher role must be rejected.
+/// A specialist may NOT call a tool outside its registry allowlist. Researcher
+/// has no `gedcom__*` namespace (only Validator does), so a genealogy tool
+/// invoked through the Researcher role must be rejected.
 #[test]
 fn specialist_rejects_tool_outside_allowlist() {
     let tool = ToolInvocation {
@@ -82,9 +80,9 @@ fn specialist_rejects_tool_outside_allowlist() {
     }
 }
 
-/// REQ-ORCH-002: a specialist IS permitted the tools its `terminal__*`
-/// allowlist grants (bare `write_file` normalizes to `terminal__write_file`).
-/// Coder's allowlist includes `terminal__*`, so `write_file` must succeed.
+/// A specialist IS permitted the tools its `terminal__*` allowlist grants (bare
+/// `write_file` normalizes to `terminal__write_file`). Coder's allowlist
+/// includes `terminal__*`, so `write_file` must succeed.
 #[test]
 fn specialist_permitted_allowlisted_terminal_tool() {
     let tmp = tempfile::tempdir().expect("creates tempdir");
@@ -161,8 +159,8 @@ async fn validator_forbidden_from_file_modification_and_execution_tools() {
     );
 }
 
-/// REQ-ORCH-001: `create_plan` is Manager-only. Even DeepBrain (allowlist `*`)
-/// must be forbidden from authoring the plan.
+/// `create_plan` is Manager-only: even a wildcard-allowlist specialist
+/// (Generalist, namespace `*`) must be forbidden from authoring the plan.
 #[test]
 fn create_plan_is_manager_only_even_for_wildcard_specialist() {
     let tool = ToolInvocation {
@@ -179,9 +177,9 @@ fn create_plan_is_manager_only_even_for_wildcard_specialist() {
     }
 }
 
-/// REQ-ORCH-002: a specialist may delegate only when its allowlist grants
-/// `delegate_task` (all canonical roles grant it). Researcher's allowlist
-/// includes `delegate_task`, so delegation must succeed.
+/// A specialist may delegate only when its allowlist grants `delegate_task`
+/// (all canonical roles grant it). Researcher's allowlist includes
+/// `delegate_task`, so delegation must succeed.
 #[test]
 fn specialist_delegate_task_allowed_by_allowlist() {
     let tool = ToolInvocation {
@@ -333,7 +331,7 @@ async fn test_prompt_based_tool_gating() {
         other => panic!("Coder without write_file in prompt must be forbidden, got: {other:?}"),
     }
 
-    // 3. Normalization: aliases matching the canonical name are properly gated.
+    // 3. Normalization: aliases matching the canonical name are allowed alike.
     let tool_read_alias = ToolInvocation {
         name: "view_file".to_string(),
         arguments: serde_json::json!({
@@ -350,28 +348,24 @@ async fn test_prompt_based_tool_gating() {
     );
 }
 
-// t-033b — the verdict tool (`leave_verdict`) is validator-only
+// The verdict tool (`leave_verdict`) is validator-only, enforced in two
+// deliberately different layers:
 //
-// Two enforcement layers exist and they are deliberately different:
-//
-// 1. The *dispatch* layer (`dispatch_for`) gates a tool by the caller's registry
-//    allowlist / prompt blueprint. For the verdict tool that is necessary but
-//    not sufficient: the allowlist is a per-role tool namespace, and the
-//    Generalist namespace is the wildcard `*`, so a wildcard role "allows"
-//    `leave_verdict`. `create_plan` is handled the same way in this file
-//    (`create_plan_is_manager_only_even_for_wildcard_specialist`).
-// 2. The *agent-loop* layer adds the identity rule: only the validator role may
+// 1. The dispatch layer (`dispatch_for`) checks the caller's registry allowlist
+//    or prompt blueprint. For the verdict tool that is necessary but not
+//    sufficient: an allowlist is a per-role tool namespace and the Generalist
+//    namespace is the wildcard `*`, so a wildcard role "allows" `leave_verdict`
+//    — the same shape as `create_plan_is_manager_only_even_for_wildcard_specialist`.
+// 2. The agent-loop layer adds the identity rule: only the validator role may
 //    record a verdict for a deliverable — see
-//    [`marmennill::agents::runner::execution::may_record_verdict`]. That gate
-//    returns an explicit tool error to the worker, logs a warning, and never
+//    [`marmennill::agents::runner::execution::may_record_verdict`]. A refusal
+//    returns an explicit tool error to the worker, logs a warning and never
 //    dispatches the call, so no verdict state and no verdict file is touched.
 //
-// Relationship to `test_prompt_based_tool_gating`: that test describes the
-// *advisory* prompt-blueprint gate (a tool named in the prompt is expected to be
-// executable), which is a sanctioned pre-existing failure and is NOT changed
-// here. The verdict gate below is orthogonal and strictly stronger: it is a hard
-// identity rule that no prompt blueprint, allowlist, or wildcard namespace can
-// widen, and it is asserted independently of the advisory layer.
+// `test_prompt_based_tool_gating` covers the *advisory* prompt-blueprint layer
+// (a tool named in the prompt is expected to be executable); it is a sanctioned
+// known failure, untouched here. The identity rule asserted below is orthogonal
+// and stronger: no prompt blueprint, allowlist or wildcard namespace widens it.
 
 fn verdict_tool(verdict: &str, comments: &str) -> ToolInvocation {
     ToolInvocation {
@@ -436,8 +430,8 @@ fn prompt_blueprint_naming_the_verdict_tool_does_not_authorise_a_coder() {
         Err(ToolError::Forbidden { .. }) => {}
         other => panic!("unexpected dispatch outcome: {other:?}"),
     }
-    // Regardless of the advisory dispatch outcome, the identity rule below is the
-    // authoritative gate for verdicts, and it refuses a coder blueprint.
+    // Regardless of the advisory dispatch outcome, the identity rule below is
+    // authoritative for verdicts, and it refuses a coder blueprint.
     let registry = marmennill::orchestrator::SpecialistRegistry::canonical();
     assert!(
         !marmennill::agents::runner::execution::may_record_verdict(Agent::Coder, &registry),
@@ -445,9 +439,9 @@ fn prompt_blueprint_naming_the_verdict_tool_does_not_authorise_a_coder() {
     );
 }
 
-/// The identity rule of the agent-loop gate: exactly the validator role. This
-/// also proves the registry allowlist alone is insufficient — the Generalist
-/// namespace is `*`, so `caller_allows_tool` reports it as allowed while
+/// The agent-loop identity rule: exactly the validator role. This also proves
+/// the registry allowlist alone is insufficient — the Generalist namespace is
+/// `*`, so `caller_allows_tool` reports it as allowed while
 /// `may_record_verdict` still refuses it.
 #[test]
 fn only_the_validator_satisfies_may_record_verdict() {
@@ -471,8 +465,8 @@ fn only_the_validator_satisfies_may_record_verdict() {
         );
     }
 
-    // Residual documentation: the registry alone would let the wildcard
-    // Generalist self-approve, which is why the gate carries the identity rule.
+    // The registry alone would let the wildcard Generalist self-approve, which
+    // is why verdict authority carries the identity rule.
     assert!(
         marmennill::orchestrator::caller_allows_tool(
             Agent::Generalist,
@@ -514,10 +508,10 @@ fn sse_text(text: &str) -> String {
     )
 }
 
-/// End-to-end proof of the agent-loop role gate: a coder that calls the verdict
-/// tool to approve its own deliverable is refused with an explicit error visible
-/// to it, the seeded verdict file is left byte-for-byte unchanged, and the
-/// outcome is decided by the automated validator — not by the worker.
+/// End-to-end proof of the agent-loop identity rule: a coder that calls the
+/// verdict tool to approve its own deliverable is refused with an explicit error
+/// visible to it, the seeded verdict file is left byte-for-byte unchanged, and
+/// the outcome is decided by the automated validator — not by the worker.
 #[tokio::test]
 async fn worker_self_approval_is_refused_and_the_verdict_file_is_untouched() {
     use wiremock::matchers::{method, path};
@@ -774,9 +768,9 @@ async fn repeated_self_verdict_attempts_fail_the_run_without_recording_a_verdict
     );
 }
 
-/// The other side of the gate: the validator role is *not* obstructed. A
-/// validator that records an explicit approval through the verdict tool has that
-/// verdict accepted verbatim.
+/// The other side of the identity rule: the validator role is *not* obstructed.
+/// A validator that records an explicit approval through the verdict tool has
+/// that verdict accepted verbatim.
 #[tokio::test]
 async fn validator_may_record_an_explicit_approval() {
     use wiremock::matchers::{method, path};
@@ -845,25 +839,17 @@ async fn validator_may_record_an_explicit_approval() {
     );
 }
 
-// t-033e — the fix-loop tool blueprint is role-aware
+// The fix-loop tool blueprint is role-aware.
 //
 // `run_fix_loop` (`src/agents/runner/fix_loop.rs`) is the shared driver behind
 // the deliverable validator and the plan auditor. Its *blueprint* is the
-// tool-schema list the run hands the model, plus the tool calls that same run is
-// allowed to dispatch. Two role-gating holes existed there:
-//
-// 1. a prompt/blueprint allow-list naming the verdict tool put that tool into the
-//    advertised schema list of *any* role (a permissive registry, e.g. the
-//    wildcard Generalist namespace, was enough), and
-// 2. the loop consumed a verdict tool call from *any* caller and returned it as
-//    the run's verdict — i.e. a non-validator could certify a deliverable purely
-//    through the fix loop, without ever reaching `dispatch_for`.
-//
-// Both are closed by reusing the crate's single public role gate
-// (`may_record_verdict`, `runner/execution.rs`): the fix loop asks that gate once
-// per run and everything verdict-shaped (advertised list, nudges, consumption,
-// dispatch) follows its answer. No second gate, no new error type: the refusal is
-// the same typed `ToolError::Forbidden` the agent-loop gate reports.
+// tool-schema list the run hands the model, plus the tool calls that same run
+// may dispatch. Everything verdict-shaped — advertised list, nudges,
+// consumption, dispatch — follows one answer from the crate's public
+// `may_record_verdict` (`runner/execution.rs`), asked once per run: a prompt or
+// blueprint naming the verdict tool never grants it, and a verdict call from a
+// role without verdict authority is refused with the same typed
+// `ToolError::Forbidden` the agent loop reports.
 
 use marmennill::agents::runner::fix_loop::{
     ALWAYS_ADVERTISED_TOOLS, BlueprintToolClass, FixLoopBounds, FixLoopResult, INSPECTION_TOOLS,
@@ -977,8 +963,8 @@ async fn drive_fix_loop(
 }
 
 /// (a) The blueprint vocabulary itself: the verdict class is defined by the
-/// `tool_names` constants, and the public gate — not an allow-list — decides who
-/// may hold it.
+/// `tool_names` constants, and verdict authority — not an allow-list — decides
+/// who may hold it.
 #[test]
 fn fix_loop_blueprint_verdict_class_is_defined_by_the_tool_name_constants() {
     use marmennill::tool_names::{
@@ -1016,8 +1002,8 @@ fn fix_loop_blueprint_verdict_class_is_defined_by_the_tool_name_constants() {
     )));
     assert!(!is_verdict_recording_tool(TOOL_READ_FILE));
 
-    // The loop asks the crate's public gate and nothing else: only the validator
-    // role has verdict authority; the Manager (no role) has none either.
+    // The loop asks the crate's public verdict authority and nothing else: only
+    // the validator role may record a verdict; the Manager (no role) may not.
     assert!(caller_may_record_verdict(&ToolCaller::Specialist(
         Agent::Validator
     )));
@@ -1040,8 +1026,8 @@ fn fix_loop_blueprint_verdict_class_is_defined_by_the_tool_name_constants() {
 }
 
 /// (b) A prompt/blueprint allow-list can never widen the verdict class: the
-/// registry/entry authority has to propose it, and a role rejected by the public
-/// gate never receives it — neither in the filtered blueprint nor in the
+/// registry/entry authority has to propose it, and a role refused verdict
+/// authority never receives it — neither in the filtered blueprint nor in the
 /// advertised schema view of an already-assembled list.
 #[test]
 fn fix_loop_blueprint_cannot_grant_verdict_tools_to_a_non_validator_role() {
@@ -1084,9 +1070,9 @@ fn fix_loop_blueprint_cannot_grant_verdict_tools_to_a_non_validator_role() {
         tool_names_of(&blueprint_only)
     );
 
-    // Whatever the assembled list contains, the loop's advertised view strips the
-    // verdict class for a role the public gate refuses, and keeps it for the
-    // validator.
+    // Whatever the assembled list contains, the loop's advertised view strips
+    // the verdict class for a role without verdict authority, and keeps it for
+    // the validator.
     let coder_view = advertised_tools_for_caller(&permissive, &coder);
     assert!(tool_names_of(&coder_view).contains(&TOOL_READ_FILE.to_string()));
     assert!(
@@ -1246,7 +1232,7 @@ async fn non_validator_verdict_call_through_the_fix_loop_blueprint_fails_closed(
             ];
             // Deliberately permissive entry authority (the wildcard-namespace
             // situation), so the only thing standing between the coder and a
-            // recorded verdict is the role gate.
+            // recorded verdict is role authority.
             let tools = assemble_tools(Some(&blueprint), |_| true, &[]);
             let caller = ToolCaller::SpecialistWithTools {
                 agent: Agent::Coder,
@@ -1313,9 +1299,9 @@ async fn non_validator_verdict_call_through_the_fix_loop_blueprint_fails_closed(
     );
 }
 
-/// (e) The dispatch half of the same gate: the fix loop's shared dispatcher
-/// refuses to execute a verdict tool for a role the public gate rejects, and the
-/// refusal is an explicit tool error (never a silent success).
+/// (e) The dispatch half of the same rule: the fix loop's shared dispatcher
+/// refuses to execute a verdict tool for a role without verdict authority, and
+/// the refusal is an explicit tool error (never a silent success).
 #[tokio::test]
 async fn fix_loop_dispatcher_refuses_a_verdict_tool_without_verdict_authority() {
     use marmennill::agents::runner::fix_loop::dispatch_tool_call;
@@ -1555,24 +1541,22 @@ fn string_literals_in_source(src: &str) -> Vec<String> {
     out
 }
 
-// ── Gate t-056: role-aware tool ADVERTISING inside the specialist loop ───────
+// ── Role-aware tool ADVERTISING inside the specialist loop ──────────────────
 //
-// Gates t-033b/t-051 refused a worker's *call* to a verdict tool, but the
-// specialist loop still *offered* one: `runner/execution.rs` built the schema
-// list with the raw prompt blueprint plus the registry entry's namespaces, and
-// the Generalist's wildcard (`"*"`) namespace — or a blueprint naming the tool —
-// was enough to put a verdict tool in front of a worker's model. An offer the
-// dispatcher will refuse is not harmless decoration: it invites exactly the
-// hallucinated self-approval the turn loop then has to reject and count against
-// the worker (three refusals fail the run).
+// Refusing a worker's *call* to a verdict tool is not enough on its own: the
+// schema list handed to the model comes from the prompt blueprint plus the
+// registry entry's namespaces, so a wildcard (`"*"`) namespace or a blueprint
+// naming the tool can put a verdict tool in front of a worker's model. An offer
+// the dispatcher will refuse invites the hallucinated self-approval the turn
+// loop then has to reject and count against the worker (three refusals fail the
+// run).
 //
-// t-056 closes the offer by **reusing** the fix loop's role-aware helpers
-// (`assemble_tools_for_caller` → `role_filtered_blueprint`, then
-// `advertised_tools_for_caller`), so the answer still comes from the crate's one
-// public gate [`may_record_verdict`] — no new gate, no second filter. The tests
-// below assert the **exact set difference**, never "one name is missing": the
-// validator's advertised set minus a worker's advertised set must be precisely
-// the verdict class, and the worker must keep every ordinary tool.
+// The offer is filtered by the same verdict authority as the call, through the
+// fix loop's helpers (`assemble_tools_for_caller` → `role_filtered_blueprint`,
+// then `advertised_tools_for_caller` → [`may_record_verdict`]). The tests below
+// assert the **exact set difference**: the validator's advertised set minus a
+// worker's advertised set is precisely the verdict class, and every ordinary
+// tool survives.
 
 /// The verdict-recording names that can ever appear in a list built from
 /// `ToolDef::default_tools()` — derived through the crate's own predicate and the
@@ -1598,9 +1582,9 @@ fn specialist_advertised(
 }
 
 /// (a)+(b) The advertised set is role-aware: for every non-validator role the
-/// difference against the validator's set is **exactly** the verdict class, while
-/// every ordinary tool survives. The registry authority is pinned to the same
-/// permissive predicate for both sides so the *only* variable is the role gate.
+/// difference against the validator's set is **exactly** the verdict class,
+/// while every ordinary tool survives. The registry authority is pinned to the
+/// same permissive predicate on both sides, so the only variable is role.
 #[test]
 fn specialist_loop_advertising_drops_the_verdict_class_by_exact_set_difference() {
     use std::collections::BTreeSet;
@@ -1689,9 +1673,9 @@ fn specialist_loop_advertising_drops_the_verdict_class_by_exact_set_difference()
     }
 }
 
-/// The hole itself: neither a wildcard registry namespace nor a prompt blueprint
-/// that names both verdict spellings can put a verdict tool in a worker's offer,
-/// while the validator role keeps it.
+/// Neither a wildcard registry namespace nor a prompt blueprint that names both
+/// verdict spellings can put a verdict tool in a worker's offer, while the
+/// validator role keeps it.
 #[test]
 fn specialist_loop_advertising_strips_verdicts_from_registry_and_blueprint_authority() {
     use std::collections::BTreeSet;
@@ -1815,9 +1799,9 @@ fn specialist_loop_advertising_strips_verdicts_from_registry_and_blueprint_autho
     );
 }
 
-/// (c) Defence in depth: even though the verdict tool is no longer offered, a
-/// model that hallucinates the call anyway is still refused by the dispatcher-side
-/// gate, and nothing about the refusal is softened by the advertising change.
+/// (c) Defence in depth: even though a verdict tool is not offered to a
+/// non-validator, a model that hallucinates the call anyway is still refused by
+/// the dispatcher-side rule, unchanged by the advertising behaviour.
 #[tokio::test]
 async fn specialist_loop_refuses_a_hallucinated_verdict_it_never_advertised() {
     use marmennill::agents::AgentBlueprint;
@@ -1917,8 +1901,8 @@ async fn specialist_loop_refuses_a_hallucinated_verdict_it_never_advertised() {
             audio_urls: None,
             recursion_granted: false,
         };
-        // A blueprint that names both verdict spellings: before t-056 this is what
-        // advertised a verdict tool to a worker.
+        // A blueprint naming both verdict spellings: the widest offer a worker
+        // can be handed.
         let ctx = marmennill::agents::IsolatedContext::from_request(
             "You are the Generalist specialist.".to_string(),
             &req,

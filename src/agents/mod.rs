@@ -12,10 +12,8 @@ pub mod validation;
 pub mod validator;
 
 /// Terminal outcome a specialist returns. The marker grammar — marker set,
-/// precedence rules and parser — has a single owner in [`crate::markers`]
-/// (dedup cluster C4, `docs/recon_duplication_helpers.md` §2.4). It is
-/// re-exported under the name the agents layer always published, so no
-/// consumer outside these files needed editing.
+/// precedence rules and parser — has a single owner in [`crate::markers`];
+/// the agents layer republishes that owner under its own name.
 pub use crate::markers::MissionMarker;
 pub use catalog::{AgentArchetype, Catalog, Skill, SkillSource};
 pub use coder::Coder;
@@ -92,13 +90,10 @@ impl std::str::FromStr for Agent {
     }
 }
 
-// `MissionMarker`, its `parse` and the `contains_failed_marker` sanitiser used
-// to be declared here (and, byte-for-byte, again in `src/manager/phase.rs`).
-// Dedup cluster C4 collapsed them into the single owner `crate::markers`, which
-// is re-exported above under the historical `crate::agents::MissionMarker` path.
-// Deleting this copy also removed the second substring-first parser responsible
-// for bug C1 (`docs/recon_bugs_manager.md`): a FAILED deliverable that merely
-// mentions `MISSION COMPLETE` in its prose was reported as `Complete`.
+// The marker type, its parser and the failure sanitiser have exactly one owner,
+// `crate::markers` (republished above as `crate::agents::MissionMarker`).
+// Parsing is positional, never substring-first: a FAILED deliverable that merely
+// mentions `MISSION COMPLETE` in its prose is never reported as `Complete`.
 
 /// The `delegate_task` argument payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,7 +192,7 @@ pub trait Specialist: Send + Sync + fmt::Debug {
                 marker: MissionMarker::Failed {
                     reason: ABORT_REASON.to_string(),
                 },
-                // Gate t-070: the aborted-deliverable body has exactly one owner,
+                // The aborted-deliverable body has exactly one owner,
                 // `crate::markers::aborted_deliverable` — the same call the
                 // runner's own abort path (`runner::execution::aborted_deliverable`),
                 // the `delegate_task` handler and the orchestrator worker loop
@@ -224,9 +219,8 @@ pub trait Specialist: Send + Sync + fmt::Debug {
     }
 }
 
-/// Shared assertion helper for per-specialist role/namespace tests: the six
-/// specialist files previously each embedded a near-identical `#[cfg(test)]`
-/// block; they now delegate to this helper.
+/// Shared assertion helper for per-specialist role/namespace tests: each
+/// specialist test module calls this single helper.
 #[cfg(test)]
 pub(crate) fn assert_specialist_role(
     agent: &dyn Specialist,
@@ -276,7 +270,7 @@ mod tests {
         assert_eq!(Agent::from_str("unknown"), None);
     }
 
-    /// Dedup cluster C4: one `MissionMarker` type, shared by both layers.
+    /// One `MissionMarker` type, shared by both layers.
     #[test]
     fn mission_marker_has_one_owner_reexported_by_both_layers() {
         let agents_side: MissionMarker = MissionMarker::Complete { task_id: None };
@@ -285,9 +279,9 @@ mod tests {
         assert_eq!(agents_side, plan_side);
     }
 
-    /// Gate t-059 byte-pin: the abort path builds its trailer through
+    /// Byte-pin: the abort path builds its trailer through
     /// `markers::failed_trailer`, and the rendered deliverable text is still
-    /// **exactly** the historical bytes (this string is asserted elsewhere and
+    /// **exactly** the pinned bytes (this string is asserted elsewhere and
     /// read by `ui::helpers::extract_failure_reason`).
     #[tokio::test]
     async fn aborted_deliverable_keeps_its_exact_bytes() {
@@ -327,7 +321,7 @@ mod tests {
         );
     }
 
-    /// Bug C1 regression (a), seen from the specialist layer: a FAILED
+    /// Regression (a), seen from the specialist layer: a FAILED
     /// deliverable whose prose mentions `MISSION COMPLETE` must not be
     /// reported as a completion.
     #[test]
@@ -342,7 +336,7 @@ mod tests {
         assert!(!marker.is_complete());
     }
 
-    /// Bug C1 regression (b)/(c) at the deliverable boundary: a genuine
+    /// Regression (b)/(c) at the deliverable boundary: a genuine
     /// completion still checks off logically, and `REPLAN REQUIRED` is never a
     /// success.
     #[test]
@@ -359,7 +353,7 @@ mod tests {
         assert!(replan.is_failure());
     }
 
-    /// Bug C1 regression (d): the structured `Deliverable.marker` field is
+    /// Regression (d): the structured `Deliverable.marker` field is
     /// authoritative over the body text; the positional body parse is only the
     /// fallback when no structured marker exists.
     #[test]

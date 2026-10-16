@@ -7,11 +7,9 @@
 //! client: HTTP 503/429/502/504, transport failures, stream errors and the
 //! watchdog timeouts). Application-level errors are never retried.
 //!
-//! **Consumers (cluster C2, see `docs/recon_duplication_net.md`):**
-//! `crate::llm::client::ChatClient::chat_stream` and — since the MCP
-//! unification — both MCP HTTP/SSE request paths,
-//! `crate::mcp::http::HttpSseConnection::send_request` and
-//! `HttpSseConnection::send_notification`.
+//! Consumers: `crate::llm::client::ChatClient::chat_stream` and both MCP
+//! HTTP/SSE request paths, `crate::mcp::http::HttpSseConnection::send_request`
+//! and `HttpSseConnection::send_notification`.
 
 use std::time::Duration;
 

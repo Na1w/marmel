@@ -1,16 +1,15 @@
-//! Char-boundary-safe truncation helpers (dedup cluster C7).
+//! Char-boundary-safe truncation helpers.
 //!
 //! One shared implementation of the "clip a string for display without ever
-//! splitting a multi-byte UTF-8 character" idiom that previously existed as
-//! copy-paste twins in `orchestrator::workers` and as a byte-slicing (panicking)
-//! variant in `ui::helpers::truncate_reason`.
+//! splitting a multi-byte UTF-8 character" idiom: byte-index slicing of a
+//! non-ASCII string panics mid-character, these helpers never do.
 //!
 //! Counting unit is **characters** (Unicode scalar values), not bytes. All
 //! functions here are infallible: they never panic on a non-char boundary and
 //! never split a multi-byte char (Swedish `å`/`ä`/`ö`, emoji, CJK, …).
 //!
-//! The ellipsis wording (`"..."`, three ASCII dots) matches the user-visible
-//! suffix produced by the call sites this module replaced.
+//! The ellipsis wording (`"..."`, three ASCII dots) is the user-visible suffix
+//! these helpers produce.
 
 /// Suffix appended when [`truncate_with_ellipsis`] clips the input.
 const ELLIPSIS: &str = "...";
@@ -30,9 +29,8 @@ pub fn truncate_chars(s: &str, max_chars: usize) -> &str {
 
 /// Returns `s` unchanged when it fits in `max_chars` characters, otherwise the
 /// first `max_chars - 3` characters followed by `"..."` so the *total* result
-/// never exceeds `max_chars` characters (the ellipsis is part of the budget,
-/// matching the 300-byte-cap + 297-char prefix + `"..."` shape of the call
-/// sites this replaced).
+/// never exceeds `max_chars` characters — the ellipsis is part of the budget (a
+/// 300-character cap yields a 297-character prefix plus `"..."`).
 ///
 /// Never splits a multi-byte character and never panics. If `max_chars` is
 /// smaller than the 3-character ellipsis, the result is just `"..."` for a
@@ -63,7 +61,7 @@ mod tests {
         assert_eq!(truncate_with_ellipsis("abc", 10), "abc");
         assert_eq!(truncate_with_ellipsis("abcdefghi", 9), "abcdefghi");
         assert_eq!(truncate_with_ellipsis("abcdefghij", 9), "abcdef..."); // longer: 6 + "..." = 9 chars
-        // Regression for the workers.rs twin shape (300 cap -> 297 chars + "...").
+        // The 300-cap shape: 297 chars + "...".
         let long = "x".repeat(301);
         let cut = truncate_with_ellipsis(&long, 300);
         assert_eq!(cut.chars().count(), 300);

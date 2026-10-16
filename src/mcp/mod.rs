@@ -3,7 +3,7 @@
 //! Provides JSON-RPC 2.0 communication over stdio and HTTP/SSE transports,
 //! supporting server initialization, tool discovery (`tools/list`), and tool execution (`tools/call`).
 //!
-//! # Name policy (security t-034c)
+//! # Name policy
 //!
 //! MCP tools reach the model and the dispatcher under a *composed* wire name,
 //! `{server_name}__{raw_tool_name}` (see [`McpTool::qualified_name`]). Because the
@@ -26,7 +26,7 @@ mod protocol;
 pub use client::{McpClient, McpManager, McpServerConfig, McpTool};
 pub use http::HttpSseConnection;
 
-/// The separator used to compose an MCP server name with a raw tool name
+/// The separator that composes an MCP server name with a raw tool name
 /// (`{server_name}{NAME_SEPARATOR}{raw_tool_name}`).
 pub const NAME_SEPARATOR: &str = "__";
 

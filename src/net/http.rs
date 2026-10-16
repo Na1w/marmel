@@ -1,8 +1,7 @@
-//! Shared reqwest client construction.
+//! Shared reqwest client construction — the single place both clients are built.
 //!
-//! The LLM client (`connect_timeout(10s)`, no total timeout) and the MCP
-//! transport (`timeout(30s)`, no connect timeout) previously built near-
-//! identical clients inline; this is the single shared builder. Each caller
+//! The LLM client wants `connect_timeout(10s)` and no total timeout; the MCP
+//! transport wants `timeout(30s)` and no connect timeout. Each caller
 //! keeps the client-level settings it genuinely needs by passing them in as
 //! [`HttpClientOptions`]; per-request concerns (auth headers, `Accept`,
 //! `Mcp-Session-Id`, bodies) stay at the call sites.
@@ -26,7 +25,7 @@ pub struct HttpClientOptions {
 /// Build a reqwest client with optional connect and total timeouts.
 ///
 /// `None` leaves the corresponding timeout unset (reqwest default: none).
-/// Ergonomic entry point for timeout-only callers; it delegates to
+/// Ergonomic entry point for timeout-only callers; it forwards to
 /// [`build_http_client_with`] so there is exactly one construction site.
 pub fn build_http_client(
     connect_timeout: Option<Duration>,
@@ -38,9 +37,8 @@ pub fn build_http_client(
     })
 }
 
-/// Build a reqwest client from [`HttpClientOptions`] — the single place both the
-/// LLM chat client and the MCP HTTP/SSE transport construct their `Client`
-/// (cluster C3 in `docs/recon_duplication_net.md`).
+/// Build a reqwest client from [`HttpClientOptions`] — the single place both
+/// the LLM chat client and the MCP HTTP/SSE transport construct their `Client`.
 pub fn build_http_client_with(opts: HttpClientOptions) -> Result<reqwest::Client, reqwest::Error> {
     let mut builder = reqwest::Client::builder();
     if let Some(t) = opts.connect_timeout {

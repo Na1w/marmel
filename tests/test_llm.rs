@@ -1,4 +1,5 @@
-//! Phase D integration tests (direct streaming, thinking demuxer, request construction).
+//! Integration tests for direct streaming, the thinking demuxer, and request
+//! construction.
 
 use marmennill::llm::ThinkingDemuxer;
 use marmennill::llm::client::{ChatClient, ReplyOutcome, TerminalCause};
@@ -232,7 +233,7 @@ mod raw_backend {
     }
 }
 
-/// (defect 2) A connection dropped after deltas were already delivered must not
+/// A connection dropped after deltas were already delivered must not
 /// trigger a full-stream retry of the same request: exactly ONE request reaches
 /// the backend, and the turn terminates as `Truncated` with its partial output.
 #[tokio::test]

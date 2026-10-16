@@ -1,6 +1,6 @@
 //! Specialist: **Debugger** — Low-Level Systems Debugger.
 //!
-//! Domain (REQ-ORCH-002): crash forensics, interactive PTY execution,
+//! Domain: crash forensics, interactive PTY execution,
 //! diagnostics, and root-cause analysis.
 //!
 //! Allowed tool namespaces: `delegate_task`, `write_file`, `replace`,

@@ -1,4 +1,4 @@
-//! Phase C integration tests (harness dispatch, FS, and replace).
+//! Integration tests for the harness: dispatch, the filesystem tools, and replace.
 
 use marmennill::agents::Agent;
 use marmennill::harness::fs::{
@@ -106,7 +106,7 @@ async fn test_sleep_execution_and_cancellation() {
     marmennill::orchestrator::reset_cancellation();
 }
 
-// read_file byte ceiling (recon bug H2)
+// read_file byte ceiling
 
 /// The `.`-prefixed staging leftovers currently inside `dir`.
 fn staging_leftovers(dir: &std::path::Path) -> Vec<String> {
@@ -280,7 +280,7 @@ fn read_file_truncation_report_survives_dispatch() {
     assert!(res.content.contains("truncated: true"));
 }
 
-// collision-proof staging + atomic rename (recon bug H4)
+// collision-proof staging + atomic rename
 
 /// (c) Eight `replace` calls racing on the SAME target: none may error, none may
 /// collide on a staging name, no edit may be lost, and no `.`-prefixed staging
@@ -345,9 +345,8 @@ async fn concurrent_replace_on_same_target_keeps_every_edit() {
 }
 
 /// (c2) Collision-proof staging names under a raw race (no per-path lock in
-/// `write_file_atomic`): 24 threads staging into the same directory at once.
-/// With the old `.{name}.tmp.{pid}` shape they all picked one name and
-/// clobbered/renamed each other's staged content.
+/// `write_file_atomic`): 24 threads stage into the same directory at once and
+/// each must land on a distinct staging name.
 #[test]
 fn concurrent_atomic_writes_never_collide_on_staging_names() {
     const WRITERS: usize = 24;
@@ -388,7 +387,7 @@ fn replace_does_not_clobber_preexisting_staging_name() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path().join("clobber_target.txt");
     std::fs::write(&path, "alpha one\n").expect("write fixture");
-    // The pre-fix deterministic temp name, planted as a decoy.
+    // A deterministic pid-derived staging name, planted as a decoy.
     let decoy = tmp
         .path()
         .join(format!(".clobber_target.txt.tmp.{}", std::process::id()));
@@ -462,7 +461,7 @@ fn atomic_write_staging_create_failure_is_explicit_and_leaves_nothing() {
     assert!(!target.exists());
 }
 
-// search truncation contract + brace globs (recon bugs H8 and H10)
+// search truncation contract + brace globs
 
 /// A capped `grep_search` answer carries the machine-visible truncation report
 /// through the real dispatch/role plumbing; a complete answer carries neither
@@ -569,16 +568,15 @@ async fn glob_brace_pattern_and_truncation_survive_dispatch() {
     );
 }
 
-// Gate t-046 — task ids may never escape the directory they are joined onto.
+// Task ids may never escape the directory they are joined onto.
 //
 // Every on-disk path derived from a task id (synthesized prompt files, per-task
-// `-validation.md` verdict files) must route through the crate's single
-// validator in `src/task_id.rs`. These tests run against a temp workspace via
-// `harness::with_workspace_root` and never touch the repository's real
-// `.marmel/`.
+// `-validation.md` verdict files) routes through the crate's single validator in
+// `src/task_id.rs`. These tests run against a temp workspace via
+// `harness::with_workspace_root` and never touch the repository's real `.marmel/`.
 
 /// SSE body carrying one tool call, shaped like the OpenAI stream the client
-/// parses (local helper for the t-046 end-to-end test).
+/// parses (local helper for the task-id end-to-end test).
 fn t046_tool_call_sse(call_id: &str, tool_name: &str, args_json: &str) -> String {
     format!(
         "data: {}\n\ndata: [DONE]\n\n",
@@ -600,7 +598,7 @@ fn t046_tool_call_sse(call_id: &str, tool_name: &str, args_json: &str) -> String
     )
 }
 
-/// Plain-text SSE body (local helper for the t-046 end-to-end test).
+/// Plain-text SSE body (local helper for the task-id end-to-end test).
 fn t046_text_sse(text: &str) -> String {
     format!(
         "data: {}\n\ndata: [DONE]\n\n",
@@ -718,7 +716,7 @@ async fn hostile_task_id_fails_closed_instead_of_reading_a_verdict_outside_promp
                         &serde_json::json!({"path": "notes.md", "content": "hostile id run\n"})
                             .to_string(),
                     ),
-                    // Turn 1: specialist concludes; the verdict gate then runs.
+                    // Turn 1: specialist concludes; validation then runs.
                     1 => t046_text_sse("Work finished.\n\nMISSION COMPLETE (t-046)"),
                     // Only an escaped verdict read would let validation start.
                     _ => t046_text_sse("UNEXPECTED-VALIDATOR-CALL"),

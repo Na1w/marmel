@@ -43,12 +43,9 @@ impl StreamIdentity {
     /// identity model owned by notice routing
     /// ([`crate::orchestrator::notice::worker_routing_identity`]).
     ///
-    /// `agent_tag` is the worker's registry tag — `{agent}-{task}`, possibly
-    /// carrying the `{base}#{n}` collision handle — so it is treated as the
-    /// effective key and split structurally (disambiguator removed, task id
-    /// taken from the canonical task-id grammar). The stream's own
-    /// `agent_name` / `task_id` are the authoritative fields the sink was
-    /// registered with, so they pin the split fields when present.
+    /// `agent_tag` is the registry tag (`{agent}-{task}`, possibly with a
+    /// `{base}#{n}` collision handle) and acts as the effective key; the
+    /// registered `agent_name` / `task_id` are authoritative and pin the split.
     fn routing_identity(&self) -> crate::orchestrator::notice::WorkerRoutingIdentity {
         let mut identity = crate::orchestrator::notice::worker_routing_identity(&self.agent_tag);
 
@@ -70,23 +67,13 @@ impl StreamIdentity {
     }
 
     /// Check if this stream is addressed **exactly** by a target agent name or
-    /// tool_call_id.
-    ///
-    /// Accepted addresses — identical to the notice router
+    /// tool_call_id — accepted addresses are identical to the notice router
     /// ([`crate::orchestrator::notice::WorkerRoutingIdentity::routes`]): the
-    /// broadcast wildcards `*` / `worker`; the exact effective tag
-    /// (`researcher-t-001#7`); the exact natural tag (`researcher-t-001`); the
-    /// exact agent name or a leading role-family segment of it (`validator` →
-    /// `validator-coder`); and the exact task id (`t-001`), decoration- and
-    /// case-tolerant through the canonical normalizer.
-    ///
-    /// t-065: every `contains` / unanchored prefix arm is deliberately gone.
-    /// They aborted the wrong stream — a `t-1` cancel killed the `t-10` stream
-    /// (`ends_with("-t-1")`/`contains`), a truncated tag such as `coder-t-00`
-    /// killed `coder-t-001`, and a bare `coder` killed `validator-coder`. The
-    /// argument *composition* is unchanged: either supplied address may identify
-    /// the stream, and an absent (empty / decoration-only) address is a
-    /// wildcard that matches nothing on its own.
+    /// broadcast wildcards `*` / `worker`, the exact effective or natural tag,
+    /// the exact agent name (or a leading role-family segment of it), and the
+    /// exact task id, decoration- and case-tolerant. Substring or unanchored
+    /// prefix matching is never applied, and an absent (empty or
+    /// decoration-only) address matches nothing on its own.
     pub fn matches(&self, target_agent: Option<&str>, target_tool_call_id: &str) -> bool {
         let identity = self.routing_identity();
 
@@ -237,11 +224,10 @@ impl StreamSink for PreemptibleStreamSink {
 
     fn poll_control(&mut self) -> StreamControl {
         while let Ok(signal) = self.pause_rx.try_recv() {
-            // H2: when the coordinator gives up on this stream it drops the
+            // When the coordinator gives up on this stream it drops the
             // acknowledgement receiver and cancels the stream instead. A signal
             // still queued in the channel is therefore stale: dropping it here
-            // stops the stream from later pausing, printing "Yielded model
-            // slot", and resuming from a pause the orchestrator no longer owns.
+            // stops the stream from pausing into a handshake nobody owns.
             if signal.yielded_tx.is_closed() {
                 tracing::debug!(
                     agent_tag = %self.identity.agent_tag,
@@ -306,7 +292,7 @@ impl PreemptHandle {
 
     pub fn complete_with_subtask_decision(self, decision: Option<&SteerDecision>) {
         if let PreemptHandle::Active(list) = self {
-            // H3: `steer` owns the subtask `action` vocabulary, so every action is
+            // `steer` owns the subtask `action` vocabulary, so every action is
             // normalized once through the single shared normalizer (which rejects
             // and logs unrecognized spellings) instead of being compared raw here.
             let cancel_subtasks: Vec<&SteerSubtaskDecision> = decision
@@ -342,18 +328,14 @@ impl PreemptHandle {
     }
 }
 
-/// Upper bound for the whole preemption acknowledgement handshake (H2).
+/// Upper bound for the whole preemption acknowledgement handshake.
 ///
 /// A preempted stream acknowledges by returning [`StreamControl::Pause`] from
-/// `poll_control` and handing its action receiver back from `on_pause`. Every
-/// conflicting stream must do so within this window; a stream that never
-/// acknowledges is cancelled rather than left running.
-///
-/// Trade-off: the bound has to be short enough that arbitration is not blocked,
-/// so a worker that is blocked mid-tool-call (no SSE chunk to yield, e.g. a long
-/// tool execution) is cancelled instead of waited for. It is `pub` so the product
-/// layer can raise it if a workload legitimately needs longer to reach a yield
-/// point; nothing in this module may wait longer than this for an ack.
+/// `poll_control` and handing its action receiver back from `on_pause`; a
+/// stream that never acknowledges inside this window is cancelled instead of
+/// left running. The bound stays short so arbitration is never blocked, which
+/// means a worker blocked mid-tool-call (no SSE chunk to yield) is cancelled
+/// rather than waited for; it is `pub` so the product layer can raise it.
 pub const PREEMPT_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// One outstanding preemption acknowledgement, bound to its own stream identity.
@@ -385,19 +367,12 @@ impl Future for PendingAck {
 
 /// Preempt any active specialist stream conflicting with `target_model`.
 ///
-/// Handshake (H2): all pause signals are sent up front and their
-/// acknowledgements are then collected concurrently under ONE shared deadline
-/// ([`PREEMPT_ACK_TIMEOUT`]). A stream that has not acknowledged when the
-/// deadline expires has its own `cancel_token` fired, is excluded from the
-/// returned handle, and the call still returns in bounded time — the pause
-/// decision can never hang on a stream that cannot yield its model slot, and a
-/// non-acking stream is never left running until the turn ends.
-///
-/// Each acknowledgement travels together with the identity of the stream that
-/// produced it, so the handle entries and the cancellations stay attached to the
-/// right streams regardless of the order in which the streams acknowledge.
-///
-/// Returns a `PreemptHandle` that must be completed with `PauseAction` after steering.
+/// Handshake: all pause signals are sent up front and their acknowledgements
+/// are collected concurrently under ONE shared deadline
+/// ([`PREEMPT_ACK_TIMEOUT`]); a stream that has not acknowledged when it expires
+/// has its own `cancel_token` fired and is excluded from the returned handle, so
+/// the call always returns in bounded time and each acknowledgement stays paired
+/// with the stream that produced it. The handle must be completed after steering.
 pub async fn preempt_conflicting_stream(target_model: &str, user_msg: &str) -> PreemptHandle {
     let entries: Vec<(StreamIdentity, mpsc::UnboundedSender<PauseSignal>)> = {
         let Ok(map) = ACTIVE_STREAMS.read() else {
@@ -413,10 +388,10 @@ pub async fn preempt_conflicting_stream(target_model: &str, user_msg: &str) -> P
         return PreemptHandle::None;
     }
 
-    // 1. Signal every conflicting stream up front. Waiting for each ack before
-    //    signalling the next one delayed arbitration by 2 s per non-acking stream.
-    //    Every signal is tracked by a waiter that owns its stream identity, so a
-    //    completion can always be attributed to the stream that produced it.
+    // 1. Signal every conflicting stream up front — signalling one at a time
+    //    delays arbitration by up to the ack timeout per non-acking stream.
+    //    Every signal is tracked by a waiter that owns its stream identity, so
+    //    a completion can always be attributed to the stream that produced it.
     let mut waiters: FuturesUnordered<PendingAck> = FuturesUnordered::new();
     for (identity, pause_tx) in entries {
         let (yielded_tx, yielded_rx) = oneshot::channel();
@@ -464,9 +439,8 @@ pub async fn preempt_conflicting_stream(target_model: &str, user_msg: &str) -> P
         }
     }
 
-    // 3. H2: cancel every stream that never acknowledged. Previously these
-    //    identities were dropped without touching their token, so the worker
-    //    stream kept emitting until the whole turn ended.
+    // 3. Cancel every stream that never acknowledged: an identity left
+    //    untouched keeps its worker stream emitting until the turn ends.
     for waiter in waiters.iter() {
         let identity = &waiter.identity;
         match identity.cancel_token.as_ref() {
@@ -619,9 +593,9 @@ mod tests {
         };
         assert!(val_ident.matches(None, "t-002"));
         assert!(val_ident.matches(Some("validator-coder"), ""));
-        // t-065: a role name that is only a *substring* of another role no
-        // longer aborts the wrong stream. `coder` does not address
-        // `validator-coder`; the role-family form that does is `validator`.
+        // A role name that is only a *substring* of another role addresses
+        // nothing: `coder` does not address `validator-coder`; the role-family
+        // form that does is `validator`.
         assert!(!val_ident.matches(Some("coder"), ""));
         assert!(val_ident.matches(Some("validator"), ""));
 
@@ -631,9 +605,9 @@ mod tests {
         assert!(!ident.matches(None, ""));
     }
 
-    /// t-065 (cancel path of the preemption handle): the `t-1` / `t-10` pair
-    /// must be told apart, and every truncated prefix of a tag or task id must
-    /// address nobody.
+    /// Cancel path of the preemption handle: the `t-1` / `t-10` pair must be
+    /// told apart, and every truncated prefix of a tag or task id must address
+    /// nobody.
     #[test]
     fn test_stream_identity_matches_rejects_truncated_prefixes() {
         let short = StreamIdentity {
@@ -650,7 +624,7 @@ mod tests {
         };
 
         // The exact pair: `t-1` addresses the `t-1` stream and never the
-        // `t-10` stream (the legacy arms were `contains` / `ends_with("-{id}")`).
+        // `t-10` stream — substring or suffix matching would address both.
         assert!(short.matches(None, "t-1"));
         assert!(
             !long.matches(None, "t-1"),
@@ -709,8 +683,8 @@ mod tests {
         assert!(!disambiguated.matches(None, "[]"));
     }
 
-    /// t-065 kept the legitimate targeting forms: exact agent name, role
-    /// family, whole tag, and the deliberate broadcast vocabulary of the router.
+    /// The legitimate targeting forms stay: exact agent name, role family,
+    /// whole tag, and the deliberate broadcast vocabulary of the router.
     #[test]
     fn test_stream_identity_name_role_family_and_broadcast_targets_still_match() {
         let validator = StreamIdentity {
@@ -770,7 +744,7 @@ mod tests {
             "handle must be active"
         );
 
-        // Arbitrator cancels t-001 using just the task_id
+        // Arbitrator cancels the running worker using just the task id
         let decision = SteerDecision {
             decision: "DelegateTask".to_string(),
             response: Some(
@@ -809,10 +783,10 @@ mod tests {
         );
     }
 
-    // H2: bounded acknowledgement, non-acking streams get cancelled
+    // Bounded acknowledgement: non-acking streams get cancelled
 
     /// A preemption stream that never acknowledges must be cancelled, not left
-    /// running until the turn ends (H2).
+    /// running until the turn ends.
     #[tokio::test]
     async fn test_non_acking_preemption_stream_is_cancelled_within_bound() {
         let cancel_token = tokio_util::sync::CancellationToken::new();
@@ -844,7 +818,7 @@ mod tests {
         );
     }
 
-    /// Every conflicting stream is awaited under ONE shared deadline (H2), so N
+    /// Every conflicting stream is awaited under ONE shared deadline, so N
     /// non-acking streams cannot delay arbitration by N x the ack timeout, and a
     /// stream that does acknowledge late is still part of the handle.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -965,9 +939,9 @@ mod tests {
         );
     }
 
-    /// A pause signal left queued for a stream that was already given up on must
-    /// be dropped sink-side, so the stream neither pauses nor "resumes" from a
-    /// handshake the orchestrator no longer owns.
+    /// A pause signal left queued for a stream that was already given up on is
+    /// dropped sink-side, so the stream neither pauses nor "resumes" from a
+    /// handshake the orchestrator does not own.
     #[tokio::test]
     async fn test_stale_pause_signal_dropped_after_non_ack_cancel() {
         let cancel_token = tokio_util::sync::CancellationToken::new();
@@ -990,7 +964,7 @@ mod tests {
         );
     }
 
-    // H3: subtask `action` normalization at the preemption call site
+    // Subtask `action` normalization at the preemption call site
 
     /// Every spelling of a known `Cancel` action must reach the same branch.
     #[tokio::test]
@@ -1132,18 +1106,14 @@ mod tests {
         }
     }
 
-    /// H2 pairing guard: every acknowledgement must be paired with the stream
-    /// that produced it, and the cancellation must hit exactly the streams that
-    /// never acknowledged.
+    /// Pairing guard: every acknowledgement must be paired with the stream that
+    /// produced it, and the cancellation must hit exactly the streams that never
+    /// acknowledged.
     ///
     /// `select_all` reports completions in an arbitrary order and reorders the
     /// remaining futures (`swap_remove`), so acknowledgements cannot be tracked
-    /// by position against a parallel identity vector. Eight streams are used
-    /// because the mis-pairing is only observable once several acknowledgements
-    /// arrive in sequence: four of the seven acknowledging streams are Cancel
-    /// targets, so any identity/receiver swap changes which sink is aborted and
-    /// which token is fired, and the one non-acking stream must be the only
-    /// stream excluded from the handle.
+    /// by position against a parallel identity vector; several streams must be
+    /// in flight before any mis-pairing is observable.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_each_preemption_ack_is_paired_with_its_own_stream() {
         const NAMES: [&str; 8] = ["pa", "pb", "pc", "pd", "pe", "pf", "pg", "ph"];

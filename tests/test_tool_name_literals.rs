@@ -1,5 +1,5 @@
-//! Guard test (refactor t-c1v9): tool-name string literals must reference the
-//! constants in `src/tool_names.rs` instead of raw literals.
+//! Guard test: tool-name string literals must reference the constants in
+//! `src/tool_names.rs` instead of raw literals.
 //!
 //! Implementation: scan every `src/**/*.rs` file (except `tool_names.rs`
 //! itself) for raw `"tool_name"` literals from a maintained list of known tool
@@ -69,17 +69,10 @@ const BASELINE: &[(&str, &str, usize)] = &[
     ("src/orchestrator/steer_tests.rs", "delegate_task", 1),
     // Wire-format JSON fixture (serialized tool call shape).
     ("src/types/wire.rs", "read_file", 1),
-    // t-069: the two `sleep` rows this table used to carry are GONE. The fixtures
-    // that needed them now spell the name through the shared table
-    // (`crate::tool_names::TOOL_SLEEP`): `harness/sleep.rs` builds its scanned
-    // needle from `TOOL_SLEEP`, and `tool_args.rs` feeds `json!(TOOL_SLEEP)` as an
-    // arbitrary non-object scalar.
-    // t-070 closed the hand-off t-069 left here: `steer_tests.rs` no longer builds
-    // its scanned needle out of fragments (`["sleep", "_duration_secs("].concat()`)
-    // and no longer passes a bare `"sleep"` decision string, so the
-    // `("src/orchestrator/steer_tests.rs", "sleep", …)` row is deleted — that file
-    // now holds ZERO raw `sleep` literals. Nothing else in `src/` may re-add a
-    // bare tool-name literal without a justified row here.
+    // No `sleep` rows belong here: `harness/sleep.rs`, `tool_args.rs` and
+    // `orchestrator/steer_tests.rs` spell the name through the shared table
+    // (`crate::tool_names::TOOL_SLEEP`) instead of a bare literal. Nothing in
+    // `src/` may add one without a justified row here.
 ];
 
 fn count_literal(content: &str, tool_name: &str) -> usize {

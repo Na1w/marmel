@@ -4,8 +4,7 @@
 //! (checked / unchecked / task id / list-marker strip) comes from
 //! [`crate::plan_parse`], the single owner, so these counts agree with
 //! [`crate::manager::phase::Plan::pending_tasks`] and
-//! [`crate::manager::phase::Plan::all_tasks`] for the same plan on disk
-//! (dedup cluster C3; bug M1 in `docs/recon_bugs_orchestrator.md`).
+//! [`crate::manager::phase::Plan::all_tasks`] for the same plan on disk.
 
 use super::workers::has_active_workers;
 
@@ -127,9 +126,8 @@ mod tests {
         crate::manager::phase::clear_plan_start();
     }
 
-    /// The summary must count exactly what the plan grammar on disk counts —
-    /// including the parenthesised / bold / star / numbered spellings that this
-    /// module's old private regexes silently dropped (`(x)` in particular).
+    /// The summary counts exactly what the plan grammar on disk counts,
+    /// including parenthesised, bold, star and numbered task-line spellings.
     #[test]
     fn test_plan_progress_summary_agrees_with_plan_parse_counts() {
         let plan = "\

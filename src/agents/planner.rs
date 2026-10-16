@@ -1,6 +1,6 @@
 //! Specialist: **Planner** — Strategic Planner & Mission Architect.
 //!
-//! Domain: workspace reconnaissance, dependency-ordered phased planning, and
+//! Domain: workspace inspection, dependency-ordered phased planning, and
 //! mission decomposition into `.marmel/execution_plan.md`.
 //!
 //! Allowed tool namespaces: `create_plan`, `read_file`, `grep_search`, `glob`,

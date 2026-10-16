@@ -1,43 +1,23 @@
-//! t-014a — **manager-history fidelity** acceptance tests, `docs/design_session_restore_data.md`
-//! §9.1 AC-M1 … AC-M8, one `#[test]` per criterion (a failure names the criterion).
+//! Manager-history fidelity tests: a committed manager transcript must come back
+//! from `session::restore::load_bundle` record for record, not merely in summary.
 //!
-//! Every case follows the `tests/test_session_bundle.rs` idiom: build a
-//! `CapturePayload` in memory, commit it with `session::commit::write_bundle` into
-//! a private temp directory (`<temp>/…/.marmel/session`), read it back with
-//! `session::restore::load_bundle`, and compare the restored `ManagerSection`
-//! against the committed one **as `MessageRecord`s** — never as wire forms,
-//! because `types::wire::serialize_assistant_content` (`src/types/wire.rs:30-41`)
-//! folds `content: None` into `""` and a wire comparison would therefore be blind
-//! to the exact loss this format exists to prevent.
+//! Every case builds a `CapturePayload` in memory, commits it with
+//! `session::commit::write_bundle` into a private temp directory under
+//! `<temp>/…/.marmel/session`, reads it back and compares the restored
+//! `ManagerSection` against the committed one **as `MessageRecord`s** — never as
+//! wire forms, because `serialize_assistant_content` folds `content: None` into
+//! `""`, so a wire comparison would be blind to the exact loss this format exists
+//! to prevent. Each case owns its own temp subdirectory and deletes it.
 //!
-//! What each criterion pins:
-//!
-//! * **AC-M1** element-by-element record equality of committed vs restored history;
-//! * **AC-M2** `content: None` vs `Some("")` survive, *and* the member bytes
-//!   literally spell `"content": null` for the `None` case;
-//! * **AC-M3** `reasoning_content`: text, absent, and `Some("")` stay distinct;
-//! * **AC-M4** `tool_calls` verbatim — count, order, `id`, the `"type"` spelling,
-//!   `function.name`, and `function.arguments` **byte-identical**, including an
-//!   `{"_error":"malformed_arguments",…}` payload (never re-sanitized,
-//!   `src/types/wire.rs:88-108`, `:135-138`) and a non-canonical payload (never
-//!   re-serialized);
-//! * **AC-M5** `role:"tool"` results byte-identical with the exact `tool_call_id`,
-//!   and a committed `"(aborted)"` placeholder (`ABORTED_TOOL_RESULT`,
-//!   `src/manager/context.rs:327`/`:390`, `session/format/mod.rs:64`) comes back as
-//!   an ordinary result instead of being re-synthesized or special-cased;
-//! * **AC-M6** no re-role / no illegal re-order; §8 N2 moves are asserted as
-//!   "each moved result sits directly after its own parent assistant, and every
-//!   non-`Tool` turn keeps its own place";
-//! * **AC-M7** the legacy `SYSTEM: CONTEXT LIMIT EXCEEDED` advisory
-//!   (`src/manager/context.rs:287-309`, marker kept in
-//!   `INJECTED_ADVISORY_PREFIXES`) returns byte-identical and unpruned, and a
-//!   `System`-variant rebirth checkpoint stays `System` (§4 R-PIN-3);
-//! * **AC-M8** the engine scalars survive, and a deliberately different `Config`
-//!   budget is *reported* with both numbers, changing neither (§4 R-PIN-6).
-//!
-//! Hermetic: every case owns a unique subdirectory of `std::env::temp_dir()` and
-//! deletes it; nothing is written into the repository; no network, no PTY, no
-//! sleeps; all assertions are deterministic.
+//! Pinned per case, with the witness named in the assertion message: element-wise
+//! record equality; `content: None` vs `Some("")` and the three
+//! `reasoning_content` shapes kept distinct in the member bytes themselves;
+//! `tool_calls` stored verbatim — never re-sanitized, never re-serialized;
+//! `role:"tool"` results byte-identical, a committed `"(aborted)"` placeholder
+//! (`ABORTED_TOOL_RESULT`) restored as an ordinary result; no re-role, no illegal
+//! re-order, and the legacy `SYSTEM: CONTEXT LIMIT EXCEEDED` advisory returned
+//! byte-identical and unpruned while a `System` rebirth checkpoint stays `System`;
+//! the engine scalars survive, a different `Config` budget being reported only.
 
 use std::path::{Path, PathBuf};
 
@@ -56,8 +36,8 @@ use marmennill::session::{
     ToolCallRecord, ToolFunctionRecord, UiSection,
 };
 
-/// Budget the fixture commits with, deliberately far from `Config::default()`
-/// (8192, `src/config.rs:224`) so a silent adoption would be visible.
+/// Budget the fixture commits with, deliberately far from the 8192 default so a
+/// silent adoption would be visible.
 const COMMITTED_BUDGET: usize = 1234;
 
 // ------------------------------------------------------------------ fixtures
@@ -99,7 +79,7 @@ fn cleanup(bundle: &Path) {
 /// A `ManagerSection` whose witnesses are exactly what the capture side would
 /// record: the pin witness is the byte length of `[0]`/`[1]`, and
 /// `pinned_prefix_end` is the loader's own rule (`pinned_prefix_end_records`), so
-/// a fixture is never refused for a reason unrelated to the criterion under test.
+/// a fixture is never refused for a reason unrelated to the behaviour under test.
 fn manager_section(messages: Vec<MessageRecord>) -> ManagerSection {
     manager_section_with(messages, COMMITTED_BUDGET, false, 0)
 }
@@ -256,7 +236,7 @@ fn roles(messages: &[MessageRecord]) -> Vec<&'static str> {
     messages.iter().map(MessageRecord::role).collect()
 }
 
-/// The transcript with every `Tool` turn removed: what the §8 pass set is
+/// The transcript with every `Tool` turn removed: what the loader's re-order is
 /// forbidden to touch.
 fn non_tool(messages: &[MessageRecord]) -> Vec<&MessageRecord> {
     messages
@@ -283,9 +263,9 @@ fn index_of_result(messages: &[MessageRecord], id: &str) -> usize {
 }
 
 /// Every repair counter of a restore that must be a pure no-op.
-/// §8 N2's only legal re-order: a `Tool` result may move, but it must land in the
-/// run of results that belongs to **its own** parent assistant — a block starting
-/// directly after that assistant, covering exactly its calls, in call order.
+/// The loader's only legal re-order: a `Tool` result may move, but it must land in
+/// the run of results that belongs to **its own** parent assistant — a block
+/// starting directly after that assistant, covering exactly its calls, in order.
 fn assert_results_grouped_with_parent(messages: &[MessageRecord]) {
     for (index, record) in messages.iter().enumerate() {
         let MessageRecord::Assistant { tool_calls, .. } = record else {
@@ -327,7 +307,7 @@ fn assert_untouched_by_repairs(report: &RepairReport, expected_len: usize) {
     assert!(report.pins_verified);
 }
 
-// ------------------------------------------------------- AC-M1 (design §9.1 1)
+// ------------------------------------------------- record-for-record equality
 
 /// The committed manager history and the restored one are equal **element by
 /// element** as `MessageRecord`s.
@@ -388,7 +368,7 @@ fn ac_m1_restored_manager_history_equals_committed_element_by_element() {
     cleanup(&bundle);
 }
 
-// ------------------------------------------------------- AC-M2 (design §9.1 2)
+// --------------------------------------- content: None vs Some("") distinct
 
 /// `content: None` and `content: Some("")` are two different facts, and the
 /// **member bytes** say so (`"content": null` vs `"content": ""`).
@@ -447,9 +427,8 @@ fn ac_m2_content_none_vs_empty_string_survive() {
     assert_eq!(restored, &committed, "the whole history is unchanged");
     assert_untouched_by_repairs(&report, committed.len());
 
-    // The assertion the criterion asks for: the serialized member, not only the
-    // decoded value. `session::commit` writes members with `to_vec_pretty`
-    // (`src/session/commit.rs:259`), so `null` is spelled with one space.
+    // The serialized member, not only the decoded value: `session::commit` writes
+    // members with `to_vec_pretty`, so `null` is spelled with one space.
     let text = member_text(&bundle, MANAGER_FILE);
     assert_eq!(
         text.matches(r#""content": null"#).count(),
@@ -463,8 +442,8 @@ fn ac_m2_content_none_vs_empty_string_survive() {
     );
 
     // Why the member bytes, and not the wire form, are the authority: the very
-    // same record, handed to the wire type, loses the distinction — this is the
-    // trap `src/types/wire.rs:30-41` documents.
+    // same record, handed to the wire type, loses the distinction — the trap
+    // `serialize_assistant_content` documents.
     let wire = restored[2].clone().into_wire();
     let wire_json = serde_json::to_string(&wire).expect("a wire message serializes");
     assert!(
@@ -479,7 +458,7 @@ fn ac_m2_content_none_vs_empty_string_survive() {
     cleanup(&bundle);
 }
 
-// ------------------------------------------------------- AC-M3 (design §9.1 3)
+// ------------------------------------- reasoning_content stays distinct
 
 /// `reasoning_content`: text stays text, absent stays absent (the key is not even
 /// written), and `Some("")` stays `Some("")`.
@@ -560,7 +539,7 @@ fn ac_m3_reasoning_content_survives() {
     cleanup(&bundle);
 }
 
-// ------------------------------------------------------- AC-M4 (design §9.1 4)
+// ------------------------------------------------------- tool_calls verbatim
 
 /// `tool_calls` come back verbatim: same count, same order, same `id`, the `type`
 /// key spelled exactly `"function"`, same `function.name`, and
@@ -577,9 +556,9 @@ fn ac_m4_tool_calls_survive_verbatim() {
     // round-trip would sort the keys and re-flow the spacing.
     let noncanonical =
         "{ \"z\" : 1,  \"a\":2, \"nested\": { \"y\": true ,\"x\": null }, \"m\": \"a\\nb\" }";
-    // Already healed by the live boundary repair, with padding: `
-    // ensure_valid_json_arguments` would TRIM it (`src/types/wire.rs:88-108`),
-    // `sanitize_arguments` would rewrite it (`:135-138`).
+    // Already healed by the live boundary repair, with padding:
+    // `ensure_valid_json_arguments` would TRIM it, `sanitize_arguments` would
+    // rewrite it.
     let already_malformed = "  {\"_error\":\"malformed_arguments\",\"_raw\":\"{oops\"}  ";
     // Not JSON at all: a sanitizer would replace it with an `_error` envelope.
     let unterminated = "{oops";
@@ -684,8 +663,8 @@ fn ac_m4_tool_calls_survive_verbatim() {
         "non-canonical key order and whitespace must survive: {shuffled}"
     );
 
-    // `is_malformed` is a read-out, never a repair (`format/messages.rs`): it
-    // reports the two broken payloads and leaves them byte-identical.
+    // `is_malformed` is a read-out, never a repair: it reports the two broken
+    // payloads and leaves them byte-identical.
     assert!(!tool_calls[0].is_malformed());
     assert!(tool_calls[2].is_malformed() && tool_calls[3].is_malformed());
     let again = ToolCallRecord::from_wire(&tool_calls[3].clone().into_wire());
@@ -711,7 +690,7 @@ fn ac_m4_tool_calls_survive_verbatim() {
     cleanup(&bundle);
 }
 
-// ------------------------------------------------------- AC-M5 (design §9.1 5)
+// ------------------------------------------ tool results, aborted included
 
 /// `role:"tool"` results come back byte-identical with the exact `tool_call_id`,
 /// and the `"(aborted)"` placeholder left by the live boundary repair is an
@@ -750,8 +729,8 @@ fn ac_m5_tool_results_survive_byte_identical() {
         ),
         tool("m5-a", nasty),
         tool("m5-b", ""),
-        // Committed by the live boundary repair (`context.rs:327`/`:390`), not by
-        // the restore: after this point the transcript was already paired.
+        // Committed by the live boundary repair, not by the restore: after this
+        // point the transcript was already paired.
         tool("m5-c", ABORTED_TOOL_RESULT),
     ];
     write(&bundle, &payload(committed.clone()));
@@ -827,11 +806,11 @@ fn ac_m5_tool_results_survive_byte_identical() {
     cleanup(&bundle);
 }
 
-// ------------------------------------------------------- AC-M6 (design §9.1 6)
+// ---------------------------------- no re-role, no illegal re-order
 
-/// No re-role, no re-order. `Tool` results may move (that is §8 N2) — and then
-/// each moved result must sit directly after its own parent assistant, while
-/// every non-`Tool` turn keeps its own place and identity.
+/// No re-role, no re-order. `Tool` results may move — and then each moved
+/// result must sit directly after its own parent assistant, while every
+/// non-`Tool` turn keeps its own place and identity.
 #[test]
 fn ac_m6_no_re_role_and_no_illegal_reorder() {
     // ---------- case A: the moves are inside one result block ----------
@@ -997,20 +976,20 @@ fn ac_m6_no_re_role_and_no_illegal_reorder() {
     cleanup(&bundle);
 }
 
-// ------------------------------------------------------- AC-M7 (design §9.1 7)
+// ------------------------------------ legacy advisory, pinned prefix
 
 /// The legacy `SYSTEM: CONTEXT LIMIT EXCEEDED` advisory is opaque bytes: it comes
 /// back byte-identical and unpruned, and a `System`-variant rebirth checkpoint
-/// stays `System` (§4 R-PIN-3/R-PIN-4).
+/// stays `System`.
 #[test]
 fn ac_m7_legacy_advisory_text_and_system_checkpoint_are_opaque() {
     let bundle = bundle_dir("ac-m7");
-    // The marker the current binary no longer emits but old bundles carry
-    // (`context.rs:287-309`, kept in `INJECTED_ADVISORY_PREFIXES:367-372`).
+    // The legacy marker: old bundles carry it, this binary does not emit it.
+    // Its prefix is kept in `INJECTED_ADVISORY_PREFIXES`.
     let advisory = "(SYSTEM: CONTEXT LIMIT EXCEEDED — compaction dropped 12 older \
                     turn(s).\nContinue from the last genuine instruction.)";
-    // The historic `System` spelling of a rebirth checkpoint (the current binary
-    // emits the `User` spelling, bug M12).
+    // The historic `System` spelling of a rebirth checkpoint; the current
+    // binary emits the `User` spelling.
     let checkpoint = format!("{REBIRTH_CHECKPOINT_PREFIX}3 turns distilled: goal pinned.)");
     let committed = vec![
         MessageRecord::System {
@@ -1103,11 +1082,11 @@ fn ac_m7_legacy_advisory_text_and_system_checkpoint_are_opaque() {
     cleanup(&bundle);
 }
 
-// ------------------------------------------------------- AC-M8 (design §9.1 8)
+// -------------------------------------- engine scalars and budget warning
 
 /// The engine scalars survive the bundle, and a deliberately different `Config`
 /// budget produces a `warnings` entry naming **both** numbers while changing
-/// neither (§4 R-PIN-6).
+/// neither.
 #[test]
 fn ac_m8_engine_scalars_survive_and_budget_drift_is_reported() {
     const STORED_BUDGET: usize = COMMITTED_BUDGET; // 1234
@@ -1162,9 +1141,9 @@ fn ac_m8_engine_scalars_survive_and_budget_drift_is_reported() {
     assert_eq!(engine.consecutive_rebirths(), 3);
     assert_eq!(engine.messages().len(), committed.len());
 
-    // ---------- a different Config budget: reported, never reconciled ----------
-    // `ui::session::boot` is the public seam that owns the R-PIN-6 comparison
-    // (`src/ui/session.rs:1219-1226`): `load_bundle` alone has no Config.
+    // ---------- a different Config budget: reported, never adopted ----------
+    // `ui::session::boot` is the public seam that owns the budget comparison:
+    // `load_bundle` alone has no Config.
     let cfg = Config {
         max_context_tokens: LIVE_BUDGET,
         ..Config::default()
@@ -1214,7 +1193,7 @@ fn ac_m8_engine_scalars_survive_and_budget_drift_is_reported() {
         "the advisory flag survives"
     );
     assert_eq!(again.manager.consecutive_rebirths, 3);
-    // The bundle bytes were never rewritten to agree with either budget (A D6).
+    // The bundle bytes were never rewritten to agree with either budget.
     let manifest = member_text(&bundle, MANIFEST_FILE);
     let member = member_text(&bundle, MANAGER_FILE);
     assert!(

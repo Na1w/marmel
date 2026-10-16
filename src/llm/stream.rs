@@ -271,10 +271,6 @@ impl<'a> TurnStreamHandler<'a> {
     }
 
     /// Process an incoming chunk delta delivering events to `sink`. Returns true to continue streaming, false to cut stream.
-    ///
-    /// This is the single chunk entry point: the orchestrator-transcript variant
-    /// that used to sit next to it (`on_chunk`) had no callers and was removed
-    /// as dead plumbing.
     pub fn on_chunk_with_sink<S: StreamSink + ?Sized>(
         &mut self,
         chunk: &str,
@@ -336,9 +332,6 @@ impl<'a> TurnStreamHandler<'a> {
     }
 
     /// Flushes any pending thinking/content deltas to `sink`.
-    ///
-    /// Single flush entry point: the orchestrator-transcript twin (`finish`)
-    /// had no callers and was removed as dead plumbing.
     pub fn finish_with_sink<S: StreamSink + ?Sized>(&mut self, sink: &mut S) {
         self.demux.finish_delta(|kind, text| match kind {
             DeltaKind::Content => sink.emit(StreamEvent::Content(text.to_string())),
@@ -447,8 +440,8 @@ fn is_empty_production(m: &Message) -> bool {
 
 pub(crate) fn build_request(cfg: &StreamConfig, messages: Vec<Message>) -> ChatRequest {
     let mut tools = crate::types::ToolDef::manager_tools();
-    // Advertising goes through the same policy gate as dispatch (t-034c): a MCP
-    // name the policy refused is never even offered to the model, so the schema
+    // MCP tools are advertised under the same policy as dispatch: a name the
+    // policy refused is never even offered to the model, so the advertised schema
     // list and the dispatchable set can never disagree.
     for tool in crate::harness::allowed_mcp_tools(&cfg.mcp_servers) {
         tools.push(crate::types::ToolDef::from_mcp(&tool));

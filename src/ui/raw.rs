@@ -68,11 +68,10 @@ impl RawRenderer {
 
 /// The `delegation` line raw mode prints for a failed delegation.
 ///
-/// Gate t-059: the verdict word is the marker owner's constant
+/// The verdict word is the marker owner's constant
 /// ([`crate::markers::MARKER_FAILED`]) rather than a hand-typed literal, so the
 /// vocabulary has one owner. The rendered bytes are unchanged — `FAILED` is
-/// followed by exactly two spaces to column-align with `STARTED →` / `DONE` —
-/// and that alignment is pinned by `test_delegation_failed_line_keeps_its_exact_bytes`.
+/// followed by exactly two spaces to column-align with `STARTED →` / `DONE`.
 fn delegation_failed_line(agent: Agent, task: Option<&str>, reason: Option<&str>) -> String {
     let t = task.unwrap_or("(no task id)");
     let reason_suffix = reason
@@ -170,61 +169,32 @@ impl Renderer for RawRenderer {
         let _ = self.flush();
     }
 
-    // ---- session-rehydration hooks (flow §4.7, design A §6) ----
+    // ---- session-rehydration hooks ----
 
-    /// Raw mode keeps **no pane model**, so it can honestly claim **nothing**.
-    ///
-    /// What it would have to report does not exist: there is no chat pane (each
-    /// event is written straight to stdout, and stdout is not readable back), no
-    /// status line, no composer (`poll_input`/`read_input` are the trait
-    /// defaults: headless mode has no interactive stdin), no scroll offsets, no
-    /// selection, and no subagent panels — subagent streams go to stdout as
-    /// they arrive. The only state here is `buffer` (bytes already committed to
-    /// the stream, pending a flush) and the abort flags, neither of which is a
-    /// pane. So capture returns the empty section, which is a *loadable* one
-    /// (`UiSection::structural_violations()` is empty for it) and asserts no
-    /// capability raw mode does not have.
-    ///
-    /// That covers the t-020 groups as well: there is no plan box, no in-flight
-    /// streaming region, no agent identity line, no token counter and no armed
-    /// abort window in raw mode, so `plan_content`, `current_thought`,
-    /// `current_content`, `active_agent`, `steer_sentence_buffer`, the three
-    /// token witnesses and `abort_armed` are all honestly the serde default —
-    /// the empty section is still a loadable one.
+    /// Raw mode keeps **no pane model**, so an honest capture claims **nothing**:
+    /// there is no chat pane (events go straight to stdout, which is not readable
+    /// back), no status line, no composer (`poll_input`/`read_input` are the trait
+    /// defaults), no scroll offsets, no selection and no subagent panels — only
+    /// `buffer` (bytes pending a flush) and the abort flags. The empty section
+    /// returned is a *loadable* one (`UiSection::structural_violations()` is empty
+    /// for it), and every extra pane group — plan box, streaming partials, agent
+    /// identity, token counters, abort-arming window — is unclaimed at its serde
+    /// default for the same reason.
     fn capture_ui(&self) -> crate::session::format::UiSection {
         crate::session::format::UiSection::default()
     }
 
-    /// Raw mode has no panes to rehydrate, so the honest restore is a **replay
-    /// of the stored pane text into the output stream**: one labelled line per
-    /// stored entry, in stored order, byte-verbatim.
-    ///
-    /// The stream is not corrupted:
-    /// * every line goes through `push_line`, which chunks on UTF-8 boundaries
-    ///   (`chunk_utf8`), so a multi-byte character is never split;
-    /// * nothing is written to `stdout` behind the buffer — the bytes join the
-    ///   buffer and leave through the single existing writer (`flush`), which
-    ///   writes the whole buffer and clears it in one step;
-    /// * `input_state` (the abort / user-exit flags) is untouched, and the
-    ///   replay never re-emits `[done]`, so the session-loop termination
-    ///   contract is unchanged.
-    ///
-    /// What raw mode therefore CANNOT restore, honestly: it never enters terminal
-    /// raw mode or the alternate screen, so there is no screen to repaint —
-    /// `shutdown` is only a flush (see the doc on [`RawRenderer`]), and the
-    /// already-printed part of a previous process's stdout is unrecoverable.
-    /// Composer text, caret, scroll offsets, selection, subagent panels, thinking
-    /// and budget counters, and every group added for pane coverage (t-020: the
-    /// plan box, the streaming partials, the agent identity, the token witness
-    /// and the abort-arming witness) have no raw-mode representation at all, so
-    /// the corresponding `UiSection` fields are named on the stream
-    /// (`[restore]` header + one `[restore-skipped]` line per non-empty group)
-    /// rather than pretended at.
-    ///
-    /// The replay only ever JOINS `buffer`: the bytes leave through the single
-    /// existing writer (`flush`, reached by the next event or by `shutdown`), so
-    /// there is no partial write, no interleaving with an in-flight line, and no
-    /// change to the abort / user-exit flags or to the `[done]` contract.
+    /// Raw mode has no panes to rehydrate, so the honest restore is a **replay of
+    /// the stored pane text into the output stream**: one labelled line per stored
+    /// entry, in stored order, byte-verbatim, each through `push_line`
+    /// (`chunk_utf8`) so no multi-byte character is split and nothing is written
+    /// to stdout behind the buffer. `[done]` is never re-emitted, so the
+    /// session-loop termination contract and the abort / user-exit flags stand.
+    /// What raw mode cannot represent — composer, caret, scroll offsets,
+    /// selection, subagent panels, counters, and the plan / streaming / identity /
+    /// token / abort groups (see the doc on [`RawRenderer`]) — is named on the
+    /// stream (`[restore]` header plus one `[restore-skipped]` line per non-empty
+    /// group) instead of being dropped silently.
     fn restore_panes(&mut self, section: &crate::session::format::UiSection) {
         self.push_line(
             "restore",
@@ -237,13 +207,13 @@ impl Renderer for RawRenderer {
         );
         for line in &section.chat_messages {
             if line.is_empty() {
-                // U2: an empty pane line is legal content that SHALL survive.
+                // An empty pane line is legal content that SHALL survive:
                 // `push_line` would skip it (`chunk_utf8("")` yields no chunk),
                 // so it is spelled here as its own labelled line.
                 let _ = writeln!(self.buffer, "[restored]");
                 continue;
             }
-            // U1: the stored string is echoed verbatim; it is never re-rendered.
+            // The stored string is echoed verbatim; it is never re-rendered.
             self.push_line("restored", line);
         }
         for panel in &section.subagent_panels {
@@ -256,9 +226,8 @@ impl Renderer for RawRenderer {
                 ),
             );
         }
-        // t-020 pane-coverage groups: raw mode has no box for any of them, and it
-        // says so per group instead of dropping them silently (A §10 N-R2: an
-        // unlisted loss is a defect; a named one is honest).
+        // Raw mode has no pane for any of these groups, so it names each one on
+        // the stream instead of dropping it silently.
         if !section.plan_content.is_empty() {
             self.push_line(
                 "restore-skipped",
@@ -325,9 +294,9 @@ impl Renderer for RawRenderer {
         }
     }
 
-    /// The report goes to the same stream, as labelled lines, plus the
-    /// `tracing::warn!` (A §8.4: loud, never a `let _ =` swallow). Raw mode has
-    /// no status line, so the header line stands in for it.
+    /// The report goes to the same stream, as labelled lines, plus a
+    /// `tracing::warn!` — loud, never swallowed. Raw mode has no status line, so
+    /// the header line stands in for it.
     fn announce_restore(&mut self, report: &crate::session::format::RepairReport) {
         self.push_line(
             "restore",
@@ -370,10 +339,10 @@ mod tests {
         assert_eq!(buffered, "[assistant] I am on it\n[tool-result] content\n");
     }
 
-    /// Gate t-059 byte-pin: the verdict word now comes from
-    /// `crate::markers::MARKER_FAILED`, and every rendered byte is unchanged —
-    /// including the two spaces that column-align `FAILED` with `STARTED →` /
-    /// `DONE`, the `(no task id)` placeholder and the empty-reason filter.
+    /// Byte-pin: the verdict word comes from `crate::markers::MARKER_FAILED`,
+    /// and every rendered byte is fixed — including the two spaces that
+    /// column-align `FAILED` with `STARTED →` / `DONE`, the `(no task id)`
+    /// placeholder and the empty-reason filter.
     #[test]
     fn test_delegation_failed_line_keeps_its_exact_bytes() {
         assert_eq!(
@@ -413,7 +382,7 @@ mod tests {
         assert!(lines.iter().all(|l| l.starts_with("[status] ")));
     }
 
-    // ---- rehydration hooks (t-011, flow §4.7) ----
+    // ---- rehydration hooks ----
 
     /// Raw mode owns no pane model, so capture must not claim one: it returns the
     /// empty (but loadable) section.
@@ -435,9 +404,9 @@ mod tests {
             section.budgets,
             crate::session::format::BudgetWitness::default()
         );
-        // t-020: every group added for pane coverage is unclaimed too, because
-        // raw mode holds none of it (no plan box, no streaming region, no agent
-        // identity, no counters, no armed abort window).
+        // Every group added for pane coverage is unclaimed too: raw mode holds
+        // none of it (no plan box, no streaming region, no agent identity, no
+        // counters, no armed abort window).
         assert_eq!(section.plan_content, "");
         assert!(!section.view.show_plan_panel);
         assert!(!section.had_active_plan);
@@ -505,7 +474,7 @@ mod tests {
             buffered.contains("[restore] raw mode has no panes: replaying 3 stored pane line(s)")
         );
         assert!(buffered.contains("[restored] User: héllo wörld 🎉\n"));
-        // U2: the empty pane line survives as its own line.
+        // The empty pane line survives as its own line.
         assert!(buffered.contains("[restored]\n"));
         assert!(buffered.contains("[restored] Marmennill: done\n"));
         assert!(
@@ -537,8 +506,8 @@ mod tests {
         assert_eq!(payload, "é".repeat(600));
     }
 
-    /// t-020: every pane-coverage group raw mode cannot represent is named on the
-    /// stream, so no stored group is dropped silently (A §10 N-R2).
+    /// Every pane-coverage group raw mode cannot represent is named on the
+    /// stream, so no stored group is dropped silently.
     #[test]
     fn test_raw_restore_names_every_pane_group_it_cannot_represent() {
         let mut r = RawRenderer::new();

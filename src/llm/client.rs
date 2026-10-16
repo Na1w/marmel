@@ -12,9 +12,9 @@ pub const INITIAL_RESPONSE_WATCHDOG_SECS: u64 = 300;
 pub const INTER_CHUNK_WATCHDOG_SECS: u64 = 300;
 /// Upper bound on the entire streaming read (20 minutes safety watchdog for up to 32k tokens).
 pub const OVERALL_READ_TIMEOUT_SECS: u64 = 1200;
-// This client owns no retry policy of its own: the attempt count, the backoff
-// base and the retryability classification (`ChatError::is_retryable`) are
-// consumed from their single owner, `crate::net::retry` (see `src/net/retry.rs`).
+// Retry policy has one owner, `crate::net::retry` (see `src/net/retry.rs`):
+// this client consumes from it the attempt count, the backoff base and the
+// retryability classification (`ChatError::is_retryable`).
 
 static GLOBAL_TOKENS_IN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GLOBAL_TOKENS_OUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -153,7 +153,7 @@ impl TerminalCause {
 /// The terminal signal handed to [`ReplyAccumulator::finalize`]: the state, the
 /// cause that produced it, the provider's `finish_reason` when one was seen, and
 /// whether the "LLM reply completed" info lines are emitted (only the full-read
-/// path ever did that).
+/// path emits them).
 #[derive(Debug, Clone)]
 pub(crate) struct Terminal {
     pub(crate) outcome: ReplyOutcome,
@@ -240,7 +240,7 @@ pub struct ChatClient {
 }
 
 fn default_http_client() -> reqwest::Client {
-    // Shared client builder (was hand-rolled here and in mcp/http.rs).
+    // Shared HTTP client builder: this client builds no client of its own.
     crate::net::build_http_client(Some(Duration::from_secs(10)), None).unwrap_or_default()
 }
 
@@ -324,8 +324,7 @@ impl ChatError {
 /// every attempt of [`ChatAttempt`]. The counter is per *call*, not per attempt,
 /// so the single retry owner is told — through [`ChatError::Interrupted`], the
 /// one `ChatError` class whose [`crate::net::Retryable`] classification says
-/// "never retry" — that a request which already delivered deltas must not be
-/// re-sent. No second retry path is added here.
+/// "never retry" — that a request which has already delivered deltas is never re-sent.
 #[derive(Debug)]
 pub(crate) struct StreamProgress<F> {
     on_delta: F,
@@ -356,14 +355,15 @@ impl<F: FnMut(&str) -> bool> StreamProgress<F> {
         self.deltas
     }
 
-    /// The retry-forbid gate: has this call already delivered anything?
+    /// Has this call already delivered anything? If so, a retry of the same
+    /// request is forbidden.
     fn has_emitted_deltas(&self) -> bool {
         self.deltas > 0
     }
 
     /// Turn a failure that landed after deltas were delivered into the terminal
     /// `Truncated` state, carrying the partial accumulation. The warn names the
-    /// delta count and the byte count — the re-billing this guard prevented.
+    /// delta count and the byte count — the re-billing this prevents.
     fn forbid_mid_stream_retry(&self, cause: ChatError, partial: StreamedReply) -> ChatError {
         tracing::warn!(
             "LLM stream interrupted after {} deltas / {} bytes: {cause}; a mid-stream retry of the same request is forbidden, terminating as {}",
@@ -538,16 +538,13 @@ impl ChatClient {
             req_body.model = self.model.clone();
         }
         // Pre-send normalization of the cloned payload (never the caller's history):
-        // strict OpenAI-compatible chat formats accept `role: "system"` only in the
-        // first position and reject anything later with HTTP 400 ("System message
-        // must be at the beginning."). System messages mid-history come from
-        // compaction checkpoints (ContextEngine::perform_rebirth injects the
-        // "(SYSTEM: REBIRTH CHECKPOINT ...)" message) and from session bundles
-        // restored from older builds. Demote them to `user` on the wire, keeping the
-        // content byte-for-byte; the in-memory vector keeps its real roles so the
-        // rebirth/checkpoint detectors (REBIRTH_CHECKPOINT_PREFIX, pinned_prefix_end)
-        // keep matching. Runs before token counting, debug dumps and request logging
-        // so those reflect the real payload.
+        // strict OpenAI-compatible chat formats accept `role: "system"` only at index
+        // 0 and reject later ones with HTTP 400 ("System message must be at the
+        // beginning."). Mid-history system messages come from compaction checkpoints
+        // (`ContextEngine::perform_rebirth`) and from session bundles restored from
+        // older builds: demote them to `user` on the wire with byte-identical content,
+        // keeping the real roles in memory so the checkpoint detectors still match.
+        // Runs before token counting, debug dumps and request logging.
         for (index, msg) in req_body.messages.iter_mut().enumerate() {
             if index > 0 && matches!(msg, crate::types::Message::System { .. }) {
                 // `Message` has no `Default`, so swap the element out before reading it.
@@ -696,7 +693,7 @@ impl ChatClient {
                 terminal.finish_reason = state.finish_reason.take();
                 return Ok(
                     // The very first SSE event already carried the terminal
-                    // marker: no completion-summary lines, as before.
+                    // marker: this site emits no completion-summary lines.
                     state.into_accumulator().finalize(
                         &url,
                         &req_body.model,
@@ -1097,8 +1094,8 @@ where
                         }
                     }
                 }
-                // A keep-alive poll of the caller's hook, as before: a tool-call
-                // only stream must still observe cancellation.
+                // Keep-alive poll of the caller's hook: a tool-call-only stream
+                // must still observe cancellation.
                 progress.count_delta();
                 if !progress.on_delta_mut()("") {
                     return Ok(ConsumeMark::Aborted);

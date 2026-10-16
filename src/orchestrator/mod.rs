@@ -1,14 +1,15 @@
-//! Fractal Orchestration — Manager + Specialist Subagents (REQ-ORCH-001…005).
+//! Fractal Orchestration — Manager + Specialist Subagents.
 //!
 //! The Manager (`OrchestratorManager`) owns user interaction, goal
 //! decomposition, planning, delegation, and synthesis. It is STRICTLY
 //! FORBIDDEN from performing domain-specific work; every unit of domain work is
-//! emitted via `delegate_task` (REQ-ORCH-001). Its only permitted tools are
-//! `delegate_task`, `create_plan`/plan updates, read-only non-domain diagnostic
-//! inspection, and final synthesis.
+//! emitted via `delegate_task`. Its only permitted tools are `delegate_task`,
+//! `create_plan`/plan updates, read-only non-domain diagnostic inspection, and
+//! final synthesis.
 //!
 //! Submodules:
-//! - `registry` — the `SpecialistRegistry` (REQ-ORCH-002).
+//! - `registry` — the `SpecialistRegistry` of resolvable role ids and their
+//!   tool namespaces.
 
 pub mod bus;
 pub mod delegate;
@@ -81,16 +82,15 @@ pub const MAX_EXECUTING_ROUNDS: usize = 100;
 /// The Manager (Orchestrator). Owns user interaction, goal decomposition,
 /// planning, delegation, and synthesis. It NEVER performs domain work itself.
 ///
-/// All delegation methods are **synchronous from the Manager's perspective**
-/// (REQ-ORCH-005): `delegate` blocks until the specialist returns its
-/// deliverable.
+/// All delegation methods are **synchronous from the Manager's perspective**:
+/// `delegate` blocks until the specialist returns its deliverable.
 #[derive(Debug)]
 pub struct OrchestratorManager {
     /// User interaction handle (synthesis-driven replies to the user).
     pub client: ChatClient,
-    /// The on-disk plan (shared workspace source of truth, REQ-ORCH-004).
+    /// The on-disk plan (shared workspace source of truth).
     pub plan: Plan,
-    /// The specialist registry (REQ-ORCH-002).
+    /// The specialist registry.
     pub registry: SpecialistRegistry,
     /// Orchestration config (max depth bound).
     pub orchestration: OrchestrationConfig,
@@ -98,14 +98,12 @@ pub struct OrchestratorManager {
     pub stats: Arc<HarnessStats>,
     /// Current recursion depth (the Manager is the root, depth 0).
     pub depth: RecursionDepth,
-    /// Delegation lifecycle events surfaced to the UI (t6-REQ-3). The Manager
-    /// records a `Started`/`Completed` event per delegation so renderers can show
+    /// Delegation lifecycle events surfaced to the UI: the Manager records a
+    /// `Started`/`Completed`/`Failed` event per delegation so renderers can show
     /// which specialist is active and on which task. Interior mutability
-    /// (`Arc<Mutex<_>>`) lets the shared Manager — built in `boot_manager`
-    /// (`src/main.rs`) and handed to the live session runner as
-    /// `Arc<OrchestratorManager>` (`run_session` in `src/ui/session.rs`, which
-    /// drives the Manager turn loop while delegated specialist turns run in
-    /// `src/agents/runner/*`) — be drained concurrently by the UI
+    /// (`Arc<Mutex<_>>`) lets the shared `Arc<OrchestratorManager>` — built in
+    /// `boot_manager` (`src/main.rs`) and handed to `run_session`
+    /// (`src/ui/session.rs`) — be drained by the UI
     /// (`drain_delegation_events_with_transcript`) without a `&mut` borrow, so
     /// `delegate` stays `&self`.
     pub delegation_events: Arc<std::sync::Mutex<Vec<DelegationEvent>>>,
@@ -193,22 +191,20 @@ impl OrchestratorManager {
         Ok(())
     }
 
-    /// REQ-ORCH-005: emit a `delegate_task` and **block** until the specialist
+    /// Emit a `delegate_task` and **block** until the specialist
     /// returns. This is synchronous from the Manager's perspective.
     pub async fn delegate(&self, req: DelegationRequest) -> Result<Deliverable> {
-        // 1. Resolve the agent against the registry (REQ-ORCH-002).
+        // 1. Resolve the agent against the registry.
         let entry = self
             .registry
             .resolve(req.agent_name)
             .ok_or_else(|| anyhow::anyhow!("unknown specialist: {}", req.agent_name))?;
 
-        // 2. Fractal depth gate (REQ-ORCH-001): nested delegation beyond the
-        //    bound is rejected. This mirrors caesar's `Orchestrator` recursion
-        //    gate, which is UNCONDITIONAL — the bound is enforced regardless of
-        //    `recursion_granted`, so a request that would exceed the bound is
-        //    rejected before any worker is spawned and before any `Started`
-        //    event is surfaced (a rejected delegation must not emit a spurious
-        //    lifecycle event).
+        // 2. Fractal depth bound: nested delegation beyond the bound is
+        //    rejected UNCONDITIONALLY — the bound is enforced regardless of
+        //    `recursion_granted` — and before any worker is spawned or any
+        //    `Started` event is surfaced, so a rejected delegation never emits a
+        //    spurious lifecycle event.
         if self
             .depth
             .step(self.orchestration.max_recursion_depth)
@@ -221,10 +217,9 @@ impl OrchestratorManager {
             ));
         }
 
-        // 2b. Surface the delegation start to the UI (t6-REQ-3). Emitted only
-        //     after the depth gate passes, so a rejected delegation never
-        //     surfaces a `Started` event (parity with caesar, which returns
-        //     before spawning a worker on depth rejection).
+        // 2b. Surface the delegation start to the UI. Emitted only
+        //     after the depth check passes, so a rejected delegation never
+        //     surfaces a `Started` event: it returns before spawning a worker.
         if let Ok(mut ev) = self.delegation_events.lock() {
             ev.push(DelegationEvent::Started {
                 agent: entry.agent,
@@ -239,18 +234,17 @@ impl OrchestratorManager {
         );
         let start_time = std::time::Instant::now();
 
-        // 4. Build the ISOLATED context (REQ-ORCH-003): Disk-first lookup!
-        //    If a prompt already exists for this task on disk (from plan pregeneration),
-        //    load it immediately for zero-latency startup. Fall back to JIT synthesis
-        //    for ad-hoc or un-planned tasks.
+        // 4. Build the ISOLATED context: disk-first lookup. A prompt that already
+        //    exists on disk for this task (from plan pregeneration) is loaded
+        //    immediately for zero-latency startup; ad-hoc or un-planned tasks
+        //    fall back to JIT synthesis.
         //
-        //    Gate t-055: the disk-first path is built through
-        //    [`saved_prompt_path_for_task`] so the task id passes
-        //    [`crate::task_id::validate_task_id`] before it is ever joined onto the
-        //    prompts directory. A rejected id is reported and the read is skipped —
-        //    exactly the shape of a missing prompt file — so the delegation falls
-        //    back to JIT prompt synthesis instead of reading (or deriving) some
-        //    other file name.
+        //    The path is built through [`saved_prompt_path_for_task`], so the task
+        //    id passes [`crate::task_id::validate_task_id`] before it is ever
+        //    joined onto the prompts directory. A rejected id is reported and the
+        //    read skipped — the same shape as a missing prompt file — so the
+        //    delegation falls back to JIT synthesis rather than reading (or
+        //    deriving) some other file name.
         let prompts_dir = self.plan.dir().join("prompts");
         let ws_root = self.plan.dir().parent().unwrap_or_else(|| self.plan.dir());
 
@@ -311,18 +305,13 @@ impl OrchestratorManager {
                 marker: MissionMarker::Failed {
                     reason: crate::markers::ABORT_REASON.to_string(),
                 },
-                // gate t-070: the whole aborted-deliverable body — sentence and
-                // verdict trailer — is spelled by the single owner
-                // `crate::markers::aborted_deliverable`, the same call
+                // The whole aborted-deliverable body — sentence and verdict
+                // trailer — is spelled by the single owner
+                // `crate::markers::aborted_deliverable`, the same call made by
                 // `orchestrator::delegate::handle_delegate_task`,
                 // `agents::Generalist::run` and
-                // `agents::runner::execution::aborted_deliverable` make. This
-                // site used to hand-build `"…\n\nFAILED (aborted)"` through
-                // `failed_trailer`, which is the one marker vocabulary copy the
-                // conservative single-owner scan could not see (this file
-                // declares `#[cfg(test)] mod …` items *before* its production
-                // code, so the line-by-line scan stops at line 18) — the reason
-                // `HAND_OFF_MARKER_SITES` existed and the reason it is now empty.
+                // `agents::runner::execution::aborted_deliverable`; no marker
+                // text is hand-built at this site.
                 content: crate::markers::aborted_deliverable("aborted by user instruction"),
                 task_id: req.task_id.clone(),
             }
@@ -368,30 +357,17 @@ impl OrchestratorManager {
     }
 
     /// Auto check-off: on `MISSION COMPLETE (task-id)` flip `- [ ] [t-xxx]` to
-    /// `- [x] [t-xxx]`; on FAILED/REPLAN leave unchecked (REQ-PLAN-002).
-    ///
-    /// t-202/t-302: the authoritative [`MissionMarker`] on the deliverable is the
-    /// gate keeper. A task is only ever checked off when the *marker* is a
-    /// genuine [`MissionMarker::Complete`] AND the *content* still carries a
-    /// `MISSION COMPLETE (t-xxx)` terminal marker. This double gate guarantees
-    /// that a `FAILED` / `REPLAN` deliverable — or a REJECTED deliverable that
-    /// carries a stale completion token from a pre-validation draft in its
-    /// content body — stays unchecked (REQ-PLAN-002 / REQ-ORCH-005). The
-    /// resolved `task_id` override is passed as the explicit binding so
-    /// check-off still works when the subagent omits the parenthesized id.
-    ///
-    /// t-035a: the already-parsed `d.marker` is **threaded into**
-    /// [`Plan::check_plan_on_deliverable`] instead of being dropped, so the plan
-    /// layer resolves the verdict and the task id from the structured marker
-    /// (the single authority) rather than re-deriving them from the body. The
-    /// body scan below stays as the second gate and is produced by the same
-    /// owner (`crate::markers` through [`MissionMarker::parse`]) — it can never
-    /// diverge from the plan layer's parse, and a marker naming a **different**
-    /// task id aborts the check-off there.
+    /// `- [x] [t-xxx]`; on FAILED/REPLAN leave unchecked. The authoritative
+    /// [`MissionMarker`] decides: only a genuine [`MissionMarker::Complete`]
+    /// **and** a body that [`MissionMarker::parse`] still reads as complete may
+    /// check a task off, so a deliverable carrying a stale completion token from
+    /// an earlier draft stays unchecked. The parsed marker plus the resolved
+    /// `task_id` binding are threaded into [`Plan::check_plan_on_deliverable`],
+    /// which aborts when the marker names a **different** task id.
     fn apply_check_off(&self, d: Deliverable, task_id: Option<String>) -> Deliverable {
         let tid = d.task_id.clone().or(task_id);
         if matches!(d.marker, MissionMarker::Complete { .. }) {
-            // Second gate: the *content* must still carry a terminal completion
+            // Second check: the *content* must still carry a terminal completion
             // marker, judged by the marker owner — no second parser here.
             let body_says_complete = matches!(
                 MissionMarker::parse(&d.content),
@@ -414,7 +390,7 @@ impl OrchestratorManager {
         d
     }
 
-    /// REQ-ORCH-001: resolve the role system prompt for a specialist.
+    /// Resolve the role system prompt for a specialist.
     /// Used in tests to verify specialist prompt isolation invariants.
     #[cfg(test)]
     pub(crate) fn role_prompt_for(&self, agent: Agent) -> String {
@@ -428,27 +404,19 @@ impl OrchestratorManager {
         }
     }
 
-    /// REQ-ORCH-001 / REQ-PLAN-003: drive the Executing phase as a Silent
-    /// Dispatcher. For each unchecked plan task, route it to the specialist
-    /// whose domain matches the task's type (via the `scheduler` closure),
-    /// emitting `delegate_task` calls only. Independent tasks MAY be delegated
-    /// in parallel (REQ-ORCH-005); each call blocks per-specialist.
+    /// Drive the Executing phase as a Silent Dispatcher: every unchecked plan
+    /// task is routed by the `scheduler` closure (task id → matching specialist)
+    /// to `delegate_task` calls only, each blocking per-specialist.
     ///
-    /// The `scheduler` closure maps a task id to the specialist whose domain
-    /// matches that task's type (REQ-ORCH-002 selection rule).
-    ///
-    /// The loop gate uses the **fallible** plan API ([`Plan::try_pending_tasks`]),
-    /// so an unreadable plan is an error, never a completion (bug M8):
-    /// * `Ok(non-empty)` — dispatch those tasks (the normal path);
-    /// * `Ok(empty)` — the plan **was read successfully** and nothing is pending
-    ///   (all boxes ticked, or no plan file at all): the completion path;
-    /// * `Err(_)` — the plan state is **UNKNOWN**: logged and propagated, so no
-    ///   caller can read this run as "the mission is finished".
+    /// Each round reads the plan exactly once through the **fallible**
+    /// [`Plan::try_pending_tasks`]: `Ok(non-empty)` dispatches, `Ok(empty)` is the
+    /// completion path, and `Err(_)` means the plan state is **UNKNOWN** — logged
+    /// and propagated, never readable as "the mission is finished".
     pub async fn run_executing(
         &mut self,
         scheduler: &dyn Fn(&str) -> Agent,
     ) -> Result<Vec<Deliverable>> {
-        // t6-REQ-4: enforce the Manager-Never-Does-Domain-Work invariant at the
+        // Enforce the Manager-Never-Does-Domain-Work invariant at the
         // entry to the silent-dispatch loop, before any delegation.
         self.guard_no_domain_work()?;
 
@@ -456,16 +424,10 @@ impl OrchestratorManager {
         let mut attempts = 0;
         // Cap iterations so an un-delegate-able task cannot loop forever.
         //
-        // M8 (t-031h fallible API; folded hand-off): this gate used to be
-        // `!is_complete() && pending_tasks()`. `pending_tasks()` swallows a read
-        // failure (it logs, then yields an EMPTY `Vec`), and the `is_empty()`
-        // break below returned `Ok(results)` — byte-for-byte what a finished plan
-        // returns. An unreadable plan therefore silently dropped the remaining
-        // work and let the mission look complete. The gate now reads the plan
-        // exactly ONCE per round through `try_pending_tasks()`, which propagates
-        // the failure (it also removes the old second `PLAN_MUTEX` acquisition per
-        // round made by `is_complete()`; nothing else on this path holds the
-        // guard, so there is no second lock path and no re-entrant deadlock).
+        // The plan is read exactly ONCE per round through `try_pending_tasks()`,
+        // which propagates a read failure instead of yielding an empty list: an
+        // unreadable plan can therefore never be mistaken for a finished one, and
+        // no second per-round `PLAN_MUTEX` acquisition exists on this path.
         while attempts < MAX_EXECUTING_ROUNDS {
             let pending = match self.plan.try_pending_tasks() {
                 Ok(pending) => pending,
@@ -480,7 +442,7 @@ impl OrchestratorManager {
             };
             if pending.is_empty() {
                 // A successfully read plan with nothing pending (every box ticked,
-                // or no plan file on disk): the pre-existing completion path.
+                // or no plan file on disk): the completion path.
                 break;
             }
             attempts += 1;
@@ -504,7 +466,7 @@ impl OrchestratorManager {
         Ok(results)
     }
 
-    /// REQ-ORCH-001: synthesize the final answer from all sub-deliverables.
+    /// Synthesize the final answer from all sub-deliverables.
     /// This is the ONLY Manager prose permitted.
     pub fn synthesize(&self, results: &[Deliverable]) -> String {
         let mut out = String::new();
@@ -515,13 +477,13 @@ impl OrchestratorManager {
         out
     }
 
-    /// REQ-ORCH-005: forward `/abort` to in-flight sub-tasks.
+    /// Forward `/abort` to in-flight sub-tasks.
     ///
-    /// NOTE (REQ-HARN-004 integrity): an abort is NOT a text-repetition break,
-    /// so this does NOT touch `repetition_breaks` — that counter is reserved
-    /// exclusively for [`HarnessMonitor::feed_text`] truncations. An abort
-    /// terminates the turn (REQ-LOOP-004) and kills active PTY process groups
-    /// via `crate::harness::pty::kill_process_group`; it is not counted as a
+    /// INTEGRITY: an abort is NOT a text-repetition break, so this does NOT touch
+    /// `repetition_breaks` — that counter is reserved exclusively for
+    /// [`HarnessMonitor::feed_text`] truncations. An abort terminates the turn and
+    /// kills active PTY process groups via
+    /// `crate::harness::pty::kill_process_group`; it is never counted as a
     /// resilience-repetition intervention.
     pub fn abort(&mut self) {
         self.cancellation_token.cancel();
@@ -529,25 +491,14 @@ impl OrchestratorManager {
     }
 }
 
-/// Disk-first prompt path for a delegation request, gated on the canonical
-/// task-id grammar.
-///
-/// Gate t-055 (single grammar authority): `.marmel/prompts/<task_id>.md` is an
-/// on-disk path derived from a task id that originates as LLM output
-/// (`delegate_task` argument / plan checkbox), so the id must pass
-/// [`crate::task_id::validate_task_id`] before it is joined onto `prompts_dir`.
-/// That function is the only place in the crate that defines the task-id
-/// grammar — this helper does not re-implement, extend or bypass it.
-///
-/// Contract (same shape as
-/// [`crate::harness::workspace::Workspace::prompt_path_for_task`]):
-/// * the raw id is normalized first (decoration stripping only, order unchanged)
-///   and the **normalized** value is validated and joined byte-for-byte — never
-///   sanitized, trimmed, clamped or mended into a different file name;
-/// * `Ok(None)` means "no task id was supplied" (the JIT-synthesis case);
-/// * `Err(TaskIdError)` means the id was refused: the caller must skip the read
-///   and degrade exactly like a missing prompt file, which is what makes the
-///   JIT fallback observable rather than a silent path escape.
+/// Disk-first prompt path for a delegation request: `.marmel/prompts/<task_id>.md`
+/// derives from an id that originates as LLM output (`delegate_task` argument /
+/// plan checkbox), so it must pass [`crate::task_id::validate_task_id`] — the single
+/// task-id authority, never re-implemented or bypassed here — before it is joined
+/// onto `prompts_dir`. Same shape as
+/// [`crate::harness::workspace::Workspace::prompt_path_for_task`]: no id yields
+/// `Ok(None)`, a refused id makes the caller skip the read and degrade like a
+/// missing prompt file, and a valid id is joined byte-for-byte — never sanitized.
 fn saved_prompt_path_for_task(
     prompts_dir: &Path,
     raw_task_id: Option<&str>,

@@ -1,50 +1,23 @@
 //! PTY wrapper: shell execution with process-group isolation.
 //!
-//! REQ-TOOL-001: shell execution via `run_command` uses portable-pty.
-//! Every command is wrapped as:
+//! `run_command` wraps every command as:
 //! ```text
 //! sh -c "stty -echo; ulimit -f 4194304 2>/dev/null || ulimit -f 2097152 2>/dev/null; <command>"
 //! ```
-//! - `stty -echo` stops the echoed command line from polluting stdout.
-//! - `ulimit -f` caps each command's file write to 2 GiB (4194304 × 512 B),
-//!   falling back to 1 GiB (2097152 × 512 B) on platforms where the larger
-//!   limit is rejected. This matches marmennill-cli's local tool execution.
+//! `stty -echo` stops the echoed command line from polluting stdout; `ulimit -f` caps
+//! each command's file write to 2 GiB (1 GiB fallback).
 //!
-//! On command completion, timeout (strict 300 s), or teardown, the manager
-//! issues `libc::kill(-pid, libc::SIGKILL)` to the *entire process group*
-//! (negative pid) followed by a child kill, so no lingering subshells,
-//! debuggers, or REPLs survive.
+//! Completion, timeout (strict 300 s) and teardown all issue `libc::kill(-pid,
+//! libc::SIGKILL)` to the *entire process group* (negative pid), then reap the child
+//! exactly once through one idempotent, bounded `try_wait()` path (a child still running
+//! after the grace window goes to the bounded [`DeferredReapQueue`]), so no `<defunct>`
+//! entry can accumulate and exhaust the process table (`EAGAIN`). Interactive output is a
+//! bounded ring of [`PTY_OUTPUT_BUFFER_CAP`] bytes (256 KiB): an over-cap unread tail loses
+//! its *head* at a UTF-8 char boundary, counted and reported ([`truncation_notice`]).
 //!
-//! **Every spawned child is then reaped.** The `Child` handle lives in the
-//! session struct (`ChildReaper`), and the kill path always ends in a bounded
-//! `try_wait()` poll (plus a blocking `wait()` for one-shot commands), so no
-//! `<defunct>` entry accumulates across a long session and the process table
-//! cannot be exhausted (`EAGAIN` on the next spawn). Reaping happens exactly
-//! once per child: completion, timeout, cancellation, eviction, `pty_close`,
-//! and `Drop` all funnel through the same idempotent path, and a child that
-//! outlives the teardown grace window is handed to the bounded
-//! [`DeferredReapQueue`] drained by the single janitor task (never a thread per
-//! command).
-//!
-//! **Interactive output is a bounded ring.** `SharedBuffer.output` retains at
-//! most [`PTY_OUTPUT_BUFFER_CAP`] bytes (256 KiB): consumed bytes are reclaimed
-//! on every push, and an over-cap unread tail loses its *head* at a UTF-8 char
-//! boundary, with the loss counted and reported to the reader
-//! ([`truncation_notice`], `dropped_bytes`/`truncated` in `pty_list`).
-//!
-//! Sandbox gating (t-034b) never depends on the executable's **name**: whether
-//! the Landlock re-entry is applied is decided by [`should_apply_sandbox`] from
-//! the resolved executable path (`current_exe()` canonicalized), platform
-//! support, and an explicit opt-out. It is enabled by default (fail-closed); any
-//! skip is warned about, and an unresolvable executable hard-fails rather than
-//! degrading to a plain `sh -c`.
-//!
-//! All captured output is passed through `sanitize_terminal_output`, which
-//! strips OSC sequences and other non-printable terminal artifacts, matching
-//! marmennill-cli's `sanitize_terminal_output`.
-//!
-//! NOTE: `unsafe_op_in_unsafe_fn` is a hard error in edition 2024, so any
-//! `libc::kill` call must be wrapped in an explicit `unsafe {}` block.
+//! Whether the sandbox applies never depends on the executable's **name**: [`should_apply_sandbox`]
+//! decides from the resolved executable path (`current_exe()` canonicalized), platform support and an
+//! explicit opt-out; it is fail-closed, every skip is warned about, and an unresolvable exe hard-fails.
 
 use crate::harness::{ToolError, ToolResult};
 use crate::tool_names::{
@@ -59,17 +32,12 @@ use std::time::Duration;
 /// Default per-command timeout in seconds (default 60 s, max 300 s).
 pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
-/// Hard byte cap of the interactive output ring (`SharedBuffer.output`), in
-/// bytes: **256 KiB** (`256 * 1024` = 262 144 B).
-///
-/// The buffer is a ring window, not a log: bytes a reader already consumed are
-/// reclaimed on every push, and if the *unread* tail still exceeds this cap the
-/// oldest bytes are dropped (at a UTF-8 char boundary) and the loss is counted
-/// and reported to the next reader. 256 KiB is orders of magnitude more output
-/// than one `pty_read` round-trip realistically consumes, yet bounded, so a
-/// chatty command (`yes`, `tail -f`, a build log) can no longer grow the process
-/// without limit. Enforced in exactly one place: [`SharedBuffer::trim_to_cap`],
-/// called from [`SharedBuffer::push`] (the PTY reader thread).
+/// Hard byte cap of the interactive output ring (`SharedBuffer.output`), in bytes: **256 KiB**
+/// (`256 * 1024` = 262 144 B). The ring is a window, not a log: consumed bytes are reclaimed on every push,
+/// and if the *unread* tail still exceeds this cap the oldest bytes are dropped at a UTF-8 char boundary
+/// and the loss is counted and reported to the next reader, so a chatty command (`yes`, `tail -f`, a build
+/// log) cannot grow the process without limit. Enforced only by [`SharedBuffer::trim_to_cap`], called from
+/// [`SharedBuffer::push`].
 pub const PTY_OUTPUT_BUFFER_CAP: usize = 256 * 1024;
 
 /// How long a `SIGKILL`ed one-shot command (the `run_command` path) is polled
@@ -99,14 +67,10 @@ pub const ULIMIT_FILE_BLOCKS: &str = "4194304";
 /// 2097152 blocks × 512 B = 1 GiB ceiling.
 pub const ULIMIT_FILE_BLOCKS_FALLBACK: &str = "2097152";
 
-/// Strip OSC sequences and other non-printable terminal artifacts from output.
-///
-/// This mirrors the stripping applied by the standalone marmennill CLI during its
-/// own local tool execution:
-/// - OSC sequences (`ESC ] <n> ; ... BEL` or `ESC ] <n> ; ... ESC \`) are removed.
-/// - Bell (`\x07`) and backspace (`\x08`) are removed.
-/// - Other control characters below ` ` (0x20) are removed, except `\n`, `\r`,
-///   `\t`, and `\x1b` (ESC, which is preserved so CSI color codes survive).
+/// Strip OSC sequences and other non-printable terminal artifacts from captured output:
+/// OSC sequences (`ESC ] <n> ; ... BEL` or `ESC ] <n> ; ... ESC \`) and bell (`\x07`) /
+/// backspace (`\x08`) are removed, as are other control characters below ` ` (0x20)
+/// except `\n`, `\r`, `\t` and `\x1b` (ESC, preserved so CSI color codes survive).
 static RE_OSC: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
     Regex::new(r"\x1b\][0-9]+;.*?(?:\x07|\x1b\\)").expect("valid OSC regex")
 });
@@ -159,13 +123,11 @@ impl ChildHandle for PtyChildHandle {
     }
 }
 
-/// Exactly-once reap bookkeeping for one spawned child.
-///
-/// A child is waited on at most once (a second `wait` on a reaped pid could
-/// otherwise block forever or hit a recycled pid), its exit status is recorded
-/// once, and a handle is never dropped while the child is still unreaped: the
-/// session types either reap it via [`ChildReaper::kill_and_reap`] or hand it to
-/// a [`DeferredReapQueue`] via [`ChildReaper::defer_to`].
+/// Exactly-once reap bookkeeping for one spawned child. A child is waited on at most once
+/// (a second `wait` on a reaped pid could otherwise block forever or hit a recycled pid),
+/// its exit status is recorded once, and a handle is never dropped while the child is
+/// still unreaped: the session types either reap it via [`ChildReaper::kill_and_reap`] or
+/// hand it to a [`DeferredReapQueue`] via [`ChildReaper::defer_to`].
 pub struct ChildReaper {
     /// `None` once the child has been reaped or handed to a [`DeferredReapQueue`].
     handle: Option<Box<dyn ChildHandle + Send>>,
@@ -237,19 +199,12 @@ impl ChildReaper {
         }
     }
 
-    /// `SIGKILL` the whole process group (negative pid, so backgrounded
-    /// subshells, debuggers and REPLs die too), then the child, then reap the
-    /// child exactly once.
-    ///
-    /// * Already reaped ⇒ pure no-op: nothing is signalled (the pid may have
-    ///   been recycled) and nothing is waited on again. This makes the repeated
-    ///   completion/timeout/cancellation/`Drop` teardown passes safe.
-    /// * The `try_wait()` poll is bounded by `grace`. If the child is still
-    ///   alive afterwards, `wait_after_grace` chooses between the blocking
-    ///   `wait()` — correct for the one-shot `run_command` path, where the child
-    ///   has been `SIGKILL`ed so this returns promptly and no zombie can
-    ///   survive — and returning `reaped: false`, for the interactive path that
-    ///   must not block the async runtime and defers via [`ChildReaper::defer_to`].
+    /// `SIGKILL` the whole process group (negative pid, so backgrounded subshells and REPLs die too), then
+    /// the child, then reap the child exactly once. Already reaped ⇒ pure no-op: nothing is signalled (the
+    /// pid may have been recycled) and nothing is waited on again, so repeated completion/timeout/
+    /// cancellation/`Drop` teardown passes stay safe. The `try_wait()` poll is bounded by `grace`; afterwards
+    /// `wait_after_grace` picks the blocking `wait()` (one-shot `run_command`, whose child is already
+    /// `SIGKILL`ed) or `reaped: false` for the interactive path, deferring via [`ChildReaper::defer_to`].
     pub fn kill_and_reap(&mut self, grace: Duration, wait_after_grace: bool) -> ReapOutcome {
         if self.reaped {
             return ReapOutcome {
@@ -411,7 +366,7 @@ impl DeferredReapQueue {
                     false
                 }
                 Ok(None) => true,
-                // waitpid failed: the child is gone, retire the handle.
+                // waitpid failed: the child is already reaped, retire the handle.
                 Err(_) => false,
             }
         });
@@ -438,22 +393,14 @@ pub struct PtySession {
     pub pid: i32,
 }
 
-// Sandbox gating — decided from authoritative inputs, never from the
-// executable's NAME (t-034b)
-//
-// The previous gate compared `file_name(current_exe())` against the literal
-// name `marmel`, which silently disabled Landlock for every
-// renamed/copied/installed binary (`marmel-dev`, `target/debug/marmel-x`, …)
-// and enabled it for unrelated programs that merely happened to be called
-// `marmel`. Gating now comes from the **resolved** executable path
-// (`current_exe()` canonicalized), platform support, and an explicit opt-out.
-//
-// The re-entry protocol is implemented by the `marmel` **bin target**
-// (`src/main.rs`), not by the library, so a Cargo test-harness binary
-// (`cfg!(test)`) cannot re-enter — that one skip is compile-time, cannot be
-// reached by renaming anything, and is logged as a warning like every other
-// skip. Follow-up (hand-off): apply Landlock in-process via `pre_exec` so no
-// self-exec is needed at all.
+// Sandbox decision inputs — authoritative ones, never the executable's NAME: the
+// **resolved** executable path (`current_exe()` canonicalized), platform support, and an
+// explicit opt-out. A renamed, copied or installed binary is sandboxed exactly like any
+// other; comparing `file_name(current_exe())` against a name literal would silently
+// disable Landlock for those binaries and enable it for unrelated programs sharing the
+// name. The re-entry protocol lives in the `marmel` **bin target** (`src/main.rs`), not
+// the library, so a Cargo test-harness binary (`cfg!(test)`) cannot re-enter — a
+// compile-time skip that renaming can never reach, warned about like any other skip.
 
 /// argv sentinel understood by `src/main.rs`: re-executing the **same resolved
 /// binary** with it applies Landlock in the child and then execs `sh -c <cmd>`.
@@ -463,18 +410,12 @@ pub const SANDBOX_EXEC_ARG: &str = "--internal-sandbox-exec";
 
 /// The environment fallback for the Landlock sandbox opt-out, deliberately strict.
 ///
-/// The crate has a typed knob for the same switch — `sandbox_disabled = true` in
-/// `marmel.toml` ([`crate::config::Config::sandbox_disabled`], read through
-/// [`crate::config::sandbox_disabled`]) — and **either source opts out**: the env
-/// value parsed here and the config value are merged by
-/// [`crate::config::sandbox_opt_out`] and handed to [`SandboxInputs::opt_out`]
-/// where the per-process decision is taken. The env var remains as an equivalent
-/// escape hatch for opting one process out without editing a config file, and
-/// every skip it produces is warned about by [`log_sandbox_decision`].
-///
-/// Only `1`, `true`, `yes`, `on` (case-insensitive, surrounding blanks ignored)
-/// disable the sandbox. **Every other value — including `0`, `false`, `off`,
-/// `no`, an empty value, or a typo — leaves it enabled (fail-closed).**
+/// The typed config knob `sandbox_disabled = true` in `marmel.toml` is the primary switch
+/// ([`crate::config::Config::sandbox_disabled`] via [`crate::config::sandbox_disabled`]);
+/// **either source opts out** — both are merged by [`crate::config::sandbox_opt_out`] and
+/// handed to [`SandboxInputs::opt_out`], and every skip is warned by [`log_sandbox_decision`].
+/// Only `1`, `true`, `yes`, `on` (case-insensitive, blanks ignored) disable the sandbox;
+/// **every other value — `0`, `false`, `off`, `no`, empty or a typo — keeps it on (fail-closed).**
 pub const SANDBOX_OPTOUT_ENV: &str = "MARMEL_DISABLE_SANDBOX";
 
 /// Values of [`SANDBOX_OPTOUT_ENV`] that count as an explicit opt-out.
@@ -566,31 +507,14 @@ impl SandboxDecision {
     }
 }
 
-/// Decide whether the Landlock sandbox **must** be applied for the next command.
-///
-/// Contract — this is the entire point of the function:
-///
-/// * **Enabled by default (fail-closed).** Nothing about the executable's *name*
-///   is consulted: a renamed / copied / installed binary (`marmel-dev`,
-///   `target/debug/marmel-x`, `/usr/local/bin/mm`) is sandboxed exactly like one
-///   named `marmel`, and an unrelated program that merely happens to be named
-///   `marmel` is treated like any other host of this code.
-/// * It is disabled **only** by an explicit, unambiguous opt-out
-///   ([`OptOut::Explicit`]): the typed config knob `sandbox_disabled`
-///   ([`crate::config::Config::sandbox_disabled`], attributed as
-///   `sandbox_disabled=true`) or the `MARMEL_DISABLE_SANDBOX` env fallback
-///   ([`SANDBOX_OPTOUT_ENV`]) — the two are merged by
-///   [`crate::config::sandbox_opt_out`] and **either** source opts out. Empty,
-///   malformed or falsy-looking values do **not** disable it.
-/// * A Linux process that cannot resolve its own executable yields
-///   [`SandboxDecision::UnresolvedExe`]; the caller must fail the command rather
-///   than quietly run it unsandboxed.
-/// * [`SandboxDecision::Skip`] exists only for a platform without Landlock, an
-///   explicit opt-out, or a Cargo test-harness binary. Every skip is warned
-///   about by [`log_sandbox_decision`] — running unsandboxed is never silent.
-///
-/// All inputs are injected, so this is pure logic: no `current_exe()`, no
-/// Landlock availability probe, no `/dev/pts`, no environment mutation.
+/// Decide whether the Landlock sandbox **must** apply to the next command: pure logic over injected inputs,
+/// fail-closed and name-blind — a renamed, copied, installed or coincidentally-named binary is sandboxed from
+/// its resolved exe path like any other. Only an explicit, unambiguous [`OptOut::Explicit`] disables it: the
+/// typed `sandbox_disabled` knob ([`crate::config::Config::sandbox_disabled`]) or the `MARMEL_DISABLE_SANDBOX`
+/// env fallback ([`SANDBOX_OPTOUT_ENV`]) merged by [`crate::config::sandbox_opt_out`]. An unresolved exe is a
+/// hard [`SandboxDecision::UnresolvedExe`], never a plain `sh -c`; [`SandboxDecision::Skip`] covers only no
+/// Landlock on this platform, an explicit opt-out, or a Cargo test-harness binary — and
+/// [`log_sandbox_decision`] warns about every skip.
 pub fn should_apply_sandbox(inputs: &SandboxInputs<'_>) -> SandboxDecision {
     let resolved_exe = inputs.resolved_exe.map(std::path::Path::to_path_buf);
 
@@ -716,12 +640,12 @@ fn sandbox_decision_for_current_process() -> SandboxDecision {
     decision
 }
 
-/// Turn a [`SandboxDecision`] into the argv (`program`, `args`) of the command
-/// to spawn. Pure, so the re-entry argv is unit-testable without a PTY.
+/// Turn a [`SandboxDecision`] into the argv (`program`, `args`) of the command to spawn.
+/// Pure, so the re-entry argv is unit-testable without a PTY.
 ///
-/// [`SandboxDecision::UnresolvedExe`] is deliberately a **hard error**: the
-/// previous code fell back to a plain `sh -c` here, which is exactly the silent
-/// fail-open this task removes.
+/// [`SandboxDecision::UnresolvedExe`] is a **hard error**: an unresolved exe never falls
+/// back to a plain `sh -c`, because that would run the command unsandboxed without saying
+/// so.
 fn sandbox_command_argv(
     decision: &SandboxDecision,
     command: &str,
@@ -748,11 +672,10 @@ fn sandbox_command_argv(
 
 /// Build the shell command for one `run_command`/PTY execution.
 ///
-/// Landlock is applied on Linux through [`SANDBOX_EXEC_ARG`] re-entry decided by
-/// [`should_apply_sandbox`] — from the resolved exe path, platform support and an
-/// explicit opt-out, **never** from the executable's name. `Err` is returned when
-/// the sandbox is required but cannot be applied (fail-closed). On Windows the
-/// command is built as before (no Landlock exists there; the skip is logged).
+/// Landlock is applied on Linux through [`SANDBOX_EXEC_ARG`] re-entry decided by [`should_apply_sandbox`] —
+/// from the resolved exe path, platform support and an explicit opt-out, **never** from the executable's name.
+/// `Err` is returned when the sandbox is required but cannot be applied (fail-closed). On Windows there is no
+/// Landlock: the skip is logged and the command is built unchanged.
 pub fn build_sandboxed_command(
     command: &str,
     cwd: &std::path::Path,
@@ -794,7 +717,7 @@ pub fn build_sandboxed_command(
 }
 
 impl PtySession {
-    /// Wrap `command` in the REQ-TOOL-001 sandbox and spawn it into a PTY.
+    /// Wrap `command` in the sandbox preamble and spawn it into a PTY.
     pub fn spawn(command: &str) -> Result<Self, ToolError> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -892,15 +815,12 @@ pub fn run_command(args: &Value) -> Result<ToolResult, ToolError> {
     Ok(ToolResult::ok(output))
 }
 
-/// Core PTY execution: spawn the sandbox, read output with a timeout, and
-/// always tear down the process group **and reap the child** afterwards.
-///
-/// The `timeout` is strict (default 300 s) and preempts a hung child by
-/// SIGKILLing the entire process group. Every exit path — normal completion,
-/// timeout, cancellation signal, abrupt disconnect, or an error from `?` before
-/// the loop even starts — ends in [`PtySession::teardown`] /
-/// `Drop as PtySession`, which kills the group, kills the child, and `wait()`s
-/// it exactly once, so no `<defunct>` child survives a `run_command`.
+/// Core PTY execution: spawn the sandbox, read output with a timeout, and always tear down
+/// the process group **and reap the child** afterwards. The `timeout` is strict (default
+/// 300 s) and preempts a hung child by SIGKILLing the entire process group. Every exit
+/// path — normal completion, timeout, cancellation signal, abrupt disconnect, or an error
+/// from `?` before the loop even starts — ends in [`PtySession::teardown`] /
+/// `Drop as PtySession`, so no `<defunct>` child survives a `run_command`.
 pub fn run_command_pty(command: &str, timeout: Duration) -> Result<String, ToolError> {
     let mut session = PtySession::spawn(command)?;
 
@@ -963,31 +883,21 @@ pub fn run_command_pty(command: &str, timeout: Duration) -> Result<String, ToolE
 
 // Interactive Multi-Turn PTY Manager
 
-/// `true` when `byte` may begin a UTF-8 code point, i.e. it is **not** a
-/// `10xxxxxx` continuation byte.
-///
-/// Byte-level char-boundary test for the ring buffer trim in
-/// [`SharedBuffer::trim_to_cap`]: advancing the cut to the next lead byte means
-/// the retained window never starts in the middle of a multi-byte character
-/// (never a split `å`/`é`/`🙂`, and never a mid-character byte slice).
+/// `true` when `byte` may begin a UTF-8 code point, i.e. it is **not** a `10xxxxxx`
+/// continuation byte. Byte-level char-boundary test for the ring buffer trim in
+/// [`SharedBuffer::trim_to_cap`]: advancing the cut to the next lead byte means the
+/// retained window never starts in the middle of a multi-byte character (never a split
+/// `å`/`é`/`🙂`, and never a mid-character byte slice).
 fn is_utf8_lead_byte(byte: u8) -> bool {
     byte & 0b1100_0000 != 0b1000_0000
 }
 
-/// Bounded retention window for one interactive PTY session.
-///
-/// `output` is a ring window, not an append-only log:
-/// * bytes a reader has already consumed (`..cursor`) are reclaimed on every
-///   push — once handed out they are pure duplication;
-/// * if the *unread* tail still exceeds [`PTY_OUTPUT_BUFFER_CAP`], the oldest
-///   bytes are dropped at a UTF-8 char boundary and counted in `dropped_bytes`,
-///   with the amount since the last read queued in `pending_notice_bytes` so
-///   the next reader sees that the head was discarded.
-///
-/// Both trimming steps live in [`SharedBuffer::trim_to_cap`], called from the
-/// single writer side ([`SharedBuffer::push`], i.e. the PTY reader thread), so
-/// `output.len()` never meaningfully exceeds the cap no matter how chatty the
-/// command is (`yes`, `tail -f`, a build log).
+/// Bounded retention window for one interactive PTY session. `output` is a ring window, not an append-only
+/// log: bytes a reader has already consumed (`..cursor`) are reclaimed on every push, and if the *unread*
+/// tail still exceeds [`PTY_OUTPUT_BUFFER_CAP`] the oldest bytes are dropped at a UTF-8 char boundary and
+/// counted in `dropped_bytes`, with the amount since the last read queued in `pending_notice_bytes` so the
+/// next reader sees that the head was discarded. Both steps live in [`SharedBuffer::trim_to_cap`], called
+/// from the single writer side ([`SharedBuffer::push`], the PTY reader thread).
 struct SharedBuffer {
     output: Vec<u8>,
     cursor: usize,
@@ -1018,18 +928,12 @@ impl SharedBuffer {
         self.trim_to_cap();
     }
 
-    /// Enforce [`PTY_OUTPUT_BUFFER_CAP`].
-    ///
-    /// 1. Reclaim the already-delivered prefix `..cursor`.
-    /// 2. If the tail is still over the cap, drop from the head. The cut point
-    ///    is advanced to the next UTF-8 char boundary with [`is_utf8_lead_byte`],
-    ///    the byte-level counterpart of the `text_util::truncate_chars` /
-    ///    `truncate_with_ellipsis` guarantee: those clip a `&str` by *character*
-    ///    count, while this cap is a *byte* budget over raw `Vec<u8>` pty bytes
-    ///    (bytes arrive in 4 KiB reads and may split a character across reads),
-    ///    so they do not fit here. A cut is never taken through a multi-byte
-    ///    character, and the dropped amount is recorded so the loss is visible
-    ///    instead of silent.
+    /// Enforce [`PTY_OUTPUT_BUFFER_CAP`]: 1. reclaim the already-delivered prefix `..cursor`; 2. if the tail is
+    /// still over the cap, drop from the head, advancing the cut to the next UTF-8 char boundary with
+    /// [`is_utf8_lead_byte`]. That is the byte-level counterpart of the `text_util::truncate_chars` /
+    /// `truncate_with_ellipsis` guarantee: those clip a `&str` by *character* count, while this cap is a
+    /// *byte* budget over raw `Vec<u8>` pty bytes (a character can straddle two 4 KiB reads), so they do not
+    /// fit here; a cut never goes through a multi-byte character, and the dropped amount is recorded.
     fn trim_to_cap(&mut self) {
         if self.cursor > 0 {
             self.output.drain(..self.cursor);
@@ -1056,7 +960,7 @@ impl SharedBuffer {
     }
 
     /// Reader side: take the unread window as sanitized text, prefixed (once)
-    /// with a truncation notice when the cap discarded earlier output.
+    /// with a truncation notice when the cap discarded output from the head.
     fn take_readable(&mut self) -> String {
         let end = self.output.len();
         let text =
@@ -1098,11 +1002,10 @@ pub struct InteractivePtySession {
 impl InteractivePtySession {
     /// Kill the process group + child and reap it exactly once. Idempotent.
     ///
-    /// The reap grace is deliberately short and non-blocking: this runs on an
-    /// async worker thread (with the session map lock held for the
-    /// `pty_close`/eviction paths), so a child that has not exited in time is
-    /// handed to the manager's [`DeferredReapQueue`] instead of being waited on
-    /// blocking — and is never simply dropped unreaped.
+    /// The reap grace is deliberately short and non-blocking: this runs on an async worker thread (with the
+    /// session map lock held for the `pty_close`/eviction paths), so a child that has not exited in time is
+    /// handed to the manager's [`DeferredReapQueue`] instead of being waited on blocking — and is never
+    /// simply dropped unreaped.
     fn shutdown_and_reap(&mut self) {
         let outcome = self.reaper.kill_and_reap(PTY_REAP_GRACE_INTERACTIVE, false);
         if let Some(status) = &outcome.status {
@@ -1401,10 +1304,9 @@ impl PtyManager {
         let mut map = self.sessions.lock().await;
         match map.remove(key) {
             Some(mut session) => {
-                // Reap explicitly instead of relying on `Drop` alone, so the
-                // child is verifiably gone from the process table before
-                // `close` returns (`Drop` stays the safety net for the
-                // eviction/replace paths).
+                // Reap explicitly instead of relying on `Drop` alone, so the child is
+                // verifiably reaped (absent from the process table) before `close` returns;
+                // `Drop` stays the safety net for the eviction/replace paths.
                 session.shutdown_and_reap();
                 true
             }
@@ -1427,10 +1329,9 @@ impl PtyManager {
                     "pid": s.pid,
                     "is_alive": buf.is_alive,
                     "idle_seconds": idle_secs,
-                    // Retained ring window, not a cumulative counter: the
-                    // cumulative amount is `dropped_bytes` (head bytes discarded
-                    // because of PTY_OUTPUT_BUFFER_CAP). `total_bytes_read` is
-                    // kept as the historical alias of `retained_bytes`.
+                    // Retained ring window, not a cumulative counter: the cumulative amount
+                    // is `dropped_bytes` (head bytes discarded by PTY_OUTPUT_BUFFER_CAP), and
+                    // `total_bytes_read` reports the same retained window.
                     "retained_bytes": buf.output.len(),
                     "total_bytes_read": buf.output.len(),
                     "dropped_bytes": buf.dropped_bytes,

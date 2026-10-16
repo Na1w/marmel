@@ -24,15 +24,11 @@ const PLAN_MD: &str = "# Execution Plan\n\
 - [ ] [t-002] Implement strict replace tool\n\
 - [ ] [t-003] Run cargo test\n";
 
-/// Plan existence is the gate the live paths actually consult (REQ-PLAN-001).
+/// Plan existence is what the live paths actually consult.
 ///
-/// The `MissionPhase` / `determine_phase` / `forced_phase` gate this test used
-/// to certify was **deleted** — it had no caller outside `src/manager/`, and
-/// nothing in the crate ever wrote `.marmel/forced_phase.txt`, so the
-/// REQ-PLAN-004 override could never fire (recon L8; evidence in `phase.rs`).
-/// What is left to certify is the disk state itself: `exists()` follows the
-/// plan file, and `clear()` still sweeps a stale override left by an older
-/// release.
+/// What is certified here is the disk state itself: `exists()` follows the
+/// plan file, and `clear()` also deletes a stale override file left behind by
+/// an older release.
 #[test]
 fn test_plan_exists_tracks_the_plan_file() {
     let dir = temp_marmel();
@@ -52,8 +48,8 @@ fn test_plan_exists_tracks_the_plan_file() {
         ]
     );
 
-    // A stale forced-phase override from an older release is deleted by
-    // `clear()` together with the plan (REQ-PLAN-004 file sweep).
+    // A stale plan-override file from an older release is deleted by `clear()`
+    // together with the plan.
     fs::write(plan.forced_phase_path(), "Conversational\n").unwrap();
     plan.clear().unwrap();
     assert!(!plan.exists());
@@ -66,16 +62,13 @@ fn test_plan_exists_tracks_the_plan_file() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// REQ-PLAN-002 (tool half): executing `[t-001]` successfully updates
-/// `.marmel/execution_plan.md`, toggling `- [ ] [t-001]` to `- [x] [t-001]`.
+/// Executing `[t-xxx]` successfully updates `.marmel/execution_plan.md`,
+/// toggling `- [ ] [t-xxx]` to `- [x] [t-xxx]`.
 ///
-/// The live gate is the **structured** `ToolResult::is_error` flag at the call
-/// site in `src/ui/session.rs` (the tool-dispatch loop), never a
-/// re-classification of the
-/// output prose: the substring heuristic `output_is_success` that used to back
-/// this is deleted (recon M9 + `docs/decision_dead_code_manager.md` §6 hand-off
-/// 3). The witness below proves that heuristic really mis-judged successful
-/// output that merely mentions `error`.
+/// The decision is the **structured** `ToolResult::is_error` flag at the call
+/// site in `src/ui/session.rs`, never a re-classification of the output prose:
+/// the witness below shows that a prose heuristic really does mis-judge
+/// successful output that merely mentions `error`.
 #[test]
 fn test_agent_auto_plan_checkoff() {
     let dir = temp_marmel();
@@ -91,9 +84,9 @@ fn test_agent_auto_plan_checkoff() {
         ]
     );
 
-    // A successful tool output triggers check-off of t-001 — the tool reported
+    // A successful tool output triggers check-off: the tool reported
     // `is_error == false` and the harness holds the plan id explicitly, so the
-    // wording of the output is irrelevant (M9).
+    // wording of the output is irrelevant.
     let output = "Compiling thiserror v1.0.65 (src/error.rs) … test result: ok";
     assert!(
         legacy_substring_says_failure(output),
@@ -119,16 +112,14 @@ fn test_agent_auto_plan_checkoff() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// REQ-PLAN-002 / SPEC pass criterion: a failed tool leaves `- [ ] [t-001]`
-/// unchecked (`src/ui/session.rs` calls `check_off` only when the structured
-/// `ToolResult::is_error` flag is false, so a failed result never reaches the
-/// plan at all), and an error-shaped deliverable never checks anything off
-/// through the deliverable path either: `FAILED`, `REPLAN REQUIRED` and a body
-/// with no terminal marker all resolve to a non-completion verdict.
+/// A failed tool leaves `- [ ] [t-xxx]` unchecked: `src/ui/session.rs` calls
+/// `check_off` only when the structured `ToolResult::is_error` flag is false, so
+/// a failed result never reaches the plan. An error-shaped deliverable never
+/// checks anything off either — `FAILED`, `REPLAN REQUIRED` and a body with no
+/// terminal marker all resolve to a non-completion verdict.
 ///
-/// The closing loop is the non-vacuity half: the very same plan lines do flip for
-/// a decorated completion, so the refusals above are about the verdict and not
-/// about a check-off path that never works.
+/// Non-vacuity: the very same plan lines do flip for a decorated completion, so
+/// the refusals above are about the verdict, not about a broken check-off path.
 #[test]
 fn test_failed_deliverables_leave_every_plan_line_unchecked() {
     let dir = temp_marmel();
@@ -196,10 +187,8 @@ fn test_failed_deliverables_leave_every_plan_line_unchecked() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// REQ-PLAN-003 needs the plan layer to expose exactly two facts to the live
-/// dispatcher: which items are still pending, and when there are none left.
-/// (`Plan::is_silent_dispatcher(MissionPhase::Executing)` used to be asserted
-/// here; the phase gate was deleted as unwired — recon L8.)
+/// The plan layer exposes exactly two facts to the live dispatcher: which items
+/// are still pending, and when there are none left.
 #[test]
 fn test_pending_and_complete_are_the_dispatchers_input() {
     let dir = temp_marmel();
@@ -237,12 +226,12 @@ fn test_agent_create_plan_creates_dir() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// Recon item **L6** (`docs/recon_bugs_manager.md`): newline handling has exactly
-/// one owner and happens once — `create` runs the plan markdown through
-/// `crate::plan_parse::normalize_newlines` and decides the trailing newline.
-/// `check_off` is a byte-faithful rewrite: it must not re-spell the document's
-/// line endings as a side effect of ticking one box, so a plan that reached disk
-/// with CRLF (hand-edited, outside `create`) keeps every CRLF byte.
+/// Newline handling has exactly one owner and happens once — `create` runs the
+/// plan markdown through `crate::plan_parse::normalize_newlines` and decides the
+/// trailing newline. `check_off` is a byte-faithful rewrite: it must not re-spell
+/// the document's line endings as a side effect of ticking one box, so a plan
+/// that reached disk with CRLF (hand-edited, outside `create`) keeps every CRLF
+/// byte.
 #[test]
 fn test_newlines_normalised_once_and_check_off_is_byte_faithful() {
     let dir = temp_marmel();
@@ -305,8 +294,8 @@ fn test_newlines_normalised_once_and_check_off_is_byte_faithful() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// Recon item **L9**: lines inside a fenced code block are documentation, not
-/// tasks. End-to-end through the on-disk authority: no phantom pending task, no
+/// Lines inside a fenced code block are documentation, not tasks.
+/// End-to-end through the on-disk authority: no phantom pending task, no
 /// phantom check-off, and the example cannot hold the plan open forever.
 #[test]
 fn test_fenced_plan_examples_are_not_live_tasks() {
@@ -356,12 +345,12 @@ The plan format is:
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// Recon item **L5**: every read of the active plan file goes through the same
-/// `PLAN_MUTEX` that already guards `create`/`check_off`/`clear`/`archive`, so a
-/// reader can never observe the file mid-rewrite (check_off rewrites the whole
-/// document). The reader thread below must queue behind a held guard; and
-/// `check_off`/`archive`/`is_complete` must not self-deadlock, i.e. they read
-/// through the unlocked internals once they hold the guard.
+/// Every read of the active plan file goes through the same `PLAN_MUTEX` that
+/// already guards `create`/`check_off`/`clear`/`archive`, so a reader can never
+/// observe the file mid-rewrite (check_off rewrites the whole document). The
+/// reader thread below must queue behind a held guard; and `check_off`/
+/// `archive`/`is_complete` must not self-deadlock, i.e. they read through the
+/// unlocked internals once they hold the guard.
 #[test]
 fn test_read_participates_in_the_plan_guard() {
     let dir = temp_marmel();
@@ -399,10 +388,10 @@ fn test_read_participates_in_the_plan_guard() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// REQ-ORCH-005 + dedup C4: the plan layer no longer owns a marker parser —
-/// `crate::manager::phase::MissionMarker` *is* `crate::markers::MissionMarker`,
-/// and the plan-side entry point recognizes the canonical markers with the
-/// single shared precedence table (FAIL-first) and binds the `(t-xxx)` token.
+/// The plan layer owns no marker parser: `crate::manager::phase::MissionMarker`
+/// *is* `crate::markers::MissionMarker`, and the plan-side entry point recognizes
+/// the canonical markers with the single shared precedence table (FAIL-first)
+/// and binds the `(t-xxx)` token.
 #[test]
 fn test_shared_marker_parser_binds_the_decorated_id_and_is_fail_first() {
     // One grammar, three import paths: the plan module re-exports the single
@@ -480,11 +469,10 @@ fn test_shared_marker_parser_binds_the_decorated_id_and_is_fail_first() {
     );
 }
 
-/// Bug C1 regression (a) at the parse boundary: a `FAILED` deliverable that only
-/// *quotes* the completion marker must resolve to Failed. The deleted
-/// `phase.rs` copy tested the completion marker as a substring before the
-/// failure marker and returned `Complete` here — which is what flipped the plan
-/// checkbox.
+/// A `FAILED` deliverable that only *quotes* the completion marker resolves to
+/// Failed at the parse boundary. A substring-first reading — completion marker
+/// tested before the failure marker — returns `Complete` here, which is what
+/// flipped the plan checkbox.
 #[test]
 fn test_failed_body_quoting_the_completion_marker_is_not_a_completion() {
     let deliverable = format!(
@@ -508,9 +496,8 @@ fn test_failed_body_quoting_the_completion_marker_is_not_a_completion() {
     assert!(matches!(replan, MissionMarker::Replan { .. }));
 }
 
-/// REQ-PLAN-002 + REQ-ORCH-005: a deliverable carrying `MISSION COMPLETE
-/// (t-xxx)` flips `- [ ] [t-xxx]` to `- [x] [t-xxx]` on disk; `FAILED` /
-/// `REPLAN REQUIRED` leave it unchecked.
+/// A deliverable carrying `MISSION COMPLETE (t-xxx)` flips `- [ ] [t-xxx]` to
+/// `- [x] [t-xxx]` on disk; `FAILED` / `REPLAN REQUIRED` leave it unchecked.
 #[test]
 fn test_check_plan_on_marker_complete_flips() {
     let dir = temp_marmel();
@@ -549,8 +536,8 @@ fn test_check_plan_on_marker_complete_flips() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// REQ-PLAN-002 + REQ-ORCH-005: a completion whose marker has no task id and
-/// no explicit override cannot be bound to a plan line -> no check-off.
+/// A completion whose marker has no task id and no explicit override cannot be
+/// bound to a plan line -> no check-off.
 #[test]
 fn test_check_plan_on_marker_no_task_id_leaves_unchecked() {
     let dir = temp_marmel();
@@ -570,13 +557,12 @@ fn test_check_plan_on_marker_no_task_id_leaves_unchecked() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// Bug C1 regression (a) — end-to-end at the plan boundary: a FAILED subagent
-/// deliverable that quotes the literal text `MISSION COMPLETE` in its prose
-/// must NOT check the plan line off. On disk `- [ ] [t-014]` stays `- [ ]`,
-/// `pending_tasks()` still lists the task, and the plan never looks complete.
-/// Against the deleted substring-first parser this test fails: the body's
-/// `MISSION COMPLETE` substring produced a `Complete` marker and the box
-/// flipped to `- [x]`.
+/// End-to-end at the plan boundary: a FAILED subagent deliverable that quotes the
+/// literal text `MISSION COMPLETE` in its prose must NOT check the plan line off.
+/// On disk the line stays `- [ ]`, `pending_tasks()` still lists the task, and
+/// the plan never looks complete. A substring-first parser fails this witness:
+/// its completion substring yields a `Complete` marker and flips the box to
+/// `- [x]`.
 #[test]
 fn test_check_plan_on_marker_failed_body_quoting_mission_complete_keeps_box_unchecked() {
     let dir = temp_marmel();
@@ -605,8 +591,8 @@ fn test_check_plan_on_marker_failed_body_quoting_mission_complete_keeps_box_unch
     assert_eq!(plan.pending_tasks(), vec!["t-014".to_string()]);
     assert!(!plan.is_complete(), "plan must not self-complete");
 
-    // Same body without an explicit override: the `(t-014)` token quoted by the
-    // failed deliverable must not be used to bind a check-off either.
+    // Same body without an explicit override: the `(t-xxx)` token quoted by the
+    // failed deliverable must not bind a check-off on its own either.
     let flipped = plan
         .check_plan_on_marker(None, &deliverable)
         .expect("plan io");
@@ -616,8 +602,8 @@ fn test_check_plan_on_marker_failed_body_quoting_mission_complete_keeps_box_unch
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// Bug C1 regression (b): a genuine `MISSION COMPLETE (t-007)` deliverable still
-/// checks its plan line off on disk.
+/// A genuine `MISSION COMPLETE (t-xxx)` deliverable still checks its plan line
+/// off on disk.
 #[test]
 fn test_check_plan_on_marker_genuine_completion_still_checks_off() {
     let dir = temp_marmel();
@@ -645,9 +631,8 @@ fn test_check_plan_on_marker_genuine_completion_still_checks_off() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// Bug C1 regression (c) — end-to-end: `REPLAN REQUIRED` is never a success,
-/// even when the same deliverable quotes a completion marker from an earlier
-/// round.
+/// End-to-end: `REPLAN REQUIRED` is never a success, even when the same
+/// deliverable quotes a completion marker from an earlier round.
 #[test]
 fn test_check_plan_on_marker_replan_never_checks_off() {
     let dir = temp_marmel();
@@ -674,9 +659,9 @@ fn test_check_plan_on_marker_replan_never_checks_off() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// Bug C1 regression (d): the structured marker field wins over body text.
-/// A structured `Complete` is not vetoed by the word `FAILED` in the body, and
-/// a structured `Failed` is never rescued by a completion sentence.
+/// The structured marker field wins over body text: a structured `Complete` is
+/// not vetoed by the word `FAILED` in the body, and a structured `Failed` is
+/// never rescued by a completion sentence.
 #[test]
 fn test_check_plan_on_deliverable_structured_marker_wins_over_body() {
     let dir = temp_marmel();
@@ -723,15 +708,14 @@ fn test_check_plan_on_deliverable_structured_marker_wins_over_body() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// t-301 (b): `archive()` succeeds (returns `Some(dest)`), writes the completed
-/// plan to the timestamped snapshot and to `execution_plan_archive.md`, and
-/// removes the active `.marmel/execution_plan.md` — but only when
-/// `is_complete()` is true.
+/// `archive()` succeeds (returns `Some(dest)`), writes the completed plan to the
+/// timestamped snapshot and to `execution_plan_archive.md`, and removes the
+/// active `.marmel/execution_plan.md` — but only when `is_complete()` is true.
 #[test]
 fn test_archive_removes_active_when_complete() {
     let dir = temp_marmel();
     let plan = Plan::at(&dir);
-    // A pre-complete plan (all tasks checked) with no pending checkboxes.
+    // A complete plan: every task is checked, so nothing is pending.
     plan.create("# Plan\n- [x] [t-001] Step 1\n").unwrap();
     assert!(plan.is_complete());
 
@@ -768,9 +752,9 @@ fn test_archive_removes_active_when_complete() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// t-301 (a): `archive()` returns `Ok(None)` and writes NO files when the
-/// plan is incomplete (has at least one unchecked task). The incomplete plan
-/// is the working checkpoint and must be left entirely untouched on disk.
+/// `archive()` returns `Ok(None)` and writes NO files when the plan is
+/// incomplete (has at least one unchecked task). The incomplete plan is the
+/// working checkpoint and must be left entirely untouched on disk.
 #[test]
 fn test_archive_noop_when_incomplete() {
     let dir = temp_marmel();
@@ -805,12 +789,11 @@ fn test_archive_noop_when_incomplete() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// t-301 (c): after archiving a complete plan, `read()`, `pending_tasks()`,
-/// `all_tasks()` and `is_complete()` all reflect the ABSENCE of an
-/// active plan — there must be NO stale-archive fallback to
-/// `.marmel/execution_plan_archive.md` (an archived plan must never resurrect
-/// a pending-task set; the phase gate that used to be asserted here was deleted
-/// with recon item **L8** — see [`Plan`] docs).
+/// After archiving a complete plan, `read()`, `pending_tasks()`, `all_tasks()`
+/// and `is_complete()` all reflect the ABSENCE of an active plan — there must be
+/// NO stale-archive fallback to `.marmel/execution_plan_archive.md`: an archived
+/// plan must never resurrect a pending-task set (see [`Plan`] docs for the
+/// archive semantics).
 #[test]
 fn test_archive_no_stale_read_fallback() {
     let dir = temp_marmel();
@@ -821,7 +804,7 @@ fn test_archive_no_stale_read_fallback() {
 
     let result = plan.archive().unwrap();
     assert!(result.is_some());
-    // Archive artifacts now exist on disk, but the active file is gone.
+    // Archive artifacts exist on disk; the active plan file does not.
     assert!(dir.join("archive").is_dir());
     assert!(dir.join("execution_plan_archive.md").exists());
     assert!(!plan.exists());
@@ -841,10 +824,9 @@ fn test_archive_no_stale_read_fallback() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// t-301 (d): `check_off` auto-archives a completed plan snapshot to
-/// `.marmel/archive/` the moment the final pending task is checked off, while
-/// keeping the active `.marmel/execution_plan.md` readable until an explicit
-/// `archive()`.
+/// `check_off` auto-archives a completed plan snapshot to `.marmel/archive/` the
+/// moment the final pending task is checked off, while keeping the active
+/// `.marmel/execution_plan.md` readable until an explicit `archive()`.
 #[test]
 fn test_checkoff_auto_archives_completed_snapshot() {
     let dir = temp_marmel();
@@ -901,7 +883,8 @@ fn test_check_off_avoids_substring_collision() {
     let plan_content = "# Execution Plan\n- [ ] [t-010] Tenth task\n- [ ] [t-01] First task\n";
     plan.create(plan_content).unwrap();
 
-    // Flipping t-01 must flip t-01, NOT t-010 (even though t-010 appears first).
+    // Flipping a short id must not flip the longer id that contains it, even
+    // though the longer one appears first in the file.
     let flipped = plan.check_off("t-01").unwrap();
     assert!(flipped, "t-01 should flip");
 
@@ -929,7 +912,7 @@ fn test_check_off_does_not_flip_task_mentioned_in_other_description() {
     plan.create(plan_content).unwrap();
 
     assert!(plan.check_off("t-006").unwrap());
-    // Checking off t-006 a second time must NOT check off t-011
+    // Checking off an id a second time must NOT check off a different id
     assert!(!plan.check_off("t-006").unwrap());
 
     let disk = plan.read().unwrap().unwrap();
@@ -943,26 +926,15 @@ fn test_check_off_does_not_flip_task_mentioned_in_other_description() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-// H6 regression guards (`docs/recon_bugs_manager.md` H6, retargeted by
-// `docs/decision_dead_code_manager.md` §6 item 3 to this file).
+// Regression guards for task-id binding and the deliverable verdict.
 //
-// The two H6 defects lived in the `AgentLoop` executor that has since been
-// deleted:
-//   * `extract_task_id` fell back to scanning the whole serialized arguments
-//     JSON with `\(?\[?(t-[A-Za-z0-9_-]+)\]?\)?`, so an unrelated successful
-//     tool whose *path* happened to contain a `t-…` substring checked a plan
-//     line off;
-//   * the check-off gate was fed the canned literal `"ok"` by the deleted
-//     `Plan::check_off_on_success` call site, i.e. the decision never looked at
-//     real deliverable text.
-//
-// The witnesses below re-state those two deleted behaviours *inside the test*
-// (the same technique `src/markers.rs` uses for its `legacy_substring_first_parse`
+// Each witness below re-states a legacy rule *inside the test* (the same
+// technique `src/markers.rs` uses for its `legacy_substring_first_parse`
 // witness) so every guard here is provably non-vacuous: the legacy rule would
 // have flipped the box, the live path refuses.
 
-/// Witness of the deleted `loop.rs::extract_task_id` fallback: a regex scan over
-/// an arbitrary blob (the serialized tool arguments, or any deliverable prose).
+/// Witness of a legacy task-id fallback: a regex scan over an arbitrary blob (the
+/// serialized tool arguments, or any deliverable prose).
 fn legacy_blob_scan_task_id(blob: &str) -> Option<String> {
     regex::Regex::new(r"\(?\[?(t-[A-Za-z0-9_-]+)\]?\)?")
         .expect("witness regex")
@@ -970,20 +942,18 @@ fn legacy_blob_scan_task_id(blob: &str) -> Option<String> {
         .map(|c| c[1].to_string())
 }
 
-/// Witness of the deleted check-off gate: `output_is_success` was a substring
-/// heuristic, and the deleted `Plan::check_off_on_success` call site handed it
-/// the literal `"ok"`, so the gate was satisfied unconditionally for any canned
-/// success token.
+/// Witness of a legacy check-off test: a substring heuristic handed a canned
+/// token, so the test was satisfied unconditionally for any such token and never
+/// consulted real deliverable text.
 fn legacy_canned_token_passes_gate(token: &str) -> bool {
     let upper = token.to_ascii_uppercase();
     !(upper.contains(MARKER_REPLAN) || upper.contains("ERROR") || upper.contains(MARKER_FAILED))
 }
 
-/// Witness of the deleted `output_is_success` substring heuristic (recon M9,
-/// `docs/recon_duplication_helpers.md` C5): it read *output prose* instead of the
-/// structured tool-result flag, so successful output that merely contains
-/// `error` / `failed` (`thiserror`, `src/error.rs`, `errors.log`) was reported as
-/// a failure and the plan line was never checked off.
+/// Witness of a legacy verdict heuristic that read *output prose* instead of the
+/// structured tool-result flag: successful output that merely contains `error` /
+/// `failed` (`thiserror`, `src/error.rs`, `errors.log`) was reported as a failure
+/// and the plan line was never checked off.
 fn legacy_substring_says_failure(output: &str) -> bool {
     let upper = output.to_ascii_uppercase();
     if upper.contains(MARKER_REPLAN) {
@@ -1000,11 +970,10 @@ fn legacy_substring_says_failure(output: &str) -> bool {
     sanitized.contains("ERROR") || sanitized.contains(MARKER_FAILED)
 }
 
-/// Witness of the pre-C3 `Plan::check_off` grammar (recorded verbatim in the
-/// drift table of the `src/plan_parse` module doc):
+/// Witness of a legacy `Plan::check_off` line grammar:
 /// `^\s*(?:[-*]|\d+\.)\s*\[\s*\]\s*\*{0,2}\[?<tid>\]?\*{0,2}\b`
 /// — it only ever accepted a *square-bracket* id, so a parenthesised plan line
-/// `- [ ] (t-002) migrate schema` could never be checked off.
+/// `- [ ] (t-xxx) migrate schema` could never be checked off.
 fn legacy_check_off_line(line: &str, task_id: &str) -> Option<String> {
     let pat = format!(r"^\s*(?:[-*]|\d+\.)\s*\[\s*\]\s*\*{{0,2}}\[?{task_id}\]?\*{{0,2}}\b");
     if regex::Regex::new(&pat)
@@ -1017,10 +986,10 @@ fn legacy_check_off_line(line: &str, task_id: &str) -> Option<String> {
     }
 }
 
-/// H6 guard (i): a deliverable that merely *mentions* a path whose name contains
-/// a `t-…` substring must never check off the task whose id that substring
-/// spells. `src/chart-notes.md` → `t-notes` is the exact fixture recorded under
-/// **H6** in `docs/recon_bugs_manager.md`.
+/// Guard (i): a deliverable that merely *mentions* a path whose name contains a
+/// `t-…` substring must never check off the task whose id that substring spells.
+/// `src/chart-notes.md` → `t-notes` is the fixture used below: it looks like a
+/// task id and is not one.
 #[test]
 fn test_path_substring_never_becomes_a_checked_off_task_id() {
     let dir = temp_marmel();
@@ -1028,7 +997,7 @@ fn test_path_substring_never_becomes_a_checked_off_task_id() {
     plan.create("# Execution Plan\n- [ ] [t-notes] Chart notes doc\n- [ ] [t-001] Real task\n")
         .unwrap();
 
-    // Witness: the deleted arguments-JSON scan really did produce `t-notes`
+    // Witness: the legacy arguments-JSON scan really did produce `t-notes`
     // from this payload, and would then have checked the line off.
     let args_json = r##"{"path":"src/chart-notes.md","content":"# notes"}"##;
     assert_eq!(
@@ -1102,9 +1071,9 @@ fn test_path_substring_never_becomes_a_checked_off_task_id() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// H6 guard (ii): a real `MISSION COMPLETE (t-007)` deliverable checks off
-/// exactly `t-007` — never an id merely named in the body prose, which is what
-/// the deleted first-hit regex scan would have bound.
+/// Guard (ii): a real `MISSION COMPLETE (t-xxx)` deliverable checks off exactly
+/// that task — never an id merely named in the body prose, which is what a
+/// first-hit regex scan would have bound.
 #[test]
 fn test_real_marker_checks_off_exactly_the_decorated_task() {
     let dir = temp_marmel();
@@ -1155,10 +1124,10 @@ fn test_real_marker_checks_off_exactly_the_decorated_task() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// H6 guard (iii): a canned success token handed to the check-off path is not
-/// evidence. The deleted call site passed the literal `"ok"`, which always
-/// satisfied the substring gate; the live path requires the real deliverable to
-/// carry a terminal marker.
+/// Guard (iii): a canned success token handed to the check-off path is not
+/// evidence. A text-based substring test accepted the literal `"ok"`
+/// unconditionally, while the live path requires the real deliverable to carry a
+/// terminal marker.
 #[test]
 fn test_canned_success_token_is_not_accepted_as_evidence() {
     let dir = temp_marmel();
@@ -1166,8 +1135,8 @@ fn test_canned_success_token_is_not_accepted_as_evidence() {
     plan.create("# Execution Plan\n- [ ] [t-009] Harden the gate\n")
         .unwrap();
 
-    // Witness: every canned token cleared the deleted substring gate, and the
-    // deleted call site then checked the bound task off.
+    // Witness: every canned token cleared the legacy substring test, which then
+    // checked the bound task off.
     for canned in ["ok", "OK", "success", "done", "completed successfully"] {
         assert!(
             legacy_canned_token_passes_gate(canned),
@@ -1222,9 +1191,9 @@ fn test_canned_success_token_is_not_accepted_as_evidence() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// H6 guard (iv): the live check-off path uses the single plan-line grammar
-/// owner, so a parenthesised task id (`- [ ] (t-002) …`, added by t-039) is
-/// listed as pending and checked off, preserving its on-disk spelling.
+/// Guard (iv): the live check-off path uses the single plan-line grammar owner, so
+/// a parenthesised task id (`- [ ] (t-xxx) …`) is listed as pending and checked
+/// off, preserving its on-disk spelling.
 #[test]
 fn test_parenthesised_task_id_flips_through_the_live_path() {
     let dir = temp_marmel();
@@ -1239,7 +1208,7 @@ fn test_parenthesised_task_id_flips_through_the_live_path() {
         "parenthesised id must be listed as pending"
     );
 
-    // Witness: the deleted per-call grammar could not rewrite that line at all.
+    // Witness: a legacy per-call grammar could not rewrite that line at all.
     assert!(
         legacy_check_off_line("- [ ] (t-002) migrate schema", "t-002").is_none(),
         "witness: the pre-C3 grammar could not check off a parenthesised id"
@@ -1288,15 +1257,13 @@ fn test_parenthesised_task_id_flips_through_the_live_path() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-// M8 — an execution plan that cannot be read must never look like
-// "nothing pending" / "plan complete" (`docs/recon_bugs_manager.md` M8).
-//
-// The pre-M7 code was `match self.read_unlocked() { Ok(Some(c)) => parse(c), _ => Vec::new() }`:
-// the `_` arm swallowed the `Err` from `fs::read_to_string` and returned an
-// empty list, which the Silent Dispatcher (`src/orchestrator/mod.rs::run_executing`)
-// and the UI auto-nudge (`src/ui/session.rs`) read as "the plan is finished".
+// An unreadable execution plan must never look like "nothing pending" or
+// "plan complete": an arm that swallows the `Err` from `fs::read_to_string` and
+// returns an empty list is read by the executing dispatcher
+// (`src/orchestrator/mod.rs::run_executing`) and by the UI auto-nudge
+// (`src/ui/session.rs`) as "the plan is finished".
 
-/// M8: `try_pending_tasks` / `try_all_tasks` distinguish "no plan file" from
+/// `try_pending_tasks` / `try_all_tasks` distinguish "no plan file" from
 /// "plan file cannot be read", while `is_complete` can never report completion
 /// for an unreadable plan.
 #[test]
@@ -1342,15 +1309,15 @@ fn test_m8_unreadable_plan_is_not_reported_as_no_pending_tasks() {
         "all_tasks must propagate the same failure"
     );
 
-    // The gates the dispatcher actually consults must stay on the safe side.
+    // The checks the dispatcher actually consults must stay on the safe side.
     assert!(
         !plan.is_complete(),
         "an unreadable plan is NEVER complete (otherwise the dispatcher stops)"
     );
 
     // The Vec-shaped compatibility wrappers still degrade to empty for callers
-    // that cannot handle a `Result` yet — but that empty list is now logged as
-    // an error and is never paired with `is_complete() == true`.
+    // that cannot handle a `Result` yet — but that empty list is logged as an
+    // error and is never paired with `is_complete() == true`.
     assert!(plan.pending_tasks().is_empty());
     assert!(plan.all_tasks().is_empty());
     assert!(!plan.is_complete());
@@ -1358,10 +1325,10 @@ fn test_m8_unreadable_plan_is_not_reported_as_no_pending_tasks() {
     fs::remove_dir_all(&dir).ok();
 }
 
-/// M8: the two error-propagating readers answer different questions, and the
+/// The two error-propagating readers answer different questions, and the
 /// compatibility wrappers must keep answering them faithfully for a readable plan
-/// (a wrapper that swallowed the plan and returned an empty list — the old M8
-/// failure mode — fails here even though the plan is on disk and readable).
+/// (a wrapper that swallows the plan and returns an empty list fails here even
+/// though the plan is on disk and readable).
 #[test]
 fn test_try_all_tasks_lists_checked_ids_while_try_pending_tasks_omits_them() {
     let dir = temp_marmel();
@@ -1393,7 +1360,7 @@ fn test_try_all_tasks_lists_checked_ids_while_try_pending_tasks_omits_them() {
     );
     assert!(!plan.is_complete());
 
-    // The Vec-shaped wrappers carry the same state (the M8 log-and-empty path is
+    // The Vec-shaped wrappers carry the same state (the log-and-empty path is
     // pinned by the unreadable-plan test above, not by these happy-path values).
     assert_eq!(
         plan.pending_tasks(),
@@ -1418,15 +1385,15 @@ fn test_try_all_tasks_lists_checked_ids_while_try_pending_tasks_omits_them() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-// M9 — the success/failure decision behind check-off has exactly one owner:
+// The success/failure decision behind check-off has exactly one owner:
 // `crate::markers` (`MissionMarker::resolve`, `has_failure_marker`,
-// `has_replan_marker`). `src/manager/phase.rs` must not carry a second matcher.
+// `has_replan_marker`). `src/manager/phase.rs` declares no matcher of its own.
 
-/// M9: every check-off decision is taken by the single marker matcher, including
-/// the payloads that fooled the deleted substring matcher pair: a benign
-/// `0 failed` test counter, prose that *quotes* `MISSION COMPLETE` inside a
-/// failure, a negated mention ("not … MISSION COMPLETE"), a canned success token
-/// and a replan that embeds the completion words.
+/// Every check-off decision is taken by the single marker matcher, including the
+/// payloads that fool a substring matcher pair: a benign `0 failed` test counter,
+/// prose that *quotes* `MISSION COMPLETE` inside a failure, a negated mention
+/// ("not … MISSION COMPLETE"), a canned success token and a replan that embeds
+/// the completion words.
 #[test]
 fn test_m9_checkoff_is_decided_by_the_single_marker_matcher() {
     struct Case {
@@ -1516,8 +1483,8 @@ fn test_m9_checkoff_is_decided_by_the_single_marker_matcher() {
         fs::remove_dir_all(&dir).ok();
     }
 
-    // (3) Non-vacuity: the deleted substring pair would have decided the benign
-    // counter case the other way round, and accepted the canned token.
+    // (3) Non-vacuity: a substring pair would have decided the benign counter
+    // case the other way round, and accepted the canned token.
     let benign = cases[0].body.as_str();
     assert!(
         legacy_substring_says_failure(benign),
@@ -1534,13 +1501,13 @@ fn test_m9_checkoff_is_decided_by_the_single_marker_matcher() {
     );
 }
 
-// t-035a — check-off integrity: one marker gate, one task id, and a plan that
-// cannot be read/parsed never reports itself as finished.
+// Check-off integrity: one marker decision, one task id, and a plan that
+// cannot be read or parsed never reports itself as finished.
 
-/// t-035a: a completion marker that names a **different** plan task than the id
-/// the caller bound aborts the check-off instead of silently preferring either
-/// side. Both live session loops bind the `delegate_task` task id, so the old
-/// "honour the bound id" rule let a deliverable for `t-011` tick `- [ ] [t-010]`.
+/// A completion marker that names a **different** plan task than the id the
+/// caller bound aborts the check-off instead of silently preferring either side:
+/// the live session loops bind the `delegate_task` task id, so a completion for
+/// one task can never tick another task's box.
 #[test]
 fn test_bound_id_and_marker_id_disagreement_aborts_check_off() {
     let dir = temp_marmel();
@@ -1550,7 +1517,7 @@ fn test_bound_id_and_marker_id_disagreement_aborts_check_off() {
     )
     .unwrap();
 
-    // (1) Body-derived marker id `t-011` vs caller-bound `t-010`.
+    // (1) Body-derived marker id vs the caller-bound id.
     let body = format!(
         "Audited both session loops.\n\n{}",
         decorated(MARKER_COMPLETE, "t-011")
@@ -1562,7 +1529,7 @@ fn test_bound_id_and_marker_id_disagreement_aborts_check_off() {
         "a marker for another task must not check off the bound task"
     );
 
-    // (2) The same rule for the structured marker the orchestrator now threads.
+    // (2) The same rule for the structured marker threaded by the orchestrator.
     let structured = MissionMarker::Complete {
         task_id: Some("t-011".to_string()),
     };
@@ -1608,10 +1575,10 @@ fn test_bound_id_and_marker_id_disagreement_aborts_check_off() {
     fs::remove_dir_all(&dir).ok();
 }
 
-/// t-035a: a plan file that exists but holds no parseable task line is a plan
-/// whose state is **unknown**, never "all tasks done": `is_complete()` stays
-/// false and nothing can be ticked. The session surfaces this (`read_plan_gate`
-/// in `src/ui/session.rs`) instead of folding it into an empty pending list.
+/// A plan file that exists but holds no parseable task line is a plan whose state
+/// is **unknown**, never "all tasks done": `is_complete()` stays false and
+/// nothing can be ticked. The session surfaces this (`read_plan_gate` in
+/// `src/ui/session.rs`) instead of folding it into an empty pending list.
 #[test]
 fn test_unparseable_plan_is_never_reported_as_complete() {
     let dir = temp_marmel();
@@ -1653,10 +1620,10 @@ fn test_unparseable_plan_is_never_reported_as_complete() {
     fs::remove_dir_all(&dir).ok();
 }
 
-/// t-035a: an unreadable plan (here: invalid UTF-8, so the parse cannot even
-/// start) is an **error** through the fallible API and an incomplete plan
-/// through the completion gate — the two facts the UI now turns into a visible
-/// warning instead of silence (bug M8 at the UI boundary).
+/// An unreadable plan (here: invalid UTF-8, so the parse cannot even start) is an
+/// **error** through the fallible API and an incomplete plan through the
+/// completion check — the two facts the UI turns into a visible warning instead
+/// of silence.
 #[test]
 fn test_unreadable_plan_reports_an_error_and_is_not_complete() {
     let dir = temp_marmel();

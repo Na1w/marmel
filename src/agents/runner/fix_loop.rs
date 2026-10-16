@@ -1,55 +1,20 @@
-//! Shared validator/fix-loop driver.
+//! Shared validator/fix-loop driver: one `LLM turn → tool dispatch → verdict`
+//! loop behind the validator pass, the plan audit and the specialist streaming
+//! turn. Abort, cancellation and hard LLM/backend errors yield `Err` (strict
+//! failure), never `Ok(false, …)`: a cancelled run records no verdict and must
+//! not be read as an authoritative rejection.
 //!
-//! **Consolidation (one shared driver):** three near-identical copies of the
-//! "LLM turn → tool dispatch → verdict" loop existed:
-//! `run_automated_validation_inner` and `run_plan_validation_inner`
-//! (validation.rs) plus the specialist streaming turn in `runner/execution.rs`.
-//! They had already drifted semantically (abort → `Ok(false, …)` vs `Err(…)`),
-//! which is exactly the class of bug this consolidation eliminates.
-//!
-//! ## Abort-semantics decision (deliberate, documented)
-//!
-//! **All abort/cancellation paths now return `Err` (strict failure), never
-//! `Ok(false, …)` (soft rejection).** Rationale:
-//! - A cancelled validation is NOT a verdict. Returning `Ok(false)` ("rejected")
-//!   would let downstream logic treat a user-initiated abort as an authoritative
-//!   negative verdict, potentially triggering revision loops or rejections that
-//!   the user never asked for.
-//! - `Err` propagates to the caller, which already special-cases cancellation
-//!   (e.g. `harness/plan.rs` checks `token.is_cancelled()` before treating an
-//!   `Err` as a skip) — so the strict path is fully supported by all consumers.
-//! - The deliverable loop and the plan loop previously disagreed on this; the
-//!   stricter `Err` behavior (previously used by the deliverable loop) wins.
-//!
-//! Likewise, a hard LLM/backend error now always returns `Err` (previously the
-//! deliverable loop `break`-ed out of its turn loop and the post-loop fallback
-//! *assumed approved* — the unsafe direction for a validator).
-//!
-//! ## Bounds of one fix-loop run (gate t-033c)
-//!
-//! The fix loop used to be **unbounded at its own level**: it had no round cap
-//! and no wall-clock deadline, so one validator / plan-audit pass could spin
-//! forever (the outer Manager turn has [`crate::manager::r#loop::MAX_TURNS`] and
-//! the t-031c turn watchdog, but neither counts the *inner* rounds of this loop).
-//! One fix-loop run is now bounded twice:
-//!
-//! * [`MAX_FIX_LOOP_ROUNDS`] — an explicit iteration (round) cap;
-//! * [`FIX_LOOP_IDLE_LIMIT_SECS`] / [`FIX_LOOP_HARD_CAP_SECS`] — a wall-clock
-//!   deadline enforced by the crate's existing [`TurnWatchdog`] /
-//!   [`DeadlineKind`] machinery (no second timer is invented), with the idle
-//!   window fed by observable progress (a completed tool call, an injected
-//!   steering notice).
-//!
-//! Exhausting either bound returns [`FixLoopResult::Exhausted`] with an explicit
-//! reason and a `tracing::warn!` — never a silent success.
-//!
-//! ## Fail-closed verdict contract (gate t-033c, contract change)
-//!
-//! After the three verdict reminders, a validator that still never called
-//! `leave_verdict` **no longer auto-approves** its deliverable. Not having
-//! recorded a verdict is not approval: the loop returns `approved = false` with
-//! an explicit "no verdict recorded" reason, the deliverable fails and its plan
-//! line stays unchecked.
+//! One run is bounded twice: an iteration cap ([`MAX_FIX_LOOP_ROUNDS`]) and a
+//! wall-clock deadline ([`FIX_LOOP_IDLE_LIMIT_SECS`] / [`FIX_LOOP_HARD_CAP_SECS`])
+//! enforced by the crate's [`TurnWatchdog`] / [`DeadlineKind`] machinery, with the
+//! idle window fed by observable progress (a completed tool call, an injected
+//! steering notice). The Manager turn bound [`crate::manager::r#loop::MAX_TURNS`]
+//! does not count these inner rounds. Hitting either bound returns
+//! [`FixLoopResult::Exhausted`] with an explicit reason — never a silent success.
+//! Fail closed on a missing verdict: after the three verdict reminders, a
+//! validator that never called `leave_verdict` gets `approved = false` with a
+//! "no verdict recorded" reason, the deliverable fails and its plan line stays
+//! unchecked.
 
 use crate::agents::Agent;
 use crate::agents::runner::execution::may_record_verdict;
@@ -84,16 +49,14 @@ pub enum FixLoopResult {
     Aborted,
     /// The run hit one of its own bounds — the round cap ([`MAX_FIX_LOOP_ROUNDS`])
     /// or the wall-clock deadline ([`FIX_LOOP_IDLE_LIMIT_SECS`] /
-    /// [`FIX_LOOP_HARD_CAP_SECS`]) — without ever recording a verdict.
-    ///
-    /// This is an **explicit failed outcome**, carrying the reason the loop was
-    /// torn down. It is deliberately not a `Verdict { approved: false, … }`: the
-    /// loop never reached a verdict, and callers must be able to tell "the auditor
-    /// ran out of budget" from "the auditor rejected the deliverable".
+    /// [`FIX_LOOP_HARD_CAP_SECS`]) — without ever recording a verdict. This is an
+    /// explicit failed outcome carrying the reason the run ended; it is not a
+    /// `Verdict { approved: false, … }`, so callers can tell "the auditor ran out
+    /// of budget" from "the auditor rejected the deliverable".
     Exhausted { reason: String },
 }
 
-// ── Fix-loop bounds (gate t-033c) ──────────────────────────────────────────
+// ── Fix-loop bounds ──────────────────────────────────────────
 
 /// How many LLM rounds **one** fix-loop run may take (validator pass, plan audit
 /// or any other [`run_fix_loop`] driver).
@@ -104,7 +67,7 @@ pub enum FixLoopResult {
 pub const MAX_FIX_LOOP_ROUNDS: usize = 200;
 
 /// How many verdict reminders a validator gets before the run is concluded
-/// **without** a verdict (fail-closed, gate t-033c).
+/// **without** a verdict, i.e. fail closed.
 const VERDICT_REMINDERS: usize = 3;
 
 /// Prefix that marks a tool result as a failure for this driver's own dispatch
@@ -113,9 +76,8 @@ const VERDICT_REMINDERS: usize = 3;
 pub const TOOL_ERROR_PREFIX: &str = "ERROR: ";
 
 /// The repetition-intervention fallback handed to [`dispatch_tool_call`]. The
-/// verdict tool is named through its constant (gate t-033e: no raw tool-name
-/// literal anywhere in this file); the `{tool}` placeholder is substituted by
-/// the dispatcher.
+/// verdict tool is named through its constant, never as a raw tool-name
+/// literal; the `{tool}` placeholder is substituted by the dispatcher.
 pub fn repetition_intervention_fallback() -> String {
     format!(
         "Tool repetition detected for '{{tool}}'. Conclude by calling {} or proceed with the task.",
@@ -128,12 +90,10 @@ pub fn repetition_intervention_fallback() -> String {
 /// ([`TURN_WATCHDOG_SECS`]) so there is exactly one wall-clock vocabulary.
 pub const FIX_LOOP_IDLE_LIMIT_SECS: u64 = TURN_WATCHDOG_SECS;
 
-/// Absolute wall-clock bound of one fix-loop run, progress or not.
-///
-/// Must stay **strictly inside** the enclosing Manager turn hard cap
-/// ([`TURN_HARD_CAP_SECS`]) — otherwise the fix loop could outlive the turn that
-/// owns it and the outer watchdog would be the first to fire, which is exactly
-/// the "no bound at the fix-loop's own level" situation this constant removes.
+/// Absolute wall-clock bound of one fix-loop run, progress or not. It must stay
+/// **strictly inside** the enclosing Manager turn hard cap
+/// ([`TURN_HARD_CAP_SECS`]) so the fix loop can never outlive the turn that
+/// owns it.
 pub const FIX_LOOP_HARD_CAP_SECS: u64 = 30 * 60;
 
 /// The iteration + wall-clock bounds of one [`run_fix_loop`] run.
@@ -259,23 +219,21 @@ pub struct LoopParams<'a> {
     pub status_template: String,
     /// Role label for `debug_log::log_validation_verdict`.
     pub verdict_log_role: String,
-    /// Iteration + wall-clock bounds of this run (gate t-033c, see
-    /// [`FixLoopBounds`]). Exhausting either bound ends the run with
-    /// [`FixLoopResult::Exhausted`] — an explicit failed outcome, never a
-    /// silent success.
+    /// Iteration + wall-clock bounds of this run ([`FixLoopBounds`]). Hitting
+    /// either bound ends the run with [`FixLoopResult::Exhausted`] — an explicit
+    /// failed outcome, never a silent success.
     pub bounds: FixLoopBounds,
     /// Prefix for the "aborted before tool {name}" warn log.
     pub abort_log_prefix: String,
-    /// Whether to emit a per-tool `emit_status` line (deliverable/specialist
-    /// loops do; the plan auditor loop historically did not).
+    /// Whether to emit a per-tool `emit_status` line (the deliverable/specialist
+    /// loop does, the plan-auditor loop does not).
     pub emit_tool_status: bool,
     /// User-level notice injected when a `rebirth` call succeeds (wording
     /// differs between validator and specialist loops).
     pub rebirth_notice: String,
 }
 
-/// Build the canonical `ChatRequest` shared by all fix-loop turn calls
-/// (previously a 10-line literal duplicated ×3).
+/// Build the canonical `ChatRequest` shared by all fix-loop turn calls.
 pub fn build_turn_request(
     model: &str,
     engine: &ContextEngine,
@@ -296,31 +254,27 @@ pub fn build_turn_request(
     }
 }
 
-// ── Fix-loop tool blueprint (gate t-033e) ────────────────────────────────────
+// ── Fix-loop tool blueprint ────────────────────────────────────
 //
 // The "blueprint" of a fix-loop run is the set of tool schemas handed to the
-// model plus the tool calls that same run is allowed to dispatch. It is spelled
+// model plus the tool calls that same run may dispatch. It is spelled
 // **exclusively** with the constants of [`crate::tool_names`]: no tool name is
-// ever re-typed as a string literal in this file, so the blueprint, the
-// dispatcher (`src/harness/mod.rs`) and the specialist registry can never drift
-// apart by a typo.
+// re-typed as a string literal here, so the blueprint, the dispatcher
+// (`src/harness/mod.rs`) and the specialist registry cannot drift apart by a
+// typo.
 //
-// The classes exist so the blueprint is reasoned about **by class** rather than
-// by ad-hoc name comparisons. The verdict class is the one a role must never
-// receive unless the crate's public role gate [`may_record_verdict`]
-// (`runner/execution.rs`, gate t-033b) accepts that role. This block does **not**
-// restate that gate: it calls it, so the identity rule lives in exactly one place.
+// The classes let the blueprint be reasoned about **by class** rather than by
+// ad-hoc name comparisons. A role may never receive the verdict class unless the
+// crate's public role check [`may_record_verdict`] (`runner/execution.rs`)
+// admits it; this block calls that check instead of restating it, so the identity
+// rule lives in exactly one place.
 
 /// The tools that record a validation verdict (bare + `terminal__` variant).
-///
-/// **The spellings are owned by [`tool_names`]** (gate t-064): the verdict rows of
+/// [`tool_names`] owns the spellings — the verdict rows of
 /// [`tool_names::TOOL_ALIAS_TABLE`] enumerated by [`tool_names::tool_spellings_for`]
-/// and the predicate [`tool_names::is_leave_verdict_tool_name`] are the single
-/// source of truth, and [`is_verdict_recording_tool`] answers from that owner —
-/// never from this list. This constant survives only as the compile-time mirror of
-/// the two canonical spellings for callers that need a `&'static [&'static str]`
-/// (it is asserted to be a subset of the owner's spelling family by
-/// `verdict_recording_spellings_have_a_single_owner_in_tool_names` below).
+/// plus the predicate [`tool_names::is_leave_verdict_tool_name`] — and
+/// [`is_verdict_recording_tool`] answers from that owner, never from this list,
+/// which only mirrors the two canonical spellings as a `&'static [&'static str]`.
 pub const VERDICT_RECORDING_TOOLS: &[&str] = &[
     tool_names::TOOL_LEAVE_VERDICT,
     tool_names::TERMINAL_LEAVE_VERDICT,
@@ -339,18 +293,11 @@ pub fn verdict_recording_tool_spellings() -> Vec<&'static str> {
 /// `dispatch_specialist` applies to [`tool_names::TOOL_REPLY_TO_ARBITRATOR`]).
 pub const ALWAYS_ADVERTISED_TOOLS: &[&str] = &[tool_names::TOOL_REPLY_TO_ARBITRATOR];
 
-/// Read-only inspection tools an auditor may be advertised.
-///
-/// `list_directory` / `terminal__list_directory` used to be listed here while the
-/// alias rows that claimed those spellings were still in the tool-name table.
-/// They are gone (gate t-064): `src/harness/mod.rs` has **no** built-in dispatch
-/// arm for `list_directory` (the alias rows were deliberately removed in t-069,
-/// see the note on `tool_names::CANONICAL_TOOL_NAMES`), so advertising them
-/// promised the model a tool nobody serves — the call comes back
-/// `ToolError::UnknownTool` (or falls through to an MCP server that does publish
-/// the name, in which case the MCP view of the blueprint carries it, not this
-/// list). The constants in `src/tool_names.rs` stay; only the unclaimed
-/// advertisement is removed.
+/// Read-only inspection tools an auditor may be advertised. Only names that
+/// `src/harness/mod.rs` actually serves belong here: advertising an unclaimed
+/// spelling promises the model a tool nobody dispatches, and the call comes back
+/// `ToolError::UnknownTool`. Names published by an MCP server reach the model
+/// through the MCP view of the blueprint, not through this list.
 pub const INSPECTION_TOOLS: &[&str] = &[
     tool_names::TOOL_READ_FILE,
     tool_names::TOOL_GREP_SEARCH,
@@ -387,7 +334,8 @@ pub enum BlueprintToolClass {
     Inspection,
     /// File mutation / execution ([`MUTATING_TOOLS`]).
     Mutating,
-    /// Verdict recording ([`VERDICT_RECORDING_TOOLS`]) — role-gated.
+    /// Verdict recording ([`VERDICT_RECORDING_TOOLS`]) — restricted to the
+    /// validator role.
     Verdict,
     /// Unclassified (Manager-only tools, MCP names, aliases): decided purely by
     /// the caller's allow-list / registry entry.
@@ -412,22 +360,20 @@ pub fn blueprint_tool_class(name: &str) -> BlueprintToolClass {
     }
 }
 
-/// `true` when `name` names a verdict-recording tool.
-///
-/// The answer comes from the crate's single owner of verdict spellings
-/// ([`crate::agents::validation::is_leave_verdict_tool`] → [`tool_names::is_leave_verdict_tool_name`],
-/// i.e. the verdict rows of [`tool_names::TOOL_ALIAS_TABLE`] plus the
-/// [`tool_names::LEAVE_VERDICT_NAME_SUFFIXES`] rule). Gate t-064 removed the
-/// hand-maintained [`VERDICT_RECORDING_TOOLS`] lookup from here: a locally kept
-/// list can only drift from the owner, and a spelling the owner accepts but this
-/// list missed would silently re-open the verdict class to a role the role gate
-/// refuses.
+/// `true` when `name` names a verdict-recording tool, answered by the crate's
+/// single owner of verdict spellings:
+/// [`crate::agents::validation::is_leave_verdict_tool`] →
+/// [`tool_names::is_leave_verdict_tool_name`] (the verdict rows of
+/// [`tool_names::TOOL_ALIAS_TABLE`] plus the
+/// [`tool_names::LEAVE_VERDICT_NAME_SUFFIXES`] rule). A locally kept list such as
+/// [`VERDICT_RECORDING_TOOLS`] can only drift and would re-open the verdict class
+/// to a role that has no verdict authority, so it is never consulted here.
 pub fn is_verdict_recording_tool(name: &str) -> bool {
     is_leave_verdict_tool(name)
 }
 
-/// The fix loop's one and only question about verdict authority. It delegates to
-/// the crate's **public** role gate [`may_record_verdict`] instead of restating
+/// The fix loop's one and only question about verdict authority. It defers to
+/// the crate's **public** role check [`may_record_verdict`] instead of restating
 /// it: a caller without a role (the Manager) or with any non-validator role has
 /// no verdict authority, and no allow-list or prompt blueprint can widen that.
 pub fn caller_may_record_verdict(caller: &harness::ToolCaller) -> bool {
@@ -439,8 +385,8 @@ pub fn caller_may_record_verdict(caller: &harness::ToolCaller) -> bool {
 
 /// The fail-closed verdict rejection, spelled with the crate's existing
 /// verdict-rejection vocabulary: a typed [`ToolError::Forbidden`] (the very
-/// variant the agent-loop gate in `runner/execution.rs` reports) rendered into
-/// the tool-error text the caller sees. No new error type is invented.
+/// variant the agent-loop role check in `runner/execution.rs` reports) rendered
+/// into the tool-error text the caller sees. No new error type is invented.
 fn verdict_role_rejection(caller: &harness::ToolCaller, tool: &str) -> String {
     let forbidden = ToolError::Forbidden {
         tool: tool.to_string(),
@@ -453,10 +399,10 @@ fn verdict_role_rejection(caller: &harness::ToolCaller, tool: &str) -> String {
     )
 }
 
-/// Role-aware blueprint allow-list (gate t-033e): an explicit prompt/blueprint
-/// allow-list may name anything, but a verdict-recording tool is **dropped** for
-/// any role the public gate refuses. A blueprint is a description of intent,
-/// never an authority.
+/// Role-aware blueprint allow-list: an explicit prompt/blueprint allow-list may
+/// name anything, but a verdict-recording tool is **dropped** for any role the
+/// public verdict check `may_record_verdict` refuses. A blueprint describes
+/// intent, never authority.
 pub fn role_filtered_blueprint(
     caller: &harness::ToolCaller,
     allowed_tools: &[String],
@@ -482,13 +428,12 @@ pub fn assemble_tools_for_caller(
     assemble_tools(blueprint.as_deref(), entry_allows, mcp_servers)
 }
 
-/// The tool schemas one fix-loop run may actually advertise (gate t-033e).
-///
-/// Even when a caller assembled its tool list from a blueprint that named a
-/// verdict tool, a role rejected by [`may_record_verdict`] never sees a verdict
-/// tool in the schema list: the fix loop strips the whole verdict class from its
-/// own advertised view. Fail-closed by construction — a tool the model is never
-/// told about cannot be requested from the blueprint.
+/// The tool schemas one fix-loop run may actually advertise. Even when a caller
+/// assembled its tool list from a blueprint that named a verdict tool, a role
+/// rejected by [`may_record_verdict`] never sees a verdict tool in the schema
+/// list: the fix loop strips the whole verdict class from its own advertised view.
+/// Fail closed by construction — a tool the model is never told about cannot be
+/// requested from the blueprint.
 pub fn advertised_tools_for_caller(
     tools: &[ToolDef],
     caller: &harness::ToolCaller,
@@ -501,23 +446,14 @@ pub fn advertised_tools_for_caller(
         .collect()
 }
 
-/// Charge `engine` with the exact tool schemas of one fix-loop run (bug M7,
-/// gate t-064) and return the charged schema token count.
-///
-/// [`crate::manager::context::ContextEngine::should_compact`] measures the whole
-/// request, but its tool-schema term is only as good as what the caller declares:
-/// an engine that never calls [`ContextEngine::set_tools`](crate::manager::context::ContextEngine::set_tools)
-/// budgets the transcript alone and therefore under-prices every turn by the size
-/// of the advertised schemas. The value passed here **must** be the same list
-/// handed to [`build_turn_request`] — never a superset (which would compact
-/// transcript away too early) and never a subset (which would let an over-budget
-/// request through).
-///
-/// `run_fix_loop` calls it once per run with its [`advertised_tools_for_caller`]
-/// view, which is exactly what the run sends on every turn. The specialist turn in
-/// `runner/execution.rs` builds its own advertised list through
-/// `execution::specialist_advertised_tools`; that list is likewise the one it
-/// sends, so charging the engine with it here is the same one-liner.
+/// Charge `engine` with the exact tool schemas of one fix-loop run and return the
+/// charged schema token count. [`crate::manager::context::ContextEngine::should_compact`]
+/// budgets the whole request, and its tool-schema term is only as good as what the
+/// caller declares: an engine that never calls
+/// [`ContextEngine::set_tools`](crate::manager::context::ContextEngine::set_tools)
+/// prices the transcript alone and under-prices every turn by the advertised
+/// schemas. The list here **must** equal the [`advertised_tools_for_caller`] view
+/// that [`build_turn_request`] sends — never a superset, never a subset.
 pub fn charge_engine_tool_schema(engine: &mut ContextEngine, advertised: &[ToolDef]) -> usize {
     let previous = engine.tool_schema_tokens();
     engine.set_tools(advertised);
@@ -537,13 +473,11 @@ pub fn charge_engine_tool_schema(engine: &mut ContextEngine, advertised: &[ToolD
 }
 
 /// Assemble the tool list: `ToolDef::default_tools()` filtered by either an
-/// explicit prompt-blueprint allow-list or the registry entry's namespaces,
-/// plus MCP tools for the given servers. (Previously duplicated ×3.)
-///
-/// **Verdict-class hardening (gate t-033e):** a prompt/blueprint allow-list can
-/// never grant the verdict class on its own — only the registry/entry authority
-/// can even propose it, and the fix loop then strips it from the advertised view
-/// of any role [`may_record_verdict`] refuses (see [`advertised_tools_for_caller`]).
+/// explicit prompt-blueprint allow-list or the registry entry's namespaces, plus
+/// MCP tools for the given servers. A prompt/blueprint allow-list can never grant
+/// the verdict class on its own — only the registry/entry authority can propose
+/// it, and the fix loop strips it from the advertised view of any role
+/// [`may_record_verdict`] refuses (see [`advertised_tools_for_caller`]).
 pub fn assemble_tools(
     allowed_tools: Option<&[String]>,
     entry_allows: impl Fn(&str) -> bool,
@@ -555,7 +489,8 @@ pub fn assemble_tools(
         let is_allowed = match blueprint_tool_class(name) {
             BlueprintToolClass::AlwaysAdvertised => true,
             // Not grantable by a blueprint alone: the entry/registry authority has
-            // to propose it, and the loop-level role gate has to accept the role.
+            // to propose it, and the loop-level verdict check has to accept the
+            // role.
             BlueprintToolClass::Verdict => entry_allows(name),
             _ => {
                 if let Some(allowed) = allowed_tools {
@@ -572,12 +507,12 @@ pub fn assemble_tools(
             tools.push(tool);
         }
     }
-    // Advertising de-dup (gate t-033c, folded from t-034c): the schema list
-    // handed to a model must be the **policy-filtered** MCP view, never the raw
-    // registry. `harness::allowed_mcp_tools` is the single advertising entry
-    // point (`src/harness/mod.rs`), so a name the MCP name policy refused — or
-    // one that collides with a built-in — can never even be offered to a model,
-    // let alone dispatched by a worker that copied it out of its own tool list.
+    // Advertising de-dup: the schema list handed to a model must be the
+    // **policy-filtered** MCP view, never the raw registry.
+    // `harness::allowed_mcp_tools` is the single advertising entry point
+    // (`src/harness/mod.rs`), so a name the MCP name policy refused — or one that
+    // collides with a built-in — can never even be offered to a model, let alone
+    // dispatched by a worker that copied it out of its own tool list.
     for tool in harness::allowed_mcp_tools(mcp_servers) {
         tools.push(ToolDef::from_mcp(&tool));
     }
@@ -616,8 +551,7 @@ pub fn resolve_validator_backend(
 
 /// Shared tool-dispatch core: monitor intervention check → cancellation check
 /// → `dispatch_for_async_with_engine`. Returns `(content, execution_succeeded)`
-/// where `content` starts with `"ERROR: "` on failure. Previously duplicated
-/// across the deliverable loop, the plan loop, and the specialist loop.
+/// where `content` starts with `"ERROR: "` on failure.
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch_tool_call(
     monitor: &mut HarnessMonitor,
@@ -630,12 +564,11 @@ pub async fn dispatch_tool_call(
     error_prefix: &str,
     intervention_fallback: &str,
 ) -> Option<(String, bool)> {
-    // Verdict dispatch gate (gate t-033e): a fix loop must never *dispatch* a
-    // verdict tool for a role that [`may_record_verdict`] refuses, even if a
-    // blueprint allow-list named it and the tool therefore reached this point.
-    // The refusal is a typed [`ToolError::Forbidden`] surfaced as a tool error —
-    // logged, visible to the caller, and never handed to the dispatcher, so no
-    // verdict state is touched.
+    // Verdict dispatch rule: a fix loop must never *dispatch* a verdict tool for
+    // a role that [`may_record_verdict`] refuses, even if a blueprint allow-list
+    // named it and the tool therefore reached this point. The refusal is a typed
+    // [`ToolError::Forbidden`] surfaced as a tool error — logged, visible to the
+    // caller, and never handed to the dispatcher, so no verdict state is touched.
     if is_verdict_recording_tool(&tc.function.name) && !caller_may_record_verdict(&caller) {
         let rejection = verdict_role_rejection(&caller, &tc.function.name);
         tracing::warn!(
@@ -752,29 +685,13 @@ pub fn append_tool_result(
 }
 
 /// Drain the steering notices addressed to `worker_key` and append them to the
-/// transcript, rendered by the crate's **single** notice renderer
-/// ([`crate::orchestrator::render_notice_for_worker`]).
-///
-/// This is the one and only place in the crate that turns a
-/// [`crate::orchestrator::SteerNotice`] into transcript text; the two inline
-/// renderings this replaced (`runner/execution.rs` and the turn-start block here)
-/// re-spelled the same format string, which is how the reply contract drifted
-/// away from what `render_notice_for_worker` promises the worker (verbatim notice
-/// id + the exact reply call).
-///
-/// `mid_turn` selects the drain seam:
-/// * `false` — the turn-start drain, as before.
-/// * `true` — the after-each-tool-round drain (t-048): a notice posted **while a
-///   turn is in flight** is injected into the SAME turn, before compaction and
-///   before a verdict/`break` can end the loop, instead of waiting for a turn
-///   boundary the worker may never cross again.
-///
-/// Both seams route through the same exact-identity routing
-/// (`drain_worker_notices` / [`crate::orchestrator::drain_worker_notices_mid_turn`]),
-/// so a notice addressed to a *different* worker is never injected here — it stays
-/// queued for that worker.
-///
-/// Returns the number of notices injected.
+/// transcript through the crate's **single** notice renderer
+/// ([`crate::orchestrator::render_notice_for_worker`]), the only place a
+/// [`crate::orchestrator::SteerNotice`] becomes transcript text. A notice posted
+/// mid-turn is injected into that same turn, before compaction or a verdict ends
+/// the loop. Both the turn-start and the after-each-tool-round seam route through
+/// the same exact-identity routing (`drain_worker_notices` /
+/// [`crate::orchestrator::drain_worker_notices_mid_turn`]).
 fn inject_drained_notices(
     engine: &mut ContextEngine,
     notices: Vec<crate::orchestrator::SteerNotice>,
@@ -819,12 +736,10 @@ pub fn inject_worker_notices_mid_turn(engine: &mut ContextEngine, worker_key: &s
 /// The shared fix-loop driver: cancel check → worker context update → status
 /// emit → turn-start notice drain → streaming LLM turn → abort/steer handling →
 /// XML rescue → assistant folding → verdict detection → nudge-on-silence → tool
-/// dispatch → mid-turn notice drain → compaction. One implementation for the
-/// deliverable validator, the plan auditor, and (via `stream_single_turn`) the
-/// specialist turn.
-///
-/// Returns `Err` on hard LLM errors and maps aborts to `FixLoopResult::Aborted`
-/// (strict semantics — see module docs).
+/// dispatch → mid-turn notice drain → compaction. One implementation behind the
+/// deliverable validator, the plan auditor and (via `stream_single_turn`) the
+/// specialist turn. Hard LLM errors return `Err`; aborts map to
+/// `FixLoopResult::Aborted` — strict, because an aborted run records no verdict.
 pub async fn run_fix_loop(
     p: &mut LoopParams<'_>,
     monitor: &mut HarnessMonitor,
@@ -836,29 +751,29 @@ pub async fn run_fix_loop(
     let mut consecutive_malformed_tool_calls = 0u32;
     let mut turn = 0usize;
 
-    // Role gate for the whole run (gate t-033e): the fix loop asks the crate's
-    // public gate [`may_record_verdict`] exactly once, and everything verdict-shaped
-    // downstream (what is advertised, what is nudged, what is consumed, what is
-    // dispatched) is decided by that single answer. A blueprint allow-list naming a
-    // verdict tool cannot widen it.
+    // Verdict authority for the whole run: the fix loop asks the crate's public
+    // role check [`may_record_verdict`] exactly once, and everything
+    // verdict-shaped downstream (what is advertised, what is nudged, what is
+    // consumed, what is dispatched) follows from that single answer. A blueprint
+    // allow-list naming a verdict tool cannot widen it.
     let verdict_authority = caller_may_record_verdict(&caller);
     // The advertised schema view — the blueprint the model actually sees.
     let advertised = advertised_tools_for_caller(&p.tools, &caller);
-    // Gate t-064 (offender E): the request this loop sends carries exactly
-    // `advertised` (see `build_turn_request` below), so the engine is charged with
-    // exactly that list before its first budget decision. From here on
-    // `should_compact()` / `should_advise_rebirth()` price the **real** request
-    // (transcript + tool schemas) instead of the transcript alone.
+    // The request this loop sends carries exactly `advertised` (see
+    // `build_turn_request` below), so the engine is charged with that same list
+    // before its first budget decision: `should_compact()` /
+    // `should_advise_rebirth()` price the **real** request (transcript + tool
+    // schemas), never the transcript alone.
     charge_engine_tool_schema(p.engine, &advertised);
 
     loop {
         turn += 1;
 
-        // Fix-loop bounds (gate t-033c): one run may not spin forever. The
-        // iteration cap and the wall-clock deadline are evaluated **before** the
-        // round's LLM call, so the run is torn down instead of paying for yet
-        // another turn, and both exhaustion paths return an explicit failed
-        // outcome (`Exhausted` + reason + `warn!`) — never a silent approval.
+        // Fix-loop bounds: one run may not spin forever. The iteration cap and the
+        // wall-clock deadline are evaluated **before** the round's LLM call, so the
+        // run is torn down instead of paying for yet another turn, and both
+        // exhaustion paths return an explicit failed outcome (`Exhausted` + reason +
+        // `warn!`) — never a silent approval.
         if p.bounds.round_cap_reached(turn) {
             let reason = p.bounds.round_cap_reason();
             tracing::warn!(
@@ -876,10 +791,10 @@ pub async fn run_fix_loop(
             return Ok(FixLoopResult::Exhausted { reason });
         }
 
-        // Behavior-preserving: the original validator loops checked only their
-        // own token here (not the global token). The stricter abort *semantics*
-        // (Err, not Ok(false)) is applied below; the *trigger* stays token-only
-        // to avoid new aborts from unrelated global cancels in parallel runs.
+        // Only this run's own cancellation token aborts here — not the global
+        // token. The strict abort *semantics* (`Err`, not `Ok(false)`) is applied
+        // below; the *trigger* stays token-scoped so an unrelated global cancel in
+        // a parallel run cannot abort this run.
         if p.token.is_cancelled() {
             tracing::warn!("{}: aborted by cancellation token", p.tag);
             return Ok(FixLoopResult::Aborted);
@@ -976,13 +891,13 @@ pub async fn run_fix_loop(
 
         for tc in &tool_calls {
             if is_leave_verdict_tool(&tc.function.name) {
-                // **Role gate (gate t-033e).** This loop does not record a verdict
-                // for just any caller: only a caller accepted by the crate's public
-                // gate [`may_record_verdict`] may conclude a fix-loop run with one.
-                // Anything else fails closed — the call is not consumed as a
-                // verdict, no verdict is logged, nothing is dispatched, and the run
-                // ends NOT approved carrying the typed rejection
-                // ([`ToolError::Forbidden`]). No blueprint allow-list can widen this.
+                // **Verdict role rule.** This loop records a verdict only for a
+                // caller accepted by the crate's public role check
+                // [`may_record_verdict`]; anything else fails closed — the call is
+                // not consumed as a verdict, no verdict is logged, nothing is
+                // dispatched, and the run ends NOT approved carrying the typed
+                // rejection ([`ToolError::Forbidden`]). No blueprint allow-list can
+                // widen this.
                 if !verdict_authority {
                     let rejection = verdict_role_rejection(&caller, &tc.function.name);
                     append_tool_result(
@@ -1009,21 +924,19 @@ pub async fn run_fix_loop(
                     });
                 }
 
-                // The verdict tool is **terminal-only** inside this loop (gate
-                // t-033c): it is consumed here and never handed to the tool
-                // dispatcher, so no fix-loop switch can make the loop execute a
-                // verdict call on a worker's behalf. (A *worker's* own verdict
-                // attempt is refused further upstream by the identity gate
-                // `runner/execution.rs::may_record_verdict`, t-033b, and inside
-                // this loop by the gate above, t-033e.)
+                // The verdict tool is **terminal-only** inside this loop: it is
+                // consumed here and never handed to the tool dispatcher, so no fix
+                // loop can execute a verdict call on a worker's behalf. A worker's
+                // own verdict attempt is refused upstream by
+                // `runner/execution.rs::may_record_verdict` and inside this loop by
+                // the verdict role rule above.
                 let args_val = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
                     .unwrap_or_else(|_| serde_json::Value::String(tc.function.arguments.clone()));
                 let (approved, critique) = match parse_verdict_args(&args_val) {
                     Some(v) => v,
-                    // Fail-closed guard (gate t-033c): `parse_verdict_args`
-                    // resolves every payload to a verdict, so this arm exists
-                    // only to guarantee that a future regression can never
-                    // resurrect the historical "assume approved" default.
+                    // Fail closed: `parse_verdict_args` resolves every payload to a
+                    // verdict, so this arm guarantees that an absent, ambiguous or
+                    // unparseable verdict is never read as approval.
                     None => (false, NO_EXPLICIT_APPROVAL_REASON.to_string()),
                 };
                 crate::debug_log::log_validation_verdict(&p.verdict_log_role, approved, &critique);
@@ -1039,8 +952,8 @@ pub async fn run_fix_loop(
 
         if tool_calls.is_empty() {
             // A role without verdict authority is never nudged towards a verdict
-            // tool (it is not even advertised to it, gate t-033e): it concludes the
-            // run immediately with the fail-closed outcome below instead.
+            // tool (it is not even advertised to it): it concludes the run
+            // immediately with the fail-closed outcome below instead.
             if verdict_authority && verdict_nudge_count < VERDICT_REMINDERS {
                 verdict_nudge_count += 1;
                 let notice = if out.thinking_budget_exceeded {
@@ -1059,12 +972,11 @@ pub async fn run_fix_loop(
                 mirror_append_here(p.engine, Message::User { content: notice });
                 continue;
             } else {
-                // **Fail-closed (contract change, gate t-033c).** This branch used
-                // to end the run with `approved = true` ("assumed approved"), which
-                // let a deliverable be certified by a validator that never
-                // recorded any verdict. Not having recorded a verdict is not a
-                // verdict: the run now ends NOT approved, with an explicit reason,
-                // so the deliverable fails and its plan line stays unchecked.
+                // **Fail closed.** A missing verdict is never approval: after
+                // `VERDICT_REMINDERS` reminders the run ends NOT approved with an
+                // explicit reason, so a deliverable cannot be certified by a
+                // validator that recorded no verdict, and its plan line stays
+                // unchecked.
                 let reason = if verdict_authority {
                     format!(
                         "{} did not call {} after {VERDICT_REMINDERS} reminders: no validation verdict was recorded. {NO_EXPLICIT_APPROVAL_REASON}",
@@ -1072,9 +984,9 @@ pub async fn run_fix_loop(
                         tool_names::TOOL_LEAVE_VERDICT,
                     )
                 } else {
-                    // Gate t-033e: a caller the public verdict gate refuses can
-                    // never conclude this run with a verdict, so there is nothing
-                    // to wait for — carry the typed rejection as the reason.
+                    // A caller the public verdict check refuses can never conclude
+                    // this run with a verdict, so there is nothing to wait for —
+                    // carry the typed rejection as the reason.
                     format!(
                         "{} — {NO_EXPLICIT_APPROVAL_REASON}",
                         verdict_role_rejection(&caller, tool_names::TOOL_LEAVE_VERDICT),
@@ -1140,11 +1052,11 @@ pub async fn run_fix_loop(
             update_active_worker_context(&p.worker_key, p.engine.token_count());
         }
 
-        // Mid-turn notice drain (t-048): notices posted while this validator /
-        // auditor turn was in flight are injected right after the tool round, in
-        // the SAME turn — before compaction and before any of the turn's exit
-        // paths end the loop — so the steer reaches this worker's very next
-        // request instead of rotting in its inbox until the TTL sweep drops it.
+        // Mid-turn notice drain: notices posted while this validator / auditor turn
+        // was in flight are injected right after the tool round, in the SAME turn —
+        // before compaction and before any of the turn's exit paths end the loop —
+        // so the steer reaches this worker's very next request instead of waiting
+        // in its inbox for the notice TTL to expire.
         let notices_injected = inject_worker_notices_mid_turn(p.engine, &p.worker_key);
 
         // Periodic inspection reminder for validators (auditors) to avoid endless
@@ -1160,11 +1072,11 @@ pub async fn run_fix_loop(
             mirror_append_here(p.engine, Message::User { content: reminder });
         }
 
-        // Wall-clock progress (gate t-033c): observable forward progress — a tool
-        // call that actually completed, or a steering notice that reached this
-        // worker — refreshes the stalled-run window of the deadline. A run that
-        // only produces prose never resets it, so a spinning auditor is torn down
-        // by the idle bound while a busy, productive one is never cut off.
+        // Wall-clock progress: observable forward progress — a tool call that
+        // actually completed, or a steering notice that reached this worker —
+        // refreshes the stalled-run window of the deadline. A run that only
+        // produces prose never resets it, so a spinning auditor is torn down by the
+        // idle bound while a busy, productive one is never cut off.
         if turn_had_successful_tool_call || notices_injected > 0 {
             p.bounds.note_round_progress();
         }
@@ -1185,15 +1097,14 @@ pub async fn run_fix_loop(
             consecutive_malformed_tool_calls = 0;
         }
         if p.engine.should_compact() {
-            // Gate t-064: the outcome is never discarded. `CompactionOutcome` is
-            // the only evidence of whether the 70% target was actually reached,
-            // and `TargetUnreachable` means the run keeps working over budget —
-            // the same lie `surface_compaction_outcome` removed on the Manager
-            // path (t-063). The fix loop has no renderer, so it surfaces through
-            // the orchestrator status channel (the worker line the UI already
-            // reads) plus `tracing::warn!`.
+            // The compaction outcome is never discarded: `CompactionOutcome` is the
+            // only evidence of whether the 70% target was actually reached, and
+            // `TargetUnreachable` means the run keeps working over budget. This loop
+            // has no renderer, so the outcome surfaces through the orchestrator
+            // status channel (the worker line the UI already reads) plus
+            // `tracing::warn!`.
             let outcome = p.engine.compact();
-            // The mirror collapses with the engine (A §5.5 point 4).
+            // The mirror collapses with the engine.
             mirror_collapse_here(p.engine);
             tracing::info!("{}: automatic context compaction: {outcome:?}", p.tag);
             if let Some(notice) = fix_loop_compaction_notice(&p.tag, &outcome) {
@@ -1208,13 +1119,11 @@ pub async fn run_fix_loop(
 }
 
 /// The user-visible line for a fix-loop compaction that did **not** reach its
-/// 70% target — `None` when it did (gate t-064).
-///
-/// Mirrors `src/ui/session.rs::surface_compaction_outcome`: this loop has no
-/// renderer, so the caller routes the text through the orchestrator status
-/// channel and `tracing::warn!`. It must never claim a compaction that did not
-/// happen: [`CompactionOutcome::TargetUnreachable`] means everything trimmable was
-/// trimmed and the transcript is still over the compaction threshold.
+/// 70% target — `None` when it did. This loop has no renderer, so the caller
+/// routes the text through the orchestrator status channel and `tracing::warn!`,
+/// mirroring `src/ui/session.rs::surface_compaction_outcome`. It must never claim
+/// a compaction that did not happen: [`CompactionOutcome::TargetUnreachable`]
+/// means everything trimmable was trimmed and the transcript is still over budget.
 pub fn fix_loop_compaction_notice(tag: &str, outcome: &CompactionOutcome) -> Option<String> {
     if outcome.succeeded() {
         return None;
@@ -1322,8 +1231,8 @@ mod tests {
             .collect()
     }
 
-    /// t-010 wiring: the fix loop owns engine mutations the runner cannot see
-    /// (`append_tool_result`, both notice injectors, compaction). They mirror
+    /// Engine mutations owned by the fix loop (both notice injectors,
+    /// `append_tool_result`, compaction) are invisible to the runner: they mirror
     /// out through the task-local handle — the same way `CURRENT_WORKER_TOKEN`
     /// reaches this module — and stay a no-op when no journal is scoped.
     #[tokio::test]
@@ -1411,10 +1320,10 @@ mod tests {
         crate::session::worker_journal::unregister(key);
     }
 
-    /// The mid-turn seam (t-048): a notice posted while a turn is in flight is
-    /// drained and injected for the worker it addresses, and the injected text is
-    /// byte-identical to the crate's single notice rendering. A notice addressed
-    /// to another worker is never injected — it stays queued for that worker.
+    /// The mid-turn seam: a notice posted while a turn is in flight is drained and
+    /// injected for the worker it addresses, and the injected text is byte-identical
+    /// to the crate's single notice rendering. A notice addressed to another worker
+    /// is never injected — it stays queued for that worker.
     #[tokio::test]
     async fn mid_turn_drain_injects_only_its_own_worker_with_the_single_rendering() {
         let _notice_lock = TEST_NOTICE_MUTEX.lock().await;
@@ -1462,10 +1371,10 @@ mod tests {
         );
     }
 
-    /// De-duplication (t-048): the turn-start seam and the mid-turn seam emit the
-    /// **same** rendering — the one from `render_notice_for_worker` — so both turn
-    /// boundaries honour one identical reply contract (notice id verbatim + the
-    /// exact reply call).
+    /// De-duplication: the turn-start seam and the mid-turn seam emit the **same**
+    /// rendering — the one from `render_notice_for_worker` — so both turn boundaries
+    /// honour one identical reply contract (notice id verbatim + the exact reply
+    /// call).
     #[tokio::test]
     async fn turn_start_and_mid_turn_seams_share_one_rendering() {
         let _notice_lock = TEST_NOTICE_MUTEX.lock().await;
@@ -1526,7 +1435,7 @@ mod tests {
         );
     }
 
-    // ── Fix-loop bounds, fail-closed verdicts and verdict-tool routing (t-033c) ──
+    // ── Fix-loop bounds, fail-closed verdicts and verdict-tool routing ──
 
     use super::{
         FIX_LOOP_HARD_CAP_SECS, FIX_LOOP_IDLE_LIMIT_SECS, FixLoopBounds, FixLoopResult, LoopParams,
@@ -1666,8 +1575,8 @@ mod tests {
         )])
     }
 
-    /// Work item 1 — the iteration cap. The loop used to have no bound at its own
-    /// level: a validator that keeps calling tools could spin forever.
+    /// The iteration cap: a run has a bound at its own level, so a validator that
+    /// keeps calling tools is stopped with an explicit failed outcome.
     #[tokio::test]
     async fn iteration_cap_stops_the_run_with_an_explicit_failed_outcome() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1711,7 +1620,7 @@ mod tests {
         }
     }
 
-    /// Work item 1 — the wall-clock deadline, enforced through the crate's own
+    /// The wall-clock deadline, enforced through the crate's own
     /// [`DeadlineKind`] vocabulary rather than a second timer.
     #[tokio::test]
     async fn wall_clock_deadline_stops_the_run_before_any_round() {
@@ -1761,7 +1670,7 @@ mod tests {
         }
     }
 
-    /// Work item 1 — the bounds themselves: idle bound reuses the crate's turn
+    /// The bounds themselves: the idle bound reuses the crate's turn
     /// watchdog, the hard cap stays strictly inside the enclosing turn's cap, and
     /// both deadline kinds are distinguishable.
     #[test]
@@ -1849,9 +1758,8 @@ mod tests {
         assert!(!bounded.round_cap_reached(bounded.max_rounds()));
     }
 
-    /// Work item 2 — fail-closed contract change. Three reminders and no verdict
-    /// used to end the run with `approved = true` ("assumed approved"); a missing
-    /// verdict is now NOT an approval.
+    /// Fail-closed verdict contract: three reminders and no recorded verdict is NOT
+    /// an approval — the run ends rejected with an explicit reason.
     #[tokio::test]
     async fn no_verdict_after_reminders_fails_closed_instead_of_approving() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1897,21 +1805,14 @@ mod tests {
         }
     }
 
-    /// Work item 3 — the removed verdict-dispatch allow/deny switch.
-    ///
     /// The verdict tool is terminal-only: the shared driver consumes it and ends
-    /// the run, and it never hands the call to the tool dispatcher — not even for
-    /// a caller that is fully allowed to run the *other* tool in the same turn,
-    /// and not even for the tool that follows the verdict in the same response.
-    /// That is what makes the removed switch meaningless: no setting of it could
-    /// have let a worker record its own verdict through this loop, and the t-033b
-    /// identity gate (`runner/execution.rs::may_record_verdict`) is the only
-    /// authority over who may record one.
-    ///
-    /// The caller is deliberately the **validator**: since gate t-033e a caller
-    /// without verdict authority never reaches the "recorded a verdict" path at all
-    /// (see [`verdict_call_from_a_role_without_verdict_authority_fails_closed`]),
-    /// so only an authorised caller can isolate the *terminal-only* property.
+    /// the run, and never hands the call to the tool dispatcher — not even for a
+    /// caller allowed to run the *other* tool in the same turn, not even for the
+    /// tool that follows the verdict in the same response.
+    /// `runner/execution.rs::may_record_verdict` is the only authority over who may
+    /// record a verdict. The caller here is deliberately the **validator**: only a
+    /// caller with verdict authority reaches the "recorded a verdict" path (see
+    /// [`verdict_call_from_a_role_without_verdict_authority_fails_closed`]).
     #[tokio::test]
     async fn verdict_tool_is_terminal_only_and_never_reaches_the_dispatcher() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1952,10 +1853,9 @@ mod tests {
         );
     }
 
-    /// Gate t-033e — the same turn driven by a role the public verdict gate
-    /// refuses. The loop must not record the verdict, not dispatch anything from
-    /// that turn, and end NOT approved carrying the typed rejection
-    /// (`ToolError::Forbidden` text).
+    /// The same turn driven by a role the public verdict check refuses: the loop
+    /// must not record the verdict, not dispatch anything from that turn, and end
+    /// NOT approved carrying the typed rejection (`ToolError::Forbidden` text).
     #[tokio::test]
     async fn verdict_call_from_a_role_without_verdict_authority_fails_closed() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2018,18 +1918,16 @@ mod tests {
         );
     }
 
-    /// Work item 3 (structural half) — the allow/deny switch is gone, and MCP
-    /// tool advertising goes through the policy-filtered helper (work item 5).
-    ///
-    /// Source-shape guard, in the style of `tests/test_tool_name_literals.rs`: the
-    /// needles are assembled at runtime so this test's own text cannot satisfy
+    /// Source-shape guard: the verdict-dispatch allow/deny switch does not exist in
+    /// the driver, and MCP tool advertising goes through the policy-filtered helper.
+    /// The needles are assembled at runtime so this test's own text cannot satisfy
     /// them.
     #[test]
     fn switch_is_gone_and_mcp_advertising_goes_through_the_policy_helper() {
         let src = include_str!("fix_loop.rs");
 
-        // (a) The undecided allow/deny switch no longer exists anywhere in the
-        //     driver: neither the field nor a read of it.
+        // (a) The allow/deny switch exists nowhere in the driver: neither the field
+        //     nor a read of it.
         let switch_name = ["dispatch", "_verdict", "_tools"].concat();
         let field_decl = ["pub ", switch_name.as_str(), ": bool"].concat();
         assert!(
@@ -2056,7 +1954,7 @@ mod tests {
         );
     }
 
-    // ── gate t-064: single-owner verdict spellings, claimed inspection tools,
+    // ── single-owner verdict spellings, claimed inspection tools,
     //    and a live tool-schema charge for the run ────────────────────────────
 
     use super::BlueprintToolClass;
@@ -2070,9 +1968,9 @@ mod tests {
     /// The verdict spelling family is owned by `crate::tool_names`: the local
     /// mirror may only contain spellings that owner enumerates, and the predicate
     /// the whole blueprint asks (`is_verdict_recording_tool`) must answer from the
-    /// owner. Drift here would silently re-open the verdict class to a role the
-    /// role gate refuses — a name the blueprint does not classify `Verdict` is
-    /// grantable by a plain prompt allow-list.
+    /// owner. Drift here would silently re-open the verdict class to a role that
+    /// has no verdict authority — a name the blueprint does not classify `Verdict`
+    /// is grantable by a plain prompt allow-list.
     #[test]
     fn verdict_recording_spellings_have_a_single_owner_in_tool_names() {
         let owner = verdict_recording_tool_spellings();
@@ -2123,11 +2021,9 @@ mod tests {
         );
     }
 
-    /// Every advertised inspection tool must be a spelling a built-in handler
-    /// actually serves. `list_directory` / `terminal__list_directory` were removed
-    /// from [`INSPECTION_TOOLS`] for exactly this reason: t-069 deleted the alias
-    /// rows that claimed them and no dispatch arm implements them, so advertising
-    /// them promised the model a tool that answers `UnknownTool`.
+    /// Every advertised inspection tool must be a canonical spelling a built-in
+    /// handler actually serves: an unclaimed spelling promises the model a tool that
+    /// answers `UnknownTool`, so it never belongs in [`INSPECTION_TOOLS`].
     #[test]
     fn inspection_tools_are_all_claimed_by_a_builtin_handler() {
         for name in INSPECTION_TOOLS {
@@ -2154,8 +2050,8 @@ mod tests {
 
     /// Drive [`run_fix_loop`] with an explicit tool list against an unreachable
     /// backend: with a round cap of `0` the driver exits at the top of its first
-    /// round, so no HTTP happens while the run's setup (verdict gate, advertised
-    /// view, tool-schema charge) is still exercised end to end.
+    /// round, so no HTTP happens while the run's setup (verdict role check,
+    /// advertised view, tool-schema charge) is still exercised end to end.
     async fn drive_bounded_run_with_tools(
         engine: &mut ContextEngine,
         tools: Vec<crate::types::ToolDef>,
@@ -2204,11 +2100,10 @@ mod tests {
             .expect("a bounded run is an outcome, never a hard error")
     }
 
-    /// Gate t-064, live proof on the shared fix-loop driver: a run charges its
-    /// engine with exactly the schemas it advertises, so `should_compact()` prices
-    /// the real request. The same transcript priced message-only (the pre-t-064
-    /// behaviour) stays under the 90% trigger — that is the under-count the gate
-    /// flagged.
+    /// Live proof on the shared fix-loop driver: a run charges its engine with
+    /// exactly the schemas it advertises, so `should_compact()` prices the real
+    /// request. The same transcript priced message-only stays under the 90%
+    /// trigger — that is the under-count this prevents.
     #[tokio::test]
     async fn fix_loop_run_charges_its_advertised_tool_schema() {
         let tools = assemble_tools(None, |_| true, &[]);

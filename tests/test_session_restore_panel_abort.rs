@@ -1,28 +1,26 @@
-//! t-014e — the three acceptance families of `docs/design_session_restore_data.md`
-//! that decide whether an **aborted subagent** comes back honest:
+//! Session-restore coverage for an **aborted subagent**: the subagent panel,
+//! the time base, and the abort-mid-subagent round trip decide whether it comes
+//! back honest.
 //!
-//! * **§9.7 AC-S1 … AC-S4 — the subagent panel** (AC-S1 the restored vector
-//!   equals the committed one in length and order with every listed field equal
-//!   and `logs` compared element-by-element; AC-S2 `worked_duration_secs` is the
-//!   stored number and is **never** re-derived from the two re-anchored clocks
-//!   (D5 T3); AC-S3 the two clocks re-anchor inside the documented error term
-//!   (§5.6 T2) while their `wall` stamps stay byte-exact; AC-S4 an
-//!   `is_active: true` panel keeps its bytes **and** is reported as a lost
-//!   `JoinHandle` named by the panel name — §6.3, §10.3);
-//! * **§9.8 AC-T1 … AC-T2 — the time base** (AC-T1 every restored
-//!   `elapsed_secs` is measured against the very anchor `Manifest.anchor_wall`
-//!   names, and the ordering of `saved_elapsed_secs` between members is the
-//!   committed ordering (§5.6 T4); AC-T2 a NaN / infinite / negative monotonic
-//!   offset is a refusal, never a silent default to "now");
-//! * **§9.9 AC-A1 … AC-A3 — abort mid-subagent** (AC-A1 one live worker + one
-//!   active panel + composer draft + a non-zero `chat_scroll`, aborted, committed
-//!   with `ending: UserAbort`, coming back as it was; AC-A2 the notices are
-//!   present and specific — `CancellationToken`, `JoinHandle`, `DropGuard` per
-//!   in-flight worker plus the queued `PendingNotice` — with `Restored` as the
-//!   outcome and the worker keys as subjects; AC-A3 the restored cancellation
-//!   token provably is **not** the old one, the worker is reported as
-//!   non-cancellable until re-armed, and nothing in the restore path re-launches
-//!   it).
+//! * the **panel**: the restored vector equals the committed one in length and
+//!   order with every listed field equal and `logs` compared element-by-element;
+//!   `worked_duration_secs` is the stored number and is **never** re-derived from
+//!   the two re-anchored clocks; the clocks re-anchor inside the documented error
+//!   term while their `wall` stamps stay byte-exact; and an `is_active: true`
+//!   panel keeps its bytes **and** is reported as a lost `JoinHandle` named by the
+//!   panel name;
+//! * the **time base**: every restored `elapsed_secs` is measured against the very
+//!   anchor `Manifest.anchor_wall` names, the ordering of `saved_elapsed_secs`
+//!   between members is the committed ordering, and a NaN / infinite / negative
+//!   monotonic offset is a refusal, never a silent default to "now";
+//! * the **abort**: one live worker + one active panel + composer draft + a
+//!   non-zero `chat_scroll`, aborted and committed with `ending: UserAbort`, comes
+//!   back as it was; the losses are reported specifically — `CancellationToken`,
+//!   `JoinHandle`, `DropGuard` per in-flight worker plus the queued
+//!   `PendingNotice` — with `Restored` as the outcome and the worker keys as
+//!   subjects; the restored cancellation token provably is **not** the old one,
+//!   the worker is reported as non-cancellable until re-armed, and nothing in the
+//!   restore path re-launches it.
 //!
 //! ## How each authority is observed
 //!
@@ -32,63 +30,47 @@
 //!   `manifest.json`) so a claim about a byte is checked against the byte;
 //! * the **live panes** are read through a real `TuiRenderer` wrapped in
 //!   [`PaneWitness`], which snapshots the pane model *inside* `restore_panes`
-//!   (the post-assign, pre-draw instant of I-U2) and records the exact
-//!   `Vec<SubagentDetail>` that `ui::session::boot` handed to `set_subagents`
-//!   (`src/ui/session.rs:1235-1244`) — that is the only public mirror of the
-//!   crate's private pane fields;
+//!   (after the assign, before the draw) and records the exact
+//!   `Vec<SubagentDetail>` that `ui::session::boot` hands to `set_subagents` — the
+//!   only public mirror of the crate's private pane fields;
 //! * the **live worker** is read through the same registry production uses
 //!   (`orchestrator::workers::worker_state_snapshot`, `session::registry_get`,
 //!   `orchestrator::notice::worker_inbox_len`).
 //!
 //! ## Honest limits, stated instead of hidden
 //!
-//! * **AC-S4 (notice half)** has **two** production emitters of
-//!   `NonRestorableKind::JoinHandle` — `src/session/worker_journal.rs:844-851`
-//!   (kind line 845), whose subject is a **worker key**, and
-//!   `src/ui/session.rs:1256-1274` (kind line 1263), which emits one notice per
-//!   restored `SubagentPanel` with `is_active: true` whose subject is the **panel
-//!   name**. The byte half is pinned in AC-S1 (`is_active: true` survives, never
-//!   flipped); the notice half keeps the criterion's wording and runs in this
-//!   gate — the `#[ignore]` it carried while awaiting its first execution was
-//!   dropped by t-035 after it passed under `--ignored`.
-//! * **AC-A2 (capture half)**: the capture side does sample the live inbox —
-//!   `session::worker_journal::project_worker_section` folds in
-//!   `pending_notice_notices` (call at `src/session/worker_journal.rs:624`, fn
-//!   995-1008), which reads `WORKER_INBOXES` through
-//!   `orchestrator::notice::peek_worker_inbox` (`src/orchestrator/notice.rs:285-292`)
-//!   rather than through `worker_inbox_len`. AC-A2 still supplies the queued count
-//!   through the channel boot reads (`section.non_restorable`,
-//!   `src/ui/session.rs:1157-1181`); the separate capture probe now runs in this
-//!   gate too (t-035 dropped its `#[ignore]` once it had executed green).
-//! * **AC-T2 (non-finite values)**: `serde_json` does **not** refuse NaN/infinity
-//!   — `serialize_f64` writes them as `null` — so the commit seam refuses them
-//!   itself: `check_time_points` (`src/session/commit.rs:641`, called at
-//!   `src/session/commit.rs:723` inside `assemble_members`) runs *before* C1
-//!   serializes anything, so a non-finite offset never becomes a bundle byte and
-//!   there is no manifest to load. That keeps the load-side sentence at
-//!   `src/session/restore.rs:1101` unreachable through the commit seam; AC-T2
-//!   pins the seam (no bundle, no manifest, `Err`) and pins the load-side refusal
-//!   for the value that *does* reach it (negative, which §7.1 C1–C4 deliberately
-//!   leaves to the loader rather than repairing it on the way out).
-//! * **AC-A1 (live trigger half)**: the in-loop wiring "operator aborted ⇒ the
-//!   commit is stamped `userAbort`" is a session-loop concern and is pinned by
-//!   `tests/test_session_abort_flush.rs`; this file pins the data half (the
-//!   committed `userAbort` byte, and everything that comes back with it).
+//! * `NonRestorableKind::JoinHandle` has **two** production emitters: one whose
+//!   subject is a **worker key** (`session::worker_journal`) and one that emits a
+//!   notice per restored `SubagentPanel` with `is_active: true` whose subject is
+//!   the **panel name** (`ui::session`). The byte half is pinned with the panel
+//!   copy test (`is_active: true` survives, never flipped).
+//! * the capture side samples the live inbox through
+//!   `orchestrator::notice::peek_worker_inbox` (via
+//!   `session::worker_journal::pending_notice_notices`), not through
+//!   `worker_inbox_len`; the boot pass reads the queued count from
+//!   `section.non_restorable`.
+//! * `serde_json` does **not** refuse NaN/infinity — it writes them as `null` — so
+//!   the commit seam refuses them itself: `check_time_points` runs inside
+//!   `assemble_members` before anything serializes, so a non-finite offset never
+//!   becomes a bundle byte. The load-side refusal is pinned for the value that
+//!   *does* reach it (negative), which the committer deliberately leaves to the
+//!   loader instead of repairing on the way out.
+//! * the in-loop wiring "operator aborted ⇒ the commit is stamped `userAbort`" is
+//!   a session-loop concern pinned by `tests/test_session_abort_flush.rs`; this
+//!   file pins the data half: the committed `userAbort` byte, and everything that
+//!   comes back with it.
 //!
-//! Two rules this file never breaks:
+//! Two rules this file never breaks: every "the bytes did not change" witness
+//! re-uses the crate's own `session::commit::fingerprint`, never a second one; and
+//! no assertion is weakened — where the contract and the implementation disagree,
+//! the test keeps the contract's wording.
 //!
-//! * **one hasher** — every "the bytes did not change" witness re-uses the
-//!   crate's own `session::commit::fingerprint` (§7.2), never a second one;
-//! * **no weakened assertion** — where a criterion and the implementation
-//!   disagree, the test keeps the criterion's wording and carries `#[ignore]`.
-//!
-//! Hermetic: one unique temp directory per test
-//! (`<tmp>/marmel-t014e-<tag>-<pid>-<nanos>/.marmel/session`), removed at the
-//! end; no network, no PTY, no terminal, no sleeps. The process-global
-//! `WORKERS` map, journal `REGISTRY`, notice store and identity counters are
-//! serialized by one local mutex, every key is private to this file
-//! (`t014e…`), and expectations are stated relative to the live counters read at
-//! runtime — never absolutely. Fixture ids are `t014e-`.
+//! Hermetic: one unique temp directory per test, created by `bundle_dir` and
+//! removed at the end; no network, no PTY, no terminal, no sleeps. The
+//! process-global `WORKERS` map, journal `REGISTRY`, notice store and identity
+//! counters are serialized by one local mutex, every fixture key is private to
+//! this file, and expectations are stated relative to the live counters read at
+//! runtime — never absolutely.
 
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -127,14 +109,14 @@ const COMMITTED_BUDGET: usize = 1234;
 /// could never be mistaken for a restoration.
 const LIVE_BUDGET: usize = 4321;
 
-/// §5.6 T2's documented error term for a re-anchored `Instant`: the pair
-/// survives suspend/hibernate and wall-clock steps, and the residual drift
-/// between the monotonic and the wall clock is what a restored `Instant` may be
-/// off by. Two seconds is that term; every re-anchor witness is stated against
-/// it, and a *stored* value is compared bit-for-bit instead.
+/// The documented error term for a re-anchored `Instant`: the pair survives
+/// suspend/hibernate and wall-clock steps, and the residual drift between the
+/// monotonic and the wall clock is what a restored `Instant` may be off by. Two
+/// seconds is that term; every re-anchor witness is stated against it, and a
+/// *stored* value is compared bit-for-bit instead.
 const RE_ANCHOR_TOLERANCE_SECS: f64 = 2.0;
 
-// ------------------------------------------------------------------- gating
+// ------------------------------------------------------------------- registry
 
 /// Serializes every test in this file that reads or mutates the process-global
 /// `WORKERS` map, the journal `REGISTRY`, the notice store or the identity
@@ -183,9 +165,9 @@ fn cleanup(bundle: &Path) {
 // ---------------------------------------------------------------- time helpers
 
 /// A synthetic `TimePoint` that is **exactly** consistent with this process's
-/// anchor: `wall == anchor_wall + elapsed_secs`. Used where the criterion is
-/// about the anchor relation itself (AC-T1), because any drift would then be a
-/// finding instead of an artifact of the fixture.
+/// anchor: `wall == anchor_wall + elapsed_secs`. Used where the test is about
+/// the anchor relation itself, because any drift would then be a finding instead
+/// of an artifact of the fixture.
 fn point(elapsed_secs: f64) -> TimePoint {
     TimePoint {
         elapsed_secs,
@@ -201,7 +183,8 @@ fn point(elapsed_secs: f64) -> TimePoint {
 /// this process's anchor age plus how long ago the event happened, `wall` is
 /// `now - that much`. `started_back` / `last_back` are the ages in seconds, so
 /// the pair's own delta is `started_back - last_back` and can be set to anything
-/// independent of `worked_duration_secs` (AC-S2 needs exactly that).
+/// independent of `worked_duration_secs` (the stored-duration check needs exactly
+/// that).
 fn clock_pair(started_back: f64, last_back: f64) -> (TimePoint, TimePoint) {
     let age = TimePoint::now().elapsed_secs;
     let base = Local::now();
@@ -216,7 +199,7 @@ fn clock_pair(started_back: f64, last_back: f64) -> (TimePoint, TimePoint) {
 
 /// How far one restored offset sits from "what `wall` says, measured from the
 /// anchor `manifest.anchor_wall` names". Zero means the offset really is measured
-/// against that anchor (AC-T1).
+/// against that anchor.
 fn anchor_consistency(value: &TimePoint, anchor: &DateTime<Local>) -> f64 {
     let wall_delta = value
         .wall
@@ -230,7 +213,7 @@ fn anchor_consistency(value: &TimePoint, anchor: &DateTime<Local>) -> f64 {
 /// The re-anchoring error of one durable clock point read in *this* process:
 /// `to_instant()` (monotonic side) versus the `wall` stamp (calendar side), both
 /// expressed as "how long ago". A restored `Instant` may be off by suspend /
-/// wall-step drift, never by the value itself (AC-S3, §5.6 T2).
+/// wall-step drift, never by the value itself.
 fn re_anchor_error(value: &TimePoint) -> f64 {
     let from_instant = Instant::now()
         .saturating_duration_since(value.to_instant())
@@ -243,7 +226,7 @@ fn re_anchor_error(value: &TimePoint) -> f64 {
     (from_instant - from_wall).abs()
 }
 
-/// `duration_from_secs` (`src/ui/tui/mod.rs:1510`): the projection that turns a
+/// `duration_from_secs` in `src/ui/tui/mod.rs`: the projection that turns a
 /// stored `worked_duration_secs` back into the `Duration` the pane shows.
 fn expected_detail_duration(secs: f64) -> Duration {
     if secs.is_finite() && secs > 0.0 {
@@ -298,7 +281,7 @@ fn tool(id: &str, content: &str) -> MessageRecord {
 }
 
 /// The pinned pair plus one settled turn: `[0]`/`[1]` are the two pins the loader
-/// insists on (§4). This file is about panels, clocks and abort notices.
+/// insists on. This file is about panels, clocks and abort notices.
 fn manager_transcript() -> Vec<MessageRecord> {
     vec![
         MessageRecord::System {
@@ -332,8 +315,8 @@ fn manager_section() -> ManagerSection {
 }
 
 /// A worker transcript with at least one assistant turn whose `tool_calls` are
-/// each answered by a paired `Tool` result — the shape AC-A1 names for a worker
-/// that was mid-round when the operator aborted.
+/// each answered by a paired `Tool` result — the shape of a worker that was
+/// mid-round when the operator aborted.
 fn worker_history(key: &str) -> Vec<MessageRecord> {
     vec![
         sys(&format!("specialist prompt for {key}")),
@@ -374,7 +357,7 @@ fn worker_history(key: &str) -> Vec<MessageRecord> {
 
 // ----------------------------------------------------------- worker fixtures
 
-/// Everything a fixture worker states that these criteria read. Every other
+/// Everything a fixture worker states that the panel and abort tests read. Every
 /// `WorkerSection` field is filled with a distinctive, non-default value inside
 /// [`WorkerFixture::build`], so an accidentally dropped field is caught instead
 /// of coincidentally matched.
@@ -396,7 +379,8 @@ struct WorkerFixture {
 }
 
 /// `Coder`, `LiveMirror` history with paired tool calls, `InProgress` /
-/// `"In Progress"` / `completed_seq: None` — the in-flight shape §9.9 describes.
+/// `"In Progress"` / `completed_seq: None` — the shape of a worker still in flight
+/// when the process ended.
 fn worker_fixture(key: &str) -> WorkerFixture {
     WorkerFixture {
         key: key.to_string(),
@@ -463,8 +447,8 @@ impl WorkerFixture {
 
 // ------------------------------------------------------------ panel fixtures
 
-/// The `SubagentPanel` fields these criteria read. `SubagentPanel` itself has no
-/// `Default` (`src/session/format/ui.rs:168`), so the fixture is the shorthand
+/// The `SubagentPanel` fields these tests read. `SubagentPanel` itself has no
+/// `Default` (`src/session/format/ui.rs`), so the fixture is the shorthand
 /// and every test varies it with struct-update syntax.
 struct PanelFixture {
     name: String,
@@ -526,9 +510,9 @@ impl PanelFixture {
 
 // ----------------------------------------------------------------- ui fixture
 
-/// `count` single-line pane entries. AC-A1 needs a tall pane so the restored
-/// `chat_scroll` sits far inside what the live clamp
-/// (`src/ui/tui/events.rs:465-481`) allows instead of being pulled back by it.
+/// `count` single-line pane entries. The abort fixture needs a tall pane so the
+/// restored `chat_scroll` sits far inside what the live clamp (`clamp_scrolls` in
+/// `src/ui/tui/events.rs`) allows instead of being pulled back by it.
 fn pane_lines(count: usize) -> Vec<String> {
     (0..count)
         .map(|i| format!("[Tool Result] t014e pane line {i:03}"))
@@ -569,10 +553,9 @@ fn payload(
 }
 
 /// The public commit seam, unthrottled. The committer does NOT validate the UI
-/// section (§7 C1–C4) — which is what lets AC-T2 commit a *negative* clock the
-/// loader must then refuse — while `assemble_members` does refuse a **non-finite**
-/// offset up front (`check_time_points`, `src/session/commit.rs:641`), which is
-/// what AC-T2's NaN/infinity branch pins.
+/// section — which is what lets a *negative* clock be committed for the loader to
+/// refuse — while `assemble_members` does refuse a **non-finite** offset up front
+/// (`check_time_points`), which is what the NaN/infinity branch pins.
 fn commit(
     bundle: &Path,
     session_id: &str,
@@ -659,7 +642,7 @@ fn refused(bundle: &Path) -> (RefusalCode, Option<String>, String) {
 }
 
 /// The committed `ui.json` read back through the loader: the authority every
-/// AC-S* comparison is made against, so no test compares the boot pass with a
+/// comparison here is made against, so no test compares the boot pass with a
 /// fixture it merely built in memory.
 fn committed_ui(bundle: &Path) -> UiSection {
     restored_session(bundle).0.ui
@@ -692,7 +675,7 @@ fn member_paths(bundle: &Path) -> Vec<String> {
 }
 
 /// `(rel_path, fingerprint)` for every member plus `manifest.json`, hashed with
-/// the crate's own §7.2 hasher — never a second one.
+/// the crate's own hasher — never a second one.
 fn fingerprints(bundle: &Path) -> Vec<(String, u64)> {
     let mut table: Vec<(String, u64)> = member_paths(bundle)
         .into_iter()
@@ -733,7 +716,7 @@ fn notice_for<'a>(
         .find(|notice| &notice.kind == kind && notice.subject == subject)
 }
 
-/// AC-S1's field list, one assertion per field, so a failure names the field.
+/// The panel field list, one assertion per field, so a failure names the field.
 /// `logs` is compared element-by-element, `worked_duration_secs` bit-for-bit
 /// (never with a float tolerance).
 fn assert_panel_fields_eq(index: usize, what: &str, got: &SubagentPanel, want: &SubagentPanel) {
@@ -814,7 +797,7 @@ impl Default for PaneWitness {
 }
 
 impl PaneWitness {
-    /// The pane model at the post-assign, pre-draw instant.
+    /// The pane model after the assign and before the draw.
     fn snapshot(&self) -> &UiSection {
         self.after_restore
             .as_ref()
@@ -891,8 +874,8 @@ struct Booted {
     session_id: String,
 }
 
-/// THE boot path (`ui::session::boot`, flow §4.9) driven end to end with a real
-/// TUI renderer: `load_bundle` → floors + `WORKERS` → the engine → the panes →
+/// THE boot path (`ui::session::boot`) driven end to end with a real TUI
+/// renderer: `load_bundle` → floors + `WORKERS` → the engine → the panes →
 /// the loud report → `N-MGR-1`.
 fn boot_with_panes(bundle: &Path) -> Booted {
     let cfg = Config {
@@ -944,15 +927,15 @@ fn boot_with_panes(bundle: &Path) -> Booted {
 }
 
 // ===========================================================================
-// §9.7 — the subagent panel
+// The subagent panel
 // ===========================================================================
 
-/// **AC-S1** — the restored panel vector equals the committed one in length and
-/// order, and per entry `name`, `task_id`, `prompt`, `logs` (element-by-element),
-/// `thinking`, `content`, `is_active` and `context_tokens` are equal.
+/// The restored panel vector equals the committed one in length and order, and
+/// per entry `name`, `task_id`, `prompt`, `logs` (element-by-element), `thinking`,
+/// `content`, `is_active` and `context_tokens` are equal.
 ///
 /// Asserted at three depths: `load_bundle` (the bytes), `BootReport::subagent_panels`
-/// (what the caller sees), and the live pane model at the pre-draw instant plus
+/// (what the caller sees), and the live pane model just before the draw plus
 /// the exact `SubagentDetail` vector handed to `set_subagents`. The fixture
 /// carries the awkward shapes that make this a copy test and not a tautology: an
 /// empty panel, a duplicate `name`, a multi-line prompt, a repeated and an empty
@@ -1070,7 +1053,7 @@ fn ac_s1_restored_panel_vector_equals_the_committed_one_in_length_and_order() {
     {
         assert_panel_fields_eq(index, "load_bundle", got, want);
     }
-    // The AC-S4 **byte** half is pinned here, where it is observable: the active
+    // The byte half is pinned here, where it is observable: the active
     // panel's byte comes back active, never flipped to `false`.
     assert!(
         committed.subagent_panels[1].is_active,
@@ -1097,11 +1080,11 @@ fn ac_s1_restored_panel_vector_equals_the_committed_one_in_length_and_order() {
         let got = &snapshot.subagent_panels[index];
         assert_panel_fields_eq(index, "live pane snapshot", got, want);
         // The clocks survive as clocks. Their *Instant* side is re-anchored by
-        // design (`TimePoint::to_instant()` rebuilds it from the `wall` delta,
-        // §5.6 T2), so the live pane's `elapsed_secs` is this process's offset,
-        // not the stored one — AC-S3 owns that invariant and asserts it against
-        // the durable pair. What is pinned here is that no clock was dropped or
-        // invented, and that the re-anchored pair is still a sane clock.
+        // design (`TimePoint::to_instant()` rebuilds it from the `wall` delta), so
+        // the live pane's `elapsed_secs` is this process's offset, not the stored
+        // one — the clock invariant is asserted against the durable pair instead.
+        // What is pinned here is that no clock was dropped or invented, and that
+        // the re-anchored pair is still a sane clock.
         assert_eq!(
             got.started_at.is_some(),
             want.started_at.is_some(),
@@ -1126,7 +1109,7 @@ fn ac_s1_restored_panel_vector_equals_the_committed_one_in_length_and_order() {
         }
     }
 
-    // (c) the subagent pane model the boot pass advertised (flow §3.4's channel).
+    // (c) the subagent pane model the boot pass advertised.
     assert_eq!(
         booted.renderer.captured_subagents.len(),
         panels.len(),
@@ -1173,8 +1156,8 @@ fn ac_s1_restored_panel_vector_equals_the_committed_one_in_length_and_order() {
     cleanup(&bundle);
 }
 
-/// **AC-S2** — `worked_duration_secs` equals the committed number and is **not**
-/// recomputed from `started_at` / `last_activity_at` (D5 T3).
+/// `worked_duration_secs` equals the committed number and is **not** recomputed
+/// from `started_at` / `last_activity_at`.
 ///
 /// The fixture is built so the subtraction hypothesis is *falsifiable for every
 /// panel*: panel A stores 12.5 s while its two clocks are 3600 s apart, panel B
@@ -1282,8 +1265,8 @@ fn ac_s2_worked_duration_secs_is_carried_and_never_recomputed_from_the_two_clock
         );
         // And it is provably NOT the clock delta. The witness is the DURABLE pair
         // (which the loader hands back byte-exact); the live pane's `Instant` side
-        // is re-anchored from the wall by design (§5.6 T2, AC-S3) and therefore
-        // cannot serve as a subtraction witness at all.
+        // is re-anchored from the wall by design and therefore cannot serve as a
+        // subtraction witness at all.
         let durable = restored
             .ui
             .subagent_panels
@@ -1332,8 +1315,8 @@ fn ac_s2_worked_duration_secs_is_carried_and_never_recomputed_from_the_two_clock
     cleanup(&bundle);
 }
 
-/// **AC-S3** — `started_at` / `last_activity_at` re-anchor within the documented
-/// error term (§5.6 T2) and their `wall` values are byte-exact.
+/// `started_at` / `last_activity_at` re-anchor within the documented error term
+/// and their `wall` values are byte-exact.
 ///
 /// The clocks are sampled the way the old process would have sampled them
 /// (`elapsed_secs` measured against the *previous* process's anchor age, `wall`
@@ -1445,7 +1428,7 @@ fn ac_s3_panel_clocks_re_anchor_within_the_error_term_and_their_wall_bytes_are_e
         "AC-S3: the clock ordering flipped"
     );
 
-    // (c) the re-anchor error term (§5.6 T2) — for both clocks. Stated honestly:
+    // (c) the re-anchor error term — for both clocks. Stated honestly:
     // `to_instant()` is *defined* as `now - (wall_now - wall_recorded)`, so this
     // residual measures the drift/clamp of that reconstruction, not an independent
     // cross-clock reconstruction. The load-bearing witness against "defaulted to
@@ -1508,27 +1491,19 @@ fn ac_s3_panel_clocks_re_anchor_within_the_error_term_and_their_wall_bytes_are_e
     cleanup(&bundle);
 }
 
-/// **AC-S4** — a panel with `is_active: true` restores its bytes **and** emits
-/// `NonRestorableNotice { kind: JoinHandle, subject: <panel name> }` (§6.3,
-/// §10.3: "A restored `SubagentPanel { is_active: true }` SHALL emit `JoinHandle`
-/// with `subject: <panel name>` even though the pane byte is kept").
+/// A panel with `is_active: true` restores its bytes **and** emits
+/// `NonRestorableNotice { kind: JoinHandle, subject: <panel name> }`: "a restored
+/// `SubagentPanel { is_active: true }` emits `JoinHandle` with
+/// `subject: <panel name>` even though the pane byte is kept".
 ///
-/// **The byte half is green and pinned elsewhere** (`ac_s1_…` asserts the active
-/// panel's `is_active` and every field come back unchanged). **The notice half is
-/// emitted by production**: the restore path emits `JoinHandle` from **two**
-/// production sites —
-/// `src/session/worker_journal.rs:844-851` (kind line **845**), where `subject`
-/// is the worker key, and `src/ui/session.rs:1256-1274` (kind line **1263**),
-/// which pushes one `NonRestorableNotice { kind: JoinHandle, subject:
-/// <panel name> }` per restored `SubagentPanel` carrying `is_active: true`.
-/// `grep 'NonRestorableKind::JoinHandle' src/` yields those two production sites,
-/// a third on the raw-UI path (`src/ui/raw.rs:585`), plus in-crate unit tests
-/// (`src/ui/session_tests.rs:1015`, `src/ui/tui/tests.rs:2515`). A bundle with an
-/// active panel and no worker section therefore does announce the handle that
-/// died with the process. The assertion below is kept at full strength; the
-/// `#[ignore]` this probe carried while it awaited its first execution was
-/// dropped by t-035 after it passed under `--ignored` twice, so it now runs in
-/// the ordinary gate.
+/// The byte half is pinned by the panel copy test, which asserts `is_active` and
+/// every other field come back unchanged. The notice half is emitted by
+/// production from two sites: `session::worker_journal::project_worker_section`
+/// (subject = the worker key) and the boot pass in `ui::session` (one notice per
+/// restored `SubagentPanel` carrying `is_active: true`, subject = the panel name);
+/// the raw-UI path in `ui::raw` carries a third. A bundle with an active panel and
+/// no worker section therefore does announce the handle that died with the
+/// process, and the assertion below is kept at full strength.
 #[test]
 fn ac_s4_an_active_panel_restores_its_byte_and_emits_a_join_handle_notice_naming_it() {
     let _guard = registry_lock();
@@ -1547,7 +1522,7 @@ fn ac_s4_an_active_panel_restores_its_byte_and_emits_a_join_handle_notice_naming
         subagent_panels: vec![panel.clone()],
         ..base_ui()
     };
-    // No worker section: the criterion is about the *panel*, not the worker.
+    // No worker section: this witness is about the *panel*, not the worker.
     write(
         &bundle,
         "session-t014e-ac-s4",
@@ -1579,12 +1554,12 @@ fn ac_s4_an_active_panel_restores_its_byte_and_emits_a_join_handle_notice_naming
 }
 
 // ===========================================================================
-// §9.8 — the time base
+// The time base
 // ===========================================================================
 
-/// **AC-T1** — every restored `TimePoint.elapsed_secs` is measured against the
-/// same anchor as `Manifest.anchor_wall`, and the ordering of
-/// `saved_elapsed_secs` between members matches the committed ordering (§5.6 T4).
+/// Every restored `TimePoint.elapsed_secs` is measured against the same anchor as
+/// `Manifest.anchor_wall`, and the ordering of `saved_elapsed_secs` between members
+/// matches the committed ordering.
 ///
 /// Within one process the anchor cannot drift, so this test pins the three
 /// observable forms the claim takes: (a) `manifest.anchor_wall` *is* the anchor
@@ -1779,7 +1754,7 @@ fn ac_t1_every_restored_offset_is_measured_against_the_anchor_the_manifest_names
     );
 
     // Every section clock point, in the captured order, element-for-element — the
-    // ordering half of the criterion read through the sections themselves.
+    // ordering half of the round trip, read through the sections themselves.
     let wanted_offsets: Vec<f64> = vec![
         panel_clocks.0.elapsed_secs,
         panel_clocks
@@ -1852,7 +1827,7 @@ fn ac_t1_every_restored_offset_is_measured_against_the_anchor_the_manifest_names
     }
 
     // (c) `saved_elapsed_secs`: one capture instant, same order, member header
-    // mirrors the manifest entry (§5.6 T4 / L5).
+    // mirrors the manifest entry.
     let manifest = manifest_json(&bundle);
     let members = manifest["members"].as_array().expect("members is an array");
     assert_eq!(
@@ -1926,8 +1901,8 @@ fn ac_t1_every_restored_offset_is_measured_against_the_anchor_the_manifest_names
     cleanup(&bundle);
 }
 
-/// **AC-T2** — a `TimePoint` with `elapsed_secs` NaN / infinity / negative is
-/// **Refused**, with no silent defaulting to "now" (§5.6).
+/// A `TimePoint` with `elapsed_secs` NaN / infinity / negative is **Refused**,
+/// with no silent defaulting to "now".
 ///
 /// Four branches, all pinned at full strength:
 ///
@@ -1935,15 +1910,14 @@ fn ac_t1_every_restored_offset_is_measured_against_the_anchor_the_manifest_names
 ///   refused by the loader, naming the member `ui.json`, with the bad byte still
 ///   on disk afterwards (nothing was defaulted);
 /// * **worker clock negative** → refused, naming that worker's member;
-/// * **NaN / ±infinity** → these can never *become* a bundle byte: the commit
-///   seam refuses them at `check_time_points` (`src/session/commit.rs:641`, run
-///   inside `assemble_members` before C1), because `assemble_members` serializes
-///   every member before the first write and `serde_json` would turn a non-finite
-///   float into `null` — a silent default, which §5.6 forbids. The commit
-///   therefore returns `CommitError::Serialize` and there is no manifest to load.
-///   The load-side sentence at `src/session/restore.rs:1101` is therefore
-///   unreachable through the commit seam, and this test says so out loud instead
-///   of pretending to reach it.
+/// * **NaN / ±infinity** → these can never *become* a bundle byte: the commit seam
+///   refuses them at `check_time_points`, run inside `assemble_members` before
+///   anything serializes, because `assemble_members` serializes every member
+///   before the first write and `serde_json` would turn a non-finite float into
+///   `null` — a silent default that is forbidden here. The commit therefore
+///   returns `CommitError::Serialize` and there is no manifest to load, so the
+///   load-side refusal is unreachable through the commit seam; this test says so
+///   out loud instead of pretending to reach it.
 #[test]
 fn ac_t2_a_non_finite_or_negative_offset_is_refused_and_never_defaulted_to_now() {
     let _guard = registry_lock();
@@ -1985,9 +1959,9 @@ fn ac_t2_a_non_finite_or_negative_offset_is_refused_and_never_defaulted_to_now()
         subagent_panels: vec![panel],
         ..base_ui()
     };
-    // Deliberately U-chk-dirty: the committer does not validate the section
-    // (§7 C1–C4), which is what makes the loader's refusal the load-bearing
-    // check. Stated, not hidden.
+    // Deliberately unvalidated on the way out: the committer does not check the
+    // UI section, which is what makes the loader's refusal the load-bearing check.
+    // Stated, not hidden.
     assert!(
         !ui.structural_violations().is_empty(),
         "AC-T2 fixture: the section must already be known-dirty, or the loader's \
@@ -2123,10 +2097,10 @@ fn ac_t2_a_non_finite_or_negative_offset_is_refused_and_never_defaulted_to_now()
 }
 
 // ===========================================================================
-// §9.9 — abort mid-subagent
+// Abort mid-subagent
 // ===========================================================================
 
-/// **AC-A1** — the abort fixture: one active worker (`status_label:
+/// The abort fixture: one active worker (`status_label:
 /// "In Progress"`, `completed_seq: None`, `history_source: LiveMirror`, ≥1
 /// assistant turn with paired `tool_calls`), one `SubagentPanel` with
 /// `is_active: true` and non-empty `logs` / `thinking` / `content`, a composer
@@ -2139,8 +2113,8 @@ fn ac_t2_a_non_finite_or_negative_offset_is_refused_and_never_defaulted_to_now()
 /// the panel vector is byte-equal, the composer draft and the non-zero scroll
 /// offset survive the live clamp.
 ///
-/// **Stated limit:** the *live trigger* half of §9.9 ("the operator aborted, so
-/// the stamp is `userAbort`") is session-loop wiring pinned by
+/// **Stated limit:** the *live trigger* half ("the operator aborted, so the stamp
+/// is `userAbort`") is session-loop wiring pinned by
 /// `tests/test_session_abort_flush.rs`; this test pins the data half, i.e. that a
 /// `UserAbort` commit point carries and returns the whole aborted state.
 #[test]
@@ -2198,7 +2172,7 @@ fn ac_a1_abort_mid_subagent_commits_user_abort_and_comes_back_as_it_was() {
     );
     // The composer and scroll witnesses are captured *before* the section moves
     // into the commit payload, so the screen comparison below is against what the
-    // pre-crash screen held, not against something the loader just handed back.
+    // screen held before the crash, not against something the loader just handed back.
     let composer_witness = ui.composer.clone();
     let scroll_witness = ui.view.chat_scroll;
     write(
@@ -2208,7 +2182,7 @@ fn ac_a1_abort_mid_subagent_commits_user_abort_and_comes_back_as_it_was() {
         ProcessEnding::UserAbort,
     );
 
-    // The on-disk ending is the abort, verbatim (§3.10 spelling `userAbort`).
+    // The on-disk ending is the abort, verbatim (spelled `userAbort` on disk).
     assert_eq!(
         manifest_json(&bundle)["ending"]["kind"].as_str(),
         Some("userAbort"),
@@ -2339,27 +2313,21 @@ fn ac_a1_abort_mid_subagent_commits_user_abort_and_comes_back_as_it_was() {
     cleanup(&bundle);
 }
 
-/// **AC-A2** — the notices are present and specific: `CancellationToken`,
-/// `JoinHandle`, `DropGuard` for each in-flight worker, plus a `PendingNotice`
-/// for a notice queued at abort time; the outcome is `Restored` (never silently
-/// "complete"), `report.notices` is non-empty, and its subjects are the worker
-/// keys.
+/// The notices are present and specific: `CancellationToken`, `JoinHandle`,
+/// `DropGuard` for each in-flight worker, plus a `PendingNotice` for a notice
+/// queued at abort time; the outcome is `Restored` (never silently "complete"),
+/// `report.notices` is non-empty, and its subjects are the worker keys.
 ///
-/// **Stated basis for the `PendingNotice` half:** the capture side **does** sample
-/// `PENDING_NOTICES` / `WORKER_INBOXES` —
+/// The capture side **does** sample `PENDING_NOTICES` / `WORKER_INBOXES`:
 /// `session::worker_journal::project_worker_section` folds in
-/// `pending_notice_notices` (fn 995-1008, call at `worker_journal.rs:624`), which
-/// peeks the very inbox `notice::worker_inbox_len` counts
-/// (`orchestrator::notice::peek_worker_inbox`, `src/orchestrator/notice.rs:285-292`)
-/// — so a notice that really was queued when the process died does reach the
-/// bundle; that capture half is pinned by the probe
-/// `ac_a2_capture_side_records_the_notice_queued_at_abort_time`, which runs in
-/// the ordinary gate (t-035 dropped its `#[ignore]` once it had executed green).
-/// Boot reads the count from
-/// `section.non_restorable` and re-spells it
-/// (`src/ui/session.rs:1157-1181`), so this test supplies the queued count
-/// through that channel — the only one the restore path reads — while also
-/// posting real live notices so the invariant is anchored in a real queue.
+/// `pending_notice_notices`, which peeks the very inbox that
+/// `notice::worker_inbox_len` counts through
+/// `orchestrator::notice::peek_worker_inbox`, so a notice that really was queued
+/// when the process died does reach the bundle; that half is pinned by
+/// `ac_a2_capture_side_records_the_notice_queued_at_abort_time`. Boot reads the
+/// count from `section.non_restorable` and re-spells it, so this test supplies the
+/// queued count through that channel — the only one the restore path reads — while
+/// also posting real live notices so the invariant is anchored in a real queue.
 #[test]
 fn ac_a2_the_notices_are_present_specific_and_the_outcome_is_restored_not_complete() {
     let _guard = registry_lock();
@@ -2495,18 +2463,13 @@ fn ac_a2_the_notices_are_present_specific_and_the_outcome_is_restored_not_comple
     cleanup(&bundle);
 }
 
-/// **AC-A2 capture half** — a notice that really was queued in the pending /
-/// notice-inbox structures at abort time SHALL leave a trace the loader can
-/// report. The capture path provides one: `pending_notice_notices`
-/// (`src/session/worker_journal.rs:995-1008`) is folded into
-/// `section.non_restorable` by `project_worker_section` at
-/// `src/session/worker_journal.rs:624`, reading the live inbox through
-/// `orchestrator::notice::peek_worker_inbox`
-/// (`src/orchestrator/notice.rs:285-292`) — the same `WORKER_INBOXES` entry that
-/// `notice::worker_inbox_len` counts, not a second store. Kept at full strength
-/// and run in the ordinary gate: the `#[ignore]` this probe carried while it
-/// awaited its first execution was dropped by t-035, after it had passed under
-/// `--ignored` twice.
+/// The capture half of the queued-notice rule: a notice that really was queued in
+/// the pending / notice-inbox structures at abort time leaves a trace the loader
+/// can report. `pending_notice_notices` (`session::worker_journal`) is folded into
+/// `section.non_restorable` by `project_worker_section`, reading the live inbox
+/// through `orchestrator::notice::peek_worker_inbox` — the same `WORKER_INBOXES`
+/// entry that `notice::worker_inbox_len` counts, not a second store. Kept at full
+/// strength.
 #[test]
 fn ac_a2_capture_side_records_the_notice_queued_at_abort_time() {
     let _guard = registry_lock();
@@ -2539,12 +2502,12 @@ fn ac_a2_capture_side_records_the_notice_queued_at_abort_time() {
     drop(guard);
 }
 
-/// **AC-A3** — the cancellation token of a restored worker is **not** the old one
-/// (it cannot be), the worker is reported as non-cancellable until it is
-/// re-armed, and nothing in the restore path re-launches it.
+/// The cancellation token of a restored worker is **not** the old one (it cannot
+/// be), the worker is reported as non-cancellable until it is re-armed, and
+/// nothing in the restore path re-launches it.
 ///
 /// The witness is designed so the identity of the two tokens is decidable rather
-/// than asserted: the pre-crash token is **cancelled** before the crash (that is
+/// than asserted: the old token is **cancelled** before the crash (that is
 /// the abort), and the token attached to the restored entry is not — plus a fresh
 /// child of the restored token is not cancelled while a child of the old one
 /// still is, which is only possible for a different token tree. Then nothing
@@ -2577,7 +2540,7 @@ fn ac_a3_the_restored_token_is_not_the_old_one_and_nothing_in_the_restore_re_lau
     );
 
     // Capture while it is still live — the committer's own projection, so the
-    // committed byte is the real in-flight shape AC-A1/AC-A3 describe.
+    // committed byte is the real in-flight shape the abort fixture describes.
     let section = project_worker_section(&key, &state, Agent::Coder, None);
     assert_eq!(
         section.status,

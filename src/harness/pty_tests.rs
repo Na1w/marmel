@@ -1,7 +1,7 @@
 use super::*;
 
-/// REQ-TOOL-001: Spawning a background sleep loop and tearing down the PTY
-/// leaves zero orphan processes — the backgrounded child dies with the group.
+/// Spawning a background sleep loop and tearing down the PTY leaves zero orphan
+/// processes — the backgrounded child dies with the group.
 #[test]
 #[cfg(unix)]
 fn test_harness_pty_process_group_kill() {
@@ -184,7 +184,7 @@ async fn test_run_command_pty_cancelled_by_worker_token() {
     );
 }
 
-// Bug P1 (zombie children) — reap state machine, tested as pure logic.
+// Reap state machine, tested as pure logic (zombie children are what it prevents).
 // None of these tests need a real `/dev/pts`: they drive the `ChildHandle`
 // seam with a fake and with a plain `std::process::Child`.
 
@@ -325,13 +325,11 @@ fn waitpid_nowait(pid: i32) -> (i32, i32) {
     (ret, io::Error::last_os_error().raw_os_error().unwrap_or(0))
 }
 
-/// Spawn spec (program + args) for a child that exits successfully right away.
-///
-/// The program is deliberately **not** an absolute path: coreutils sit in the
-/// root `bin` directory on Linux but under `/usr` on macOS, so hard-coding the
-/// absolute location of `true` fails on the latter with `NotFound (os error 2)`.
-/// Letting the OS resolve `true` through `PATH` works on both; `cmd /C exit 0`
-/// is the equivalent short-lived process on Windows.
+/// Spawn spec (program + args) for a child that exits successfully right away. The program
+/// is deliberately **not** an absolute path: coreutils sit in the root `bin` directory on
+/// Linux but under `/usr` on macOS, so a hard-coded absolute location of `true` fails on
+/// the latter with `NotFound (os error 2)`. Resolving `true` through `PATH` works on both;
+/// `cmd /C exit 0` is the equivalent short-lived process on Windows.
 fn short_lived_child_spec() -> (&'static str, &'static [&'static str]) {
     if cfg!(windows) {
         ("cmd", &["/C", "exit 0"])
@@ -386,8 +384,8 @@ fn assert_gone_from_process_table(pid: i32, label: &str) {
 #[cfg(not(unix))]
 fn assert_gone_from_process_table(_pid: i32, _label: &str) {}
 
-/// Regression (P1): a reaped child must leave nothing in the process table.
-/// Spawned with `std::process::Command`, so no `/dev/pts` is involved.
+/// A reaped child must leave nothing in the process table. Spawned with
+/// `std::process::Command`, so no `/dev/pts` is involved.
 #[test]
 fn test_reap_removes_real_child_from_process_table() {
     let child = spawn_real_child(short_lived_child_spec());
@@ -403,8 +401,8 @@ fn test_reap_removes_real_child_from_process_table() {
     assert_gone_from_process_table(pid, "child");
 }
 
-/// Regression (P1): a long-running child is killed **and** reaped, so a
-/// `run_command` that times out cannot accumulate zombies.
+/// A long-running child is killed **and** reaped, so a `run_command` that times out
+/// cannot accumulate zombies.
 #[test]
 fn test_reap_kills_and_reaps_real_long_running_child() {
     let child = spawn_real_child(long_running_child_spec());
@@ -526,8 +524,8 @@ fn test_child_reaper_blocking_fallback_reaps_stubborn_child() {
     );
 }
 
-/// A failing `waitpid` means the pid is gone: treat it as reaped so the handle
-/// is never waited on a second time (which is what a double-reap looks like).
+/// A failing `waitpid` means the pid is not in the process table: treat it as reaped so
+/// the handle is never waited on a second time (which is what a double-reap looks like).
 #[test]
 fn test_child_reaper_treats_waitpid_error_as_reaped_and_never_retries() {
     let fake = FakeChild::waitpid_error();
@@ -616,8 +614,8 @@ fn test_deferred_reap_queue_reaps_inline_and_stays_bounded() {
     assert_eq!(queue.len(), DEFERRED_REAP_QUEUE_CAP);
 }
 
-// Bug P3 (unbounded interactive buffer) — ring buffer + truncation accounting,
-// pure logic on `SharedBuffer`.
+// Ring buffer + truncation accounting, pure logic on `SharedBuffer` (this is what
+// keeps an interactive session's buffer bounded).
 
 #[test]
 fn test_shared_buffer_cap_constant_is_documented() {
@@ -784,7 +782,7 @@ fn test_is_utf8_lead_byte_classifies_lead_and_continuation_bytes() {
     assert!(!is_utf8_lead_byte(0xA4)); // second byte of `ä`
 }
 
-// Bug (t-034b) — the Landlock gate must NEVER depend on the executable NAME.
+// The Landlock decision must NEVER depend on the executable NAME.
 // These tests drive [`should_apply_sandbox`] / [`sandbox_command_argv`] as pure
 // logic with injected inputs: no Landlock availability, no `/dev/pts`, no
 // `current_exe()`, no environment mutation, so they are deterministic
@@ -849,8 +847,8 @@ fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
     (result, text)
 }
 
-/// A renamed / copied / installed binary is sandboxed exactly like `marmel`:
-/// the whole point of the fix.
+/// A renamed / copied / installed binary is sandboxed exactly like any other: the
+/// resolved path decides, the name never does.
 #[test]
 fn test_sandbox_gate_renamed_binary_is_still_sandboxed() {
     for name in [
@@ -875,12 +873,13 @@ fn test_sandbox_gate_renamed_binary_is_still_sandboxed() {
     }
 }
 
-/// The old `file_name(current_exe) == "marmel"` equality must decide nothing:
-/// the decision is identical across names that the old heuristic split apart.
+/// Name equality decides nothing: the decision is identical across names that comparing
+/// `file_name(current_exe)` against a literal would have split apart.
 #[test]
 fn test_sandbox_gate_executable_name_has_zero_influence() {
     let dir = Path::new("/home/fredrik/src/wip/target/debug");
-    // The old heuristic said `true` only for the exact `marmel`/`marmel.exe`.
+    // A name-equality check answers `true` for the exact names only — that is precisely
+    // the split these tests prove impossible.
     let names = ["marmel", "marmel.exe", "marmel-x", "sh", "bash", "cargo"];
     let old_heuristic: Vec<bool> = names
         .iter()
@@ -917,8 +916,7 @@ fn test_sandbox_gate_executable_name_has_zero_influence() {
     ));
 }
 
-/// Regression guard: the name-equality test is gone from the source, not merely
-/// bypassed.
+/// Regression guard: name equality must be absent from the source, not merely bypassed.
 #[test]
 fn test_sandbox_gate_source_has_no_executable_name_heuristic() {
     let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/harness/pty.rs"))
@@ -975,7 +973,7 @@ fn test_sandbox_gate_explicit_opt_out_disables_and_is_warned() {
         "the warn must state the resolved exe and the chosen mode, got {logs:?}"
     );
 
-    // The opted-out command really is a plain `sh -c …` (with t-034a's preamble).
+    // The opted-out command really is a plain `sh -c …`, preamble included.
     let cwd = Path::new("/tmp/work");
     let (program, args) =
         sandbox_command_argv(&decision, "echo hi", cwd).expect("skip decision builds argv");
@@ -1053,8 +1051,8 @@ fn test_sandbox_gate_test_harness_binary_skips_with_warning() {
     );
 }
 
-/// Fail-closed: on Linux, an unresolvable exe is a hard error — the old code
-/// fell back to `sh -c` here, which is the silent fail-open this removes.
+/// Fail-closed: on Linux, an unresolvable exe is a hard error — falling back to `sh -c`
+/// here would run the command unsandboxed in silence.
 #[test]
 fn test_sandbox_gate_unresolved_exe_fails_closed_and_is_logged() {
     let inputs = SandboxInputs {
@@ -1082,14 +1080,11 @@ fn test_sandbox_gate_unresolved_exe_fails_closed_and_is_logged() {
     );
 }
 
-/// Expected shell argv prefix of `build_sandboxed_command` on this platform,
-/// following the same platform spawn-spec idiom as
-/// `short_lived_child_spec`/`long_running_child_spec` above.
-///
-/// Grounded in the production builder: Windows takes its own branch and emits
-/// the bare `cmd` token plus `/C` (`pty.rs:779-780` — portable-pty keeps argv0
-/// verbatim, the OS resolves `cmd` to `cmd.exe` only at spawn time), while every
-/// unix skip emits `sh` plus `-c` (`pty.rs:742`).
+/// Expected shell argv prefix of `build_sandboxed_command` on this platform, following
+/// the same platform spawn-spec idiom as `short_lived_child_spec`/`long_running_child_spec`
+/// above. Grounded in the production builder: Windows takes its own branch and emits the
+/// bare `cmd` token plus `/C` (portable-pty keeps argv0 verbatim; the OS resolves `cmd` to
+/// `cmd.exe` only at spawn time), while every unix skip emits `sh` plus `-c`.
 fn expected_sandbox_shell() -> (&'static str, &'static str) {
     if cfg!(windows) {
         ("cmd", "/C")
@@ -1115,11 +1110,10 @@ fn test_build_sandboxed_command_logs_its_choice_and_keeps_the_wrapper() {
         let (program, shell_flag) = expected_sandbox_shell();
         assert_eq!(argv[0].to_string_lossy(), program);
         assert_eq!(argv[1].to_string_lossy(), shell_flag);
-        // Both platforms warn, but from different call sites: the unix skip runs
-        // through `log_sandbox_decision` (`pty.rs:662`, debug line `pty sandbox
-        // decision` + the `SKIPPED` warn), while the Windows branch warns
-        // directly from `build_sandboxed_command` (`pty.rs:768`) and never emits
-        // that debug line. Only the shared wording is asserted on Windows.
+        // Both platforms warn, but from different call sites: the unix skip runs through
+        // `log_sandbox_decision` (the `pty sandbox decision` debug line plus the `SKIPPED`
+        // warn), while the Windows branch warns directly from `build_sandboxed_command` and
+        // never emits that debug line. Only the shared wording is asserted on Windows.
         let marker = if cfg!(windows) {
             "SKIPPED"
         } else {

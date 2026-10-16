@@ -1,6 +1,6 @@
 //! Specialist: **Researcher** — Deep Knowledge & Research Specialist.
 //!
-//! Domain (REQ-ORCH-002): comprehensive codebase exploration, information
+//! Domain: comprehensive codebase exploration, information
 //! retrieval, architecture analysis, and documentation.
 //!
 //! Allowed tool namespaces: `delegate_task`, `write_file`, `replace`,

@@ -1,45 +1,29 @@
-//! Gate t-073 — the tool-schema token budget **and** the compaction outcome must
-//! be live on the SPECIALIST TURN path (`src/agents/runner/execution.rs`), not
-//! only on the Manager path (t-063/t-064) and the fix loop (t-064).
+//! The tool-schema token budget **and** the compaction outcome must be live on
+//! the specialist turn path (`src/agents/runner/execution.rs`), not only on the
+//! Manager path and the fix loop.
 //!
-//! The two residual defects the t-067 manager-cluster gate found on this loop are
-//! pinned here through the **real live path** (`run_specialist_live`) against a
-//! wiremock backend — the established technique of
+//! Three contracts, pinned through the real live path (`run_specialist_live`)
+//! against a wiremock backend: capture the request bodies the worker sends and
+//! the orchestrator status channel, then assert on what the loop actually did —
+//! the technique of
 //! `src/ui/session.rs::charged_manager_schema_is_exactly_the_wire_schema` and
-//! `tests/test_midturn_notice.rs`: capture the request bodies the worker sends,
-//! capture the orchestrator status channel, assert on what the loop actually did.
+//! `tests/test_midturn_notice.rs`.
 //!
-//! 1. **The advertised list was never charged to the specialist engine.** No
-//!    `set_tools` / `charge_engine_tool_schema` call existed anywhere in
-//!    `execution.rs`, while `build_turn_request(&model, &engine, &tools, …)`
-//!    (`fix_loop::build_turn_request`) puts that very list on the wire. `request_token_count()`
-//!    was therefore the message-only number that `context.rs` honestly documents
-//!    as a *lower bound*, and `should_compact()` / `should_advise_rebirth()`
-//!    under-priced every specialist request by the whole schema payload — a real
-//!    context-window overflow risk.
-//!    → `test_only_the_charged_tool_schema_crosses_the_specialist_compaction_trigger`
-//!    measures the transcript and the schema off the wire, picks a budget where
-//!    the transcript alone stays **under** the 90 % trigger while the transcript
-//!    *plus the advertised schemas* crosses it, and requires the loop to compact
-//!    in exactly that situation.
-//!    → `test_specialist_engine_charges_and_reprices_the_advertised_list` asserts
-//!    the engine-level arithmetic directly (charged == advertised schema size,
-//!    re-charge idempotent, lost charge healed).
-//! 2. **The `CompactionOutcome` was discarded** (bare `engine.compact();`), so a
-//!    `TargetUnreachable` compaction — everything trimmable trimmed, transcript
-//!    still over budget — was invisible to the operator.
-//!    → `test_specialist_compaction_outcome_is_surfaced_on_the_worker_status_channel`
-//!    (budget so small that the *message-only* transcript already triggers, which
-//!    pins the surfacing independently of the charge) and the budget test above
-//!    both demand the `fix_loop_compaction_notice` line carrying
-//!    messages_removed / tokens_reclaimed / final tokens / target.
-//! 3. **Byte-exactness of the charge** — never a superset (transcript trimmed
-//!    away that the wire never paid for), never a subset (an over-budget request
-//!    let through).
-//!    → `test_charged_specialist_schema_is_exactly_the_wire_schema` compares the
-//!    serialized list from the crate's advertising authority
-//!    (`execution::specialist_advertised_tools`) with the `tools` array the live
-//!    loop sent, and prices both sides with the crate's own schema counter.
+//! 1. The advertised list is charged to the specialist engine, so
+//!    `request_token_count()` reports the whole request rather than the
+//!    message-only *lower bound* that `context.rs` documents, and
+//!    `should_compact()` / `should_advise_rebirth()` price the schema payload too
+//!    (`test_only_the_charged_tool_schema_crosses_the_specialist_compaction_trigger`,
+//!    `test_specialist_engine_charges_and_reprices_the_advertised_list`).
+//! 2. A `CompactionOutcome` is never discarded: a `TargetUnreachable` compaction
+//!    reaches the operator through the `fix_loop_compaction_notice` status line
+//!    carrying messages_removed / tokens_reclaimed / final tokens / target
+//!    (`test_specialist_compaction_outcome_is_surfaced_on_the_worker_status_channel`).
+//! 3. The charge is byte-exact — never a superset (nothing trimmed that the wire
+//!    never paid for), never a subset (no over-budget request let through):
+//!    `execution::specialist_advertised_tools` equals the `tools` array the live
+//!    loop sent, and both sides are priced with the crate's own schema counter
+//!    (`test_charged_specialist_schema_is_exactly_the_wire_schema`).
 //!
 //! Hermeticity: every run is scoped to an isolated temporary workspace root
 //! (`harness::with_workspace_root`); the repository's real `.marmel/` is never
@@ -310,7 +294,7 @@ fn wire_schema_tokens(tools: &[serde_json::Value]) -> usize {
 /// Require the `fix_loop_compaction_notice` line on the status channel, and pin
 /// every field the outcome carries (messages_removed / tokens_reclaimed / final /
 /// target). Panics with the full captured status list when it is absent — which
-/// is exactly the pre-fix state, where the outcome was thrown away.
+/// is exactly the state where the outcome is thrown away.
 fn assert_compaction_notice(statuses: &[String], tag: &str, target: usize) -> String {
     let needle = "automatic context compaction could not reach its target";
     let Some(notice) = statuses.iter().find(|s| s.contains(needle)) else {

@@ -1,36 +1,31 @@
-//! Integration tests for the pre-send role normalization in
-//! `ChatClient::try_chat_once` (`src/llm/client.rs:540-578`) as it applies to a
-//! **restored** session history carrying a legacy `Message::System` rebirth
-//! checkpoint, and for the in-memory detector half of that fix.
+//! Integration tests for the role normalization applied before sending, in
+//! `ChatClient::try_chat_once` as it applies to a **restored** session history
+//! carrying a legacy `Message::System` rebirth checkpoint, and for the in-memory
+//! detector half of that behaviour.
 //!
-//! Seam (stated honestly): these are end-to-end on the transport side — the real
-//! `ChatClient` performs a real HTTP POST against a real socket owned by
-//! `wiremock`, and the assertions read the **request body that actually arrived**
-//! (`received_requests()[0].body`), never a re-serialization of the input. On the
-//! history side the transcript enters the engine through the sanctioned restore
-//! seam [`ContextEngine::install_restored_messages`] (A §4 R-PIN-2), which is the
-//! documented source of a mid-history `Message::System` checkpoint
-//! (`src/manager/context.rs:268-274`). The bundle → `MessageRecord` half is owned
-//! by `tests/test_session_restore_manager.rs::ac_m7_legacy_advisory_text_and_system_checkpoint_are_opaque`
-//! (which proves a `System`-variant checkpoint is restored as `System`), so this
-//! file starts exactly where that guarantee ends: a live engine vector holding
-//! `Message::System` at index > 0 that is about to be sent.
+//! Seam: the transport side is end-to-end — a real `ChatClient` POSTs to a socket
+//! owned by `wiremock`, and the assertions read the **request body that actually
+//! arrived** (`received_requests()[0].body`), never a re-serialization of the
+//! input. The transcript enters the engine through the sanctioned restore seam
+//! [`ContextEngine::install_restored_messages`], the documented source of a
+//! mid-history `Message::System` checkpoint; the bundle → `MessageRecord` half is
+//! owned by `tests/test_session_restore_manager.rs`. These tests start there: a
+//! live engine vector holding `Message::System` at index > 0 about to be sent.
 //!
 //! What each test pins:
 //!
 //! 1. the checkpoint's **wire** role is `"user"` while `[0]` stays `"system"`;
-//! 2. the content of every demoted turn is **byte-identical**, and the order and
-//!    length of the transcript are untouched;
-//! 3. the same send leaves the in-memory history detectable: `REBIRTH_CHECKPOINT_PREFIX`
-//!    and `pinned_prefix_end` still find the checkpoint in the engine's own
-//!    vector, which still holds the `System` variant afterwards;
-//! 4. a post-`perform_rebirth` history keeps the REQ-CORE-001/002/004 contract
-//!    (`[0]` system, `[1]` user, 4 messages, checkpoint last) and goes out with
-//!    the checkpoint as `"user"`.
+//! 2. every demoted turn's content is byte-identical, and transcript order and
+//!    length are untouched;
+//! 3. the send leaves the checkpoint detectable in memory —
+//!    `REBIRTH_CHECKPOINT_PREFIX` and `pinned_prefix_end` still find it in the
+//!    engine's own vector, which still holds the `System` variant;
+//! 4. a post-`perform_rebirth` history keeps the pinned-history contract
+//!    (`[0]` system, `[1]` user, 4 messages, checkpoint last) and sends the
+//!    checkpoint as `"user"`.
 //!
-//! `types::Message` has no `PartialEq` (`src/types/wire.rs:7`), so every
-//! comparison goes through `role()`/`content()`, `matches!`, or the captured
-//! `serde_json` value.
+//! `types::Message` has no `PartialEq`, so every comparison goes through
+//! `role()`/`content()`, `matches!`, or the captured `serde_json` value.
 
 use marmennill::llm::client::{ChatClient, ReplyOutcome};
 use marmennill::manager::context::{
@@ -45,19 +40,18 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const SYSTEM_PROMPT: &str = "SYSTEM PROMPT — pinned bytes (REQ-CORE-001)";
 /// Pinned goal bytes as a restored bundle carries them.
 const GOAL: &str = "goal: pinned bytes, verbatim (REQ-CORE-002)";
-/// The historic `System` spelling of a rebirth checkpoint, i.e. what a bundle
-/// written before bug M12 still contains (fixture shape copied from
-/// `src/session/manager_capture.rs:143-146`).
+/// The historic `System` spelling of a rebirth checkpoint, i.e. the shape an old
+/// session bundle still carries (fixture shape in `src/session/manager_capture.rs`).
 const LEGACY_CHECKPOINT_1: &str = "(SYSTEM: REBIRTH CHECKPOINT. The previous turn-by-turn history has been compacted. Summarized progress: 3 turns distilled: goal pinned at [1], loader shipped.)";
 /// A second legacy checkpoint from an even older build, further down the same
 /// restored transcript.
 const LEGACY_CHECKPOINT_2: &str = "(SYSTEM: REBIRTH CHECKPOINT. The previous turn-by-turn history has been compacted. Summarized progress: earlier compaction, older build still.)";
-/// The legacy advisory marker this binary no longer emits but old bundles carry.
+/// The legacy advisory marker that only old session bundles carry.
 const LEGACY_ADVISORY: &str = "(SYSTEM: CONTEXT LIMIT EXCEEDED — compaction dropped 12 older turn(s). Continue from the last genuine instruction.)";
 
 // --------------------------------------------------------------------- fixtures
 
-/// A restored transcript in the shape a pre-M12 session bundle produces: the
+/// A restored transcript in the shape a legacy session bundle produces: the
 /// pinned pair, a `MessageRecord::System` rebirth checkpoint at index 2, a
 /// legacy advisory, a genuine instruction, an assistant `tool_calls` turn with
 /// its matching `role:"tool"` result.
@@ -107,8 +101,8 @@ fn legacy_restored_records_with_two_checkpoints() -> Vec<MessageRecord> {
     records
 }
 
-/// Install a restored transcript **wholesale** — the only sanctioned restore path
-/// (A §4 R-PIN-2), which keeps every role exactly as the bundle spelled it.
+/// Install a restored transcript **wholesale** — the only sanctioned restore
+/// path, which keeps every role exactly as the bundle spelled it.
 fn restored_engine(records: Vec<MessageRecord>) -> ContextEngine {
     let mut engine = ContextEngine::new(8_000);
     engine.install_restored_messages(records);
@@ -342,16 +336,16 @@ async fn test_every_mid_history_system_turn_is_demoted_and_index_zero_is_untouch
 
 /// (4) The live chain on a rehydrated session: the restored legacy history is
 /// sent (`[2]` out as `user`), the in-memory vector then feeds a real
-/// `perform_rebirth`, and the collapsed history still honours the
-/// REQ-CORE-001/002/004 contract from `tests/test_context.rs:352-383`
-/// (`[0]` system, `[1]` user, 4 messages, checkpoint last) and goes out with
+/// `perform_rebirth`, and the collapsed history still honours the pinned-history
+/// contract (`test_context.rs::test_integration_rebirth_checkpoint_shape_after_injected_advisory`:
+/// `[0]` system, `[1]` user, 4 messages, checkpoint last) and goes out with
 /// `messages[0]` as `system` and the checkpoint as `user`.
 ///
-/// The pre-rebirth send is asserted here (not only in the tests above) because it
-/// is what proves the normalization never reaches back into the vector
-/// `perform_rebirth` re-reads positionally: the collapse below still finds the
-/// pinned prompt at `[0]`, the pinned goal byte-identical at `[1]`, and the last
-/// genuine instruction — not boilerplate — at `[2]`.
+/// The send before `perform_rebirth` is asserted here as well: it proves the
+/// normalization never reaches back into the vector `perform_rebirth` re-reads
+/// positionally — the collapse still finds the pinned prompt at `[0]`, the pinned
+/// goal byte-identical at `[1]`, and the last genuine instruction — not
+/// boilerplate — at `[2]`.
 #[tokio::test]
 async fn test_reborn_history_keeps_pin_contract_and_sends_checkpoint_as_user() {
     // Rehydrated session: the legacy `System` checkpoint is live in memory.

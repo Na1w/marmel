@@ -1,38 +1,20 @@
-//! Reproduction regression test for the "session exits after one turn" defect
-//! (execution plan task t-rpr1).
+//! Regression guard for the interactive session loop: a session must never exit after
+//! a single turn.
 //!
-//! Root cause (from `src/ui/mod.rs::run_session`): at the *bottom* of the main
-//! loop the code calls `renderer.poll_input()` **unconditionally**. For the
-//! interactive TUI renderer `poll_input()` is **non-blocking**
-//! (`handle_events(false)` + `rx.try_recv()`). If the user has not typed a
-//! complete line at the exact instant of that poll, it returns `None`, which
-//! sets `keep_going = false` and terminates the session — even though the
-//! renderer is interactive and should instead block (via `read_input()`) for
-//! the next steering line.
+//! Contract at the bottom of `run_session`: the loop must not treat a *non-blocking*
+//! `renderer.poll_input()` (for the interactive TUI renderer `handle_events(false)` +
+//! `rx.try_recv()`) that finds no complete input line as an end-of-session signal. An
+//! interactive renderer blocks for the next steering line through `read_input()`.
 //!
-//! This test drives the real `run_session` with:
-//!   * a **mock renderer** whose `poll_input()` always returns `None` (the
-//!     "user hasn't typed at the poll instant" case) and whose `read_input()`
-//!     returns a scripted sequence of lines; and
-//!   * a **mock streaming adapter** (a wiremock backend that always yields a
-//!     valid SSE reply) so the first turn succeeds.
+//! This test drives the real loop with:
+//!   * a **mock renderer** whose `poll_input()` returns no line at the poll instant and
+//!     whose `read_input()` returns a scripted sequence of lines; and
+//!   * a **mock streaming adapter** (a wiremock backend that always yields a valid SSE
+//!     reply) so every turn succeeds.
 //!
-//! The assertion encodes the *required* behaviour: an interactive session must
-//! NOT terminate after a single turn. It must keep looping, take a second
-//! steering line ("steer2"), run a **second** turn, and only then terminate via
-//! an explicit `/abort`.
-//!
-//! ## Documented failing behaviour (current code)
-//!
-//! With the un-fixed loop, after turn 1 the loop-bottom `poll_input()` returns
-//! `None` → `keep_going = false` → the session exits after **one** turn:
-//!   * the backend was called only **once** (assertion `backend_calls == 2`
-//!     fails with `== 1`); and
-//!   * the renderer never received an abort (`aborted() == false`).
-//!
-//! The test therefore FAILS against the current code, documenting the bug. It
-//! is expected to pass once `src/ui/mod.rs::run_session` uses the blocking
-//! `read_input()` at the loop bottom for interactive renderers (t-fix1).
+//! The assertion encodes the required behaviour: keep looping, take the second steering
+//! line ("steer2"), run a **second** turn (`backend_calls == 2`), and only then
+//! terminate through an explicit `/abort` (`aborted()`).
 
 use marmennill::config::Config;
 use marmennill::ui::{Event, Renderer};
@@ -45,11 +27,11 @@ static TEST_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
 
 /// A scripted mock renderer that reproduces the TUI's non-blocking poll.
 ///
-/// * `poll_input()` always returns `None` — it is the non-blocking poll that,
-///   at the instant after turn 1, finds no completed input line.
+/// * `poll_input()` is the non-blocking poll: it answers from its own script and
+///   reports no line when that script is empty.
 /// * `read_input()` draws from a scripted queue of lines: the first call is the
-///   initial *goal*; later calls are the steering lines the *fixed* loop-bottom
-///   would consume while blocking for input.
+///   initial *goal*; later calls are the steering lines the loop bottom consumes
+///   while blocking for input.
 struct ScriptedRenderer {
     /// Lines returned by `read_input()`, consumed in order.
     read_script: Vec<String>,
@@ -158,13 +140,12 @@ fn completion_sse(text: &str) -> String {
     )
 }
 
-// ── Durable-state witnesses (t-025b) ──────────────────────────────────────────
+// ── Durable-state witnesses ─────────────────────────────────────────────────────
 //
 // The session bundle at `Plan::session_bundle_path()` is the ONLY durable session
-// state. t-025b deleted the superseded UI journal's persistence owner
-// (`UiTranscript::save`/`load` and the `.ui_transcript.json` file name), so every
-// "still visible after the fact" witness in this file reads the bundle off disk —
-// and pins that the legacy journal is never written again.
+// state, so every "still visible after the fact" witness in this file reads the
+// bundle off disk — and pins that the legacy `.ui_transcript.json` journal is
+// never written again.
 
 /// The committed bundle's member list, read straight off disk (never from the
 /// in-process commit cache), so these witnesses prove the bytes are there.
@@ -193,16 +174,16 @@ fn bundle_member(bundle: &std::path::Path, rel: &str) -> String {
         .unwrap_or_else(|err| panic!("{rel} must exist in {}: {err}", bundle.display()))
 }
 
-/// Path of the superseded UI journal — the file the session SHALL NOT write again.
+/// Path of the legacy UI journal — the file the session SHALL NOT write again.
 fn legacy_ui_journal(plan: &marmennill::manager::phase::Plan) -> std::path::PathBuf {
     plan.dir().join(".ui_transcript.json")
 }
 
-/// The reproduction test (t-rpr1).
+/// The single-turn regression test.
 ///
-/// Asserts the *required* behaviour: the loop must NOT terminate after a single
-/// turn. It should take a second steering line and run a second turn, then stop
-/// via an explicit `/abort`.
+/// Asserts the required behaviour: the loop must NOT terminate after a single
+/// turn. It takes a second steering line, runs a second turn, then stops via an
+/// explicit `/abort`.
 #[tokio::test]
 async fn test_ui_run_session_continues_after_first_turn() {
     let _lock = TEST_MUTEX.lock().await;
@@ -259,10 +240,9 @@ async fn test_ui_run_session_continues_after_first_turn() {
 
     let backend_calls = calls.load(Ordering::SeqCst);
 
-    // REQUIRED behaviour: the interactive loop must NOT stop after one turn.
-    // With the bug, `poll_input()` at the loop bottom returns `None` and the
-    // session exits after turn 1 (backend_calls == 1). The correct behaviour is
-    // a second turn (backend_calls == 2).
+    // REQUIRED behaviour: the interactive loop must NOT stop after one turn. A
+    // loop-bottom `poll_input()` that reports no line must not end the session; the
+    // second steering line drives a second turn (backend_calls == 2).
     assert_eq!(
         backend_calls, 2,
         "loop must NOT terminate after a single turn: expected 2 backend calls \
@@ -1062,11 +1042,10 @@ async fn test_steering_arbitrator_sleep_re_invokes_after_delay() {
 /// Verify that an interactive session persists what the user saw in the ONE durable
 /// session format: the bundle at `Plan::session_bundle_path()`.
 ///
-/// The witness used to be `.ui_transcript.json` read back with `UiTranscript::load`.
-/// t-025b deleted that persistence owner, so the same two records of the visible
-/// turn — the user goal and the assistant reply — are pinned here in the member a
-/// `--resume` reads (`manager.json`), the manifest must list both mandatory members,
-/// and the superseded UI journal must not be written again on the way out.
+/// Both records of the visible turn — the user goal and the assistant reply — are
+/// pinned in the member a `--resume` reads (`manager.json`), the manifest must list
+/// both mandatory members, and the legacy `.ui_transcript.json` journal must not be
+/// written again on the way out.
 #[tokio::test]
 async fn test_ui_session_persists_the_visible_turn_to_the_bundle() {
     let _lock = TEST_MUTEX.lock().await;
@@ -1127,8 +1106,7 @@ async fn test_ui_session_persists_the_visible_turn_to_the_bundle() {
          got: {durable}"
     );
 
-    // The superseded journal stays superseded: nothing in the session loop may
-    // re-create it.
+    // The legacy journal stays legacy: nothing in the session loop may re-create it.
     assert!(
         !legacy_ui_journal(&plan).exists(),
         "the session must not write the superseded `.ui_transcript.json` again"
@@ -1141,9 +1119,8 @@ async fn test_ui_session_persists_the_visible_turn_to_the_bundle() {
 ///    that goal is what the committed bundle carries.
 /// 2. A stale `.ui_transcript.json` left on disk by an older release is NOT carried
 ///    into the session's durable state.
-/// 3. Nothing touches that stale file any more: it is not rewritten, because its
-///    persistence owner (`UiTranscript::save`/`load` and the file-name constant) was
-///    deleted by t-025b — the bundle is the sole persistence owner.
+/// 3. Nothing rewrites that stale file either: the committed bundle is the sole
+///    persistence owner, so the leftover bytes stay exactly as found.
 #[tokio::test]
 async fn test_ui_session_starts_fresh_and_persists_a_bundle_not_the_legacy_journal() {
     let _lock = TEST_MUTEX.lock().await;
@@ -1164,10 +1141,9 @@ async fn test_ui_session_starts_fresh_and_persists_a_bundle_not_the_legacy_journ
     plan.create("# Plan\n- [ ] [t-001] old pending task\n")
         .expect("plan created");
 
-    // Pre-create a stale UI transcript left behind by an older release. Nothing in
-    // this crate can write that file any more (t-025b deleted its writer), so the
-    // fixture spells the stale bytes by hand — that IS the leftover case the session
-    // has to live with.
+    // Pre-create a stale UI transcript of the kind an older release left behind.
+    // Nothing in this crate writes that file, so the fixture spells the stale bytes by
+    // hand — that IS the leftover case the session has to live with.
     let stale_journal = legacy_ui_journal(&plan);
     let stale_bytes =
         br#"{"records":[{"type":"User","text":"Old user goal from yesterday"}]}"#.to_vec();
@@ -1217,8 +1193,8 @@ async fn test_ui_session_starts_fresh_and_persists_a_bundle_not_the_legacy_journ
          `.ui_transcript.json` on disk; got: {durable}"
     );
 
-    // 3. And nothing rewrites that stale file: its owner is gone, so the bytes the
-    //    fixture left behind are exactly the bytes still on disk.
+    // 3. And nothing rewrites that stale file: the committed bundle is the sole
+    //    persistence owner, so the bytes the fixture left behind are still on disk.
     let still_on_disk = std::fs::read(&stale_journal).expect("stale legacy journal still there");
     assert_eq!(
         still_on_disk, stale_bytes,
@@ -1226,28 +1202,18 @@ async fn test_ui_session_starts_fresh_and_persists_a_bundle_not_the_legacy_journ
     );
 }
 
-// t-031b — DEFECT CLASS H2 (live executor): leaked in-flight round work on a
-// hard error path.
-//
-// The live delegation round lives in `src/ui/session.rs`: every parallel
-// tool batch (`all_parallel && tool_calls.len() > 1`) is fanned out into
-// `tokio::task::spawn_blocking` handles and then joined one by one. Every
-// *abort* exit of that join loop calls `crate::orchestrator::cancel_all()`
-// first, which (i) cancels the global cancellation token that in-flight PTY
-// command loops poll (`src/harness/pty.rs` `teardown()` -> `kill_and_reap()` ->
-// `kill_process_group`) and (ii) cancels every registered worker token via
-// `cancel_all_active_workers()` (`src/orchestrator/workers.rs`).
-//
-// A *hard error* raised inside the round (here: a renderer write failure, the
-// `renderer.flush()?` in `src/ui/session.rs`) used to propagate out
-// of `run_session` with `?` and simply **detach** the remaining handles — no
-// `cancel_all()`, so the delegated/parallel work kept running after the session
-// aborted.
-//
-// The test is fully hermetic: no `openpty`, no real specialist. The in-flight
-// work is modelled the same way `OrchestratorManager::delegate` models it
-// (`src/orchestrator/mod.rs`, `delegate`): a worker registered in the live registry
-// with an explicit cancellation token, kept active until the round aborts.
+// Hard errors on the live executor: in-flight round work must be cancelled, never
+// detached. Every parallel tool batch (`all_parallel && tool_calls.len() > 1`) is
+// fanned out into `tokio::task::spawn_blocking` handles and joined one by one, and every
+// *abort* exit of that join loop calls `crate::orchestrator::cancel_all()` first — the
+// global cancellation token in-flight PTY command loops poll
+// (`teardown()` -> `kill_and_reap()` -> `kill_process_group`) plus every registered
+// worker token through `cancel_all_active_workers()`. A *hard error* raised inside the
+// round (here: the renderer write failure raised by `renderer.flush()?` in
+// `run_session_with_bounds`) takes that same route instead of propagating out of
+// `run_session` and detaching the remaining handles. The test is hermetic: no `openpty`,
+// no real specialist — in-flight work is modelled the way `OrchestratorManager::delegate`
+// models it.
 
 /// SSE body with TWO read-only tool calls -> forces the parallel fan-out branch.
 fn two_parallel_tool_calls_sse() -> String {
@@ -1308,7 +1274,7 @@ impl Renderer for RoundHardErrorRenderer {
     fn set_subagents(&mut self, _subagents: Vec<marmennill::ui::SubagentDetail>) {}
     fn flush(&mut self) -> anyhow::Result<()> {
         // The fan-out loop emits one `ToolCall` event per parallel call and then
-        // flushes once every handle has been spawned (`src/ui/session.rs`).
+        // flushes once every handle has been spawned (`run_session_with_bounds`).
         if self.tool_call_events >= 2 && !self.fired {
             self.fired = true;
             self.cancelled_when_raised = Some(marmennill::orchestrator::is_globally_cancelled());
@@ -1390,7 +1356,7 @@ async fn test_ui_session_hard_error_mid_round_cancels_inflight_work() {
         "precondition: nothing was cancelled at the instant the round hit the hard error"
     );
 
-    // H2: the round's in-flight work must be cancelled, not detached.
+    // The round's in-flight work must be cancelled, not detached.
     assert!(
         token.is_cancelled(),
         "H2 leak: the hard error returned out of run_session while the round still \
@@ -1406,19 +1372,18 @@ async fn test_ui_session_hard_error_mid_round_cancels_inflight_work() {
     );
 }
 
-// H5 — execution bounds (recon H5: "no failure budget, no wall-clock bound")
+// Execution bounds: no failure budget and no wall-clock bound is tolerated.
 //
-// The live session loop used to be bounded by nothing but a turn counter
-// (`MAX_TURNS`): a turn that hung, or a task that failed the same way forever,
-// kept the session alive and kept in-flight specialist work running. These two
-// tests drive the *real* loop (no openpty, wiremock backend only) with small
-// injected bounds to prove the wall-clock bound and the repeated-failure budget
-// actually fire.
+// The live session loop is bounded by more than a turn counter (`MAX_TURNS`): a turn
+// that hangs, or a task that fails the same way forever, must end the session and stop
+// in-flight specialist work. These tests drive the *real* loop (no openpty, wiremock
+// backend only) with small injected bounds to prove the wall-clock bound and the
+// repeated-failure budget actually fire.
 
 /// Renderer standing in for a session that has in-flight delegated work.
 ///
 /// * `init()` registers a live worker plus the cancellation token that worker
-///   would poll — the same shape `src/orchestrator/workers.rs` gives a real
+///   would poll — the same shape `register_active_worker_with_token` gives a real
 ///   delegated specialist.
 /// * `flush()` records the cancellation state at the first flush after the
 ///   bound has been rendered, i.e. the moment the loop tears the turn down.
@@ -1499,8 +1464,8 @@ impl Renderer for BoundProbeRenderer {
     fn shutdown(&mut self) {}
 }
 
-/// Recon H5 / REQ-LOOP-002: a turn that blows its wall-clock bound is terminated
-/// with a user-visible reason **and** its in-flight work is cancelled.
+/// A turn that blows its wall-clock bound is terminated with a user-visible reason
+/// **and** its in-flight work is cancelled.
 #[tokio::test]
 async fn test_ui_session_wall_clock_bound_terminates_runaway_turn() {
     let _lock = TEST_MUTEX.lock().await;
@@ -1687,8 +1652,8 @@ impl Renderer for FailureBudgetRenderer {
     fn shutdown(&mut self) {}
 }
 
-/// Recon H5: the same failing task/tool call must escalate after a small
-/// threshold instead of being retried blindly for the whole session.
+/// The same failing task/tool call must escalate after a small threshold instead of
+/// being retried blindly for the whole session.
 #[tokio::test]
 async fn test_ui_session_repeated_failure_escalates_instead_of_retrying_forever() {
     let _lock = TEST_MUTEX.lock().await;
@@ -1786,7 +1751,7 @@ async fn test_ui_session_repeated_failure_escalates_instead_of_retrying_forever(
     );
 }
 
-/// Recon H5 / REQ-LOOP-002: the *stalled* half of the wall-clock bound.
+/// The *stalled* half of the wall-clock bound.
 ///
 /// A tool call that produces no observable progress must not be able to hold the
 /// turn open indefinitely: the watchdog tears the turn down, cancels everything
@@ -1888,33 +1853,16 @@ async fn test_ui_session_stalled_turn_watchdog_cancels_inflight_tool_call() {
     );
 }
 
-// t-057: a fail-closed plan verdict must reach the *user*, not only the prompt.
+// A fail-closed plan verdict must reach the *user*, not only the prompt.
 
-/// Guard for the UNKNOWN-plan surfacing path wired into
-/// `src/ui/session.rs::run_session_with_bounds` (t-057).
-///
-/// Setup: a temporary workspace root (`harness::with_workspace_root`) with a temp
-/// `.marmel/` holding an execution plan that **exists but holds no parseable
-/// `- [ ] [t-xxx]` task line** — exactly the shape that used to be read as
-/// "nothing pending / all complete". The body carries a `SENTINEL` line so the
-/// test can prove the unparseable body was never embedded in the system prompt as
-/// though it were an active plan. (A parse failure is used instead of a
-/// permission failure: `chmod`-based unreadability is not reproducible for every
-/// CI user, and both routes produce the same `PlanGate::Unknown` warning.)
-///
-/// Required behaviour asserted:
-/// 1. the renderer received an `Event::Status` carrying the plan-state warning
-///    **before the first assistant turn** (the wiring at the top of the session
-///    loop, not the end-of-turn plan gate);
-/// 2. that `Event::Status` is the **first** status line the session surfaces (it
-///    comes from the prompt load, not from a later gate) — the durable trace of the
-///    session is its committed bundle, since t-025b deleted the superseded
-///    `.ui_transcript.json` owner;
-/// 3. the system prompt actually sent to the backend declares the plan state
-///    UNKNOWN (fail-closed) and never presents the plan as active/complete.
-///
-/// Pty-free: scripted in-memory renderer + wiremock backend; the repository's
-/// real `.marmel/` is never touched.
+/// Guard for the UNKNOWN-plan surfacing path wired into `run_session_with_bounds`.
+/// Setup: a temp workspace root (`harness::with_workspace_root`) whose `.marmel/` plan
+/// **exists but holds no parseable `- [ ] [t-xxx]` task line**; its body carries a
+/// `SENTINEL` proving that body never reached the system prompt as an active plan. A
+/// parse failure stands in for a permission failure (`chmod` is not reproducible for
+/// every CI user; both produce the same `PlanGate::Unknown` warning). Required: the
+/// `Event::Status` carrying the plan-state warning is the FIRST status surfaced, before
+/// the first assistant turn, and every backend prompt declares the plan UNKNOWN.
 #[tokio::test]
 async fn test_ui_session_unknown_plan_state_surfaces_status() {
     let _lock = TEST_MUTEX.lock().await;
@@ -1968,10 +1916,10 @@ async fn test_ui_session_unknown_plan_state_surfaces_status() {
     .await
     .expect("run_session should complete");
 
-    // (1) A renderer `Status` event carries the plan-state warning, and it is
-    //     emitted at **session start** — before any assistant output. (The
-    //     end-of-turn plan gate surfaces the same text; this ordering pins the
-    //     prompt-load surfacing wired at the top of `run_session_with_bounds`.)
+    // (1) A renderer `Status` event carries the plan-state warning, and it is emitted
+    //     at **session start** — before any assistant output. The end-of-turn plan
+    //     check surfaces the same text; this ordering pins the prompt-load surfacing at
+    //     the top of `run_session_with_bounds`.
     let status_events: Vec<String> = renderer
         .events
         .iter()
@@ -2018,11 +1966,9 @@ async fn test_ui_session_unknown_plan_state_surfaces_status() {
         );
     }
 
-    // (2) The warning is a **session-start** surfacing, not the end-of-turn plan
-    //     gate: it is the FIRST `Status` line the session hands the renderer. (The
-    //     journal half of that surfacing stayed in memory, and t-025b deleted its
-    //     superseded on-disk owner, so the durable trace of this session is its
-    //     bundle and nothing else.)
+    // (2) The warning is a **session-start** surfacing: it is the FIRST `Status` line
+    //     the session hands the renderer, and the durable trace of this session is its
+    //     committed bundle and nothing else.
     let first_status = status_events
         .first()
         .unwrap_or_else(|| panic!("the session must surface at least one Status line"));
@@ -2067,21 +2013,14 @@ async fn test_ui_session_unknown_plan_state_surfaces_status() {
     }
 }
 
-// t-063 (manager gate item B): the assistant `tool_calls` <-> `role:"tool"` pair
-// invariant must hold on the **live** abort/bound path, not only inside
-// `compact()`.
-//
-// The repair used to be reachable only through `compact()`, which (a) is gated at
-// > 90% utilization and (b) sits *after* the `bound_stop_reason` /
-// `user_exit_requested` breaks that end a turn. A round cut off in the middle
-// therefore left the transcript holding the assistant with **all** its
-// `tool_calls` and no `role:"tool"` result for the skipped tail — and that
-// transcript is what the next turn re-sends verbatim (`src/ui/session.rs` builds
-// the request from `ctx.messages()`), which is a provider 400.
-//
-// These tests drive the *real* session loop: scripted in-memory renderer,
-// wiremock backend, `harness::with_workspace_root` — pty-free, and the
-// repository's real `.marmel/` is never reachable.
+// The assistant `tool_calls` <-> `role:"tool"` pairing invariant must hold on the
+// **live** abort/bound path, not only inside `compact()` — which runs only above 90%
+// utilization and sits *after* the `bound_stop_reason` / `user_exit_requested` breaks
+// that end a turn. A round cut off in the middle would otherwise leave the transcript
+// holding the assistant with **all** its `tool_calls` and no `role:"tool"` result for the
+// skipped tail, and that transcript is exactly what the next turn re-sends (built from
+// `ctx.messages()`) — a provider 400. These tests drive the *real* session loop:
+// pty-free, the repository's real `.marmel/` unreachable.
 
 /// SSE body whose assistant turn carries **three** tool calls: a long `sleep`
 /// followed by two reads. The mixed names force the *sequential* dispatch branch
@@ -2162,7 +2101,7 @@ fn tool_result_ids(messages: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// Every defect of the pairing invariant in a message array: a `tool_calls` entry
+/// Every violation of the pairing invariant in a message array: a `tool_calls` entry
 /// with **no** result, one with duplicate results, or a result whose id belongs to
 /// no surviving `tool_calls` entry. Empty means the array is a valid
 /// OpenAI-compatible chat sequence.
@@ -2201,10 +2140,9 @@ fn tool_result_content(messages: &serde_json::Value, id: &str) -> Option<String>
         .map(str::to_string)
 }
 
-/// Recon H5 bound + t-063: when the wall-clock bound cuts a round off, the calls
-/// in the skipped tail still need a result — the **next** request the session
-/// builds must be a valid chat sequence, not an assistant `tool_calls` list with
-/// holes in it.
+/// When the wall-clock bound cuts a round off, the calls in the skipped tail still
+/// need a result — the **next** request the session builds must be a valid chat
+/// sequence, not an assistant `tool_calls` list with holes in it.
 #[tokio::test]
 async fn test_ui_session_bound_mid_round_repairs_pairing_for_next_request() {
     let _lock = TEST_MUTEX.lock().await;
@@ -2279,8 +2217,8 @@ async fn test_ui_session_bound_mid_round_repairs_pairing_for_next_request() {
     .await
     .expect("an execution bound is an orderly stop, not a hard error");
 
-    // (1) Precondition: the bound fired mid-round, and turn 2 really did put the
-    //     torn transcript back on the wire.
+    // (1) The bound fired mid-round, and turn 2 really did put the torn transcript
+    //     back on the wire.
     let captured = requests.lock().expect("request capture lock").clone();
     assert!(
         captured.len() >= 2,
@@ -2303,9 +2241,8 @@ async fn test_ui_session_bound_mid_round_repairs_pairing_for_next_request() {
          round must be part of the next request"
     );
 
-    // (2) The invariant: every one of those three calls is answered. This is the
-    //     regression under test — before the fix `call_b`/`call_c` had no result
-    //     at all and the provider rejects the request.
+    // (2) The invariant: every one of those three calls is answered — an unanswered
+    //     `call_b`/`call_c` is precisely what the provider rejects.
     let defects = pairing_defects(&second);
     assert!(
         defects.is_empty(),
@@ -2341,9 +2278,7 @@ async fn test_ui_session_bound_mid_round_repairs_pairing_for_next_request() {
 
     // (4) The repair is not confined to the in-memory copy that built the request:
     //     the manager section the session **captured** at the round boundary is what
-    //     a rehydration would install. (The duplicate
-    //     `.marmel/.session_transcript.json` journal this assertion used to read is
-    //     deleted — A §1 D2, t-009 — and the capture is its successor.)
+    //     a rehydration would install.
     let captured = marmennill::session::manager_capture::last_capture()
         .expect("the session must capture its manager section at the round boundary");
     let persisted = serde_json::to_value(&captured.messages).expect("captured records serialize");
@@ -2432,10 +2367,10 @@ impl Renderer for ExitOnFirstToolCallRenderer {
     fn shutdown(&mut self) {}
 }
 
-/// t-063: a **user exit** in the middle of a round ends the session, so there is
-/// no next request to inspect — but the transcript the session leaves behind (and
-/// would rehydrate) must still satisfy the pairing invariant, with a placeholder
-/// for every call that was never dispatched.
+/// A **user exit** in the middle of a round ends the session, so there is no next
+/// request to inspect — but the transcript the session leaves behind (and would
+/// rehydrate) must still satisfy the pairing invariant, with a placeholder for every
+/// call that was never dispatched.
 #[tokio::test]
 async fn test_ui_session_user_exit_mid_round_persists_paired_transcript() {
     let _lock = TEST_MUTEX.lock().await;
@@ -2493,10 +2428,8 @@ async fn test_ui_session_user_exit_mid_round_persists_paired_transcript() {
         captured.len()
     );
 
-    // The superseded `.session_transcript.json` journal this test used to read is
-    // deleted (A §1 D2, t-009). What an exited round must leave behind is the pairing
-    // witness the session captured in memory at the boundary — exactly what a
-    // rehydration would install.
+    // What an exited round must leave behind is the pairing witness the session
+    // captured in memory at the boundary — exactly what a rehydration would install.
     let captured = marmennill::session::manager_capture::last_capture()
         .expect("the session must capture its manager section on the user-exit boundary");
     let on_disk = serde_json::to_value(&captured.messages).expect("captured records serialize");
@@ -2554,10 +2487,9 @@ async fn test_ui_session_user_exit_mid_round_persists_paired_transcript() {
     );
 }
 
-/// t-063: `CompactionOutcome` must not be discarded on the live path. When the
-/// 70% target is unreachable (the pinned prefix alone is over budget) the session
-/// has to say so through its status channel instead of reporting
-/// "context compacted".
+/// `CompactionOutcome` must not be discarded on the live path. When the 70% target is
+/// unreachable (the pinned prefix alone is over budget) the session has to say so
+/// through its status channel instead of reporting "context compacted".
 #[tokio::test]
 async fn test_ui_session_surfaces_unreachable_compaction() {
     let _lock = TEST_MUTEX.lock().await;
@@ -2574,7 +2506,7 @@ async fn test_ui_session_surfaces_unreachable_compaction() {
     let mut cfg = config_for_backend(&server.uri());
     // A budget far below the size of the pinned system prompt: the target is
     // unreachable by construction, so `compact()` returns
-    // `CompactionOutcome::TargetUnreachable` on every gate.
+    // `CompactionOutcome::TargetUnreachable` on every pass.
     cfg.max_context_tokens = 64;
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -2623,11 +2555,9 @@ async fn test_ui_session_surfaces_unreachable_compaction() {
         failures[0]
     );
 
-    // The warning itself is live-only by design: the UI journal stayed in memory and
-    // t-025b deleted its superseded on-disk owner, so "after the fact" is pinned on
-    // the ONE durable artefact this session leaves — its committed bundle. An
-    // unreachable compaction has to be loud, and it must never damage the state the
-    // bundle keeps.
+    // The warning itself is live-only by design: the ONE durable artefact this session
+    // leaves is its committed bundle. An unreachable compaction has to be loud, and it
+    // must never damage the state the bundle keeps.
     let bundle = plan.session_bundle_path();
     let members = bundle_members(&bundle);
     assert!(
@@ -2648,7 +2578,7 @@ async fn test_ui_session_surfaces_unreachable_compaction() {
     );
 }
 
-// ── t-074: the Manager turn-cap exit must be observable (recon M2 live analogue) ──
+// ── The Manager turn-cap exit must be observable ────────────────────────────────
 
 /// One `read_file` tool call on a **distinct** path per turn.
 ///
@@ -2673,17 +2603,14 @@ fn names_turn_cap(text: &str) -> bool {
         && lower.contains(&marmennill::manager::MAX_TURNS.to_string())
 }
 
-/// Residual defect 2 of the manager-cluster gate (t-067), the live analogue of
-/// recon finding **M2** (`docs/recon_bugs_manager.md`): the session loop breaks
-/// its turn loop when `turn_count > MAX_TURNS` **silently** — no status line, no
-/// journaled record, nothing that tells the operator (or the caller) that the
-/// request was cut off by the turn budget instead of finishing cleanly. The
-/// operator just watches a session stop responding, with no explanation.
+/// The session loop breaks its turn loop when `turn_count > MAX_TURNS`, and that exit
+/// must not be **silent**: with no status line and no recorded status the operator (or
+/// the caller) cannot tell a turn-budget cut-off from a clean finish.
 ///
 /// Required behaviour, through the SAME channel every other session exit uses
-/// (renderer `Message`/`Status` event + a `Status` record in the UI transcript):
-/// the exit must be reported, must name the real limit and the turn count, and
-/// must leave the on-disk transcript pair-consistent (the t-063 invariant).
+/// (renderer `Message`/`Status` event + a `Status` record in the transcript): the exit
+/// must be reported, must name the real limit and the turn count, and must leave the
+/// captured transcript pair-consistent (the `tool_calls` pairing invariant).
 #[tokio::test]
 async fn test_ui_session_turn_cap_surfaces_observable_stop_reason() {
     let _lock = TEST_MUTEX.lock().await;
@@ -2759,8 +2686,8 @@ async fn test_ui_session_turn_cap_surfaces_observable_stop_reason() {
     .await
     .expect("hitting the turn budget is an orderly stop, not a hard error");
 
-    // (1) Precondition: the turn budget really is what ended the loop — exactly
-    //     `MAX_TURNS` successful rounds ran, and the next one was refused.
+    // (1) The turn budget really is what ended the loop — exactly `MAX_TURNS`
+    //     successful rounds ran, and the next one was refused.
     let captured = requests.lock().expect("request capture lock").clone();
     assert_eq!(
         captured.len(),
@@ -2770,10 +2697,8 @@ async fn test_ui_session_turn_cap_surfaces_observable_stop_reason() {
         captured.len()
     );
 
-    // (2) The caller-visible machine-readable reason: the session reports the
-    //     budget exit instead of returning a bare `Ok` that looks like a clean
-    //     finish (this is the "indistinguishable from plan complete" half of
-    //     recon M2).
+    // (2) The caller-visible machine-readable reason: the session reports the budget
+    //     exit instead of returning a bare `Ok` that looks like a clean finish.
     assert!(
         report.turn_cap_reached(),
         "the caller must be able to tell a turn-cap stop from a clean finish; \
@@ -2850,8 +2775,8 @@ async fn test_ui_session_turn_cap_surfaces_observable_stop_reason() {
          machine-readable code (`turn_cap`) that `SessionStopReport` reports; \
          cap lines: {cap_lines:?}"
     );
-    // (4b) And the durable trace of a capped session is its bundle — never the
-    //      superseded journal t-025b deleted.
+    // (4b) And the durable trace of a capped session is its bundle — never the legacy
+    //      `.ui_transcript.json` journal.
     let bundle = plan.session_bundle_path();
     let members = bundle_members(&bundle);
     assert!(
@@ -2864,10 +2789,9 @@ async fn test_ui_session_turn_cap_surfaces_observable_stop_reason() {
         "the superseded `.ui_transcript.json` must not be written again"
     );
 
-    // (5) The t-063 invariant still holds at this exit: the manager state the
-    //     session captured is a valid chat sequence, every assistant `tool_calls`
-    //     entry has exactly one matching tool result. (The duplicate
-    //     `.session_transcript.json` journal is deleted — A §1 D2, t-009.)
+    // (5) The pairing invariant still holds at this exit: the manager state the session
+    //     captured is a valid chat sequence — every assistant `tool_calls` entry has
+    //     exactly one matching tool result.
     let captured = marmennill::session::manager_capture::last_capture()
         .expect("the session must capture its manager section at the turn-cap exit");
     let on_disk = serde_json::to_value(&captured.messages).expect("captured records serialize");
@@ -2879,8 +2803,8 @@ async fn test_ui_session_turn_cap_surfaces_observable_stop_reason() {
     );
 }
 
-/// The other half of the distinction t-074 has to provide: a session that stops
-/// **without** hitting a bound must not report one. Without this the
+/// The other half of the distinction the turn-cap report has to provide: a session
+/// that stops **without** hitting a bound must not report one. Without this the
 /// machine-readable reason would be meaningless (a report that always says
 /// "turn cap" is as blind as a report that says nothing).
 #[tokio::test]

@@ -1,11 +1,11 @@
 //! Thinking demuxer and reasoning-suppression policy.
 //!
-//! REQ-LLM-002: real-time `[thinking]`/`[/thinking]` tag demuxing — thought
-//! content is routed to a dedicated thinking channel and stripped from the
-//! assistant payload unless `preserve_thinking` is enabled.
-//! REQ-LLM-003: recovery turns force `enable_thinking=false`,
-//! `frequency_penalty += 0.5`, `temperature += 0.1` for exactly one turn.
-//! REQ-LLM-004: empty productions are nudged up to 3 attempts.
+//! Real-time `[thinking]`/`[/thinking]` tag demuxing routes thought content to
+//! a dedicated thinking channel and strips it from the assistant payload unless
+//! `preserve_thinking` is enabled.
+//! Recovery turns force `enable_thinking=false`, `frequency_penalty += 0.5` and
+//! `temperature += 0.1` for exactly one turn.
+//! Empty productions are nudged up to 3 attempts.
 
 use crate::types::{ChatRequest, Message};
 
@@ -197,8 +197,8 @@ impl ThinkingDemuxer {
         }
         if thinking {
             self.thinking.push_str(s);
-            // REQ-LLM-002: when `preserve_thinking` is enabled the thought
-            // content stays in the assistant payload too (it is not stripped).
+            // With `preserve_thinking` the thought content stays in the
+            // assistant payload too (it is not stripped).
             if self.preserve_thinking {
                 self.content.push_str(s);
             }
@@ -272,14 +272,14 @@ fn partial_prefix_split(buf: &str, tag: &str) -> Option<usize> {
     None
 }
 
-/// Demux a pre-assembled raw assistant string into visible content + thinking.
+/// Demux an already-assembled raw assistant string into visible content + thinking.
 pub fn demux_stream(raw: &str) -> ThinkingDemuxer {
     let mut d = ThinkingDemuxer::new();
     d.demux_all(raw);
     d
 }
 
-/// REQ-LLM-003: Build a *recovery* request from a normal request by applying
+/// Build a *recovery* request from a normal request by applying
 /// the one-turn suppression policy:
 ///
 /// - `enable_thinking = false`
@@ -456,7 +456,7 @@ impl RecoveryOutcome {
     }
 }
 
-/// REQ-LLM-004: Empty-production nudge state.
+/// Empty-production nudge state.
 ///
 /// If a model stream finishes with 0 bytes of content and 0 tool calls, the
 /// agent injects a user nudge `"?"` up to a maximum of 3 attempts before
@@ -506,7 +506,7 @@ impl NudgePolicy {
     }
 }
 
-// Unit tests (Phase D checkpoint: `cargo test --lib test_llm_`)
+// Unit tests live in `thinking_tests.rs`.
 
 #[cfg(test)]
 #[cfg(test)]

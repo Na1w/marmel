@@ -3,7 +3,7 @@
 use crate::agents::{Agent, DelegationRequest, Deliverable};
 use crate::config::Config;
 
-/// Default fractal recursion bound (REQ-ORCH-001).
+/// Default fractal recursion bound.
 pub const DEFAULT_MAX_RECURSION_DEPTH: usize = 3;
 
 /// Runtime orchestration configuration.
@@ -74,7 +74,8 @@ pub enum DelegationEvent {
 
 /// A depth counter passed down a delegation chain. The Manager is depth 0; each
 /// nested `delegate_task` increments it; a call that would exceed the bound is
-/// rejected (REQ-ORCH-001 / REQ-ORCH-003 fractal isolation).
+/// rejected before any worker is spawned, so delegation stays bounded and each
+/// level keeps its own isolated context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecursionDepth(pub usize);
 

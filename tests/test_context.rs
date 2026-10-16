@@ -1,4 +1,4 @@
-//! Phase A integration tests (context engine & compaction).
+//! Integration tests for the context engine and compaction.
 
 use marmennill::manager::ContextEngineFactory;
 use marmennill::manager::context::{
@@ -48,9 +48,9 @@ fn test_integration_context_engine_lifecycle() {
     );
 }
 
-// H1 — the compacted transcript must always be a valid OpenAI-compatible chat
-// request: every assistant `tool_calls` entry is followed by exactly one `Tool`
-// message per call id, and every `Tool` message has a surviving parent.
+// The compacted transcript must always be a valid OpenAI-compatible chat request:
+// every assistant `tool_calls` entry is followed by exactly one `Tool` message per
+// call id, and every `Tool` message has a surviving parent.
 
 fn assistant_with_tool_calls(ids: &[&str]) -> Message {
     Message::Assistant {
@@ -255,8 +255,8 @@ fn test_integration_repair_tool_call_pairs_helper() {
     ));
 }
 
-// M5 — compaction must fail loudly when the 70% target is unreachable, and the
-// pinned prefix must be part of the budget arithmetic.
+// Compaction must fail loudly when the 70% target is unreachable, and the pinned
+// prefix must be part of the budget arithmetic.
 
 /// Long enough that the pinned prefix alone can exceed a small budget.
 const LONG_SYSTEM_PROMPT: &str = "You are the manager. You must read files before editing them. You must verify every change with the available test commands. Never guess at file contents. Always report findings precisely with file paths and line numbers. You must delegate implementation work to specialists. You must keep the plan file on disk up to date and never output conversational filler. You must keep the plan file on disk up to date and never output conversational filler.";
@@ -278,7 +278,7 @@ fn fill(engine: &mut marmennill::manager::ContextEngine, turns: usize) {
 #[test]
 fn test_integration_compaction_reports_failure_for_unreachable_target() {
     let budget = 100usize;
-    // Ratio constants are unchanged by the M5 fix.
+    // The ratio constants stay fixed at 0.70 target / 0.90 trigger.
     assert_eq!(
         marmennill::manager::context::compaction_target(budget),
         70,
@@ -307,7 +307,7 @@ fn test_integration_compaction_reports_failure_for_unreachable_target() {
         engine.token_count() > marmennill::manager::context::compaction_target(budget),
         "the transcript really is over budget, which is why compaction must report failure"
     );
-    // The pin survives the failure (REQ-CORE-001/002).
+    // The pinned prefix survives the failed compaction.
     assert!(matches!(engine.messages()[0], Message::System { .. }));
     assert_eq!(
         engine.messages()[1].content().unwrap(),
@@ -360,7 +360,7 @@ fn test_integration_rebirth_checkpoint_shape_after_injected_advisory() {
     assert_eq!(msgs[0].role(), "system");
     assert_eq!(msgs[1].role(), "user");
     assert_eq!(msgs[1].content().unwrap(), "Build the rocket.");
-    // M6: the last genuine instruction wins slot [2], not the injected advisory.
+    // The last genuine instruction wins slot [2], not the injected advisory.
     assert_eq!(
         msgs[2].content().unwrap(),
         "Check the rocket engine pressure."
@@ -369,7 +369,7 @@ fn test_integration_rebirth_checkpoint_shape_after_injected_advisory() {
         msgs[2].content().unwrap(),
         marmennill::manager::context::REBIRTH_ADVISORY_MESSAGE
     );
-    // M12: the checkpoint is a User turn and the goal appears exactly once.
+    // The checkpoint is a User turn and the goal appears exactly once.
     let last = msgs.last().unwrap();
     assert_eq!(last.role(), "user");
     assert!(
@@ -387,13 +387,13 @@ fn test_integration_rebirth_checkpoint_shape_after_injected_advisory() {
     assert_valid_openai_pairing(msgs);
 }
 
-// ── Gate t-064: the tool-schema term must be LIVE on the production paths ─────
+// ── The tool-schema term must be LIVE on the production paths ────────────────
 //
 // `ContextEngine::request_token_count()` and `should_compact()` price the whole
 // request (transcript **plus** the advertised tool schemas). That is only true if
-// the live Manager/specialist paths actually declare the list they send; an engine
-// built with a bare `ContextEngine::new` and no `set_tools` call silently budgets
-// messages alone. These tests pin the wiring, not just the arithmetic.
+// the live Manager/specialist paths actually declare the list they send; an
+// engine built with a bare `ContextEngine::new` and no `set_tools` call silently
+// budgets messages alone. These tests pin the wiring, not just the arithmetic.
 
 const MANAGER_SYSTEM: &str = "You are the manager.";
 
@@ -507,7 +507,7 @@ fn test_live_manager_compaction_triggers_earlier_than_message_only_baseline() {
     );
 }
 
-/// The specialist side of the same bug: the role-filtered list a specialist
+/// The specialist side of the same contract: the role-filtered list a specialist
 /// advertises is the authority, and charging it raises the measured request size
 /// (and moves the compaction trigger) exactly as the live Manager path does.
 #[test]
@@ -550,7 +550,7 @@ fn test_specialist_advertised_list_precharge_raises_request_size() {
 
     // Same transcript, budget chosen so the 90% trigger sits between the
     // message-only baseline and the real request: charged it compacts, uncharged
-    // (the pre-fix behaviour) it does not.
+    // it does not.
     let midpoint = baseline + charged / 2;
     let budget = ((midpoint as f64) / 0.9).round() as usize;
     let threshold = marmennill::manager::context::compaction_threshold(budget);

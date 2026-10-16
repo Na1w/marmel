@@ -1,32 +1,24 @@
-//! The read side of the session bundle: Design A §7.3 L0–L9 (verify **before**
-//! parse), §7.4 orphan rules, §7.5 fail-closed decision tree, §4 R-PIN-5 pin
-//! rules, and §8 N0–N6 normalization (flow §4.5).
-//!
-//! Two properties dominate everything below.
+//! The read side of the session bundle: the L0–L9 ladder (verify **before**
+//! parse), the orphan rules, the fail-closed decision tree, the pin rules, and
+//! the N0–N6 normalization passes.
 //!
 //! **Verify before parse.** The manifest is the only authority on the member set
-//! and on `byte_len`/`fingerprint`. A member that parses fine but whose length or
-//! fingerprint disagrees is still a refusal — "it parsed" is not evidence of
-//! completeness. Integrity fields are checked against the raw bytes before the
-//! bytes are handed to serde (A §7.3).
+//! and on `byte_len`/`fingerprint`; a member that parses but whose length or
+//! fingerprint disagrees is still a refusal — integrity is checked against the
+//! raw bytes before serde ever sees them.
 //!
-//! **The loader is read-only with respect to disk** (A D6, §7.4). No rewrite, no
-//! in-place repair, no rename, no delete, no `.bak`. `Refused` leaves every byte
-//! of the bundle for post-mortem inspection, and the refusal message promises
-//! that out loud ([`Refusal::display`]). Normalization (N0–N6) is entirely
-//! in-memory: the next *commit* writes the normalized vector, at the normal
-//! commit trigger, not the restore.
+//! **The loader is read-only with respect to disk.** No rewrite, no in-place
+//! repair, no rename, no delete, no `.bak`: `Refused` leaves every byte for
+//! post-mortem inspection and the refusal message says so ([`Refusal::display`]).
+//! Normalization (N0–N6) is in-memory — the next *commit* writes the
+//! normalized vector, not the restore.
 //!
-//! `RestoredSession` is **inert**: nothing is installed into live state by
-//! loading (L9). `install_restored_messages`/`restore_engine_flags` and the
-//! boot-time wiring are t-009/t-012; [`load_bundle`] only decides, reports and
-//! refuses.
-//!
-//! The one tolerated partial (A D6): exactly **one** corrupt or missing worker
-//! member while every other member verifies ⇒ that worker comes back as
-//! [`WorkerStatus::Unrecoverable`] and everything else restores
-//! ([`RestoreOutcome::PartiallyRestored`]). Two corrupt members, or any manager
-//! or `ui.json` failure, is a refusal.
+//! `RestoredSession` is **inert**: loading installs nothing into live state (L9);
+//! [`load_bundle`] only decides, reports and refuses. The one tolerated partial:
+//! exactly **one** corrupt or missing worker member while every other member
+//! verifies ⇒ that worker comes back as [`WorkerStatus::Unrecoverable`] and
+//! everything else restores ([`RestoreOutcome::PartiallyRestored`]). Two corrupt
+//! members, or any manager or `ui.json` failure, is a refusal.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -63,17 +55,17 @@ struct Loaded {
     worker: Option<WorkerSection>,
 }
 
-/// A §8.2 N5: the pass set always runs twice — the second run is the stability
+/// N5: the pass set always runs twice — the second run is the stability
 /// check, and it must be a no-op.
 const PASS_SET_RUNS: u8 = 2;
 
-/// The one call sites use (flow §4.5). Walks L0–L9 and returns a verdict; never
-/// mutates a byte of the bundle, never installs live state.
+/// The one call sites use. Walks L0–L9 and returns a verdict; never mutates a
+/// byte of the bundle, never installs live state.
 pub fn load_bundle(bundle: &Path) -> RestoreOutcome {
     let mut report = RepairReport::default();
-    // A §7.5/§8.4: a refusal is a first-class deliverable and it is never silent.
-    // The loader writes the very sentence the UI shows; the report it returns is
-    // what feeds the other two loud destinations (renderer status, journaled
+    // A refusal is a first-class deliverable and it is never silent. The loader
+    // writes the very sentence the UI shows; the report it returns is what feeds
+    // the other two loud destinations (renderer status, journaled
     // `UiRecord::Status`), and none of the three may be a discarded `let _`.
     let refused = |report: RepairReport, refusal: Refusal| {
         tracing::warn!("{}", refusal.display(bundle));
@@ -141,7 +133,7 @@ pub fn load_bundle(bundle: &Path) -> RestoreOutcome {
     }
 
     // A member file on disk that the manifest does not name is an orphan: ignored,
-    // never merged, never partially read — but named out loud (§7.4).
+    // never merged, never partially read — but named out loud.
     let listed: BTreeMap<String, ()> = manifest
         .members
         .iter()
@@ -155,10 +147,9 @@ pub fn load_bundle(bundle: &Path) -> RestoreOutcome {
     }
 
     // ---------------------------------------------------------------- L4 + L5
-    // Collected member outcomes. A §7.5/D6 tolerance: a worker member may fail on
-    // its own; a manager or ui member failure, or a second worker failure, is a
-    // refusal. Failures are kept in manifest order so the reported member is
-    // deterministic.
+    // Collected member outcomes. One worker member may fail on its own; a manager
+    // or ui member failure, or a second worker failure, is a refusal. Failures are
+    // kept in manifest order so the reported member is deterministic.
     let mut loaded: Vec<Loaded> = Vec::with_capacity(manifest.members.len());
     let mut failures: Vec<(SectionKind, String, Refusal)> = Vec::new();
     for member in &manifest.members {
@@ -264,10 +255,10 @@ pub fn load_bundle(bundle: &Path) -> RestoreOutcome {
     }
 
     // ---------------------------------------------------------------- L8
-    // Normalization only ever runs on a bundle that passed L0–L7 (A §7.3: verify
-    // before parse; §7.5: refuse before repair). The passes are in-memory — the
-    // bundle bytes stay exactly as they are (D6), and the next commit writes the
-    // normalized vector at the normal commit trigger, not here.
+    // Normalization only ever runs on a bundle that passed L0–L7: verify before
+    // parse, refuse before repair. The passes are in-memory — the bundle bytes
+    // stay exactly as they are, and the next commit writes the normalized vector
+    // at the normal commit trigger, not here.
     let mut scratch = ContextEngine::new(manager.max_context_tokens.max(1));
     let pinned_before = pinned_prefix_end_records(&manager.messages);
     let normalized = match normalize(
@@ -288,9 +279,9 @@ pub fn load_bundle(bundle: &Path) -> RestoreOutcome {
             section
         }
         Err(refusal) => {
-            // A §8.4: a normalization refusal is still a report. `passes` says how
-            // far the pass set got and `normalization_stable: false` is what makes
-            // the refusal a verdict rather than a warning.
+            // A normalization refusal is still a report. `passes` says how far the
+            // pass set got and `normalization_stable: false` is what makes the
+            // refusal a verdict rather than a warning.
             if refusal.code == RefusalCode::NormalizationUnstable {
                 report.normalization_passes = PASS_SET_RUNS;
             }
@@ -298,9 +289,9 @@ pub fn load_bundle(bundle: &Path) -> RestoreOutcome {
             return refused(report, refusal);
         }
     };
-    // A §8.2 N3, in its normative form: R-PIN-5 steps 1–5 re-run on the **installed**
-    // vector. L6 verified the stored one; this is what proves a pass did not cost
-    // the session its identity (REQ-CORE-001/002 degradation is silent).
+    // N3 in its normative form: the five pinned-prefix checks re-run on the
+    // **installed** vector. L6 verified the stored one; this is what proves a pass
+    // did not cost the session its pinned identity (that degradation is silent).
     if let Err(refusal) = verify_pins(&normalized, PinStage::Installed) {
         report.pins_verified = false;
         return refused(report, refusal);
@@ -352,7 +343,7 @@ pub fn load_bundle(bundle: &Path) -> RestoreOutcome {
         }
     }
 
-    // N6 witness cross-check (§8.2): a disagreement is reported, never reconciled.
+    // N6 witness cross-check: a disagreement is reported, never silently repaired.
     n6_witness_warnings(&mut report, &normalized, &manager, &workers);
 
     // ---------------------------------------------------------------- L9
@@ -368,10 +359,10 @@ pub fn load_bundle(bundle: &Path) -> RestoreOutcome {
         .map(|w| w.worker_key.clone())
         .collect();
 
-    // A §8.4/§10.4: repair and loss are never silent. The three loud destinations
-    // are the status line, the journaled `UiRecord::Status` and `tracing::warn!`;
-    // the loader owns the log and hands `report` (every sentence already in
-    // `warnings`, every `notices` entry) to the other two. `let _ =` is prohibited.
+    // Repair and loss are never silent. The three loud destinations are the status
+    // line, the journaled `UiRecord::Status` and `tracing::warn!`; the loader owns
+    // the log and hands `report` (every sentence already in `warnings`, every
+    // `notices` entry) to the other two. `let _ =` is prohibited.
     announce_verdict(&report, bundle);
 
     let ending = derive_ending(&manifest.ending);
@@ -406,12 +397,12 @@ pub fn load_bundle(bundle: &Path) -> RestoreOutcome {
     }
 }
 
-/// R-PIN-5 steps 1–5 on a stored or installed `ManagerSection` (A §4, §8.2 N3).
+/// The five pinned-prefix checks on a stored or installed `ManagerSection`.
 ///
 /// `PinStage` only changes the *wording*: a stored-vector failure means the
 /// bundle is inconsistent with itself; an installed-vector failure means a
-/// normalization pass moved the pinned window (A §8.2: "no *the repair moved the
-/// window, accept it* branch").
+/// normalization pass moved the pinned window — there is no *the repair moved
+/// the window, accept it* branch.
 pub fn verify_pins(section: &ManagerSection, on: PinStage) -> Result<(), Refusal> {
     let stage = on.label();
     if section.messages.len() < 2 {
@@ -491,28 +482,14 @@ pub fn verify_pins(section: &ManagerSection, on: PinStage) -> Result<(), Refusal
     Ok(())
 }
 
-/// A §8.2 N0–N6 for one transcript. The manager vector and **every** worker
-/// vector go through this same function: no pairing rule lives in `session/`
-/// (A D1) — N1 is [`prune_orphan_tool_messages`] and N2 is
-/// `repair_tool_call_pairs` reached through the engine seam
-/// [`ContextEngine::ensure_tool_call_pairs`], the exact grammar the live loop
-/// uses.
-///
-/// `engine` is a scratch carrier (flow §4.5 "carries the repair grammar; no state
-/// kept"): [`load_bundle`] passes a fresh one per transcript, and any leftovers
-/// are drained here so a reused carrier can never merge two transcripts. The N2
-/// rule itself is `manager::context::repair_tool_call_pairs`, reached only
-/// through that seam — `session/` never calls the free function and never owns a
-/// pairing rule (A D1).
-///
-/// The full pass set (A §8.2 N0–N6) — t-008 owns it in production, and the ladder
-/// is the one `session/` is allowed to run: N0 (`MessageRecord` → wire `Message`),
-/// N1 [`prune_orphan_tool_messages`], N2 `repair_tool_call_pairs` through the
-/// engine seam, N3 pin re-verification on the **installed** vector, N4 (wire →
-/// `MessageRecord`), N5 stability double-run, N6 witness cross-check. A §8.3 H1 —
-/// the assistant turn persisted with `tool_calls` and no result — is the shape
-/// this exists for: the healed history is provider-valid, every synthesized id is
-/// named, and nothing is written back.
+/// N0–N6 for one transcript: manager and **every** worker vector go through this
+/// same function, because `session/` owns no pairing rule. N1 is
+/// [`prune_orphan_tool_messages`], N2 is `repair_tool_call_pairs` through the
+/// engine seam [`ContextEngine::ensure_tool_call_pairs`] — the live loop's exact
+/// grammar — N3 re-verifies the pins on the **installed** vector, N5 reruns the
+/// passes for stability, N6 cross-checks the recorded witness. [`load_bundle`]
+/// hands `engine` as a fresh scratch carrier per transcript, so a reused one can
+/// never merge two transcripts, and nothing is ever written back to disk.
 pub fn normalize(
     messages: Vec<MessageRecord>,
     recorded: &DanglingToolCallState,
@@ -541,9 +518,9 @@ pub fn normalize(
     // serde, `ToolCall::new`, `sanitize_arguments` or
     // `ensure_valid_json_arguments` (`types/wire.rs`) — they mutate arguments.
     //
-    // A §8.2 N0/N4 says byte-exactness is **asserted here, not assumed**: decode
-    // then re-encode must be the identity for every record, or the pass set would
-    // be quietly rewriting the `None`/`""` distinction it exists to protect.
+    // Byte-exactness is **asserted here, not assumed**: decode then re-encode must
+    // be the identity for every record, or the pass set would be quietly rewriting
+    // the `None`/`""` distinction it exists to protect.
     let stored = messages;
     let stored_positions = tool_result_positions(&stored);
     let mut wire: Vec<crate::types::Message> = stored
@@ -565,7 +542,7 @@ pub fn normalize(
     }
 
     // ------------------------------------------------------------- N1
-    // N1 before N2 is not optional in reporting terms (A §8.2): `repair_tool_call_pairs`
+    // N1 before N2 is not optional in reporting terms: `repair_tool_call_pairs`
     // prunes orphans internally, so calling only N2 would produce the right
     // transcript and the wrong report. Running N1 first is what makes an orphan
     // distinguishable from a dropped duplicate.
@@ -584,8 +561,8 @@ pub fn normalize(
 
     // ------------------------------------------------------------- N2
     // The grammar itself is `manager::context::repair_tool_call_pairs`, reached
-    // only through the documented idempotent seam (A D1): `session/` owns no
-    // pairing rule, no grouping rule and no placeholder vocabulary of its own.
+    // only through the documented idempotent seam: `session/` owns no pairing
+    // rule, no grouping rule and no placeholder vocabulary of its own.
     drain(engine);
     for msg in wire.iter().cloned() {
         engine.append(msg);
@@ -597,8 +574,8 @@ pub fn normalize(
     let healed = result_positions(&wire);
     if repaired {
         // Duplicate results for one id: N2 keeps the first and drops the rest.
-        // A §8.3 H2 requires this count out loud; `RepairReport` has no field for
-        // it, so it is its own rule and its own warning sentence.
+        // The count must come out loud; `RepairReport` has no field for it, so it
+        // is its own rule and its own warning sentence.
         for (id, index) in dropped_results(&pre_repair, &healed) {
             report.dropped_duplicate_ids.push(id.clone());
             report.applied.push(AppliedRule {
@@ -618,8 +595,8 @@ pub fn normalize(
             });
         }
     }
-    // A §8.4: regrouping is counted against the **pre-normalization** vector, so
-    // the index a reader can reproduce by hand is the one in the bundle.
+    // Regrouping is counted against the un-normalized vector as stored, so the
+    // index a reader can reproduce by hand is the one in the bundle.
     for (id, before, after) in moved_results(&stored_positions, &healed) {
         report.regrouped_ids.push(id.clone());
         report.applied.push(AppliedRule {
@@ -669,27 +646,27 @@ pub fn normalize(
         )
         .with_member(MANAGER_FILE));
     }
-    // A §8.2: "`messages[0]` and `messages[1]` are never touched by any pass" is
-    // asserted here, byte for byte, because REQ-CORE-001/002 degradation is
-    // silent. Identity — not "same length" — is the claim.
+    // "`messages[0]` and `messages[1]` are never touched by any pass" is asserted
+    // here, byte for byte, because losing the pinned prompt or goal fails silently.
+    // Identity — not "same length" — is the claim.
     if let Some(detail) = pinned_identity_drift(&stored, &records, pinned_prefix_end) {
         return Err(
             Refusal::new(RefusalCode::PinViolation, format!("N3: {detail}"))
                 .with_member(MANAGER_FILE),
         );
     }
-    // A §8.1/§8.2: the grammar prunes, moves and synthesizes **`Tool` messages
-    // only** — it never edits content, never drops a turn and never re-roles or
-    // re-orders one (R-PIN-3/R-PIN-4: advisory and checkpoint text is opaque).
-    // Asserting that is what makes "we reused the manager grammar" checkable.
+    // The grammar prunes, moves and synthesizes **`Tool` messages only** — it
+    // never edits content, never drops a turn and never re-roles or re-orders one
+    // (advisory and checkpoint text is opaque). Asserting that is what makes "we
+    // reused the manager grammar" checkable.
     if let Some(detail) = unpaired_message_drift(&stored, &records) {
         return Err(unstable("N4", detail, &report));
     }
 
     // ------------------------------------------------------------- N5
     // Run N1+N2 a second time: it must be a no-op. `ensure_tool_call_pairs`
-    // documents idempotence (`manager/context.rs:887-890`); anything else means
-    // the input admitted two incompatible readings — a verdict, not a retry.
+    // documents idempotence; anything else means the input admitted two
+    // incompatible readings — a verdict, not a retry.
     let mut second_wire: Vec<crate::types::Message> = records
         .iter()
         .cloned()
@@ -716,12 +693,12 @@ pub fn normalize(
     report.stable = true;
 
     // ------------------------------------------------------------- N6
-    // A §8.2 N6: the recorded witness is not re-healed. The caller compares the
-    // observed state of the healed vector against the stored witness; this is the
-    // half only the pass set can see — a capture that already claimed
-    // `Healed { ids }` for an id N2 still had to synthesize means the member's
-    // witness and its transcript disagree about what is in it. Reported, never
-    // reconciled (A §8.2: "a disagreement is reported, never reconciled").
+    // The recorded witness is not re-healed. The caller compares the observed
+    // state of the healed vector against the stored witness; this is the half only
+    // the pass set can see — a capture that already claimed `Healed { ids }` for
+    // an id N2 still had to synthesize means the member's witness and its
+    // transcript disagree about what is in it. Such a disagreement is reported,
+    // never silently repaired.
     if let DanglingToolCallState::Healed {
         aborted_tool_call_ids,
     } = recorded
@@ -741,7 +718,7 @@ pub fn normalize(
 }
 
 /// Carries a refusal out to `main` so a `--resume` run can exit
-/// [`super::EXIT_RESTORE_REFUSED`] (flow §3.5).
+/// [`super::EXIT_RESTORE_REFUSED`].
 #[derive(Debug)]
 pub struct RestoreRefused {
     pub refusal: Refusal,
@@ -757,15 +734,12 @@ impl std::fmt::Display for RestoreRefused {
 impl std::error::Error for RestoreRefused {}
 
 /// The interim re-computation of `manager::context::pinned_prefix_end`
-/// (`src/manager/context.rs:270`, **private**) over `MessageRecord`s.
+/// (**private**) over `MessageRecord`s.
 ///
-/// It is the same rule with the same marker ([`REBIRTH_CHECKPOINT_PREFIX`]): the
-/// window is `[0,1]` plus, if a checkpoint exists in `[2..]`, everything through
-/// the **last** one. It lives here only because t-007 must stay additive and
-/// `ContextEngine::pinned_prefix_end()` (flow §4.6) does not exist yet — t-009
-/// exposes it and this function becomes a one-line delegation. The two `System`
-/// and `User` spellings of the checkpoint are matched on content, exactly like
-/// the original, so a bundle written by an older build is read the same way.
+/// The same rule with the same marker ([`REBIRTH_CHECKPOINT_PREFIX`]): the window
+/// is `[0,1]` plus, if a checkpoint exists in `[2..]`, everything through the
+/// **last** one. Both the `System` and the `User` spelling of the checkpoint are
+/// matched on content, so a bundle written by an older build is read the same way.
 pub fn pinned_prefix_end_records(messages: &[MessageRecord]) -> usize {
     messages
         .iter()
@@ -783,9 +757,9 @@ pub fn pinned_prefix_end_records(messages: &[MessageRecord]) -> usize {
         .unwrap_or(2)
 }
 
-/// The ending a user is told about (A D6): `InProgress` means the writer never
-/// recorded its own death, so the loader **infers** `HardKillInferred`. The
-/// bundle bytes are never rewritten to say so.
+/// The ending a user is told about: `InProgress` means the writer never recorded
+/// its own death, so the loader **infers** `HardKillInferred`. The bundle bytes
+/// are never rewritten to say so.
 pub fn derive_ending(ending: &ProcessEnding) -> ProcessEnding {
     match ending {
         ProcessEnding::InProgress => ProcessEnding::HardKillInferred,
@@ -797,19 +771,15 @@ pub fn derive_ending(ending: &ProcessEnding) -> ProcessEnding {
 
 /// **Legacy-only** journal names, spelled out as local literals.
 ///
-/// Nothing writes either file any more: t-009 deleted the manager journal
-/// (`ContextEngine::save_transcript`/`load_transcript`), t-025b deleted the UI
-/// journal's owner (`UiTranscript::save`/`load`) and its file-name constant. They
-/// are therefore no longer part of the live persistence vocabulary — the session
-/// bundle is the **sole** persistence owner — and the only thing that still depends
-/// on them is a user-facing promise: a fresh boot with no bundle must NAME a stale
-/// copy left on disk by an older release (A §7.4, "ignored" must not mean
-/// "invisible") so the user can delete it. The names are never written again.
+/// Nothing writes either file: the session bundle is the **sole** persistence
+/// owner. What still depends on these names is a user-facing promise — a fresh
+/// boot with no bundle must NAME a stale copy left on disk by an older release
+/// ("ignored" must not mean "invisible") so the user can delete it.
 const LEGACY_MANAGER_JOURNAL: &str = ".session_transcript.json";
 const LEGACY_UI_JOURNAL: &str = ".ui_transcript.json";
 
 /// L0: no bundle. Not an error. Legacy journals and member-looking orphans are
-/// named out loud (A D2, §7.4) — "ignored" must not mean "invisible".
+/// named out loud — "ignored" must not mean "invisible".
 fn no_bundle(bundle: &Path) -> RestoreOutcome {
     let mut legacy_journals = Vec::new();
     if let Some(parent) = bundle.parent() {
@@ -828,7 +798,7 @@ fn no_bundle(bundle: &Path) -> RestoreOutcome {
 }
 
 /// Files on disk that no manifest lists. Dot-prefixed entries are staging
-/// leftovers — noise, not state, and never orphans (A §7.4).
+/// leftovers — noise, not state, and never orphans.
 fn orphan_members(bundle: &Path, listed: &BTreeMap<String, ()>) -> Vec<String> {
     let mut orphans = Vec::new();
     let mut scan = |dir: &Path, prefix: &str| {
@@ -895,7 +865,7 @@ fn load_member(
         }
     };
 
-    // L4: byte_len, then fingerprint. Both comparisons print both sides (F4).
+    // L4: byte_len, then fingerprint. Both comparisons print both sides.
     if bytes.len() as u64 != member.byte_len {
         return Err(Refusal::new(
             RefusalCode::ByteLen,
@@ -948,8 +918,8 @@ fn load_member(
         SectionKind::Worker => {
             let file: WorkerFile = parse_member(&bytes, &member.rel_path)?;
             check_header(&file.header, member, manifest, &member.rel_path)?;
-            // A §5.2: the escaped path key is a *projection* of `worker_key`. A
-            // file whose name decodes to something else is not this worker.
+            // The escaped path key is a *projection* of `worker_key`. A file whose
+            // name decodes to something else is not this worker.
             let decoded = percent_unescape(file_stem(&member.rel_path))?;
             if decoded != file.section.worker_key {
                 return Err(Refusal::new(
@@ -979,8 +949,8 @@ where
     serde_json::from_slice(bytes).map_err(|err| classify_parse_error(&err, rel_path, bytes))
 }
 
-/// §7.5: `deny_unknown_fields` violations are `UnknownField` (naming the field),
-/// an unknown enum spelling or a torn document is `Json`, and the raw text of the
+/// `deny_unknown_fields` violations are `UnknownField` (naming the field), an
+/// unknown enum spelling or a torn document is `Json`, and the raw text of the
 /// serde error — with line/column — is always carried.
 fn classify_parse_error(err: &serde_json::Error, member: &str, bytes: &[u8]) -> Refusal {
     let text = err.to_string();
@@ -1065,7 +1035,7 @@ fn check_header(
     .with_member(rel_path))
 }
 
-/// L7: the structural preconditions of every section (§5.6, §6.5, §5.7, §4).
+/// L7: the structural requirements every section must satisfy.
 fn structural_violation(
     manager: &ManagerSection,
     ui: &UiSection,
@@ -1130,14 +1100,14 @@ fn structural_violation(
     None
 }
 
-/// One refusal sentence for N structural preconditions: every violation is named,
+/// One refusal sentence for N structural violations: every one is named,
 /// because a reader must be able to fix the file by hand from the message alone.
 fn violation_text(violations: &[String]) -> String {
     violations.join("; ")
 }
 
-/// §8.2 N6: compare the recorded pairing witness against what the transcript
-/// actually contains after N1/N2. A disagreement is reported, never reconciled.
+/// N6: compare the recorded pairing witness against what the transcript actually
+/// contains after N1/N2. A disagreement is reported, never silently repaired.
 fn n6_witness_warnings(
     report: &mut RepairReport,
     normalized: &ManagerSection,
@@ -1201,9 +1171,9 @@ fn describe_dangling(state: &DanglingToolCallState) -> String {
     }
 }
 
-/// The D6 partial-restore stand-in for a worker whose member failed verification.
-/// Its history is gone; its *pane identity* is kept so the UI can still show that
-/// the worker existed, and the reason is carried verbatim.
+/// The partial-restore stand-in for a worker whose member failed verification.
+/// Its history is unrecoverable; its *pane identity* is kept so the UI can still
+/// show that the worker existed, and the reason is carried verbatim.
 fn unrecoverable_worker(key: &str, refusal: &Refusal) -> WorkerSection {
     WorkerSection {
         worker_key: key.to_string(),
@@ -1240,11 +1210,10 @@ fn unrecoverable_worker(key: &str, refusal: &Refusal) -> WorkerSection {
     }
 }
 
-/// `{agent_name}-{task_id}` / `{agent_name}-w{worker_id}`
-/// (`src/orchestrator/workers.rs:245-247`): the agent name is the head of the
-/// key, so an unrecoverable worker can still be classified without inventing an
-/// identity. An unrecognized head is `Generalist` and the reason text says the
-/// role is a guess from the key, never a recovered fact.
+/// `{agent_name}-{task_id}` / `{agent_name}-w{worker_id}`: the agent name is the
+/// head of the key, so an unrecoverable worker can still be classified without
+/// inventing an identity. An unrecognized head is `Generalist` and the reason text
+/// says the role is a guess from the key, never a recovered fact.
 fn role_hint_from_key(key: &str) -> Agent {
     let head = key.split(['-', '/', '#']).next().unwrap_or("");
     Agent::from_str(head).unwrap_or(Agent::Generalist)
@@ -1271,7 +1240,7 @@ fn file_stem(rel_path: &str) -> &str {
     name.strip_suffix(".json").unwrap_or(name)
 }
 
-/// A §8.4 per-member rule summary for [`WorkerRepairCounts`] — the same facts the
+/// The per-member rule summary for [`WorkerRepairCounts`] — the same facts the
 /// `warnings` sentences carry, structured where a test can assert them.
 fn applied_rules(report: &NormalizeReport) -> Vec<String> {
     let mut rules = Vec::new();
@@ -1327,8 +1296,8 @@ fn result_positions(wire: &[crate::types::Message]) -> Vec<(String, usize)> {
         .collect()
 }
 
-/// The same over `MessageRecord`s, for the **pre-normalization** baseline A §8.4
-/// requires the regrouping count to be measured against.
+/// The same over `MessageRecord`s, for the un-normalized baseline the regrouping
+/// count is measured against.
 fn tool_result_positions(messages: &[MessageRecord]) -> Vec<(String, usize)> {
     messages
         .iter()
@@ -1341,8 +1310,8 @@ fn tool_result_positions(messages: &[MessageRecord]) -> Vec<(String, usize)> {
 }
 
 /// Results `before` carries that `after` does not — multiplicity counted, so a
-/// dropped duplicate is reported exactly once — keeping the index each one had in
-/// `before` (A §8.4: the report names the affected message index).
+/// dropped duplicate is reported exactly once — keeping the index each one had
+/// in `before`, which is the index the report names.
 fn dropped_results(before: &[(String, usize)], after: &[(String, usize)]) -> Vec<(String, usize)> {
     let mut remaining: Vec<&(String, usize)> = after.iter().collect();
     let mut dropped = Vec::new();
@@ -1392,11 +1361,11 @@ fn moved_results(
     moved
 }
 
-/// A §8.2 N0/N4 byte-exactness, **asserted not assumed**: decoding a record into
-/// the wire type and re-encoding it must return the same record. This is where a
-/// regression that folds `content: None` into `Some("")`, drops `reasoning_content`
-/// or re-canonicalizes `arguments` would be caught, instead of surfacing as a
-/// provider 400 or a silently rewritten transcript.
+/// N0/N4 byte-exactness, **asserted not assumed**: decoding a record into the
+/// wire type and re-encoding it must return the same record. This is where a
+/// regression that folds `content: None` into `Some("")`, drops
+/// `reasoning_content` or re-canonicalizes `arguments` is caught, instead of
+/// surfacing as a provider 400 or a silently rewritten transcript.
 fn decode_drift(stored: &[MessageRecord], wire: &[crate::types::Message]) -> Option<usize> {
     match stored
         .iter()
@@ -1419,10 +1388,10 @@ fn first_record_drift(before: &[MessageRecord], after: &[MessageRecord]) -> Opti
     }
 }
 
-/// A §8.1/§8.2 invariant asserted rather than trusted: the reused grammar prunes,
-/// moves and synthesizes **`Tool` messages only**. Every other turn must come
-/// back identical and in the same order — no reworded advisory or checkpoint text
-/// (R-PIN-4), no re-roled or re-ordered turn (R-PIN-3), no dropped assistant turn.
+/// Invariant asserted rather than trusted: the reused grammar prunes, moves and
+/// synthesizes **`Tool` messages only**. Every other turn must come back identical
+/// and in the same order — no reworded advisory or checkpoint text, no re-roled
+/// or re-ordered turn, no dropped assistant turn.
 fn unpaired_message_drift(before: &[MessageRecord], after: &[MessageRecord]) -> Option<String> {
     let before_kept = non_tool_turns(before);
     let after_kept = non_tool_turns(after);
@@ -1451,11 +1420,11 @@ fn unpaired_message_drift(before: &[MessageRecord], after: &[MessageRecord]) -> 
     None
 }
 
-/// A §8.2 N3 identity assertion. `messages[0]` (REQ-CORE-001) and `messages[1]`
-/// (REQ-CORE-002) must survive **byte-identically**, keep their roles, and every
-/// non-`Tool` turn inside the pinned window must be unchanged. A pruned or moved
-/// `Tool` result inside the window is legal; a reworded checkpoint or a replaced
-/// goal is a pin violation, not a repair.
+/// N3 identity assertion. `messages[0]` (the system prompt) and `messages[1]`
+/// (the pinned goal) must survive **byte-identically**, keep their roles, and
+/// every non-`Tool` turn inside the pinned window must be unchanged. A pruned or
+/// moved `Tool` result inside the window is legal; a reworded checkpoint or a
+/// replaced goal is a pin violation, not a repair.
 fn pinned_identity_drift(
     before: &[MessageRecord],
     after: &[MessageRecord],
@@ -1493,8 +1462,8 @@ fn pinned_identity_drift(
     }
     // Byte-identity already fixes the roles, so this can only fire on a stored
     // transcript that already had the pinned shape — asserted for the manager
-    // because REQ-CORE-001/002 degradation is silent. A worker transcript that
-    // legitimately starts differently is not rewritten by that claim.
+    // because losing the pinned prompt or goal fails silently. A worker transcript
+    // that legitimately starts differently is not rewritten by that claim.
     if matches!(
         (&before[0], &before[1]),
         (MessageRecord::System { .. }, MessageRecord::User { .. })
@@ -1537,7 +1506,7 @@ fn pinned_non_tool_turns(messages: &[MessageRecord], window: usize) -> Vec<&Mess
         .collect()
 }
 
-/// What the second pass set (A §8.2 N5) produced. Nothing means the pass set is a
+/// What the second N5 run produced. Nothing means the pass set is a
 /// fixed point and the transcript has exactly one reading.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct SecondPassEvidence {
@@ -1551,10 +1520,10 @@ struct SecondPassEvidence {
 }
 
 impl SecondPassEvidence {
-    /// A §8.2 N5 / §8.4: non-idempotence is a **verdict**, not a retry. The loader
-    /// SHALL NOT loop to a fixed point, SHALL NOT pick one reading and SHALL NOT
-    /// persist a normalized copy — `Refused { NormalizationUnstable }`, bundle
-    /// bytes untouched, both pass reports printed.
+    /// Non-idempotence is a **verdict**, not a retry. The loader SHALL NOT loop to
+    /// a fixed point, SHALL NOT pick one reading and SHALL NOT persist a normalized
+    /// copy — `Refused { NormalizationUnstable }`, bundle bytes untouched, both
+    /// pass reports printed.
     fn verdict(&self, report: &NormalizeReport) -> Option<Refusal> {
         let mut findings = Vec::new();
         if !self.extra_pruned_ids.is_empty() {
@@ -1583,8 +1552,8 @@ impl SecondPassEvidence {
     }
 }
 
-/// The one `NormalizationUnstable` refusal shape (A §8.4: both pass reports are
-/// printed, so a reader can check the numbers by hand).
+/// The one `NormalizationUnstable` refusal shape: both pass reports are printed,
+/// so a reader can check the numbers by hand.
 fn unstable(rule: &str, detail: impl Into<String>, report: &NormalizeReport) -> Refusal {
     Refusal::new(
         RefusalCode::NormalizationUnstable,
@@ -1606,10 +1575,10 @@ fn unstable(rule: &str, detail: impl Into<String>, report: &NormalizeReport) -> 
     .with_member(MANAGER_FILE)
 }
 
-/// A §8.4 loudness sentence for one applied rule: the rule, the `tool_call_id`,
-/// and the message index it acted on. For a synthesized placeholder the sentence
+/// The loudness sentence for one applied rule: the rule, the `tool_call_id`, and
+/// the message index it acted on. For a synthesized placeholder the sentence
 /// carries the function name and the verbatim arguments of the call that never got
-/// an answer, so a user can see what the model asked for (A §8.3 H1).
+/// an answer, so a user can see what the model asked for.
 fn rule_sentence(rule: &AppliedRule, subject: &str, healed: &[MessageRecord]) -> String {
     let index = |value: Option<usize>| match value {
         Some(value) => value.to_string(),
@@ -1662,12 +1631,11 @@ fn call_of(records: &[MessageRecord], id: &str) -> (String, String) {
     ("<unknown>".to_string(), "<unknown>".to_string())
 }
 
-/// A §8.4: repair is never silent. The live boundary repair already writes a
-/// `tracing::warn!`, a renderer status and a journaled `UiRecord::Status`
-/// (`ui/session.rs:2153-2174`); the loader owns the first and hands the report to
-/// the other two. The sentence keeps the live wording's shape with the site
-/// spelled `"on session restore"` and the member named, so a user who saw the live
-/// message recognizes this one.
+/// Repair is never silent. The live boundary repair already writes a
+/// `tracing::warn!`, a renderer status and a journaled `UiRecord::Status`; the
+/// loader owns the first and hands the report to the other two. The sentence keeps
+/// the live wording's shape with the site spelled `"on session restore"` and the
+/// member named, so a user who saw the live message recognizes this one.
 fn repair_sentence(member: &str, norm: &NormalizeReport) -> String {
     format!(
         "tool-call pairing repaired (on session restore): missing tool results synthesized as \
@@ -1683,8 +1651,8 @@ fn repair_sentence(member: &str, norm: &NormalizeReport) -> String {
     )
 }
 
-/// The loud half of A §8.4 for the loader: one `warn!` per member the passes
-/// changed, plus one line per applied rule so the log alone tells the whole story.
+/// The loud half of the loader: one `warn!` per member the passes changed, plus
+/// one line per applied rule so the log alone tells the whole story.
 fn announce_repairs(member: &str, subject: &str, norm: &NormalizeReport, healed: &[MessageRecord]) {
     if norm.applied.is_empty() {
         return;
@@ -1695,9 +1663,9 @@ fn announce_repairs(member: &str, subject: &str, norm: &NormalizeReport, healed:
     }
 }
 
-/// The `NonRestorableNotice` A §8.3 H1 requires for `dispatched: true` dangling
-/// calls: the tool may have run and mutated the workspace while its result never
-/// landed, and the loader can claim neither that it did nor that it did not.
+/// The `NonRestorableNotice` required for `dispatched: true` dangling calls: the
+/// tool may have run and mutated the workspace while its result never landed, and
+/// the loader can claim neither that it did nor that it did not.
 fn dispatched_notice(member: &str, calls: &[&DanglingCall]) -> NonRestorableNotice {
     let list = calls
         .iter()
@@ -1721,10 +1689,9 @@ fn dispatched_notice(member: &str, calls: &[&DanglingCall]) -> NonRestorableNoti
     }
 }
 
-/// A §8.3 H1: an already-dispatched dangling call is a lost capability, not a
-/// repair, so it is a D5 notice and not a warning. Deduplicated on
-/// `(kind, subject)` (A §11.3 finding 4), and every id is still named in the
-/// sentence so the report stays checkable by hand.
+/// An already-dispatched dangling call is a lost capability, not a repair, so it
+/// is a notice and not a warning. Deduplicated on `(kind, subject)`, and every id
+/// is still named in the sentence so the report stays checkable by hand.
 fn dispatched_dangling(report: &mut RepairReport, subject: &str, recorded: &DanglingToolCallState) {
     let DanglingToolCallState::Dangling { calls } = recorded else {
         return;
@@ -1749,9 +1716,8 @@ fn dispatched_dangling(report: &mut RepairReport, subject: &str, recorded: &Dang
 
 /// Fold one member's pass-set report into the loader's [`RepairReport`] — the
 /// counts, one warning sentence per applied rule (rule, `tool_call_id`, affected
-/// index), the per-worker before/after counts A §11.3-2 requires, and the N6
-/// disagreements. A §8.4 bans silent repair, so this is not optional on any path
-/// that ran the passes.
+/// index), the per-worker before/after counts, and the N6 disagreements. Repair is
+/// never silent, so this is not optional on any path that ran the passes.
 fn fold_pass_set(
     report: &mut RepairReport,
     member: &str,
@@ -1783,8 +1749,8 @@ fn fold_pass_set(
             after: norm.messages_after,
             applied_rules: applied_rules(norm),
         });
-        // A §8.4: the per-worker numbers live in `warnings` as a sentence, in the
-        // exact shape `worker <key>: history <before> -> <after>`.
+        // The per-worker numbers live in `warnings` as a sentence, in the exact
+        // shape `worker <key>: history <before> -> <after>`.
         report.warnings.push(format!(
             "worker {key}: history {} -> {}",
             norm.messages_before, norm.messages_after
@@ -1793,11 +1759,11 @@ fn fold_pass_set(
     announce_repairs(member, subject, norm, healed);
 }
 
-/// A §8.4/§10.4 verdict line: one summary `warn!` whenever a pass changed a
-/// transcript, one per `NonRestorableNotice`, and an explicit verdict line so a
-/// clean restore is distinguishable from a silent no-op in the log. The counts
-/// repeat the numbers in `RepairReport`, and the sentence repeats the one promise
-/// that matters most: the bundle bytes were not rewritten (D6).
+/// The verdict line: one summary `warn!` whenever a pass changed a transcript, one
+/// per `NonRestorableNotice`, and an explicit verdict line so a clean restore is
+/// distinguishable from a silent no-op in the log. The counts repeat the numbers in
+/// `RepairReport`, and the sentence repeats the one promise that matters most: the
+/// bundle bytes were not rewritten.
 fn announce_verdict(report: &RepairReport, bundle: &Path) {
     let changed = report.orphan_tool_results_pruned
         + report.aborted_results_synthesized
@@ -1949,9 +1915,9 @@ mod tests {
         }
     }
 
-    /// The provider contract H1 exists to protect (`manager/context.rs:376-383`):
-    /// every `tool_calls` entry is answered immediately after its parent, in call
-    /// order, and no `Tool` result outlives a surviving parent.
+    /// The provider contract the pass set protects: every `tool_calls` entry is
+    /// answered immediately after its parent, in call order, and no `Tool` result
+    /// outlives a surviving parent.
     fn assert_sendable(records: &[MessageRecord]) {
         let mut parents: Vec<String> = Vec::new();
         let mut index = 0;
@@ -1983,10 +1949,10 @@ mod tests {
         }
     }
 
-    // ------------------------------------------------------- §8.3 H1: dangling
-    // `ui/session.rs:689-690` persists the assistant before dispatch and the
-    // abort break at `:1127-1135` never reaches the boundary repair at
-    // `:1788-1795`, so the bundle's newest message is an unanswered `tool_calls`.
+    // ------------------------------------------------------- dangling tool_calls
+    // The live loop persists the assistant before dispatch and the abort break
+    // never reaches the boundary repair, so the bundle's newest message is an
+    // unanswered `tool_calls`.
     #[test]
     fn h1_dangling_tool_calls_are_answered_with_the_aborted_placeholder() {
         let messages = vec![
@@ -2025,7 +1991,7 @@ mod tests {
             vec![(AppliedRule::N2_SYNTHESIZE, "call-1", Some(3))]
         );
 
-        // A §8.3 H1: the sentence names the function and the verbatim arguments.
+        // The sentence names the function and the verbatim arguments.
         let sentence = rule_sentence(&report.applied[0], "manager", &healed);
         assert!(sentence.contains(
             "synthesized (aborted) for tool_call_id call-1 (function read_file, manager)"
@@ -2033,7 +1999,7 @@ mod tests {
         assert!(sentence.contains("arguments {\"path\":\"src/main.rs\"}"));
     }
 
-    // --------------------------------------------------------- §8.3 H2: orphans
+    // ------------------------------------------------------------ orphan results
     #[test]
     fn orphan_tool_results_are_pruned_and_reported_with_their_index() {
         let messages = vec![
@@ -2062,9 +2028,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 (AppliedRule::N1_PRUNE, "call-gone", Some(2), None),
-                // A §8.4 measures regrouping against the **pre-normalization**
-                // vector, so a surviving result that shifted down when the orphan
-                // in front of it was pruned is reported with the bundle index.
+                // Regrouping is measured against the un-normalized vector, so a
+                // surviving result that shifted down when the orphan in front of it
+                // was pruned is reported with the bundle index.
                 (AppliedRule::N2_REGROUP, "call-1", Some(4), Some(3)),
             ]
         );
@@ -2079,7 +2045,7 @@ mod tests {
         );
         assert_eq!(healed[3], tool("call-1", "listing"));
         assert_sendable(&healed);
-        // A §8.3 H2's exact required wording.
+        // The exact required wording for a pruned orphan.
         assert_eq!(
             rule_sentence(&report.applied[0], "manager", &healed),
             "pruned orphan tool result call-gone at message index 2 (manager)"
@@ -2218,8 +2184,8 @@ mod tests {
     #[test]
     fn a_pass_that_would_move_the_pinned_window_is_a_pin_violation_not_a_repair() {
         // The orphan sits inside the pinned window, so pruning it would shift the
-        // checkpoint — and A §8.2 forbids the "the repair moved the window, accept
-        // it" branch.
+        // checkpoint — and the "the repair moved the window, accept it" branch is
+        // forbidden.
         let messages = vec![
             sys("system prompt"),
             user("the goal"),
@@ -2310,7 +2276,7 @@ mod tests {
             "the second N1 pass pruned 1 more tool result(s): c1",
             "the second `ensure_tool_call_pairs` pass changed the transcript",
             "differ at message 3",
-            // A §8.4: both pass reports are printed with their numbers.
+            // Both pass reports are printed with their numbers.
             "pass 1 applied 1 rule(s) over 3 message(s)",
             "1 synthesized",
         ] {
@@ -2341,7 +2307,7 @@ mod tests {
             .collect();
         assert_eq!(decode_drift(&stored, &wire), None);
 
-        // Exactly what `serialize_assistant_content` (`types/wire.rs:30-41`) does.
+        // Exactly what `serialize_assistant_content` (`types/wire.rs`) does.
         let mut folded = wire.clone();
         if let crate::types::Message::Assistant { content, .. } = &mut folded[2] {
             *content = Some(String::new());
@@ -2381,7 +2347,7 @@ mod tests {
             .expect("a re-roled pin is a pin violation");
         assert!(detail.contains("messages[0]"), "{detail}");
 
-        // A checkpoint rewritten inside the window is caught too (R-PIN-4).
+        // A checkpoint rewritten inside the window is caught too.
         let window = vec![sys("s"), user("g"), checkpoint("body")];
         let rewritten = vec![sys("s"), user("g"), checkpoint("rewritten body")];
         let detail = pinned_identity_drift(&window, &rewritten, 3)
@@ -2478,7 +2444,7 @@ mod tests {
             "{}",
             report.n6_disagreements[0]
         );
-        // Reported, never reconciled: exactly one placeholder, still synthesized.
+        // Reported, never silently repaired: exactly one placeholder, still synthesized.
         assert_eq!(healed.len(), 4);
         assert_eq!(report.synthesized_aborted_ids, vec!["c1".to_string()]);
     }
@@ -2607,7 +2573,7 @@ mod tests {
                 tool("m1", ABORTED_TOOL_RESULT),
             ]
         );
-        // A §11.3 finding 2: per-worker before/after counts, machine-checkable.
+        // Per-worker before/after counts, machine-checkable.
         assert_eq!(
             report.worker_counts,
             vec![WorkerRepairCounts {
@@ -2617,8 +2583,8 @@ mod tests {
                 applied_rules: vec!["N2 synthesized 1 (aborted) tool result(s): w1".to_string()],
             }]
         );
-        // A §8.4: loud, and checkable by hand — one sentence per applied rule plus
-        // the per-worker `history <before> -> <after>` line.
+        // Loud, and checkable by hand — one sentence per applied rule plus the
+        // per-worker `history <before> -> <after>` line.
         assert!(
             report
                 .warnings
@@ -2634,7 +2600,7 @@ mod tests {
         assert_sendable(&session.manager.messages);
         assert_sendable(&session.workers[0].history);
 
-        // D6: the loader is read-only with respect to disk.
+        // The loader is read-only with respect to disk.
         let after = std::fs::read(bundle.join(MANAGER_FILE)).expect("manager.json after");
         assert_eq!(
             before, after,

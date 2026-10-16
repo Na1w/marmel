@@ -1,38 +1,36 @@
-//! t-014b — the two acceptance families of `docs/design_session_restore_data.md`
-//! that decide whether a restored session is still *the same session*:
+//! Session-restore coverage for the *pinned prefix* and the *dangling tool call*
+//! — the two things that decide whether a restored session is still the same
+//! session.
 //!
-//! * **§9.2 AC-P1 … AC-P5 — the pinned prefix survives the boot path**
-//!   (`AC-P1` asserts *after* `ui::session::boot` has run in full, which is what
-//!   proves the two pin writers — `ContextEngine::set_system_prompt`
-//!   (`src/manager/context.rs:592`) and `ContextEngine::set_goal` (`:604`) — were
-//!   skipped. **No test in this file ever calls either of them**; the only engine
-//!   that gets a transcript is `build_restored_context` + `boot`.);
-//! * **§9.10 AC-D1 … AC-D7 — the dangling tool call survives honestly**: the
-//!   unanswered assistant turn is kept with `content: null`, the un-dispatched
-//!   call gets one named `ABORTED_TOOL_RESULT` placeholder, an already-dispatched
-//!   call becomes a `NonRestorableNotice { kind: PtyProcess }` and is **never**
-//!   re-run, an orphan result is pruned and named, the bundle bytes are never
-//!   rewritten, and the single-corrupt-worker tolerance degrades loudly instead of
-//!   pretending.
+//! * **the pinned prefix survives the boot path**: after the whole pass has run,
+//!   `messages[0]` and `messages[1]` still hold the committed pin bytes, the pin
+//!   witnesses equal their lengths, the recomputed pinned window equals the
+//!   persisted one, this process's own composed prompt is provably different from
+//!   them, and a hand-truncated pin is refused rather than repaired. No test here
+//!   ever calls `ContextEngine::set_system_prompt` or `ContextEngine::set_goal`;
+//!   the proof that those two pin writers were skipped is that `ui::session::boot`
+//!   ran to completion.
+//! * **the dangling tool call survives honestly**: the unanswered assistant turn is
+//!   kept with `content: null`, the un-dispatched call gets one named
+//!   `ABORTED_TOOL_RESULT` placeholder, an already-dispatched call becomes a
+//!   `NonRestorableNotice { kind: PtyProcess }` and is **never** re-run, an orphan
+//!   result is pruned and named, the bundle bytes are never rewritten, and the
+//!   single-corrupt-worker tolerance degrades loudly instead of pretending.
 //!
 //! Fixture idiom is the one already used by `tests/test_session_bundle.rs` and
 //! `tests/test_session_restore_manager.rs`: build a `CapturePayload`, commit it
-//! with `session::commit::write_bundle` into a private temp directory
-//! (`<temp>/marmel-t014b-<tag>-<pid>-<nanos>/.marmel/session`), then read it back
-//! through `session::restore::load_bundle` and — for AC-P1…AC-P4 — through the
-//! real boot path `ui::session::boot`.
+//! with `session::commit::write_bundle` into a private temp directory, then read
+//! it back through `session::restore::load_bundle` and — for the pinned-prefix
+//! claims — through the real boot path `ui::session::boot`.
 //!
-//! Two rules this file never breaks:
-//!
-//! * **one hasher.** Every "the bytes did not change" assertion re-uses the
-//!   crate's own `session::fingerprint` (§7.2) over the member file, including for
-//!   `manifest.json` — no second hash function is introduced here (§7.3 L9);
-//! * **no weakened assertion.** Where a criterion and the implementation disagree,
-//!   the test keeps the criterion's wording and is marked `#[ignore]`, never
-//!   relaxed.
+//! Two rules this file never breaks: every "the bytes did not change" assertion
+//! re-uses the crate's own `session::fingerprint` over the member file and the
+//! manifest, so no second hash function is ever introduced; and no assertion is
+//! weakened — where the stated contract and the implementation could disagree, the
+//! test keeps the contract's wording and says so.
 //!
 //! Hermetic: one unique temp directory per test, deleted at the end; no network,
-//! no PTY, no sleeps, no global state that another test could observe (the
+//! no PTY, no sleeps, no global state another test could observe (the
 //! dangling/partial cases never enter the boot path, so `install_restored_workers`
 //! is never reached with fixtures of their own).
 
@@ -58,12 +56,12 @@ use marmennill::types::Message;
 
 // ------------------------------------------------------------------ fixtures
 
-/// The pinned system prompt as the *previous* process sent it (REQ-CORE-001).
-/// Deliberately nothing like the prompt this process composes, so AC-P4 can prove
-/// AC-P1 is not a tautology.
+/// The pinned system prompt as the *previous* process sent it.
+/// Deliberately nothing like the prompt this process composes, so "the pins
+/// survived" is provable and not a tautology.
 const PIN_TEXT: &str = "PINNED SYSTEM PROMPT (REQ-CORE-001): the exact bytes the previous process sent first, kept byte-for-byte.";
 
-/// The pinned goal as the previous process pinned it (REQ-CORE-002).
+/// The pinned goal as the previous process pinned it.
 const GOAL_TEXT: &str = "PINNED GOAL (REQ-CORE-002): keep the prefix identical across the restart.";
 
 /// Budget the fixture commits with — far from `Config::default()` so the boot
@@ -75,8 +73,8 @@ const COMMITTED_BUDGET: usize = 1234;
 const LIVE_BUDGET: usize = 4321;
 
 /// Monotonic floors for fixtures: every fixture worker keeps `worker_id_seq_value`
-/// and `completed_seq` strictly below these, so L7 (§5.7) never refuses for a
-/// reason unrelated to the criterion under test.
+/// and `completed_seq` strictly below these, so a floor never refuses a bundle for
+/// a reason unrelated to the behaviour under test.
 const SEQ_FLOOR: u64 = 10;
 
 /// A fresh temp dir whose `.marmel/session` layout mirrors a real plan. The tag is
@@ -169,16 +167,16 @@ fn settled_round() -> Vec<MessageRecord> {
 }
 
 /// A rebirth checkpoint carried as a `System` turn — the only thing that legally
-/// extends the pinned window (§4 R-PIN-3: its text is opaque to every pass).
+/// extends the pinned window: its text is opaque to every pass.
 fn checkpoint_turn() -> MessageRecord {
     sys(&format!(
         "{REBIRTH_CHECKPOINT_PREFIX}t-013 shipped the loader; next: keep the prefix identical."
     ))
 }
 
-/// AC-P fixture: the pinned pair, a settled round, a checkpoint at index 4 and one
-/// more turn. The checkpoint makes the persisted pinned window `5`, i.e. something
-/// other than the trivial `2`, so AC-P3 cannot be satisfied by accident.
+/// The pinned-prefix fixture: the pinned pair, a settled round, a checkpoint at
+/// index 4 and one more turn. The checkpoint makes the persisted pinned window `5`,
+/// i.e. something other than the trivial `2`, so a window match proves something.
 fn pinned_transcript() -> Vec<MessageRecord> {
     let mut messages = pinned_pair();
     messages.extend(settled_round());
@@ -187,7 +185,7 @@ fn pinned_transcript() -> Vec<MessageRecord> {
     messages
 }
 
-/// §9.10 AC-D fixture: the transcript ends with the exact crash shape —
+/// The dangling-call fixture: the transcript ends with the exact crash shape —
 /// `Assistant { content: null, tool_calls: [d-c1, d-c2] }` followed by **exactly
 /// one** `Tool { tool_call_id: "d-c1" }`.
 fn dangling_transcript() -> Vec<MessageRecord> {
@@ -207,7 +205,7 @@ fn dangling_transcript() -> Vec<MessageRecord> {
 
 /// The hand-written witness for that transcript. `observe()` always reports
 /// `dispatched: false` (`src/session/format/worker.rs`), so the fixture states the
-/// dispatch flags the design describes instead of deriving them.
+/// dispatch flags the crash shape calls for instead of deriving them.
 fn dangling_witness() -> DanglingToolCallState {
     DanglingToolCallState::Dangling {
         calls: vec![
@@ -227,8 +225,8 @@ fn dangling_witness() -> DanglingToolCallState {
     }
 }
 
-/// AC-D5 fixture: the same settled transcript plus one `Tool` result whose parent
-/// assistant turn is gone.
+/// The orphan-result fixture: the same settled transcript plus one `Tool` result
+/// whose parent assistant turn is missing.
 fn orphan_transcript() -> Vec<MessageRecord> {
     let mut messages = pinned_pair();
     messages.extend(settled_round());
@@ -241,7 +239,7 @@ fn orphan_transcript() -> Vec<MessageRecord> {
 
 /// A `ManagerSection` whose witnesses are exactly what the capture side would
 /// record for `messages` — except `dangling`, which every caller states on purpose
-/// (that is the half of the fixture AC-D1…AC-D4 read).
+/// (that is the half of the fixture the dangling tests read).
 fn manager_section(
     messages: Vec<MessageRecord>,
     dangling: DanglingToolCallState,
@@ -438,7 +436,7 @@ fn member_paths(bundle: &Path) -> Vec<String> {
 }
 
 /// `(rel_path, fingerprint)` for every member and for the manifest, using the
-/// crate's own §7.2 hasher — never a second one.
+/// crate's own `session::fingerprint` — never a second hasher.
 fn fingerprints(bundle: &Path) -> Vec<(String, u64)> {
     let mut table: Vec<(String, u64)> = member_paths(bundle)
         .into_iter()
@@ -448,8 +446,8 @@ fn fingerprints(bundle: &Path) -> Vec<(String, u64)> {
     table
 }
 
-/// Asserts that a restore left every committed byte where it found it (§7.3 L9,
-/// AC-D6) — members and manifest alike.
+/// Asserts that a restore left every committed byte where it found it — members
+/// and manifest alike.
 fn assert_bundle_bytes_unchanged(bundle: &Path, before: &[(String, u64)]) {
     let after = fingerprints(bundle);
     assert_eq!(
@@ -462,8 +460,9 @@ fn assert_bundle_bytes_unchanged(bundle: &Path, before: &[(String, u64)]) {
 }
 
 /// Rewrites the `byte_len`/`fingerprint` of one member inside the manifest so a
-/// hand-patched member still passes L4/L5 — isolating the check under test. Uses
-/// the crate's `fingerprint`, so the probe introduces no second hasher.
+/// hand-patched member still passes the size and fingerprint checks — isolating the
+/// check under test. Uses the crate's `fingerprint`, so the probe introduces no
+/// second hasher.
 fn patch_member_witness(manifest_text: &str, rel_path: &str, bytes: &[u8]) -> String {
     let mut doc: serde_json::Value =
         serde_json::from_str(manifest_text).expect("the committed manifest parses");
@@ -481,8 +480,8 @@ fn patch_member_witness(manifest_text: &str, rel_path: &str, bytes: &[u8]) -> St
 }
 
 /// Flips one byte in the middle of one worker member — same `byte_len`, different
-/// `fingerprint`, so L4 passes and L5 is what fires (§7.3 order). Returns the
-/// member's relative path.
+/// `fingerprint`, so the size check passes and the fingerprint mismatch is what
+/// fires. Returns the member's relative path.
 fn corrupt_one_byte(bundle: &Path, worker_key: &str) -> String {
     let rel = worker_rel_path(worker_key);
     let path = bundle.join(&rel);
@@ -519,8 +518,8 @@ fn results(messages: &[MessageRecord]) -> Vec<(&str, &str)> {
         .collect()
 }
 
-/// The transcript with every `Tool` turn removed: what the §8 pass set is
-/// forbidden to touch (AC-D2/AC-D5 read this against the installed vector).
+/// The transcript with every `Tool` turn removed: the shape normalization is
+/// forbidden to touch (compared against the installed vector).
 fn non_tool(messages: &[MessageRecord]) -> Vec<&MessageRecord> {
     messages
         .iter()
@@ -548,8 +547,8 @@ fn index_of_result(messages: &[MessageRecord], id: &str) -> usize {
         .unwrap_or_else(|| panic!("no tool result carries tool_call_id {id}"))
 }
 
-/// The bytes of `messages[index]` when it is a `System` turn — the pinned witness
-/// reader shared by AC-P1/AC-P4.
+/// The bytes of `messages[index]` when it is a `System` turn — the pinned-witness
+/// reader shared by the prefix tests.
 fn system_bytes(messages: &[MessageRecord], index: usize) -> String {
     match messages.get(index) {
         Some(MessageRecord::System { content }) => content.clone(),
@@ -566,11 +565,11 @@ fn user_bytes(messages: &[MessageRecord], index: usize) -> String {
 }
 
 /// The prompt a **fresh** boot of this process would install at `[0]`:
-/// `ui::helpers::load_system_prompt_with_plan_and_warning` (`src/ui/helpers.rs:111-124`)
-/// composes it as `"{system.md}\n\n{environment block}\n"` when
-/// `Config::system_prompt_path` does not exist, which is the case here. AC-P4
-/// needs exactly these bytes to prove the pinned pair survived rather than being
-/// re-composed.
+/// `load_system_prompt_with_plan_and_warning` in `src/ui/helpers.rs` composes it as
+/// `"{system.md}\n\n{environment block}\n"` when
+/// `Config::system_prompt_path` does not exist, which is the case here. The
+/// "not re-composed" proof needs exactly these bytes: they are what the pins must
+/// *differ* from.
 fn fresh_composed_prompt() -> String {
     format!(
         "{}\n\n{}\n",
@@ -629,11 +628,11 @@ struct Booted {
     session_id: String,
 }
 
-/// THE boot path (`ui::session::boot`, flow §4.9) driven end to end: `load_bundle`
-/// → floors + `WORKERS` → the engine → the panes → the loud report → `N-MGR-1`.
-/// AC-P1/AC-P2/AC-P3/AC-P4 assert on what this returns, i.e. **after** the whole
-/// pass ran: had `set_system_prompt` or `set_goal` run, `[0]`/`[1]` would already
-/// carry this process's bytes by now.
+/// THE boot path (`ui::session::boot`) driven end to end: `load_bundle` → floors +
+/// `WORKERS` → the engine → the panes → the loud report → `N-MGR-1`. The
+/// pinned-prefix tests assert on what this returns, i.e. **after** the whole pass
+/// ran: had `set_system_prompt` or `set_goal` run, `[0]`/`[1]` would already carry
+/// this process's bytes by now.
 fn boot_bundle(bundle: &Path) -> Booted {
     let cfg = Config {
         max_context_tokens: LIVE_BUDGET,
@@ -670,10 +669,10 @@ fn boot_bundle(bundle: &Path) -> Booted {
 }
 
 // ==========================================================================
-// §9.2 — the pinned prefix (AC-P1 … AC-P5)
+// The pinned prefix
 // ==========================================================================
 
-/// **AC-P1** — after the **full** boot path has run, `messages[0]` is still the
+/// After the **full** boot path has run, `messages[0]` is still the
 /// `System` pin byte-for-byte and `messages[1]` is still the `User` pin
 /// byte-for-byte. Nothing here calls `set_system_prompt` / `set_goal`: the proof
 /// that the two pin writers were skipped is that `ui::session::boot` ran to
@@ -790,7 +789,7 @@ fn ac_p1_pinned_pair_survives_the_full_boot_path_byte_for_byte() {
     cleanup(&bundle);
 }
 
-/// **AC-P2** — on the vector that was actually installed, the pin witness equals
+/// On the vector that was actually installed, the pin witness equals
 /// the byte length of the message it witnesses:
 /// `pin_witness.system_prompt_len == messages[0].content.len()` and
 /// `pin_witness.goal_len == messages[1].content.len()`.
@@ -849,9 +848,9 @@ fn ac_p2_pin_witness_agrees_with_the_installed_vector() {
     cleanup(&bundle);
 }
 
-/// **AC-P3** — the recomputed pinned window equals the persisted one *after*
-/// normalization (§8 N3). The fixture carries a rebirth checkpoint at index 4, so
-/// the window is `5`, not the trivial `2`: matching on `2` would prove nothing.
+/// The recomputed pinned window equals the persisted one *after*
+/// normalization. The fixture carries a rebirth checkpoint at index 4, so the
+/// window is `5`, not the trivial `2`: matching on `2` would prove nothing.
 #[test]
 fn ac_p3_recomputed_pinned_prefix_end_matches_the_persisted_value() {
     let bundle = bundle_dir("ac-p3");
@@ -920,10 +919,10 @@ fn ac_p3_recomputed_pinned_prefix_end_matches_the_persisted_value() {
     cleanup(&bundle);
 }
 
-/// **AC-P4** — the prompt this boot composed is **different** from the pinned
-/// bytes. Without this, AC-P1 could pass by accident: if the fixture pinned the
-/// same text this process composes, "the pins were not overwritten" and "they were
-/// overwritten with the same thing" would be indistinguishable.
+/// The prompt this boot composed is **different** from the pinned
+/// bytes. Without this, the pin test could pass by accident: if the fixture pinned
+/// the same text this process composes, "the pins were not overwritten" and "they
+/// were overwritten with the same thing" would be indistinguishable.
 #[test]
 fn ac_p4_the_prompt_this_boot_composed_is_not_the_pinned_bytes() {
     let bundle = bundle_dir("ac-p4");
@@ -969,8 +968,8 @@ fn ac_p4_the_prompt_this_boot_composed_is_not_the_pinned_bytes() {
     );
 
     // The boot pass says so out loud, quoting both witness lengths and the stored
-    // window: this is R-PIN-2's loud half, and it only exists because the composed
-    // bytes were deliberately not installed.
+    // window: this warning exists only because the composed bytes were deliberately
+    // not installed.
     let sentence = booted
         .report
         .repair
@@ -992,12 +991,12 @@ fn ac_p4_the_prompt_this_boot_composed_is_not_the_pinned_bytes() {
     cleanup(&bundle);
 }
 
-/// **AC-P5** — a bundle whose pin was truncated by hand is **refused**, not
+/// A bundle whose pin was truncated by hand is **refused**, not
 /// repaired: `Refused { code: PinViolation, member: "manager.json" }`, and the
 /// member bytes are unchanged afterwards. The manifest witness is re-sealed with
-/// the crate's own `fingerprint` so L4/L5 pass and the pin rule is the only thing
-/// that can fire; every member and `manifest.json` is then hashed with that same
-/// hasher before and after (§7.2 — no second hasher).
+/// the crate's own `fingerprint` so the size and fingerprint checks pass and the
+/// pin rule is the only thing that can fire; every member and `manifest.json` is
+/// then hashed with that same hasher before and after.
 #[test]
 fn ac_p5_a_hand_edited_pin_is_refused_and_no_byte_of_the_bundle_changes() {
     let bundle = bundle_dir("ac-p5");
@@ -1074,11 +1073,11 @@ fn ac_p5_a_hand_edited_pin_is_refused_and_no_byte_of_the_bundle_changes() {
 }
 
 // ==========================================================================
-// §9.10 — the dangling tool call (AC-D1 … AC-D7)
+// The dangling tool call
 // ==========================================================================
 
-/// **AC-D1** — the crash shape is reported and healed, with every synthesized id
-/// named: a manager transcript ending `Assistant { content: null, tool_calls:
+/// The crash shape is reported and healed, with every synthesized id named: a
+/// manager transcript ending `Assistant { content: null, tool_calls:
 /// [d-c1, d-c2] }` plus **exactly one** `Tool { "d-c1" }`, recorded
 /// `ending: InProgress` and
 /// `dangling: Dangling { [d-c1 dispatched, d-c2 not dispatched] }`, restores as
@@ -1090,7 +1089,7 @@ fn ac_p5_a_hand_edited_pin_is_refused_and_no_byte_of_the_bundle_changes() {
 fn ac_d1_the_dangling_pair_is_reported_and_healed_with_one_named_placeholder() {
     let bundle = bundle_dir("ac-d1");
     let committed = dangling_transcript();
-    // The fixture IS the §9.10 shape; say so before asserting anything about it.
+    // The fixture IS the crash shape; say so before asserting anything about it.
     assert_eq!(
         roles(&committed),
         vec!["system", "user", "assistant", "tool", "assistant", "tool"],
@@ -1206,7 +1205,7 @@ fn ac_d1_the_dangling_pair_is_reported_and_healed_with_one_named_placeholder() {
     );
 
     // The healed vector is what the engine receives, and the engine's own observer
-    // (`ContextEngine::dangling_state`, src/manager/context.rs:1196) reads it as
+    // (`ContextEngine::dangling_state` in `src/manager/context.rs`) reads it as
     // **healed**: no call is left unanswered, and the one placeholder it finds is
     // named by id — the vocabulary `DanglingToolCallState::Healed` exists for.
     let mut engine = marmennill::manager::ContextEngine::new(LIVE_BUDGET);
@@ -1222,7 +1221,7 @@ fn ac_d1_the_dangling_pair_is_reported_and_healed_with_one_named_placeholder() {
     cleanup(&bundle);
 }
 
-/// **AC-D2** — the unanswered assistant turn is **not dropped**, and its
+/// The unanswered assistant turn is **not dropped**, and its
 /// `content: None` is still `None` (not `""`, not a synthesized sentence). This is
 /// the whole reason `MessageRecord` exists: the wire type folds `None` into `""`.
 #[test]
@@ -1242,7 +1241,7 @@ fn ac_d2_the_unanswered_assistant_turn_survives_with_content_still_none() {
         ),
         ProcessEnding::InProgress,
     );
-    // On disk the fact is spelled `null`, so the criterion is checkable in the file.
+    // On disk the fact is spelled `null`, so the claim is checkable in the file.
     assert!(
         member_text(&bundle, MANAGER_FILE).contains("\"content\": null"),
         "the committed member must carry a JSON null for the content-less assistant turn"
@@ -1297,7 +1296,7 @@ fn ac_d2_the_unanswered_assistant_turn_survives_with_content_still_none() {
     cleanup(&bundle);
 }
 
-/// **AC-D3** — the synthesis happens *behind* the pins: `messages[0]` and
+/// The synthesis happens *behind* the pins: `messages[0]` and
 /// `messages[1]` keep their indices and their bytes, and `pinned_prefix_end` is
 /// unchanged by the repair.
 #[test]
@@ -1372,7 +1371,7 @@ fn ac_d3_the_pins_keep_their_indices_and_bytes_through_the_synthesis() {
     cleanup(&bundle);
 }
 
-/// **AC-D4** — a call that had already been **dispatched** is a lost capability,
+/// A call that had already been **dispatched** is a lost capability,
 /// not a repair: it raises `NonRestorableNotice { kind: PtyProcess }` naming the
 /// subject (`manager` for the manager transcript, `worker <key>` for a worker),
 /// says the tool *may have mutated the workspace*, and promises not to re-run it —
@@ -1527,8 +1526,8 @@ fn ac_d4_a_dispatched_call_becomes_a_pty_notice_and_is_never_re_run() {
     cleanup(&worker_bundle);
 }
 
-/// **AC-D5** — the orphan variant: a `Tool` result whose parent assistant turn is
-/// gone is pruned (§8 N1), counted once, and its id appears in `warnings`; the rest
+/// The orphan variant: a `Tool` result whose parent assistant turn is missing is
+/// pruned, counted once, and its id appears in `warnings`; the rest
 /// of the transcript is element-by-element equal to what was committed.
 #[test]
 fn ac_d5_an_orphan_tool_result_is_pruned_counted_and_named() {
@@ -1597,7 +1596,7 @@ fn ac_d5_an_orphan_tool_result_is_pruned_counted_and_named() {
     );
     assert!(report.pins_verified);
     // The stored witness says `OrphanedResults`; after the prune the vector reads
-    // `Balanced`. §8.2 N6: that disagreement is reported, never reconciled.
+    // `Balanced`. That disagreement is reported, never reconciled.
     assert!(
         warnings(&report)
             .iter()
@@ -1615,7 +1614,7 @@ fn ac_d5_an_orphan_tool_result_is_pruned_counted_and_named() {
     cleanup(&bundle);
 }
 
-/// **AC-D6** — the read-only rule (§7.3 L9): after a restore that repaired a
+/// The read-only rule: after a restore that repaired a
 /// transcript, `fingerprint` of **every** member file *and* `manifest.json` is
 /// identical to before the load. The normalized bytes appear only on the **next**
 /// commit, which is the only writer of bundle bytes.
@@ -1691,10 +1690,10 @@ fn ac_d6_the_bundle_is_byte_identical_after_restore_and_only_the_next_commit_rew
     cleanup(&bundle);
 }
 
-/// **AC-D7** — the corrupt-member ladder: **two** corrupt worker files (one flipped
+/// The corrupt-member ladder: **two** corrupt worker files (one flipped
 /// byte each, so every fingerprint mismatches) mean `Refused` with every member
 /// byte unchanged; **exactly one** corrupt worker means `PartiallyRestored` with
-/// `unrecoverable_workers == [<that key>]`, while every other criterion keeps
+/// `unrecoverable_workers == [<that key>]`, while every other contract keeps
 /// holding for the surviving workers.
 #[test]
 fn ac_d7_two_corrupt_workers_refuse_one_corrupt_worker_degrades_loudly() {
@@ -1789,8 +1788,8 @@ fn ac_d7_two_corrupt_workers_refuse_one_corrupt_worker_degrades_loudly() {
     assert_eq!(report.workers_unrecoverable, vec![BETA.to_string()]);
     assert_eq!(ending, ProcessEnding::HardKillInferred);
 
-    // The lost worker is reported, not hidden: identity kept, history gone, reason
-    // verbatim, and a `WorkerHistory` notice naming its key.
+    // The lost worker is reported, not hidden: identity kept, history missing,
+    // reason verbatim, and a `WorkerHistory` notice naming its key.
     let beta = session
         .workers
         .iter()
@@ -1820,7 +1819,7 @@ fn ac_d7_two_corrupt_workers_refuse_one_corrupt_worker_degrades_loudly() {
         warnings(&report)
     );
 
-    // Every other criterion still holds for the surviving worker.
+    // Every other contract still holds for the surviving worker.
     let alpha = session
         .workers
         .iter()
@@ -1846,7 +1845,7 @@ fn ac_d7_two_corrupt_workers_refuse_one_corrupt_worker_degrades_loudly() {
         counts.before, counts.after,
         "no repair was needed for the survivor"
     );
-    // …and for the manager: AC-P1's pins and AC-D1's verdicts still hold here.
+    // …and for the manager: the pinned prefix and the dangling-call verdicts hold.
     assert_eq!(
         system_bytes(&session.manager.messages, 0),
         PIN_TEXT,

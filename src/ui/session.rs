@@ -25,8 +25,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-/// Execution bounds applied to the live session loop (recon H5: "no failure
-/// budget, no wall-clock bound").
+/// Execution bounds applied to the live session loop: a failure budget and a
+/// wall-clock bound.
 ///
 /// Production always runs on [`SessionBounds::default()`]. The bounds are
 /// deliberately **config-independent**: they are a runaway safety net for the
@@ -39,7 +39,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionBounds {
     /// Wall-clock watchdog: how long one turn may go with **no observable
-    /// progress** before it is torn down (REQ-LOOP-002, wall-clock half).
+    /// progress** before it is torn down.
     pub turn_idle: Duration,
     /// Absolute wall-clock bound for a single turn, progress or not.
     pub turn_hard_cap: Duration,
@@ -58,16 +58,16 @@ impl Default for SessionBounds {
     }
 }
 
-// ── Why a session execution bound ended a turn (recon M2 / residual defect 2) ──
+// ── Why a session execution bound ended a turn ───────────────────────────────
 //
 // The session loop has several ways to stop a turn: the wall-clock halves of
 // [`SessionBounds`], and the per-request **turn budget**
-// ([`crate::manager::r#loop::MAX_TURNS`]). Until t-074 only the wall-clock exits
-// said anything: `turn_count > MAX_TURNS` broke the loop **silently**, so an
-// operator watched a session stop responding after the budget was spent and had
-// nothing distinguishing that from a clean end-of-turn finish (recon finding M2,
-// `docs/recon_bugs_manager.md`; residual defect 2 of the manager-cluster gate
-// t-067). The vocabulary below is the single stop-reason type the loop carries:
+// ([`crate::manager::r#loop::MAX_TURNS`]). A bare `turn_count > MAX_TURNS` break
+// stops the loop **silently**: an operator sees a session stop responding once the
+// budget is spent, with nothing distinguishing that from a clean end-of-turn
+// finish.
+//
+// The vocabulary below is the single stop-reason type the loop carries:
 // every bound exit produces one, it is surfaced through the session's existing
 // status channel (renderer `Message`/`Status` event + a `Status` record in the
 // UI transcript + `tracing::warn!`), and it exposes a stable machine-readable
@@ -80,9 +80,8 @@ pub enum BoundStopReason {
     Deadline { kind: DeadlineKind, text: String },
     /// The per-request turn budget was exhausted: `limit` turns are allowed and
     /// all of them ran, so turn `turn` was refused. (The count is deliberately
-    /// reported as *refused*, matching the loop's pre-incremented counter —
-    /// exactly `limit` turns ran; recon M2 confirmed the off-by-one itself is
-    /// correct.)
+    /// reported as *refused*, matching the loop's pre-incremented counter:
+    /// exactly `limit` turns ran, so that off-by-one is intentional.)
     TurnCap { limit: usize, turn: usize },
 }
 
@@ -105,8 +104,8 @@ impl BoundStopReason {
 
     /// Short tag used in the `(Ready)` status line.
     ///
-    /// The deadline branch is preserved byte-for-byte from the previous
-    /// string-based selection so the existing bound status lines do not move.
+    /// The deadline branch wording is byte-stable so the existing bound status
+    /// lines do not move.
     pub fn label(&self) -> &'static str {
         match self {
             BoundStopReason::Deadline { text, .. } => {
@@ -139,8 +138,7 @@ impl BoundStopReason {
 /// counterpart of the messages the operator was shown.
 ///
 /// This is what makes a capped finish distinguishable from a clean one from
-/// *outside* the UI — `run_session` cannot say anything at all, which is exactly
-/// the residual defect t-074 fixes.
+/// *outside* the UI, which `run_session` alone cannot do.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionStopReport {
     /// Every session execution bound that cut a turn off, in the order it fired.
@@ -164,7 +162,7 @@ impl SessionStopReport {
     }
 }
 
-// ── The Manager request budget (bug M7, gate t-064) ──────────────────────────
+// ── The Manager request budget ───────────────────────────────────────────────
 //
 // [`ContextEngine::should_compact`] prices the **request**, i.e. transcript plus
 // the serialized `ChatRequest.tools` payload
@@ -179,7 +177,7 @@ impl SessionStopReport {
 // over-budget request through).
 
 /// Build the session's Manager context engine, pre-charged with the exact tool
-/// schemas the Manager advertises (bug M7, gate t-064).
+/// schemas the Manager advertises.
 ///
 /// The live loop constructs its engine **here** so the wiring is a single,
 /// test-reachable line instead of an inline `ContextEngine::new` that silently
@@ -194,14 +192,14 @@ pub fn build_manager_context(cfg: &Config, system_prompt: String) -> ContextEngi
 }
 
 /// Re-charge `ctx` with the tool schemas the Manager advertises **right now** and
-/// return the charged schema token count (bug M7, gate t-064).
+/// return the charged schema token count.
 ///
 /// The advertised Manager list is not static: MCP servers boot lazily and
 /// reconnect, and the advertised MCP view is policy-filtered per request
 /// ([`crate::harness::allowed_mcp_tools`]). The session therefore re-declares the
 /// list at every budget decision rather than trusting a one-time construction
-/// charge — a stale charge is the same defect mirrored (compacting against a
-/// schema the wire no longer carries).
+/// charge — a stale charge would compact against a schema the wire does not
+/// carry.
 pub fn sync_manager_tool_schema(ctx: &mut ContextEngine, cfg: &Config) -> usize {
     let previous = ctx.tool_schema_tokens();
     let advertised = manager_wire_tools(&cfg.orchestration.mcp_servers);
@@ -222,31 +220,29 @@ pub fn sync_manager_tool_schema(ctx: &mut ContextEngine, cfg: &Config) -> usize 
 }
 
 // ---------------------------------------------------------------------------
-// Boot-time restore (t-012): the ONE exact restore pass (flow §4.9)
+// Boot-time restore: the ONE exact restore pass
 // ---------------------------------------------------------------------------
 
-/// `--resume` as spelled on the command line (flow §3.3).
+/// `--resume` as spelled on the command line.
 ///
-/// **Documented deviation from flow §3.3:** the design prefers an explicit
-/// parameter carried through `ui::tui::run` / `ui::raw::run` and explicitly
-/// rejects smuggling the trigger through `Config`. Both `run` entry points
-/// (`ui/tui/mod.rs:1602`, `ui/raw.rs:20`) and `CliArgs` itself belong to other
-/// tasks, so the only seam left is a one-shot handoff from `main` — the only place
-/// that ever sees `CliArgs` — to the module that owns the session loop. `main`
-/// calls [`set_resume_request`] exactly once, before either `run`; nothing else
-/// writes these statics, and they are read once per process at boot.
+/// **Documented deviation:** the design prefers an explicit parameter through
+/// `ui::tui::run` / `ui::raw::run` and rejects smuggling the trigger through
+/// `Config`. Both `run` entry points (`ui/tui/mod.rs:1602`, `ui/raw.rs:20`) and
+/// `CliArgs` itself live in other modules, so the only seam left is a one-shot
+/// handoff from `main` — the only place that sees `CliArgs` — to the module that
+/// owns the session loop, made exactly once via [`set_resume_request`].
 static RESUME_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// The `--fresh` half of the [`RESUME_REQUESTED`] handoff.
 static FRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// Hand the CLI's resume decision to the session loop (flow §3.3).
+/// Hand the CLI's resume decision to the session loop.
 pub fn set_resume_request(resume: bool, fresh: bool) {
     RESUME_REQUESTED.store(resume, Ordering::SeqCst);
     FRESH_REQUESTED.store(fresh, Ordering::SeqCst);
 }
 
-/// The resume trigger, resolved with the precedence flow §3.3 fixes:
+/// The resume trigger, resolved with this precedence:
 ///
 /// ```text
 ///   --fresh                    wins over everything else: never restore
@@ -267,22 +263,22 @@ pub fn resume_requested(cfg: &Config) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Session commit triggers (flow §1.1–§1.3, t-023)
+// Session commit triggers
 //
-// WHEN a bundle is written, and by whom. **R-TRIG-0**: only the thread that owns
+// WHEN a bundle is written, and by whom. **Only** the thread that owns
 // `ctx`, `ui_transcript` and `renderer` may commit — `Renderer: Send` but **not**
 // `Sync`, so `capture_ui` is legal only here. Worker threads therefore never
 // write a file: [`mark_worker_lifecycle_edge`] records that a worker mirror
 // changed, and this pump turns that into a `workers/*.json` member on the
 // session thread.
 //
-// **Coalescing (R-TRIG-1…3)**: the 24 legacy `save_transcript` sites keep their
+// **Coalescing**: the 24 legacy `save_transcript` sites keep their
 // event semantics but only mirror in memory ([`manager_capture`]); a bundle is
 // written once per trigger, with T-4/T-5 throttled to
 // `Config::session_commit_min_interval_ms` and mandatory triggers (T-1, T-2,
 // T-3, T-9) never throttled.
 //
-// **t-024 added the interrupted-session half**: T-6/T-7 (`UserAbort`), T-8
+// **Interrupted-session triggers**: T-6/T-7 (`UserAbort`), T-8
 // (`PanicHook`, [`commit_from_panic`]) and T-10 (`Reset` / `PlanArchived`,
 // [`mark_ending_commit`] + [`confirm_bundle_swept`]). These are the endings that
 // make an INTERRUPTED run restorable, so none of them is ever throttled and none
@@ -290,7 +286,7 @@ pub fn resume_requested(cfg: &Config) -> bool {
 // writes.
 // ---------------------------------------------------------------------------
 
-/// Why a commit was requested — flow §1.1 `T-n`.
+/// Why a commit was requested — the `T-n` trigger vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitTrigger {
     /// T-1: one round of the turn loop ended, after the pairing repair.
@@ -305,30 +301,30 @@ pub enum CommitTrigger {
     WorkerEdge,
     /// T-9: the session loop reached its tail.
     CleanTail,
-    /// T-6/T-7 (t-024): the user aborted — `/abort`, the two-stage Ctrl-C/Esc
+    /// T-6/T-7: the user aborted — `/abort`, the two-stage Ctrl-C/Esc
     /// confirm, or an abort the loop observed mid-round. Mandatory: this is
     /// frequently the LAST bundle a dying process ever writes.
     UserAbort,
-    /// T-10 (t-024): `/reset`. The ending is recorded first, then
-    /// `Plan::clear()`/`sweep_session_state()` deletes the bundle (A D3).
+    /// T-10: `/reset`. The ending is recorded first, then
+    /// `Plan::clear()`/`sweep_session_state()` deletes the bundle.
     Reset,
-    /// T-10 (t-024): the plan was archived — the session is **finished**, which
+    /// T-10: the plan was archived — the session is **finished**, which
     /// is a different verdict from "interrupted".
     PlanArchived,
 }
 
 impl CommitTrigger {
-    /// R-TRIG-2: only T-4/T-5 respect the rate floor; losing T-1/T-2/T-3/T-9
+    /// Only T-4/T-5 respect the rate floor; losing T-1/T-2/T-3/T-9
     /// loses facts.
     fn throttled(self) -> bool {
         matches!(self, CommitTrigger::UiEvent | CommitTrigger::WorkerEdge)
     }
 
-    /// The ending this trigger writes (flow §1.5). Every in-loop writer here
-    /// records `InProgress`; the loop tail records `CleanTail`, an abort records
-    /// `UserAbort` and a plan sweep records `Reset`/`PlanArchived`. That mapping
-    /// is what lets a later boot tell `CleanTail`, an honest abort and
-    /// `HardKillInferred` apart at all.
+    /// The ending this trigger writes. Every in-loop writer here records
+    /// `InProgress`; the loop tail records `CleanTail`, an abort records
+    /// `UserAbort` and a reset or plan archive records `Reset`/`PlanArchived`.
+    /// That mapping is what lets a later boot tell `CleanTail`, an honest abort
+    /// and `HardKillInferred` apart at all.
     fn ending(self) -> ProcessEnding {
         match self {
             CommitTrigger::CleanTail => ProcessEnding::CleanTail,
@@ -340,11 +336,11 @@ impl CommitTrigger {
     }
 }
 
-/// What one request decided. Kept so a commit result is never discarded
-/// (A §7.1); it lands in [`session_commit_ledger`].
+/// What one request decided. Kept so a commit result is never discarded;
+/// it lands in [`session_commit_ledger`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitDecision {
-    /// A bundle was written; `members` counts the members actually renamed (C2).
+    /// A bundle was written; `members` counts the members actually renamed.
     Written { members: usize },
     /// Inside the `session_commit_min_interval_ms` window: folded into the next commit.
     Throttled,
@@ -353,7 +349,7 @@ pub enum CommitDecision {
     Suppressed,
     /// `session_enabled = false`: nothing is written, ever.
     Disabled,
-    /// Another commit holds the session commit lock (R-TRIG-1).
+    /// Another commit holds the session commit lock.
     Busy,
     /// The commit failed; the reason is logged, never swallowed.
     Failed,
@@ -377,13 +373,13 @@ pub struct SessionCommitLedger {
     pub ui_event: u64,
     pub worker_edge: u64,
     pub clean_tail: u64,
-    /// t-024: T-6/T-7 abort requests.
+    /// T-6/T-7 abort requests.
     pub user_abort: u64,
-    /// t-024: T-10 `/reset` requests.
+    /// T-10 `/reset` requests.
     pub reset: u64,
-    /// t-024: T-10 plan-archive requests.
+    /// T-10 plan-archive requests.
     pub plan_archived: u64,
-    /// t-024: T-8 panic-hook flushes that reached the committer.
+    /// T-8 panic-hook flushes that reached the committer.
     pub panic_hook: u64,
     /// Successful commits whose manager member was **dangling** (the T-2 witness:
     /// an assistant `tool_calls` batch persisted before its results existed).
@@ -410,7 +406,7 @@ pub fn session_commit_ledger() -> SessionCommitLedger {
 
 /// A worker lifecycle edge is pending: set from `orchestrator::workers` — which
 /// may run on a **worker** thread — and consumed only here, on the session
-/// thread. Deliberately an atomic, never a write: R-TRIG-0.
+/// thread. Deliberately an atomic, never a write: only this thread consumes it.
 static WORKER_EDGE: AtomicBool = AtomicBool::new(false);
 
 /// Record that a worker started / completed / failed / was preempted, and that
@@ -424,9 +420,9 @@ pub fn take_worker_lifecycle_edge() -> bool {
     WORKER_EDGE.swap(false, Ordering::SeqCst)
 }
 
-/// The worker members: every live registry entry joined with its mirror
-/// (A §5.3). Both sides are clones with no map guard outliving the call
-/// (A §5.7 step 4), so a harvest can never deadlock against a worker.
+/// The worker members: every live registry entry joined with its mirror.
+/// Both sides are clones with no map guard outliving the call, so a harvest can
+/// never deadlock against a worker.
 fn harvest_worker_sections() -> Vec<WorkerSection> {
     crate::orchestrator::workers::live_worker_states()
         .into_iter()
@@ -444,7 +440,7 @@ fn harvest_worker_sections() -> Vec<WorkerSection> {
         .collect()
 }
 
-/// The floors of the three identity counters, read at commit time (A §3.4).
+/// The floors of the three identity counters, read at commit time.
 fn current_identity_floors() -> IdentityFloors {
     IdentityFloors {
         worker_id_seq_floor: crate::orchestrator::workers::worker_id_seq_floor(),
@@ -453,8 +449,8 @@ fn current_identity_floors() -> IdentityFloors {
     }
 }
 
-/// Mirror the manager state **and** request a commit — the pair every legacy
-/// `save_transcript` site becomes. The mirror is always cheap and in-memory; the
+/// Mirror the manager state **and** request a commit — the pair behind every
+/// transcript-mutating site. The mirror is always cheap and in-memory; the
 /// commit is the pump's decision, so most calls write nothing at all.
 fn capture_and_request(
     pump: &mut SessionCommitPump,
@@ -466,8 +462,8 @@ fn capture_and_request(
     pump.request(trigger, ctx, renderer);
 }
 
-/// The session-thread commit pump (flow §1.1/§1.3). One per session; it owns the
-/// throttle clock, the bundle identity and the [`CommitLock`].
+/// The session-thread commit pump. One per session; it owns the throttle clock,
+/// the bundle identity and the [`CommitLock`].
 #[derive(Debug)]
 pub struct SessionCommitPump {
     bundle: std::path::PathBuf,
@@ -476,7 +472,7 @@ pub struct SessionCommitPump {
     policy: CommitPolicy,
     /// Shared with the panic hook ([`PANIC_TARGET`]) as an `Arc`, so a hook that
     /// runs while this pump's thread is unwinding can still `try_guard` it and
-    /// never blocks on its owner (flow §1.8).
+    /// never blocks on its owner.
     lock: Arc<CommitLock>,
     last_commit: Option<std::time::Instant>,
     /// A throttled request still owed a commit.
@@ -487,8 +483,8 @@ pub struct SessionCommitPump {
 }
 
 impl SessionCommitPump {
-    /// `session_id` is the restored id when one exists (identity continuity,
-    /// A §4); a fresh session mints one, because the manifest, the member
+    /// `session_id` is the restored id when one exists (identity continuity);
+    /// a fresh session mints one, because the manifest, the member
     /// headers and the L4/L5 cross-checks all require it.
     pub fn new(plan: &crate::manager::phase::Plan, cfg: &Config, session_id: &str) -> Self {
         let bundle = crate::session::bundle_dir(plan);
@@ -504,7 +500,7 @@ impl SessionCommitPump {
         };
         let lock = Arc::new(CommitLock::new());
         if cfg.session_enabled {
-            // t-024 (flow §1.8): register what the panic hook may reach. Capture
+            // Register what the panic hook may reach. Capture
             // being switched off leaves the hook with nothing to flush, which is
             // the honest answer — this run never wrote a bundle.
             let mut slot = PANIC_TARGET
@@ -535,7 +531,7 @@ impl SessionCommitPump {
 
     /// The pump's commit lock. Read-only access, for diagnostics and tests: the
     /// panic hook holds the SAME `Arc` (it was handed one at construction) and
-    /// only ever *tries* it — nothing on that path may block (R-TRIG-1).
+    /// only ever *tries* it — nothing on that path may block.
     pub fn commit_lock(&self) -> &CommitLock {
         &self.lock
     }
@@ -583,7 +579,7 @@ impl SessionCommitPump {
         if !self.enabled {
             return decide(CommitDecision::Disabled);
         }
-        // `session_commit_on_tool_result` gates T-3 entirely.
+        // `session_commit_on_tool_result` switches T-3 off entirely.
         if trigger == CommitTrigger::ToolResult && !self.policy.allow_throttled {
             return decide(CommitDecision::Suppressed);
         }
@@ -598,7 +594,7 @@ impl SessionCommitPump {
                 return decide(CommitDecision::Throttled);
             }
         } else {
-            // R-TRIG-3: a mandatory trigger wins and cancels the pending one.
+            // A mandatory trigger wins and cancels the pending one.
             self.pending = false;
         }
         self.commit(trigger, ctx, renderer)
@@ -675,10 +671,10 @@ impl SessionCommitPump {
     }
 }
 
-/// The ONLY thing a panic hook may reach about a session (flow §1.8, t-024): the
+/// The ONLY thing a panic hook may reach about a session: the
 /// bundle identity, the commit policy, and the session's [`CommitLock`] — never
 /// the renderer (`TuiRenderer: !Sync`) and never the engine (`ctx` lives on the
-/// session thread, R-TRIG-0).
+/// session thread).
 #[derive(Debug, Clone)]
 pub struct PanicFlushTarget {
     pub bundle: std::path::PathBuf,
@@ -710,37 +706,35 @@ pub fn panic_target_bundle_hint() -> String {
         .unwrap_or_else(|| "no session bundle".to_string())
 }
 
-/// What the panic hook did, so it can never report success it did not earn
-/// (flow §1.8: "if the panic happened before any successful commit, T-8 SHALL
-/// write nothing and log why").
+/// What the panic hook did, so it can never report success it did not earn: if
+/// the panic happened before any successful commit, T-8 writes nothing and logs
+/// why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanicFlushOutcome {
     /// `true` only when a manifest with `ending: panicHook` was renamed into
     /// place (manifest-last, so the bundle really carries it).
     pub written: bool,
     /// Members the flush re-listed (0 is normal: an unchanged member keeps its
-    /// bytes, A §7.1 C2).
+    /// bytes).
     pub members_written: usize,
     /// Plain English for the user and the log: what was written, or why nothing
     /// could be.
     pub detail: String,
 }
 
-/// T-8 (flow §1.8): the panic-hook flush. **Pure synchronous I/O** — no runtime,
-/// no `block_on`, no renderer, no engine, no allocation of a task. It rewrites
-/// the manifest of the last committed bundle with `ending: panicHook`, carrying
-/// the member bytes exactly as the last successful commit wrote them (A §7.2 C2
-/// says an unchanged member keeps its bytes; the manifest is the thing that
-/// changes).
+/// T-8: the panic-hook flush. **Pure synchronous I/O** — no runtime, no
+/// `block_on`, no renderer, no engine, no allocation of a task. It rewrites the
+/// manifest of the last committed bundle with `ending: panicHook`, carrying the
+/// member bytes exactly as the last successful commit wrote them: an unchanged
+/// member keeps its bytes, the manifest is the thing that changes.
 ///
-/// Thread model: a panic runs the hook **on whichever thread panicked**. Nothing
-/// here touches session-thread-only state, so the flush is legal from any thread;
-/// what it honestly cannot do is capture a pane or a transcript that was never
-/// committed — that data does not exist, and this says so out loud instead of
-/// racing the session thread for it.
+/// Thread model: a panic runs the hook **on whichever thread panicked**, and
+/// nothing here touches session-thread-only state. What it cannot honestly do is
+/// capture a pane or a transcript that was never committed — that data does not
+/// exist, and this says so out loud instead of racing the session thread for it.
 pub fn commit_from_panic() -> PanicFlushOutcome {
     let outcome = panic_flush_inner();
-    // A D6 forbids `let _ =` on a commit: the outcome is counted, logged and
+    // `let _ =` on a commit is forbidden: the outcome is counted, logged and
     // returned to `main`, which repeats it on stderr.
     {
         let mut slot = ledger();
@@ -821,9 +815,9 @@ fn panic_flush_inner() -> PanicFlushOutcome {
                 report.members_written.len()
             ),
         },
-        // R-TRIG-1: the session thread holds the commit lock (a panic *inside* a
-        // commit). Blocking here would deadlock the hook against the thread that
-        // is unwinding, so the flush degrades honestly: the last committed bundle
+        // The session thread holds the commit lock (a panic *inside* a commit).
+        // Blocking here would deadlock the hook against the thread that is
+        // unwinding, so the flush degrades honestly: the last committed bundle
         // survives with `inProgress`, and the next boot infers the hard kill.
         Err(CommitError::Locked) => fail(format!(
             "the session commit lock was already held while the panic was unwinding, so {} was \
@@ -839,8 +833,8 @@ fn panic_flush_inner() -> PanicFlushOutcome {
 }
 
 /// Rebuild the payload the panic hook re-commits **from the commit cache alone**
-/// (flow §1.8: global state only). A member that will not deserialize is reported,
-/// not swallowed: the flush then writes nothing rather than a manifest that lists
+/// (global state only). A member that will not deserialize is reported, not
+/// swallowed: the flush then writes nothing rather than a manifest that lists
 /// members it cannot vouch for.
 fn payload_from_last_commit(
     last: &crate::session::commit::LastCommit,
@@ -850,8 +844,8 @@ fn payload_from_last_commit(
     let mut workers: Vec<WorkerSection> = Vec::new();
     for (rel_path, (_, _, bytes)) in &last.members {
         // The cached bytes are the whole member **file** — header frame plus
-        // section, exactly what `write_file_atomic` was handed (F1) — so the
-        // frame is parsed and its section unwrapped, the same way
+        // section, exactly what `write_file_atomic` was handed — so the frame is
+        // parsed and its section unwrapped, the same way
         // `session::restore::parse_member` reads the file back off disk.
         if rel_path == crate::session::MANAGER_FILE {
             let file: crate::session::ManagerFile =
@@ -876,11 +870,11 @@ fn payload_from_last_commit(
     })
 }
 
-/// T-10 step 1 (flow §1.5, t-024): record the ending of a session that is about
-/// to be **deleted** — `/reset` (`Reset`) or a plan archive (`PlanArchived`).
-/// Mandatory and never throttled: a crash between this commit and the sweep must
-/// leave a bundle that says `reset`, not one still claiming `inProgress` (which a
-/// later boot would report as a hard kill that never happened).
+/// T-10 step 1: record the ending of a session that is about to be **deleted** —
+/// `/reset` (`Reset`) or a plan archive (`PlanArchived`). Mandatory and never
+/// throttled: a crash between this commit and the deletion must leave a bundle
+/// that says `reset`, not one still claiming `inProgress` (which a later boot
+/// would report as a hard kill that never happened).
 pub fn mark_ending_commit(
     pump: &mut SessionCommitPump,
     trigger: CommitTrigger,
@@ -891,21 +885,17 @@ pub fn mark_ending_commit(
     pump.request(trigger, ctx, renderer)
 }
 
-/// T-10 step 2 (flow §1.5, A D3/A §3.4): after `Plan::clear()` / `Plan::archive()`
-/// ran their sweep, confirm the bundle really is gone. A plan sweep means "this
-/// session MUST NOT be resurrected", so a bundle the sweep left behind is deleted
-/// here, on the session thread, loudly.
-///
-/// Returns `true` when the bundle is gone. If the delete itself is blocked
-/// (permissions, a busy mount) the surviving bundle is re-marked with the ending
-/// — the "marker file only if deletion is blocked" rule of A §7.4 — and `false`
-/// is returned.
+/// T-10 step 2: after `Plan::clear()` / `Plan::archive()` deleted the plan,
+/// confirm the bundle really is gone — a cleared plan means "this session MUST
+/// NOT be resurrected", so a leftover bundle is deleted here, on the session
+/// thread, loudly. Returns `true` when the bundle is gone; when the delete is
+/// blocked (permissions, a busy mount) the survivor is re-marked with the
+/// ending and `false` is returned.
 ///
 /// The delete, not the marker, is the safety-critical half: `session::restore`
-/// does not refuse a `Reset`-marked bundle (that gate is not in this binary), so a
-/// bundle surviving a plan sweep could be resurrected. That is exactly why
-/// reaching the marker branch is logged at error level rather than treated as a
-/// clean resolution.
+/// does not refuse a `Reset`-marked bundle, so a bundle that survives a reset
+/// could be resurrected — which is why reaching the marker branch is logged at
+/// error level rather than treated as clean.
 pub fn confirm_bundle_swept(
     pump: &mut SessionCommitPump,
     trigger: CommitTrigger,
@@ -936,14 +926,12 @@ pub fn confirm_bundle_swept(
     false
 }
 
-/// T-10 end to end (t-024): one `/reset`. Mark the bundle with `reset`, run the
-/// plan sweep (`Plan::clear()` → `sweep_session_state()`), then confirm the sweep
-/// really deleted the bundle.
-///
-/// The order is the contract: a crash between the mark and the sweep leaves a
-/// bundle that already says `reset` — never one still claiming `inProgress`, which
-/// a later boot would report as a hard kill that never happened. Every `/reset`
-/// call site in the loop goes through here so no site can forget half the pair.
+/// T-10 end to end: one `/reset`. Mark the bundle with `reset`, run the plan
+/// clear (`Plan::clear()` → `sweep_session_state()`), then confirm the bundle
+/// really was deleted. The order is the contract: a crash between the mark and
+/// the delete leaves a bundle that already says `reset` — never one still
+/// claiming `inProgress`, which a later boot would report as a hard kill that
+/// never happened. Every `/reset` call site in the loop goes through here.
 fn handle_reset_command_and_commit(
     pump: &mut SessionCommitPump,
     plan: &crate::manager::phase::Plan,
@@ -958,11 +946,11 @@ fn handle_reset_command_and_commit(
     if let Ok(mut hist) = steering_history.write() {
         hist.clear();
     }
-    // The legacy `.ui_transcript.json` sweep stays: the boot path only NAMES a
-    // leftover legacy journal (`src/session/restore.rs:804`, `no_bundle`) and never
-    // deletes one, so this is the removal that guarantees `/reset` leaves none.
-    // Sourced locally from the plan directory because the journal is no longer
-    // written (and its path is no longer threaded) anywhere in the session loop.
+    // The legacy `.ui_transcript.json` deletion stays: the boot path only NAMES a
+    // leftover legacy journal (`src/session/restore.rs:804`, `no_bundle`) and
+    // never deletes one, so this is the removal that guarantees `/reset` leaves
+    // none. The path is sourced locally from the plan directory because the
+    // session loop never writes that journal.
     let legacy_ui_journal = plan.dir().join(".ui_transcript.json");
     if legacy_ui_journal.is_file() {
         let _ = std::fs::remove_file(&legacy_ui_journal);
@@ -975,11 +963,11 @@ fn handle_reset_command_and_commit(
 /// `archive_plan` → `Plan::archive()` having run during this round (a tool, so it
 /// may have run on another thread; only this thread may commit).
 ///
-/// `/reset` deliberately does not match: `Plan::clear()` deletes the plan *and*
-/// `execution_plan_archive.md` (`src/manager/phase.rs:455-497`), and it is handled
-/// where the user asked for it, in [`handle_reset_command_and_commit`]. The
-/// archive file name is spelled here as it is spelled in `phase.rs` — the plan
-/// module owns it, and this is the only read-side consumer.
+/// `/reset` deliberately does not match: `Plan::clear()` in `phase.rs` deletes
+/// the plan *and* `execution_plan_archive.md`, and it is handled where the user
+/// asked for it, in [`handle_reset_command_and_commit`]. The archive file name is
+/// spelled here as it is spelled in `phase.rs` — the plan module owns it, and
+/// this is the only read-side consumer.
 fn plan_archived_during_round(
     plan: &crate::manager::phase::Plan,
     plan_present_at_round_start: bool,
@@ -1008,53 +996,53 @@ fn decide(decision: CommitDecision) -> CommitDecision {
     decision
 }
 
-/// The transcript half of the three loud destinations A §8.4 requires. Only the
-/// session loop owns a `UiTranscript`, so [`boot`] is handed that journal instead
-/// of owning one: every refusal, repair and loss sentence reaches the panes, the
-/// journaled `UiRecord::Status` and `tracing::warn!`, and none of the three may be
-/// a discarded `let _`.
+/// The transcript half of the three loud destinations a restore must reach. Only
+/// the session loop owns a `UiTranscript`, so [`boot`] is handed that journal
+/// instead of owning one: every refusal, repair and loss sentence reaches the
+/// panes, the journaled `UiRecord::Status` and `tracing::warn!`, and none of the
+/// three may be a discarded `let _`.
 pub struct BootSink<'a> {
     pub ui_transcript: &'a mut UiTranscript,
 }
 
-/// What the one boot pass did (flow §4.9). Nothing here is dropped: the caller
-/// prints it, the panes draw it, the journal records it and the log carries it.
+/// What the one boot pass did. Nothing here is dropped: the caller prints it,
+/// the panes draw it, the journal records it and the log carries it.
 ///
-/// The flow's field set is kept verbatim; the added fields are what lets the
-/// session **continue** from the restored state instead of starting over
-/// (flow §3.4: the goal, the subagent panes, the reconstructed journal).
+/// The field set is kept verbatim; the added fields are what lets the session
+/// **continue** from the restored state instead of starting over: the goal, the
+/// subagent panes, the reconstructed journal.
 #[derive(Debug, Default)]
 pub struct BootReport {
     /// `true` when live state was installed (engine vector, worker registry,
     /// panes). `false` means the pass installed **nothing**: no bundle existed.
     pub restored: bool,
-    /// `true` for `RestoreOutcome::PartiallyRestored` (A D6's one tolerated
+    /// `true` for `RestoreOutcome::PartiallyRestored` (the one tolerated
     /// `Unrecoverable` worker): the run continues, with the losses surfaced.
     pub partial: bool,
     pub manager_messages: usize,
     pub workers_installed: usize,
     pub interrupted_worker_keys: Vec<String>,
     pub side_effect_risk_keys: Vec<String>,
-    /// N-MGR-1, the single synthetic manager notice (flow §2.4).
+    /// N-MGR-1, the single synthetic manager notice.
     pub restore_notice: Option<String>,
     pub ui_restored: bool,
     pub session_id: String,
-    /// The restored pinned goal — `manager.messages[1]` verbatim (REQ-CORE-002).
+    /// The restored pinned goal — `manager.messages[1]` verbatim.
     /// Never re-typed, and `ContextEngine::set_goal` is never called for it.
     pub goal: String,
     pub subagent_panels: Vec<SubagentPanel>,
     pub journal: Vec<UiJournalRecord>,
     pub repair: RepairReport,
     pub unrecoverable_workers: Vec<String>,
-    /// The ending the loader derived for the previous process (A D6: an
+    /// The ending the loader derived for the previous process (an
     /// `InProgress` bundle is *reported* as `HardKillInferred`, never rewritten).
     pub previous_ending: Option<ProcessEnding>,
     /// Sentences naming the searched path and what was found instead, for the
-    /// loud fresh start flow §3.5 requires when there is no bundle.
+    /// loud fresh start required when there is no bundle.
     pub no_bundle_lines: Vec<String>,
 }
 
-/// THE boot function (flow §4.9): one pass, on the session thread, in the fixed
+/// THE boot function: one pass, on the session thread, in the fixed
 /// order `load_bundle` (L0–L9 verify, N0–N6 normalize) → identity floors +
 /// `WORKERS` → the engine → the panes → the loud report → `N-MGR-1`.
 ///
@@ -1068,11 +1056,10 @@ pub struct BootReport {
 /// * [`ContextEngine::install_restored_messages`] / [`ContextEngine::restore_engine_flags`]
 ///   — the wholesale install. **No pin writer runs on this path**: neither
 ///   `set_system_prompt` nor `set_goal` may touch `[0]`/`[1]` of a restored
-///   transcript (A R-PIN-1/R-PIN-2), which is why the resume branch builds its
-///   engine through [`build_restored_context`] instead of
-///   [`build_manager_context`];
+///   transcript, which is why the resume branch builds its engine through
+///   [`build_restored_context`] instead of [`build_manager_context`];
 /// * [`Renderer::restore_panes`] / [`Renderer::announce_restore`] — the pane bytes
-///   are assigned verbatim, never regenerated (A D4/U1).
+///   are assigned verbatim, never regenerated.
 pub fn boot(
     plan: &crate::manager::phase::Plan,
     cfg: &Config,
@@ -1094,7 +1081,7 @@ pub fn boot(
             return Ok(report);
         }
         RestoreOutcome::Refused { refusal, report } => {
-            // Fail-closed (A D6): the bundle was never read into live state, so
+            // Fail-closed: the bundle was never read into live state, so
             // there is nothing to un-install. The refusal is still printed through
             // all three destinations before the typed error carries it out to
             // `main`, which maps it to `session::EXIT_RESTORE_REFUSED` (3).
@@ -1138,7 +1125,7 @@ pub fn boot(
 
     // ---------------------------------------------------------------- 1. floors + WORKERS
     // Before the engine, so no id, `completed_seq` or notice id can be re-issued
-    // under a floor the bundle already spent (A §5.7).
+    // under a floor the bundle already spent.
     let worker_report =
         crate::session::install_restored_workers(&session.workers, &session.identity_floors);
     repair.workers_restored = worker_report.installed;
@@ -1152,7 +1139,7 @@ pub fn boot(
 
     // The capture-side losses are part of the worker sections: the loader cannot
     // read the dead process's notice store, so the boot wiring supplies the
-    // queued-notice count (flow §2.2 step 3) and merges every other recorded loss.
+    // queued-notice count and merges every other recorded loss.
     for section in &session.workers {
         let mut queued = 0usize;
         for notice in &section.non_restorable {
@@ -1170,8 +1157,8 @@ pub fn boot(
             }
         }
     }
-    // Two losses the previous process always takes with it (A §3.11, flow §3.4):
-    // the MCP view is re-advertised, and the intervention counters restart.
+    // Two losses the previous process always takes with it: the MCP view is
+    // re-advertised, and the intervention counters restart.
     push_repair_notice(
         &mut repair,
         NonRestorableNotice {
@@ -1203,8 +1190,8 @@ pub fn boot(
         session.manager.rebirth_advisory_emitted,
         session.manager.consecutive_rebirths,
     );
-    // flow §3.4: the prompt this Config would have composed is deliberately not
-    // installed; the difference is a reported deviation, never a silent re-pin.
+    // The prompt this Config would have composed is deliberately not installed;
+    // the difference is a reported deviation, never a silent re-pin.
     push_repair_warning(
         &mut repair,
         format!(
@@ -1228,12 +1215,12 @@ pub fn boot(
 
     // ---------------------------------------------------------------- 3. the panes
     // Captured BEFORE the assign: the token witnesses compare the stored counters
-    // against the ones THIS process owns, and the streams own those numbers
-    // (A §6.5) — a restore never adopts them.
+    // against the ones THIS process owns, and the streams own those numbers — a
+    // restore never adopts them.
     let live_ui = renderer.capture_ui();
     renderer.restore_panes(&session.ui);
     // A renderer with no pane model gets a no-op `restore_panes`, so the subagent
-    // list is handed through the loop's own channel as well (flow §3.4).
+    // list is handed through the loop's own channel as well.
     let panels: Vec<SubagentDetail> = session
         .ui
         .subagent_panels
@@ -1241,17 +1228,13 @@ pub fn boot(
         .map(subagent_detail_from_panel)
         .collect();
     renderer.set_subagents(panels);
-    // §6.3 / §10.3 (AC-S4): a panel that was showing an in-flight subagent keeps
-    // its byte — `is_active: true` is never flipped (N-R1), because the pane must
-    // keep saying what the screen said. What died with the process is the task
-    // behind it, so the pane gets a `JoinHandle` notice of its own, keyed on the
-    // **panel name**: the worker-key notices from `install_restored_workers` name
-    // the registry entry, never the pane, and a bundle with an active panel and no
-    // worker section at all would otherwise announce nothing about the gone handle.
-    // Folded in BEFORE `announce_restore` so this loss reaches the same three
-    // destinations as every other one (panes, journaled `UiRecord::Status`,
-    // `tracing::warn!` via the announced report) and lands in
-    // `BootReport::repair.notices`.
+    // A panel that was showing an in-flight subagent keeps its byte:
+    // `is_active: true` is never flipped — the pane must keep saying what the
+    // screen said. What died with the process is the task behind it, so the pane
+    // gets a `JoinHandle` notice of its own keyed on the **panel name**: the
+    // worker-key notices from `install_restored_workers` name the registry entry,
+    // never the pane. Folded in BEFORE `announce_restore` so the loss reaches the
+    // panes, the journal and the log, and lands in `BootReport::repair.notices`.
     for panel in &session.ui.subagent_panels {
         if !panel.is_active {
             continue;
@@ -1272,16 +1255,13 @@ pub fn boot(
             },
         );
     }
-    // §6.6 I-U6 / §9.6 AC-C3 branch 2: a restored scroll offset that the live
-    // clamp moved is only legal when a `warnings` entry names the offset AND
-    // both values. This capture is taken AFTER `restore_panes` (whose last step
-    // is `clamp_scrolls`, `ui/tui/events.rs:465-481`) and after `set_subagents`
-    // (which re-clamps `selected_subagent_idx`, `ui/tui/mod.rs:1066-1068`), so
-    // the sentence names the number the panes actually ended on. Folded BEFORE
-    // `announce_restore` — the opposite of the token witnesses, which
-    // `restore_panes` draws itself — because nothing on the renderer side says
-    // this one: `announce_restore` is what puts it in the panes and the log, so
-    // a moved offset is stated exactly once.
+    // A restored scroll offset that the live clamp moved is only legal when a
+    // `warnings` entry names the offset AND both values. This capture is taken
+    // AFTER `restore_panes` (last step `clamp_scrolls`,
+    // `ui/tui/events.rs:465-481`) and after `set_subagents` (re-clamps
+    // `selected_subagent_idx`, `ui/tui/mod.rs:1066-1068`), so the sentence names
+    // the number the panes ended on. Folded BEFORE `announce_restore`, which is
+    // what puts it in the panes and the log — stated exactly once.
     let restored_ui = renderer.capture_ui();
     for warning in scroll_clamp_warnings(&session.ui, &restored_ui) {
         tracing::warn!("session restore (ui.json): {warning}");
@@ -1301,9 +1281,8 @@ pub fn boot(
     let ui_restored = !session.ui.chat_messages.is_empty() || !session.ui.journal.is_empty();
 
     // The report, journaled (the third destination; the panes were served by
-    // `announce_restore`), and the legacy `.ui_transcript.json` re-seeded from the
-    // restored journal so the session's own visible history continues rather than
-    // starting blank (t-013 deletes this legacy path).
+    // `announce_restore`), and the visible history re-seeded from the restored
+    // journal so the session continues rather than starting blank.
     seed_restored_transcript(sink, &session.ui.journal);
     let summary = format!(
         "Session restored (session id {}, previous ending {:?}): {} manager message(s), {} \
@@ -1339,8 +1318,8 @@ pub fn boot(
     renderer.on_event(&Event::Status(summary));
 
     // ---------------------------------------------------------------- 4. N-MGR-1 last
-    // After the normalized vector and before any new user input (A R-PIN-3): the
-    // manager is told once, in one message, what is interrupted and what is lost.
+    // After the normalized vector and before any new user input: the manager is
+    // told once, in one message, what is interrupted and what is lost.
     *session_id = session.session_id.clone();
     let notice = crate::session::restore_notice(
         session_id,
@@ -1377,9 +1356,9 @@ pub fn boot(
     })
 }
 
-/// The `--resume` gate (flow §3.3–§3.5). `Ok(None)` means the session continues as
+/// The `--resume` decision point. `Ok(None)` means the session continues as
 /// a fresh run — either nothing asked for a restore, or `--resume` was asked and
-/// there is no bundle, which flow §3.5 answers with a **loud** fresh start (exit
+/// there is no bundle, which is answered with a **loud** fresh start (exit
 /// `0`). `Err(RestoreRefused)` is the hard stop (exit `EXIT_RESTORE_REFUSED`).
 ///
 /// **Caller contract:** `Ok(None)` while a resume was asked means the resume-branch
@@ -1410,16 +1389,16 @@ pub fn boot_if_requested(
 
 /// The engine for a **restored** session: constructed exactly like
 /// [`build_manager_context`] — real budgets, and the live advertised tool list
-/// charged to the budget (gate t-064) — but with **no** `set_system_prompt`. The
-/// restored vector arrives wholesale through
-/// [`ContextEngine::install_restored_messages`] (flow §3.4, A R-PIN-2).
+/// charged to the budget — but with **no** `set_system_prompt`. The restored
+/// vector arrives wholesale through
+/// [`ContextEngine::install_restored_messages`].
 pub fn build_restored_context(cfg: &Config) -> ContextEngine {
     let mut ctx = ContextEngine::new(cfg.max_context_tokens);
     sync_manager_tool_schema(&mut ctx, cfg);
     ctx
 }
 
-/// L0 with a voice (flow §3.5): "no bundle" is a normal outcome, never silent.
+/// L0 with a voice: "no bundle" is a normal outcome, never silent.
 fn no_bundle_report(
     bundle: &std::path::Path,
     legacy_journals: &[std::path::PathBuf],
@@ -1455,8 +1434,8 @@ fn no_bundle_report(
     }
 }
 
-/// Union of `NonRestorableNotice`s, deduplicated by `(kind, subject)` (A §11.3
-/// rule 1). `RepairReport` is a durable type owned by `session::format` and has no
+/// Union of `NonRestorableNotice`s, deduplicated by `(kind, subject)`.
+/// `RepairReport` is a durable type owned by `session::format` and has no
 /// push helper, so the union rule lives with the wiring that performs the union.
 fn push_repair_notice(report: &mut RepairReport, notice: NonRestorableNotice) {
     let key = notice.dedup_key();
@@ -1483,8 +1462,7 @@ fn surface_restore_lines(renderer: &mut dyn Renderer, sink: &mut BootSink<'_>, l
 }
 
 /// The journaled half: one `UiRecord::Status` per sentence. The journal stays in
-/// memory — the session bundle's `ui` member is the only durable UI state
-/// (t-025a removed the superseded `.ui_transcript.json` writes).
+/// memory — the session bundle's `ui` member is the only durable UI state.
 fn journal_restore_lines(sink: &mut BootSink<'_>, lines: &[String]) {
     for line in lines {
         sink.ui_transcript
@@ -1493,8 +1471,8 @@ fn journal_restore_lines(sink: &mut BootSink<'_>, lines: &[String]) {
 }
 
 /// Seed the live in-memory `UiTranscript` from the restored `UiSection` journal
-/// (A §6.4's 1:1 mirror), so a resumed session keeps its visible chat history;
-/// the bundle's `ui` member is what persists that journal from here on (t-025a).
+/// (1:1 mirror), so a resumed session keeps its visible chat history; the
+/// bundle's `ui` member is what persists that journal from here on.
 fn seed_restored_transcript(sink: &mut BootSink<'_>, journal: &[UiJournalRecord]) {
     for record in journal_records(journal) {
         sink.ui_transcript.append(record);
@@ -1502,7 +1480,7 @@ fn seed_restored_transcript(sink: &mut BootSink<'_>, journal: &[UiJournalRecord]
 }
 
 /// `UiJournalRecord` → `UiRecord`: the two enums are the same closed set of eight
-/// variants by construction (A §6.4), so this is a rename, not a re-derivation.
+/// variants by construction, so this is a rename, not a re-derivation.
 fn journal_records(journal: &[UiJournalRecord]) -> Vec<UiRecord> {
     journal
         .iter()
@@ -1560,11 +1538,10 @@ fn token_witness_warnings(stored: &UiSection, live: &UiSection) -> Vec<String> {
 
 /// The scroll-clamp comparison folded into `RepairReport::warnings` at boot,
 /// reached through the single shared sentence builder
-/// `crate::ui::tui::clamp_warning_sentences` so the report, the `tracing::warn!`
-/// and the pane line drawn by `announce_restore` say the same thing word for
+/// `crate::ui::tui::clamp_warning_sentences` so the report, the
+/// `tracing::warn!` and the pane line from `announce_restore` match word for
 /// word. Unlike the token witnesses, `live` is captured AFTER the restore: the
-/// restore's own `clamp_scrolls()` and `set_subagents`' selection clamp are
-/// exactly what moved these numbers (§6.6 I-U6, §9.6 AC-C3 branch 2).
+/// restore's own clamping is exactly what moved these numbers.
 fn scroll_clamp_warnings(stored: &UiSection, live: &UiSection) -> Vec<String> {
     crate::ui::tui::clamp_warning_sentences(&[
         (
@@ -1597,9 +1574,9 @@ fn scroll_clamp_warnings(stored: &UiSection, live: &UiSection) -> Vec<String> {
 
 /// The inverse projection of [`SubagentPanel`] into the loop's own
 /// [`SubagentDetail`] model. Mirrors `ui::tui::subagent_detail_from_panel`
-/// (`ui/tui/mod.rs:1489`), which is private to a file this task does not own: the
-/// session loop needs the same projection because its `subagents` vector is the
-/// authority the next frame is built from (flow §3.4).
+/// (`ui/tui/mod.rs:1489`), which is private to that file: the session loop
+/// needs the same projection because its `subagents` vector is the authority
+/// the next frame is built from.
 fn subagent_detail_from_panel(panel: &SubagentPanel) -> SubagentDetail {
     SubagentDetail {
         name: panel.name.clone(),
@@ -1663,12 +1640,10 @@ pub async fn run_session_with_bounds(
 }
 
 /// [`run_session_with_bounds`] plus a machine-readable account of **why** the
-/// session stopped (t-074).
+/// session stopped.
 ///
-/// A session that ran out of turns used to be indistinguishable from one that
-/// finished its work: the turn-cap exit emitted nothing at all. Every bound exit
-/// now carries a [`BoundStopReason`], which is both shown through the session's
-/// status channel and returned here, so a caller or a session summary can say
+/// Every bound exit carries a [`BoundStopReason`], shown through the session's
+/// status channel and returned here, so a caller can say
 /// `report.turn_cap_reached()` instead of guessing from a silent stop.
 pub async fn run_session_with_bounds_report(
     cfg: &Config,
@@ -1684,30 +1659,31 @@ pub async fn run_session_with_bounds_report(
 
     let plan = manager.as_ref().map(|m| m.plan.clone()).unwrap_or_default();
 
-    // t-057: the plan gate is fail-closed and also reports a plan-integrity
-    // warning. The prompt (and `tracing::warn!`) alone is not enough — the user
-    // must see it too, so the warning is captured here and surfaced through the
-    // session's existing warning channel once the transcript exists below.
+    // The plan check is fail-closed and also reports a plan-integrity warning.
+    // The prompt (and `tracing::warn!`) alone is not enough — the user must see
+    // it too, so the warning is captured here and surfaced through the session's
+    // existing warning channel once the transcript exists below.
     let (system, plan_warning) = load_system_prompt_with_plan_and_warning(cfg, &plan)?;
-    // Gate t-064 (offender E): the live Manager engine is built with the exact
-    // advertised tool list charged to the budget, so `should_compact()` measures
-    // the request that is really sent (transcript **+** tool schemas).
+    // The live Manager engine is built with the exact advertised tool list
+    // charged to the budget, so `should_compact()` measures the request that is
+    // really sent (transcript **+** tool schemas).
     //
-    // t-012 (flow §3.3/§3.4): the resume trigger is resolved here because it
-    // decides **how** the engine is built. On the resume branch the engine is
-    // still constructed — same budgets, same live tool-schema charge — but no
-    // prompt is installed: `set_system_prompt` inside [`build_manager_context`]
-    // is one of the two writers that would overwrite a restored pin (A R-PIN-2),
-    // and the boot pass below installs the restored vector wholesale instead.
-    // The prompt is still *composed* here because the plan-gate warning half of
-    // [`load_system_prompt_with_plan_and_warning`] is unchanged for a resume, and
-    // the difference between the composed bytes and the restored `[0]` is reported
-    // as a `RepairReport::warnings` entry by the boot pass, never applied.
+    // The resume trigger is resolved here because it decides **how** the engine
+    // is built. On the resume branch the engine is still constructed — same
+    // budgets, same live tool-schema charge — but no prompt is installed:
+    // `set_system_prompt` inside [`build_manager_context`] is one of the two
+    // writers that would overwrite a restored pin, and the boot pass below
+    // installs the restored vector wholesale instead.
+    // The prompt is still *composed* here because the plan-integrity warning
+    // half of [`load_system_prompt_with_plan_and_warning`] is unchanged for a
+    // resume, and the difference between the composed bytes and the restored
+    // `[0]` is reported as a `RepairReport::warnings` entry by the boot pass,
+    // never applied.
     //
     // **The resume branch must never be the only answer to a resume.** When the
-    // boot pass finds no bundle (flow §3.5's loud fresh start) it installs
+    // boot pass finds no bundle — the loud fresh start — it installs
     // nothing, and an engine with no `[0]` would let the `ctx.set_goal` below pad
-    // `messages[0]` with an **empty** `System` (`manager/context.rs:697-706`) —
+    // `messages[0]` with an **empty** `System` (`ContextEngine::set_goal`) —
     // the Manager would then run a whole session with no system prompt. The
     // composed prompt is therefore installed right after the boot pass, in exactly
     // the order a fresh boot installs it, so `--resume` / `MARMEL_RESUME=1` /
@@ -1739,33 +1715,31 @@ pub async fn run_session_with_bounds_report(
 
     let mut ui_transcript = UiTranscript::new();
 
-    // t-057: an UNKNOWN plan state (unreadable / unparseable plan file) must reach
-    // the user, not only the model. Same channel as every other plan-integrity
-    // warning in this loop: a renderer `Status` event plus a `Status` record in the
-    // UI transcript, via the session's single surfacing helper.
+    // An UNKNOWN plan state (unreadable / unparseable plan file) must reach the
+    // user, not only the model. Same channel as every other plan-integrity
+    // warning in this loop: a renderer `Status` event plus a `Status` record in
+    // the UI transcript, via the session's single surfacing helper.
     if let Some(warning) = plan_warning {
         surface_plan_warning(&mut *renderer, &mut ui_transcript, warning);
     }
 
-    // t-012 (flow §4.9): THE single restore pass, and the only place in the crate
-    // where a session bundle is read into live state. The position is load-bearing:
-    // the `Plan` exists (the bundle hangs off it), the transcript paths exist, and
+    // THE single restore pass, and the only place in the crate where a session
+    // bundle is read into live state. The position is load-bearing: the `Plan`
+    // exists (the bundle hangs off it), the transcript paths exist, and
     // the boot pass runs **before** the manager loop, before `subagents` is seeded,
     // and before any pin writer — the resume branch above already skipped
-    // `set_system_prompt`, and `set_goal` further down is skipped too, so the two
-    // clobber sites that used to follow every boot (`build_manager_context` and
-    // `ctx.set_goal`) cannot overwrite the restored pins (A R-PIN-1).
+    // `set_system_prompt`, and `set_goal` further down is skipped too, so neither
+    // `build_manager_context` nor `ctx.set_goal` can overwrite the restored pins.
     //
-    // One pass, fixed order. **Order note for the reviewer:** the task brief lists
-    // `load_bundle` → manager context → workers → panes → announce, while flow §4
-    // (`docs/design_session_restore_flow.md:902-903`) fixes the order as
-    // `verify (L0-L7) → normalize (L8) → floors → install WORKERS → install the
-    // engine → restore the panes → append N-MGR-1`, and the loader/installer that
-    // t-010 shipped implement exactly that (floors first, so no id/seq/notice can
-    // be re-issued below a floor *while* the registry is being rebuilt — A §5.7).
-    // This pass follows the flow §4 order, which is the superset constraint: the
-    // engine install is still the step that owns the transcript, and no worker can
-    // touch the engine before it exists, so the two orders differ only in that the
+    // One pass, fixed order. **Order note for the reviewer:** the short order
+    // `load_bundle` → manager context → workers → panes → announce is a subset of
+    // the order fixed here: `verify (L0-L7) → normalize (L8) → floors → install
+    // WORKERS → install the engine → restore the panes → append N-MGR-1`, and the
+    // loader/installer implements exactly that (floors first, so no id/seq/notice
+    // can be re-issued below a floor *while* the registry is being rebuilt). This
+    // pass follows that order, which is the superset constraint: the engine
+    // install is still the step that owns the transcript, and no worker can touch
+    // the engine before it exists, so the two orders differ only in that the
     // floors are raised before the engine vector is swapped — never in what is
     // installed or in what the Manager is finally shown.
     let mut session_id = String::new();
@@ -1787,48 +1761,40 @@ pub async fn run_session_with_bounds_report(
         Ok(report) => report,
         Err(refused) => {
             // A refusal installed **nothing**: `load_bundle` is fail-closed and
-            // never touched live state, so there is nothing half-installed to roll
-            // back. It is never papered over by starting a fresh session under a
-            // flag that asked for the old one (flow §3.5) either — `boot` already
-            // printed `refusal.display(bundle)`, the repair notices and the
-            // warnings through the renderer, the journaled `UiRecord::Status` and
-            // `tracing::warn!`, and this typed error is what `main` maps onto
+            // never touched live state, so there is nothing to roll back, and a
+            // refusal is never papered over by a fresh session under a flag that
+            // asked for the old one: `boot` already printed the refusal, notices
+            // and warnings (renderer, journaled `UiRecord::Status`,
+            // `tracing::warn!`), and `main` maps this error onto
             // `session::EXIT_RESTORE_REFUSED` (3) after its teardown.
             return Err(anyhow::Error::new(refused));
         }
     };
 
-    // Flow §3.5's loud fresh start re-joins the **fresh** engine contract, and the
-    // resume branch above built the engine *without* a system prompt on purpose (so
-    // a real restore never routes through a pin setter, A R-PIN-2). A real restore
-    // installs `[0]`/`[1]` verbatim; a **loud fresh start** installed nothing, and
-    // an empty engine would let the `ctx.set_goal` below pad `messages[0]` with an
-    // empty `Message::System` (`manager/context.rs:697-706`) — i.e. the Manager
-    // would run the whole session with no system prompt at all. So the composed
-    // prompt is installed here, in the same order a fresh boot installs it
-    // (`build_manager_context` → `set_system_prompt`, then `set_goal`). This is not
-    // the skipped clobber writer: there is no restored pin to overwrite, and
-    // `boot.is_some()` means bytes were restored, in which case this must stay a
-    // no-op (A R-PIN-1).
+    // A loud fresh start re-joins the **fresh** engine contract: the resume branch
+    // built the engine *without* a system prompt on purpose (a real restore must
+    // not route through a pin setter). An empty engine would let the
+    // `ctx.set_goal` below pad `messages[0]` with an empty `Message::System`
+    // (`ContextEngine::set_goal`), so the composed prompt is installed here in
+    // the fresh-boot order. With `boot.is_some()` bytes were restored: no-op.
     if resume && boot.is_none() {
         ctx.set_system_prompt(system.clone());
     }
 
-    // t-023 (flow §1.1): the ONE committer of this session. Built after the boot
-    // pass — so a resumed session keeps the restored `session_id` and its L4/L5
-    // cross-checks keep working — and before the turn loop, so every trigger
-    // below is served by the single writer the thread model allows (R-TRIG-0).
-    // `session_enabled = false` leaves it inert: requests are counted, nothing is
-    // ever written.
+    // The ONE committer of this session. Built after the boot pass — so a resumed
+    // session keeps the restored `session_id` and its L4/L5 cross-checks keep
+    // working — and before the turn loop, so every trigger below is served by the
+    // single writer the thread model allows. `session_enabled = false` leaves it
+    // inert: requests are counted, nothing is ever written.
     let mut commit_pump = SessionCommitPump::new(&plan, cfg, &session_id);
 
     let mut steer_queue = Vec::<String>::new();
     let mut steer_abort_requested = false;
-    // t-012 (flow §3.4): a resumed session adopts the restored subagent panes as
-    // the loop's authoritative list instead of starting from an empty one, so the
-    // subagent panes and the status line keep showing the interrupted delegations.
-    // Those delegations are open in the worker registry and were **not**
-    // relaunched (policy P-R1): the manager is told by N-MGR-1 and decides.
+    // A resumed session adopts the restored subagent panes as the loop's
+    // authoritative list instead of starting from an empty one, so the subagent
+    // panes and the status line keep showing the interrupted delegations. Those
+    // delegations are open in the worker registry and were **not** relaunched:
+    // the manager is told by N-MGR-1 and decides.
     let mut subagents: Vec<SubagentDetail> = boot
         .as_ref()
         .map(|boot| {
@@ -1839,9 +1805,8 @@ pub async fn run_session_with_bounds_report(
         })
         .unwrap_or_default();
 
-    // H5 execution bounds, alive for the whole session (not per request):
-    //  * `watchdog` — the per-turn wall-clock bound, re-armed at every turn
-    //    (REQ-LOOP-002 wall-clock half),
+    // Execution bounds, alive for the whole session (not per request):
+    //  * `watchdog` — the per-turn wall-clock bound, re-armed at every turn,
     //  * `failures` — repeated-failure accounting keyed by plan task id (or by
     //    tool signature for direct tool calls).
     let mut watchdog = TurnWatchdog::new(bounds.turn_idle, bounds.turn_hard_cap);
@@ -1860,14 +1825,13 @@ pub async fn run_session_with_bounds_report(
         Some(&mut ui_transcript),
     );
 
-    // t-012 (flow §3.4): a resumed session already owns its goal — it is
-    // `messages[1]` of the restored vector, verbatim (REQ-CORE-002) — so the
-    // interactive prompt below is skipped on that branch: its early exits
-    // (`return Ok(SessionStopReport::default())`) would end a resumed session
-    // before its first turn, and a re-typed goal would re-write the pinned slot.
-    // The positional `PROMPT` of a `--resume` run is set aside first, because the
-    // goal match below moves `initial`: on a resume it becomes an ordinary user
-    // message *after* N-MGR-1 and must never become `messages[1]`.
+    // A resumed session already owns its goal — it is `messages[1]` of the
+    // restored vector, verbatim — so the interactive prompt below is skipped on
+    // that branch: its early exits (`return Ok(SessionStopReport::default())`)
+    // would end a resumed session before its first turn, and a re-typed goal
+    // would re-write the pinned slot. The positional `PROMPT` of a `--resume`
+    // run is set aside first: on a resume it becomes an ordinary user message
+    // *after* N-MGR-1 and must never become `messages[1]`.
     let resume_prompt = boot.as_ref().and_then(|_| initial.clone());
     let goal = match boot.as_ref().map(|boot| boot.goal.clone()) {
         Some(goal) => {
@@ -1884,12 +1848,12 @@ pub async fn run_session_with_bounds_report(
                     Some(line) => {
                         if is_abort_command(&line) {
                             crate::debug_log::log_user_input("command", &line);
-                            // t-024 (flow §1.9): an abort here is still an exit path and gets a
-                            // mandatory ending commit — but only if THIS run already wrote the
-                            // bundle. Marking unconditionally would stamp a previous run's bundle
-                            // (the one a `--resume` boot reads) with an empty transcript and a
-                            // `userAbort` ending this run never earned; leaving it alone keeps its
-                            // own ending honest (an `inProgress` there is a real hard kill).
+                            // An abort here is still an exit path and gets a mandatory ending
+                            // commit — but only if THIS run already wrote the bundle. Marking it
+                            // unconditionally would stamp a previous run's bundle (the one a
+                            // `--resume` boot reads) with an empty transcript and a `userAbort`
+                            // ending this run never earned; leaving it alone keeps its own
+                            // ending honest (an `inProgress` there is a real hard kill).
                             if commit_pump.has_committed() {
                                 capture_and_request(
                                     &mut commit_pump,
@@ -1945,16 +1909,16 @@ pub async fn run_session_with_bounds_report(
         ui_transcript.append(UiRecord::User { text: goal.clone() });
     }
 
-    // t-074: every bound exit is collected here so the caller gets the same
-    // distinction the operator gets on screen — a turn-cap stop is recorded and
-    // reportable, never conflated with a clean finish.
+    // Every bound exit is collected here so the caller gets the same distinction
+    // the operator gets on screen — a turn-cap stop is recorded and reportable,
+    // never conflated with a clean finish.
     let mut session_stops: Vec<BoundStopReason> = Vec::new();
 
     crate::orchestrator::reset_cancellation();
 
-    // t-024 (flow §1.9): remember whether this round started with a plan file, so
-    // an archive that lands mid-round is detectable at the round boundary (only
-    // this thread may write the bundle — design R-TRIG-0).
+    // Remember whether this round started with a plan file, so an archive that
+    // lands mid-round is detectable at the round boundary (only this thread may
+    // write the bundle).
     let mut plan_present_at_round_start = plan.exists();
 
     while !renderer.aborted() {
@@ -2043,24 +2007,19 @@ pub async fn run_session_with_bounds_report(
         loop {
             turn_count += 1;
 
-            // T-5 (flow §1.1): a worker started / completed / failed / was
-            // preempted since this was last checked. The flag is set from
+            // T-5: a worker started / completed / failed / was preempted since
+            // this was last checked. The flag is set from
             // `orchestrator::workers`, possibly on a worker thread — harvesting
-            // and writing happen HERE, on the session thread (R-TRIG-0).
+            // and writing happen HERE, on the session thread.
             if take_worker_lifecycle_edge() {
                 commit_pump.request(CommitTrigger::WorkerEdge, &ctx, &*renderer);
             }
 
-            // t-074 (residual defect 2 of the manager-cluster gate t-067, live
-            // analogue of recon finding M2): this exit used to break silently.
-            // The operator saw a session stop responding after `MAX_TURNS` turns
-            // with no status line, no journal record and nothing that separated
-            // it from a normal end-of-turn finish. The reason is recorded here —
-            // at the identical break point — and surfaced by the machinery the
-            // wall-clock exits already use (after this loop): `tracing::warn!`,
-            // a renderer `Message` + `Status` event, a matching `Status` record
-            // in the UI transcript, and the machine-readable code the session
-            // report returns.
+            // The turn-cap exit is recorded at the identical break point and
+            // surfaced by the machinery the wall-clock exits already use (after
+            // this loop): `tracing::warn!`, a renderer `Message` + `Status` event,
+            // a matching `Status` record in the UI transcript, and the
+            // machine-readable code the session report returns.
             if turn_count > crate::manager::r#loop::MAX_TURNS {
                 let reason = BoundStopReason::TurnCap {
                     limit: crate::manager::r#loop::MAX_TURNS,
@@ -2073,13 +2032,13 @@ pub async fn run_session_with_bounds_report(
                     "turn budget exhausted: {}",
                     reason.text()
                 );
-                // t-063 invariant: this break happens at the **top** of the loop,
-                // so it never passes the round-boundary repair below. The
-                // transcript is already repaired by the previous round's
-                // boundary, but the invariant is asserted here as well
-                // (idempotent, and only surfaced if it actually changed
-                // something), so a capped finish always leaves a valid chat
-                // sequence on disk and on the next request.
+                // This break happens at the **top** of the loop, so it never
+                // passes the round-boundary repair below. The transcript is
+                // already repaired by the previous round's boundary, but the
+                // invariant is asserted here as well (idempotent, and only
+                // surfaced if it actually changed something), so a capped finish
+                // always leaves a valid chat sequence on disk and on the next
+                // request.
                 ensure_pairing_at_boundary(
                     "before turn-budget exit",
                     &mut ctx,
@@ -2100,15 +2059,14 @@ pub async fn run_session_with_bounds_report(
                 break;
             }
             if renderer.aborted() || renderer.user_exit_requested() {
-                // T-6 (flow §1.6.4, t-024): the abort commit must land BEFORE the
-                // `break`, while the round's facts and a live renderer are still
-                // reachable — this is the last bundle a session that the user
-                // stopped ever has to write, so it is mandatory and never
-                // throttled.
+                // The abort commit must land BEFORE the `break`, while the round's
+                // facts and a live renderer are still reachable — this is the last
+                // bundle a session the user stopped ever has to write, so it is
+                // mandatory and never throttled.
                 capture_and_request(&mut commit_pump, CommitTrigger::UserAbort, &ctx, &*renderer);
                 break;
             }
-            // REQ-LOOP-002 (wall-clock half): bound ONE turn of the request.
+            // Bound ONE turn of the request on the wall clock.
             watchdog.rearm();
 
             // Status traffic from live workers/specialists is forward progress:
@@ -2138,11 +2096,10 @@ pub async fn run_session_with_bounds_report(
                 ctx.append(Message::User { content: steer });
             }
 
-            // Gate t-064 (offender E): re-price the advertised tool schema before
-            // every budget decision. The advertised Manager list is not static
-            // (MCP servers boot lazily / reconnect and the MCP view is
-            // policy-filtered per request), so a one-time charge could compact
-            // against a schema list the wire no longer carries.
+            // Re-price the advertised tool schema before every budget decision. The
+            // advertised Manager list is not static (MCP servers boot lazily /
+            // reconnect and the MCP view is policy-filtered per request), so a
+            // one-time charge could compact against a stale schema list.
             sync_manager_tool_schema(&mut ctx, cfg);
             if ctx.should_compact() {
                 let outcome = ctx.compact();
@@ -2160,12 +2117,12 @@ pub async fn run_session_with_bounds_report(
             renderer.on_event(&Event::Status(format!("Running ({})", stream_cfg.model)));
             renderer.flush()?;
 
-            // t-063 (manager gate item B): this is the exact line that turns the
-            // transcript into the next provider request, so the tool-call pairing
-            // invariant is enforced here as well — one idempotent call, with the
-            // grammar owned by `context.rs`. A repair here means some earlier path
-            // ended a turn with an assistant `tool_calls` entry and no result for
-            // it; it is surfaced instead of silently rewritten.
+            // This is the exact line that turns the transcript into the next
+            // provider request, so the tool-call pairing invariant is enforced here
+            // as well — one idempotent call, grammar owned by `context.rs`. A
+            // repair here means some earlier path ended a turn with an assistant
+            // `tool_calls` entry and no result for it; it is surfaced instead of
+            // silently rewritten.
             ensure_pairing_at_boundary(
                 "before request",
                 &mut ctx,
@@ -2188,11 +2145,10 @@ pub async fn run_session_with_bounds_report(
                 ctx: Some(&mut ctx),
                 steering_history: Some(Arc::clone(&steering_history)),
             };
-            // REQ-LOOP-002 (wall-clock half): no await in the live loop may be
-            // unbounded. A single backend call is bounded by the absolute
-            // per-turn cap (`src/llm/client.rs` caps one stream at
-            // `OVERALL_READ_TIMEOUT_SECS`; this cap is the backstop for a turn
-            // that keeps re-entering the backend, and it makes an endless turn
+            // No await in the live loop may be unbounded. A single backend call is
+            // bounded by the absolute per-turn cap (`src/llm/client.rs` caps one
+            // stream at `OVERALL_READ_TIMEOUT_SECS`; this cap is the backstop for a
+            // turn that keeps re-entering the backend, and it makes an endless turn
             // impossible). On expiry: cancel in-flight work through the same
             // plumbing the abort paths use, and say why.
             let llm_budget = watchdog.time_to_hard_limit();
@@ -2321,9 +2277,9 @@ pub async fn run_session_with_bounds_report(
 
             if tool_calls.is_empty() {
                 let current_plan = manager.as_ref().map(|m| m.plan.clone()).unwrap_or_default();
-                // t-035a: read the plan fail-closed. A plan that cannot be read
-                // or parsed is shown to the user through the warning channel
-                // instead of being reported as "no pending work" (M8).
+                // Read the plan fail-closed. A plan that cannot be read or parsed
+                // is shown to the user through the warning channel instead of being
+                // reported as "no pending work".
                 let pending = match read_plan_gate(&current_plan) {
                     PlanGate::Read { pending, .. } => pending,
                     PlanGate::Unknown { warning } => {
@@ -2364,7 +2320,7 @@ pub async fn run_session_with_bounds_report(
                 ctx.reset_consecutive_rebirths();
                 let mut handles = Vec::new();
                 // Aligned index-for-index with `handles`: which unit of work each
-                // joined result belongs to (H5 failure budget).
+                // joined result belongs to (failure budget).
                 let mut failure_keys: Vec<String> = Vec::new();
                 for call in &tool_calls {
                     let name = call.function.name.clone();
@@ -2390,8 +2346,8 @@ pub async fn run_session_with_bounds_report(
                         None
                     };
 
-                    // H5 failure budget: one identity per repeated unit of work —
-                    // the plan task id for delegations, the tool signature for
+                    // Failure budget: one identity per repeated unit of work — the
+                    // plan task id for delegations, the tool signature for
                     // everything else.
                     let failure_key = failure_key_for(&name, &args_val, delegated_task.as_deref());
                     failure_keys.push(failure_key.clone());
@@ -2439,7 +2395,7 @@ pub async fn run_session_with_bounds_report(
                         continue;
                     }
 
-                    // H5 repeated-failure budget: once the same unit of work has
+                    // Repeated-failure budget: once the same unit of work has
                     // failed `threshold` times in this session, do not dispatch it
                     // again. The refusal is reported as a normal tool error so the
                     // model sees the escalation instead of an endless retry loop.
@@ -2511,33 +2467,26 @@ pub async fn run_session_with_bounds_report(
                     });
                     handles.push(handle);
                 }
-                // H2 (live hard-error path): a failing flush here propagates out of
-                // `run_session`. The round has just been fanned out, so every handle
-                // in `handles` is still in flight; abandoning them via `?` would
-                // detach them and let delegated/parallel work keep running (and keep
-                // its PTY process groups alive) after the session aborted. Cancel
-                // through the same plumbing the abort paths use (`cancel_all` ->
-                // global token, which `src/harness/pty.rs` polls to SIGKILL process
-                // groups, plus `cancel_all_active_workers` for every registered
-                // specialist) and abort the handles we still own.
+                // A failing flush here propagates out of `run_session`. The round
+                // has just been fanned out, so every handle in `handles` is still
+                // in flight: `?` would detach them and let delegated/parallel work
+                // (and its PTY process groups) keep running after the session
+                // aborted. Cancel through the same plumbing the abort paths use
+                // (`cancel_all` -> global token, which `src/harness/pty.rs` polls
+                // to SIGKILL process groups, plus `cancel_all_active_workers`) and
+                // abort the handles we still own.
                 if let Err(e) = renderer.flush() {
                     crate::orchestrator::cancel_all();
                     for handle in handles.iter() {
                         handle.abort();
                     }
-                    // t-063: this round has been fanned out but never joined, so
-                    // the assistant `tool_calls` already in the transcript have no
-                    // results at all. The hard error ends the session, but the
-                    // manager state is captured turn by turn and a rehydration would
-                    // install the newest capture — close the invariant and record it
-                    // before leaving.
-                    //
-                    // t-024: "record it" is now a REAL commit, not a mirror. A flush
-                    // failure ends the session HERE, so the loop tail (T-9) never
-                    // runs and this is the last chance the round has to reach disk.
-                    // The ending stays `inProgress`: no terminal marker was reached,
-                    // so a later boot infers the death (`HardKillInferred`) instead of
-                    // being told this exit was clean.
+                    // This round has been fanned out but never joined, so the
+                    // assistant `tool_calls` in the transcript have no results. A
+                    // rehydration installs the newest manager capture, so close the
+                    // invariant and commit before leaving: this is the round's last
+                    // chance to reach disk. The ending stays `inProgress` — no
+                    // terminal marker was reached, so a later boot infers the death
+                    // (`HardKillInferred`) rather than a clean exit.
                     ctx.ensure_tool_call_pairs();
                     capture_and_request(
                         &mut commit_pump,
@@ -2595,11 +2544,11 @@ pub async fn run_session_with_bounds_report(
                             Some(&mut ui_transcript),
                         );
                         if renderer.user_exit_requested() {
-                            // T-6 (flow §1.6.4, t-024): the abort commit lands
-                            // BEFORE `cancel_all()` and before the in-flight
-                            // handle is torn down by the round's teardown, so a
-                            // session stopped mid-round leaves a bundle that says
-                            // so instead of one that claims `inProgress`.
+                            // The abort commit lands BEFORE `cancel_all()` and
+                            // before the in-flight handle is torn down by the
+                            // round's teardown, so a session stopped mid-round
+                            // leaves a bundle that says so instead of one that
+                            // claims `inProgress`.
                             capture_and_request(
                                 &mut commit_pump,
                                 CommitTrigger::UserAbort,
@@ -2632,8 +2581,8 @@ pub async fn run_session_with_bounds_report(
                                 ))),
                             );
                         }
-                        // H5 wall-clock bound: a turn that stops making progress
-                        // (or exceeds the absolute cap) cancels the in-flight round
+                        // Wall-clock bound: a turn that stops making progress (or
+                        // exceeds the absolute cap) cancels the in-flight round
                         // through the same plumbing the abort paths use.
                         if let Some(kind) = watchdog.expired() {
                             let reason = kind.describe(bounds.turn_idle, bounds.turn_hard_cap);
@@ -2724,8 +2673,8 @@ pub async fn run_session_with_bounds_report(
                                     }
                                 }
                                 if renderer.user_exit_requested() {
-                                    // T-6 (t-024): same rule one level deeper —
-                                    // the round is still in flight here too.
+                                    // Same rule one level deeper: the round is
+                                    // still in flight here too.
                                     capture_and_request(
                                         &mut commit_pump,
                                         CommitTrigger::UserAbort,
@@ -2781,18 +2730,16 @@ pub async fn run_session_with_bounds_report(
                                 reason: Some(reason),
                             });
                         } else {
-                            // REQ-PLAN-002 / t-035a: `is_error == false` is not
-                            // completion evidence. The plan box flips only
-                            // through the orchestrator's marker-gated entry
-                            // point (`Plan::check_plan_on_deliverable`), so a
-                            // deliverable that carries no valid completion
-                            // marker leaves its plan task pending.
-                            //
-                            // The outcome is classified before anything is said:
-                            // `handle_delegate_task` already ran `apply_check_off`
-                            // for a marker-bearing deliverable, so an
-                            // `AlreadyChecked` here is the normal, healthy path
-                            // and must NOT be reported as a missing marker.
+                            // `is_error == false` is not completion evidence: the
+                            // plan box flips only through the orchestrator's
+                            // marker-checked entry point
+                            // (`Plan::check_plan_on_deliverable`), so a deliverable
+                            // with no valid completion marker leaves its plan task
+                            // pending. The outcome is classified before anything is
+                            // said: `handle_delegate_task` already ran
+                            // `apply_check_off` for a marker-bearing deliverable, so
+                            // an `AlreadyChecked` here is the normal path and must
+                            // NOT be reported as a missing marker.
                             if let Some(ref tid_task) = task {
                                 let outcome =
                                     marker_gated_check_off(&plan, Some(tid_task), &result_content);
@@ -2834,7 +2781,7 @@ pub async fn run_session_with_bounds_report(
                         &*renderer,
                     );
 
-                    // H5 repeated-failure accounting: an abort/cancel result is not
+                    // Repeated-failure accounting: an abort/cancel result is not
                     // the tool's own failure, so it must not consume the budget.
                     if is_error
                         && !(renderer.aborted()
@@ -2864,25 +2811,23 @@ pub async fn run_session_with_bounds_report(
                     }
                     watchdog.note_progress();
 
-                    // H2 (live hard-error path): flush only after the round result we
-                    // just received has been appended to the context/transcript, so an
-                    // error raised here cannot drop a completed deliverable. If the
-                    // write does fail, cancel + abort the still-unjoined tail of the
-                    // round instead of detaching it (see the note above the join loop).
+                    // Flush only after the round result just received has been
+                    // appended to the context/transcript, so an error raised here
+                    // cannot drop a completed deliverable. If the write does fail,
+                    // cancel + abort the still-unjoined tail of the round instead of
+                    // detaching it (see the note above the join loop).
                     if let Err(e) = renderer.flush() {
                         crate::orchestrator::cancel_all();
                         for handle in handles[idx + 1..].iter() {
                             handle.abort();
                         }
-                        // t-063: the tail of the round is torn down here, so the
-                        // calls after `idx` never get a `Message::Tool`. Repair and
-                        // capture before propagating, so the manager state a
-                        // rehydration would install is a valid chat request.
-                        //
-                        // t-024: the capture became a REAL commit — this return
-                        // leaves the loop entirely, so without it the joined half of
-                        // the round (already a completed deliverable) would exist
-                        // only in memory.
+                        // The tail of the round is torn down here, so the calls
+                        // after `idx` never get a `Message::Tool`. Repair and capture
+                        // before propagating, so the manager state a rehydration
+                        // would install is a valid chat request. That capture is a
+                        // real commit: this return leaves the loop entirely, and
+                        // without it the joined half of the round (already a
+                        // completed deliverable) would exist only in memory.
                         ctx.ensure_tool_call_pairs();
                         capture_and_request(
                             &mut commit_pump,
@@ -2897,10 +2842,10 @@ pub async fn run_session_with_bounds_report(
                         break;
                     }
                 }
-                // H5: the break paths above (bound, abort, user exit) can leave the
-                // rest of the round running. Cancel through the shared token and
-                // abort every handle we still own; aborting a completed handle is a
-                // no-op, so this only closes genuinely detached work.
+                // The break paths above (bound, abort, user exit) can leave the rest
+                // of the round running. Cancel through the shared token and abort
+                // every handle we still own; aborting a completed handle is a no-op,
+                // so this only closes genuinely detached work.
                 for handle in handles.iter() {
                     handle.abort();
                 }
@@ -2999,10 +2944,9 @@ pub async fn run_session_with_bounds_report(
                                         .as_ref()
                                         .map(|m| m.plan.clone())
                                         .unwrap_or_default();
-                                    // t-035a: same fail-closed plan read as the
-                                    // auto-nudge gate — an unreadable/unparseable
-                                    // plan is surfaced, never reported as
-                                    // "nothing pending".
+                                    // Same fail-closed plan read as the auto-nudge:
+                                    // an unreadable/unparseable plan is surfaced,
+                                    // never reported as "nothing pending".
                                     let pending = match read_plan_gate(&current_plan) {
                                         PlanGate::Read { pending, .. } => pending,
                                         PlanGate::Unknown { warning } => {
@@ -3083,8 +3027,8 @@ pub async fn run_session_with_bounds_report(
                         continue;
                     }
 
-                    // H5 repeated-failure budget: refuse to re-dispatch work that
-                    // has already failed the threshold number of times this session.
+                    // Repeated-failure budget: refuse to re-dispatch work that has
+                    // already failed the threshold number of times this session.
                     if !failures.retry_allowed(&failure_key) {
                         let count = failures.count(&failure_key);
                         let err_msg = failure_refusal_message(&failure_key, count);
@@ -3182,8 +3126,8 @@ pub async fn run_session_with_bounds_report(
                             Some(&mut ui_transcript),
                         );
                         if renderer.user_exit_requested() {
-                            // T-6 (t-024): the sequential branch breaks out of a
-                            // live call; the abort must still be recorded first.
+                            // The sequential branch breaks out of a live call; the
+                            // abort must still be recorded first.
                             capture_and_request(
                                 &mut commit_pump,
                                 CommitTrigger::UserAbort,
@@ -3206,8 +3150,8 @@ pub async fn run_session_with_bounds_report(
                                 "aborted"
                             )));
                         }
-                        // H5 wall-clock bound: a turn that stops making progress
-                        // (or exceeds the absolute cap) cancels the in-flight round
+                        // Wall-clock bound: a turn that stops making progress (or
+                        // exceeds the absolute cap) cancels the in-flight round
                         // through the same plumbing the abort paths use.
                         if let Some(kind) = watchdog.expired() {
                             let reason = kind.describe(bounds.turn_idle, bounds.turn_hard_cap);
@@ -3294,7 +3238,7 @@ pub async fn run_session_with_bounds_report(
                                     }
                                 }
                                 if renderer.user_exit_requested() {
-                                    // T-6 (t-024): mandatory, mid-call.
+                                    // Mandatory, mid-call.
                                     capture_and_request(
                                         &mut commit_pump,
                                         CommitTrigger::UserAbort,
@@ -3350,10 +3294,9 @@ pub async fn run_session_with_bounds_report(
                                 reason: Some(reason),
                             });
                         } else {
-                            // REQ-PLAN-002 / t-035a: same marker gate as the
-                            // parallel branch — a non-error result without a
-                            // completion marker must never tick a plan box, and
-                            // a box the orchestrator already ticked
+                            // Same marker check as the parallel branch: a non-error
+                            // result without a completion marker must never tick a
+                            // plan box, and a box the orchestrator already ticked
                             // (`AlreadyChecked`) is never reported as a warning.
                             if let Some(ref tid) = delegated_task {
                                 let outcome =
@@ -3401,7 +3344,7 @@ pub async fn run_session_with_bounds_report(
                         &*renderer,
                     );
 
-                    // H5 repeated-failure accounting: an abort/cancel result is not
+                    // Repeated-failure accounting: an abort/cancel result is not
                     // the tool's own failure, so it must not consume the budget.
                     if is_error
                         && !(renderer.aborted()
@@ -3436,20 +3379,17 @@ pub async fn run_session_with_bounds_report(
                 }
             }
 
-            // t-063 (manager gate item B): single repair boundary for the whole
-            // round. Every way this round can end early leaves the transcript
-            // half-paired — the assistant carrying **all** `tool_calls` was
-            // appended before dispatch, and the skipped tail never got a
-            // `Message::Tool`:
-            //   * parallel join: `bound_stop_reason` break, `user_exit_requested`
-            //     break, and the abort/cancel/bound breaks inside the join poll
-            //     loop (the unjoined tail is only `handle.abort()`ed),
-            //   * sequential dispatch: the `bound_stop_reason` /
-            //     `renderer.aborted() || renderer.user_exit_requested()` breaks.
-            // All of them fall through to this point *before* the
-            // `bound_stop_reason` / `user_exit_requested` breaks below, which end
-            // the turn and skip the compaction gate that used to be the only
-            // caller of the repair. Repairing here (idempotent, grammar owned by
+            // Single repair boundary for the whole round. Every way this round can
+            // end early leaves the transcript half-paired: the assistant carrying
+            // **all** `tool_calls` was appended before dispatch, and the skipped
+            // tail never got a `Message::Tool`. That happens on the parallel join
+            // breaks (`bound_stop_reason`, `user_exit_requested`, and the
+            // abort/cancel/bound breaks inside the poll loop, where the unjoined
+            // tail is only `handle.abort()`ed) and on the sequential
+            // `bound_stop_reason` / `renderer.aborted() ||
+            // renderer.user_exit_requested()` breaks. All of them fall through to
+            // this point *before* the breaks below that end the turn. Repairing
+            // here (idempotent; grammar owned by
             // `ContextEngine::ensure_tool_call_pairs`) makes the transcript both
             // sendable on the next turn and valid on disk.
             ensure_pairing_at_boundary(
@@ -3459,9 +3399,9 @@ pub async fn run_session_with_bounds_report(
                 &mut ui_transcript,
             );
 
-            // T-1 (flow §1.1/§1.6.2): the turn boundary is committed AFTER the
-            // pairing repair, so the persisted manager transcript is already
-            // pair-valid and the loader never has to normalize a torn round.
+            // The turn boundary is committed AFTER the pairing repair, so the
+            // persisted manager transcript is already pair-valid and the loader
+            // never has to normalize a torn round.
             capture_and_request(
                 &mut commit_pump,
                 CommitTrigger::ManagerTurnBoundary,
@@ -3469,7 +3409,7 @@ pub async fn run_session_with_bounds_report(
                 &*renderer,
             );
 
-            // H5: the round was cut off by an execution bound -> end the turn; the
+            // The round was cut off by an execution bound -> end the turn; the
             // reason is surfaced once, after the turn loop.
             if bound_stop_reason.is_some() {
                 break;
@@ -3495,13 +3435,13 @@ pub async fn run_session_with_bounds_report(
             }
 
             let current_plan = manager.as_ref().map(|m| m.plan.clone()).unwrap_or_default();
-            // t-035a: `is_complete()` is already fail-closed for an unreadable
-            // plan, but the failure itself was invisible. Read the plan through
-            // the same gate as everywhere else: the "all tasks COMPLETE" notice
-            // is only ever injected for a plan that really was read and parsed,
-            // and a plan that cannot be read/parsed is surfaced as a warning.
-            // `complete` is judged from that single read, so the notice and the
-            // warning can never disagree because two reads saw two files.
+            // `is_complete()` is already fail-closed for an unreadable plan, but the
+            // failure itself must stay visible. Read the plan the same way as
+            // everywhere else: the "all tasks COMPLETE" notice is only ever
+            // injected for a plan that really was read and parsed, and a plan that
+            // cannot be read/parsed is surfaced as a warning. `complete` is judged
+            // from that single read, so notice and warning cannot disagree because
+            // two reads saw two files.
             match read_plan_gate(&current_plan) {
                 PlanGate::Unknown { warning } => {
                     surface_plan_warning(&mut *renderer, &mut ui_transcript, warning);
@@ -3515,11 +3455,11 @@ pub async fn run_session_with_bounds_report(
                 PlanGate::Read { .. } => {}
             }
 
-            // t-024 (flow §1.9): `archive_plan` runs as a tool, i.e. possibly on
-            // another thread, and it sweeps the bundle with it. The only thread
-            // allowed to write the bundle is this one, so the archive is detected
-            // here at the round boundary: the plan is committed with the
-            // `planArchived` ending first, then the sweep is confirmed.
+            // `archive_plan` runs as a tool, i.e. possibly on another thread, and it
+            // deletes the bundle with it. The only thread allowed to write the
+            // bundle is this one, so the archive is detected here at the round
+            // boundary: the plan is committed with the `planArchived` ending first,
+            // then the removal is confirmed.
             if plan_archived_during_round(&current_plan, plan_present_at_round_start) {
                 tracing::warn!(
                     "execution plan was archived during this round: committing the session with \
@@ -3544,15 +3484,15 @@ pub async fn run_session_with_bounds_report(
             plan_present_at_round_start = current_plan.plan_path().exists();
         }
 
-        // H5: make the bound user-visible exactly once per turn, keep the session
+        // Make the bound user-visible exactly once per turn, keep the session
         // interactive (same reset pattern the steer-abort redirection uses), and
         // leave an explicit note in the context so the model cannot silently
         // repeat the approach that just hit the bound.
         //
-        // t-074: the turn-budget exit travels this exact path too — one stop
-        // vocabulary, one status channel — and every stop is additionally handed
-        // to the caller through [`SessionStopReport`], so a capped finish can
-        // never be reported as a clean one.
+        // The turn-budget exit travels this exact path too — one stop vocabulary,
+        // one status channel — and every stop is additionally handed to the caller
+        // through [`SessionStopReport`], so a capped finish can never be reported
+        // as a clean one.
         if let Some(reason) = bound_stop_reason.take() {
             session_stops.push(reason.clone());
             let text = reason.text();
@@ -3666,14 +3606,13 @@ pub async fn run_session_with_bounds_report(
         }
     }
 
-    // T-9 / T-6 at the tail (flow §1.1, §1.5, t-024): the last word of a session
-    // names HOW it ended, which is the only thing that lets a later boot tell
-    // `CleanTail` from `UserAbort` from `HardKillInferred`. An abort that broke out
-    // of the round still has `aborted` / `user_exit_requested` set here, and that
-    // is the truth the manifest must carry — a session the user stopped is not a
-    // session that finished. Mandatory either way: the throttle never skips the
-    // last word, and it runs BEFORE `shutdown()` (flow §1.6.5) because the UI
-    // capture needs a live renderer.
+    // The last word of a session names HOW it ended, which is the only thing that
+    // lets a later boot tell `CleanTail` from `UserAbort` from
+    // `HardKillInferred`. An abort that broke out of the round still has
+    // `aborted` / `user_exit_requested` set here, and that is the truth the
+    // manifest must carry — a session the user stopped is not a session that
+    // finished. Mandatory either way: the throttle never skips the last word, and
+    // it runs BEFORE `shutdown()` because the UI capture needs a live renderer.
     let tail_trigger = if renderer.aborted() || renderer.user_exit_requested() {
         CommitTrigger::UserAbort
     } else {
@@ -3689,7 +3628,7 @@ pub async fn run_session_with_bounds_report(
     })
 }
 
-// H5 execution-bound helpers
+// Execution-bound helpers
 
 /// Stable identity for a repeated unit of work inside one session.
 ///
@@ -3735,17 +3674,16 @@ fn failure_refusal_message(key: &str, count: u32) -> String {
     )
 }
 
-// REQ-PLAN-002: plan check-off + plan-state helpers (shared by both live loops)
+// Plan check-off + plan-state helpers (shared by both live loops)
 
 /// What the session is allowed to conclude about the on-disk execution plan.
 ///
-/// t-035a: the session used to ask [`crate::manager::phase::Plan::pending_tasks`],
-/// whose compatibility wrapper folds a read failure into an empty `Vec`. An
-/// empty list is exactly what the auto-nudge and the completion notice read as
-/// "nothing left to do", so a plan that cannot be read (or that cannot be parsed
-/// into task lines) silently looked like a *finished* plan — bug M8 again, this
-/// time at the UI boundary. This type keeps the two apart: `Unknown` must be
-/// surfaced to the user and must never be taken as completion.
+/// [`crate::manager::phase::Plan::pending_tasks`] folds a read failure into an
+/// empty `Vec`, and an empty list is exactly what the auto-nudge and the
+/// completion notice read as "nothing left to do" — so a plan that cannot be
+/// read (or parsed into task lines) looks like a *finished* plan. This type
+/// keeps the two apart: `Unknown` must be surfaced to the user and must never
+/// be taken as completion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanGate {
     /// The plan was read and parsed by the single grammar owner
@@ -3771,8 +3709,8 @@ pub enum PlanGate {
 pub fn read_plan_gate(plan: &crate::manager::phase::Plan) -> PlanGate {
     let content = match plan.read() {
         Ok(Some(content)) => content,
-        // No plan file on disk: genuinely nothing pending (M8 keeps this apart
-        // from a plan that exists but cannot be read).
+        // No plan file on disk: genuinely nothing pending, kept apart from a plan
+        // that exists but cannot be read.
         Ok(None) => {
             return PlanGate::Read {
                 pending: Vec::new(),
@@ -3829,13 +3767,12 @@ fn surface_plan_warning(
     ui_transcript.append(UiRecord::Status { text: warning });
 }
 
-/// Wall-clock bound of one iteration of a tool-round join loop (t-063).
+/// Wall-clock bound of one iteration of a tool-round join loop.
 ///
-/// The join loops used to sleep a fixed 20 ms per iteration, so an idle-bound
-/// teardown could be noticed up to a full slice late. The slice is now capped by
-/// [`TurnWatchdog::time_to_idle_limit`] — the bound the loops honour is the one
-/// the watchdog actually advertises. The `1 ms` floor keeps the loop from
-/// spinning when the remaining budget is (sub-millisecond but) non-zero.
+/// The `20 ms` slice is capped by [`TurnWatchdog::time_to_idle_limit`] — the
+/// bound the loops honour is the one the watchdog actually advertises. The
+/// `1 ms` floor keeps the loop from spinning when the remaining budget is
+/// (sub-millisecond but) non-zero.
 fn join_poll_slice(watchdog: &TurnWatchdog) -> Duration {
     const TOOL_JOIN_POLL_SLICE: Duration = Duration::from_millis(20);
     TOOL_JOIN_POLL_SLICE
@@ -3845,22 +3782,12 @@ fn join_poll_slice(watchdog: &TurnWatchdog) -> Duration {
 
 /// Close the assistant `tool_calls` ↔ `Tool` pairing invariant on the live
 /// transcript at a boundary that can end a turn early, persist it, and surface
-/// it through the session's existing status channel — but only when the repair
-/// actually changed something ([`ContextEngine::ensure_tool_call_pairs`] is
-/// idempotent).
-///
-/// **Why the boundary is needed (manager gate item B):** the assistant message
-/// carrying **all** `tool_calls` is appended before the round is dispatched, and
-/// every early exit — an execution bound (`bound_stop_reason`), a renderer
-/// abort, a steering abort, or a user exit — breaks out of the round before the
-/// skipped tail of that round ever gets a `Message::Tool`. The transcript is
-/// then re-sent verbatim on the next request, i.e. an assistant `tool_calls`
-/// entry with no result: a provider 400. Nothing used to repair it, because the
-/// repair lived only inside `compact()`, which is gated at > 90% utilization and
-/// sits *after* those breaks.
-///
-/// `site` names the boundary in the user-visible status line so the repair is
-/// attributable rather than silent.
+/// it through the session's status channel — but only when the repair actually
+/// changed something ([`ContextEngine::ensure_tool_call_pairs`] is idempotent).
+/// Every early exit (execution bound, renderer abort, steering abort, user exit)
+/// can leave an assistant `tool_calls` entry with no `Message::Tool` result,
+/// which the next request would resend as a provider 400. `site` names the
+/// boundary in the user-visible status line.
 fn ensure_pairing_at_boundary(
     site: &str,
     ctx: &mut ContextEngine,
@@ -3871,9 +3798,8 @@ fn ensure_pairing_at_boundary(
         return;
     }
     // The repaired transcript is what the next request is built from, and the
-    // capture below is what a rehydration would install: the superseded
-    // `.session_transcript.json` journal is gone (A §1 D2), so the repaired state is
-    // recorded in memory instead of written to a second journal.
+    // capture below records it in memory so a later rehydration installs the
+    // repaired state.
     crate::session::manager_capture::capture_into_session_state(ctx);
     let note = format!(
         "tool-call pairing repaired ({site}): missing tool results synthesized as `{ABORTED_TOOL_RESULT}`"
@@ -3883,14 +3809,13 @@ fn ensure_pairing_at_boundary(
     ui_transcript.append(UiRecord::Status { text: note });
 }
 
-/// Report the outcome of an automatic compaction (t-063).
+/// Report the outcome of an automatic compaction.
 ///
-/// The live sites used to discard [`CompactionOutcome`] and print
-/// `"context compacted"` unconditionally, which is a lie for
-/// [`CompactionOutcome::TargetUnreachable`]: nothing reached the 70% target, the
-/// transcript is still over budget, and the model is never told. Surfacing goes
-/// through the session's one status channel (renderer `Status` event + matching
-/// `Status` record in the UI transcript + `tracing::warn!`), the same channel
+/// [`CompactionOutcome`] must never be discarded: `"context compacted"` would be
+/// a lie for [`CompactionOutcome::TargetUnreachable`], where nothing reached the
+/// target and the transcript is still over budget. Surfacing goes through the
+/// session's one status channel (renderer `Status` event + matching `Status`
+/// record in the UI transcript + `tracing::warn!`), the same channel
 /// [`surface_plan_warning`] uses. Control flow is deliberately unchanged — the
 /// session keeps running — but it must never claim a compaction that did not
 /// happen.
@@ -3918,19 +3843,19 @@ fn surface_compaction_outcome(
 /// Why a plan box did — or did not — flip, as decided by the single check-off
 /// entry point [`crate::manager::phase::Plan::check_plan_on_deliverable`].
 ///
-/// t-035a: a plain `bool` cannot tell the UI anything it is allowed to say out
-/// loud. In particular `false` conflates "the box was already ticked by the
-/// orchestrator's own marker-gated check-off" (harmless — `handle_delegate_task`
-/// runs `apply_check_off` before the session ever sees the deliverable) with
-/// "the deliverable carried no completion marker" (a real plan-integrity
-/// warning). Printing a warning for the first case would be a lie, so the two
-/// are separated here and only the genuinely suspicious outcomes are surfaced.
+/// A plain `bool` cannot tell the UI anything it is allowed to say out loud:
+/// `false` conflates "the box was already ticked by the orchestrator's own
+/// marker-checked check-off" (harmless — `handle_delegate_task` runs
+/// `apply_check_off` before the session ever sees the deliverable) with "the
+/// deliverable carried no completion marker" (a real plan-integrity warning).
+/// Printing a warning for the first case would be a lie, so the two are
+/// separated here and only the genuinely suspicious outcomes are surfaced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckOffOutcome {
     /// A pending plan box was flipped to `[x]`.
     Flipped,
     /// The task line was already `[x]` before this call — the orchestrator's
-    /// marker-gated check-off already recorded the completion.
+    /// marker-checked check-off already recorded the completion.
     AlreadyChecked,
     /// No plan file on disk, or the bound id has no task line in it (a
     /// delegation that was never bound to a plan task).
@@ -3955,16 +3880,16 @@ pub enum CheckOffOutcome {
     Refused { detail: String },
 }
 
-/// REQ-PLAN-002 / t-035a: the single marker-gated check-off used by **both**
-/// live session loops when a delegation comes back without an error.
+/// The single marker-checked check-off used by **both** live session loops when
+/// a delegation comes back without an error.
 ///
 /// It routes straight into [`crate::manager::phase::Plan::check_plan_on_deliverable`]
 /// — the same entry point the orchestrator's `apply_check_off` uses — so a
 /// deliverable that carries no terminal completion marker can never tick a plan
 /// box, and `is_error == false` alone is never treated as completion. The marker
 /// grammar and the task-id binding stay owned by [`crate::markers`] and
-/// [`crate::plan_parse`]; the UI adds no parser of its own and makes no
-/// decision of its own.
+/// [`crate::plan_parse`]; the UI adds no parser of its own and makes no decision
+/// of its own.
 ///
 /// The one extra read below is **diagnostic only**: it captures the plan state
 /// before the call so the outcome can be classified honestly (already checked vs
@@ -3981,8 +3906,8 @@ pub fn marker_gated_check_off(
     let bound = task_id
         .map(crate::task_id::normalize_task_id_ref)
         .filter(|t| !t.is_empty());
-    // Diagnostic pre-state: does the plan even hold a line for this id, and was
-    // it already `[x]` when we got here?
+    // Diagnostic read before the call: does the plan hold a line for this id,
+    // and was it already `[x]` when we got here?
     let content = match plan.read() {
         Ok(content) => content,
         Err(e) => {

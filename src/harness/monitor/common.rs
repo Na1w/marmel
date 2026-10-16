@@ -2,9 +2,9 @@
 
 use super::repetition::semantic_json_value_eq;
 
-/// A single tool call record tracked by the semantic repetition detector
-/// (REQ-HARN-002). Equality is *semantic*: argument key ordering is ignored
-/// and pagination fields (`offset`, `page`) are excluded.
+/// A single tool call record tracked by the semantic repetition detector.
+/// Equality is *semantic*: argument key ordering is ignored and pagination
+/// fields (`offset`, `page`) are excluded.
 #[derive(Debug, Clone)]
 pub struct ToolCallRecord {
     pub name: String,

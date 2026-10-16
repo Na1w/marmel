@@ -5,7 +5,7 @@ fn temp_dir() -> std::path::PathBuf {
     tempfile::tempdir().unwrap().keep()
 }
 
-/// REQ-TOOL-002: replace on a non-matching string returns an error and
+/// `replace` on a non-matching string returns an error and
 /// does not modify the file; ambiguous (≥2) matches error without writing;
 /// a single match writes correctly.
 #[test]
@@ -58,7 +58,7 @@ fn test_harness_replace_uniqueness() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// REQ-TOOL-003: reading a large fixture outputs characters and a pagination footer.
+/// Reading a large fixture outputs characters and a pagination footer.
 #[test]
 fn test_harness_paginated_read() {
     let dir = temp_dir();
@@ -129,7 +129,7 @@ fn test_harness_map_path() {
     assert_eq!(rel, PathBuf::from("src/lib.rs"));
 }
 
-/// REQ-TOOL-004: write_file creates missing parent dirs.
+/// `write_file` creates missing parent dirs.
 #[test]
 fn test_harness_write_file_creates_parents() {
     let base = temp_dir();

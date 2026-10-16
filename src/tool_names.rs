@@ -8,7 +8,7 @@
 //! allowlists, and the registry all agree).
 
 /// `delegate_task` — dispatch a bounded unit of domain work to a specialist
-/// subagent (REQ-ORCH-005).
+/// subagent.
 pub const TOOL_DELEGATE_TASK: &str = "delegate_task";
 /// `read_file` — read paginated lines of UTF-8 text from a file.
 pub const TOOL_READ_FILE: &str = "read_file";
@@ -57,7 +57,7 @@ pub const TERMINAL_RUN_COMMAND: &str = "terminal__run_command";
 pub const TERMINAL_GREP_SEARCH: &str = "terminal__grep_search";
 /// `terminal__glob` — caesar-style namespaced variant of `glob`.
 pub const TERMINAL_GLOB: &str = "terminal__glob";
-// `list_directory` / `terminal__list_directory` (t-069 decision, see the note on
+// `list_directory` / `terminal__list_directory` (see the note on
 // [`TOOL_ALIAS_TABLE`]): **no built-in handler implements these names.** They are
 // deliberately *not* members of [`CANONICAL_TOOL_NAMES`] nor rows of
 // [`TOOL_ALIAS_TABLE`], so the dispatcher claims neither and an MCP server is free
@@ -86,29 +86,23 @@ pub fn terminal_tool(bare: &str) -> String {
     format!("{TERMINAL_PREFIX}{bare}")
 }
 
-// The one canonical tool-alias vocabulary (dedup gate t-044, sweep B)
+// The one canonical tool-alias vocabulary.
 //
-// Before this table existed, the same tool had *two* vocabularies: the harness
-// dispatcher spelled sleep `sleep | terminal__sleep | wait`, while the steer
-// arbitrator's subtask-action grammar spelled it
-// `sleep | sleeptask | wait | waitseconds | pause`. A name accepted on one path
-// was rejected on the other. The full alias arms were also re-typed three times
-// inside the harness dispatcher. This table is now the single owner: every site
-// that recognizes a tool alias must ask this table.
+// The harness dispatcher and the steer arbitrator's subtask-action grammar each
+// spelled the same tool their own way (`sleep | terminal__sleep | wait` vs
+// `sleep | sleeptask | wait | waitseconds | pause`), so a name recognized on one
+// path was rejected on the other. This table is the single owner: every site that
+// recognizes a tool alias must ask this table.
 //
-// Review decision on the divergent sleep set (deliberate union, not an accident):
-// `sleeptask`, `waitseconds` and `pause` existed **only** in the steer path. They
-// are folded into the shared table, so the harness dispatcher accepts them too.
-// Rationale: all three name the same tool (`sleep`), they were already reachable
-// from a model-facing spelling in production, and keeping them steer-only would
-// preserve the exact defect this table removes. They are ordinary names a
-// dispatcher can serve; nothing security-bearing is widened by accepting them
-// (the sleep handler is the least privileged built-in, and the specialist
-// allowlist gate still applies to them exactly like `wait`).
-// Consequence worth knowing: alias spellings also reserve their MCP namespace —
-// the registration policy refuses an MCP server whose config key is `pause`,
-// `sleeptask` or `waitseconds`, exactly as it already refused `wait`, `sh`,
-// `run`, `read`, `write`, `ls`, `grep`, …
+// `sleeptask`, `waitseconds` and `pause` are a deliberate union, not an accident:
+// all three name the same tool (`sleep`), they are ordinary names a dispatcher can
+// serve, and nothing security-bearing is widened by accepting them (the sleep
+// handler is the least privileged built-in, and the specialist allowlist applies
+// to them exactly like `wait`).
+//
+// Alias spellings also reserve their MCP namespace: the registration policy refuses
+// an MCP server whose config key is `pause`, `sleeptask` or `waitseconds`, exactly
+// as it refuses `wait`, `sh`, `run`, `read`, `write`, `ls`, `grep`, …
 
 /// Every canonical spelling a built-in handler answers to **verbatim**: the
 /// advertised bare names plus the caesar-style `terminal__` variants.
@@ -129,8 +123,8 @@ pub const CANONICAL_TOOL_NAMES: &[&str] = &[
     TOOL_GLOB,
     TERMINAL_GLOB,
     // `list_directory` / `terminal__list_directory` are NOT listed here: claiming a
-    // name with no dispatch arm made them claimed-but-unresolved (t-069 decision b,
-    // see the note on the constants).
+    // name with no dispatch arm leaves them claimed-but-unresolved (see the note on
+    // the constants).
     TOOL_SLEEP,
     TERMINAL_SLEEP,
     TOOL_REBIRTH,
@@ -146,10 +140,10 @@ pub const CANONICAL_TOOL_NAMES: &[&str] = &[
 
 /// The alias table: `(accepted spelling, spelling it normalizes onto)`.
 ///
-/// The normalized spelling is the one the dispatch gate (`normalize_tool_name`)
-/// compares against: for the file/command families that is the `terminal__`
-/// spelling, for the `pty_*` tools it is the bare spelling (there is no
-/// `terminal__pty_*` spelling anywhere in the wire format).
+/// The normalized spelling is the one the dispatch normalizer
+/// (`normalize_tool_name`) compares against: for the file/command families that is
+/// the `terminal__` spelling, for the `pty_*` tools it is the bare spelling (there
+/// is no `terminal__pty_*` spelling anywhere in the wire format).
 ///
 /// Canonical spellings are deliberately **not** rows here — they resolve through
 /// [`CANONICAL_TOOL_NAMES`] — so this table lists only names that are aliases of
@@ -186,31 +180,27 @@ pub const TOOL_ALIAS_TABLE: &[(&str, &str)] = &[
     (TOOL_GLOB, TERMINAL_GLOB),
     ("find_files", TERMINAL_GLOB),
     ("glob_search", TERMINAL_GLOB),
-    // sleep family — `sleeptask`/`waitseconds`/`pause` joined in from the steer
-    // path (see the review note at the top of this section).
+    // sleep family — `sleeptask`/`waitseconds`/`pause` are part of the shared
+    // sleep set (see the note at the top of this section).
     (TOOL_SLEEP, TERMINAL_SLEEP),
     ("wait", TERMINAL_SLEEP),
     ("sleeptask", TERMINAL_SLEEP),
     ("waitseconds", TERMINAL_SLEEP),
     ("pause", TERMINAL_SLEEP),
-    // verdict family — the spellings `agents::validation::is_leave_verdict_tool`
-    // used to enumerate privately (t-069); the table owns them now (see the section
+    // verdict family — this table owns the accepted spellings (see the section
     // note). Namespaced spellings are *not* rows: the single suffix rule in
     // [`LEAVE_VERDICT_NAME_SUFFIXES`] covers them instead of a row per prefix.
     (TOOL_LEAVE_VERDICT, TERMINAL_LEAVE_VERDICT),
     ("leaveVerdict", TERMINAL_LEAVE_VERDICT),
     ("leave_verdict_tool", TERMINAL_LEAVE_VERDICT),
-    // list_directory family — **removed** (t-069, decision b). No dispatch arm in
+    // list_directory family — intentionally absent. No dispatch arm in
     // `src/harness/mod.rs` implements `list_directory`, `terminal__list_directory`,
-    // `ls` or `list_files` (the handler itself has never existed). A row here claims
-    // the name for the built-in dispatcher *and* reserves it against MCP
-    // registration, so every one of these spellings resolved to neither: the call
-    // fell through MCP and came back `ToolError::UnknownTool`. Claiming a name no
-    // handler serves is strictly worse than not claiming it, so the rows are gone and
-    // an MCP server is now free to publish the name.
-    // pty family — the `pty__` spelling was accepted by the dispatcher arms and
-    // by the built-in name table, but was missing from the normalizer, so it
-    // could not pass the specialist allowlist gate. Same defect, same fix.
+    // `ls` or `list_files`. A row here would claim the name for the built-in
+    // dispatcher *and* reserve it against MCP registration while no handler serves
+    // it, so the rows stay out and an MCP server is free to publish the name.
+    // pty family — the `pty__` spellings are routed through the dispatcher arms,
+    // the built-in name table and the normalizer alike, so they pass the specialist
+    // allowlist like every other alias.
     ("pty__spawn", TOOL_PTY_SPAWN),
     ("pty__write", TOOL_PTY_WRITE),
     ("pty__read", TOOL_PTY_READ),
@@ -282,8 +272,7 @@ pub fn fold_tool_spelling(name: &str) -> String {
 
 /// Grammar-tolerant counterpart of [`is_sleep_tool_name`]: `true` when a folded
 /// action spelling names the sleep tool, e.g. `Terminal_Sleep`, `WAIT SECONDS` or
-/// `sleeptask`. Used by the steer path so it cannot drift away from the harness
-/// vocabulary again.
+/// `sleeptask`. Used by the steer path so both sides share one vocabulary.
 pub fn is_sleep_tool_grammar_spelling(name: &str) -> bool {
     let key = fold_tool_spelling(name);
     fold_tool_spelling(TERMINAL_SLEEP) == key
@@ -292,11 +281,11 @@ pub fn is_sleep_tool_grammar_spelling(name: &str) -> bool {
             .any(|(alias, target)| *target == TERMINAL_SLEEP && fold_tool_spelling(alias) == key)
 }
 
-// The verdict family (t-069)
+// The verdict family
 //
 // The **one** place verdict-name spellings are enumerated: the exact spellings are
-// the verdict rows of [`TOOL_ALIAS_TABLE`], and the only structural rule the
-// validator ever needed is [`LEAVE_VERDICT_NAME_SUFFIXES`].
+// the verdict rows of [`TOOL_ALIAS_TABLE`], and the only structural rule for a
+// namespaced spelling is [`LEAVE_VERDICT_NAME_SUFFIXES`].
 // [`crate::agents::validation::is_leave_verdict_tool`] is a thin wrapper over
 // [`is_leave_verdict_tool_name`] — callers must not compare verdict names
 // themselves, and no second verdict vocabulary may exist.
@@ -310,8 +299,8 @@ pub const LEAVE_VERDICT_NAME_SUFFIXES: &[&str] = &["__leave_verdict", "_leave_ve
 
 /// `true` when `name` names the verdict tool: either verbatim through the shared
 /// alias table ([`TOOL_LEAVE_VERDICT`], [`TERMINAL_LEAVE_VERDICT`] and their alias
-/// rows) or through the namespaced suffix rule. Case-tolerant like the matcher it
-/// replaces, so `LEAVE_VERDICT` keeps working.
+/// rows) or through the namespaced suffix rule. Case-tolerant, so `LEAVE_VERDICT`
+/// keeps working.
 pub fn is_leave_verdict_tool_name(name: &str) -> bool {
     if normalize_tool_alias(name) == Some(TERMINAL_LEAVE_VERDICT) {
         return true;
@@ -391,18 +380,18 @@ const BUILTIN_TABLE: [&str; BUILTIN_TABLE_LEN] = build_builtin_table();
 ///
 /// **Derived, never re-typed** — the harness re-exports this as
 /// `crate::harness::BUILTIN_TOOL_NAMES`, which is the table the MCP name policy
-/// is built on (t-034c). Adding an alias to [`TOOL_ALIAS_TABLE`] therefore also
-/// reserves that spelling against MCP registration; forgetting that link is what
-/// let an alias be dispatchable but unregistered (or the reverse).
+/// is built on. Adding an alias to [`TOOL_ALIAS_TABLE`] therefore also reserves
+/// that spelling against MCP registration; forgetting that link is what lets an
+/// alias be dispatchable but unregistered (or the reverse).
 pub const BUILTIN_TOOL_NAME_TABLE: &[&str] = &BUILTIN_TABLE;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// (b) Every canonical `TOOL_*` / `TERMINAL_*` constant round-trips through
-    /// the shared table, and every one of them is claimed by the derived
-    /// built-in name table.
+    /// Every canonical `TOOL_*` / `TERMINAL_*` constant round-trips through the
+    /// shared table, and every one of them is claimed by the derived built-in name
+    /// table.
     #[test]
     fn every_canonical_tool_constant_round_trips_through_the_table() {
         let canonical: &[&str] = &[
@@ -500,10 +489,9 @@ mod tests {
         );
     }
 
-    /// (a) THE REGRESSION PIN: one alias set, two consumers. Every spelling the
-    /// harness path resolves onto the sleep tool must be accepted by the steer
-    /// path as the Sleep action, and vice versa — the divergent vocabularies this
-    /// table replaces are exactly what this test would have caught.
+    /// One alias set, two consumers: every spelling the harness path resolves onto
+    /// the sleep tool must be accepted by the steer path as the Sleep action, and
+    /// vice versa.
     #[test]
     fn sleep_vocabulary_is_identical_on_the_harness_and_steer_paths() {
         // Spellings that must be recognised by *both* paths.
@@ -570,10 +558,10 @@ mod tests {
         }
     }
 
-    /// Source guard for the collapse: the routed call sites must not keep any
-    /// hand-typed tool-name string literal of this vocabulary — neither an
-    /// alias arm nor a quoted canonical name. Needles are derived from the
-    /// table at runtime so a newly added alias row is guarded automatically.
+    /// Source guard: the routed call sites must not keep any hand-typed tool-name
+    /// string literal of this vocabulary — neither an alias arm nor a quoted
+    /// canonical name. Needles are derived from the table at runtime so a newly
+    /// added alias row is guarded automatically.
     #[test]
     fn routed_call_sites_do_not_retype_tool_alias_literals() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -605,9 +593,9 @@ mod tests {
         assert_eq!(audited, routed_files.len());
     }
 
-    /// (t-069 item 1) The verdict family lives here and nowhere else: the table
-    /// rows plus one suffix rule cover every accepted spelling, and the validator's
-    /// public matcher agrees with the table on all of them.
+    /// The verdict family lives here and nowhere else: the table rows plus one
+    /// suffix rule cover every accepted spelling, and the validator's public
+    /// matcher agrees with the table on all of them.
     #[test]
     fn verdict_family_is_owned_by_the_table() {
         let family = tool_spellings_for(TERMINAL_LEAVE_VERDICT);
@@ -644,13 +632,11 @@ mod tests {
         }
     }
 
-    /// (t-069 item 3, decision pin) `list_directory`, `terminal__list_directory`,
-    /// `ls` and `list_files` are **not** claimed: no dispatch arm in
-    /// `src/harness/mod.rs` implements them (READ-ONLY evidence, `dispatch`,
-    /// `dispatch_manager`, `dispatch_specialist`, `dispatch_specialist_async` —
-    /// none has a `*_LIST_DIRECTORY` arm), so the table rows that used to claim
-    /// them made every one of them claimed-but-unresolved. The decision is: the
-    /// rows are gone, and the end-to-end outcome is asserted here.
+    /// `list_directory`, `terminal__list_directory`, `ls` and `list_files` are
+    /// **not** claimed: no dispatch arm in `src/harness/mod.rs` implements them
+    /// (`dispatch`, `dispatch_manager`, `dispatch_specialist` and
+    /// `dispatch_specialist_async` have no `*_LIST_DIRECTORY` arm), and the
+    /// end-to-end outcome is asserted here.
     #[test]
     fn list_directory_spellings_are_unclaimed_and_report_unknown_tool() {
         let unclaimed = [
@@ -688,12 +674,11 @@ mod tests {
         }
     }
 
-    /// (t-069 item 3, the guard that keeps the decision from regressing) The other
-    /// direction of the same rule: every alias the table **does** claim must reach a
-    /// dispatch arm, i.e. must never come back as `UnknownTool`. Probed with the
-    /// handlers that refuse on missing arguments before touching anything (no shell,
-    /// no sleep timer, no plan archive, no orchestrator, no arbitrator, no PTY
-    /// spawn), so the probe is hermetic.
+    /// The other direction of the same rule: every alias the table **does** claim
+    /// must reach a dispatch arm, i.e. must never come back as `UnknownTool`.
+    /// Probed with the handlers that refuse on missing arguments before touching
+    /// anything (no shell, no sleep timer, no plan archive, no orchestrator, no
+    /// arbitrator, no PTY spawn), so the probe is hermetic.
     #[test]
     fn claimed_aliases_never_fall_through_to_unknown_tool() {
         for alias in [

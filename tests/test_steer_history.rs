@@ -1,4 +1,4 @@
-//! t-071 — steering-history correlation must be keyed by identity, never by a
+//! Steering-history correlation must be keyed by identity, never by a
 //! bidirectional substring test (`a.contains(b) || b.contains(a)`).
 //!
 //! `crate::orchestrator::record_steering_exchange` (implemented in
@@ -49,7 +49,7 @@ fn install_history() -> SharedSteeringHistory {
     history
 }
 
-/// Install a private steering history pre-seeded with `entries`
+/// Install a private steering history seeded in advance with `entries`
 /// (`(user inquiry, arbitrator response)` pairs).
 fn install_history_with(entries: &[(&str, &str)]) -> SharedSteeringHistory {
     let history: SharedSteeringHistory = Arc::new(std::sync::RwLock::new(
@@ -73,8 +73,8 @@ fn snapshot(history: &SharedSteeringHistory) -> Vec<(String, String)> {
 }
 
 /// A short inquiry must NOT be attributed to a longer recorded inquiry that
-/// merely contains it — the `t-1` / `t-10` class of the removed
-/// `inq.contains(q) || q.contains(inq)` test.
+/// merely contains it: the `t-1` / `t-10` pair shows why the lookup key must be
+/// an exact identity.
 #[test]
 fn short_inquiry_never_matches_a_longer_recorded_inquiry_that_contains_it() {
     let _guard = lock_history_bus();
@@ -167,7 +167,7 @@ fn inquiry_prefix_does_not_suppress_a_new_entry() {
     let history =
         install_history_with(&[("Deploy the new allocator", &pending("notice-7", "coder"))]);
 
-    // Recon M3 scenario: a longer/different user message that merely contains the
+    // A longer/different user message that merely contains the
     // recorded inquiry (here: a shorter prefix of it) must not rewrite it.
     record_steering_exchange(
         None,
@@ -204,7 +204,8 @@ fn duplicate_suppression_is_not_triggered_by_incidental_substring_overlap() {
         &pending("notice-1", "coder"),
     );
     // A different user message that contains the recorded inquiry verbatim as a
-    // substring — the old `q.contains(inq)` branch merged these two steers.
+    // substring must stay a separate steer: identity, not overlap, drives the
+    // merge decision.
     record_steering_exchange(
         None,
         "Fix the parser now",
@@ -248,9 +249,8 @@ fn same_inquiry_matches_after_trim_and_case_fold_only() {
 }
 
 /// A reply for a notice id that no recorded entry names is a *miss*: nothing is
-/// rewritten, the exchange is appended. (The removed stage-3 fallback rewrote
-/// the most recent pending entry instead, which is what silently re-attributed
-/// answers to unrelated steers.)
+/// rewritten, the exchange is appended. Rewriting the most recent pending entry
+/// instead would silently re-attribute answers to unrelated steers.
 #[test]
 fn unknown_notice_id_appends_instead_of_hijacking_the_latest_pending_entry() {
     let _guard = lock_history_bus();
@@ -274,7 +274,8 @@ fn unknown_notice_id_appends_instead_of_hijacking_the_latest_pending_entry() {
 }
 
 /// Empty/whitespace inquiries are never a wildcard: they address nothing, so the
-/// exchange is appended (the old `contains("")` branch matched *every* entry).
+/// exchange is appended — a substring lookup with an empty needle would match
+/// *every* entry.
 #[test]
 fn empty_inquiry_matches_nothing_and_appends() {
     let _guard = lock_history_bus();

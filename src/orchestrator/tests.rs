@@ -22,11 +22,11 @@ fn test_format_duration_human_minutes_and_seconds() {
     assert_eq!(format_duration_human(3665), "61m 5s");
 }
 
-/// REQ-ORCH-003: a delegated IsolatedContext contains ONLY the specialist's
-/// role system prompt + task brief + bounded snippets — never the Manager's
-/// `messages[]`. The produced context engine must start with exactly two
-/// messages (`[0]` = role system prompt, `[1]` = brief) and must not expose
-/// any Manager transcript or the Manager's own conversation history.
+/// A delegated IsolatedContext contains ONLY the specialist's role system
+/// prompt + task brief + bounded snippets — never the Manager's `messages[]`.
+/// The produced context engine must start with exactly two messages (`[0]` =
+/// role system prompt, `[1]` = brief) and must not expose any Manager
+/// transcript or the Manager's own conversation history.
 #[tokio::test]
 async fn test_orchestr_context_isolation() {
     let tmp = tempfile::tempdir().unwrap();
@@ -70,8 +70,8 @@ async fn test_orchestr_context_isolation() {
     }
 }
 
-/// REQ-ORCH-005 / REQ-PLAN-002: MISSION COMPLETE (t-xxx) flips `[t-xxx]` →
-/// `[x]`; a FAILED marker leaves it unchecked.
+/// A `MISSION COMPLETE (task-id)` marker flips the matching plan box to `[x]`;
+/// a FAILED marker leaves it unchecked.
 #[tokio::test]
 async fn test_orchestr_task_checkoff_complete_flips() {
     let tmp = tempfile::tempdir().unwrap();
@@ -93,8 +93,7 @@ async fn test_orchestr_task_checkoff_complete_flips() {
     assert_eq!(remaining, vec!["t-102".to_string()]);
 }
 
-/// REQ-ORCH-005 / REQ-PLAN-002: a FAILED terminal marker leaves the item
-/// unchecked.
+/// A FAILED terminal marker leaves the plan item unchecked.
 #[tokio::test]
 async fn test_orchestr_task_checkoff_failed_leaves_unchecked() {
     let tmp = tempfile::tempdir().unwrap();
@@ -113,8 +112,8 @@ async fn test_orchestr_task_checkoff_failed_leaves_unchecked() {
     assert!(m.plan.pending_tasks().contains(&"t-200".to_string()));
 }
 
-/// REQ-ORCH-005 / REQ-PLAN-002: a `REPLAN REQUIRED` terminal marker also
-/// leaves the plan item unchecked — only `MISSION COMPLETE` flips `[ ]`→`[x]`.
+/// A `REPLAN REQUIRED` terminal marker also leaves the plan item unchecked —
+/// only `MISSION COMPLETE` flips `[ ]`→`[x]`.
 #[tokio::test]
 async fn test_orchestr_task_checkoff_replan_leaves_unchecked() {
     let tmp = tempfile::tempdir().unwrap();
@@ -137,10 +136,10 @@ async fn test_orchestr_task_checkoff_replan_leaves_unchecked() {
     );
 }
 
-/// t-302 (a): `apply_check_off` leaves the task UNCHECKED even when the
-/// content body contains the literal string `MISSION COMPLETE`, as long as
-/// the authoritative `Deliverable.marker` is `Failed` or `Replan`. The
-/// marker — not the free-form body — is the gate keeper.
+/// `apply_check_off` leaves the task UNCHECKED even when the content body
+/// contains the literal string `MISSION COMPLETE`, as long as the authoritative
+/// `Deliverable.marker` is `Failed` or `Replan`. The marker — not the free-form
+/// body — decides whether the task is checked off.
 #[tokio::test]
 async fn test_orchestr_apply_checkoff_marker_failed_overrides_body_complete() {
     let tmp = tempfile::tempdir().unwrap();
@@ -148,8 +147,8 @@ async fn test_orchestr_apply_checkoff_marker_failed_overrides_body_complete() {
     let plan = "- [ ] [t-401] Step one\n- [ ] [t-402] Step two\n";
     m.create_plan(plan).unwrap();
 
-    // Marker FAILED, but the body leaks a stale MISSION COMPLETE token from a
-    // pre-validation draft. This must NOT check the task off.
+    // Marker FAILED, but the body leaks a stale MISSION COMPLETE token from an
+    // earlier draft. This must NOT check the task off.
     let d = Deliverable {
         marker: MissionMarker::Failed {
             reason: "validator rejected".to_string(),
@@ -180,9 +179,9 @@ async fn test_orchestr_apply_checkoff_marker_failed_overrides_body_complete() {
     );
 }
 
-/// t-302 (b): `apply_check_off` checks off a task ONLY when the deliverable
-/// carries a genuine `MissionMarker::Complete` whose content body also
-/// retains the `MISSION COMPLETE` terminal marker.
+/// `apply_check_off` checks off a task ONLY when the deliverable carries a
+/// genuine `MissionMarker::Complete` whose content body also retains the
+/// `MISSION COMPLETE` terminal marker.
 #[tokio::test]
 async fn test_orchestr_apply_checkoff_only_checks_on_genuine_complete() {
     let tmp = tempfile::tempdir().unwrap();
@@ -217,8 +216,8 @@ async fn test_orchestr_apply_checkoff_only_checks_on_genuine_complete() {
     );
 }
 
-/// t-302 (c): a REJECTED deliverable's content retains the validator critique
-/// in a `VALIDATOR REJECTION` block, so the downstream consumer can act on it.
+/// A REJECTED deliverable's content retains the validator critique in a
+/// `VALIDATOR REJECTION` block, so the downstream consumer can act on it.
 #[tokio::test]
 async fn test_orchestr_apply_checkoff_rejected_retains_critique_content() {
     let tmp = tempfile::tempdir().unwrap();
@@ -236,11 +235,11 @@ async fn test_orchestr_apply_checkoff_rejected_retains_critique_content() {
     let d = m.apply_check_off(d, Some("t-601".to_string()));
     assert!(d.content.contains("VALIDATOR REJECTION"));
     assert!(d.content.contains("assertions failed on line 12"));
-    // And the REJECTED marker leaves the task unchecked (parity with t-302 a).
+    // And the REJECTED marker leaves the task unchecked.
     assert!(m.plan.pending_tasks().contains(&"t-601".to_string()));
 }
 
-/// REQ-ORCH-001 fractal: nested delegation beyond max_recursion_depth is
+/// Fractal delegation: nested delegation beyond max_recursion_depth is
 /// rejected.
 #[tokio::test]
 async fn test_orchestr_fractal_depth_rejected() {
@@ -297,14 +296,14 @@ fn test_orchestr_synthesize_joins_deliverables() {
     assert!(out.contains("second"));
 }
 
-// REQ-ORCH-005: `handle_delegate_task` handler-level tests
+// `handle_delegate_task` handler-level tests
 
-/// REQ-ORCH-005 canonical signature: `handle_delegate_task` accepts the full
-/// payload `(agent_name, prompt, snippets, task_id?, image_urls?, audio_urls?)`
-/// where `agent_name` is the snake_case enum. It returns the specialist's
-/// deliverable as a `ToolResult` whose content carries the `MISSION COMPLETE
-/// (task-id)` terminal marker, and is synchronous-from-Manager (blocks until
-/// the specialist returns — this call itself completes in-line).
+/// Canonical signature: `handle_delegate_task` accepts the full payload
+/// `(agent_name, prompt, snippets, task_id?, image_urls?, audio_urls?)` where
+/// `agent_name` is the snake_case enum. It returns the specialist's deliverable
+/// as a `ToolResult` whose content carries the `MISSION COMPLETE (task-id)`
+/// terminal marker, and it is synchronous-from-Manager: the call blocks until
+/// the specialist returns.
 #[test]
 fn test_orchestr_handler_full_signature_and_success_marker() {
     let args = serde_json::json!({
@@ -321,8 +320,8 @@ fn test_orchestr_handler_full_signature_and_success_marker() {
     assert!(result.content.contains("Implement the widget parser."));
 }
 
-/// REQ-ORCH-002: an unknown `agent_name` is rejected at parse time with a
-/// `BadArguments` ToolError (the snake_case enum rejects it), never a panic.
+/// An unknown `agent_name` is rejected at parse time with a `BadArguments`
+/// ToolError (the snake_case enum rejects it), never a panic.
 #[test]
 fn test_handler_rejects_unknown_agent() {
     let args = serde_json::json!({
@@ -334,9 +333,9 @@ fn test_handler_rejects_unknown_agent() {
     assert!(matches!(err, ToolError::BadArguments { .. }));
 }
 
-/// REQ-ORCH-003/005: the brief MUST be self-contained and non-empty — a
-/// blank prompt is rejected (one task per call; the subagent cannot see the
-/// Manager's context, so the brief must stand alone).
+/// The brief MUST be self-contained and non-empty — a blank prompt is
+/// rejected (one task per call; the subagent cannot see the Manager's context,
+/// so the brief must stand alone).
 #[test]
 fn test_handler_rejects_empty_prompt() {
     let args = serde_json::json!({
@@ -371,10 +370,10 @@ fn test_handler_rejects_missing_or_empty_task_id() {
     assert!(matches!(err, ToolError::BadArguments { .. }));
 }
 
-/// t6-REQ-1 / t6-REQ-2: `OrchestrationConfig::from_config` hydrates the
-/// runtime orchestration config (recursion bound + manager module + tool
-/// table) from the loaded `[orchestration]` TOML block, and
-/// `OrchestratorManager::from_config` threads it through.
+/// `OrchestrationConfig::from_config` hydrates the runtime orchestration config
+/// (recursion bound + manager module + tool table) from the loaded
+/// `[orchestration]` TOML block, and `OrchestratorManager::from_config` threads
+/// it through.
 #[test]
 fn test_orchestr_config_threads_into_manager() {
     use crate::config::Config;
@@ -427,11 +426,11 @@ async fn test_orchestr_run_executing_rejects_domain_module() {
     assert!(res.is_err());
 }
 
-// M8: the Silent Dispatcher must never read "the plan could not be read" as
-// "the mission is finished" (`docs/recon_bugs_manager.md` M8). The gate now uses
-// the fallible plan API added in t-031h (`Plan::try_pending_tasks`), so a read
-// failure is an Err, a successfully-read empty pending list is the only
-// completion signal, and dispatch of real pending tasks is unchanged.
+// The Silent Dispatcher must never read "the plan could not be read" as "the
+// mission is finished". The check uses the fallible plan API
+// (`Plan::try_pending_tasks`), so a read failure is an Err, a successfully-read
+// empty pending list is the only completion signal, and dispatch of real
+// pending tasks is unchanged.
 
 /// Minimal ERROR-level log capture (same shape as the WARN counter in
 /// `steer_tests.rs`): proves the plan-read failure is *logged* loudly, not only
@@ -487,9 +486,9 @@ impl tracing::Subscriber for ErrorLogCapture {
     fn exit(&self, _span: &tracing::span::Id) {}
 }
 
-/// M8 (i): an execution plan that exists but **cannot be read** must abort the
-/// Silent Dispatcher with an explicit, logged error — it must never return `Ok`
-/// (which the Manager reads as "the Executing phase is done"), and it must never
+/// An execution plan that exists but **cannot be read** must abort the Silent
+/// Dispatcher with an explicit, logged error — it must never return `Ok` (which
+/// the Manager reads as "the Executing phase is done"), and it must never
 /// delegate anything or touch the plan on disk.
 #[tokio::test]
 async fn test_orchestr_run_executing_plan_read_error_is_not_completion() {
@@ -502,9 +501,9 @@ async fn test_orchestr_run_executing_plan_read_error_is_not_completion() {
     ];
     std::fs::write(m.plan.plan_path(), undecodable).unwrap();
 
-    // Precondition at the plan layer: the state is UNKNOWN. The old Vec-shaped
-    // wrapper still degrades to an empty list — which is exactly the lie this
-    // call site used to act on.
+    // Precondition at the plan layer: the state is UNKNOWN. A Vec-shaped
+    // wrapper degrades to an empty list — the very thing this call site must
+    // refuse to act on.
     assert!(m.plan.exists(), "the plan file is on disk");
     assert!(
         m.plan.try_pending_tasks().is_err(),
@@ -563,10 +562,10 @@ async fn test_orchestr_run_executing_plan_read_error_is_not_completion() {
     );
 }
 
-/// M8 (ii): a plan that **was read successfully** and has nothing pending —
-/// every box ticked, or no plan file at all — keeps the pre-existing completion
-/// path: `Ok(..)`, no delegation, and no error logged. This is what distinguishes
-/// "nothing pending" from "cannot read" in the migrated gate.
+/// A plan that **was read successfully** and has nothing pending — every box
+/// ticked, or no plan file at all — keeps the documented completion path:
+/// `Ok(..)`, no delegation, and no error logged. That is what distinguishes
+/// "nothing pending" from "cannot read" at this call site.
 #[tokio::test]
 async fn test_orchestr_run_executing_empty_pending_list_still_completes() {
     let capture = ErrorLogCapture::default();
@@ -618,8 +617,8 @@ async fn test_orchestr_run_executing_empty_pending_list_still_completes() {
     );
 }
 
-/// M8 (iii): the normal path is unchanged — pending tasks are dispatched once
-/// each, checked off on completion, and the loop terminates via the empty-pending
+/// The normal path is unchanged: pending tasks are dispatched once each,
+/// checked off on completion, and the loop terminates via the empty-pending
 /// completion path.
 #[tokio::test]
 async fn test_orchestr_run_executing_dispatches_pending_tasks_unchanged() {
@@ -661,7 +660,7 @@ async fn test_orchestr_run_executing_dispatches_pending_tasks_unchanged() {
         "deliverables stay bound to their task id"
     );
 
-    // The same completion signal as before the migration: everything checked off.
+    // The same completion signal as any ordinary run: everything checked off.
     assert!(
         m.plan.try_pending_tasks().unwrap().is_empty(),
         "all tasks checked off by the dispatcher"
@@ -753,11 +752,11 @@ fn test_handle_delegate_task_terminal_marker_deduplication() {
     );
 }
 
-/// Concurrency regression (Phase 2): 20 concurrent emitters hammer
-/// `emit_status` / `emit_event` (clone-the-sender-out-and-drop pattern) while
-/// a SINGLE drainer task consumes the channels. No panic, no deadlock, fast
-/// completion. (Unbounded channels + a single drainer — multiple drainers
-/// would race over message ownership.)
+/// Concurrency regression: 20 concurrent emitters hammer `emit_status` /
+/// `emit_event` (clone-the-sender-out-and-drop pattern) while a SINGLE drainer
+/// task consumes the channels. No panic, no deadlock, fast completion.
+/// (Unbounded channels + a single drainer — multiple drainers would race over
+/// message ownership.)
 #[tokio::test]
 async fn test_bus_hammer_concurrent_emitters() {
     let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -821,8 +820,8 @@ async fn test_bus_hammer_concurrent_emitters() {
 
 #[test]
 fn test_stream_identity_matches_decorated_task_ids() {
-    // Dedup cluster C1 part 2: `StreamIdentity::matches` normalizes all three
-    // inputs through `crate::task_id`, and decoration-only / empty targets stay
+    // Dedup part 2: `StreamIdentity::matches` normalizes all three inputs
+    // through `crate::task_id`, and decoration-only / empty targets stay
     // "absent" (never a wildcard match).
     let identity = StreamIdentity {
         agent_tag: "coder-t-001".to_string(),
@@ -838,8 +837,8 @@ fn test_stream_identity_matches_decorated_task_ids() {
     assert!(!identity.matches(None, "t-999"));
 }
 
-/// Re-export guard (t-048): the live worker loops in `src/agents/runner/*` reach
-/// the notice API through the crate-level `crate::orchestrator::…` path. Pinning
+/// Re-export guard: the live worker loops under `src/agents/runner/` reach the
+/// notice API through the crate-level `crate::orchestrator::…` path. Pinning
 /// those paths here means a rename inside `notice.rs` fails at compile time
 /// instead of silently leaving a turn loop without a drain seam.
 #[test]
@@ -876,14 +875,11 @@ fn test_notice_api_is_reachable_through_the_crate_level_path() {
     ));
 }
 
-/// Single-rendering guard (t-048): the transcript text of a steering notice is
-/// produced in exactly ONE place in `src/` — `render_notice_for_worker`.
-///
-/// Before t-048 there were three copies of that format string (the canonical
-/// renderer, one inline copy in the specialist loop, one in the shared fix
-/// loop), and the inline copies had already drifted from the reply contract the
-/// renderer promises. Two live loops each with their own rendering is how a
-/// worker gets told one reply protocol by one turn and another by the next.
+/// Single-rendering guard: the transcript text of a steering notice is produced
+/// in exactly ONE place in `src/` — `render_notice_for_worker`. Several live
+/// loops each with their own rendering is how a worker gets told one reply
+/// protocol by one turn and another by the next, so the inline copies are gone
+/// and the reply contract is promised in one place only.
 #[test]
 fn test_notice_transcript_is_rendered_in_exactly_one_place() {
     // Assembled rather than spelled out, so this file cannot match its own
@@ -929,8 +925,8 @@ fn walk_src_for(dir: &Path, needle: &str, out: &mut Vec<(String, usize)>) {
     }
 }
 
-// Gate t-055: the disk-first prompt lookup in `OrchestratorManager::delegate`
-// (`saved_prompt_path_for_task`) is grammar-gated by
+// The disk-first prompt lookup in `OrchestratorManager::delegate`
+// (`saved_prompt_path_for_task`) is validated by
 // `crate::task_id::validate_task_id` — the single grammar authority for task
 // ids. A rejected id is a typed refusal, so the join never happens, the read
 // is never attempted, and the delegation degrades exactly like a missing
@@ -1002,7 +998,7 @@ impl tracing::Subscriber for RejectedTaskIdWarns {
 }
 
 /// Every hostile task-id spelling is refused with its own typed variant, and no
-/// path is ever returned — so the read that used to follow the join is never
+/// path is ever returned — so the read that would follow the join is never
 /// attempted, and nothing is created in the prompts directory either.
 #[test]
 fn test_saved_prompt_path_refuses_hostile_task_ids() {
@@ -1010,7 +1006,7 @@ fn test_saved_prompt_path_refuses_hostile_task_ids() {
     let plan_dir = tmp.path().join("plan");
     let prompts_dir = plan_dir.join("prompts");
     std::fs::create_dir_all(&prompts_dir).unwrap();
-    // Exactly where the un-gated `prompts/{clean}.md` join resolved for the id
+    // Exactly where an unchecked `prompts/{clean}.md` join resolves for the id
     // `../escape`: one level ABOVE the prompts directory.
     let planted = plan_dir.join("escape.md");
     std::fs::write(&planted, "planted blueprint outside the prompts dir").unwrap();
@@ -1062,9 +1058,9 @@ fn test_saved_prompt_path_refuses_hostile_task_ids() {
     );
 }
 
-/// A normal `t-0NN` id — plain or decorated — still resolves to exactly one file
+/// A normal task id — plain or decorated — still resolves to exactly one file
 /// name inside the prompts directory and round-trips through the disk-first
-/// lookup, so the gate does not change the happy path.
+/// lookup, so validation does not change the happy path.
 #[test]
 fn test_saved_prompt_path_round_trips_a_normal_task_id() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1108,7 +1104,7 @@ fn test_delegate_with_rejected_task_id_falls_back_to_jit_and_warns() {
     let m = test_manager(&tmp);
     let prompts_dir = tmp.path().join("prompts");
     std::fs::create_dir_all(&prompts_dir).unwrap();
-    // The un-gated join for `../escape` resolved to `<plan dir>/escape.md`.
+    // An unchecked join for `../escape` resolves to `<plan dir>/escape.md`.
     let planted = tmp.path().join("escape.md");
     let planted_text = "---\nrole_name: \"planted_outside_prompts\"\n---\n\nplanted\n";
     std::fs::write(&planted, planted_text).unwrap();

@@ -1,7 +1,7 @@
 //! Shared wiremock helpers and fixture loaders for integration tests.
 //!
 //! These helpers are NOT run under `cargo test --lib`; they are compiled only
-//! into the `tests/` integration targets only.
+//! into the `tests/` integration targets.
 
 /// Construct a mock backend URL for wiremock.
 pub fn mock_backend() -> String {

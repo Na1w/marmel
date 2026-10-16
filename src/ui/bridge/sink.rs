@@ -12,12 +12,9 @@ use std::sync::Arc;
 /// What the paused-stream host asks the sleep chain for, given the `Sleep` decision it renders.
 ///
 /// The duration is resolved by the single owner, [`arbiter::clamped_sleep_secs`] — the owner's
-/// default, its `SLEEP_MIN_SECS` floor and the arbitrator's own upper budget knob. This site used
-/// to re-type the default (`unwrap_or(5)`) and apply its own upper clamp, which skipped the floor:
-/// a steered `"sleep_seconds": 0` reached the host verbatim, so the arbitrator slept
-/// `SLEEP_MIN_SECS` while the host announced `"Steering arbitrator sleeping for 0s..."` and then
-/// slept nothing — the phantom / hot-loop sleep the arbiter's floor was added to remove. Host and
-/// arbitrator now agree on the number by construction (gate t-072).
+/// default, its `SLEEP_MIN_SECS` floor and the arbitrator's own upper budget knob. Host and
+/// arbitrator agree on the number by construction: a steered `"sleep_seconds": 0` is raised to
+/// that floor before it reaches the host, so the announced duration is the slept duration.
 pub(crate) fn host_sleep_request(decision: Option<&crate::orchestrator::SteerDecision>) -> u64 {
     arbiter::clamped_sleep_secs(decision.and_then(|d| d.sleep_seconds))
 }
@@ -376,8 +373,8 @@ impl ArbitrationChannel for RendererChannel<'_> {
     }
 
     fn has_active_work(&self, _round: usize) -> bool {
-        // The renderer's subagent table cannot change during a paused turn, so it counts as
-        // active work in every round (behaviour kept from the original `on_pause`).
+        // The renderer's subagent table cannot change during a paused turn, so it
+        // counts as active work in every round.
         crate::orchestrator::has_active_workers() || self.subagents.iter().any(|s| s.is_active)
     }
 

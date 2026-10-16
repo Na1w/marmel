@@ -876,8 +876,8 @@ fn test_arbiter_entry_pause_steer_sleeps_then_re_evaluates_with_notice() {
         assert_eq!(
             channel.sleep_notices,
             vec![
-                // gate t-070: this fixture asks for `sleep_seconds: 0`; the
-                // arbitrator floors that to the sleep tool's own minimum
+                // This fixture asks for `sleep_seconds: 0`; the arbitrator
+                // floors that to the sleep tool's own minimum
                 // (`crate::tool_args::SLEEP_MIN_SECS`) instead of spinning.
                 arbiter::SleepNotice::Started {
                     sleep_secs: crate::tool_args::SLEEP_MIN_SECS
@@ -898,8 +898,8 @@ fn test_arbiter_entry_pause_steer_sleeps_then_re_evaluates_with_notice() {
         let hist = history.read().unwrap();
         assert_eq!(hist.len(), 1, "the sleep round records one history entry");
         assert_eq!(hist[0].0, "wait for the build to finish");
-        // t-070: the floored sleep is what the history names — the arbitrator
-        // slept `SLEEP_MIN_SECS`, not the requested 0.
+        // The floored sleep is what the history names: the arbitrator slept
+        // `SLEEP_MIN_SECS`, not the requested 0.
         assert_eq!(
             hist[0].1,
             format!(
@@ -980,8 +980,8 @@ fn test_arbiter_entry_reports_cancelled_sleep_and_stops_rounds() {
     });
 }
 
-// t-035c — one action vocabulary for both layers, durable steering around Sleep,
-// a capped chained-sleep budget, and observable inbox-capacity drops
+// One action vocabulary for both layers, durable steering around Sleep, a capped
+// chained-sleep budget, and observable inbox-capacity drops
 
 /// One subtask decision with a raw (possibly non-canonical) action spelling.
 fn subtask_with(
@@ -1012,8 +1012,8 @@ fn test_bridge_subtask_action_spelling_variants_route_to_one_typed_action() {
                 "FORWARD NOTICE",
                 "forward",
                 "send notice",
-                // Tool-name spellings must come from `crate::tool_names` — a raw
-                // literal here trips the repo-wide literal guard (t-054).
+                // Tool-name spellings must come from `crate::tool_names`: a raw
+                // literal here trips the repo-wide tool-name literal guard.
                 crate::tool_names::TOOL_REPLY_TO_ARBITRATOR,
             ],
             action::ACTION_FORWARD_NOTICE,
@@ -1488,12 +1488,10 @@ fn test_bridge_sleep_budget_deadline_cap_and_host_clamp_are_deterministic() {
     assert_eq!(stopped.host_sleep_secs(30), None);
 }
 
-// t-076 — a **sub-second** remainder of the cumulative sleep budget is an
-// exhausted budget, not a zero-length sleep. `remaining.is_zero()` is false but
-// `remaining.as_secs()` is `0`, so the old `Ok(remaining.as_secs())` returned
-// `Ok(0)`, the round machine slept nothing and re-asked the arbitrator
-// immediately — the very hot-loop the `SLEEP_MIN_SECS` floor removed, re-created
-// because the floor was applied *before* the budget clamp.
+// A **sub-second** remainder of the cumulative sleep budget is an exhausted
+// budget, not a zero-length sleep: `remaining.is_zero()` is false but
+// `remaining.as_secs()` is `0`, so the floor is applied *after* the budget
+// clamp and a budget that cannot cover it is refused.
 
 /// A [`arbiter::SleepBudget`] with exactly `remaining` left of the cumulative cap
 /// (injectable clock, so this is deterministic and pty-free).
@@ -1506,10 +1504,10 @@ fn sleep_budget_with_remaining(
     )
 }
 
-/// (t-076 a) Every sub-second remainder is refused through the same typed exhaustion
-/// outcome a fully spent budget reports — the caller can tell "budget exhausted" apart
-/// from "slept N seconds" — and **nothing** is accounted: no `note_slept(0)`, no
-/// extension, no slept seconds on the chain the host reads back.
+/// Every sub-second remainder is refused through the same typed exhaustion outcome a
+/// fully spent budget reports — the caller can tell "budget exhausted" apart from
+/// "slept N seconds" — and **nothing** is accounted: no `note_slept(0)`, no extension,
+/// no slept seconds on the chain the host reads back.
 #[test]
 fn test_bridge_sleep_budget_sub_second_remainder_is_refused_not_a_zero_length_sleep() {
     let now = std::time::Instant::now();
@@ -1573,8 +1571,8 @@ fn test_bridge_sleep_budget_sub_second_remainder_is_refused_not_a_zero_length_sl
     );
 }
 
-/// (t-076 b) The floor is applied **after** the budget clamp: an inside-the-budget request
-/// still comes back clamped, and no reachable call returns a duration below the floor.
+/// The floor is applied **after** the budget clamp: an inside-the-budget request still
+/// comes back clamped, and no reachable call returns a duration below the floor.
 #[test]
 fn test_bridge_sleep_budget_floor_is_applied_after_the_budget_clamp() {
     let now = std::time::Instant::now();
@@ -1633,16 +1631,16 @@ fn test_bridge_sleep_budget_floor_is_applied_after_the_budget_clamp() {
     }
 }
 
-/// (t-076 c) The **host** chain (`SleepChain::host_sleep_secs`) applies the same
-/// refuse-vs-floor policy: a budget that cannot cover the floor is refused with `None`, a
-/// sub-minimum request is floored, and no chain state can hand the host a zero-length sleep.
+/// The **host** chain (`SleepChain::host_sleep_secs`) applies the same refuse-vs-floor
+/// policy: a budget that cannot cover the floor is refused with `None`, a sub-minimum
+/// request is floored, and no chain state can hand the host a zero-length sleep.
 #[test]
 fn test_bridge_sleep_chain_host_sleep_refuses_a_sub_minimum_budget_and_floors_the_request() {
     let now = std::time::Instant::now();
     let floor = crate::tool_args::SLEEP_MIN_SECS;
     let limit = arbiter::MAX_CHAINED_SLEEP_SECONDS;
 
-    // Budget fully spent: refusal (this half held before t-076 as well).
+    // Budget fully spent: refusal.
     let spent = arbiter::SleepChain {
         extensions: 1,
         slept_secs: limit,
@@ -1655,8 +1653,8 @@ fn test_bridge_sleep_chain_host_sleep_refuses_a_sub_minimum_budget_and_floors_th
         "a spent budget stays a refusal even for a sub-minimum request"
     );
 
-    // Budget left, request below the floor: floored — the host used to get `Some(0)` and
-    // announce a sleep that never happened.
+    // Budget left, request below the floor: floored — never a zero-length duration the
+    // host would announce as a sleep that never happened.
     let fresh = arbiter::SleepChain {
         extensions: 0,
         slept_secs: 0,
@@ -1793,7 +1791,7 @@ fn test_bridge_notice_capacity_drop_is_observable_and_inbox_stays_bounded() {
         "a capacity drop must be counted, delta was {evicted_delta}"
     );
 
-    // Drop-oldest: the oldest undelivered notice is gone, the next one and the newest survive.
+    // Drop-oldest: the oldest undelivered notice is dropped, the next one and the newest survive.
     assert!(
         crate::orchestrator::get_pending_notice("t035c-fill-0").is_none(),
         "the oldest notice is the one dropped by the capacity policy"
@@ -1828,10 +1826,10 @@ fn test_bridge_notice_capacity_drop_is_observable_and_inbox_stays_bounded() {
     );
 }
 
-// t-072 — the paused-stream host (`sink.rs`) resolves a `Sleep` duration through
-// the single owner (`arbiter::clamped_sleep_secs`), never with its own default
-// and clamp. Host and arbitrator must agree on the number, in the value slept
-// *and* in the text the user is shown.
+// The paused-stream host (`sink.rs`) resolves a `Sleep` duration through the single
+// owner (`arbiter::clamped_sleep_secs`), never with a host-local default or clamp.
+// Host and arbitrator must agree on the number, in the value slept *and* in the text
+// the user is shown.
 
 /// Parse every sleep duration announced in rendered host text, e.g.
 /// "Steering arbitrator sleeping for 3s..." / "... woke up after 3s — ...".
@@ -1854,8 +1852,8 @@ fn rendered_sleep_durations(statuses: &[String]) -> Vec<u64> {
     out
 }
 
-/// (t-072 a) The host's view of a `Sleep` request **is** the owner's clamped
-/// value for every input shape — no re-typed default, no host-local clamp.
+/// The host's view of a `Sleep` request **is** the owner's clamped value for every
+/// input shape — no host-local default, no host-local clamp.
 #[test]
 fn test_bridge_sink_host_sleep_duration_is_the_owners_clamped_value() {
     for requested in [
@@ -1878,7 +1876,7 @@ fn test_bridge_sink_host_sleep_duration_is_the_owners_clamped_value() {
         );
     }
 
-    // The three gate inputs, pinned against the owner's constants instead of numbers.
+    // The three sleep inputs, pinned against the owner's constants, not numbers.
     let absent = steer_decision("Sleep", None, None);
     assert_eq!(
         super::sink::host_sleep_request(Some(&absent)),
@@ -1904,9 +1902,9 @@ fn test_bridge_sink_host_sleep_duration_is_the_owners_clamped_value() {
     // `test_bridge_sink_sleep_site_redeclares_no_default_and_no_clamp`.
 }
 
-/// (t-072 b) The trailing host sleep — the extension the paused-stream host may add
-/// on top of the arbitration's own sleeps — carries the floored value into the
-/// user-visible wording: host text and arbitrator duration never disagree.
+/// The trailing host sleep — the extension the paused-stream host may add on top of
+/// the arbitration's own sleeps — carries the floored value into the user-visible
+/// wording: host text and arbitrator duration never disagree.
 #[test]
 fn test_bridge_sink_host_sleep_and_its_rendered_text_agree_with_the_arbitrator() {
     // A chain with budget left: this is exactly the state in which the sink sleeps
@@ -1960,7 +1958,7 @@ fn test_bridge_sink_host_sleep_and_its_rendered_text_agree_with_the_arbitrator()
     );
 }
 
-/// (t-072 c) End-to-end through the paused-stream host: an arbitrator steered into a
+/// End-to-end through the paused-stream host: an arbitrator steered into a
 /// zero-second sleep actually waits the floored minimum, and everything the host
 /// renders says that same duration — the host must not announce a sleep that never
 /// happened (or hide one that did).
@@ -2075,9 +2073,9 @@ fn test_bridge_sink_host_and_arbitrator_agree_on_a_steered_zero_second_sleep() {
     });
 }
 
-/// (t-072 d) Source-level pin: the sink must **call** the owner instead of
-/// re-declaring the sleep resolution. Needles are assembled at runtime so this
-/// test cannot satisfy its own forbidden patterns.
+/// Source-level pin: the sink must **call** the owner instead of re-declaring
+/// the sleep resolution. Needles are assembled at runtime so this test cannot
+/// satisfy its own forbidden patterns.
 #[test]
 fn test_bridge_sink_sleep_site_redeclares_no_default_and_no_clamp() {
     let src = include_str!("sink.rs");
@@ -2130,11 +2128,11 @@ fn test_bridge_sink_sleep_site_redeclares_no_default_and_no_clamp() {
     );
 }
 
-/// t-054 guard: no raw tool-name string literals may live anywhere under
-/// `src/ui/bridge/`. The needles are built **at runtime** from the
-/// `crate::tool_names` constants (mirroring `tests/test_tool_name_literals.rs`),
-/// so a newly added constant is covered the moment it exists, and this file
-/// itself stays free of the literals it forbids.
+/// No raw tool-name string literals may live anywhere under `src/ui/bridge/`.
+/// The needles are built **at runtime** from the `crate::tool_names` constants
+/// (mirroring `tests/test_tool_name_literals.rs`), so a newly added constant is
+/// covered the moment it exists, and this file stays free of the literals it
+/// forbids.
 #[test]
 fn test_no_raw_tool_name_literals_in_bridge_tree() {
     /// Every tool name owned by `crate::tool_names` (bare + caesar variants).

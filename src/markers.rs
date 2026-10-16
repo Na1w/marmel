@@ -1,15 +1,10 @@
-//! Single owner of the mission-marker grammar — dedup cluster **C4**
-//! (`docs/recon_duplication_helpers.md` §2.4) and the data-integrity bug **C1**
-//! (`docs/recon_bugs_manager.md`).
+//! Single owner of the mission-marker grammar: one `MissionMarker` type, one
+//! parser, and one vocabulary for testing, building and rewriting a marker.
 //!
-//! Two independent `MissionMarker` types used to exist — one in
-//! `src/agents/mod.rs`, one in `src/manager/phase.rs` — each with a verbatim
-//! copy of `contains_failed_marker` + `MissionMarker::parse`. Both copies tested
-//! `MISSION COMPLETE` as a plain *substring* **before** testing `FAILED`, so a
-//! FAILED deliverable that merely *mentions* `MISSION COMPLETE` (subagents echo
-//! `MISSION COMPLETE (t-xxx)` inside rejection/rollback prose all the time)
-//! was classified `Complete`, which flipped `- [ ] [t-xxx]` → `- [x] [t-xxx]`
-//! on disk. This module replaces both copies with one type and one parser.
+//! A verdict is decided positionally, never by counting substrings: only a
+//! line-initial or verdict-shaped `FAILED`, or a line-initial or terminal
+//! `MISSION COMPLETE`, states an outcome. A completion mention buried in prose
+//! must never flip `- [ ]` → `- [x]` on disk.
 //!
 //! ## Precedence table (authoritative order — do not reorder)
 //!
@@ -26,26 +21,23 @@
 //! | 6 | any remaining non-negated `MISSION COMPLETE` (no failure at all)    | `Complete` |
 //! | 7 | nothing recognised (incl. a negated-only `MISSION COMPLETE` mention) | `None`     |
 //!
-//! Rows 3 and 5 are the **FAIL-first rule** and the reason this module exists:
-//! an explicit `FAILED` / `REPLAN REQUIRED` signal must win over an *embedded*
-//! `MISSION COMPLETE` substring. Rationale — a specialist emits its verdict as
-//! its own line (`FAILED: reason`, `FAILED (Validator rejected deliverable)`),
-//! so a line-initial or verdict-shaped `FAILED` is positional evidence of the
-//! deliverable's outcome, whereas `MISSION COMPLETE` buried in the middle of a
-//! sentence is only evidence that those *words* occur in the text. Treating that
-//! substring as success corrupts the on-disk plan (`- [ ]` → `- [x]`), hides the
-//! task from `pending_tasks()`, and can auto-archive a plan whose work was never
-//! done (bug C1). Conversely a line-initial/terminal `MISSION COMPLETE` still
-//! beats the word "failed" inside narrative prose (row 4 before row 5), which
-//! preserves the historical "narrative mentions an old failure, then completes"
-//! behaviour that the validator/fix-loop rounds rely on.
+//! Rows 3 and 5 are the **FAIL-first rule**: an explicit `FAILED` /
+//! `REPLAN REQUIRED` signal wins over an *embedded* `MISSION COMPLETE`
+//! substring. A specialist emits its verdict as its own line (`FAILED: reason`,
+//! `FAILED (Validator rejected deliverable)`), so a line-initial or
+//! verdict-shaped `FAILED` is positional evidence of the deliverable's outcome,
+//! whereas `MISSION COMPLETE` buried in the middle of a sentence only proves
+//! that those *words* occur in the text. Treating such a mention as success
+//! corrupts the on-disk plan (`- [ ]` → `- [x]`), hides the task from
+//! `pending_tasks()`, and can auto-archive a plan whose work was never done.
+//! Conversely a line-initial or terminal `MISSION COMPLETE` still beats the word
+//! "failed" inside narrative prose (row 4 before row 5), which the
+//! validator/fix-loop rounds rely on.
 //!
 //! ## Vocabulary API — the only sanctioned way to touch a marker elsewhere
 //!
-//! Gate t-030 found the grammar re-implemented in six production files: ~20
-//! hard-coded marker literals, ten of them functional copies of the parser
-//! (substring tests, `format!("MISSION COMPLETE ({task_id})")` decorations, a
-//! case-sensitive revocation rewrite). Those call sites now call this module:
+//! Every production call site goes through this module, so no caller can invent
+//! its own marker spelling, casing rule or decoration:
 //!
 //! | Helper | Replaces |
 //! |---|---|
@@ -61,15 +53,14 @@
 //! `src/markers.rs` is asserted (by `tests` below) to be the only file in
 //! `src/` whose production code may contain a marker literal, and the
 //! [`MARKER_COMPLETE`] / [`MARKER_FAILED`] / [`MARKER_REPLAN`] constants must
-//! have real consumers. The exception list that gate t-030 needed for
-//! not-yet-migrated files (`KNOWN_EXTERNAL_MARKER_SITES` in the test module) is
-//! a **ratchet**, not an excuse: gate t-059 emptied it and the guard now fails
-//! outright on an undocumented or stale entry.
+//! have real consumers. The exemption list (`KNOWN_EXTERNAL_MARKER_SITES` in the
+//! test module) is empty and fails outright on an undocumented, stale or
+//! self-referential entry.
 
 use regex::Regex;
 use std::sync::LazyLock;
 
-/// Canonical success marker (REQ-ORCH-005).
+/// Canonical success marker.
 pub const MARKER_COMPLETE: &str = "MISSION COMPLETE";
 /// Canonical failure marker.
 pub const MARKER_FAILED: &str = "FAILED";
@@ -97,8 +88,7 @@ static NEGATED_BEFORE_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Terminal outcome a specialist returns, and the verdict the plan layer uses
-/// to decide whether a plan line may be checked off (REQ-PLAN-002 +
-/// REQ-ORCH-005).
+/// to decide whether a plan line may be checked off.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MissionMarker {
     /// Task fully satisfied. `task_id` matches the plan line to auto-check.
@@ -150,7 +140,7 @@ struct LineMap {
 }
 
 impl MissionMarker {
-    /// Parse the terminal marker out of a deliverable's text (REQ-ORCH-005).
+    /// Parse the terminal marker out of a deliverable's text.
     ///
     /// Matching is case-insensitive, but *positional*: markers at the start of
     /// a line or in the terminal summary line outrank substrings buried in
@@ -164,8 +154,7 @@ impl MissionMarker {
         }
 
         // Row 2: `REPLAN REQUIRED` outranks everything — a replan is never a
-        // success, and it must also win over a `... FAILED` tail (historical
-        // behaviour, kept verbatim).
+        // success, and it also wins over a trailing `... FAILED`.
         if find(&occurrences, MarkerKind::Replan).is_some() {
             return Some(MissionMarker::Replan {
                 reason: text.to_string(),
@@ -175,7 +164,7 @@ impl MissionMarker {
         // Row 3 (FAIL-first, part 1): an explicitly emitted failure marker —
         // one that starts its own line, or is verdict-shaped (`FAILED: …` /
         // `FAILED (…)`) — decides the outcome even when the same body also
-        // quotes `MISSION COMPLETE`. This is the C1 fix.
+        // quotes `MISSION COMPLETE`.
         if occurrences.iter().any(|o| {
             o.kind == MarkerKind::Failed
                 && (o.placement == Placement::LineStart || o.verdict_shaped)
@@ -214,9 +203,9 @@ impl MissionMarker {
             });
         }
 
-        // Row 6: no failure signal whatsoever — keep the historical lenient
-        // behaviour and accept a (positionally weaker) completion mention, as
-        // long as it is not a negated mention of the marker words.
+        // Row 6: no failure signal whatsoever — accept a (positionally weaker)
+        // completion mention, as long as it is not a negated mention of the
+        // marker words.
         let mentions: Vec<&Occurrence> = occurrences
             .iter()
             .filter(|o| o.kind == MarkerKind::Complete && !o.negated)
@@ -235,17 +224,16 @@ impl MissionMarker {
     ///
     /// The *structured* field wins: when the caller already holds a parsed
     /// `Deliverable.marker`, that verdict is used verbatim and the body text is
-    /// never re-parsed (`docs/recon_bugs_manager.md` C1 "minimal fix"). Only
-    /// when no structured marker is available does this fall back to the
-    /// positional body parse.
+    /// never re-parsed. Only when no structured marker is available does this
+    /// fall back to the positional body parse.
     #[must_use]
     pub fn resolve(explicit: Option<&MissionMarker>, body: &str) -> Option<MissionMarker> {
         explicit.cloned().or_else(|| MissionMarker::parse(body))
     }
 
     /// Returns `true` when the marker is a successful completion, i.e. it
-    /// carries `MISSION COMPLETE` (REQ-ORCH-005). Only this marker flips a
-    /// plan line to `[x]`; `FAILED` / `REPLAN REQUIRED` never do.
+    /// carries `MISSION COMPLETE`. Only this marker flips a plan line to `[x]`;
+    /// `FAILED` / `REPLAN REQUIRED` never do.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         matches!(self, MissionMarker::Complete { .. })
@@ -262,14 +250,14 @@ impl MissionMarker {
     }
 }
 
-/// `true` when already-uppercased text carries a non-benign `FAILED` marker
-/// (the sanitiser table used by both historical copies, now owned here).
+/// `true` when already-uppercased text carries a non-benign `FAILED` marker,
+/// i.e. after the benign failure-counter table has been blanked out.
 #[must_use]
 pub fn contains_failed_marker(upper: &str) -> bool {
     sanitize_failure_counters(upper).contains(FAILED_UPPER)
 }
 
-// Vocabulary API (gate t-030)
+// Vocabulary API
 //
 // Everything production code is allowed to do with a marker: test for one,
 // build one, or rewrite one. These helpers are the *only* sanctioned way to
@@ -278,7 +266,7 @@ pub fn contains_failed_marker(upper: &str) -> bool {
 // casing rule or its own decoration.
 
 /// Token written over a completion marker when a deliverable is revoked
-/// (`agents::runner::assembly`), replacing the hard-coded `"REVOKED"` spelling.
+/// (`agents::runner::assembly`).
 pub const REVOCATION_TOKEN: &str = "REVOKED";
 
 /// Decorate a marker with the task id it closes:
@@ -319,13 +307,9 @@ pub const ABORT_REASON: &str = "aborted";
 /// the `FAILED`-prefix vocabulary stays owned here and the body always parses
 /// back through [`failure_reason`] / [`MissionMarker::parse`].
 ///
-/// Four call sites used to hand-build this body with slightly different wording
-/// (`orchestrator::OrchestratorManager::delegate`,
-/// `agents::runner::execution`, `agents::Generalist::run`,
-/// `orchestrator::delegate`); they all call this one
-/// owner now, so an aborted deliverable has exactly one byte-for-byte spelling
-/// everywhere — including in the UI, whose failure-reason extraction reads the
-/// trailer this writes.
+/// Every abort site calls this one owner, so an aborted deliverable has exactly
+/// one byte-for-byte spelling everywhere — including in the UI, whose
+/// failure-reason extraction reads the trailer this writes.
 #[must_use]
 pub fn aborted_deliverable(context: &str) -> String {
     format!("Task {context}.\n\n{}", failed_trailer(ABORT_REASON))
@@ -372,16 +356,14 @@ pub fn starts_with_complete(text: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(COMPLETE_UPPER))
 }
 
-// Failure-verdict vocabulary (gate t-059, dedup sweep A / t-044)
+// Failure-verdict vocabulary
 //
 // The grammar does not stop at "is a marker present". The *shapes* a verdict is
-// emitted in (`FAILED (reason)`, `FAILED: reason`, `REPLAN REQUIRED (t-002):
+// emitted in (`FAILED (reason)`, `FAILED: reason`, `REPLAN REQUIRED (<task>):
 // reason`), the *words* a structured verdict payload carries
 // (`{"status": "FAILED"}`), and the weak prose stem that decides whether a line
-// reads like a failure, all belong to the same vocabulary. Gate t-044 found
-// them re-spelled by hand in `src/agents/validation.rs`, `src/ui/helpers.rs`,
-// `src/ui/raw.rs` and `src/ui/transcript.rs`; they live here now, in one table
-// each, so the marker owner — and only the marker owner — decides what a
+// reads like a failure, all belong to the same vocabulary and live here in one
+// table each, so the marker owner — and only the marker owner — decides what a
 // failure looks like. There is deliberately no second parser module.
 
 /// Prefix of the parenthesised verdict shape: `FAILED (<reason>)`.
@@ -492,9 +474,9 @@ fn first_non_empty_line(text: &str) -> &str {
 
 /// Verdict words that state a **negative** verdict when they are the whole
 /// value of a verdict field (`{"status": "FAILED"}`,
-/// `{"decision": "DECLINED"}`). Compared case-insensitively against the
-/// trimmed field value; this is the table `agents::validation` used to
-/// hand-roll as a chain of `eq_ignore_ascii_case("<literal>")` calls.
+/// `{"decision": "DECLINED"}`). Compared case-insensitively against the trimmed
+/// field value; this is the table `agents::validation` matches a verdict field
+/// against.
 pub const FAILURE_VERDICT_WORDS: &[&str] = &[
     "REJECTED",
     "REJECT",
@@ -539,8 +521,8 @@ pub const FAILURE_WORD_STEMS: &[&str] = &["fail"];
 /// `true` when `text` contains one of [`FAILURE_WORD_STEMS`].
 ///
 /// Case folding uses `to_lowercase` (Unicode) rather than `to_ascii_lowercase`
-/// because the historical call site did, and the transcript's rendered summary
-/// must not change: some full-width capitals (ｅｆｇｉ) fold into ASCII stems.
+/// so the transcript's rendered summary stays stable: some full-width capitals
+/// (ｅｆｇｉ) fold into ASCII stems.
 #[must_use]
 pub fn has_failure_word(text: &str) -> bool {
     let lower = text.to_lowercase();
@@ -551,12 +533,11 @@ pub fn has_failure_word(text: &str) -> bool {
 /// **case-correctly** (`MISSION COMPLETE`, `mission complete`,
 /// `Mission Complete`, `Mission COMPLETE`, …).
 ///
-/// The historical caller did two case-sensitive `replace()` calls, so any other
-/// casing survived a rejection: the rejected deliverable kept an intact
-/// completion marker, which `MissionMarker::parse` reads case-insensitively and
-/// which therefore still checked `- [ ] [t-xxx]` off on disk. Revocation now
-/// reuses the parser's own case-insensitive occurrence scan
-/// ([`find_all`] over the ascii-uppercased text) instead of a second parser.
+/// Every casing is folded, because `MissionMarker::parse` is case-insensitive:
+/// a completion marker that survived a rejection in some other casing would
+/// still check `- [ ]` off on disk. The rewrite reuses the parser's own
+/// case-insensitive occurrence scan ([`find_all`] over the ascii-uppercased
+/// text).
 ///
 /// Byte offsets transfer 1:1 because `to_ascii_uppercase` is length-preserving
 /// and ASCII bytes never occur inside a multi-byte UTF-8 sequence, so the
@@ -697,21 +678,18 @@ fn verdict_shaped(sanitized: &str, end: usize) -> bool {
 }
 
 /// Task id for a completion occurrence: the task-id token sitting on the
-/// marker's own line, after the marker words (`MISSION COMPLETE (t-007)`).
+/// marker's own line, after the marker words (`MISSION COMPLETE (t-…)`).
 ///
-/// Two hardening rules, from the H6 hand-off after t-031d
-/// (`docs/recon_bugs_manager.md` H6):
+/// Two hardening rules:
 ///
 /// 1. **A token, never a substring.** The match is delegated to
 ///    [`crate::plan_parse::find_task_id_token`], the crate's single task-id
-///    token recogniser, which is boundary-aware. This module used to own a
-///    private copy of the task-id regex that was *not* boundary-safe, so a
-///    deliverable mentioning a path such as `src/chart-notes.md` bound the
-///    task `t-notes` and checked off work nobody had done.
-/// 2. **The marker's own line only.** The old second half of this function
-///    scanned the WHOLE deliverable for the first `t-…` run; that whole-text
-///    fallback is removed. An id named anywhere else in the text is prose, not
-///    the verdict's id — callers that know the id bind it explicitly (the
+///    token recogniser, which is boundary-aware: a deliverable mentioning a
+///    path such as `src/chart-notes.md` must never bind the task `t-notes` and
+///    check off work nobody had done.
+/// 2. **The marker's own line only.** There is no whole-text fallback for the
+///    first `t-…` run: an id named anywhere else in the text is prose, not the
+///    verdict's id — callers that know the id bind it explicitly (the
 ///    `delegate_task` argument, or the structured [`MissionMarker`] field).
 fn bound_task_id(text: &str, o: &Occurrence) -> Option<String> {
     let line_end = text[o.end..]
@@ -728,7 +706,7 @@ fn bound_task_id(text: &str, o: &Occurrence) -> Option<String> {
 /// sits on **the own line of any non-negated `MISSION COMPLETE` occurrence** in
 /// `candidates`.
 ///
-/// This is deliberately NOT a text scan (H6): every candidate is a line that
+/// This is deliberately NOT a text scan: every candidate is a line that
 /// actually spells the completion marker, and the id still has to be a
 /// boundary-safe token on that line. It exists for the shape the harness
 /// produces — `agents::runner::assembly::assemble_final_deliverable` appends a
@@ -766,13 +744,9 @@ mod tests {
         );
     }
 
-    // ---- H6 hardening: the task id bound to a marker is a *token*, never a
-    // substring. These three guards pin the fix for the hand-off recorded after
-    // t-031d: the module-private task-id regex was not word-boundary safe, and
-    // `bound_task_id` fell back to scanning the WHOLE deliverable, so a task id
-    // hiding inside a path could be bound to a completion marker — the
-    // `docs/recon_bugs_manager.md` H6 failure mode, one layer below the
-    // `manager::phase` caller-side guard.
+    // ---- task-id binding: the id bound to a marker is a *token*, never a
+    // substring, and it is only ever taken from the marker's own line — an id
+    // hiding inside a path must never check off work nobody had done.
 
     /// (i) A path whose name contains a `t-…` substring must never bind that
     /// substring as the marker's task id: `src/chart-notes.md` → `t-notes` is
@@ -781,8 +755,8 @@ mod tests {
     #[test]
     fn path_substring_on_the_marker_line_is_never_a_bound_task_id() {
         let fixture = "Notes consolidated.\n\nMISSION COMPLETE — see src/chart-notes.md";
-        // Witness: the deleted unbounded pattern really did bind the path
-        // substring, i.e. the guards below are not vacuous.
+        // Witness: the unbounded pattern really does bind the path substring,
+        // i.e. the guards below are not vacuous.
         assert_eq!(
             legacy_unbounded_task_id("MISSION COMPLETE — see src/chart-notes.md").as_deref(),
             Some("t-notes"),
@@ -822,8 +796,7 @@ mod tests {
     }
 
     /// (iii) An id named in prose somewhere other than the marker's own line
-    /// must not bind: the whole-text fallback is gone, so only the marker line
-    /// can hand out an id.
+    /// must not bind: only the marker line can hand out an id.
     #[test]
     fn prose_id_on_another_line_is_not_bound() {
         assert_eq!(
@@ -944,14 +917,12 @@ mod tests {
         );
     }
 
-    // ---- regression guards for bug C1 (docs/recon_bugs_manager.md) ----------
+    // ---- regression guards: fail-first marker precedence -------------------
 
-    /// Witness of the task-id grammar this module **used to own**
-    /// `\(?\[?(t-[A-Za-z0-9_-]+)\]?` with an optional fallback scan over the
-    /// whole text, kept under `cfg(test)` only (same convention as
-    /// `manager::phase_tests`'s legacy witnesses). It is deliberately not
-    /// boundary-safe: that is exactly what bound `t-notes` out of
-    /// `src/chart-notes.md`.
+    /// Witness kept under `cfg(test)` only: the unbounded task-id grammar
+    /// `\(?\[?(t-[A-Za-z0-9_-]+)\]?` plus a fallback scan over the whole text.
+    /// It is deliberately not boundary-safe — that is what binds `t-notes` out
+    /// of `src/chart-notes.md`.
     fn legacy_unbounded_task_id(text: &str) -> Option<String> {
         regex::Regex::new(r"\(?\[?(t-[A-Za-z0-9_-]+)\]?\)?")
             .expect("witness regex")
@@ -959,12 +930,9 @@ mod tests {
             .map(|c| c[1].to_string())
     }
 
-    /// The parser that used to live in `crate::agents` and, character for
-    /// character, in `crate::manager::phase` (which now only re-exports this
-    /// module's `MissionMarker`), kept here under `cfg(test)` only as a witness:
-    /// it tests `MISSION COMPLETE` as a
-    /// substring *before* `FAILED`, so it cannot see that a failure verdict and
-    /// a quoted completion mention are different things.
+    /// Witness kept under `cfg(test)` only: a substring-first parser that tests
+    /// `MISSION COMPLETE` before `FAILED`, so it cannot tell a failure verdict
+    /// apart from a quoted completion mention.
     fn legacy_substring_first_parse(text: &str) -> Option<MissionMarker> {
         let upper = text.to_ascii_uppercase();
         if upper.contains("REPLAN REQUIRED") {
@@ -984,10 +952,10 @@ mod tests {
         None
     }
 
-    /// Proof that regression test (a) is live: the deleted substring-first
-    /// parser reports the very same deliverable as `Complete { t-014 }` — which
-    /// is what flipped `- [ ] [t-014]` to `- [x]` on disk — while the
-    /// single-owner parser reports `Failed`.
+    /// Proof that regression test (a) is live: the substring-first witness
+    /// parser reports the very same deliverable as a completion — which is what
+    /// checked `- [ ]` off on disk — while the single-owner parser reports
+    /// `Failed`.
     #[test]
     fn regression_old_substring_first_parser_misclassified_case_a_as_complete() {
         let deliverable = "FAILED: replace tool rejected; I did not emit \
@@ -1005,7 +973,7 @@ mod tests {
     }
 
     /// (a) A FAILED deliverable whose body *mentions* `MISSION COMPLETE` must
-    /// classify as FAILED — the old substring-first parser said `Complete`.
+    /// classify as FAILED, never as a completion.
     #[test]
     fn regression_failed_body_mentioning_mission_complete_is_failed() {
         let deliverable = "FAILED: replace tool rejected; I did not emit \
@@ -1032,8 +1000,8 @@ mod tests {
         );
     }
 
-    /// (b) A genuine `MISSION COMPLETE (t-007)` deliverable still parses as a
-    /// completion carrying the bound task id.
+    /// (b) A genuine decorated completion still parses as a completion carrying
+    /// its bound task id.
     #[test]
     fn regression_genuine_completion_still_parses() {
         assert_eq!(
@@ -1104,11 +1072,10 @@ mod tests {
         assert_eq!(MissionMarker::parse(""), None);
     }
 
-    // ---- vocabulary API (gate t-030) --------------------------------------
+    // ---- vocabulary API ----------------------------------------------------
 
-    /// Presence tests are case-correct — the historical call sites each wrote
-    /// their own `upper.contains("<literal>")`, and one of them (the revocation
-    /// rewrite) forgot to fold case at all.
+    /// Presence tests are case-correct: every casing of a marker is detected,
+    /// including by the revocation rewrite.
     #[test]
     fn vocabulary_presence_tests_are_case_correct() {
         for text in [
@@ -1167,10 +1134,9 @@ mod tests {
         );
     }
 
-    /// Regression (gate t-030): the revocation rewrite was two case-sensitive
-    /// `replace()` calls, so every casing except two survived. `MissionMarker`
-    /// is case-insensitive, so a rejected/aborted deliverable kept a live
-    /// completion marker and the plan line was still checked off.
+    /// Revocation must fold every casing: `MissionMarker::parse` reads markers
+    /// case-insensitively, so a completion marker that survived a rejection in
+    /// another casing would still check the plan line off.
     #[test]
     fn revoke_completion_is_case_correct() {
         let legacy: Vec<String> = vec![
@@ -1188,7 +1154,7 @@ mod tests {
             );
             assert!(revoked.contains(REVOCATION_TOKEN), "{variant} -> {revoked}");
             assert!(revoked.contains("(t-023)"), "task id lost: {revoked}");
-            // A revoked marker is no longer a completion for the parser.
+            // A revoked marker is not a completion for the parser.
             assert!(
                 !MissionMarker::parse(&revoked).is_some_and(|m| m.is_complete()),
                 "parsed as complete after revocation: {revoked}"
@@ -1211,7 +1177,7 @@ mod tests {
         assert_eq!(revoke_completion(""), "");
     }
 
-    // ---- failure-verdict vocabulary (gate t-059) ---------------------------
+    // ---- failure-verdict vocabulary ----------------------------------------
 
     /// The failure-prefix table must stay pinned to the marker constants: a
     /// prefix that drifts from `MARKER_FAILED` / `MARKER_REPLAN` would create a
@@ -1327,13 +1293,13 @@ mod tests {
         }
     }
 
-    /// (b, gate t-070) The **aborted-deliverable body** has exactly one owner.
-    /// The exact bytes are pinned — several call sites assert them and
+    /// (b) The **aborted-deliverable body** has exactly one owner. The exact
+    /// bytes are pinned — several call sites assert them and
     /// `ui::helpers::extract_failure_reason` reads the trailer — and the body
     /// must read back through the same module that wrote it.
     #[test]
     fn aborted_deliverable_body_is_single_owned_and_parses_back() {
-        // The historical wording of every one of the four former copies.
+        // The exact wording every abort site depends on.
         assert_eq!(
             aborted_deliverable("aborted by user instruction"),
             "Task aborted by user instruction.\n\nFAILED (aborted)"
@@ -1368,12 +1334,11 @@ mod tests {
         }
     }
 
-    /// (b, gate t-070) Ownership guard for the four sites that used to
-    /// hand-build nearly identical abort text: each must name the owner and
-    /// none may re-type the body's sentence or trailer. Scanned **brace-aware**,
-    /// because `src/orchestrator/mod.rs` hides production code behind an early
-    /// `#[cfg(test)]` item — the very blind spot [`HAND_OFF_MARKER_SITES`] used
-    /// to pin.
+    /// (b) Ownership guard for the abort sites: each must call the single body
+    /// owner and none may re-type the body's sentence or trailer. Scanned
+    /// **brace-aware**, because `src/orchestrator/mod.rs` hides production code
+    /// behind an early `#[cfg(test)]` item — the blind spot
+    /// [`HAND_OFF_MARKER_SITES`] exists to pin.
     #[test]
     fn abort_sites_call_the_body_owner_instead_of_building_it() {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1511,7 +1476,7 @@ mod tests {
         }
     }
 
-    // ---- gate t-030: single-owner guard tests -----------------------------
+    // ---- single-owner guard tests -----------------------------------------
 
     /// Marker literals that may legitimately appear in this module: the
     /// constants themselves, their case-folded twins and the benign-counter
@@ -1520,53 +1485,28 @@ mod tests {
     const MARKER_LITERALS: &[&str] = &[MARKER_COMPLETE, MARKER_REPLAN, MARKER_FAILED];
 
     /// Production files outside this module that are nevertheless allowed to
-    /// spell a marker literal: `(file, justification-with-owner)` pairs. The
-    /// escape hatch of the single-owner guard.
-    ///
-    /// Gate t-059 turned this from an archive of excuses into a **ratchet**. An
-    /// entry is accepted only while all of the following hold, and any breach
-    /// fails the guard (it used to be an `eprintln!` note):
-    ///
-    /// 1. the entry names a file that is not `src/markers.rs`;
-    /// 2. it carries a documented justification of at least
-    ///    [`MIN_JUSTIFICATION_LEN`] characters naming who owns it and why the
-    ///    grammar cannot be called instead;
-    /// 3. it is **live** — the named file really does still contain a marker
-    ///    literal, so a file that has been migrated must be deleted from the
-    ///    list instead of rotting in it.
-    ///
-    /// The list is EMPTY: the five entries gate t-030 needed are gone.
-    /// `src/agents/mod.rs`, `src/agents/validation.rs`, `src/ui/helpers.rs` and
-    /// `src/ui/raw.rs` now call the vocabulary API; `src/manager/phase.rs` was
-    /// already clean (its entry had gone stale and the old guard only muttered
-    /// about it).
+    /// spell a marker literal: `(file, justification-with-owner)` pairs — the
+    /// escape hatch of the single-owner guard, and it is EMPTY. An entry is
+    /// accepted only while it names a file other than `src/markers.rs`, carries
+    /// a justification of at least [`MIN_JUSTIFICATION_LEN`] characters naming
+    /// who owns it and why the grammar cannot be called instead, and is
+    /// **live** — a file that has been migrated must be deleted from the list
+    /// instead of rotting in it. Any breach fails the guard.
     const KNOWN_EXTERNAL_MARKER_SITES: &[(&str, &str)] = &[];
 
     /// Shortest justification an escape-hatch entry may carry. A bare name or
     /// "TODO" is not a justification.
     const MIN_JUSTIFICATION_LEN: usize = 40;
 
-    /// Hand-off inventory — **not** a vocabulary exemption, and now **EMPTY**.
-    ///
-    /// The primary guard scans line-by-line and stops at the first
-    /// `#[cfg(test)]` attribute (see [`production_lines_numbered`]), so a file
-    /// that places a `#[cfg(test)]` item *before* its production code hides part
-    /// of that production code from the scan. `HAND_OFF_MARKER_SITES` pinned that
-    /// blind spot: the brace-aware sweep below must never find a hidden marker
-    /// literal in a file that is not listed here, i.e. the blind spot could never
-    /// grow, and every entry named a file owned by somebody else that session.
-    ///
-    /// The list is EMPTY: gate t-068 routed the last entry
-    /// (the abort site in `src/orchestrator/mod.rs`, which hand-built
-    /// `"…\n\nFAILED (aborted)"`)
-    /// through the vocabulary API, and gate t-070 made that file — and every
-    /// other abort site — call the single body owner
-    /// [`aborted_deliverable`](crate::markers::aborted_deliverable). No
-    /// production file outside this module spells a marker literal any more,
-    /// hidden or otherwise, so the ratchet below has nothing left to tolerate:
-    /// an empty inventory means the brace-aware sweep must find **zero** hidden
-    /// marker literals, and a new one fails the guard outright. There is no
-    /// allowlist and no note-taking escape hatch here.
+    /// Hand-off inventory — **not** a vocabulary exemption, and **EMPTY**. The
+    /// primary guard scans line-by-line and stops at the first `#[cfg(test)]`
+    /// attribute (see [`production_lines_numbered`]), so a file that puts such
+    /// an item *before* its production code hides part of that code from the
+    /// scan. Every abort site calls the single body owner
+    /// [`aborted_deliverable`](crate::markers::aborted_deliverable), so an empty
+    /// inventory means the brace-aware scan must find **zero** marker literals
+    /// outside this module, hidden or otherwise, and a new hidden literal fails
+    /// the guard outright.
     const HAND_OFF_MARKER_SITES: &[&str] = &[];
 
     /// Every `.rs` file under `src/`, recursively.
@@ -1597,9 +1537,9 @@ mod tests {
         !glued_before && !glued_after
     }
 
-    /// `true` when `bytes[from..to]` is a whole identifier/word (used to find
-    /// real references to the `MARKER_*` constants, and to skip occurrences
-    /// glued to a longer identifier run).
+    /// `true` when `bytes[from..to]` is a whole identifier/word: it finds real
+    /// references to the `MARKER_*` constants and skips occurrences glued to a
+    /// longer identifier run.
     fn is_identifier_occurrence(bytes: &[u8], from: usize, to: usize) -> bool {
         let glued = |i: usize| bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_';
         !(from > 0 && glued(from - 1)) && !(to < bytes.len() && glued(to))
@@ -1648,8 +1588,7 @@ mod tests {
 
     /// The grammar must have exactly one owner: apart from `src/markers.rs`
     /// itself, no production file may contain a marker literal — and every
-    /// escape-hatch entry must still be documented and live (ratchet, gate
-    /// t-059).
+    /// escape-hatch entry must still be documented and live.
     #[test]
     fn only_markers_module_spells_marker_literals_in_production_code() {
         let offenders = production_marker_libraries(false);
@@ -1672,10 +1611,9 @@ mod tests {
             untracked.join("\n")
         );
 
-        // Ratchet (gate t-059): a whitelist entry is only tolerated while it is
-        // documented and still live. Stale or hand-wavy entries fail the build;
-        // the old `eprintln!` note that let `src/manager/phase.rs` rot in the
-        // list is gone.
+        // A whitelist entry is only tolerated while it is documented and still
+        // live: stale or hand-wavy entries fail the build instead of printing a
+        // note.
         let live: std::collections::BTreeSet<&str> =
             offenders.iter().map(|(f, _, _)| f.as_str()).collect();
         let violations = whitelist_violations(KNOWN_EXTERNAL_MARKER_SITES, &live);
@@ -1686,7 +1624,7 @@ mod tests {
         );
     }
 
-    /// The ratchet rule itself, as a pure function so it can be tested with
+    /// The whitelist rule itself, as a pure function so it can be tested with
     /// synthetic entries (the real list is empty, so the guard alone would
     /// never exercise it).
     fn whitelist_violations(
@@ -1723,8 +1661,7 @@ mod tests {
     }
 
     /// (b) The whitelist is EMPTY — and specifically does not archive any of
-    /// the sites gate t-044 sweep A named, including the stale
-    /// `src/manager/phase.rs` entry the old guard only printed a note about.
+    /// the migrated sites, each of which has its own guard below.
     #[test]
     fn external_marker_whitelist_is_empty() {
         let listed: Vec<&str> = KNOWN_EXTERNAL_MARKER_SITES
@@ -1752,7 +1689,7 @@ mod tests {
         }
     }
 
-    /// The ratchet rule rejects undocumented, self-referential and stale
+    /// The whitelist rule rejects undocumented, self-referential and stale
     /// entries, and accepts a documented live one — proved directly, so an
     /// empty real whitelist cannot hide a broken guard.
     #[test]
@@ -1771,7 +1708,7 @@ mod tests {
             1,
             "\"TODO\" is not a justification"
         );
-        // Stale (the file no longer has a marker literal) -> violation.
+        // Stale (the file has no marker literal) -> violation.
         assert_eq!(
             whitelist_violations(
                 &[(
@@ -1815,7 +1752,7 @@ mod tests {
     }
 
     /// (a) Production code outside `src/markers.rs` contains **zero** marker
-    /// literals — the whitelist can no longer absorb any of them.
+    /// literals — the whitelist absorbs none of them.
     #[test]
     fn production_code_outside_markers_has_zero_marker_literals() {
         let external: Vec<String> = production_marker_libraries(false)
@@ -1831,8 +1768,8 @@ mod tests {
         );
     }
 
-    /// (a, targeted) Each site gate t-044 sweep A named is provably clean, so
-    /// a regression in one of them is attributed to that file.
+    /// (a, targeted) Each migrated site is provably clean, so a regression in
+    /// one of them is attributed to that file.
     #[test]
     fn migrated_sites_contain_no_marker_literals() {
         let offenders = production_marker_libraries(false);
@@ -1858,7 +1795,7 @@ mod tests {
         }
     }
 
-    /// Witness that the hand-off inventory is live: the brace-aware sweep sees
+    /// Witness that the hand-off inventory is live: the brace-aware scan sees
     /// production code that the conservative scan stops in front of, so a marker
     /// literal written after an early `#[cfg(test)]` item is still detected.
     #[test]
@@ -1884,7 +1821,7 @@ mod tests {
         );
     }
 
-    /// (a, fully owned) The brace-aware sweep — which sees the production code a
+    /// (a, fully owned) The brace-aware scan — which sees the production code a
     /// file hides behind an early `#[cfg(test)]` item — must find **zero** marker
     /// literals outside `src/markers.rs`. With [`HAND_OFF_MARKER_SITES`] empty
     /// there is no declared hand-off left to absorb anything, so a marker literal
@@ -2034,7 +1971,7 @@ mod tests {
 
     /// The public marker constants must have real production consumers —
     /// otherwise "single owner" is only a comment, and the constants can be
-    /// deleted without anyone noticing (the exact loophole gate t-030 caught).
+    /// deleted without anyone noticing.
     #[test]
     fn every_marker_constant_has_a_production_consumer() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

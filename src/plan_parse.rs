@@ -1,40 +1,22 @@
-//! Single owner of the execution-plan **task-line grammar** — dedup cluster C3
-//! (`docs/recon_duplication_helpers.md` §2.3).
+//! Single owner of the execution-plan **task-line grammar**: one task-line
+//! parser (checkbox state + task id + byte/line offsets), one `check_off` line
+//! rewriter, and one task-id token recogniser. `manager::phase` stays the
+//! authority for the on-disk mutation (it owns the files and the `PLAN_MUTEX`);
+//! every other site asks this module what a task line is, so summaries, briefs,
+//! prompts and the UI all agree with the disk.
 //!
-//! Before this module existed, the same "what is a plan task line?" rule was
-//! open-coded five times, and the five copies had drifted apart:
-//!
-//! | site | grammar | checkbox | id forms | list markers |
-//! |---|---|---|---|---|
-//! | `manager::phase::TASK_LINE_RE` / `ALL_TASKS_RE` | `^\s*[-*]\s*\[\s*[ xX]?\s*\]\s*\*{0,2}\[?(t-…)\]?` | `[ ] [x] [X]` | `[t-001]`, bare `t-001` | `- *` |
-//! | `manager::phase::check_off` | built per call: `^\s*(?:[-*]|\d+\.)\s*\[\s*\]\s*\*{0,2}\[?<tid>\]?\*{0,2}\b` | `[ ]` only | `[t-001]`, bare | `- * 1.` |
-//! | `orchestrator::delegate` (checked-off guard + `brief_for_task`) | `^\s*-\s*\[\s*[ xX]?\s*\]\s*\[(t-…)\]\s*(.*)$` | `[ ] [x] [X]` | **`[t-001]` only** | `-` only |
-//! | `orchestrator::plan_summary` | three loose regexes (`t-…` anywhere, `\[[xX]\]`, `\[\s*\]|\(\s*\)`) | `[x]` **but not `(x)`** | any `t-…` token anywhere | none (string trim) |
-//! | `agents::prompt_builder` (its old private task-line regex) | phase's plus `\s*(.*?)$` | `[ ]` | `[t-001]`, bare | `- *` |
-//! | `ui::tui::formatting` | checkbox + adjacent-token + bracketed fallback | `[ ] [x] [X] ( ) (x) (X)` | `[t-001]`, `(t-001)`, bare, bold, backtick | `- * + 1. 1)` |
-//!
-//! The drift was a real bug (`docs/recon_bugs_harness_llm_ui.md` §3 C1/C2): a
-//! plan written as `- [ ] (t-002) migrate schema` was recognised by **no**
-//! on-disk copy, so `pending_tasks()` listed nothing, `check_off("t-002")`
-//! reported "task id not found or already checked", the plan could never reach
-//! `is_complete()`, `archive()` refused forever, and the loop re-delegated the
-//! same work indefinitely. Conversely `1. [ ] [t-004] x` was checkable but
-//! invisible to the pending/all-task summaries.
-//!
-//! This module owns the grammar once: one task-line parser (checkbox state +
-//! task id + byte/line offsets), one `check_off` line rewriter, and one
-//! task-id token recogniser. `manager::phase` stays the authority for the
-//! on-disk mutation (it owns the files and the `PLAN_MUTEX`); every other site
-//! now asks this module what a task line is, so summaries, briefs, prompts and
-//! the UI all agree with the disk.
+//! One grammar for every reader: list markers `- * + 1. 1)`, checkboxes `[ ]`,
+//! `[]`, `[x]`, `[X]`, `( )`, `(x)`, `(X)`, bold/backtick decoration, and id
+//! spellings `[t-001]`, `(t-001)` or bare `t-001` — a plan written as
+//! `- [ ] (t-002) migrate schema` is a pending task. The id bound to a checkbox
+//! sits at a word boundary: \[?<tid>\]? after optional bold/italic decoration.
 //!
 //! Deliberately out of scope (owned elsewhere, unchanged): the *marker* grammar
 //! and the verdict that is allowed to flip a box — [`crate::markers::MissionMarker`],
 //! applied to the plan by `manager::phase::Plan::check_plan_on_deliverable` —
 //! and task-id **normalization** (`crate::task_id`, re-used here rather than
-//! re-implemented). The deleted free-form success heuristic
-//! (`output_is_success`, recon item M9) has no successor in this module: a box
-//! is flipped only from an explicitly resolved task id, never from output prose.
+//! re-implemented). A box is flipped only from an explicitly resolved task id,
+//! never from output prose.
 
 use crate::task_id::normalize_task_id_ref;
 use regex::Regex;
@@ -141,18 +123,16 @@ static TASK_ID_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:^|[^A-Za-z0-9_-])(t-[A-Za-z0-9_-]+)").expect("valid task id token regex")
 });
 
-/// Bare task-id token (no boundary context), used to validate an adjacent token.
+/// Bare task-id token (no boundary context), for validating an adjacent token.
 static TASK_ID_STRICT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^t-[A-Za-z0-9_-]+$").expect("valid strict task id regex"));
 
-/// Whole-document unchecked-box scan (kept byte-identical to the historical
-/// `manager::phase::UNCHECKED_BOX_RE`; `is_complete` semantics are not a
-/// task-line grammar concern).
+/// Whole-document unchecked-box scan (`\[\s*\]|\(\s*\)`). Completion is a
+/// whole-document text property, not a task-line grammar concern.
 static UNCHECKED_BOX_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[\s*\]|\(\s*\)").expect("valid unchecked box regex"));
 
-/// Whole-document checked-box scan (kept byte-identical to the historical
-/// `manager::phase::CHECKED_BOX_RE`).
+/// Whole-document checked-box scan (`\[[xX]\]|\([xX]\)`).
 static CHECKED_BOX_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[[xX]\]|\([xX]\)").expect("valid checked box regex"));
 
@@ -245,14 +225,10 @@ pub fn parse_task_line_at(line: &str, line_number: usize) -> Option<TaskLine> {
 
 /// Parse every task line (checked **and** unchecked) of a plan document.
 ///
-/// Lines sitting **inside a fenced code block** are skipped (recon item **L9**,
-/// `docs/recon_bugs_manager.md`): a plan that documents its own
-/// `- [ ] [t-xxx]` format inside a ```` ``` ```` block used to report phantom
-/// pending task ids, which then showed up in `pending_tasks()`, in the
-/// orchestrator's progress summary, in the delegation briefs — and could even be
-/// delegated as if they were real work. The *line* grammar itself is unchanged
-/// (see [`parse_task_line`]); only the document-level scan learned where fences
-/// are.
+/// Lines sitting **inside a fenced code block** are skipped: a plan that
+/// documents its own `- [ ] [t-xxx]` format inside a ```` ``` ```` block must
+/// not report phantom pending task ids to `pending_tasks()`, the progress
+/// summary or a delegation brief. Line grammar unchanged (see [`parse_task_line`]).
 #[must_use]
 pub fn parse_tasks(text: &str) -> Vec<TaskLine> {
     scannable_lines(text)
@@ -382,7 +358,7 @@ pub fn is_checked_task(text: &str, task_id: &str) -> bool {
 ///
 /// Line indices are absolute in the original document (the UI highlights that
 /// exact line), and lines inside fenced code blocks are skipped — see
-/// [`parse_tasks`] for the recon **L9** rationale.
+/// [`parse_tasks`].
 #[must_use]
 pub fn first_unchecked_line_index(text: &str) -> Option<usize> {
     scannable_lines(text).find_map(|(idx, line)| {
@@ -412,24 +388,13 @@ pub fn check_off_line(line: &str, task_id: &str) -> Option<String> {
 }
 
 /// Rewrite a whole plan document, ticking the first line whose own task id is
-/// `task_id`. Returns the new content and whether anything was flipped — the
-/// body of `manager::phase::Plan::check_off`.
-///
-/// **The rewrite is byte-faithful** (recon item **L6**,
-/// `docs/recon_bugs_manager.md`): every line keeps its own terminator and the
-/// document keeps (or keeps out) its trailing newline. The old
-/// `content.lines().join("\n"` rewrite silently dropped the final newline and
-/// turned every CRLF into LF as a *side effect of ticking one box*, so a plan
-/// written with CRLF was re-written whole on the first check-off. Newline
-/// normalization is a separate, explicit operation with exactly one owner:
-/// [`normalize_newlines`].
-///
-/// Lines inside fenced code blocks are **not** candidates (recon **L9**): a plan
-/// that quotes `- [ ] [t-001] …` as a format example inside a fence must not get
-/// the *example* ticked instead of the real task line. The set of candidate
-/// lines is exactly the set the readers use ([`parse_tasks`],
-/// [`find_task_line`]), so what the orchestrator sees and what check-off writes
-/// are the same line.
+/// `task_id`. Returns new content plus whether anything flipped — the body of
+/// `manager::phase::Plan::check_off`. **Byte-faithful**: each line keeps its own
+/// terminator and the document keeps (or keeps out) its trailing newline,
+/// newline normalization having exactly one owner ([`normalize_newlines`]).
+/// Lines inside fenced code blocks are not candidates, so a quoted
+/// `- [ ] [t-001] …` example is never ticked instead of the real task line; the
+/// candidate set is exactly what [`parse_tasks`] and [`find_task_line`] read.
 #[must_use]
 pub fn check_off_content(content: &str, task_id: &str) -> (String, bool) {
     // Sorted absolute indices of the lines outside fences; `split_inclusive`
@@ -469,15 +434,12 @@ pub fn check_off_content(content: &str, task_id: &str) -> (String, bool) {
 
 /// Normalize line endings of a plan document: `\r\n` and lone `\r` become `\n`.
 ///
-/// This is the crate's **only** newline normalizer for plan text (recon L6). It
-/// is applied exactly once — when the plan is written by
-/// `manager::phase::Plan::create` — so every later read/scan/check-off sees one
-/// spelling of end-of-line, and nothing else (not `check_off`, not the UI)
-/// re-writes the file's line endings as a side effect.
-///
-/// A trailing newline is *not* added here: whether the document ends with one
-/// is the writer's decision, and `check_off_content` preserves whatever was
-/// chosen.
+/// This is the crate's **only** newline normalizer for plan text, applied exactly
+/// once — when the plan is written by `manager::phase::Plan::create` — so every
+/// later read/scan/check-off sees one spelling of end-of-line and nothing else
+/// (not `check_off`, not the UI) re-writes line endings as a side effect. A
+/// trailing newline is *not* added here: that is the writer's decision, and
+/// `check_off_content` preserves whatever was chosen.
 #[must_use]
 pub fn normalize_newlines(text: &str) -> String {
     if !text.contains('\r') {
@@ -561,30 +523,27 @@ pub fn line_matches_task_id(line: &str, task_id: &str) -> bool {
 }
 
 /// `true` when the text contains an unchecked checkbox anywhere (plan
-/// completion gate).
+/// completion check).
 ///
-/// Scanned line by line so that checkbox examples sitting **inside a fenced
-/// code block** cannot hold a plan open forever (recon **L9**): a plan that
-/// documents its own `- [ ]` template in a fence used to report
-/// `has_unchecked_box == true` no matter how many real tasks were ticked, so
-/// `Plan::is_complete` never fired and the plan never archived. The regex
-/// grammar itself is unchanged (t-039); the only behavioural difference is that
-/// `\s` inside a checkbox no longer matches across a line break, which is not a
-/// spelling any writer produces.
+/// Scanned line by line so a `- [ ]` template sitting **inside a fenced code
+/// block** cannot hold a plan open forever: a fence-only match would keep
+/// `has_unchecked_box == true` while every real task is ticked, so
+/// `Plan::is_complete` would never fire and the plan would never archive. `\s`
+/// inside a checkbox never matches a line break — no writer produces that.
 #[must_use]
 pub fn has_unchecked_box(text: &str) -> bool {
     scannable_lines(text).any(|(_, line)| UNCHECKED_BOX_RE.is_match(line))
 }
 
 /// `true` when the text contains a checked checkbox anywhere (plan completion
-/// gate). Fence-aware for the same reason as [`has_unchecked_box`].
+/// check). Fence-aware for the same reason as [`has_unchecked_box`].
 #[must_use]
 pub fn has_checked_box(text: &str) -> bool {
     scannable_lines(text).any(|(_, line)| CHECKED_BOX_RE.is_match(line))
 }
 
 /// Strip a leading list marker / blockquote / table gutter from a plan line for
-/// display (the closure `orchestrator::plan_summary` used to re-type twice).
+/// display (shared with `orchestrator::plan_summary`).
 #[must_use]
 pub fn strip_list_marker(line: &str) -> &str {
     line.trim_start_matches(|c: char| {
@@ -872,8 +831,8 @@ mod tests {
         let content = "- [ ] [t-010] Tenth\n- [ ] [t-01] First\n- [ ] [t-01] Again\n";
         let (updated, flipped) = check_off_content(content, "t-01");
         assert!(flipped);
-        // Recon L6: the rewrite is byte-faithful — the trailing newline the
-        // document had is still there, and only the one checkbox changed.
+        // The rewrite is byte-faithful: the trailing newline the document had
+        // is still there, and only the one checkbox changed.
         assert_eq!(
             updated,
             "- [ ] [t-010] Tenth\n- [x] [t-01] First\n- [ ] [t-01] Again\n"
@@ -883,9 +842,9 @@ mod tests {
         assert_eq!(same, content);
     }
 
-    /// Witness of the deleted newline handling (`content.lines().join("\n")`):
-    /// ticking one box also dropped the final newline and flattened CRLF, i.e.
-    /// the whole document was re-written as a side effect.
+    /// Contrast rewrite for the same fixtures: joining lines with `"\n"` drops
+    /// the final newline and flattens CRLF, so ticking one box re-writes the
+    /// whole document.
     fn legacy_lines_join_rewrite(content: &str, task_id: &str) -> String {
         content
             .lines()
@@ -1042,7 +1001,7 @@ mod tests {
         assert_eq!(strip_list_marker("  * [ ] t-003 Task"), "[ ] t-003 Task");
     }
 
-    // Recon L9 — fenced code blocks are documentation, not tasks.
+    // Fenced code blocks are documentation, not tasks.
 
     /// A plan that documents its own checklist format inside a fenced block.
     /// The fenced lines look exactly like real task lines (both spellings of
@@ -1061,7 +1020,7 @@ The plan format is:
 - [ ] [t-101] Real task, still open
 ";
 
-    /// Witness for the pre-L9 scan: every line of the document, fences ignored.
+    /// Scan of the whole document with fences ignored, for contrast.
     fn legacy_unfenced_pending_task_ids(text: &str) -> Vec<String> {
         text.lines()
             .enumerate()
@@ -1073,8 +1032,8 @@ The plan format is:
 
     #[test]
     fn fenced_examples_are_never_tasks() {
-        // RED witness: the pre-L9 document scan ignored fences, so the plan
-        // advertised a phantom pending task (delegatable, counted in progress).
+        // Contrast: with fences ignored the scan advertises a phantom pending
+        // task, which would be delegatable and counted in progress.
         assert_eq!(
             legacy_unfenced_pending_task_ids(FENCED_FIXTURE),
             vec!["t-phantom".to_string(), "t-101".to_string()],
@@ -1116,14 +1075,14 @@ The plan format is:
 
     #[test]
     fn fenced_checkbox_examples_cannot_hold_a_plan_open() {
-        // Real work still open -> the gate stays open because of the REAL line.
+        // Real work still open -> completion stays open because of the REAL line.
         assert!(has_unchecked_box(FENCED_FIXTURE));
 
         // Same document with the real tasks ticked: the fenced `- [ ]` example
         // must not keep the plan incomplete.
         let done = FENCED_FIXTURE.replace("- [ ] [t-101]", "- [x] [t-101]");
-        // RED witness: the old whole-document scan reported an unchecked box,
-        // so `Plan::is_complete` stayed false and the plan never archived.
+        // Contrast: a whole-document scan sees the fenced box as unchecked,
+        // which would keep `Plan::is_complete` false and the plan unarchived.
         assert!(
             UNCHECKED_BOX_RE.is_match(&done),
             "witness must reproduce the never-complete bug"
@@ -1195,8 +1154,8 @@ The plan format is:
 
     // Cross-site agreement + on-disk regression guards.
 
-    /// One fixture plan exercising the drifted forms, shared by the agreement
-    /// tests below.
+    /// One fixture plan exercising every accepted id spelling, shared by the
+    /// agreement tests below.
     const FIXTURE: &str = "\
 # Execution Plan
 
@@ -1215,7 +1174,7 @@ The plan format is:
         plan.create("# Execution Plan\n- [ ] (t-002) migrate schema\n")
             .expect("create plan");
 
-        // Was invisible before the shared grammar (`docs/recon_bugs_harness_llm_ui.md` §3 C1).
+        // A parenthesised id is a real task line for every reader, disk included.
         assert_eq!(plan.pending_tasks(), vec!["t-002".to_string()]);
         assert_eq!(plan.all_tasks(), vec!["t-002".to_string()]);
         assert!(!plan.is_complete());
