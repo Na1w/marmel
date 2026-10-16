@@ -31,6 +31,7 @@ fn request() -> ChatRequest {
         presence_penalty: None,
         stream: None,
         enable_thinking: None,
+        reasoning_effort: None,
         tools: None,
     }
 }
@@ -1060,4 +1061,141 @@ async fn test_llm_system_demotion_mutates_only_the_cloned_payload_not_the_caller
         Some(checkpoint.as_str()),
         "the in-memory checkpoint content must be untouched"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The `reasoning_effort` dial on the wire: whatever the caller set on
+// `ChatRequest::reasoning_effort` must arrive verbatim in the body that reaches
+// `/chat/completions` (the client never strips or rewrites it), and an unset —
+// or blank, once it went through `stream::build_request` — dial must be omitted
+// from the body entirely (`skip_serializing_if = "Option::is_none"`), never sent
+// as `""` or `null`.
+// ---------------------------------------------------------------------------
+
+/// Like [`sent_body_for`], but sends a caller-built [`ChatRequest`] instead of the
+/// default fixture with a swapped-in history, so the assertions can be made on a
+/// request that carries a specific optional dial.
+async fn sent_body_for_request(req: &ChatRequest) -> serde_json::Value {
+    let server = MockServer::start().await;
+    let bodies = capturing_sse_mock(&server, sse_body("effort")).await;
+
+    let client = ChatClient::new(server.uri(), "test-model".to_string());
+    let reply = client.chat(req).await.expect("request sent");
+    assert!(reply.is_success(), "the mock answers with a terminal frame");
+
+    let bodies = bodies.lock().unwrap();
+    assert!(
+        !bodies.is_empty(),
+        "the request body must have reached the mock server"
+    );
+    // A 200 answer means a single attempt; `last()` keeps the helper robust in
+    // case the fixture ever trips the shared retry policy.
+    bodies.last().expect("non-empty").clone()
+}
+
+/// A request that asks for `reasoning_effort: Some("low")` must put exactly that
+/// key/value pair in the body the backend actually receives — the client clones
+/// the request for its pre-send normalization, and that clone must not drop the
+/// dial (or leak `null`).
+#[tokio::test]
+async fn test_llm_reasoning_effort_arrives_verbatim_in_the_request_body() {
+    let mut req = request();
+    req.reasoning_effort = Some("low".to_string());
+
+    let sent = sent_body_for_request(&req).await;
+
+    assert_eq!(
+        sent.get("reasoning_effort"),
+        Some(&serde_json::json!("low")),
+        "`reasoning_effort: Some(\"low\")` must reach the wire unchanged, got {sent}"
+    );
+    // Belt and braces on the exact spelling: the backend compares this string.
+    assert_eq!(
+        sent["reasoning_effort"].as_str(),
+        Some("low"),
+        "the effort must be serialized as the exact string, no padding or quoting, got {sent}"
+    );
+    // The rest of the body is untouched by the dial: model fallback and streaming
+    // flag still hold, and `tools` is absent in this fixture.
+    assert_eq!(sent["model"], serde_json::json!("test-model"));
+    assert_eq!(sent["stream"], serde_json::json!(true));
+    assert!(
+        sent.get("tools").is_none(),
+        "the fixture advertises no tools, got {sent}"
+    );
+}
+
+/// The unset case: with `reasoning_effort: None` the key must be missing from the
+/// body entirely, while the neighbouring optional dials still serialize (so the
+/// omission is the field's own, not an accidentally empty payload).
+#[tokio::test]
+async fn test_llm_reasoning_effort_is_omitted_from_the_body_when_unset() {
+    let mut req = request();
+    req.reasoning_effort = None;
+    req.temperature = Some(0.5);
+    req.enable_thinking = Some(false);
+
+    let sent = sent_body_for_request(&req).await;
+
+    assert!(
+        sent.get("reasoning_effort").is_none(),
+        "`reasoning_effort` must never appear when unset — not as `null`, not as `\"\"` — got {sent}"
+    );
+    assert!(
+        sent.get("enable_thinking").is_some() && sent.get("temperature").is_some(),
+        "the neighbouring optional fields must still serialize, got {sent}"
+    );
+    assert_eq!(sent["enable_thinking"], serde_json::json!(false));
+}
+
+/// The `StreamConfig` path end to end: `build_request` is the single chokepoint
+/// where the Manager/role dial reaches the wire, so a padded value must arrive
+/// trimmed (never `"  high "`, which the backend cannot match to a vocabulary).
+#[tokio::test]
+async fn test_llm_stream_config_reasoning_effort_arrives_trimmed_on_the_wire() {
+    use crate::llm::stream::{StreamConfig, build_request};
+
+    let cfg = StreamConfig {
+        reasoning_effort: Some("  high ".to_string()),
+        ..StreamConfig::default()
+    };
+    let built = build_request(&cfg, vec![user_msg("think about this")]);
+    assert_eq!(
+        built.reasoning_effort.as_deref(),
+        Some("high"),
+        "`build_request` must trim the configured dial before serialization"
+    );
+
+    let sent = sent_body_for_request(&built).await;
+    assert_eq!(
+        sent["reasoning_effort"],
+        serde_json::json!("high"),
+        "a padded `StreamConfig::reasoning_effort` must arrive trimmed, got {sent}"
+    );
+}
+
+/// The blank-value guard: a configured but meaningless effort (`""`, spaces, a
+/// tab) must be normalized to "unset" by `build_request` and therefore stay off
+/// the wire — a backend that validates the field rejects `reasoning_effort: ""`.
+#[tokio::test]
+async fn test_llm_stream_config_blank_reasoning_effort_never_reaches_the_wire() {
+    use crate::llm::stream::{StreamConfig, build_request};
+
+    for blank in ["", "   ", "\t"] {
+        let cfg = StreamConfig {
+            reasoning_effort: Some(blank.to_string()),
+            ..StreamConfig::default()
+        };
+        let built = build_request(&cfg, vec![user_msg("think about this")]);
+        assert!(
+            built.reasoning_effort.is_none(),
+            "a blank configured effort ({blank:?}) must normalize to `None`"
+        );
+
+        let sent = sent_body_for_request(&built).await;
+        assert!(
+            sent.get("reasoning_effort").is_none(),
+            "a blank effort ({blank:?}) must be omitted from the body, got {sent}"
+        );
+    }
 }

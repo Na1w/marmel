@@ -176,6 +176,10 @@ pub struct ChatRequest {
     /// `enable_thinking=false` forces the backend to suppress reasoning tokens.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_thinking: Option<bool>,
+    /// Optional reasoning-effort dial (free-form; backends use different vocabularies).
+    /// Emitted only when set. `max_thinking_tokens` remains the independent hard cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDef>>,
 }
@@ -287,5 +291,140 @@ mod tests {
         );
         assert!(!tc.is_malformed());
         assert_eq!(tc.function.arguments, r#"{"command":"echo hello"}"#);
+    }
+
+    /// `ChatRequest` has no `Default`, so every literal stays exhaustive; this is
+    /// the minimal body (every optional field `None`) the wire tests start from.
+    fn minimal_request() -> ChatRequest {
+        ChatRequest {
+            model: "model-x".to_string(),
+            messages: vec![Message::User {
+                content: "hi".to_string(),
+            }],
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stream: None,
+            enable_thinking: None,
+            reasoning_effort: None,
+            tools: None,
+        }
+    }
+
+    /// Sorted key inventory of a serialized body, for exact-shape assertions.
+    fn body_keys(body: &serde_json::Value) -> Vec<String> {
+        let mut keys: Vec<String> = body
+            .as_object()
+            .expect("the request body is a JSON object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn chat_request_omits_reasoning_effort_when_none() {
+        let req = minimal_request();
+        let body = serde_json::to_value(&req).expect("request body serializes");
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "unset reasoning_effort must not appear in the body: {body}"
+        );
+        assert_eq!(
+            body_keys(&body),
+            vec!["messages".to_string(), "model".to_string()],
+            "only the always-present keys remain"
+        );
+        let raw = serde_json::to_string(&req).expect("request body serializes");
+        assert!(
+            !raw.contains("reasoning_effort"),
+            "the key must not appear in the serialized string: {raw}"
+        );
+    }
+
+    #[test]
+    fn chat_request_emits_reasoning_effort_verbatim() {
+        let mut req = minimal_request();
+        req.reasoning_effort = Some("low".to_string());
+        let raw = serde_json::to_string(&req).expect("request body serializes");
+        assert!(
+            raw.contains(r#""reasoning_effort":"low""#),
+            "expected verbatim key/value pair in {raw}"
+        );
+
+        let body = serde_json::to_value(&req).expect("request body serializes");
+        assert_eq!(body["reasoning_effort"], "low");
+        assert_eq!(
+            body_keys(&body),
+            vec![
+                "messages".to_string(),
+                "model".to_string(),
+                "reasoning_effort".to_string(),
+            ]
+        );
+
+        // Free-form pass-through: no enum mapping, no casing normalisation, no
+        // validation of the vocabulary.
+        for effort in [
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "VERY HIGH",
+        ] {
+            let mut req = minimal_request();
+            req.reasoning_effort = Some(effort.to_string());
+            assert_eq!(
+                serde_json::to_value(&req).expect("serializes")["reasoning_effort"],
+                effort,
+                "reasoning_effort must be passed through unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_request_reasoning_effort_is_independent_of_sibling_optionals() {
+        // All other optionals unset: exactly `model` + `messages`.
+        let bare = minimal_request();
+        let bare_body = serde_json::to_value(&bare).expect("request body serializes");
+        assert_eq!(
+            body_keys(&bare_body),
+            vec!["messages".to_string(), "model".to_string()],
+            "no optional key leaks into the body"
+        );
+
+        // `stream` is the only extra key when just it is set.
+        let mut streamed = minimal_request();
+        streamed.stream = Some(true);
+        let streamed_body = serde_json::to_value(&streamed).expect("request body serializes");
+        assert_eq!(
+            body_keys(&streamed_body),
+            vec![
+                "messages".to_string(),
+                "model".to_string(),
+                "stream".to_string(),
+            ]
+        );
+
+        // The binary off switch and the new dial are emitted independently.
+        let mut both = minimal_request();
+        both.enable_thinking = Some(false);
+        both.reasoning_effort = Some("high".to_string());
+        let both_body = serde_json::to_value(&both).expect("request body serializes");
+        assert_eq!(both_body["enable_thinking"], false);
+        assert_eq!(both_body["reasoning_effort"], "high");
+        assert_eq!(
+            body_keys(&both_body),
+            vec![
+                "enable_thinking".to_string(),
+                "messages".to_string(),
+                "model".to_string(),
+                "reasoning_effort".to_string(),
+            ]
+        );
     }
 }

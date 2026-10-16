@@ -47,6 +47,7 @@ fn test_integration_chat_request_payload_construction() {
         tools: Some(vec![ToolDef::read_file(), ToolDef::write_file()]),
         stream: Some(true),
         enable_thinking: None,
+        reasoning_effort: None,
         temperature: Some(0.7),
         top_p: Some(0.95),
         presence_penalty: Some(0.0),
@@ -136,6 +137,7 @@ mod raw_backend {
             presence_penalty: None,
             stream: Some(true),
             enable_thinking: None,
+            reasoning_effort: None,
             tools: None,
         }
     }

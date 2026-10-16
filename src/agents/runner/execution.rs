@@ -162,6 +162,19 @@ async fn run_specialist_live_inner(
         .and_then(|sc| sc.model.as_ref())
         .cloned()
         .unwrap_or_else(|| cfg.model.clone());
+    // The reasoning-effort **dial** of this specialist's turns, resolved with the
+    // same per-role → top-level precedence the thinking cap below uses
+    // (`max_thinking_tokens` at the turn site is the ceiling; this is the dial,
+    // and both can be set). `None` ⇒ the key is omitted from the wire body, and a
+    // blank configured value **counts as unset** — it is normalized away here so
+    // the top-level value still applies, and normalized again at the request
+    // chokepoint (`fix_loop::build_turn_request`).
+    // No other role's value is consulted here: validator passes get their own
+    // chain (`resolve_validator_backend`) and the Manager gets the top-level
+    // value through `StreamConfig`.
+    let specialist_reasoning_effort = specialist_cfg
+        .and_then(|sc| super::fix_loop::normalized_reasoning_effort(sc.reasoning_effort.as_deref()))
+        .or_else(|| super::fix_loop::normalized_reasoning_effort(cfg.reasoning_effort.as_deref()));
 
     let clean_task_id = ctx
         .task_id
@@ -358,6 +371,7 @@ async fn run_specialist_live_inner(
             &tools,
             cfg,
             cfg.temperature,
+            specialist_reasoning_effort.as_deref(),
         );
         let max_tokens = mon_cfg.max_stream_tokens.max(256);
         let max_thinking_tokens = specialist_cfg

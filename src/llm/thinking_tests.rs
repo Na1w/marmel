@@ -17,6 +17,7 @@ fn req() -> ChatRequest {
         presence_penalty: None,
         stream: Some(true),
         enable_thinking: Some(true),
+        reasoning_effort: None,
         tools: None,
     }
 }
