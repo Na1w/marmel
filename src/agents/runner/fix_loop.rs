@@ -231,15 +231,49 @@ pub struct LoopParams<'a> {
     /// User-level notice injected when a `rebirth` call succeeds (wording
     /// differs between validator and specialist loops).
     pub rebirth_notice: String,
+    /// Reasoning-effort **dial** of this run, already resolved by the caller.
+    /// A validator run carries the **validator** value
+    /// ([`crate::config::SpecialistConfig::validator_reasoning_effort`] →
+    /// [`crate::config::Config::reasoning_effort`] — never the specialist's own
+    /// value, which is a different model's dial); the `None` case means the key
+    /// is omitted from the wire body. A blank string is treated as unset by
+    /// [`normalized_reasoning_effort`] at the request chokepoint below.
+    ///
+    /// Orthogonal to the thinking **cap**: `mon_cfg.max_thinking_tokens` stays
+    /// the ceiling and is read separately per turn.
+    pub reasoning_effort: Option<String>,
+}
+
+/// Normalize a configured reasoning-effort string for the wire body.
+///
+/// Same contract as the Manager path's private helper in
+/// `src/llm/stream.rs::normalized_reasoning_effort`, restated here because that
+/// one is module-private and this is the chokepoint for **specialist and
+/// validator** requests: the value is a free-form pass-through (no vocabulary
+/// check), but a blank one is meaningless, so an empty or whitespace-only string
+/// becomes `None` and `ChatRequest::reasoning_effort`
+/// (`skip_serializing_if = "Option::is_none"`) omits the key entirely. Anything
+/// else is trimmed and sent verbatim.
+pub fn normalized_reasoning_effort(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// Build the canonical `ChatRequest` shared by all fix-loop turn calls.
+///
+/// `reasoning_effort` is the **already-resolved** dial for this run (see
+/// [`LoopParams::reasoning_effort`]); the caller owns the precedence chain and
+/// this builder owns the normalization, so no call site can send a blank value.
+/// `enable_thinking` stays `None` on purpose — the binary off switch is not a
+/// dial, and the internal fast calls keep it hard-coded.
 pub fn build_turn_request(
     model: &str,
     engine: &ContextEngine,
     tools: &[ToolDef],
     cfg: &crate::config::Config,
     temperature: f32,
+    reasoning_effort: Option<&str>,
 ) -> ChatRequest {
     ChatRequest {
         model: model.to_string(),
@@ -247,6 +281,7 @@ pub fn build_turn_request(
         tools: Some(tools.to_vec()),
         stream: Some(true),
         enable_thinking: None,
+        reasoning_effort: normalized_reasoning_effort(reasoning_effort),
         temperature: Some(temperature),
         top_p: Some(cfg.top_p),
         presence_penalty: Some(cfg.presence_penalty),
@@ -519,13 +554,22 @@ pub fn assemble_tools(
     tools
 }
 
-/// Resolve the validator backend/token/model fallback chain
+/// Resolve the validator backend/token/model/effort fallback chain
 /// (specialist override → validator entry → global config).
 /// Previously duplicated ×2 in validation.rs.
+///
+/// The fourth element is the validator pass's **reasoning-effort dial**, and it
+/// deliberately does **not** fall back to the audited specialist's own
+/// `reasoning_effort`: that dial belongs to a different model, and a validator
+/// runs up to `max_validator_iterations` times per task, so it is priced
+/// separately (feature.md precedence: per-validator value → top-level value →
+/// unset). Blank values are normalized away **here**, so an empty
+/// `validator_reasoning_effort` falls through to the top-level value instead of
+/// masking it; [`build_turn_request`] normalizes again as the wire chokepoint.
 pub fn resolve_validator_backend(
     cfg: &crate::config::Config,
     specialist: crate::agents::Agent,
-) -> (String, String, String) {
+) -> (String, String, String, Option<String>) {
     let specialist_cfg = cfg.orchestration.specialists.get(specialist.as_str());
     let validator_cfg = cfg
         .orchestration
@@ -546,7 +590,19 @@ pub fn resolve_validator_backend(
         .or_else(|| validator_cfg.and_then(|vc| vc.model.as_ref()))
         .cloned()
         .unwrap_or_else(|| cfg.model.clone());
-    (backend, token, model)
+    // Per-validator dial: the specialist's `validator_reasoning_effort` (the key
+    // that sits next to `validator_model`) wins; otherwise the top-level
+    // `Config::reasoning_effort`; otherwise unset ⇒ omitted from the body. The
+    // `[specialists.validator]` entry is consulted for model/backend/token above
+    // but carries no `validator_reasoning_effort` of its own here, because that
+    // key is defined on the *audited* role's section (it names that role's
+    // validator), and the specialist's own `reasoning_effort` is never a
+    // validator value. A blank value at either level counts as **unset**, so it
+    // falls through the chain instead of masking the level below it.
+    let reasoning_effort = specialist_cfg
+        .and_then(|sc| normalized_reasoning_effort(sc.validator_reasoning_effort.as_deref()))
+        .or_else(|| normalized_reasoning_effort(cfg.reasoning_effort.as_deref()));
+    (backend, token, model, reasoning_effort)
 }
 
 /// Shared tool-dispatch core: monitor intervention check → cancellation check
@@ -805,7 +861,14 @@ pub async fn run_fix_loop(
         // Turn-start notice drain — rendered by the crate's single notice renderer.
         inject_worker_notices_at_turn_start(p.engine, &p.worker_key);
 
-        let req = build_turn_request(&p.model, p.engine, &advertised, p.cfg, p.temperature);
+        let req = build_turn_request(
+            &p.model,
+            p.engine,
+            &advertised,
+            p.cfg,
+            p.temperature,
+            p.reasoning_effort.as_deref(),
+        );
 
         let max_tokens = p.mon_cfg.max_stream_tokens.max(256);
         let max_thinking_tokens = p.mon_cfg.max_thinking_tokens.max(256);
@@ -1557,6 +1620,7 @@ mod tests {
             abort_log_prefix: tag.to_string(),
             emit_tool_status: false,
             rebirth_notice: format!("({TOOL_REBIRTH} checkpoint accepted)"),
+            reasoning_effort: None,
         };
         let mut monitor = HarnessMonitor::new_with_config(
             std::sync::Arc::new(crate::harness::HarnessStats::new()),
@@ -2090,6 +2154,7 @@ mod tests {
             abort_log_prefix: "validator-coder-t-schema".to_string(),
             emit_tool_status: false,
             rebirth_notice: format!("({TOOL_REBIRTH} checkpoint accepted)"),
+            reasoning_effort: None,
         };
         let mut monitor = HarnessMonitor::new_with_config(
             std::sync::Arc::new(crate::harness::HarnessStats::new()),
@@ -2291,6 +2356,7 @@ mod tests {
                 abort_log_prefix: "validator-coder-nudge".to_string(),
                 emit_tool_status: false,
                 rebirth_notice: format!("({TOOL_REBIRTH} checkpoint accepted)"),
+                reasoning_effort: None,
             };
             let mut monitor = HarnessMonitor::new_with_config(
                 std::sync::Arc::new(crate::harness::HarnessStats::new()),

@@ -1814,6 +1814,10 @@ pub async fn run_session_with_bounds_report(
 
     let client = ChatClient::from_config(cfg);
     let harness_stats = stats.clone();
+    // The Manager's wire knobs come from `StreamConfig::from_config`, which reads
+    // the thinking **cap** from `[monitoring].max_thinking_tokens` and the effort
+    // **dial** from the top-level `Config.reasoning_effort` (top level applies to
+    // the Manager). Blank values normalize to unset at the wire chokepoint.
     let stream_cfg = StreamConfig::from_config(cfg);
 
     drain_steer_arbitration_events_with_transcript(

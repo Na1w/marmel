@@ -68,6 +68,7 @@ fn test_continuation_request_helpers() {
         presence_penalty: None,
         stream: Some(true),
         enable_thinking: None,
+        reasoning_effort: None,
         tools: None,
     };
 

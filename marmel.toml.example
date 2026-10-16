@@ -22,7 +22,16 @@ max_context_tokens = 8192
 preserve_thinking = true
 
 # Maximum reasoning/thinking tokens per turn before cutting off runaway reasoning.
+# This is the hard CAP — it cuts a reasoning run that overruns.
 max_thinking_tokens = 32768
+
+# Optional reasoning-effort DIAL sent to the backend ("none", "minimal", "low",
+# "medium", "high" are the documented vocabulary; the value is free-form
+# pass-through, so a backend-specific spelling is forwarded verbatim). Applies to
+# the Manager and to roles that do not override it. Omit it (or leave it blank)
+# and the key is not sent at all. A dial, not a cap: max_thinking_tokens above
+# stays the ceiling, and no effort level derives a thinking budget.
+# reasoning_effort = "medium"
 
 # Timeout (seconds) for a single run_command / PTY invocation.
 # Valid range 1..=300; an out-of-range value is logged and clamped into that range.
@@ -124,6 +133,16 @@ max_validator_iterations = 5
 # max_fix_loop_rounds = 200
 # Optional reasoning budget / max thinking tokens override for this specialist:
 # max_thinking_tokens = 8192
+# Optional reasoning-effort dial for this specialist's OWN turns (free-form
+# pass-through — see the top-level note; falls back to the top-level
+# `reasoning_effort` when omitted, and is independent of max_thinking_tokens):
+# reasoning_effort = "high"
+# Optional reasoning-effort dial for this specialist's VALIDATOR passes. It sits
+# next to `validator_model` above and falls back to the top-level
+# `reasoning_effort` — never to this specialist's own value, which belongs to a
+# different model. Cheaper pays off here: a validator runs up to
+# `max_validator_iterations` (default 5) times per task.
+# validator_reasoning_effort = "minimal"
 
 [orchestration.specialists.debugger]
 tools = ["delegate_task", "write_file", "replace", "read_file", "run_command", "grep_search", "glob", "pty_spawn", "pty_write", "pty_read", "pty_close", "pty_list"]

@@ -127,6 +127,15 @@ pub struct StreamConfig {
     pub min_pattern_len: usize,
     pub max_stream_tokens: usize,
     pub max_thinking_tokens: usize,
+    /// Reasoning-effort **dial** (free-form: `none`/`minimal`/`low`/`medium`/`high`
+    /// are the documented vocabulary, but the value is passed through verbatim
+    /// because backends use different vocabularies). `None` — or a blank string,
+    /// which the wire chokepoint normalizes to `None` — omits the key entirely.
+    ///
+    /// This is orthogonal to [`StreamConfig::max_thinking_tokens`], which stays the
+    /// hard **cap**: effort tells the model how hard to think, the budget cuts a run
+    /// that goes over. Both can be set at once.
+    pub reasoning_effort: Option<String>,
 }
 
 impl Default for StreamConfig {
@@ -144,6 +153,7 @@ impl Default for StreamConfig {
             min_pattern_len: 5,
             max_stream_tokens: 32768,
             max_thinking_tokens: crate::config::DEFAULT_MAX_THINKING_TOKENS,
+            reasoning_effort: None,
         }
     }
 }
@@ -165,6 +175,12 @@ impl StreamConfig {
             min_pattern_len: mon.min_pattern_len,
             max_stream_tokens: mon.max_stream_tokens,
             max_thinking_tokens: mon.max_thinking_tokens,
+            // The effort dial's source of truth is the **top-level** `Config` key
+            // (top level applies to the Manager, per feature.md); unlike the thinking
+            // budget above there is no `[monitoring].reasoning_effort` mirror, so
+            // nothing is read from `mon` here. Blank values stay as configured and
+            // are normalized to "unset" by the wire chokepoint (`build_request`).
+            reasoning_effort: cfg.reasoning_effort.clone(),
         }
     }
 }
@@ -438,6 +454,19 @@ fn is_empty_production(m: &Message) -> bool {
     }
 }
 
+/// Normalize a configured reasoning-effort string for the wire body.
+///
+/// The value is a free-form pass-through (no vocabulary check), but a **blank**
+/// one is meaningless: an empty or whitespace-only string is treated as unset so
+/// `reasoning_effort` is omitted from the request entirely
+/// (`ChatRequest::reasoning_effort` is `skip_serializing_if = "Option::is_none"`).
+/// Anything else is trimmed and sent verbatim.
+fn normalized_reasoning_effort(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 pub(crate) fn build_request(cfg: &StreamConfig, messages: Vec<Message>) -> ChatRequest {
     let mut tools = crate::types::ToolDef::manager_tools();
     // MCP tools are advertised under the same policy as dispatch: a name the
@@ -456,6 +485,11 @@ pub(crate) fn build_request(cfg: &StreamConfig, messages: Vec<Message>) -> ChatR
         presence_penalty: Some(cfg.presence_penalty),
         stream: Some(true),
         enable_thinking: None,
+        // The single chokepoint where the Manager's effort dial reaches the wire:
+        // a blank configured value becomes `None` here, so the key is never sent
+        // as `""`. `max_thinking_tokens` (the hard cap) is applied separately by
+        // the stream handler and is untouched by this.
+        reasoning_effort: normalized_reasoning_effort(cfg.reasoning_effort.as_deref()),
         tools: Some(tools),
     }
 }

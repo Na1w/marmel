@@ -125,6 +125,9 @@ pub struct SpecialistConfig {
     pub validator_backend_url: Option<String>,
     /// Optional auth token override for this specialist's validator.
     pub validator_auth_token: Option<String>,
+    /// Optional reasoning-effort override for this specialist's validator
+    /// (free-form pass-through; backends use different vocabularies).
+    pub validator_reasoning_effort: Option<String>,
     /// Optional max validation iterations.
     pub max_validator_iterations: Option<usize>,
     /// Optional max fix-loop rounds per validation pass (defaults to MAX_FIX_LOOP_ROUNDS = 200).
@@ -135,6 +138,11 @@ pub struct SpecialistConfig {
     /// Optional max thinking tokens override for this specialist.
     #[serde(alias = "reasoning_budget", alias = "thinking_budget")]
     pub max_thinking_tokens: Option<usize>,
+    /// Optional reasoning-effort override for this specialist (free-form
+    /// pass-through; backends use different vocabularies). A dial, not a cap:
+    /// it is independent of [`Self::max_thinking_tokens`], which stays the
+    /// ceiling. Unset ⇒ the field is not sent.
+    pub reasoning_effort: Option<String>,
     /// MCP servers whose tools this specialist is allowed to see.
     pub mcp_servers: Vec<String>,
 }
@@ -181,6 +189,13 @@ pub struct Config {
     pub debug: bool,
     /// Maximum reasoning/thinking tokens per single turn before cutting off runaway reasoning.
     pub max_thinking_tokens: usize,
+    /// Optional reasoning-effort hint (`none`/`minimal`/`low`/`medium`/`high` are the
+    /// documented vocabulary, but the value is free-form pass-through — backends use
+    /// different vocabularies and this layer performs no vocabulary check). Applies to
+    /// the Manager and to roles that do not override it; `SpecialistConfig::reasoning_effort`
+    /// and `SpecialistConfig::validator_reasoning_effort` win per role. Unset ⇒ the field
+    /// is omitted from the request.
+    pub reasoning_effort: Option<String>,
     /// Resilience harness thresholds.
     pub monitoring: Option<MonitoringConfig>,
     pub orchestration: OrchestrationConfig,
@@ -231,6 +246,7 @@ impl Default for Config {
             ui_mode: "tui".to_string(),
             debug: false,
             max_thinking_tokens: DEFAULT_MAX_THINKING_TOKENS,
+            reasoning_effort: None,
             monitoring: Some(MonitoringConfig::default()),
             orchestration: OrchestrationConfig::default_depth(),
             mcp_servers: HashMap::new(),
@@ -507,6 +523,7 @@ struct PartialConfig {
     pub max_repetition_threshold: Option<usize>,
     pub enable_xml_rescue: Option<bool>,
     pub max_thinking_tokens: Option<usize>,
+    pub reasoning_effort: Option<String>,
     pub ui_mode: Option<String>,
     pub monitoring: Option<PartialMonitoringConfig>,
     pub orchestration: Option<PartialOrchestrationConfig>,
@@ -598,6 +615,9 @@ fn merge(mut base: Config, partial: PartialConfig) -> Config {
     }
     if let Some(v) = partial.max_thinking_tokens {
         base.max_thinking_tokens = v;
+    }
+    if let Some(v) = partial.reasoning_effort {
+        base.reasoning_effort = Some(v);
     }
     if let Some(v) = partial.base_prompt {
         base.base_prompt = Some(v);
@@ -966,6 +986,374 @@ mod tests {
         let cfg = merge(Config::default(), partial);
 
         assert!(cfg.base_prompt.is_none());
+    }
+
+    // ------------------------------------------------------------ reasoning effort
+    //
+    // Three `Option<String>` knobs: `Config::reasoning_effort` (top level),
+    // `SpecialistConfig::reasoning_effort` (per role) and
+    // `SpecialistConfig::validator_reasoning_effort` (per validator, next to
+    // `validator_model`). All are reached through `PartialConfig`, which has no
+    // `deny_unknown_fields` — so a key missing from the mirror or from `merge` is
+    // dropped **silently** by `toml::from_str` (the `max_fix_loop_rounds` hazard
+    // recorded in docs/research_config_parsing.md). These tests, plus the
+    // source-scraping guard below, are what catches that drift.
+    // The values are free-form pass-through: this layer performs no vocabulary
+    // check and no normalization.
+
+    #[test]
+    fn reasoning_effort_absent_everywhere_stays_none() {
+        // Unset must stay "not set" (⇒ the field is omitted from the request),
+        // never a synthetic default.
+        assert!(
+            Config::default().reasoning_effort.is_none(),
+            "the top-level default must be None"
+        );
+        let cfg = merged("backend_url = \"http://localhost:9000/v1\"\n");
+        assert!(
+            cfg.reasoning_effort.is_none(),
+            "an absent top-level key keeps None"
+        );
+
+        let cfg = merged(
+            r#"
+            [orchestration.specialists.coder]
+            module = "src/agents/coder.rs"
+            "#,
+        );
+        let coder = cfg
+            .orchestration
+            .specialists
+            .get("coder")
+            .expect("coder present");
+        assert!(
+            coder.reasoning_effort.is_none(),
+            "an absent per-role key keeps None"
+        );
+        assert!(
+            coder.validator_reasoning_effort.is_none(),
+            "an absent per-validator key keeps None"
+        );
+        assert!(SpecialistConfig::default().reasoning_effort.is_none());
+        assert!(
+            SpecialistConfig::default()
+                .validator_reasoning_effort
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_top_level_parses() {
+        let cfg = merged("reasoning_effort = \"medium\"\n");
+        assert_eq!(cfg.reasoning_effort.as_deref(), Some("medium"));
+
+        // It sits next to the token ceiling without disturbing it: effort is a
+        // dial, `max_thinking_tokens` stays the cap.
+        let cfg = merged(
+            r#"
+            max_thinking_tokens = 16384
+            reasoning_effort = "medium"
+            "#,
+        );
+        assert_eq!(cfg.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(cfg.max_thinking_tokens, 16384);
+    }
+
+    #[test]
+    fn specialist_reasoning_effort_is_per_role_without_cross_contamination() {
+        let cfg = merged(
+            r#"
+            [orchestration.specialists.coder]
+            module = "src/agents/coder.rs"
+            reasoning_effort = "high"
+
+            [orchestration.specialists.researcher]
+            module = "src/agents/researcher.rs"
+            "#,
+        );
+
+        let coder = cfg
+            .orchestration
+            .specialists
+            .get("coder")
+            .expect("coder present");
+        assert_eq!(coder.reasoning_effort.as_deref(), Some("high"));
+
+        let researcher = cfg
+            .orchestration
+            .specialists
+            .get("researcher")
+            .expect("researcher present");
+        assert!(
+            researcher.reasoning_effort.is_none(),
+            "a sibling role must not inherit another role's effort"
+        );
+        assert!(researcher.validator_reasoning_effort.is_none());
+
+        assert!(
+            cfg.reasoning_effort.is_none(),
+            "a per-role value must not set the top-level key"
+        );
+
+        // The other direction: a top-level value is not copied down during
+        // parsing — the specialist > top-level precedence is applied where the
+        // effort is resolved, not in `merge`.
+        let cfg = merged(
+            r#"
+            reasoning_effort = "medium"
+
+            [orchestration.specialists.coder]
+            module = "src/agents/coder.rs"
+            "#,
+        );
+        assert_eq!(cfg.reasoning_effort.as_deref(), Some("medium"));
+        assert!(
+            cfg.orchestration
+                .specialists
+                .get("coder")
+                .expect("coder present")
+                .reasoning_effort
+                .is_none(),
+            "parsing must not flatten the top-level value into the role entry"
+        );
+    }
+
+    #[test]
+    fn validator_reasoning_effort_parses_without_touching_the_specialist() {
+        let cfg = merged(
+            r#"
+            [orchestration.specialists.coder]
+            module = "src/agents/coder.rs"
+            model = "coder-9"
+            validator_model = "validator-9"
+            validator_reasoning_effort = "low"
+            "#,
+        );
+
+        let coder = cfg
+            .orchestration
+            .specialists
+            .get("coder")
+            .expect("coder present");
+        assert_eq!(coder.validator_reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(coder.validator_model.as_deref(), Some("validator-9"));
+        assert_eq!(
+            coder.reasoning_effort.as_deref(),
+            None,
+            "the validator knob must not set the specialist's own effort"
+        );
+        assert_eq!(coder.model.as_deref(), Some("coder-9"));
+    }
+
+    #[test]
+    fn reasoning_effort_supplied_only_in_the_partial_survives_the_merge() {
+        // The silent-drop guard: `PartialConfig` mirrors the key and `merge`
+        // applies it, so a value that exists only in the file reaches the
+        // resolved config instead of vanishing.
+        assert_eq!(
+            merged("reasoning_effort = \"high\"\n")
+                .reasoning_effort
+                .as_deref(),
+            Some("high")
+        );
+
+        // A partial that omits the key must leave an already-resolved base value
+        // alone (no silent reset), even when it sets other keys.
+        let base = Config {
+            reasoning_effort: Some("medium".to_string()),
+            ..Default::default()
+        };
+        let partial: PartialConfig = toml::from_str("model = \"other-model\"\n").expect("parses");
+        assert_eq!(
+            merge(base, partial).reasoning_effort.as_deref(),
+            Some("medium"),
+            "an omitted key keeps the base value"
+        );
+        let partial: PartialConfig = toml::from_str("").expect("parses");
+        let base = Config {
+            reasoning_effort: Some("minimal".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge(base, partial).reasoning_effort.as_deref(),
+            Some("minimal"),
+            "an empty partial must never clear the key"
+        );
+
+        // NOTE (not asserted): role entries merge at *entry* granularity —
+        // `merge` `extend`s the specialist table, so re-declaring
+        // `[orchestration.specialists.coder]` replaces that whole entry. Unlike
+        // the top-level key, a per-role knob must be repeated in the entry that
+        // declares it.
+    }
+
+    #[test]
+    fn reasoning_effort_values_are_preserved_verbatim() {
+        // Documented vocabulary plus backend-specific spellings and odd casing:
+        // this layer is a pass-through, so nothing is lowered, trimmed, mapped or
+        // rejected.
+        for value in [
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "Extra-High",
+            " max ",
+        ] {
+            let cfg = merged(&format!("reasoning_effort = \"{value}\"\n"));
+            assert_eq!(
+                cfg.reasoning_effort.as_deref(),
+                Some(value),
+                "top level must store {value:?} verbatim (no vocabulary check, no normalization)"
+            );
+
+            let cfg = merged(&format!(
+                "[orchestration.specialists.coder]\nreasoning_effort = \"{value}\"\n"
+            ));
+            assert_eq!(
+                cfg.orchestration
+                    .specialists
+                    .get("coder")
+                    .expect("coder present")
+                    .reasoning_effort
+                    .as_deref(),
+                Some(value),
+                "the per-role knob must store {value:?} verbatim"
+            );
+
+            let cfg = merged(&format!(
+                "[orchestration.specialists.coder]\nvalidator_reasoning_effort = \"{value}\"\n"
+            ));
+            assert_eq!(
+                cfg.orchestration
+                    .specialists
+                    .get("coder")
+                    .expect("coder present")
+                    .validator_reasoning_effort
+                    .as_deref(),
+                Some(value),
+                "the per-validator knob must store {value:?} verbatim"
+            );
+        }
+
+        // `"none"` is a *value*, not an unset: it stays Some("none") and must not
+        // be collapsed into None by a vocabulary check.
+        assert_eq!(
+            merged("reasoning_effort = \"none\"\n")
+                .reasoning_effort
+                .as_deref(),
+            Some("none")
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_type_mismatch_is_a_toml_error_not_a_silent_default() {
+        // Same contract as `load_toml_type_mismatch_is_an_error_not_a_silent_default`
+        // (tests/test_session_config.rs:845-864), which mirrors `load`'s own parse
+        // (`toml::from_str::<PartialConfig>` at src/config.rs:381): a *known* key
+        // carrying the wrong TOML type fails the parse, and the exact diagnostic
+        // text belongs to the `toml` crate and is deliberately not pinned.
+        let err = toml::from_str::<PartialConfig>("reasoning_effort = 3\n")
+            .expect_err("an integer where a string belongs must be rejected, not defaulted");
+        assert!(!err.to_string().is_empty(), "the error must be reportable");
+
+        for (label, toml_str) in [
+            ("top level integer", "reasoning_effort = 3\n"),
+            ("top level boolean", "reasoning_effort = true\n"),
+            (
+                "top level table",
+                "reasoning_effort = { level = \"high\" }\n",
+            ),
+            (
+                "specialist integer",
+                "[orchestration.specialists.coder]\nreasoning_effort = 3\n",
+            ),
+            (
+                "validator integer",
+                "[orchestration.specialists.coder]\nvalidator_reasoning_effort = 3\n",
+            ),
+            (
+                "validator array",
+                "[orchestration.specialists.coder]\nvalidator_reasoning_effort = [\"low\"]\n",
+            ),
+        ] {
+            assert!(
+                toml::from_str::<PartialConfig>(toml_str).is_err(),
+                "{label}: a mistyped `reasoning_effort` must be a TOML parse error"
+            );
+        }
+
+        // Parity with another typed key: the rejection is not specific to
+        // `reasoning_effort`.
+        assert!(
+            toml::from_str::<PartialConfig>("max_thinking_tokens = \"many\"\n").is_err(),
+            "a mistyped `max_thinking_tokens` must be rejected the same way"
+        );
+
+        // And a bare string still parses in every position (the happy path next
+        // to the failures above).
+        assert!(
+            toml::from_str::<PartialConfig>(
+                "reasoning_effort = \"low\"\n[orchestration.specialists.coder]\nreasoning_effort = \"high\"\nvalidator_reasoning_effort = \"minimal\"\n"
+            )
+            .is_ok(),
+            "well-typed effort keys must parse"
+        );
+    }
+
+    /// The "four places" rule for `reasoning_effort`, scraped from this file: a key
+    /// absent from `PartialConfig` or from `merge` is silently dropped by `toml`.
+    /// Sibling of
+    /// `every_session_key_exists_in_config_partial_merge_and_the_example`, minus the
+    /// `marmel.toml.example` leg — that file is owned by the docs task.
+    #[test]
+    fn reasoning_effort_exists_in_config_default_partial_and_merge() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/config.rs"))
+            .expect("src/config.rs must be readable");
+
+        let slice = |start: &str, end: &str| -> String {
+            let from = src
+                .find(start)
+                .unwrap_or_else(|| panic!("{start} must exist in src/config.rs"));
+            let rest = &src[from..];
+            let to = rest.find(end).unwrap_or(rest.len());
+            rest[..to].to_string()
+        };
+
+        let specialist_struct = slice("pub struct SpecialistConfig {", "pub struct Config {");
+        let config_struct = slice("pub struct Config {", "impl Default for Config {");
+        let defaults = slice("impl Default for Config {", "static ACTIVE_CONFIG");
+        let partial_struct = slice("struct PartialConfig {", "struct PartialMonitoringConfig {");
+        let merge_body = slice("fn merge(mut base: Config", "impl Config {");
+
+        assert!(
+            config_struct.contains("pub reasoning_effort: Option<String>"),
+            "Config must declare reasoning_effort"
+        );
+        assert!(
+            defaults.contains("reasoning_effort: None"),
+            "impl Default for Config must set reasoning_effort: None"
+        );
+        assert!(
+            partial_struct.contains("pub reasoning_effort: Option<String>"),
+            "PartialConfig must mirror reasoning_effort as Option, otherwise the key is \
+             silently dropped by toml"
+        );
+        assert!(
+            merge_body.contains("partial.reasoning_effort")
+                && merge_body.contains("base.reasoning_effort ="),
+            "merge must apply reasoning_effort"
+        );
+        assert!(
+            specialist_struct.contains("pub reasoning_effort: Option<String>"),
+            "SpecialistConfig must declare reasoning_effort"
+        );
+        assert!(
+            specialist_struct.contains("pub validator_reasoning_effort: Option<String>"),
+            "SpecialistConfig must declare validator_reasoning_effort next to validator_model"
+        );
     }
 
     // Typed config knobs that the harness actually reads: `command_timeout_secs`

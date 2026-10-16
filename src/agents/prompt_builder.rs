@@ -337,6 +337,7 @@ impl PromptBuilder {
             presence_penalty: None,
             stream: Some(false),
             enable_thinking: Some(false),
+            reasoning_effort: None,
             tools: None,
         };
 

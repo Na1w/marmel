@@ -117,6 +117,7 @@ fn request_for(engine: &ContextEngine) -> ChatRequest {
         tools: None,
         stream: Some(true),
         enable_thinking: None,
+        reasoning_effort: None,
         temperature: None,
         top_p: None,
         presence_penalty: None,

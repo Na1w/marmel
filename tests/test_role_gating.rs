@@ -952,6 +952,7 @@ async fn drive_fix_loop(
         abort_log_prefix: tag.to_string(),
         emit_tool_status: false,
         rebirth_notice: "(checkpoint accepted)".to_string(),
+        reasoning_effort: None,
     };
     let mut monitor = marmennill::harness::monitor::HarnessMonitor::new_with_config(
         std::sync::Arc::new(marmennill::harness::HarnessStats::new()),

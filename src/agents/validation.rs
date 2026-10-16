@@ -256,7 +256,8 @@ async fn run_automated_validation_inner(
         }
     };
 
-    let (backend, auth, validator_model) = resolve_validator_backend(cfg, agent);
+    let (backend, auth, validator_model, validator_reasoning_effort) =
+        resolve_validator_backend(cfg, agent);
     let val_client = crate::llm::ChatClient::new_with_token(&backend, &validator_model, &auth);
 
     let brief = format!(
@@ -387,6 +388,9 @@ async fn run_automated_validation_inner(
         abort_log_prefix: format!("validator-{agent}"),
         emit_tool_status: true,
         rebirth_notice: "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. Do not call rebirth consecutively without making progress. Continue your validation inspection and submit your verdict via leave_verdict.)".to_string(),
+        // The validator's own effort dial, resolved with the validator chain
+        // (`validator_reasoning_effort` → top level), never the specialist's.
+        reasoning_effort: validator_reasoning_effort,
     };
 
     match crate::session::worker_journal::with_journal_async(
@@ -445,7 +449,8 @@ async fn run_plan_validation_inner(
 
     let validator_prompt = crate::agents::validator::VALIDATOR_PLANNER_ROLE_PROMPT;
 
-    let (backend, auth, validator_model) = resolve_validator_backend(cfg, Agent::Planner);
+    let (backend, auth, validator_model, validator_reasoning_effort) =
+        resolve_validator_backend(cfg, Agent::Planner);
     let val_client = crate::llm::ChatClient::new_with_token(&backend, &validator_model, &auth);
 
     let brief = format!(
@@ -534,6 +539,10 @@ async fn run_plan_validation_inner(
         abort_log_prefix: val_tag.clone(),
         emit_tool_status: false,
         rebirth_notice: "(SYSTEM: Rebirth checkpoint accepted. Conversation history has been compacted. Do not call rebirth consecutively without making progress. Continue your validation inspection and submit your verdict via leave_verdict.)".to_string(),
+        // Same validator chain as the deliverable pass: the plan auditor is a
+        // validator run, so it takes `planner.validator_reasoning_effort` →
+        // top level, not any specialist value.
+        reasoning_effort: validator_reasoning_effort,
     };
 
     match crate::session::worker_journal::with_journal_async(

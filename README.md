@@ -156,7 +156,8 @@ Marmel searches for configuration in the following priority order (first match w
 | `frequency_penalty` | `0.0` | Repetition penalty. |
 | `presence_penalty` | `0.0` | Topic freshness penalty. |
 | `max_context_tokens` | `8192` | Maximum context tokens before compaction triggers. |
-| `max_thinking_tokens` | `32768` | Maximum reasoning/thinking tokens before forcing continuation. |
+| `max_thinking_tokens` | `32768` | Maximum reasoning/thinking tokens before forcing continuation. Hard **cap**: it cuts a reasoning run that goes over. Aliases `reasoning_budget` / `thinking_budget` are accepted per specialist. |
+| `reasoning_effort` | _unset_ | Reasoning-effort **dial** forwarded to the backend (`none`, `minimal`, `low`, `medium`, `high` are the documented vocabulary; the value itself is free-form pass-through). Applies to the Manager and to roles that do not override it. Unset, empty, or whitespace-only ⇒ the key is omitted from the request body entirely. See [Reasoning Effort](#reasoning-effort-reasoning_effort). |
 | `preserve_thinking` | `true` | Retain thinking blocks in the session transcript. |
 | `command_timeout_secs` | `60` | Timeout per terminal command or PTY invocation. Valid range `1..=300` seconds; an out-of-range value is logged and clamped into that range, never applied verbatim. |
 | `sandbox_disabled` | `false` | Fail-closed opt-out of the Linux Landlock command sandbox: `true` runs commands unsandboxed and always logs an attributable warning. `MARMEL_DISABLE_SANDBOX=1` is an equivalent escape hatch — either source opts out. |
@@ -165,7 +166,7 @@ Marmel searches for configuration in the following priority order (first match w
 | `ui_mode` | `"tui"` | Interface mode: `"tui"` (Ratatui) or `"raw"` (streaming stdout). |
 | `debug` | `false` | Write detailed debug logs to `debug.log`. |
 | `[orchestration]` | — | Top-level settings: `max_recursion_depth` (default 3), `mcp_servers`. |
-| `[orchestration.specialists.<role>]` | — | Per-role overrides for `model`, `backend_url`, `tools`, `mcp_servers`, and validator settings. |
+| `[orchestration.specialists.<role>]` | — | Per-role overrides for `model`, `backend_url`, `auth_token`, `tools`, `mcp_servers`, `reasoning_effort`, and validator settings (`validator_model`, `validator_backend_url`, `validator_auth_token`, `validator_reasoning_effort`, `max_validator_iterations`, `max_fix_loop_rounds`, `enable_validator`). |
 | `[mcp_servers.<name>]` | — | External MCP server registration (`command`, `args`, `env`, `url`). |
 
 ### Example `marmel.toml`
@@ -195,6 +196,64 @@ max_validator_iterations = 5
 model = "deepseek-v4-flash"
 tools = ["read_file", "run_command", "grep_search", "glob"]
 ```
+
+### Reasoning Effort (`reasoning_effort`)
+
+`max_thinking_tokens` is a **ceiling**: it cuts off a reasoning run that overruns, it does
+not tell the model how hard to think. `reasoning_effort` is the matching **dial** — an
+optional hint sent as `reasoning_effort` in the chat-completions request body
+(`ChatRequest::reasoning_effort` in `src/types/wire.rs`, serialized only when set). It can
+be declared in three places:
+
+- top level (`src/config.rs` → `Config::reasoning_effort`) — the Manager, plus every role
+  that does not override it;
+- per specialist (`[orchestration.specialists.<role>]` → `reasoning_effort`) — that role's
+  own turns;
+- per validator (`[orchestration.specialists.<role>]` → `validator_reasoning_effort`, the
+  key sitting next to `validator_model`) — that role's validation passes.
+
+```toml
+# Top level: applies to the Manager and to roles that do not override it.
+reasoning_effort = "medium"
+
+# A strong model with high effort for coding.
+[orchestration.specialists.coder]
+model = "deepseek-v4-flash:cloud"
+reasoning_effort = "high"
+
+# A cheap model with low effort for research, and an even cheaper dial for the
+# validator passes that audit it.
+[orchestration.specialists.researcher]
+model = "qwen-3.8-27b"
+reasoning_effort = "low"
+validator_model = "gemma4:cloud"
+validator_reasoning_effort = "minimal"
+```
+
+**Precedence** — per request, first match wins (a blank/whitespace-only value counts as
+unset and falls through to the next level):
+
+| Request | Value used |
+|---|---|
+| Manager turn | top-level `reasoning_effort` |
+| Specialist turn | `[orchestration.specialists.<role>].reasoning_effort`, else top level |
+| Validator pass | `[orchestration.specialists.<role>].validator_reasoning_effort`, else top level — **never** the specialist's own value, which belongs to a different model |
+| All of the above unset | key omitted from the request body (never sent as `null` or `""`) |
+
+- **Free-form pass-through.** `none`, `minimal`, `low`, `medium`, and `high` are the
+  documented vocabulary, but no value is validated: backends use different vocabularies, so
+  anything else is forwarded verbatim. Trimming is the only normalization, and an empty or
+  whitespace-only string is treated as unset.
+- **Dial vs. ceiling.** `max_thinking_tokens` stays the hard cap and is read independently
+  per turn; both knobs can be set at once. Selecting an effort level never derives a
+  thinking budget — no effort level implies a `max_thinking_tokens` default.
+- **Cost.** Each task runs up to `max_validator_iterations` (default `5`) validator passes,
+  each a full session against the validator model, so a low-effort validator multiplies the
+  saving: it is billed five times per task, not once.
+- **Not covered.** The internal fast calls — the steer arbitrator, the Agent Architect
+  prompt builder, and the mid-turn notice path — stay thinking-off (`enable_thinking =
+  false`) and never send `reasoning_effort`; this knob is for the Manager, specialist, and
+  validator sessions only.
 
 ---
 
