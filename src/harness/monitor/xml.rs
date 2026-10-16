@@ -1,4 +1,4 @@
-//! XML tool-call rescue (REQ-HARN-001).
+//! XML tool-call rescue.
 
 use super::HarnessStats;
 use crate::tool_names::{
@@ -20,13 +20,11 @@ use crate::types::ToolCall;
 ///    `tool_call <function=read_file><parameter=path>a</parameter></function> tool_call`
 ///
 /// Tool-call XML that sits inside a **fenced code block** of the assistant text
-/// is never rescued: it is an example the model was showing, not a call it
-/// wanted to run (recon item **M5**, related note in
-/// `docs/recon_bugs_agents_monitor.md`). The
-/// fence convention follows `crate::plan_parse`: a fence line is three or more
-/// backticks or tildes with only leading whitespace before it, a closing fence
-/// must use the same character and be at least as long as the opener, and an
-/// unterminated fence suppresses the rest of the text.
+/// is never rescued: it is an example the model is showing, not a call it wanted
+/// to run. The fence rules match `crate::plan_parse` — three-or-more identical
+/// fence characters with only leading whitespace before them, a closer using the
+/// same character and at least as long as the opener, an unterminated fence that
+/// swallows the rest of the text.
 #[derive(Debug, Clone)]
 pub struct XMLToolRescue {
     stats: Option<std::sync::Arc<HarnessStats>>,
@@ -136,11 +134,10 @@ fn find_next_tool_call_block(text: &str, from: usize) -> Option<(usize, usize)> 
 /// `crate::plan_parse` is the single owner of this convention for plan text
 /// (`fence_delimiter` / `FenceState` / `scannable_lines`), but those items are
 /// private to that module and therefore not reachable from here. This mirror is
-/// deliberately the same plain string scanning, **not** a second regex grammar
-/// for fences: it stays byte-for-byte compatible with the plan-layer rules
-/// (three-or-more fence character, leading whitespace allowed, closer must use
-/// the same character and be at least as long as the opener, an unterminated
-/// fence swallows the rest of the document).
+/// the same plain string scanning, **not** a second regex grammar, and stays
+/// byte-for-byte compatible with the plan-layer rules (three-or-more fence
+/// character, leading whitespace allowed, closer with the same character at
+/// least as long as the opener, unterminated fence swallows the rest).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FenceState {
     Outside,
@@ -404,8 +401,8 @@ fn make_rescued_call(name: String, arguments: serde_json::Value) -> ToolCall {
 /// `query` is only ever tolerated as an **input** alias — the opening-tag
 /// attribute list in [`parse_tool_call_block`] still accepts it, and
 /// `crate::harness::fs::str_arg` still tolerates it at execution time — but the
-/// rescued payload is renamed so the call cannot fail with a schema error
-/// (recon item **M5**). When both spellings are present the canonical key wins.
+/// rescued payload is renamed so the call cannot fail with a schema error.
+/// When both spellings are present the canonical key wins.
 fn canonicalize_arguments(name: &str, arguments: serde_json::Value) -> serde_json::Value {
     if name != TOOL_GREP_SEARCH {
         return arguments;
@@ -425,4 +422,4 @@ fn uuid_v4() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-// Tool repetition & cycle detector (REQ-HARN-002): see `repetition.rs`.
+// Tool repetition & cycle detector: see `repetition.rs`.

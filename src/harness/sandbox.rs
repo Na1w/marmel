@@ -1,35 +1,23 @@
 //! Landlock LSM sandbox for Linux process isolation.
 //!
-//! Restricts child processes (such as spawned PTY shells) to the workspace
-//! root, /tmp, and standard build caches (~/.cargo, ~/.cache), while keeping
-//! system toolchains (/usr, /bin, /lib, ~/.rustup) strictly read-only and
-//! blocking all access to sensitive user directories (~/.ssh, ~/.gnupg, other projects).
+//! Restricts child processes (such as spawned PTY shells) to the workspace root, /tmp and standard build
+//! caches (~/.cargo, ~/.cache); system toolchains (/usr, /bin, /lib, ~/.rustup) stay strictly read-only and
+//! sensitive directories (~/.ssh, ~/.gnupg, other projects) are blocked outright.
 //!
-//! ## Fail-closed contract (t-052)
+//! [`apply_sandbox`] returns `Ok(())` **only when Landlock enforcement is actually in effect for
+//! the calling process**; every way an attempt falls short is a [`SandboxError`] naming the reason —
+//! [`SandboxError::Unavailable`] (no Landlock on this build/kernel, a refused ruleset syscall, or
+//! `restrict_self()` succeeding while the kernel still reports `NotEnforced`),
+//! [`SandboxError::RuleSetup`] (a rule could not be added, so the requested policy cannot be built)
+//! or [`SandboxError::Enforcement`] (a ruleset exists but enforcing it failed, so this process is
+//! **not** restricted). "The kernel has no Landlock" and "enforcement failed" are hard errors, never
+//! warnings, and [`reentry_action`] turns any failure into a refusal to exec: a stderr message plus a
+//! non-zero exit.
 //!
-//! [`apply_sandbox`] returns `Ok(())` **only when Landlock enforcement is actually in
-//! effect for the calling process**. Every way an attempt can fall short is a
-//! [`SandboxError`] that carries the reason:
-//!
-//! * [`SandboxError::Unavailable`] — Landlock cannot be used here: this build has no
-//!   Landlock (non-Linux target), the running kernel has no Landlock LSM, the ruleset
-//!   syscall was refused (`ENOSYS`/`EACCES`), or `restrict_self()` succeeded while the
-//!   kernel still reported `NotEnforced` (nothing is restricted).
-//! * [`SandboxError::RuleSetup`] — a ruleset exists but a rule could not be added, so
-//!   the policy that was asked for cannot be built.
-//! * [`SandboxError::Enforcement`] — a ruleset exists but enforcing it failed, so this
-//!   process is **not** restricted.
-//!
-//! Before t-052 the "kernel has no Landlock" and "enforcement failed" cases only
-//! logged a warning and returned `Ok(())`, and the re-entry path in `src/main.rs`
-//! discarded the result — so a failed setup exec-ed the command completely
-//! unsandboxed. `Ok`/`Err` is now the whole story, and [`reentry_action`] turns any
-//! failure into a refusal to exec (stderr message + non-zero exit).
-//!
-//! The only legitimate way to run unsandboxed is still t-034b's explicit opt-out:
-//! [`SANDBOX_OPTOUT_ENV`] parsed fail-closed by [`is_optout_value`] and surfaced by
-//! [`opt_out_from_env`]. It is honoured *before* any enforcement attempt and is always
-//! warned about ([`optout_warning`]).
+//! The only legitimate way to run unsandboxed is the operator's explicit opt-out
+//! ([`SANDBOX_OPTOUT_ENV`], parsed fail-closed by [`is_optout_value`] and surfaced by
+//! [`opt_out_from_env`]), honoured *before* any enforcement attempt and always warned
+//! about ([`optout_warning`]).
 
 use crate::harness::pty::{SANDBOX_OPTOUT_ENV, SandboxDecision, SandboxSkip, is_optout_value};
 use std::path::Path;
@@ -55,8 +43,8 @@ pub const SANDBOX_REFUSE_EXIT_CODE: i32 = 73;
 /// reason string is always non-empty and is what the caller logs.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SandboxError {
-    /// Landlock does not exist on this platform, or the kernel refused to create a
-    /// ruleset, or it created one and still reports that nothing is enforced.
+    /// Landlock does not exist on this platform, or creating a ruleset was rejected, or
+    /// one was created and the kernel still reports that nothing is enforced.
     #[error("Landlock is unavailable here: {reason}")]
     Unavailable { reason: String },
     /// A ruleset was created but the rule for `path` was rejected, so the requested
@@ -145,15 +133,12 @@ pub fn sandbox_outcome(attempt: &SandboxAttempt) -> Result<(), SandboxError> {
 
 /// Restrict the current process with Landlock, or report why that did not happen.
 ///
-/// `Ok(())` means a Landlock ruleset **is enforcing on this process** (a partially
-/// enforced one counts, and is warned about). Anything else is a [`SandboxError`] —
-/// see the module docs for the exact contract.
-///
-/// This function deliberately does not consult the opt-out: *whether* a sandbox is
-/// wanted is decided by the caller ([`crate::harness::pty::should_apply_sandbox`] on the
-/// spawn side, [`reentry_action`] on the re-entry side). Keeping the decision out of
-/// the enforcement step is what makes an enforcement failure impossible to mistake for
-/// success.
+/// `Ok(())` means a Landlock ruleset **is enforcing on this process** (a partially enforced one
+/// counts, and is warned about). Anything else is a [`SandboxError`] — see the module docs for the
+/// exact contract. This function deliberately does not consult the opt-out: *whether* a sandbox is
+/// wanted is decided by the caller ([`crate::harness::pty::should_apply_sandbox`] on the spawn side,
+/// [`reentry_action`] on the re-entry side), which is what makes an enforcement failure impossible
+/// to mistake for success.
 pub fn apply_sandbox(workspace_root: &Path) -> Result<(), SandboxError> {
     let attempt = attempt_landlock(workspace_root);
     let outcome = sandbox_outcome(&attempt);
@@ -185,8 +170,8 @@ pub fn apply_sandbox(workspace_root: &Path) -> Result<(), SandboxError> {
     outcome
 }
 
-/// The operator's explicit opt-out, read from the environment with t-034b's
-/// fail-closed parsing. Call sites must use this instead of re-reading the variable.
+/// The operator's explicit opt-out, read from the environment with fail-closed parsing.
+/// Call sites must use this instead of re-reading the variable.
 #[must_use]
 pub fn opt_out_from_env() -> crate::harness::pty::OptOut {
     opt_out_from_value(std::env::var(SANDBOX_OPTOUT_ENV).ok().as_deref())
@@ -227,16 +212,14 @@ pub enum ReentryAction {
     Refuse { reason: String, exit_code: i32 },
 }
 
-/// Decide the re-entry action from injected inputs — no exec, no Landlock, no
-/// environment — so the fail-closed choice (exit over exec) is unit-testable.
+/// Decide the re-entry action from injected inputs — no exec, no Landlock, no environment — so the
+/// fail-closed choice (exit over exec) is unit-testable. Its rules are the security contract of the
+/// re-entry protocol:
 ///
-/// The rules are the security contract of the re-entry protocol:
-///
-/// * exec only when the decision demanded Landlock **and** it was established, or when
-///   the decision and the enforcement step agree on an explicit opt-out;
-/// * everything else — a failed attempt, a decision that demands Landlock without an
-///   established ruleset, a platform that cannot provide it, an unresolved executable —
-///   is a refusal with a non-zero exit code.
+/// * exec only when the decision demanded Landlock **and** it was established, or when the decision
+///   and the enforcement step agree on an explicit opt-out;
+/// * everything else — a failed attempt, a decision demanding Landlock without an established ruleset,
+///   a platform that cannot provide it, an unresolved executable — is a refusal with a non-zero exit code.
 #[must_use]
 pub fn reentry_action(decision: &SandboxDecision, enforcement: &Enforcement) -> ReentryAction {
     match (decision, enforcement) {
@@ -323,11 +306,10 @@ fn attempt_landlock(workspace_root: &Path) -> SandboxAttempt {
 
 /// Build the allow-list ruleset.
 ///
-/// A rule that the policy **requires** is added with `?`: if it cannot be added the
-/// whole attempt fails, because a partially built policy is not the policy the caller
-/// asked for. The workspace root is such a rule — silently dropping it would enforce a
-/// policy nobody chose. Rules for paths that simply do not exist on this host (no
-/// `~/.npm`, no `/var/tmp`, …) stay optional: an absent allow-list entry widens nothing.
+/// A rule that the policy **requires** is added with `?`: if it cannot be added the whole attempt fails,
+/// because a partially built policy is not the policy the caller asked for — the workspace root is such a
+/// rule, and silently dropping it would enforce a policy nobody chose. Rules for paths that simply do not
+/// exist on this host (no `~/.npm`, no `/var/tmp`, …) stay optional: an absent allow-list entry widens nothing.
 #[cfg(target_os = "linux")]
 fn build_ruleset(workspace_root: &Path, abi: ABI) -> Result<RulesetCreated, SandboxAttempt> {
     let ruleset = Ruleset::default()
@@ -549,7 +531,7 @@ mod tests {
     // PTY, no `/dev/pts`).
 
     /// `Ok(())` is reserved for an established ruleset: every other attempt must be an
-    /// error. This is the exact hole t-052 closes.
+    /// error, so a failed setup can never look like success.
     #[test]
     fn test_sandbox_outcome_is_ok_only_when_enforcement_is_established() {
         assert!(
@@ -634,13 +616,10 @@ mod tests {
         assert!(err.to_string().contains("/tmp/missing-root"), "{err}");
     }
 
-    /// End-to-end on the real code path, without restricting the test process: an
-    /// unusable workspace root must produce an `Err` (before t-052 it produced
-    /// `Ok(())` after a warning, and the caller then exec-ed the command unsandboxed).
-    ///
-    /// Whether the host reports "no Landlock here" or "this rule could not be built"
-    /// depends on the kernel; either way it must be an error with a reason, and it must
-    /// be logged rather than swallowed.
+    /// End-to-end on the real code path, without restricting the test process: an unusable workspace
+    /// root must produce an `Err`, never `Ok(())` after a warning, so the caller can never exec the
+    /// command unsandboxed. Whether the host reports "no Landlock here" or "this rule could not be
+    /// built" depends on the kernel; either way it must be an error with a reason, logged not swallowed.
     #[test]
     fn test_apply_sandbox_fails_closed_on_an_unusable_workspace_root() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -805,8 +784,9 @@ mod tests {
 
     // Source guards.
 
-    /// The re-entry path in `main.rs` must never discard the enforcement result and
-    /// must never re-spell the protocol literal: both were the fail-open in t-052.
+    /// The re-entry path in `main.rs` must never discard the enforcement result and must
+    /// never re-spell the protocol literal: either would let a failed setup run the
+    /// command unsandboxed.
     #[test]
     fn test_main_rs_never_ignores_the_sandbox_result() {
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
@@ -864,8 +844,8 @@ mod tests {
         );
     }
 
-    /// The Landlock integration tests must not rebuild a binary path from a hard-coded
-    /// executable name — the same class of assumption t-034b removed from `pty.rs`.
+    /// The Landlock integration tests must not rebuild a binary path from a hard-coded executable
+    /// name: sandboxing is decided by the resolved exe path, never by a name.
     #[test]
     fn test_sandbox_tests_never_rebuild_the_binary_path_from_a_name() {
         let src = std::fs::read_to_string(concat!(

@@ -1,67 +1,44 @@
 //! Turn-budget constants, wall-clock bounds and repeated-failure accounting
-//! consumed by the **live** turn loops.
+//! consumed by the **live** turn loops: the Manager interactive loop
+//! (`src/ui/session.rs` — turn budget, steer queue, compaction trigger,
+//! parallel read-only tool fan-out, sequential write dispatch), the specialist
+//! loop (`src/agents/runner/execution.rs`, `src/agents/runner/fix_loop.rs`) and
+//! silent-dispatch delegation (`src/orchestrator/delegate.rs` →
+//! `OrchestratorManager::delegate`). Only the items those loops import live
+//! here; turn-execution logic itself is not duplicated in this module.
 //!
-//! # Why this module is small
+//! What the surviving items guarantee, in the loops that import them:
 //!
-//! The `AgentLoop` / `ManagerLoop` state machines that used to live here were
-//! **deleted** (decision + evidence: `docs/decision_dead_code_manager.md`,
-//! recon item H8). Neither type was ever constructed outside `src/manager/`
-//! (only unit tests), and both duplicated executors that *do* run in the
-//! shipped binary:
-//!
-//! * Manager interactive turn loop (turn budget, steer queue, compaction
-//!   trigger, parallel read-only tool fan-out, sequential write dispatch):
-//!   `src/ui/session.rs`.
-//! * Specialist turn loop (LLM call, XML rescue, repetition gate, tool
-//!   dispatch, abort/cancellation): `src/agents/runner/execution.rs` and
-//!   `src/agents/runner/fix_loop.rs`.
-//! * Silent-dispatch delegation (one task per `delegate_task` call, auto
-//!   check-off): `src/orchestrator/delegate.rs::handle_delegate_task` →
-//!   `OrchestratorManager::delegate`.
-//!
-//! Keeping a second, un-instantiated copy of those loops meant ~40 green unit
-//! tests certified behaviour the binary never ran, and the two executors could
-//! (and did) drift. Only the items the live loops actually import remain here.
-//!
-//! # Requirements enforced by the surviving items
-//!
-//! * **REQ-LOOP-002** (turn limit half): the 100-turn cap below is enforced at
-//!   `src/ui/session.rs`.
-//! * **REQ-LOOP-002** (wall-clock half — restored by t-031c): the 600 s turn
-//!   watchdog below is enforced **in the live session loop**
-//!   (`src/ui/session.rs::run_session_with_bounds`), together with an absolute
-//!   per-turn hard cap. The constants used to be enforced only by the deleted
-//!   `AgentLoop::run_turn`, which the binary never called.
-//! * **REQ-LOOP-003** (parallel read-only tools): the read/write split below is
-//!   the gate the live loop uses to decide whether a batch of tool calls may be
-//!   dispatched concurrently.
-//! * **H5 failure budget** (recon `docs/recon_bugs_manager.md`): [`FailureBudget`]
-//!   below is the per-session repeated-failure accounting the live loop applies
-//!   per task id / tool call, so an impossible task cannot be retried blindly
-//!   for the whole turn budget.
+//! * the 100-turn cap below bounds the Manager turn loop in `src/ui/session.rs`;
+//! * the 600 s idle watchdog below is enforced **in the live session loop**
+//!   (`src/ui/session.rs::run_session_with_bounds`) together with an absolute
+//!   per-turn hard cap;
+//! * the read/write split below decides whether a batch of tool calls may be
+//!   dispatched concurrently;
+//! * [`FailureBudget`] is the per-session repeated-failure accounting the live
+//!   loop applies per task id / tool call, so an impossible task cannot be
+//!   retried blindly for the whole turn budget.
 
 use crate::tool_names::{TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_READ_FILE};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// Maximum number of turns per interactive request (REQ-LOOP-002).
+/// Maximum number of turns per interactive request.
 ///
 /// Live caller: the Manager session loop in `src/ui/session.rs`, which breaks
 /// its turn loop once this budget is exhausted.
 pub const MAX_TURNS: usize = 100;
 
-/// Wall-clock watchdog bound for **one** turn, in seconds (REQ-LOOP-002).
+/// Wall-clock watchdog bound for **one** turn, in seconds.
 ///
 /// A turn is torn down once it has gone this long with **no observable
 /// progress** — no status/event traffic from workers, no completed tool call,
 /// no streamed steer arbitration. Progress-aware on purpose: a legitimately
 /// long delegation keeps emitting `emit_status(...)` lines from
 /// `src/agents/runner/{execution,fix_loop}.rs`, so it is never cut off, while a
-/// genuinely stuck turn (hung tool, silent worker, wedged round) dies.
-///
-/// Live enforcement: `src/ui/session.rs` (checked in the tool-round poll loops
-/// and against the in-flight backend call), with the original 600 s value of
-/// the deleted `TURN_WATCHDOG_SECS`.
+/// genuinely stuck turn (hung tool, silent worker, wedged round) dies. Live
+/// enforcement is `src/ui/session.rs`: the tool-round poll loops and the
+/// in-flight backend call.
 pub const TURN_WATCHDOG_SECS: u64 = 600;
 
 /// Absolute wall-clock bound for **one** turn, in seconds, regardless of how
@@ -74,14 +51,13 @@ pub const TURN_WATCHDOG_SECS: u64 = 600;
 pub const TURN_HARD_CAP_SECS: u64 = 3 * 60 * 60;
 
 /// How many failures of the same task/tool call are tolerated inside one
-/// session before the live loop stops retrying it blindly (recon H5).
+/// session before the live loop stops retrying it blindly.
 ///
 /// Reaching the threshold injects a strategy-change escalation into the model
 /// context; the *next* attempt is refused outright and the turn ends.
 pub const TASK_FAILURE_ESCALATION_THRESHOLD: u32 = 2;
 
-/// Returns `true` for read-only tools eligible for parallel execution
-/// (REQ-LOOP-003).
+/// Returns `true` for read-only tools eligible for parallel execution.
 ///
 /// Every other tool — writers, `run_command`, plan tools, `rebirth`, PTY tools,
 /// MCP tools and `delegate_task` — must run sequentially in the order it
@@ -125,13 +101,13 @@ impl DeadlineKind {
     }
 }
 
-/// Per-turn wall-clock watchdog (REQ-LOOP-002, wall-clock half).
+/// Per-turn wall-clock watchdog.
 ///
 /// Two independent bounds: an **idle** bound (no observable progress) and an
 /// **absolute** hard cap. The session loop arms it per turn
 /// ([`TurnWatchdog::rearm`]), feeds it observable progress
-/// ([`TurnWatchdog::note_progress`]) and asks it before blocking on anything
-/// that can hang.
+/// ([`TurnWatchdog::note_progress`]) and asks it before blocking on a call that
+/// can hang.
 ///
 /// The clock is injectable (`*_at` variants) so the bound is testable without
 /// waiting 600 s.
@@ -221,7 +197,7 @@ impl TurnWatchdog {
 
     /// Time left before the **absolute** per-turn bound.
     ///
-    /// Used to bound an await whose internal progress the session loop cannot
+    /// Bounds an await whose internal progress the session loop cannot
     /// observe — a single backend call. The idle bound is not used there: a
     /// live-but-slow stream does not surface events into the session loop, so
     /// only the absolute bound may cut it off.
@@ -265,12 +241,11 @@ pub enum FailureVerdict {
     Escalate { count: u32 },
 }
 
-/// Per-session accounting of repeated failures of the same task/tool call
-/// (recon H5: "no failure budget").
+/// Per-session accounting of repeated failures of the same task/tool call.
 ///
 /// Deliberately a plain `HashMap<String, u32>`: explicit, local to the session
 /// loop, and trivially auditable. A key is a plan task id for delegated work
-/// (`task:t-012`) or a tool signature for direct tool calls
+/// (`task:<id>`) or a tool signature for direct tool calls
 /// (`tool:read_file:{...}`).
 ///
 /// Policy with the default threshold of 2:
@@ -334,7 +309,7 @@ mod tests {
         TOOL_RUN_COMMAND, TOOL_WRITE_FILE,
     };
 
-    /// REQ-LOOP-003: exactly the three read-only tools are parallel-safe.
+    /// Exactly the three read-only tools are parallel-safe.
     #[test]
     fn read_tool_gate_covers_only_read_only_tools() {
         assert!(is_read_tool(TOOL_READ_FILE));
@@ -342,8 +317,8 @@ mod tests {
         assert!(is_read_tool(TOOL_GLOB));
     }
 
-    /// REQ-LOOP-003: mutating, executing and orchestration tools are never
-    /// classified as parallel-safe reads.
+    /// Mutating, executing and orchestration tools are never classified as
+    /// parallel-safe reads.
     #[test]
     fn mutating_and_orchestration_tools_are_not_reads() {
         for tool in [
@@ -360,14 +335,14 @@ mod tests {
         }
     }
 
-    /// REQ-LOOP-002: the interactive turn budget stays at 100 turns.
+    /// The interactive turn budget stays at 100 turns.
     #[test]
     fn turn_budget_is_one_hundred() {
         assert_eq!(MAX_TURNS, 100);
     }
 
-    /// REQ-LOOP-002: the 600 s watchdog bound exists again, and it is paired
-    /// with an absolute per-turn cap (the H5 wall-clock gap).
+    /// The 600 s idle watchdog is paired with an absolute per-turn cap, so a turn
+    /// that keeps reporting progress still ends at the hard cap.
     #[test]
     fn turn_wall_clock_bounds_are_declared() {
         assert_eq!(TURN_WATCHDOG_SECS, 600);
@@ -380,8 +355,8 @@ mod tests {
 
     // ---- TurnWatchdog -----------------------------------------------------
 
-    /// REQ-LOOP-002: a turn that reports no progress is cut off at the idle
-    /// bound, and the reason names the watchdog.
+    /// A turn that reports no progress is cut off at the idle bound, and the
+    /// reason names the watchdog.
     #[test]
     fn watchdog_fires_when_a_turn_makes_no_progress() {
         let start = Instant::now();
@@ -487,8 +462,8 @@ mod tests {
 
     // ---- FailureBudget ----------------------------------------------------
 
-    /// Recon H5: two failures of the same task escalate, and the third attempt
-    /// is refused instead of being retried blindly.
+    /// Two failures of the same task escalate, and the third attempt is refused
+    /// instead of being retried blindly.
     #[test]
     fn failure_budget_escalates_at_threshold_and_then_refunds_no_more_attempts() {
         let mut budget = FailureBudget::new(TASK_FAILURE_ESCALATION_THRESHOLD);

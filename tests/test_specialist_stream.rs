@@ -47,10 +47,10 @@ async fn test_preemptible_stream_sink_forwards_all_stream_events_to_orchestrator
 async fn test_mock_specialist_live_execution_streams_thinking_and_content_to_ui() {
     let _guard = TEST_BUS_MUTEX.lock().await;
 
-    // Hermeticity (t-033b): scope this run to an isolated temporary workspace
-    // root. Without this scoping the suite resolves `.marmel/prompts/` from the
-    // repository working directory and would read (and assert against) the real
-    // per-task prompt/verdict files of the checkout.
+    // Hermeticity: scope this run to an isolated temporary workspace root. Without
+    // this scoping the suite resolves `.marmel/prompts/` from the repository
+    // working directory and would read (and assert against) the real per-task
+    // prompt/verdict files of the checkout.
     let tmp = tempfile::tempdir().expect("isolated temporary workspace root");
     marmennill::harness::with_workspace_root(tmp.path().to_path_buf(), async move {
 
@@ -155,8 +155,8 @@ async fn test_mock_specialist_live_execution_streams_thinking_and_content_to_ui(
 async fn test_specialist_consecutive_thinking_nudges_triggers_replan_required() {
     let _guard = TEST_BUS_MUTEX.lock().await;
 
-    // Hermeticity (t-033b): isolated temporary workspace root — see the
-    // rationale on the first test of this file.
+    // Hermeticity: isolated temporary workspace root — see the rationale on the
+    // first test of this file.
     let tmp = tempfile::tempdir().expect("isolated temporary workspace root");
     marmennill::harness::with_workspace_root(tmp.path().to_path_buf(), async move {
 
@@ -228,8 +228,8 @@ async fn test_specialist_consecutive_thinking_nudges_triggers_replan_required() 
 async fn test_specialist_thinking_nudges_reset_when_thinking_within_budget() {
     let _guard = TEST_BUS_MUTEX.lock().await;
 
-    // Hermeticity (t-033b): isolated temporary workspace root — see the
-    // rationale on the first test of this file.
+    // Hermeticity: isolated temporary workspace root — see the rationale on the
+    // first test of this file.
     let tmp = tempfile::tempdir().expect("isolated temporary workspace root");
     marmennill::harness::with_workspace_root(tmp.path().to_path_buf(), async move {
 
@@ -321,9 +321,7 @@ async fn test_specialist_thinking_nudges_reset_when_thinking_within_budget() {
     );
     // 8 specialist turns + 1 automated validator pass. The validator pass only
     // exists because the run is hermetic: in a scoped root the verdict-file
-    // precondition is satisfiable, so validation actually runs (before
-    // hermetic scoping this task's missing verdict file in the repository's
-    // `.marmel/prompts/` used to skip validation altogether).
+    // requirement is satisfiable, so validation actually runs.
     assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 9);
     })
     .await;
@@ -333,8 +331,8 @@ async fn test_specialist_thinking_nudges_reset_when_thinking_within_budget() {
 async fn test_specialist_truncated_tool_call_feedback_and_recovery() {
     let _guard = TEST_BUS_MUTEX.lock().await;
 
-    // Hermeticity (t-033b): isolated temporary workspace root — see the
-    // rationale on the first test of this file.
+    // Hermeticity: isolated temporary workspace root — see the rationale on the
+    // first test of this file.
     let tmp = tempfile::tempdir().expect("isolated temporary workspace root");
     marmennill::harness::with_workspace_root(tmp.path().to_path_buf(), async move {
 
@@ -422,8 +420,8 @@ async fn test_specialist_truncated_tool_call_feedback_and_recovery() {
 async fn test_specialist_repeated_malformed_tool_calls_triggers_replan() {
     let _guard = TEST_BUS_MUTEX.lock().await;
 
-    // Hermeticity (t-033b): isolated temporary workspace root — see the
-    // rationale on the first test of this file.
+    // Hermeticity: isolated temporary workspace root — see the rationale on the
+    // first test of this file.
     let tmp = tempfile::tempdir().expect("isolated temporary workspace root");
     marmennill::harness::with_workspace_root(tmp.path().to_path_buf(), async move {
 
@@ -492,8 +490,8 @@ async fn test_specialist_repeated_malformed_tool_calls_triggers_replan() {
 async fn test_specialist_malformed_tool_calls_reset_on_successful_tool_call() {
     let _guard = TEST_BUS_MUTEX.lock().await;
 
-    // Hermeticity (t-033b): isolated temporary workspace root — see the
-    // rationale on the first test of this file.
+    // Hermeticity: isolated temporary workspace root — see the rationale on the
+    // first test of this file.
     let tmp = tempfile::tempdir().expect("isolated temporary workspace root");
     marmennill::harness::with_workspace_root(tmp.path().to_path_buf(), async move {
 
@@ -584,7 +582,7 @@ async fn test_specialist_malformed_tool_calls_reset_on_successful_tool_call() {
     .await;
 }
 
-// t-033b — hermetic workspace scoping + unconditional missing-verdict failure
+// Hermetic workspace scoping + unconditional missing-verdict failure
 
 /// Minimal SSE fixture: a single tool call.
 fn tool_call_sse(call_id: &str, tool_name: &str, args_json: &str) -> String {
@@ -646,9 +644,8 @@ fn snapshot_dir(dir: &std::path::Path) -> Vec<(String, u64, std::time::SystemTim
 }
 
 /// A prompts directory that exists but holds **no** `{tid}-validation.md`, and
-/// **no execution plan at all**: the task id is not plan-tracked, so this is the
-/// exact shape the t-033a cut-off used to let through. The missing verdict is
-/// now an unconditional hard failure — the validator must not run, the
+/// **no execution plan at all**: the task id is not plan-tracked. A missing
+/// verdict is an unconditional hard failure — the validator must not run, the
 /// deliverable must be reported as not validated, and no MISSION COMPLETE may be
 /// reported.
 #[tokio::test]

@@ -26,24 +26,24 @@ pub const MIN_COMMAND_TIMEOUT_SECS: u64 = 1;
 pub const MAX_COMMAND_TIMEOUT_SECS: u64 = 300;
 
 /// Default floor between throttled session commits
-/// (`session_commit_min_interval_ms`, flow §3.1).
+/// (`session_commit_min_interval_ms`).
 pub const DEFAULT_SESSION_COMMIT_MIN_INTERVAL_MS: u64 = 250;
 
 /// Default cap on the in-memory per-worker mirror
-/// (`session_worker_mirror_max_messages`, flow §1.3 R-TRIG-4).
+/// (`session_worker_mirror_max_messages`).
 pub const DEFAULT_SESSION_WORKER_MIRROR_MAX_MESSAGES: usize = 4000;
 
 /// Default soft ceiling on total session-bundle member bytes
-/// (`session_max_bundle_bytes`, flow §3.1; A §7.1 C1 warn-once latch).
+/// (`session_max_bundle_bytes`).
 pub const DEFAULT_SESSION_MAX_BUNDLE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Environment key that requests a session resume for one run
-/// (`1`/`true` ⇒ true). Equivalent to `--resume`; flow §3.2.
+/// (`1`/`true` ⇒ true). Equivalent to `--resume`.
 pub const SESSION_RESUME_ENV: &str = "MARMEL_RESUME";
 
 /// Environment key that disables session capture. **One-way switch**: it can only
 /// turn capture off, never on, mirroring how `MARMEL_DISABLE_SANDBOX` ORs with
-/// [`Config::sandbox_disabled`]; flow §3.2.
+/// [`Config::sandbox_disabled`].
 pub const SESSION_DISABLE_ENV: &str = "MARMEL_SESSION_DISABLE";
 
 /// Environment key that overrides the commit throttling floor (integer ms).
@@ -190,8 +190,8 @@ pub struct Config {
     pub base_prompt: Option<String>,
     /// Optional global cap on fix-loop rounds per validation pass (defaults to MAX_FIX_LOOP_ROUNDS = 200).
     pub max_fix_loop_rounds: Option<usize>,
-    /// Session capture/rehydration master switch (Design A D2: replaces the
-    /// deleted `enable_rehydration`). Default `true`: a bundle is always written.
+    /// Session capture/rehydration master switch. Default `true`: a bundle is
+    /// always written.
     ///
     /// One-way against the environment: `MARMEL_SESSION_DISABLE` can turn capture
     /// **off**, never on — see [`session_env_overrides`].
@@ -199,12 +199,12 @@ pub struct Config {
     /// Rehydrate from the bundle at boot. Default `false`: a fresh start is the
     /// default behaviour; `--resume` / `MARMEL_RESUME` turn it on for one run.
     pub session_resume: bool,
-    /// Floor between throttled commits (flow §1.3 R-TRIG-2). Default 250 ms.
+    /// Floor between throttled commits. Default 250 ms.
     pub session_commit_min_interval_ms: u64,
-    /// Cap on the in-memory per-worker mirror (flow §1.3 R-TRIG-4). Default 4000 records.
+    /// Cap on the in-memory per-worker mirror. Default 4000 records.
     pub session_worker_mirror_max_messages: usize,
-    /// Commit at every landed tool result (flow T-3). `false` keeps T-1/T-2/T-6/T-9
-    /// and drops T-3/T-4: fewer writes, coarser crash granularity. Default `true`.
+    /// Commit at every landed tool result. `false` drops the tool-result commits:
+    /// fewer writes, coarser crash granularity. Default `true`.
     pub session_commit_on_tool_result: bool,
     /// Soft ceiling on total member bytes before the committer stops writing
     /// throttled triggers and warns once. Default 32 MiB.
@@ -381,7 +381,7 @@ pub fn load(explicit_path: Option<&str>) -> Result<Config> {
         cfg.model = m;
     }
 
-    // Session keys (flow §3.2): env beats file beats default, with the deliberate
+    // Session keys: env beats file beats default, with the deliberate
     // exception that `MARMEL_SESSION_DISABLE` is a one-way switch. Factored into
     // [`apply_session_env`] so the precedence is testable without mutating the
     // process environment.
@@ -408,7 +408,7 @@ pub fn env_flag(value: Option<&String>) -> Option<bool> {
     }
 }
 
-/// Applies the three session environment overrides (flow §3.2) to `cfg`.
+/// Applies the three session environment overrides to `cfg`.
 ///
 /// * `MARMEL_RESUME` — resume for this run; a recognized value overrides the file,
 ///   an unrecognized one is reported and ignored.
@@ -687,10 +687,9 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
     // `HOME` wins when it is set. The fallback is written as an early return and
     // not as an `or_else` closure: on non-unix targets the closure body degenerates
     // into a plain `None`, which makes clippy raise
-    // `clippy::unnecessary_lazy_evaluations` on the windows target only
-    // (`docs/cross_platform_gating.md:94`, `docs/nonlinux_unused_inventory.md:47`),
-    // and a cross-target `-D warnings` gate must stay green. Semantics are
-    // unchanged: `HOME` first, platform fallback second.
+    // `clippy::unnecessary_lazy_evaluations` on the windows target only, and a
+    // cross-target `-D warnings` build must stay green. Semantics are unchanged:
+    // `HOME` first, platform fallback second.
     if let Some(home) = std::env::var_os("HOME") {
         return Some(PathBuf::from(home));
     }
@@ -722,9 +721,8 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 /// Rust 2024 makes `std::env::set_var`/`remove_var` `unsafe` precisely because a
 /// concurrent env read on another thread races with them, and libtest runs tests
 /// concurrently by default — CI never passes `--test-threads=1`
-/// (`.github/workflows/ci.yml`; see `docs/windows_failures_analysis.md` "Site 1",
-/// measured 33/40 failures in parallel vs 0/5 serialized). This lock, not the
-/// thread count, is the gate that makes those writes sound.
+/// (`.github/workflows/ci.yml`). This lock, not the thread count, is what makes
+/// those writes sound.
 ///
 /// `pub(crate)` so the other test modules that mutate `ACTIVE_CONFIG`
 /// (`src/orchestrator/notice_tests.rs`, `src/harness/dispatch_integrity_tests.rs`)
@@ -970,12 +968,10 @@ mod tests {
         assert!(cfg.base_prompt.is_none());
     }
 
-    // t-035d — typed knobs that the harness actually reads:
-    //   * `command_timeout_secs` used to be parsed and merged but never read, so
-    //     every command ran with the built-in default;
-    //   * the sandbox had no typed knob at all (env-only opt-out).
-    // These tests are pty-free: the sandbox outcome is asserted through
-    // `should_apply_sandbox(&SandboxInputs)`, never by executing a command.
+    // Typed config knobs that the harness actually reads: `command_timeout_secs`
+    // and `sandbox_disabled`. These tests are pty-free: the sandbox outcome is
+    // asserted through `should_apply_sandbox(&SandboxInputs)`, never by executing
+    // a command.
 
     /// Install a config as the process-global active config and restore the
     /// previous state (including "none active") when the guard is dropped, so a
@@ -1164,7 +1160,7 @@ mod tests {
         assert_eq!(cfg.backend_url, "http://localhost:9000/v1");
     }
 
-    /// (a) the knob reaches `SandboxInputs::opt_out` and therefore the decision.
+    /// The knob reaches `SandboxInputs::opt_out` and therefore the decision.
     #[test]
     fn sandbox_disabled_knob_reaches_sandbox_inputs_opt_out() {
         let cfg = partial_from("sandbox_disabled = true\n");
@@ -1204,7 +1200,7 @@ mod tests {
         );
     }
 
-    /// (b) direction 1: knob OFF + env opt-out ⇒ the env opt-out still applies.
+    /// Knob off plus an env opt-out ⇒ the env opt-out still applies.
     #[test]
     fn sandbox_env_opt_out_wins_independently_of_the_knob() {
         let _guard = ActiveConfigTestGuard::install(Config {
@@ -1245,9 +1241,9 @@ mod tests {
         );
     }
 
-    /// (b) direction 2: knob ON + an env value that is not an opt-out ⇒ Skip; with
-    /// both set the outcome is the same Skip (never an AND of the two sources); with
-    /// nothing opted out the sandbox stays on.
+    /// Knob on plus an env value that is not an opt-out ⇒ Skip; with both set the
+    /// outcome is the same Skip (never an AND of the two sources); with nothing
+    /// opted out the sandbox stays on.
     ///
     /// The env side is asserted through the pure parser
     /// (`crate::harness::sandbox::opt_out_from_value`), the config side through the
@@ -1346,7 +1342,7 @@ mod tests {
         );
     }
 
-    /// (d) the configured `command_timeout_secs` is what the harness applies.
+    /// The configured `command_timeout_secs` is what the harness applies.
     #[test]
     fn command_timeout_secs_reaches_execution_timeout() {
         let cfg = partial_from("command_timeout_secs = 17\n");
@@ -1457,8 +1453,7 @@ mod tests {
     // `PartialConfig` has no `deny_unknown_fields`, so a `session_*` key that is
     // missing from the mirror — or from `merge` — is dropped **silently** by
     // `toml::from_str`. These tests are the only mechanism that catches that
-    // drift (flow §3.1 T-CFG-1/T-CFG-2; the existing `max_fix_loop_rounds` key is
-    // the in-repo proof that it happens).
+    // drift; `max_fix_loop_rounds` is the in-repo proof that it happens.
 
     fn merged(toml_str: &str) -> Config {
         let partial: PartialConfig = toml::from_str(toml_str).expect("parses");
@@ -1544,7 +1539,7 @@ session_max_bundle_bytes = 4096
         assert_eq!(cfg.session_max_bundle_bytes, 4096);
     }
 
-    /// T-CFG-2: every key must exist in all four places, or it is unsettable.
+    /// Every key must exist in all four places, or it is unsettable.
     #[test]
     fn every_session_key_exists_in_config_partial_merge_and_the_example() {
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/config.rs"))

@@ -1,4 +1,4 @@
-//! t-035a — plan check-off integrity, end to end at the live call sites.
+//! Plan check-off integrity, end to end at the live call sites.
 //!
 //! What is pinned here is the *boundary* the UI and the orchestrator share:
 //!
@@ -8,7 +8,7 @@
 //!    marker the orchestrator threads through) checks its own box off;
 //! 3. a marker that names a **different** task id never ticks the other box;
 //! 4. a plan that cannot be read or parsed is **surfaced** as a warning and is
-//!    never treated as "all tasks done" (bug M8 at the UI boundary).
+//!    never treated as "all tasks done".
 //!
 //! Every test is pty-free, asserts no process-global counter, and roots its plan
 //! in a private temporary workspace (`harness::with_workspace_root`) so the
@@ -35,9 +35,9 @@ fn on_disk(plan: &Plan) -> String {
     std::fs::read_to_string(plan.plan_path()).expect("plan file must exist")
 }
 
-/// The gate exactly as both live session loops use it: run the marker-gated
-/// check-off, then ask whether the outcome deserves a user-visible warning.
-/// Returns the classified outcome plus the warning text (if any).
+/// The shared path exactly as both live session loops use it: run the
+/// marker-checked check-off, then ask whether the outcome deserves a
+/// user-visible warning. Returns the classified outcome plus the warning text.
 fn gate(
     plan: &Plan,
     task_id: Option<&str>,
@@ -75,7 +75,7 @@ async fn deliverable_without_a_completion_marker_never_checks_off() {
             warning.contains(MARKER_COMPLETE) && warning.contains("t-001"),
             "the warning must name the missing marker and the task: {warning}"
         );
-        // The orchestrator's entry point is the same gate, not a second one.
+        // The orchestrator's entry point is the same path, not a second one.
         assert!(
             !plan
                 .check_plan_on_deliverable(None, Some("t-001"), deliverable)
@@ -96,7 +96,7 @@ async fn deliverable_without_a_completion_marker_never_checks_off() {
         assert!(!plan.is_complete(), "the plan must not self-complete");
 
         // Non-vacuity witness: the raw (tool-only) mutation *would* have ticked
-        // the box — the marker gate is what stopped it. Nothing is written.
+        // the box — the marker check is what stopped it. Nothing is written.
         let (rewritten, flipped) = marmennill::plan_parse::check_off_content(&disk, "t-001");
         assert!(
             flipped && rewritten.contains("- [x] [t-001]"),
@@ -257,8 +257,7 @@ async fn marker_for_a_different_task_does_not_check_off_the_bound_box() {
 
 /// (d) A plan that cannot be read, or cannot be parsed into task lines, is
 /// surfaced through the session's warning channel and is never reported as
-/// "all tasks done". The empty pending list the old call sites saw would have
-/// looked exactly like completion.
+/// "all tasks done": an empty pending list is not evidence of completion.
 #[tokio::test]
 async fn plan_parse_errors_are_surfaced_and_never_mean_complete() {
     let tmp = tempfile::tempdir().expect("isolated workspace root");
@@ -277,8 +276,8 @@ async fn plan_parse_errors_are_surfaced_and_never_mean_complete() {
         )
         .expect("write undecodable plan");
 
-        // Witness of the bug being closed: the plain list-shaped API the session
-        // used to call reports "nothing pending" for this file.
+        // Non-vacuity: the plain list-shaped API reports "nothing pending" for
+        // this file, which is exactly what looks like completion.
         assert!(
             plan.pending_tasks().is_empty(),
             "the old call site would have read this as an empty plan"
@@ -395,12 +394,12 @@ async fn plan_parse_errors_are_surfaced_and_never_mean_complete() {
     .await;
 }
 
-/// t-035a regression guard: `handle_delegate_task` runs the orchestrator's own
-/// marker-gated check-off (`apply_check_off`) before the session ever sees the
-/// deliverable, so by the time the live loop reaches its gate the box is already
-/// `[x]`. A `false` return there must **not** be reported as "no completion
-/// marker" — that message would be a lie on every healthy delegation, and the
-/// user would be trained to ignore plan warnings.
+/// `handle_delegate_task` runs the orchestrator's own marker-checked check-off
+/// (`apply_check_off`) before the session ever sees the deliverable, so by the
+/// time the live loop reaches its own check-off the box is already `[x]`. A
+/// `false` return there must **not** be reported as "no completion marker" — that
+/// message would be a lie on every healthy delegation, and the user would be
+/// trained to ignore plan warnings.
 #[tokio::test]
 async fn a_box_the_orchestrator_already_ticked_never_warns_about_a_missing_marker() {
     let tmp = tempfile::tempdir().expect("isolated workspace root");
@@ -430,7 +429,7 @@ async fn a_box_the_orchestrator_already_ticked_never_warns_about_a_missing_marke
             "the orchestrator flipped the box"
         );
 
-        // Step 2 — the session's gate now runs on the very same deliverable.
+        // Step 2 — the session's check-off now runs on the very same deliverable.
         let (outcome, warning) = gate(&plan, Some("t-001"), &deliverable);
         assert_eq!(
             outcome,

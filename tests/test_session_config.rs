@@ -1,96 +1,23 @@
-//! Integration coverage for the six session-config keys of `marmennill::config`
-//! (`session_enabled`, `session_resume`, `session_commit_min_interval_ms`,
+//! Integration coverage for the six session-config keys of `marmennill::config`:
+//! `session_enabled`, `session_resume`, `session_commit_min_interval_ms`,
 //! `session_worker_mirror_max_messages`, `session_commit_on_tool_result`,
-//! `session_max_bundle_bytes`) — mission "session bundle capture and restore",
-//! flow §3.2 (config keys + env override precedence).
+//! `session_max_bundle_bytes`.
 //!
-//! # What is covered here
+//! Covered: the `Config::default()` values and the public `DEFAULT_SESSION_*` /
+//! `MARMEL_*` env-key consts; the `env_flag` tri-state table (anything outside
+//! `1|true|yes|on` / `0|false|no|off` means "leave the file value alone");
+//! `apply_session_env` precedence through its pure seam (a config plus three
+//! `Option<String>` env values in, a config out, no process env involved);
+//! `load()` over throwaway `marmel.toml` files — full, partial, typo'd keys, a
+//! TOML type mismatch, a missing explicit path, the env-beats-file overrides; and
+//! `load(None)`'s `resolve_config_path` walk over the four cwd and four `$HOME`
+//! candidates in priority order, where a candidate that exists but cannot be read
+//! is reported — never panicked over, never silently defaulted.
 //!
-//! * The documented defaults of all six fields (`Config::default()`), plus the
-//!   public `DEFAULT_SESSION_*` consts and the public `MARMEL_*` env-key consts
-//!   that carry them.
-//! * The tri-state `env_flag` truth table: `1|true|yes|on` -> `Some(true)`,
-//!   `0|false|no|off` -> `Some(false)`, anything else (including unset) ->
-//!   `None`, which means "leave the file/default value alone".
-//! * `apply_session_env` precedence through its pure seam (a config plus three
-//!   `Option<String>` env values in, a config out — no process env involved):
-//!   resume on/off, the deliberate one-way nature of `MARMEL_SESSION_DISABLE`,
-//!   min-interval parse failures, and purity/idempotence when nothing is set.
-//! * `load()` against throwaway `marmel.toml` files: full file, partial file,
-//!   typo'd/unknown keys, a TOML type mismatch, a missing explicit path, and the
-//!   env-beats-file overrides (`MARMEL_RESUME`, `MARMEL_SESSION_COMMIT_MIN_MS`,
-//!   the one-way `MARMEL_SESSION_DISABLE`) end-to-end.
-//! * `load(None)`'s search-path walk (`src/config.rs:460-492`) with **both** path
-//!   authorities under test control: `HOME` and the process cwd are relocated into
-//!   empty throwaway directories, so the four cwd candidates and the four `$HOME`
-//!   candidates are asserted in priority order, and a candidate that exists but
-//!   cannot be read is asserted to be reported — never panicked over, never
-//!   silently defaulted.
-//! * The flow §3.3 resume precedence (`--fresh` > `--resume` >
-//!   `MARMEL_RESUME`/`session_resume`) through the public handoff seam
-//!   `ui::session::set_resume_request` / `ui::session::resume_requested`
-//!   (`src/ui/session.rs:244`, `:264`), plus the refusal exit-code constant
-//!   `session::EXIT_RESTORE_REFUSED == 3` (`src/session/mod.rs:50`).
-//!
-//! # What is deliberately NOT covered here (documented gap)
-//!
-//! The `--resume` / `--fresh` *flag parsing*, the contradictory-flag usage error
-//! (exit 2) and the literal `std::process::exit(EXIT_RESTORE_REFUSED)` call all
-//! live in the `marmel` **binary** target (`src/main.rs:256`, `:302`, `:105`). An
-//! integration test under `tests/` links the library only: it cannot reach the
-//! binary's private argument parser, and spawning the binary is out of scope for
-//! this task, so no exit code is observable from here. The nearest public seam —
-//! the one-shot `main -> ui::session` handoff that resolves the precedence — IS
-//! covered here; the parser itself is covered by the `#[cfg(test)]` unit tests in
-//! `src/main.rs:395-600`.
-//!
-//! `PartialConfig` (`src/config.rs:516-521`) and `merge` (`src/config.rs:605-621`)
-//! are module-private, so TOML behaviour is only observable from here through
-//! `load()`. Because `load` always starts from `Config::default()`
-//! (`src/config.rs:361`), `merge`'s `None` arms are observable only in the
-//! "absent key keeps the *default*" form, never as "absent key keeps a
-//! pre-set non-default base value".
-//!
-//! # Env-var serialization strategy
-//!
-//! Process environment variables are process-global state and cargo runs the
-//! `#[test]` functions of one integration binary on parallel threads, so
-//! anything that reads *or writes* `MARMEL_RESUME`, `MARMEL_SESSION_DISABLE` or
-//! `MARMEL_SESSION_COMMIT_MIN_MS` must be serialized. No reusable public guard
-//! exists under `tests/` (the precedent guard `SandboxEnvGuard` lives in the
-//! lib's own `#[cfg(test)]` module at `src/config.rs:1023` and is unreachable
-//! from an integration test), so this file defines its own private
-//! `static SESSION_ENV_TEST_SERIAL: Mutex<()>` and a `SessionEnvGuard` modelled
-//! on that precedent: take the lock, snapshot all three keys, remove them (so no
-//! ambient value inherited from the runner or from a sibling test can leak in),
-//! optionally install one override, and restore the exact previous state in
-//! `Drop` — `set_var` for a key that was present, `remove_var` for a key that
-//! was absent, never `set_var(key, "")`, which cannot even express "present but
-//! empty" on Windows. The lock is held from just before the first mutation until
-//! after the restore, because the `MutexGuard` is a field of the guard.
-//! `std::env::set_var`/`remove_var` are `unsafe` in edition 2024, so each block
-//! carries a `// SAFETY:` note resting on that lock. Tests that use only the
-//! pure seams (`env_flag`, `apply_session_env`) mutate nothing and take no lock.
-//!
-//! # Path isolation for the `load(None)` family
-//!
-//! `resolve_config_path` (`src/config.rs:460-492`) consults two more pieces of
-//! process-global state: `std::env::current_dir()` (the four cwd candidates) and
-//! `home_dir()` (the four `$HOME` candidates, and `home_dir` is `HOME` whenever it
-//! is set — `src/config.rs:694`). A test that leaves both alone is therefore
-//! asserting against the machine running it, not against the loader: in this
-//! sandbox `$HOME/.marmel/marmel.toml` *exists* but `open()` on it returns
-//! `EACCES` (`Permission denied (os error 13)`), which is exactly why the
-//! search-path test used to fail for environmental reasons
-//! (`docs/verification_t014f.md` §5). `SessionEnvGuard::isolated_paths` closes
-//! that hole: it moves `HOME` and the cwd into fresh empty temp dirs for the
-//! duration of one test and restores both in `Drop` (cwd *first*, because the temp
-//! dirs must still exist while the process chdirs out of them). It is only
-//! reachable through a `&SessionEnvGuard`, which is the compile-time proof that
-//! `SESSION_ENV_TEST_SERIAL` is already held — `Mutex` is not reentrant, so a
-//! second `lock()` here would self-deadlock. The same mutex also serializes the
-//! `ui::session` resume-handoff statics (`ResumeRequestGuard`), which are
-//! process-global for the same reason.
+//! Not covered: `--resume` / `--fresh` flag parsing, the contradictory-flag usage
+//! error (exit 2) and the `std::process::exit(EXIT_RESTORE_REFUSED)` call — all in
+//! the `marmel` **binary** target. The seam resolving that precedence,
+//! `ui::session::set_resume_request` / `resume_requested`, is covered here.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -270,7 +197,7 @@ impl SessionEnvGuard {
     /// Install the one-shot CLI resume request (`--resume` / `--fresh`) into the
     /// `ui::session` handoff statics and hand it back for restoration.
     ///
-    /// `RESUME_REQUESTED` / `FRESH_REQUESTED` (`src/ui/session.rs:238`, `:241`)
+    /// `RESUME_REQUESTED` / `FRESH_REQUESTED` in `ui::session`
     /// are process-global statics written exactly once by `main` in production,
     /// so a test that writes them must hold the same process-wide mutex as the
     /// env keys and must leave them at the `(false, false)` boot state. Requiring
@@ -332,7 +259,7 @@ fn env_map(entries: &[(&'static str, &'static str)]) -> EnvMap {
 }
 
 /// Feed `env` into the pure seam exactly the way `load()` feeds the live process
-/// environment into it (`src/config.rs:388-393`).
+/// environment into `apply_session_env`.
 fn apply_from_map(cfg: Config, env: &EnvMap) -> Config {
     apply_session_env(
         cfg,
@@ -482,8 +409,8 @@ fn apply_session_env_disable_truthy_turns_capture_off() {
 
 #[test]
 fn apply_session_env_disable_is_one_way_and_never_reenables() {
-    // `SESSION_DISABLE_ENV` is documented as one-way (`src/config.rs:47`) and
-    // `apply_session_env` (`src/config.rs:438`) confirms it: the only write this
+    // `SESSION_DISABLE_ENV` is documented as one-way and
+    // `apply_session_env` confirms it: the only write this
     // function makes to `session_enabled` is `false`, under
     // `matches!(env_flag(disable), Some(true))`. A falsy, unrecognized or absent
     // value therefore cannot bring capture back on.
@@ -517,9 +444,9 @@ fn apply_session_env_disable_is_one_way_and_never_reenables() {
 
 #[test]
 fn apply_session_env_min_ms_non_integer_keeps_previous_and_never_zero() {
-    // `src/config.rs:448` is `raw.trim().parse::<u64>()`; the `Err` arm only
-    // warns and leaves the field alone, so a bad value must never silently
-    // become a 0 ms floor (which would disable commit throttling).
+    // `apply_session_env` parses the floor with `raw.trim().parse::<u64>()`; the
+    // `Err` arm only warns and leaves the field alone, so a bad value must never
+    // silently become a 0 ms floor (which would disable commit throttling).
     for raw in ["soon", "abc", "", "   ", "1500ms", "-5", "1_000", "2.5"] {
         let base = Config {
             session_commit_min_interval_ms: 900,
@@ -540,13 +467,11 @@ fn apply_session_env_min_ms_non_integer_keeps_previous_and_never_zero() {
 
 #[test]
 fn apply_session_env_min_ms_zero_is_applied_verbatim_without_clamping() {
-    // LOAD-BEARING case revealed by the source (not by the mission brief):
-    // `"0"` is a *valid* `u64`, so the `Ok(value)` arm at `src/config.rs:449`
-    // stores it verbatim — there is no lower clamp anywhere in
-    // `apply_session_env`, unlike the documented clamp for
+    // LOAD-BEARING case: `"0"` is a *valid* `u64`, so the
+    // `Ok(value)` arm of `apply_session_env` stores it verbatim — there is no
+    // lower clamp anywhere in `apply_session_env`, unlike the documented clamp for
     // `command_timeout_secs`. "never yields 0" holds only for *unparseable*
-    // input (see the sibling test). Expected value marked for the gate to
-    // adjudicate if the intended contract was a floor clamp instead.
+    // input (see the sibling test).
     for raw in ["0", " 0 "] {
         let env = env_map(&[(SESSION_COMMIT_MIN_MS_ENV, raw)]);
         let out = apply_from_map(Config::default(), &env);
@@ -648,7 +573,7 @@ session_max_bundle_bytes = 4096
     assert_eq!(cfg.session_commit_min_interval_ms, 500);
     assert_eq!(cfg.session_max_bundle_bytes, 4_096);
     // Absent keys keep their defaults: every `PartialConfig` session field is an
-    // `Option<_>`, and `merge` (`src/config.rs:543`) only assigns the `Some` ones.
+    // `Option<_>`, and `merge` only assigns the `Some` ones.
     assert!(cfg.session_enabled);
     assert!(!cfg.session_resume);
     assert_eq!(cfg.session_worker_mirror_max_messages, 4_000);
@@ -682,11 +607,10 @@ sesion_enabled = false
 
 #[test]
 fn load_missing_path_is_an_error_and_never_panics() {
-    // Observed behaviour of `src/config.rs:362-365`: an explicit path is used
-    // verbatim by `resolve_config_path` (`src/config.rs:460`) and a failed read
+    // Observed behaviour of `load`: an explicit path is used
+    // verbatim by `resolve_config_path` and a failed read
     // is propagated with `?` + `.with_context(|| format!("reading {}", ..))`.
-    // A missing *explicit* path is therefore an error, not a silent default —
-    // marked here because the mission brief expected "defaults" for this case.
+    // A missing *explicit* path is therefore an error, not a silent default.
     let _guard = SessionEnvGuard::cleared();
     let dir = tempfile::tempdir().expect("tempdir");
     let missing = dir
@@ -714,14 +638,11 @@ fn load_missing_path_is_an_error_and_never_panics() {
 
 #[test]
 fn load_none_uses_the_searched_paths_and_never_panics() {
-    // HERMETIC (t-015b). `load(None)` walks the cwd candidates and then the
-    // `$HOME` candidates (`src/config.rs:460-492`); both authorities are moved
+    // HERMETIC: `load(None)` walks the cwd candidates and then the
+    // `$HOME` candidates through `resolve_config_path`; both authorities are moved
     // into fresh *empty* temp dirs, so "no candidate exists anywhere" is a state
-    // this test creates rather than one it hopes the machine happens to be in.
-    // The pre-t-015b version inherited the real `$HOME`, where
-    // `$HOME/.marmel/marmel.toml` exists but cannot be opened in this sandbox
-    // (EACCES), so `load(None)` returned `Err("reading <path>")` and the
-    // `.expect(...)` below failed for environmental reasons only.
+    // this test creates rather than one it hopes the machine happens to be in —
+    // a real `$HOME` can hold an unreadable `$HOME/.marmel/marmel.toml`.
     let env_guard = SessionEnvGuard::cleared();
     let paths = env_guard.isolated_paths();
     assert!(
@@ -760,7 +681,7 @@ fn load_none_uses_the_searched_paths_and_never_panics() {
 
 #[test]
 fn load_none_walks_the_home_candidates_in_documented_order() {
-    // `src/config.rs:477-489` searches, in this order:
+    // `resolve_config_path`'s `$HOME` block searches, in this order:
     //   $HOME/.marmel/marmel.toml, $HOME/.marmel/config.toml,
     //   $HOME/.config/marmel/config.toml, $HOME/.config/marmel/marmel.toml
     // and returns the FIRST hit, so each step below names the winner by the
@@ -794,8 +715,9 @@ fn load_none_walks_the_home_candidates_in_documented_order() {
     );
 
     // Drop both `.marmel` candidates: the walk must fall through to the
-    // `.config/marmel` pair. Note the deliberate asymmetry at `src/config.rs:481`
-    // — the 3rd home candidate is `config.toml` and the 4th is `marmel.toml`, the
+    // `.config/marmel` pair. Note the deliberate asymmetry in
+    // `resolve_config_path`'s `$HOME` list — the 3rd home candidate is
+    // `config.toml` and the 4th is `marmel.toml`, the
     // mirror image of the `.marmel` pair above.
     std::fs::remove_dir_all(paths.home().join(".marmel"))
         .expect("the .marmel fixture must be removable");
@@ -820,7 +742,7 @@ fn load_none_walks_the_home_candidates_in_documented_order() {
 
 #[test]
 fn load_none_prefers_cwd_candidates_over_home_candidates() {
-    // `src/config.rs:464-476` searches the cwd block
+    // `resolve_config_path` searches the cwd block
     //   ./marmel.toml, ./.marmel.toml, ./.marmel/marmel.toml, ./.marmel/config.toml
     // *before* the `$HOME` block, and returns the first hit. The ladder below
     // pins the whole order: a HOME value loses to any cwd hit, and within the
@@ -859,13 +781,12 @@ fn load_none_prefers_cwd_candidates_over_home_candidates() {
 #[cfg(unix)]
 #[test]
 fn load_none_reports_an_unreadable_candidate_as_an_error_not_a_panic() {
-    // Exact, self-contained reproduction of the sandbox condition that used to
-    // break this file: the candidate exists (`Path::exists` = stat succeeds) but
-    // cannot be opened. The observable contract asserted here is the one
-    // `src/config.rs:362-365` implements — the read failure is propagated with
-    // its `reading <path>` context, never panicked over and never swallowed into
-    // a default. "Unreadable" is spelled as mode 000 rather than by inheriting
-    // the real `$HOME`, because that is the part the sandbox actually blocks.
+    // The candidate exists (`Path::exists` = stat succeeds) but cannot be
+    // opened. The observable contract asserted here is the one `load`
+    // implements — the read failure is propagated with its `reading <path>`
+    // context, never panicked over and never swallowed into a default.
+    // "Unreadable" is spelled as mode 000 rather than by inheriting the real
+    // `$HOME`, because that is the part the sandbox actually blocks.
     let env_guard = SessionEnvGuard::cleared();
     let paths = env_guard.isolated_paths();
     let candidate = write_candidate(paths.home(), ".marmel/marmel.toml", 31);
@@ -925,7 +846,7 @@ fn load_none_reports_an_unreadable_directory_candidate_as_an_error() {
 fn load_toml_type_mismatch_is_an_error_not_a_silent_default() {
     // The mirror image of the typo'd-key case: a *known* key carrying the wrong
     // TOML type fails `toml::from_str::<PartialConfig>` and `load` propagates it
-    // (`src/config.rs:365`) instead of shrugging.
+    // instead of shrugging.
     let _guard = SessionEnvGuard::cleared();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = write_toml(&dir, "session_enabled = \"yes\"\n");
@@ -972,10 +893,9 @@ session_commit_min_interval_ms = 600
 
 #[test]
 fn load_resume_env_truthy_overrides_a_false_file_value() {
-    // `load` reads the live process env for the three session keys
-    // (`src/config.rs:390-392`) and feeds them to `apply_session_env`
-    // (`:428-453`) *after* the TOML merge, so a recognized `MARMEL_RESUME`
-    // outranks the file.
+    // `load` reads the live process env for the three session keys and feeds
+    // them to `apply_session_env` *after* the TOML merge, so a recognized
+    // `MARMEL_RESUME` outranks the file.
     let _guard = SessionEnvGuard::set(SESSION_RESUME_ENV, "yes");
     let dir = tempfile::tempdir().expect("tempdir");
     let path = write_toml(&dir, "session_resume = false\n");
@@ -1054,7 +974,7 @@ session_commit_min_interval_ms = 640
 
 #[test]
 fn load_disable_and_resume_env_apply_together_and_disable_stays_one_way() {
-    // All three env reads happen on one pass (`src/config.rs:390-392`), so the
+    // All three env reads happen in `load` on one pass, so the
     // keys must not interfere: resume turns on, the floor keeps the file value,
     // and `MARMEL_SESSION_DISABLE=0` cannot re-enable an explicit
     // `session_enabled = false` from the file.
@@ -1086,10 +1006,10 @@ session_commit_min_interval_ms = 700
 
 #[test]
 fn exit_restore_refused_const_is_three() {
-    // The exit code a refused restore is carried out as (flow §3.5). Only the
-    // constant is observable from an integration test; the
+    // The exit code a refused restore is carried out as. Only the constant is
+    // observable from an integration test; the
     // `std::process::exit(EXIT_RESTORE_REFUSED)` call sits in the binary target
-    // (`src/main.rs:105`), which this file cannot link or spawn.
+    // (`main`), which this file cannot link or spawn.
     assert_eq!(
         EXIT_RESTORE_REFUSED, 3,
         "refused-restore exit code (flow §3.5)"
@@ -1098,9 +1018,10 @@ fn exit_restore_refused_const_is_three() {
 
 #[test]
 fn resume_handoff_fresh_outranks_the_resume_flag_and_the_config_spelling() {
-    // Flow §3.3 precedence, resolved by the public seam the binary hands its
-    // flags to (`src/ui/session.rs:244`, `:264`). The flags themselves are parsed
-    // in `src/main.rs`, which is unreachable from here — see the module header.
+    // Precedence resolved by the public seam the binary hands its flags to
+    // (`ui::session::set_resume_request`, `resume_requested`). The flags
+    // themselves are parsed in `main`, which is unreachable from here — see the
+    // module header.
     let env_guard = SessionEnvGuard::cleared();
     let _handoff = env_guard.resume_handoff(true, true);
     let cfg = Config {

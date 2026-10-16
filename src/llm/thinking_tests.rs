@@ -21,7 +21,7 @@ fn req() -> ChatRequest {
     }
 }
 
-/// REQ-LLM-002: interleaved `[thinking]` tags separate the reasoning
+/// Interleaved `[thinking]` tags separate the reasoning
 /// channel from the main payload, even when tags span delta boundaries.
 #[test]
 fn test_llm_stream_thinking_demux() {
@@ -47,7 +47,7 @@ fn test_llm_stream_thinking_demux() {
     );
 }
 
-/// REQ-LLM-002: `preserve_thinking = true` keeps the raw tags in the payload.
+/// `preserve_thinking = true` keeps the raw tags in the payload.
 #[test]
 fn test_llm_thinking_preserve() {
     let mut d = ThinkingDemuxer::with_preserve(true);
@@ -60,7 +60,7 @@ fn test_llm_thinking_preserve() {
     assert_eq!(d.thinking(), "b");
 }
 
-/// REQ-LLM-002: into_message carries reasoning in a separate field.
+/// `into_message` carries reasoning in a separate field.
 #[test]
 fn test_llm_into_message_strips_thinking() {
     let mut d = ThinkingDemuxer::new();
@@ -80,7 +80,7 @@ fn test_llm_into_message_strips_thinking() {
     }
 }
 
-/// REQ-LLM-003: a recovery request disables thinking and shifts
+/// A recovery request disables thinking and shifts
 /// frequency_penalty (+0.5) and temperature (+0.1) for one turn.
 #[test]
 fn test_llm_recovery_suppresses_thinking() {
@@ -101,7 +101,7 @@ fn test_llm_recovery_suppresses_thinking() {
     assert_eq!(base.temperature, Some(0.7));
 }
 
-/// REQ-LLM-003: recovery works when penalties/temperature are None.
+/// Recovery works when penalties/temperature are None.
 #[test]
 fn test_llm_recovery_defaults_when_absent() {
     let mut base = req();
@@ -112,10 +112,10 @@ fn test_llm_recovery_defaults_when_absent() {
     assert_eq!(recovered.temperature, Some(0.8)); // 0.7 default + 0.1
 }
 
-// t-035d — recovery parameters must be clamped into the documented ranges.
-// Before the fix `frequency_penalty = 2.0` became `2.5` and `temperature = 2.0`
-// became `2.1`, both of which the provider rejects with HTTP 400, so the
-// recovery turn could never recover.
+// Recovery parameters must be clamped into the documented ranges: a shifted
+// value such as `frequency_penalty = 2.0` becoming `2.5`, or `temperature = 2.0`
+// becoming `2.1`, is rejected by the provider with HTTP 400, so an out-of-range
+// recovery request can never recover.
 
 fn approx_eq(a: f32, b: f32) -> bool {
     (a - b).abs() < 1e-3
@@ -323,7 +323,7 @@ fn test_llm_recovery_clamp_is_logged_once_with_old_and_new_value() {
     );
 }
 
-/// REQ-LLM-004: nudge policy allows up to 3 empty-production attempts.
+/// Nudge policy allows up to 3 empty-production attempts.
 #[test]
 fn test_llm_empty_production_nudges() {
     let policy = NudgePolicy::default();
@@ -341,7 +341,7 @@ fn test_llm_empty_production_nudges() {
     }
 }
 
-/// REQ-LLM-002: multi-byte UTF-8 characters and emojis (e.g. 🔍, 🚀)
+/// Multi-byte UTF-8 characters and emojis (e.g. 🔍, 🚀)
 /// must not panic on char boundary slicing during partial tag detection.
 #[test]
 fn test_llm_stream_thinking_demux_multibyte_utf8() {

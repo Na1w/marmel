@@ -1,7 +1,6 @@
 //! Unit tests for the search tools (`src/harness/search.rs`): gitignore-aware
-//! grep, glob sorting, the truncation contract (recon bugs H8/H10) and brace
-//! alternation (recon bug H10). Every test runs inside an isolated tempdir —
-//! never the repo root.
+//! grep, glob sorting, the truncation contract and brace alternation. Every test
+//! runs inside an isolated tempdir — never the repo root.
 
 use super::*;
 use serde_json::Value;
@@ -131,7 +130,7 @@ fn seed_match_tree(dir: &Path, files: usize, lines: usize) {
     }
 }
 
-/// REQ-TOOL-005: grep_search honors `.gitignore` rules via the `ignore`
+/// `grep_search` honors `.gitignore` rules via the `ignore`
 /// crate — ignored files' matches are not returned.
 #[test]
 fn test_harness_grep_gitignore() {
@@ -163,7 +162,7 @@ fn test_harness_grep_gitignore() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// REQ-TOOL-006: glob returns relative paths sorted alphabetically.
+/// `glob` returns relative paths sorted alphabetically.
 #[test]
 fn test_harness_glob_sorting() {
     let dir = temp_dir();
@@ -183,11 +182,11 @@ fn test_harness_glob_sorting() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-// ── truncation contract (defect 1 / recon H8 + H10) ───────────────────────
+// ── truncation contract ────────────────────────────────────────────────────
 
 /// (a) grep_search: when `max_results` is hit, the answer carries an explicit
 /// `truncated: true` marker plus the exact total, so a caller can never mistake
-/// a partial view for the complete set (recon H8).
+/// a partial view for the complete set.
 #[test]
 fn grep_truncation_reports_marker_flag_and_exact_total() {
     let dir = temp_dir();
@@ -426,7 +425,7 @@ fn grep_with_zero_results_cap_still_reports_the_matches_that_exist() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-// ── brace alternation (defect 2 / recon H10) ──────────────────────────────
+// ── brace alternation ──────────────────────────────────────────────────────
 
 /// (d) `**/*.{rs,md}` matches both extensions and yields each path exactly once.
 #[test]
@@ -492,7 +491,7 @@ fn glob_brace_pattern_matches_every_extension_without_duplicates() {
         vec!["top.toml"],
         "control: the third extension exists in the tree"
     );
-    // The pre-fix behaviour this test defends against: braces escaped literally.
+    // What this test defends against: braces escaped into literal text.
     assert!(
         !normalize_paths(
             &glob_in_root("**/*.rs", &dir, GLOB_HARD_CAP)
@@ -672,7 +671,7 @@ fn glob_matching_nothing_is_an_honest_empty_result() {
     }
 
     // End to end through the tool entry point: the literal `no matches` string,
-    // byte-identical to the pre-fix answer.
+    // byte-identical to the answer an unclipped search produces.
     let r = glob_at(
         &dir,
         serde_json::json!({"pattern": "no-such-extension.zzz"}),

@@ -1,7 +1,5 @@
-//! The commit side of the session bundle (Design A §7.1–§7.2, flow §4.4).
-//!
-//! There is exactly **one** writer routine in the crate: [`write_bundle`]. It
-//! writes a bundle member set in the normative order
+//! The commit side of the session bundle: exactly **one** writer routine in the
+//! crate, [`write_bundle`], writing a bundle member set in the normative order
 //!
 //! ```text
 //! C3(a) workers/<key>.json   ascending rel_path
@@ -10,38 +8,17 @@
 //! C4    manifest.json        <- LAST, nothing after it. This rename IS the commit.
 //! ```
 //!
-//! and nothing else may create a file under [`Plan::session_bundle_path`].
+//! Nothing else may create a file under [`Plan::session_bundle_path`]; deciding
+//! *when* to call [`write_bundle`] lives elsewhere, and [`write_bundle`] is the
+//! primitive every caller uses. `harness::fs::replace_path_lock` is private, so
+//! `session/` owns [`CommitLock`] — in-process serialization only.
 //!
-//! ## Session-owned commit mutex
-//!
-//! Design A §2.5's "take the per-path lock for `manifest.json`" is **not
-//! implementable as written**: `harness::fs::replace_path_lock`
-//! (`src/harness/fs.rs:342`) is a private plain `fn` used only by `fs::replace`.
-//! A §11.3-1 records the two ways out and §7.1 prescribes the second one: `harness::fs`
-//! stays untouched and `session/` owns [`CommitLock`], with manifest-last commit as
-//! the cross-process guard. `CommitLock` serializes committers **in-process** — the
-//! real race is a panic-hook commit against an in-loop commit (`main.rs` hook).
-//!
-//! ## Honest durability limit (property of the helper, not of this function)
-//!
-//! Every member write goes through [`crate::harness::fs::write_file_atomic`]
-//! (`src/harness/fs.rs:475-503`): unique `O_EXCL` staging name in the same
-//! directory, `write_all` + `flush`, permission preservation, same-directory
-//! `rename`, and an unlink of the staged file on **every** failure path.
-//! It does **not** `fsync` the file or the parent directory (there is no
-//! `sync_all`/`sync_data` anywhere in `src/harness/fs.rs`). So `rename` buys
-//! *atomicity* — a reader sees the old bytes or the new bytes, never a mix —
-//! against **process death**, not *durability* against power loss. A power cut can
-//! therefore leave a newer `manifest.json` on disk while the `manager.json` it
-//! describes is lost: that is a `byte_len`/`fingerprint` mismatch ⇒ `Refused`,
-//! never a half-restored session. A torn member is not reachable through this
-//! protocol (A §7.5).
-//!
-//! Not here yet: the capture-trigger surface that decides *when* to call
-//! [`write_bundle`] and how a `CommitError` feeds the `CaptureLedger`
-//! (flow §1.3/§1.10, t-011), and the panic-hook/global-state capture path
-//! `commit_from_panic` (flow §4.3, t-012). [`write_bundle`] is the primitive they
-//! all call.
+//! Every member write goes through [`crate::harness::fs::write_file_atomic`]:
+//! unique `O_EXCL` staging name, `write_all` + `flush`, same-directory `rename`,
+//! unlink of the staged file on **every** failure path, and **no** `fsync`. So
+//! `rename` buys *atomicity* against **process death**, not *durability* against
+//! power loss: a newer `manifest.json` over a lost `manager.json` is a
+//! `byte_len`/`fingerprint` mismatch ⇒ `Refused`, never a half-restored session.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -64,12 +41,12 @@ use crate::session::format::{
     UI_FILE, WORKERS_DIR_NAME,
 };
 
-/// Re-export so the flow doc's `session::commit::fingerprint` spelling resolves
-/// to the one and only fingerprint in the crate (A §7.2 F3: it is **not**
-/// `harness::fs::hash_path`, which is a private shard selector over a `Path`).
+/// Re-export so `session::commit::fingerprint` resolves to the one and only
+/// fingerprint in the crate: it is **not** `harness::fs::hash_path`, which is a
+/// private shard selector over a `Path`.
 pub use crate::session::format::fingerprint;
 
-/// Bundle root for a plan — the single path authority (flow §4.2).
+/// Bundle root for a plan — the single path authority.
 pub fn bundle_dir(plan: &Plan) -> PathBuf {
     plan.session_bundle_path()
 }
@@ -105,7 +82,7 @@ pub fn worker_rel_path(worker_key: &str) -> String {
     )
 }
 
-/// A §5.2 key escaping. `%` first, or the two later substitutions would be
+/// Key escaping: `%` first, or the two later substitutions would be
 /// double-escaped (`#` → `%23` would become `%2523`).
 pub fn percent_escape_key(worker_key: &str) -> String {
     worker_key
@@ -164,18 +141,17 @@ pub fn percent_unescape(escaped: &str) -> Result<String, Refusal> {
     })
 }
 
-/// `.{stem}.tmp.{pid}.{nanos}.{seq:08}` — the staging name `harness::fs` derives
-/// (`src/harness/fs.rs:395`). Only used to *recognise* leftovers for the C5
-/// sweep, never to create one.
+/// `.{stem}.tmp.{pid}.{nanos}.{seq:08}` — the staging name `harness::fs` derives.
+/// Consulted only to *recognise* leftovers, never to create one.
 pub fn staging_name(stem: &str, pid: u32, nanos: u32, seq: u32) -> String {
     format!(".{stem}.tmp.{pid}.{nanos}.{seq:08}")
 }
 
 /// Is `name` a stale staging leftover from a **different** process?
 ///
-/// A §7.4: leftovers are noise, not state — never treated as members, never
-/// reported as orphans. A leftover carrying *this* pid belongs to a write in
-/// flight and must not be touched.
+/// Leftovers are noise, not state — never treated as members, never reported as
+/// orphans. A leftover carrying *this* pid belongs to a write in flight and must
+/// not be touched.
 pub fn is_stale_staging_name(name: &str, this_pid: u32) -> bool {
     let Some(rest) = name.strip_prefix('.') else {
         return false;
@@ -200,10 +176,10 @@ pub fn is_stale_staging_name(name: &str, this_pid: u32) -> bool {
 }
 
 /// The three section families' frame values. `member_count`/`member_index` are
-/// literal to A §3.2: each member file *is* a one-member section (`1` for
-/// Manager/Ui, `1` per worker file), so the pair is `1`/`0` for every member the
-/// committer writes. The loader still cross-checks them — a member from an older
-/// or a hand-edited bundle disagrees, and that is a `HeaderManifestDisagreement`.
+/// literal: each member file *is* a one-member section (`1` for Manager/Ui, `1`
+/// per worker file), so the pair is `1`/`0` for every member the committer
+/// writes. The loader still cross-checks them — a member from an older or a
+/// hand-edited bundle disagrees, and that is a `HeaderManifestDisagreement`.
 fn header(session_id: &str, kind: SectionKind, now: &TimePoint) -> SectionHeader {
     SectionHeader {
         format_version: FORMAT_VERSION,
@@ -217,9 +193,9 @@ fn header(session_id: &str, kind: SectionKind, now: &TimePoint) -> SectionHeader
     }
 }
 
-/// A member's payload serialized exactly **once** (A §7.1 C1), plus the two
-/// integrity fields computed from that same owned buffer (A §7.2 F1). The
-/// manifest mirrors these values; the loader compares them against the file.
+/// A member's payload serialized exactly **once**, plus the two integrity
+/// fields computed from that same owned buffer. The manifest mirrors these
+/// values; the loader compares them against the file.
 #[derive(Debug)]
 struct MemberBytes {
     rel_path: String,
@@ -253,8 +229,8 @@ impl MemberBytes {
 struct SectionBytes;
 
 impl SectionBytes {
-    /// A §7.1: pretty JSON, the same shape the whole bundle is written in, so a
-    /// reader can reproduce a fingerprint by hand against the file (F4).
+    /// Pretty JSON, the same shape the whole bundle is written in, so a reader
+    /// can reproduce a fingerprint by hand against the file.
     fn serialize(value: &impl serde::Serialize) -> Result<Vec<u8>, Refusal> {
         serde_json::to_vec_pretty(value).map_err(|err| {
             Refusal::new(
@@ -265,9 +241,9 @@ impl SectionBytes {
     }
 }
 
-/// What a trigger hands the committer (flow §4.4). `ui` is `None` on the panic
-/// path, which cannot reach the renderer; the previous `ui.json` then simply
-/// stays unlisted and unrewritten.
+/// What a trigger hands the committer. `ui` is `None` on the panic path, which
+/// cannot reach the renderer; the previous `ui.json` then simply stays
+/// unlisted and unrewritten.
 #[derive(Debug, Clone)]
 pub struct CapturePayload {
     pub manager: ManagerSection,
@@ -276,11 +252,11 @@ pub struct CapturePayload {
     pub identity_floors: IdentityFloors,
 }
 
-/// Throttling/size policy mirrored from `Config` (flow §3.1).
+/// Throttling/size policy mirrored from `Config`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitPolicy {
     /// Minimum wall time between commits (`session_commit_min_interval_ms`).
-    /// Enforced by the trigger layer (t-011), never here: a committer that got
+    /// Enforced by the trigger layer, never here: a committer that got
     /// this far has already been allowed.
     pub min_interval: Duration,
     /// Soft ceiling on total member bytes (`session_max_bundle_bytes`). Crossing
@@ -302,17 +278,16 @@ impl Default for CommitPolicy {
     }
 }
 
-/// What a commit did. A §7.1: "commit results are never discarded" — every
-/// former `let _ = save_transcript(..)` site is replaced by a call whose
-/// `CommitReport`/`CommitError` feeds the capture ledger (t-011).
+/// What a commit did. Commit results are never discarded: every caller consumes
+/// the `CommitReport`/`CommitError` and records it in the capture ledger.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitReport {
-    /// Members actually renamed this commit (changed only, A §7.1 C2).
+    /// Members actually renamed this commit (changed members only).
     pub members_written: Vec<String>,
     /// Members whose bytes were byte-identical to the last committed ones.
     pub members_skipped_identical: usize,
     pub manifest_bytes: u64,
-    /// A §7.4 C5 sweep: worker files the new manifest does not list, plus stale
+    /// Worker files the new manifest does not list, plus stale
     /// staging leftovers from other processes.
     pub orphans_removed: usize,
     pub duration: Duration,
@@ -331,8 +306,8 @@ pub enum CommitError {
     /// A member could not be serialized.
     #[error("session commit: serialization failed: {0}")]
     Serialize(String),
-    /// Another commit holds the session commit lock (flow §1.3 R-TRIG-1: the
-    /// caller sets `throttled_pending` rather than blocking).
+    /// Another commit holds the session commit lock: the caller sets
+    /// `throttled_pending` rather than blocking.
     #[error("session commit: another commit is already in flight")]
     Locked,
     /// A member write failed. `write_file_atomic` reports `harness::ToolError`,
@@ -342,12 +317,11 @@ pub enum CommitError {
     Write { path: PathBuf, detail: String },
 }
 
-/// Byte-identity diff cache plus the last committed manifest (A §7.1 C2).
+/// Byte-identity diff cache plus the last committed manifest.
 ///
 /// A global by design: there is one bundle per process, and the panic path reads
-/// it to rewrite only the manifest (flow §1.8). [`LastCommit::bundle`] guards
-/// against a second bundle (a test, or a plan switch) silently poisoning the
-/// cache.
+/// it to rewrite only the manifest. [`LastCommit::bundle`] guards against a
+/// second bundle (a test, or a plan switch) silently poisoning the cache.
 #[derive(Debug)]
 pub struct LastCommit {
     pub bundle: PathBuf,
@@ -376,7 +350,7 @@ static SIZE_CEILING_WARNED: AtomicBool = AtomicBool::new(false);
 ///
 /// Returns `true` **once** per process. The committer never truncates or refuses
 /// on size (that would silently drop history); the trigger layer decides whether
-/// to keep committing (t-011).
+/// to keep committing.
 pub fn size_ceiling_hit(total_bytes: u64, policy: &CommitPolicy) -> bool {
     if total_bytes <= policy.max_bundle_bytes {
         return false;
@@ -394,8 +368,8 @@ pub fn size_ceiling_hit(total_bytes: u64, policy: &CommitPolicy) -> bool {
     }
 }
 
-/// Session-owned commit mutex (A §11.3-1: `harness::fs::replace_path_lock` is
-/// private, so `session/` owns its own).
+/// Session-owned commit mutex: `harness::fs::replace_path_lock` is private, so
+/// `session/` owns its own.
 ///
 /// `Send + Sync`. It serializes C1–C5 in-process; cross-process atomicity comes
 /// from manifest-last, not from this mutex.
@@ -419,7 +393,7 @@ impl CommitLock {
     }
 
     /// `None` when a commit is already in flight: the caller sets
-    /// `throttled_pending` instead of blocking (flow R-TRIG-1).
+    /// `throttled_pending` instead of blocking.
     pub fn try_guard(&self) -> Option<CommitGuard<'_>> {
         let mut state = self.lock_state();
         if state.in_flight {
@@ -471,29 +445,14 @@ impl Drop for CommitGuard<'_> {
     }
 }
 
-/// THE commit entry point (A §7.1 C1–C5).
-///
-/// Writes the payload set for `session_id` into `bundle`, in the normative order
-/// workers (ascending `rel_path`) → `ui.json` → `manager.json`, then
-/// `manifest.json` **last**: that rename *is* the commit. A reader that finds a
-/// manifest that parses is looking at a set of members that each completed an
-/// atomic rename before it.
-///
-/// * members byte-identical to the last committed bytes are not rewritten (C2);
-/// * every member write goes through `harness::fs::write_file_atomic` — never
-///   `std::fs::write`, which is how today's journals get truncated;
-/// * `fingerprint` and `byte_len` come from the **same owned buffer** handed to
-///   the writer (F1);
-/// * a `TimePoint` whose `elapsed_secs` is NaN or ±infinity is refused **before
-///   C1** ([`check_time_points`]) — such a value cannot be a JSON number, so it
-///   would be written as `null` (a silent default) and only surface at load
-///   (A §5.6, AC-T2);
-/// * after the manifest, a best-effort sweep deletes worker files the new
-///   manifest does not list and stale `.{stem}.tmp.*` leftovers of *other*
-///   processes (C5).
-///
-/// `ending` is written verbatim; `ProcessEnding::HardKillInferred` is a
-/// loader-side sentinel and must never be passed here ([`assert_writable_ending`]).
+/// THE commit entry point (steps C1–C5): writes the payload set for `session_id`
+/// into `bundle` as workers (ascending `rel_path`) → `ui.json` → `manager.json`,
+/// then `manifest.json` **last** — that rename *is* the commit. Members
+/// byte-identical to the last committed bytes are not rewritten; every write goes
+/// through `harness::fs::write_file_atomic` (never `std::fs::write`), with
+/// `fingerprint`/`byte_len` from the **same owned buffer**. A non-finite
+/// `elapsed_secs` is refused **before C1** ([`check_time_points`]); `ending` is
+/// written verbatim, and `HardKillInferred` never is ([`assert_writable_ending`]).
 pub fn write_bundle(
     bundle: &Path,
     session_id: &str,
@@ -577,7 +536,7 @@ pub fn write_bundle(
         detail: err.to_string(),
     })?;
 
-    // C5: post-commit sweep, best effort, never load-bearing.
+    // C5: post-commit cleanup, best effort, never load-bearing.
     let orphans_removed = sweep_orphans(bundle, &manifest);
 
     // Publish the diff cache only after the commit point, so a failed commit
@@ -601,8 +560,8 @@ pub fn write_bundle(
     })
 }
 
-/// `HardKillInferred` is a loader-side sentinel (A §3.4): writing it would let a
-/// process claim a death it never observed — the exact lie the sentinel exists to
+/// `HardKillInferred` is a loader-side sentinel: writing it would let a process
+/// claim a death it never observed — the exact lie the sentinel exists to
 /// prevent. A caller that has nothing better to say must pass `InProgress`, which
 /// is what this guard substitutes (loudly) rather than writing the sentinel or
 /// panicking inside a commit.
@@ -617,34 +576,14 @@ pub fn writable_ending(ending: &ProcessEnding) -> ProcessEnding {
     ending.clone()
 }
 
-/// A §5.6 / AC-T2 on the **write** side: a `TimePoint` whose `elapsed_secs` is
-/// NaN or ±infinity is refused **before C1 serializes anything**, so no member
-/// and no `manifest.json` ever carries it.
-///
-/// Why the guard has to sit here and not only on the load side: `serde_json`
-/// does *not* error on a non-finite float — `serialize_f64` writes `null` for
-/// `NaN`/`Infinite` (serde_json 1.0.151, `src/ser.rs:167-177`). Without this
-/// check a corrupt clock is committed as `"elapsed_secs": null` and only becomes
-/// visible when the bundle is read back: the value was silently defaulted on the
-/// way out, which is exactly what §5.6 ("No defaulting to \"now\"") and D6
-/// forbid. A refusal naming member, field and value is the honest alternative
-/// (§7.5: "the refusal message is a first-class deliverable").
-///
-/// The predicate is the same family the load-side guards use (`is_sane`, i.e.
-/// `elapsed_secs.is_finite() && elapsed_secs >= 0.0`, as applied at
-/// `session/restore.rs:1084-1105` and `session/format/ui.rs:376-404`); here only
-/// the **finite** half decides, because that is the half `serde_json` cannot
-/// represent at all. It is as pure as the load-side guards: it inspects the
-/// payload and repairs nothing.
-///
-/// **A negative offset is deliberately NOT refused at this seam.** §7.1 C1–C4
-/// keeps the committer out of section validation, and §5.6/§7.5 place the
-/// negative case on the load side as a structural violation ⇒ `Refused` — AC-T2's
-/// two negative branches pin that (the bad byte stays on disk, the loader names
-/// it). It is still warned about, because `session::time` floors every captured
-/// offset at `0.0` (`time.rs::elapsed_since`), so a negative offset can only mean
-/// hand-written or already-corrupted state. Nothing here ever substitutes a
-/// value with `TimePoint::now()`.
+/// Write-side clock sanity: a `TimePoint` whose `elapsed_secs` is NaN or
+/// ±infinity is refused **before C1 serializes anything**. `serde_json` does not
+/// error on a non-finite float (`serialize_f64` writes `null`), so without this
+/// check a corrupt clock would be committed as `"elapsed_secs": null` and only
+/// surface at load — a silent default. The refusal names member, field and value.
+/// A negative offset is **not** refused here (the load side reports it as a
+/// structural violation ⇒ `Refused`), only warned about, since `session::time`
+/// floors every captured offset at `0.0`. Nothing substitutes `TimePoint::now()`.
 fn check_time_points(payload: &CapturePayload) -> Result<(), CommitError> {
     // One located sentence per suspect clock point: a non-finite one refuses the
     // commit, a merely-negative one only warns (see the rule above).
@@ -660,7 +599,7 @@ fn check_time_points(payload: &CapturePayload) -> Result<(), CommitError> {
                 negatives.push(named);
             }
         };
-        // Worker clocks — the same triple the loader walks at restore.rs:1084.
+        // Worker clocks — the same triple the loader walks on the load side.
         for worker in &payload.workers {
             let member = worker_rel_path(&worker.worker_key);
             check(member.clone(), "started", &worker.started);
@@ -673,8 +612,8 @@ fn check_time_points(payload: &CapturePayload) -> Result<(), CommitError> {
                 }
             }
         }
-        // UI clocks — the panel pair plus the t-020 plan/abort witnesses, i.e.
-        // exactly the set `format/ui.rs:376-404` guards on the way back in.
+        // UI clocks — the panel pair plus the plan/abort witnesses, i.e. exactly
+        // the set the UI loader guards on the way back in.
         if let Some(ui) = &payload.ui {
             for panel in &ui.subagent_panels {
                 let site = format!("{UI_FILE} subagent {}", panel.name);
@@ -720,18 +659,18 @@ fn check_time_points(payload: &CapturePayload) -> Result<(), CommitError> {
 }
 
 /// Builds the member list in write order: workers by ascending `rel_path`, then
-/// `ui.json`, then `manager.json` (A §7.1 C3).
+/// `ui.json`, then `manager.json`.
 fn assemble_members(
     session_id: &str,
     payload: &CapturePayload,
 ) -> Result<Vec<MemberBytes>, CommitError> {
-    // A §5.6 (AC-T2): the write-side sanity gate runs before C1, so a non-finite
-    // clock never reaches a bundle byte and the bundle stays exactly as it was.
+    // The write-side clock check runs before C1, so a non-finite clock never
+    // reaches a bundle byte and the bundle stays exactly as it was.
     check_time_points(payload)?;
     let mut members = Vec::with_capacity(payload.workers.len() + 2);
-    // A §3.2/§3.3: one capture instant for the whole set. Every member header and
-    // every manifest member entry mirror the *same* `saved_wall` /
-    // `saved_elapsed_secs`, which is what makes the L5 cross-check meaningful.
+    // One capture instant for the whole set. Every member header and every
+    // manifest member entry mirror the *same* `saved_wall` /
+    // `saved_elapsed_secs`, which is what makes the cross-check meaningful.
     let saved = TimePoint::now();
 
     let mut workers: Vec<&WorkerSection> = payload.workers.iter().collect();
@@ -803,10 +742,10 @@ fn ensure_parent_dir(path: &Path) -> Result<(), CommitError> {
     })
 }
 
-/// A §7.1 C5 / §7.4: delete worker files the new manifest does not list, and
-/// stale `.{stem}.tmp.*` leftovers that are not this process's.
+/// Delete worker files the new manifest does not list, and stale
+/// `.{stem}.tmp.*` leftovers that are not this process's.
 ///
-/// Best effort: an `Err` is logged and counted as "not removed", never propagated
+/// Best effort: an `Err` is logged and counted as "not removed", never returned
 /// — the commit already happened, and failing to tidy must not be reported as a
 /// failed commit.
 fn sweep_orphans(bundle: &Path, manifest: &Manifest) -> usize {
@@ -818,7 +757,7 @@ fn sweep_orphans(bundle: &Path, manifest: &Manifest) -> usize {
     let pid = std::process::id();
     let mut removed = 0usize;
 
-    // Workers the manifest no longer names. Only `*.json` files: staging names
+    // Workers the manifest does not name. Only `*.json` files: staging names
     // and dot-entries are noise, not members.
     let workers_dir = bundle.join(WORKERS_DIR_NAME);
     match std::fs::read_dir(&workers_dir) {
@@ -884,7 +823,7 @@ fn remove_orphan(path: &Path, removed: &mut usize) {
 }
 
 /// The last committed manifest for `bundle`, if any (read side of the cache;
-/// flow §1.8: the panic path uses it to rewrite only the manifest).
+/// the panic path uses it to rewrite only the manifest).
 pub fn last_manifest(bundle: &Path) -> Option<Manifest> {
     let slot = last_commit_lock();
     slot.as_ref()
@@ -893,7 +832,7 @@ pub fn last_manifest(bundle: &Path) -> Option<Manifest> {
 }
 
 /// Directory name of the bundle, re-exported for callers that must not hardcode
-/// it (A D1).
+/// it.
 pub const BUNDLE_DIRECTORY_NAME: &str = BUNDLE_DIR_NAME;
 
 #[cfg(test)]

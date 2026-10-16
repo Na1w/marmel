@@ -128,7 +128,7 @@ pub trait Renderer: Send {
     fn set_thinking_budgets(&mut self, _cfg: &crate::config::Config) {}
     fn reset_active_agent(&mut self) {}
 
-    // ---- session-rehydration hooks (flow §4.7, design A §6) ----
+    // ---- session-rehydration hooks ----
     //
     // All three have default bodies, so a renderer that keeps no pane model
     // (`RawRenderer`, the test renderers) compiles and behaves unchanged.
@@ -137,35 +137,34 @@ pub trait Renderer: Send {
     // layout state, so `dyn Renderer` is `Send` but NOT `Sync`. `capture_ui`
     // therefore takes `&self`, never `&dyn Renderer` handed to another thread:
     // a capture/restore is legal only on the session thread, reached through the
-    // `&mut dyn Renderer` the session loop already owns (flow §4.3, §4.7).
-    // Nothing here requires `Sync`, and nothing may be added that would.
+    // `&mut dyn Renderer` the session loop already owns. Nothing here requires
+    // `Sync`, and nothing may be added that would.
 
-    /// CAPTURE the pane model into the durable `UiSection` (A §6.1). `&self`
-    /// because a capture never mutates the UI.
+    /// CAPTURE the pane model into the durable `UiSection`. `&self` because a
+    /// capture never mutates the UI.
     ///
-    /// Pane strings are the **byte authority** for the display (A D4): the
-    /// returned `chat_messages` is the live pane buffer verbatim — embedded
-    /// newlines, prefixes the pane spells, empty and duplicate entries included
-    /// (U1–U3). The default body returns an **empty** section, which is what a
-    /// renderer with no pane model can honestly claim; it is a loadable section
+    /// Pane strings are the **byte authority** for the display: `chat_messages`
+    /// is the live pane buffer verbatim — embedded newlines, prefixes the pane
+    /// spells, empty and duplicate entries included. A renderer with no pane
+    /// model honestly claims the **empty** section, which is still loadable
     /// (`UiSection::structural_violations()` is empty for it).
     fn capture_ui(&self) -> crate::session::format::UiSection {
         crate::session::format::UiSection::default()
     }
 
-    /// REHYDRATE the panes from a stored section (A D4). Assign, never append,
-    /// never re-render, and never regenerate a line from a journal record — the
-    /// crate has no `UiRecord → pane line` formatter and adding one for the
-    /// restore path is prohibited (U1). Scroll/caret are re-clamped by the
-    /// renderer's own existing clamp after assignment, not validated here.
+    /// REHYDRATE the panes from a stored section. Assign, never append, never
+    /// re-render, and never regenerate a line from a journal record — the crate
+    /// has no `UiRecord → pane line` formatter and adding one for the restore
+    /// path is prohibited. Scroll/caret are re-clamped by the renderer's own
+    /// existing clamp after assignment, not validated here.
     ///
     /// The default body is a **no-op**: a renderer without a pane model has
     /// nothing to rehydrate.
     fn restore_panes(&mut self, _section: &crate::session::format::UiSection) {}
 
     /// One-shot, loud surfacing of what the loader did and what it could not
-    /// restore (A §8.4: the report reaches the UI, the journaled UI record and
-    /// the log; discarding it is prohibited by D6).
+    /// restore: the report reaches the UI, the journaled UI record and the log,
+    /// and discarding it is prohibited.
     ///
     /// The default body is a no-op: the report itself is still logged/returned by
     /// the caller, so a renderer that cannot draw one loses only the on-screen

@@ -13,10 +13,10 @@ struct CliArgs {
     /// Detailed debug logging to debug.log.
     debug: bool,
     /// Rehydrate this run from the previous run's `.marmel/session/` bundle
-    /// (equivalent to `MARMEL_RESUME=1` or `session_resume = true`). The boot-time
-    /// restore is wired (t-012/t-024): `ui::session::set_resume_request` records the
-    /// decision and the session loop boots from the bundle, exiting with code 3
-    /// (`session::EXIT_RESTORE_REFUSED`) when a bundle cannot be restored.
+    /// (equivalent to `MARMEL_RESUME=1` or `session_resume = true`):
+    /// `ui::session::set_resume_request` records the decision and the session loop
+    /// boots from the bundle, exiting with `session::EXIT_RESTORE_REFUSED` (3) when a
+    /// bundle cannot be restored.
     resume: bool,
     /// Force a fresh start: overrides `session_resume = true` and
     /// `MARMEL_RESUME=1`. `--fresh` always wins; it is the escape hatch.
@@ -46,13 +46,11 @@ fn main() -> Result<()> {
         std::process::exit(2);
     }
     config::set_active(cfg.clone());
-    // t-012 (flow §3.3): hand the CLI's resume decision to the module that owns
-    // the session loop. `ui::tui::run` / `ui::raw::run` keep their signatures (they
-    // belong to other tasks), so this one-shot handoff is the seam; the precedence
-    // `--fresh` > `--resume` > `MARMEL_RESUME` / `session_resume` is documented at
-    // `ui::session::resume_requested`, and the contradictory combinations were
-    // rejected above (`exit 2`). Without either flag this records `false`/`false`
-    // and the run behaves exactly as before.
+    // Hand the CLI's resume decision to the module that owns the session loop. The
+    // precedence `--fresh` > `--resume` > `MARMEL_RESUME` / `session_resume` is
+    // documented at `ui::session::resume_requested`, and the contradictory
+    // combinations are rejected above (`exit 2`). With neither flag this records
+    // `false`/`false`.
     ui::session::set_resume_request(args.resume, args.fresh);
 
     if cfg.debug {
@@ -87,15 +85,14 @@ fn main() -> Result<()> {
 
     orchestrator::cancel_all();
     rt.shutdown_timeout(std::time::Duration::from_millis(300));
-    // t-012 (flow §3.5): a **refused** `--resume` is a first-class verdict, not a
-    // runtime error. `main() -> Result<()>` can only ever exit `1`, so the typed
-    // `session::RestoreRefused` the boot pass returned is mapped here — after the
+    // A **refused** `--resume` is a first-class verdict, not a runtime error:
+    // `main() -> Result<()>` can only ever exit `1`, so the typed
+    // `session::RestoreRefused` returned by the boot pass is mapped here — after the
     // teardown above has restored the screen and cancelled every worker — onto the
     // named constant `session::EXIT_RESTORE_REFUSED` (3). The refusal itself (code,
-    // member, the byte_len/fingerprint pair, the bundle path, "the bundle was NOT
-    // modified") was already printed through the session's renderer, journal and
-    // log by the boot pass; it is repeated to stderr because the TUI status line is
-    // gone by now.
+    // member, byte_len/fingerprint pair, bundle path) was already printed through the
+    // session's renderer, journal and log; it is repeated to stderr because the TUI
+    // status line is already torn down at this point.
     if let Err(err) = &res
         && err
             .downcast_ref::<marmennill::session::restore::RestoreRefused>()
@@ -116,18 +113,13 @@ fn is_sandbox_reentry(first: Option<&str>) -> bool {
 }
 
 /// The Landlock re-entry path: apply the sandbox to this process, then exec the
-/// pending command — **only if enforcement was actually established**.
-///
-/// The order is load-bearing:
-///
-/// 1. resolve the working directory canonically ([`canonical_sandbox_cwd`]);
-/// 2. honour the explicit opt-out ([`harness::pty::SANDBOX_OPTOUT_ENV`]) *before* any
-///    Landlock call, and say so out loud ([`harness::sandbox::optout_warning`]);
-/// 3. otherwise attempt enforcement and record what it achieved;
-/// 4. ask [`harness::sandbox::reentry_action`] whether to exec. On
-///    [`harness::sandbox::ReentryAction::Refuse`] the command is **never** run
-///    unsandboxed: the reason goes to stderr and the process exits with
-///    [`harness::sandbox::SANDBOX_REFUSE_EXIT_CODE`] (non-zero).
+/// pending command — **only if enforcement was actually established**. The order is
+/// load-bearing: resolve the cwd canonically ([`canonical_sandbox_cwd`]); honour the
+/// explicit opt-out ([`harness::pty::SANDBOX_OPTOUT_ENV`]) *before* any Landlock call,
+/// saying so out loud ([`harness::sandbox::optout_warning`]); otherwise attempt
+/// enforcement; then ask [`harness::sandbox::reentry_action`], which on
+/// [`harness::sandbox::ReentryAction::Refuse`] never runs the command unsandboxed:
+/// stderr gets the reason; exit code [`harness::sandbox::SANDBOX_REFUSE_EXIT_CODE`] (non-zero).
 fn run_sandbox_reentry(args: &mut impl Iterator<Item = String>) -> Result<()> {
     let cwd_raw = args.next().unwrap_or_else(|| ".".to_string());
     let command = args.next().unwrap_or_default();
@@ -175,16 +167,13 @@ fn run_sandbox_reentry(args: &mut impl Iterator<Item = String>) -> Result<()> {
     }
 }
 
-/// Canonicalize the working directory handed over by the spawn side.
+/// Canonicalize the working directory handed over by the spawn side. Landlock anchors
+/// its rules on resolved inodes and the pending command inherits this directory, so a
+/// relative or symlinked root (`.`, `~/wip`) is resolved once, here.
 ///
-/// Landlock anchors its rules on resolved inodes and the pending command inherits this
-/// directory, so a relative or symlinked root (`.`, `~/wip`) is resolved once, here,
-/// instead of being re-derived differently on each end of the protocol.
-///
-/// Documented fallback: if canonicalization fails (the directory vanished
-/// concurrently, a component is unreadable), the raw path is kept and the failure is
-/// reported on stderr. That is not a fail-open — the sandbox either resolves that path
-/// itself or the attempt fails, and a failed attempt exits
+/// Fallback: if canonicalization fails (the directory vanished concurrently, a
+/// component is unreadable), the raw path is kept and the failure goes to stderr — not
+/// a fail-open: the sandbox resolves that path itself or the attempt fails, exiting
 /// [`harness::sandbox::SANDBOX_REFUSE_EXIT_CODE`] without exec-ing anything.
 fn canonical_sandbox_cwd(raw: &str) -> std::path::PathBuf {
     let path = std::path::Path::new(raw);
@@ -283,20 +272,13 @@ fn parse_args() -> CliArgs {
 const DEFAULT_MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 const LOG_BACKUPS: u32 = 3;
 
-/// The session-flag usage errors, resolved once in `main` after `config::load`
-/// (flow §3.3). Two cases, both the same shape as the valueless `--config`
-/// precedent (`eprintln!` + `exit(2)`):
-///
-/// * `--resume` **and** `--fresh` — contradictory requests;
-/// * `--resume` while capture is disabled — resuming a bundle this run would
-///   never have written is not a meaningful state. `cfg.session_enabled` already
-///   folds in `MARMEL_SESSION_DISABLE` (see [`config::apply_session_env`]).
-///
-/// `--fresh` alone is never an error: it is the documented escape hatch, and it
-/// also overrides `session_resume = true` / `MARMEL_RESUME=1`. The boot-time
-/// restore these switches feed is wired (t-012/t-024): the handoff at
-/// `ui::session::set_resume_request` makes the session loop boot from the previous
-/// run's bundle, and a refused restore exits with `session::EXIT_RESTORE_REFUSED`.
+/// The session-flag usage errors, resolved once in `main` after `config::load` and
+/// reported like the valueless `--config` precedent (`eprintln!` + `exit(2)`):
+/// `--resume` **and** `--fresh` are contradictory, and `--resume` while capture is
+/// disabled asks this run to read a bundle it would never have written
+/// (`cfg.session_enabled` folds in `MARMEL_SESSION_DISABLE`, see
+/// [`config::apply_session_env`]). `--fresh` alone is never an error: it is the
+/// documented escape hatch, overriding `session_resume = true` / `MARMEL_RESUME=1`.
 fn session_flag_error(args: &CliArgs, cfg: &config::Config) -> Option<&'static str> {
     if args.resume && args.fresh {
         return Some("--resume and --fresh are mutually exclusive");
@@ -354,24 +336,14 @@ fn setup_panic_hook(use_raw: bool) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ui::restore();
         }));
-        // t-024 (flow §1.8, T-8): flush the session bundle before the panic
-        // message is printed, so the last thing a crashed run leaves behind is a
-        // bundle that says `panicHook` rather than one still claiming
-        // `inProgress`. Three properties this hook must keep, and only keeps
-        // because they are built into `commit_from_panic`:
-        //  * pure synchronous I/O — no runtime is built here (a runtime cannot be
-        //    created while a runtime is unwinding, and none is needed);
-        //  * lock-poison-tolerant — every guard on that path takes
-        //    `into_inner()` on a poisoned lock (precedent: `manager::phase`);
-        //  * never blocks — the session's `CommitLock` is only *tried*; if the
-        //    panic happened inside a commit on the session thread, the hook
-        //    degrades honestly (the bundle keeps `inProgress` and the next boot
-        //    infers `HardKillInferred`) instead of deadlocking against the thread
-        //    that is unwinding. A panic on any other thread takes the same path
-        //    and reports exactly what it managed to write.
-        // `ui::restore()` above is untouched and still runs first: the screen is
-        // restored whether or not the flush succeeds, and the flush itself cannot
-        // panic out of the hook because it is wrapped here too.
+        // Flush the session bundle before the panic message is printed, so a crashed
+        // run leaves behind a bundle that says `panicHook` rather than `inProgress`.
+        // `commit_from_panic` keeps what this hook depends on: pure synchronous I/O (no
+        // runtime is built while one is unwinding), lock-poison tolerance (every guard
+        // takes `into_inner()` on a poisoned lock), and no blocking — the session's
+        // `CommitLock` is only *tried*, so a panic inside a commit degrades honestly
+        // (the bundle keeps `inProgress`, the next boot infers `HardKillInferred`).
+        // `ui::restore()` above still runs first, and this flush is wrapped too.
         let flushed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             marmennill::ui::session::commit_from_panic()
         }));
@@ -461,7 +433,7 @@ mod tests {
     }
 
     /// Both ends of the re-entry protocol must speak the same sentinel; a private copy
-    /// of the literal in `main.rs` is what let them drift (t-052 defect X3).
+    /// of the literal in `main.rs` is what lets the two ends drift apart.
     #[test]
     fn test_sandbox_reentry_recognizes_the_shared_sentinel_constant() {
         assert!(is_sandbox_reentry(Some(harness::pty::SANDBOX_EXEC_ARG)));
@@ -516,8 +488,8 @@ mod tests {
         assert!(!args.fresh);
     }
 
-    /// No flags (the pre-t-007 invocation) must produce no error, whatever the
-    /// config says — the run behaves exactly as before.
+    /// No flags at all must produce no error, whatever the config says — the run
+    /// behaves exactly as an ordinary start.
     #[test]
     fn absent_session_flags_are_never_an_error() {
         let args = CliArgs {

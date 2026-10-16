@@ -175,7 +175,7 @@ impl TuiRenderer {
                             } else if ctrl && (c == 'p' || c == 'P') {
                                 self.confirm_abort = false;
                                 self.abort_armed_at = None;
-                                // F12: single Ctrl+P handler (toggle plan panel).
+                                // Single Ctrl+P handler (toggle plan panel).
                                 self.show_plan_panel = !self.show_plan_panel;
                                 if !self.show_plan_panel && self.focused_panel == FocusedPanel::Plan
                                 {
@@ -184,7 +184,7 @@ impl TuiRenderer {
                             } else if ctrl && (c == 'a' || c == 'A') {
                                 self.confirm_abort = false;
                                 self.abort_armed_at = None;
-                                // F12: single Ctrl+A handler (toggle subagents).
+                                // Single Ctrl+A handler (toggle subagents).
                                 self.toggle_subagent_panel();
                                 if !self.show_subagent_panel
                                     && self.focused_panel == FocusedPanel::Subagents
@@ -274,7 +274,7 @@ impl TuiRenderer {
                         } else if rect_contains(self.subagent_area, x, y) {
                             self.focused_panel = FocusedPanel::Subagents;
                         }
-                        // F7: click within the input area places the cursor at the
+                        // Click within the input area places the cursor at the
                         // nearest grapheme boundary. The input area occupies the
                         // bottom 3 rows of the terminal.
                         let input_area = self.input_area;
@@ -299,7 +299,7 @@ impl TuiRenderer {
                     }
                 }
                 Ok(TermEvent::Resize(_, _)) => {
-                    // F6: explicit resize handling — clamp all scroll offsets and
+                    // Explicit resize handling — clamp all scroll offsets and
                     // trigger a flush so no stale viewport shows blank space.
                     self.clamp_scrolls();
                     let _ = self.flush();
@@ -371,7 +371,7 @@ impl TuiRenderer {
         }
     }
 
-    /// Move the input cursor one grapheme to the left (F1).
+    /// Move the input cursor one grapheme to the left.
     #[allow(dead_code)]
     pub(crate) fn cursor_left(&mut self) {
         self.sanitize_cursor();
@@ -388,7 +388,7 @@ impl TuiRenderer {
         ));
     }
 
-    /// Move the input cursor one grapheme to the right (F1).
+    /// Move the input cursor one grapheme to the right.
     #[allow(dead_code)]
     pub(crate) fn cursor_right(&mut self) {
         self.sanitize_cursor();
@@ -404,7 +404,7 @@ impl TuiRenderer {
         ));
     }
 
-    /// Delete the grapheme immediately before the cursor (Backspace, F1).
+    /// Delete the grapheme immediately before the cursor (Backspace).
     #[allow(dead_code)]
     pub(crate) fn delete_backward(&mut self) {
         self.sanitize_cursor();
@@ -419,7 +419,7 @@ impl TuiRenderer {
         self.ensure_textarea_in_sync();
     }
 
-    /// Delete the grapheme immediately after the cursor (Delete, F1).
+    /// Delete the grapheme immediately after the cursor (Delete).
     #[allow(dead_code)]
     pub(crate) fn delete_forward(&mut self) {
         self.sanitize_cursor();
@@ -432,7 +432,7 @@ impl TuiRenderer {
         self.ensure_textarea_in_sync();
     }
 
-    /// Insert a character at the cursor position (F1).
+    /// Insert a character at the cursor position.
     #[allow(dead_code)]
     pub(crate) fn insert_char(&mut self, c: char) {
         self.sanitize_cursor();
@@ -441,8 +441,8 @@ impl TuiRenderer {
         self.ensure_textarea_in_sync();
     }
 
-    /// F7: click within the input area places the cursor at the
-    /// nearest grapheme boundary.
+    /// Click within the input area places the cursor at the nearest
+    /// grapheme boundary.
     pub(crate) fn click_to_cursor(&mut self, x: u16, area: Rect) {
         let relative_x = x.saturating_sub(area.x);
         let mut byte_offset = 0;
@@ -461,7 +461,7 @@ impl TuiRenderer {
             .move_cursor(ratatui_textarea::CursorMove::Jump(0, self.cursor as u16));
     }
 
-    /// Clamp all scroll offsets to their recomputed maxima (F6).
+    /// Clamp all scroll offsets to their recomputed maxima.
     pub(crate) fn clamp_scrolls(&mut self) {
         let w = self.chat_width.get();
         let n = self.estimated_chat_lines(w);
@@ -586,8 +586,8 @@ impl TuiRenderer {
         }
     }
 
-    /// Create or update a subagent entry in the local list (t-c304). Used by
-    /// the `Delegation` event handler so the panel reflects Started/Completed
+    /// Create or update a subagent entry in the local list. Used by the
+    /// `Delegation` event handler so the panel reflects Started/Completed
     /// transitions immediately, and by `set_subagents` to adopt the
     /// session-loop's authoritative list.
     pub(crate) fn upsert_subagent(&mut self, name: &str, is_active: bool, log: &str) {
@@ -726,7 +726,7 @@ impl TuiRenderer {
             self.chat_auto_scroll = true;
             return;
         }
-        // Handle the `/help` command locally (F2): print the command/keybinding
+        // Handle the `/help` command locally: print the command/keybinding
         // legend into the chat pane and do not forward to the session loop.
         if line.trim().eq_ignore_ascii_case("/help") {
             self.messages.push(

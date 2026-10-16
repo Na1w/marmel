@@ -437,12 +437,12 @@ async fn test_ui_run_session_executes_parallel_delegations() {
 }
 
 // ---------------------------------------------------------------------------
-// t-012: the boot wiring — `resume_requested`, `boot_if_requested`, `boot`.
+// The boot wiring — `resume_requested`, `boot_if_requested`, `boot`.
 //
 // These exercise the ONE restore pass the session loop runs before its manager
 // loop: `load_bundle` -> floors + `WORKERS` -> the engine -> the panes -> the
-// loud report -> N-MGR-1. The fixtures write a real bundle through the real
-// committer, so nothing here is mocked at the loader seam.
+// loud report. The fixtures write a real bundle through the real committer, so
+// nothing here is mocked at the loader seam.
 // ---------------------------------------------------------------------------
 
 use super::session::{
@@ -545,9 +545,8 @@ fn boot_manager_section(messages: Vec<MessageRecord>) -> ManagerSection {
 }
 
 /// The pinned pair plus one tool round trip: `[0]` the prompt, `[1]` the goal
-/// verbatim (REQ-CORE-002), then an assistant call, its result and a closing
-/// assistant turn whose `content` is `Some("")` (a distinction only the bundle
-/// keeps).
+/// verbatim, then an assistant call, its result and a closing assistant turn
+/// whose `content` is `Some("")` (a distinction only the bundle keeps).
 fn boot_transcript() -> Vec<MessageRecord> {
     vec![
         MessageRecord::System {
@@ -694,7 +693,7 @@ fn write_boot_bundle(
 }
 
 /// Append a byte to one committed member: `byte_len`/`fingerprint` then disagree
-/// with the manifest, which is the loader's fail-closed L4 case.
+/// with the manifest, which is a fail-closed loader refusal.
 fn tamper_member(bundle: &std::path::Path, rel: &str) {
     let path = bundle.join(rel);
     let mut bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("read {rel}: {error}"));
@@ -703,7 +702,7 @@ fn tamper_member(bundle: &std::path::Path, rel: &str) {
 }
 
 /// Flip one byte inside a worker member: same length, wrong fingerprint. Exactly
-/// one such member is A D6's tolerated partial, not a refusal.
+/// one such member is a tolerated partial, not a refusal.
 fn corrupt_worker_member(bundle: &std::path::Path, rel: &str) {
     let path = bundle.join(rel);
     let mut bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("read {rel}: {error}"));
@@ -717,7 +716,7 @@ fn boot_cfg() -> Config {
 
 // ---------------------------------------------------------------------- tests
 
-/// Flow §3.3 precedence, spelled out: `--fresh` outranks `--resume`, which
+/// Trigger precedence, spelled out: `--fresh` outranks `--resume`, which
 /// outranks `MARMEL_RESUME` / `session_resume`. `MARMEL_RESUME` reaches this
 /// function already folded into `cfg.session_resume` by
 /// `config::apply_session_env`, so the env spelling is the same read.
@@ -762,8 +761,8 @@ fn resume_trigger_precedence_is_fresh_then_resume_then_env_then_config() {
     assert!(!resume_requested(&cfg));
 }
 
-/// The fresh path must be untouched by this task: with a real bundle sitting on
-/// disk and nobody asking for a resume, the pass installs **nothing**, and the
+/// The fresh path is untouched by the restore pass: with a real bundle sitting
+/// on disk and nobody asking for a resume, the pass installs **nothing**, and the
 /// prompt this process composed stays at `[0]`.
 #[test]
 fn fresh_boot_never_reads_a_bundle_and_keeps_the_live_prompt() {
@@ -839,7 +838,7 @@ fn fresh_boot_never_reads_a_bundle_and_keeps_the_live_prompt() {
 }
 
 /// The one pass, in the required order, through a real bundle: engine vector +
-/// floors/`WORKERS` + panes + report + N-MGR-1.
+/// floors/`WORKERS` + panes + report + the manager's restore notice.
 #[test]
 fn resume_boot_installs_manager_history_workers_and_panes_in_one_pass() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -864,7 +863,7 @@ fn resume_boot_installs_manager_history_workers_and_panes_in_one_pass() {
     let mut renderer = BootRenderer {
         // Live counters that deliberately disagree with the stored witnesses:
         // the streams own these numbers, so restore keeps the live ones and
-        // reports the difference (A §6.5).
+        // reports the difference.
         live: UiSection {
             tokens_in: 11,
             tokens_out: 22,
@@ -1022,9 +1021,9 @@ fn resume_boot_installs_manager_history_workers_and_panes_in_one_pass() {
         "every D5 loss is surfaced, got {journaled:?}"
     );
 
-    // t-025a: the restore pass no longer writes the superseded
-    // `.ui_transcript.json` at all, so the durable UI journal is the bundle's own
-    // `ui` member — that is what must still be on disk after a resume.
+    // The restore pass writes no legacy `.ui_transcript.json`: the durable UI
+    // journal is the bundle's own `ui` member, and that is what must still be on
+    // disk after a resume.
     assert!(
         bundle.join(crate::session::UI_FILE).is_file(),
         "the session bundle's UI member is the only durable UI journal"
@@ -1177,16 +1176,16 @@ fn refusal_installs_nothing_and_is_carried_as_exit_three() {
             .any(|record| matches!(record, UiRecord::Status { text } if text.contains("session restore refused"))),
         "the refusal must be journaled as a Status record"
     );
-    // t-025a: loudness lives in the in-memory journal above; the pass must not
-    // re-create the superseded `.ui_transcript.json` on its way out.
+    // Loudness lives in the in-memory journal above; the pass must not re-create
+    // the legacy `.ui_transcript.json` on its way out.
     assert!(
         !transcript_path.exists(),
         "a refused restore never writes the legacy UI journal file"
     );
 }
 
-/// A D6 partial: exactly one corrupt worker member is tolerated. The session
-/// continues, the good worker is restored-interrupted, the bad one is
+/// A tolerated partial: exactly one corrupt worker member is accepted. The
+/// session continues, the good worker is restored-interrupted, the bad one is
 /// `Unrecoverable`, and the loss is surfaced.
 #[test]
 fn partial_restore_continues_and_surfaces_the_unrecoverable_worker() {
@@ -1281,8 +1280,8 @@ fn partial_restore_continues_and_surfaces_the_unrecoverable_worker() {
     crate::orchestrator::workers::remove_worker_entry_for_test(bad);
 }
 
-/// `--resume` with no bundle is flow §3.5's loud fresh start: exit 0, everything
-/// says so, nothing is installed.
+/// `--resume` with no bundle is the loud fresh start: exit 0, everything says
+/// so, nothing is installed.
 #[test]
 fn resume_without_a_bundle_is_a_loud_fresh_start() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1334,12 +1333,11 @@ fn resume_without_a_bundle_is_a_loud_fresh_start() {
     assert!(renderer.announcements.is_empty());
     assert!(session_id.is_empty());
 
-    // The pass leaves a resume-branch engine with **no** pins — which is correct for a
-    // restore and fatal for a fresh start, because the next writer in the session loop
-    // is `ctx.set_goal`, and that pads `messages[0]` with an empty `Message::System`
-    // (`manager/context.rs:697-706`). So the caller contract is explicit
-    // (`boot_if_requested`): when a requested resume yields `Ok(None)`, the loop MUST
-    // install the composed prompt first. Doing exactly that produces a normal transcript:
+    // The pass leaves a resume-branch engine with **no** pins — correct for a
+    // restore, fatal for a fresh start: the next writer in the session loop is
+    // `ctx.set_goal`, which pads `messages[0]` with an empty `Message::System`.
+    // The caller contract is explicit (`boot_if_requested`): when a requested
+    // resume yields `Ok(None)`, the loop MUST install the composed prompt first.
     ctx.set_system_prompt("composed system prompt".to_string());
     ctx.set_goal("a goal with no bundle behind it".to_string());
     let Message::System { content: prompt } = &ctx.messages()[0] else {
@@ -1352,31 +1350,22 @@ fn resume_without_a_bundle_is_a_loud_fresh_start() {
     assert_eq!(goal, "a goal with no bundle behind it");
 }
 
-/// The blocking defect the audit found: the resume branch builds the engine **without**
-/// a system prompt on purpose (a restore may never route through a pin setter, A
-/// R-PIN-2), so flow §3.5's loud fresh start — a resume trigger with **no** bundle —
-/// must re-install the composed prompt before the goal is pinned. Otherwise `set_goal`
-/// pads `messages[0]` with an **empty** `System` and the whole session runs with no
-/// system prompt, silently, exit `0`.
-///
-/// Asserted on the request that is really sent, through a wiremock backend: the
-/// Manager's own transcript is the witness, not internal state. A `session_resume =
-/// true` run with no bundle must send the same `[0]` as a plain fresh start, byte for
-/// byte, and `[0]` must be the composed prompt (non-empty).
-///
-/// The trigger here is `Config::session_resume`, **not** [`set_resume_request`]: this
-/// test never writes the process-wide CLI statics, so it cannot leak a resume into
-/// another test or depend on the precedence test that owns them. That coupling is
-/// provably harmless anyway — those statics are fenced by `RESUME_FLAGS_LOCK`, that
-/// test always leaves them `(false, false)`, and with the repair in place a resume read
-/// with no bundle is byte-identical to a fresh start, which is what is asserted here.
+/// The resume branch builds the engine **without** a system prompt on purpose (a
+/// restore may never route through a pin setter), so a resume trigger with **no**
+/// bundle must re-install the composed prompt before the goal is pinned; otherwise
+/// `set_goal` pads `messages[0]` with an **empty** `System` and the session runs
+/// with no system prompt, silently, exit `0`. Asserted on the request that is
+/// really sent, through a wiremock backend: `[0]` is byte-identical to a plain
+/// fresh start and is the composed prompt. The trigger here is
+/// `Config::session_resume`, **not** [`set_resume_request`], so this test never
+/// writes the process-wide CLI statics.
 #[tokio::test]
 async fn resume_without_a_bundle_sends_the_same_request_as_a_fresh_start() {
     const GOAL: &str = "the same goal in both runs";
 
     /// One one-turn session. Returns the parsed backend requests, the `Status`
-    /// sentences the session surfaced, whether the superseded
-    /// `.ui_transcript.json` reappeared on disk, and the prompt this process
+    /// sentences the session surfaced, whether the legacy
+    /// `.ui_transcript.json` appeared on disk, and the prompt this process
     /// composes for this plan.
     async fn one_run(session_resume: bool) -> (Vec<serde_json::Value>, Vec<String>, bool, String) {
         use wiremock::matchers::{method, path};
@@ -1404,7 +1393,7 @@ async fn resume_without_a_bundle_sends_the_same_request_as_a_fresh_start() {
             ..config_for_backend(&server.uri())
         };
         // A private plan dir per run, so `session::bundle_dir(plan)` can never exist:
-        // the resume run always lands on flow §3.5's loud fresh start.
+        // the resume run always lands on the loud fresh start.
         let tmp = tempfile::tempdir().expect("tempdir");
         let plan = crate::manager::phase::Plan::at(tmp.path());
         let composed = load_system_prompt_with_plan_and_warning(&cfg, &plan)
@@ -1418,16 +1407,15 @@ async fn resume_without_a_bundle_sends_the_same_request_as_a_fresh_start() {
             plan,
             stats,
         ));
-        // A recording renderer: since t-025a the session loop writes no
-        // `.ui_transcript.json`, so flow §3.5's loud fresh start has a renderer
-        // witness and no file witness.
+        // A recording renderer: the session loop writes no `.ui_transcript.json`,
+        // so the loud fresh start has a renderer witness and no file witness.
         let mut renderer = BootRenderer::default();
         run_session(&cfg, &mut renderer, Some(GOAL.to_string()), Some(manager))
             .await
             .expect("run_session should complete without error");
 
-        // The superseded journal must stay superseded: neither run may re-create
-        // it under the plan directory (checked while the temp dir is still alive).
+        // The legacy journal stays absent: neither run may re-create it under the
+        // plan directory (checked while the temp dir is still alive).
         let legacy_journal = tmp.path().join(".ui_transcript.json").is_file();
         let statuses = renderer.status_lines();
         let requests = bodies
@@ -1484,9 +1472,9 @@ async fn resume_without_a_bundle_sends_the_same_request_as_a_fresh_start() {
         "a resume trigger with no bundle must send byte-for-byte the fresh request"
     );
     // The only thing a resume trigger may add when there is nothing to restore is
-    // noise for the user — flow §3.5's loud fresh start. Since t-025a the session
-    // loop writes no `.ui_transcript.json`, so the witness is the renderer, plus a
-    // guard that the superseded journal never reappears.
+    // noise for the user — the loud fresh start. The session loop writes no
+    // `.ui_transcript.json`, so the witness is the renderer, plus a guard that the
+    // legacy journal never reappears.
     assert!(
         resumed_statuses
             .iter()
@@ -1516,7 +1504,7 @@ async fn resume_without_a_bundle_sends_the_same_request_as_a_fresh_start() {
 }
 
 // ---------------------------------------------------------------------------
-// t-022: focused boot-path tests.
+// Focused boot-path tests.
 //
 // Five properties of the ONE restore pass the session loop runs before its
 // manager loop, each pinned on a real bundle written by the real committer:
@@ -1524,18 +1512,17 @@ async fn resume_without_a_bundle_sends_the_same_request_as_a_fresh_start() {
 //      resume path would refuse), and writes nothing;
 //   2. `--resume` with a real bundle installs the manager history
 //      element-for-element (`content: null` vs `Some("")` included), keeps the
-//      pinned pair byte-identical, rebuilds every worker key with the
-//      id/seq/notice floors never decreasing, and assigns the pane strings;
-//   3. a refused bundle (here: an `format_version` this binary does not
-//      understand) installs NOTHING — engine, registry, floors, panes, session
-//      id — and comes back as the typed refusal `main` maps onto exit 3;
+//      pinned pair byte-identical, never lets the id/seq/notice floors
+//      decrease, and assigns the pane strings;
+//   3. a refused bundle (a `format_version` this binary does not understand)
+//      installs NOTHING — engine, registry, floors, panes, session id — and
+//      comes back as the typed refusal `main` maps onto exit 3;
 //   4. one corrupt worker file makes exactly that worker `Unrecoverable` while
 //      the rest of the session installs, with the loss surfaced out loud;
 //   5. trigger precedence through the pass itself: `--fresh` outranks
 //      `session_resume = true`, and the `MARMEL_RESUME` spelling reaches the same
 //      pass. The `--resume --fresh` usage error and the exit-3 mapping live in
 //      `main`, so they are pinned end-to-end in `tests/test_session_boot.rs`.
-//
 // Worker keys carry a `t022-` prefix: the worker registry and the identity
 // floors are process-wide statics shared with the `orchestrator` and
 // `session::worker_journal` suites, so these tests assert only on their own
@@ -1582,7 +1569,7 @@ fn wire_bytes(messages: &[Message]) -> Vec<String> {
         .collect()
 }
 
-/// The three identity floors this process currently owns (A §5.7).
+/// The three identity floors this process currently owns.
 fn identity_floors() -> (u64, u64, u64) {
     (
         crate::orchestrator::workers::worker_id_seq_floor(),
@@ -1591,9 +1578,9 @@ fn identity_floors() -> (u64, u64, u64) {
     )
 }
 
-/// Rewrite the committed `manifest.json`'s `format_version`: the loader's L3
-/// gate refuses it **before** a single member byte is parsed, and because the
-/// manifest carries no self-hash it is the one tamper that leaves every member's
+/// Rewrite the committed `manifest.json`'s `format_version`: the loader refuses it
+/// **before** a single member byte is parsed, and because the manifest carries no
+/// self-hash it is the one tamper that leaves every member's
 /// `byte_len`/`fingerprint` intact.
 fn rewrite_manifest_format_version(bundle: &std::path::Path, version: u32) {
     let path = bundle.join(crate::session::MANIFEST_FILE);
@@ -1617,10 +1604,10 @@ fn run_boot(
     boot_if_requested(resume, plan, cfg, ctx, renderer, session_id, sink)
 }
 
-/// Requirement 1: a fresh boot is untouched by the restore path. The bundle on
-/// disk is one the resume path would **refuse** (L3 `format_version`), so a pass
-/// that so much as opened the directory would say so; a fresh boot says nothing,
-/// installs nothing, and leaves every byte under the plan directory alone.
+/// A fresh boot is untouched by the restore path. The bundle on disk is one the
+/// resume path would **refuse** (an unknown `format_version`), so a pass that so
+/// much as opened the directory would say so; a fresh boot says nothing, installs
+/// nothing, and leaves every byte under the plan directory alone.
 #[test]
 fn fresh_boot_never_opens_the_bundle_dir_even_when_it_would_refuse() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1771,8 +1758,8 @@ fn t022_transcript() -> Vec<MessageRecord> {
 }
 
 /// The engine transcript reduced to a shape string that keeps the `null` /
-/// `""` / missing-key distinctions the wire serializer flattens
-/// (`wire.rs:21`), so an element-for-element comparison cannot hide a collapse.
+/// `""` / missing-key distinctions the wire serializer flattens, so an
+/// element-for-element comparison cannot hide a collapse.
 fn wire_shape(message: &Message) -> String {
     match message {
         Message::System { content } => format!("system|{content:?}"),
@@ -1805,7 +1792,7 @@ fn wire_shape(message: &Message) -> String {
     }
 }
 
-/// A payload builder for the t-022 tests: the manager member, the pane member,
+/// Payload builder for the boot-path tests: the manager member, the pane member,
 /// the worker members and the identity floors are all chosen per test.
 fn t022_payload(
     manager: ManagerSection,
@@ -1822,8 +1809,8 @@ fn t022_payload(
 }
 
 /// Floors a fixture may lawfully claim: every one of them sits above the highest
-/// counter value its own workers recorded, which is what L7
-/// (`IdentityFloors::sanity_violations`) refuses otherwise.
+/// counter value its own workers recorded, which is what
+/// `IdentityFloors::sanity_violations` refuses otherwise.
 fn t022_floors() -> IdentityFloors {
     IdentityFloors {
         worker_id_seq_floor: 3,
@@ -1832,19 +1819,19 @@ fn t022_floors() -> IdentityFloors {
     }
 }
 
-/// Mirrors the private `orchestrator::workers::MAX_RECENT_COMPLETED` (A §5.7 step
-/// 3): the restored registry is a bounded working set, and eviction always takes
-/// the **lowest** `completed_seq` first. That cap is the only lawful way a
-/// restored closed entry can leave the process-wide registry again — and because
-/// the registry is a static shared with the `orchestrator` and
+/// Mirrors the private `orchestrator::workers::MAX_RECENT_COMPLETED`: the
+/// restored registry is a bounded working set, and eviction always takes the
+/// **lowest** `completed_seq` first. That cap is the only lawful way a restored
+/// closed entry can leave the process-wide registry again — and because the
+/// registry is a static shared with the `orchestrator` and
 /// `session::worker_journal` suites, the eviction may be triggered, and counted,
 /// by a concurrent test rather than by this one.
 const COMPLETED_RING_CAP: usize = 10;
 
-/// Requirement 2a: the manager history comes back element for element — every
-/// record in the bundle becomes the corresponding engine message, `content:
-/// null` stays distinct from `content: ""`, the tool arguments keep their exact
-/// bytes, and `[0]`/`[1]` are byte-identical to what was stored (A R-PIN-1/2).
+/// The manager history comes back element for element — every record in the
+/// bundle becomes the corresponding engine message, `content: null` stays
+/// distinct from `content: ""`, the tool arguments keep their exact bytes, and
+/// `[0]`/`[1]` are byte-identical to what was stored.
 #[test]
 fn resume_boot_restores_the_manager_history_element_for_element() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1894,7 +1881,7 @@ fn resume_boot_restores_the_manager_history_element_for_element() {
         "the resume engine starts with nothing to preserve"
     );
 
-    // ---- element for element, in stored order, with N-MGR-1 appended last
+    // ---- element for element, in stored order, with the restore notice last
     let expected: Vec<String> = stored
         .iter()
         .cloned()
@@ -1994,7 +1981,7 @@ fn resume_boot_restores_the_manager_history_element_for_element() {
         "the loop continues on the stored goal"
     );
 
-    // ---- the engine scalars the loader carried (A §3.5)
+    // ---- the engine scalars the loader carried
     assert!(
         ctx.rebirth_advisory_emitted(),
         "the rebirth latch the previous process had already spent is restored"
@@ -2020,10 +2007,10 @@ fn resume_boot_restores_the_manager_history_element_for_element() {
     crate::orchestrator::workers::remove_worker_entry_for_test("t022-element-for-element");
 }
 
-/// Requirement 2b: the pane strings come back verbatim — `chat_messages` 1:1
-/// with empty and duplicate lines kept, `plan_content` byte-identical, the
-/// streaming partials, composer, view and panel state included — and they are
-/// **assigned**, not appended (A D4, U1–U3).
+/// The pane strings come back verbatim — `chat_messages` 1:1 with empty and
+/// duplicate lines kept, `plan_content` byte-identical, the streaming partials,
+/// composer, view and panel state included — and they are **assigned**, not
+/// appended.
 #[test]
 fn resume_boot_assigns_every_pane_string_verbatim_including_the_plan_pane() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -2258,7 +2245,7 @@ fn t022_worker(
     section.completed_seq = completed_seq;
     if completed_seq.is_some() {
         // A closed record carries its own completion instant; the installer
-        // re-anchors it through the D5 projection rather than inventing one.
+        // re-anchors that instant rather than inventing one.
         section.completed = Some(boot_timepoint(2.0));
     }
     section.counters.implementation_turns = 4;
@@ -2267,9 +2254,9 @@ fn t022_worker(
     section
 }
 
-/// Requirement 2c: every worker key in the bundle is rebuilt under exactly that
-/// key, with its own id/`completed_seq`/counter values carried verbatim, and the
-/// three process-wide identity floors only ever move up (A §5.7).
+/// Every worker key in the bundle is rebuilt under exactly that key, with its
+/// own id/`completed_seq`/counter values carried verbatim, and the three
+/// process-wide identity floors only ever move up.
 #[test]
 fn resume_boot_rebuilds_every_worker_key_and_never_lowers_the_identity_floors() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -2284,8 +2271,8 @@ fn resume_boot_rebuilds_every_worker_key_and_never_lowers_the_identity_floors() 
     let notice_floor = notices_before + 20;
     // The closed record's `COMPLETED_SEQ` is drawn just under the floor this
     // bundle claims, so it is the newest closed entry at install time: the
-    // bounded completed ring (A §5.7 step 3) evicts the **lowest** first, and
-    // that ring is a process-wide static shared with the `orchestrator` and
+    // bounded completed ring evicts the **lowest** first, and that ring is a
+    // process-wide static shared with the `orchestrator` and
     // `session::worker_journal` suites running concurrently in this binary.
     let closed_seq = seqs_before + 19;
 
@@ -2347,10 +2334,9 @@ fn resume_boot_rebuilds_every_worker_key_and_never_lowers_the_identity_floors() 
     // lowest `completed_seq` evicted first) is shared with the `orchestrator` and
     // `session::worker_journal` suites running concurrently in this test binary,
     // so a restored **closed** entry can be evicted again by another suite's
-    // completion, with the eviction count landing on that suite's call. What the
-    // restore owns, and what is pinned strictly, is that every OPEN key comes back
-    // under exactly its stored name, and that a missing closed key is explained by
-    // a full ring rather than by the restore.
+    // completion. What the restore owns, and what is pinned strictly, is that
+    // every OPEN key comes back under exactly its stored name, and that a missing
+    // closed key is explained by a full ring rather than by the restore.
     let live = crate::orchestrator::workers::live_worker_states();
     let completed_present = live
         .iter()
@@ -2386,8 +2372,8 @@ fn resume_boot_rebuilds_every_worker_key_and_never_lowers_the_identity_floors() 
             Some(state) => state,
             None => {
                 // The one lawful way a restored key can be absent again is the
-                // bounded completed ring (A §5.7 step 3), which only ever drops
-                // CLOSED entries — and never an open one.
+                // bounded completed ring, which only ever drops CLOSED entries —
+                // and never an open one.
                 assert_eq!(
                     section.worker_key, finished,
                     "an OPEN restored entry may never leave the registry"
@@ -2480,10 +2466,10 @@ fn resume_boot_rebuilds_every_worker_key_and_never_lowers_the_identity_floors() 
     }
 }
 
-/// Requirement 3: a bundle this binary refuses (here: an `format_version` it does
-/// not understand, L3) installs **nothing** — not a message, not a worker, not a
-/// floor, not a pane line — leaves the bundle bytes untouched, and comes back as
-/// the typed `RestoreRefused` that `main` maps onto `session::EXIT_RESTORE_REFUSED`
+/// A bundle this binary refuses (here: a `format_version` it does not
+/// understand) installs **nothing** — not a message, not a worker, not a floor,
+/// not a pane line — leaves the bundle bytes untouched, and comes back as the
+/// typed `RestoreRefused` that `main` maps onto `session::EXIT_RESTORE_REFUSED`
 /// (3). The engine deliberately starts **non-empty** here so "unchanged" is a
 /// witness rather than a vacuity.
 #[test]
@@ -2640,15 +2626,15 @@ fn refusal_on_an_ununderstood_format_version_installs_nothing_and_is_exit_three(
     );
 }
 
-/// Requirement 4: A D6's tolerated partial, pinned through the boot pass. One
-/// corrupt worker member makes **that** worker `Unrecoverable` — its key and task
-/// are kept, its history is gone, and it must never read as an in-flight
-/// delegation — while everything else in the same bundle installs: the manager
-/// transcript element for element, both sound workers under their own keys with
-/// their own `WORKER_ID_SEQ` values and the interrupted label, and the pane
-/// strings including the plan pane. The loss is then counted out loud in the
-/// panes, the journal and the manager's own restore notice, and the damaged
-/// member is never repaired in place.
+/// The tolerated partial, pinned through the boot pass. One corrupt worker
+/// member makes **that** worker `Unrecoverable` — its key and task are kept, its
+/// history is not restored, and it must never read as an in-flight delegation —
+/// while everything else in the same bundle installs: the manager transcript
+/// element for element, both sound workers under their own keys with their own
+/// `WORKER_ID_SEQ` values and the interrupted label, and the pane strings
+/// including the plan pane. The loss is then counted out loud in the panes, the
+/// journal and the manager's own restore notice, and the damaged member is never
+/// repaired in place.
 #[test]
 fn one_corrupt_worker_file_is_the_tolerated_partial_and_the_rest_installs() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -2687,7 +2673,7 @@ fn one_corrupt_worker_file_is_the_tolerated_partial_and_the_rest_installs() {
     for key in [good_a, good_b, bad] {
         crate::orchestrator::workers::remove_worker_entry_for_test(key);
     }
-    // Exactly one member is damaged: same byte length, wrong fingerprint (L4).
+    // Exactly one member is damaged: same byte length, wrong fingerprint.
     corrupt_worker_member(&bundle, &format!("workers/{bad}.json"));
     let bundle_bytes_after_damage = tree_bytes(&bundle);
 
@@ -2791,8 +2777,8 @@ fn one_corrupt_worker_file_is_the_tolerated_partial_and_the_rest_installs() {
 
     // ---- the damaged one is kept by name and closed out of the active set. It is
     // closed the moment it is installed (it carried no `completed_seq`), so the
-    // process-wide bounded ring may take it again; if it is gone, that must be the
-    // ring and never the installer.
+    // process-wide bounded ring may take it again; if it is absent, that must be
+    // the ring and never the installer.
     if !live_keys.contains(&bad.to_string()) {
         assert!(
             ring_was_full,
@@ -2937,7 +2923,7 @@ fn one_corrupt_worker_file_is_the_tolerated_partial_and_the_rest_installs() {
         "the count spoken out loud is the count reported, got {summary}"
     );
 
-    // ---- and the manager itself is told, in N-MGR-1, which worker lost its history
+    // ---- and the manager's own restore notice names the worker that lost history
     let notice = report
         .restore_notice
         .clone()
@@ -2964,15 +2950,15 @@ fn one_corrupt_worker_file_is_the_tolerated_partial_and_the_rest_installs() {
     }
 }
 
-/// Requirement 5a: the precedence is pinned where it actually bites — inside the
-/// boot pass, not only in the trigger read. With `session_resume = true` in the
-/// Config **and** a real, fully restorable bundle on disk, `--fresh` still means
-/// the pass is never entered: `boot_if_requested` answers `None`, the engine
-/// keeps what this process put in it, no worker key appears, no pane is assigned,
-/// nothing is journaled, the session keeps its own id, and every byte under the
-/// plan directory is untouched. Flipping the flag to `--resume` on the **same**
-/// bundle and Config then installs everything, which is what makes the silence
-/// above a precedence result rather than a broken fixture.
+/// The precedence is pinned where it actually bites — inside the boot pass, not
+/// only in the trigger read. With `session_resume = true` in the Config **and** a
+/// real, fully restorable bundle on disk, `--fresh` still means the pass is never
+/// entered: `boot_if_requested` answers `None`, the engine keeps what this
+/// process put in it, no worker key appears, no pane is assigned, nothing is
+/// journaled, the session keeps its own id, and every byte under the plan
+/// directory is untouched. Flipping the flag to `--resume` on the **same** bundle
+/// and Config then installs everything, which is what makes the silence above a
+/// precedence result rather than a broken fixture.
 #[test]
 fn the_fresh_flag_outranks_session_resume_inside_the_boot_pass() {
     let _resume_guard = RESUME_FLAGS_LOCK
@@ -3126,9 +3112,9 @@ fn the_fresh_flag_outranks_session_resume_inside_the_boot_pass() {
     crate::orchestrator::workers::remove_worker_entry_for_test(key);
 }
 
-/// Requirement 5b: the `MARMEL_RESUME` spelling reaches the same boot pass, with
-/// **no** command-line flag set. Three layers are pinned in one place: the env
-/// value folded into `Config` by `config::apply_session_env` (the recognized
+/// The `MARMEL_RESUME` spelling reaches the same boot pass, with **no**
+/// command-line flag set. Three layers are pinned in one place: the env value
+/// folded into `Config` by `config::apply_session_env` (the recognized
 /// spellings, the cancelling spellings, and an unrecognized value keeping the
 /// file's answer), the trigger read `resume_requested` with the process-wide flag
 /// statics at rest, and — decisively — a real restore through `boot_if_requested`
@@ -3301,17 +3287,17 @@ fn marmel_resume_env_reaches_the_boot_pass_and_restores() {
 }
 
 // ---------------------------------------------------------------------------
-// t-014d: AC-C3 (flow §9.6) — the strong half of the "values match" branch.
+// The strong half of the "values match" branch.
 //
 // From an integration test `plan_scroll` can only ever be pinned at `0`: that
-// offset's upper bound is `TuiRenderer::plan_max_scroll` (`tui/mod.rs:133`), a
-// per-frame display value derived while drawing (`render.rs:578`, `:596`) and
-// therefore `0` in a process that has not drawn yet — so every stored non-zero
-// plan offset lands in the criterion's *second* branch (the clamp-difference
-// case, pinned in `tests/test_session_restore_ui.rs`) and the "restored value
-// equals the stored value" branch is never exercised for it. The geometry is
-// `pub(crate)`, so that branch can only be pinned in-crate: give the live clamp
-// room, then demand verbatim equality for all twelve view values.
+// offset's upper bound is `TuiRenderer::plan_max_scroll`, a per-frame display
+// value derived while drawing and therefore `0` in a process that has not drawn
+// yet — so every stored non-zero plan offset lands in the criterion's *second*
+// branch (the clamp-difference case, pinned in `tests/test_session_restore_ui.rs`)
+// and the "restored value equals the stored value" branch is never exercised for
+// it. The geometry is `pub(crate)`, so that branch can only be pinned in-crate:
+// give the live clamp room, then demand verbatim equality for all twelve view
+// values.
 // ---------------------------------------------------------------------------
 
 /// Four panels, the selected one (`[2]`) carrying enough content that the live
@@ -3392,14 +3378,11 @@ fn ac_c3_view_offsets_and_toggles_come_back_verbatim_when_the_clamp_has_room() {
     let mut renderer = crate::ui::tui::TuiRenderer::new();
     renderer.plan_max_scroll = 20;
 
-    // The hook call is the AC-C3 instant, and it is the instant the criterion
-    // speaks about: `boot` hands the committed section to exactly this hook
-    // (`ui/session.rs:1238-1243`, pinned element-by-element in
+    // The hook call is the instant the criterion speaks about: `boot` hands the
+    // committed section to exactly this hook (pinned element-by-element in
     // `tests/test_session_restore_ui.rs`). Reading the renderer any later would
-    // compare something else — the boot pass ends with one
-    // `on_event(Event::Status)`, and `TuiRenderer::on_event` finishes by flushing
-    // a frame (`tui/mod.rs:900-904`) whose plan reload
-    // (`render.rs:272-318`, `:596`) re-reads the disk-backed plan box and moves
+    // compare something else — the boot pass ends with one `on_event(Event::Status)`,
+    // whose frame flush re-reads the disk-backed plan box (`render.rs`) and moves
     // `plan_scroll`/`plan_auto_scroll` to what that frame shows. That is the
     // documented behaviour of a disk-backed pane, not a restore difference.
     renderer.restore_panes(&stored);
@@ -3463,9 +3446,9 @@ fn ac_c3_view_offsets_and_toggles_come_back_verbatim_when_the_clamp_has_room() {
     );
 
     // The matching branch needs no warning: nothing moved. The hook is also the
-    // place a difference would have been said out loud (`tui/mod.rs:1308-1313`
-    // pushes `[CLI] Restore warning:` pane lines), so the absence of a scroll
-    // sentence is observable in the same witness.
+    // place a difference would have been said out loud (the pane-restore hook
+    // pushes `[CLI] Restore warning:` lines), so the absence of a scroll sentence
+    // is observable in the same witness.
     assert!(
         !live
             .chat_messages

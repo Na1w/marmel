@@ -36,7 +36,7 @@ async fn test_worker_inbox_draining_with_exact_role_matching() {
     let n1 = post_notice_to_worker("coder", "Question 1 for coder", None);
     let _n2 = post_notice_to_worker("debugger", "Question for debugger", None);
 
-    // Draining for worker key "coder-t-001" matches target "coder" because the
+    // Draining for the coder worker key matches target "coder" because the
     // worker's authoritative agent name is exactly "coder".
     let drained = drain_worker_notices("coder-t-001");
     assert_eq!(drained.len(), 1);
@@ -51,12 +51,13 @@ async fn test_worker_inbox_draining_with_exact_role_matching() {
     assert_eq!(drained_dbg[0].user_inquiry, "Question for debugger");
 }
 
-// Routing regression tests — recon H1 (substring/prefix routing) and the
-// disambiguated worker keys `{base}#{n}` introduced for recon H5.
+// Routing regression tests: substring and unanchored-prefix addressing must
+// never route, and a disambiguated worker key `{base}#{n}` is addressed only by
+// its exact identity.
 
-/// H1: a notice addressed to the `coder` role must NOT be drained by the
-/// validator worker auditing that coder — its registry key
-/// `validator-coder-t-001` merely *contains* the substring `coder`.
+/// A notice addressed to the `coder` role must NOT be drained by the validator
+/// worker auditing that coder — its registry key merely *contains* the
+/// substring `coder`.
 #[tokio::test]
 async fn test_notice_for_coder_is_not_stolen_by_validator_worker() {
     let _lock = TEST_NOTICE_MUTEX.lock().await;
@@ -65,7 +66,7 @@ async fn test_notice_for_coder_is_not_stolen_by_validator_worker() {
     let notice = post_notice_to_worker("coder", "Please switch to async I/O", None);
 
     // The validator loop registers `validator-{agent}` + task id
-    // (src/agents/validation.rs), i.e. key `validator-coder-t-001`.
+    // (src/agents/validation.rs), i.e. a nested validator key for that coder.
     assert!(
         drain_worker_notices("validator-coder-t-001").is_empty(),
         "validator-coder-t-001 must not drain a notice addressed to the coder role"
@@ -127,8 +128,8 @@ async fn test_role_family_address_reaches_nested_validator_worker() {
     assert_eq!(drained[0].notice_id, notice.notice_id);
 }
 
-/// H1 + disambiguated keys: the key `coder-t-001#7` is routed only by addresses
-/// that equal the worker's identity exactly — never by a `coder-t-00` prefix and
+/// Disambiguated keys: a worker keyed with a collision handle is routed only by
+/// addresses that equal its identity exactly — never by a truncated prefix and
 /// never by a sibling worker sharing the same natural key.
 #[tokio::test]
 async fn test_disambiguated_worker_key_matches_exact_worker_only() {
@@ -137,7 +138,7 @@ async fn test_disambiguated_worker_key_matches_exact_worker_only() {
 
     let notice = post_notice_to_worker("coder-t-001#7", "Follow-up on the exact worker", None);
 
-    // Unanchored prefixes of the key must not route (this was `contains`).
+    // Unanchored prefixes of the key must not route.
     assert!(drain_worker_notices("coder-t-00").is_empty());
     assert!(drain_worker_notices("coder-t-0").is_empty());
     assert!(drain_worker_notices("coder").is_empty());
@@ -181,8 +182,8 @@ async fn test_disambiguated_worker_drains_notice_addressed_to_natural_key() {
     assert!(ids.contains(&other.notice_id.as_str()));
 }
 
-/// H1 second scenario: a task-id address is matched by exact task id only, so
-/// `t-1` is no longer drained by `coder-t-10`.
+/// Task-id addressing is matched by exact task id only, so a `t-1` address is
+/// never drained by the worker keyed to `t-10`.
 #[tokio::test]
 async fn test_task_id_address_matches_exact_task_id_only() {
     let _lock = TEST_NOTICE_MUTEX.lock().await;
@@ -191,8 +192,8 @@ async fn test_task_id_address_matches_exact_task_id_only() {
     let short = post_notice_to_worker("t-1", "Notice for task t-1", None);
     let exact = post_notice_to_worker("t-001", "Notice for task t-001", None);
 
-    // `coder-t-10` contains `t-1`, and `coder-t-0010` contains `t-001` — neither
-    // may route.
+    // A task id that merely contains a shorter task id — as a prefix or in the
+    // middle of its text — may not route.
     assert!(drain_worker_notices("coder-t-10").is_empty());
     assert!(drain_worker_notices("coder-t-0010").is_empty());
     assert!(drain_worker_notices("validator-coder-t-0010").is_empty());
@@ -225,8 +226,8 @@ async fn test_unroutable_notice_is_not_delivered_or_dropped() {
     assert!(drain_worker_notices("").is_empty());
 
     // A truncated prefix of a real worker key addresses nobody: the worker whose
-    // key merely *starts with* that prefix must not pull the notice in (this was
-    // the `contains` rule against disambiguated keys such as `coder-t-001#7`).
+    // key merely *starts with* that prefix must not pull the notice in — the
+    // substring reading never applies to disambiguated keys.
     let truncated = post_notice_to_worker("coder-t-0", "Prefix of coder-t-001#7", None);
     assert!(drain_worker_notices("coder-t-001#7").is_empty());
     assert!(drain_worker_notices("coder-t-001").is_empty());
@@ -238,9 +239,9 @@ async fn test_unroutable_notice_is_not_delivered_or_dropped() {
     assert_eq!(drained_prefix[0].notice_id, truncated.notice_id);
 
     // Not consumed, not evicted: still pending. Under the strict reply contract
-    // (recon H6) it is *not* replyable by a worker it never addressed either —
-    // the deterministic outcome is that it stays pending until the TTL sweep
-    // drops it, instead of being silently consumed by an unrelated reply.
+    // it is *not* replyable by a worker it never addressed either — the
+    // deterministic outcome is that it stays pending until the TTL prune drops
+    // it, instead of being silently consumed by an unrelated reply.
     let pending = get_pending_notice(&notice.notice_id);
     assert!(pending.is_some());
     assert_eq!(pending.unwrap().target_worker, "archaeologist-t-4242");
@@ -261,8 +262,7 @@ async fn test_unroutable_notice_is_not_delivered_or_dropped() {
 }
 
 /// A target that normalizes to nothing (pure decoration) must not match every
-/// worker — the old `contains(&target)` rule matched the empty string against
-/// every key.
+/// worker — an absent target matches nothing at all.
 #[tokio::test]
 async fn test_empty_target_is_not_drained_by_every_worker() {
     let _lock = TEST_NOTICE_MUTEX.lock().await;
@@ -799,7 +799,7 @@ async fn test_evaluate_worker_reply_ask_followup() {
     assert!(streamed_deltas.is_empty());
 }
 
-/// Pin (t-013, producer side of the pair asserted in `ui::transcript`): the
+/// Pin (producer side of the pair asserted in `ui::transcript`): the
 /// `user_status` example baked into [`WORKER_REPLY_SYSTEM_PROMPT`] must stay
 /// byte-identical to the agreed glossary wording, must stay inside the
 /// language-neutral pending-decision vocabulary shared by
@@ -902,16 +902,16 @@ fn test_assemble_tools_includes_reply_to_arbitrator_unconditionally() {
     );
 }
 
-// Storage lifecycle regression tests — recon H4 (no TTL, unbounded inboxes,
-// drained-empty entries never reclaimed, drain only at turn boundaries).
+// Storage lifecycle regression tests: TTL expiry, bounded inboxes, drained-empty
+// entries reclaimed, and draining only at turn boundaries.
 //
 // Expiry is driven through the module's injectable clock
 // ([`advance_notice_clock_ms`]); no test sleeps, and `clear_all_notices()`
 // resets the offset so a shifted clock never leaks into the next test.
 
 /// Minimal `tracing` subscriber that counts WARN events whose message contains
-/// a needle — used to prove that drops are reported, and reported *bounded*
-/// (once per sweep, not once per entry).
+/// a needle — it proves that drops are reported, and reported *bounded*: once
+/// per prune, not once per entry.
 #[derive(Debug)]
 struct WarnMessageCounter {
     needle: &'static str,
@@ -1030,7 +1030,7 @@ async fn test_expired_notice_is_not_delivered_and_is_reported() {
     );
 }
 
-/// The expiry warning is emitted once per sweep (with the ids), not once per
+/// The expiry warning is emitted once per prune (with the ids), not once per
 /// expired notice.
 #[tokio::test]
 async fn test_expired_notice_warning_is_bounded_not_per_entry() {
@@ -1233,7 +1233,7 @@ async fn test_gone_worker_inbox_entries_are_reclaimed() {
     assert_eq!(worker_inbox_len("gone-worker-t-900"), 0);
 
     // 2. A worker that never drains: once its notice ages out, the entry that
-    //    held it is reclaimed in the same sweep.
+    //    held it is reclaimed in the same prune.
     let stale = post_notice_to_worker("dead-worker-t-901", "never drained", None);
     assert_eq!(worker_inbox_len("dead-worker-t-901"), 1);
     advance_notice_clock_ms(NOTICE_TTL_MS + 60_000);
@@ -1279,10 +1279,10 @@ async fn test_mid_turn_drain_routes_exactly_and_is_idempotent() {
     let exact = post_notice_to_worker("coder-t-001", "Only for the exact worker", None);
 
     // Routing stays exact mid-turn: a validator whose key merely *contains* the
-    // coder role must not pick up the coder's notice (recon H1), a longer task
-    // id sharing the same text prefix addresses nobody, a different agent
-    // sharing the task id does not answer an address that spells out another
-    // agent's key, and the bare role address is not the exact key.
+    // coder role must not pick up the coder's notice, a longer task id sharing
+    // the same text prefix addresses nobody, a different agent sharing the task
+    // id does not answer an address that spells out another agent's key, and the
+    // bare role address is not the exact key.
     assert!(drain_worker_notices_mid_turn("validator-coder-t-001").is_empty());
     assert!(drain_worker_notices_mid_turn("coder-t-0010").is_empty());
     assert!(drain_worker_notices_mid_turn("planner-t-001").is_empty());
@@ -1333,8 +1333,8 @@ async fn test_mid_turn_drain_drops_expired_notice_with_report() {
     assert!(!has_worker_inbox("coder-t-001"));
 }
 
-// Reply-targeting regression tests — recon H6 (`record_worker_reply` used to
-// *guess* the notice: `else if PENDING_NOTICES.len() == 1 { take the first }`).
+// Reply-targeting regression tests: `record_worker_reply` never *guesses* the
+// notice a reply answers.
 //
 // A reply must name the notice it answers. Every assertion below is keyed on
 // the concrete notice ids / per-key deltas, never on absolute process-global
@@ -1469,8 +1469,8 @@ async fn test_reply_without_explicit_id_is_rejected_and_logged() {
     let _lock = TEST_NOTICE_MUTEX.lock().await;
     clear_all_notices();
 
-    // The exact precondition the deleted fallback keyed on: a single pending
-    // notice exists, so "take the first pending one" would have resolved it.
+    // The precondition a guess-the-first fallback would exploit: exactly one
+    // pending notice exists — a reply with no id must still be rejected.
     let mine = post_notice_to_worker("coder-t-9201", "The only instruction in flight", None);
 
     let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));

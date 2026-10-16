@@ -1,6 +1,6 @@
 //! Specialist: **Validator** — Independent Quality Auditor.
 //!
-//! Domain (REQ-ORCH-002): verifies accuracy/logic/fact-checking; inspects
+//! Domain: verifies accuracy/logic/fact-checking; inspects
 //! deliverables and source files; issues formal verdicts. Rejects
 //! incomplete work with actionable feedback; never inflates pass status.
 //!
@@ -30,9 +30,8 @@ pub const VALIDATOR_GENERALIST_ROLE_PROMPT: &str =
 /// Specialist prompt for planner auditing — statically embedded from prompts/validator_planner.md.
 pub const VALIDATOR_PLANNER_ROLE_PROMPT: &str = include_str!("../../prompts/validator_planner.md");
 
-/// Centralized per-specialist validator role-prompt mapping (static, compile-time
-/// prompts — see REQ-ORCH-002 role discipline). Previously duplicated as a
-/// `match agent { … }` inside each validation loop.
+/// Centralized per-specialist validator role-prompt mapping: static,
+/// compile-time prompts, exactly one entry per specialist role.
 pub fn role_prompt_for(agent: crate::agents::Agent) -> &'static str {
     match agent {
         crate::agents::Agent::Coder => VALIDATOR_CODER_ROLE_PROMPT,

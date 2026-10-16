@@ -1,17 +1,17 @@
 //! Single owner of "render a one-line human preview of a tool call's JSON
-//! arguments" (dedup cluster: preview/format twins).
+//! arguments".
 //!
-//! Two independent copies of this rendering used to exist:
-//! * `agents::runner::formatting` — the bare *value* preview used for the
-//!   specialist status line and the `invoking tool:` log line;
-//! * `ui::helpers` — the decorated `name(args)` line used for the TUI tool-call
-//!   row and the transcript.
+//! Two preview styles live here:
+//! * the bare *value* preview used for the specialist status line and the
+//!   `invoking tool:` log line;
+//! * the decorated `name(args)` line used for the TUI tool-call row and the
+//!   transcript.
 //!
-//! Both now delegate here. The module keeps the **union** of the two renders
-//! (no tool-specific formatting was dropped) while centralising everything that
-//! both copies knew independently: which argument key carries which value per
-//! tool, the legacy aliases that are still emitted in practice, and the
-//! char-boundary-safe clipping used to keep a preview on one line.
+//! The module keeps the **union** of both renders (no tool-specific formatting is
+//! dropped) while centralising everything both renders must agree on: which
+//! argument key carries which value per tool, the legacy aliases that are still
+//! emitted in practice, and the char-boundary-safe clipping that keeps a preview
+//! on one line.
 //!
 //! ## Argument-key authority
 //! Keys follow the wire schema in [`crate::types::tools`] and the harness
@@ -26,13 +26,11 @@
 //! can never split a multi-byte character (Swedish `å`/`ä`/`ö`, emoji, CJK, …)
 //! and never panics on a non-char boundary.
 //!
-//! ## Sleep-argument authority (dedup gate t-044, sweep C; refreshed t-070)
+//! ## Sleep-argument authority
 //! Beyond rendering, this module is also the single owner of `sleep`-argument
 //! *extraction*: [`sleep_duration_secs`] resolves the duration key(s), every
-//! JSON number shape, the fallback default and the min/max clamp. The two
-//! harness handlers (`handle_sleep`, `handle_sleep_async`) used to carry three
-//! divergent copies of that canonicalization; they now call this owner, so the
-//! sync and async tool paths cannot disagree about what an input means.
+//! JSON number shape, the fallback default and the min/max clamp, so the sync and
+//! async tool paths cannot disagree about what an input means.
 //!
 //! The owner is one function plus one constant trio, and both are `pub` so no
 //! other subsystem may re-type the numbers:
@@ -42,15 +40,14 @@
 //! * [`SLEEP_MIN_SECS`] / [`SLEEP_MAX_SECS`] — the bounds every *parsed*
 //!   duration is clamped into (`0` → `SLEEP_MIN_SECS`, `301` → `SLEEP_MAX_SECS`).
 //!
-//! Every caller that decides "how long may this sleep be" now asks this owner
-//! for the vocabulary: the harness sleep handlers, the steered sleep
-//! (`orchestrator::steer` calls [`sleep_duration_secs`] / [`SLEEP_DEFAULT_SECS`]
-//! instead of its old unclamped `unwrap_or(5)` copy) and the steering
-//! arbitrator's **lower** bound (`ui::bridge::arbiter` floors a requested sleep
-//! at [`SLEEP_MIN_SECS`], defaulting it to [`SLEEP_DEFAULT_SECS`]). Only the
-//! arbitrator's *upper* budget knobs stay separate on purpose — they bound one
-//! steering instruction's chained sleep, not the `sleep` tool's own ceiling, and
-//! are deliberately not derived from [`SLEEP_MAX_SECS`].
+//! Every caller that decides "how long may this sleep be" asks this owner for the
+//! vocabulary: the harness sleep handlers, the steered sleep
+//! (`orchestrator::steer` calls [`sleep_duration_secs`] / [`SLEEP_DEFAULT_SECS`])
+//! and the steering arbitrator's **lower** bound (`ui::bridge::arbiter` floors a
+//! requested sleep at [`SLEEP_MIN_SECS`], defaulting it to [`SLEEP_DEFAULT_SECS`]).
+//! Only the arbitrator's *upper* budget knobs stay separate on purpose — they
+//! bound one steering instruction's chained sleep, not the `sleep` tool's own
+//! ceiling, and are deliberately not derived from [`SLEEP_MAX_SECS`].
 
 use crate::text_util::truncate_chars;
 use crate::tool_names::{
@@ -62,9 +59,9 @@ use serde_json::Value;
 /// Ellipsis appended by [`clip`] when a value had to be shortened.
 const ELLIPSIS: &str = "…";
 /// How many characters of the budget are reserved for the clip marker. The
-/// single-character ellipsis is rendered one-wide but historically the cut left
-/// three characters of slack (matching the width of `...`), so the visible
-/// budget is `budget - CLIP_SLACK` characters.
+/// single-character ellipsis is rendered one-wide but the cut leaves three
+/// characters of slack (matching the width of `...`), so the visible budget is
+/// `budget - CLIP_SLACK` characters.
 const CLIP_SLACK: usize = 3;
 
 /// Character budget for the `run_command` value in the compact preview.
@@ -74,7 +71,7 @@ const GENERIC_PREVIEW_BUDGET: usize = 30;
 /// Character budget for the serialized argument text in the decorated preview.
 const DECORATED_BUDGET: usize = 60;
 
-// Sleep-duration authority (dedup gate t-044 sweep C)
+// Sleep-duration authority
 
 /// Fallback sleep duration (seconds) when no duration key is present or the
 /// value is not a usable duration. Single owner of the default/clamp trio **for
@@ -197,8 +194,7 @@ pub fn search_pattern(args: &Value) -> &str {
     first_str(args, &["pattern", "query"])
 }
 
-/// Pattern key of the glob tool — strictly `pattern`, no aliases (the two
-/// renders this module replaced never guessed at glob aliases either).
+/// Pattern key of the glob tool — strictly `pattern`, no aliases.
 fn glob_pattern(args: &Value) -> &str {
     first_str(args, &["pattern"])
 }
@@ -215,9 +211,8 @@ fn command_arg(args: &Value) -> &str {
 
 /// Length of the plan payload in a `create_plan` call.
 ///
-/// Counted in **bytes**, exactly as the `ui::helpers` render this replaced did
-/// (the `chars` wording of that render's label is kept verbatim to avoid any
-/// behaviour drift; see the note in the task report).
+/// Counted in **bytes**; the rendered label spells it `chars`, which is kept
+/// verbatim because the rendered text itself is asserted byte-for-byte.
 fn plan_markdown_len(args: &Value) -> usize {
     byte_len(args.get("plan_markdown"))
 }
@@ -240,10 +235,9 @@ fn delegate_prompt(args: &Value) -> &str {
     first_str(args, &["prompt"])
 }
 
-/// The **single owner** of `sleep`-argument extraction (dedup gate t-044,
-/// sweep C: three divergent copies of this canonicalization used to exist —
+/// The **single owner** of `sleep`-argument extraction, called by
 /// `harness::sleep::handle_sleep`, `harness::sleep::handle_sleep_async` and the
-/// preview render below).
+/// preview render below.
 ///
 /// Returns the duration in seconds that a `sleep` call will actually wait, i.e.
 /// the whole pipeline in one place: key lookup → number-shape parsing → default
@@ -251,8 +245,8 @@ fn delegate_prompt(args: &Value) -> &str {
 /// an input accepted by one path is by construction accepted (with the same
 /// value) by the other.
 ///
-/// Accepted keys — the aliases the harness has always tolerated: `seconds`,
-/// then `duration`, then `duration_seconds` (first key present wins).
+/// Accepted keys — every spelling the harness tolerates: `seconds`, then
+/// `duration`, then `duration_seconds` (first key present wins).
 ///
 /// Accepted value shapes:
 /// * JSON unsigned integers (`5`), including integers too large for `i64`;
@@ -261,14 +255,12 @@ fn delegate_prompt(args: &Value) -> &str {
 ///   [`SLEEP_MIN_SECS`]..=[`SLEEP_MAX_SECS`] truncated toward zero (`2.5` → `2`,
 ///   `6.0` → `6`, `299.9` → `299`, `300.0` → `300`). Truncation is the safer
 ///   direction: it can never sleep *longer* than the caller asked. Out-of-range
-///   floats (`0.5`, `300.9`, `1e9`, `f64::MAX`) are *not* durations and fall
-///   back to the default — `serde_json` never reports a float through
-///   `as_u64`/`as_i64`, so before this owner existed no copy accepted any float
-///   spelling at all and each of them resolved to the default; clamping them to
-///   the ceiling instead would have made a malformed float sleep 60x longer
-///   than before.
-/// * string-encoded unsigned integers (`"5"`) — exactly what the previous copies
-///   accepted via `parse::<u64>()`; `"2.5"`/`"-3"`/`"5s"` stay unparseable.
+///   floats (`0.5`, `300.9`, `1e9`, `f64::MAX`) are *not* durations and fall back
+///   to the default (`serde_json` never reports a float through `as_u64` or
+///   `as_i64`); clamping them to the ceiling instead would make a malformed float
+///   sleep 60x longer than the default.
+/// * string-encoded unsigned integers (`"5"`) parsed with `parse::<u64>()`;
+///   `"2.5"`/`"-3"`/`"5s"` stay unparseable.
 ///
 /// Unusable values (missing key, `null`, `bool`, object/array, non-positive
 /// integers such as `-3`, floats outside the range above, unparseable strings)
@@ -299,18 +291,15 @@ fn parse_secs_value(value: &Value) -> Option<u64> {
         return Some(secs);
     }
     // Negative integers are not durations: they must fall back to the default
-    // rather than be clamped up to `SLEEP_MIN_SECS` (the behaviour every copy
-    // had, via the `i > 0` guard of the sync path).
+    // rather than be clamped up to `SLEEP_MIN_SECS`.
     if let Some(secs) = value.as_i64() {
         return if secs > 0 { Some(secs as u64) } else { None };
     }
     // Fractional durations: only floats already inside the tool's own range are
     // accepted, truncated toward zero (`2.5` -> `2`, `299.9` -> `299`).
-    // Out-of-range floats stay unusable, exactly as in every pre-existing copy
-    // (`serde_json` never reported a float through `as_u64`/`as_i64`); clamping
-    // them up to the ceiling instead would make a malformed float sleep 60x
-    // longer than the default, i.e. strictly *less* safe than the behaviour
-    // being replaced.
+    // Out-of-range floats stay unusable: clamping them up to the ceiling instead
+    // would make a malformed float sleep 60x longer than the default, i.e.
+    // strictly *less* safe.
     if let Some(secs) = value.as_f64() {
         return if secs.is_finite() && secs >= SLEEP_MIN_SECS as f64 && secs <= SLEEP_MAX_SECS as f64
         {
@@ -319,7 +308,7 @@ fn parse_secs_value(value: &Value) -> Option<u64> {
             None
         };
     }
-    // String-encoded numbers, exactly as tolerated before (`parse::<u64>`).
+    // String-encoded numbers, parsed with `parse::<u64>`.
     value.as_str().and_then(|s| s.parse().ok())
 }
 
@@ -513,8 +502,8 @@ mod tests {
 
     #[test]
     fn tool_args_truncation_never_splits_multi_byte_chars() {
-        // Regression for the historical panic: a 3-byte `—` straddled byte index 27
-        // of the serialized JSON and byte index 57 of the command string.
+        // Char-boundary safety: a 3-byte `—` straddles byte index 27 of the
+        // serialized JSON and byte index 57 of the command string.
         let val = json!({ "k": format!("{}—rest_of_string", "a".repeat(24)) });
         let res = preview_tool_args("custom_tool", &val);
         assert!(res.ends_with('…'));
@@ -582,8 +571,7 @@ mod tests {
             preview_tool_call(TOOL_CREATE_PLAN, &args),
             "create_plan(plan_markdown: 13 chars)"
         );
-        // Byte-counted payload size (inherited verbatim from the original UI
-        // render): `åäö` is 3 characters but 6 bytes.
+        // Byte-counted payload size: `åäö` is 3 characters but 6 bytes.
         let swe = json!({ "plan_markdown": "åäö" });
         assert_eq!(
             preview_tool_call(TOOL_CREATE_PLAN, &swe),
@@ -611,14 +599,14 @@ mod tests {
             ),
             "seconds=3, reason=\"wait for build\""
         );
-        // The decorated UI render keeps the raw JSON (as before).
+        // The decorated render keeps the raw JSON.
         assert_eq!(
             preview_tool_call(TOOL_SLEEP, &json!({ "seconds": 3 })),
             "sleep({\"seconds\":3})"
         );
     }
 
-    // Sleep-argument extraction owner (dedup gate t-044, sweep C)
+    // Sleep-argument extraction owner
 
     /// The single owner's contract: key precedence, every JSON number shape,
     /// the fallback default and one clamp pair.
@@ -636,7 +624,7 @@ mod tests {
             ("{\"seconds\":{}}", SLEEP_DEFAULT_SECS),
             ("{\"seconds\":[1]}", SLEEP_DEFAULT_SECS),
             ("{\"seconds\":\"later\"}", SLEEP_DEFAULT_SECS),
-            // string-encoded integers were accepted by every copy
+            // string-encoded integers parse
             ("{\"seconds\":\"5\"}", 5),
             ("{\"seconds\":\"-3\"}", SLEEP_DEFAULT_SECS),
             ("{\"seconds\":\"5s\"}", SLEEP_DEFAULT_SECS),
@@ -652,8 +640,7 @@ mod tests {
             ("{\"seconds\":6.0}", 6),
             ("{\"seconds\":2.5}", 2),
             ("{\"seconds\":299.9}", 299),
-            // floats outside it stay unusable -> the default, exactly like every
-            // pre-existing copy (they were never parsed at all)
+            // floats outside it stay unusable -> the default
             ("{\"seconds\":1e9}", SLEEP_DEFAULT_SECS),
             ("{\"seconds\":300.9}", SLEEP_DEFAULT_SECS),
             ("{\"seconds\":300.0}", SLEEP_MAX_SECS),
@@ -672,7 +659,7 @@ mod tests {
         // A non-object argument (truncated XML rescue payloads) cannot carry a
         // duration key: the default is returned rather than a panic. The scalar
         // value is irrelevant to the assertion, so it is spelled from the shared
-        // table (`TOOL_SLEEP`) instead of a raw tool-name literal (t-069).
+        // table (`TOOL_SLEEP`).
         for args in [Value::Null, json!(TOOL_SLEEP), json!(42), json!([])] {
             assert_eq!(sleep_duration_secs(&args), SLEEP_DEFAULT_SECS);
         }
@@ -706,8 +693,8 @@ mod tests {
         }
     }
 
-    /// The preview no longer shows a duration the executor would never wait:
-    /// it renders the owner's resolved (defaulted + clamped) value.
+    /// The preview shows a duration the executor will actually wait: it renders
+    /// the owner's resolved (defaulted + clamped) value.
     #[test]
     fn tool_args_sleep_preview_renders_the_resolved_duration() {
         assert_eq!(

@@ -1,13 +1,12 @@
-//! Dispatch-layer integrity (t-051).
+//! Dispatch-layer integrity.
 //!
 //! Two rules that the dispatcher itself must enforce:
 //!
 //! 1. **Reply targeting.** A `reply_to_arbitrator` call must name the notice it
 //!    answers, and that notice must address the replying worker. A rejection is
 //!    surfaced to the specialist as a `ToolError` naming the rejection kind; the
-//!    notice stays pending, nothing is recorded, and — the regression this pins —
-//!    the dispatcher never synthesizes a stand-in notice or answers the user from
-//!    a notice nobody named.
+//!    notice stays pending, nothing is recorded, and the dispatcher never
+//!    synthesizes a stand-in notice or answers the user from a notice nobody named.
 //! 2. **Verdict identity.** `leave_verdict` is refused at dispatch for every role
 //!    except the validator, even when the role's allowlist admits it (the
 //!    Generalist namespace is `"*"`, and a blueprint allowlist can name the tool

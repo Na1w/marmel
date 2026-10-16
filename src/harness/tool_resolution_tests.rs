@@ -1,4 +1,4 @@
-//! Tool-resolution test matrix (security t-034c).
+//! Tool-resolution test matrix.
 //!
 //! Pins the dispatcher's resolution order and the MCP name policy:
 //! (a) a built-in name always resolves to the built-in handler, even when an MCP
@@ -123,8 +123,9 @@ async fn boot_manager(scripted: &ScriptedServer, server_name: &str) -> McpManage
         .expect("the scripted MCP server must boot")
 }
 
-/// Build a gate whose allowed set is injected directly, bypassing the registration
-/// policy, to prove the dispatch-time guard is independent of registration.
+/// Build an `McpDispatchGate` whose allowed set is injected directly, bypassing the
+/// registration policy, to prove the dispatch-time guard is independent of
+/// registration.
 fn gate_with_allowed(allowed: &[&str]) -> McpDispatchGate {
     let mut set = HashSet::new();
     for name in allowed {
@@ -149,7 +150,7 @@ fn invocation(name: &str, arguments: serde_json::Value) -> ToolInvocation {
 /// (a) A built-in name is answered by the built-in handler even though the MCP
 /// registry really does hold that name. The scripted server is registered under the
 /// config key `terminal`, so its read-file tool composes to the built-in alias
-/// `terminal__read_file` — the exact escape the recon flagged.
+/// `terminal__read_file`.
 #[cfg(unix)]
 #[test]
 fn builtin_name_resolves_to_builtin_handler_even_when_mcp_registers_it() {
@@ -157,7 +158,7 @@ fn builtin_name_resolves_to_builtin_handler_even_when_mcp_registers_it() {
     let scripted = scripted_server(&[TOOL_READ_FILE]);
     let standalone = boot_in_private_runtime(&scripted, "terminal");
     // The raw registry still carries the shadowing name: the refusal lives in the
-    // gate, which is what dispatch consults.
+    // policy-filtered view that dispatch consults.
     assert!(
         standalone.has_tool(TERMINAL_READ_FILE),
         "the scripted server must really have registered the built-in alias"
@@ -198,20 +199,20 @@ fn builtin_name_resolves_to_builtin_handler_even_when_mcp_registers_it() {
 }
 
 /// Boot a scripted manager on a runtime that is dropped straight away (used only to
-/// inspect the raw registry without touching the global gate).
+/// inspect the raw registry without touching the global dispatch view).
 #[cfg(unix)]
 fn boot_in_private_runtime(scripted: &ScriptedServer, server_name: &str) -> McpManager {
     let rt = multi_thread_runtime();
     rt.block_on(boot_manager(scripted, server_name))
 }
 
-/// (a)/(3) Dispatch-time defence in isolation: even a gate that (hypothetically)
-/// allows a built-in name refuses to route it to MCP, and the built-in handler
-/// answers instead.
+/// (a)/(3) Dispatch-time defence in isolation: even an `McpDispatchGate` that
+/// (hypothetically) allows a built-in name refuses to route it to MCP, and the
+/// built-in handler answers instead.
 #[test]
 fn dispatch_time_guard_refuses_builtin_names_even_when_allowed() {
-    // `list_directory` is not in this list (gate t-069): the built-in dispatcher
-    // owns no such tool, so it owns nothing to refuse either.
+    // `list_directory` is not in this list: the built-in dispatcher owns no such
+    // tool, so it owns nothing to refuse either.
     let builtins = [
         TOOL_RUN_COMMAND,
         TERMINAL_RUN_COMMAND,
@@ -276,7 +277,7 @@ fn server_owning_a_builtin_namespace_is_refused_at_registration() {
     );
 }
 
-/// (b) The refusal is observable through the registry gate as well: a booted
+/// (b) The refusal is observable through the dispatch view as well: a booted
 /// `terminal` server contributes nothing to the dispatchable set.
 #[cfg(unix)]
 #[test]
@@ -572,9 +573,9 @@ fn legitimate_builtin_still_dispatches_to_the_builtin_path() {
 
 /// The table the policy is built on has to cover every name the dispatcher claims.
 ///
-/// `list_directory` / `terminal__list_directory` are deliberately **absent**
-/// (gate t-069): no dispatch arm implements them, so they are not claimed by the
-/// built-in dispatcher. Their unclaimed status is pinned by
+/// `list_directory` / `terminal__list_directory` are deliberately **absent**: no
+/// dispatch arm implements them, so they are not claimed by the built-in dispatcher.
+/// Their unclaimed status is pinned by
 /// `list_directory_spellings_are_unclaimed_and_report_unknown_tool` in
 /// `src/tool_names.rs`.
 #[test]
@@ -627,13 +628,13 @@ fn builtin_table_covers_canonical_namespaced_and_alias_forms() {
     assert!(gate.route(TOOL_GLOB).is_none());
 }
 
-// ── t-061: one alias vocabulary, every dispatch path ───────────────────────
+// ── one alias vocabulary, every dispatch path ──────────────────────────────
 
-/// The harness normalizer and the built-in name table are no longer hand-typed
-/// copies of the alias vocabulary: every row of
-/// `crate::tool_names::TOOL_ALIAS_TABLE` must be reproduced by
-/// `normalize_tool_name`, and every spelling of the vocabulary must be claimed by
-/// the built-in dispatcher (the built-in table is *derived* from the same rows).
+/// The harness normalizer and the built-in name table are one vocabulary, not
+/// hand-typed copies: every row of `crate::tool_names::TOOL_ALIAS_TABLE` must be
+/// reproduced by `normalize_tool_name`, and every spelling of the vocabulary must be
+/// claimed by the built-in dispatcher (the built-in table is *derived* from the same
+/// rows).
 #[test]
 fn harness_normalizer_and_builtin_table_are_the_shared_alias_table() {
     assert!(
@@ -715,11 +716,10 @@ fn aliases_that_resolved_before_still_reach_a_builtin_handler() {
     );
 }
 
-/// The gate side of the same table: an allowlist written in canonical spellings
-/// admits the alias spellings, on both the sync and the async specialist path.
-/// (Before the dedup, the `pty__` spellings reached a dispatch arm but could never
-/// pass the allowlist gate, and the steer-only sleep spellings were invisible to
-/// the harness gate.)
+/// The allowlist side of the same table: an allowlist written in canonical spellings
+/// admits the alias spellings, on both the sync and the async specialist path — every
+/// spelling of a granted tool folds through the one table, so an alias can neither slip
+/// past the allowlist nor miss its dispatch arm.
 #[test]
 fn specialist_allowlists_admit_alias_spellings_of_the_granted_tool() {
     let caller = || ToolCaller::SpecialistWithTools {
@@ -755,11 +755,11 @@ fn specialist_allowlists_admit_alias_spellings_of_the_granted_tool() {
     );
 }
 
-/// t-061 control pin: the gate for the **canonical** `run_command` spelling is
-/// unchanged by the alias collapse. The invocation is deliberately missing its
-/// `command` argument so the assertion cannot be polluted by the sandboxed PTY
-/// (this sandbox has no working `openpty`, which is the environmental reason the
-/// `run_command` case in `tests/test_role_gating.rs` cannot execute).
+/// Control pin: the allowlist check for the **canonical** `run_command` spelling is
+/// unaffected by alias folding. The invocation is deliberately missing its `command`
+/// argument so the assertion cannot be polluted by the sandboxed PTY (this sandbox has
+/// no working `openpty`, which is the environmental reason the `run_command` case in
+/// `tests/test_role_gating.rs` cannot execute).
 #[test]
 fn granted_canonical_run_command_still_passes_the_gate() {
     let granted = || ToolCaller::SpecialistWithTools {

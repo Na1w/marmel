@@ -1,8 +1,7 @@
 //! Tool argument formatting for previews and logs.
 //!
-//! The rendering itself has a single owner: [`crate::tool_args`] (it replaced
-//! the twin implementations that used to live here and in `ui::helpers`). These
-//! thin wrappers keep the runner-facing names used by `runner::fix_loop` and add
+//! The rendering itself has a single owner: [`crate::tool_args`]. These thin
+//! wrappers keep the runner-facing names used by `runner::fix_loop` and add
 //! no formatting logic of their own — see `crate::tool_args` for the per-tool
 //! argument keys and the clipping budgets.
 

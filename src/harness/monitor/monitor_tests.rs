@@ -186,7 +186,7 @@ fn test_monitor_repetition_detector() {
         "pattern repeated 5 times at the tail must trigger"
     );
 
-    // Interrupt the pattern: no longer repeating.
+    // Break the pattern: the next delta is distinct.
     det.push("zzz");
     assert!(!det.is_repeating());
 }
@@ -415,7 +415,7 @@ fn test_monitor_composed_text_repetition_truncates_and_counts() {
     );
 }
 
-// --- Config-driven thresholds (t-d403 parity with caesar) ---
+// --- Config-driven thresholds (parity with caesar) ---
 
 #[test]
 fn test_monitor_config_driven_tool_threshold() {
@@ -506,7 +506,7 @@ fn test_monitor_config_defaults_match_caesar() {
     assert!(cfg.enabled);
 }
 
-// --- Orphan-message pruning (t-d403 parity with caesar) ---
+// --- Orphan-message pruning (parity with caesar) ---
 
 #[test]
 fn test_monitor_prune_orphan_tool_messages() {
@@ -610,7 +610,7 @@ fn test_monitor_consecutive_rebirth_blocked() {
     );
 }
 
-// --- Bounded scan windows (recon M3 regression guard) ---
+// --- Bounded scan windows ---
 
 /// Non-repeating filler: every line is distinct (the numbers differ), so the
 /// filler itself never trips any of the repetition rules.
@@ -669,8 +669,8 @@ fn test_monitor_repetition_window_bounded_after_long_streams() {
 #[test]
 fn test_monitor_repetition_scan_work_is_bounded() {
     // The per-delta scan budget must be a property of the windows, not of how
-    // much text has streamed by. These counts are the *before* regression: the
-    // old scan grew linearly (and its cost quadratically) with the buffer.
+    // much text has streamed by: a scan sized by the buffer would grow linearly
+    // per delta and quadratically in cost, so these counts pin the window bound.
     let small = {
         let mut det = RepetitionDetector::new(5, 5);
         fill_until(&mut det, 300);
@@ -703,9 +703,9 @@ fn test_monitor_repetition_scan_work_is_bounded() {
         huge.word_window_len()
     );
 
-    // Benchmark-style guard on the *measured* cost. Before the fix, one
-    // `is_repeating` call on a saturated 16 384-char buffer measured ~256 ms in
-    // this debug build (23 s for a 4 500-delta stream in the recon replica).
+    // Benchmark-style guard on the *measured* cost: a scan walking the whole
+    // saturated 16 384-char buffer measures ~256 ms per `is_repeating` call in
+    // this debug build (23 s for a 4 500-delta stream of the same workload).
     // The bounded scan has to stay three orders of magnitude below that.
     let mut det = huge;
     let started = std::time::Instant::now();
@@ -715,9 +715,9 @@ fn test_monitor_repetition_scan_work_is_bounded() {
     }
     let elapsed = started.elapsed();
     println!("300 saturated push+is_repeating cycles: {elapsed:?}");
-    // The same 300 deltas measured ~77 s before the fix (256 ms per scan on a
-    // saturated buffer in this debug build). The bounded scan must stay far
-    // below that; 4 s leaves a wide margin over the measured ~0.7 s.
+    // A scan walking the whole saturated buffer puts these same 300 deltas at
+    // ~77 s (256 ms per scan in this debug build). The bounded scan must stay
+    // far below that; 4 s leaves a wide margin over the measured ~0.7 s.
     assert!(
         elapsed < std::time::Duration::from_secs(4),
         "the per-delta repetition scan is no longer bounded: 300 saturated \
@@ -725,7 +725,7 @@ fn test_monitor_repetition_scan_work_is_bounded() {
     );
 }
 
-// --- Rescued argument keys & fenced-code awareness (recon M5 regression guard) ---
+// --- Rescued argument keys & fenced-code awareness ---
 
 /// Search-tool call written in the attribute/body encodings.
 fn grep_call_body(pattern: &str) -> String {

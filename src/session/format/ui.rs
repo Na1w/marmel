@@ -1,4 +1,4 @@
-//! The UI section (Design A §3.6 + §6): pane text is the byte authority (D4),
+//! The UI section: pane text is the byte authority,
 //! the semantic journal is a steering mirror only.
 
 use serde::{Deserialize, Serialize};
@@ -14,155 +14,132 @@ pub struct UiFile {
     pub section: UiSection,
 }
 
-/// Two authorities, exactly one of them for display (A D4): `chat_messages` for
-/// the chat pane, `subagent_panels` for the subagent panes. `journal` exists for
-/// steering correlation only.
-///
-/// Deliberately **not** `Eq`: `SubagentPanel::worked_duration_secs` is an `f64`
-/// (A §11.3 finding 5).
-///
-/// `Default` is derived, and that is only sound because [`ViewState`]'s own
+/// Two authorities, exactly one of them for display: `chat_messages` for the chat
+/// pane, `subagent_panels` for the subagent panes. `journal` is a steering mirror
+/// only. Deliberately **not** `Eq`: `SubagentPanel::worked_duration_secs` is an
+/// `f64`. `Default` is derived, and that is only sound because [`ViewState`]'s own
 /// `Default` is hand-written: a derived default `ViewState` would carry
-/// `focused_panel: ""`, which U-chk (A §6.5) refuses, and then
-/// `UiSection::default()` would not be a loadable bundle.
-///
-/// **t-020 pane-coverage extension:** the plan panel, the two streaming
-/// partials, the agent identity, the token counters and the abort-arming witness
-/// were appended as `#[serde(default)]` fields, so the version gate stays where
-/// A §3.1 put it: `SCHEMA_VERSION` is **unchanged**, because every new field has
-/// a serde default and an old `ui.json` therefore still parses — and each
-/// default is the value `Default` would have produced, so an old bundle keeps
-/// passing `structural_violations()` (U-chk refuses, it never invents).
-/// Compatibility is one-directional and honestly so: this struct is still
-/// `deny_unknown_fields`, so a section written by THIS binary is refused by an
-/// older one as a version mismatch rather than silently half-read
-/// (`session/format/mod.rs:10`).
+/// `focused_panel: ""`, which U-chk refuses, and then `UiSection::default()` would
+/// not be a loadable bundle. New pane fields arrive as `#[serde(default)]` whose
+/// default is exactly what `Default` produces, so `SCHEMA_VERSION` is unchanged and
+/// an old `ui.json` still parses; `deny_unknown_fields` makes this binary's output a
+/// version mismatch for an older binary rather than a silent half-read.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UiSection {
-    // ---- display authority (A §3.6) ----
+    // ---- display authority ----
     /// The chat pane, one entry per pane line, **exactly as displayed** (1:1 with
     /// `TuiRenderer::messages`). Includes the prefixes the pane spells
     /// (`"User: "`, `"[Tool Call] "`, …) and the local `[CLI]` lines the semantic
     /// journal never records. Restore SHALL assign this vector and SHALL NOT
-    /// regenerate any entry from a journal record (U1–U3).
+    /// regenerate any entry from a journal record.
     pub chat_messages: Vec<String>,
     /// Exact status-line text, so the status bar is byte-identical instead of
     /// resetting to `"Ready"`.
     pub status_line: String,
 
-    // ---- subagent panes (display authority for those panes, A §6.3) ----
+    // ---- subagent panes (display authority for those panes) ----
     pub subagent_panels: Vec<SubagentPanel>,
 
-    // ---- semantic journal mirror (A §6.4) ----
+    // ---- semantic journal mirror ----
     pub journal: Vec<UiJournalRecord>,
 
-    // ---- composer (gap 5) ----
+    // ---- composer ----
     pub composer: ComposerState,
 
-    // ---- view state: selection + scroll (gap 6) ----
+    // ---- view state: selection + scroll ----
     pub view: ViewState,
 
-    // ---- budget counters (witness only, A §6.5) ----
+    // ---- budget counters (witness only) ----
     pub budgets: BudgetWitness,
 
-    // ---- plan panel (gap 10, t-020) ----
+    // ---- plan panel ----
     //
-    // A §6.5 declared these "not persisted by decision" because the plan FILE
-    // (`.marmel/execution_plan.md`) is the authority for a fresh process
-    // (`tui/mod.rs:417-424` re-reads it at `init`). That decision is superseded
-    // for the *pane text*: the mission is "the exact text in every UI pane", and
-    // between `init` and the first plan-file poll the pane would otherwise show
-    // `"No active execution plan."` over a screen that said something else.
-    // The plan file stays the authority for a live session; these fields are
-    // what the pane actually displayed at capture instant.
-    /// The plan pane's text verbatim (`TuiRenderer::plan_content`, `tui/mod.rs:49`).
+    // The plan file (`.marmel/execution_plan.md`) stays the authority for a live
+    // session; these fields are what the plan *pane* displayed at capture
+    // instant. Without them the pane shows `"No active execution plan."` between
+    // boot and the first plan-file poll.
+    /// The plan pane's text verbatim (`TuiRenderer::plan_content`).
     #[serde(default)]
     pub plan_content: String,
-    /// The auto-open/auto-close latch (`tui/mod.rs:78`): it decides whether the
+    /// The auto-open/auto-close latch: it decides whether the
     /// elapsed-time figure in the plan border is drawn, so it is pane state too.
     #[serde(default)]
     pub had_active_plan: bool,
-    /// Task the plan box was flagging as in flight (`tui/mod.rs:135`). A §6.2 U5
-    /// called this derived; it is persisted here because it is *drawn*, and it is
-    /// restored as display state only (the live loop recomputes it on the next
-    /// tool call, which is the pre-existing behaviour).
+    /// Task the plan box was flagging as in flight. It is persisted here because
+    /// it is *drawn*, and it is restored as display state only: the live loop
+    /// recomputes it on the next tool call, as it already does.
     #[serde(default)]
     pub active_plan_task: Option<String>,
-    /// `plan_start_time` / `plan_completed_time` (`tui/mod.rs:167`, `:169`) as the
-    /// D5 `TimePoint` projection: the plan elapsed timer is an `Instant` pair and
+    /// `plan_start_time` / `plan_completed_time` as the
+    /// `TimePoint` projection: the plan elapsed timer is an `Instant` pair and
     /// can only survive as a projection.
     #[serde(default)]
     pub plan_start: Option<TimePoint>,
     #[serde(default)]
     pub plan_completed: Option<TimePoint>,
 
-    // ---- streaming partials (gap 11, t-020) ----
+    // ---- streaming partials ----
     //
-    // A §10.2 said these are "deliberately not persisted" because persisting a
-    // half-turn would fabricate a finished message. They are persisted here
-    // because they are **pane text** — the thinking/content region of the chat
-    // pane shows them live (`tui/render.rs:204-210`, `:450-456`) and losing them
-    // loses visible bytes. They stay display-only: restore SHALL NOT resume the
-    // provider request (§10.2) and SHALL NOT invent a finished transcript record;
-    // the text simply sits in the streaming region where the screen left it.
-    /// Partial thinking streamed for the turn in flight (`tui/mod.rs:45`).
+    // They are **pane text**: the chat pane's thinking/content region shows them
+    // live, and losing them loses visible bytes. Restore SHALL NOT resume the
+    // provider request and SHALL NOT invent a finished transcript record — the
+    // text sits in the streaming region where the screen left it.
+    /// Partial thinking streamed for the turn in flight.
     #[serde(default)]
     pub current_thought: String,
-    /// Partial answer text streamed for the turn in flight (`tui/mod.rs:47`).
+    /// Partial answer text streamed for the turn in flight.
     #[serde(default)]
     pub current_content: String,
 
-    // ---- agent / notice identity (gap 12, t-020) ----
-    /// Which agent the status line was crediting (`tui/mod.rs:142`; `"Manager"`
+    // ---- agent / notice identity ----
+    /// Which agent the status line was crediting (`"Manager"`
     /// when none). `None` means "old bundle, field absent" — the renderer then
     /// keeps whatever it derived at boot instead of inventing `"Manager"`.
     #[serde(default)]
     pub active_agent: Option<String>,
-    /// Half-collected steer sentence waiting for its newline (`tui/mod.rs:97`).
+    /// Half-collected steer sentence waiting for its newline.
     /// It is a pane-boundary buffer: dropping it silently loses the first words
     /// of the next notice line.
     #[serde(default)]
     pub steer_sentence_buffer: Option<String>,
 
-    // ---- token counters (witness only, t-020) ----
+    // ---- token counters (witness only) ----
     //
-    // Same rule as `budgets` (A §6.5): a persisted counter is compared and
-    // reported, never adopted, because the live session's counters belong to the
-    // live streams. `tui/mod.rs:434-444` derives them from `Event::TokensIn`/
-    // `Event::TokensOut`, so adopting stored numbers would double-count or erase a
-    // running total.
-    /// Estimated prompt tokens for the session (`tui/mod.rs:153`).
+    // Same rule as `budgets`: a persisted counter is compared and reported, never
+    // adopted, because the live session's counters belong to the live streams,
+    // which derive them from `Event::TokensIn`/`Event::TokensOut`; adopting
+    // stored numbers would double-count or erase a running total.
+    /// Estimated prompt tokens for the session.
     #[serde(default)]
     pub tokens_in: u64,
-    /// Estimated completion tokens for the session (`tui/mod.rs:155`).
+    /// Estimated completion tokens for the session.
     #[serde(default)]
     pub tokens_out: u64,
-    /// Context-window size in tokens of the orchestrator turn (`tui/mod.rs:157`).
+    /// Context-window size in tokens of the orchestrator turn.
     #[serde(default)]
     pub orchestrator_context_tokens: u64,
 
-    // ---- abort arming (display-only witness, t-020) ----
+    // ---- abort arming (display-only witness) ----
     //
-    // A §6.5 keeps `confirm_abort` / `abort_armed_at` out of the bundle ("a
-    // 3-second armed window has no meaning after a restart"), and §10's closed
-    // inventory has no rule that re-arms it. Both hold: the fields below record
-    // that the previous screen was showing "Abort armed. Press ESC again to
-    // abort.", and restore SHALL NOT re-arm the live renderer — re-arming would
-    // let one keypress abort a session the user never asked to abort.
-    /// Was the confirm-abort window open at capture instant (`tui/mod.rs:58`,
-    /// `:60`, and `TuiRenderer::is_abort_armed` at `tui/mod.rs:344`).
+    // A 3-second armed window has no meaning after a restart and nothing here
+    // re-arms it: the fields below record only that the previous screen showed
+    // "Abort armed. Press ESC again to abort.", and restore SHALL NOT re-arm the
+    // live renderer — re-arming would let one keypress abort a session the user
+    // never asked to abort.
+    /// Was the confirm-abort window open at capture instant
+    /// (`TuiRenderer::is_abort_armed`).
     #[serde(default)]
     pub abort_armed: bool,
-    /// When it was armed, as the D5 projection — the pair lets a reader state how
-    /// long the window had left. It is never converted back into an `Instant`
-    /// that could fire an abort.
+    /// When it was armed, as a `TimePoint` projection — the pair lets a reader
+    /// state how long the window had left. It is never converted back into an
+    /// `Instant` that could fire an abort.
     #[serde(default)]
     pub abort_armed_at: Option<TimePoint>,
 }
 
 /// Durable projection of one `SubagentDetail`, field-for-field, with the two
-/// `Instant`s and the `Duration` replaced by the D5 projection.
+/// `Instant`s and the `Duration` replaced by a `TimePoint` projection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubagentPanel {
@@ -179,19 +156,19 @@ pub struct SubagentPanel {
     pub content: String,
     pub is_active: bool,
     pub context_tokens: usize,
-    /// `worked_duration: Duration` as an explicit number of seconds (D5 T3 —
-    /// never a difference of two re-anchored instants).
+    /// `worked_duration: Duration` as an explicit number of seconds — never a
+    /// difference of two re-anchored instants.
     pub worked_duration_secs: f64,
     pub started_at: Option<TimePoint>,
     pub last_activity_at: Option<TimePoint>,
-    /// Per-subagent **turn** thinking (t-020): the mirror of the renderer's
-    /// `subagent_turn_thinking` map (`tui/mod.rs:163`) for this panel's `name`.
+    /// Per-subagent **turn** thinking: the mirror of the renderer's
+    /// `subagent_turn_thinking` map for this panel's `name`.
     /// `None` = the map had no entry, which is a real distinction: the detail
-    /// pane falls back to `thinking` in that case (`tui/render.rs:864-878`), so
+    /// pane falls back to `thinking` in that case, so
     /// an empty string and an absent entry draw different text.
     #[serde(default)]
     pub turn_thinking: Option<String>,
-    /// The mirror of `subagent_is_thinking` (`tui/mod.rs:165`): whether this
+    /// The mirror of `subagent_is_thinking`: whether this
     /// subagent was streaming reasoning tokens at capture instant. The spinner
     /// and the "thinking …/budget" bar in the detail pane are driven by it, so
     /// without it the pane comes back in the wrong state. `None` = no entry.
@@ -201,7 +178,7 @@ pub struct SubagentPanel {
 
 /// Persistence mirror of `ui::transcript::UiRecord` — the same 8 variants, the
 /// same payload types, the same `#[serde(tag = "type")]` layout. Declared here
-/// (A D1) because `UiTranscript` MUST NOT become a persistence type again (D2).
+/// because `UiTranscript` is not a persistence type.
 ///
 /// **Never display authority.** If a journal `User { text }` and a
 /// `chat_messages` entry disagree, `chat_messages` wins for the screen and the
@@ -269,9 +246,9 @@ pub struct ViewState {
     pub focused_panel: String,
     pub show_thought: bool,
     pub show_subagent_panel: bool,
-    /// Whether the plan box was on screen (t-020; `tui/mod.rs:76`). It sits here
+    /// Whether the plan box was on screen. It sits here
     /// because its sibling `show_subagent_panel` does: it is a viewer toggle
-    /// (`events.rs:179` flips it), not plan content.
+    /// (`events.rs` flips it), not plan content.
     #[serde(default)]
     pub show_plan_panel: bool,
     pub chat_auto_scroll: bool,
@@ -280,12 +257,11 @@ pub struct ViewState {
 }
 
 /// Hand-written rather than derived on purpose: `#[derive(Default)]` would give
-/// `focused_panel: ""`, which U-chk (A §6.5) refuses. The default here mirrors
-/// the renderer's own initial state — `focused_panel: FocusedPanel::Chat`
-/// (`src/ui/tui/mod.rs:192`), `show_thought`/`show_subagent_panel`/
-/// `show_plan_panel` false (`:195-198`) — so a hand-built `UiSection::default()`
-/// is a *loadable* bundle. Every field added later (t-020) keeps that property:
-/// its serde default is the same value written here.
+/// `focused_panel: ""`, which U-chk refuses. The default here mirrors
+/// the renderer's own initial state — `focused_panel: FocusedPanel::Chat`,
+/// `show_thought`/`show_subagent_panel`/`show_plan_panel` all false — so a
+/// hand-built `UiSection::default()` is a *loadable* bundle. Every field added
+/// later keeps that property: its serde default is the same value written here.
 impl Default for ViewState {
     fn default() -> Self {
         ViewState {
@@ -306,7 +282,7 @@ impl Default for ViewState {
 }
 
 /// Witness-only: the budgets are owned by `Config`, so a persisted difference is
-/// reported, never adopted (A §4 R-PIN-6 pattern).
+/// reported, never adopted.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetWitness {
@@ -319,12 +295,12 @@ pub struct BudgetWitness {
 pub const FOCUSED_PANELS: &[&str] = &["chat", "plan", "subagents"];
 
 impl UiSection {
-    /// U-chk (A §6.5): the structural preconditions of `ui.json`, checked before
-    /// any assignment. These are **preconditions, not repairs** — the loader
-    /// never "fixes" a caret or a selection; every violation is a
+    /// U-chk: the structural state `ui.json` must be in before any assignment.
+    /// These are **checks, not repairs** — the loader never "fixes" a caret or a
+    /// selection; every violation is a
     /// `Refused { HeaderManifestDisagreement, member: "ui.json" }`.
     ///
-    /// Returns one sentence per violation, quoting the offending value.
+    /// Returns one sentence per violation, quoting the value at fault.
     pub fn structural_violations(&self) -> Vec<String> {
         let mut out = Vec::new();
 
@@ -388,9 +364,9 @@ impl UiSection {
                 }
             }
         }
-        // t-020: the plan timer and the abort-arming witness are `TimePoint`s
-        // too, so they get the same A §5.6 sanity rule (negative / NaN /
-        // infinite monotonic offsets are a refusal, never defaulted to now).
+        // The plan timer and the abort-arming witness are `TimePoint`s too, so
+        // they get the same sanity rule: a negative, NaN or infinite monotonic
+        // offset is a refusal, never defaulted to now.
         for (field, tp) in [
             ("plan_start", &self.plan_start),
             ("plan_completed", &self.plan_completed),

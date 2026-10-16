@@ -40,33 +40,25 @@ impl ValidationOutcome {
 
 /// `true` when a tool name refers to the verdict tool (`leave_verdict`).
 ///
-/// **There is no verdict vocabulary in this module** (t-069): the matcher is a thin
-/// wrapper over [`crate::tool_names::is_leave_verdict_tool_name`], so the accepted
-/// spellings are exactly
-/// * the verdict rows of [`crate::tool_names::TOOL_ALIAS_TABLE`]
-///   (`leave_verdict`, `terminal__leave_verdict`, `leaveVerdict`,
-///   `leave_verdict_tool`), and
-/// * the one namespaced-suffix rule
-///   [`crate::tool_names::LEAVE_VERDICT_NAME_SUFFIXES`]
-///   (`validator__leave_verdict`, `…_leave_verdict`).
-///
-/// Adding a verdict spelling means adding a table row — never a comparison here.
-/// The harness dispatch arms, the tool-argument preview and the agent-loop verdict
-/// handling all agree because they all end up in that one table.
+/// This module owns no verdict vocabulary: the matcher is a thin wrapper over
+/// [`crate::tool_names::is_leave_verdict_tool_name`], so the accepted spellings
+/// are exactly the verdict rows of [`crate::tool_names::TOOL_ALIAS_TABLE`] and
+/// the suffix rule in [`crate::tool_names::LEAVE_VERDICT_NAME_SUFFIXES`]. A new
+/// spelling means a new table row, never a comparison here.
 pub fn is_leave_verdict_tool(name: &str) -> bool {
     is_leave_verdict_tool_name(name)
 }
 
-/// Reason recorded when no explicit approval was recorded anywhere in a verdict
-/// (gate t-033b). An absent, ambiguous or unparseable verdict marker is *not* an
-/// approval, so the deliverable is treated as not approved.
+/// Reason recorded when no explicit approval was recorded anywhere in a verdict.
+/// An absent, ambiguous or unparseable verdict marker is *not* an approval, so
+/// the deliverable is treated as not approved.
 pub const NO_EXPLICIT_APPROVAL_REASON: &str = "No explicit verdict recorded: the verdict file does not record an explicit approval, so the deliverable is treated as not approved.";
 
 /// Robustly parse (approved, critique) from `leave_verdict` arguments.
 ///
-/// Fail-closed (gate t-033b): an explicitly recorded approval approves, an
-/// explicitly recorded rejection rejects, and an ambiguous / unparseable /
-/// marker-less payload resolves to **not approved** carrying
+/// Fail closed: an explicitly recorded approval approves, an explicitly
+/// recorded rejection rejects, and an ambiguous / unparseable / marker-less
+/// payload resolves to **not approved** carrying
 /// [`NO_EXPLICIT_APPROVAL_REASON`]. It never returns `None`, so callers cannot
 /// paper over a missing verdict with an `unwrap_or(true)`-style default.
 pub fn parse_verdict_args(args: &serde_json::Value) -> Option<(bool, String)> {
@@ -92,9 +84,9 @@ pub fn parse_verdict_args(args: &serde_json::Value) -> Option<(bool, String)> {
         {
             Some(true)
         } else if is_failure_verdict_word(s) {
-            // The negative verdict words are owned by `crate::markers`
-            // (gate t-059); this site used to chain seven
-            // `eq_ignore_ascii_case("<literal>")` comparisons of its own.
+            // The negative verdict words come from the table owned by
+            // `crate::markers`; this site keeps no verdict-word comparisons of
+            // its own.
             Some(false)
         } else {
             None
@@ -121,15 +113,13 @@ pub fn parse_verdict_args(args: &serde_json::Value) -> Option<(bool, String)> {
         .trim()
         .to_string();
 
-    // Fail-closed verdict resolution (gate t-033b): an explicit verdict field
-    // wins; otherwise explicit approval/rejection wording inside the comments
-    // is honoured; otherwise NO verdict was recorded and the deliverable is
-    // not approved. The historical fallback defaulted to `true` ("assume
-    // approved if no rejection indicated"), which turned an absent, ambiguous
-    // or unparseable verdict marker into evidence of success.
+    // Fail-closed verdict resolution: an explicit verdict field wins; otherwise
+    // explicit approval/rejection wording inside the comments is honoured;
+    // otherwise NO verdict was recorded and the deliverable is not approved — an
+    // absent, ambiguous or unparseable marker is never evidence of success.
     let upper = comments.to_ascii_uppercase();
-    // The failure cues come from the marker owner's table (gate t-059); the
-    // approval side of the wording stays local to the validator.
+    // The failure cues come from the marker owner's table; the approval side of
+    // the wording stays local to the validator.
     let explicit_verdict_wording = has_failure_verdict_cue(&upper)
         || upper.contains("APPROV")
         || upper.contains("PASS")
@@ -202,9 +192,9 @@ async fn run_automated_validation_inner(
     cfg: &crate::config::Config,
     token: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<(bool, String)> {
-    // Gate t-046: `{tid}-validation.md` is an on-disk path derived from a task id,
-    // so the id is validated as a single path segment before any join. A rejected
-    // id is recorded as a hard verdict gap — the same fail-closed outcome as a
+    // `{tid}-validation.md` is an on-disk path derived from a task id, so the id
+    // is validated as a single path segment before any join. A rejected id is
+    // recorded as a hard verdict gap — the same fail-closed outcome as a
     // missing, unreadable or blank verdict file — and the id is never sanitized,
     // trimmed or clamped into some other file name.
     let validation_verdict_file = match task_id {
@@ -243,17 +233,14 @@ async fn run_automated_validation_inner(
                 .join(crate::manager::phase::MARMEL_DIR)
                 .join("prompts");
             if prompts_dir.is_dir() {
-                // Inverted fallback fixed (H4 in docs/recon_bugs_agents_monitor.md,
-                // gate t-033a): the prompts directory exists, yet this task has no
-                // readable, non-empty `{tid}-validation.md` verdict file. That used
-                // to resolve to an *approved* verdict ("deliverable assumed
-                // approved"), i.e. missing validation configuration counted as
-                // evidence of success. Absence of a recorded verdict is not an
-                // approval, so it now maps to not-approved and the caller leaves the
-                // plan line unchecked. An explicitly recorded verdict (the
-                // `Some(prompt)` arm above) behaves exactly as before, and a
-                // workspace without a prompts directory still falls back to the
-                // generic validator role prompt.
+                // Fail closed: the prompts directory exists, yet this task has
+                // no readable, non-empty `{tid}-validation.md` verdict file.
+                // Absence of a recorded verdict is not an approval, so this arm
+                // maps to not-approved and the caller leaves the plan line
+                // unchecked. An explicitly recorded verdict (the `Some(prompt)`
+                // arm above) behaves as documented, and a workspace without a
+                // prompts directory falls back to the generic validator role
+                // prompt.
                 let verdict_ref = validation_verdict_file
                     .as_deref()
                     .unwrap_or("<task-id>-validation.md");
@@ -331,10 +318,9 @@ async fn run_automated_validation_inner(
         token,
     );
 
-    // t-010 (A §5.5): the validator's engine is a local of this function too, so
-    // its history is mirrored out under the live worker key. `run_fix_loop`
-    // mirrors through the task-local handle (flow §4.8), exactly like
-    // `CURRENT_WORKER_TOKEN` is threaded.
+    // The validator's engine is a local of this function, so its history is
+    // mirrored out under the live worker key: `run_fix_loop` mirrors through the
+    // task-local handle, exactly like `CURRENT_WORKER_TOKEN` is threaded.
     let journal = crate::session::worker_journal::open(
         &_active_guard.0,
         crate::orchestrator::workers::worker_state_snapshot(&_active_guard.0)
@@ -382,8 +368,8 @@ async fn run_automated_validation_inner(
         temperature: 0.0,
         status_template: format!("{val_tag}: evaluating test & inspection output..."),
         verdict_log_role: agent.as_str().to_string(),
-        // Bounds of this validation pass (gate t-033c): the round cap and the
-        // wall-clock deadline end the pass with an explicit failed outcome.
+        // Bounds of this validation pass: the round cap and the wall-clock
+        // deadline end the pass with an explicit failed outcome.
         bounds: FixLoopBounds::new(
             cfg.orchestration
                 .specialists
@@ -495,7 +481,7 @@ async fn run_plan_validation_inner(
         token,
     );
 
-    // t-010 (A §5.5): same mirror for the plan-audit loop.
+    // Same engine mirror for the plan-audit loop.
     let journal = crate::session::worker_journal::open(
         &_active_guard.0,
         crate::orchestrator::workers::worker_state_snapshot(&_active_guard.0)
@@ -534,7 +520,7 @@ async fn run_plan_validation_inner(
         temperature: 0.0,
         status_template: format!("{val_tag}: auditing execution plan structure & granularity..."),
         verdict_log_role: "planner".to_string(),
-        // Bounds of this audit pass (gate t-033c).
+        // Bounds of this audit pass.
         bounds: FixLoopBounds::new(
             planner_cfg
                 .and_then(|sc| sc.max_fix_loop_rounds)
@@ -568,9 +554,9 @@ async fn run_plan_validation_inner(
             Ok((false, reason))
         }
         Ok(FixLoopResult::Aborted) => {
-            // Cancellation is a failure, not a verdict. (Previously returned
-            // Ok((false, …)), a soft rejection that downstream consumers could
-            // mistake for an auditor verdict.)
+            // Cancellation is a failure, not a verdict: it never surfaces as a
+            // soft rejection an upstream caller could mistake for an auditor
+            // verdict.
             Err(anyhow::anyhow!(
                 "Plan validation aborted by cancellation signal."
             ))
@@ -607,7 +593,7 @@ mod tests {
         assert!(!is_leave_verdict_tool(TOOL_DELEGATE_TASK));
     }
 
-    /// (t-069 item 1, test (a)) Table-driven equivalence: the validator's matcher
+    /// Table-driven equivalence (test (a)): the validator's matcher
     /// and the shared alias table must accept **exactly** the same verdict
     /// spellings. The spellings are read from the table at runtime, so a newly
     /// added verdict row is covered by this test the moment it exists — and a
@@ -688,7 +674,7 @@ mod tests {
         }
     }
 
-    /// (t-069 item 1) Source guard: this module must not enumerate a verdict-name
+    /// Source guard: this module must not enumerate a verdict-name
     /// spelling of its own. Needles are built at runtime from the table and from
     /// the suffix rule, so the guard covers spellings added later. Only the
     /// production part is scanned — the tests above legitimately *call* the matcher
@@ -793,11 +779,11 @@ mod tests {
         );
     }
 
-    /// Gate t-059 (dedup sweep A): the negative verdict vocabulary is owned by
+    /// The negative verdict vocabulary is owned by
     /// `crate::markers` (`FAILURE_VERDICT_WORDS` for whole verdict fields,
     /// `FAILURE_PROSE_CUES` for free-form comments). Table driven, and pinned
-    /// to the exact rendered critique bytes so the migration cannot change any
-    /// observable output.
+    /// to the exact rendered critique bytes so the shared table cannot change
+    /// any observable output.
     #[test]
     fn test_parse_verdict_args_uses_the_marker_owned_failure_vocabulary() {
         // (1) whole-value verdict fields — every word of the owner's table,
@@ -848,11 +834,10 @@ mod tests {
         );
     }
 
-    /// Gate t-059: the validator's prose cue is deliberately **weaker** than
+    /// The validator's prose cue is deliberately **weaker** than
     /// `markers::has_failure_marker` (a `0 failed` test counter is a benign
     /// counter for the marker grammar but still reads as a rejection cue in a
-    /// validator comment). Preserving that asymmetry is what keeps this
-    /// migration output-neutral; pinning it stops a later "cleanup" from
+    /// validator comment). Pinning that asymmetry stops a later change from
     /// silently merging the two predicates.
     #[test]
     fn test_verdict_prose_cue_is_weaker_than_the_failure_marker() {
@@ -871,10 +856,9 @@ mod tests {
         assert_eq!(critique, benign_counter);
     }
 
-    /// Gate t-033b: the parsed verdict used to DEFAULT TO APPROVED whenever the
-    /// payload carried no recognizable verdict marker ("assume approved if no
-    /// rejection indicated"). An absent, ambiguous or unparseable marker must now
-    /// resolve to *not approved* with an explicit reason.
+    /// Fail closed on a missing marker: a payload carrying no recognizable
+    /// verdict marker never defaults to approved. An absent, ambiguous or
+    /// unparseable marker resolves to *not approved* with an explicit reason.
     #[test]
     fn test_parse_verdict_args_ambiguous_payload_is_not_approved() {
         let ambiguous = [
@@ -927,7 +911,7 @@ mod tests {
         );
     }
 
-    /// Gate t-033b (counterpart): failing closed must not break the explicit
+    /// Counterpart: failing closed must not break the explicit verdict
     /// direction — an explicitly recorded approve still approves and an explicit
     /// reject still rejects, with the recorded comments untouched.
     #[test]
@@ -957,10 +941,9 @@ mod tests {
         );
     }
 
-    /// H4 (gate t-033a): a workspace that pre-generates task prompts but has no
-    /// `{tid}-validation.md` verdict file for this task used to come back as an
-    /// **approved** verdict ("deliverable assumed approved"). Absence of a
-    /// recorded verdict must map to not-approved.
+    /// A workspace that holds task prompts but has no
+    /// `{tid}-validation.md` verdict file for this task must not come back as an
+    /// **approved** verdict: absence of a recorded verdict maps to not-approved.
     #[tokio::test]
     async fn missing_validation_verdict_file_is_not_an_approval() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -984,7 +967,7 @@ mod tests {
         );
     }
 
-    /// H4 (gate t-033a): an unreadable (invalid UTF-8 garbage) or blank verdict
+    /// An unreadable (invalid UTF-8 garbage) or blank verdict
     /// file is not an approval either — the fallback must fail closed.
     #[tokio::test]
     async fn unreadable_or_blank_validation_verdict_file_is_not_an_approval() {
@@ -1041,16 +1024,14 @@ mod tests {
         .await
     }
 
-    /// Gate t-046: the task id is validated as a single path segment before it is
-    /// joined onto the prompts directory.
-    ///
-    /// The fixture plants a verdict file **one directory above** the prompts
-    /// directory, i.e. only reachable through `../`. Without the gate the id
-    /// `../escape` would read it, the auditor would run against that planted
-    /// brief and the run would reach the (dead) validator backend — so the
-    /// escape is visible here as an error from `verdict_for`'s `expect`, never as
-    /// a silent success. With the gate the id is refused and reported as a hard
-    /// verdict gap, exactly like a missing verdict file.
+    /// The task id is validated as a single path segment before it is joined
+    /// onto the prompts directory. The fixture plants a verdict file **one
+    /// directory above** the prompts directory, i.e. only reachable through
+    /// `../`. An accepted `../escape` id would read it, audit against that
+    /// planted brief and reach the (dead) validator backend, so a successful
+    /// escape surfaces here as an error from `verdict_for`'s `expect`, never as
+    /// a silent success. A refused id is reported as a hard verdict gap, exactly
+    /// like a missing verdict file.
     #[tokio::test]
     async fn hostile_task_id_cannot_reach_a_verdict_file_outside_the_prompts_dir() {
         let tmp = tempfile::tempdir().expect("tempdir");

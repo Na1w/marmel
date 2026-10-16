@@ -2,8 +2,8 @@
 //!
 //! The stdio connection below is a raw transport only: the JSON-RPC envelopes,
 //! ids, method names, param shapes and result/error decoding come from
-//! [`super::protocol`] (cluster C7), exactly like the HTTP/SSE transport in
-//! [`super::http`] consumes them. What is stdio-specific here is the child
+//! [`super::protocol`], exactly as the HTTP/SSE transport in [`super::http`]
+//! consumes them. What is stdio-specific here is the child
 //! process, the newline framing and this transport's debug instrumentation.
 
 use anyhow::{Context, Result, anyhow};
@@ -170,10 +170,9 @@ impl JsonRpcTransport for StdioMcpConnection {
         let mut line = String::new();
         loop {
             line.clear();
-            // Shared pump skeleton from `crate::net::sse` (cluster C4) replaces
-            // the hand-rolled `tokio::time::timeout` around `read_line`. The
-            // deadline is recomputed per read, preserving the flat per-response
-            // timeout the previous code had.
+            // Shared pump skeleton from `crate::net::sse`: the deadline is
+            // recomputed per read, which keeps this transport's flat
+            // per-response timeout.
             let n = {
                 let read_fut = self.stdout_reader.read_line(&mut line);
                 tokio::pin!(read_fut);
@@ -264,7 +263,7 @@ impl StdioMcpConnection {
 pub enum McpClient {
     Stdio(Box<Mutex<StdioMcpConnection>>),
     HttpSse(Mutex<HttpSseConnection>),
-    /// Test-only mock used to assert the routing chain without a live server.
+    /// Test-only mock for asserting the routing chain without a live server.
     #[cfg(test)]
     Mock(Mutex<MockMcpConnection>),
 }
@@ -474,7 +473,7 @@ mod tests {
         // has_tool matches the qualified name.
         assert!(manager.has_tool("alpha__get_weather"));
         assert!(manager.has_tool("beta__get_weather"));
-        // The raw name alone is no longer a valid key.
+        // The raw name alone is not a valid key.
         assert!(!manager.has_tool("get_weather"));
 
         // call_tool resolves the qualified name and dispatches the RAW name.
@@ -551,17 +550,16 @@ mod tests {
         );
     }
 
-    // ── net-C4: the stdio transport reads responses through the shared pump ──
+    // ── The stdio transport reads responses through the shared pump ────────
 
     /// `cat` — looked up on `PATH` instead of hard-coding its absolute path,
     /// which differs between runners (`/usr/bin` on macOS) — echoes every line
     /// written to it, which is enough to drive the `initialize` handshake and a
-    /// `tools/list` round-trip through `crate::net::pump_future` — the shared
-    /// replacement for the hand-rolled `tokio::time::timeout` around `read_line`.
+    /// `tools/list` round-trip through `crate::net::pump_future`.
     ///
-    /// Keeps the `cfg(unix)` gate: the point of the test is the echoed byte
-    /// stream, and Windows has no equivalent that mirrors a piped stdin back out
-    /// (`more` paginates and buffers instead of echoing).
+    /// Unix-only: the point of the test is the echoed byte stream, and Windows
+    /// has no equivalent that mirrors a piped stdin back out (`more` paginates
+    /// and buffers instead of echoing).
     #[cfg(unix)]
     #[tokio::test]
     async fn stdio_response_is_read_through_the_shared_pump() {
@@ -586,11 +584,10 @@ mod tests {
 
     /// The pump's idle deadline still surfaces the transport's own timeout error.
     ///
-    /// Made cross-platform deliberately: the only requirement is a child that
-    /// stays alive and never writes to stdout, so on Windows `cmd /C ping …`
-    /// (output sent to `NUL`) stands in for `sleep`. Program names come from
-    /// `PATH` — the previously hard-coded absolute path is missing on macOS
-    /// runners, where the binary lives in `/usr/bin` instead.
+    /// Cross-platform by design: the only requirement is a child that stays
+    /// alive and never writes to stdout, so on Windows `cmd /C ping …` (output
+    /// sent to `NUL`) stands in for `sleep`. Program names come from `PATH`;
+    /// their absolute paths differ between runners (`/usr/bin` on macOS).
     #[tokio::test]
     async fn stdio_read_hits_the_shared_pump_deadline() {
         // A "server" that never writes anything back.
@@ -627,7 +624,7 @@ mod tests {
         );
     }
 
-    // ── net-C7: the stdio transport speaks the shared protocol layer ────────
+    // ── The stdio transport speaks the shared protocol layer ───────────────
 
     #[cfg(unix)]
     use crate::mcp::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcTransport};
@@ -657,9 +654,9 @@ mod tests {
     /// A scripted "server" on stdout: emits the lines and then idles so its
     /// stdout stays open while the transport drives a round-trip.
     ///
-    /// Keeps the `cfg(unix)` gate: the script is POSIX shell (`printf` +
-    /// `sleep`). `sh` is resolved through `PATH` rather than hard-coding its
-    /// absolute location, which differs between Unix runners.
+    /// Unix-only: the script is POSIX shell (`printf` + `sleep`). `sh` is
+    /// resolved through `PATH` rather than hard-coding its absolute location,
+    /// which differs between Unix runners.
     #[cfg(unix)]
     fn scripted_server(lines: &[&str]) -> McpServerConfig {
         let mut script = String::from("printf '%s\\n'");
@@ -676,16 +673,15 @@ mod tests {
         }
     }
 
-    /// Cluster C7 guard: what the stdio transport puts on the wire is exactly
-    /// the envelope text `crate::mcp::protocol` builds — the very same bytes the
-    /// HTTP/SSE transport sends (see `http_wire_bodies_are_the_protocol_layers_envelopes`
-    /// in `mcp::http_tests`), which is what makes this one protocol layer and
-    /// not two.
+    /// What the stdio transport puts on the wire is exactly the envelope text
+    /// `crate::mcp::protocol` builds — the very same bytes the HTTP/SSE transport
+    /// sends (see `http_wire_bodies_are_the_protocol_layers_envelopes` in
+    /// `mcp::http_tests`), which is what makes this one protocol layer and not
+    /// two.
     ///
-    /// Keeps the `cfg(unix)` gate: the capture needs a real `tee` (stdin mirrored
-    /// to both the capture file and the pipe back to us), and Windows ships no
-    /// such program. `tee` is resolved through `PATH`, so the test no longer
-    /// hard-codes its absolute location.
+    /// Unix-only: the capture needs a real `tee` (stdin mirrored to both the
+    /// capture file and the pipe back to us), and Windows ships no such program.
+    /// `tee` is resolved through `PATH`.
     #[cfg(unix)]
     #[tokio::test]
     async fn stdio_wire_bodies_are_the_protocol_layers_envelopes() {
@@ -818,8 +814,8 @@ mod tests {
     /// the two share the protocol layer's id policy: a fresh connection starts at
     /// the first request id, and the handshake does not consume one.
     ///
-    /// Keeps the `cfg(unix)` gate (the echo-backed `cat` server above): `cat` is
-    /// looked up on `PATH` rather than pinned to an absolute path.
+    /// Unix-only (the echo-backed `cat` server above): `cat` is looked up on
+    /// `PATH` rather than pinned to an absolute path.
     #[cfg(unix)]
     #[tokio::test]
     async fn both_transports_share_the_protocols_id_allocator_policy() {

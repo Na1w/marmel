@@ -1,6 +1,6 @@
 //! Loader vocabulary: the outcome of a restore, the machine-readable refusal,
-//! the repair report, and the D5 non-restorable notices (Design A §3.10, §3.11;
-//! `RestoredSession` is defined by flow §4.6/§4.9, which A §3.10 only uses).
+//! the repair report, and the non-restorable notices. `RestoredSession` is
+//! defined here too: the verified bundle, inert until an installer runs.
 
 use std::path::PathBuf;
 
@@ -14,12 +14,12 @@ use super::worker::WorkerSection;
 /// Result of `session::restore::load_bundle`. **In-memory only** — never
 /// serialized: it is the loader's verdict about a bundle, and
 /// `ProcessEnding::HardKillInferred` exists precisely because this verdict must
-/// not be written back (A D6: bundle bytes untouched).
+/// not be written back (bundle bytes untouched).
 #[derive(Debug)]
 pub enum RestoreOutcome {
     /// No `manifest.json` under `Plan::session_bundle_path()`. Not an error. If
     /// legacy journals are present, the caller MUST be told they are not
-    /// restorable (A D2).
+    /// restorable.
     NoBundle {
         /// The bundle directory that was searched.
         bundle: PathBuf,
@@ -29,7 +29,7 @@ pub enum RestoreOutcome {
         /// Member-looking files on disk that the (absent) manifest cannot list.
         orphan_members: Vec<String>,
     },
-    /// Fail-closed (A D6): the bundle was **not** read into state and **no byte
+    /// Fail-closed: the bundle was **not** read into state and **no byte
     /// of it was modified**.
     Refused {
         refusal: Refusal,
@@ -42,7 +42,7 @@ pub enum RestoreOutcome {
         ending: ProcessEnding,
         report: RepairReport,
     },
-    /// A D6's single tolerated partial: one corrupt worker file. That worker is
+    /// The single tolerated partial restore: one corrupt worker file. That worker is
     /// present with `WorkerStatus::Unrecoverable`; everything else restored.
     PartiallyRestored {
         session: RestoredSession,
@@ -58,7 +58,7 @@ pub enum RestoreOutcome {
 pub struct Refusal {
     pub code: RefusalCode,
     pub message: String,
-    /// Offending member, when the refusal is member-scoped.
+    /// The member the refusal names, when the refusal is member-scoped.
     pub member: Option<String>,
 }
 
@@ -76,8 +76,8 @@ impl Refusal {
         self
     }
 
-    /// The refusal sentence a user is shown (A §7.5: "the refusal message is a
-    /// first-class deliverable" — code, member, the numbers involved, and the
+    /// The refusal sentence a user is shown — the refusal message is a
+    /// first-class deliverable: code, member, the numbers involved, and the
     /// promise that the bundle was not modified).
     pub fn display(&self, bundle: &std::path::Path) -> String {
         match &self.member {
@@ -135,7 +135,7 @@ impl RefusalCode {
 
 /// What the loader had to do to make the transcript sendable, and everything it
 /// could not restore. One object, three destinations: UI status line, journaled
-/// UI record, `tracing::warn!` — never a discarded `let _` (A D6).
+/// UI record, `tracing::warn!` — never a discarded `let _`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepairReport {
@@ -143,12 +143,12 @@ pub struct RepairReport {
     /// Recomputed vs. persisted `ManagerSection::pinned_prefix_end`.
     pub pinned_prefix_end_expected: Option<u32>,
     pub pinned_prefix_end_actual: Option<u32>,
-    /// Counts from the normalization passes (A §8).
+    /// Counts from the normalization passes.
     pub orphan_tool_results_pruned: usize,
     pub aborted_results_synthesized: usize,
     pub tool_results_regrouped: usize,
     /// MUST be `2` on any path that ran normalization, and `normalization_stable`
-    /// MUST be `true` — otherwise the outcome is `Refused` (A D6).
+    /// MUST be `true` — otherwise the outcome is `Refused`.
     pub normalization_passes: u8,
     pub normalization_stable: bool,
     pub manager_messages_before: usize,
@@ -158,17 +158,17 @@ pub struct RepairReport {
     pub workers_unrecoverable: Vec<String>,
     /// Completed entries dropped because the live ring holds ≤10.
     pub completed_dropped_by_ring_cap: usize,
-    /// Every D5 projection that lost a capability.
+    /// Every `NonRestorableNotice` for a capability that was lost.
     pub notices: Vec<NonRestorableNotice>,
     pub warnings: Vec<String>,
-    /// Per-worker before/after history counts (A §11.3 finding 2: the §3.10
-    /// shape carries manager-level counts only, which makes per-worker
-    /// acceptance criteria string-matching). The `warnings` sentences required by
-    /// A §8.4 are still emitted, so both readers are served.
+    /// Per-worker before/after history counts. The manager-level shape carries
+    /// manager counts only, which would make per-worker acceptance criteria
+    /// string-matching; the `warnings` sentences the repair contract requires are
+    /// still emitted, so both readers are served.
     pub worker_counts: Vec<WorkerRepairCounts>,
 }
 
-/// Per-worker normalization bookkeeping (A §11.3 finding 2).
+/// Per-worker normalization bookkeeping.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerRepairCounts {
@@ -182,7 +182,7 @@ pub struct WorkerRepairCounts {
 }
 
 /// A first-class, user-visible statement that a capability did not survive the
-/// restart (A D5). Emitted by every lossy projection; collected into
+/// restart (emitted by every lossy projection); collected into
 /// `RepairReport`, the UI, and the journaled UI record. Not a log line, and
 /// never a silent re-mint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,15 +221,15 @@ pub enum NonRestorableKind {
 }
 
 impl NonRestorableNotice {
-    /// Deduplicated union key (A §11.3 finding 4: capture may record
+    /// Deduplicated union key: capture may record
     /// capture-time losses, the loader always adds load-time losses, and the
-    /// deduplicated union is what lands in `RepairReport::notices`).
+    /// deduplicated union is what lands in `RepairReport::notices`.
     pub fn dedup_key(&self) -> (NonRestorableKind, String) {
         (self.kind.clone(), self.subject.clone())
     }
 }
 
-/// The verified bundle, inert until an installer runs (flow §4.9). Nothing in
+/// The verified bundle, inert until an installer runs. Nothing in
 /// this type has touched live state.
 #[derive(Debug, Clone)]
 pub struct RestoredSession {
@@ -243,42 +243,42 @@ pub struct RestoredSession {
     pub bundle: PathBuf,
 }
 
-/// What one normalization pass set did to one transcript (flow §4.5); feeds
-/// `RepairReport` (A §3.10/§8.4).
+/// What one normalization pass set did to one transcript; feeds
+/// `RepairReport`.
 ///
-/// Every count here is paired with [`AppliedRule`] entries in `applied`: A §8.4
-/// bans silent repair, so a number without the ids and message indices behind it
+/// Every count here is paired with [`AppliedRule`] entries in `applied`: silent
+/// repair is banned, so a number without the ids and message indices behind it
 /// is not a report.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NormalizeReport {
     pub pruned_orphan_ids: Vec<String>,
     pub synthesized_aborted_ids: Vec<String>,
     pub regrouped_ids: Vec<String>,
-    /// Duplicate `role:"tool"` results N2 dropped while keeping the first
-    /// (`manager::context::repair_tool_call_pairs`, A §8.1/§8.3 H2). A §8.4 gives
-    /// `RepairReport` no dedicated duplicate field, so these are counted here and
+    /// Duplicate `role:"tool"` results dropped while keeping the first
+    /// (`manager::context::repair_tool_call_pairs`). `RepairReport` has no
+    /// dedicated duplicate field, so these are counted here and
     /// spelled out in `RepairReport::warnings`.
     pub dropped_duplicate_ids: Vec<String>,
     /// Every rule the pass set applied, in pass order, with the id and the
-    /// affected message index (A §8.4).
+    /// affected message index.
     pub applied: Vec<AppliedRule>,
-    /// What N6 found when it cross-checked the recorded pairing witness against
-    /// what the passes actually did (A §8.2 N6): reported, never reconciled.
+    /// What the pairing-witness cross-check found — the recorded witness against
+    /// what the passes actually did: reported, never silently fixed.
     pub n6_disagreements: Vec<String>,
-    /// Always `2` (A §8.2 N5): the passes run exactly twice.
+    /// Always `2`: the passes run exactly twice.
     pub passes: u8,
     pub stable: bool,
     pub pinned_prefix_end_before: usize,
     pub pinned_prefix_end_after: usize,
-    /// History length as decoded / as installed (A §8.4 before/after counts — the
+    /// History length as decoded / as installed (before/after counts — the
     /// per-worker half of which `RepairReport` carries in `worker_counts`).
     pub messages_before: usize,
     pub messages_after: usize,
 }
 
-/// One applied normalization rule (A §8.2/§8.4): which pass, which
+/// One applied normalization rule: which pass, which
 /// `tool_call_id`, and which message it acted on. `index_before` is the index in
-/// the **pre-normalization** vector, `index_after` the index in the healed one — a
+/// the vector as decoded, `index_after` the index in the healed one — a
 /// rule that added a message has no `index_before`, one that removed a message has
 /// no `index_after`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,18 +290,18 @@ pub struct AppliedRule {
 }
 
 impl AppliedRule {
-    /// N1 = `prune_orphan_tool_messages`.
+    /// The orphan-tool-result prune: `prune_orphan_tool_messages`.
     pub const N1_PRUNE: &'static str = "N1 prune orphan result";
-    /// N2 synthesize = the missing half of `repair_tool_call_pairs`.
+    /// The missing-result half of `repair_tool_call_pairs`.
     pub const N2_SYNTHESIZE: &'static str = "N2 synthesize aborted result";
-    /// N2 regroup = the move half of `repair_tool_call_pairs`.
+    /// The move half of `repair_tool_call_pairs`.
     pub const N2_REGROUP: &'static str = "N2 regroup result";
-    /// N2 dedup = the duplicate-keeping-first half of `repair_tool_call_pairs`.
+    /// The duplicate-keeping-first half of `repair_tool_call_pairs`.
     pub const N2_DEDUPLICATE: &'static str = "N2 drop duplicate result";
 }
 
-/// Which vector the pins are being verified on (A §4 R-PIN-5 for the stored
-/// transcript, A §8.2 N3 for the normalized one).
+/// Which vector the pins are being verified on: the stored
+/// transcript, or the normalized one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinStage {
     Stored,
@@ -318,7 +318,7 @@ impl PinStage {
 }
 
 /// Convenience: recompute the pin witness from a transcript, exactly the way the
-/// capture side does it (R-PIN-5 step 5).
+/// capture side does it.
 pub fn witness_of(messages: &[MessageRecord]) -> Option<PinWitness> {
     if messages.len() < 2 {
         return None;

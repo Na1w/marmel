@@ -1,31 +1,23 @@
-//! t-023 — the periodic commit triggers: does a crash actually leave a bundle?
+//! The periodic commit triggers: does a crash actually leave a bundle? The abort
+//! and panic-hook flush belongs to the abort-flush integration tests.
 //!
-//! Flow `docs/design_session_restore_flow.md` §1 fixes **when** a session bundle
-//! is written and **who** writes it. This file pins the non-abort, non-panic half
-//! of that contract (Ctrl-C / abort / panic-hook flush belongs to t-024):
-//!
-//! * **T-1 turn boundary** — a bundle with a manifest appears after one round of
-//!   the manager loop (a) — that bundle is what a `--resume` can open at all;
-//! * **R-TRIG-2/3 coalescing** — the ~250 ms floor (`session_commit_min_interval_ms`)
-//!   really folds repeated T-4/T-5 requests into one write, and mandatory triggers
-//!   (T-1/T-2/T-3/T-9) ignore the floor (b);
-//! * **T-2 pre-dispatch** — a commit is requested *before* a tool batch is
-//!   dispatched, and the committed manager section is provably **dangling** at
-//!   that moment: an assistant `tool_calls` batch with no results yet, which is
-//!   what the loader's normalizer (L8) needs to find after a hard kill (c);
-//! * **T-9 loop tail** — the tail commit records `ProcessEnding::CleanTail`, which
-//!   is the only thing that lets a later boot classify `CleanTail` apart from
-//!   `HardKillInferred` (d);
-//! * `session_enabled = false` writes **nothing**, ever (e), and
-//!   `session_commit_on_tool_result = false` suppresses T-3 only.
+//! * **T-1 `ManagerTurnBoundary`** — a bundle with a manifest appears after one
+//!   round of the manager loop, and that bundle is what a `--resume` can open;
+//! * **coalescing** — the `session_commit_min_interval_ms` floor folds repeated
+//!   T-4 `UiEvent` / T-5 `WorkerEdge` requests into one write; T-1/T-2/T-3/T-9 do not;
+//! * **T-2 `PreDispatch`** — a commit is requested *before* a tool batch is
+//!   dispatched and the committed section is provably **dangling**: an assistant
+//!   `tool_calls` batch with no results, which the dangling repair needs;
+//! * **T-9 `CleanTail`** — the tail commit records `ProcessEnding::CleanTail`, the
+//!   only thing that lets a later boot tell `CleanTail` from `HardKillInferred`;
+//! * `session_enabled = false` writes **nothing**, ever, and
+//!   `session_commit_on_tool_result = false` suppresses T-3 `ToolResult` only.
 //!
 //! The two end-to-end cases drive the **real** session loop
 //! ([`marmennill::ui::run_session`]) against a wiremock backend, so the triggers
-//! are observed as the loop actually reaches them, not as a mock pump.
-//!
-//! State discipline: the commit ledger and the commit-diff cache are
-//! process-global, so every case takes the mutex and asserts **deltas** of the
-//! ledger rather than absolute counts.
+//! are observed as the loop actually reaches them, not as a mock pump. State
+//! discipline: the commit ledger and the commit-diff cache are process-global, so
+//! every case takes the mutex and asserts ledger **deltas**.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -103,7 +95,7 @@ impl Renderer for MirrorRenderer {
 }
 
 /// A minimal but legal transcript: the pinned `[0]`/`[1]` pair every member header
-/// and every L1–L2 gate expects.
+/// and every L1–L2 loader check expects.
 fn engine() -> ContextEngine {
     let mut ctx = ContextEngine::new(200_000);
     ctx.append(Message::System {
@@ -214,7 +206,7 @@ fn one_tool_call_sse() -> String {
     }))
 }
 
-// ------------------------------------------------------------------ (a) T-1
+// --------------------------------------------------- (a) T-1 turn boundary
 
 #[tokio::test]
 async fn turn_boundary_commit_leaves_a_manifest_bearing_bundle() {
@@ -262,7 +254,7 @@ async fn turn_boundary_commit_leaves_a_manifest_bearing_bundle() {
     );
 }
 
-// --------------------------------------------------------------------- (b)
+// --------------------------------- (b) coalescing vs the mandatory triggers
 
 #[tokio::test]
 async fn throttled_triggers_coalesce_and_mandatory_triggers_ignore_the_floor() {
@@ -293,7 +285,7 @@ async fn throttled_triggers_coalesce_and_mandatory_triggers_ignore_the_floor() {
     assert_eq!(throttled, 24);
     assert!(pump.pending(), "the throttled debt is still owed");
 
-    // R-TRIG-3: a mandatory trigger wins inside the same window and clears the debt.
+    // A mandatory trigger wins inside the same window and clears the debt.
     assert!(
         is_written(pump.request(CommitTrigger::PreDispatch, &ctx, &renderer)),
         "T-2 is never throttled"
@@ -336,7 +328,7 @@ async fn throttled_triggers_coalesce_and_mandatory_triggers_ignore_the_floor() {
     );
 }
 
-// --------------------------------------------------------------------- (c)
+// ----------------------------------- (c) T-2 pre-dispatch, dangling batch
 
 #[tokio::test]
 async fn pre_dispatch_commit_captures_the_dangling_tool_call_batch() {
@@ -378,7 +370,7 @@ async fn pre_dispatch_commit_captures_the_dangling_tool_call_batch() {
     assert_eq!(ending_on_disk(&bundle), "inProgress");
 }
 
-// --------------------------------------------------------------------- (d)
+// ------------------------------------------- (d) T-9 clean-tail ending
 
 #[tokio::test]
 async fn clean_tail_trigger_records_the_clean_tail_ending() {
@@ -414,7 +406,7 @@ async fn clean_tail_trigger_records_the_clean_tail_ending() {
     );
 }
 
-// --------------------------------------------------------------------- (e)
+// ----------------------- (e) disabled writes nothing / result switch off
 
 #[tokio::test]
 async fn session_disabled_writes_nothing_at_any_trigger() {
@@ -487,7 +479,7 @@ async fn worker_lifecycle_edge_is_harvested_on_the_session_thread() {
     let before = marmennill::ui::session::session_commit_ledger();
 
     // A worker edge is recorded (as `orchestrator::workers` does from a worker
-    // thread) and consumed exactly once (R-TRIG-0: no write off-thread, ever).
+    // thread) and consumed exactly once: no commit is ever written off-thread.
     marmennill::ui::session::mark_worker_lifecycle_edge();
     assert!(marmennill::ui::session::take_worker_lifecycle_edge());
     assert!(

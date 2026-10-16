@@ -1,30 +1,22 @@
-//! Filesystem tools: read_file (paginated, byte-capped), replace (strict),
-//! write_file.
+//! Filesystem tools: `read_file` (paginated, byte-capped), `replace` (strict),
+//! `write_file`.
 //!
-//! REQ-TOOL-002: `replace` only writes when the target string occurs exactly
-//! once — 0 or ≥2 matches return an error without touching the file.
-//! REQ-TOOL-003: `read_file` is character-paginated with `offset` and `limit`
-//! parameters and a `[Showing characters X-Y of Z...]` footer.
-//! REQ-TOOL-004: `write_file` auto-creates parent directories with mode 0o755.
+//! [`replace`] writes only when the target string occurs exactly once — 0 or ≥2
+//! matches return an error without touching the file. [`read_file`] is
+//! character-paginated (`offset`, `limit`, `[Showing characters X-Y of Z...]`
+//! footer) and never loads more than [`READ_FILE_MAX_BYTES`] from one file: a
+//! larger file yields the requested window of the loaded head plus a
+//! machine-visible [`READ_FILE_TRUNCATION_MARKER`] block (`truncated: true`,
+//! byte/character offsets, re-run hint) instead of an opaque failure.
+//! [`write_file`] auto-creates parent directories with mode 0o755.
 //!
-//! Read ceiling (recon bug H2): [`read_file`] never loads more than
-//! [`READ_FILE_MAX_BYTES`] from one file. A file larger than that yields the
-//! requested window of the loaded head plus a machine-visible
-//! [`READ_FILE_TRUNCATION_MARKER`] block (`truncated: true`, byte/character
-//! offsets, and a re-run hint) instead of an opaque failure or an unbounded
-//! allocation.
-//!
-//! Staged writes (recon bug H4): [`replace`] and [`write_file`] write through
-//! [`write_file_atomic`], which stages into a name that is unique per caller
-//! (`.{stem}.tmp.{pid}.{nanos}.{seq}`, created with `O_EXCL`), renames it within
-//! the same directory (atomic, same filesystem), and removes the staged file on
-//! *every* failure path — including a failed `rename`. Concurrent `replace`
-//! calls on one target are additionally serialised per path so a later rename
-//! cannot silently discard an earlier edit.
-//!
-//! Path mapping: every path argument is passed through `map_path`, which maps
-//! the canonical container path `/home/coder/workspace/...` onto the current
-//! working directory, matching marmennill-cli's local tool execution.
+//! Both writers go through [`write_file_atomic`]: a per-caller unique staged name
+//! created with `O_EXCL`, renamed within the same directory, and removed on
+//! *every* failure path — including a failed `rename`. Concurrent `replace` calls
+//! on one target are serialised per path so a later rename cannot silently
+//! discard an earlier edit. Every path argument passes through `map_path`, which
+//! maps the canonical container path `/home/coder/workspace/...` onto the current
+//! working directory.
 
 use crate::harness::{ToolError, ToolResult};
 use crate::tool_names::{TOOL_READ_FILE, TOOL_REPLACE, TOOL_WRITE_FILE};
@@ -114,24 +106,20 @@ pub const READ_FILE_MIN_LIMIT: usize = 2000;
 pub const READ_FILE_MAX_LIMIT: usize = 8000;
 pub const READ_FILE_DEFAULT_LIMIT: usize = 4000;
 
-/// Hard ceiling on how many **bytes** [`read_file`] loads from a single file
-/// (recon bug H2: an uncapped `std::fs::read` on a log, a minified asset or a
-/// sparse file allocated 2–3× the file size — `read` + `from_utf8_lossy` +
-/// `chars().count()` — and dumped it straight into the model context).
+/// Hard ceiling on how many **bytes** [`read_file`] loads from a single file: an
+/// uncapped `std::fs::read` on a log, a minified asset or a sparse file allocates
+/// 2–3× the file size (`read` + `from_utf8_lossy` + `chars().count()`) and dumps it
+/// straight into the model context.
 ///
 /// **Why 256 KiB (262 144 bytes):** the session budget is
-/// `config.max_context_tokens = 8192` by default (`src/config.rs`), and every
-/// tool result is additionally clipped to
-/// `harness::MAX_TOOL_OUTPUT_CHARS = 10_000` characters by
-/// `crate::harness::apply_tool_output_length_limit`. The widest page a caller
-/// may request is `READ_FILE_MAX_LIMIT = 8000` characters, which
+/// `config.max_context_tokens = 8192` by default (`src/config.rs`), and every tool
+/// result is additionally clipped to `harness::MAX_TOOL_OUTPUT_CHARS = 10_000`
+/// characters by `crate::harness::apply_tool_output_length_limit`. The widest page a
+/// caller may request is `READ_FILE_MAX_LIMIT = 8000` characters, which
 /// `crate::manager::context::count_text_tokens` (cl100k_base) prices at roughly
-/// 2 000–3 000 tokens — already ~30% of the whole budget. Bytes beyond one page
-/// window therefore can never reach the model, so loading more than 32 pages'
-/// worth of source buys nothing while exposing the process to a multi-hundred-
-/// MB allocation. 256 KiB = 32 × the widest page keeps ordinary source files
-/// fully walkable in a handful of calls, while the worst case per call is a
-/// quarter of a MiB of heap no matter how large the file on disk is.
+/// 2 000–3 000 tokens — already ~30% of the whole budget — so bytes beyond one page
+/// window can never reach the model. 256 KiB = 32 × the widest page, and the worst
+/// case per call is a quarter of a MiB of heap however large the file on disk is.
 pub const READ_FILE_MAX_BYTES: usize = 256 * 1024;
 
 /// Machine-visible prefix of the footer [`read_file`] appends when
@@ -140,17 +128,15 @@ pub const READ_FILE_MAX_BYTES: usize = 256 * 1024;
 pub const READ_FILE_TRUNCATION_MARKER: &str = "[read_file truncated]";
 
 /// `read_file(path, offset, limit)` — reads a UTF-8 file window by *characters*.
-///
-/// - `offset` is 0-based character index (default: 0).
-/// - `limit` is character count (default: 4000, min: 2000, max: 8000). Values
-///   below 2000 are clamped to 2000 to prevent models getting trapped in micro-pagination loops.
-/// - Returns sliced text with pagination footer if more characters remain.
-/// - Two-stage guard: at most [`READ_FILE_MAX_BYTES`] bytes are read from disk,
-///   and at most `READ_FILE_MAX_LIMIT` characters are returned. When the byte
-///   ceiling bites, the result is **not** an error: the text is followed by a
-///   [`READ_FILE_TRUNCATION_MARKER`] block carrying `truncated: true`, the byte
-///   and character offsets, and a "re-run with offset/limit" hint. The cut is
-///   always on a character boundary (see [`drop_partial_utf8_tail`]).
+/// `offset` is a 0-based character index (default: 0); `limit` is a character count
+/// (default: 4000, min: 2000, max: 8000), and values below 2000 are clamped to 2000 so
+/// a caller cannot get trapped in micro-pagination. Sliced text comes back with a
+/// pagination footer when more characters remain. Two-stage guard: at most
+/// [`READ_FILE_MAX_BYTES`] bytes are read from disk and at most `READ_FILE_MAX_LIMIT`
+/// characters are returned; when the byte ceiling bites the result is **not** an error
+/// but the window plus a [`READ_FILE_TRUNCATION_MARKER`] block (`truncated: true`, byte
+/// and character offsets, re-run hint), always cut on a character boundary
+/// (see [`drop_partial_utf8_tail`]).
 pub fn read_file(args: &Value) -> Result<ToolResult, ToolError> {
     let path = str_arg(args, "path", TOOL_READ_FILE)?;
     let offset = usize_arg(args, "offset", 0, TOOL_READ_FILE)?;
@@ -296,7 +282,7 @@ fn read_truncation_footer(
 /// The whole read-modify-write cycle is serialised per target path (see
 /// [`replace_path_lock`]) and the write itself goes through
 /// [`write_file_atomic`], so concurrent callers can neither collide on a staged
-/// temp name nor lose each other's edit (recon bug H4).
+/// temp name nor lose each other's edit.
 pub fn replace(args: &Value) -> Result<ToolResult, ToolError> {
     let path = str_arg(args, "path", TOOL_REPLACE)?;
     let old_str = str_arg(args, "old_str", TOOL_REPLACE)?;
@@ -324,7 +310,7 @@ pub fn replace(args: &Value) -> Result<ToolResult, ToolError> {
     Ok(ToolResult::ok("replace applied"))
 }
 
-/// Number of process-local locks used to serialise [`replace`] per target path.
+/// Number of process-local locks that serialise [`replace`] per target path.
 ///
 /// Sharded rather than one-lock-per-path: no map to grow, no eviction policy,
 /// and the worst case is two unrelated files sharing a shard (harmless — the
@@ -348,7 +334,7 @@ fn replace_path_lock(path: &Path) -> std::sync::MutexGuard<'static, ()> {
     }
 }
 
-/// FNV-1a over the path text, used to pick a lock shard deterministically.
+/// FNV-1a over the path text; picks a lock shard deterministically.
 fn hash_path(path: &Path) -> usize {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in path.to_string_lossy().as_bytes() {
@@ -371,11 +357,10 @@ static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Stage a brand-new, exclusively-created file next to `target`.
 ///
-/// Name shape: `.{stem}.tmp.{pid}.{nanos}.{seq:08}` where
-/// * `pid` separates different processes,
-/// * `nanos` separates calls that a coarse clock would otherwise stamp alike,
-/// * `seq` is a process-global atomic counter, so **no two calls in this
-///   process can ever name the same path**, even with a one-second clock.
+/// Name shape: `.{stem}.tmp.{pid}.{nanos}.{seq:08}` — `pid` separates processes,
+/// `nanos` separates calls a coarse clock would stamp alike, and `seq` is a
+/// process-global atomic counter, so **no two calls in this process can ever
+/// name the same path**, even with a one-second clock.
 ///
 /// The file is created with `create_new` (`O_EXCL`): if the name is already
 /// taken — a stale temp file, a symlink planted by someone else, a genuine
@@ -462,15 +447,13 @@ impl Drop for StagedTemp {
 }
 
 /// Atomically (re)write `path` via a collision-proof staging file in the **same
-/// directory** followed by a `rename` (atomic within one filesystem).
-///
-/// Guarantees:
-/// * the staged name is unique per caller and created with `O_EXCL` — a
-///   concurrent caller, or a leftover temp file, is never clobbered;
+/// directory** followed by a `rename` (atomic within one filesystem). Guarantees:
+/// * the staged name is unique per caller and created with `O_EXCL` — a concurrent
+///   caller, or a leftover temp file, is never clobbered;
 /// * readers of `path` only ever observe the old or the new content, never a
 ///   truncated or interleaved mix;
-/// * any failure (payload write, permission copy, `rename`) removes the staged
-///   file, so no orphan temp files survive;
+/// * any failure (payload write, permission copy, `rename`) removes the staged file,
+///   so no orphan temp files survive;
 /// * the mode of an existing `path` is preserved.
 pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
     let dir = path

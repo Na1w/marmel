@@ -1,25 +1,23 @@
-//! Integration tests for the orchestrator `delegate` flow (execution plan
-//! task t-a102).
+//! Integration tests for the orchestrator `delegate` flow.
 //!
-//! These tests verify that `src/orchestrator/mod.rs` `delegate` flow is
-//! aligned with caesar's `Orchestrator` logic as captured in
-//! the caesar reference orchestration contract (not vendored in this repo):
+//! They verify that the `delegate` flow in `src/orchestrator/mod.rs` matches the
+//! caesar reference orchestration contract (not vendored in this repo):
 //!
-//! 1. **Fractal depth gating** — recursion bounds are STRICTLY enforced. The
-//!    gate is UNCONDITIONAL (parity with the caesar tools_manager gate), so a
-//!    request that would exceed the bound is rejected regardless of
-//!    `recursion_granted`, and a rejected delegation emits NO `Started` event.
-//! 2. **`DelegationEvent` surfacing** — a successful delegation emits exactly
-//!    one `Started` then one `Completed` event for the specialist + task.
+//! 1. **Fractal depth limits** — recursion bounds are STRICTLY enforced and
+//!    UNCONDITIONAL (parity with the caesar tools_manager check), so a request
+//!    that would exceed the bound is rejected regardless of `recursion_granted`,
+//!    and a rejected delegation emits NO `Started` event.
+//! 2. **`DelegationEvent` surfacing** — a successful delegation emits exactly one
+//!    `Started` then one `Completed` event for the specialist + task.
 //! 3. **`apply_check_off` parity** — `MISSION COMPLETE (t-xxx)` flips the plan
 //!    line to `[x]`.
 //!
-//! NOTE: The specialist workers (`run_specialist_llm`) attempt a live LLM call
-//! in non-`cfg(test)` builds. To keep these tests deterministic and offline, we
-//! set the process working directory to a fresh temp dir that contains NO
+//! NOTE: the specialist workers (`run_specialist_llm`) attempt a live LLM call in
+//! non-`cfg(test)` builds. To keep these tests deterministic and offline, the
+//! process working directory is set to a fresh temp dir containing NO
 //! `marmel.toml`, so `config::load(None)` returns the default config whose
-//! `backend_url` (`http://localhost:8000/v1`) is refused immediately, causing
-//! the worker to fall back to its deterministic canned deliverable.
+//! `backend_url` (`http://localhost:8000/v1`) is refused immediately, making the
+//! worker fall back to its deterministic canned deliverable.
 
 use marmennill::agents::{Agent, DelegationRequest, MissionMarker};
 use marmennill::harness::HarnessStats;
@@ -97,11 +95,11 @@ fn req(
     }
 }
 
-// 1. Fractal depth gating
+// 1. Fractal depth limits
 
 /// The recursion bound is STRICTLY enforced: a delegation at the max depth is
-/// rejected even when `recursion_granted` is false (parity with caesar's
-/// unconditional gate in caesar tools_manager).
+/// rejected even when `recursion_granted` is false (parity with the unconditional
+/// caesar tools_manager check).
 #[tokio::test]
 async fn test_depth_gate_rejects_at_bound_regardless_of_grant() {
     let tmp = setup().await;

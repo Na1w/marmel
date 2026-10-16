@@ -1,12 +1,12 @@
-//! t-022 — the boot path of `--resume`, end to end through the real binary.
+//! The boot path of `--resume`, end to end through the real binary.
 //!
 //! The unit-level pass in `src/ui/session_tests.rs` pins what the restore itself
 //! installs. This file pins the two things only `main` can get wrong:
 //!
-//! * the **usage errors** (`src/main.rs:296`, `session_flag_error`): a
-//!   contradictory `--resume --fresh`, and `--resume` while capture is off — both
-//!   `eprintln!` + exit **2**, before any runtime, config publish or bundle read;
-//! * the **exit-code mapping** (`src/main.rs:92-103`): the typed
+//! * the **usage errors** (`session_flag_error`): a contradictory
+//!   `--resume --fresh`, and `--resume` while capture is off — both `eprintln!`
+//!   + exit **2**, before any runtime, config publish or bundle read;
+//! * the **exit-code mapping** in `main`: the typed
 //!   `session::restore::RestoreRefused` the boot pass returns is mapped, after
 //!   teardown, onto `session::EXIT_RESTORE_REFUSED` (3) — and the trigger for that
 //!   pass may come from the flag or from `MARMEL_RESUME`, while `--fresh` stays
@@ -162,9 +162,9 @@ fn write_bundle_at(dir: &Path) -> PathBuf {
     bundle
 }
 
-/// Raise the stored `format_version` past what this binary understands: the L3
-/// gate refuses **before** any member is parsed, and because the manifest carries
-/// no self-hash, every member keeps its own `byte_len`/`fingerprint`.
+/// Raise the stored `format_version` past what this binary understands: the
+/// version check refuses **before** any member is parsed, and because the
+/// manifest carries no self-hash, every member keeps its own `byte_len`/`fingerprint`.
 fn tamper_format_version(bundle: &Path) {
     let path = bundle.join(marmennill::session::MANIFEST_FILE);
     let text = std::fs::read_to_string(&path).expect("manifest");
@@ -353,7 +353,7 @@ fn resume_with_capture_disabled_is_a_usage_error_that_exits_two() {
     assert_eq!(tree_bytes(&bundle), bundle_before);
 }
 
-/// The exit-3 mapping in `src/main.rs:92-103`: the boot pass prints the refusal
+/// The exit-3 mapping in `main`: the boot pass prints the refusal
 /// (code, member, both versions, "was NOT modified") to panes, journal and log,
 /// returns the typed `RestoreRefused`, and `main` maps it — after teardown — onto
 /// `session::EXIT_RESTORE_REFUSED`.
@@ -373,7 +373,7 @@ fn a_refused_resume_exits_with_the_named_refusal_code_and_says_so_three_times() 
     );
     assert_eq!(marmennill::session::EXIT_RESTORE_REFUSED, 3);
 
-    // stderr: what `main` repeats after the screen is gone.
+    // stderr: what `main` repeats once the screen is torn down.
     assert!(
         run.stderr.contains("session restore refused")
             && run.stderr.contains("was NOT modified")

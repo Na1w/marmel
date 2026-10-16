@@ -186,9 +186,9 @@ async fn test_llm_non_retryable_error_short_circuits() {
     );
 }
 
-/// Pin the pre-existing retryability classification of the LLM client: the
-/// transient statuses/timeouts/transport failures it always retried, and the
-/// rest it always surfaced immediately.
+/// Pin the retryability classification of the LLM client: the transient
+/// statuses/timeouts/transport failures it retries, and the rest it surfaces
+/// immediately.
 #[test]
 fn test_chat_error_retryability_matches_shared_policy() {
     for status in [503u16, 429, 502, 504] {
@@ -249,7 +249,7 @@ async fn test_llm_prefill_delay_triggers_initial_timeout_and_retries() {
             move |_req: &Request| {
                 let n = calls.fetch_add(1, Ordering::SeqCst);
                 if n < 2 {
-                    // Stalled prompt pre-fill: delay 1.5s (exceeding initial_timeout_secs of 1s)
+                    // Stalled first event: delay 1.5s (exceeding initial_timeout_secs of 1s)
                     ResponseTemplate::new(200)
                         .set_delay(Duration::from_millis(1500))
                         .set_body_string(sse_body("delayed"))
@@ -745,10 +745,10 @@ async fn test_policy_refused_mcp_names_are_never_advertised() {
     );
 }
 
-/// t-035d: a recovery turn built from out-of-range settings must reach the wire
-/// with every sampling parameter inside its documented range. The pre-fix
-/// `frequency_penalty: 2.5` / `temperature: 2.1` are exactly what made the
-/// provider answer HTTP 400, so the recovery turn could never recover.
+/// A recovery turn built from out-of-range settings must reach the wire with
+/// every sampling parameter inside its documented range: `frequency_penalty: 2.5`
+/// / `temperature: 2.1` are exactly what makes the provider answer HTTP 400, so an
+/// out-of-range recovery request can never recover.
 #[tokio::test]
 async fn test_llm_recovery_request_body_stays_in_documented_ranges() {
     use crate::llm::thinking::{
@@ -901,11 +901,11 @@ fn user_msg(text: &str) -> Message {
     }
 }
 
-/// The rebirth checkpoint spelled as the legacy `Message::System`, the variant
-/// that reaches the wire from restored older session bundles; `perform_rebirth`
-/// itself now emits the checkpoint as `Message::User`, and the request-boundary
-/// normalization covers both. Built from the real detector constant so the
-/// checkpoint bytes the normalization has to preserve are the ones under test.
+/// The rebirth checkpoint spelled as `Message::System`, the shape that reaches
+/// the wire from session bundles restored from older builds (`perform_rebirth`
+/// emits the checkpoint as `Message::User`); the request-boundary normalization
+/// covers both. Built from the real detector constant so the checkpoint bytes the
+/// normalization has to preserve are the ones under test.
 fn checkpoint_content() -> String {
     format!(
         "{prefix}1. demote mid-history system messages on the wire; 2. cover it with tests)",

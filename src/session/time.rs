@@ -1,33 +1,23 @@
-//! The `Instant` ↔ wall-clock projection of Design A D5 / §5.6 — the sole owner
-//! of `Instant` conversion for sessions.
+//! The `Instant` ↔ wall-clock projection for sessions: the sole owner of
+//! `Instant` conversion.
 //!
-//! `std::time::Instant` is NOT serializable in any meaningful way: its zero is
-//! process-local and undefined. The durable form is a pair (A §3.9):
+//! `std::time::Instant` is not serializable in any meaningful way — its zero is
+//! process-local and undefined. The durable form is a pair:
 //!
-//! * `elapsed_secs` — seconds since a **process-lifetime monotonic anchor**, and
+//! * `elapsed_secs` — seconds since a **process-lifetime monotonic anchor**;
 //! * `wall` — an absolute wall-clock reading sampled in the same statement.
-//!
-//! Rules implemented here (A §5.6):
-//!
 //! * **T1 (capture)** — [`TimePoint::now`] samples `Instant::now()` and
-//!   `chrono::Local::now()` back to back, both measured against
-//!   [`anchor`]. The anchor's own wall-clock position is written once per bundle
-//!   as `Manifest::anchor_wall`.
-//! * **T2 (re-anchor)** — [`TimePoint::to_instant`] rebuilds an `Instant` from
-//!   the wall delta, following the sanctioned precedent
-//!   [`manager::phase::get_plan_start_time`] (`src/manager/phase.rs`, which
-//!   re-derives `Instant::now() - elapsed` from a file's mtime). **Documented
-//!   approximation:** suspend/hibernate and wall-clock steps (NTP, manual set)
-//!   make the delta wrong by the size of the discontinuity — the same trade-off
-//!   the plan-start fallback already makes, and the only one available across a
-//!   process boundary.
+//!   `chrono::Local::now()` back to back, both measured against [`anchor`];
+//!   `Manifest::anchor_wall` records the anchor's wall position once per bundle.
+//! * **T2 (re-anchor)** — [`TimePoint::to_instant`] rebuilds an `Instant` from the
+//!   wall delta, the precedent set by [`manager::phase::get_plan_start_time`].
+//!   **Documented approximation:** suspend/hibernate and wall-clock steps (NTP,
+//!   manual set) make the delta wrong by the size of the discontinuity.
 //! * **T3 (durations are numbers)** — durations come from the persisted `f64`
 //!   (`WorkerSection::worked_secs`, `SubagentPanel::worked_duration_secs`), never
-//!   from a difference of two independently re-anchored instants. There is
-//!   deliberately no helper that subtracts two `TimePoint`s into an `Instant`.
+//!   from two independently re-anchored instants.
 //! * **T4 (ordering only)** — `elapsed_secs` orders members *within one process*
-//!   and must never be compared across processes or used to reconstruct an
-//!   `Instant`.
+//!   and must never be compared across processes nor rebuilt into an `Instant`.
 
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -41,7 +31,7 @@ use crate::session::format::TimePoint;
 ///
 /// One anchor per process is what makes `elapsed_secs` monotonic and comparable
 /// inside a bundle; `Manifest::anchor_wall` records its wall-clock position so a
-/// later process can describe (not reconstruct) it.
+/// later process can describe (not rebuild) it.
 static ANCHOR: LazyLock<(Instant, DateTime<Local>)> = LazyLock::new(|| {
     let instant = Instant::now();
     let wall = Local::now();
@@ -54,7 +44,7 @@ pub fn anchor() -> (Instant, DateTime<Local>) {
 }
 
 /// Wall-clock position of the process anchor — written as `Manifest::anchor_wall`
-/// so every `elapsed_secs` in the bundle has a stated origin (A §3.2).
+/// so every `elapsed_secs` in the bundle has a stated origin.
 pub fn anchor_wall() -> DateTime<Local> {
     ANCHOR.1
 }
@@ -74,14 +64,13 @@ impl TimePoint {
     }
 
     /// T2: rebuild an `Instant` in this process from the stored wall delta
-    /// (`instant' = Instant::now() - (wall_now - wall_recorded)`), exactly the
-    /// `Plan::get_plan_start_time()` shape.
+    /// (`instant' = Instant::now() - (wall_now - wall_recorded)`), the same shape
+    /// as `manager::phase::get_plan_start_time`.
     ///
-    /// The result is clamped to `Instant::now()` when the recorded wall clock is
-    /// in the future (a clock step backwards, or a machine whose clock was
-    /// corrected) — `Instant::checked_sub` cannot go negative, and silently
-    /// minting an instant far in the past would make every later duration
-    /// nonsense. Call sites that care SHALL report the clamp, not swallow it.
+    /// The result is clamped to `Instant::now()` when the recorded wall clock is in
+    /// the future: `Instant::checked_sub` cannot go negative, and minting an instant
+    /// far in the past would make every later duration nonsense. Call sites that
+    /// care SHALL report the clamp, not swallow it.
     pub fn to_instant(&self) -> Instant {
         let now_wall = Local::now();
         let age = match now_wall.signed_duration_since(self.wall).to_std() {
@@ -97,10 +86,10 @@ impl TimePoint {
     /// `ActiveWorkerInfo::started_at`) onto the durable pair.
     ///
     /// An instant older than the anchor cannot be expressed as a negative offset
-    /// (A §5.6 forbids a negative `elapsed_secs`), so such an input is floored at
+    /// (`elapsed_secs` is never negative), so such an input is floored at
     /// `0.0` and keeps its own wall-clock companion when the caller supplies one;
     /// [`TimePoint::from_instant_with_wall`] is the form capture code should use
-    /// for pre-existing timestamps.
+    /// for instants taken earlier in the process.
     pub fn from_instant(instant: Instant) -> Self {
         TimePoint::from_instant_with_wall(instant, Local::now())
     }
@@ -123,7 +112,7 @@ impl TimePoint {
 }
 
 /// `f64` seconds between two instants of this process's monotonic clock, floored
-/// at `0.0` because the durable shape has no negative offsets (A §5.6).
+/// at `0.0` because the durable shape has no negative offsets.
 fn elapsed_since(anchor: Instant, instant: Instant) -> f64 {
     instant
         .checked_duration_since(anchor)
@@ -179,7 +168,7 @@ mod tests {
     fn an_instant_older_than_the_anchor_floors_at_zero() {
         // The anchor is a `LazyLock` sampled at first use, so a `from_instant`
         // call made with an earlier process instant must not produce a negative
-        // offset (which A §5.6 makes a structural violation).
+        // offset (a negative offset is a structural violation).
         let tp = TimePoint::from_instant(Instant::now() - Duration::from_secs(1_000_000));
         assert_eq!(tp.elapsed_secs, 0.0);
         assert!(tp.is_sane());

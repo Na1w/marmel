@@ -3,26 +3,21 @@
 //! The subtask action vocabulary (`ForwardNotice` | `Cancel` | `DelegateTask` | `Sleep`) is
 //! owned by [`crate::orchestrator::steer`], and so is the **one** normalizer for it
 //! ([`normalize_steer_subtask_action`]). The bridge never compares the raw JSON `action`
-//! string: every action branch goes through the helpers below, which delegate to that
-//! normalizer. There is deliberately no second normalizer here and no action vocabulary
-//! spelled out as string literals — the typed constants are aliases of the orchestrator's own
-//! [`SteerSubtaskAction`] variants, so UI and orchestrator cannot drift apart and equivalent
-//! spellings (`Cancel`, `cancel_task`, `Abort Task`, `Sleep`, `crate::tool_names::TOOL_SLEEP`, …)
-//! always take the same branch in both layers.
+//! string: every action branch delegates to that normalizer. There is no second normalizer
+//! and no action vocabulary spelled out as string literals — the typed constants are aliases
+//! of the orchestrator's own [`SteerSubtaskAction`] variants, so UI and orchestrator cannot
+//! drift apart and equivalent spellings (`Cancel`, `cancel_task`, `Abort Task`, `Sleep`,
+//! `crate::tool_names::TOOL_SLEEP`, …) always take the same branch in both layers.
 //!
 //! A spelling outside the vocabulary is an explicit rejection: the normalizer logs it and
 //! returns [`SteerSubtaskAction::Unknown`], which matches none of the bridge's branches.
 //!
-//! ## Two vocabularies, two owners (t-069)
-//! The **subtask-action** vocabulary (`Cancel`, `abort`, `new task`, …) is steer-owned and
-//! never consults the tool table. The **tool-alias** vocabulary (the `sleep` family:
-//! `wait`, `sleeptask`, `waitseconds`, `pause`, the `terminal__` spelling, …) is owned by
+//! Two vocabularies, two owners: the subtask-action vocabulary (`Cancel`, `abort`, `new
+//! task`, …) is steer-owned and never consults the tool table, while the tool-alias
+//! vocabulary (the sleep-family spellings) is owned by
 //! [`crate::tool_names::TOOL_ALIAS_TABLE`] and reaches this module only through the
 //! orchestrator's normalizer, which asks that table
-//! ([`crate::tool_names::is_sleep_tool_grammar_spelling`]). This file spells neither
-//! vocabulary out — the guard test below builds its needles from the table at runtime —
-//! so a tool alias added to the table is accepted here automatically and a subtask action
-//! added to the table would be a bug the same test surfaces.
+//! ([`crate::tool_names::is_sleep_tool_grammar_spelling`]).
 
 use crate::orchestrator::SteerDecision;
 use crate::orchestrator::SteerSubtaskDecision;
@@ -101,11 +96,11 @@ mod tests {
         }
     }
 
-    /// (t-069 item 2, test (b)) Source guard: this module keeps **no** tool-alias
-    /// vocabulary of its own. The needles are built at runtime from the shared table
-    /// (every alias row and every canonical spelling), so a spelling added tomorrow is
-    /// covered the moment the table knows it — and this file cannot satisfy its own
-    /// needles, because it never quotes a tool name.
+    /// Source guard: this module keeps **no** tool-alias vocabulary of its own. The
+    /// needles are built at runtime from the shared table (every alias row and every
+    /// canonical spelling), so a spelling added later is covered the moment the table
+    /// knows it — and this file cannot satisfy its own needles, because it never quotes
+    /// a tool name.
     #[test]
     fn bridge_action_module_retains_no_tool_alias_literals() {
         let src = include_str!("action.rs");
@@ -151,9 +146,9 @@ mod tests {
         );
     }
 
-    /// The two vocabularies stay separate (t-069 item 2): the tool-alias part comes
-    /// from the table **through the steer normalizer**, and the bridge refuses a tool
-    /// alias that is not also a subtask action.
+    /// The two vocabularies stay separate: the tool-alias part comes from the table
+    /// **through the steer normalizer**, and the bridge refuses a tool alias that is
+    /// not also a subtask action.
     #[test]
     fn bridge_routes_tool_aliases_through_the_shared_table_not_its_own_list() {
         // (1) Every sleep-family spelling the shared table knows routes to the Sleep

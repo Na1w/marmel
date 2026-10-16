@@ -1,4 +1,4 @@
-//! The harness-level `delegate_task` handler and per-specialist tool gating.
+//! The harness-level `delegate_task` handler and per-specialist tool allowlist.
 
 use super::OrchestratorManager;
 use super::registry::SpecialistRegistry;
@@ -14,31 +14,26 @@ use crate::markers::{
 use crate::tool_names::TOOL_DELEGATE_TASK;
 use std::sync::Arc;
 
-/// REQ-ORCH-005: the harness-level `delegate_task` handler.
-///
-/// Parses the tool arguments (`agent_name`, `prompt`, `snippets`, `task_id?`,
-/// `image_urls?`, `audio_urls?`), validates the role against the registry,
-/// builds a self-contained `DelegationRequest` (one task per call), routes it
-/// through `OrchestratorManager::delegate` **synchronously** (REQ-ORCH-005:
-/// the call blocks from the Manager's perspective via `block_on`), and returns
-/// the deliverable as a `ToolResult` whose outcome reflects the `MISSION
-/// COMPLETE (task-id)` / `FAILED` / `REPLAN REQUIRED` terminal marker.
-///
-/// The handler installs a Manager rooted at the shared `.marmel` plan dir so
-/// `task_id` binding auto-check-off (`Plan::check_off`) targets the on-disk
-/// plan (REQ-ORCH-004 shared workspace / REQ-PLAN-002).
+/// The harness-level `delegate_task` handler: parses the tool arguments
+/// (`agent_name`, `prompt`, `snippets`, `task_id?`, `image_urls?`,
+/// `audio_urls?`), validates the role against the registry, and builds one
+/// self-contained `DelegationRequest` per call. Routing through
+/// `OrchestratorManager::delegate` blocks (via `block_on`) until the
+/// deliverable returns, and the `ToolResult` outcome reflects its terminal
+/// marker. The Manager is rooted at the shared `.marmel` plan dir, so the
+/// bound `task_id` auto-checks off that on-disk plan.
 pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, ToolError> {
     // 1. Parse the payload. `agent_name` deserializes through `Agent`'s
     //    snake_case enum, so an unknown role is rejected here with a clear
-    //    error rather than panicking (REQ-ORCH-002).
+    //    error rather than panicking.
     let req: DelegationRequest =
         serde_json::from_value(args.clone()).map_err(|e| ToolError::BadArguments {
             tool: TOOL_DELEGATE_TASK.to_string(),
             detail: e.to_string(),
         })?;
 
-    // 2. One task per call: the brief MUST be self-contained and non-empty
-    //    (REQ-ORCH-003/005). The subagent sees only this brief + snippets.
+    // 2. One task per call: the brief MUST be self-contained and non-empty.
+    //    The subagent sees only this brief + snippets.
     if req.prompt.trim().is_empty() {
         return Err(ToolError::BadArguments {
             tool: TOOL_DELEGATE_TASK.to_string(),
@@ -46,7 +41,8 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
         });
     }
 
-    // 2b. task_id is mandatory (REQ-ORCH-005): must identify which execution plan item is being delegated.
+    // 2b. task_id is mandatory: it must identify which execution plan task is
+    //     being delegated, because auto check-off is keyed on that binding.
     let raw_task_id = req.task_id.as_deref().unwrap_or("").trim();
     if raw_task_id.is_empty() {
         return Err(ToolError::BadArguments {
@@ -72,8 +68,7 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
         {
             let clean_tid = crate::task_id::normalize_task_id_ref(tid);
             // Same grammar as the on-disk check-off in `manager::phase`, so a
-            // plan written as `- [x] (t-002) …` is recognised here too
-            // (dedup cluster C3).
+            // plan written as `- [x] (t-xxx) …` is recognised here too.
             let is_checked = crate::plan_parse::is_checked_task(&content, clean_tid);
             if is_checked {
                 tracing::warn!("Rejecting re-delegation of already completed task [{clean_tid}]");
@@ -180,13 +175,13 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
     }
 }
 
-/// REQ-ORCH-002 / REQ-ORCH-005: per-specialist tool-allowlist enforcement.
+/// Per-specialist tool-allowlist enforcement.
 ///
 /// Returns `true` when the named caller role is permitted to invoke `tool`.
-/// Specialists are gated by their registry allowlist; `create_plan` is a
+/// Specialists are restricted by their registry allowlist; `create_plan` is a
 /// Manager-only tool (no specialist allowlist grants it), and `delegate_task`
 /// is permitted to a specialist only when its granted tool set includes it
-/// (fractal recursion, REQ-ORCH-001).
+/// (bounded fractal recursion).
 pub fn caller_allows_tool(agent: Agent, tool: &str, registry: &SpecialistRegistry) -> bool {
     match registry.resolve(agent) {
         Some(entry) => entry.allows(tool),
@@ -194,16 +189,12 @@ pub fn caller_allows_tool(agent: Agent, tool: &str, registry: &SpecialistRegistr
     }
 }
 
-// NOTE: `brief_for_task` reads a plan line's text to build a delegation brief
-// (REQ-ORCH-005 one-task-per-call: the brief is self-contained so the subagent
-// does not need the Manager's context). It is `pub` so the Manager turn loop in
-// `src/manager/loop.rs` reuses the same plan-line → brief builder.
-//
-// The old private `TASK_LINE_RE` (a sixth copy of the plan grammar, restricted
-// to `- [ ] [t-xxx] ` with a *mandatory* bracket around the id) is gone: the
-// lookup now goes through [`crate::plan_parse`], so plans written as
-// `- [ ] (t-002) …`, `* [x] [t-003] …` or `- [X] t-004 …` yield a real brief
-// instead of the generic fallback text.
+// NOTE: `brief_for_task` reads a plan line's text to build the delegation
+// brief: one task per call, and the brief is self-contained so the subagent
+// never needs the Manager's context. It is `pub` so the Manager turn loop in
+// `src/manager/loop.rs` reuses the same plan-line → brief builder. The lookup
+// goes through [`crate::plan_parse`], so bracketed, parenthesised, starred and
+// upper-case-checkbox spellings all yield a real brief.
 pub fn brief_for_task(plan: &Plan, task_id: &str) -> String {
     // Read-only diagnostic: build a self-contained brief from the plan task
     // text. If the plan line is present, its descriptive text becomes the

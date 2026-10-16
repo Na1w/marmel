@@ -1,17 +1,16 @@
 //! Shared steering-arbitration engine for both bridge hosts.
 //!
 //! `RendererSink::on_pause` (stream paused for mid-flight steering) and
-//! `spawn_steer_arbitration` (background arbitration task) used to carry their own copy of the
-//! whole arbitration round machine: context snapshot, wake-up SYSTEM NOTICE, preemption handling,
-//! decision branching, sleep/re-evaluation loop, delegated-subtask execution and the steering
-//! history summary. This module owns that logic once; the two hosts are thin adapters that only
-//! supply their differing inputs and surface the progress through their own channel
+//! One arbitration round machine (context snapshot, wake-up SYSTEM NOTICE, preemption
+//! handling, decision branching, sleep/re-evaluation loop, delegated-subtask execution and the
+//! steering history summary) is owned here once and shared by both hosts. The hosts are thin
+//! adapters: they supply their differing inputs and surface progress through their own channel
 //! (renderer events vs. the [`super::drain`] event channel).
 //!
 //! Deliberately *not* unified: the per-channel wording of the sleep notices and the per-round
-//! notion of "is work active" differ between the two hosts. Both differences are kept as they
-//! were and are expressed explicitly (see [`SleepNotice::status_text`] /
-//! [`SleepNotice::delta_text`] and the `ArbitrationChannel` snapshot methods).
+//! notion of "is work active" differ between the two hosts, and both differences are expressed
+//! explicitly (see [`SleepNotice::status_text`] / [`SleepNotice::delta_text`] and the
+//! `ArbitrationChannel` snapshot methods).
 
 use super::action;
 use crate::agents::{Agent, Deliverable, MissionMarker};
@@ -52,39 +51,24 @@ pub(crate) const MAX_CHAINED_SLEEP_EXTENSIONS: usize = 3;
 /// Enforced with the crate's existing [`TurnWatchdog`] / [`DeadlineKind`] machinery (see
 /// [`SleepBudget`]) instead of inventing a second timer: every requested sleep is clamped to the
 /// remaining budget and the chain stops once the budget is spent. "Spent" includes a remainder
-/// too small to cover the sleep floor — a sub-second remainder is refused, never slept as zero
-/// seconds (see [`SleepBudget::allow_at`], gate t-076).
+/// too small to cover the sleep floor %s a sub-second remainder is refused, never slept as zero
+/// seconds (see [`SleepBudget::allow_at`]).
 pub(crate) const MAX_CHAINED_SLEEP_SECONDS: u64 = 300;
 
-/// Wall-clock bound of a single arbitrator sleep, kept from the original per-decision clamp.
+/// Wall-clock bound of a single arbitrator sleep.
 pub(crate) const MAX_SINGLE_SLEEP_SECONDS: u64 = 300;
 
-/// How long **one** arbitrator sleep actually is, given the `sleep_seconds` a
-/// `Sleep` decision asked for (gate t-070).
-///
-/// * **Lower bound — owned by the sleep tool.** A `Sleep` with no duration
-///   resolves to [`crate::tool_args::SLEEP_DEFAULT_SECS`], and a sub-minimum
-///   request (`0`, or anything below [`crate::tool_args::SLEEP_MIN_SECS`]) is
-///   clamped **up** to that minimum. Both numbers are the `sleep`-argument
-///   owner's constants ([`crate::tool_args`]); they are deliberately not
-///   re-typed here. Before this floor a steered `sleep_seconds: 0` produced a
-///   zero-length wait: the loop re-asked the arbitrator immediately — a hot loop
-///   against the LLM — while both hosts announced "sleeping for 0s" for a sleep
-///   that never happened.
-/// * **Upper bound — owned by the arbitrator.** [`MAX_SINGLE_SLEEP_SECONDS`] and
-///   the chained [`MAX_CHAINED_SLEEP_SECONDS`] budget are the arbitrator's own
-///   knobs and are **deliberately not coupled** to
-///   [`crate::tool_args::SLEEP_MAX_SECS`]: the tool ceiling bounds what the
-///   `sleep` *tool* may wait, these bound how long **one steering instruction**
-///   may keep the arbitration loop asleep. Wiring them together would let a
-///   change to the tool ceiling silently rewrite the arbitration budget (and the
-///   other way round), so the separation is kept — and asserted — here (see
-///   `arbitrator_upper_budget_is_not_the_sleep_tool_ceiling`).
-///
-/// The floor is the **lower** bound of the sleep itself; the chained budget may clamp a
-/// request down afterwards but must never undo it — a remaining budget smaller than
-/// [`SLEEP_MIN_SECS`] is refused rather than slept as zero seconds (see
-/// [`SleepBudget::allow_at`], gate t-076).
+/// How long **one** arbitrator sleep is for a given `sleep_seconds` request.
+/// * **Lower bound (owned by the sleep tool):** no `sleep_seconds` resolves to
+///   [`crate::tool_args::SLEEP_DEFAULT_SECS`], and any request below
+///   [`crate::tool_args::SLEEP_MIN_SECS`] is clamped **up** to it; both come from
+///   [`crate::tool_args`] and are never re-typed here, so a steered `sleep_seconds: 0` sleeps
+///   the floor instead of nothing.
+/// * **Upper bound (owned by the arbitrator):** [`MAX_SINGLE_SLEEP_SECONDS`] and the chained
+///   [`MAX_CHAINED_SLEEP_SECONDS`] budget are **deliberately not coupled** to
+///   [`crate::tool_args::SLEEP_MAX_SECS`]: that ceiling bounds the sleep tool, these bound one
+///   steering instruction's arbitration budget. A chained budget below [`SLEEP_MIN_SECS`] is
+///   refused, never slept as zero seconds (see [`SleepBudget::allow_at`]).
 pub(crate) fn clamped_sleep_secs(requested: Option<u64>) -> u64 {
     requested
         .unwrap_or(SLEEP_DEFAULT_SECS)
@@ -155,24 +139,18 @@ impl SleepBudget {
         self.slept_secs
     }
 
-    /// May the chain sleep again, and for how long?
+    /// May the chain sleep again, and for how long? `Ok(secs)` is the requested sleep
+    /// clamped to the remaining cumulative budget and floored at [`SLEEP_MIN_SECS`];
+    /// `Err(stop)` names the documented cap that ended the chain.
     ///
-    /// `Ok(secs)` is the requested sleep clamped to the remaining cumulative budget and
-    /// floored at [`SLEEP_MIN_SECS`]; `Err(stop)` names the documented cap that ended the
-    /// chain.
-    ///
-    /// **A remainder below the floor is an exhausted budget, not a zero-length sleep**
-    /// (gate t-076). A remainder of e.g. 500 ms is not [`Duration::is_zero`], but it carries
-    /// zero whole seconds, so returning `Ok(remaining.as_secs())` handed back `Ok(0)`: the
-    /// round machine then accounted `note_slept(0)`, slept nothing and re-asked the
-    /// arbitrator immediately — exactly the hot-loop [`clamped_sleep_secs`] was added to
-    /// remove, re-created because that floor is applied *before* this clamp. The floor is
-    /// therefore applied **after** the budget clamp, and a budget that cannot cover it is
-    /// refused through the same typed [`SleepStop::Deadline`] outcome a fully spent budget
-    /// reports: the caller tells "budget exhausted" apart from "slept N seconds", no sleep
-    /// is performed and nothing is accounted. Rounding a sub-second remainder **up** to the
-    /// floor is not an option either — that would overshoot the watchdog hard limit
-    /// ([`MAX_CHAINED_SLEEP_SECONDS`]).
+    /// **A remainder below the floor is an exhausted budget, not a zero-length sleep:** a
+    /// remainder of e.g. 500 ms is not [`Duration::is_zero`] but carries zero whole seconds,
+    /// so the floor of [`clamped_sleep_secs`] is applied **after** this budget clamp, and a
+    /// budget that cannot cover it is refused through the same typed [`SleepStop::Deadline`]
+    /// outcome a fully spent budget reports: the caller tells "budget exhausted" apart from
+    /// "slept N seconds", no sleep is performed and nothing is accounted. Rounding a
+    /// sub-second remainder **up** to the floor is not an option either, because that would
+    /// overshoot the watchdog hard limit ([`MAX_CHAINED_SLEEP_SECONDS`]).
     pub(crate) fn allow_at(self, requested_secs: u64, now: Instant) -> Result<u64, SleepStop> {
         if self.extensions >= MAX_CHAINED_SLEEP_EXTENSIONS {
             return Err(SleepStop::Extensions {
@@ -229,15 +207,12 @@ impl SleepChain {
     /// same documented budget: `None` means the budget is spent and the host must not sleep again
     /// (it says so instead — see [`SleepNotice::Capped`]).
     ///
-    /// Same refuse-vs-floor policy as [`SleepBudget::allow_at`] (gate t-076), so the two halves
-    /// of one arbitration can never disagree about whether a sleep is possible at all:
-    ///
-    /// * a remaining budget **below [`SLEEP_MIN_SECS`]** is refused with `None` — the host is
-    ///   told not to sleep rather than handed a sub-minimum (zero-length) duration, which is
-    ///   the hot-loop the floor exists to prevent (`Some(0)` announced a sleep that never
-    ///   happened);
-    /// * otherwise the request is clamped to what is left and only then floored, so a returned
-    ///   duration is never sub-minimum and never overshoots [`MAX_CHAINED_SLEEP_SECONDS`].
+    /// Same refuse-vs-floor policy as [`SleepBudget::allow_at`], so the two halves of one
+    /// arbitration can never disagree about whether a sleep is possible at all: a remaining
+    /// budget **below [`SLEEP_MIN_SECS`]** is refused with `None` (the host is told not to
+    /// sleep rather than handed a zero-length duration), and otherwise the request is clamped
+    /// to what is left and only then floored — never sub-minimum, never overshooting
+    /// [`MAX_CHAINED_SLEEP_SECONDS`].
     pub(crate) fn host_sleep_secs(&self, requested_secs: u64) -> Option<u64> {
         if self.stop.is_some() || self.extensions >= MAX_CHAINED_SLEEP_EXTENSIONS {
             return None;
@@ -293,10 +268,10 @@ pub(crate) struct BridgeNotice {
 
 /// Post a steering notice **observably**.
 ///
-/// The inbox bounds stay exactly as they are ([`INBOX_CAPACITY`] per target with a documented
-/// drop-oldest policy, `MAX_INBOX_KEYS` targets); what must not happen is a silently lost
-/// steering instruction: every notice dropped by capacity is returned here, logged, and surfaced
-/// by the host through [`capacity_drop_text`].
+/// The inbox bounds stay as documented ([`INBOX_CAPACITY`] per target with a drop-oldest
+/// policy, `MAX_INBOX_KEYS` targets); a steering instruction must never be lost silently:
+/// every notice dropped by capacity is returned here, logged, and surfaced by the host
+/// through [`capacity_drop_text`].
 pub(crate) fn post_notice_observable(target: &str, user_inquiry: &str) -> BridgeNotice {
     let outcome =
         crate::orchestrator::notice::post_notice_to_worker_tracked(target, user_inquiry, None);
@@ -725,9 +700,9 @@ mod tests {
         }
     }
 
-    /// (f) **The floor.** A `Sleep` that asks for less than the `sleep` tool's
-    /// own minimum — including `0` — must never turn into a zero-length wait,
-    /// and a `Sleep` with no duration at all uses the owner's default.
+    /// **The floor.** A `Sleep` that asks for less than the `sleep` tool's own
+    /// minimum — including `0` — must never turn into a zero-length wait, and a `Sleep`
+    /// with no duration at all uses the owner's default.
     #[test]
     fn clamped_sleep_secs_floors_a_sub_minimum_request() {
         assert_eq!(
@@ -766,10 +741,10 @@ mod tests {
         assert_eq!(SLEEP_DEFAULT_SECS, crate::tool_args::SLEEP_DEFAULT_SECS);
     }
 
-    /// (f) **The ceiling stays separate.** The arbitrator's upper knobs bound
-    /// one steering instruction, not the `sleep` tool, so they must not be
-    /// derived from the tool's ceiling constant — proved on the source level
-    /// (comment lines excluded, like the other source guards) and behaviourally.
+    /// **The ceiling stays separate.** The arbitrator's upper knobs bound one
+    /// steering instruction, not the `sleep` tool, so they must not be derived from
+    /// the tool's ceiling constant — proved on the source level (comment lines
+    /// excluded, like the other source guards) and behaviourally.
     #[test]
     fn arbitrator_upper_budget_is_not_the_sleep_tool_ceiling() {
         let src = include_str!("arbiter.rs");
@@ -826,7 +801,7 @@ mod tests {
         );
     }
 
-    /// (f) The **steered** path, end to end: a `Sleep` decision carrying
+    /// The **steered** path, end to end: a `Sleep` decision carrying
     /// `sleep_seconds: 0` sleeps the floor instead of nothing, both hosts report
     /// the floor, and the history text names the seconds actually slept.
     #[test]
@@ -914,8 +889,8 @@ mod tests {
             );
         });
 
-        // The other site of the old `unwrap_or(5)` — the recorded history line of
-        // a Sleep decision with no response text — is floored the same way.
+        // The recorded history line of a Sleep decision with no response text is
+        // floored the same way.
         let no_response = SteerDecision {
             decision: "Sleep".to_string(),
             response: None,
@@ -942,13 +917,12 @@ mod tests {
         );
     }
 
-    /// (g) **The clamp may not undo the floor** (gate t-076). A SUB-SECOND remainder of the
-    /// cumulative budget is not `Duration::is_zero()`, but it carries zero whole seconds:
-    /// the old `Ok(requested.min(remaining.as_secs()))` returned `Ok(0)`, the round machine
-    /// then booked `note_slept(0)` and re-asked the arbitrator immediately — the hot-loop
-    /// [`clamped_sleep_secs`] exists to prevent, re-created by clamping after the floor.
-    /// Such a remainder is now refused through the same typed exhaustion outcome, and the
-    /// host-facing [`SleepChain::host_sleep_secs`] applies the same refuse-vs-floor policy.
+    /// **The clamp may not undo the floor.** A sub-second remainder of the cumulative
+    /// budget is not `Duration::is_zero()` but carries zero whole seconds, so it is
+    /// refused through the same typed exhaustion outcome instead of being handed back as
+    /// a zero-length wait that would re-ask the arbitrator immediately — the hot-loop
+    /// [`clamped_sleep_secs`] exists to prevent. The host-facing
+    /// [`SleepChain::host_sleep_secs`] applies the same refuse-vs-floor policy.
     #[test]
     fn remaining_budget_below_the_floor_is_refused_never_a_zero_length_sleep() {
         let now = Instant::now();

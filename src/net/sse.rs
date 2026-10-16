@@ -4,17 +4,16 @@
 //!
 //! Both the LLM chat client (three-tier watchdogs: initial-response,
 //! inter-chunk stall, overall read timeout) and the MCP HTTP/SSE transport
-//! (flat per-event request timeout) previously hand-rolled this exact
-//! "poll with a clock" idiom; this is the single shared implementation.
-//! Callers keep their own deadline *policy* (which instant to treat as the
-//! watchdog) and only the polling/abort/idle mechanics live here.
+//! (flat per-event request timeout) poll against a clock. Callers keep their
+//! own deadline *policy* (which instant to treat as the watchdog); only the
+//! polling/abort/idle mechanics live here.
 
 use futures_util::StreamExt;
 use std::future::Future;
 use std::time::{Duration, Instant};
 
 /// Interval between stream polls. Keeps the pump responsive to the abort hook
-/// and deadline checks. (Same 50 ms value the LLM client has always used.)
+/// and deadline checks.
 pub const SSE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Outcome of one pump cycle.
@@ -28,11 +27,10 @@ pub enum PumpNext<T> {
 }
 
 /// Poll `stream` once, every [`SSE_POLL_INTERVAL`], checking `abort` and the
-/// optional `deadline` before each poll (abort is checked first, matching the
-/// original LLM client ordering).
+/// optional `deadline` before each poll (abort is checked first).
 ///
-/// `abort` is the same delta-probe callback the LLM client has always used
-/// (`on_delta("")`): a falsy return means the caller wants to stop.
+/// `abort` is a delta-probe callback (`on_delta("")`): a falsy return means
+/// the caller wants to stop.
 pub async fn pump_next<S>(
     stream: &mut S,
     deadline: Option<Instant>,

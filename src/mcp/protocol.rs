@@ -1,13 +1,8 @@
 //! The single MCP JSON-RPC 2.0 protocol layer, shared by both transports.
 //!
-//! Extracted from `src/mcp/client.rs` (stdio) and `src/mcp/http.rs` (HTTP + SSE)
-//! per `docs/recon_duplication_net.md` §2 clusters **C7** (the two transports
-//! carried their own copies of the request envelopes, the id allocator, the
-//! method-name literals, the `initialize` handshake and the `tools/list` /
-//! `tools/call` result parsing) and **C8** (the MCP test file carried a *third*
-//! copy of the result parsing, already drifted from production).
-//!
-//! Everything protocol-shaped lives here exactly once:
+//! The stdio transport (`src/mcp/client.rs`) and the HTTP/SSE transport
+//! (`src/mcp/http.rs`) both build on it. Everything protocol-shaped lives here
+//! exactly once:
 //! * the envelope types and their wire form — [`JsonRpcRequest`],
 //!   [`JsonRpcNotification`], [`JsonRpcResponse`], [`JsonRpcError`];
 //! * the monotonic JSON-RPC id allocator [`RequestIds`];
@@ -32,12 +27,11 @@
 //! ```
 //!
 //! The `initialize` envelope carries the reserved [`HANDSHAKE_REQUEST_ID`] and
-//! therefore does *not* consume an id from the allocator. That is the HTTP/SSE
-//! transport's pre-existing behaviour (it POSTed `id: 0` for the handshake) and
-//! it is what lets both transports agree on the bytes of the handshake
-//! envelope; the stdio transport's numeric ids shift by one as a result, which
-//! is invisible on the wire — ids are opaque to the server and the client only
-//! matches replies against them ([`JsonRpcResponse::id_matches`]).
+//! therefore does *not* consume an id from the allocator, so both transports
+//! agree on the bytes of the handshake envelope. The stdio transport's numeric
+//! ids shift by one as a result, which is invisible on the wire — ids are
+//! opaque to the server and the client only matches replies against them
+//! ([`JsonRpcResponse::id_matches`]).
 //!
 //! Layering note: the transport error type [`McpError`] stays where it is (it
 //! owns the retryability classification consumed by [`crate::net::Retryable`],
@@ -86,9 +80,9 @@ pub(crate) const FIRST_REQUEST_ID: u64 = 1;
 
 /// Monotonically increasing JSON-RPC request id allocator.
 ///
-/// One allocator per live connection (mirroring the `AtomicU64` each transport
-/// used to carry itself). Never reused, never reset: a reply is matched to its
-/// request by id, so reusing an id could pair a stale event with a new call.
+/// One allocator per live connection. Never reused, never reset: a reply is
+/// matched to its request by id, so reusing an id could pair a stale event with
+/// a new call.
 #[derive(Debug)]
 pub(crate) struct RequestIds {
     next: AtomicU64,
@@ -207,7 +201,7 @@ impl JsonRpcNotification {
 /// The `jsonrpc` version member is deliberately *not* a field: nothing in either
 /// transport validates it, and a stored-but-unread field is dead weight that a
 /// waiver would only hide. Serde ignores it on the wire, so an envelope without
-/// a `jsonrpc` member (or with an unexpected one) decodes exactly as before.
+/// a `jsonrpc` member (or with an unexpected one) decodes just the same.
 #[derive(Debug, Deserialize)]
 pub(crate) struct JsonRpcResponse {
     pub id: Option<Value>,
@@ -281,8 +275,7 @@ pub(crate) fn decode_reply(raw: &str, id: u64) -> Option<JsonRpcResponse> {
 
 // ── Param shapes ───────────────────────────────────────────────────────────
 
-/// The `params` of the `initialize` request: identical for both transports
-/// (they used to spell this literal out twice).
+/// The `params` of the `initialize` request, shared by both transports.
 pub(crate) fn initialize_params() -> Value {
     serde_json::json!({
         "protocolVersion": MCP_PROTOCOL_VERSION,
@@ -315,10 +308,7 @@ fn default_input_schema() -> Value {
 ///
 /// A tool entry without a name is skipped; `description` is optional; a missing
 /// `inputSchema` falls back to an empty object schema. An `inputSchema` that is
-/// present but `null` stays `null` — production has always passed it through,
-/// and the hand-copied C8 test that filtered it out was wrong (the drift is
-/// recorded on the transport-level `tools/list` decode test in `http_tests`,
-/// which exercises this function instead of a local copy).
+/// present but `null` stays `null` — it is passed through untouched.
 pub(crate) fn parse_tools(result: &Value, server_name: &str) -> Vec<McpTool> {
     let mut tools = Vec::new();
     if let Some(tools_arr) = result.get("tools").and_then(Value::as_array) {
@@ -349,7 +339,7 @@ pub(crate) fn parse_tools(result: &Value, server_name: &str) -> Vec<McpTool> {
 /// `content[]` items contribute their `text` (non-text items are dumped as JSON,
 /// one line each); a result without `content` falls back to a `text` field and
 /// then to the whole result. `isError: true` turns the rendered text into an
-/// error, unchanged from what both transports did.
+/// error.
 pub(crate) fn render_call_tool_result(result: &Value) -> Result<String> {
     let mut output = String::new();
     if let Some(content_arr) = result.get("content").and_then(Value::as_array) {
@@ -520,7 +510,7 @@ mod tests {
             canonical_initialize_body()
         );
 
-        // The params keep the capability fields the transports always sent.
+        // The params carry the capability fields verbatim.
         assert_eq!(
             initialize_params(),
             json!({
@@ -594,7 +584,7 @@ mod tests {
             }
             other => panic!("expected the JsonRpc variant, got {other:?}"),
         }
-        // The text surfaced to MCP consumers is unchanged.
+        // The text surfaced to MCP consumers carries the same parts.
         let text = err.to_string();
         assert!(text.contains("-32601"), "{text}");
         assert!(text.contains("Method not found"), "{text}");
@@ -701,7 +691,7 @@ mod tests {
         assert_eq!(tools[1].description, None);
         assert_eq!(tools[1].input_schema, json!({"type": "object"}));
 
-        // Production passes an explicit null through (the old test copy did not).
+        // An explicit null schema is passed through untouched.
         assert_eq!(tools[2].name, "tool3");
         assert_eq!(tools[2].input_schema, Value::Null);
 

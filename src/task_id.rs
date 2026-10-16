@@ -1,29 +1,23 @@
-//! Canonical task-identifier normalization — dedup cluster C1, part 1.
+//! Canonical task-identifier normalization and validation — the single source of
+//! truth for id handling across the agents, harness and manager layers.
 //!
 //! Task ids such as `t-001` are produced by the LLM and then round-trip through
 //! tool arguments, plan checkboxes, synthesized-prompt filenames and worker
-//! tags. Along the way they are usually wrapped in markdown / JSON decoration —
-//! `[t-001]`, `(t-001)`, `"t-001"`, `'t-001'` — so every consumer used to
-//! open-code the same trimming chain
-//! (`trim_matches(|c| c == '[' || c == ']' || ...).trim()`). Cluster C1 of
-//! `docs/recon_duplication_helpers.md` tracks those clones; this module is the
-//! single source of truth for the eight of them living in the agents, harness
-//! and manager layers.
+//! tags, usually wrapped in markdown / JSON decoration: `[t-001]`, `(t-001)`,
+//! `"t-001"`, `'t-001'`.
 //!
-//! Normalization never repairs an id: inner characters are preserved
-//! byte-for-byte, so normalization alone is safe for matching and tagging but
-//! **not** for path construction.
+//! Normalization never repairs an id: inner characters are preserved byte for
+//! byte, so it is safe for matching and tagging but **not** for path building.
 //!
 //! Two responsibilities live here, and they stay separate on purpose:
 //!
 //! 1. *normalization* ([`normalize_task_id_ref`] / [`normalize_task_id`]) —
 //!    decoration stripping only, never validation, never rewriting the grammar.
-//! 2. *validation* ([`validate_task_id`] / [`validate_task_id_owned`], gate
-//!    t-046) — the single canonical gate every on-disk path derived from a task
-//!    id must pass before the id is joined onto a directory. Normalization is
-//!    deliberately *not* folded into it: a caller that normalizes must validate
-//!    the normalized value, and a caller that validates raw input must not be
-//!    handed a silently repaired id.
+//! 2. *validation* ([`validate_task_id`] / [`validate_task_id_owned`]) — the
+//!    check every on-disk path derived from a task id must pass before the id is
+//!    joined onto a directory. Normalization is deliberately *not* folded into
+//!    it: a caller that normalizes must validate the normalized value, and a
+//!    caller that validates raw input must not be handed a silently repaired id.
 
 /// Decoration characters stripped from both ends of a task id.
 ///
@@ -37,12 +31,10 @@ const fn is_decoration(c: char) -> bool {
 ///
 /// Trims surrounding whitespace, strips `[`/`]`/`(`/`)`/`"`/`'` decoration, then
 /// trims whitespace again, so `"[t-001]"`, `" \"t-001\" "` and `"t-001"` all
-/// normalize to the same value. The operation is idempotent.
-///
-/// Returns `""` when nothing but decoration/whitespace is left; callers that
-/// need to distinguish "absent" from "empty" must do that check themselves (this
-/// mirrors the historical behaviour of the sites this replaced, several of which
-/// deliberately keep an empty string).
+/// normalize to the same value; the operation is idempotent. Returns `""` when
+/// nothing but decoration/whitespace is left, so callers that need to tell
+/// "absent" from "empty" must do that check themselves (some consumers keep the
+/// empty string, others map it to `None`).
 #[must_use]
 pub fn normalize_task_id_ref(raw: &str) -> &str {
     raw.trim().trim_matches(is_decoration).trim()
@@ -65,7 +57,7 @@ pub fn normalize_task_id(raw: &str) -> Option<String> {
 /// `steer-task-3`) is far below the cap, which is set to 64 characters.
 pub const MAX_TASK_ID_LEN: usize = 64;
 
-/// Why a candidate task id was refused (gate t-046).
+/// Why a candidate task id was refused.
 ///
 /// The variants are deliberately specific: callers surface this text verbatim
 /// in a verdict-gap reason, so an operator must be able to tell *which* rule the
@@ -82,11 +74,11 @@ pub enum TaskIdError {
         /// The documented cap ([`MAX_TASK_ID_LEN`]).
         max: usize,
     },
-    /// A path separator (`/` or `\`) — the path-traversal vector this gate
+    /// A path separator (`/` or `\`) — the path-traversal vector this validator
     /// exists to close.
     #[error("task id contains the path separator {ch:?}")]
     PathSeparator {
-        /// The offending separator character.
+        /// The rejected separator character.
         ch: char,
     },
     /// A `..` segment anywhere in the id (parent-directory escape).
@@ -102,55 +94,38 @@ pub enum TaskIdError {
     /// Whitespace anywhere inside the id (leading, inner or trailing).
     #[error("task id contains whitespace ({ch:?})")]
     Whitespace {
-        /// The offending whitespace character.
+        /// The rejected whitespace character.
         ch: char,
     },
     /// A control character (NUL, ESC, DEL, C1 controls, ...).
     #[error("task id contains the control character {ch:?}")]
     ControlCharacter {
-        /// The offending control character.
+        /// The rejected control character.
         ch: char,
     },
     /// A non-ASCII character: ids must stay byte-predictable on disk.
     #[error("task id contains the non-ASCII character {ch:?}")]
     NonAscii {
-        /// The offending non-ASCII character.
+        /// The rejected non-ASCII character.
         ch: char,
     },
     /// Any other character outside the accepted alphabet
     /// (ASCII alphanumeric, `-`, `_`, and an inner `.`).
     #[error("task id contains the disallowed character {ch:?}")]
     DisallowedCharacter {
-        /// The offending character.
+        /// The rejected character.
         ch: char,
     },
 }
 
-/// The single canonical task-id validator (gate t-046).
-///
-/// Returns the id unchanged on success — nothing here sanitizes, trims, clamps
-/// or otherwise repairs the input, so a rejected id can never be silently turned
-/// into a *different* file name. Callers that build a path from a task id must
-/// propagate this error (or record it as a hard verdict gap) instead of falling
-/// back to a mended value.
-///
-/// Accepted alphabet: ASCII alphanumeric plus `-` and `_` (the in-repo shape,
-/// e.g. `t-001`, `task-t-001`, `t_val_01`), plus a single inner `.` that is
-/// neither leading, trailing nor adjacent to another `.`.
-///
-/// Rejected, each with its own [`TaskIdError`] variant:
-/// * empty / whitespace-only ids,
-/// * ids longer than [`MAX_TASK_ID_LEN`] characters,
-/// * `..` segments, `/` and `\` (path traversal / separator escape),
-/// * a leading or trailing `.`,
-/// * whitespace anywhere (leading, inner or trailing),
-/// * control characters and non-ASCII characters,
-/// * any other character outside the accepted alphabet.
-///
-/// The check is applied to the string as given. Ids that arrive decorated
-/// (`[t-001]`) must be normalized first with [`normalize_task_id_ref`] and the
-/// *normalized* value validated — validating the raw form would reject ids the
-/// rest of the crate legitimately uses.
+/// The canonical task-id validator every caller must pass before building a
+/// path from an id. Returns the id unchanged on success — nothing here sanitizes,
+/// trims, clamps or repairs, so a rejected id can never become a *different*
+/// file name; propagate the error or record a hard verdict gap. Accepted: ASCII
+/// alphanumeric, `-`, `_`, and one inner `.`. Rejected, each with its own
+/// [`TaskIdError`] variant: empty/whitespace-only ids, ids over
+/// [`MAX_TASK_ID_LEN`], `..`, `/`, `\`, leading or trailing `.`, whitespace,
+/// control and non-ASCII characters. Decorated ids go through [`normalize_task_id_ref`] first.
 pub fn validate_task_id(id: &str) -> Result<&str, TaskIdError> {
     if id.trim().is_empty() {
         return Err(TaskIdError::Empty);
@@ -183,7 +158,7 @@ pub fn validate_task_id(id: &str) -> Result<&str, TaskIdError> {
             if idx + 1 == chars.len() {
                 return Err(TaskIdError::TrailingDot);
             }
-            // An inner single dot is inside the accepted grammar (see docs); a
+            // An inner single dot is inside the accepted grammar; a
             // second one would already have tripped `DotDotSegment`.
             continue;
         }
@@ -275,11 +250,9 @@ mod tests {
     /// normalization to `None`.
     type OptionSite = (&'static str, fn(&str) -> Option<String>);
 
-    /// Regression guard for dedup cluster C1 part 1: every call site whose
-    /// inline trimming chain was replaced must agree on the same normalized
-    /// value for the same input. The adapters below mirror how each site
-    /// consumes the API, so re-spelling the trimming chain at one of them (or
-    /// diverging on the empty-vs-absent handling) fails this test.
+    /// Every call site that normalizes an id must agree on the same value for
+    /// the same input. The adapters below mirror how each site consumes the API,
+    /// so diverging on the empty-vs-absent handling fails this test.
     #[test]
     fn c1_call_sites_agree_on_the_same_normalized_value() {
         // Sites that feed the normalized value straight into a path, tag or
@@ -366,10 +339,9 @@ mod tests {
         }
     }
 
-    /// Regression guard for dedup cluster C1 part 2: the two named UI helpers
-    /// and every remaining inline clone in `src/ui/*` and `src/orchestrator/*`
-    /// must agree on the same normalized value, and must keep their historical
-    /// empty-vs-absent handling (empty string kept vs `None`).
+    /// The UI and orchestrator call sites must agree on the same normalized
+    /// value and keep their empty-vs-absent handling (empty string kept vs
+    /// `None`).
     #[test]
     fn c1_part_2_call_sites_agree_on_the_same_normalized_value() {
         let borrowed_ref_sites: &[BorrowedRefSite] = &[
@@ -481,7 +453,7 @@ mod tests {
         }
     }
 
-    // Gate t-046: the canonical task-id validator behind every id-derived path.
+    // The canonical task-id validator behind every id-derived path.
 
     /// Ids that must pass [`validate_task_id`] unchanged — the shapes actually
     /// used in this repository.
@@ -502,7 +474,7 @@ mod tests {
 
     /// Hostile or malformed ids plus the exact rejection each must produce.
     const REJECTED: &[(&str, TaskIdError)] = &[
-        // Path traversal / separator escape — the core of gate t-046.
+        // Path traversal / separator escape.
         ("../../etc/x", TaskIdError::DotDotSegment),
         ("../../etc/passwd", TaskIdError::DotDotSegment),
         ("../x", TaskIdError::DotDotSegment),

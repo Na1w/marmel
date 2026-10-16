@@ -1,15 +1,14 @@
-//! t-007 round-trip acceptance for the session bundle: write a small bundle into
-//! a temp dir, read it back, and pin the four properties the design calls
-//! load-bearing —
+//! Round-trip acceptance for the session bundle: write a small bundle into a
+//! temp dir, read it back, and pin the four properties that are load-bearing —
 //!
-//! * **manifest-last is the commit point** (A §7.1 C4): members that no manifest
+//! * **manifest-last is the commit point**: members that no manifest
 //!   names are not committed, and members rewritten under an older manifest are
 //!   caught by integrity, not by luck;
 //! * **tamper detection** (`byte_len`, `fingerprint`) with both numbers reported
-//!   and the bundle left byte-identical (A §7.2 F1/F4, §7.5);
+//!   and the bundle left byte-identical;
 //! * **`content: None` vs `Some("")`** survives the bundle exactly, which is the
-//!   reason `MessageRecord` exists at all (A §2.1, `types/wire.rs:30-41`);
-//! * the single-corrupt-worker partial (A D6) and the L0–L9 refusals around it.
+//!   reason `MessageRecord` exists at all;
+//! * the single-corrupt-worker partial and the L0–L9 refusals around it.
 
 use std::path::{Path, PathBuf};
 
@@ -228,7 +227,7 @@ fn round_trip_restores_every_member_byte_exactly() {
     };
 
     assert_eq!(session.session_id, "session-1");
-    // InProgress is reported as HardKillInferred, never written (A D6).
+    // InProgress is reported as HardKillInferred, never written.
     assert_eq!(ending, ProcessEnding::HardKillInferred);
     assert_eq!(session.manager.messages, original.manager.messages);
     assert_eq!(session.ui.status_line, "phase 2/3");
@@ -658,8 +657,8 @@ fn version_gates_refuse_before_anything_is_parsed() {
 }
 
 /// A hand-built bundle whose member carries a field this binary does not know:
-/// the manifest is the authority, so the member verifies and *then* the schema
-/// gate fires (`A §7.5`, `deny_unknown_fields`).
+/// the manifest is the authority, so the member verifies and *then* the
+/// `deny_unknown_fields` check fires.
 #[test]
 fn an_unknown_field_in_a_member_is_a_hard_refusal_not_a_silent_drop() {
     let bundle = bundle_dir("unknown-field");
@@ -811,7 +810,7 @@ fn patch_member_witness(manifest_text: &str, rel_path: &str, bytes: &[u8]) -> St
     serde_json::to_string_pretty(&doc).expect("re-serialize manifest")
 }
 
-// ------------------------------------------------- the D6 single-worker partial
+// ------------------------------------------ the single-corrupt-worker partial
 
 #[test]
 fn exactly_one_corrupt_worker_restores_everything_else_as_unrecoverable() {
@@ -935,7 +934,7 @@ fn a_pinned_prefix_end_mismatch_refuses() {
     std::fs::remove_dir_all(bundle.parent().unwrap().parent().unwrap()).ok();
 }
 
-// ------------------------------------------------------------- structural gate
+// ----------------------------------------------------------- structural check
 
 #[test]
 fn a_dangling_call_recorded_in_the_manager_is_healed_and_reported() {

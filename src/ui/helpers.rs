@@ -36,25 +36,21 @@ pub fn format_active_subtasks(subagents: &[SubagentDetail]) -> String {
 pub fn format_plan_progress_summary(plan_content: &str) -> String {
     crate::orchestrator::generate_plan_progress_summary(plan_content)
 }
-/// Build the execution-plan section of the system prompt — **fail-closed** (t-054).
+/// Build the execution-plan section of the system prompt — **fail-closed**. The
+/// verdict is delegated to the single plan-read decision in
+/// [`super::session::read_plan_gate`] and the body to the plan layer's own reader
+/// [`crate::manager::phase::Plan::read`], so the prompt and the session's
+/// nudge/completion notices can never disagree about what the plan file said.
 ///
-/// The verdict is delegated to the single plan-read gate that t-035a added in
-/// [`super::session::read_plan_gate`]; this helper invents no plan grammar of its
-/// own, so the prompt and the session's nudge/completion notices can never
-/// disagree about what the plan file said.
+/// * [`super::session::PlanGate::Read`] — the plan was read and parsed, so its
+///   markdown is embedded verbatim.
+/// * [`super::session::PlanGate::Unknown`] — the plan exists but could not be read
+///   or parsed: an explicit "plan state UNKNOWN" block replaces the markdown and the
+///   warning is returned for the caller, because an absent block reads to the model
+///   and the UI as *no work pending / all complete*.
 ///
-/// * [`super::session::PlanGate::Read`] — the plan really was read and parsed, so
-///   its markdown is embedded verbatim (the body itself comes from the plan
-///   layer's own reader, [`crate::manager::phase::Plan::read`], never from a
-///   second reader here).
-/// * [`super::session::PlanGate::Unknown`] — the plan exists but could not be
-///   read or parsed. The old code folded that into "no plan block at all", which
-///   is exactly what the model and the UI read as *no work pending / all
-///   complete*. Instead the plan block is replaced by an explicit "plan state
-///   UNKNOWN" section and the warning is returned for the caller to surface.
-///
-/// Returns `(prompt_section, warning)`; an empty section with no warning means
-/// there is genuinely no plan file on disk.
+/// Returns `(prompt_section, warning)`; an empty section with no warning means there
+/// is genuinely no plan file on disk.
 fn plan_prompt_section(plan: &crate::manager::phase::Plan) -> (String, Option<String>) {
     match super::session::read_plan_gate(plan) {
         super::session::PlanGate::Unknown { warning } => (String::new(), Some(warning)),
@@ -69,7 +65,7 @@ fn plan_prompt_section(plan: &crate::manager::phase::Plan) -> (String, Option<St
                 ),
                 // No plan file, or an empty one: nothing pending, nothing to warn about.
                 Ok(_) => (String::new(), None),
-                // TOCTOU only — the gate just read the same file successfully. Even
+                // TOCTOU only — the plan file was just read successfully above. Even
                 // so it must fail closed: no plan block, and a loud warning.
                 Err(e) => (
                     String::new(),
@@ -199,10 +195,9 @@ pub(crate) fn handle_reset_command(
     renderer: &mut dyn Renderer,
     mut ctx: Option<&mut ContextEngine>,
 ) {
-    // `Plan::clear()` already sweeps the session state with the plan: the superseded
-    // `.session_transcript.json` journal (a stale copy only — t-009 deleted that
-    // writer), the session bundle that replaced it, and the in-memory manager
-    // capture. No separate transcript unlink here any more.
+    // `Plan::clear()` already clears the session state along with the plan: the
+    // `.session_transcript.json` journal, the session bundle and the in-memory
+    // manager capture. No separate transcript unlink is needed here.
     let _ = plan.clear();
     renderer.on_event(&Event::Message(
         "Execution plan has been cleared and reset by user.".to_string(),
@@ -406,10 +401,9 @@ pub fn extract_failure_reason(text: &str) -> String {
 
     // 2. The marker-shaped verdicts (`REPLAN REQUIRED (<task>): …`,
     //    `FAILED (<reason>)`, `FAILED: <reason>`) are parsed by their single
-    //    owner, `crate::markers`, which walks one failure-prefix table
-    //    (gate t-059 — this site used to hand-roll three literal `find`s).
-    //    The 120-char budget stays here: truncation is presentation, not
-    //    grammar, and the rendered bytes are unchanged.
+    //    owner, `crate::markers`, which walks one failure-prefix table. The
+    //    120-char budget stays here: truncation is presentation, not grammar,
+    //    and the rendered bytes are unchanged.
     if let Some(reason) = crate::markers::failure_reason(trimmed) {
         return truncate_reason(reason, 120);
     }
@@ -446,8 +440,8 @@ pub fn extract_failure_reason(text: &str) -> String {
 
 fn truncate_reason(s: &str, max_len: usize) -> String {
     let s = s.trim();
-    // Char-boundary-safe prefix (shared helper): the old `s[..max_len]` byte
-    // slice could panic mid-character on multi-byte text (å/ä/ö, emoji, …).
+    // Char-boundary-safe prefix (shared helper): a byte slice like `s[..max_len]`
+    // can panic mid-character on multi-byte text (å/ä/ö, emoji, …).
     let head = crate::text_util::truncate_chars(s, max_len);
     if head.len() == s.len() {
         s.to_string()
@@ -539,9 +533,9 @@ mod tests {
         assert_eq!(extract_failure_reason("   "), "unknown failure");
     }
 
-    /// Gate t-059 byte-pin (table driven): the marker-shaped verdicts are read
-    /// through [`crate::markers::failure_reason`], and the **rendered output of
-    /// this UI helper is unchanged** — same reason text, same 120-char budget.
+    /// Byte-pin (table driven): the marker-shaped verdicts are read through
+    /// [`crate::markers::failure_reason`], and the **rendered output of this UI
+    /// helper is unchanged** — same reason text, same 120-char budget.
     #[test]
     fn test_extract_failure_reason_marker_shapes_are_byte_pinned() {
         let cases: &[(&str, &str)] = &[
@@ -585,7 +579,7 @@ mod tests {
         }
 
         // Verdict shapes with no reason clause fall through to the UI's own
-        // non-marker heuristics, exactly as before the migration.
+        // non-marker heuristics.
         let fallthrough: &[(&str, &str)] = &[
             ("FAILED ()", "FAILED ()"),
             ("REPLAN REQUIRED (t-003)", "REPLAN REQUIRED (t-003)"),
@@ -603,9 +597,9 @@ mod tests {
         }
     }
 
-    /// Gate t-059: for any marker-shaped input the UI's answer is exactly the
-    /// marker owner's reason, truncated by the UI's own budget — the two layers
-    /// cannot drift apart silently.
+    /// For any marker-shaped input the UI's answer is exactly the marker owner's
+    /// reason, truncated by the UI's own budget — the two layers cannot drift apart
+    /// silently.
     #[test]
     fn test_extract_failure_reason_delegates_to_the_marker_owner() {
         let inputs = [
@@ -635,9 +629,9 @@ mod tests {
 
     #[test]
     fn test_truncate_reason_multibyte_no_panic() {
-        // Regression (C7): the old `&s[..max_len]` byte slice panicked with
-        // "byte index is not a char boundary" on multi-byte reasons crossing
-        // the slice point. These inputs cross it deliberately.
+        // A byte slice like `&s[..max_len]` panics with "byte index is not a char
+        // boundary" on multi-byte reasons crossing the slice point; these inputs
+        // cross it deliberately.
         // "x" + 60x 'ä' = 121 bytes; byte index 120 falls inside an 'ä'.
         let s = format!("{}{}", "x", "ä".repeat(60));
         assert_eq!(s.len(), 121);
@@ -738,8 +732,8 @@ mod tests {
         assert!(!prompt.contains("## Machine Specific Guidance"));
     }
 
-    /// Dedup cluster C1 part 2: this owned UI seam is a pure delegation to
-    /// `crate::task_id` — re-spelling the trimming chain here fails this test.
+    /// This owned UI seam is a pure delegation to `crate::task_id`: re-spelling the
+    /// trimming chain here fails this test.
     #[test]
     fn test_clean_task_id_delegates_to_task_id_normalizer() {
         for raw in [
@@ -776,15 +770,15 @@ mod tests {
         assert!(find_subagent_mut(&mut subs, "coder", Some("[]")).is_none());
     }
 
-    // t-054 — the system prompt must read the plan fail-closed
-    // (regression guard for the swallowed `if let Ok(Some(..))` read).
+    // The system prompt must read the plan fail-closed: a plan file that exists
+    // but cannot be read or parsed is never presented as "no plan".
     //
     // Every test below roots its plan in a private temporary workspace through
     // `harness::with_workspace_root`, so the repository's real `.marmel/` is
     // never touched, and none of them asserts on a process-global counter.
 
     /// A two-task plan with multi-byte text, nested markdown and a tab-indented
-    /// line: used to prove the readable-plan path embeds the body byte for byte.
+    /// line: the readable-plan path must embed this body byte for byte.
     const PLAN_MD: &str = "# Execution Plan\n\
 - [x] [t-001] Normalize plan reading — `åäö` ✅\n\
 - [ ] [t-002] Surface plan-read errors\n\
@@ -839,9 +833,9 @@ mod tests {
             "the warning must name the plan file the user can act on: {warning}"
         );
 
-        // Fail-closed: the prompt carries the warning visibly, and must not
-        // present a plan block (the old silent omission read as "no work
-        // pending / all complete").
+        // Fail-closed: the prompt carries the warning visibly and must not
+        // present a plan block, which the model and the UI would read as "no
+        // work pending / all complete".
         assert!(
             prompt.contains("## Execution Plan State: UNKNOWN"),
             "the prompt itself must carry the UNKNOWN section:\n{prompt}"
@@ -868,8 +862,8 @@ mod tests {
         );
     }
 
-    /// (1b) A plan that **is** readable but carries no parseable task line is
-    /// equally unknown — the shared gate owns that verdict, not this helper.
+    /// A plan that **is** readable but carries no parseable task line is equally
+    /// unknown — the shared plan-read decision owns that verdict, not this helper.
     #[test]
     fn test_load_system_prompt_unparseable_plan_is_surfaced_and_not_complete() {
         let (_tmp, _plan_path, (prompt, warning)) = with_isolated_plan(|plan| async move {
@@ -883,8 +877,8 @@ mod tests {
         assert!(!prompt.contains("## Active Execution Plan"));
     }
 
-    /// (1c) No plan file on disk is genuinely "nothing pending" and must **not**
-    /// warn — the gate keeps that case apart from a failed read.
+    /// No plan file on disk is genuinely "nothing pending" and must **not** warn
+    /// — the shared plan-read decision keeps that case apart from a failed read.
     #[test]
     fn test_load_system_prompt_missing_plan_does_not_warn() {
         let (_tmp, _plan_path, (prompt, warning)) = with_isolated_plan(|plan| async move {
@@ -897,9 +891,8 @@ mod tests {
         assert!(!prompt.contains("## Active Execution Plan"), "{prompt}");
     }
 
-    /// (2) A readable plan still embeds the plan block byte-faithfully, and the
-    /// loader's prompt projection stays identical across calls (the projection the
-    /// removed `load_system_prompt_with_plan` wrapper used to provide).
+    /// A readable plan still embeds the plan block byte-faithfully, and the
+    /// loader's prompt projection stays identical across calls.
     #[test]
     fn test_load_system_prompt_readable_plan_embeds_plan_block_byte_faithfully() {
         let cfg = Config::default();
@@ -910,9 +903,9 @@ mod tests {
                     .expect("create plan in isolated workspace");
                 let (prompt, warning) =
                     load_system_prompt_with_plan_and_warning(&cfg, &plan).expect("prompt loads");
-                // Wrapper-equivalent projection: what the deleted
-                // `load_system_prompt_with_plan` returned was exactly this call with the
-                // warning discarded, so re-projecting keeps that behaviour covered.
+                // Projection equivalent: this call with the warning discarded must
+                // hand back exactly the prompt the warning-carrying call produced, so
+                // the prompt-only projection stays covered.
                 let projected = load_system_prompt_with_plan_and_warning(&cfg, &plan)
                     .map(|(prompt, _warning)| prompt)
                     .expect("prompt loads");
@@ -946,9 +939,9 @@ mod tests {
         );
     }
 
-    /// Non-vacuity witness: the pre-fix shape (`if let Ok(Some(..))`) would have
-    /// produced a prompt with **no** plan section at all for the unreadable plan
-    /// above — i.e. exactly the fail-open behaviour this task repairs.
+    /// Non-vacuity witness: a shape that swallows the read result
+    /// (`if let Ok(Some(..))`) yields a prompt with **no** plan section at all for
+    /// the unreadable plan above — i.e. fail-open, which this test rules out.
     #[test]
     fn test_load_system_prompt_fail_open_shape_would_have_been_silent() {
         let (_tmp, _plan_path, ()) = with_isolated_plan(|plan| async move {

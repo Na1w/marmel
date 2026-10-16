@@ -3,12 +3,10 @@
 //! ## Duration authority
 //! The whole duration pipeline (duration-key aliases, JSON number shapes, the
 //! fallback default and the min/max clamp) lives in one place:
-//! [`crate::tool_args::sleep_duration_secs`] (dedup gate t-044, sweep C removed
-//! the three divergent copies that used to be re-typed in this file). Both
-//! entry points below are deliberately thin wrappers over that owner, so the
-//! sync and the async tool path can never disagree about what an argument
-//! means — any input accepted by one is accepted with the same value by the
-//! other.
+//! [`crate::tool_args::sleep_duration_secs`]. Both entry points below are
+//! deliberately thin wrappers over that owner, so the sync and the async tool path
+//! can never disagree about what an argument means — any input accepted by one is
+//! accepted with the same value by the other.
 //!
 //! What still differs between the two entry points is only *how* the wait is
 //! performed (blocking vs. async) and which cancellation sources they observe
@@ -160,10 +158,9 @@ mod tests {
     /// The shared sleep-argument input table: `(label, arguments, seconds each
     /// path is expected to actually wait)`.
     ///
-    /// It is driven through *both* sleep paths so the copies of the
-    /// canonicalization this task merged can never diverge again unnoticed: the
-    /// async copy used to be missing the `as_i64` branch the sync copy had, and
-    /// a third copy in the tool-argument preview defaulted without clamping.
+    /// It is driven through *both* sleep paths so the two paths can never
+    /// diverge unnoticed: an integer shape accepted by one and rejected by the
+    /// other, or a default applied without clamping, shows up as a parity failure.
     fn parity_table() -> Vec<(&'static str, Value, u64)> {
         vec![
             // missing / null / wrong type -> the shared default
@@ -195,7 +192,7 @@ mod tests {
                 SLEEP_DEFAULT_SECS,
             ),
             // floats outside the tool's own range stay unusable -> the default
-            // (they were never parsed by any pre-existing copy either)
+            // (neither sleep path parses them)
             ("float 1e9", json!({"seconds": 1e9}), SLEEP_DEFAULT_SECS),
             (
                 "float above max",
@@ -468,7 +465,7 @@ mod tests {
         });
         let task = tokio::spawn(scoped);
         // Let the wait actually start, so this exercises the mid-flight
-        // interruption and not the pre-flight guard.
+        // interruption and not the guard at the start of the wait.
         tokio::task::yield_now().await;
         token.cancel();
 
@@ -510,12 +507,12 @@ mod tests {
         assert!(wait_with_polling(0, &CancellationToken::new()));
     }
 
-    /// Structural guard (style of the source-shape checks in
-    /// `agents::runner::fix_loop`): the sleep handlers must not re-type the
-    /// default/clamp literals they used to own — they must go through the single
-    /// owner — and they must share the same outcome helpers, which is what makes
-    /// the two paths' refusals identical by construction. The needles are
-    /// assembled at runtime so this test's own text cannot satisfy them.
+    /// Structural source-shape guard (in the style of the checks in
+    /// `agents::runner::fix_loop`): the sleep handlers must not re-type the default
+    /// or clamp bounds — they go through the single owner — and they must share the
+    /// same outcome helpers, which is what makes the two paths' refusals identical by
+    /// construction. The needles are assembled at runtime so this test's own text
+    /// cannot satisfy them.
     #[test]
     fn sleep_handlers_retype_no_default_or_clamp_literals() {
         let src = include_str!("sleep.rs");
@@ -541,7 +538,7 @@ mod tests {
         }
 
         // The owner's name is spelled by the shared table (`TOOL_SLEEP` + the
-        // suffix), never as a raw tool-name literal (t-069).
+        // suffix), never as a raw tool-name literal.
         let owner_call = [TOOL_SLEEP, "_duration_secs("].concat();
         assert_eq!(
             code.matches(&owner_call).count(),

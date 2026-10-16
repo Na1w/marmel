@@ -34,7 +34,7 @@ pub struct Skill {
     pub source: SkillSource,
 }
 
-/// A pre-configured agent archetype template.
+/// A configured agent archetype template.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentArchetype {
     pub id: String,

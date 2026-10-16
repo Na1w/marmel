@@ -426,7 +426,7 @@ fn test_normalize_steer_decision() {
     assert_eq!(normalize_steer_decision(Some("Sleep")), "Sleep");
     // The lower-case spelling is the sleep **tool** name itself (the arbitrator
     // asks for the same tool by name), so it is spelled through the shared
-    // table instead of as a bare tool-name literal in `src/` (gate t-070).
+    // table instead of as a bare tool-name literal in `src/`.
     assert_eq!(
         normalize_steer_decision(Some(crate::tool_names::TOOL_SLEEP)),
         "Sleep"
@@ -530,7 +530,7 @@ async fn test_arbitrate_steer_context_stream_plain_text_fallback() {
     );
 }
 
-// H3: one shared normalizer for the subtask `action` vocabulary
+// One shared normalizer for the subtask `action` vocabulary
 
 /// Every spelling of a known action must fold onto the same canonical action,
 /// and therefore drive the same branch everywhere it is consumed.
@@ -817,16 +817,14 @@ fn test_extract_tasks_to_delegate_rejects_unknown_action() {
     assert_eq!(extract_tasks_to_delegate(&d, "run cargo check").len(), 1);
 }
 
-/// t-061 regression pin: the sleep **tool** has exactly ONE alias vocabulary.
+/// Regression pin: the sleep **tool** has exactly ONE alias vocabulary.
 ///
-/// Every spelling of `crate::tool_names::TOOL_ALIAS_TABLE` that names the sleep
-/// tool must be accepted by BOTH consumers — the harness gate/dispatchers
+/// Every spelling of `crate::tool_names::TOOL_ALIAS_TABLE` naming the sleep tool
+/// must be accepted by BOTH consumers — the harness dispatchers
 /// (`harness::normalize_tool_name` + `tool_names::is_sleep_tool_name`) and the
-/// steer subtask-action grammar (`normalize_steer_subtask_action` /
-/// `FromStr`) — and a near-miss must be refused by both. Before t-061 `steer.rs`
-/// carried its own private set (`sleep|sleeptask|wait|waitseconds|pause`) which
-/// disagreed with the harness owner, so a name accepted on one path was rejected
-/// on the other.
+/// steer subtask-action grammar (`normalize_steer_subtask_action` / `FromStr`)
+/// — and a near-miss must be refused by both. A steer-private alias set would
+/// disagree with the harness owner and split the vocabulary in two.
 #[test]
 fn sleep_tool_aliases_resolve_identically_on_the_harness_and_steer_paths() {
     let vocabulary = crate::tool_names::tool_spellings_for(crate::tool_names::TERMINAL_SLEEP);
@@ -910,7 +908,7 @@ fn sleep_tool_aliases_resolve_identically_on_the_harness_and_steer_paths() {
     }
 }
 
-// gate t-068: the steered sleep duration belongs to the sleep owner
+// The steered sleep duration belongs to the sleep owner
 
 /// Every `sleep`-argument shape a steered sleep can arrive with, and the number
 /// of seconds the single owner resolves it to.
@@ -954,8 +952,8 @@ fn steered_sleep_cases() -> Vec<(&'static str, &'static str, u64)> {
 
 /// The steered sleep must be resolved by the sleep-argument owner: same value
 /// the owner returns for the same arguments, and always inside the owner's
-/// bounds. The pre-t-068 copy in this module applied **no clamp at all**, so
-/// `1e9`/`999999` used to reach the caller as an unbounded request.
+/// bounds — an unbounded request such as `1e9`/`999999` must never reach the
+/// caller as a sleep duration.
 #[test]
 fn steered_sleep_tool_call_resolves_through_the_sleep_owner() {
     for (label, arguments, expected) in steered_sleep_cases() {
@@ -1124,13 +1122,13 @@ async fn test_arbitrate_steer_json_sleep_without_duration_uses_the_owner_default
 }
 
 /// Source guard for the collapse: the production region of `steer.rs` must not
-/// keep any of the sleep default/clamp literals the fourth copy used to carry
-/// (`unwrap_or(5)` + `Some(5)`, no clamp), nor re-type the duration-key lookups
-/// or the arbitrator's own budget knob — everything goes through
-/// `tool_args::sleep_duration_secs` / its constants. Needles are assembled at
-/// runtime (style of the guards in `harness::sleep` and `tool_names`) so this
-/// test's own text can never satisfy them, and comment-only lines are excluded
-/// the way the marker guard excludes them.
+/// keep a sleep default/clamp literal (`unwrap_or(5)` + `Some(5)` without a
+/// clamp), nor re-type the duration-key lookups or the arbitrator's own budget
+/// knob — everything goes through `tool_args::sleep_duration_secs` / its
+/// constants. Needles are assembled at runtime (style of the guards in
+/// `harness::sleep` and `tool_names`) so this test's own text can never satisfy
+/// them, and comment-only lines are excluded the way the marker guard excludes
+/// them.
 #[test]
 fn steer_production_region_retypes_no_sleep_default_or_clamp_literals() {
     let src = include_str!("steer.rs");
@@ -1175,8 +1173,8 @@ fn steer_production_region_retypes_no_sleep_default_or_clamp_literals() {
     }
 
     // The owner call is assembled from the shared tool-name constant — no bare
-    // tool-name literal in `src/` (gate t-070), and still no literal the guards
-    // above could satisfy by accident.
+    // tool-name literal in `src/`, and still no literal the guards above could
+    // satisfy by accident.
     let owner_call = format!("{}_duration_secs(", crate::tool_names::TOOL_SLEEP);
     assert_eq!(
         code.matches(&owner_call).count(),

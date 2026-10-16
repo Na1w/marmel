@@ -3,11 +3,10 @@
 //! Two families:
 //! * the protocol guards call the *production* code in `crate::mcp::protocol`
 //!   (envelope bytes, error-envelope decoding, id matching, result decoding) and
-//!   assert what actually travels on the wire. They replace the old copies of the
-//!   production parsing bodies, which had already drifted from it (cluster C8).
+//!   assert what actually travels on the wire.
 //! * the transport guards exercise `HttpSseConnection` against a mock MCP
-//!   endpoint: shared reqwest builder (C3), shared SSE pump (C4), shared retry
-//!   policy (C2) and the protocol seam (C7).
+//!   endpoint: the shared reqwest builder, the shared SSE pump, the shared retry
+//!   policy and the protocol seam.
 
 #[cfg(test)]
 mod tests {
@@ -40,9 +39,8 @@ mod tests {
 
     // Protocol guards — these call production code (`crate::mcp::protocol`).
 
-    /// The request envelope keeps the wire shape both transports have always
-    /// sent: `jsonrpc`, `id`, `method`, and `params` omitted entirely when there
-    /// are none.
+    /// The request envelope keeps the wire shape: `jsonrpc`, `id`, `method`, and
+    /// `params` omitted entirely when there are none.
     #[test]
     fn request_envelope_keeps_its_wire_shape() {
         let req = JsonRpcRequest::tools_list(123);
@@ -87,7 +85,7 @@ mod tests {
     }
 
     /// (a) A JSON-RPC error envelope decodes into the right `McpError` variant,
-    /// with the code, message, data and server name the callers always saw.
+    /// carrying the code, message, data and server name the callers see.
     #[test]
     fn json_rpc_error_envelope_decodes_into_the_mcp_error_variant() {
         let raw = concat!(
@@ -114,7 +112,7 @@ mod tests {
             }
             other => panic!("expected the JsonRpc variant, got {other:?}"),
         }
-        // The message text surfaced to MCP consumers is unchanged.
+        // The message text surfaced to MCP consumers keeps all its parts.
         let text = err.to_string();
         assert!(text.contains("-32601"), "{text}");
         assert!(text.contains("Method not found"), "{text}");
@@ -335,7 +333,7 @@ mod tests {
         .expect("initialize handshake should succeed")
     }
 
-    // C7: both transports speak the protocol layer's envelopes on the wire.
+    // Both transports speak the protocol layer's envelopes on the wire.
 
     /// The HTTP transport puts exactly the envelopes `crate::mcp::protocol`
     /// builds — nothing of its own: same `jsonrpc`, same method strings, same
@@ -394,12 +392,12 @@ mod tests {
         );
     }
 
-    // C3 + C4 + C2 wiring: shared reqwest builder, shared SSE pump, shared
-    // retry policy (see docs/recon_duplication_net.md).
+    // Wiring of the shared plumbing: reqwest builder, SSE pump and the shared
+    // retry policy.
 
-    /// Cluster C3: the transport must construct its `reqwest::Client` through
-    /// the shared builder — never with a hand-rolled `reqwest::Client::builder()`
-    /// — and must pass its own (unchanged) client-level settings into it.
+    /// The transport must construct its `reqwest::Client` through the shared
+    /// builder, never a hand-rolled one, and must pass its own client-level
+    /// settings into it.
     #[test]
     fn mcp_http_builds_its_client_through_the_shared_builder() {
         let src = include_str!("http.rs");
@@ -429,7 +427,7 @@ mod tests {
             "the shared builder must accept the MCP options"
         );
 
-        // Cluster C2: the retry policy is consumed from its single owner.
+        // The retry policy is consumed from its single owner.
         assert_eq!(MAX_ATTEMPTS, 3, "MCP must use the shared attempt count");
         assert_eq!(
             BACKOFF_BASE_MS, 1000,
@@ -440,7 +438,7 @@ mod tests {
     /// Does the scanned transport file carry its test code inline?
     #[derive(Clone, Copy)]
     enum InlineTests {
-        /// `client.rs:427-428` holds `#[cfg(test)] mod tests { … }`.
+        /// `client.rs` carries an inline `#[cfg(test)] mod tests { … }`.
         Yes,
         /// `http.rs` has none: its tests are wired at `src/mcp/mod.rs` as
         /// `mod http_tests;`, so every line of it is production code.
@@ -450,31 +448,26 @@ mod tests {
     /// The *production* half of a transport source file: CRLF-normalized and cut
     /// at the point where the file's test code begins.
     ///
-    /// Both halves of that job are load-bearing (`docs/windows_failures_analysis.md`,
-    /// Site 4). The old `src.split("#[cfg(test)]\nmod tests {")` anchor never
-    /// matched a `windows-latest` checkout, where `actions/checkout` yields
-    /// `\r\n` and this repo carries no `.gitattributes`; and its `unwrap_or(src)`
-    /// fallback turned that miss into a *silent* whole-file scan — inline test
-    /// module, and the wire literals its fixtures pin on purpose, included.
+    /// Both halves of that job are load-bearing: a `\r\n` checkout must still hit
+    /// the cut, and a cut that silently misses would turn this into a whole-file
+    /// scan — including the inline test module and the wire literals its fixtures
+    /// pin on purpose.
     fn production_only(src: &str, file: &str, inline_tests: InlineTests) -> String {
         let normalized = src.replace("\r\n", "\n");
-        // Anchor-free, layout-tolerant cut: `mod tests` matches the inline
-        // `mod tests {` of `client.rs:428` *and* the extracted
-        // `#[path = "x_tests.rs"] mod tests;` form this repo already uses
-        // (`src/llm/client.rs:1089`), at any indentation and whatever the line
-        // endings are. A renamed test module is still caught by the
-        // "`#[cfg(test)]` gates a `mod`" fallback.
+        // Anchor-free, layout-tolerant cut: `mod tests` matches an inline
+        // `mod tests {` *and* the extracted `#[path = "x_tests.rs"] mod tests;`
+        // form, at any indentation and whatever the line endings are. A renamed
+        // test module still trips the `#[cfg(test)]`-before-`mod` fallback.
         let cut = normalized
             .find("mod tests")
             .or_else(|| cfg_gated_module(&normalized));
         match cut {
             Some(index) => normalized[..index].to_owned(),
             None => {
-                // Fail closed, never open: the old `unwrap_or(src)` scanned the
-                // whole file, so a lost anchor surfaced as "the transport spells
-                // out 'initialize'" — a diagnosis of the test, not of the tree.
-                // A file known to carry an inline test module reports the lost
-                // cut point instead.
+                // Fail closed, never open: scanning the whole file would pull the
+                // inline test module and its deliberately quoted wire literals
+                // into a production-code guard. A file known to carry inline test
+                // modules reports the lost cut point instead.
                 assert!(
                     matches!(inline_tests, InlineTests::None),
                     "{file}: no test-module cut point (`mod tests`, or `#[cfg(test)]` \
@@ -485,14 +478,14 @@ mod tests {
         }
     }
 
-    /// Index of the first `#[cfg(test)]` gate that introduces a **module**
-    /// (doc comments and other attributes between gate and `mod` are tolerated),
-    /// or `None` when the file has no cfg-gated module at all.
+    /// Index of the first `#[cfg(test)]` attribute that introduces a **module**
+    /// (doc comments and other attributes between it and the `mod` are
+    /// tolerated), or `None` when the file declares no test module at all.
     ///
-    /// The gate has to be a *module* gate: a bare `#[cfg(test)]` item is not a
-    /// safe cut point, because `http.rs:366` is a cfg(test) test seam in the
-    /// middle of production code — cutting there would drop the real
-    /// `protocol::…` calls at `http.rs:390/566/571` out of the scan.
+    /// The cut has to land on a *module*: a bare `#[cfg(test)]` item is not a
+    /// safe cut point, because `http.rs` has a cfg(test) test seam in the middle
+    /// of its production code — cutting there would drop the real
+    /// `protocol::…` calls out of the scan.
     fn cfg_gated_module(text: &str) -> Option<usize> {
         const GATE: &str = "#[cfg(test)]";
         let mut from = 0usize;
@@ -520,9 +513,9 @@ mod tests {
         None
     }
 
-    /// Cluster C7: the transport must not own a second copy of the protocol.
-    /// Only the *production* half of each transport file is inspected — the test
-    /// modules deliberately quote wire literals to pin them.
+    /// The transport must not own a second copy of the protocol. Only the
+    /// *production* half of each transport file is inspected — the test modules
+    /// deliberately quote wire literals to pin them.
     ///
     /// The guard is stated in both directions: positively, every protocol call
     /// goes through the shared layer in `src/mcp/protocol.rs`, and negatively, no
@@ -542,8 +535,7 @@ mod tests {
             );
 
             // Positive: the transport delegates to the shared protocol layer
-            // (`src/mcp/protocol.rs`) — `client.rs:136/250/255` and
-            // `http.rs:390/566/571` today.
+            // (`src/mcp/protocol.rs`).
             for seam in [
                 "protocol::initialize(",
                 "protocol::list_tools(",
@@ -590,8 +582,8 @@ mod tests {
         }
     }
 
-    /// Site 4 regression guard: the production-half cut must be independent of
-    /// the checkout's line endings, and it must never widen the scan.
+    /// The production-half cut must be independent of the checkout's line
+    /// endings, and it must never widen the scan.
     #[test]
     fn production_only_cut_survives_crlf_line_endings() {
         let lf = concat!(
@@ -621,7 +613,7 @@ mod tests {
         }
 
         // A cfg(test) *item* that is not a module must not be used as a cut:
-        // that is the `http.rs:366` shape, and cutting there would delete real
+        // `http.rs` has that shape, and cutting there would delete real
         // production code (and its seam calls) from the scan.
         let seam_in_the_middle = concat!(
             "fn a() { protocol::initialize(); }\n",
@@ -635,9 +627,8 @@ mod tests {
         );
     }
 
-    /// The cut used to fail *open* (`unwrap_or(src)`); it now fails loudly, so a
-    /// renamed or restructured test module can never turn this guard into a
-    /// whole-file scan of test fixtures.
+    /// A missing cut point fails loudly: a renamed or restructured test module
+    /// can never turn this guard into a whole-file scan of test fixtures.
     #[test]
     #[should_panic(expected = "no test-module cut point")]
     fn production_only_refuses_to_scan_a_file_whole() {
@@ -648,8 +639,8 @@ mod tests {
         );
     }
 
-    /// Cluster C2 retry classes: connection/timeout/5xx-class failures are
-    /// retried, everything else fails immediately.
+    /// Retry classes: connection/timeout/5xx-class failures are retried,
+    /// everything else fails immediately.
     #[test]
     fn mcp_retryable_error_classes() {
         for code in [408u16, 429, 500, 501, 502, 503, 504] {
@@ -712,8 +703,8 @@ mod tests {
         );
     }
 
-    /// Cluster C2/C4: stream failures are replayable only while the stream has
-    /// delivered nothing — never after an event reached the caller.
+    /// Stream failures are replayable only while the stream has delivered
+    /// nothing — never after an event reached the caller.
     #[test]
     fn mcp_stream_failures_retry_only_before_the_first_event() {
         let server = "srv".to_string();
@@ -840,7 +831,7 @@ mod tests {
     }
 
     /// (a) An application-level JSON-RPC error envelope on the wire is decoded
-    /// into `McpError::JsonRpc` with the unchanged message, and is never
+    /// into `McpError::JsonRpc` with its code and message intact, and is never
     /// retried.
     #[tokio::test]
     async fn mcp_http_does_not_retry_a_json_rpc_error() {
@@ -861,10 +852,10 @@ mod tests {
         );
     }
 
-    /// (b) Cluster C4/C7: `text/event-stream` responses are consumed through the
-    /// shared pump and the protocol's reply matching — events that answer
-    /// another id (and non-JSON events) are skipped in place, and the matching
-    /// event still resolves the call.
+    /// (b) `text/event-stream` responses are consumed through the shared pump
+    /// and the protocol's reply matching — events that answer another id (and
+    /// non-JSON events) are skipped in place, and the matching event still
+    /// resolves the call.
     #[tokio::test]
     async fn mcp_http_skips_unrelated_events_and_resolves_the_matching_one() {
         let (server, _all_calls, call_calls) =
@@ -903,8 +894,8 @@ mod tests {
         assert_eq!(call_calls.load(Ordering::SeqCst), 1);
     }
 
-    /// Cluster C2 safety rule: once the SSE stream has delivered an event, the
-    /// request is never replayed — even though the caller got no answer.
+    /// Safety rule: once the SSE stream has delivered an event, the request is
+    /// never replayed — even though the caller got no answer.
     #[tokio::test]
     async fn mcp_http_never_replays_a_stream_that_already_delivered_an_event() {
         let (server, _all_calls, call_calls) =
@@ -927,8 +918,7 @@ mod tests {
     /// (c) A `tools/list` result decodes into the tool list type through the
     /// production path: description is optional, a missing `inputSchema` falls
     /// back to the default object schema, an explicit `null` schema is passed
-    /// through (the old hand-copied test filtered it out — that copy was the
-    /// C8 drift), and a nameless entry is skipped.
+    /// through, and a nameless entry is skipped.
     #[tokio::test]
     async fn tools_list_result_decodes_into_the_tool_list_type() {
         let (server, _all_calls, _call_calls) =
@@ -985,9 +975,9 @@ mod tests {
         assert_eq!(err.to_string(), "Critical failure");
     }
 
-    /// Cluster C3 end-to-end: the total timeout handed to the shared builder is
-    /// the one enforced by the transport, and such a timeout is retried as a
-    /// transport failure.
+    /// End to end: the total timeout handed to the shared builder is the one
+    /// enforced by the transport, and such a timeout is retried as a transport
+    /// failure.
     #[tokio::test]
     async fn mcp_http_enforces_the_shared_builder_timeout_and_retries_it() {
         let server = MockServer::start().await;

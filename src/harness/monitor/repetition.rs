@@ -1,4 +1,4 @@
-//! Semantic JSON helpers and repetition detectors (REQ-HARN-002 / REQ-HARN-003).
+//! Semantic JSON helpers and repetition detectors.
 
 use std::collections::VecDeque;
 
@@ -14,8 +14,8 @@ const DEFAULT_REPETITION_THRESHOLD: usize = 5;
 /// Rolling buffer length (in characters) for the text repetition detector.
 pub(super) const TEXT_BUFFER_CAPACITY: usize = 16384;
 /// Hard bound on how many tail characters the tail-period scan inspects for a
-/// single [`RepetitionDetector::is_repeating`] call (recon item **M3**: the scan
-/// used to walk the whole rolling buffer for every streamed delta).
+/// single [`RepetitionDetector::is_repeating`] call: the scan never walks the
+/// whole rolling buffer.
 pub(super) const TAIL_SCAN_WINDOW: usize = 4096;
 /// Hard bound on how many recent lines the line/bigram rules keep in their
 /// rolling window.
@@ -77,7 +77,7 @@ fn strip_pagination(value: &serde_json::Value) -> serde_json::Value {
 }
 
 /// Normalize a tool-call JSON payload for semantic equality, dropping
-/// pagination fields at the top level (legacy helper used by older callers).
+/// pagination fields at the top level.
 pub fn semantic_json_eq(a: &str, b: &str) -> bool {
     let norm = |s: &str| -> serde_json::Value {
         match serde_json::from_str::<serde_json::Value>(s) {
@@ -94,9 +94,9 @@ pub fn semantic_json_eq(a: &str, b: &str) -> bool {
     norm(a) == norm(b)
 }
 
-// Tool-call repetition detector (REQ-HARN-002)
+// Tool-call repetition detector
 
-/// Semantic repetition guard over the recent tool-call window (REQ-HARN-002).
+/// Semantic repetition guard over the recent tool-call window.
 #[derive(Debug, Clone)]
 
 pub struct ToolRepetitionDetector {
@@ -169,7 +169,7 @@ impl ToolRepetitionDetector {
 
     /// True if `record` completes ≥`self.threshold` consecutive
     /// repetition-equivalent calls (counting `record` itself). Pagination-only
-    /// differences are exempt (REQ-HARN-002).
+    /// differences are exempt.
     fn detect_consecutive(&self, record: &ToolCallRecord) -> bool {
         let mut count = 1usize;
         for existing in self.buffer.iter().rev() {
@@ -224,31 +224,21 @@ impl ToolRepetitionDetector {
     }
 }
 
-// Text repetition detector (REQ-HARN-003)
+// Text repetition detector
 
 /// Detects text repetition in a rolling buffer of streamed assistant output.
 /// If a pattern of length ≥`min_len` repeats ≥`threshold` times consecutively
-/// at the tail of the buffer, a repetition break fires (REQ-HARN-003). Both
-/// thresholds are config-driven (caesar `repetition_threshold` /
-/// `min_pattern_len`).
+/// at the tail of the buffer, a repetition break fires. Both thresholds are
+/// config-driven (caesar `repetition_threshold` / `min_pattern_len`).
 ///
-/// Cost discipline (recon item **M3**, `docs/recon_bugs_agents_monitor.md`):
-/// `is_repeating` is invoked for **every streamed delta**
-/// (`src/llm/stream.rs`, `HarnessMonitor::feed_text`), so it must never walk the
-/// whole rolling buffer. The detector therefore keeps bounded rolling state that
-/// [`RepetitionDetector::push`] updates incrementally in the same single pass it
-/// already needs for the character buffer:
-///
-/// * the tail-period scan looks at the last [`TAIL_SCAN_WINDOW`] characters at
-///   most and rejects each candidate pattern length on its first mismatching
-///   character (O(window) per delta instead of the previous O(buffer²));
-/// * the line rules look at the last [`LINE_WINDOW`] completed lines plus the
-///   line currently being streamed;
-/// * the word 4-gram rule looks at the last [`WORD_WINDOW`] words.
-///
-/// Memory is bounded by `TEXT_BUFFER_CAPACITY` characters for the buffer itself
-/// plus a character budget per rolling window, independent of how much text is
-/// streamed through the detector.
+/// `is_repeating` runs for **every streamed delta** (`src/llm/stream.rs`,
+/// `HarnessMonitor::feed_text`) and never walks the whole rolling buffer:
+/// [`RepetitionDetector::push`] keeps bounded rolling state — the tail-period
+/// scan looks at the last [`TAIL_SCAN_WINDOW`] characters at most, the line
+/// rules at the last [`LINE_WINDOW`] completed lines plus the line being
+/// streamed, the word 4-gram rule at the last [`WORD_WINDOW`] words. Memory is
+/// bounded by `TEXT_BUFFER_CAPACITY` characters plus a character budget per
+/// rolling window.
 #[derive(Debug, Clone)]
 pub struct RepetitionDetector {
     pub(super) buffer: VecDeque<char>,
@@ -260,12 +250,12 @@ pub struct RepetitionDetector {
     pub(super) min_len: usize,
     /// Rolling window of recent **completed** lines (trimmed, non-empty) in
     /// stream order — the same view `text.lines().map(trim).filter(non-empty)`
-    /// produced, maintained incrementally instead of re-derived per delta. Each
+    /// yields, maintained incrementally rather than re-derived per delta. Each
     /// entry caches the per-line heuristics so they are evaluated once per line
     /// rather than once per streamed delta.
     lines: VecDeque<LineEntry>,
     /// Characters of the line currently being streamed (no `\n` seen yet).
-    /// `str::lines()` reported a trailing partial line as well, so it is part of
+    /// `str::lines()` reports a trailing partial line as well, so it is part of
     /// the line view.
     partial_line: String,
     /// Rolling window of recent whitespace-separated words with surrounding
@@ -374,7 +364,7 @@ impl RepetitionDetector {
     }
 
     /// Bounded tail scan: walk the candidate pattern lengths from the longest
-    /// inside [`TAIL_SCAN_WINDOW`] down to `min_len` (the previous order and
+    /// inside [`TAIL_SCAN_WINDOW`] down to `min_len` (the same order and
     /// semantics, restricted to a fixed window) and return on the first match.
     fn tail_repeats_any_length(&self) -> bool {
         let max_pattern = self.tail_scan_chars() / self.threshold;
@@ -394,8 +384,8 @@ impl RepetitionDetector {
         if n < pat_len * self.threshold {
             return false;
         }
-        // Cheap gate: the last character of every candidate group must equal the
-        // tail character. Most candidate lengths die here in O(1).
+        // Cheap filter: the last character of every candidate group must equal
+        // the tail character. Most candidate lengths die here in O(1).
         let tail_ch = self.buffer[n - 1];
         for group in 1..self.threshold {
             if self.buffer[n - group * pat_len - 1] != tail_ch {
@@ -429,9 +419,9 @@ impl RepetitionDetector {
     /// 2. A 2-line sequence (bigram) repeated >= threshold times in the window.
     /// 3. Any non-trivial conversational line appearing >= threshold times in the window.
     fn line_or_phrase_repeats(&self) -> bool {
-        // Bounded rolling view (recon M3) instead of re-collecting the whole
-        // buffer per delta: the recent completed lines, plus the line currently
-        // being streamed, which `str::lines()` also reported as a trailing
+        // Bounded rolling view rather than re-collecting the whole buffer per
+        // delta: the recent completed lines, plus the line currently
+        // being streamed, which `str::lines()` also reports as a trailing
         // partial line.
         let mut lines: Vec<&LineEntry> = self.lines.iter().collect();
         let trailing_line = trimmed_line(&self.partial_line);
@@ -583,7 +573,7 @@ impl WordEntry {
 }
 
 /// The trailing (not yet newline-terminated) line of the rolling buffer in the
-/// same trimmed/non-empty form `str::lines()` reported it.
+/// same trimmed/non-empty form `str::lines()` reports.
 fn trimmed_line(raw: &str) -> Option<LineEntry> {
     let line = raw.trim();
     (!line.is_empty()).then(|| LineEntry::new(line))

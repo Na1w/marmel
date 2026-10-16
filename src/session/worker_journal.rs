@@ -1,42 +1,27 @@
-//! The per-worker history mirror and the worker restore/installer seam
-//! (Design A §5.5 + §5.7, flow §4.8 + §2).
+//! The per-worker history mirror and the worker restore/installer seam: the two
+//! halves of the *worker* side of the session contract.
 //!
-//! Two halves, one file, because both are the *worker* half of the session
-//! contract:
+//! **Capture (mirror-out).** The specialist's `ContextEngine` is a local inside
+//! `run_specialist_live_inner` and is unreachable from outside it, so the
+//! worker's history is mirrored out **as it is produced**: one
+//! `Vec<MessageRecord>` per worker, appended once per engine mutation, kept in
+//! memory only, harvested by the committer through [`REGISTRY`]. It never touches
+//! disk and never re-enters the engine, which stays authoritative; no journal
+//! lock is ever held across file I/O, a registry lookup or another map guard.
 //!
-//! 1. **Capture (mirror-out).** The specialist's `ContextEngine` is a local
-//!    inside `run_specialist_live_inner` (`src/agents/runner/execution.rs:175`)
-//!    and is unreachable from outside that function, so the worker's history
-//!    has to be mirrored out **as it is produced** (A §5.5). `WorkerJournal` is
-//!    that mirror: one `Vec<MessageRecord>` per worker, appended once per engine
-//!    mutation, kept in memory only, harvested by the committer through
-//!    [`REGISTRY`]. It never touches disk and never re-enters the engine: the
-//!    worker's own engine stays authoritative.
-//! 2. **Restore (identity + status projection).** A restored worker is inserted
-//!    into the live `WORKERS` table under its **stored** key with its
-//!    `completed_seq` verbatim, after the three id floors are raised with
-//!    `fetch_max` (A §5.7). Resume policy **P-R1 / O3** (flow §2.2): the record
-//!    is restored, the *execution* is not, and nothing is auto-relaunched —
-//!    exactly one synthetic manager notice ([`restore_notice`]) says what was
-//!    interrupted.
+//! **Restore (identity + status projection).** A restored worker is inserted into
+//! the live `WORKERS` table under its **stored** key with its `completed_seq`
+//! verbatim, after the three id floors are raised with `fetch_max`. The record is
+//! restored, the *execution* is not: nothing is auto-relaunched, and exactly one
+//! synthetic manager notice ([`restore_notice`]) says what was interrupted. The
+//! installer lives here because `WORKERS` is private to `orchestrator::workers`,
+//! whose seam is [`crate::orchestrator::workers::install_restored_worker`], the
+//! `seed_*_floor` helpers and
+//! [`crate::orchestrator::workers::retire_restored_worker`].
 //!
-//! The installer lives here (and not in `session::restore`) because
-//! `WORKERS` is private to `orchestrator::workers`; the registry side is the
-//! narrow seam that module exposes ([`crate::orchestrator::workers::install_restored_worker`],
-//! the `seed_*_floor` helpers, and
-//! [`crate::orchestrator::workers::retire_restored_worker`]).
-//!
-//! ## Cost and locking rules (flow §1.3, A §5.7 step 4)
-//!
-//! * Mirroring costs one `MessageRecord` clone per engine mutation, on the
-//!   worker thread. No serialization, no I/O, no allocation beyond the clone.
-//! * Every lock here is a short in-process lock. A `DashMap` guard is never
-//!   alive while a journal lock is taken, and no lock here is ever held across
-//!   file I/O or across a registry lookup.
-//! * The mirror is bounded by `Config.session_worker_mirror_max_messages`
-//!   (flow R-TRIG-4); the overflow is counted and reported through
-//!   [`WorkerJournal::was_truncated`] / [`WorkerJournal::truncation_notice`],
-//!   never silently dropped.
+//! The mirror is bounded by `Config.session_worker_mirror_max_messages`; overflow
+//! is counted and reported through [`WorkerJournal::was_truncated`] /
+//! [`WorkerJournal::truncation_notice`], never silently dropped.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -54,10 +39,9 @@ use crate::session::format::{
 };
 use crate::types::Message;
 
-/// The label a restored in-flight worker carries in the subagent list
-/// (flow §2.2 step 2). The stored label survives inside
-/// `WorkerRestoreReport` / [`restore_notice`], which prints both halves
-/// (`In Progress -> Interrupted by restart`).
+/// The label a restored in-flight worker carries in the subagent list. The
+/// stored label survives inside `WorkerRestoreReport` / [`restore_notice`], which
+/// prints both halves (`In Progress -> Interrupted by restart`).
 pub const INTERRUPTED_STATUS_LABEL: &str = "Interrupted by restart";
 
 /// How many **finished** journals stay in [`REGISTRY`] before the oldest are
@@ -68,9 +52,9 @@ pub const INTERRUPTED_STATUS_LABEL: &str = "Interrupted by restart";
 pub const MAX_CLOSED_JOURNALS: usize = 10;
 
 /// The delegation seed a journal carries alongside the mirrored history
-/// (`DelegationRequest` / `IsolatedContext`, A §5.3). It is what lets the
-/// committer rebuild a full `WorkerSection` from `(WORKERS entry, journal)`
-/// without reaching into a live runner.
+/// (`DelegationRequest` / `IsolatedContext`). It is what lets the committer
+/// rebuild a full `WorkerSection` from `(WORKERS entry, journal)` without
+/// reaching into a live runner.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkerSeed {
     pub brief: String,
@@ -103,7 +87,7 @@ struct MirrorState {
     seeded: bool,
     /// Engine mutations observed **after** seeding. `0` means the worker
     /// registered but never reached a live mirror point, which is exactly the
-    /// `SeedOnly` case (A §5.5 point 5).
+    /// `SeedOnly` case.
     live_mutations: usize,
     /// The mirror cap bit: records were refused because of
     /// `session_worker_mirror_max_messages`.
@@ -113,7 +97,7 @@ struct MirrorState {
     seed: Option<WorkerSeed>,
 }
 
-/// A worker's mirrored engine history (A §5.5).
+/// A worker's mirrored engine history.
 ///
 /// `Send + Sync`: the state is a `Mutex<Vec<MessageRecord>>` plus copyable
 /// identity. It is a *shadow* of the engine, never the engine — the worker's
@@ -125,8 +109,8 @@ pub struct WorkerJournal {
     mirror_cap: usize,
     /// The run-ended flag and the close order live **outside** the history
     /// mutex: the registry pruner reads them while it holds the registry write
-    /// guard, and it must never take a second journal lock in that window
-    /// (A §5.7 step 4 — no lock nested under a map guard).
+    /// guard, and it must never take a second journal lock in that window (no
+    /// lock nested under a map guard).
     closed: AtomicBool,
     closed_seq: AtomicU64,
     state: Mutex<MirrorState>,
@@ -147,7 +131,7 @@ impl WorkerJournal {
         &self.worker_key
     }
 
-    /// The `WORKER_ID_SEQ` value drawn when the worker registered (A §5.3).
+    /// The `WORKER_ID_SEQ` value drawn when the worker registered.
     pub fn worker_id_seq_value(&self) -> u64 {
         self.worker_id_seq_value
     }
@@ -176,7 +160,7 @@ impl WorkerJournal {
         state.seed = Some(seed.clone());
     }
 
-    /// Mirror one `engine.append(..)` (A §5.5 point 2).
+    /// Mirror one `engine.append(..)`.
     pub fn mirrored_append(&self, msg: &Message) {
         let record = MessageRecord::from_wire(msg);
         let mut state = self.lock();
@@ -189,10 +173,9 @@ impl WorkerJournal {
         state.records.push(record);
     }
 
-    /// Mirror one `engine.replace_last(..)` as a **replace** of the last
-    /// mirrored record, never an append (A §5.5 point 3: appending here makes
-    /// the mirror longer than the engine and breaks the `pairing_shape`
-    /// cross-check).
+    /// Mirror one `engine.replace_last(..)` as a **replace** of the last mirrored
+    /// record, never an append: appending here would make the mirror longer than
+    /// the engine and break the `pairing_shape` cross-check.
     pub fn mirrored_replace_last(&self, msg: &Message) {
         let record = MessageRecord::from_wire(msg);
         let mut state = self.lock();
@@ -214,8 +197,8 @@ impl WorkerJournal {
     }
 
     /// Collapse the mirror to the engine's new vector — the compaction /
-    /// `inject_rebirth_advisory` / `perform_rebirth` case (A §5.5 point 4): the
-    /// mirror must never re-expand history the worker itself discarded.
+    /// `inject_rebirth_advisory` / `perform_rebirth` case: the mirror must never
+    /// re-expand history the worker itself discarded.
     pub fn mirrored_collapse(&self, messages: &[Message]) {
         let records: Vec<MessageRecord> = messages.iter().map(MessageRecord::from_wire).collect();
         self.collapse_records(records);
@@ -232,7 +215,7 @@ impl WorkerJournal {
         }
     }
 
-    /// A copy of the mirrored history. In memory only (flow §1.3).
+    /// A copy of the mirrored history. In memory only.
     pub fn snapshot(&self) -> Vec<MessageRecord> {
         self.lock().records.clone()
     }
@@ -246,7 +229,7 @@ impl WorkerJournal {
         self.lock().records.is_empty()
     }
 
-    /// Provenance of the mirrored history (A §3.8 `HistorySource`).
+    /// Provenance of the mirrored history (`HistorySource`).
     ///
     /// * `LiveMirror` — at least one live engine mutation was mirrored.
     /// * `SeedOnly`   — only the seed was recorded: the worker registered but
@@ -263,7 +246,7 @@ impl WorkerJournal {
         }
     }
 
-    /// Did the mirror cap bite? Drives the R-TRIG-4 notice.
+    /// Did the mirror cap bite? Drives the truncation notice.
     pub fn was_truncated(&self) -> bool {
         self.lock().truncated
     }
@@ -310,8 +293,8 @@ impl WorkerJournal {
         )
     }
 
-    /// The loud statement that history was cut short (flow R-TRIG-4). `None`
-    /// while the cap has not bitten.
+    /// The loud statement that history was cut short. `None` while the cap has
+    /// not bitten.
     pub fn truncation_notice(&self) -> Option<NonRestorableNotice> {
         let state = self.lock();
         if !state.truncated {
@@ -406,7 +389,7 @@ fn clamp_to_cap(records: Vec<MessageRecord>, cap: usize) -> (Vec<MessageRecord>,
 }
 
 // ---------------------------------------------------------------------------
-// Task-local handle + process-wide registry (flow §4.8)
+// Task-local handle + process-wide registry
 // ---------------------------------------------------------------------------
 
 task_local! {
@@ -429,8 +412,7 @@ pub fn current_journal() -> Option<Arc<WorkerJournal>> {
 /// This is how the handle reaches code that mutates the engine in **another**
 /// module (`fix_loop::append_tool_result`, the notice injectors): they call the
 /// `*_here` helpers, which resolve the journal here. Synchronous scope — the
-/// scoped call must not await (A §5.5: thread the handle the way
-/// `CURRENT_WORKER_TOKEN` is threaded).
+/// scoped call must not await.
 pub fn with_journal<T>(journal: &Arc<WorkerJournal>, f: impl FnOnce() -> T) -> T {
     CURRENT_WORKER_JOURNAL.sync_scope(journal.clone(), f)
 }
@@ -444,11 +426,10 @@ where
     CURRENT_WORKER_JOURNAL.scope(journal.clone(), fut).await
 }
 
-/// Process-wide `worker_key -> journal`, consulted by the committer (T-5) and by
-/// the panic path. A `RwLock<BTreeMap>` rather than a `DashMap`: the harvest
-/// order is the key order (deterministic member writes), and every access here
-/// clones `Arc`s and releases the guard before anything else happens
-/// (A §5.7 step 4: never hold a map guard across a step).
+/// Process-wide `worker_key -> journal`, consulted by the committer and by the
+/// panic path. A `RwLock<BTreeMap>` rather than a `DashMap`: the harvest order is
+/// the key order (deterministic member writes), and every access here clones
+/// `Arc`s and releases the guard before anything else happens.
 pub static REGISTRY: LazyLock<RwLock<BTreeMap<String, Arc<WorkerJournal>>>> =
     LazyLock::new(|| RwLock::new(BTreeMap::new()));
 
@@ -464,9 +445,8 @@ fn registry_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<String, Arc<W
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Open (and register) a worker's mirror.
-///
-/// `mirror_cap` is `Config.session_worker_mirror_max_messages` (flow R-TRIG-4).
+/// Open (and register) a worker's mirror. `mirror_cap` is
+/// `Config.session_worker_mirror_max_messages`.
 pub fn open(worker_key: &str, worker_id_seq_value: u64, mirror_cap: usize) -> Arc<WorkerJournal> {
     let journal = Arc::new(WorkerJournal {
         worker_key: worker_key.to_string(),
@@ -506,8 +486,8 @@ pub fn registry_len() -> usize {
     registry_read().len()
 }
 
-/// Remove a journal from the registry (the committer calls this for keys that
-/// are no longer in `WORKERS`).
+/// Remove a journal from the registry (the committer calls this for keys absent
+/// from `WORKERS`).
 pub fn unregister(worker_key: &str) -> Option<Arc<WorkerJournal>> {
     registry_write().remove(worker_key)
 }
@@ -538,7 +518,7 @@ pub fn mirror_replace_last(
 }
 
 /// Collapse the mirror onto the engine after `compact()` /
-/// `inject_rebirth_advisory()` / `perform_rebirth()` (A §5.5 point 4).
+/// `inject_rebirth_advisory()` / `perform_rebirth()`.
 pub fn mirror_collapse(engine: &ContextEngine, journal: Option<&WorkerJournal>) {
     if let Some(journal) = journal {
         journal.mirrored_collapse(engine.messages());
@@ -562,12 +542,12 @@ pub fn mirror_collapse_here(engine: &ContextEngine) {
 }
 
 // ---------------------------------------------------------------------------
-// Capture-side projection: live entry + journal -> WorkerSection (A §5.3)
+// Capture-side projection: live entry + journal -> WorkerSection
 // ---------------------------------------------------------------------------
 
-/// The lifecycle class a live entry projects to (A §5.3: the label is display
-/// bytes, `status` is control state; an unrecognized label is `Unknown`, never a
-/// coerced class).
+/// The lifecycle class a live entry projects to (the label is display bytes,
+/// `status` is control state; an unrecognized label is `Unknown`, never a coerced
+/// class).
 pub fn project_status(state: &WorkerState) -> WorkerStatus {
     if state.completed_seq.is_none() {
         return WorkerStatus::InProgress;
@@ -582,12 +562,12 @@ pub fn project_status(state: &WorkerState) -> WorkerStatus {
 }
 
 /// Project one live registry entry (+ its journal) into the durable
-/// `WorkerSection` (A §5.3/§5.6). Everything the entry cannot carry becomes a
+/// `WorkerSection`. Everything the entry cannot carry becomes a
 /// `NonRestorableNotice`, and every `Instant` becomes a `TimePoint` through
-/// `session::time` (D5 T1).
+/// `session::time`.
 ///
 /// `last_activity` is `None`: the live registry has no last-activity clock (only
-/// the UI pane does), and inventing one would be a fabricated timestamp (D5).
+/// the UI pane does), and inventing one would be a fabricated timestamp.
 pub fn project_worker_section(
     worker_key: &str,
     state: &WorkerState,
@@ -616,11 +596,10 @@ pub fn project_worker_section(
     if let Some(notice) = journal.and_then(WorkerJournal::truncation_notice) {
         non_restorable.push(notice);
     }
-    // A §10.3/§10.4 (AC-A2 capture half): a steering notice queued for this
-    // worker at the capture instant dies with the process, and the loader of a
-    // later process cannot read a dead process's notice store — so it is named
-    // here, one entry per queued notice. Sampling only: the inbox is never
-    // drained by capture (§7.3 L9).
+    // A steering notice queued for this worker at the capture instant dies with
+    // the process, and the loader of a later process cannot read a dead process's
+    // notice store — so it is named here, one entry per queued notice. Sampling
+    // only: the inbox is never drained by capture.
     non_restorable.extend(pending_notice_notices(worker_key));
     if history_source != HistorySource::LiveMirror {
         non_restorable.push(NonRestorableNotice {
@@ -669,7 +648,7 @@ pub fn project_worker_section(
 }
 
 // ---------------------------------------------------------------------------
-// Restore: identity floors, the `WORKERS` rebuild, status projections (A §5.7)
+// Restore: identity floors, the `WORKERS` rebuild, status projections
 // ---------------------------------------------------------------------------
 
 /// What installing restored workers did. Mirrors the worker half of
@@ -679,14 +658,14 @@ pub struct WorkerRestoreReport {
     /// Entries inserted into `WORKERS`.
     pub installed: usize,
     /// Keys that were in flight before the restart and are installed as open,
-    /// interrupted delegations (flow §2.2).
+    /// interrupted delegations.
     pub interrupted_keys: Vec<String>,
-    /// Keys the loader marked `Unrecoverable` (A D6's one tolerated partial).
+    /// Keys the loader marked `Unrecoverable` (the one tolerated partial).
     pub unrecoverable_keys: Vec<String>,
-    /// Keys with at least one `dispatched` dangling call: a tool may already
-    /// have applied its effect (flow §2.3, AC-D4).
+    /// Keys with at least one `dispatched` dangling call: a tool may already have
+    /// applied its effect.
     pub side_effect_risk_keys: Vec<String>,
-    /// Completed entries the live ring could not hold (A §5.7 step 3).
+    /// Completed entries the live ring could not hold.
     pub completed_dropped_by_ring_cap: usize,
     /// Insertions refused because the key is held by a live entry (the loader
     /// never clobbers a cancellation token).
@@ -699,7 +678,7 @@ pub struct WorkerRestoreReport {
 }
 
 impl WorkerRestoreReport {
-    /// Union, deduplicated by `(kind, subject)` (A §10.7 rule 1).
+    /// Union, deduplicated by `(kind, subject)`.
     pub fn push_notice(&mut self, notice: NonRestorableNotice) {
         let key = notice.dedup_key();
         if !self.notices.iter().any(|n| n.dedup_key() == key) {
@@ -709,11 +688,11 @@ impl WorkerRestoreReport {
 }
 
 /// Raise the three identity floors, then re-insert every restored worker under
-/// its stored key, then apply the completed-ring cap (A §5.7, in that order).
+/// its stored key, then apply the completed-ring cap (in that order).
 ///
-/// Policy P-R1 (flow §2.2): **no worker is relaunched here.** In-flight entries
-/// come back as open, interrupted delegations with a fresh cancellation token;
-/// the manager is told by [`restore_notice`] and decides.
+/// **No worker is relaunched here.** In-flight entries come back as open,
+/// interrupted delegations with a fresh cancellation token; the manager is told
+/// by [`restore_notice`] and decides.
 pub fn install_restored_workers(
     sections: &[WorkerSection],
     floors: &IdentityFloors,
@@ -721,7 +700,7 @@ pub fn install_restored_workers(
     let mut report = WorkerRestoreReport::default();
 
     // Step 1 — floors first, so nothing below a floor can be re-issued while
-    // step 2 runs (A §5.7). `fetch_max`: never lower, never assign.
+    // step 2 runs. `fetch_max`: never lower, never assign.
     let previous_worker_ids = workers::seed_worker_id_seq_floor(floors.worker_id_seq_floor);
     let previous_completed = workers::seed_completed_seq_floor(floors.completed_seq_floor);
     let previous_notices =
@@ -787,10 +766,10 @@ fn install_one_worker(
 ) -> Option<InstallOutcome> {
     let key = section.worker_key.clone();
 
-    // A §5.3: `inProgress <=> completed_seq == None`. A terminal class with no
-    // stored sequence is a contradiction; it is closed through the *existing*
-    // completion path (never a re-derivation of the guard's Drop) and the
-    // deviation is reported.
+    // `inProgress <=> completed_seq == None`. A terminal class with no stored
+    // sequence is a contradiction; it is closed through the *existing* completion
+    // path (never a re-derivation of the guard's Drop) and the deviation is
+    // reported.
     let state = restored_worker_state(section);
     if !workers::install_restored_worker(key.clone(), state) {
         report.rejected_keys.push(key.clone());
@@ -826,12 +805,11 @@ fn install_one_worker(
 
     match section.status {
         WorkerStatus::InProgress | WorkerStatus::Unknown => {
-            // Flow §2.2 step 2: keep the entry open (`completed_seq: None`) so
-            // `has_active_workers()` and every cancel path still see it, and
-            // label it as interrupted. A fresh token is minted here (A §5.7
-            // step 5 permits minting for the *interrupted* projection) so a
-            // later `/abort` cannot be confused by a `None` token — and the old
-            // token is named as lost.
+            // Keep the entry open (`completed_seq: None`) so
+            // `has_active_workers()` and every cancel path still see it, and label
+            // it as interrupted. A fresh token is minted here (minting is permitted
+            // for the *interrupted* projection) so a later `/abort` cannot be
+            // confused by a `None` token — and the old token is named as lost.
             workers::set_active_worker_status(&key, INTERRUPTED_STATUS_LABEL);
             report.push_notice(NonRestorableNotice {
                 kind: NonRestorableKind::CancellationToken,
@@ -882,8 +860,8 @@ fn install_one_worker(
             }
         }
         WorkerStatus::Unrecoverable => {
-            // A D6's tolerated partial: the pane identity survives, the history
-            // does not. Keep it non-active (A §2.3: `is_active: false`).
+            // The tolerated partial: the pane identity survives, the history does
+            // not. Keep it non-active (`is_active: false`).
             if section.completed_seq.is_none() {
                 workers::retire_restored_worker(&key, &section.status_label);
                 report.warnings.push(format!(
@@ -921,15 +899,15 @@ fn install_one_worker(
                 ));
             }
             // Nothing extra is reported: the manager's own transcript already
-            // carries this worker's result (flow §2.3).
+            // carries this worker's result.
             Some(InstallOutcome::Terminal)
         }
     }
 }
 
 /// Build the live entry for a restored section: identity, counters and clocks
-/// verbatim, `Instant`s re-anchored through `session::time` (D5 T2), and a fresh
-/// cancellation token (D5: the old one is reported as lost, never re-minted
+/// verbatim, `Instant`s re-anchored through `session::time`, and a fresh
+/// cancellation token (the old one is reported as lost, never re-minted
 /// silently).
 fn restored_worker_state(section: &WorkerSection) -> WorkerState {
     WorkerState {
@@ -937,7 +915,7 @@ fn restored_worker_state(section: &WorkerSection) -> WorkerState {
             task_id: section.task_id.clone(),
             agent_name: section.role.as_str().to_string(),
             prompt: section.brief.clone(),
-            // D5 T2: the only sanctioned re-anchor, the same trade-off
+            // The only sanctioned re-anchor, the same trade-off
             // `Plan::get_plan_start_time()` makes (suspend/hibernate and wall
             // steps make the delta wrong by the size of the discontinuity).
             started_at: section.started.to_instant(),
@@ -949,8 +927,8 @@ fn restored_worker_state(section: &WorkerSection) -> WorkerState {
             status: section.status_label.clone(),
             cancel_token: Some(crate::orchestrator::bus::global_cancellation_token().child_token()),
         },
-        // D5 T3: clocks are carried, durations stay numbers; nothing here is
-        // computed as a difference of two re-anchored instants.
+        // Clocks are carried, durations stay numbers; nothing here is computed as
+        // a difference of two re-anchored instants.
         last_tokens: section.last_tokens,
         completed_seq: section.completed_seq,
         completed_at: section.completed.as_ref().map(TimePoint::to_instant),
@@ -959,7 +937,7 @@ fn restored_worker_state(section: &WorkerSection) -> WorkerState {
     }
 }
 
-/// `tool_call_id (function)` for every `dispatched` dangling call (A §5.4).
+/// `tool_call_id (function)` for every `dispatched` dangling call.
 fn dispatched_calls(section: &WorkerSection) -> Vec<String> {
     match &section.dangling {
         DanglingToolCallState::Dangling { calls } => calls
@@ -971,27 +949,25 @@ fn dispatched_calls(section: &WorkerSection) -> Vec<String> {
     }
 }
 
-/// Close a restored, interrupted record (flow §2.5): the manager chose to retire
-/// the delegation, re-delegate it, or continue it, so the open record must be
-/// closed the way a real completion closes it — through the existing
-/// `COMPLETED_SEQ` path, the ring eviction and the inbox reclaim — without ever
-/// synthesizing an `ActiveWorkerGuard`.
+/// Close a restored, interrupted record: the manager chose to retire the
+/// delegation, re-delegate it, or continue it, so the open record must be closed
+/// the way a real completion closes it — through the existing `COMPLETED_SEQ`
+/// path, the ring eviction and the inbox reclaim — without ever synthesizing an
+/// `ActiveWorkerGuard`.
 pub fn retire_interrupted_worker(worker_key: &str) -> Option<u64> {
     workers::retire_restored_worker(worker_key, "Retired after restart")
 }
 
 /// One `NonRestorableNotice` **per notice** sitting in the live inbox of
-/// `worker_key` at the capture instant (A §10.3/§10.4, AC-A2 capture half).
+/// `worker_key` at the capture instant.
 ///
 /// The notice queue is process memory: what is queued here when the process dies
 /// can never be read back by the loader, so capture is the only instant at which
-/// it can be recorded. `subject` is the worker key (A §10.3, the same subject the
+/// it can be recorded. `subject` is the worker key (the same subject the
 /// `CancellationToken`/`JoinHandle`/`DropGuard` entries use) and `detail` names
-/// the **notice id**, so an operator can see exactly which steering input was
-/// lost rather than only that "something" was.
-///
+/// the **notice id**, so an operator can see which steering input was lost.
 /// Read-only by construction: [`crate::orchestrator::notice::peek_worker_inbox`]
-/// copies the queue and the caller never drains or expires it (§7.3 L9).
+/// copies the queue and the caller never drains or expires it.
 pub fn pending_notice_notices(worker_key: &str) -> Vec<NonRestorableNotice> {
     crate::orchestrator::notice::peek_worker_inbox(worker_key)
         .into_iter()
@@ -1008,27 +984,18 @@ pub fn pending_notice_notices(worker_key: &str) -> Vec<NonRestorableNotice> {
         .collect()
 }
 
-/// Synthesises one `NonRestorableNotice` **per unit of `count`** for the
-/// queued-but-undelivered notices the previous process held for `worker_key`
-/// (flow §2.2 step 3). The loader cannot read the old process's notice store —
-/// it does not exist — so the caller (the boot wiring) supplies the count it
-/// captured, and what comes back re-spells that count: unlike
-/// [`pending_notice_notices`], which recorded one entry per real notice (naming
-/// its notice id) into `WorkerSection::non_restorable` at capture time, nothing
-/// here names a notice id.
+/// Synthesises one `NonRestorableNotice` **per unit of `count`** for the notices
+/// the previous process had queued, undelivered, for `worker_key`: the loader
+/// cannot read the old process's notice store, so the caller (the boot wiring)
+/// supplies the count it captured. Unlike [`pending_notice_notices`], which
+/// recorded one entry per real notice (naming its notice id) at capture time,
+/// nothing here names an id.
 ///
-/// Current behaviour, stated exactly as the body reads: the range is
-/// `(0..count.max(1))`, so `count = 0` still yields **ONE** entry — a loss that
-/// was never recorded — and all the entries for one key are byte-identical.
-///
-/// The rendered output collapses: `push_repair_notice` (`ui/session.rs:1463`)
-/// dedups on [`NonRestorableNotice::dedup_key`] = `(kind, subject)` and the
-/// subject here is always `worker_key`, so N synthesised notices for one worker
-/// key reach the report as **one line per distinct worker key**.
-///
-/// TODO(t-034): `(0..count.max(1))` → `(0..count)` in the body below, so the
-/// `pub` contract ("per notice") holds and a zero count yields nothing, plus
-/// the matching guard assertions in this module's `mod tests`.
+/// As the body reads, `(0..count.max(1))` means `count = 0` still yields **ONE**
+/// entry and every entry for one key is byte-identical; `push_repair_notice`
+/// dedups on [`NonRestorableNotice::dedup_key`] = `(kind, subject)` with `subject`
+/// always `worker_key`, so N notices for one worker reach the report as **one
+/// line per distinct worker key**.
 pub fn queued_notice_notices(worker_key: &str, count: usize) -> Vec<NonRestorableNotice> {
     (0..count.max(1))
         .map(|_| NonRestorableNotice {
@@ -1043,18 +1010,18 @@ pub fn queued_notice_notices(worker_key: &str, count: usize) -> Vec<NonRestorabl
 }
 
 // ---------------------------------------------------------------------------
-// N-MGR-1 — the single synthetic manager notice (flow §2.4)
+// The single synthetic manager notice
 // ---------------------------------------------------------------------------
 
 /// Exactly one synthetic notice for the manager, summarizing what was
-/// interrupted. Every field is a field of `WorkerSection` (A §5.3) or of
-/// `DanglingCall` (A §3.9): the notice never invents status it did not read.
+/// interrupted. Every field is a field of `WorkerSection` or of `DanglingCall`:
+/// the notice never invents status it did not read.
 ///
-/// Its first line starts with `session::format::SESSION_RESTORE_NOTICE_PREFIX`
-/// so the manager grammar recognizes it as its own injection. The **caller**
-/// (t-012, boot wiring) appends it to the restored manager transcript — the
-/// loader must not re-enter the engine, and the message must land after the
-/// normalized vector and before any new user input (A R-PIN-1/R-PIN-3).
+/// Its first line starts with `session::format::SESSION_RESTORE_NOTICE_PREFIX` so
+/// the manager grammar recognizes it as its own injection. The **caller** (the
+/// boot wiring) appends it to the restored manager transcript — the loader must
+/// not re-enter the engine, and the message must land after the normalized vector
+/// and before any new user input.
 pub fn restore_notice(
     session_id: &str,
     stored_ending: &ProcessEnding,
@@ -1135,9 +1102,9 @@ pub fn restore_notice(
     out
 }
 
-/// [`restore_notice`] wrapped as the single `Message::User` the manager reads
-/// (flow §2.4: a `User` insert at index >= 2 cannot disturb the pins; a `System`
-/// insert would be a re-role).
+/// [`restore_notice`] wrapped as the single `Message::User` the manager reads (a
+/// `User` insert at index >= 2 cannot disturb the pins; a `System` insert would be
+/// a re-role).
 pub fn restore_notice_message(
     session_id: &str,
     stored_ending: &ProcessEnding,
@@ -1229,7 +1196,7 @@ fn lost_kinds_for(section: &WorkerSection, report: &WorkerRestoreReport) -> Vec<
     kinds
 }
 
-/// `18 431`-style grouping, so the notice reads the way the design's example does.
+/// `18 431`-style digit grouping, so the totals in the notice read alike.
 fn group_thousands(value: usize) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
@@ -1275,7 +1242,7 @@ mod tests {
     }
 
     /// Arguments deliberately left **unbalanced**: the mirror must copy them
-    /// verbatim, never sanitize or re-canonicalize them (A §3.7).
+    /// verbatim, never sanitize or re-canonicalize them.
     fn tool_call() -> crate::types::ToolCall {
         crate::types::ToolCall {
             id: "call-1".to_string(),
@@ -1403,7 +1370,7 @@ mod tests {
         );
 
         // `replace_last` must REPLACE: the mirror may never end up longer than
-        // the engine (that would break the pairing cross-check, A §5.5 point 3).
+        // the engine (that would break the pairing cross-check).
         let len_before = journal.len();
         mirror_replace_last(
             &mut engine,
@@ -1524,7 +1491,7 @@ mod tests {
         assert_eq!(dangling, DanglingToolCallState::Balanced);
         assert!(!journal.was_truncated());
 
-        // The projection says so out loud (A D6 "loudly").
+        // The projection says so out loud.
         let state = live_state("In Progress", None);
         let projected =
             project_worker_section("coder-t010-seedonly", &state, Agent::Coder, Some(&journal));
@@ -1614,7 +1581,7 @@ mod tests {
         );
 
         // Identical keys — verbatim, `#7` disambiguator included, never
-        // re-derived (A §5.7 step 2).
+        // re-derived.
         let present: Vec<String> = workers::live_worker_states()
             .into_iter()
             .map(|(key, _)| key)
@@ -1652,8 +1619,8 @@ mod tests {
         );
 
         // A worker registered **after** the restore must draw an id above every
-        // id the bundle carried, and must not clobber the restored key: it gets
-        // a disambiguator instead (claim_worker_slot, A §5.7).
+        // id the bundle carried, and must not clobber the restored key: it gets a
+        // disambiguator instead (`claim_worker_slot`).
         let guard = crate::orchestrator::workers::register_active_worker_with_token(
             Some("t010-restore-a".to_string()),
             "coder".to_string(),
@@ -1767,7 +1734,7 @@ mod tests {
             "install must not steer or dispatch anything to the worker"
         );
 
-        // The lost capabilities are named, never silently swallowed (A D5).
+        // The lost capabilities are named, never silently swallowed.
         for kind in [
             NonRestorableKind::JoinHandle,
             NonRestorableKind::CancellationToken,
@@ -1897,7 +1864,7 @@ mod tests {
         // The registry is process-global, so the registry-touching assertions are
         // serialised with the other journal tests. The guard is always released
         // before the `await`: neither the mirror nor the registry may hold a lock
-        // across a suspension point (A §5.7).
+        // across a suspension point.
         let journal = open("validator-t010-tasklocal", 9, 64);
         let mut engine = specialist_engine(64_000);
         journal.record_seed(&engine, &seed());

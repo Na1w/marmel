@@ -27,22 +27,14 @@ pub struct AgentBlueprint {
 }
 
 impl AgentBlueprint {
-    /// File stem used for this blueprint, gated on the canonical task-id grammar.
-    ///
-    /// Gate t-055 (single grammar authority): the blueprint file stem is a task
-    /// id produced by the LLM (`delegate_task` argument / plan checkbox), so it
-    /// must pass [`crate::task_id::validate_task_id`] before it becomes a file
-    /// name. That function owns the task-id grammar; nothing here re-implements
-    /// or extends it. The id is normalized first (decoration stripping only,
-    /// unchanged order) and the **normalized** value is what is validated and
-    /// used — never sanitized, trimmed, clamped or mended into another name.
-    ///
-    /// Only a blueprint with **no task id at all** falls back to the
-    /// crate-composed role name (the ad-hoc JIT prompt), exactly as before.
-    ///
-    /// [`crate::task_id::TaskIdError::Empty`] is returned for an id that is
-    /// present but empty after normalization — a provided-but-unusable id is a
-    /// rejection, not a reason to invent a different file name.
+    /// File stem for this blueprint: the task id — an LLM-authored id from the
+    /// `plan` checkbox or the delegation argument — checked by
+    /// [`crate::task_id::validate_task_id`], the single owner of the task-id
+    /// grammar. The id is normalized first (decoration stripping only, unchanged
+    /// order) and the **normalized** value is what is validated and used, never
+    /// sanitized, trimmed, clamped or mended into another name. A blueprint with
+    /// **no task id** falls back to the crate-composed role name; an id empty
+    /// after normalization yields [`crate::task_id::TaskIdError::Empty`].
     fn prompt_file_stem(&self) -> Result<&str, crate::task_id::TaskIdError> {
         match self.task_id.as_deref() {
             None => Ok(self.role_name.as_str()),
@@ -55,7 +47,7 @@ impl AgentBlueprint {
 
     /// Save the synthesized prompt with YAML frontmatter to the given directory.
     ///
-    /// Fail closed (gate t-055): a rejected task id produces
+    /// Fail closed: a rejected task id produces
     /// [`std::io::ErrorKind::InvalidInput`] and **no file at all** — never a
     /// file written outside `dir` and never a file under a derived/mended name.
     /// Every caller already treats a failed save as "no prompt file on disk", so
@@ -549,12 +541,11 @@ impl PromptBuilder {
 
     /// Parse all task items from the raw execution plan markdown.
     ///
-    /// The task-line grammar is owned by [`crate::plan_parse`] (dedup cluster
-    /// C3); this is now a thin mapping onto [`crate::plan_parse::parse_tasks`],
-    /// so the prompts pre-generated here cover exactly the lines
-    /// `manager::phase::Plan::pending_tasks` reports — including the
-    /// parenthesised (`- [ ] (t-002) …`), starred, numbered and bold-decorated
-    /// spellings the old private `PLAN_TASK_RE` dropped.
+    /// The task-line grammar is owned by [`crate::plan_parse`]; this is a thin
+    /// mapping onto [`crate::plan_parse::parse_tasks`], so the prompt files
+    /// generated from this list cover exactly the plan lines
+    /// `Plan::pending_tasks` reports — bracketed, parenthesised, starred,
+    /// numbered and bold-decorated task ids alike, and only unchecked boxes.
     pub fn parse_tasks_from_plan(markdown: &str) -> Vec<PlanTaskItem> {
         crate::plan_parse::parse_tasks(markdown)
             .into_iter()
@@ -574,17 +565,14 @@ impl PromptBuilder {
 
     /// File name of the `<task_id>-validation.md` prompt/verdict pair.
     ///
-    /// Gate t-055 (single grammar authority): this name is written to disk and
-    /// later read back by the runner verdict path and by `agents::validation`, so
-    /// the task id must pass [`crate::task_id::validate_task_id`] before it is
-    /// joined onto the prompts directory. The id arrives already normalized (the
-    /// plan-line grammar in [`crate::plan_parse`] strips decoration through
-    /// [`crate::task_id::normalize_task_id_ref`]), and normalization is
-    /// deliberately **not** folded into the validator: the value handed to the
-    /// validator is the value used in the name, byte-for-byte.
-    ///
-    /// A rejection is returned as [`crate::task_id::TaskIdError`] — never turned
-    /// into a different, "repaired" file name.
+    /// File name of the `<task_id>-validation.md` prompt/verdict pair: the id
+    /// must pass [`crate::task_id::validate_task_id`] before it is joined onto
+    /// the prompts directory, because this name is written here and read back by
+    /// the runner verdict path and by `agents::validation`. The plan-line grammar
+    /// strips id decoration ([`crate::plan_parse`] via
+    /// [`crate::task_id::normalize_task_id_ref`]); that normalization is
+    /// deliberately **not** folded in, so the value validated is the value used.
+    /// A rejection is a [`crate::task_id::TaskIdError`], never a repaired name.
     fn validation_prompt_file_name(
         raw_task_id: &str,
     ) -> Result<String, crate::task_id::TaskIdError> {
@@ -652,12 +640,12 @@ impl PromptBuilder {
                 && agent != crate::agents::Agent::Planner
                 && agent != crate::agents::Agent::Validator
             {
-                // Gate t-055: the `<task_id>-validation.md` name is a WRITE whose
-                // file stem is an LLM-authored plan id, so it is grammar-gated by
-                // [`Self::validation_prompt_file_name`] before any join. A rejected
-                // id writes nothing and never gets a substitute name; the runner
-                // verdict path and `agents::validation` then see exactly what they
-                // see for an absent validation prompt (a hard verdict gap).
+                // The `<task_id>-validation.md` name is a WRITE whose file stem
+                // is an LLM-authored plan id, so it is checked by
+                // [`Self::validation_prompt_file_name`] before any join. A
+                // rejected id writes nothing and never gets a substitute name;
+                // the runner verdict path and `agents::validation` then see
+                // exactly what they see for an absent validation prompt.
                 let val_filename = match Self::validation_prompt_file_name(&item.task_id) {
                     Ok(name) => name,
                     Err(err) => {
@@ -786,16 +774,16 @@ mod tests {
         assert!(generated.contains(&"t-001.md".to_string()));
         assert!(generated.contains(&"t-002.md".to_string()));
         assert!(generated.contains(&"t-003.md".to_string()));
-        // t-002 is a coder task ("implement"), so it must also generate t-002-validation.md
+        // The coder task ("implement") must also get its validation prompt
         assert!(generated.contains(&"t-002-validation.md".to_string()));
-        // t-001 is pure research and t-003 is documentation, so neither should have validation
+        // Pure research and pure documentation get no validation prompt
         assert!(!generated.contains(&"t-001-validation.md".to_string()));
         assert!(!generated.contains(&"t-003-validation.md".to_string()));
     }
 
     /// `parse_tasks_from_plan` must see every accepted task-line spelling —
-    /// including the parenthesised task ids the old private `PLAN_TASK_RE`
-    /// rejected — and must keep the role-hint split and the "unchecked only"
+    /// bracketed, parenthesised, starred, numbered and bold-decorated task ids —
+    /// and must keep the role-hint split and the "unchecked only"
     /// semantics of that grammar.
     #[test]
     fn test_parse_tasks_from_plan_covers_all_accepted_forms() {
@@ -872,15 +860,14 @@ mod tests {
         assert!(!blueprint.system_prompt.contains("Active Domain Skills"));
     }
 
-    // Gate t-055 — the two prompt WRITE sites.
+    // The two prompt WRITE sites.
     //
-    // `AgentBlueprint::prompt_file_stem` (which owns `<task_id>.md`) and
-    // `PromptBuilder::validation_prompt_file_name` (which owns
+    // `AgentBlueprint::prompt_file_stem` (owns `<task_id>.md`) and
+    // `PromptBuilder::validation_prompt_file_name` (owns
     // `<task_id>-validation.md`) both route the task id through
-    // `crate::task_id::validate_task_id` — the single grammar authority. A
-    // rejected id produces a typed refusal, a WARN, and **no file at all**: no
-    // write outside the prompts directory and never a substitute name derived
-    // from the rejected id, so the downstream prompt/verdict lookups degrade
+    // `crate::task_id::validate_task_id`, the single grammar authority. A
+    // rejected id yields a typed refusal, a WARN and **no file at all**: no
+    // substitute name is derived, so downstream prompt/verdict lookups degrade
     // exactly like a missing file.
 
     /// Task-id spellings that must never become a file name, each with the
@@ -940,7 +927,7 @@ mod tests {
         found
     }
 
-    /// WARN capture counting only the rejections emitted by this gate.
+    /// WARN capture counting only the rejections emitted by the prompt writes.
     #[derive(Clone, Default)]
     struct PromptWriteWarns(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
@@ -1061,7 +1048,7 @@ mod tests {
         }
     }
 
-    /// `<task_id>.md` happy path: a normal `t-0NN` id (here in its decorated
+    /// `<task_id>.md` happy path: a normal task id (here in its decorated
     /// spelling) normalizes, validates, lands inside the prompts dir and reads
     /// back. A blueprint with **no** task id keeps the documented role-name stem.
     #[test]
@@ -1108,7 +1095,7 @@ mod tests {
         );
     }
 
-    /// Plan pre-generation: a normal id round-trips through both prompt files
+    /// Plan prompt generation: a normal id round-trips through both prompt files
     /// inside the prompts dir, while an over-long plan id contributes neither a
     /// name to the returned list nor a file on disk — and nothing lands outside
     /// the prompts directory.

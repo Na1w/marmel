@@ -1,6 +1,6 @@
 //! Specialist: **Coder** — Lead Software Engineer.
 //!
-//! Domain (REQ-ORCH-002): system architecture, refactoring, and code
+//! Domain: system architecture, refactoring, and code
 //! implementation.
 //!
 //! Allowed tool namespaces: `delegate_task`, `write_file`, `replace`,
@@ -14,7 +14,7 @@ use async_trait::async_trait;
 pub struct Coder;
 
 /// Role system prompt that fixes this specialist's role and tool set
-/// (REQ-ORCH-002 role discipline) — statically embedded at compile time from prompts/coder.md.
+/// — statically embedded at compile time from prompts/coder.md.
 pub const CODER_ROLE_PROMPT: &str = include_str!("../../prompts/coder.md");
 
 #[async_trait]

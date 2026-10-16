@@ -1,58 +1,26 @@
-//! Search tools: grep_search (gitignore-aware) and glob (sorted, capped).
+//! Search tools: `grep_search` (gitignore-aware `ignore`-crate walk, 100 results by
+//! default) and `glob` (root-relative paths sorted lexicographically). Hard cap: 500.
 //!
-//! REQ-TOOL-005: `grep_search` uses the `ignore` crate to traverse files,
-//! honoring `.gitignore` rules. Results are capped at 500 (default 100).
-//! REQ-TOOL-006: `glob` returns sorted relative paths capped at 500 entries.
+//! # Truncation contract — identical for both tools
 //!
-//! # Truncation contract (recon bugs H8 and H10)
+//! The walk always completes, so the reported total is an *exact* match count and not a
+//! lower bound, while only the first `max_results` entries are materialised. Hidden
+//! matches append a footer opening with [`GREP_TRUNCATION_MARKER`] /
+//! [`GLOB_TRUNCATION_MARKER`]: `truncated: true`, returned/total/hidden counts, the
+//! effective `max_results` (plus `max_results_requested` above the hard cap), the
+//! ordering guarantee and a "narrow the search / raise `max_results`" hint. Truncation
+//! is deterministic because [`search_walker`] installs the `ignore` crate's path sorter
+//! — depth-first, siblings lexicographic by path — and `glob` keeps the *first*
+//! `max_results` of its sorted set: one pattern on one tree is byte-identical run to
+//! run. Zero matches yields the literal `no matches`, and the completed walk proves the
+//! whole tree was searched.
 //!
-//! Both tools used to cut their list **silently**: `grep_search` returned the
-//! moment `max_results` was reached, and `glob` collected every match, sorted
-//! them, then dropped the tail with `truncate(500)`. A caller could not tell a
-//! complete answer from a partial one, so a subagent that grepped `TODO`,
-//! received 100 of 900 lines, reported "all fixed" after a partial refactor.
-//!
-//! The contract now — identical for both tools:
-//!
-//! 1. **The walk always completes**, so `total_matches` is an *exact* count of
-//!    what the pattern matched, not a lower bound. Only the first
-//!    `max_results` entries are materialised, so memory stays bounded however
-//!    many matches exist.
-//! 2. **Truncation is machine-visible.** When more matches exist than were
-//!    returned, the output gets a footer opening with
-//!    [`GREP_TRUNCATION_MARKER`] / [`GLOB_TRUNCATION_MARKER`] followed by
-//!    `truncated: true`, the returned/total/hidden counts, the effective
-//!    `max_results` (plus `max_results_requested` when the caller asked for
-//!    more than the hard cap allows), the ordering guarantee and a
-//!    "narrow the search / raise `max_results`" hint.
-//! 3. **Truncation is deterministic.** The shared [`search_walker`] installs the
-//!    `ignore` crate's path sorter, so traversal is depth-first pre-order with
-//!    sibling entries sorted lexicographically by path. `glob` additionally
-//!    sorts its root-relative paths lexicographically and keeps the *first*
-//!    `max_results` of that sorted set, so the same pattern on the same tree
-//!    yields byte-identical output across runs.
-//! 4. **An honest empty answer.** Zero matches still returns the literal
-//!    `no matches` — and because the walk now completes, that string provably
-//!    means "the whole tree was walked and nothing matched".
-//! 5. **Byte-for-byte compatibility.** When nothing was clipped the output is
-//!    exactly what these tools always produced: match lines joined by `\n` for
-//!    `grep_search`, root-relative paths joined by `\n` for `glob`.
-//!
-//! # Glob grammar
-//!
-//! `*` matches within one path segment, `**` crosses path separators, `?`
-//! matches one character, `\X` matches `X` literally (so `\{` matches a real
-//! brace). Character classes (`[...]`) are **not** supported and are matched
-//! literally.
-//!
-//! Brace alternation is supported (recon bug H10: `src/**/*.{rs,md}` used to be
-//! escaped into a literal and answer "no matches" with total confidence). The
-//! pattern is expanded into its alternative forms *before* matching, all
-//! alternatives are tested against a single walk, and the union is de-duplicated
-//! — see [`expand_braces`]. Nesting is supported up to
-//! [`MAX_GLOB_BRACE_DEPTH`] levels and the whole pattern may expand to at most
-//! [`MAX_GLOB_ALTERNATIVES`] alternatives. Anything that cannot be honoured is
-//! rejected as `BadArguments`, never as a silent empty result.
+//! `*` in a glob stays inside one path segment, `**` crosses separators, `?` matches one
+//! character, `\X` matches `X` literally, and `[...]` is matched literally. Brace
+//! alternation expands the pattern into alternatives *before* matching, tests each one
+//! against a single walk and de-duplicates the union ([`expand_braces`]), up to
+//! [`MAX_GLOB_BRACE_DEPTH`] nesting levels and [`MAX_GLOB_ALTERNATIVES`] alternatives; a
+//! pattern that cannot be honoured is `BadArguments`, never a silent empty result.
 
 use crate::harness::fs::{str_arg, usize_arg};
 use crate::harness::{ToolError, ToolResult};
@@ -63,17 +31,17 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-/// Hard cap on the number of grep results (REQ-TOOL-005).
+/// Hard cap on the number of grep results.
 pub const GREP_HARD_CAP: usize = 500;
-/// Hard cap on the number of glob results (REQ-TOOL-006).
+/// Hard cap on the number of glob results.
 pub const GLOB_HARD_CAP: usize = 500;
 
 /// Machine-visible prefix of the footer `grep_search` appends when its cap
-/// clipped the list (recon bug H8). Callers and tests key off this constant
+/// clipped the list. Callers and tests key off this constant
 /// rather than re-wording the human-readable lines that follow it.
 pub const GREP_TRUNCATION_MARKER: &str = "[grep_search truncated]";
 /// Machine-visible prefix of the footer `glob` appends when its cap clipped the
-/// list (recon bug H10).
+/// list.
 pub const GLOB_TRUNCATION_MARKER: &str = "[glob truncated]";
 
 /// Ceiling on how many alternative patterns one brace-heavy glob may grow into.
@@ -91,13 +59,13 @@ const ORDERING_NOTE: &str = "ordering: depth-first pre-order walk with sibling e
 /// `grep_search(pattern, path, max_results)` — regex search over files.
 ///
 /// Walks `path` with the `ignore` crate (which honors `.gitignore`), reads each
-/// file, and collects lines matching the regex. Returns at most `max_results`
-/// match lines, hard-capped at [`GREP_HARD_CAP`].
+/// file, and collects lines matching the regex. Returns at most `max_results` match
+/// lines, hard-capped at [`GREP_HARD_CAP`].
 ///
 /// The walk is *not* short-circuited when the cap is reached: the count keeps
-/// climbing so the footer can state the exact `total_matches`. When the cap bit,
-/// the footer described in the module docs is appended; the match lines
-/// themselves are byte-identical to the previous output.
+/// climbing so the footer can state the exact `total_matches`. When the cap bit, the
+/// footer described in the module docs is appended; the match lines themselves are
+/// byte-identical to an unclipped run.
 pub fn grep_search(args: &Value) -> Result<ToolResult, ToolError> {
     let pattern = str_arg(args, "pattern", TOOL_GREP_SEARCH)?;
     let raw_root = args.get("path").and_then(Value::as_str).unwrap_or(".");
@@ -355,19 +323,17 @@ fn append_footer(content: &mut String, footer: &str) {
 /// patterns it stands for.
 ///
 /// * `src/*.{rs,md}` → `["src/*.rs", "src/*.md"]`
-/// * `{a,{b,c}}` → `["a", "b", "c"]` (nesting is expanded, not treated as
-///   literal text; alternatives come back de-duplicated in left-to-right
-///   expansion order)
-/// * `{a}` → `["a"]` (a one-option group is still alternation, matching the
-///   `globset` behaviour this hand-rolled expansion stands in for — `globset`
-///   is only a transitive dependency of `ignore` and is not declared by this
-///   crate, so no dependency was added)
-/// * `\{a,b\}` → `["\\{a,b\\}"]` — backslash escapes keep a brace literal.
+/// * `{a,{b,c}}` → `["a", "b", "c"]` — nesting is expanded, not treated as literal
+///   text, and alternatives come back de-duplicated in left-to-right expansion order
+/// * `{a}` → `["a"]` — a one-option group is still alternation, matching the
+///   `globset` semantics this hand-rolled expansion stands in for (`globset` is only
+///   a transitive dependency of `ignore` and is not declared by this crate)
+/// * `\{a,b\}` → `["\\{a,b\\}"]` — backslash escapes keep a brace literal
 ///
-/// Errors (surfaced as `BadArguments`, never as an empty result): unbalanced
-/// `{`, an empty group `{}`, deeper nesting than [`MAX_GLOB_BRACE_DEPTH`], or
-/// more alternatives than [`MAX_GLOB_ALTERNATIVES`]. A stray `}` with no
-/// matching `{` is literal text, matching shell/globset semantics.
+/// Errors (surfaced as `BadArguments`, never as an empty result): unbalanced `{`, an
+/// empty group `{}`, deeper nesting than [`MAX_GLOB_BRACE_DEPTH`], or more
+/// alternatives than [`MAX_GLOB_ALTERNATIVES`]. A stray `}` with no matching `{` is
+/// literal text, matching shell/globset semantics.
 pub(crate) fn expand_braces(pattern: &str) -> Result<Vec<String>, String> {
     let mut out: Vec<String> = Vec::new();
     expand_into(pattern, pattern, 0, &mut out)?;
@@ -503,20 +469,18 @@ fn split_alternatives(body: &[char]) -> Vec<String> {
 /// Windows, `/` everywhere else.
 const NATIVE_PATH_SEPARATOR: char = if cfg!(windows) { '\\' } else { '/' };
 
-/// Render a root-relative walker path in the `/`-based spelling of the glob
-/// grammar implemented by [`glob_to_regex`] (`/` → literal `/`, `*` → `[^/]*`,
-/// `?` → `[^/]`, `**/` → `(?:.*/)?`).
+/// Render a root-relative walker path in the `/`-based spelling of the glob grammar
+/// implemented by [`glob_to_regex`] (`/` → literal `/`, `*` → `[^/]*`, `?` → `[^/]`,
+/// `**/` → `(?:.*/)?`).
 ///
-/// The matcher and the reported list must speak the same spelling, otherwise a
-/// pattern written with `/` (`src/**/*.rs`) matches *nothing* on Windows, where
-/// the walker spells the same path with `\` (possibly mixed when the caller
-/// passed `/` inside a path component). Canonicalising **before** matching and
-/// before insertion into the ordered set keeps matching, the returned paths and
-/// the "lexicographically first `max_results`" cap aligned with the documented
-/// root-relative contract on every platform.
-///
-/// A platform whose native separator is already `/` is returned byte-identical,
-/// so a Unix file name containing a literal `\` is never rewritten.
+/// The matcher and the reported list must speak the same spelling, otherwise a pattern
+/// written with `/` (`src/**/*.rs`) matches *nothing* on Windows, where the walker
+/// spells the same path with `\` (possibly mixed when the caller passed `/` inside a
+/// path component). Canonicalising **before** matching and before insertion into the
+/// ordered set keeps matching, the returned paths and the "lexicographically first
+/// `max_results`" cap aligned with the documented root-relative contract on every
+/// platform. A platform whose native separator is already `/` is returned
+/// byte-identical, so a Unix file name containing a literal `\` is never rewritten.
 fn normalize_glob_path(rel: &str, native_separator: char) -> String {
     if native_separator == '/' {
         return rel.to_owned();

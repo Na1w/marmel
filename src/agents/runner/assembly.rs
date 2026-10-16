@@ -1,8 +1,8 @@
 //! Deliverable assembly and revision tracking.
 //!
 //! The mission-marker grammar is owned by [`crate::markers`]; this module only
-//! composes deliverables out of that vocabulary (gate t-030). It never spells a
-//! marker literal itself.
+//! composes deliverables out of that vocabulary and never spells a marker literal
+//! itself.
 
 use crate::markers::{
     MARKER_COMPLETE, decorated, failed_trailer, has_complete_marker, has_failure_marker,
@@ -82,10 +82,9 @@ mod tests {
     use super::*;
     use crate::markers::MissionMarker;
 
-    /// Regression (gate t-030): the revocation rewrite used to be two
-    /// case-sensitive `replace()` calls, so `Mission Complete` / `mission
-    /// COMPLETE` survived a rejection — and because `MissionMarker::parse` is
-    /// case-insensitive, an aborted/rejected run still reported a completion.
+    /// Revocation is case-insensitive: `MissionMarker::parse` reads markers without
+    /// regard to casing, so a completion marker left in any spelling inside a rejected
+    /// deliverable would still report a completion and check the plan line off.
     #[test]
     fn regression_differently_cased_marker_is_revoked_in_a_rejected_run() {
         let variants: Vec<String> = vec![

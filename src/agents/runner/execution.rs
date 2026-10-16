@@ -14,16 +14,15 @@ use crate::tool_names::TOOL_LEAVE_VERDICT;
 
 const MAX_CONSECUTIVE_THINKING_NUDGES: u32 = 5;
 const MAX_CONSECUTIVE_MALFORMED_TOOL_CALLS: u32 = 5;
-/// How often one worker may be refused by the verdict role gate (gate t-033b)
-/// before its deliverable is failed outright. Bounded so a model that insists on
-/// approving itself cannot spin the turn loop forever.
+/// How often one worker may be refused by the verdict role check before its
+/// deliverable is failed outright. Bounded so a model that insists on approving
+/// itself cannot spin the turn loop forever.
 const MAX_CONSECUTIVE_VERDICT_ROLE_REJECTIONS: u32 = 3;
 
 /// Deliverable handed back when the user cancels a specialist mid-turn. The
 /// whole body — the `Task …` sentence as well as the verdict trailer — comes
 /// from [`crate::markers::aborted_deliverable`], so both the wording and the
-/// marker spelling stay owned by `crate::markers` (gate t-070: this used to be
-/// one of four near-identical hand-built copies).
+/// marker spelling stay owned by `crate::markers`.
 fn aborted_deliverable() -> String {
     crate::markers::aborted_deliverable("aborted by user instruction")
 }
@@ -37,26 +36,13 @@ fn rebirth_notice() -> String {
     )
 }
 
-/// The verdict role gate (gate t-033b): may this caller role record a
-/// validation verdict at all?
-///
-/// **Only the validator role.** The check deliberately layers the two existing
-/// role-gating mechanisms of the crate instead of inventing a third:
-///
-/// 1. the specialist registry (`caller_allows_tool` → `SpecialistEntry::allows`,
-///    i.e. the same authority `dispatch_specialist` consults before it dispatches
-///    anything), and
-/// 2. an explicit role identity rule that overrides wildcard allowlists — the
-///    precedent the crate already sets for `create_plan`, which is Manager-only
-///    *even for a wildcard (`*`) specialist*
-///    (`create_plan_is_manager_only_even_for_wildcard_specialist`).
-///
-/// The registry check alone is **not** sufficient: the generalist's namespace is
-/// literally `"*"`, so it "allows" the verdict tool while still being a worker
-/// that must never certify its own deliverable. Prompt/blueprint allowlists are
-/// not sufficient either — prompt-based gating is advisory (see the sanctioned
-/// `test_prompt_based_tool_gating`) — which is why this hard gate is evaluated
-/// *before* any dispatch.
+/// May this caller role record a validation verdict at all? **Only the validator
+/// role**, and only when the specialist registry (`caller_allows_tool` →
+/// `SpecialistEntry::allows`) also allows the verdict tool for that role. The
+/// registry check alone is not sufficient — the generalist namespace is `*` — and
+/// prompt/blueprint allowlists are advisory, so this check overrides wildcard
+/// allowlists and runs *before* any dispatch, the way `create_plan` is
+/// Manager-only even for a wildcard (`*`) specialist.
 pub fn may_record_verdict(
     agent: Agent,
     registry: &crate::orchestrator::SpecialistRegistry,
@@ -65,12 +51,10 @@ pub fn may_record_verdict(
         && crate::orchestrator::caller_allows_tool(agent, TOOL_LEAVE_VERDICT, registry)
 }
 
-/// The caller identity of one specialist run (gate t-056).
-///
-/// It is resolved **once** per run so that the advertised tool list and every
-/// dispatch inside the turn loop are judged for exactly the same caller: what the
-/// model is *offered* and what it is *allowed to execute* can never drift apart.
-/// The shape is byte-for-byte the one the dispatch sites used to build inline.
+/// The caller identity of one specialist run, resolved **once** per run and
+/// reused by every dispatch in the turn loop. What the model is *offered* and
+/// what it is *allowed to execute* are judged for exactly the same caller and can
+/// never drift apart.
 pub fn specialist_caller(agent: Agent, ctx: &IsolatedContext) -> crate::harness::ToolCaller {
     match ctx.allowed_tools() {
         Some(allowed) => crate::harness::ToolCaller::SpecialistWithTools {
@@ -81,28 +65,14 @@ pub fn specialist_caller(agent: Agent, ctx: &IsolatedContext) -> crate::harness:
     }
 }
 
-/// The tool schemas one specialist run is **offered** (gate t-056).
-///
-/// The advertising path used to be role-blind: [`super::fix_loop::assemble_tools`]
-/// was called with the raw prompt blueprint plus the registry entry's namespaces,
-/// and a wildcard namespace (the Generalist's `"*"`) was already enough to put a
-/// verdict tool in front of a worker's model — the *offer* leaked a privilege the
-/// dispatcher had refused, which invites exactly the hallucinated
-/// `leave_verdict` call the turn loop then has to reject.
-///
-/// This closes the offer by **reusing** the fix loop's role-aware helpers, so the
-/// answer still comes from the crate's single public gate [`may_record_verdict`]:
-///
-/// * [`super::fix_loop::assemble_tools_for_caller`] — the caller's blueprint first
-///   filtered through [`super::fix_loop::role_filtered_blueprint`];
-/// * [`super::fix_loop::advertised_tools_for_caller`] — the assembled list minus
-///   the whole verdict class for a caller without verdict authority.
-///
-/// No new gate and no second filter implementation: for any caller where
-/// [`may_record_verdict`] is false, no name for which
-/// [`super::fix_loop::is_verdict_recording_tool`] holds is ever advertised, while
-/// [`Agent::Validator`] keeps its verdict tool. The dispatcher-side gate further
-/// down this file stays in place as the second line of defence.
+/// The tool schemas one specialist run is **offered**: assembled by
+/// [`super::fix_loop::assemble_tools_for_caller`] (its blueprint first filtered
+/// through [`super::fix_loop::role_filtered_blueprint`], never the raw
+/// [`super::fix_loop::assemble_tools`] plus wildcard registry namespaces) and then
+/// narrowed by [`super::fix_loop::advertised_tools_for_caller`], which drops the
+/// whole verdict class for any caller [`may_record_verdict`] refuses: no name
+/// matched by [`super::fix_loop::is_verdict_recording_tool`] reaches a worker, while
+/// [`Agent::Validator`] keeps its verdict tool under [`may_record_verdict`].
 pub fn specialist_advertised_tools(
     caller: &crate::harness::ToolCaller,
     entry_allows: impl Fn(&str) -> bool,
@@ -112,25 +82,14 @@ pub fn specialist_advertised_tools(
     super::fix_loop::advertised_tools_for_caller(&assembled, caller)
 }
 
-/// Build the context engine of one specialist run and charge it with the exact
-/// tool schemas that run advertises (bug M7 / gate t-064, specialist turn path:
-/// residual defect 1 found by the t-067 manager-cluster gate).
-///
-/// `advertised` **must** be the very list the run hands to
-/// [`super::fix_loop::build_turn_request`] — in this file that is the single
-/// `specialist_advertised_tools(...)` result the turn loop reuses on every turn.
-/// A superset would trim transcript the wire never paid for; a subset would
-/// under-price the request and let an over-budget turn through. The charge is
-/// delegated to [`super::fix_loop::charge_engine_tool_schema`], the crate's one
-/// owner of this primitive (the fix loop charges through it at
-/// `fix_loop.rs:843`), so there is exactly one implementation of "price the
-/// advertised view".
-///
-/// The Manager path does the same thing at engine construction
-/// (`src/ui/session.rs::build_manager_context` → `sync_manager_tool_schema`);
-/// before t-073 the specialist turn built its engine with the bare
-/// [`crate::manager::ContextEngineFactory::specialist_context`] and stayed
-/// message-only for its whole life.
+/// Build the context engine of one specialist run — from
+/// [`crate::manager::ContextEngineFactory::specialist_context`] — and charge it with
+/// the exact tool schemas that run advertises, through
+/// [`super::fix_loop::charge_engine_tool_schema`]: the crate's one implementation of
+/// "price the advertised view". `advertised` **must** be the very list the run hands
+/// to [`super::fix_loop::build_turn_request`] — a superset would trim transcript the
+/// wire never paid for, a subset would under-price the request and let an
+/// over-budget turn through. The Manager path charges the same way at construction.
 pub fn build_specialist_context(
     cfg: &crate::config::Config,
     enhanced_system_prompt: String,
@@ -144,15 +103,12 @@ pub fn build_specialist_context(
 }
 
 /// Re-charge `engine` with the advertised view it is **about to send** and return
-/// the charged schema token count (gate t-073).
-///
-/// A specialist's advertised list is not static within a process lifetime: MCP
-/// servers boot and reconnect, and the advertised MCP view is policy-filtered.
-/// The loop therefore re-declares the list immediately before every budget
-/// decision instead of trusting the construction-time charge — the exact pattern
-/// `src/ui/session.rs::sync_manager_tool_schema` applies to the Manager engine.
-/// It is a one-line delegation to [`super::fix_loop::charge_engine_tool_schema`],
-/// not a second implementation.
+/// the charged schema token count. A specialist's advertised list is not static: MCP
+/// servers boot again and the advertised MCP view is policy-filtered, so the loop
+/// re-declares the list immediately before every budget decision instead of
+/// trusting the construction-time charge — the same pattern
+/// `src/ui/session.rs::sync_manager_tool_schema` applies to the Manager engine, in
+/// one call to [`super::fix_loop::charge_engine_tool_schema`].
 pub fn sync_specialist_tool_schema(
     engine: &mut crate::manager::ContextEngine,
     advertised: &[crate::types::ToolDef],
@@ -182,13 +138,13 @@ async fn run_specialist_live_inner(
     cfg: &crate::config::Config,
     token: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<String> {
-    // Gate t-056: resolve the caller identity once, before anything is advertised.
+    // Resolve the caller identity once, before anything is advertised.
     let caller = specialist_caller(agent, ctx);
 
     let tools_list = if let Some(ref bp) = ctx.blueprint {
         // The prose tool list is advertising too: a verdict-recording tool is
-        // dropped for every caller the public gate refuses, through the same
-        // helper the fix-loop blueprint path uses (no second filter).
+        // dropped for every caller the public verdict check refuses, through the
+        // same helper the fix-loop blueprint path uses (no second filter).
         super::fix_loop::role_filtered_blueprint(&caller, &bp.allowed_tools).join("`, `")
     } else {
         "write_file`, `replace`, `read_file`, `run_command`, `grep_search`, `glob`, `rebirth"
@@ -224,32 +180,25 @@ async fn run_specialist_live_inner(
             agent.as_str()
         )
     })?;
-    // Shared tool-assembly helper (single owner): default tools filtered
-    // by blueprint allow-list / registry namespaces + MCP fan-out, then made
-    // role-aware for advertising (gate t-056): the verdict class is never even
-    // *offered* to a caller [`may_record_verdict`] refuses — not via a prompt
-    // blueprint, and not via a wildcard registry namespace such as the
-    // Generalist's `"*"`. [`Agent::Validator`] keeps its verdict tool. The
-    // dispatcher-side gate further below stays as the second line of defence.
-    // `caller` is the exact value the dispatch sites below use, so the offer and
-    // the authority can never disagree.
+    // Shared tool-assembly helper (single owner): default tools filtered by the
+    // blueprint allow-list / registry namespaces + MCP fan-out, then made role-aware
+    // for advertising: the verdict class is never *offered* to a caller
+    // [`may_record_verdict`] refuses — not through a prompt blueprint, not through a
+    // wildcard registry namespace such as the Generalist's `"*"` — while
+    // [`Agent::Validator`] keeps its verdict tool. The dispatcher-side check below
+    // stays as the second line of defence.
     let mcp_servers = specialist_cfg
         .map(|sc| sc.mcp_servers.clone())
         .unwrap_or_default();
     let tools = specialist_advertised_tools(&caller, |name| reg_entry.allows(name), &mcp_servers);
 
-    // Gate t-073 (residual defect 1 of the t-067 manager-cluster gate): the
-    // context engine is now built **through** `build_specialist_context`, i.e. on
-    // the very line the advertised list exists and therefore charged with
-    // exactly that list before the first `build_turn_request` and before any
-    // budget decision. The construction used to sit above the tool assembly, so
-    // the engine never saw a schema at all: `request_token_count()` was the
-    // message-only number `context.rs` honestly documents as a **lower bound**,
-    // and `should_compact()` / `should_advise_rebirth()` priced a request that is
-    // thousands of tokens bigger on the wire — the specialist could walk straight
-    // over the provider context window. The list is still moved *after* assembly
-    // rather than re-derived here, so the charge and the wire stay identical by
-    // construction.
+    // The engine is built **through** `build_specialist_context`, on the very line
+    // the advertised list exists, so it is charged with exactly that list before the
+    // first `build_turn_request` and before any budget decision. An uncharged engine
+    // reports only the message-only `request_token_count()`, which `context.rs`
+    // documents as a **lower bound**, while `should_compact()` /
+    // `should_advise_rebirth()` price a request thousands of tokens larger on the
+    // wire. The list is moved here, not re-derived, so charge and wire stay identical.
     let mut engine =
         build_specialist_context(cfg, enhanced_system_prompt, ctx.brief.clone(), &tools);
 
@@ -273,13 +222,12 @@ async fn run_specialist_live_inner(
         Some(token.clone()),
     );
 
-    // t-010 (Design A §5.5): the engine above is a **local**, so nothing outside
-    // this function can read the worker's history once the run ends. The journal
-    // is an append-side *mirror* of it, opened under the live worker key and
-    // seeded with what the engine already holds (system prompt, brief, snippets
-    // block) plus the delegation seed. It is a shadow only — the engine stays
-    // authoritative for execution, the mirror never touches disk, and every
-    // mirrored step is a clone on this thread (flow §1.3).
+    // The engine above is a **local**, so nothing outside this function can read the
+    // worker's history once the run ends. The journal is an append-side *mirror* of
+    // it, opened under the live worker key and seeded with what the engine already
+    // holds (system prompt, brief, snippets block) plus the delegation seed. It is a
+    // shadow only: the engine stays authoritative for execution, the mirror never
+    // touches disk, and every mirrored step is a clone on this thread.
     let journal = worker_journal::open(
         &_active_guard.0,
         crate::orchestrator::workers::worker_state_snapshot(&_active_guard.0)
@@ -316,33 +264,14 @@ async fn run_specialist_live_inner(
     let validation_configured =
         auto_validate_enabled && agent != Agent::Validator && agent != Agent::Planner;
 
-    // Fail-closed verdict handling (H1/H4 in docs/recon_bugs_agents_monitor.md,
-    // gates t-033a + t-033b). In a workspace that pre-generates per-task prompts,
-    // the per-task verdict file `{tid}-validation.md` is the recorded evidence
-    // that a validation verdict exists for the task. When that file was absent
-    // the loop used to *skip* validation and start with `validation_passed =
-    // true`, so a deliverable was reported as validated — and its plan line
-    // checked off — although no validator ever ran.
-    //
-    // An absent, unreadable or blank verdict file is now an UNCONDITIONAL hard
-    // validation failure for every task that requires validation: the verdict
-    // gate in the turn loop refuses to validate the deliverable, the deliverable
-    // is reported as not validated, and the `- [ ] [t-xxx]` line stays
-    // unchecked. The t-033a cut-off ("only for task ids the plan still lists as
-    // open") was only ever a workaround for a non-hermetic test — `tests/
-    // test_specialist_stream.rs` read the repository's real `.marmel/prompts/`
-    // and asserted MISSION COMPLETE. That suite is now scoped to an isolated
-    // temporary workspace root, so the residual is closed instead of codified:
-    // no plan lookup, no plan read, no exception for untracked task ids.
-    // `max_validator_iterations = 0` and `enable_validator = false` stay the
-    // explicit, configuration-level opt-outs they always were.
-    //
-    // The verdict path is now grammar-gated as well (gate t-046): the task id is
-    // validated as a single path segment before it is joined, so an id like
-    // `../../etc/x` or `a/b` can no longer read a `-validation.md` file outside
-    // the prompts directory. A rejected id is recorded as a verdict gap — exactly
-    // the hard failure an absent, unreadable or blank verdict file already is —
-    // and the id is never sanitized or clamped into a different file name.
+    // Fail closed: an absent, unreadable or blank verdict file
+    // (`{tid}-validation.md` under the prompts directory) is an unconditional
+    // validation failure for every task that requires validation: the deliverable is
+    // reported as not validated and its plan line stays unchecked. No plan lookup, no
+    // exception for untracked task ids; only `max_validator_iterations = 0` /
+    // `enable_validator = false` opt out. The id is validated as a single path segment
+    // before joining, so `../../etc/x` or `a/b` cannot reach a verdict file outside
+    // the prompts directory; a rejected id is a verdict gap, never sanitized/clamped.
     let verdict_gap: Option<String> = if has_prompts_dir
         && validation_configured
         && max_val_iterations > 0
@@ -381,12 +310,9 @@ async fn run_specialist_live_inner(
         None
     };
 
-    // Unconditional (t-033b): every task that requires validation is gated, and
-    // a verdict gap is carried into that gate as a hard failure regardless of
-    // whether the execution plan happens to track the task id. (The t-033a shape
-    // — `requires_validation = … && (hard_verdict_gap || verdict_gap.is_none())`
-    // — silently left `validation_passed = true` for gap runs whose task id was
-    // not an open plan line, i.e. exactly the residual it was meant to close.)
+    // Every task that requires validation is checked, and a verdict gap is carried
+    // into that check as a hard failure regardless of whether the execution plan
+    // happens to track the task id.
     let requires_validation = validation_configured && max_val_iterations > 0;
     let missing_verdict_reason: Option<String> = verdict_gap;
 
@@ -417,7 +343,7 @@ async fn run_specialist_live_inner(
 
         // Turn-start notice drain — rendered by the crate's single notice renderer.
         // The injector mutates the engine, so it mirrors through the task-local
-        // handle (A §5.5).
+        // handle.
         worker_journal::with_journal(&journal, || {
             super::fix_loop::inject_worker_notices_at_turn_start(&mut engine, &_active_guard.0);
         });
@@ -706,10 +632,9 @@ async fn run_specialist_live_inner(
                 && (tools_executed_count > 0 || has_verdict)
                 && !has_replan_marker(&reply.content)
             {
-                // Hard failure (H1/H4, gate t-033a): without a recorded
-                // per-task verdict file the validator has no brief, so the
-                // deliverable must be reported as *not validated* — never as
-                // silently validated.
+                // Hard failure: without a recorded per-task verdict file the
+                // validator has no brief, so the deliverable must be reported as
+                // *not validated* — never as silently validated.
                 if let Some(gap) = missing_verdict_reason.as_deref() {
                     let critique = format!(
                         "Validation was not performed — {gap}. The deliverable is reported as not validated."
@@ -874,18 +799,14 @@ async fn run_specialist_live_inner(
                 .unwrap_or_else(|_| serde_json::Value::String(tc.function.arguments.clone()));
 
             if is_leave_verdict_tool(&tc.function.name) {
-                // Hard role gate (gate t-033b): a verdict is the validator's
-                // instrument, so a worker calling the verdict tool is refusing to
-                // audit itself — see [`may_record_verdict`] for why the registry
-                // allowlist and the prompt blueprint are each insufficient on
-                // their own.
-                //
-                // The refusal is an explicit tool error visible to the worker
-                // (never a panic, never a silent ignore), it is logged, and the
-                // call is never dispatched — so no verdict state and no verdict
-                // file is touched, and the deliverable still has to pass the
-                // automated validator. A worker that keeps trying is failed
-                // outright instead of being allowed to spin the turn loop.
+                // Only the validator role may record a verdict — a worker calling
+                // the verdict tool is refusing to audit itself (see
+                // [`may_record_verdict`] for why the registry allowlist and the
+                // prompt blueprint are each insufficient on their own). The refusal
+                // is an explicit tool error visible to the worker (never a panic,
+                // never a silent ignore) and the call is never dispatched: no verdict
+                // state and no verdict file is touched, and the deliverable still has
+                // to pass the automated validator. Repeated attempts fail the run.
                 if !may_record_verdict(agent, &registry) {
                     verdict_role_rejections += 1;
                     let forbidden = crate::harness::ToolError::Forbidden {
@@ -940,8 +861,8 @@ async fn run_specialist_live_inner(
                 }
 
                 // Validator role: record the verdict. A payload with no explicit
-                // verdict resolves to NOT approved (fail-closed, t-033b) instead
-                // of the historical `true` default.
+                // verdict resolves to NOT approved (fail-closed), never to an
+                // implicit `true`.
                 let (approved, critique) = parse_verdict_args(&args_val)
                     .unwrap_or((false, NO_EXPLICIT_APPROVAL_REASON.to_string()));
 
@@ -976,7 +897,7 @@ async fn run_specialist_live_inner(
                     name: tc.function.name.clone(),
                     arguments: args_val,
                 };
-                // Same caller identity as the advertised tool list (gate t-056).
+                // Same caller identity as the advertised tool list.
                 let _ = crate::harness::dispatch_for_async_with_engine(
                     &invocation,
                     caller.clone(),
@@ -989,11 +910,10 @@ async fn run_specialist_live_inner(
                 break;
             }
 
-            // Shared tool-dispatch core (one owner in `fix_loop`): monitor intervention
-            // check → cancellation check → dispatch. `None` means aborted.
-            // The caller is the very identity the advertised tool list was built
-            // from (gate t-056), so no tool can be offered that dispatch would
-            // not judge for the same caller.
+            // Shared tool-dispatch core (one owner in `fix_loop`): monitor
+            // intervention check → cancellation check → dispatch. `None` means
+            // aborted. The caller is the very identity the advertised tool list was
+            // built from, so no tool is offered that dispatch would not judge alike.
             let dispatched = super::fix_loop::dispatch_tool_call(
                 &mut monitor,
                 &tc,
@@ -1008,9 +928,8 @@ async fn run_specialist_live_inner(
             .await;
             let (content, execution_succeeded) = match dispatched {
                 Some(d) => {
-                    // Behavior-preserving: the original loop only counted a
-                    // tool as executed when dispatch returned Ok (not on
-                    // errors or repetition blocks).
+                    // A tool counts as executed only when dispatch returned Ok — not
+                    // on errors and not on repetition blocks.
                     if d.1 {
                         tools_executed_count += 1;
                         turn_had_successful_tool_call = true;
@@ -1038,14 +957,12 @@ async fn run_specialist_live_inner(
             );
         }
 
-        // Mid-turn notice drain (t-048): a steering notice posted while this
-        // turn was in flight must reach the worker inside this SAME turn. The
-        // drain runs immediately after the tool round, so the injected notice is
-        // part of the transcript before compaction and before every exit path
-        // below (replan return, the `leave_verdict` break) — a worker that
-        // concludes on this turn can still be steered, instead of leaving the
-        // notice queued until the TTL sweep drops it. Routing is exact-identity,
-        // so a notice addressed to another worker is not injected here.
+        // Mid-turn notice drain: a steering notice posted while this turn was in
+        // flight reaches the worker inside this SAME turn. The drain runs right after
+        // the tool round, so the injected notice is part of the transcript before
+        // compaction and before every exit path below (replan return, the
+        // `leave_verdict` break). Routing is exact-identity, so a notice addressed to
+        // another worker is never injected here.
         worker_journal::with_journal(&journal, || {
             super::fix_loop::inject_worker_notices_mid_turn(&mut engine, &_active_guard.0);
         });
@@ -1072,32 +989,19 @@ async fn run_specialist_live_inner(
         } else if turn_had_successful_tool_call || leave_verdict_called {
             consecutive_malformed_tool_calls = 0;
         }
-        // Gate t-073 (the two residual defects the t-067 manager-cluster gate
-        // found on this loop):
-        //
-        // 1. the budget decision is priced against the **advertised view the loop
-        //    is about to send**. The list is re-declared immediately before the
-        //    decision — mirroring the Manager path's
-        //    `src/ui/session.rs::sync_manager_tool_schema` — because a
-        //    construction-time charge can go stale (MCP servers boot and
-        //    reconnect, and the advertised MCP view is policy-filtered).
-        //    `tools` is the same `Vec` this loop hands to
-        //    `super::fix_loop::build_turn_request`, so charge and wire cannot
-        //    drift.
-        // 2. the `CompactionOutcome` is never discarded again. It is the only
-        //    evidence of whether the 70% target was actually reached, and
-        //    `TargetUnreachable` means the run keeps working **over budget**. The
-        //    surfacing reuses the fix loop's own renderer
-        //    (`super::fix_loop::fix_loop_compaction_notice`) verbatim rather than
-        //    re-implementing it: `tracing::warn!` plus the orchestrator status
-        //    channel the worker line already renders, carrying messages_removed /
-        //    tokens_reclaimed / final tokens / target. Compaction behaviour itself
-        //    is unchanged.
+        // The budget decision is priced against the **advertised view this loop is
+        // about to send**: the list is re-declared immediately before the decision,
+        // because a construction-time charge goes stale (MCP servers boot again and
+        // the advertised MCP view is policy-filtered). `tools` is the same `Vec`
+        // this loop hands to `super::fix_loop::build_turn_request`, so charge and
+        // wire cannot drift. The `CompactionOutcome` is never discarded:
+        // it is the only evidence of whether the 70% target was reached, and
+        // `TargetUnreachable` means the run keeps working over budget.
         sync_specialist_tool_schema(&mut engine, &tools);
         if engine.should_compact() {
             let outcome = engine.compact();
-            // The mirror must follow the engine's collapse, never re-expand the
-            // history the worker itself discarded (A §5.5 point 4).
+            // The mirror follows the engine's collapse; it never re-expands the
+            // history the worker itself discarded.
             mirror_collapse(&engine, Some(&journal));
             tracing::info!("{agent_tag}: automatic context compaction: {outcome:?}");
             if let Some(notice) = super::fix_loop::fix_loop_compaction_notice(&agent_tag, &outcome)

@@ -1,86 +1,25 @@
 //! Context engine: token counting (cl100k_base BPE), compaction, and rebirth.
 //!
-//! # Requirements
-//!
-//! - **REQ-CORE-001** (KV-Cache Prefix Preservation): the system prompt is
-//!   locked strictly at `messages[0]` and must never be moved or prepended
-//!   with transient state.
-//! - **REQ-CORE-002** (Immutable Goal Pinning): the initial user goal is
-//!   locked at `messages[1]`; compaction/rebirth never remove or alter it.
-//! - **REQ-CORE-003** (Context Budget & Compaction): token counting uses a
-//!   `cl100k_base` BPE singleton. Compaction triggers at > 90% of budget and
-//!   targets 70%, keeping `[0]`/`[1]`. The assistant `tool_calls` ↔ `Tool`
-//!   pairing invariant is enforced in **both** directions: orphan
-//!   `role:"tool"` messages are pruned, and `tool_calls` entries whose result
-//!   is gone get an `"(aborted)"` result synthesized
-//!   ([`repair_tool_call_pairs`]), so the compacted transcript is always a
-//!   valid OpenAI-compatible chat request. The pinned window is charged against
-//!   the target: when it alone exceeds 70% the target is unreachable and
-//!   `compact()` reports [`CompactionOutcome::TargetUnreachable`] instead of
-//!   claiming success on an over-budget transcript (bug M5); the reported
-//!   message/token deltas are always measured on the final vector (bug M5b).
-//! - **REQ-CORE-004** (Forced Rebirth): collapse to the 4-message checkpoint
-//!   shape — `[0]` system prompt, `[1]` pinned goal, `[2]` last genuine user
-//!   instruction, `[3]` the `SYSTEM: REBIRTH CHECKPOINT` injection emitted as a
-//!   **`User`** message (bug M12) — and bump `session_rebirths`. `[2]` is
-//!   omitted when it would only duplicate the pinned goal, and injected
-//!   advisories are never summarized as an instruction (bug M6).
-//!
-//! # Requirement status (dead-code decision, see `docs/decision_dead_code_manager.md`)
-//!
-//! - **REQ-CORE-003** is implemented by the live path only: `should_compact()`
-//!   (> 90%) + `compact()` (target 70%) + `repair_tool_call_pairs()` (which
-//!   reuses `prune_orphan_tool_messages()` for the orphan half and closes the
-//!   dangling-`tool_calls` half of the invariant), as
-//!   called from `src/ui/session.rs` and `src/agents/runner/{execution,fix_loop}.rs`.
-//!   The caesar-style hard-limit **retry escalation** (`compact_with_retry` /
-//!   `compact_context` / `force_compact_context` + `COMPACTION_RETRY_CAP` and
-//!   the `SYSTEM: CONTEXT LIMIT EXCEEDED` injection) had no non-test caller and
-//!   was deleted; nothing in the runtime compacts on a hard-limit overflow.
-//!   **Bug M7 (tool-schema accounting, gate t-064):** the budget is measured on
-//!   the whole *request*, and the charge is owned by the caller that actually
-//!   sends it. [`ContextEngine::should_compact`] compares
-//!   [`ContextEngine::request_token_count`]
-//!   (transcript plus the serialized `ChatRequest.tools` payload, counted by
-//!   [`tools_tokens`]) against the unchanged 90% trigger. The engine starts at
-//!   `0` schema tokens — an engine that declares no tools keeps the exact
-//!   message-only numbers — and a caller opts in with
-//!   [`ContextEngine::set_tools`], which must be handed **exactly** the list the
-//!   wire request carries (never a superset, never a subset). The live Manager
-//!   path declares [`manager_wire_tools`] (the same list
-//!   `src/llm/stream.rs::build_request` builds: [`crate::types::ToolDef::manager_tools()`
-//!   plus the policy-filtered MCP view) in `src/ui/session.rs::build_manager_context`
-//!   and re-declares it at every budget decision, so a later MCP connection also
-//!   re-prices the budget. There are exactly **three** live declarers, each charging
-//!   the list it is about to send:
-//!   (1) Manager — `src/ui/session.rs::build_manager_context` plus
-//!   `src/ui/session.rs::sync_manager_tool_schema`, re-declared at every budget
-//!   decision; (2) fix loop — `src/agents/runner/fix_loop.rs::run_fix_loop` via
-//!   `fix_loop::charge_engine_tool_schema`; (3) specialist turn (gate t-073) —
-//!   `src/agents/runner/execution.rs::build_specialist_context` charges the
-//!   advertised view at construction and
-//!   `src/agents/runner/execution.rs::sync_specialist_tool_schema` re-prices it
-//!   immediately before every budget decision of the specialist turn loop; the
-//!   liveness of that charge is proved by
-//!   `tests/test_specialist_schema_charge.rs`. A
-//!   message-only engine (schema tokens `0`) is therefore only reachable from a
-//!   caller that declares nothing at all — which is what
-//!   `ContextEngineFactory::specialist_context()` hands out by design; it is a
-//!   **lower bound** on the real request, never an over-count, and the three live
-//!   declarers above close that gap rather than rely on it.
-//!   `ContextEngineFactory::manager_context()` pre-charges the MCP-free Manager
-//!   default so a caller that forgets to declare is still closer to the truth.
-//!   Neither `count_tokens` nor the ratio constants changed.
-//! - **REQ-CORE-005** (Slow-Prefill Cooling, ≥300 s consecutive backend
-//!   prefills with a 5-turn post-rebirth cooldown) is **not implemented**: the
-//!   `SlowPrefillTracker` that modelled it had no non-test caller and no live
-//!   prefill instrumentation exists, so it was deleted rather than left as a
-//!   false assurance.
-//! - **REQ-CORE-006** (UTF-8 safe slicing) is satisfied *at the call sites*:
-//!   every display truncation goes through `crate::text_util` or an
-//!   `is_char_boundary`/`floor_char_boundary` loop (e.g. `src/markers.rs`,
-//!   `src/ui/helpers.rs`, `src/harness/mod.rs`). The manager-local
-//!   `utf8_safe_slice` copy had no non-test caller and was deleted.
+//! - The system prompt is locked at `messages[0]` and the user goal at `messages[1]`;
+//!   compaction and rebirth never move, prepend to, remove or alter either one.
+//! - Compaction triggers above 90% of the budget and targets 70%. The assistant
+//!   `tool_calls` ↔ `Tool` pairing invariant is enforced in **both** directions (orphan
+//!   `role:"tool"` messages pruned; a missing result synthesized as `"(aborted)"`,
+//!   [`repair_tool_call_pairs`]), so a compacted transcript is always a valid
+//!   OpenAI-compatible request. The pinned window is charged against that target: a
+//!   pinned prefix alone over 70% yields [`CompactionOutcome::TargetUnreachable`], and
+//!   reported deltas are measured on the final vector.
+//! - Forced rebirth collapses the transcript to `[0]` system prompt, `[1]` pinned goal,
+//!   `[2]` the last genuine user instruction (never an injected advisory; omitted when it
+//!   would duplicate `[1]`) and a `SYSTEM: REBIRTH CHECKPOINT` line emitted as `User`.
+//! - The budget is measured on the whole **request**: [`ContextEngine::should_compact`]
+//!   compares [`ContextEngine::request_token_count`] (transcript plus the tool-schema
+//!   payload, [`tools_tokens`]) against the same 90% trigger, and the caller that sends
+//!   the request owns that charge via [`ContextEngine::set_tools`] with exactly the list
+//!   it wires ([`manager_wire_tools`] =
+//!   [`crate::types::ToolDef::manager_tools()`] plus the policy-filtered MCP view). Only
+//!   a caller that declares nothing at all ends up message-only, and then that count is
+//!   a **lower bound** on the real request.
 
 use std::sync::Arc;
 
@@ -90,8 +29,7 @@ use crate::session::format::{
 };
 use crate::types::Message;
 
-/// The exact system checkpoint content injected at `messages[3]` on rebirth
-/// (REQ-CORE-004).
+/// The exact system checkpoint content injected at `messages[3]` on rebirth.
 pub const REBIRTH_CHECKPOINT_PREFIX: &str = "(SYSTEM: REBIRTH CHECKPOINT. The previous turn-by-turn history has been compacted. Summarized progress: ";
 
 /// Rebirth advisory trigger ratio (80% of budget).
@@ -176,11 +114,10 @@ pub fn compaction_target(max_context_tokens: usize) -> usize {
 }
 
 /// Per-tool-definition framing overhead charged by the provider for the
-/// `{"type":"function","function":{…}}` wrapper around every schema
-/// (bug M7).
+/// `{"type":"function","function":{…}}` wrapper around every schema.
 ///
-/// Mirrors the per-message framing constant in [`message_tokens`]: the wire
-/// object costs a few tokens beyond its serialized body.
+/// Mirrors the per-message framing constant in [`message_tokens`]: the wire object
+/// costs a few tokens beyond its serialized body.
 pub const TOOL_DEF_FRAMING_TOKENS: usize = 8;
 
 /// The tool names the Manager stream sends by default, i.e. the name set of
@@ -201,19 +138,17 @@ pub const MANAGER_TOOL_NAMES: &[&str] = &[
     crate::tool_names::TOOL_REPLY_TO_ARBITRATOR,
 ];
 
-/// BPE token count of the **tool-schema payload** of a chat request (bug M7).
+/// BPE token count of the **tool-schema payload** of a chat request.
 ///
 /// Every request carries `tools: Option<Vec<ToolDef>>` (see
 /// `src/llm/stream.rs::build_request` and
-/// `src/agents/runner/fix_loop.rs::build_turn_request`), but the budget model
-/// used to count only the message array, so the real request size was
-/// systematically underestimated by the size of the schemas.
+/// `src/agents/runner/fix_loop.rs::build_turn_request`), and the budget charges that
+/// payload, not only the message array.
 ///
-/// Each definition is charged as its `type` tag, function name, description and
-/// the JSON serialization of its `parameters` schema, plus
-/// [`TOOL_DEF_FRAMING_TOKENS`]. The count is **additive and optional**: an empty
-/// (or `None`, i.e. no tools at all) tool list contributes `0`, so callers that
-/// send no tools keep the exact pre-M7 numbers.
+/// Each definition is charged as its `type` tag, function name, description and the
+/// JSON serialization of its `parameters` schema, plus [`TOOL_DEF_FRAMING_TOKENS`].
+/// The count is **additive and optional**: an empty (or `None`, i.e. no tools at all)
+/// tool list contributes `0`.
 pub fn tools_tokens(tools: &[crate::types::ToolDef]) -> usize {
     tools
         .iter()
@@ -230,27 +165,26 @@ pub fn tools_tokens(tools: &[crate::types::ToolDef]) -> usize {
 }
 
 /// BPE token count of a **complete chat request**: the transcript plus the tool
-/// schemas sent with it (bug M7).
+/// schemas sent with it.
 ///
-/// Equal to [`count_tokens`] when `tools` is empty, which keeps every
-/// tool-less caller numerically identical to the pre-M7 behaviour.
+/// Equal to [`count_tokens`] when `tools` is empty.
 pub fn request_tokens(messages: &[Message], tools: &[crate::types::ToolDef]) -> usize {
     count_tokens(messages) + tools_tokens(tools)
 }
 
 /// The **exact** tool-schema payload a Manager request carries on the wire.
 ///
-/// The wire owner is `src/llm/stream.rs::build_request`: every Manager request
-/// sends [`crate::types::ToolDef::manager_tools()`] plus the *policy-filtered* MCP
-/// view of the configured servers ([`crate::harness::allowed_mcp_tools`], so a MCP
-/// name the tool-policy gate refused is never advertised). The budget model has to
-/// charge precisely that list — a superset would compact too early and hide
-/// transcript, a subset would under-count and let an over-budget request through.
+/// The wire owner is `src/llm/stream.rs::build_request`: every Manager request sends
+/// [`crate::types::ToolDef::manager_tools()`] plus the *policy-filtered* MCP view of
+/// the configured servers ([`crate::harness::allowed_mcp_tools`], so an MCP name the
+/// tool policy does not allow is never advertised). The budget model has to charge
+/// precisely that list — a superset would compact too early and hide transcript, a
+/// subset would under-count and let an over-budget request through.
 ///
-/// It is deliberately a function of the *server names only*: the MCP tool list
-/// itself comes from the process-wide MCP gate, which is installed when the
-/// servers boot and can change when a server (re)connects, so callers re-read it
-/// whenever they price a request (see `src/ui/session.rs`).
+/// It is deliberately a function of the *server names only*: the MCP tool list itself
+/// is process-wide, installed when the servers boot and changed when a server
+/// (re)connects, so callers re-read it whenever they price a request (see
+/// `src/ui/session.rs`).
 pub fn manager_wire_tools(mcp_servers: &[String]) -> Vec<crate::types::ToolDef> {
     let mut tools = crate::types::ToolDef::manager_tools();
     for tool in crate::harness::allowed_mcp_tools(mcp_servers) {
@@ -261,17 +195,15 @@ pub fn manager_wire_tools(mcp_servers: &[String]) -> Vec<crate::types::ToolDef> 
 
 /// Exclusive end index of the pinned prefix of a transcript.
 ///
-/// `messages[0]` (system prompt, REQ-CORE-001) and `messages[1]` (immutable
-/// goal, REQ-CORE-002) are always pinned. If a `REBIRTH CHECKPOINT` exists in
-/// `messages[2..]`, the pinned window is extended through it so distilled
-/// session state is never dropped during compaction.
+/// `messages[0]` (system prompt) and `messages[1]` (immutable goal) are always pinned.
+/// If a `REBIRTH CHECKPOINT` exists in `messages[2..]`, the pinned window is extended
+/// through it so distilled session state is never dropped during compaction.
 ///
 /// The checkpoint is matched on its **content marker**, not its role:
-/// `perform_rebirth` emits it as a `User` message (bug M12) while transcripts
-/// restored from a session bundle (installed wholesale by
-/// [`ContextEngine::install_restored_messages`]) can still carry the historic
-/// `System` variant. The window is therefore pinned by content, and the restored
-/// bytes MUST NOT be re-role'd or re-ordered (A §4 R-PIN-3).
+/// `perform_rebirth` emits it as a `User` message, while a transcript installed
+/// wholesale by [`ContextEngine::install_restored_messages`] can still carry the
+/// `System` variant. The window is therefore pinned by content, and the installed bytes
+/// MUST NOT be re-role'd or re-ordered.
 fn pinned_prefix_end(messages: &[Message]) -> usize {
     messages
         .iter()
@@ -289,18 +221,16 @@ fn pinned_prefix_end(messages: &[Message]) -> usize {
         .unwrap_or(2)
 }
 
-/// R-PIN-2 guard (**test-only**): how many writes have gone through a *by-index*
-/// pin setter — [`ContextEngine::set_system_prompt`] or [`ContextEngine::set_goal`].
+/// Test-only witness: how many writes have gone through a *by-index* pin setter —
+/// [`ContextEngine::set_system_prompt`] or [`ContextEngine::set_goal`].
 ///
 /// A restore installs its vector wholesale through
 /// [`ContextEngine::install_restored_messages`] and MUST NOT route through either
-/// setter: both write `messages[0]`/`messages[1]` **by index**, so a restore that
-/// let them run would replace the pinned bytes with the freshly composed prompt
-/// and goal (the concrete clobber path `docs/design_session_restore_data.md` §4
-/// R-PIN-2 documents). The restore tests snapshot this witness around
-/// `install_restored_messages` and require it to stay `0`, which turns the
-/// clobber path into a test failure instead of a silent loss of REQ-CORE-001 /
-/// REQ-CORE-002.
+/// setter: both write `messages[0]`/`messages[1]` **by index**, so a restore that let
+/// them run would replace the pinned bytes with the freshly composed prompt and goal.
+/// The restore tests snapshot this witness around `install_restored_messages` and
+/// require it to stay `0`, which turns that clobber path into a test failure instead of
+/// a silent loss of both pins.
 #[cfg(test)]
 fn note_pin_setter_write(engine: &ContextEngine) {
     engine
@@ -308,17 +238,16 @@ fn note_pin_setter_write(engine: &ContextEngine) {
         .set(engine.pin_setter_calls.get() + 1);
 }
 
-/// Byte-length witnesses of the two pinned messages (A §3.5 `PinWitness`,
-/// R-PIN-1): `messages[0]` is the system prompt (REQ-CORE-001), `messages[1]`
-/// the immutable goal (REQ-CORE-002).
+/// Byte-length witnesses of the two pinned messages: `messages[0]` is the system
+/// prompt, `messages[1]` the immutable goal.
 ///
-/// Lengths, not hashes — cheap, and enough to name *which* pin broke instead of
-/// "the transcript differs". The measurement is identical to
-/// `session::format::restore::witness_of`, which measures the same pair on the
-/// durable `MessageRecord` form: the two MUST agree, or the capture side would
-/// witness numbers its own loader cannot reproduce. A transcript that does not
-/// carry `System` at `[0]` / `User` at `[1]` witnesses `0`/`0` — capture stays
-/// total, and the loader refuses the vector (R-PIN-5 steps 2 and 3).
+/// Lengths, not hashes — cheap, and enough to name *which* pin broke instead of "the
+/// transcript differs". The measurement is identical to
+/// `session::format::restore::witness_of`, which measures the same pair on the durable
+/// `MessageRecord` form: the two MUST agree, or the capture side would witness numbers
+/// its own loader cannot reproduce. A transcript that does not carry `System` at `[0]`
+/// / `User` at `[1]` witnesses `0`/`0` — capture stays total, and the loader refuses
+/// the vector.
 fn pin_witness_of(messages: &[Message]) -> PinWitness {
     let system_prompt_len = match messages.first() {
         Some(Message::System { content }) => content.len(),
@@ -334,36 +263,30 @@ fn pin_witness_of(messages: &[Message]) -> PinWitness {
     }
 }
 
-/// Content markers that identify an **injected** advisory/notice message — a
-/// `Message::User` the runtime put in the transcript itself rather than a turn
-/// the user or the model produced. All of them are synthesized by this crate
-/// with a fixed leading marker:
+/// Content markers that identify an **injected** advisory/notice — a `Message::User`
+/// the runtime put in the transcript itself rather than a turn the user or the model
+/// produced. All of them are synthesized by this crate with a fixed leading marker:
 ///
-/// - [`REBIRTH_ADVISORY_MESSAGE`] — the `SYSTEM: CONTEXT BUDGET ADVISORY`
-///   injection ([`ContextEngine::inject_rebirth_advisory`]).
-/// - `SYSTEM: CONTEXT LIMIT EXCEEDED` — the hard-limit notice deleted by the
-///   `compact_with_retry` dead-code decision (H7); transcripts saved before
-///   that deletion still contain it.
-/// - `SYSTEM: Rebirth checkpoint accepted` — the post-rebirth continuation
-///   injection (`src/ui/session.rs`, `src/agents/runner/execution.rs`,
-///   `src/agents/validation.rs`).
-/// - [`REBIRTH_CHECKPOINT_PREFIX`] — the rebirth checkpoint itself, which must
-///   never be summarized as if it were a user instruction.
-/// - [`SESSION_RESTORE_NOTICE_PREFIX`] — the one synthetic restore notice a
-///   rehydrated session appends ([`ContextEngine::append_restore_notice`],
-///   flow §2.4). Registered here so `perform_rebirth` can never promote it into
-///   the `messages[2]` slot instead of the last genuine instruction.
+/// - [`REBIRTH_ADVISORY_MESSAGE`] — the `SYSTEM: CONTEXT BUDGET ADVISORY` injection
+///   ([`ContextEngine::inject_rebirth_advisory`]).
+/// - `SYSTEM: CONTEXT LIMIT EXCEEDED` — a notice older saved transcripts still contain.
+/// - `SYSTEM: Rebirth checkpoint accepted` — the post-rebirth continuation injection
+///   (`src/ui/session.rs`, `src/agents/runner/execution.rs`, `src/agents/validation.rs`).
+/// - [`REBIRTH_CHECKPOINT_PREFIX`] — the rebirth checkpoint itself, never summarizable
+///   as if it were a user instruction.
+/// - [`SESSION_RESTORE_NOTICE_PREFIX`] — the one synthetic restore notice a rehydrated
+///   session appends ([`ContextEngine::append_restore_notice`]), so `perform_rebirth`
+///   can never promote it into the `messages[2]` slot instead of the last genuine
+///   instruction.
 ///
-/// Used by [`ContextEngine::perform_rebirth`] so the rebirth `messages[2]` slot
-/// carries the last **genuine** instruction (bug M6, `docs/recon_bugs_manager.md`).
-///
-/// **The text of these markers is load-bearing** (A §4 R-PIN-4):
-/// [`is_injected_advisory`] is a pure `starts_with` scan, and the pinned window
-/// ([`pinned_prefix_end`]) is found by a content match on
-/// [`REBIRTH_CHECKPOINT_PREFIX`]. Trimming, re-wrapping, normalizing, rewording
-/// or translating one of these prefixes silently moves the pinned window and
-/// makes a runtime notice look like a genuine user instruction. A restore loader
-/// MUST treat them as opaque bytes.
+/// [`ContextEngine::perform_rebirth`] uses this list so the rebirth `messages[2]` slot
+/// carries the last **genuine** instruction. **The text of these markers is
+/// load-bearing:** [`is_injected_advisory`] is a pure `starts_with` scan and the pinned
+/// window ([`pinned_prefix_end`]) is found by a content match on
+/// [`REBIRTH_CHECKPOINT_PREFIX`] — trimming, re-wrapping, normalizing, rewording or
+/// translating one of these prefixes silently moves the pinned window and makes a
+/// runtime notice look like a genuine user instruction. A restore loader MUST treat
+/// them as opaque bytes.
 pub const INJECTED_ADVISORY_PREFIXES: &[&str] = &[
     "(SYSTEM: CONTEXT BUDGET ADVISORY",
     "(SYSTEM: CONTEXT LIMIT EXCEEDED",
@@ -389,16 +312,16 @@ pub fn is_injected_advisory(content: &str) -> bool {
 /// the model's own intent; see [`repair_tool_call_pairs`].
 pub const ABORTED_TOOL_RESULT: &str = "(aborted)";
 
-/// Prune orphaned `role:"tool"` messages (REQ-CORE-003).
+/// Prune orphaned `role:"tool"` messages.
 ///
 /// A tool message is an orphan if its `tool_call_id` does not correspond to a
-/// `tool_calls` entry on a *surviving* assistant message. Orphans are dropped
-/// so no invalid tool response is ever sent upstream.
+/// `tool_calls` entry on a *surviving* assistant message. Orphans are dropped so no
+/// invalid tool response is ever sent upstream.
 ///
-/// This is only **one half** of the pairing invariant: it removes tool results
-/// that outlive their parent. The reverse half (an assistant `tool_calls` entry
-/// whose result is missing) is enforced by [`repair_tool_call_pairs`], which
-/// reuses this pass rather than duplicating it.
+/// This is only **one half** of the pairing invariant: it removes tool results that
+/// outlive their parent. The reverse half (an assistant `tool_calls` entry whose result
+/// is missing) is enforced by [`repair_tool_call_pairs`], which reuses this pass rather
+/// than duplicating it.
 pub fn prune_orphan_tool_messages(messages: Vec<Message>) -> Vec<Message> {
     let valid_ids: std::collections::HashSet<_> = messages
         .iter()
@@ -420,30 +343,25 @@ pub fn prune_orphan_tool_messages(messages: Vec<Message>) -> Vec<Message> {
 
 /// Enforce **both** directions of the assistant `tool_calls` ↔ `Tool` pairing
 /// invariant so the sequence is always valid for an OpenAI-compatible
-/// `/chat/completions` request (bug H1, `docs/recon_bugs_manager.md`):
+/// `/chat/completions` request:
 ///
 /// 1. **No orphan `Tool`** — a `role:"tool"` message whose `tool_call_id` has no
 ///    surviving assistant parent is dropped. This half reuses
-///    [`prune_orphan_tool_messages`] instead of re-implementing it, and also
-///    drops duplicate results for the same id (keeping the first).
-/// 2. **No dangling `tool_calls`** — every `tool_calls` entry of a surviving
-///    assistant message is followed by exactly one `Message::Tool` carrying its
-///    id, in `tool_calls` order. Missing results are synthesized as
+///    [`prune_orphan_tool_messages`] instead of re-implementing it, and also drops
+///    duplicate results for the same id (keeping the first).
+/// 2. **No dangling `tool_calls`** — every `tool_calls` entry of a surviving assistant
+///    message is followed by exactly one `Message::Tool` carrying its id, in
+///    `tool_calls` order. Missing results are synthesized as
 ///    `Message::Tool { content: ABORTED_TOOL_RESULT }`.
 ///
-/// Existing results are *moved* so they sit directly after their parent
-/// assistant; nothing else is reordered, so `messages[0]` (system prompt) and
-/// `messages[1]` (pinned goal) keep their positions (REQ-CORE-001/002) — they
-/// can only ever be `System`/`User` messages, which this pass never moves.
-///
-/// **Design choice (option (a)):** synthesize an `"(aborted)"` placeholder
-/// rather than dropping the assistant turn (option (b)). Rationale: the live
-/// trigger for H1 is `src/ui/session.rs` breaking its tool loop on abort/exit,
-/// which leaves the assistant-with-`tool_calls` as the *newest* message; option
-/// (b) would delete the model's most recent reasoning/intent (and, for the
-/// pinned window, could delete a turn the retention policy deliberately kept).
-/// A placeholder keeps the pairing valid while losing only the (nonexistent)
-/// tool output, and it is self-describing to the model.
+/// Existing results are *moved* so they sit directly after their parent assistant;
+/// nothing else is reordered, so `messages[0]` (system prompt) and `messages[1]`
+/// (pinned goal) keep their positions — they can only ever be `System`/`User` messages,
+/// which this pass never moves. A placeholder is synthesized instead of dropping the
+/// assistant turn: that newest assistant message can hold the model's most recent
+/// intent, and inside the pinned window it can hold a turn retention deliberately kept,
+/// so only the (nonexistent) tool output is lost and the placeholder stays
+/// self-describing to the model.
 pub fn repair_tool_call_pairs(messages: Vec<Message>) -> Vec<Message> {
     // Half 1: drop orphan tool results (and, by construction of the map below,
     // any duplicate result for an id that is already accounted for).
@@ -520,15 +438,12 @@ fn pairing_shape(messages: &[Message]) -> Vec<(&'static str, Vec<String>)> {
 }
 
 /// Outcome of [`ContextEngine::compact`] — the caller must be able to tell a
-/// compaction that actually reached the 70% target from one that could not
-/// (bug M5, `docs/recon_bugs_manager.md`).
+/// compaction that actually reached the 70% target from one that could not.
 ///
-/// The counters are always measured on the **final** message vector, i.e. after
-/// the retention window, after the pairing repair (orphan pruning + placeholder
-/// synthesis) and after the bounded re-trim (bug M5b: the pre-pruning count
-/// `initial_len - (prefix_end + kept_tail)` reported by the old
-/// `compact_to_target` is stale for any pass where pruning or synthesis changes
-/// the vector).
+/// The counters are always measured on the **final** message vector: after the
+/// retention window, after the pairing repair (orphan pruning + placeholder synthesis)
+/// and after the bounded re-trim. Window arithmetic from an earlier stage is stale
+/// whenever pruning or synthesis changes the vector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionOutcome {
     /// The transcript now fits the 70% target.
@@ -547,10 +462,9 @@ pub enum CompactionOutcome {
     },
     /// The 70% target is **unreachable**: the pinned prefix
     /// (`messages[0]`/`messages[1]`, plus a pinned `REBIRTH CHECKPOINT`, see
-    /// [`pinned_prefix_end`]) is sacrosanct per REQ-CORE-001/002 yet already
-    /// costs more than the target. Compaction trims everything it is allowed to
-    /// trim and then reports this failure instead of pretending the transcript
-    /// fits the budget.
+    /// [`pinned_prefix_end`]) is sacrosanct yet already costs more than the target.
+    /// Compaction trims everything it is allowed to trim and then reports this failure
+    /// instead of pretending the transcript fits the budget.
     TargetUnreachable {
         /// Tokens of the pinned prefix that alone exceed the target.
         pinned_tokens: usize,
@@ -627,13 +541,11 @@ pub struct ContextEngine {
     rebirth_advisory_emitted: bool,
     /// Recovery turns elapsed since the last rebirth without another rebirth attempt.
     consecutive_rebirths: usize,
-    /// Cached BPE token count of the tool schemas sent with this engine's
-    /// requests (bug M7). `0` means "no tool payload accounted for", which
-    /// reproduces the pre-M7 numbers exactly.
+    /// Cached BPE token count of the tool schemas sent with this engine's requests.
+    /// `0` means "no tool payload accounted for", i.e. message-only accounting.
     tool_schema_tokens: usize,
-    /// Test-only witness for A §4 R-PIN-2: counts every write that went through a
-    /// by-index pin setter (`set_system_prompt` / `set_goal`). See
-    /// [`ContextEngine::pin_setter_calls`].
+    /// Test-only witness: counts every write that went through a by-index pin setter
+    /// (`set_system_prompt` / `set_goal`). See [`ContextEngine::pin_setter_calls`].
     #[cfg(test)]
     pin_setter_calls: std::cell::Cell<u64>,
 }
@@ -653,7 +565,7 @@ impl ContextEngine {
     }
 
     /// Attach the shared stats registry so compaction/rebirth can record
-    /// interventions (REQ-HARN-004).
+    /// interventions.
     pub fn set_stats(&mut self, stats: Arc<HarnessStats>) {
         self.stats = Some(stats);
     }
@@ -661,20 +573,18 @@ impl ContextEngine {
     /// How many writes this engine has taken through a by-index pin setter
     /// (`set_system_prompt` / `set_goal`).
     ///
-    /// Test-only R-PIN-2 witness: a capture→restore round trip must leave this at
-    /// the value it had before [`ContextEngine::install_restored_messages`] ran,
-    /// i.e. the restore seam must never route through a pin setter.
+    /// Test-only witness: a capture→restore round trip must leave this at the value it
+    /// had before [`ContextEngine::install_restored_messages`] ran.
     #[cfg(test)]
     pub fn pin_setter_calls(&self) -> u64 {
         self.pin_setter_calls.get()
     }
 
-    /// Lock the system prompt at `messages[0]` (REQ-CORE-001).
+    /// Lock the system prompt at `messages[0]`.
     ///
-    /// A **by-index write**: it belongs to the fresh-boot path only. The restore
-    /// path MUST NOT call it — see the test-only `pin_setter_calls` witness, which
-    /// counts every call so the restore tests can prove the seam never routes
-    /// through here (A §4 R-PIN-2).
+    /// A **by-index write**: it belongs to the fresh-boot path only. The restore path
+    /// MUST NOT call it — the test-only `pin_setter_calls` witness counts every call, so
+    /// the restore tests can prove the seam never routes through here.
     pub fn set_system_prompt(&mut self, prompt: String) {
         #[cfg(test)]
         note_pin_setter_write(self);
@@ -685,15 +595,15 @@ impl ContextEngine {
         }
     }
 
-    /// Pin the goal at `messages[1]` (REQ-CORE-002).
+    /// Pin the goal at `messages[1]`.
     ///
-    /// If the transcript has no system prompt yet, a placeholder is inserted
-    /// first to keep `messages[0]`/`messages[1]` indexing stable.
+    /// If the transcript has no system prompt yet, a placeholder is inserted first to
+    /// keep `messages[0]`/`messages[1]` indexing stable.
     ///
-    /// Both halves are forbidden on the restore branch (A §4 R-PIN-2): the write
-    /// is by index, and the empty-`System` padding would paper over what the
-    /// loader is required to refuse — a restored transcript with no real system
-    /// prompt is a `Refused(PinViolation)`, not something to pad.
+    /// Both halves are forbidden on the restore branch: the write is by index, and the
+    /// empty-`System` padding would paper over what the loader is required to refuse — a
+    /// restored transcript with no real system prompt is a `Refused(PinViolation)`, not
+    /// something to pad.
     pub fn set_goal(&mut self, goal: String) {
         #[cfg(test)]
         note_pin_setter_write(self);
@@ -737,15 +647,14 @@ impl ContextEngine {
         count_tokens(&self.messages)
     }
 
-    /// Declare the tool schemas this engine's requests will carry, so the budget
-    /// model measures the **real** request size (bug M7, gate t-064).
+    /// Declare the tool schemas this engine's requests will carry, so the budget model
+    /// measures the **real** request size.
     ///
     /// `tools` must be exactly the list the next request sends — the same
-    /// `Vec<ToolDef>` handed to `ChatRequest.tools` — because the count is cached
-    /// and reused by every later budget decision. Pass an empty slice to go back
-    /// to message-only accounting. Callers whose advertised list can change
-    /// mid-life (MCP servers connecting later, per-run role filtering) must
-    /// re-declare it, which is why the live callers re-declare at every budget
+    /// `Vec<ToolDef>` handed to `ChatRequest.tools` — because the count is cached and
+    /// reused by every later budget decision. Pass an empty slice to go back to
+    /// message-only accounting. A caller whose advertised list can change mid-life (MCP
+    /// servers connecting later, per-run role filtering) re-declares it at every budget
     /// decision instead of once at construction.
     pub fn set_tools(&mut self, tools: &[crate::types::ToolDef]) {
         self.tool_schema_tokens = tools_tokens(tools);
@@ -756,16 +665,15 @@ impl ContextEngine {
         self.tool_schema_tokens
     }
 
-    /// Token count of the request this engine would send right now: transcript
-    /// plus tool schemas (bug M7). Identical to [`ContextEngine::token_count`]
-    /// when no tools were declared.
+    /// Token count of the request this engine would send right now: transcript plus
+    /// tool schemas. Identical to [`ContextEngine::token_count`] when no tools were
+    /// declared.
     pub fn request_token_count(&self) -> usize {
         self.token_count() + self.tool_schema_tokens
     }
 
-    /// Whether compaction should trigger right now for a request carrying
-    /// `tools` (> 90% of budget measured on transcript **plus** tool schemas,
-    /// bug M7).
+    /// Whether compaction should trigger right now for a request carrying `tools`
+    /// (> 90% of budget measured on transcript **plus** tool schemas).
     ///
     /// Equivalent to [`ContextEngine::should_compact`] after
     /// [`ContextEngine::set_tools(tools)`][ContextEngine::set_tools], without
@@ -776,9 +684,9 @@ impl ContextEngine {
 
     /// Whether compaction should trigger right now (> 90% of budget).
     ///
-    /// The measurement is the full request size — transcript plus the declared
-    /// tool schemas — so a tool-heavy request can no longer slip past the
-    /// trigger (bug M7). Engines with no declared tools are unchanged.
+    /// The measurement is the full request size — transcript plus the declared tool
+    /// schemas — so a tool-heavy request cannot slip past the trigger. An engine with no
+    /// declared tools is measured on its messages alone.
     pub fn should_compact(&self) -> bool {
         self.request_token_count() > compaction_threshold(self.max_context_tokens)
     }
@@ -816,40 +724,31 @@ impl ContextEngine {
         self.rebirth_advisory_emitted
     }
 
-    /// Compact the transcript down to ~70% of the budget (REQ-CORE-003).
+    /// Compact the transcript down to ~70% of the budget, always keeping
+    /// `messages[0]` (System) and `messages[1]` (Goal): newest turn pairs first, older
+    /// turns dropped once the target is reached. The assistant `tool_calls` ↔ `Tool`
+    /// pairing invariant is then enforced over the **entire** retained sequence, pinned
+    /// window included, so the result is always a valid OpenAI-compatible chat request
+    /// ([`repair_tool_call_pairs`]).
     ///
-    /// Always keeps `messages[0]` (System) and `messages[1]` (Goal). The most
-    /// recent turn pairs are preserved first; once the target budget is
-    /// reached, older turns are dropped. The assistant `tool_calls` ↔ `Tool`
-    /// pairing invariant is then enforced over the **entire** retained sequence
-    /// (including the pinned window): orphaned `role:"tool"` messages are
-    /// pruned and `tool_calls` entries that lost their result get an
-    /// `"(aborted)"` result synthesized, so the compacted transcript is always
-    /// a valid OpenAI-compatible chat request (see [`repair_tool_call_pairs`]).
+    /// **Target safety.** The pinned window from [`pinned_prefix_end`] is charged against
+    /// the target, and the pins may never be dropped: when the pinned prefix alone costs
+    /// more than the 70% target, compaction trims everything it may trim and returns
+    /// [`CompactionOutcome::TargetUnreachable`] instead of reporting success on an
+    /// over-budget transcript, so the live loops at `src/ui/session.rs` and
+    /// `src/agents/runner/{execution,fix_loop}.rs` stop re-compacting a context that can
+    /// never fit (e.g. by asking for a rebirth). A re-trim that stops making progress
+    /// ends the same way, which keeps that loop terminating.
     ///
-    /// **Target safety (bug M5).** The pinned window returned by
-    /// [`pinned_prefix_end`] is part of the budget arithmetic, not a free
-    /// rider: if the pinned prefix alone already costs more than the 70% target
-    /// the target is unreachable, because REQ-CORE-001/002 forbid dropping it.
-    /// Compaction then trims everything it is allowed to trim and returns
-    /// [`CompactionOutcome::TargetUnreachable`] instead of reporting success on
-    /// an over-budget transcript (the live loops at `src/ui/session.rs` and
-    /// `src/agents/runner/{execution,fix_loop}.rs` can use that to stop
-    /// re-compacting a context that can never fit, e.g. by asking for a
-    /// rebirth). The same failure is returned if the re-trim stops making
-    /// progress, which also keeps that loop terminating.
-    ///
-    /// **Truthful accounting (bug M5b).** The reported message/token deltas are
-    /// computed from the **final** message vector — after the retention window,
-    /// after the pairing repair and after the re-trim — never from the
-    /// pre-pruning window arithmetic.
+    /// **Truthful accounting.** The reported message/token deltas are measured on the
+    /// **final** vector — after the retention window, the pairing repair and the re-trim.
     pub fn compact(&mut self) -> CompactionOutcome {
         let initial_tokens = self.token_count();
         let initial_msgs = self.messages.len();
         let target = compaction_target(self.max_context_tokens);
 
-        // M5: that pinned window is charged against the target — it can never
-        // be dropped, so it decides whether the target is reachable at all.
+        // The pinned window is charged against the target: it can never be dropped, so
+        // it decides whether the target is reachable at all.
         let prefix_end = pinned_prefix_end(&self.messages).min(self.messages.len());
         let pinned_messages = prefix_end;
         let pinned_tokens = count_tokens(&self.messages[..prefix_end]);
@@ -878,8 +777,8 @@ impl ContextEngine {
         let mut kept: Vec<Message> = self.messages.iter().take(prefix_end).cloned().collect();
         let tail: Vec<Message> = self.messages.iter().skip(prefix_end).cloned().collect();
         let mut kept_tail: Vec<Message> = Vec::new();
-        // `total` starts at the pinned prefix cost (M5: the pinned prefix is
-        // budgeted, the tail only gets what the target leaves over it).
+        // `total` starts at the pinned prefix cost (the pinned prefix is budgeted; the
+        // tail only gets what the target leaves over it).
         let mut total = pinned_tokens;
 
         for m in tail.into_iter().rev() {
@@ -968,27 +867,25 @@ impl ContextEngine {
         }
     }
 
-    /// Enforce the assistant `tool_calls` ↔ `Tool` pairing invariant on the
-    /// **live** transcript and report whether anything had to be repaired.
+    /// Enforce the assistant `tool_calls` ↔ `Tool` pairing invariant on the **live**
+    /// transcript and report whether anything had to be repaired.
     ///
-    /// This is the idempotent public entry point for the invariant outside of
-    /// compaction (t-063). Before it existed, [`repair_tool_call_pairs`] had no
-    /// non-test caller other than [`ContextEngine::compact`], and `compact()` is
-    /// gated at > 90% utilization — so the transcripts that actually end a turn
-    /// early (session abort, user exit, wall-clock bound, failure budget) were
-    /// re-sent verbatim with an assistant `tool_calls` entry and no `role:"tool"`
-    /// result for the calls that were skipped: a provider 400.
+    /// This is the idempotent public entry point for the invariant:
+    /// [`repair_tool_call_pairs`] is otherwise reached only from
+    /// [`ContextEngine::compact`], which only runs above 90% utilization, so a turn that
+    /// ends early (session abort, user exit, wall-clock bound, failure budget) would be
+    /// re-sent with an assistant `tool_calls` entry and no `role:"tool"` result for the
+    /// calls that were skipped — a provider 400.
     ///
-    /// **Idempotent:** running it on an already valid transcript is a no-op that
-    /// returns `false`, so a call site can safely be a belt-and-braces guard on
-    /// top of a boundary repair.
+    /// **Idempotent:** on an already valid transcript this is a no-op returning `false`,
+    /// so a call site can use it as a belt-and-braces guard on top of a boundary repair.
     ///
-    /// **Grammar:** the pass itself is owned by [`repair_tool_call_pairs`] and is
-    /// reused verbatim — this wrapper does not add, drop or reword any rule, it
-    /// only applies that pass to `self.messages` in place.
+    /// **Grammar:** the pass itself is owned by [`repair_tool_call_pairs`] and is reused
+    /// verbatim — this wrapper adds, drops or rewords no rule, it only applies that pass
+    /// to `self.messages` in place.
     ///
-    /// Returns `true` when the transcript was changed (a repair was needed),
-    /// `false` when it already satisfied the invariant.
+    /// Returns `true` when the transcript was changed (a repair was needed), `false`
+    /// when it already satisfied the invariant.
     pub fn ensure_tool_call_pairs(&mut self) -> bool {
         let before = pairing_shape(&self.messages);
         let repaired = repair_tool_call_pairs(std::mem::take(&mut self.messages));
@@ -997,36 +894,31 @@ impl ContextEngine {
         changed
     }
 
-    /// Collapse the history into the rebirth checkpoint shape (REQ-CORE-004).
+    /// Collapse the history into the rebirth checkpoint shape.
     ///
-    /// - `messages[0]`: static system prompt (REQ-CORE-001).
-    /// - `messages[1]`: original user goal (REQ-CORE-002).
-    /// - `messages[2]`: the last **genuine** user instruction, when there is
-    ///   one (see below).
-    /// - last: the `SYSTEM: REBIRTH CHECKPOINT` injection, emitted as a
-    ///   **`User`** message (bug M12: strict providers reject a non-leading
-    ///   `system` turn). The [`REBIRTH_CHECKPOINT_PREFIX`] text is unchanged,
-    ///   and [`pinned_prefix_end`] keeps pinning it through later compactions.
+    /// - `messages[0]`: the static system prompt.
+    /// - `messages[1]`: the original user goal.
+    /// - `messages[2]`: the last **genuine** user instruction, when there is one.
+    /// - last: the `SYSTEM: REBIRTH CHECKPOINT` injection, emitted as a **`User`**
+    ///   message (strict providers reject a non-leading `system` turn). The
+    ///   [`REBIRTH_CHECKPOINT_PREFIX`] text is unchanged and [`pinned_prefix_end`] keeps
+    ///   pinning it through later compactions.
     ///
-    /// Two history-hygiene rules (bugs M6/M12, `docs/recon_bugs_manager.md`):
+    /// Two history-hygiene rules:
     ///
-    /// 1. Runtime-injected advisories/notices ([`INJECTED_ADVISORY_PREFIXES`]:
-    ///    the `CONTEXT BUDGET ADVISORY`, the legacy `CONTEXT LIMIT EXCEEDED`
-    ///    notice, the post-rebirth continuation injection, and an earlier
-    ///    checkpoint) are never summarized as `messages[2]` — the real last
-    ///    instruction would be lost behind boilerplate.
-    /// 2. The `messages[2]` slot is **omitted** when the only candidate is the
-    ///    pinned goal itself, so the goal appears exactly once in the collapsed
-    ///    transcript instead of being duplicated verbatim at `[1]` and `[2]`.
-    ///    Rebirth therefore collapses to 4 messages when a distinct instruction
+    /// 1. Runtime-injected advisories/notices ([`INJECTED_ADVISORY_PREFIXES`]: the
+    ///    `CONTEXT BUDGET ADVISORY`, the legacy `CONTEXT LIMIT EXCEEDED` notice, the
+    ///    post-rebirth continuation injection, and an earlier checkpoint) are never
+    ///    summarized as `messages[2]` — the real last instruction would be lost behind
+    ///    boilerplate.
+    /// 2. The `messages[2]` slot is **omitted** when the only candidate is the pinned
+    ///    goal itself, so the goal appears exactly once instead of being duplicated at
+    ///    `[1]` and `[2]`: rebirth collapses to 4 messages when a distinct instruction
     ///    exists and to 3 when it does not.
     ///
-    /// The collapse also preserves the assistant `tool_calls` ↔ `Tool` pairing
-    /// invariant: every emitted message is `System`/`User`, so no `tool_calls`
-    /// entry and no orphan `Tool` can survive a rebirth.
-    ///
-    /// The `session_rebirths` counter in the attached [`HarnessStats`] is
-    /// incremented.
+    /// Every emitted message is `System`/`User`, so no `tool_calls` entry and no orphan
+    /// `Tool` can survive a rebirth: the pairing invariant holds by construction. The
+    /// `session_rebirths` counter in the attached [`HarnessStats`] is incremented.
     pub fn perform_rebirth(&mut self, summary: &str) {
         let initial_tokens = self.token_count();
         let initial_msgs = self.messages.len();
@@ -1040,7 +932,7 @@ impl ContextEngine {
         };
 
         // Determine the last user instruction distinct from the goal, skipping
-        // every runtime-injected advisory/notice message (bug M6).
+        // every runtime-injected advisory/notice message.
         let last_user_instruction = self.messages.iter().skip(2).rev().find_map(|m| match m {
             Message::User { content } if *content != goal && !is_injected_advisory(content) => {
                 Some(content.clone())
@@ -1053,7 +945,7 @@ impl ContextEngine {
             Message::System { content: system },
             Message::User { content: goal },
         ];
-        // M12: never duplicate the pinned goal at `[2]`.
+        // Never duplicate the pinned goal at `[2]`.
         if let Some(instruction) = last_user_instruction {
             collapsed.push(Message::User {
                 content: instruction,
@@ -1080,28 +972,25 @@ impl ContextEngine {
     }
 
     // ---------------------------------------------------------------------
-    // Session capture / restore seams (flow §4.6, Design A §3.5 / §4)
+    // Session capture / restore seams
     // ---------------------------------------------------------------------
 
-    /// CAPTURE — the exact `ManagerSection` snapshot of this engine
-    /// (A §3.5, flow §4.6): the transcript **verbatim and in order**, plus the
-    /// scalars that change the next request and the witnesses a restore verifies.
+    /// CAPTURE — the exact `ManagerSection` snapshot of this engine: the transcript
+    /// **verbatim and in order**, plus the scalars that change the next request and the
+    /// witnesses a restore verifies.
     ///
-    /// A pure read: it never mutates, repairs, prunes, truncates, re-roles or
-    /// re-orders `messages()` (R-PIN-1/R-PIN-3). The transcript is mapped through
-    /// [`MessageRecord::from_wire`] field by field — never through a JSON
-    /// round-trip of the wire type, because
-    /// `types::wire::serialize_assistant_content` (`src/types/wire.rs:30-41`)
-    /// writes `content: None` as `""`, which would erase the difference between
-    /// "the model produced no content" and "the model produced an empty string".
-    /// `reasoning_content` and the verbatim `ToolCall.function.arguments` ride
-    /// along unchanged: arguments are opaque bytes here, never re-serialized and
-    /// never run through `ensure_valid_json_arguments` (that would *rewrite*
-    /// history with `{"_error":"malformed_arguments",…}`).
+    /// A pure read: it never mutates, repairs, prunes, truncates, re-roles or re-orders
+    /// `messages()`. The transcript is mapped through [`MessageRecord::from_wire`] field
+    /// by field — never through a JSON round-trip of the wire type, because
+    /// `types::wire::serialize_assistant_content` (`src/types/wire.rs`) writes
+    /// `content: None` as `""`, erasing the difference between "the model produced no
+    /// content" and "the model produced an empty string". `reasoning_content` and the
+    /// verbatim `ToolCall.function.arguments` ride along unchanged: arguments are opaque
+    /// bytes here, never re-serialized and never run through
+    /// `ensure_valid_json_arguments` (that would *rewrite* history).
     ///
-    /// `pinned_prefix_end` and `pin_witness` are witnesses computed from the very
-    /// same vector, so a restore can prove it installed the transcript that was
-    /// captured rather than a re-composition of it.
+    /// `pinned_prefix_end` and `pin_witness` are witnesses computed from the very same
+    /// vector, so a restore can prove it installed the transcript that was captured.
     pub fn capture_manager_section(&self) -> ManagerSection {
         let messages: Vec<MessageRecord> =
             self.messages.iter().map(MessageRecord::from_wire).collect();
@@ -1110,8 +999,8 @@ impl ContextEngine {
         let dangling = DanglingToolCallState::observe(&messages);
         ManagerSection {
             messages,
-            // `2` for an engine shorter than the pinned pair: the loader refuses
-            // such a transcript (R-PIN-5 step 1) rather than inventing a window.
+            // `2` for an engine shorter than the pinned pair: the loader refuses such a
+            // transcript rather than inventing a window.
             pinned_prefix_end: pinned_prefix_end as u32,
             pin_witness,
             max_context_tokens: self.max_context_tokens,
@@ -1121,33 +1010,28 @@ impl ContextEngine {
         }
     }
 
-    /// RESTORE — install a restored transcript **wholesale** (A §4 R-PIN-2).
+    /// RESTORE — install a restored transcript **wholesale**.
     ///
-    /// This is the only sanctioned way a persisted manager transcript enters the
-    /// engine, and it deliberately does **not** go through
-    /// [`ContextEngine::set_system_prompt`] or [`ContextEngine::set_goal`]: both
-    /// write **by index**, and the boot path calls them unconditionally
-    /// (`src/ui/session.rs`: `build_manager_context` → `set_system_prompt`, then
-    /// `set_goal` once a goal exists). A restore routed through them therefore
-    /// clobbers the two pins with freshly composed bytes — load-then-set
-    /// overwrites `[0]`/`[1]` with the new system prompt and the CLI/typed input,
-    /// set-then-load throws away the just-restored vector — which silently kills
-    /// REQ-CORE-001 (KV-cache prefix identity) and REQ-CORE-002 (immutable goal)
-    /// while every pane still looks right.
+    /// The only sanctioned way a persisted manager transcript enters the engine, and it
+    /// deliberately does **not** go through [`ContextEngine::set_system_prompt`] or
+    /// [`ContextEngine::set_goal`]: both write **by index**, and the boot path calls them
+    /// unconditionally (`src/ui/session.rs`: `build_manager_context` →
+    /// `set_system_prompt`, then `set_goal` once a goal exists). A restore routed through
+    /// them clobbers the two pins with freshly composed bytes — load-then-set overwrites
+    /// `[0]`/`[1]`, set-then-load throws away the vector it just restored — silently
+    /// losing the KV-cache prefix identity and the immutable goal while every pane still
+    /// looks right.
     ///
-    /// The vector is installed **as-is**: no role is changed, nothing is
-    /// re-ordered, nothing is padded, and no advisory or checkpoint text is
-    /// rewritten. [`pinned_prefix_end`] identifies the pinned window by a
+    /// The vector is installed **as-is**: no role is changed, nothing is re-ordered,
+    /// padded or rewritten. [`pinned_prefix_end`] identifies the pinned window by a
     /// content match on [`REBIRTH_CHECKPOINT_PREFIX`], and `compact()` keeps
-    /// `messages[..pinned_prefix_end]` unconditionally — so a re-role or a
-    /// re-order would silently move the window and change which turns survive
-    /// the next compaction, while `perform_rebirth` re-reads `[0]`/`[1]`
-    /// positionally and would collapse to a system-less, goal-less transcript.
+    /// `messages[..pinned_prefix_end]` unconditionally, so a re-role or re-order silently
+    /// moves that window and changes which turns survive the next compaction — and
+    /// `perform_rebirth`, which re-reads `[0]`/`[1]` positionally, would collapse to a
+    /// system-less, goal-less transcript.
     ///
-    /// Panics when `messages` holds fewer than two records: that is a caller bug,
-    /// because `session::restore` refuses such a bundle before anything is
-    /// installed (R-PIN-5 step 1). The panic is the last line of that rule, not a
-    /// substitute for it.
+    /// Panics when `messages` holds fewer than two records: that is a caller bug, because
+    /// `session::restore` refuses such a bundle before anything is installed.
     pub fn install_restored_messages(&mut self, messages: Vec<MessageRecord>) {
         assert!(
             messages.len() >= 2,
@@ -1160,13 +1044,13 @@ impl ContextEngine {
     }
 
     /// Restore the non-message engine scalars captured by
-    /// [`ContextEngine::capture_manager_section`] (A §3.5).
+    /// [`ContextEngine::capture_manager_section`].
     ///
     /// Direct field assignment on purpose: [`ContextEngine::inject_rebirth_advisory`]
     /// appends a message and [`ContextEngine::reset_rebirth_advisory`] /
-    /// [`ContextEngine::reset_consecutive_rebirths`] change behaviour the stored
-    /// state said was already spent. Without the latch the rebirth advisory
-    /// re-fires on a rehydrated session that had already been advised.
+    /// [`ContextEngine::reset_consecutive_rebirths`] change behaviour the stored state
+    /// said was already spent. Without the latch the rebirth advisory re-fires on a
+    /// rehydrated session that had already been advised.
     pub fn restore_engine_flags(
         &mut self,
         rebirth_advisory_emitted: bool,
@@ -1177,41 +1061,40 @@ impl ContextEngine {
     }
 
     /// The exclusive end index of this engine's pinned window — the private
-    /// [`pinned_prefix_end`] rule exposed for capture, for the loader's N3/N6
-    /// cross-checks, and for `RepairReport::pinned_prefix_end_{expected,actual}`.
+    /// [`pinned_prefix_end`] rule exposed for capture, for the loader's cross-checks, and
+    /// for `RepairReport::pinned_prefix_end_{expected,actual}`.
     pub fn pinned_prefix_end(&self) -> usize {
         pinned_prefix_end(&self.messages)
     }
 
-    /// Byte-length witnesses of the two pins (A §3.5 `PinWitness`). Same
-    /// measurement the loader recomputes, so a mismatch names *which* pin moved.
+    /// Byte-length witnesses of the two pins. This is the same measurement the loader
+    /// recomputes, so a mismatch names *which* pin moved.
     pub fn pin_witness(&self) -> PinWitness {
         pin_witness_of(&self.messages)
     }
 
-    /// The assistant `tool_calls` ↔ `Tool` pairing state of the transcript at
-    /// this instant, as the durable `DanglingToolCallState` (A §3.9). Computed by
-    /// the same observer the loader cross-checks (N6) — no second pairing rule
-    /// (A D1) — and purely read-only: capture never heals.
+    /// The assistant `tool_calls` ↔ `Tool` pairing state of the transcript at this
+    /// instant, as the durable `DanglingToolCallState`. The loader cross-checks the same
+    /// observer — there is no second pairing rule — and the read is purely observational:
+    /// capture never heals.
     pub fn dangling_state(&self) -> DanglingToolCallState {
         let records: Vec<MessageRecord> =
             self.messages.iter().map(MessageRecord::from_wire).collect();
         DanglingToolCallState::observe(&records)
     }
 
-    /// Append the one synthetic restore notice (flow §2.4) to the transcript.
+    /// Append the one synthetic restore notice to the transcript.
     ///
     /// This is the **only** place the notice is added, and it is added as a
-    /// `Message::User` at index `>= 2`, which is what keeps the pins untouched:
-    /// nothing at `[0]`/`[1]` is read or written, and the vector is only
-    /// extended. `SESSION_RESTORE_NOTICE_PREFIX` is a member of
-    /// [`INJECTED_ADVISORY_PREFIXES`], so `perform_rebirth` can never promote the
-    /// notice into the `messages[2]` slot instead of the last genuine
-    /// instruction (bug M6).
+    /// `Message::User` at index `>= 2`, which is what keeps the pins untouched: nothing
+    /// at `[0]`/`[1]` is read or written, and the vector is only extended.
+    /// `SESSION_RESTORE_NOTICE_PREFIX` is a member of [`INJECTED_ADVISORY_PREFIXES`], so
+    /// `perform_rebirth` can never promote the notice into the `messages[2]` slot instead
+    /// of the last genuine instruction.
     ///
-    /// The text is stored verbatim — never trimmed, wrapped or re-rendered
-    /// (R-PIN-4). A transcript without the pinned pair gets a `tracing::warn!`
-    /// and no append: a notice is never allowed to *become* a pin.
+    /// The text is stored verbatim — never trimmed, wrapped or re-rendered. A transcript
+    /// without the pinned pair gets a `tracing::warn!` and no append: a notice is never
+    /// allowed to *become* a pin.
     pub fn append_restore_notice(&mut self, notice: &str) {
         if self.messages.len() < 2 {
             tracing::warn!(
@@ -1237,19 +1120,17 @@ impl ContextEngine {
 
 /// Per-agent [`ContextEngine`] factory.
 ///
-/// Produces isolated, KV-cache-prefix-preserving contexts for the Manager and
-/// every Specialist (REQ-ORCH-003). Each engine is seeded so that
-/// `messages[0]` is the agent's own role system prompt and `messages[1]` is
-/// its pinned goal/task brief, guaranteeing:
+/// Produces isolated, KV-cache-prefix-preserving contexts for the Manager and every
+/// Specialist. Each engine is seeded so that `messages[0]` is the agent's own role
+/// system prompt and `messages[1]` is its pinned goal/task brief, guaranteeing:
 ///
-/// - **REQ-CORE-001** KV-cache prefix preservation at the *agent* scope: the
-///   system/role prompt is locked at `[0]` for the lifetime of the engine.
-/// - **REQ-CORE-002** goal pinning: the user goal (Manager) or task brief
-///   (specialist) is pinned at `[1]` and survives compaction/rebirth.
-/// - **REQ-ORCH-003** strict isolation: a specialist context contains ONLY its
-///   own role prompt + brief — never the Manager's transcript. The factory is
-///   the canonical construction point so no code path can seed a specialist
-///   with Manager history.
+/// - KV-cache prefix preservation at the *agent* scope: the system/role prompt is locked
+///   at `[0]` for the lifetime of the engine.
+/// - Goal pinning: the user goal (Manager) or task brief (specialist) is pinned at `[1]`
+///   and survives compaction/rebirth.
+/// - Strict isolation: a specialist context contains ONLY its own role prompt + brief —
+///   never the Manager's transcript. The factory is the canonical construction point so
+///   no code path can seed a specialist with Manager history.
 #[derive(Debug, Clone)]
 pub struct ContextEngineFactory {
     /// Shared token budget for every produced engine.
@@ -1265,26 +1146,20 @@ impl ContextEngineFactory {
         self.max_context_tokens
     }
 
-    /// Build the Manager's context engine (REQ-CORE-001/002 at the top level).
+    /// Build the Manager's context engine.
     ///
-    /// The Manager owns the *user* conversation, so its `[0]` is the global
-    /// system prompt and `[1]` is the user's goal. This engine accumulates the
-    /// full interactive transcript and is distinct from every specialist's.
+    /// The Manager owns the *user* conversation, so its `[0]` is the global system
+    /// prompt and `[1]` is the user's goal; this engine accumulates the full interactive
+    /// transcript and is distinct from every specialist's.
     ///
-    /// The MCP-free Manager tool schemas are charged to the budget up front
-    /// (bug M7, gate t-064): every Manager request goes through
-    /// `src/llm/stream.rs::build_request`, which always sends
-    /// [`ToolDef::manager_tools()`] — names pinned to [`MANAGER_TOOL_NAMES`] so
-    /// the accounting cannot drift from the wire set. A configured MCP server
-    /// **widens** that wire list, so this default is then a strict subset: the
-    /// live Manager path does not use this constructor and re-declares the exact
-    /// list with [`ContextEngine::set_tools`] on [`manager_wire_tools`] instead
-    /// (see `src/ui/session.rs::build_manager_context`, which charges once and
-    /// then re-prices through `src/ui/session.rs::sync_manager_tool_schema` at
-    /// every budget decision — one of the three live declarers named in the
-    /// module doc, alongside `fix_loop::charge_engine_tool_schema` and
-    /// `execution::build_specialist_context` /
-    /// `execution::sync_specialist_tool_schema`).
+    /// The MCP-free Manager tool schemas are charged to the budget up front: every
+    /// Manager request goes through `src/llm/stream.rs::build_request`, which always
+    /// sends [`ToolDef::manager_tools()`] — names pinned to [`MANAGER_TOOL_NAMES`] so the
+    /// accounting cannot drift from the wire set. A configured MCP server **widens** that
+    /// wire list, so this charge is then a strict subset: the live Manager path skips
+    /// this constructor and re-declares the exact list with [`ContextEngine::set_tools`]
+    /// on [`manager_wire_tools`] — `src/ui/session.rs::build_manager_context` charges
+    /// once and `sync_manager_tool_schema` re-prices it at every budget decision.
     pub fn manager_context(&self, system_prompt: String, goal: String) -> ContextEngine {
         let mut ctx = ContextEngine::new(self.max_context_tokens);
         ctx.set_system_prompt(system_prompt);
@@ -1293,36 +1168,28 @@ impl ContextEngineFactory {
         ctx
     }
 
-    /// Build a specialist's fully isolated context engine (REQ-ORCH-003).
+    /// Build a specialist's fully isolated context engine.
     ///
-    /// The produced engine carries ONLY `role_prompt` at `messages[0]` and
-    /// `brief` at `messages[1]` (the pinned subagent "goal", mirroring
-    /// REQ-CORE-002 at the subagent scope). No Manager history is ever copied.
-    /// A freshly built engine therefore starts with exactly two messages and a
-    /// stable KV-cache prefix for the specialist's backend.
+    /// The produced engine carries ONLY `role_prompt` at `messages[0]` and `brief` at
+    /// `messages[1]` (the pinned subagent "goal") — no Manager history is ever copied —
+    /// so it starts at exactly two messages with a stable KV-cache prefix.
     ///
-    /// No tool schemas are pre-charged **by this constructor**: a specialist's
-    /// tool list is a role-filtered subset of [`ToolDef::default_tools()`] plus
-    /// MCP tools, and the authority for it is
-    /// `src/agents/runner/execution.rs::specialist_advertised_tools`
-    /// (see also `src/agents/runner/fix_loop.rs::assemble_tools`), so a caller
-    /// that wants the true request size must declare that exact list with
-    /// [`ContextEngine::set_tools`]. Three callers do exactly that in the shipped
-    /// binary (see Bug M7 in the module doc): the fix loop
-    /// (`fix_loop::run_fix_loop` → `fix_loop::charge_engine_tool_schema`), the
-    /// Manager path (`ui/session.rs::build_manager_context` →
-    /// `sync_manager_tool_schema`), and the specialist turn (gate t-073):
-    /// `execution::build_specialist_context` calls this constructor and charges
-    /// the advertised view right away, and
-    /// `execution::sync_specialist_tool_schema` re-prices it immediately before
-    /// every budget decision of the specialist turn loop — liveness proved by
-    /// `tests/test_specialist_schema_charge.rs`.
-    ///
-    /// Only an engine that never goes through one of those declarers — i.e. built
-    /// here and left alone — stays message-only, and only for such an engine is
-    /// the budget a **lower bound** on the real request, never an over-count. The
-    /// live specialist path is charged and re-priced, so its number is not a
-    /// message-only lower bound.
+    /// No tool schemas are charged **by this constructor**: a specialist's tool list is a
+    /// role-filtered subset of [`ToolDef::default_tools()`] plus MCP tools, owned by
+    /// `src/agents/runner/execution.rs::specialist_advertised_tools` (also
+    /// `src/agents/runner/fix_loop.rs::assemble_tools`), so a caller that wants the true
+    /// request size must declare that exact list with [`ContextEngine::set_tools`]. Three
+    /// callers do exactly that in the shipped binary: the fix loop
+    /// (`fix_loop::run_fix_loop` → `fix_loop::charge_engine_tool_schema`), the Manager
+    /// path (`ui/session.rs::build_manager_context` → `sync_manager_tool_schema`), and
+    /// the specialist turn: `execution::build_specialist_context` calls this constructor
+    /// and charges the advertised view right away, and
+    /// `execution::sync_specialist_tool_schema` re-prices it immediately before every
+    /// budget decision of the specialist turn loop — liveness proved by
+    /// `tests/test_specialist_schema_charge.rs`. Only an engine that never goes through
+    /// one of those declarers — built here and left alone — stays message-only, which is
+    /// what a caller that declares nothing at all ends up with; only for such an engine
+    /// is the budget a **lower bound** on the real request, never an over-count.
     pub fn specialist_context(&self, role_prompt: String, brief: String) -> ContextEngine {
         let mut ctx = ContextEngine::new(self.max_context_tokens);
         ctx.set_system_prompt(role_prompt);

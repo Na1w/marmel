@@ -98,7 +98,7 @@ fn tool_ids(messages: &[Message]) -> Vec<String> {
 ///
 /// Used to prove that an id missing from the compacted transcript really was
 /// dropped by the repair pass: if the tail-keep alone already dropped it, the
-/// assertion "the orphan was pruned" proves nothing (recon item M13).
+/// assertion "the orphan was pruned" proves nothing.
 fn window_only_transcript(messages: &[Message], target: usize) -> Vec<Message> {
     let end = pinned_prefix_end(messages).min(messages.len());
     let mut kept = messages[..end].to_vec();
@@ -117,10 +117,9 @@ fn window_only_transcript(messages: &[Message], target: usize) -> Vec<Message> {
     kept
 }
 
-/// REQ-CORE-003 / M13: the half of the pairing invariant that
-/// `prune_orphan_tool_messages` owns must be exercised at the `compact()` level
-/// by the **pair-split** shape — the assistant that owns a `Tool` result leaves
-/// the retention window while that result stays inside it.
+/// The half of the pairing invariant owned by `prune_orphan_tool_messages` is
+/// exercised at the `compact()` level by the **pair-split** shape — the assistant that
+/// owns a `Tool` result leaves the retention window while that result stays inside it.
 ///
 /// The fixture is built so the assertion is discriminating:
 /// * `call_split_parent`'s assistant is the message that tips the target, so the
@@ -267,8 +266,8 @@ fn test_context_rebirth_reconstruction() {
         "rebirth collapses to 4 messages when a distinct last instruction exists"
     );
 
-    // [0] system, [1] goal, [2] last user instruction, [3] checkpoint (M12: the
-    // checkpoint is a User turn, never a second system turn).
+    // [0] system, [1] goal, [2] last user instruction, [3] checkpoint — the
+    // checkpoint is a User turn, never a second system turn.
     assert!(matches!(msgs[0], Message::System { .. }));
     assert!(matches!(msgs[1], Message::User { .. }));
     match &msgs[2] {
@@ -287,7 +286,7 @@ fn test_context_rebirth_reconstruction() {
         }
         _ => panic!("messages[3] should be the checkpoint User message"),
     }
-    // t-031a pairing invariant: a collapsed transcript is a valid request.
+    // The pairing invariant: a collapsed transcript is a valid request.
     assert_valid_openai_pairing(msgs);
 
     assert_eq!(
@@ -305,7 +304,7 @@ fn test_context_factory_manager_prefix_locked() {
         "You are the Manager.".to_string(),
         "Ship the feature.".to_string(),
     );
-    // Manager prefix: [0]=system, [1]=goal (REQ-CORE-001/002).
+    // Manager prefix: [0]=system, [1]=goal, both pinned.
     assert!(matches!(ctx.messages()[0], Message::System { .. }));
     assert!(matches!(ctx.messages()[1], Message::User { .. }));
 
@@ -336,7 +335,7 @@ fn test_context_factory_specialist_isolated_prefix() {
         "You are the Coder specialist.".to_string(),
         "Implement the parser.".to_string(),
     );
-    // Exactly two seeded messages: role at [0], brief at [1] (REQ-ORCH-003).
+    // Exactly two seeded messages: role at [0], brief at [1], fully isolated.
     assert_eq!(spec.messages().len(), 2);
     match &spec.messages()[0] {
         Message::System { content } => assert_eq!(content, "You are the Coder specialist."),
@@ -554,7 +553,7 @@ fn test_compaction_preserves_rebirth_checkpoint() {
 
     // Rebirth collapses to 3 messages here: there is no instruction distinct
     // from the goal, so the `[2]` slot is omitted instead of duplicating the
-    // pinned goal (bug M12), and the checkpoint rides in at `[2]` as a User turn.
+    // pinned goal, and the checkpoint rides in at `[2]` as a User turn.
     engine
         .perform_rebirth("Vital checkpoint: inspected parser.rs at line 250, next step is ast.rs");
     assert_eq!(engine.messages().len(), 3);
@@ -612,7 +611,7 @@ fn test_compaction_preserves_rebirth_checkpoint() {
         "Rebirth checkpoint MUST survive context compaction!"
     );
     // ... and it must survive *as part of the pinned window*, which is charged
-    // against the budget arithmetic since the M5 fix.
+    // against the compaction budget arithmetic.
     let pinned = pinned_prefix_end(engine.messages());
     assert!(
         engine.messages()[..pinned].iter().any(is_checkpoint),
@@ -710,9 +709,9 @@ fn test_count_tokens_reuses_count_text_tokens() {
     );
 }
 
-// H1 — assistant `tool_calls` <-> `Tool` pairing invariant
+// Assistant `tool_calls` <-> `Tool` pairing invariant
 //
-// Invariant enforced by `compact()` (bug H1, `docs/recon_bugs_manager.md`):
+// Invariant enforced by `compact()`:
 //
 //   For every `Message::Assistant { tool_calls, .. }` in the compacted
 //   transcript, each `tool_calls[].id` is immediately followed by exactly one
@@ -884,11 +883,11 @@ fn assert_valid_openai_pairing(messages: &[Message]) {
     );
 }
 
-/// Regression (H1): an assistant with N `tool_calls` survives compaction while
-/// some of its `Tool` results never arrived (the live trigger is
-/// `src/ui/session.rs` breaking the tool loop on abort). After `compact()` the
-/// missing results must be synthesized as `"(aborted)"` placeholders so the
-/// sequence stays valid for an OpenAI-compatible request.
+/// Regression: an assistant with N `tool_calls` survives compaction while some of
+/// its `Tool` results never arrived (the live trigger is `src/ui/session.rs` breaking
+/// the tool loop on abort). After `compact()` the missing results are synthesized as
+/// `"(aborted)"` placeholders so the sequence stays valid for an OpenAI-compatible
+/// request.
 #[test]
 fn test_compaction_synthesizes_aborted_result_for_dangling_tool_calls() {
     let mut engine = ContextEngine::new(400);
@@ -907,7 +906,7 @@ fn test_compaction_synthesizes_aborted_result_for_dangling_tool_calls() {
 
     let msgs = engine.messages();
 
-    // Pins are untouched (REQ-CORE-001/002).
+    // The pins at [0] and [1] are untouched.
     assert!(matches!(msgs[0], Message::System { .. }));
     assert!(matches!(msgs[1], Message::User { .. }));
 
@@ -955,7 +954,7 @@ fn test_compaction_synthesizes_aborted_result_for_dangling_tool_calls() {
     );
 }
 
-/// Regression (H1): pinning must not bypass the invariant. A dangling assistant
+/// Regression: pinning never bypasses the pairing invariant. A dangling assistant
 /// inside the pinned window (`messages[2..=rebirth checkpoint]`) is repaired too.
 #[test]
 fn test_compaction_pinned_prefix_respects_pairing_invariant() {
@@ -992,16 +991,15 @@ fn test_compaction_pinned_prefix_respects_pairing_invariant() {
     assert_valid_openai_pairing(msgs);
 }
 
-/// Helper level (REQ-CORE-003, M13): `prune_orphan_tool_messages` must remove
-/// **only** the results whose owning assistant is gone, and must keep every
-/// result that still has a parent — including the newest message of the
-/// transcript. The input is the pair-split state the retention window leaves
-/// behind: the assistant owning `call_dropped_parent` was dropped, while
+/// Helper level: `prune_orphan_tool_messages` removes **only** the results with no
+/// surviving parent, and keeps every result that still has one — including the newest
+/// message of the transcript. The input is the pair-split state the retention window
+/// leaves behind: the assistant owning `call_dropped_parent` was dropped, while
 /// `call_newest` (the newest message) is a legitimate result.
 ///
-/// The expectation is a full-vector comparison, so the test fails for all three
-/// wrong implementations: no pruning at all, pruning that drops the newest tool
-/// result, or pruning that also removes results whose parent survived.
+/// The expectation is a full-vector comparison, so this test fails for all three wrong
+/// implementations: no pruning at all, pruning that drops the newest tool result, or
+/// pruning that also removes results whose parent survived.
 #[test]
 fn test_prune_orphan_tool_messages_drops_only_results_without_a_surviving_parent() {
     let after_window = vec![
@@ -1372,25 +1370,20 @@ fn test_compaction_budget_target_holds_after_placeholder_synthesis() {
     assert_valid_openai_pairing(msgs);
 }
 
-// M5 / M5b — compaction must be target-safe and must account truthfully
-// (`docs/recon_bugs_manager.md`, items M5 + M5b).
+// Compaction must be target-safe and must account truthfully.
 //
-// M5: the pinned window (`messages[0]`/`messages[1]` plus a pinned
-// `REBIRTH CHECKPOINT`, see `pinned_prefix_end`) is charged against the 70%
-// budget. If it alone exceeds the target, the target is unreachable — the pin
-// is sacrosanct (REQ-CORE-001/002) — so `compact()` must report
-// `CompactionOutcome::TargetUnreachable` instead of reporting success while
+// The pinned window (`messages[0]`/`messages[1]` plus a pinned `REBIRTH CHECKPOINT`,
+// see `pinned_prefix_end`) is charged against the 70% budget. If it alone exceeds the
+// target, the target is unreachable — the pins are sacrosanct — so `compact()` must
+// report `CompactionOutcome::TargetUnreachable` instead of reporting success while
 // delivering an over-budget transcript.
 //
-// RED-before evidence (before the fix `compact()` returned `()` and logged
-// "Context compaction executed (automatic)" i.e. success):
+// Failure shape this section pins:
 //   pinned prefix = 103 tokens, target = 70 (budget 100)
 //   after `compact()`: token_count = 103 > 70, still `should_compact() == true`
 //
-// M5b: the reclaimed counts are measured on the FINAL vector.
-// RED-before evidence: the pre-pruning arithmetic
-// `initial_len - (prefix_end + kept_tail)` (the pre-fix `compact_to_target`,
-// since deleted from `context.rs`) reported `0` for a pruning-only pass in
+// The reclaimed counts are measured on the FINAL vector:
+// `initial_len - (prefix_end + kept_tail)` reports `0` for a pruning-only pass in
 // which the final vector actually dropped 1 message.
 
 /// System prompt long enough that the pinned prefix alone exceeds the target.
@@ -1402,9 +1395,8 @@ fn pinned_tokens_of(messages: &[Message]) -> usize {
     count_tokens(&messages[..end])
 }
 
-/// The pre-pruning window arithmetic that the old `compact_to_target` reported
-/// as `removed` (since deleted from `src/manager/context.rs`), replicated here
-/// to prove the reported number is stale.
+/// Window arithmetic measured **before** orphan pruning and placeholder synthesis,
+/// replicated here to prove that a count taken at that point is stale.
 fn stale_removed_before_pruning(messages: &[Message], target: usize) -> usize {
     let end = pinned_prefix_end(messages).min(messages.len());
     let mut total = count_tokens(&messages[..end]);
@@ -1438,7 +1430,7 @@ fn test_compaction_reports_failure_when_pinned_prefix_alone_exceeds_target() {
 
     let outcome = engine.compact();
 
-    // M5: a distinct, visible failure — never a silent success.
+    // A distinct, visible failure — never a silent success.
     assert!(
         !outcome.succeeded(),
         "compaction must not report success when the target is unreachable"
@@ -1464,7 +1456,7 @@ fn test_compaction_reports_failure_when_pinned_prefix_alone_exceeds_target() {
         "the transcript really is over budget, which is exactly why this must fail"
     );
 
-    // REQ-CORE-001/002: the failure must not have eaten the pin.
+    // The failure must not have eaten the pins at [0] and [1].
     assert!(matches!(engine.messages()[0], Message::System { .. }));
     assert_eq!(
         engine.messages()[1].content().unwrap_or_default(),
@@ -1491,8 +1483,8 @@ fn test_compaction_reports_failure_when_pinned_prefix_alone_exceeds_target() {
 
 #[test]
 fn test_compaction_budgets_pinned_rebirth_checkpoint_and_reports_failure() {
-    // The checkpoint pinned at `messages[2]` is now part of the arithmetic
-    // (M5): a long checkpoint can make the target unreachable on its own.
+    // The checkpoint pinned at `messages[2]` is part of the pinned-window
+    // arithmetic: a long checkpoint can make the target unreachable on its own.
     let budget = 300usize;
     let target = compaction_target(budget); // 210
     let mut engine = ContextEngine::new(budget);
@@ -1507,7 +1499,7 @@ fn test_compaction_budgets_pinned_rebirth_checkpoint_and_reports_failure() {
 
     let long_summary = "Inspected parser.rs and mapped every call site. ".repeat(30);
     engine.perform_rebirth(&long_summary);
-    // [0] system, [1] goal, [2] checkpoint — no duplicated goal (M12).
+    // [0] system, [1] goal, [2] checkpoint — never a duplicated goal.
     assert_eq!(engine.messages().len(), 3);
 
     let pinned = pinned_tokens_of(engine.messages());
@@ -1546,8 +1538,8 @@ fn test_compaction_budgets_pinned_rebirth_checkpoint_and_reports_failure() {
 
 #[test]
 fn test_compaction_reports_success_and_hits_target_for_reachable_targets() {
-    // 0.70 semantics are unchanged for reachable targets (M5 must not move the
-    // ratio constants nor make every compaction fail).
+    // The 0.70 target semantics hold for reachable targets: neither the ratio
+    // constants nor the unreachable-target failure may move them.
     let budget = 300usize;
     let target = compaction_target(budget);
     let mut engine = ContextEngine::new(budget);
@@ -1674,16 +1666,15 @@ fn test_compaction_removed_count_covers_pruning_beyond_the_retention_window() {
     assert_valid_openai_pairing(engine.messages());
 }
 
-// M6 / M12 — `perform_rebirth()` must summarize the real history, not the
-// runtime's own injected boilerplate, must not emit a second `system` turn, and
-// must not duplicate the pinned goal (`docs/recon_bugs_manager.md`).
+// `perform_rebirth()` summarizes the real history, never the runtime's own
+// injected boilerplate: it emits no second `system` turn and never duplicates the
+// pinned goal.
 //
-// RED-before evidence (pre-fix `perform_rebirth`):
+// Pinned failure modes:
 //   messages[2] == "(SYSTEM: Rebirth checkpoint accepted. Proceed
-//   immediately.)" (an injected continuation notice, not the real instruction);
-//   the checkpoint was `Message::System` -> `role() == "system"`;
-//   with no distinct instruction the goal was emitted verbatim at [1] AND [2]
-//   (2 copies).
+//   immediately.)" would be an injected continuation notice, not the real
+//   instruction; a `Message::System` checkpoint gives `role() == "system"`;
+//   with no distinct instruction the goal is emitted verbatim at [1] AND [2].
 
 #[test]
 fn test_rebirth_slot2_excludes_injected_advisory_messages() {
@@ -1698,8 +1689,8 @@ fn test_rebirth_slot2_excludes_injected_advisory_messages() {
         reasoning_content: None,
         tool_calls: vec![],
     });
-    // Every shape of runtime-injected `User` boilerplate that used to win the
-    // `messages[2]` slot because it was the newest non-goal user message. The
+    // Every shape of runtime-injected `User` boilerplate that would otherwise win the
+    // `messages[2]` slot as the newest non-goal user message. The
     // fixtures are spelled from the single owner of those notices,
     // [`INJECTED_ADVISORY_PREFIXES`], so the grammar cannot drift apart here.
     let legacy_limit_notice = INJECTED_ADVISORY_PREFIXES[1];
@@ -1817,7 +1808,7 @@ fn test_rebirth_does_not_duplicate_the_pinned_goal() {
             .starts_with(REBIRTH_CHECKPOINT_PREFIX),
         "the checkpoint follows the pinned goal directly"
     );
-    // t-031a invariant must hold after rebirth too.
+    // The pairing invariant must hold after rebirth too.
     assert_valid_openai_pairing(msgs);
 
     // Case B: a distinct instruction keeps the 4-message shape, and the goal is
@@ -1852,10 +1843,10 @@ fn test_rebirth_does_not_duplicate_the_pinned_goal() {
     assert_valid_openai_pairing(msgs2);
 }
 
-// M7 — the context budget model must account for the tool schemas that ride on
-// every request (`ChatRequest.tools`), not only for the message array.
+// The context budget model accounts for the tool schemas that ride on every
+// request (`ChatRequest.tools`), not only for the message array.
 
-/// Filler turn used to grow a transcript to a target token window.
+/// Filler turn that grows a transcript to a target token window.
 const M7_FILLER: &str = "Verbose manager turn padding the transcript with plenty of tokens.";
 
 /// Grow an engine's transcript while the *transcript alone* stays at or below
@@ -2000,7 +1991,7 @@ fn test_m7_compaction_trigger_reflects_the_true_request_size() {
     assert!(engine.should_compact_with_tools(&tools));
     assert!(!engine.should_compact_with_tools(&[]));
 
-    // Declaring no tools again restores the pre-M7 decision exactly.
+    // Declaring no tools again restores message-only accounting exactly.
     engine.set_tools(&[]);
     assert_eq!(engine.tool_schema_tokens(), 0);
     assert!(
@@ -2055,12 +2046,12 @@ fn test_m7_manager_context_charges_its_default_tool_schemas() {
     );
 }
 
-/// (t-076) Doc-shape guard for the tool-schema accounting docs. The module doc and
-/// the factory docs must name **every** live declarer of a tool-schema charge, so the
-/// "message-only is a **lower bound**" caveat can never again be read as covering the
-/// live paths. All three live declarers are pinned by name, as is the evidence file
-/// proving the newest one is live, and the caveat must stay scoped to a caller that
-/// declares nothing at all.
+/// Doc-shape guard for the tool-schema accounting docs: the module doc and the
+/// factory docs must name **every** live declarer of a tool-schema charge, so the
+/// "message-only is a **lower bound**" caveat can never be read as covering the live
+/// paths. Every live declarer is pinned by name, as is the evidence file proving the
+/// newest one is live, and the caveat must stay scoped to a caller that declares
+/// nothing at all.
 #[test]
 fn tool_schema_docs_name_every_live_declarer_and_scope_the_lower_bound_caveat() {
     let src = include_str!("context.rs");
@@ -2083,7 +2074,7 @@ fn tool_schema_docs_name_every_live_declarer_and_scope_the_lower_bound_caveat() 
         "sync_manager_tool_schema",
         // (2) fix loop.
         "charge_engine_tool_schema",
-        // (3) specialist turn (gate t-073).
+        // (3) specialist turn.
         "build_specialist_context",
         "sync_specialist_tool_schema",
     ] {

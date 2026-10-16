@@ -1,13 +1,9 @@
 //! Centralized handling of the `.marmel` workspace directory.
 //!
-//! CODE_REVIEW #4 (Dependence on the existence of the `.marmel` directory):
-//! previously the `.marmel` directory was created ad-hoc via scattered
-//! `std::fs::create_dir_all(".marmel")` calls, risking race conditions and
-//! confusing permissions errors on a read-only filesystem. This module owns the
-//! workspace directory: [`Workspace::new`] creates it and validates write
-//! permissions with a probe file exactly once at boot, and every canonical path
-//! (execution plan, session log, forced-phase override, archive) resolves
-//! through this single struct.
+//! This module owns the workspace directory: [`Workspace::new`] creates it and
+//! validates write permissions with a probe file exactly once at boot, and every
+//! canonical path (execution plan, session log, forced-phase override, archive)
+//! resolves through this single struct.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -90,9 +86,9 @@ impl Workspace {
     /// Path to a specific synthesized prompt markdown file
     /// (`.marmel/prompts/<task_id>.md`).
     ///
-    /// Gate t-046: the task id is validated as a single path segment before it is
-    /// joined onto the prompts directory, so an id such as `../../etc/x`, `a/b`
-    /// or `..\\..\\x` is reported as an error instead of silently becoming a path
+    /// The task id is validated as a single path segment before it is joined onto
+    /// the prompts directory, so an id such as `../../etc/x`, `a/b` or
+    /// `..\\..\\x` is reported as an error instead of silently becoming a path
     /// outside that directory. The id is never sanitized, trimmed or clamped —
     /// callers must propagate [`crate::task_id::TaskIdError`].
     pub fn prompt_path_for_task(
@@ -193,8 +189,8 @@ mod tests {
         assert_eq!(ws.log_path(), ws.root().join(LOG_FILE));
     }
 
-    /// Gate t-046: an accepted task id resolves to a single file name *inside*
-    /// the prompts directory — decoration is normalized, the rest is verbatim.
+    /// An accepted task id resolves to a single file name *inside* the prompts
+    /// directory — decoration is normalized, the rest is verbatim.
     #[test]
     fn prompt_path_for_task_resolves_inside_the_prompts_dir() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -219,9 +215,9 @@ mod tests {
         }
     }
 
-    /// Gate t-046: a hostile task id is refused outright. The call reports the
-    /// typed rejection and leaves nothing behind — no file in the workspace, and
-    /// nothing at the location the unguarded join would have reached.
+    /// A hostile task id is refused outright. The call reports the typed rejection
+    /// and leaves nothing behind — no file in the workspace, and nothing at the
+    /// location an unvalidated join would have reached.
     #[test]
     fn prompt_path_for_task_rejects_hostile_ids_and_creates_no_file() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -259,9 +255,9 @@ mod tests {
             .collect();
         assert!(entries.is_empty(), "no file may be created: {entries:?}");
 
-        // Control: the ungated join injects parent-directory components, i.e. it
-        // leaves the workspace root as soon as the path is resolved (it would
-        // land in the temp directory that holds this workspace).
+        // Control: the unvalidated join injects parent-directory components,
+        // i.e. it leaves the workspace root as soon as the path is resolved (it
+        // would land in the temp directory that holds this workspace).
         let would_be = root.join("prompts").join("../../escape.md");
         assert!(
             would_be

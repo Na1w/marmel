@@ -6,7 +6,7 @@
 //! bounded 10-entry completed cap evicts the oldest completed entry. No
 //! function in this module ever holds more than one map guard at a time.
 //!
-//! Two registry invariants (recon H5):
+//! Two registry invariants:
 //! 1. Every worker key is unique *among live workers*. Keys are
 //!    `{agent}-{task}` when a task id exists, `{agent}-w{n}` (a monotonic id
 //!    from `WORKER_ID_SEQ`) when it does not, and `{base}#{n}` when the
@@ -66,19 +66,17 @@ pub struct WorkerState {
     /// preserved after completion so `get_active_worker_tokens` keeps
     /// returning the last value for recently-finished workers.
     pub last_tokens: usize,
-    /// Monotonic completion sequence (None while active); used to order the
-    /// recently-completed list and to evict the oldest completed entry.
+    /// Monotonic completion sequence (None while active); used for ordering the
+    /// recently-completed list and evicting the oldest completed entry.
     pub completed_seq: Option<u64>,
     pub completed_at: Option<Instant>,
     pub completed_wall: Option<chrono::DateTime<chrono::Local>>,
     /// The value this registration drew from [`WORKER_ID_SEQ`] (see
-    /// [`next_worker_id`]).
-    ///
-    /// Carried on the entry because the session capture path (Design A §5.3)
-    /// must persist it: a restored worker is inserted under its stored key and
+    /// [`next_worker_id`]). `0` marks a token-count placeholder entry, which is
+    /// not a registration. Carried on the entry because the session capture
+    /// path persists it: a restored worker is inserted under its stored key and
     /// never re-registers, so the id embedded in `{agent}-wN` / the `#N`
-    /// collision handle has to be readable without re-drawing it.
-    /// `0` marks a token-count placeholder entry, which is not a registration.
+    /// collision handle must stay readable without re-drawing it.
     pub worker_id_seq_value: u64,
 }
 
@@ -117,16 +115,12 @@ static WORKERS: LazyLock<DashMap<String, WorkerState>> = LazyLock::new(DashMap::
 /// Monotonic sequence handed out to completed entries (oldest = smallest).
 static COMPLETED_SEQ: LazyLock<std::sync::atomic::AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
 
-/// Unique-id source for worker registry keys (recon H5).
+/// Unique-id source for worker registry keys.
 ///
-/// Every registration draws a strictly increasing id from this counter. It
-/// replaces the previous pseudo-id `Instant::now().elapsed().as_nanos()`, which
-/// is *not* a unique id: the value is a near-constant low-entropy clock offset
-/// (measured 202/33/41/39/40 in the audit), so two workers registered in the
-/// same tick produced the same key (e.g. `coder-33` twice).
-///
-/// It is also the disambiguator used when a registration would otherwise
-/// overwrite a *live* registry entry (see [`claim_worker_slot`]).
+/// Every registration draws a strictly increasing id from this counter, so two
+/// workers registered in the same tick can never share a key. It is also the
+/// disambiguator used when a registration would otherwise overwrite a *live*
+/// registry entry (see [`claim_worker_slot`]).
 static WORKER_ID_SEQ: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
 
 /// Next monotonic worker id. Never reused within a process.
@@ -135,11 +129,11 @@ fn next_worker_id() -> u64 {
 }
 
 /// Separator marking a collision-resolved ("disambiguated") worker key, e.g.
-/// `coder-t-001#7`. The base key `{agent}-{task}` is always a prefix of its
+/// `{agent}-{task}#7`. The base key `{agent}-{task}` is always a prefix of its
 /// disambiguated form — which is **why** matching must never be prefix- or
 /// substring-based: everything after `#` is an opaque collision handle, and the
 /// identity behind it is recovered structurally by
-/// [`crate::orchestrator::notice::worker_routing_identity`] (t-065).
+/// [`crate::orchestrator::notice::worker_routing_identity`].
 const KEY_DISAMBIGUATOR: char = '#';
 
 /// Bound on key-disambiguation retries. Each retry draws a fresh id from
@@ -169,10 +163,9 @@ impl Drop for ActiveWorkerGuard {
         // Single entry mutation: flip this worker to completed in place,
         // preserving the key and its last-seen token count. Only a *live* entry
         // is flipped, which makes the drop idempotent: a stale/duplicate guard
-        // cannot re-complete an entry, and cannot mark a still-running worker's
-        // entry completed (pre-fix, after a clobber) — that hid live workers
-        // from `has_active_workers()` and from every cancel path, both of which
-        // filter on `is_active()`.
+        // can neither re-complete an entry nor complete a still-running
+        // worker's entry — `has_active_workers()` and every cancel path filter
+        // on `is_active()`.
         if let Some(mut entry) = WORKERS.get_mut(&self.0)
             && entry.is_active()
         {
@@ -184,28 +177,19 @@ impl Drop for ActiveWorkerGuard {
         }
         // Bounded completed ring: evict oldest completed entries while over cap.
         evict_completed_ring();
-        // Inbox hygiene on teardown (t-048): a finished worker must not leave an
-        // empty notice-inbox entry behind in the notice store.
-        //
-        // * Empty inboxes only — `reclaim_worker_inbox` never discards a queued
-        //   notice, so a steer posted for this key that was never drained stays
-        //   pending and a replacement worker registered under the same key (a
-        //   retry of the same task) remains steerable.
-        // * No lock ordering hazard: the notice store is a separate map from
-        //   `WORKERS`, and this runs after every `WORKERS` guard above has been
-        //   released (the completed-ring loop collects keys into a `Vec` before
-        //   removing, so no iterator guard is alive here). The call takes no
-        //   guard at all, so there is nothing to deadlock against.
-        // * Infallible by construction: the reclaim reports counts instead of
-        //   `Result`s and unwraps nothing, so this drop path cannot panic —
-        //   a panic inside `Drop` while another panic is unwinding would abort
-        //   the process.
+        // Inbox hygiene on teardown: a finished worker must not leave an empty
+        // notice-inbox entry behind. Empty inboxes only — `reclaim_worker_inbox`
+        // never discards a queued notice, so an undrained steer stays pending and
+        // a replacement worker under the same key (a retry of the same task) stays
+        // steerable. No lock ordering hazard: every `WORKERS` guard above is
+        // released first and the reclaim takes no `WORKERS` guard. Infallible: it
+        // reports counts and unwraps nothing, so this `Drop` cannot panic.
         super::notice::reclaim_worker_inbox(&self.0);
-        // t-023 (flow T-5): freeze this worker's mirror so the next bundle
-        // commit writes a stable `workers/<key>.json`, and record that an edge
-        // happened. Both are infallible and touch **no disk**: `Drop` must never
-        // panic, and a worker thread is never a writer (R-TRIG-0) — the session
-        // thread harvests the registry at its next commit.
+        // Freeze this worker's mirror so the next bundle commit writes a stable
+        // `workers/<key>.json`, and record that an edge happened. Both are
+        // infallible and touch **no disk**: `Drop` must never panic, and a
+        // worker thread is never a writer — the session thread harvests the
+        // registry at its next commit.
         if let Some(journal) = crate::session::worker_journal::registry_get(&self.0) {
             journal.close();
         }
@@ -216,12 +200,11 @@ impl Drop for ActiveWorkerGuard {
 /// Bounded completed ring: evict oldest-first completed entries past
 /// [`MAX_RECENT_COMPLETED`], returning how many entries were removed.
 ///
-/// Shared by [`ActiveWorkerGuard::drop`] and by the session restore installer
-/// (Design A §5.7 step 3), so there is exactly one eviction policy. Keys are
-/// collected into a `Vec` before any removal: no map guard is ever alive while
-/// another lookup happens (the module's single-guard rule, and the reason the
-/// restore path — which may run where a panic would abort the process — can
-/// reuse this without a second implementation).
+/// Shared by [`ActiveWorkerGuard::drop`] and by the session restore installer,
+/// so there is exactly one eviction policy. Keys are collected into a `Vec`
+/// before any removal: no map guard is ever alive while another lookup happens
+/// (the module's single-guard rule), so the restore path — where a panic would
+/// abort the process — reuses it without a second implementation.
 fn evict_completed_ring() -> usize {
     let mut removed_total = 0usize;
     loop {
@@ -248,7 +231,7 @@ fn evict_completed_ring() -> usize {
     removed_total
 }
 
-/// Raise [`WORKER_ID_SEQ`] to a restore floor (Design A §5.7 step 1).
+/// Raise [`WORKER_ID_SEQ`] to a restore floor.
 ///
 /// `fetch_max`, never an assignment: the floor says "every id below `floor` has
 /// already been handed out", and the counter may legitimately be ahead of it (a
@@ -263,7 +246,7 @@ pub fn worker_id_seq_floor() -> u64 {
     WORKER_ID_SEQ.load(Ordering::SeqCst)
 }
 
-/// Raise [`COMPLETED_SEQ`] to a restore floor (A §5.7 step 1) — see
+/// Raise [`COMPLETED_SEQ`] to a restore floor — see
 /// [`seed_worker_id_seq_floor`] for the ordering rule.
 pub fn seed_completed_seq_floor(floor: u64) -> u64 {
     COMPLETED_SEQ.fetch_max(floor, Ordering::SeqCst)
@@ -274,19 +257,14 @@ pub fn completed_seq_floor() -> u64 {
     COMPLETED_SEQ.load(Ordering::SeqCst)
 }
 
-/// Insert a **restored** worker under its stored registry key.
+/// Insert a **restored** worker under its stored registry key — the only registry
+/// mutation the session loader is given: key and `completed_seq` are written
+/// verbatim and no id is re-drawn. Deliberately **not**
+/// [`register_active_worker_with_token`] / [`claim_worker_slot`]: those draw a
+/// fresh `WORKER_ID_SEQ` id and may disambiguate the key, which is identity drift.
 ///
-/// This is the installer A §5.7 step 2 requires and the only registry mutation
-/// the session loader is given: the key is written verbatim, `completed_seq` is
-/// carried verbatim, and no id is re-drawn. Deliberately **not**
-/// [`register_active_worker_with_token`] / [`claim_worker_slot`] — those draw a
-/// fresh `WORKER_ID_SEQ` id and may disambiguate the key, which is the identity
-/// drift A §5.7 exists to prevent.
-///
-/// Returns `false` (inserting nothing) when the key is currently held by a
-/// **live** entry: clobbering it would drop that worker's `CancellationToken`,
-/// the same refusal [`claim_worker_slot`] makes. The caller reports the
-/// collision; it never overwrites.
+/// Returns `false` (inserting nothing) when a **live** entry holds the key, the
+/// same refusal [`claim_worker_slot`] makes; the caller reports the collision.
 pub fn install_restored_worker(worker_key: String, state: WorkerState) -> bool {
     match WORKERS.entry(worker_key) {
         Entry::Occupied(mut occupied) => {
@@ -304,21 +282,19 @@ pub fn install_restored_worker(worker_key: String, state: WorkerState) -> bool {
 }
 
 /// Enforce the completed-ring cap over a set of freshly re-inserted entries and
-/// report how many completed entries the live map could not hold (A §5.7 step 3:
-/// the files are the durable record, the map is the working set).
+/// report how many completed entries the live map could not hold: the files are
+/// the durable record, the map is the working set.
 pub fn enforce_completed_ring_cap() -> usize {
     evict_completed_ring()
 }
 
-/// Close a restored record without an [`ActiveWorkerGuard`] (flow §2.5: the
-/// manager chose to retire / re-delegate / continue, so the open delegation
-/// must be closed the same way a real completion closes it).
-///
-/// Runs the *existing* teardown steps — draw `COMPLETED_SEQ`, flip the entry to
-/// completed, evict the ring, reclaim the notice inbox — and returns the drawn
-/// sequence (`Some(existing)` when the entry was already closed, `None` when the
-/// key is unknown). No guard is synthesized: the guard's `Drop` would report a
-/// completion the worker never had (flow §2.2 step 2).
+/// Close a restored record without an [`ActiveWorkerGuard`] (the manager chose
+/// to retire / re-delegate / continue, so the open delegation closes the way a
+/// real completion closes it). Runs the existing teardown steps — draw
+/// `COMPLETED_SEQ`, flip to completed, evict the ring, reclaim the notice
+/// inbox — and returns the drawn sequence (`Some(existing)` when already
+/// closed, `None` when the key is unknown). No guard is synthesized: its `Drop`
+/// would report a completion the worker never had.
 pub fn retire_restored_worker(worker_key: &str, status_label: &str) -> Option<u64> {
     let seq = {
         let mut entry = WORKERS.get_mut(worker_key)?;
@@ -340,15 +316,15 @@ pub fn retire_restored_worker(worker_key: &str, status_label: &str) -> Option<u6
     seq
 }
 
-/// Clone one registry entry (A §5.3: the capture side projects a live
-/// `WorkerState` into a `WorkerSection`; `WORKERS` is private to this module).
+/// Clone one registry entry: the capture side projects a live `WorkerState` into
+/// a `WorkerSection`, and `WORKERS` is private to this module.
 pub fn worker_state_snapshot(worker_key: &str) -> Option<WorkerState> {
     WORKERS.get(worker_key).map(|entry| entry.value().clone())
 }
 
 /// Snapshot every entry as `(key, state)`, no guard outliving the call. The
 /// committer walks this and joins it with [`crate::session::worker_journal`] to
-/// build the `workers/*.json` members (flow §1.3).
+/// build the `workers/*.json` members.
 pub fn live_worker_states() -> Vec<(String, WorkerState)> {
     let mut out: Vec<(String, WorkerState)> = WORKERS
         .iter()
@@ -380,8 +356,8 @@ pub fn register_active_worker(
 /// The returned [`ActiveWorkerGuard`] carries the **effective** registry key:
 /// when the natural key `{agent}-{task}` is already owned by a live worker, a
 /// distinct disambiguated key (`{agent}-{task}#{id}`) is allocated instead of
-/// overwriting it (recon H5), and that new key is what the guard reports — so
-/// every caller keeps updating and cancelling *its own* entry.
+/// overwriting it, and that new key is what the guard reports — so every caller
+/// keeps updating and cancelling *its own* entry.
 pub fn register_active_worker_with_token(
     task_id: Option<String>,
     agent_name: String,
@@ -392,10 +368,10 @@ pub fn register_active_worker_with_token(
         .as_deref()
         .and_then(crate::task_id::normalize_task_id);
 
-    // Correlation key: agent name + normalized task id (unchanged public
-    // format). Workers *without* a task id get the monotonic id from
-    // `WORKER_ID_SEQ` instead of the old nanosecond pseudo-id, which collided
-    // for anything registered inside the same clock tick.
+    // Correlation key: agent name + normalized task id (public format is
+    // stable). Workers *without* a task id get the monotonic id from
+    // `WORKER_ID_SEQ`, so two registrations inside the same clock tick cannot
+    // share a key.
     let worker_id = next_worker_id();
     let base_key = if let Some(ref t) = clean_task_id {
         format!("{agent_name}-{t}")
@@ -416,9 +392,9 @@ pub fn register_active_worker_with_token(
         started_at,
         worker_id,
     );
-    // T-5 (flow §1.1): a worker started. Only the edge is recorded here — the
-    // journal is opened by the runner and harvested/written by the session
-    // thread at its next commit (R-TRIG-0), never from this thread.
+    // A worker started: only the edge is recorded here — the journal is opened
+    // by the runner and harvested/written by the session thread at its next
+    // commit, never from this thread.
     crate::ui::session::mark_worker_lifecycle_edge();
     ActiveWorkerGuard(key)
 }
@@ -457,19 +433,13 @@ fn new_worker_state(
 }
 
 /// Claim a registry slot for a new worker, **never overwriting a live entry**.
-///
-/// * Key free → insert under the natural key.
-/// * Key held only by a *completed* entry → the natural key is reused and the
-///   entry replaced, preserving the last-seen token count (legacy behavior).
-/// * Key held by a **live** entry → a distinct disambiguated key
-///   `{base}#{id}` is allocated and a `warn!` is emitted. Overwriting would
-///   drop the live worker's `CancellationToken` on the floor: the running
-///   worker stays active but is no longer reachable from
-///   [`cancel_active_worker`] / [`cancel_all_active_workers`], and the first
-///   guard's `drop` would then flip the *borrowed* entry to completed, hiding
-///   the still-running worker from `has_active_workers()` too.
-///
-/// Returns the effective key, which the caller must use for all later updates.
+/// Key free → insert under the natural key. Key held only by a *completed* entry →
+/// the natural key is reused and replaced, preserving the last-seen token count.
+/// Key held by a **live** entry → a distinct disambiguated key `{base}#{id}` is
+/// allocated and a `warn!` is emitted: overwriting would drop the live worker's
+/// `CancellationToken`, leaving it active but unreachable from
+/// [`cancel_active_worker`] / [`cancel_all_active_workers`]; the first guard's
+/// `drop` would flip the *borrowed* entry to completed. Returns the effective key.
 fn claim_worker_slot(
     base_key: &str,
     task_id: Option<String>,
@@ -507,7 +477,7 @@ fn claim_worker_slot(
                 }
 
                 // Stale (already-completed) entry: reuse the key and inherit
-                // its last-seen token count, as before.
+                // its last-seen token count.
                 let initial_tokens = occupied.get().last_tokens;
                 occupied.insert(new_worker_state(
                     task_id.clone(),
@@ -571,8 +541,9 @@ pub fn update_active_worker_context(key: &str, tokens: usize) {
                 completed_seq: Some(COMPLETED_SEQ.fetch_add(1, Ordering::SeqCst)),
                 completed_at: Some(Instant::now()),
                 completed_wall: Some(chrono::Local::now()),
-                // Not a registration: no id was drawn for it (A §5.3 keeps
-                // `worker_id_seq_value` meaningful for real registrations only).
+                // Not a registration: no id is drawn for it, so
+                // `worker_id_seq_value` stays meaningful for real
+                // registrations only.
                 worker_id_seq_value: 0,
             });
         }
@@ -607,16 +578,17 @@ pub fn set_active_worker_status(key: &str, status: &str) {
     } else {
         false
     };
-    // T-5 (flow §1.1): `status_label` is a persisted worker field, so a
-    // completion / failure / abort label is a lifecycle edge. The guard above is
-    // released before this call (A §5.7 step 4: no map guard across a step), and
-    // recording an edge is an atomic store — no disk, no commit (R-TRIG-0).
+    // `status_label` is a persisted worker field, so a completion / failure /
+    // abort label is a lifecycle edge. The guard above is released before this
+    // call (no map guard across a step), and recording an edge is an atomic
+    // store — no disk, no commit.
     if updated {
         crate::ui::session::mark_worker_lifecycle_edge();
     }
 }
 
-/// Get the context token count for an active specialist worker by its key (e.g. `coder-t-001`).
+/// Get the context token count for an active specialist worker by its registry
+/// key (e.g. `{agent}-{task}`).
 pub fn get_active_worker_tokens(key: &str) -> Option<usize> {
     WORKERS.get(key).map(|e| e.last_tokens)
 }
@@ -675,22 +647,14 @@ pub fn format_duration_human(secs: u64) -> String {
     }
 }
 
-/// Prompt file of a registered worker, gated on the canonical task-id grammar.
-///
-/// Gate t-055 (single grammar authority): this lookup turns a worker's task id —
-/// originally LLM output from `delegate_task` / a plan checkbox — into the file
-/// name of `.marmel/prompts/<task_id>.md`. The join goes through
-/// [`crate::task_id::validate_task_id`], which is the only place in the crate
-/// that decides what a task id may be; nothing here re-implements or extends
-/// that grammar.
-///
-/// Contract, mirroring [`crate::harness::workspace::Workspace::prompt_path_for_task`]:
-/// * the id is normalized first (decoration stripping only, unchanged order) and
-///   the **normalized** value is what is validated and joined — byte-for-byte,
-///   never sanitized, trimmed, clamped or mended into a different file name;
-/// * `Ok(None)` means "there is no task id to look up";
-/// * `Err(TaskIdError)` means the id was refused, and the caller must then skip
-///   the read entirely (fail closed) rather than trying a repaired id.
+/// Prompt file of a registered worker: a task id — LLM output from `delegate_task`
+/// or a plan checkbox — becomes `.marmel/prompts/<task_id>.md` only through
+/// [`crate::task_id::validate_task_id`], the crate's single authority on an id.
+/// Mirroring [`crate::harness::workspace::Workspace::prompt_path_for_task`], the
+/// id is normalized first (decoration stripping only) and that **normalized**
+/// value is validated and joined — never sanitized, trimmed, clamped or mended.
+/// `Ok(None)` = no task id; `Err(TaskIdError)` = refused: skip the read (fail
+/// closed) rather than retrying a repaired id.
 fn worker_prompt_path(
     raw_task_id: Option<&str>,
 ) -> Result<Option<std::path::PathBuf>, crate::task_id::TaskIdError> {
@@ -749,11 +713,11 @@ pub fn get_active_subtasks_str() -> String {
                 task_id_str, id, info.agent_name, info.status, info.prompt, start_wall_str,
                 duration_str, info.implementation_turns, info.validation_rounds
             ));
-            // Gate t-055: the per-worker prompt read is grammar-gated (see
-            // [`worker_prompt_path`]). A rejected task id never reaches the read,
-            // so the worker is rendered exactly as it already is when its prompt
-            // file is missing — the "prompt unavailable" shape — and the id is
-            // never repaired into some other file name.
+            // The per-worker prompt read is grammar-validated (see
+            // [`worker_prompt_path`]): a rejected task id never reaches the
+            // read, so the worker renders in the same "prompt unavailable"
+            // shape as when its prompt file is missing, and the id is never
+            // repaired into some other file name.
             let prompt_file = match worker_prompt_path(info.task_id.as_deref()) {
                 Ok(path) => path,
                 Err(err) => {
@@ -831,26 +795,16 @@ pub fn get_active_subtasks_str() -> String {
     out
 }
 
-// Exact worker identity (t-065) — the notice router's model, reused verbatim.
+// Exact worker identity — the notice router's model, reused verbatim.
 
-/// The **exact routing identity** of a registered worker.
-///
-/// This is not a second identity model: it delegates to the single authority
-/// used for notice routing,
-/// [`crate::orchestrator::notice::worker_routing_identity`] (effective registry
-/// key vs. natural `{agent}-{task}` key, the `#…` collision handle stripped,
-/// the task id taken from the canonical task-id grammar via
-/// [`crate::plan_parse::is_task_id_token`]), and then pins the two
-/// **authoritative** fields off the registry entry itself.
-///
-/// Those fields are what the key was *built from* at registration time
-/// ([`register_active_worker_with_token`] joins `agent_name` + the normalized
-/// `task_id`), so preferring them over a re-parse of the composite key is
-/// strictly more precise — an agent name whose own tail is task-shaped (e.g.
-/// `reviewer-t-x` running `t-001`, key `reviewer-t-x-t-001`) would otherwise be
-/// split into the wrong agent/task pair. A field the entry does not carry falls
-/// back to the value split out of the key, so task-less workers (`{agent}-w{n}`)
-/// keep resolving to their bare agent name.
+/// The **exact routing identity** of a registered worker — not a second identity
+/// model: it defers to the single authority used for notice routing,
+/// [`crate::orchestrator::notice::worker_routing_identity`] (effective key vs.
+/// natural `{agent}-{task}` key, task id taken from the canonical grammar via
+/// [`crate::plan_parse::is_task_id_token`]), then pins the two **authoritative**
+/// fields off the registry entry — what [`register_active_worker_with_token`]
+/// joined — so a task-shaped agent name cannot split wrongly; a missing field
+/// falls back to the key-split value, keeping `{agent}-w{n}` workers addressable.
 fn worker_identity(
     key: &str,
     info: &ActiveWorkerInfo,
@@ -874,19 +828,12 @@ fn worker_identity(
 
 /// Helper to find the active worker addressed **exactly** by `task_id`.
 ///
-/// t-065: this used to be a substring hunt — the address was tested with
-/// `contains` against the registry key *and* against the worker's free-text
-/// prompt — so asking for `t-1` returned the worker running `t-10` (and any
-/// worker whose prompt merely happened to mention `t-1`). It now asks the shared
-/// identity model whether the address names this worker exactly
-/// ([`worker_identity`] + [`crate::orchestrator::notice::WorkerRoutingIdentity::routes`]):
-/// the exact task id (case- and decoration-tolerant through the canonical
-/// normalizer), the exact natural key, the exact effective key (including a
-/// `#…` collision handle), the exact agent name, or a deliberate broadcast
-/// address (`*` / `worker`).
-///
-/// An empty or decoration-only address matches **nothing**; under the old
-/// `key.contains(&tid)` rule an empty id matched *every* active worker.
+/// Tested through the shared identity model ([`worker_identity`] +
+/// [`crate::orchestrator::notice::WorkerRoutingIdentity::routes`]), never by
+/// substring matching or free-text fields: exact task id (case- and
+/// decoration-tolerant through the canonical normalizer), exact natural key,
+/// exact effective key (including a `#…` collision handle), exact agent name, or
+/// a broadcast (`*` / `worker`). An empty or decoration-only address matches none.
 pub fn get_active_subtask_by_id(task_id: &str) -> Option<(String, String)> {
     let address = crate::task_id::normalize_task_id_ref(task_id).to_ascii_lowercase();
     if address.is_empty() {
@@ -907,26 +854,13 @@ pub fn get_active_subtask_by_id(task_id: &str) -> Option<(String, String)> {
 }
 
 /// Does the caller's `(target_agent, target_task)` pair address this worker
-/// **exactly**?
-///
-/// Both arguments are routed through the notice router's whole-field equality
-/// rules ([`crate::orchestrator::notice::WorkerRoutingIdentity::routes`]), so a
-/// cancel can still be aimed by agent name (`coder`), by role family
-/// (`validator` → `validator-coder`), by natural/effective key
-/// (`coder-t-001`, `coder-t-001#7`) or as an explicit broadcast (`*`,
-/// `worker`) — while a task id or key must match as a whole token. A
-/// `t-1` cancel no longer kills `t-10`, and a `coder-t-0` cancel no longer
-/// kills `coder-t-001`: every earlier `contains` arm (key substring, task-id
-/// substring in either direction, agent-name substring in either direction) is
-/// deliberately absent, and no caller in this crate relies on them — the steer
-/// arbitrator is instructed to name the target by its `tool_call_id` (e.g.
-/// `t-001`) or its exact `agent_name` (see `prompts/steer_arbitrator.md`), and
-/// [`get_active_subtask_by_id`] is fed task ids parsed by `plan_parse`. There is
-/// therefore no legacy "unique substring match" path left behind.
-///
-/// Argument composition is unchanged: an absent (`None`/empty/decoration-only)
-/// argument is a wildcard, and when both are present **both** must address the
-/// same worker.
+/// **exactly**? Both arguments go through the notice router's whole-field
+/// equality rules ([`crate::orchestrator::notice::WorkerRoutingIdentity::routes`]):
+/// agent name (`coder`), role family (`validator` → `validator-coder`), the whole
+/// natural or effective key (`{agent}-{task}`, `{agent}-{task}#7`) or a broadcast
+/// (`*`, `worker`) — but a task id or key must match as a whole token, so a `t-1`
+/// cancel never kills the worker running `t-10`. An absent argument is a wildcard;
+/// both present means **both** must match the same worker (see [`get_active_subtask_by_id`]).
 fn worker_matches(
     info: &ActiveWorkerInfo,
     key: &str,
@@ -953,11 +887,11 @@ fn worker_matches(
 /// Cancel an active specialist worker matching target_agent and/or target_task_id.
 /// Returns true if at least one matching active worker was found and cancelled.
 ///
-/// Targeting is **exact identity matching** (t-065), the same rules notice
-/// routing uses — see [`worker_matches`]. A `t-1` target cancels the worker
-/// running `t-1` and never the one running `t-10`; a bare agent name, a role
-/// family, a whole natural/effective key, or an explicit broadcast (`*` /
-/// `worker`) still address their workers as before.
+/// Targeting is **exact identity matching**, the same rules notice routing
+/// uses — see [`worker_matches`]. A `t-1` target cancels the worker running
+/// `t-1` and never the one running `t-10`; a bare agent name, a role family, a
+/// whole natural/effective key, or an explicit broadcast (`*` / `worker`)
+/// address their workers as usual.
 pub fn cancel_active_worker(target_agent: Option<&str>, target_task_id: Option<&str>) -> bool {
     let mut to_cancel = Vec::new();
     for e in WORKERS.iter() {
@@ -1009,10 +943,10 @@ pub fn cancel_all_active_workers() -> usize {
 mod tests {
     use super::*;
 
-    /// A §5.7 step 2/3: the restore installer writes the **stored** key and the
-    /// stored `completed_seq` verbatim, refuses to clobber a live entry (the
-    /// same refusal [`claim_worker_slot`] makes, so a cancellation token is
-    /// never dropped), and closing a restored record goes through the existing
+    /// The restore installer writes the **stored** key and the stored
+    /// `completed_seq` verbatim, refuses to clobber a live entry (the same
+    /// refusal [`claim_worker_slot`] makes, so a cancellation token is never
+    /// dropped), and closing a restored record goes through the existing
     /// `COMPLETED_SEQ` path — never a synthesized [`ActiveWorkerGuard`].
     #[test]
     fn test_restore_installer_keeps_keys_and_closes_through_completed_seq() {
@@ -1098,8 +1032,8 @@ mod tests {
         remove_worker_entry_for_test(&live_key);
     }
 
-    /// A §5.7 step 1: the floors move with `fetch_max`, never an assignment, so
-    /// a restore can never rewind an id counter and hand out a used id.
+    /// The floors move with `fetch_max`, never an assignment, so a restore can
+    /// never rewind an id counter and hand out a used id.
     #[test]
     fn test_restore_floors_move_up_only() {
         let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -1211,8 +1145,8 @@ mod tests {
         assert!(completed_str.contains("..."));
     }
 
-    /// Concurrency regression (Phase 2): 50 concurrent workers hammer the
-    /// single sharded `WORKERS` DashMap — each registers via
+    /// Concurrency stress: 50 concurrent workers hammer the single sharded
+    /// `WORKERS` DashMap — each registers via
     /// `register_active_worker_with_token`, interleaves
     /// `update_active_worker_context` + `set_active_worker_status`, then drops
     /// its guard (single-entry mutation + bounded-ring eviction). The whole
@@ -1282,7 +1216,7 @@ mod tests {
         );
     }
 
-    // Recon H5 — unique worker ids + registry entries are never clobbered.
+    // Unique worker ids: registry entries are never clobbered.
 
     /// Live (active) registry entries whose key starts with `prefix`.
     fn active_entries_with_prefix(prefix: &str) -> Vec<String> {
@@ -1304,11 +1238,10 @@ mod tests {
             .unwrap_or_else(|e| panic!("worker id in {key:?} is not a number: {e}"))
     }
 
-    /// (i) Two workers registered back-to-back with **no task id** — the exact
-    /// shape that produced identical keys pre-fix, because the pseudo-id was
-    /// `Instant::now().elapsed().as_nanos()`, a near-constant reading (measured
-    /// 202/33/41/39/40). They must get distinct, monotonic ids and BOTH must be
-    /// reachable by the cancel path.
+    /// (i) Two workers registered back-to-back with **no task id** — the shape
+    /// that would produce identical keys if the id source were a near-constant
+    /// clock reading — must get distinct, monotonic ids from `WORKER_ID_SEQ` and
+    /// BOTH must stay reachable by the cancel path.
     #[test]
     fn test_same_tick_taskless_workers_get_distinct_ids_and_are_both_cancellable() {
         let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -1360,10 +1293,10 @@ mod tests {
         drop(g2);
     }
 
-    /// (i/ii) Same agent + same task id ⇒ identical natural key (recon Scenario
-    /// A: overlapping steer rounds both yield `steer-task-1`). The second
-    /// registration must not clobber the first worker's live entry: the entry at
-    /// the original key must still hold the first worker's state and token, and
+    /// (i/ii) Same agent + same task id ⇒ identical natural key (two overlapping
+    /// steer rounds both yield `steer-task-1`). The second registration must not
+    /// clobber the first worker's live entry: the entry at the original key must
+    /// still hold the first worker's state and token, and
     /// `cancel_all_active_workers` must reach both.
     #[test]
     fn test_colliding_registration_does_not_drop_first_workers_token() {
@@ -1463,10 +1396,10 @@ mod tests {
         drop(gb);
     }
 
-    /// (ii) Full Scenario-A repro: after the collision, the *first* guard's
-    /// `drop` pre-fix flipped the shared entry to completed, so the still
-    /// running second worker disappeared from `has_active_workers()` and from
-    /// every cancel path (they all filter on `is_active()`).
+    /// (ii) Full Scenario-A repro: after a key collision the *first* guard's
+    /// `drop` must not flip the shared entry to completed — that hides the still
+    /// running second worker from `has_active_workers()` and from every cancel
+    /// path (they all filter on `is_active()`).
     #[test]
     fn test_first_guard_drop_cannot_hide_second_live_worker() {
         let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -1513,10 +1446,9 @@ mod tests {
     /// (ii) Hardening of the drop path: dropping a stale guard for an entry that
     /// is **already completed** must be a no-op — it must not bump the completed
     /// ring sequence, re-stamp timestamps, or touch the re-registered live
-    /// worker that inherited the key. A guard drop that flipped somebody else's
-    /// live entry to completed is precisely what makes a running worker
-    /// un-killable, since `cancel_active_worker` and `cancel_all_active_workers`
-    /// both skip non-active entries.
+    /// worker that inherited the key. Completing somebody else's live entry is
+    /// what makes a running worker un-killable: `cancel_active_worker` and
+    /// `cancel_all_active_workers` both skip non-active entries.
     #[test]
     fn test_stale_guard_drop_is_noop_and_key_reuse_keeps_worker_cancellable() {
         let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -1626,19 +1558,18 @@ mod tests {
         assert!(cancelled >= 1, "the worker must still be cancellable");
         assert!(token.is_cancelled());
 
-        // Legacy behavior kept for keys with no live entry (evicted/completed):
-        // the token count is still persisted.
+        // Keys with no live entry (evicted/completed) still store the token
+        // count.
         update_active_worker_context("h5phantom-t-777", 42);
         assert_eq!(get_active_worker_tokens("h5phantom-t-777"), Some(42));
 
         drop(guard);
     }
 
-    /// (ii) Race guard for the same clobber class: pre-fix
-    /// `update_active_worker_context` did `get_mut(key)` → on miss
-    /// `insert(placeholder)`, so a registration landing between the lookup and
-    /// the insert had its live entry (and cancellation token) replaced by the
-    /// token-less placeholder. The update now runs as one `entry` transaction.
+    /// (ii) Race guard for the same clobber class: `update_active_worker_context`
+    /// is one `entry` transaction, so a registration landing between the lookup
+    /// and the write can never have its live entry (and cancellation token)
+    /// replaced by the token-less placeholder.
     #[test]
     fn test_concurrent_update_and_registration_never_clobbers_live_entry() {
         let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -1777,7 +1708,7 @@ mod tests {
             still_live.is_empty(),
             "completed workers must not stay live in the registry: {still_live:?}"
         );
-        // … so targeted cancels no longer match them.
+        // … so a targeted cancel does not match them either.
         assert!(
             !cancel_active_worker(Some(agent), None),
             "completed workers must not be reported as cancel targets"
@@ -1811,7 +1742,7 @@ mod tests {
         );
     }
 
-    // Teardown inbox reclaim (t-048)
+    // Teardown inbox reclaim
 
     /// `ActiveWorkerGuard::drop` reclaims the finished worker's **empty** notice
     /// inbox. "Empty but present" is the real leak shape: a resolved notice drops
@@ -1964,7 +1895,7 @@ mod tests {
         }
     }
 
-    // Gate t-055 — the per-worker `.marmel/prompts/<task_id>.md` READ site.
+    // The per-worker `.marmel/prompts/<task_id>.md` READ site.
     //
     // `worker_prompt_path` is the only join for this read and it routes the
     // already-normalized id through `crate::task_id::validate_task_id`, the
@@ -1993,7 +1924,7 @@ mod tests {
         rest[..block_end].to_string()
     }
 
-    /// WARN capture counting only the rejections emitted by this gate.
+    /// WARN capture counting only the rejections emitted by `worker_prompt_path`.
     #[derive(Clone, Default)]
     struct RejectTaskIdWarns(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
@@ -2059,8 +1990,8 @@ mod tests {
 
     /// Rejected ids must be typed refusals (never a path), and a worker carrying
     /// one must render exactly like a worker whose prompt file is missing — the
-    /// blueprint planted *outside* the prompts dir (where the un-gated
-    /// `prompts/../escape.md` join used to land) must never be read.
+    /// blueprint planted *outside* the prompts dir (where an unvalidated
+    /// `prompts/../escape.md` join would land) must never be read.
     #[test]
     fn test_worker_prompt_path_rejects_hostile_task_ids_and_skips_the_read() {
         // A plain `#[test]` with its own current-thread runtime: the registry
@@ -2085,8 +2016,8 @@ mod tests {
             .build()
             .expect("current-thread runtime to scope the workspace root");
         rt.block_on(crate::harness::with_workspace_root(&root, async {
-            // 1. The gate itself: a typed refusal per hostile spelling, and no
-            //    path is ever handed back to the caller.
+            // 1. A typed refusal per hostile spelling, and no path is ever
+            //    handed back to the caller.
             assert_eq!(
                 worker_prompt_path(Some("../escape")).err(),
                 Some(crate::task_id::TaskIdError::DotDotSegment)
@@ -2170,9 +2101,9 @@ mod tests {
         );
     }
 
-    /// A normal `t-0NN` id — decorated or not — still normalizes, validates and
-    /// round-trips through the prompts directory, so the gate costs nothing on
-    /// the happy path.
+    /// A normal task id — decorated or not — still normalizes, validates and
+    /// round-trips through the prompts directory, so validation costs nothing
+    /// on the happy path.
     #[test]
     fn test_worker_prompt_path_round_trips_a_normal_task_id() {
         let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -2229,7 +2160,7 @@ mod tests {
         }));
     }
 
-    // t-065 — cancel and diagnostic targeting address a worker by its exact
+    // Cancel and diagnostic targeting address a worker by its exact
     // routing identity, never by a substring of a key, a task id or a prompt.
     // Fixtures mirror the `worker_routing_identity` / `routes()` identity tests
     // in `notice_tests`.
@@ -2340,8 +2271,8 @@ mod tests {
             );
         }
 
-        // Absent targets are wildcards, but never a match-all; both present
-        // must hold (composition unchanged from the legacy AND behaviour).
+        // Absent targets are wildcards, but never a match-all; when both are
+        // present, both must address the same worker (AND composition).
         assert!(!worker_matches(&info, key, None, None));
         assert!(!worker_matches(&info, key, Some(""), Some("[]")));
         assert!(worker_matches(&info, key, Some("validator"), Some("t-001")));
@@ -2407,8 +2338,8 @@ mod tests {
         drop(g_long);
     }
 
-    /// (a, continued) A truncated task id or tag — the old `contains` arms —
-    /// addresses nobody, while the decorated exact id still does.
+    /// (a, continued) A truncated task id or tag addresses nobody — matching is
+    /// whole-field only — while the decorated exact id still does.
     #[test]
     fn test_cancel_by_truncated_id_or_key_matches_nobody() {
         let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -2492,7 +2423,7 @@ mod tests {
             "the whole natural key still resolves"
         );
 
-        // The legacy prompt-substring fallback is gone.
+        // No prompt-substring lookup path exists.
         assert!(
             get_active_subtask_by_id("t-7777").is_none(),
             "a task id may not be looked up through a worker's free-text prompt"
@@ -2500,8 +2431,8 @@ mod tests {
         // Fragments of a live key resolve to nobody.
         assert!(get_active_subtask_by_id("t065lookshort-t-").is_none());
         assert!(get_active_subtask_by_id("t065lookshort-t-10").is_none());
-        // Empty / decoration-only ids used to match *every* active worker
-        // (`key.contains("")` is always true).
+        // Empty / decoration-only ids match nobody, never *every* active worker:
+        // the address is normalized first and an empty address matches nothing.
         assert!(get_active_subtask_by_id("").is_none());
         assert!(get_active_subtask_by_id("[]").is_none());
 
@@ -2565,7 +2496,7 @@ mod tests {
         assert!(validator_token.is_cancelled());
 
         // A role-name segment that is not a *leading* segment of the worker's
-        // role must not reach it (the legacy `contains` arm did).
+        // role must not reach it (matching is whole-field, leading-segment only).
         let substring_token = tokio_util::sync::CancellationToken::new();
         let g_substring = register_active_worker_with_token(
             Some("t-503".to_string()),

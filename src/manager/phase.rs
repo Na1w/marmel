@@ -1,103 +1,56 @@
 //! Mission phase state machine, disk plan management, and auto check-off.
 //!
-//! REQ-PLAN-001 (Mission Phase States): what decides the phase of a mission is
-//! the plan file on disk — the live turn loops consult [`Plan::exists`],
-//! [`Plan::pending_tasks`] and [`Plan::is_complete`] (`src/ui/session.rs`,
-//! `src/orchestrator/**`). The `MissionPhase` enum, `Plan::determine_phase`,
-//! `Plan::forced_phase` and `Plan::is_silent_dispatcher` that used to model the
-//! same thing here were **never consulted by any live path** and have been
-//! deleted (recon item L8; evidence and the wire-or-delete decision are recorded
-//! on [`Plan`]).
+//! The on-disk plan decides a mission's phase: [`Plan`] is the single authority
+//! for it, the live turn loops consult [`Plan::exists`], [`Plan::pending_tasks`]
+//! and [`Plan::is_complete`] (`src/ui/session.rs`, `src/orchestrator/**`), and
+//! the executing loop iterates the unchecked items [`Plan`] exposes until every
+//! task is marked `[x]` — suppressing conversational filler is that loop's job,
+//! not this module's.
 //!
-//! REQ-PLAN-002 (Disk-Driven Automatic Plan Check-off): The plan lives at
-//! `.marmel/execution_plan.md` and is formatted with `- [ ] [t-xxx]` checkboxes
-//! (`- [ ] (t-xxx)` and the other spellings are equally valid — the grammar has
-//! one owner, [`crate::plan_parse`]). Exactly two authorities may flip a box:
+//! The plan lives at `.marmel/execution_plan.md` as `- [ ] [t-xxx]` checkboxes
+//! (`- [ ] (t-xxx)` and the other spellings are equally valid); its grammar has
+//! exactly one owner, [`crate::plan_parse`], and this module owns no regex at
+//! all. A task id arrives bound by the caller, decorated onto a marker, or is
+//! proven a boundary-safe token by [`crate::plan_parse::line_matches_task_id`],
+//! so an id that exists only inside a word or a path (`t-notes` inside
+//! `src/chart-notes.md`) can never flip a plan line.
 //!
-//! * a **tool call** the loop makes itself, with an explicitly bound plan id:
-//!   the live gate is the structured `ToolResult::is_error` flag and the raw
-//!   mutation is [`Plan::check_off`]. As of t-035a **no live call site uses this
-//!   half any more** — every plan box the session loops could tick came from a
-//!   delegation, and both of those sites now go through the marker gate below.
-//!   `check_off` therefore stays what it always was: a raw mutation that derives
-//!   nothing (kept for the plan-grammar tests and any future tool-bound update),
-//!   never a success classifier;
-//! * a **subagent deliverable** — including a `delegate_task` tool result that
-//!   carries a plan task id — is flipped only through
-//!   [`Plan::check_plan_on_deliverable`] (REQ-PLAN-002 + REQ-ORCH-005, below).
-//!   For this half `is_error == false` is **not** evidence of completion: a
-//!   deliverable with no terminal completion marker leaves its box unchecked.
-//!   Both live session loops and the orchestrator's `apply_check_off` route
-//!   through that single gate (t-035a).
+//! Exactly two authorities may flip a box: a **tool call** the loop makes
+//! itself, judged by the structured `ToolResult::is_error` flag and written by
+//! [`Plan::check_off`] — the only plan mutation, a raw write that derives
+//! nothing and is never a success classifier; and a **subagent deliverable**
+//! (including a `delegate_task` tool result carrying a plan task id) flipped
+//! only through [`Plan::check_plan_on_deliverable`], where `is_error == false`
+//! is **not** evidence of completion: only a `MISSION COMPLETE (t-xxx)` marker
+//! turns `- [ ] [t-xxx]` into `- [x] [t-xxx]`, while `FAILED`, `REPLAN REQUIRED`
+//! or a marker-less deliverable leaves the box unchecked.
 //!
-//! The free-form substring heuristic that used to back the tool half
-//! (`output_is_success` + `Plan::check_off_on_success`) is **deleted**: recon
-//! item M9 (`docs/recon_bugs_manager.md`) recorded that it mis-classified any
-//! output merely containing `error` / `failed` (`thiserror`, `src/error.rs`,
-//! `errors.log`), and `docs/decision_dead_code_manager.md` §6 left the
-//! wire-or-delete decision here — after the dead `AgentLoop` was removed neither
-//! had a production caller left, so wiring them up again would re-introduce a
-//! second, divergent success matcher (and its H6 canned-`"ok"` failure mode)
-//! beside the marker gate.
-//!
-//! REQ-PLAN-002 + REQ-ORCH-005 (Delegation-aware check-off): a *subagent*
-//! deliverable is checked off via its terminal marker, not free-form output.
-//! Only a `MISSION COMPLETE (t-xxx)` marker flips `- [ ] [t-xxx]` to
-//! `- [x] [t-xxx]`; `FAILED` / `REPLAN REQUIRED` markers leave the task
-//! unchecked. The marker grammar (marker set, precedence, parser) has a single
-//! owner, [`crate::markers`], and is FAIL-first: an explicit `FAILED` /
-//! `REPLAN REQUIRED` signal outranks an embedded `MISSION COMPLETE` substring.
-//! **Bug M9 (one matcher, not two):** the check-off decision is taken solely by
-//! [`crate::markers`] — [`MissionMarker::resolve`] for the verdict plus
+//! That marker grammar — marker set, precedence, parser — has one owner,
+//! [`crate::markers`], and is FAIL-first: an explicit `FAILED` /
+//! `REPLAN REQUIRED` outranks an embedded `MISSION COMPLETE` substring. The
+//! check-off verdict is taken solely by [`crate::markers`] —
+//! [`MissionMarker::resolve`] for the verdict,
 //! [`crate::markers::has_failure_marker`] /
-//! [`crate::markers::has_replan_marker`] for presence tests. This module
-//! declares no success or failure predicate of its own (the duplicated pair it
-//! once carried tested `MISSION COMPLETE` as a substring *before* the failure
-//! test), so `not ok` prose, a benign `test result: ok. … 0 failed` counter, or
-//! a word that merely contains a marker token cannot decide the outcome; the
-//! adversarial cases are pinned in the tests of this module.
-//! `Plan::check_plan_on_marker` (content-only) and
-//! `Plan::check_plan_on_deliverable` (structured marker preferred) apply it to
-//! the plan. The **task id** is resolved from an explicit source only: the
-//! caller's bound `task_id` (the `delegate_task` argument, normalized by
-//! [`crate::task_id`]), the structured [`MissionMarker`] field, or the id
-//! decorated onto the marker (`MISSION COMPLETE (t-001)`). This module owns no
-//! regex and never scans an arbitrary blob for a `t-…` token — the H6 fallback
-//! (`manager/loop.rs::extract_task_id`, recon `docs/recon_bugs_manager.md` H6)
-//! is deleted and nothing in the live path replaces it. As the last line of
-//! defence, an id that was neither bound by the caller nor carried by a
-//! structured marker must additionally appear in the deliverable as a
-//! boundary-safe task-id token ([`crate::plan_parse::line_matches_task_id`]),
-//! so an id that exists only as a substring inside a word or a path
-//! (`t-notes` inside `src/chart-notes.md`) can never flip a plan line. The
-//! marker layer applies the same proof at its own end: [`crate::markers`] binds
-//! a `(t-xxx)` id only when it is a boundary-safe token on the marker's own
-//! line, and no longer scans the whole deliverable for the first `t-…` run.
+//! [`crate::markers::has_replan_marker`] for presence tests — and
+//! [`crate::markers`] binds a `(t-xxx)` id only as a boundary-safe token on the
+//! marker's own line. This module declares no success or failure predicate of
+//! its own, so `not ok` prose or a word merely containing a marker token cannot
+//! decide the outcome.
+//! A task id is resolved from an explicit source only: the caller's bound
+//! `task_id` (the `delegate_task` argument, normalized by [`crate::task_id`]),
+//! the structured [`MissionMarker`] field, or the id decorated onto the marker
+//! (`MISSION COMPLETE (t-xxx)`).
 //!
-//! REQ-PLAN-003 (Silent Dispatcher Enforcement): in the executing phase the
-//! agent suppresses conversational filler and iterates strictly through
-//! unchecked plan items until every task is marked `[x]`. The enforcement point
-//! is the live delegation loop (`src/orchestrator/**` driving
-//! `Plan::pending_tasks()` / `Plan::is_complete()`); this module supplies the
-//! state it iterates on, not the suppression itself.
+//! An unreadable plan is never a finished one: [`Plan::try_pending_tasks`] and
+//! [`Plan::try_all_tasks`] separate `Ok(vec![])` ("there is no plan file") from
+//! `Err(..)` ("a plan file exists but could not be read"); the `Vec`-shaped
+//! [`Plan::pending_tasks`] / [`Plan::all_tasks`] log the failure instead of
+//! swallowing it, and [`Plan::is_complete`] returns `false` when the plan cannot
+//! be read, so no loop concludes an unreadable plan was finished.
 //!
-//! **Bug M8 (unreadable plan ≠ finished plan).** `pending_tasks`/`all_tasks`
-//! used to fold a failed `fs::read_to_string` into an empty `Vec`, i.e. "no
-//! pending work", which the dispatcher and the UI auto-nudge read as "the plan
-//! is done". The error-propagating forms are [`Plan::try_pending_tasks`] and
-//! [`Plan::try_all_tasks`]: `Ok(vec![])` means "there is no plan file", `Err(..)`
-//! means "the plan exists but could not be read". The `Vec`-shaped
-//! [`Plan::pending_tasks`]/[`Plan::all_tasks`] remain for call sites that cannot
-//! handle a `Result` yet; they log the failure with `tracing::error!` instead of
-//! swallowing it, and the completion gate [`Plan::is_complete`] returns `false`
-//! when the plan cannot be read, so no loop can ever conclude that an
-//! unreadable plan was finished.
-//!
-//! REQ-PLAN-004 (Disk Override): **not implemented on the live path.** No code
-//! in the crate writes `.marmel/forced_phase.txt` and the reader
-//! (`Plan::forced_phase`) was deleted as unreachable (recon item L8, see the
-//! note on [`Plan`]). [`FORCED_PHASE_FILE`] survives as the name of that legacy
-//! file so [`Plan::clear`] can still delete a stale override left on disk.
+//! `.marmel/forced_phase.txt` is a legacy name nothing writes:
+//! [`FORCED_PHASE_FILE`] survives so that [`Plan::clear`] can delete a stale
+//! copy left on disk.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -108,76 +61,38 @@ pub const MARMEL_DIR: &str = ".marmel";
 pub const PLAN_FILE: &str = "execution_plan.md";
 /// Name of the legacy phase-override file inside the marmel directory.
 ///
-/// Nothing in the crate writes or reads it any more — the REQ-PLAN-004 gate was
-/// deleted as unreachable (recon L8, see the note above [`Plan`]). The constant
-/// survives because [`Plan::clear`] deletes a stale override left on disk by an
-/// older release, and `harness::Workspace` re-exports it as the canonical path.
+/// Nothing writes or reads it. The name survives so a **stale** override left on
+/// disk by an older release is still deletable by [`Plan::clear`] (see [`Plan`]),
+/// and `harness::Workspace` re-exports it as the canonical path.
 pub const FORCED_PHASE_FILE: &str = "forced_phase.txt";
 /// Name of the **superseded** manager journal — a re-export of the session-owned
 /// [`crate::session::manager_capture::LEGACY_TRANSCRIPT_FILE`], not a second copy.
 ///
-/// t-009 deleted the journal itself (A §1 **D2**): `ContextEngine::save_transcript`,
-/// `ContextEngine::load_transcript`, `Plan::transcript_path()` and this module's own
-/// definition of the name are all gone, and nothing in the crate writes
-/// `.marmel/.session_transcript.json` any more. The name survives in exactly one
-/// form because two readers must still recognize a **stale** copy left by an older
-/// release and say so out loud rather than merge or upgrade it:
-/// [`crate::session::restore`]'s "legacy journals found, not restorable" outcome
-/// (A §7.4 — ignored must not mean invisible) and [`Plan::clear`]/[`Plan::archive`]
-/// deleting it with the plan. The same reasoning kept [`FORCED_PHASE_FILE`].
+/// The session bundle is the durable state: nothing in the crate writes
+/// `.marmel/.session_transcript.json`. The name survives so a **stale** copy left
+/// by an older release is still recognized and named out loud instead of merged:
+/// [`crate::session::restore`] reports "legacy journals found, not restorable"
+/// (ignored must not mean invisible) and [`Plan::clear`] / [`Plan::archive`]
+/// delete it with the plan, as they delete the override named by
+/// [`FORCED_PHASE_FILE`].
 pub use crate::session::manager_capture::LEGACY_TRANSCRIPT_FILE as TRANSCRIPT_FILE;
 
-// High-level mission phases.
-//
-// **Deleted (recon item L8, `docs/recon_bugs_manager.md`).** `MissionPhase`,
-// `MissionPhase::parse`, `Plan::forced_phase`, `Plan::determine_phase` and
-// `Plan::is_silent_dispatcher` formed a phase gate that nothing on the live
-// path ever consulted:
-//
-// * no caller outside `src/manager/` referenced any of them — the only
-//   surviving uses were the `manager::mod` re-export and this module's own
-//   unit tests, which certified an unwired path;
-// * nothing in the crate ever **writes** `.marmel/forced_phase.txt`, so the
-//   REQ-PLAN-004 disk override could never be triggered from a running binary
-//   (`forced_phase()` always returned `None`);
-// * the enforcement that actually ships lives in the live turn loops —
-//   `src/ui/session.rs` (interactive Manager turn loop: which tools are
-//   offered, plan-driven dispatch) and `src/orchestrator/**`
-//   (`run_executing`/`delegate_task` as the Silent Dispatcher, REQ-ORCH-001 /
-//   REQ-PLAN-003). Both consult the plan through `Plan::exists()`,
-//   `Plan::pending_tasks()` and `Plan::check_plan_on_marker`, not through a
-//   phase enum.
-//
-// Wiring the gate would have meant re-implementing tool gating in files owned
-// by other tasks (`src/ui/**`, `src/orchestrator/**`) — out of scope here and a
-// second source of truth. Deleting it removes no behaviour: no call site could
-// observe a difference. What REQ-PLAN-001/003 still require of this module is
-// what it does provide — the on-disk plan and its pending/complete state, the
-// single authority for that being `Plan` + [`crate::plan_parse`].
-//
-// If REQ-PLAN-004 (disk override) is wanted again, it must be implemented as a
-// live-path feature: a writer for the override file plus a consultation point
-// in the live loops. `FORCED_PHASE_FILE` stays for that purpose and for the
-// `/reset` cleanup in [`Plan::clear`].
+// High-level mission phases: the on-disk plan and its pending/complete state,
+// whose single authority is `Plan` plus [`crate::plan_parse`].
+// Nothing on the live path switches "phases": enforcement lives in the turn
+// loops (`src/ui/session.rs`, `src/orchestrator/**`), which consult
+// `Plan::exists()`, `Plan::pending_tasks()` and `Plan::check_plan_on_marker`.
 
 // The plan task-line grammar (`- [ ] [t-xxx]`, `- [ ] (t-xxx)`, `- [X] …`) and
-// the whole-document checkbox gates live in exactly one place:
-// [`crate::plan_parse`] (dedup cluster C3). This module used to keep four
-// private regexes here (`TASK_LINE_RE`, `ALL_TASKS_RE`, `UNCHECKED_BOX_RE`,
-// `CHECKED_BOX_RE`) plus a per-call regex inside `check_off`; they had drifted
-// apart — a parenthesised task id such as `- [ ] (t-002) migrate schema` was
-// recognised by none of them, so that plan could never be listed as pending nor
-// checked off (`docs/recon_bugs_harness_llm_ui.md` §3 C1/C2). The copies are
-// gone; every read below delegates to the shared parser.
-//
-// **Invariant (H6 hardening, task t-031d): this module owns no regex at all.**
-// The deleted `manager/loop.rs::extract_task_id` derived a task id by running
-// `\(?\[?(t-[A-Za-z0-9_-]+)\]?\)?` over the whole serialized tool-argument blob,
-// which matched ids hiding inside paths (`"path":"src/chart-notes.md"` →
-// `t-notes`) and therefore checked off tasks that were never executed
-// (`docs/recon_bugs_manager.md` H6). Nothing here may re-introduce that scan:
-// ids arrive bound by the caller, decorated on a marker, or proven as a
-// boundary-safe token by [`crate::plan_parse::line_matches_task_id`].
+// the whole-document checkbox checks have exactly one owner:
+// [`crate::plan_parse`]. This module keeps no copy of those patterns and
+// introduces none: every read below delegates to the shared parser, so a
+// parenthesised task id is recognised everywhere or nowhere. Nor is a task id
+// ever guessed by scanning an arbitrary blob (serialized tool arguments, plan
+// text, deliverable prose) for a `t-…` run — that would bind ids hiding inside
+// paths and check off tasks that were never executed. Ids arrive bound by the
+// caller, decorated on a marker, or proven boundary-safe by
+// [`crate::plan_parse::line_matches_task_id`].
 
 /// Mutex ensuring atomic filesystem operations across parallel subagents on the execution plan.
 static PLAN_MUTEX: std::sync::LazyLock<std::sync::Mutex<()>> =
@@ -251,22 +166,16 @@ pub fn get_plan_start_time() -> Option<(std::time::Instant, chrono::DateTime<chr
     None
 }
 
-/// The terminal marker a subagent appends to its deliverable (REQ-ORCH-005):
+/// The terminal marker a subagent appends to its deliverable:
 /// `MISSION COMPLETE (task-id)` on success, `FAILED` / `REPLAN REQUIRED` when
 /// it cannot.
 ///
 /// The grammar — marker set, precedence rules and parser — has exactly one
-/// owner, [`crate::markers`]. This module used to carry a verbatim copy of the
-/// enum, `contains_failed_marker` and `parse` (dedup cluster C4,
-/// `docs/recon_duplication_helpers.md` §2.4); that copy tested `MISSION
-/// COMPLETE` as a substring *before* `FAILED`, so a FAILED deliverable that
-/// merely mentions `MISSION COMPLETE` in its prose was classified `Complete`
-/// and flipped `- [ ] [t-xxx]` → `- [x] [t-xxx]` on disk (bug C1,
-/// `docs/recon_bugs_manager.md`). The copy is gone; the name is re-exported so
+/// owner, [`crate::markers`], and this module only re-exports the type so that
 /// every existing `crate::manager::phase::MissionMarker` path keeps resolving.
 pub use crate::markers::MissionMarker;
 
-/// Manages the on-disk execution plan and phase gating under a marmel directory.
+/// Manages the on-disk execution plan and its state under a marmel directory.
 ///
 /// The directory is configurable so tests can isolate against a temp dir, but
 /// defaults to `./.marmel` for normal operation.
@@ -295,38 +204,30 @@ impl Plan {
         self.dir.join(PLAN_FILE)
     }
 
-    /// REQ-PLAN-004 cleanup: a legacy `.marmel/forced_phase.txt` override file
-    /// is deleted together with the plan. No product path writes that file and
-    /// the phase-gate helpers that used to read it are gone (recon L8, see the
-    /// module docs), but a file left over from an older release must not
-    /// survive a `/reset`.
+    /// Path of the legacy `.marmel/forced_phase.txt` override file, which is
+    /// deleted together with the plan. No product path writes that file; a copy
+    /// an older release left on disk must not survive a `/reset`.
     pub fn forced_phase_path(&self) -> PathBuf {
         self.dir.join(FORCED_PHASE_FILE)
     }
 
-    /// Path of the **superseded** manager journal (A §1 **D2**).
+    /// Path of the **superseded** manager journal, kept for one reason only.
     ///
-    /// Nothing writes this file any more: `ContextEngine::save_transcript`,
-    /// `ContextEngine::load_transcript` and the public `Plan::transcript_path()`
-    /// were deleted by t-009, and the durable session state is the bundle at
-    /// [`Plan::session_bundle_path`]. The accessor stays private for one reason
-    /// only — [`Plan::clear`] and [`Plan::archive`] must still delete a **stale**
-    /// copy left on disk by an older release, exactly as [`FORCED_PHASE_FILE`]
+    /// The session bundle at [`Plan::session_bundle_path`] is the durable state
+    /// and nothing writes this file. The accessor stays private because
+    /// [`Plan::clear`] and [`Plan::archive`] must still delete a **stale** copy
+    /// left on disk by an older release, exactly as [`FORCED_PHASE_FILE`]
     /// survives for its stale override.
     fn legacy_transcript_path(&self) -> PathBuf {
         self.dir.join(TRANSCRIPT_FILE)
     }
 
-    /// Path of the **superseded** UI journal (t-025b).
-    ///
-    /// Nothing writes this file any more: `UiTranscript::save`/`load`,
-    /// `UiTranscript::from_legacy_messages` and the public UI-journal file-name
-    /// constant are deleted, and the durable UI state is the `ui` member of the
-    /// bundle at [`Plan::session_bundle_path`]. The name therefore lives here as a
-    /// plain literal, and the accessor stays private for one reason only —
-    /// [`Plan::clear`] and [`Plan::archive`] must still delete a **stale** copy left
-    /// on disk by an older release, exactly as [`Self::legacy_transcript_path`] does
-    /// for [`TRANSCRIPT_FILE`].
+    /// Path of the **superseded** UI journal, kept for the same reason as
+    /// [`Self::legacy_transcript_path`]: nothing writes it — the durable UI state
+    /// is the `ui` member of the bundle at [`Plan::session_bundle_path`] — and
+    /// [`Plan::clear`] / [`Plan::archive`] must still delete a **stale** copy an
+    /// older release left on disk. The name is a plain literal here, just as
+    /// [`TRANSCRIPT_FILE`] is a re-export.
     fn legacy_ui_journal_path(&self) -> PathBuf {
         self.dir.join(".ui_transcript.json")
     }
@@ -336,12 +237,9 @@ impl Plan {
     /// session bundle, and the in-memory manager capture the session holder keeps
     /// for a committer.
     ///
-    /// A plan sweep is `ProcessEnding::Reset` in the durable vocabulary: the
-    /// session MUST NOT be resurrected (A §3.4), so a bundle left behind next to a
-    /// cleared plan would be a bug — the next boot would load a session the user
-    /// just erased. The ending-marked deletion (`session::discard_bundle`, flow
-    /// §1.4/T-10) belongs to the trigger layer (t-011/t-013); until that exists, a
-    /// plain recursive delete is what keeps the promise, and it is loud on failure.
+    /// A cleared plan must leave no session behind to resurrect: a bundle next to
+    /// a cleared plan would be loaded by the next boot. The delete is loud on
+    /// failure.
     fn sweep_session_state(&self) {
         crate::session::manager_capture::clear_capture();
         let transcript = self.legacy_transcript_path();
@@ -372,37 +270,30 @@ impl Plan {
         }
     }
 
-    /// Root of the **session bundle** for this plan: `.marmel/session/`
-    /// (`docs/design_session_restore_data.md` §2, flow §4.2).
+    /// Root of the **session bundle** for this plan: `.marmel/session/`, holding
+    /// `manifest.json`, `manager.json`, `ui.json` and `workers/<escaped-key>.json`;
+    /// the manifest is written **last**, which is what makes a bundle committed.
     ///
     /// This is the single path authority for the bundle: `session::commit` and
     /// `session::restore` never re-derive it from [`MARMEL_DIR`], and callers must
-    /// not hardcode `.marmel/session`. The directory holds `manifest.json`,
-    /// `manager.json`, `ui.json` and `workers/<escaped-key>.json`; the manifest is
-    /// written **last**, which is what makes a bundle committed (A §7.1 C4).
-    ///
-    /// Since t-009 this is also the only durable **manager** journal: the
-    /// `.marmel/.session_transcript.json` file it used to sit next to is deleted
-    /// (A §1 D2), and only its name survives, in
-    /// [`crate::session::manager_capture::LEGACY_TRANSCRIPT_FILE`], so a stale copy
-    /// can still be named and swept. The superseded **UI** journal
-    /// (`.marmel/.ui_transcript.json`) is named and swept the same way — its
-    /// writer was deleted by t-025b, and the durable UI state is this bundle's
-    /// `ui` member.
+    /// not hardcode `.marmel/session`. The bundle is also the only durable
+    /// **manager** journal: the superseded `.marmel/.session_transcript.json`,
+    /// whose name survives in
+    /// [`crate::session::manager_capture::LEGACY_TRANSCRIPT_FILE`], is never
+    /// written — it is only ever named and deleted, like the superseded
+    /// `.marmel/.ui_transcript.json`.
     pub fn session_bundle_path(&self) -> PathBuf {
         self.dir.join(crate::session::format::BUNDLE_DIR_NAME)
     }
 
-    /// REQ-PLAN-001: write the initial execution plan to `.marmel/execution_plan.md`,
+    /// Write the initial execution plan to `.marmel/execution_plan.md`,
     /// creating the directory if it does not exist.
     ///
-    /// Recon item **L6** (`docs/recon_bugs_manager.md`): the markdown is run
-    /// through the single newline normalizer, [`crate::plan_parse::normalize_newlines`],
-    /// and given exactly one trailing newline **here, once, at write time**.
-    /// `create` and `check_off` are the only writers of the active plan file,
-    /// and `check_off` is now byte-faithful, so a CRLF plan authored by a model
-    /// no longer gets its whole body re-spelled on the first check-off — the
-    /// bytes on disk are the normalized bytes written here.
+    /// The markdown is run through the single newline normalizer,
+    /// [`crate::plan_parse::normalize_newlines`], and given exactly one trailing
+    /// newline **here, once, at write time**: `create` and `check_off` are the
+    /// only writers of the active plan file and `check_off` is byte-faithful, so
+    /// the bytes on disk are the normalized bytes written here.
     pub fn create(&self, plan_markdown: &str) -> Result<()> {
         let _guard = PLAN_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::fs::create_dir_all(&self.dir)
@@ -426,27 +317,19 @@ impl Plan {
     }
 
     /// Read the raw *active* plan markdown, or `None` if no active plan exists
-    /// on disk (t-203).
+    /// on disk. There is no stale-archive fallback: an archive is a purely
+    /// historical artifact and `is_complete()`, `pending_tasks()` and
+    /// `all_tasks()` never read it, so an archived plan cannot resurrect a phase.
     ///
-    /// The stale-archive fallback has been removed: when `.marmel/execution_plan.md`
-    /// is absent, `None` is returned regardless of whether an archived snapshot
-    /// exists. The archive is a purely historical artifact — `is_complete()`,
-    /// `pending_tasks()` and `all_tasks()` must never read it, otherwise an
-    /// archived plan would resurrect the executing phase.
-    ///
-    /// Recon item **L5** (`docs/recon_bugs_manager.md`): the read now takes the
-    /// same `PLAN_MUTEX` that already guards `create`/`check_off`/`clear`/
-    /// `archive`. `check_off` rewrites the whole file with a non-atomic
-    /// `fs::write`, so an unguarded reader running in another parallel
-    /// subagent thread could observe a half-written plan and report "no
-    /// pending tasks" (or fail to find the line it is about to tick). The
-    /// guard is what makes the read consistent with the write.
-    ///
-    /// Call sites that **already hold** the guard must use
-    /// [`Plan::read_unlocked`] — `std::sync::Mutex` is not re-entrant and would
-    /// deadlock (`check_off` and `archive` are exactly those sites). The gap
-    /// this does *not* close is cross-process locking: `PLAN_MUTEX` is
-    /// per-process, so two `marmel` binaries sharing one workspace still race.
+    /// The read takes the same `PLAN_MUTEX` that already guards
+    /// `create`/`check_off`/`clear`/`archive`, because `check_off` rewrites the
+    /// whole file with a non-atomic `fs::write`: an unguarded reader in another
+    /// parallel subagent thread could otherwise observe a half-written plan and
+    /// report "no pending tasks". Call sites that **already hold** the guard must
+    /// use [`Plan::read_unlocked`] — `std::sync::Mutex` is not re-entrant and
+    /// would deadlock. What this does *not* close is cross-process locking:
+    /// `PLAN_MUTEX` is per-process, so two `marmel` binaries sharing one
+    /// workspace still race.
     pub fn read(&self) -> Result<Option<String>> {
         let _guard = PLAN_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         self.read_unlocked()
@@ -503,18 +386,16 @@ impl Plan {
     }
 
     /// Parse all *unchecked* task ids (`- [ ] [t-xxx]`, `- [ ] (t-xxx)`, …) from
-    /// the plan, using the shared grammar in [`crate::plan_parse`], and
-    /// **propagate any read failure** (bug M8).
+    /// the plan using the shared grammar in [`crate::plan_parse`], and
+    /// **propagate any read failure**.
     ///
-    /// Takes `PLAN_MUTEX` (recon L5) and reads through [`Plan::read_unlocked`],
-    /// so a concurrent `check_off` can never be observed mid-write.
+    /// Takes `PLAN_MUTEX` and reads through [`Plan::read_unlocked`], so a
+    /// concurrent `check_off` can never be observed mid-write.
     ///
-    /// The distinction M8 is about:
     /// * `Ok(vec![])` — there is **no plan file**, so genuinely nothing is pending;
     /// * `Err(_)` — a plan file exists but could not be read/decoded, which must
-    ///   never be reported as "nothing pending". The pre-M7 code collapsed both
-    ///   into an empty `Vec`, so an unreadable plan made the Silent Dispatcher
-    ///   (and the UI auto-nudge) believe the plan was finished.
+    ///   never be reported as "nothing pending": an unreadable plan is an
+    ///   unfinished one.
     pub fn try_pending_tasks(&self) -> Result<Vec<String>> {
         let _guard = PLAN_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         match self.read_unlocked() {
@@ -528,7 +409,7 @@ impl Plan {
     }
 
     /// Parse *all* task ids present in the plan (both `- [ ]` and `- [x]`),
-    /// propagating read failures — see [`Plan::try_pending_tasks`] (bug M8).
+    /// propagating read failures — see [`Plan::try_pending_tasks`].
     pub fn try_all_tasks(&self) -> Result<Vec<String>> {
         let _guard = PLAN_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         match self.read_unlocked() {
@@ -543,13 +424,13 @@ impl Plan {
 
     /// Compatibility wrapper over [`Plan::try_pending_tasks`] for call sites that
     /// still expect a plain `Vec` (`src/orchestrator/mod.rs`, `src/ui/session.rs`,
-    /// `src/harness/plan.rs`, `src/plan_parse.rs` tests).
+    /// `src/harness/plan.rs`).
     ///
     /// **A read failure is logged as an error and yields an empty list** — the
     /// empty list alone must never be read as "the plan is done", which is why
-    /// the completion gate is [`Plan::is_complete`] (it returns `false` when the
-    /// plan cannot be read, so the dispatcher keeps working instead of declaring
-    /// victory). New call sites must use [`Plan::try_pending_tasks`].
+    /// the completion authority is [`Plan::is_complete`]: it returns `false` when
+    /// the plan cannot be read, so the dispatcher keeps working instead of
+    /// declaring victory. New call sites must use [`Plan::try_pending_tasks`].
     pub fn pending_tasks(&self) -> Vec<String> {
         match self.try_pending_tasks() {
             Ok(tasks) => tasks,
@@ -564,7 +445,7 @@ impl Plan {
     }
 
     /// Compatibility wrapper over [`Plan::try_all_tasks`] — see
-    /// [`Plan::pending_tasks`] for the M8 contract.
+    /// [`Plan::pending_tasks`] for the unreadable-plan contract.
     pub fn all_tasks(&self) -> Vec<String> {
         match self.try_all_tasks() {
             Ok(tasks) => tasks,
@@ -580,9 +461,9 @@ impl Plan {
 
     /// Returns `true` when the plan has at least one task and none remain unchecked.
     ///
-    /// An unreadable plan is **never** complete (bug M8): the failure is logged
-    /// and `false` is returned, so no dispatcher can treat "cannot read the plan"
-    /// as "nothing pending".
+    /// An unreadable plan is **never** complete: the failure is logged and
+    /// `false` is returned, so no dispatcher can treat "cannot read the plan" as
+    /// "nothing pending".
     pub fn is_complete(&self) -> bool {
         let _guard = PLAN_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         self.is_complete_unlocked()
@@ -608,10 +489,10 @@ impl Plan {
     /// Archive the current execution plan to `.marmel/archive/execution_plan_<timestamp>.md`
     /// and `.marmel/execution_plan_archive.md`, and clean up `.marmel/execution_plan.md`.
     ///
-    /// t-203 (a): a plan is only archived once it is complete. An incomplete plan
-    /// (one with at least one unchecked box) is the working checkpoint — archiving
-    /// it would silently lose it, so this returns `Ok(None)` when `is_complete()`
-    /// is false and leaves every file untouched.
+    /// A plan is only archived once it is complete. An incomplete plan (one with
+    /// at least one unchecked box) is the working checkpoint — archiving it would
+    /// silently lose it — so this returns `Ok(None)` when `is_complete()` is false
+    /// and leaves every file untouched.
     pub fn archive(&self) -> Result<Option<PathBuf>> {
         let _guard = PLAN_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         if !self.is_complete_unlocked() {
@@ -638,8 +519,7 @@ impl Plan {
         let _ = std::fs::write(&latest, &content);
         let _ = std::fs::remove_file(&path);
         // An archived plan is a finished session: the superseded manager journal,
-        // the superseded UI journal and the session bundle go with it
-        // (A §3.4 `PlanArchived`).
+        // the superseded UI journal and the session bundle go with it.
         self.sweep_session_state();
         clear_plan_start();
         tracing::warn!(
@@ -650,18 +530,18 @@ impl Plan {
         Ok(Some(dest))
     }
 
-    /// REQ-PLAN-002: toggle a single `- [ ] [t-id]` task to `- [x] [t-id]` on disk.
-    ///
-    /// This is the raw disk mutation: it derives nothing. The caller must hand
-    /// it an id taken from an explicit source — the plan line it is acting on,
-    /// the bound `delegate_task` `task_id`, or a marker decoration resolved by
+    /// Toggle one `- [ ] [t-id]` task to `- [x] [t-id]` on disk. This is the
+    /// **only** plan mutation and it derives nothing: the caller must hand it an
+    /// id taken from an explicit source — the plan line it is acting on, the
+    /// bound `delegate_task` `task_id`, or a marker decoration resolved by
     /// [`Plan::check_plan_on_deliverable`]. The id is normalized by
     /// [`crate::task_id`] and matched by [`crate::plan_parse::check_off_content`],
     /// so an id that only appears inside another task's description never flips
     /// that other line.
     ///
-    /// When the final task is checked off and the plan becomes complete, a snapshot
-    /// is automatically archived to `.marmel/archive/`.
+    /// When the final task is checked off and the plan becomes complete, a
+    /// completion snapshot is automatically archived to `.marmel/archive/` while
+    /// the active plan file stays readable.
     ///
     /// Returns `Ok(true)` if a pending checkbox was flipped, `Ok(false)` if the
     /// task id was not found (or was already checked), and `Err` on IO failure.
@@ -689,11 +569,10 @@ impl Plan {
             self.plan_path().display(),
             complete
         );
-        // t-203 (c): when this flip completes the plan, auto-archive the
-        // completion snapshot to `.marmel/archive/` (per the `archive`
-        // docstring's promise) but KEEP the active file readable until the
-        // caller explicitly archives. This is a best-effort snapshot; a
-        // failure here must not fail the check-off itself.
+        // When this flip completes the plan, write a completion snapshot to
+        // `.marmel/archive/` (the promise in the `archive` docstring) but KEEP the
+        // active file readable until the caller archives explicitly. This is a
+        // best-effort snapshot: failing here must not fail the check-off itself.
         if complete {
             record_plan_completed();
             let _ = self.write_completed_snapshot(&updated);
@@ -701,10 +580,10 @@ impl Plan {
         Ok(true)
     }
 
-    /// t-203 (c): write a best-effort completion snapshot of `content` to
+    /// Write a best-effort completion snapshot of `content` to
     /// `.marmel/archive/execution_plan_<timestamp>.md`, leaving the active
     /// `.marmel/execution_plan.md` untouched. Used by `check_off` when the last
-    /// task is flipped to complete the plan.
+    /// task is flipped and the plan becomes complete.
     fn write_completed_snapshot(&self, content: &str) -> Result<PathBuf> {
         let archive_dir = self.dir.join("archive");
         std::fs::create_dir_all(&archive_dir)
@@ -721,79 +600,72 @@ impl Plan {
         Ok(dest)
     }
 
-    /// REQ-PLAN-002 + REQ-ORCH-005: delegation-aware auto check-off for a
-    /// subagent deliverable, judged from its **body text** alone.
+    /// Delegation-aware auto check-off for a subagent deliverable, judged from
+    /// its **body text** alone.
     ///
-    /// When the deliverable carries a `MISSION COMPLETE (t-xxx)` terminal
-    /// marker, the matching `- [ ] [t-xxx]` plan line is flipped to
-    /// `- [x] [t-xxx]` on disk. A `FAILED` / `REPLAN REQUIRED` marker (or any
-    /// unrecognized output) leaves the task unchecked. Parsing is delegated to
-    /// [`crate::markers`], which is FAIL-first: a line-initial/terminal
-    /// `FAILED` (or any `REPLAN REQUIRED`) outranks a `MISSION COMPLETE` that
-    /// is merely embedded in the prose of a failed deliverable.
-    ///
-    /// Callers that already hold the structured verdict should prefer
-    /// [`Plan::check_plan_on_deliverable`], which never re-parses the body.
+    /// A `MISSION COMPLETE (t-xxx)` terminal marker flips the matching
+    /// `- [ ] [t-xxx]` plan line to `- [x] [t-xxx]` on disk; a `FAILED` /
+    /// `REPLAN REQUIRED` marker, or any unrecognized output, leaves the task
+    /// unchecked. Parsing is delegated to [`crate::markers`], which is FAIL-first:
+    /// a line-initial/terminal `FAILED` (or any `REPLAN REQUIRED`) outranks a
+    /// `MISSION COMPLETE` merely embedded in the prose of a failed deliverable.
     ///
     /// The task id is resolved from the marker when present (the optional
-    /// `task_id` argument may be `None`); callers that already bound a
-    /// `task_id` (REQ-ORCH-005
-    /// `delegate_task` binding) may pass it explicitly so check-off still works
-    /// even if the subagent omitted the parenthesized id. Passing `None` for
-    /// both means the id has to be recovered from the deliverable itself, which
-    /// is only accepted when the id also occurs there as a boundary-safe
-    /// task-id token — see [`Plan::check_plan_on_deliverable`] (H6 hardening).
+    /// `task_id` argument may be `None`); callers that already bind a `task_id`
+    /// for the `delegate_task` may pass it explicitly, so check-off still works
+    /// when the subagent omits the parenthesized id. With neither, the id has to
+    /// be recovered from the deliverable itself and is then accepted only when it
+    /// also occurs there as a boundary-safe task-id token — see
+    /// [`Plan::check_plan_on_deliverable`]. A canned success token carries no
+    /// marker and never checks anything off.
     ///
-    /// `deliverable` must be the real deliverable text; a canned success token
-    /// carries no marker and never checks anything off.
+    /// Callers that already hold the structured verdict prefer
+    /// [`Plan::check_plan_on_deliverable`], which never re-parses the body.
     ///
-    /// Returns `Ok(true)` when the task was checked off on disk, `Ok(false)`
-    /// when the marker was not a completion (leaving the task unchecked) or the
-    /// task id was not found / already checked, and `Err` on IO failure.
+    /// Returns `Ok(true)` when the task was checked off on disk, `Ok(false)` when
+    /// the marker was not a completion (leaving the task unchecked) or the task id
+    /// was not found / already checked, and `Err` on IO failure.
     pub fn check_plan_on_marker(&self, task_id: Option<&str>, deliverable: &str) -> Result<bool> {
         self.check_plan_on_deliverable(None, task_id, deliverable)
     }
 
-    /// REQ-PLAN-002 + REQ-ORCH-005: delegation-aware auto check-off that
-    /// prefers the **structured** [`MissionMarker`] carried by the deliverable
-    /// (the `Deliverable.marker` field) over any re-parse of its body — the
-    /// minimal fix recorded for bug C1 (`docs/recon_bugs_manager.md`).
+    /// Delegation-aware auto check-off that prefers the **structured**
+    /// [`MissionMarker`] carried by the deliverable (the `Deliverable.marker`
+    /// field) over any re-parse of its body.
     ///
     /// [`MissionMarker::resolve`] uses `marker` verbatim when populated and only
     /// falls back to the positional body parse when it is `None`. A `FAILED` /
     /// `REPLAN REQUIRED` verdict therefore always leaves `- [ ] [t-xxx]`
     /// untouched, no matter what marker text the body happens to quote.
     ///
-    /// **Hardened task-id resolution (H6).** The id may only come from an
-    /// explicit, structured source, tried in this order: the caller's bound
-    /// `task_id` (the `delegate_task` argument, normalized by
-    /// [`crate::task_id`]), then the id inside a caller-supplied structured
-    /// marker, then the id decorated onto the marker (`MISSION COMPLETE (t-001)`).
-    /// This entry point never scans an arbitrary blob (tool arguments, plan
-    /// text, deliverable prose) for a `t-…` token — the deleted
-    /// `manager/loop.rs::extract_task_id` fallback must not be re-created here.
+    /// The task id may only come from an explicit, structured source, tried in
+    /// this order: the caller's bound `task_id` (the `delegate_task` argument,
+    /// normalized by [`crate::task_id`]), then the id inside a caller-supplied
+    /// structured marker, then the id decorated onto the marker
+    /// (`MISSION COMPLETE (t-xxx)`). This entry point never scans an arbitrary
+    /// blob (tool arguments, plan text, deliverable prose) for a `t-…` token.
     /// When the id is neither bound by the caller nor carried by a structured
-    /// marker it was produced by parsing the deliverable, so it is additionally
-    /// required to occur in that deliverable as a boundary-safe task-id token
-    /// ([`deliverable_mentions_task_id`]): an id that exists only as a
-    /// substring inside a word or a path (`t-notes` inside
-    /// `src/chart-notes.md`) can never flip a plan line.
+    /// marker it came from parsing the deliverable, so it is additionally required
+    /// to occur in that deliverable as a boundary-safe task-id token
+    /// ([`deliverable_mentions_task_id`]): an id that exists only as a substring
+    /// inside a word or a path (`t-notes` inside `src/chart-notes.md`) can never
+    /// flip a plan line.
+    ///
+    /// **A bound id and a marker id must agree.** When the caller binds an id *and*
+    /// the resolved marker carries one of its own, a mismatch aborts the check-off
+    /// instead of quietly preferring either side: a completion for one task can
+    /// never tick another task's box. The box stays pending, which costs at most
+    /// one extra round; a wrong tick loses work.
     ///
     /// The `deliverable` argument must be the **real deliverable content** as
     /// returned by the subagent (`Deliverable::content`); a canned verdict token
-    /// (`"ok"`, `"success"`, `"done"`) carries no marker and is therefore never
-    /// accepted as evidence.
+    /// (`"ok"`, `"success"`, `"done"`) carries no marker and is never accepted as
+    /// evidence.
     ///
-    /// **A bound id and a marker id must agree (t-035a).** When the caller binds
-    /// an id *and* the resolved marker carries one of its own, a mismatch aborts
-    /// the check-off instead of quietly preferring either side: a deliverable
-    /// that completed `t-002` must never tick `- [ ] [t-001]`. The box stays
-    /// pending, which costs at most one extra round; a wrong tick loses work.
-    ///
-    /// Returns `Ok(true)` when the task was checked off on disk, `Ok(false)`
-    /// when the resolved marker was not a completion, the task id could not be
-    /// resolved, a body-derived id failed the token proof, or a bound id
-    /// disagrees with the marker's own id, and `Err` on IO failure.
+    /// Returns `Ok(true)` when the task was checked off on disk, `Ok(false)` when
+    /// the resolved marker was not a completion, the task id could not be
+    /// resolved, a body-derived id failed the token proof, or a bound id disagrees
+    /// with the marker's own id, and `Err` on IO failure.
     pub fn check_plan_on_deliverable(
         &self,
         marker: Option<&MissionMarker>,
@@ -835,12 +707,12 @@ impl Plan {
         if let (Some(bound), Some(marker_id)) = (bound, marker_id)
             && !crate::plan_parse::task_id_eq(bound, marker_id)
         {
-            // t-035a: a completion marker that names a **different** plan task
-            // than the id the caller bound is a contradiction, not a tie-break
-            // candidate. Ticking the bound box on the strength of another
-            // task's completion is precisely the corruption this entry point
-            // exists to prevent, so the check-off is refused fail-closed: the
-            // box stays pending and can be re-delegated.
+            // A completion marker that names a **different** plan task than the
+            // id the caller bound is a contradiction, not a tie-break candidate.
+            // Ticking the bound box on the strength of another task's completion
+            // is precisely the corruption this entry point exists to prevent, so
+            // the check-off is refused fail-closed: the box stays pending and can
+            // be re-delegated.
             tracing::warn!(
                 "check_plan_on_deliverable: refusing check-off — bound task id [{bound}] disagrees \
                  with the marker's own id [{marker_id}]; a completion for one task can never tick \
@@ -876,8 +748,7 @@ pub fn parse_unchecked_tasks(markdown: &str) -> Vec<String> {
 /// `t-notes` is *not* a token inside `src/chart-notes.md` (the `t-…` run starts
 /// mid-word), while it is one inside `MISSION COMPLETE (t-notes)`.
 ///
-/// Used by [`Plan::check_plan_on_deliverable`] as the last line of defence
-/// against the H6 failure mode (`docs/recon_bugs_manager.md` H6): an id
+/// [`Plan::check_plan_on_deliverable`] uses it as the last line of defence: an id
 /// recovered from free text must really be named by that text, otherwise a
 /// completion for one task could silently check off an unrelated plan line.
 #[must_use]
