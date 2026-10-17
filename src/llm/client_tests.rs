@@ -1349,7 +1349,7 @@ fn code_only(region: &str) -> String {
 /// wherever they occur.
 fn mentions(haystack: &str, needle: &str) -> bool {
     let is_ident = |c: char| c.is_alphanumeric() || c == '_';
-    let ident_led = needle.chars().next().is_some_and(&is_ident);
+    let ident_led = needle.chars().next().is_some_and(is_ident);
     haystack.match_indices(needle).any(|(idx, _)| {
         !ident_led || !matches!(haystack[..idx].chars().next_back(), Some(c) if is_ident(c))
     })
