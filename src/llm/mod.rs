@@ -6,7 +6,8 @@ pub mod stream;
 pub mod thinking;
 
 pub use client::{
-    ChatClient, StreamedReply, get_global_token_counts, record_tokens_in, record_tokens_out,
+    ChatClient, StreamedReply, get_global_token_counts, http_client_startup_error,
+    record_tokens_in, record_tokens_out,
 };
 pub use stream::{
     NullSink, PauseAction, ResumableStreamOutput, StreamConfig, StreamControl, StreamEvent,
