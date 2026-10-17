@@ -235,6 +235,44 @@ fn test_chat_error_retryability_matches_shared_policy() {
     assert_eq!(interrupted.terminal_cause(), TerminalCause::Transport);
 }
 
+/// `QueueTimeout` is terminal and never retried: the queue bound for a capped
+/// `backend + model` pair already expired, the request was never sent, and going
+/// back into the queue would double-spend the wait budget and let this call
+/// leapfrog the sessions already in line. The message must name the cap and the
+/// key, or the failed delegation is not attributable.
+#[test]
+fn test_queue_timeout_is_terminal_and_non_retryable() {
+    let queued_out = ChatError::QueueTimeout {
+        waited_secs: 900,
+        cap: 2,
+        backend: "http://192.168.50.162:8080/v1".to_string(),
+        model: "llama-3".to_string(),
+    };
+    assert!(
+        !queued_out.is_retryable(),
+        "an expired queue wait must never be retried"
+    );
+    assert_eq!(
+        queued_out.terminal_outcome(),
+        ReplyOutcome::Error,
+        "nothing was ever sent, so there is no partial stream to truncate"
+    );
+    assert_eq!(queued_out.terminal_cause(), TerminalCause::QueueTimeout);
+    assert_eq!(
+        TerminalCause::QueueTimeout.outcome(),
+        ReplyOutcome::Error,
+        "a queue timeout is never reported as a cut stream"
+    );
+
+    let msg = queued_out.to_string();
+    for expected in ["cap 2", "http://192.168.50.162:8080/v1", "llama-3", "900s"] {
+        assert!(
+            msg.contains(expected),
+            "the failure must name {expected:?}, got: {msg}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_llm_prefill_delay_triggers_initial_timeout_and_retries() {
     use wiremock::matchers::{method, path};
@@ -1198,4 +1236,50 @@ async fn test_llm_stream_config_blank_reasoning_effort_never_reaches_the_wire() 
             "a blank effort ({blank:?}) must be omitted from the body, got {sent}"
         );
     }
+}
+
+/// Design §5 / invariant I7: every client starts on the pool's 20 s
+/// internal-reserve clock, and the only legal override is a **shortening** of it.
+/// Raising the bound would let a steer or notice call sit waiting on its reserve
+/// slot and re-introduce exactly the steering stall the reserve exists to remove,
+/// so the ceiling is enforced here rather than left to convention. The reserve
+/// clock is also kept separate from the 900 s session-queue bound: an internal
+/// fast call never inherits the budget of an ordinary session.
+#[test]
+fn test_internal_reserve_wait_is_bounded_at_twenty_seconds() {
+    use crate::orchestrator::pool;
+
+    assert_eq!(
+        pool::INTERNAL_QUEUE_WAIT_SECS,
+        20,
+        "design §5 fixes the internal-reserve bound at 20 s"
+    );
+
+    let client = ChatClient::new("http://reserve-bound:8080/v1", "m");
+    assert_eq!(client.reserve_wait(), pool::internal_queue_wait());
+    assert_eq!(
+        client.reserve_wait(),
+        Duration::from_secs(20),
+        "the default reserve wait must be the 20 s bound"
+    );
+
+    let shorter = ChatClient::new("http://reserve-bound:8080/v1", "m").with_reserve_wait_secs(1);
+    assert_eq!(shorter.reserve_wait(), Duration::from_secs(1));
+
+    let raised = ChatClient::new("http://reserve-bound:8080/v1", "m").with_reserve_wait_secs(3600);
+    assert_eq!(
+        raised.reserve_wait(),
+        Duration::from_secs(20),
+        "the 20 s ceiling must never be raised by a caller"
+    );
+
+    assert_eq!(
+        client.queue_wait,
+        Duration::from_secs(pool::QUEUE_WAIT_TIMEOUT_SECS),
+        "the session queue bound keeps its own number"
+    );
+    assert!(
+        client.reserve_wait() < client.queue_wait,
+        "an internal fast call must never inherit the session queue budget"
+    );
 }

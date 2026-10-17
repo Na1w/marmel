@@ -19,6 +19,7 @@ use crate::harness::HarnessStats;
 use crate::llm::ChatClient;
 use crate::manager::phase::Plan;
 use crate::orchestrator::OrchestratorManager;
+use crate::orchestrator::pool;
 use crate::types::{ChatRequest, Message};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -122,6 +123,23 @@ pub(crate) fn sleep_steer_decision(arguments: &str) -> SteerDecision {
     }
 }
 
+/// The concurrency-metering identity of every Steer Arbitrator backend call.
+///
+/// The arbitrator has no plan task of its own, so the class label alone is its
+/// identity — [`pool::CallClass::SteerArbitrator`] already names the actor. The
+/// class is what makes the pool treat this call as an **internal fast call**:
+/// `ChatClient::chat_stream` draws it from the per-key reserve (never behind
+/// specialist work) and runs it un-metered with a warning if the reserve stays
+/// busy past [`pool::INTERNAL_QUEUE_WAIT_SECS`] (design §5, I7).
+///
+/// Nothing is acquired or released here — that is the client's job — and the
+/// scope is discharged when the call returns, times out or is cancelled, so the
+/// class never leaks into the delegated subtasks a steer round goes on to run
+/// (those are capped `Specialist` calls).
+fn steer_arbitrator_call_context() -> pool::CallContext {
+    pool::CallContext::new(pool::CallClass::SteerArbitrator)
+}
+
 /// Run the steer arbitrator against the LLM backend with real-time SSE delta streaming and full contextual visibility.
 pub async fn arbitrate_steer_context_stream<F>(
     client: &ChatClient,
@@ -208,17 +226,29 @@ where
     let mut did_stream_response = false;
     let mut raw_stream_accum = String::new();
 
+    // Concurrency metering (design §5, I7): this is *the* Steer Arbitrator
+    // decision call, so it must carry the reserve class regardless of who
+    // invoked it. Arbitration runs while specialist streams hold every slot of
+    // the cap; inheriting the caller's class (Manager turn, or the enclosing
+    // delegation) would queue the arbitrator behind the very work it is trying
+    // to steer, which is the failure mode the reserve exists to prevent.
+    // Nothing is acquired here: `ChatClient::chat_stream` is the single
+    // acquisition site, and the scope is discharged when the call returns,
+    // times out or is cancelled, so the class never leaks outward.
     let reply = match tokio::time::timeout(
         std::time::Duration::from_secs(60),
-        client.chat_stream(&req, |chunk| {
-            raw_stream_accum.push_str(chunk);
-            let (delta, _) = extractor.push_chunk(chunk);
-            if !delta.is_empty() {
-                did_stream_response = true;
-                on_delta(&delta);
-            }
-            true
-        }),
+        pool::with_call_context(
+            steer_arbitrator_call_context(),
+            client.chat_stream(&req, |chunk| {
+                raw_stream_accum.push_str(chunk);
+                let (delta, _) = extractor.push_chunk(chunk);
+                if !delta.is_empty() {
+                    did_stream_response = true;
+                    on_delta(&delta);
+                }
+                true
+            }),
+        ),
     )
     .await
     {
@@ -771,13 +801,20 @@ Your task: Formulate a direct, helpful, and concise answer to the user in the EX
     };
 
     let mut full_response = String::new();
+    // Same internal-fast-call class as the arbitrator decision itself (see
+    // [`steer_arbitrator_call_context`]): this synthesis is part of the steering
+    // round, so it must not queue behind the specialist sessions the round is
+    // arbitrating — and it must not inherit the Manager class either.
     let reply = match tokio::time::timeout(
         std::time::Duration::from_secs(60),
-        client.chat_stream(&req, |chunk| {
-            full_response.push_str(chunk);
-            on_delta(chunk);
-            true
-        }),
+        pool::with_call_context(
+            steer_arbitrator_call_context(),
+            client.chat_stream(&req, |chunk| {
+                full_response.push_str(chunk);
+                on_delta(chunk);
+                true
+            }),
+        ),
     )
     .await
     {

@@ -115,6 +115,48 @@ max_thinking_tokens = 32768
 # `delegate_task` may descend at most this many levels (default 3).
 max_recursion_depth = 3
 
+# ---------------------------------------------------------------------------
+# Session concurrency — simultaneous LLM sessions per (backend_url, model) pair
+# ---------------------------------------------------------------------------
+# This table is entirely optional: leaving it out (or leaving it empty) meters
+# NOTHING. Concurrent sessions stay unlimited, which is exactly how it behaved
+# before this key existed.
+[orchestration.concurrency]
+# Default cap for every backend URL + model pair. For ONE LOCAL MODEL ON ONE
+# HOST, START AT 1 OR 2 — a single gguf model behind a single server gains no
+# throughput from parallel streams, only queueing, KV-cache pressure, and
+# provider 429s.
+# `0` is never applied: it is reported and fails open to UNLIMITED (a 0 cap
+# would wedge every session against that backend), and it is deliberately not
+# clamped up to 1 either. Usable range: 1..=.
+# max_sessions = 4
+
+# Per-backend overrides keyed by backend_url, living in this same table — which
+# is why the key MUST be quoted: a bare `http://host/v1 = 2` is a TOML syntax
+# error, never a silently dropped key. Trailing slashes and stray whitespace in
+# the key are ignored, so "…/v1" and "…/v1/" are one key exactly as they are one
+# backend on the wire. A typo such as `max_session = 4` can never match a
+# backend, so it is reported as a warning and otherwise does nothing.
+# "http://192.168.50.162:8080/v1" = 2
+# "https://openrouter.ai/api/v1" = 8
+
+# The cap is per backend URL + MODEL, NOT per host: two models behind one host
+# get the cap each, one model reached through two spellings of one URL shares a
+# single cap. Manager turns, specialist turns, validator / fix-loop passes, and
+# JIT prompt-architect turns all draw on that cap — a validator shares its
+# specialist's cap by default, because the validator backend/model falls back to
+# the same pair (give it a `validator_backend_url` / `validator_model` and the
+# audit traffic gets its own cap). The steer arbitrator and the notice
+# evaluation instead use a separate reserved slot and are never queued behind
+# specialist work, so a pair can briefly show at most ONE extra in-flight
+# stream (max_sessions + 1); that is intentional and bounded.
+# A session standing in line for a slot shows as `(Queued n/m)` in the Subagents
+# panel: n is its FIFO position (1 = next in line), m how many sessions are
+# queued for that pair including itself. That wait is bounded to 900 s per
+# backend call — a separate clock from the 1200 s per-stream read timeout — and
+# a queue timeout fails that delegation with an error naming the cap and the
+# backend + model pair.
+
 # Per-specialist tool allowlists, backend endpoints, and model configurations.
 [orchestration.specialists.coder]
 tools = ["delegate_task", "write_file", "replace", "read_file", "run_command", "grep_search", "glob"]

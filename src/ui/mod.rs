@@ -14,6 +14,20 @@ pub use transcript::{UiRecord, UiTranscript};
 use crate::orchestrator::DelegationEvent;
 use anyhow::Result;
 
+/// Where a delegation stands while it waits for a backend concurrency slot.
+///
+/// Orthogonal to [`SubagentDetail::is_active`]: a queued delegation belongs to
+/// the current round, is visible in the panel, and keeps its clocks — only its
+/// slot state is different. `None` means "not waiting" (running, or never
+/// capped). Positions come from the pool's FIFO ticket ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueState {
+    /// 1-based rank in this backend key's FIFO (`1` = next in line, not running).
+    pub position: usize,
+    /// Queue depth for the key, **including** this delegation.
+    pub of: usize,
+}
+
 /// Detailed status of an active specialist subagent.
 #[derive(Debug, Clone, Default)]
 pub struct SubagentDetail {
@@ -32,6 +46,11 @@ pub struct SubagentDetail {
     pub content: String,
     /// Whether this subagent is currently running (between Started/Completed).
     pub is_active: bool,
+    /// Concurrency-slot queue state, when this subagent is waiting for a slot.
+    /// Set by a `Queued` delegation event, cleared by `Running`, `Completed` and
+    /// `Failed` alike — so a row that finishes, fails or is cancelled never keeps
+    /// a stale `(n/m)` behind.
+    pub queue: Option<QueueState>,
     /// The context tokens used by this subagent.
     pub context_tokens: usize,
 }

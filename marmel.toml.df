@@ -20,6 +20,28 @@ max_stream_tokens = 32768
 [orchestration]
 max_recursion_depth = 3
 
+# Session concurrency — one simultaneous-session cap per (backend_url, model)
+# pair. Every role here points at the SAME model on the SAME host, so this one
+# number covers Manager turns, specialist turns, and validator passes alike:
+# they all queue behind each other, which is the point (the server only serves
+# a couple of streams at a time anyway). Two models behind one host would each
+# get their own cap — the cap is per URL + model, not per host.
+# Unset (omit the table) means UNLIMITED — unlimited parallel streams against
+# one gguf model buy queueing and 429s, not throughput. `0` is treated as
+# unlimited too, with a warning naming the key. Start local single-model
+# backends at 1 or 2.
+[orchestration.concurrency]
+max_sessions = 2
+# Per-URL overrides must be quoted (key = backend_url); trailing slashes in the
+# key are ignored:
+# "http://192.168.50.162:8080/v1" = 1
+# A session waiting for a slot shows as `(Queued n/m)` in the Subagents panel;
+# that wait is bounded to 900 s per backend call, separate from the 1200 s
+# per-stream read timeout, and a queue timeout fails that delegation with an
+# error naming the cap and the pair. The steer arbitrator and the notice
+# evaluation use a separate reserve slot and add at most one extra in-flight
+# stream per pair.
+
 # Reasoning-effort dials (a dial, not a cap — max_thinking_tokens stays the
 # ceiling, and both may be set). Values are free-form pass-through
 # ("none", "minimal", "low", "medium", "high"); unset or blank means the key is

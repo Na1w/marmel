@@ -20,6 +20,21 @@ max_stream_tokens = 32768
 [orchestration]
 max_recursion_depth = 3
 
+# Session concurrency — the optional `[orchestration.concurrency]` table is left
+# out here, so nothing is metered: concurrent sessions stay unlimited. When you
+# do set it, the cap is per backend URL + MODEL, not per host — the writer model
+# and the validator model below are two different models on one host, so each
+# gets its own cap. Local single-model backends should start at 1 or 2; unset
+# means unlimited, and `0` is treated as unlimited with a warning. Per-URL
+# overrides must be quoted and their trailing slashes are ignored. A session
+# waiting for a slot shows as `(Queued n/m)` in the Subagents panel, and that
+# wait is bounded to 900 s per backend call (separate from the 1200 s read
+# timeout).
+# [orchestration.concurrency]
+# max_sessions = 4
+# "http://127.0.0.1:11434/v1" = 2
+# "https://openrouter.ai/api/v1" = 8
+
 # Coder specialist — Lead Software Engineer (architecture, implementation, testing)
 [orchestration.specialists.coder]
 tools = ["delegate_task", "write_file", "replace", "read_file", "run_command", "grep_search", "glob"]

@@ -239,6 +239,317 @@ fn drain_delegation_events_folds_lifecycle_into_subagent_list() {
     assert!(!subagents[0].is_active);
 }
 
+/// Queue state is an **orthogonal** overlay on a lifecycle row: `Queued` installs
+/// it while leaving `is_active` and both clocks exactly as `Started` left them,
+/// `Running` takes it back down, and closing the delegation takes it down with it.
+#[test]
+fn queue_state_moves_orthogonally_to_the_lifecycle_row() {
+    let mut subagents = Vec::<SubagentDetail>::new();
+    let task = || Some("t-011".to_string());
+
+    update_subagent_lifecycle(
+        &mut subagents,
+        crate::agents::Agent::Coder,
+        task(),
+        None,
+        true,
+    );
+    assert_eq!(subagents.len(), 1);
+    assert_eq!(subagents[0].name, "coder-t-011");
+    assert!(subagents[0].is_active);
+    assert_eq!(subagents[0].queue, None);
+    let started_at = subagents[0]
+        .started_at
+        .expect("Started must arm the work clock");
+    let logs_after_started = subagents[0].logs.len();
+
+    // Queued: the queue field moves, nothing else does. A wait in the queue is
+    // never billed as worked time.
+    assert!(
+        update_subagent_queue(
+            &mut subagents,
+            crate::agents::Agent::Coder,
+            task(),
+            Some(QueueState { position: 2, of: 3 }),
+        ),
+        "an existing row must accept a queue transition"
+    );
+    assert_eq!(subagents[0].queue, Some(QueueState { position: 2, of: 3 }));
+    assert!(
+        subagents[0].is_active,
+        "a queued delegation is still dispatched, so it stays active"
+    );
+    assert_eq!(subagents[0].started_at, Some(started_at));
+    assert_eq!(subagents[0].worked_duration, std::time::Duration::ZERO);
+    assert_eq!(
+        subagents[0].logs.len(),
+        logs_after_started,
+        "a slot transition is state, not a log line"
+    );
+    assert_eq!(subagents.len(), 1);
+
+    // The pool re-reports position while waiting: the newest value wins.
+    assert!(update_subagent_queue(
+        &mut subagents,
+        crate::agents::Agent::Coder,
+        task(),
+        Some(QueueState { position: 1, of: 3 }),
+    ));
+    assert_eq!(subagents[0].queue, Some(QueueState { position: 1, of: 3 }));
+    assert_eq!(subagents[0].started_at, Some(started_at));
+
+    // Running: queue cleared, the delegation keeps running on the same clocks.
+    assert!(update_subagent_queue(
+        &mut subagents,
+        crate::agents::Agent::Coder,
+        task(),
+        None,
+    ));
+    assert_eq!(subagents[0].queue, None);
+    assert!(subagents[0].is_active);
+    assert_eq!(subagents[0].started_at, Some(started_at));
+
+    // Completed: lifecycle closed, so the queue field goes down too.
+    update_subagent_lifecycle(
+        &mut subagents,
+        crate::agents::Agent::Coder,
+        task(),
+        None,
+        false,
+    );
+    assert_eq!(subagents[0].queue, None);
+    assert!(!subagents[0].is_active);
+    assert_eq!(subagents.len(), 1, "no second row for the same delegation");
+}
+
+/// A queue transition with no lifecycle row is dropped, not materialized: rows
+/// belong to the `Started`/`Completed` bracket, and inventing one here would
+/// leave a permanently active, permanently queued row behind (design §7).
+#[test]
+fn queue_transitions_never_create_panel_rows() {
+    let mut subagents = Vec::<SubagentDetail>::new();
+
+    assert!(
+        !update_subagent_queue(
+            &mut subagents,
+            crate::agents::Agent::Coder,
+            Some("t-011".to_string()),
+            Some(QueueState { position: 1, of: 2 }),
+        ),
+        "no row means no queue update"
+    );
+    assert!(
+        !update_subagent_queue(
+            &mut subagents,
+            crate::agents::Agent::Coder,
+            Some("t-011".to_string()),
+            None,
+        ),
+        "clearing a queue that was never installed must not create a row either"
+    );
+    assert!(
+        subagents.is_empty(),
+        "queue traffic must never create a panel row, got: {subagents:?}"
+    );
+
+    // A row for another task must not be picked up by a mismatched key.
+    update_subagent_lifecycle(
+        &mut subagents,
+        crate::agents::Agent::Coder,
+        Some("t-011".to_string()),
+        None,
+        true,
+    );
+    assert!(!update_subagent_queue(
+        &mut subagents,
+        crate::agents::Agent::Coder,
+        Some("t-999".to_string()),
+        Some(QueueState { position: 1, of: 1 }),
+    ));
+    assert_eq!(subagents[0].queue, None);
+    assert_eq!(subagents.len(), 1);
+}
+
+/// Normal completion through the authoritative drain: the row carries its queue
+/// position while the call waits, and no queue state survives the `Completed`
+/// arm — drained in the order the stream guarantees.
+#[test]
+fn drain_queue_state_survives_until_completion_leaves_no_stale_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manager = test_manager(&tmp);
+    let mut renderer = RecordingRenderer::new();
+    let mut subagents = Vec::<SubagentDetail>::new();
+    let coder = crate::agents::Agent::Coder;
+
+    {
+        let mut ev = manager.delegation_events.lock().unwrap();
+        ev.push(DelegationEvent::Started {
+            agent: coder,
+            task: Some("t-011".to_string()),
+        });
+        ev.push(DelegationEvent::Queued {
+            agent: coder,
+            task: Some("t-011".to_string()),
+            position: 2,
+            of: 3,
+        });
+    }
+    drain_delegation_events_with_transcript(Some(&manager), &mut renderer, &mut subagents, None);
+    assert_eq!(subagents.len(), 1);
+    assert_eq!(
+        subagents[0].queue,
+        Some(QueueState { position: 2, of: 3 }),
+        "the queued call must show its place in line"
+    );
+    assert!(subagents[0].is_active);
+
+    {
+        let mut ev = manager.delegation_events.lock().unwrap();
+        ev.push(DelegationEvent::Queued {
+            agent: coder,
+            task: Some("t-011".to_string()),
+            position: 1,
+            of: 2,
+        });
+        ev.push(DelegationEvent::Running {
+            agent: coder,
+            task: Some("t-011".to_string()),
+        });
+    }
+    drain_delegation_events_with_transcript(Some(&manager), &mut renderer, &mut subagents, None);
+    assert_eq!(subagents[0].queue, None, "the slot is held: no queue");
+    assert!(subagents[0].is_active, "and the call is still running");
+
+    {
+        let mut ev = manager.delegation_events.lock().unwrap();
+        ev.push(DelegationEvent::Completed {
+            agent: coder,
+            task: Some("t-011".to_string()),
+        });
+    }
+    drain_delegation_events_with_transcript(Some(&manager), &mut renderer, &mut subagents, None);
+    assert_eq!(subagents.len(), 1);
+    assert!(!subagents[0].is_active);
+    assert_eq!(subagents[0].queue, None, "no stale queue row survives");
+    // The renderer saw every arm, in order, and the panel was re-pushed.
+    assert_eq!(renderer.delegation_events.len(), 5);
+    assert!(matches!(
+        renderer.delegation_events[1],
+        DelegationEvent::Queued {
+            position: 2,
+            of: 3,
+            ..
+        }
+    ));
+    assert!(matches!(
+        renderer.delegation_events[3],
+        DelegationEvent::Running { .. }
+    ));
+    assert_eq!(
+        renderer.subagents.len(),
+        1,
+        "the panel push must carry the same single row"
+    );
+    assert_eq!(renderer.subagents[0].name, subagents[0].name);
+    assert_eq!(renderer.subagents[0].queue, None);
+    assert!(!renderer.subagents[0].is_active);
+}
+
+/// Failure and cancel while queued: the lifecycle `Failed` arm is what closes the
+/// delegation, and it must take the queue state down with it. Neither path ever
+/// emits `Running`, so no queue state is left dangling either way.
+#[test]
+fn drain_queue_state_is_cleared_by_failure_and_by_cancel() {
+    for reason in [
+        Some("compilation error: unresolved import".to_string()),
+        // A cancel that landed while the call waited for a slot.
+        Some("Task aborted by user instruction.\n\nFAILED (aborted)".to_string()),
+        None,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = test_manager(&tmp);
+        let mut renderer = RecordingRenderer::new();
+        let mut subagents = Vec::<SubagentDetail>::new();
+        let coder = crate::agents::Agent::Coder;
+
+        {
+            let mut ev = manager.delegation_events.lock().unwrap();
+            ev.push(DelegationEvent::Started {
+                agent: coder,
+                task: Some("t-011".to_string()),
+            });
+            ev.push(DelegationEvent::Queued {
+                agent: coder,
+                task: Some("t-011".to_string()),
+                position: 1,
+                of: 2,
+            });
+            ev.push(DelegationEvent::Failed {
+                agent: coder,
+                task: Some("t-011".to_string()),
+                reason: reason.clone(),
+            });
+        }
+        drain_delegation_events_with_transcript(
+            Some(&manager),
+            &mut renderer,
+            &mut subagents,
+            None,
+        );
+
+        assert_eq!(subagents.len(), 1, "reason: {reason:?}");
+        assert!(
+            !subagents[0].is_active,
+            "reason: {reason:?} must close the delegation"
+        );
+        assert_eq!(
+            subagents[0].queue, None,
+            "no queue row may outlive its delegation (reason: {reason:?})"
+        );
+        assert!(
+            manager.delegation_events.lock().unwrap().is_empty(),
+            "the drain must consume every event"
+        );
+    }
+}
+
+/// Queue arms with no lifecycle row in the same stream: they still travel to the
+/// renderer, but they must not conjure a panel row of their own.
+#[test]
+fn drain_queue_arms_without_started_emit_without_creating_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manager = test_manager(&tmp);
+    let mut renderer = RecordingRenderer::new();
+    let mut subagents = Vec::<SubagentDetail>::new();
+    let coder = crate::agents::Agent::Coder;
+
+    {
+        let mut ev = manager.delegation_events.lock().unwrap();
+        ev.push(DelegationEvent::Queued {
+            agent: coder,
+            task: Some("t-011".to_string()),
+            position: 1,
+            of: 1,
+        });
+        ev.push(DelegationEvent::Running {
+            agent: coder,
+            task: Some("t-011".to_string()),
+        });
+    }
+    drain_delegation_events_with_transcript(Some(&manager), &mut renderer, &mut subagents, None);
+
+    assert!(
+        subagents.is_empty(),
+        "queue arms alone must not create rows, got: {subagents:?}"
+    );
+    assert_eq!(renderer.delegation_events.len(), 2);
+    assert!(
+        renderer.subagents.is_empty(),
+        "the pushed panel list must stay empty too, got: {:?}",
+        renderer.subagents
+    );
+}
+
 #[test]
 fn test_is_reset_command_matches_aliases() {
     assert!(is_reset_command("/reset"));

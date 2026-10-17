@@ -112,6 +112,12 @@ impl Renderer for RawRenderer {
                     let t = task.as_deref().unwrap_or("(no task id)");
                     self.push_line("delegation", &format!("STARTED → {agent} on {t}"));
                 }
+                // Slot transitions inside a live delegation stay silent here: queue
+                // state is Subagents-panel state, and printing it in raw mode would
+                // change headless output, which this change deliberately does not
+                // touch.
+                crate::orchestrator::DelegationEvent::Queued { .. }
+                | crate::orchestrator::DelegationEvent::Running { .. } => {}
                 crate::orchestrator::DelegationEvent::Completed { agent, task } => {
                     let t = task.as_deref().unwrap_or("(no task id)");
                     self.push_line("delegation", &format!("DONE    {agent} on {t}"));

@@ -610,6 +610,12 @@ impl TuiRenderer {
                     existing.started_at = Some(now);
                 }
                 existing.is_active = is_active;
+                // A row that stops running can never keep a queue position
+                // behind: completion, failure and cancel all land here, and the
+                // queue state belongs to a live delegation only.
+                if !is_active {
+                    existing.queue = None;
+                }
                 existing.last_activity_at = Some(now);
                 existing.logs.push(log.to_string());
                 idx
@@ -628,6 +634,7 @@ impl TuiRenderer {
                     content: String::new(),
                     is_active,
                     context_tokens: 0,
+                    queue: None,
                 });
                 idx
             }

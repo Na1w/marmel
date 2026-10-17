@@ -18,6 +18,7 @@ pub mod notice;
 #[cfg(test)]
 mod notice_tests;
 pub mod plan_summary;
+pub mod pool;
 pub mod preemption;
 pub mod registry;
 pub mod steer;
@@ -56,7 +57,10 @@ pub use bus::{
     set_status_sender, set_steering_history,
 };
 pub use delegate::{brief_for_task, caller_allows_tool, handle_delegate_task};
-pub use delegation::{Delegation, DelegationEvent, OrchestrationConfig, RecursionDepth};
+pub use delegation::{
+    Delegation, DelegationEvent, OrchestrationConfig, RecursionDepth, clear_delegation_event_sink,
+    delegation_event_sink, delegation_identity, push_delegation_event, set_delegation_event_sink,
+};
 pub use plan_summary::generate_plan_progress_summary;
 pub use registry::SpecialistRegistry;
 use std::path::{Path, PathBuf};
@@ -100,7 +104,9 @@ pub struct OrchestratorManager {
     pub depth: RecursionDepth,
     /// Delegation lifecycle events surfaced to the UI: the Manager records a
     /// `Started`/`Completed`/`Failed` event per delegation so renderers can show
-    /// which specialist is active and on which task. Interior mutability
+    /// which specialist is active and on which task, and the concurrency gate
+    /// appends the `Queued`/`Running` slot transitions for the same delegation
+    /// (see [`delegation::push_delegation_event`]). Interior mutability
     /// (`Arc<Mutex<_>>`) lets the shared `Arc<OrchestratorManager>` — built in
     /// `boot_manager` (`src/main.rs`) and handed to `run_session`
     /// (`src/ui/session.rs`) — be drained by the UI

@@ -1,5 +1,6 @@
 //! Reqwest SSE chat client with retry and timeout watchdogs.
 
+use crate::orchestrator::pool;
 use crate::types::{ChatChunk, ChatRequest};
 use anyhow::Result;
 use eventsource_stream::Eventsource;
@@ -131,6 +132,13 @@ pub enum TerminalCause {
     Watchdog,
     /// The backend answered with a non-success HTTP status.
     HttpStatus,
+    /// No concurrency slot became free within the queue bound, so the request
+    /// was never sent. Distinct from [`TerminalCause::Watchdog`]: this is the
+    /// per-acquisition **queue** bound
+    /// ([`crate::orchestrator::pool::QUEUE_WAIT_TIMEOUT_SECS`]), armed before any
+    /// stream watchdog exists, so a queued call can never be mistaken for a cut
+    /// stream.
+    QueueTimeout,
 }
 
 impl TerminalCause {
@@ -145,7 +153,9 @@ impl TerminalCause {
             TerminalCause::StreamEnd | TerminalCause::Transport | TerminalCause::Watchdog => {
                 ReplyOutcome::Truncated
             }
-            TerminalCause::HttpStatus => ReplyOutcome::Error,
+            // Nothing was ever sent to the backend, so neither of these can be a
+            // truncation: they are failures on the error channel.
+            TerminalCause::HttpStatus | TerminalCause::QueueTimeout => ReplyOutcome::Error,
         }
     }
 }
@@ -236,12 +246,42 @@ pub struct ChatClient {
     model: String,
     initial_timeout_secs: u64,
     stall_timeout_secs: u64,
+    /// Per-acquisition bound on the wait for a concurrency slot
+    /// ([`crate::orchestrator::pool`]). Only consulted when a cap is configured
+    /// for this `backend + model` pair; it is armed and discharged entirely
+    /// before any stream watchdog is, so it never eats into
+    /// [`INITIAL_RESPONSE_WATCHDOG_SECS`] or [`OVERALL_READ_TIMEOUT_SECS`].
+    queue_wait: Duration,
+    /// Bound on the wait for an **internal-reserve** slot, used only by reserve
+    /// call classes ([`crate::orchestrator::pool::CallClass::SteerArbitrator`]
+    /// and [`crate::orchestrator::pool::CallClass::NoticeEval`]).
+    ///
+    /// Defaults to [`crate::orchestrator::pool::internal_queue_wait`]
+    /// ([`crate::orchestrator::pool::INTERNAL_QUEUE_WAIT_SECS`], 20 s) and is the
+    /// fail-open clock of design §5 / invariant I7: when it expires the call
+    /// proceeds **un-metered** with a warning instead of queueing, so a cap can
+    /// never make steering unresponsive or let an internal fast call deadlock
+    /// against its own reserve slot.
+    reserve_wait: Duration,
     client: reqwest::Client,
 }
 
 fn default_http_client() -> reqwest::Client {
     // Shared HTTP client builder: this client builds no client of its own.
     crate::net::build_http_client(Some(Duration::from_secs(10)), None).unwrap_or_default()
+}
+
+/// The queue bound a client starts with: the pool module owns the number, this
+/// client only consumes it (mirrors how the retry policy is consumed from
+/// `crate::net::retry`).
+fn default_queue_wait() -> Duration {
+    pool::queue_wait_timeout()
+}
+
+/// The internal-reserve bound a client starts with, again owned by the pool
+/// module: 20 s, after which a reserve-class call fails open (design §5, I7).
+fn default_reserve_wait() -> Duration {
+    pool::internal_queue_wait()
 }
 
 #[derive(Debug, Error)]
@@ -270,17 +310,41 @@ pub(crate) enum ChatError {
         cause: Box<ChatError>,
         reply: Box<StreamedReply>,
     },
+    /// No concurrency slot for this `backend + model` pair became free within the
+    /// queue bound, so this call was **never sent**. Emitted by the pool gate in
+    /// [`ChatClient::chat_stream`], not by an attempt: the request never reached
+    /// the transport, so no delta was delivered and nothing is truncated.
+    ///
+    /// Names the cap and the key it belongs to, per the queue-timeout contract —
+    /// a failed delegation must be attributable to the configured limit.
+    #[error(
+        "no backend slot for {backend} + {model}: queue wait expired after {waited_secs}s \
+         (cap {cap} session(s) per backend+model)"
+    )]
+    QueueTimeout {
+        /// Whole seconds spent waiting for a slot.
+        waited_secs: u64,
+        /// The configured concurrency cap that produced the queue.
+        cap: usize,
+        /// Normalized backend URL half of the pool key.
+        backend: String,
+        /// Model half of the pool key.
+        model: String,
+    },
 }
 
 impl crate::net::Retryable for ChatError {
     /// Retryable classes: transient HTTP statuses (503/429/502/504), watchdog
     /// timeouts, transport failures and SSE stream errors — all only while
-    /// nothing has reached the caller yet. [`ChatError::Interrupted`] is the one
-    /// class the retry owner is told never to retry: deltas were already
-    /// delivered, so a new attempt of the same request would duplicate output.
+    /// nothing has reached the caller yet. Two classes are terminal:
+    /// [`ChatError::Interrupted`] (deltas were already delivered, so a new
+    /// attempt of the same request would duplicate output) and
+    /// [`ChatError::QueueTimeout`] (the queue bound already expired — retrying
+    /// here would re-enter the queue, double-spend the wait budget and let this
+    /// call leapfrog the sessions already in line).
     fn is_retryable(&self) -> bool {
         match self {
-            ChatError::Interrupted { .. } => false,
+            ChatError::Interrupted { .. } | ChatError::QueueTimeout { .. } => false,
             ChatError::HttpStatus { status, .. } => matches!(status, 503 | 429 | 502 | 504),
             ChatError::InitialTimeout
             | ChatError::StallTimeout
@@ -299,6 +363,8 @@ impl ChatError {
     pub(crate) fn terminal_outcome(&self) -> ReplyOutcome {
         match self {
             ChatError::Interrupted { .. } => ReplyOutcome::Truncated,
+            // Includes `QueueTimeout`: the request was never sent, so there is
+            // no partially delivered stream to truncate.
             _ => ReplyOutcome::Error,
         }
     }
@@ -310,6 +376,8 @@ impl ChatError {
             ChatError::InitialTimeout | ChatError::StallTimeout | ChatError::ReadTimeout => {
                 TerminalCause::Watchdog
             }
+            // The queue bound is not a stream watchdog: no stream existed.
+            ChatError::QueueTimeout { .. } => TerminalCause::QueueTimeout,
             ChatError::Stream(_) | ChatError::Transport(_) | ChatError::Interrupted { .. } => {
                 TerminalCause::Transport
             }
@@ -404,6 +472,85 @@ where
     }
 }
 
+/// What the concurrency gate holds for the duration of one `chat_stream` call.
+///
+/// `Drop` is the only release path (design invariant I2): the slot goes back to
+/// its pool on completion, hard error, cancellation, queue timeout, watchdog cut
+/// **or panic**, because the guard lives on this call's stack frame — never
+/// inside a retry attempt and never in a thread parked in `block_on`.
+#[derive(Debug)]
+enum SlotGuard {
+    /// A slot drawn from the per-key cap semaphore.
+    Session(pool::SessionPermit),
+    /// The per-key internal reserve slot (steer arbitrator / notice evaluation).
+    Reserve(pool::ReservePermit),
+    /// Nothing to hold: this pair has no configured cap, or a reserve-class call
+    /// failed open. The uncapped case never touches a semaphore.
+    Unmetered,
+}
+
+/// Why the concurrency gate could not hand out a guard.
+#[derive(Debug)]
+enum SlotAbort {
+    /// The queue bound expired without a slot: terminal and non-retryable.
+    Timeout(ChatError),
+    /// The enclosing worker or the whole process was cancelled while waiting.
+    /// Not a failure — the caller gets a `Cancelled` reply.
+    Cancelled,
+    /// The pool was closed under the waiter. Defensive: nothing closes a pool
+    /// today, and surfacing it beats wedging the call forever.
+    Closed(String),
+}
+
+impl SlotGuard {
+    /// Report the queued → running transition this guard represents.
+    ///
+    /// Status traffic on queue transitions is what keeps a session that spent
+    /// time in the queue from falsely tripping the idle watchdogs (design §6).
+    /// An uncapped call — and a call that never had to queue — says nothing.
+    fn announce_acquisition(&self) {
+        match self {
+            SlotGuard::Session(permit) => {
+                let waited = permit.waited();
+                if waited.is_zero() {
+                    return;
+                }
+                // The cap is named alongside the wait so an operator can tie the
+                // stall to the configured `[orchestration.concurrency]` value, and
+                // the call context says which delegation was stuck in line.
+                tracing::info!(
+                    backend = %permit.backend(),
+                    model = %permit.model(),
+                    cap = permit.limit(),
+                    waited_secs = waited.as_secs(),
+                    free_permits = permit.available_permits(),
+                    call = %pool::current_call_context()
+                        .map(|context| context.describe())
+                        .unwrap_or_else(|| "unclassified".to_string()),
+                    "backend slot acquired after queueing"
+                );
+                crate::orchestrator::bus::emit_status(format!(
+                    "backend slot acquired after {}s ({} of {} free)",
+                    waited.as_secs(),
+                    permit.available_permits(),
+                    permit.limit()
+                ));
+            }
+            SlotGuard::Reserve(permit) => {
+                // The reserve is the slot that keeps steering responsive while the
+                // cap is saturated, so holding it is worth a line.
+                tracing::debug!(
+                    backend = %permit.key().0,
+                    model = %permit.key().1,
+                    reserve_free = permit.reserve_available(),
+                    "internal reserve slot held for this backend call"
+                );
+            }
+            SlotGuard::Unmetered => {}
+        }
+    }
+}
+
 impl ChatClient {
     pub fn from_config(cfg: &crate::config::Config) -> Self {
         Self {
@@ -412,6 +559,8 @@ impl ChatClient {
             model: cfg.model.clone(),
             initial_timeout_secs: INITIAL_RESPONSE_WATCHDOG_SECS,
             stall_timeout_secs: INTER_CHUNK_WATCHDOG_SECS,
+            queue_wait: default_queue_wait(),
+            reserve_wait: default_reserve_wait(),
             client: default_http_client(),
         }
     }
@@ -423,6 +572,8 @@ impl ChatClient {
             model: model.into(),
             initial_timeout_secs: INITIAL_RESPONSE_WATCHDOG_SECS,
             stall_timeout_secs: INTER_CHUNK_WATCHDOG_SECS,
+            queue_wait: default_queue_wait(),
+            reserve_wait: default_reserve_wait(),
             client: default_http_client(),
         }
     }
@@ -438,6 +589,8 @@ impl ChatClient {
             model: model.into(),
             initial_timeout_secs: INITIAL_RESPONSE_WATCHDOG_SECS,
             stall_timeout_secs: INTER_CHUNK_WATCHDOG_SECS,
+            queue_wait: default_queue_wait(),
+            reserve_wait: default_reserve_wait(),
             client: default_http_client(),
         }
     }
@@ -457,6 +610,36 @@ impl ChatClient {
         self
     }
 
+    /// Override the per-acquisition bound on waiting for a concurrency slot.
+    ///
+    /// Only meaningful when a cap is configured for this `backend + model` pair
+    /// (`[orchestration.concurrency]`); an uncapped call never waits. The default
+    /// is [`crate::orchestrator::pool::QUEUE_WAIT_TIMEOUT_SECS`].
+    pub fn with_queue_wait_secs(mut self, secs: u64) -> Self {
+        self.queue_wait = Duration::from_secs(secs);
+        self
+    }
+
+    /// Override the bound on waiting for an **internal-reserve** slot, the slot
+    /// steer-arbitrator and notice-evaluation calls draw (design §5).
+    ///
+    /// Only ever a shortening of the pool's bound: the value is clamped to
+    /// [`crate::orchestrator::pool::INTERNAL_QUEUE_WAIT_SECS`] (20 s), because
+    /// the point of the reserve is that an internal fast call gives up and runs
+    /// un-metered rather than waiting on it — a longer wait would reintroduce
+    /// the steering stall the reserve exists to prevent (invariant I7).
+    pub fn with_reserve_wait_secs(mut self, secs: u64) -> Self {
+        self.reserve_wait = Duration::from_secs(secs).min(pool::internal_queue_wait());
+        self
+    }
+
+    /// The internal-reserve wait this client will use. Kept observable so the
+    /// 20 s fail-open bound of design §5 is assertable at the client, not only
+    /// in the pool.
+    pub fn reserve_wait(&self) -> Duration {
+        self.reserve_wait
+    }
+
     pub fn backend_url(&self) -> &str {
         &self.backend_url
     }
@@ -474,19 +657,60 @@ impl ChatClient {
     /// Terminal states, and the only honest success check on this path:
     /// * [`ReplyOutcome::Complete`] — `[DONE]` or a terminal `finish_reason`;
     /// * [`ReplyOutcome::Cancelled`] — the caller's `on_delta` hook returned
-    ///   false (cancellation token, preemption, `cancel_all()`, sink abort);
+    ///   false (cancellation token, preemption, `cancel_all()`, sink abort), or
+    ///   the call was cancelled while it was still waiting for a slot;
     /// * [`ReplyOutcome::Truncated`] — the stream ended without a terminal
     ///   marker, or failed after deltas had already been delivered;
     /// * [`ReplyOutcome::Error`] — the attempt failed before anything was
-    ///   delivered, which is the `Err` arm of this call.
+    ///   delivered, or no concurrency slot became free within the queue bound,
+    ///   which is the `Err` arm of this call.
     ///
     /// A reply is only ever returned as `Ok` when a request was actually
     /// answered or cut short; the caller must check
     /// [`StreamedReply::is_success`] before treating it as an answer.
+    ///
+    /// Concurrency metering (design §1.3/§1.4): the slot for this `backend +
+    /// model` pair is taken **before** the retry loop and held across every
+    /// attempt of this call, so a retry can never leapfrog the sessions already
+    /// queued for that pair. When no cap is configured, no semaphore is touched
+    /// at all and this path behaves exactly as it always did.
     pub async fn chat_stream<F>(&self, req: &ChatRequest, on_delta: F) -> Result<StreamedReply>
     where
         F: FnMut(&str) -> bool,
     {
+        // The slot guard is bound here, not inside a retry attempt: it stays
+        // alive until this function returns, and `Drop` is the only release path
+        // (success, hard error, cancellation, queue timeout, panic).
+        let queued_at = std::time::Instant::now();
+        let _slot = match self.acquire_slot().await {
+            Ok(guard) => guard,
+            Err(SlotAbort::Timeout(error)) => {
+                // Terminal by classification (`ChatError::QueueTimeout` is the
+                // one failure the retry owner is told about and never retries —
+                // and the request was never sent in the first place).
+                tracing::debug!(
+                    "LLM turn terminated as {}: {error}",
+                    error.terminal_outcome().as_str()
+                );
+                crate::debug_log::log_llm_error(
+                    &self.backend_url,
+                    &self.model,
+                    queued_at.elapsed().as_millis(),
+                    &error.to_string(),
+                );
+                return Err(anyhow::anyhow!("{error}"));
+            }
+            Err(SlotAbort::Cancelled) => {
+                return Ok(self.cancelled_while_queued(queued_at.elapsed()));
+            }
+            Err(SlotAbort::Closed(key)) => {
+                return Err(anyhow::anyhow!(
+                    "concurrency pool for {key} was closed; this backend call cannot run"
+                ));
+            }
+        };
+        _slot.announce_acquisition();
+
         let mut progress = StreamProgress::new(on_delta);
         // Shared retry/backoff policy (`crate::net::retry`): the helper hands
         // the mutable progress state (the `on_delta` callback plus the
@@ -514,6 +738,159 @@ impl ChatClient {
                 );
                 Err(anyhow::anyhow!("{e}"))
             }
+        }
+    }
+
+    /// Take the concurrency slot for one [`chat_stream`] call and return the
+    /// guard that holds it, before any attempt is made.
+    ///
+    /// `Ok(Unmetered)` is the "no pool" answer — no cap is configured for this
+    /// pair, so nothing is queued, no semaphore is touched, and behavior is
+    /// byte-for-byte what it was before this feature.
+    ///
+    /// The wait is cancellation-aware: the pool selects on the enclosing worker's
+    /// token (from [`crate::orchestrator::pool::current_worker_token`]), the
+    /// process-wide token, and the queue deadline. A cancelled or timed-out wait
+    /// never takes a permit, and dropping this future mid-wait leaves the slot
+    /// for the callers in line.
+    async fn acquire_slot(&self) -> Result<SlotGuard, SlotAbort> {
+        let token = pool::current_worker_token();
+        let context = pool::current_call_context();
+        // Attribution for queue traffic comes from the installed call context:
+        // a queued line must name the delegation it belongs to, not just the
+        // backend key. `None` means an unclassified call (pre-feature behaviour)
+        // and adds nothing to the text.
+        let attribution = context.as_ref().map(|context| context.describe());
+        // The same attribution in typed form, for the delegation event stream.
+        // Only a call that belongs to a tracked delegation resolves (see
+        // [`crate::orchestrator::delegation_identity`]), so a queue event can
+        // never invent a panel row that no `Started`/`Completed` pair owns.
+        let delegation = context
+            .as_ref()
+            .and_then(crate::orchestrator::delegation_identity);
+        // Queue transitions go out as status traffic so a session waiting on a
+        // slot does not falsely trip the idle watchdogs (design §6). No-op when
+        // no UI renderer is listening.
+        let queued_delegation = delegation.clone();
+        let reporter = move |position: pool::QueuePosition| {
+            let attribution = attribution
+                .as_deref()
+                .map(|who| format!(" — {who}"))
+                .unwrap_or_default();
+            crate::orchestrator::bus::emit_status(format!(
+                "queued for a backend slot ({} of {}){attribution}",
+                position.position, position.of
+            ));
+            // The panel-facing half of the same transition: position goes over
+            // as structured state, never as a free-form status label (design §7).
+            if let Some((agent, task)) = &queued_delegation {
+                crate::orchestrator::push_delegation_event(
+                    crate::orchestrator::DelegationEvent::Queued {
+                        agent: *agent,
+                        task: task.clone(),
+                        position: position.position,
+                        of: position.of,
+                    },
+                );
+            }
+        };
+
+        // Steer-arbitrator and notice-evaluation calls take the per-key reserve
+        // and fail open rather than queue behind specialist work (design §5);
+        // every other class — including a call with no installed context — is
+        // metered against the cap semaphore.
+        if pool::current_call_class().is_some_and(|class| class.uses_reserve()) {
+            return match pool::acquire_reserve_with_wait(
+                &self.backend_url,
+                &self.model,
+                token,
+                self.reserve_wait,
+            )
+            .await
+            {
+                pool::ReserveOutcome::Reserved(permit) => Ok(SlotGuard::Reserve(permit)),
+                pool::ReserveOutcome::Unmetered => Ok(SlotGuard::Unmetered),
+                pool::ReserveOutcome::FailedOpen { waited_secs } => {
+                    tracing::warn!(
+                        backend = %self.backend_url,
+                        model = %self.model,
+                        call_class = %pool::current_call_class()
+                            .map_or("unclassified", |class| class.label()),
+                        waited_secs,
+                        reserve_wait_secs = self.reserve_wait.as_secs(),
+                        "reserve slot stayed busy; running this backend call un-metered"
+                    );
+                    Ok(SlotGuard::Unmetered)
+                }
+                pool::ReserveOutcome::Cancelled => Err(SlotAbort::Cancelled),
+            };
+        }
+
+        match pool::acquire_session_with_wait(
+            &self.backend_url,
+            &self.model,
+            token,
+            self.queue_wait,
+            Some(&reporter),
+        )
+        .await
+        {
+            Ok(None) => Ok(SlotGuard::Unmetered),
+            Ok(Some(permit)) => {
+                // The queued → running edge, paired with the `Queued` the
+                // reporter emitted for this very acquisition: a call that never
+                // had to queue has no queue state to take back down, and a call
+                // whose wait ended in cancellation or timeout never reaches this
+                // arm (its lifecycle closes with `Failed`, which clears the queue
+                // state as well).
+                if permit.queue_position().is_some()
+                    && let Some((agent, task)) = &delegation
+                {
+                    crate::orchestrator::push_delegation_event(
+                        crate::orchestrator::DelegationEvent::Running {
+                            agent: *agent,
+                            task: task.clone(),
+                        },
+                    );
+                }
+                Ok(SlotGuard::Session(permit))
+            }
+            Err(pool::PoolError::QueueTimeout {
+                backend,
+                model,
+                cap,
+                waited_secs,
+                ..
+            }) => Err(SlotAbort::Timeout(ChatError::QueueTimeout {
+                waited_secs,
+                cap,
+                backend,
+                model,
+            })),
+            Err(pool::PoolError::Cancelled { .. }) => Err(SlotAbort::Cancelled),
+            Err(pool::PoolError::PoolClosed { key }) => Err(SlotAbort::Closed(key)),
+        }
+    }
+
+    /// A cancellation requested while this call was still queued for a slot: an
+    /// empty `Cancelled` reply, never an empty success and never a hard error —
+    /// nothing was sent, and the caller is the one who asked for the stop.
+    fn cancelled_while_queued(&self, waited: Duration) -> StreamedReply {
+        tracing::warn!(
+            "LLM request cancelled while waiting for a backend slot (waited {}s) — reporting {}, not an empty completion",
+            waited.as_secs(),
+            ReplyOutcome::Cancelled.as_str(),
+        );
+        crate::debug_log::log_llm_error(
+            &self.backend_url,
+            &self.model,
+            waited.as_millis(),
+            "cancelled while waiting for a backend slot",
+        );
+        StreamedReply {
+            outcome: ReplyOutcome::Cancelled,
+            cause: TerminalCause::CallerAbort,
+            ..StreamedReply::default()
         }
     }
 

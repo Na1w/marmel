@@ -166,6 +166,7 @@ Marmel searches for configuration in the following priority order (first match w
 | `ui_mode` | `"tui"` | Interface mode: `"tui"` (Ratatui) or `"raw"` (streaming stdout). |
 | `debug` | `false` | Write detailed debug logs to `debug.log`. |
 | `[orchestration]` | — | Top-level settings: `max_recursion_depth` (default 3), `mcp_servers`. |
+| `[orchestration.concurrency]` | _unset_ | Simultaneous-session cap per **backend URL + model** pair: `max_sessions` plus quoted per-URL overrides (e.g. `"http://host:8080/v1" = 2`). Unset ⇒ **unlimited** (nothing is metered); `0` ⇒ unlimited plus a warning. See [Session Concurrency](#session-concurrency-orchestrationconcurrency). |
 | `[orchestration.specialists.<role>]` | — | Per-role overrides for `model`, `backend_url`, `auth_token`, `tools`, `mcp_servers`, `reasoning_effort`, and validator settings (`validator_model`, `validator_backend_url`, `validator_auth_token`, `validator_reasoning_effort`, `max_validator_iterations`, `max_fix_loop_rounds`, `enable_validator`). |
 | `[mcp_servers.<name>]` | — | External MCP server registration (`command`, `args`, `env`, `url`). |
 
@@ -179,6 +180,11 @@ ui_mode = "tui"
 
 # Fail-closed sandbox opt-out (default false): true runs commands unsandboxed.
 sandbox_disabled = false
+
+# Simultaneous-session cap per backend URL + model pair (unset = unlimited).
+[orchestration.concurrency]
+max_sessions = 2
+"http://192.168.50.162:8080/v1" = 1
 
 # Optional external MCP servers
 [mcp_servers.fs]
@@ -255,6 +261,78 @@ unset and falls through to the next level):
   false`) and never send `reasoning_effort`; this knob is for the Manager, specialist, and
   validator sessions only.
 
+### Session Concurrency (`[orchestration.concurrency]`)
+
+By default Marmel runs **as many LLM sessions at once as the work asks for**: every
+`delegate_task` in a Manager round, every validator pass, the Manager's own turns, and the
+JIT prompt architect all stream concurrently. That is the right shape for a backend with
+real capacity. It is the wrong shape for one model on one host — a single gguf model behind
+one server serves one or a few requests at a time, so ten parallel streams buy queueing,
+KV-cache pressure, and 429s instead of throughput.
+
+```toml
+[orchestration.concurrency]
+# Default cap for every backend URL + model pair.
+max_sessions = 4
+
+# Optional per-backend override, keyed by backend_url — the key MUST be quoted.
+"http://192.168.50.162:8080/v1" = 2
+"https://openrouter.ai/api/v1" = 8
+```
+
+- **Unset means unlimited.** Omit the table, or leave it empty, and nothing is metered:
+  behaviour is exactly what it was before this key existed.
+- **`max_sessions`** is the default cap for every pair. For a **local single-model
+  backend, start at 1 or 2** — that is where a lone model on a lone host stops losing
+  ground to queueing.
+- **Per-URL overrides** are quoted keys inside the same table; a bare
+  `http://192.168.50.162:8080/v1 = 2` is a TOML syntax error, never a silently dropped
+  key. Trailing slashes and stray whitespace in a key are ignored, so `"…/v1"` and
+  `"…/v1/"` are one and the same key — exactly as they are one backend on the wire. A key
+  that is not a URL (`max_session = 4`, a typo) can never match a backend: it is reported
+  as a warning and does nothing.
+- **The cap is per backend URL + model, not per host.** Two models behind one host get
+  the cap each; one model reached through two spellings of one URL shares a single cap.
+- **`max_sessions = 0` is treated as unlimited** and logs a warning naming the key, the
+  offending value, and the usable range (`1..=`). It is never clamped up to `1`, which
+  would silently serialize traffic you asked to run in parallel.
+- **Queueing is visible.** A session waiting for a slot is labelled **`(Queued n/m)`** in
+  the **Subagents** panel: `n` is its position in the queue (1 = next in line), `m` how
+  many sessions are queued for that pair including itself. Positions are strictly FIFO —
+  a late arrival cannot barge past a session already in line. A queued session stays part
+  of the running round (green name, live clock, live token count, and counted in the
+  `[N active: …]` status line); cancelling it releases its place in line. Headless
+  (`--raw`) output is unchanged.
+- **The wait is bounded, separately from the stream timeout.** Queueing for a slot is
+  capped at **900 seconds per backend call** (`QUEUE_WAIT_TIMEOUT_SECS`, fixed), which is
+  a different clock from the **1200 second** per-stream read timeout
+  (`OVERALL_READ_TIMEOUT_SECS`): the wait is spent before any stream exists, so no stream
+  watchdog is armed yet, and queueing never eats the read budget of the call that finally
+  runs. If the queue bound expires, **that delegation fails** with a distinguishable error
+  (`ChatError::QueueTimeout`) naming the backend, the model, the cap, and the seconds
+  waited — the request was never sent, and a queue timeout is never retried. Queueing does
+  still consume the enclosing wall-clock bounds (the turn and fix-loop caps), because those
+  measure real time rather than stream time.
+- **Reserved slot for the internal fast calls.** The steer arbitrator and the notice
+  evaluation draw on their **own** reserved slot (capacity 1 per pair) instead of queuing
+  behind specialist work — a cap must never make steering unresponsive. The documented
+  cost is that a pair can momentarily show **at most one extra in-flight stream**
+  (`max_sessions + 1`), intentionally bounded. If that reserve is still busy after 20 s,
+  the internal call proceeds un-metered with a warning (fail-open) rather than failing.
+
+What draws on the cap, and what draws on the reserve:
+
+| Call class | Metered against |
+|---|---|
+| Manager turn, specialist turn, validator / fix-loop pass, JIT prompt architect | The cap of the backend URL + model that call resolves to. |
+| Steer arbitrator, notice evaluation | A separate reserved slot (1 per pair), fail-open after 20 s. |
+
+Validator passes share the cap of the specialist they audit by default, because the
+validator endpoint falls back to the same URL and model. Point `validator_backend_url` /
+`validator_model` — or `[orchestration.specialists.validator]` — somewhere else and the
+audit traffic gets its own cap, so a saturated writer endpoint cannot stall an auditor
+aimed at another one.
+
 ---
 
 ## Usage & Interface
@@ -274,7 +352,7 @@ unset and falls through to the next level):
 The interactive TUI contains three main panels:
 1. **Chat:** Conversation stream showing Manager actions, user inputs, thinking blocks, and tool executions.
 2. **Plan:** The active execution plan (`.marmel/execution_plan.md`) with task checkboxes.
-3. **Subagents:** Real-time log and deliverables from delegated specialists.
+3. **Subagents:** Real-time log and deliverables from delegated specialists. A specialist waiting for a concurrency slot is labelled `(Queued n/m)` — its queue position out of the sessions queued for that backend URL + model pair (see [Session Concurrency](#session-concurrency-orchestrationconcurrency)).
 
 ### Keyboard Shortcuts
 
@@ -431,6 +509,7 @@ The test suite covers:
 - Tool allowlists, role gating, and path confinement.
 - Stream preemption and steer arbitration.
 - Repetition breakers and XML tool call rescue.
+- Per-backend session concurrency caps, queue accounting, and queue timeouts.
 
 To verify linting and formatting:
 

@@ -210,6 +210,7 @@ fn estimated_subagent_lines_counts_sections() {
         content: "out".to_string(),
         is_active: true,
         context_tokens: 0,
+        queue: None,
     });
     // Default (show_thought = false, thinking moved to bottom status bar):
     // 1 (header) + 1 ([Output]) + 1 (out) + 1 ([Logs]) + 1 (- log1) = 5
@@ -313,6 +314,7 @@ fn cycle_focus_obeys_panel_visibility() {
         content: String::new(),
         is_active: true,
         context_tokens: 0,
+        queue: None,
     });
 
     r.focused_panel = FocusedPanel::Chat;
@@ -443,6 +445,7 @@ fn set_subagents_adopts_authoritative_list() {
         content: "local content".to_string(),
         is_active: true,
         context_tokens: 0,
+        queue: None,
     });
 
     // Authoritative list from the loop (no thinking/content, just lifecycle).
@@ -458,6 +461,7 @@ fn set_subagents_adopts_authoritative_list() {
         content: String::new(),
         is_active: true,
         context_tokens: 0,
+        queue: None,
     }];
     r.set_subagents(authoritative);
 
@@ -480,6 +484,7 @@ fn set_subagents_adopts_authoritative_list() {
         content: String::new(),
         is_active: false,
         context_tokens: 0,
+        queue: None,
     });
     r.set_subagents(vec![SubagentDetail {
         name: "coder".to_string(),
@@ -493,9 +498,680 @@ fn set_subagents_adopts_authoritative_list() {
         content: String::new(),
         is_active: false,
         context_tokens: 0,
+        queue: None,
     }]);
     assert_eq!(r.subagents.len(), 1);
     assert_eq!(r.subagents[0].name, "coder");
+}
+
+/// The `Queued` / `Running` arms move the orthogonal queue field only: same row,
+/// same `is_active`, same clocks and selection, and no chat line, log line or
+/// status line — the panel label for a queued row is a separate, later change.
+#[test]
+fn delegation_queued_and_running_move_only_the_queue_field() {
+    let mut r = TuiRenderer::new();
+    let coder = crate::agents::Agent::Coder;
+
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Started {
+            agent: coder,
+            task: Some("t-011".to_string()),
+        },
+    ));
+    let messages = r.messages.len();
+    let status = r.status_line.clone();
+    assert!(
+        r.subagents[0].started_at.is_some(),
+        "Started arms the work clock"
+    );
+    let started_at = r.subagents[0].started_at;
+    let logs = r.subagents[0].logs.len();
+    let selected = r.selected_subagent_idx;
+
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Queued {
+            agent: coder,
+            task: Some("t-011".to_string()),
+            position: 2,
+            of: 3,
+        },
+    ));
+    assert_eq!(r.subagents.len(), 1, "no extra row for a slot transition");
+    assert_eq!(
+        r.subagents[0].queue,
+        Some(crate::ui::QueueState { position: 2, of: 3 })
+    );
+    assert!(
+        r.subagents[0].is_active,
+        "queued is still dispatched, so still active"
+    );
+    assert_eq!(r.subagents[0].started_at, started_at);
+    assert_eq!(r.subagents[0].logs.len(), logs);
+    assert_eq!(r.messages.len(), messages);
+    assert_eq!(r.status_line, status);
+    assert_eq!(r.selected_subagent_idx, selected);
+
+    // A shift in the queue re-reports the position; newest value wins.
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Queued {
+            agent: coder,
+            task: Some("t-011".to_string()),
+            position: 1,
+            of: 2,
+        },
+    ));
+    assert_eq!(
+        r.subagents[0].queue,
+        Some(crate::ui::QueueState { position: 1, of: 2 })
+    );
+
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Running {
+            agent: coder,
+            task: Some("t-011".to_string()),
+        },
+    ));
+    assert_eq!(r.subagents[0].queue, None, "the slot is held: no queue");
+    assert!(r.subagents[0].is_active);
+    assert_eq!(r.subagents[0].started_at, started_at);
+    assert_eq!(r.subagents[0].logs.len(), logs);
+    assert_eq!(r.messages.len(), messages);
+    assert_eq!(r.status_line, status);
+
+    // Completion closes the delegation and takes the queue state with it.
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Completed {
+            agent: coder,
+            task: Some("t-011".to_string()),
+        },
+    ));
+    assert!(!r.subagents[0].is_active);
+    assert_eq!(r.subagents[0].queue, None, "no stale queue row survives");
+    // The lifecycle arms keep their own (unchanged) output.
+    assert_eq!(r.messages.len(), messages + 1);
+    assert_eq!(r.subagents[0].logs.len(), logs + 1);
+}
+
+/// A queue arm whose delegation this renderer never saw a `Started` for must not
+/// conjure a row, an active flag, a chat line or a panel reveal.
+#[test]
+fn delegation_queue_arms_never_create_a_row() {
+    let mut r = TuiRenderer::new();
+    let coder = crate::agents::Agent::Coder;
+
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Queued {
+            agent: coder,
+            task: Some("t-011".to_string()),
+            position: 1,
+            of: 1,
+        },
+    ));
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Running {
+            agent: coder,
+            task: Some("t-011".to_string()),
+        },
+    ));
+
+    assert!(
+        r.subagents.is_empty(),
+        "queue arms alone must not create rows, got: {:?}",
+        r.subagents
+    );
+    assert!(r.messages.is_empty());
+    assert!(
+        !r.show_subagent_panel,
+        "queue traffic must not reveal the panel on its own"
+    );
+}
+
+/// Failure closes the delegation too, so a queue position installed just before
+/// it can never linger.
+#[test]
+fn delegation_failed_while_queued_leaves_no_queue_state() {
+    let mut r = TuiRenderer::new();
+    let coder = crate::agents::Agent::Coder;
+
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Started {
+            agent: coder,
+            task: Some("t-011".to_string()),
+        },
+    ));
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Queued {
+            agent: coder,
+            task: Some("t-011".to_string()),
+            position: 1,
+            of: 4,
+        },
+    ));
+    assert_eq!(
+        r.subagents[0].queue,
+        Some(crate::ui::QueueState { position: 1, of: 4 })
+    );
+
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Failed {
+            agent: coder,
+            task: Some("t-011".to_string()),
+            reason: Some("queue wait expired".to_string()),
+        },
+    ));
+    assert!(!r.subagents[0].is_active);
+    assert_eq!(r.subagents[0].queue, None);
+}
+
+/// The session loop owns queue state, so `set_subagents` always adopts the
+/// incoming value — dropping a locally held position the loop has already
+/// cleared, and installing one the loop has just learned about.
+#[test]
+fn set_subagents_adopts_authoritative_queue_state() {
+    let mut r = TuiRenderer::new();
+
+    r.subagents.push(SubagentDetail {
+        name: "coder-t-011".to_string(),
+        task_id: Some("t-011".to_string()),
+        prompt: String::new(),
+        started_at: None,
+        worked_duration: std::time::Duration::ZERO,
+        last_activity_at: None,
+        logs: vec!["started task t-011".to_string()],
+        thinking: "local think".to_string(),
+        content: String::new(),
+        is_active: true,
+        context_tokens: 0,
+        queue: Some(crate::ui::QueueState { position: 5, of: 9 }),
+    });
+
+    // The loop says the slot is held: the stale local position must go.
+    r.set_subagents(vec![SubagentDetail {
+        name: "coder-t-011".to_string(),
+        task_id: Some("t-011".to_string()),
+        prompt: String::new(),
+        started_at: None,
+        worked_duration: std::time::Duration::ZERO,
+        last_activity_at: None,
+        logs: vec!["started task t-011".to_string()],
+        thinking: String::new(),
+        content: String::new(),
+        is_active: true,
+        context_tokens: 0,
+        queue: None,
+    }]);
+    assert_eq!(r.subagents[0].queue, None);
+    assert_eq!(
+        r.subagents[0].thinking, "local think",
+        "live streaming state is still preserved"
+    );
+
+    // And the other direction: a queue the loop learned about lands locally.
+    r.set_subagents(vec![SubagentDetail {
+        name: "coder-t-011".to_string(),
+        task_id: Some("t-011".to_string()),
+        prompt: String::new(),
+        started_at: None,
+        worked_duration: std::time::Duration::ZERO,
+        last_activity_at: None,
+        logs: vec!["started task t-011".to_string()],
+        thinking: String::new(),
+        content: String::new(),
+        is_active: true,
+        context_tokens: 0,
+        queue: Some(crate::ui::QueueState { position: 1, of: 2 }),
+    }]);
+    assert_eq!(
+        r.subagents[0].queue,
+        Some(crate::ui::QueueState { position: 1, of: 2 })
+    );
+    assert!(r.subagents[0].is_active);
+}
+
+// ---- queued state and queue position in the Subagents panel ----
+
+/// Fixture for the queue-label tests: the fields the row label is built from are
+/// parameters, everything else keeps the derived default.
+fn queue_row(name: &str, is_active: bool, queue: Option<crate::ui::QueueState>) -> SubagentDetail {
+    SubagentDetail {
+        name: name.to_string(),
+        is_active,
+        queue,
+        ..SubagentDetail::default()
+    }
+}
+
+/// Draw the Subagents panel into a `width x height` test terminal and hand back
+/// both the text of every terminal row and the style of every cell.
+fn draw_subagent_panel(
+    r: &mut TuiRenderer,
+    width: u16,
+    height: u16,
+) -> (Vec<String>, Vec<Vec<ratatui::style::Style>>) {
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 0, width, height);
+            r.render_subagents(frame, area);
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let rows = (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect();
+    let styles = (0..height)
+        .map(|y| (0..width).map(|x| buffer[(x, y)].style()).collect())
+        .collect();
+    (rows, styles)
+}
+
+/// Draw one status line into a 100-column test terminal.
+fn draw_status_line(r: &mut TuiRenderer, width: u16) -> String {
+    let backend = ratatui::backend::TestBackend::new(width, 1);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            r.render_status(frame, ratatui::layout::Rect::new(0, 0, width, 1));
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    (0..width)
+        .map(|x| buffer[(x, 0)].symbol().to_string())
+        .collect()
+}
+
+/// The frame set both spinners cycle through.
+const SPINNER_FRAMES: [char; 4] = ['-', '\\', '|', '/'];
+
+/// A queued row is labelled with its FIFO position and nothing about the row is
+/// otherwise reinterpreted: the ctx count and the work clock keep their place in
+/// the label, a row holding its slot still reads `(Active)`, and a finished row
+/// still reads `(Idle)`.
+#[test]
+fn queued_rows_are_labelled_with_their_position_in_the_list() {
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    let now = std::time::Instant::now();
+
+    let mut queued = queue_row(
+        "coder-t-1",
+        true,
+        Some(crate::ui::QueueState { position: 2, of: 4 }),
+    );
+    queued.task_id = Some("t-1".to_string());
+    queued.context_tokens = 3500;
+    queued.started_at = Some(now - Duration::from_secs(5));
+    let mut running = queue_row("coder-t-2", true, None);
+    running.task_id = Some("t-2".to_string());
+    running.context_tokens = 1200;
+    let mut idle = queue_row("researcher-t-3", false, None);
+    idle.task_id = Some("t-3".to_string());
+    idle.context_tokens = 400;
+    r.subagents.extend([queued, running, idle]);
+
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 20);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("coder-t-1 (Queued 2/4, 3.5k ctx, 5s)"),
+        "expected 'coder-t-1 (Queued 2/4, 3.5k ctx, 5s)' in the subagents panel, got:\n{text}"
+    );
+    assert!(
+        text.contains("coder-t-2 (Active, 1.2k ctx)"),
+        "a row that holds its slot must still read (Active), got:\n{text}"
+    );
+    assert!(
+        text.contains("researcher-t-3 (Idle, 400 ctx)"),
+        "a finished row must still read (Idle), got:\n{text}"
+    );
+
+    let queued_row = rows
+        .iter()
+        .find(|line| line.contains("coder-t-1"))
+        .expect("the queued row is drawn");
+    assert!(
+        !queued_row.contains("(Active"),
+        "a queued row must not claim it holds a slot, got: {queued_row:?}"
+    );
+    assert!(
+        !queued_row.contains("(Idle"),
+        "a queued row is still part of the round, got: {queued_row:?}"
+    );
+}
+
+/// The queued row stays green/bold — it belongs to the current round, so making
+/// it grey would drop it out of the panel's whole notion of liveness — while the
+/// slot label carries its own colour so the position is impossible to miss.
+#[test]
+fn a_queued_row_stays_visibly_active_and_colours_only_its_slot_label() {
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.subagents.push(queue_row(
+        "coder-t-1",
+        true,
+        Some(crate::ui::QueueState { position: 2, of: 4 }),
+    ));
+    r.subagents.push(queue_row("coder-t-2", true, None));
+
+    let (rows, styles) = draw_subagent_panel(&mut r, 100, 20);
+    // Row 0 of the list is the first line inside the bordered block (y = 1).
+    let row_y = rows
+        .iter()
+        .position(|line| line.contains("coder-t-1"))
+        .expect("the queued row is drawn");
+    let name_x = rows[row_y].find("coder-t-1").unwrap();
+    let label_x = rows[row_y].find("(Queued").unwrap();
+
+    let name = styles[row_y][name_x];
+    assert_eq!(
+        name.fg,
+        Some(Color::Green),
+        "the name of a queued row stays green, so the row still reads as live"
+    );
+    assert!(
+        name.add_modifier.contains(Modifier::BOLD),
+        "the name of a queued row stays bold"
+    );
+
+    let label = styles[row_y][label_x];
+    assert_eq!(
+        label.fg,
+        Some(Color::LightYellow),
+        "the slot label gets its own colour, got: {:?}",
+        rows[row_y]
+    );
+
+    // The row holding its slot keeps the plain green label: the queued colour is
+    // never applied to a neighbour just because a queue exists.
+    let running_y = rows
+        .iter()
+        .position(|line| line.contains("coder-t-2"))
+        .expect("the running row is drawn");
+    let running_x = rows[running_y].find("(Active").unwrap();
+    assert_eq!(styles[running_y][running_x].fg, Some(Color::LightGreen));
+}
+
+/// The detail pane says what the selected row is waiting on, with the same
+/// position, instead of the generic "waiting for model response" line — and the
+/// spinner keeps turning through the wait.
+#[test]
+fn the_detail_pane_spells_out_the_slot_wait() {
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.subagents.push(queue_row(
+        "coder-t-1",
+        true,
+        Some(crate::ui::QueueState { position: 3, of: 5 }),
+    ));
+
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 20);
+    let text = rows.join("\n");
+    const WAIT: &str = "[Status: Queued 3/5 - waiting for a backend slot...]";
+    assert!(
+        text.contains(WAIT),
+        "expected {WAIT:?} in the subagent status bar, got:\n{text}"
+    );
+    assert!(
+        !text.contains("waiting for model response"),
+        "a row waiting for a slot must not claim it is waiting on the model:\n{text}"
+    );
+
+    let bar = rows
+        .iter()
+        .find(|line| line.contains(WAIT))
+        .expect("the status bar row");
+    let spinner = bar[bar.find(WAIT).unwrap() + WAIT.len()..]
+        .trim_start()
+        .chars()
+        .next()
+        .unwrap_or(' ');
+    assert!(
+        SPINNER_FRAMES.contains(&spinner),
+        "a queued row keeps a live spinner, got {spinner:?} in {bar:?}"
+    );
+}
+
+/// A row that is not running never advertises a slot position: the queue belongs
+/// to a live delegation only.
+#[test]
+fn a_row_that_is_not_running_never_shows_a_queue_position() {
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.subagents.push(queue_row(
+        "coder-t-1",
+        false,
+        Some(crate::ui::QueueState { position: 3, of: 5 }),
+    ));
+
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 20);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("coder-t-1 (Idle)"),
+        "the row reads Idle whatever it once held, got:\n{text}"
+    );
+    assert!(
+        !text.contains("Queued"),
+        "no queue label for a row that is not running, got:\n{text}"
+    );
+}
+
+/// A queued delegation is still dispatched, so it still counts in the
+/// "[N active: …]" activity group — the clocks and the activity count keyed on
+/// `is_active` must not move when a row waits for a slot.
+#[test]
+fn a_queued_row_still_counts_as_active_in_the_main_status_line() {
+    let mut r = TuiRenderer::new();
+    r.subagents.push(queue_row(
+        "coder-t-1",
+        true,
+        Some(crate::ui::QueueState { position: 1, of: 3 }),
+    ));
+    r.subagents.push(queue_row("coder-t-2", true, None));
+    r.status_line = "Delegating to specialist coder-t-1 for t-1".to_string();
+
+    let content = draw_status_line(&mut r, 160);
+    assert!(
+        content.contains("[2 active: coder-t-1, coder-t-2]"),
+        "the queued row must stay in the active group, got: {content:?}"
+    );
+}
+
+/// A round in which every session is waiting for a backend slot has to animate
+/// exactly like a streaming round: the gate reports the wait as status traffic,
+/// and that traffic is what holds the spinner up.
+#[test]
+fn a_queued_only_round_keeps_the_status_line_animating() {
+    let mut r = TuiRenderer::new();
+    // The exact sentence the concurrency gate emits for a slot wait.
+    r.on_event(&Event::Status(
+        "queued for a backend slot (2 of 4) — Manager".to_string(),
+    ));
+    assert!(
+        r.waiting_for_token_since.is_some(),
+        "waiting for a slot counts as waiting on the backend"
+    );
+
+    let content = draw_status_line(&mut r, 160);
+    assert!(
+        content.contains("queued for a backend slot (2 of 4)"),
+        "the slot wait is surfaced in the status line, got: {content:?}"
+    );
+    let tail = content.trim_end();
+    assert!(
+        tail.ends_with(SPINNER_FRAMES),
+        "the activity spinner must keep turning for a queued-only round, got: {tail:?}"
+    );
+
+    // Control: the spinner is not simply always on.
+    let mut idle = TuiRenderer::new();
+    idle.on_event(&Event::Status("Ready".to_string()));
+    let idle_tail = draw_status_line(&mut idle, 80).trim_end().to_string();
+    assert!(
+        !idle_tail.ends_with(SPINNER_FRAMES),
+        "an idle status line must not animate, got: {idle_tail:?}"
+    );
+}
+
+/// The animation keyword set is shared by the render-loop throttle tier and the
+/// status-line indicator, so the two cannot disagree about a queued round.
+#[test]
+fn the_slot_wait_keyword_is_shared_by_both_animation_tiers() {
+    assert!(
+        ACTIVITY_STATUS_KEYWORDS.contains(&"queued"),
+        "the gate reports a slot wait in lower case"
+    );
+    assert!(
+        ACTIVITY_STATUS_KEYWORDS.contains(&"Queued"),
+        "the panel spells the same state (Queued n/m)"
+    );
+    assert!(
+        !ACTIVITY_STATUS_KEYWORDS.contains(&"Ready"),
+        "an idle line is not activity"
+    );
+}
+
+/// Queue positions are re-reported every time the line ahead moves, so the label
+/// changes several times a second. Nothing else may move with it: not the
+/// selected row, not the scrolled list window, not the other rows.
+#[test]
+fn queue_position_updates_never_move_the_selection_or_the_list_window() {
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    for n in 1..=5 {
+        r.subagents
+            .push(queue_row(&format!("coder-t-{n}"), true, None));
+    }
+    // Five rows in a three-line window: the selection has to be scrolled into
+    // view, which is exactly the state a reselect would silently destroy.
+    r.selected_subagent_idx = 4;
+
+    let (before, _) = draw_subagent_panel(&mut r, 100, 20);
+    assert_eq!(
+        r.subagent_list_scroll, 2,
+        "the selected row is scrolled into view once"
+    );
+    let selected_line = before
+        .iter()
+        .position(|line| line.contains("> coder-t-5"))
+        .expect("the selected row is visible");
+    assert!(
+        !before.iter().any(|line| line.contains("coder-t-1")),
+        "the first rows are scrolled out of the window"
+    );
+
+    // The list window, in draw order: exactly the rows carrying a slot or
+    // lifecycle label (the detail header and the detail status bar never do).
+    // Panel borders are trimmed off both ends so the expectation is the row text.
+    let window = |lines: &[String]| -> Vec<String> {
+        lines
+            .iter()
+            .filter(|line| {
+                line.contains("(Queued ") || line.contains("(Active)") || line.contains("(Idle")
+            })
+            .map(|line| line.trim_matches('│').trim_end().to_string())
+            .collect()
+    };
+    assert_eq!(
+        window(&before),
+        [
+            "  coder-t-3 (Active)",
+            "  coder-t-4 (Active)",
+            "> coder-t-5 (Active)",
+        ],
+        "the window holds the tail of the list, selected on its last row"
+    );
+
+    for (position, of) in [(4usize, 6usize), (2, 6), (1, 3)] {
+        // Half of the round queues: once through the renderer's own delegation
+        // arm, once through the session loop's authoritative push.
+        for task in ["t-3", "t-5"] {
+            r.on_event(&Event::Delegation(
+                crate::orchestrator::DelegationEvent::Queued {
+                    agent: crate::agents::Agent::Coder,
+                    task: Some(task.to_string()),
+                    position,
+                    of,
+                },
+            ));
+        }
+        let mut authoritative = r.subagents.clone();
+        for detail in &mut authoritative {
+            detail.queue = match detail.name.as_str() {
+                "coder-t-3" | "coder-t-5" => Some(crate::ui::QueueState { position, of }),
+                _ => None,
+            };
+        }
+        r.set_subagents(authoritative);
+
+        assert_eq!(
+            r.selected_subagent_idx, 4,
+            "a slot transition never reselects a row"
+        );
+        assert_eq!(
+            r.subagent_list_scroll, 2,
+            "a slot transition never scrolls the list window"
+        );
+
+        let (after, _) = draw_subagent_panel(&mut r, 100, 20);
+        assert_eq!(
+            window(&after),
+            vec![
+                format!("  coder-t-3 (Queued {position}/{of})"),
+                "  coder-t-4 (Active)".to_string(),
+                format!("> coder-t-5 (Queued {position}/{of})"),
+            ],
+            "only the two queued labels change, and only their digits"
+        );
+        assert_eq!(
+            after.iter().position(|line| line.contains("> coder-t-5")),
+            Some(selected_line),
+            "the selected row stays on the same terminal line"
+        );
+    }
+}
+
+/// A restart keeps the panel rows but not the pool: no semaphore survives, so no
+/// position may survive either. The restored row comes back as a running row.
+#[test]
+fn a_restored_row_never_shows_a_stale_queue_position() {
+    let mut live = TuiRenderer::new();
+    live.show_subagent_panel = true;
+    let mut queued = queue_row(
+        "coder-t-1",
+        true,
+        Some(crate::ui::QueueState { position: 7, of: 9 }),
+    );
+    queued.task_id = Some("t-1".to_string());
+    live.subagents.push(queued);
+
+    let section = live.capture_ui();
+    let mut restored = TuiRenderer::new();
+    restored.restore_panes(&section);
+
+    assert_eq!(restored.subagents.len(), 1);
+    assert_eq!(
+        restored.subagents[0].queue, None,
+        "the queue ledger does not survive a restart, so the panel may not claim a position"
+    );
+    assert!(
+        restored.subagents[0].is_active,
+        "the delegation was still dispatched when the session was captured"
+    );
+
+    let (rows, _) = draw_subagent_panel(&mut restored, 100, 20);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("coder-t-1 (Active)"),
+        "a restored row comes back as a running row, got:\n{text}"
+    );
+    assert!(
+        !text.contains("Queued"),
+        "no stale queue position may survive a restore, got:\n{text}"
+    );
 }
 
 #[test]
@@ -620,6 +1296,7 @@ fn test_subagent_thinking_visibility_controlled_by_show_thought() {
         content: "deliverable code".to_string(),
         is_active: true,
         context_tokens: 0,
+        queue: None,
     });
 
     // 1. By default, show_thought is false -> [Thinking] must not appear
@@ -717,6 +1394,7 @@ fn test_subagent_tool_calls_logged_with_arguments_and_stripped_prefix() {
         is_active: true,
         context_tokens: 0,
         worked_duration: Duration::ZERO,
+        queue: None,
     });
     r.active_agent = "coder-t-001".to_string();
 
@@ -1081,6 +1759,7 @@ fn test_subagent_scrolling_and_focus() {
         is_active: true,
         context_tokens: 0,
         worked_duration: Duration::ZERO,
+        queue: None,
     });
 
     r.show_thought = true;
@@ -1146,6 +1825,7 @@ fn test_subagent_switch_scrolls_to_bottom_and_autoscrolls() {
         is_active: true,
         context_tokens: 0,
         worked_duration: Duration::ZERO,
+        queue: None,
     });
     r.subagents.push(SubagentDetail {
         name: "coder-2".to_string(),
@@ -1164,6 +1844,7 @@ fn test_subagent_switch_scrolls_to_bottom_and_autoscrolls() {
         is_active: true,
         context_tokens: 0,
         worked_duration: Duration::ZERO,
+        queue: None,
     });
 
     r.subagent_width.set(40);
@@ -1331,6 +2012,7 @@ fn test_subagent_context_tokens_rendering_in_list() {
         is_active: true,
         context_tokens: 3500,
         worked_duration: Duration::ZERO,
+        queue: None,
     });
     r.subagents.push(SubagentDetail {
         name: "researcher-t-2".to_string(),
@@ -1344,6 +2026,7 @@ fn test_subagent_context_tokens_rendering_in_list() {
         is_active: false,
         context_tokens: 1200,
         worked_duration: Duration::ZERO,
+        queue: None,
     });
     r.subagents.push(SubagentDetail {
         name: "validator".to_string(),
@@ -1357,6 +2040,7 @@ fn test_subagent_context_tokens_rendering_in_list() {
         is_active: true,
         context_tokens: 0,
         worked_duration: Duration::ZERO,
+        queue: None,
     });
 
     let backend = ratatui::backend::TestBackend::new(100, 20);
@@ -1408,6 +2092,7 @@ fn test_subagent_time_counter_rendering_in_list() {
         is_active: true,
         context_tokens: 3500,
         worked_duration: Duration::ZERO,
+        queue: None,
     });
     r.subagents.push(SubagentDetail {
         name: "researcher-t-2".to_string(),
@@ -1421,6 +2106,7 @@ fn test_subagent_time_counter_rendering_in_list() {
         is_active: false,
         context_tokens: 1200,
         worked_duration: Duration::from_secs(85),
+        queue: None,
     });
 
     let backend = ratatui::backend::TestBackend::new(100, 20);
@@ -1698,6 +2384,7 @@ fn test_tui_renders_subagent_thinking_progress_and_output_during_streaming() {
         content: String::new(),
         is_active: true,
         context_tokens: 0,
+        queue: None,
     }]);
 
     // 1. When subagent is active but has not produced tokens yet:
@@ -1855,6 +2542,7 @@ fn test_subagent_thinking_shows_remaining_budget_countdown() {
         content: String::new(),
         is_active: true,
         context_tokens: 0,
+        queue: None,
     });
 
     // 1. Stream 4000 characters in Turn 1: ~1000 tokens. 10000 - 1000 = 9000 remaining (~9.0k remaining).
@@ -1964,6 +2652,7 @@ fn test_manager_output_routes_to_chat_when_specialist_inactive() {
         content: String::new(),
         is_active: false,
         context_tokens: 0,
+        queue: None,
     });
     r.active_agent = "researcher-steer-task-1".to_string();
 
@@ -2020,6 +2709,7 @@ fn test_set_subagents_preserves_manager_active_agent() {
         content: String::new(),
         is_active: true,
         context_tokens: 0,
+        queue: None,
     }];
     r.set_subagents(active_list);
 
@@ -2147,6 +2837,7 @@ fn rich_subagent(name: &str) -> SubagentDetail {
         content: "output\nsecond line".to_string(),
         is_active: true,
         context_tokens: 18_431,
+        queue: None,
     }
 }
 
