@@ -1283,3 +1283,382 @@ fn test_internal_reserve_wait_is_bounded_at_twenty_seconds() {
         "an internal fast call must never inherit the session queue budget"
     );
 }
+
+// --- trust-store regression (`bug.md`) -------------------------------------
+//
+// A host with no TLS trust store makes `reqwest::Client` impossible to build.
+// The old fallback (`build_http_client(..).unwrap_or_default()`) re-ran that
+// exact build through `Client::default()` → `ClientBuilder::new().build()
+// .expect("Client::new()")`, so the process aborted with a reqwest panic and
+// exit code 101 before it could do any work. The verdict is now **stored** on
+// the client and surfaced as a non-retryable `ChatError::TrustStore`.
+//
+// These tests use the `with_http_client_failure` seam (`#[cfg(test)] impl
+// ChatClient` in `client.rs`): no CI runner is store-less, and env tricks
+// cannot make one (`openssl-probe` reads `SSL_CERT_FILE`/`SSL_CERT_DIR` *and*
+// still probes the well-known certificate directories), so the verdict has to
+// be injected.
+
+/// Slice out one function — signature plus body, brace-counted from the first
+/// `{` after `marker` — so a source guard can be scoped to a single function
+/// instead of to a whole file. `client.rs` legitimately uses
+/// `unwrap_or_default()` elsewhere (attribution strings, body dumps), so a
+/// whole-file ban would be a false positive.
+fn fn_region(src: &str, marker: &str) -> String {
+    let start = src
+        .find(marker)
+        .unwrap_or_else(|| panic!("client.rs must still define {marker:?}"));
+    let body = &src[start..];
+    let open = body
+        .find('{')
+        .unwrap_or_else(|| panic!("{marker:?} must be followed by its body"));
+    let mut depth = 0usize;
+    for (idx, ch) in body[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return body[..open + idx + 1].to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unterminated body for {marker:?}");
+}
+
+/// Drop whole-line comments from a scanned region: `client.rs` deliberately
+/// *documents* the removed `unwrap_or_default()` / `Client::new()` trap in the
+/// doc comment of the `http` field, and prose about the bug must not trip the
+/// guard that keeps the bug from coming back.
+fn code_only(region: &str) -> String {
+    region
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !(trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*'))
+        })
+        .collect::<Vec<&str>>()
+        .join("\n")
+}
+
+/// Needle scan that respects identifier boundaries, so `Client::new(` finds a
+/// reqwest construction but never a `ChatClient::new(` mention (which is legal
+/// and everywhere), while punctuation-led needles such as `.expect(` match
+/// wherever they occur.
+fn mentions(haystack: &str, needle: &str) -> bool {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let ident_led = needle.chars().next().is_some_and(&is_ident);
+    haystack.match_indices(needle).any(|(idx, _)| {
+        !ident_led || !matches!(haystack[..idx].chars().next_back(), Some(c) if is_ident(c))
+    })
+}
+
+/// Guard: the shared HTTP-client construction path must contain **no** path
+/// that builds a second client when the shared build fails — every one of those
+/// re-runs the failing build and aborts the process (`unwrap_or_default()` →
+/// `Client::default()` → `.expect("Client::new()")`, `reqwest 0.13.4`). The scan
+/// is scoped to the helper, its reason extraction, the startup probe and the
+/// four client-owning constructors, and separately asserts the construction
+/// still goes through the shared builder exactly once per process.
+#[test]
+fn test_http_client_construction_path_has_no_panic_on_default_trap() {
+    let src = include_str!("client.rs");
+
+    // Markers of the construction path, each unique in the file.
+    let construction_fns = [
+        "fn shared_http_client()",
+        "fn build_failure_reason(",
+        "fn http_client_startup_error()",
+        "pub fn from_config(cfg:",
+        "pub fn new(backend_url: impl Into<String>, model: impl Into<String>) -> Self {",
+        "pub fn new_with_token(",
+        "pub fn with_client(",
+    ];
+    // The panic-on-default family: any of these inside the construction path
+    // either fabricates a client of its own or unwraps the stored verdict.
+    let traps = [
+        "unwrap_or_default(",
+        "unwrap_or_else(",
+        "unwrap(",
+        ".expect(",
+        "Client::default(",
+        "Client::new(",
+        "Client::builder(",
+    ];
+    for marker in construction_fns {
+        let region = code_only(&fn_region(src, marker));
+        for trap in traps {
+            assert!(
+                !mentions(&region, trap),
+                "{marker} must never reach for a fallback client or unwrap a build \
+                 failure ({trap}); the verdict is stored and reported as \
+                 ChatError::TrustStore"
+            );
+        }
+    }
+
+    // Positive side of the same guard: one memoized shared build, propagated
+    // as an error, and consumed by every constructor.
+    let helper = fn_region(src, "fn shared_http_client()");
+    assert!(
+        helper.contains("HTTP_CLIENT") && helper.contains("get_or_init"),
+        "the shared client must be built at most once and memoized"
+    );
+    assert!(
+        helper.contains("crate::net::build_http_client("),
+        "the LLM client must keep constructing through the shared net::http builder"
+    );
+    assert!(
+        helper.contains("map_err"),
+        "a build failure must be mapped into HttpClientError, never discarded"
+    );
+    assert!(
+        src.contains("static HTTP_CLIENT") && src.contains("OnceLock"),
+        "the memoized verdict must live in client.rs so every constructor reports \
+         the same reason (and src/net/http.rs stays a pure Result factory)"
+    );
+    assert_eq!(
+        src.matches("http: shared_http_client()").count(),
+        3,
+        "from_config/new/new_with_token must each store the shared verdict"
+    );
+
+    // Whole-file belt-and-braces: nothing in this file may construct a reqwest
+    // client behind the shared helper any more (the old `default_http_client()`
+    // name is gone for good). Comment lines are excluded because the removed
+    // trap is documented prose, not code.
+    let code = code_only(src);
+    for banned in [
+        "Client::default(",
+        "Client::new(",
+        "Client::builder(",
+        "default_http_client",
+    ] {
+        assert!(
+            !mentions(&code, banned),
+            "client.rs must not contain {banned} in code: it re-runs a build that \
+             can fail and panics (bug.md)"
+        );
+    }
+    for line in code.lines() {
+        assert!(
+            !(line.contains("build_http_client") && line.contains("unwrap")),
+            "a build_http_client call must never be unwrapped: {line}"
+        );
+    }
+
+    // Ordering: the verdict is refused **before** the pool gate, so a
+    // store-less run occupies no concurrency slot of another session and burns
+    // no retry attempt.
+    let refusal = code
+        .find("if let Err(err) = &self.http")
+        .expect("chat_stream must refuse a client-less process");
+    let gate = code
+        .find("self.acquire_slot().await")
+        .expect("chat_stream must still take its slot through acquire_slot");
+    assert!(
+        refusal < gate,
+        "the trust-store refusal must precede the concurrency gate"
+    );
+}
+
+/// Regression for `bug.md`: a stored HTTP-client failure must come back as an
+/// ordinary `Err` — the process must never reach `reqwest::Client::default()`,
+/// which is where the old fallback panicked with `Client::new(): ... No CA
+/// certificates were loaded from the system` and exit code 101.
+///
+/// The mock backend answers with a **retryable** status, so had the failure
+/// been treated as an ordinary transport problem the request would show up here
+/// as attempts. Zero requests plus an instant refusal is the contract.
+#[tokio::test]
+async fn test_missing_trust_store_surfaces_as_error_not_a_panic() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with({
+            let calls = calls.clone();
+            move |_req: &Request| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(503)
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let backend = server.uri();
+    let client = ChatClient::new(backend.clone(), "test-model")
+        .with_http_client_failure("builder error: No CA certificates were loaded from the system");
+
+    let started = std::time::Instant::now();
+    let err = client
+        .chat(&request())
+        .await
+        .expect_err("a process with no HTTP client must return Err, never panic");
+    let elapsed = started.elapsed();
+    let msg = err.to_string();
+
+    for expected in [
+        "no TLS trust store",
+        "No CA certificates were loaded from the system",
+        "ca-certificates",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        backend.as_str(),
+    ] {
+        assert!(
+            msg.contains(expected),
+            "the failure must be actionable and attributable — it must name \
+             {expected:?}, got: {msg}"
+        );
+    }
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "with no HTTP client there is no transport: not one request may be sent"
+    );
+    assert!(
+        elapsed < Duration::from_millis(BACKOFF_BASE_MS),
+        "the verdict is terminal, so no attempt and no backoff sleep may be spent \
+         (the refusal took {elapsed:?}, one backoff step is {BACKOFF_BASE_MS} ms)"
+    );
+}
+
+/// Classification guard: the stored verdict surfaces as
+/// [`ChatError::TrustStore`] attributed to the client's backend, is **never**
+/// retryable (the verdict was taken once, at construction, so a re-attempt can
+/// only fail identically), leaves the turn in `Error` (nothing was ever sent, so
+/// there is no partial stream to truncate) and is caused by `Transport`.
+#[test]
+fn test_trust_store_error_is_terminal_and_non_retryable() {
+    let client = ChatClient::new("http://store-less:8080/v1", "llama-3")
+        .with_http_client_failure("No CA certificates were loaded from the system");
+    let stored = client
+        .http
+        .as_ref()
+        .expect_err("the seam must store the build verdict, not a client");
+    let error = client.trust_store_error(stored);
+
+    assert!(
+        matches!(
+            &error,
+            ChatError::TrustStore { backend, reason }
+                if backend == "http://store-less:8080/v1"
+                    && reason.contains("No CA certificates were loaded from the system")
+        ),
+        "the stored verdict must surface as ChatError::TrustStore naming its \
+         backend, got: {error:?}"
+    );
+    assert!(
+        !error.is_retryable(),
+        "a client-less process must never be retried — the build verdict does not \
+         change at runtime"
+    );
+    assert_eq!(
+        error.terminal_outcome(),
+        ReplyOutcome::Error,
+        "nothing was sent, so there is no partially delivered stream to truncate"
+    );
+    assert_eq!(
+        error.terminal_cause(),
+        TerminalCause::Transport,
+        "no client exists to speak the protocol: that is the transport class"
+    );
+
+    let msg = error.to_string();
+    for expected in [
+        "no TLS trust store",
+        "ca-certificates",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "http://store-less:8080/v1",
+    ] {
+        assert!(
+            msg.contains(expected),
+            "the message must carry {expected:?}, got: {msg}"
+        );
+    }
+}
+
+/// The reason text is what makes the failure actionable, and reqwest's own
+/// `Display` for a builder error is literally `"builder error"` — the useful
+/// half ("No CA certificates were loaded from the system") only survives in the
+/// source chain. Proven against a **real** reqwest build failure, obtainable
+/// without a store-less host by inverting the TLS version range.
+#[test]
+fn test_build_failure_reason_keeps_the_actionable_chain() {
+    let err = reqwest::Client::builder()
+        .tls_version_min(reqwest::tls::Version::TLS_1_3)
+        .tls_version_max(reqwest::tls::Version::TLS_1_2)
+        .build()
+        .expect_err("an inverted TLS range must fail the client build");
+    assert!(err.is_builder(), "the probe must produce a builder error");
+    assert_eq!(
+        err.to_string(),
+        "builder error",
+        "reqwest's Display says nothing — this is why the chain has to be walked"
+    );
+
+    let reason = build_failure_reason(&err);
+    assert!(
+        reason.contains("empty supported tls versions"),
+        "build_failure_reason must capture the source chain, got: {reason}"
+    );
+    assert_ne!(
+        reason.trim(),
+        "builder error",
+        "the reason must be more than reqwest's bare kind"
+    );
+
+    // And that chain is what the user ends up reading, verbatim, through the
+    // TrustStore error.
+    let client = ChatClient::new("http://store-less:8080/v1", "m").with_http_client_failure(reason);
+    let stored = client.http.as_ref().expect_err("verdict stored");
+    let msg = client.trust_store_error(stored).to_string();
+    assert!(
+        msg.contains("empty supported tls versions") && msg.contains("no TLS trust store"),
+        "the captured chain must survive into the reported error, got: {msg}"
+    );
+}
+
+/// Process-level invariant, host-agnostic: constructing a client never panics
+/// whether or not a trust store exists, and every client carries the *same*
+/// verdict the startup probe reports (one memoized build, one shared reason).
+#[test]
+fn test_construction_verdict_matches_the_startup_probe() {
+    let client = ChatClient::new("http://construction:8080/v1", "m");
+    match http_client_startup_error() {
+        // A store-less host: still no panic, and the client carries the reason.
+        Some(message) => {
+            assert!(
+                client.http.is_err(),
+                "the probe says the build failed, so this client must carry that verdict"
+            );
+            assert!(
+                message.contains("no TLS trust store") && message.contains("SSL_CERT_FILE"),
+                "the startup line must be the actionable one, got: {message}"
+            );
+        }
+        // A normal host: the shared client was built once and reused.
+        None => {
+            assert!(
+                client.http.is_ok(),
+                "a host with a trust store must get a working client, not a verdict"
+            );
+            assert!(
+                ChatClient::new("http://construction:8080/v1", "m")
+                    .http
+                    .as_ref()
+                    .ok()
+                    .is_some(),
+                "the memoized verdict must stay Ok for every later client"
+            );
+        }
+    }
+}

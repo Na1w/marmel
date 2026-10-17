@@ -17,6 +17,12 @@
 //! looks for, `session::bundle_dir(&Plan::at(dir))` — is inside that temp dir.
 //! Nothing here ever touches the workspace's own `.marmel/`, and every worker key
 //! is prefixed `t022-e2e-`.
+//!
+//! Every case clears the child's environment as well, so the child never inherits
+//! the runner's `SSL_CERT_FILE`. On a host with no usable system trust store the
+//! boot path must still be reachable: an ordinary startup error about the missing
+//! CA bundle is acceptable, a panic in HTTP-client construction is not — that is
+//! what `assert_booted_past_the_tls_setup` pins.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -225,6 +231,9 @@ fn run_marmel(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Run {
         .env_clear()
         // A minimal, deterministic environment: the binary must not inherit the
         // test runner's `MARMEL_*` variables or its terminal.
+        // Deliberately no `SSL_CERT_FILE` either: a child that needs one to reach
+        // its own session bundle is the bug, not a fixture detail — see
+        // `assert_booted_past_the_tls_setup`.
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", dir)
         // Nothing may reach a real model, and nothing may hang on connect.
@@ -281,6 +290,75 @@ fn workspace(config: &str) -> tempfile::TempDir {
 
 const PLAIN_CONFIG: &str = "session_enabled = true\nsession_resume = false\n";
 const CAPTURE_OFF_CONFIG: &str = "session_enabled = false\nsession_resume = true\n";
+
+// ------------------------------------------------- missing-trust-store guards
+
+/// Exit status Rust produces when a panic unwinds `main`.
+///
+/// What this guards: the runner clears the environment (see `run_marmel`), so the
+/// child has no `SSL_CERT_FILE` even when the test runner does, and on a host
+/// without a usable system trust store the HTTP client used to be built **twice**
+/// — the second time through `reqwest::Client::default()`, which is
+/// `Client::new()` and `expect()`s the same build that just failed. The run then
+/// aborted inside TLS setup with `panicked at src/async_impl/client.rs…` and exit
+/// `101`, before it ever looked at a session bundle, and the four cases below
+/// observed `101` instead of the exit code they pin.
+///
+/// The verdict is now stored on the client and reported as an ordinary startup
+/// error (`main::report_http_client_verdict`), so the boot path stays reachable
+/// and the run keeps the exit code its session outcome produces. The environment
+/// is deliberately left cleared: forwarding `SSL_CERT_FILE` into the child would
+/// only paper over the panic.
+const PANIC_EXIT_CODE: i32 = 101;
+
+/// The child must reach the session boot path rather than die in TLS setup: no
+/// panic banner, and never the panic exit status — on any host, trust store
+/// present or not.
+fn assert_no_tls_startup_panic(run: &Run, case: &str) {
+    assert!(
+        !run.stderr.contains("panicked"),
+        "{case} must not abort in a panic on a host whose trust store the child cannot \
+         find (the runner clears `SSL_CERT_FILE`); stderr: {:?}",
+        run.stderr
+    );
+    assert!(
+        run.code != Some(PANIC_EXIT_CODE),
+        "{case} must not exit with Rust's panic status {PANIC_EXIT_CODE}: a missing TLS \
+         trust store is a stored client verdict, not an abort in `main`; {run:?}"
+    );
+}
+
+/// Nothing in this file can *make* the trust store empty — `openssl-probe` reads
+/// `SSL_CERT_FILE`/`SSL_CERT_DIR` **and still** probes the system directories —
+/// so the certificate verdict only shows up on a host that genuinely has no CA
+/// bundle. When it does show up, it must be actionable: every run here is raw
+/// mode (stdout is a file), where `tracing`'s sink **is** stderr, so the line is
+/// checked there.
+///
+/// Markers only, never an exact sentence: the underlying reason text (e.g. "No CA
+/// certificates were loaded from the system") belongs to reqwest /
+/// rustls-native-certs and moves with their versions.
+fn assert_trust_store_message_is_actionable(run: &Run, case: &str) {
+    let output = format!("{}{}", run.stderr, run.stdout).to_ascii_lowercase();
+    if !output.contains("ca certificates") && !output.contains("trust store") {
+        return;
+    }
+    assert!(
+        run.stderr.contains("no TLS trust store")
+            || run.stderr.contains("SSL_CERT_FILE")
+            || run.stderr.contains("ca-certificates"),
+        "{case}: a run that mentions a CA-bundle problem must also name what the user can \
+         act on (no TLS trust store / SSL_CERT_FILE / ca-certificates), instead of only \
+         the transport's internal reason; stderr: {:?}",
+        run.stderr
+    );
+}
+
+/// Both guards in one call, for the four cases that run the boot path.
+fn assert_booted_past_the_tls_setup(run: &Run, case: &str) {
+    assert_no_tls_startup_panic(run, case);
+    assert_trust_store_message_is_actionable(run, case);
+}
 
 // ----------------------------------------------------------------------- tests
 
@@ -366,6 +444,9 @@ fn a_refused_resume_exits_with_the_named_refusal_code_and_says_so_three_times() 
 
     let run = run_marmel(dir.path(), &["--config", "marmel.toml", "--resume"], &[]);
     assert!(!run.timed_out, "a refusal stops the run: {run:?}");
+    // The refusal verdict is only meaningful if the child got as far as the
+    // bundle: no trust-store panic in between, whatever the host ships.
+    assert_booted_past_the_tls_setup(&run, "a refused --resume");
     assert_eq!(
         run.code,
         Some(marmennill::session::EXIT_RESTORE_REFUSED),
@@ -422,6 +503,7 @@ fn marmel_resume_env_alone_reaches_the_same_refusal_and_the_same_exit_code() {
         &[("MARMEL_RESUME", "1")],
     );
     assert!(!run.timed_out, "the env trigger stops the run too: {run:?}");
+    assert_booted_past_the_tls_setup(&run, "the MARMEL_RESUME spelling");
     assert_eq!(
         run.code,
         Some(marmennill::session::EXIT_RESTORE_REFUSED),
@@ -452,6 +534,7 @@ fn fresh_beats_the_resume_env_and_the_refused_bundle_is_never_opened() {
         &[("MARMEL_RESUME", "1")],
     );
     assert!(!run.timed_out, "a fresh start is not a refusal: {run:?}");
+    assert_booted_past_the_tls_setup(&run, "--fresh over MARMEL_RESUME");
     assert_eq!(
         run.code,
         Some(0),
@@ -484,9 +567,12 @@ fn a_sound_resume_rehydrates_through_the_cli_and_announces_the_restore() {
 
     let run = run_marmel(dir.path(), &["--config", "marmel.toml", "--resume"], &[]);
     assert!(!run.timed_out, "the boot path returns promptly: {run:?}");
+    assert_booted_past_the_tls_setup(&run, "a sound --resume");
     assert!(
-        run.code != Some(marmennill::session::EXIT_RESTORE_REFUSED) && run.code != Some(2),
-        "a sound bundle is neither refused nor a usage error: {run:?}"
+        run.code != Some(marmennill::session::EXIT_RESTORE_REFUSED)
+            && run.code != Some(2)
+            && run.code != Some(PANIC_EXIT_CODE),
+        "a sound bundle is neither refused, a usage error, nor a panic in TLS setup: {run:?}"
     );
     assert!(
         run.stdout

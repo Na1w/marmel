@@ -4,6 +4,10 @@ use crate::orchestrator::pool;
 use crate::types::{ChatChunk, ChatRequest};
 use anyhow::Result;
 use eventsource_stream::Eventsource;
+// Only for the trait methods (`source()`) needed to walk a reqwest build
+// failure's cause chain; kept anonymous so it cannot shadow the `Error` derive
+// macro imported from `thiserror` below.
+use std::error::Error as _;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -263,12 +267,89 @@ pub struct ChatClient {
     /// never make steering unresponsive or let an internal fast call deadlock
     /// against its own reserve slot.
     reserve_wait: Duration,
-    client: reqwest::Client,
+    /// The shared HTTP client, or the verdict of why it could not be built.
+    ///
+    /// Construction never panics and never degrades silently: on a host with no
+    /// TLS trust store `reqwest::Client::build()` returns `Err`, and every
+    /// fallback that builds a client of its own (`Client::new()`,
+    /// `unwrap_or_default()`) re-runs that same failing build and aborts the
+    /// process. So the failure is **stored** here and surfaced on the error
+    /// channel at request time, which keeps every `ChatClient` constructor
+    /// infallible.
+    http: Result<reqwest::Client, HttpClientError>,
 }
 
-fn default_http_client() -> reqwest::Client {
-    // Shared HTTP client builder: this client builds no client of its own.
-    crate::net::build_http_client(Some(Duration::from_secs(10)), None).unwrap_or_default()
+/// Why marmel could not build its HTTP client at all.
+///
+/// Kept crate-internal: `ChatClient`'s public surface stays unchanged. The
+/// reason is captured at construction time because `reqwest::Error`'s
+/// `Display` for a builder failure is literally just `"builder error"` — the
+/// actionable text (e.g. "No CA certificates were loaded from the system")
+/// only survives in the source chain, see [`build_failure_reason`].
+#[derive(Debug, Clone, Error)]
+#[error(
+    "no TLS trust store: could not build marmel's HTTP client ({reason}); install your \
+     distribution's ca-certificates package, or point SSL_CERT_FILE (optionally \
+     SSL_CERT_DIR) at an existing PEM CA bundle such as \
+     /etc/ssl/certs/ca-certificates.crt — with no CA bundle loaded no backend is reachable \
+     at all, https or http"
+)]
+pub(crate) struct HttpClientError {
+    reason: String,
+}
+
+/// The HTTP client this process uses, built at most once.
+///
+/// Memoized so a store-less host pays for the failing probe a single time
+/// rather than once per [`ChatClient`] — there are well over a hundred
+/// constructor calls across the tree, and the same reason is reported to all
+/// of them.
+static HTTP_CLIENT: std::sync::OnceLock<Result<reqwest::Client, HttpClientError>> =
+    std::sync::OnceLock::new();
+
+/// Shared HTTP client builder: this client builds no client of its own, and it
+/// never falls back to one that would panic.
+fn shared_http_client() -> Result<reqwest::Client, HttpClientError> {
+    HTTP_CLIENT
+        .get_or_init(|| {
+            crate::net::build_http_client(Some(Duration::from_secs(10)), None).map_err(|err| {
+                HttpClientError {
+                    reason: build_failure_reason(&err),
+                }
+            })
+        })
+        .clone()
+}
+
+/// Extract the real cause behind a reqwest client-build failure.
+///
+/// `err.to_string()` alone is not enough: for a builder error it says only
+/// `"builder error"`. The whole source chain is therefore walked and joined,
+/// with the `Debug` rendering as fallback when there is no chain to walk.
+fn build_failure_reason(err: &reqwest::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut source = err.source();
+    while let Some(cause) = source {
+        parts.push(cause.to_string());
+        source = cause.source();
+    }
+    if parts.len() == 1 {
+        parts.push(format!("{err:?}"));
+    }
+    parts.join(": ")
+}
+
+/// Startup probe for the binary: `Some(actionable message)` when this process
+/// could not build its HTTP client at all (no TLS trust store in practice),
+/// `None` when it can talk to a backend.
+///
+/// Reads the same memoized verdict every [`ChatClient`] stores, so the probe both
+/// answers the question and pays for the single build: the request path reuses
+/// the outcome rather than probing again, and each turn then fails with the same
+/// text through [`ChatError::TrustStore`]. Deliberately **not** fatal here — the
+/// run keeps its normal exit code, because the failure is reported per turn.
+pub fn http_client_startup_error() -> Option<String> {
+    shared_http_client().err().map(|err| err.to_string())
 }
 
 /// The queue bound a client starts with: the pool module owns the number, this
@@ -331,20 +412,42 @@ pub(crate) enum ChatError {
         /// Model half of the pool key.
         model: String,
     },
+    /// This process has **no HTTP client at all**: the shared `reqwest` client
+    /// could not be built, which on a host with no TLS trust store means no CA
+    /// bundles were found. Raised by [`ChatClient::chat_stream`] before the pool
+    /// gate and before any attempt, so nothing was sent, no slot was occupied and
+    /// no retry attempt was spent.
+    ///
+    /// Unlike [`ChatError::Transport`] this is never transient — the verdict was
+    /// taken once, at construction — and `reason` carries the full actionable
+    /// text (the missing CA bundles plus how to point marmel at them through
+    /// `ca-certificates`, `SSL_CERT_FILE` or `SSL_CERT_DIR`).
+    #[error("{reason} (backend {backend})")]
+    TrustStore {
+        /// Backend this client was bound to, so the failure is attributable.
+        backend: String,
+        /// Verdict captured at construction, remediation included.
+        reason: String,
+    },
 }
 
 impl crate::net::Retryable for ChatError {
     /// Retryable classes: transient HTTP statuses (503/429/502/504), watchdog
     /// timeouts, transport failures and SSE stream errors — all only while
-    /// nothing has reached the caller yet. Two classes are terminal:
+    /// nothing has reached the caller yet. Three classes are terminal:
     /// [`ChatError::Interrupted`] (deltas were already delivered, so a new
-    /// attempt of the same request would duplicate output) and
+    /// attempt of the same request would duplicate output),
     /// [`ChatError::QueueTimeout`] (the queue bound already expired — retrying
     /// here would re-enter the queue, double-spend the wait budget and let this
-    /// call leapfrog the sessions already in line).
+    /// call leapfrog the sessions already in line) and
+    /// [`ChatError::TrustStore`] (no HTTP client exists in this process: the
+    /// verdict was taken once at construction, so re-attempting can only fail in
+    /// exactly the same way).
     fn is_retryable(&self) -> bool {
         match self {
-            ChatError::Interrupted { .. } | ChatError::QueueTimeout { .. } => false,
+            ChatError::Interrupted { .. }
+            | ChatError::QueueTimeout { .. }
+            | ChatError::TrustStore { .. } => false,
             ChatError::HttpStatus { status, .. } => matches!(status, 503 | 429 | 502 | 504),
             ChatError::InitialTimeout
             | ChatError::StallTimeout
@@ -363,8 +466,8 @@ impl ChatError {
     pub(crate) fn terminal_outcome(&self) -> ReplyOutcome {
         match self {
             ChatError::Interrupted { .. } => ReplyOutcome::Truncated,
-            // Includes `QueueTimeout`: the request was never sent, so there is
-            // no partially delivered stream to truncate.
+            // Includes `QueueTimeout` and `TrustStore`: the request was never
+            // sent, so there is no partially delivered stream to truncate.
             _ => ReplyOutcome::Error,
         }
     }
@@ -378,9 +481,13 @@ impl ChatError {
             }
             // The queue bound is not a stream watchdog: no stream existed.
             ChatError::QueueTimeout { .. } => TerminalCause::QueueTimeout,
-            ChatError::Stream(_) | ChatError::Transport(_) | ChatError::Interrupted { .. } => {
-                TerminalCause::Transport
-            }
+            // A missing trust store is a transport failure in the broad sense:
+            // no client exists to speak the protocol at all, so it belongs to
+            // the same cause class as `Transport` rather than a new one.
+            ChatError::Stream(_)
+            | ChatError::Transport(_)
+            | ChatError::TrustStore { .. }
+            | ChatError::Interrupted { .. } => TerminalCause::Transport,
         }
     }
 }
@@ -561,7 +668,7 @@ impl ChatClient {
             stall_timeout_secs: INTER_CHUNK_WATCHDOG_SECS,
             queue_wait: default_queue_wait(),
             reserve_wait: default_reserve_wait(),
-            client: default_http_client(),
+            http: shared_http_client(),
         }
     }
 
@@ -574,7 +681,7 @@ impl ChatClient {
             stall_timeout_secs: INTER_CHUNK_WATCHDOG_SECS,
             queue_wait: default_queue_wait(),
             reserve_wait: default_reserve_wait(),
-            client: default_http_client(),
+            http: shared_http_client(),
         }
     }
 
@@ -591,12 +698,13 @@ impl ChatClient {
             stall_timeout_secs: INTER_CHUNK_WATCHDOG_SECS,
             queue_wait: default_queue_wait(),
             reserve_wait: default_reserve_wait(),
-            client: default_http_client(),
+            http: shared_http_client(),
         }
     }
 
+    /// Override the stored HTTP client with a caller-built one.
     pub fn with_client(mut self, client: reqwest::Client) -> Self {
-        self.client = client;
+        self.http = Ok(client);
         self
     }
 
@@ -678,6 +786,21 @@ impl ChatClient {
     where
         F: FnMut(&str) -> bool,
     {
+        // No HTTP client exists in this process (the shared build failed, on a
+        // host with no TLS trust store in practice). Resolved **before the pool
+        // gate**: a store-less run must not occupy a concurrency slot of another
+        // session, and must not spend any of the retry policy's attempts — the
+        // verdict never changes at runtime, so an attempt could only fail the
+        // same way. Terminal, non-retryable, and never a panic.
+        if let Err(err) = &self.http {
+            let error = self.trust_store_error(err);
+            tracing::error!(
+                "LLM turn terminated as {}: {error}",
+                error.terminal_outcome().as_str()
+            );
+            crate::debug_log::log_llm_error(&self.backend_url, &self.model, 0, &error.to_string());
+            return Err(anyhow::anyhow!("{error}"));
+        }
         // The slot guard is bound here, not inside a retry attempt: it stays
         // alive until this function returns, and `Drop` is the only release path
         // (success, hard error, cancellation, queue timeout, panic).
@@ -894,6 +1017,19 @@ impl ChatClient {
         }
     }
 
+    /// The error reported when this client has **no** HTTP client: the verdict
+    /// [`shared_http_client`] captured at construction, attributed to the backend
+    /// this client is bound to. `reason` keeps the whole actionable text — the
+    /// build failure chain plus the remediation (CA bundles, `ca-certificates`,
+    /// `SSL_CERT_FILE`, `SSL_CERT_DIR`) — because `reqwest`'s own `Display` for a
+    /// builder failure says nothing useful on its own.
+    fn trust_store_error(&self, err: &HttpClientError) -> ChatError {
+        ChatError::TrustStore {
+            backend: self.backend_url.clone(),
+            reason: err.to_string(),
+        }
+    }
+
     async fn try_chat_once<F>(
         &self,
         req: &ChatRequest,
@@ -902,7 +1038,16 @@ impl ChatClient {
     where
         F: FnMut(&str) -> bool,
     {
-        let client = &self.client;
+        // Borrow the stored client. [`ChatClient::chat_stream`] already refuses a
+        // client-less process with the non-retryable [`ChatError::TrustStore`]
+        // **before** the pool gate and before the retry loop, so this arm only
+        // exists to keep the borrow total: an attempt is never reached without a
+        // client, and if one ever is, it is reported as the same terminal class
+        // instead of being mistaken for a transient transport failure.
+        let client = self
+            .http
+            .as_ref()
+            .map_err(|err| self.trust_store_error(err))?;
 
         let url = format!(
             "{}/chat/completions",
@@ -1481,6 +1626,28 @@ where
         }
     }
     Ok(ConsumeMark::Continue)
+}
+
+/// Test-only seam for the stored HTTP-client verdict.
+///
+/// A missing TLS trust store cannot be simulated through the environment:
+/// `openssl-probe` reads `SSL_CERT_FILE`/`SSL_CERT_DIR` **and still** probes the
+/// well-known certificate directories, so a normal host always finds a store and
+/// the failing branch is unreachable in CI (every runner ships `ca-certificates`).
+/// Injecting the verdict is therefore the only way to exercise the
+/// `bug.md` regression: it replaces exactly what [`shared_http_client`] handed to
+/// a constructor, which is the whole state the request path reads. Nothing in
+/// production can reach this — it exists only under `cfg(test)`.
+#[cfg(test)]
+impl ChatClient {
+    /// Force this client to carry the "no HTTP client exists" verdict, with
+    /// `reason` standing in for the captured reqwest build-failure chain.
+    fn with_http_client_failure(mut self, reason: impl Into<String>) -> Self {
+        self.http = Err(HttpClientError {
+            reason: reason.into(),
+        });
+        self
+    }
 }
 
 #[cfg(test)]
