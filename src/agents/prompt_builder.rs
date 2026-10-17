@@ -6,6 +6,7 @@
 use crate::agents::DelegationRequest;
 use crate::agents::catalog::Catalog;
 use crate::markers::{MARKER_COMPLETE, MARKER_FAILED};
+use crate::orchestrator::pool;
 use crate::tool_names::{
     TOOL_CREATE_PLAN, TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_READ_FILE, TOOL_REBIRTH,
 };
@@ -342,13 +343,27 @@ impl PromptBuilder {
         };
 
         let mut raw_response = String::new();
-        let reply = client
-            .chat_stream(&chat_req, |chunk| {
+        // Concurrency metering (design §5): the JIT blueprint is a **capped**
+        // call, metered as `PromptArchitect` on purpose rather than inheriting
+        // whatever class the caller installed. It happens before any worker is
+        // registered and before the specialist it describes ever acquires a
+        // slot, so it competes for the cap like any ordinary session and must
+        // never borrow the steer/notice reserve. Identity is the delegation this
+        // blueprint is written for, so a queued architect call names the task it
+        // is blocking.
+        let reply = pool::with_call_context(
+            pool::CallContext::for_agent(
+                pool::CallClass::PromptArchitect,
+                req.agent_name.as_str(),
+                req.task_id.clone(),
+            ),
+            client.chat_stream(&chat_req, |chunk| {
                 raw_response.push_str(chunk);
                 true
-            })
-            .await
-            .context("calling chat_stream for prompt architect")?;
+            }),
+        )
+        .await
+        .context("calling chat_stream for prompt architect")?;
 
         let raw = if !reply.content.trim().is_empty() {
             reply.content.trim()

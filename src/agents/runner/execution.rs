@@ -123,12 +123,33 @@ pub async fn run_specialist_live(
     cfg: &crate::config::Config,
     token: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<String> {
-    crate::orchestrator::CURRENT_WORKER_TOKEN
-        .scope(
+    // Call class for every backend call this turn makes, attributed to this agent
+    // and its plan task (design §1.5). The validator/fix-loop passes nested
+    // inside this turn are **re-metered** as `CallClass::Validator` by the fix-loop
+    // driver (`fix_loop::fix_loop_call_context`), so a queued auditor pass is
+    // never blamed on the specialist it audits — but they still draw from the same
+    // `Validator`-capped pool for their own resolved `backend + model` pair.
+    // This is also the *direct* specialist entry point (public API, driven
+    // directly by integration tests), so the class is installed here as well as at
+    // the delegation entry in `super::try_run_specialist_live`.
+    //
+    // It is a task-local scope, not a guard: it stays in force across every await
+    // of this turn on whichever tokio worker polls it, and it is discharged the
+    // moment the turn returns, cancels or unwinds — nothing survives for the next
+    // call on this task.
+    let call_context = crate::orchestrator::pool::CallContext::for_agent(
+        crate::orchestrator::pool::CallClass::Specialist,
+        agent.as_str(),
+        ctx.task_id.clone(),
+    );
+    crate::orchestrator::pool::with_call_context(
+        call_context,
+        crate::orchestrator::CURRENT_WORKER_TOKEN.scope(
             token.clone(),
             run_specialist_live_inner(client, agent, ctx, cfg, token),
-        )
-        .await
+        ),
+    )
+    .await
 }
 
 async fn run_specialist_live_inner(

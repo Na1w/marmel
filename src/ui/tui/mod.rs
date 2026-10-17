@@ -37,6 +37,35 @@ pub(crate) enum FocusedPanel {
     Subagents,
 }
 
+/// Status-line substrings that mean "a turn is in flight, keep animating".
+///
+/// One source of truth for the two places that must never drift apart: the
+/// render-loop throttle tier in [`TuiRenderer::drain_and_throttle_flush`] (a
+/// spinner-only repaint every 125 ms while nothing else is dirty) and the
+/// activity indicator in [`TuiRenderer::render_status`]. If they disagree, a
+/// frame can be animating in one panel and frozen in the other.
+///
+/// Both spellings of the concurrency-slot keyword are listed deliberately: the
+/// gate reports a slot wait as lowercase status traffic
+/// (`"queued for a backend slot (n of m) …"`) while the Subagents panel labels
+/// the same state `(Queued n/m)`. A round in which every session is waiting for
+/// a slot has to keep animating exactly like a streaming round, and a Manager
+/// turn that waits for a slot has no subagent row at all — so for that case this
+/// keyword list, not the `is_active` scan, is the only thing that can hold the
+/// spinner up.
+pub(crate) const ACTIVITY_STATUS_KEYWORDS: &[&str] = &[
+    "Running",
+    "Delegating",
+    "calling backend",
+    "calling model",
+    "Starting",
+    "streaming",
+    "thinking",
+    "Arbitrating",
+    "queued",
+    "Queued",
+];
+
 pub struct TuiRenderer {
     /// Ordered chat/log transcript. Each entry is a single message string
     /// (may contain embedded `\n`).
@@ -388,18 +417,9 @@ impl TuiRenderer {
             let _ = self.force_flush();
         } else {
             let active_spinner = self.subagents.iter().any(|s| s.is_active)
-                || [
-                    "Running",
-                    "Delegating",
-                    "calling backend",
-                    "calling model",
-                    "Starting",
-                    "streaming",
-                    "thinking",
-                    "Arbitrating",
-                ]
-                .iter()
-                .any(|k| self.status_line.contains(k));
+                || ACTIVITY_STATUS_KEYWORDS
+                    .iter()
+                    .any(|k| self.status_line.contains(k));
 
             if self.dirty {
                 if self.last_render.elapsed() >= Duration::from_millis(25) {
@@ -660,10 +680,15 @@ impl Renderer for TuiRenderer {
                 if !self.is_abort_armed() {
                     self.status_line = text.lines().next().unwrap_or("").to_string();
                 }
+                // The elapsed "(n.ns)" counter covers every wait for the backend,
+                // including a wait for a concurrency slot: the queue traffic the
+                // gate emits (`"queued for a backend slot (n of m) …"`) is exactly
+                // the silence that would otherwise read as a stalled turn.
                 let is_waiting = self.status_line.contains("Running")
                     || self.status_line.contains("thinking")
                     || self.status_line.contains("calling backend")
-                    || self.status_line.contains("Arbitrating");
+                    || self.status_line.contains("Arbitrating")
+                    || self.status_line.contains("queued");
                 if is_waiting {
                     if self.waiting_for_token_since.is_none() {
                         self.waiting_for_token_since = Some(std::time::Instant::now());
@@ -823,6 +848,53 @@ impl Renderer for TuiRenderer {
                         } else {
                             self.active_agent = "Manager".to_string();
                             self.status_line = format!("{name} finished task {t}");
+                        }
+                    }
+                    crate::orchestrator::DelegationEvent::Queued {
+                        agent,
+                        task,
+                        position,
+                        of,
+                    } => {
+                        // Concurrency-slot state inside an already-dispatched
+                        // delegation. The row exists by now (its `Started` arm ran
+                        // first in the same authoritative stream), so this moves
+                        // nothing but the queue field plus the row's activity
+                        // stamp: no log line, no status line, no spinner or panel
+                        // change — rendering the `(Queued n/m)` label is a later
+                        // task and is deliberately not introduced here.
+                        let clean_task = task
+                            .as_ref()
+                            .map(|t| crate::task_id::normalize_task_id_ref(t))
+                            .filter(|t| !t.is_empty());
+                        let name = match clean_task {
+                            Some(t) => format!("{agent}-{t}"),
+                            None => format!("{agent}"),
+                        };
+                        if let Some(s) = self.subagents.iter_mut().find(|s| s.name == name) {
+                            s.queue = Some(crate::ui::QueueState {
+                                position: *position,
+                                of: *of,
+                            });
+                            s.last_activity_at = Some(std::time::Instant::now());
+                        }
+                    }
+                    crate::orchestrator::DelegationEvent::Running { agent, task } => {
+                        // The queued call holds its slot: take the queue state back
+                        // down. `is_active`, clocks and selection stay untouched —
+                        // a queued delegation was already active, and this arm must
+                        // never resurrect a row the lifecycle path closed.
+                        let clean_task = task
+                            .as_ref()
+                            .map(|t| crate::task_id::normalize_task_id_ref(t))
+                            .filter(|t| !t.is_empty());
+                        let name = match clean_task {
+                            Some(t) => format!("{agent}-{t}"),
+                            None => format!("{agent}"),
+                        };
+                        if let Some(s) = self.subagents.iter_mut().find(|s| s.name == name) {
+                            s.queue = None;
+                            s.last_activity_at = Some(std::time::Instant::now());
                         }
                     }
                     crate::orchestrator::DelegationEvent::Failed {
@@ -1007,6 +1079,11 @@ impl Renderer for TuiRenderer {
                     if incoming.task_id.is_some() {
                         existing.task_id = incoming.task_id.clone();
                     }
+                    // Queue state is owned by the session loop's authoritative
+                    // list (it is the only writer of the delegation event
+                    // stream), so the loop's view always wins here — that is what
+                    // keeps a queue row from surviving a completion locally.
+                    existing.queue = incoming.queue;
                     // Keep locally-streamed thinking/content if the incoming
                     // entry has none yet (the loop only folds lifecycle events).
                     if !incoming.thinking.is_empty() {
@@ -1498,6 +1575,7 @@ fn subagent_detail_from_panel(panel: &crate::session::format::SubagentPanel) -> 
         content: panel.content.clone(),
         is_active: panel.is_active,
         context_tokens: panel.context_tokens,
+        queue: None,
     }
 }
 

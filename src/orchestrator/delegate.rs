@@ -1,6 +1,7 @@
 //! The harness-level `delegate_task` handler and per-specialist tool allowlist.
 
 use super::OrchestratorManager;
+use super::pool;
 use super::registry::SpecialistRegistry;
 use crate::agents::Agent;
 use crate::agents::{DelegationRequest, Deliverable, MissionMarker};
@@ -93,30 +94,60 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
         &cfg,
     );
 
+    // 4. Call context for the nested delegation. Whatever dispatched this tool
+    //    call installed its own context — a Manager turn, or a parent specialist
+    //    whose allowlist granted recursion — and that task-local does **not**
+    //    cross the `thread::scope` + `block_on` boundary below by itself. So it is
+    //    carried explicitly and then **overwritten**: every backend call this
+    //    nested delegation makes (worker turn, JIT prompt synthesis, validator
+    //    passes) must be attributed to this agent and task id, not to the parent
+    //    that triggered it. The sync scope restores the previous context on the way
+    //    out — including on unwind — so nothing leaks back to the caller when this
+    //    delegation returns.
+    let parent_context = pool::current_call_context();
+    let nested_context = pool::CallContext::for_agent(
+        pool::CallClass::Specialist,
+        req.agent_name.as_str(),
+        req.task_id.clone().or_else(|| {
+            parent_context
+                .as_ref()
+                .and_then(|parent| parent.task.clone())
+        }),
+    );
+    if let Some(parent) = parent_context.as_ref() {
+        tracing::debug!(
+            parent = %parent.describe(),
+            nested = %nested_context.describe(),
+            "nested delegate_task overwrites the inherited call context"
+        );
+    }
+
     let deliverable = if let Ok(handle) = tokio::runtime::Handle::try_current() {
         let join_res = std::thread::scope(|s| {
             s.spawn(|| {
-                if crate::orchestrator::is_globally_cancelled() {
-                    return Ok(Deliverable {
-                        marker: MissionMarker::Failed {
-                            reason: ABORT_REASON.to_string(),
-                        },
-                        content: aborted_deliverable("aborted by user instruction"),
-                        task_id: req.task_id.clone(),
-                    });
-                }
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handle.block_on(manager.delegate(req))
-                }))
-                .unwrap_or_else(|_| {
-                    Ok(Deliverable {
-                        marker: MissionMarker::Failed {
-                            reason: "task interrupted or runtime shutting down".to_string(),
-                        },
-                        content: aborted_deliverable(
-                            "execution interrupted or runtime shutting down",
-                        ),
-                        task_id: None,
+                pool::with_call_context_sync(nested_context.clone(), || {
+                    if crate::orchestrator::is_globally_cancelled() {
+                        return Ok(Deliverable {
+                            marker: MissionMarker::Failed {
+                                reason: ABORT_REASON.to_string(),
+                            },
+                            content: aborted_deliverable("aborted by user instruction"),
+                            task_id: req.task_id.clone(),
+                        });
+                    }
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handle.block_on(manager.delegate(req))
+                    }))
+                    .unwrap_or_else(|_| {
+                        Ok(Deliverable {
+                            marker: MissionMarker::Failed {
+                                reason: "task interrupted or runtime shutting down".to_string(),
+                            },
+                            content: aborted_deliverable(
+                                "execution interrupted or runtime shutting down",
+                            ),
+                            task_id: None,
+                        })
                     })
                 })
             })
@@ -135,7 +166,9 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
             }),
         }
     } else {
-        futures::executor::block_on(manager.delegate(req))
+        pool::with_call_context_sync(nested_context, || {
+            futures::executor::block_on(manager.delegate(req))
+        })
     }
     .map_err(ToolError::Execution)?;
 

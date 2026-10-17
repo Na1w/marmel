@@ -15,6 +15,13 @@
 //! validator that never called `leave_verdict` gets `approved = false` with a
 //! "no verdict recorded" reason, the deliverable fails and its plan line stays
 //! unchecked.
+//!
+//! Concurrency metering (design §4): every LLM turn this driver issues is re-metered
+//! as [`pool::CallClass::Validator`] by [`fix_loop_call_context`], against the pool
+//! of the **auditor's** resolved `(backend_url, model)` pair. Nothing here acquires
+//! or releases a slot — the single chokepoint is
+//! [`crate::llm::ChatClient::chat_stream`] — and no slot is ever held across the
+//! tool round, a compaction pass, or a notice drain.
 
 use crate::agents::Agent;
 use crate::agents::runner::execution::may_record_verdict;
@@ -28,6 +35,7 @@ use crate::manager::ContextEngine;
 use crate::manager::context::CompactionOutcome;
 use crate::manager::r#loop::{DeadlineKind, TURN_WATCHDOG_SECS, TurnWatchdog};
 use crate::orchestrator::SpecialistRegistry;
+use crate::orchestrator::pool;
 use crate::orchestrator::{
     ActiveWorkerGuard, PreemptibleStreamSink, emit_status, is_current_or_global_cancelled,
     register_active_worker_with_token, update_active_worker_context,
@@ -789,6 +797,42 @@ pub fn inject_worker_notices_mid_turn(engine: &mut ContextEngine, worker_key: &s
     injected
 }
 
+/// How one fix-loop LLM turn is metered against the process-global concurrency
+/// pool, and who a queued turn is attributed to.
+///
+/// **Class.** Every LLM call this driver issues is an *auditor* call — the
+/// deliverable validator pass, the plan audit, or a revision pass — never the
+/// audited specialist's own turn (that path is [`stream_single_turn`], which
+/// keeps the `Specialist` class the runner installed). So the turn is re-metered
+/// as [`pool::CallClass::Validator`] at the one place every fix-loop request is
+/// issued, instead of inheriting whatever class the enclosing delegation happened
+/// to install. Left inherited, a validator pass that queued behind a saturated
+/// cap would be blamed on the specialist it audits (design §2 "still pending",
+/// §4) — and the reserve/cap decision the client takes from the class would be
+/// derived from the wrong role.
+///
+/// **Identity.** It comes from *this run*, not from the parent context:
+/// [`LoopParams::worker_name`] is exactly the label the active-worker registry
+/// uses for the pass (`validator-coder`, `validator-planner`) and
+/// [`LoopParams::task_id`] is the audited plan task. A queued auditor call is
+/// therefore attributable to the auditor run that is waiting and to the task it
+/// belongs to, which is the pair the Subagents panel keys its rows on.
+///
+/// **Scope.** The scope covers the turn and nothing else — not the tool round,
+/// not compaction, not a notice drain, not a sleep. The permit itself is taken
+/// and released inside [`crate::llm::ChatClient::chat_stream`] per call
+/// (design §1.3/§4: nothing is acquired here), so no slot can be held across
+/// non-LLM work; scoping the context the same narrow way keeps queue attribution
+/// honest about *which* call is waiting and leaves no `Validator` context behind
+/// for calls the run's caller makes afterwards.
+pub fn fix_loop_call_context(p: &LoopParams<'_>) -> pool::CallContext {
+    pool::CallContext::for_agent(
+        pool::CallClass::Validator,
+        p.worker_name.clone(),
+        p.task_id.clone(),
+    )
+}
+
 /// The shared fix-loop driver: cancel check → worker context update → status
 /// emit → turn-start notice drain → streaming LLM turn → abort/steer handling →
 /// XML rescue → assistant folding → verdict detection → nudge-on-silence → tool
@@ -879,15 +923,24 @@ pub async fn run_fix_loop(
             Some(p.token.clone()),
             &p.model,
         );
-        let stream_out = llm::chat_stream_resumable(
-            p.client,
-            &req,
-            &mut sink,
-            max_tokens,
-            max_thinking_tokens,
-            &mut rep_detector,
-            false,
-            Some(p.token),
+        // Concurrency metering (design §4): this turn is an auditor call, so it
+        // carries the `Validator` call context — the class the pool gate inside
+        // `ChatClient::chat_stream` reads to decide cap-vs-reserve and to
+        // attribute the queue traffic. Nothing is acquired or released here: the
+        // client owns the single `(backend_url, model)` permit for the duration
+        // of this call, including every retry attempt of it.
+        let stream_out = pool::with_call_context(
+            fix_loop_call_context(p),
+            llm::chat_stream_resumable(
+                p.client,
+                &req,
+                &mut sink,
+                max_tokens,
+                max_thinking_tokens,
+                &mut rep_detector,
+                false,
+                Some(p.token),
+            ),
         )
         .await;
 
@@ -1205,6 +1258,13 @@ pub fn fix_loop_compaction_notice(tag: &str, outcome: &CompactionOutcome) -> Opt
 /// execution loop, which keeps its own tool-dispatch/revision state machine
 /// but shares the streaming plumbing with the validator loops.
 ///
+/// Metering: this path deliberately does **not** re-meter the call. It is the
+/// audited specialist's own turn, so it keeps the `CallClass::Specialist` context
+/// the runner installed (`runner/mod.rs`, `runner/execution.rs`). The auditor
+/// classes belong to [`run_fix_loop`] / [`fix_loop_call_context`]; adding a
+/// validator class here would meter a specialist turn as a validator pass and
+/// blame a queued specialist call on the wrong role.
+///
 /// Returns `Err` on hard errors; `Ok(None)` on abort/cancellation.
 #[allow(clippy::too_many_arguments)]
 pub async fn stream_single_turn(
@@ -1502,7 +1562,8 @@ mod tests {
 
     use super::{
         FIX_LOOP_HARD_CAP_SECS, FIX_LOOP_IDLE_LIMIT_SECS, FixLoopBounds, FixLoopResult, LoopParams,
-        MAX_FIX_LOOP_ROUNDS, VERDICT_REMINDERS, register_loop_worker, run_fix_loop,
+        MAX_FIX_LOOP_ROUNDS, VERDICT_REMINDERS, fix_loop_call_context, register_loop_worker,
+        run_fix_loop,
     };
     use crate::agents::Agent;
     use crate::agents::validation::NO_EXPLICIT_APPROVAL_REASON;
@@ -2393,5 +2454,79 @@ mod tests {
             );
         })
         .await;
+    }
+
+    // ── Concurrency metering: every fix-loop turn is a `Validator` call ──
+
+    /// The metering hook the driver installs around each turn (concurrency
+    /// design §2 "still pending", §4). Two things are pinned here, and both are
+    /// easy to break silently:
+    ///
+    /// * **Class** — `Validator`, i.e. capped against the backend semaphore and
+    ///   never allowed into the internal reserve. A validator pass must queue
+    ///   behind a saturated cap; if the class were inherited (`Specialist`) or
+    ///   set to a reserve class, the pool would meter the wrong role and the
+    ///   reserve could be drained by audit traffic.
+    /// * **Identity** — this run's own worker label and the audited task id, so
+    ///   a queued auditor call is attributed to the auditor run and to the plan
+    ///   line it belongs to.
+    #[test]
+    fn the_fix_loop_call_context_is_a_validator_call_with_the_runs_identity() {
+        use crate::orchestrator::pool;
+
+        let cfg = Config::default();
+        let mon_cfg = MonitoringConfig::default();
+        let client =
+            crate::llm::ChatClient::new_with_token("http://127.0.0.1:1/v1", "test-model", "tok");
+        let token = CancellationToken::new();
+        let mut engine = ContextEngineFactory::new(64_000)
+            .specialist_context("validator role prompt".to_string(), "brief".to_string());
+        let params = LoopParams {
+            client: &client,
+            model: "test-model".to_string(),
+            tag: "validator-coder-t-902".to_string(),
+            worker_name: "validator-coder".to_string(),
+            task_id: Some("t-902".to_string()),
+            worker_key: "validator-coder-t-902".to_string(),
+            engine: &mut engine,
+            tools: Vec::new(),
+            token: &token,
+            mon_cfg: &mon_cfg,
+            cfg: &cfg,
+            temperature: 0.0,
+            status_template: "validator-coder-t-902: auditing the deliverable...".to_string(),
+            verdict_log_role: "coder".to_string(),
+            bounds: FixLoopBounds::new(MAX_FIX_LOOP_ROUNDS),
+            abort_log_prefix: "validator-coder-t-902".to_string(),
+            emit_tool_status: false,
+            rebirth_notice: format!("({TOOL_REBIRTH} checkpoint accepted)"),
+            reasoning_effort: None,
+        };
+
+        let ctx = fix_loop_call_context(&params);
+        assert_eq!(ctx.class, pool::CallClass::Validator);
+        assert!(
+            ctx.class.is_capped(),
+            "a validator pass must draw from the per-key cap, never bypass it"
+        );
+        assert!(
+            !ctx.class.uses_reserve(),
+            "a validator pass must queue behind a saturated cap, not take the internal reserve"
+        );
+        assert_eq!(ctx.agent.as_deref(), Some("validator-coder"));
+        assert_eq!(ctx.task.as_deref(), Some("t-902"));
+        assert_eq!(ctx.describe(), "validator validator-coder [t-902]");
+
+        // A plan audit has an audited *plan*, not one plan task of its own; the
+        // caller passes whatever task id it carries, and the identity degrades to
+        // the class label alone rather than inventing one.
+        let no_task = LoopParams {
+            task_id: None,
+            worker_name: "validator-planner".to_string(),
+            ..params
+        };
+        let ctx = fix_loop_call_context(&no_task);
+        assert_eq!(ctx.class, pool::CallClass::Validator);
+        assert_eq!(ctx.describe(), "validator validator-planner");
     }
 }

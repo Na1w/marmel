@@ -1,7 +1,7 @@
 //! Ratatui frame drawing and panel rendering for TuiRenderer.
 
 use super::formatting::*;
-use super::{FocusedPanel, TuiRenderer};
+use super::{ACTIVITY_STATUS_KEYWORDS, FocusedPanel, TuiRenderer};
 use anyhow::Result;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -691,7 +691,20 @@ impl TuiRenderer {
             } else {
                 String::new()
             };
-            let status = if sa.is_active {
+            // Slot state changes the label only. A queued delegation keeps the
+            // green/bold name, the live clock, the live ctx lookup and its place
+            // in the "[N active: …]" status line, because it really is part of
+            // the running round — it is simply waiting behind the cap. The
+            // `(Queued n/m)` half is a stable shape built from the pool's FIFO
+            // ticket, so a position change swaps digits and nothing else here.
+            let queued = sa.queue.filter(|_| sa.is_active);
+            let status = if let Some(q) = queued {
+                let (position, of) = (q.position, q.of);
+                Span::styled(
+                    format!(" (Queued {position}/{of}{ctx_info}{elapsed_str})"),
+                    Style::default().fg(Color::LightYellow),
+                )
+            } else if sa.is_active {
                 Span::styled(
                     format!(" (Active{ctx_info}{elapsed_str})"),
                     Style::default().fg(Color::LightGreen),
@@ -876,7 +889,21 @@ impl TuiRenderer {
                 None => sa.thinking.as_str(),
             };
 
-            let (bar_text, bar_style) = if is_thinking {
+            let (bar_text, bar_style) = if let Some(q) = sa.queue.filter(|_| sa.is_active) {
+                // The queue position wins over the thinking bar for one reason:
+                // a row can only stream thinking while it holds its slot, so the
+                // moment this arm fires the previous turn's thinking state is
+                // already stale, and the useful fact is how long the row is still
+                // waiting and how many are ahead of it. The spinner keeps turning
+                // because `is_active` stays true through a slot wait.
+                let (position, of) = (q.position, q.of);
+                (
+                    format!(
+                        " [Status: Queued {position}/{of} - waiting for a backend slot...] {spinner}"
+                    ),
+                    Style::default().bg(Color::DarkGray).fg(Color::LightYellow),
+                )
+            } else if is_thinking {
                 let budget = self.get_thinking_budget(sa);
                 let chars = active_think.len();
                 let tok_count = chars.div_ceil(4);
@@ -986,18 +1013,12 @@ impl TuiRenderer {
         }
         // Animated activity indicator. When the status line indicates an
         // active phase, append a cycling suffix derived from `session_start`.
-        let active_phase = [
-            "Running",
-            "Delegating",
-            "calling backend",
-            "calling model",
-            "Starting",
-            "streaming",
-            "thinking",
-            "Arbitrating",
-        ]
-        .iter()
-        .any(|k| status_str.contains(k));
+        // The keyword set is shared with the render-loop throttle tier so the
+        // two can never disagree about what counts as activity — including a
+        // round where every session is waiting for a backend slot.
+        let active_phase = ACTIVITY_STATUS_KEYWORDS
+            .iter()
+            .any(|k| status_str.contains(k));
         if let Some(start) = self.waiting_for_token_since {
             let elapsed = start.elapsed().as_secs_f32();
             status_str.push_str(&format!(" ({:.1}s)", elapsed));

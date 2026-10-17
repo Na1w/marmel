@@ -256,6 +256,16 @@ async fn run_automated_validation_inner(
         }
     };
 
+    // Validator backend resolution (specialist override → `[specialists.validator]`
+    // → global config). The resolved pair is also **the pool key this pass is
+    // metered against**: `ChatClient::chat_stream` gates on `(backend_url, model)`,
+    // so by default — when no validator override exists and the chain falls through
+    // to `cfg.backend_url` / `cfg.model` — the pass draws from the *same* semaphore
+    // as the specialist turns it audits, and validator passes count against the
+    // same `max_sessions` cap (design §4). A `validator_backend_url` /
+    // `[specialists.validator] backend_url` or a `validator_model` /
+    // `[specialists.validator] model` override resolves elsewhere, which is
+    // correct: a different model server has its own slots, so it gets its own pool.
     let (backend, auth, validator_model, validator_reasoning_effort) =
         resolve_validator_backend(cfg, agent);
     let val_client = crate::llm::ChatClient::new_with_token(&backend, &validator_model, &auth);
@@ -393,6 +403,12 @@ async fn run_automated_validation_inner(
         reasoning_effort: validator_reasoning_effort,
     };
 
+    // Every turn of this pass is issued through `run_fix_loop`, which installs the
+    // `CallClass::Validator` call context around the turn (see
+    // `fix_loop::fix_loop_call_context`): the pool gate in `ChatClient::chat_stream`
+    // meters it against the cap for the validator pair resolved above and
+    // attributes a queued pass to `validator-{agent}` + this task, not to the
+    // audited specialist's own turn.
     match crate::session::worker_journal::with_journal_async(
         &journal,
         run_fix_loop(&mut params, &mut monitor, caller),
@@ -449,6 +465,11 @@ async fn run_plan_validation_inner(
 
     let validator_prompt = crate::agents::validator::VALIDATOR_PLANNER_ROLE_PROMPT;
 
+    // Plan-audit backend resolution, same chain and same pool consequence as the
+    // deliverable validator: the plan auditor is metered against **its own**
+    // resolved `backend + model` pair, which is the global pair (and therefore the
+    // global cap) unless a `[specialists.planner] validator_*` or
+    // `[specialists.validator]` override points it at another endpoint/model.
     let (backend, auth, validator_model, validator_reasoning_effort) =
         resolve_validator_backend(cfg, Agent::Planner);
     let val_client = crate::llm::ChatClient::new_with_token(&backend, &validator_model, &auth);
@@ -545,6 +566,10 @@ async fn run_plan_validation_inner(
         reasoning_effort: validator_reasoning_effort,
     };
 
+    // Same metering as the deliverable pass: the plan auditor's turns are issued
+    // through `run_fix_loop` under `CallClass::Validator`, attributed to the
+    // `validator-planner` run (no plan task id), and metered against the cap of
+    // the auditor's own resolved pair — the global pair unless overridden.
     match crate::session::worker_journal::with_journal_async(
         &journal,
         run_fix_loop(

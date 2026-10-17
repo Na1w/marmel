@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use crate::harness::HarnessStats;
 use crate::llm::ChatClient;
+use crate::orchestrator::pool;
 use crate::types::{ChatRequest, Message};
 
 static NEXT_NOTICE_ID: AtomicU64 = AtomicU64::new(1);
@@ -1125,6 +1126,25 @@ pub(crate) fn worker_reply_user_status_example() -> &'static str {
     &WORKER_REPLY_SYSTEM_PROMPT[start..start + end]
 }
 
+/// The concurrency-metering identity of a worker-reply evaluation.
+///
+/// [`pool::CallClass::NoticeEval`] is the second internal fast call (design §5):
+/// `ChatClient::chat_stream` draws it from the per-key **reserve** — never behind
+/// specialist work — and runs it un-metered with a warning if the reserve is
+/// still busy past [`pool::INTERNAL_QUEUE_WAIT_SECS`] (invariant I7). The call is
+/// issued from inside a specialist's own tool round, so leaving it on the
+/// inherited `Specialist` class would make it queue behind the very cap the
+/// worker's own session saturates.
+///
+/// Identity stays with the worker whose reply is being evaluated — the caller's
+/// task id when a call context is already in force — so a reserve or fail-open
+/// line in the log says which specialist the evaluation belongs to, while the
+/// class says who is paying for the slot.
+fn notice_eval_call_context(worker_tag: &str) -> pool::CallContext {
+    let task = pool::current_call_context().and_then(|context| context.task);
+    pool::CallContext::for_agent(pool::CallClass::NoticeEval, worker_tag, task)
+}
+
 /// Evaluate a specialist worker's reply through the Steer Arbitrator model:
 /// either synthesize a factual direct answer for the user, or formulate an internal
 /// follow-up question for the worker before presenting anything to the user.
@@ -1165,12 +1185,22 @@ where
     };
 
     let mut full_accum = String::new();
+    // Concurrency metering (design §5): the arbitrator's evaluation of a worker
+    // reply is an internal fast call, so it is metered as `NoticeEval` — the
+    // reserve class `ChatClient::chat_stream` never queues behind specialist
+    // work, and which runs un-metered with a warning if the reserve stays busy
+    // past [`pool::INTERNAL_QUEUE_WAIT_SECS`]. This call is issued from inside a
+    // specialist's own tool round (`reply_to_arbitrator`), so inheriting the
+    // `Specialist` class here would self-deadlock once the cap is reached.
     let reply_res = tokio::time::timeout(
         std::time::Duration::from_secs(60),
-        client.chat_stream(&req, |chunk| {
-            full_accum.push_str(chunk);
-            true
-        }),
+        pool::with_call_context(
+            notice_eval_call_context(worker_tag),
+            client.chat_stream(&req, |chunk| {
+                full_accum.push_str(chunk);
+                true
+            }),
+        ),
     )
     .await;
 

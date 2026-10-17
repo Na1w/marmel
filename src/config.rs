@@ -67,6 +67,9 @@ pub struct OrchestrationConfig {
     pub specialists: BTreeMap<String, SpecialistConfig>,
     /// MCP servers whose tools the orchestrator is allowed to see.
     pub mcp_servers: Vec<String>,
+    /// Simultaneous-session caps (`[orchestration.concurrency]`). Unset ⇒
+    /// **unlimited**, i.e. exactly today's behaviour.
+    pub concurrency: ConcurrencyConfig,
 }
 
 impl OrchestrationConfig {
@@ -75,6 +78,101 @@ impl OrchestrationConfig {
             max_recursion_depth: DEFAULT_MAX_RECURSION_DEPTH,
             ..Self::default()
         }
+    }
+}
+
+/// Concurrency limits parsed from `[orchestration.concurrency]`.
+///
+/// `max_sessions` caps how many LLM sessions may be in flight at once for one
+/// `(backend_url, model)` pair. `None` (the default) means **unlimited**: nothing
+/// is metered and behaviour is exactly what it is today. `by_backend` holds
+/// per-URL overrides keyed by `backend_url`, and both live in the same TOML
+/// table:
+///
+/// ```toml
+/// [orchestration.concurrency]
+/// max_sessions = 4                            # default cap for every pair
+/// "http://192.168.50.162:8080/v1" = 2         # per-backend override
+/// ```
+///
+/// Because the overrides share the table with `max_sessions`, they are collected
+/// through `#[serde(flatten)]` — a plain named `backends` field would silently
+/// drop them (verified: `backends: {}` while the table clearly contains them).
+/// Three consequences of `flatten` are pinned by tests below:
+///
+/// - a URL key **must be quoted**; a bare `http://host/v1 = 2` is a TOML syntax
+///   error, never a dropped key;
+/// - any value that is not an integer is a parse error, not a silent default;
+/// - a **typo'd** key (`max_session = 4`) is not ignored — it becomes an inert
+///   extra map entry that can never match a backend.
+///   [`ConcurrencyConfig::suspect_backend_keys`] is the warn-only guard for that
+///   last case.
+///
+/// Keys are never compared verbatim: both sides of the lookup go through
+/// [`backend_key`], so trailing slashes and stray whitespace are ignored.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConcurrencyConfig {
+    /// Per-backend caps keyed by `backend_url`, flattened into the same table as
+    /// `max_sessions` — hence the quoted URL keys. Matched through
+    /// [`backend_key`], never by raw string equality.
+    #[serde(flatten)]
+    pub by_backend: HashMap<String, usize>,
+    /// Default cap for every backend/model pair. `None` ⇒ unlimited.
+    ///
+    /// A value below [`MIN_MAX_SESSIONS`] (i.e. `0`) is never applied: it would
+    /// deadlock a `Semaphore::new(0)`. It fails **open** to unlimited with an
+    /// attributable warning — see [`resolve_session_cap`]. It is deliberately
+    /// *not* clamped up to `1`, which would silently serialize everything.
+    pub max_sessions: Option<usize>,
+}
+
+impl ConcurrencyConfig {
+    /// `true` when nothing is configured at all: no default cap and no
+    /// per-URL override, i.e. today's unlimited behaviour.
+    pub fn is_unlimited(&self) -> bool {
+        self.max_sessions.is_none() && self.by_backend.is_empty()
+    }
+
+    /// The override table re-keyed through [`backend_key`], which is what makes
+    /// a config key and a runtime `backend_url` reduce to the same string.
+    ///
+    /// Deterministic even when two spellings collapse onto one key
+    /// (`http://host/v1` and `http://host/v1/`): raw keys are visited in sorted
+    /// order and the first one wins.
+    pub fn normalized_backends(&self) -> BTreeMap<String, usize> {
+        let mut entries: Vec<(String, usize)> = self
+            .by_backend
+            .iter()
+            .map(|(key, value)| (key.clone(), *value))
+            .collect();
+        entries.sort();
+        let mut normalized = BTreeMap::new();
+        for (key, value) in entries {
+            normalized.entry(backend_key(&key)).or_insert(value);
+        }
+        normalized
+    }
+
+    /// Override keys that do not look like backend URLs.
+    ///
+    /// `#[serde(flatten)]` cannot tell `max_session = 4` (a typo of
+    /// `max_sessions`) from a per-URL override, so the typo lands here instead of
+    /// being ignored. Such an entry is inert — it can never match a backend — so
+    /// this is reported as a warning, never as a parse failure. Sorted for a
+    /// stable diagnostic.
+    pub fn suspect_backend_keys(&self) -> Vec<String> {
+        let mut suspects: Vec<String> = self
+            .by_backend
+            .keys()
+            .filter(|key| {
+                let key = key.trim();
+                !(key.starts_with("http://") || key.starts_with("https://"))
+            })
+            .cloned()
+            .collect();
+        suspects.sort();
+        suspects
     }
 }
 
@@ -337,6 +435,140 @@ pub fn effective_command_timeout_secs(requested: Option<u64>) -> u64 {
     }
 }
 
+/// Config key that carries the default simultaneous-session cap, used verbatim
+/// in the attributable warning that [`resolve_session_cap`] logs.
+pub const MAX_SESSIONS_KEY: &str = "orchestration.concurrency.max_sessions";
+
+/// Config table that holds the concurrency keys, used verbatim in the
+/// attributable labels that [`resolve_session_cap`] and
+/// [`ConcurrencyConfig::suspect_backend_keys`] diagnostics produce.
+pub const CONCURRENCY_TABLE: &str = "orchestration.concurrency";
+
+/// Inclusive lower bound of a usable session cap.
+///
+/// A configured cap below this bound is never applied: `Semaphore::new(0)` can
+/// never be acquired, so a `0` would wedge every session against that backend.
+/// The fail-open rule (unlimited, plus a warning) is in [`resolve_session_cap`];
+/// it is deliberately not a clamp to `1`, which would silently serialize a
+/// multi-backend configuration the user asked to run in parallel.
+pub const MIN_MAX_SESSIONS: usize = 1;
+
+/// Normalize a backend URL into the key used on **both** sides of a concurrency
+/// lookup: a `[orchestration.concurrency]` override key and a runtime
+/// `backend_url` must reduce to the same string, or the override silently misses.
+///
+/// Same rule the wire path already applies (`ChatClient` trims trailing slashes
+/// before appending `/chat/completions`), so `http://host/v1/` and
+/// `http://host/v1` are one backend here exactly as they are one backend on the
+/// wire. Runtime callers (the semaphore pool and the client that acquires from
+/// it) must key off this helper rather than off a raw URL.
+pub fn backend_key(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_string()
+}
+
+/// What `[orchestration.concurrency]` resolves to for one backend URL.
+///
+/// Carries the attribution alongside the number so no consumer has to
+/// reconstruct which key produced the cap — the pool's queue-timeout error names
+/// the cap and the key it belongs to, and this is where both come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCap {
+    /// Cap to apply. `None` ⇒ **unlimited**: nothing is metered, today's
+    /// behaviour.
+    pub limit: Option<usize>,
+    /// Key the value came from (`orchestration.concurrency.max_sessions`, or
+    /// `orchestration.concurrency."http://host:8080/v1"` for an override).
+    /// `None` when no key matched.
+    pub source: Option<String>,
+    /// Set when a configured value was **rejected**: what was configured, under
+    /// which key, and what is applied instead. Reported by
+    /// [`resolve_max_sessions`]; the pure seam only returns it.
+    pub rejected: Option<String>,
+}
+
+/// Pure precedence + validation seam behind the concurrency cap:
+/// per-URL override → `max_sessions` → unlimited.
+///
+/// Both sides of the override lookup go through [`backend_key`], so a config key
+/// written `http://host:8080/v1/` (or with stray spaces) still matches a runtime
+/// `http://host:8080/v1`. A cap below [`MIN_MAX_SESSIONS`] is reported in
+/// `SessionCap::rejected` and dropped: the resolved limit is `None` (unlimited),
+/// never `Some(0)` and never clamped to `Some(1)`. This function performs no
+/// logging and touches no global state, so the precedence, the normalization and
+/// the zero rule are all assertable without a process-global config.
+pub fn resolve_session_cap(concurrency: &ConcurrencyConfig, backend_url: &str) -> SessionCap {
+    let key = backend_key(backend_url);
+    let (raw, source) = match concurrency.normalized_backends().get(&key) {
+        Some(value) => (Some(*value), Some(format!("{CONCURRENCY_TABLE}.{key:?}"))),
+        None => match concurrency.max_sessions {
+            Some(value) => (Some(value), Some(MAX_SESSIONS_KEY.to_string())),
+            None => (None, None),
+        },
+    };
+
+    match raw {
+        Some(value) if value < MIN_MAX_SESSIONS => SessionCap {
+            limit: None,
+            source: source.clone(),
+            rejected: Some(format!(
+                "{} = {value} is below the minimum usable cap of {MIN_MAX_SESSIONS}",
+                source.unwrap_or_else(|| MAX_SESSIONS_KEY.to_string()),
+            )),
+        },
+        value => SessionCap {
+            limit: value,
+            source,
+            rejected: None,
+        },
+    }
+}
+
+/// The cap applied to the pair keyed by `backend_url`, from a caller-supplied
+/// table: per-URL override, else `max_sessions`, else unlimited.
+///
+/// A rejected value ([`MIN_MAX_SESSIONS`] violation) is logged — naming the key,
+/// the offending value and what is applied instead — and resolves to unlimited.
+pub fn resolve_max_sessions(concurrency: &ConcurrencyConfig, backend_url: &str) -> Option<usize> {
+    let cap = resolve_session_cap(concurrency, backend_url);
+    if let Some(rejected) = cap.rejected.as_deref() {
+        tracing::warn!(
+            key = cap.source.as_deref().unwrap_or(MAX_SESSIONS_KEY),
+            backend = %backend_url,
+            valid_range = format!("{MIN_MAX_SESSIONS}..="),
+            "configured concurrency cap is unusable; failing open to unlimited: {rejected}"
+        );
+    }
+    cap.limit
+}
+
+/// The cap for the pair keyed by `backend_url` according to the globally active
+/// config; `None` when no config is active, or when nothing is configured —
+/// both mean **unlimited**, i.e. behaviour unchanged from before this key
+/// existed.
+pub fn effective_max_sessions(backend_url: &str) -> Option<usize> {
+    match get_active() {
+        Some(cfg) => resolve_max_sessions(&cfg.orchestration.concurrency, backend_url),
+        None => None,
+    }
+}
+
+/// Warn (never fail) about `[orchestration.concurrency]` override keys that do
+/// not look like backend URLs.
+///
+/// `#[serde(flatten)]` cannot distinguish a typo such as `max_session = 4` from a
+/// per-URL override, so the typo becomes an inert map entry that silently does
+/// nothing. The table is only ever read from one file, so this runs once per
+/// load.
+fn warn_suspect_backend_keys(concurrency: &ConcurrencyConfig) {
+    for key in concurrency.suspect_backend_keys() {
+        tracing::warn!(
+            key = %format!("{CONCURRENCY_TABLE}.{key:?}"),
+            "not a backend URL: a typo in this table becomes an override key that can \
+             never match a backend, so it does nothing"
+        );
+    }
+}
+
 /// `true` when the active config disables the Landlock sandbox
 /// ([`Config::sandbox_disabled`]). Default `false` (sandbox on, fail-closed).
 pub fn sandbox_disabled() -> bool {
@@ -379,6 +611,7 @@ pub fn load(explicit_path: Option<&str>) -> Result<Config> {
         let file = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         cfg = merge(cfg, toml::from_str::<PartialConfig>(&file)?);
+        warn_suspect_backend_keys(&cfg.orchestration.concurrency);
     }
 
     if cfg.auth_token.is_empty()
@@ -555,6 +788,25 @@ struct PartialOrchestrationConfig {
     pub mcp_servers: Vec<String>,
     #[serde(default)]
     pub specialists: HashMap<String, SpecialistConfig>,
+    /// `Option` (not a plain mirror) so "block absent" stays distinguishable
+    /// from "block present but empty"; both mean unlimited, and the
+    /// `monitoring: Option<PartialMonitoringConfig>` precedent is why.
+    pub concurrency: Option<PartialConcurrencyConfig>,
+}
+
+/// Mandatory mirror of [`ConcurrencyConfig`] (see the "four places" rule: a key
+/// missing from the mirror or from `merge` is dropped **silently** by `toml`).
+///
+/// The `flatten` is load-bearing: without it the quoted URL keys sitting beside
+/// `max_sessions` in `[orchestration.concurrency]` are the verified silent-drop
+/// case. Keys are kept exactly as written here and normalized only at read time
+/// through [`backend_key`] — `MARMEL_BACKEND_URL` can change the runtime URL
+/// after this merge, and merge is a pure field applier.
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PartialConcurrencyConfig {
+    #[serde(flatten)]
+    pub by_backend: HashMap<String, usize>,
+    pub max_sessions: Option<usize>,
 }
 
 fn merge(mut base: Config, partial: PartialConfig) -> Config {
@@ -676,6 +928,19 @@ fn merge(mut base: Config, partial: PartialConfig) -> Config {
         }
         if !p_orch.mcp_servers.is_empty() {
             base.orchestration.mcp_servers = p_orch.mcp_servers;
+        }
+        if let Some(p_con) = p_orch.concurrency {
+            if let Some(m) = p_con.max_sessions {
+                base.orchestration.concurrency.max_sessions = Some(m);
+            }
+            // Map merge follows `specialists` (extend), not `mcp_servers`
+            // (replace): only one file is ever read, so this is default-vs-file.
+            if !p_con.by_backend.is_empty() {
+                base.orchestration
+                    .concurrency
+                    .by_backend
+                    .extend(p_con.by_backend);
+            }
         }
     }
 
@@ -802,6 +1067,11 @@ mod tests {
         );
         assert!(cfg.orchestration.manager_module.is_empty());
         assert!(cfg.orchestration.specialists.is_empty());
+        // Concurrency defaults to no cap at all: `None`, not `Some(0)` and not
+        // `Some(1)` — unset must mean today's unlimited behaviour.
+        assert_eq!(cfg.orchestration.concurrency.max_sessions, None);
+        assert!(cfg.orchestration.concurrency.by_backend.is_empty());
+        assert!(cfg.orchestration.concurrency.is_unlimited());
     }
 
     #[test]
@@ -847,6 +1117,435 @@ mod tests {
             DEFAULT_MAX_RECURSION_DEPTH
         );
         assert!(cfg.orchestration.specialists.is_empty());
+        assert!(
+            cfg.orchestration.concurrency.is_unlimited(),
+            "an absent `[orchestration.concurrency]` must change nothing"
+        );
+    }
+
+    // ------------------------------------------------- [orchestration.concurrency]
+    //
+    // The shape is the one `feature.md` specifies: `max_sessions` plus quoted URL
+    // keys **in the same table**. That is only reachable through
+    // `#[serde(flatten)]` (a plain named map field silently drops the URL keys —
+    // verified in docs/research_concurrency_config_delta.md §2), so these tests
+    // are the regression guard for both the parse and the resolution rules.
+
+    /// `[orchestration.concurrency]` present but empty is a valid no-op: no
+    /// default cap, no overrides, unlimited.
+    #[test]
+    fn concurrency_block_present_but_empty_is_a_no_op() {
+        let cfg = merged("[orchestration]\n[orchestration.concurrency]\n");
+        assert_eq!(cfg.orchestration.concurrency.max_sessions, None);
+        assert!(cfg.orchestration.concurrency.by_backend.is_empty());
+        assert!(cfg.orchestration.concurrency.is_unlimited());
+    }
+
+    #[test]
+    fn concurrency_max_sessions_parses_into_the_block() {
+        let cfg = merged("[orchestration.concurrency]\nmax_sessions = 4\n");
+        assert_eq!(cfg.orchestration.concurrency.max_sessions, Some(4));
+        assert!(
+            cfg.orchestration.concurrency.by_backend.is_empty(),
+            "`max_sessions` must not leak into the override table"
+        );
+        assert_eq!(
+            resolve_max_sessions(&cfg.orchestration.concurrency, "http://localhost:8000/v1"),
+            Some(4),
+            "the default cap applies to any backend when no override matches"
+        );
+    }
+
+    /// The verbatim `feature.md` block: `max_sessions` **and** quoted URL keys in
+    /// one table. A plain named map field would leave `by_backend` empty here,
+    /// which is why the URL keys are asserted one by one.
+    #[test]
+    fn concurrency_url_keys_parse_beside_max_sessions() {
+        let cfg = merged(
+            r#"
+[orchestration.concurrency]
+max_sessions = 4
+"http://192.168.50.162:8080/v1" = 2
+"https://us.example.com/v1" = 8
+"#,
+        );
+        let con = &cfg.orchestration.concurrency;
+        assert_eq!(con.max_sessions, Some(4));
+        assert_eq!(
+            con.by_backend.len(),
+            2,
+            "the URL keys must land in the override table, not be silently dropped"
+        );
+        assert_eq!(
+            con.by_backend.get("http://192.168.50.162:8080/v1"),
+            Some(&2)
+        );
+        assert_eq!(con.by_backend.get("https://us.example.com/v1"), Some(&8));
+        assert_eq!(
+            con.normalized_backends()
+                .get("http://192.168.50.162:8080/v1"),
+            Some(&2),
+            "a well-formed key survives normalization unchanged"
+        );
+    }
+
+    /// Precedence: the per-URL override wins for its own backend, every other
+    /// backend keeps `max_sessions`, and an unset table caps nothing.
+    #[test]
+    fn concurrency_override_wins_per_backend_and_the_default_covers_the_rest() {
+        let cfg = merged(
+            r#"
+[orchestration.concurrency]
+max_sessions = 4
+"http://192.168.50.162:8080/v1" = 2
+"#,
+        );
+        let con = &cfg.orchestration.concurrency;
+        assert_eq!(
+            resolve_max_sessions(con, "http://192.168.50.162:8080/v1"),
+            Some(2),
+            "the per-URL override wins over the default cap"
+        );
+        assert_eq!(
+            resolve_max_sessions(con, "http://localhost:8000/v1"),
+            Some(4),
+            "an unmatched backend keeps the default cap"
+        );
+        assert_eq!(
+            resolve_max_sessions(&Config::default().orchestration.concurrency, "http://x/v1"),
+            None,
+            "unset means unlimited"
+        );
+    }
+
+    /// Both sides of the lookup go through `backend_key`, so a trailing slash or
+    /// stray whitespace on **either** side cannot make an override silently miss.
+    #[test]
+    fn backend_key_normalizes_both_the_config_key_and_the_runtime_url() {
+        assert_eq!(
+            backend_key("http://192.168.50.162:8080/v1/"),
+            "http://192.168.50.162:8080/v1"
+        );
+        assert_eq!(
+            backend_key("  http://192.168.50.162:8080/v1//  "),
+            "http://192.168.50.162:8080/v1"
+        );
+        assert_eq!(
+            backend_key("http://localhost:8000"),
+            "http://localhost:8000"
+        );
+        assert_eq!(backend_key(""), "");
+        assert_eq!(
+            backend_key("http://localhost:8000/v1?x=1/"),
+            "http://localhost:8000/v1?x=1",
+            "only the trailing slash is stripped; the path itself is opaque"
+        );
+
+        let slash_key = merged(
+            "[orchestration.concurrency]\n\"http://192.168.50.162:8080/v1/  \" = 2\nmax_sessions = 4\n",
+        );
+        assert_eq!(
+            resolve_max_sessions(
+                &slash_key.orchestration.concurrency,
+                "http://192.168.50.162:8080/v1"
+            ),
+            Some(2),
+            "a trailing slash on the config key must still match a clean runtime URL"
+        );
+
+        let clean_key =
+            merged("[orchestration.concurrency]\n\"http://192.168.50.162:8080/v1\" = 2\n");
+        assert_eq!(
+            resolve_max_sessions(
+                &clean_key.orchestration.concurrency,
+                " http://192.168.50.162:8080/v1/// "
+            ),
+            Some(2),
+            "a trailing slash on the runtime URL must still match a clean config key"
+        );
+    }
+
+    /// Two spellings of one backend collapse onto one key; the rule that decides
+    /// which value wins is pinned so the resolution can never depend on `HashMap`
+    /// iteration order.
+    #[test]
+    fn collapsing_url_keys_resolve_deterministically() {
+        let cfg = merged(
+            "[orchestration.concurrency]\n\"http://h/v1/\" = 9\n\"http://h/v1\" = 2\nmax_sessions = 5\n",
+        );
+        let con = &cfg.orchestration.concurrency;
+        assert_eq!(con.by_backend.len(), 2, "raw keys are kept as written");
+        assert_eq!(
+            con.normalized_backends(),
+            [("http://h/v1".to_string(), 2)].into_iter().collect(),
+            "sorted raw keys, first write wins"
+        );
+        assert_eq!(resolve_max_sessions(con, "http://h/v1"), Some(2));
+        assert_eq!(resolve_max_sessions(con, "http://h/v1/"), Some(2));
+    }
+
+    /// `max_sessions = 0` must fail **open** to unlimited with an attributable
+    /// warning — never clamp to 1, which would silently serialize everything.
+    #[test]
+    fn concurrency_zero_fails_open_to_unlimited_and_names_the_key() {
+        let cfg = merged("[orchestration.concurrency]\nmax_sessions = 0\n");
+        let con = &cfg.orchestration.concurrency;
+        // Parsing keeps the configured value verbatim; the read seam is where it
+        // is rejected (so the warning can name what the file actually said).
+        assert_eq!(con.max_sessions, Some(0));
+
+        let cap = resolve_session_cap(con, "http://localhost:8000/v1");
+        assert_eq!(
+            cap.limit, None,
+            "a 0 cap must resolve to unlimited, not to Some(1)"
+        );
+        assert_eq!(cap.source.as_deref(), Some(MAX_SESSIONS_KEY));
+        let rejected = cap
+            .rejected
+            .expect("a rejected cap must carry the attribution the warning logs");
+        assert!(
+            rejected.contains(MAX_SESSIONS_KEY),
+            "the rejection must name the offending key, got {rejected:?}"
+        );
+        assert!(
+            rejected.contains("= 0") && rejected.contains(&MIN_MAX_SESSIONS.to_string()),
+            "the rejection must name the configured value and the bound it broke, got {rejected:?}"
+        );
+        assert_eq!(resolve_max_sessions(con, "http://localhost:8000/v1"), None);
+    }
+
+    /// A zero override is an explicit statement about that one backend: it fails
+    /// open for **that** backend only, and does not fall back to `max_sessions`
+    /// (an override that matched is never second-guessed by the looser default).
+    #[test]
+    fn concurrency_zero_override_uncaps_only_the_backend_it_names() {
+        let cfg = merged(
+            "[orchestration.concurrency]\nmax_sessions = 4\n\"http://192.168.50.162:8080/v1\" = 0\n",
+        );
+        let con = &cfg.orchestration.concurrency;
+        let cap = resolve_session_cap(con, "http://192.168.50.162:8080/v1/");
+        assert_eq!(cap.limit, None);
+        assert_eq!(
+            cap.source.as_deref(),
+            Some("orchestration.concurrency.\"http://192.168.50.162:8080/v1\""),
+            "attribution points at the override, not at `max_sessions`"
+        );
+        assert!(
+            cap.rejected
+                .as_deref()
+                .is_some_and(|r| r.contains("http://192.168.50.162:8080/v1")),
+            "the rejection must name the URL key that was set to 0"
+        );
+        assert_eq!(
+            resolve_max_sessions(con, "http://localhost:8000/v1"),
+            Some(4),
+            "the other backends keep the default cap"
+        );
+    }
+
+    /// `effective_max_sessions` is the seam the pool/client will call: it follows
+    /// the active config, and reports unlimited when nothing is configured or no
+    /// config is active at all.
+    #[test]
+    fn effective_max_sessions_follows_the_active_config() {
+        {
+            let installed = merged(
+                "[orchestration.concurrency]\nmax_sessions = 3\n\"http://192.168.50.162:8080/v1\" = 1\n",
+            );
+            let _guard = ActiveConfigTestGuard::install(installed);
+            assert_eq!(effective_max_sessions("http://localhost:8000/v1"), Some(3));
+            assert_eq!(
+                effective_max_sessions("http://192.168.50.162:8080/v1/"),
+                Some(1),
+                "the accessor normalizes the runtime URL too"
+            );
+        }
+        {
+            let _guard = ActiveConfigTestGuard::install(Config::default());
+            assert_eq!(
+                effective_max_sessions("http://localhost:8000/v1"),
+                None,
+                "an active config with no concurrency block must stay unlimited"
+            );
+        }
+
+        // "No active config" is process-global state, so it is taken and restored
+        // under the same lock the config guards use.
+        let _serial = sandbox_env_test_lock();
+        let previous = get_active();
+        clear_active();
+        let observed = effective_max_sessions("http://localhost:8000/v1");
+        if let Some(cfg) = previous {
+            set_active(cfg);
+        }
+        assert_eq!(observed, None, "no active config must never impose a cap");
+    }
+
+    /// A typo in this table is not ignored — `flatten` turns it into an override
+    /// key. It can never match a backend, so it stays inert, but it is reported.
+    #[test]
+    fn concurrency_key_typo_becomes_an_inert_suspect_key() {
+        let cfg = merged("[orchestration.concurrency]\nmax_session = 4\n");
+        let con = &cfg.orchestration.concurrency;
+        assert_eq!(
+            con.max_sessions, None,
+            "a typo'd `max_sessions` is NOT the default cap"
+        );
+        assert_eq!(
+            con.by_backend.get("max_session"),
+            Some(&4),
+            "flatten lands the typo in the override table"
+        );
+        assert_eq!(
+            con.suspect_backend_keys(),
+            vec!["max_session".to_string()],
+            "the typo must be flagged as not-a-URL"
+        );
+        assert_eq!(
+            resolve_max_sessions(con, "http://localhost:8000/v1"),
+            None,
+            "an inert key must not impose a cap on any backend"
+        );
+    }
+
+    #[test]
+    fn suspect_backend_keys_flags_only_non_url_keys() {
+        let con = ConcurrencyConfig {
+            by_backend: [
+                ("http://a/v1".to_string(), 1),
+                ("https://b/v1/".to_string(), 2),
+                (" ws://c/v1 ".to_string(), 3),
+                ("max_sessions_typo".to_string(), 7),
+            ]
+            .into_iter()
+            .collect(),
+            max_sessions: Some(4),
+        };
+        assert_eq!(
+            con.suspect_backend_keys(),
+            vec![" ws://c/v1 ".to_string(), "max_sessions_typo".to_string()],
+            "sorted, and http(s) keys are never suspects"
+        );
+        assert!(
+            !con.is_unlimited(),
+            "a table with overrides is never the unlimited default"
+        );
+    }
+
+    /// Parity with `reasoning_effort_type_mismatch_is_a_toml_error_not_a_silent_default`:
+    /// the shapes that cannot mean anything must fail the parse, and the verified
+    /// TOML grammar of this table is pinned here.
+    #[test]
+    fn concurrency_malformed_keys_are_toml_errors_not_silent_defaults() {
+        for (label, toml_str) in [
+            (
+                "unquoted URL key",
+                "[orchestration.concurrency]\nhttp://host:8080/v1 = 2\n",
+            ),
+            (
+                "negative cap",
+                "[orchestration.concurrency]\nmax_sessions = -1\n",
+            ),
+            (
+                "string where an integer belongs",
+                "[orchestration.concurrency]\n\"http://a/v1\" = \"2\"\n",
+            ),
+            (
+                "nested sub-table instead of a URL key",
+                "[orchestration.concurrency.backends]\n\"http://a/v1\" = 2\n",
+            ),
+        ] {
+            assert!(
+                toml::from_str::<PartialConfig>(toml_str).is_err(),
+                "{label}: must be a TOML parse error, never a silently dropped key"
+            );
+        }
+
+        // The well-formed shape next to the failures above.
+        assert!(
+            toml::from_str::<PartialConfig>(
+                "[orchestration.concurrency]\nmax_sessions = 4\n\"http://a/v1\" = 2\n"
+            )
+            .is_ok(),
+            "the feature.md shape must parse"
+        );
+    }
+
+    /// The "four places" rule for this key, scraped from this file: a block that
+    /// is missing from the partial mirror or from `merge` is dropped **silently**
+    /// by `toml`. The `marmel.toml.example` leg is owned by the docs task.
+    #[test]
+    fn concurrency_exists_in_config_partial_and_merge() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/config.rs"))
+            .expect("src/config.rs must be readable");
+
+        let slice = |start: &str, end: &str| -> String {
+            let from = src
+                .find(start)
+                .unwrap_or_else(|| panic!("{start} must exist in src/config.rs"));
+            let rest = &src[from..];
+            let to = rest.find(end).unwrap_or(rest.len());
+            rest[..to].to_string()
+        };
+
+        let orchestration_struct = slice(
+            "pub struct OrchestrationConfig {",
+            "impl OrchestrationConfig {",
+        );
+        let concurrency_struct =
+            slice("pub struct ConcurrencyConfig {", "impl ConcurrencyConfig {");
+        let partial_orchestration = slice(
+            "struct PartialOrchestrationConfig {",
+            "struct PartialConcurrencyConfig {",
+        );
+        let partial_concurrency = slice(
+            "struct PartialConcurrencyConfig {",
+            "fn merge(mut base: Config",
+        );
+        let merge_body = slice("fn merge(mut base: Config", "impl Config {");
+        let load_body = slice(
+            "pub fn load(explicit_path: Option<&str>)",
+            "/// Tri-state reading",
+        );
+        // Receiver chains get split across lines by rustfmt, so the wiring
+        // assertions compare whitespace-insensitively.
+        let tight = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+        let merge_wiring = tight(&merge_body);
+
+        assert!(
+            orchestration_struct.contains("pub concurrency: ConcurrencyConfig"),
+            "OrchestrationConfig must declare the concurrency block"
+        );
+        assert!(
+            concurrency_struct.contains("pub max_sessions: Option<usize>")
+                && concurrency_struct.contains("#[serde(flatten)]")
+                && concurrency_struct.contains("pub by_backend: HashMap<String, usize>"),
+            "ConcurrencyConfig must carry Option<usize> plus the flattened URL table \
+             that the same-table shape requires"
+        );
+        assert!(
+            partial_orchestration.contains("pub concurrency: Option<PartialConcurrencyConfig>"),
+            "PartialOrchestrationConfig must mirror the block as Option"
+        );
+        assert!(
+            partial_concurrency.contains("pub max_sessions: Option<usize>")
+                && partial_concurrency.contains("#[serde(flatten)]"),
+            "PartialConcurrencyConfig must mirror the block, otherwise toml drops it"
+        );
+        assert!(
+            merge_wiring.contains(&tight("if let Some(p_con) = p_orch.concurrency"))
+                && merge_wiring.contains(&tight(
+                    "base.orchestration.concurrency.max_sessions = Some(m)"
+                ))
+                && merge_wiring.contains(&tight("concurrency.by_backend.extend(p_con.by_backend)")),
+            "merge must apply both max_sessions and the override table"
+        );
+        assert!(
+            tight(&load_body).contains(&tight(
+                "warn_suspect_backend_keys(&cfg.orchestration.concurrency)"
+            )),
+            "load must report the flatten typo hazard once per file read"
+        );
     }
 
     #[test]

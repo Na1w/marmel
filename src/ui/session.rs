@@ -13,6 +13,7 @@ use crate::manager::context::{
 };
 use crate::manager::r#loop::{DeadlineKind, FailureBudget, FailureVerdict, TurnWatchdog};
 use crate::orchestrator::OrchestratorManager;
+use crate::orchestrator::pool;
 use crate::session::commit::{CapturePayload, CommitError, CommitLock, CommitPolicy};
 use crate::session::restore::RestoreRefused;
 use crate::session::{
@@ -1593,6 +1594,7 @@ fn subagent_detail_from_panel(panel: &SubagentPanel) -> SubagentDetail {
         content: panel.content.clone(),
         is_active: panel.is_active,
         context_tokens: panel.context_tokens,
+        queue: None,
     }
 }
 
@@ -1813,6 +1815,13 @@ pub async fn run_session_with_bounds_report(
     let mut failures = FailureBudget::new(bounds.failure_threshold);
 
     let client = ChatClient::from_config(cfg);
+    // Call class for every backend call this session's Manager makes, plus the
+    // tool rounds it dispatches on its behalf (design §1.5). The Manager turn has
+    // no plan task of its own, so it carries an agent label and no task id — that
+    // is what makes a queued Manager call distinguishable from a queued
+    // delegation in pool logs and status traffic.
+    let manager_call_context =
+        pool::CallContext::for_agent(pool::CallClass::ManagerTurn, pool::MANAGER_AGENT, None);
     let harness_stats = stats.clone();
     // The Manager's wire knobs come from `StreamConfig::from_config`, which reads
     // the thinking **cap** from `[monitoring].max_thinking_tokens` and the effort
@@ -2156,9 +2165,16 @@ pub async fn run_session_with_bounds_report(
             // impossible). On expiry: cancel in-flight work through the same
             // plumbing the abort paths use, and say why.
             let llm_budget = watchdog.time_to_hard_limit();
-            let assistant = match tokio::time::timeout(
-                llm_budget,
-                chat_client_turn(&client, msgs, &stream_cfg, &mut bridge),
+            // The scope wraps the whole turn, so `ManagerTurn` is the class the
+            // pool gate sees for this backend call on whichever worker polls the
+            // turn, and it is discharged the moment the turn returns, times out or
+            // is cancelled — never carried into the tool round below.
+            let assistant = match pool::with_call_context(
+                manager_call_context.clone(),
+                tokio::time::timeout(
+                    llm_budget,
+                    chat_client_turn(&client, msgs, &stream_cfg, &mut bridge),
+                ),
             )
             .await
             {
@@ -2458,16 +2474,24 @@ pub async fn run_session_with_bounds_report(
                     };
 
                     let call_id = call.id.clone();
+                    // Tool work runs on a blocking thread, which a task-local never
+                    // reaches by itself, so the Manager context is carried across
+                    // explicitly: a `delegate_task` fanned out here inherits it and
+                    // then overwrites it with its own agent/task (see
+                    // `orchestrator::delegate::handle_delegate_task`).
+                    let manager_context = manager_call_context.clone();
                     let handle = tokio::task::spawn_blocking(move || {
-                        (
-                            call_id,
-                            delegated_agent,
-                            delegated_task,
-                            crate::harness::dispatch_for(
-                                &invocation,
-                                crate::harness::ToolCaller::Manager,
-                            ),
-                        )
+                        pool::with_call_context_sync(manager_context, || {
+                            (
+                                call_id,
+                                delegated_agent,
+                                delegated_task,
+                                crate::harness::dispatch_for(
+                                    &invocation,
+                                    crate::harness::ToolCaller::Manager,
+                                ),
+                            )
+                        })
                     });
                     handles.push(handle);
                 }
@@ -3090,11 +3114,17 @@ pub async fn run_session_with_bounds_report(
                         arguments: args_val,
                     };
 
+                    // Same explicit propagation as the parallel round: the tool
+                    // runs on a blocking thread, and a nested `delegate_task`
+                    // installed there must be attributed to this session's Manager.
+                    let manager_context = manager_call_context.clone();
                     let mut handle = tokio::task::spawn_blocking(move || {
-                        crate::harness::dispatch_for(
-                            &invocation,
-                            crate::harness::ToolCaller::Manager,
-                        )
+                        pool::with_call_context_sync(manager_context, || {
+                            crate::harness::dispatch_for(
+                                &invocation,
+                                crate::harness::ToolCaller::Manager,
+                            )
+                        })
                     });
 
                     let result = loop {

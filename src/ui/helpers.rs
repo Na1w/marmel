@@ -1,11 +1,12 @@
 //! Formatting, command inspection, subagent lifecycle, and error classification helpers.
 
-use super::{Event, Renderer, SubagentDetail};
+use super::{Event, QueueState, Renderer, SubagentDetail};
 use crate::config::Config;
 use crate::manager::context::ContextEngine;
 use crate::orchestrator::{DelegationEvent, OrchestratorManager};
 use crate::types::Message;
 use anyhow::Result;
+use std::sync::Arc;
 
 pub fn format_active_subtasks(subagents: &[SubagentDetail]) -> String {
     let global_active = crate::orchestrator::get_active_subtasks_str();
@@ -228,6 +229,21 @@ pub(crate) fn classify_llm_error(e: &anyhow::Error) -> &'static str {
     }
 }
 
+/// The panel row a delegation event addresses: `{agent}-{normalized task}`, or
+/// the bare role id when the delegation carries no task id. Every writer of
+/// [`SubagentDetail`] state derives it through here so the lifecycle writer and
+/// the queue writer always land on the same row.
+fn subagent_row_name(agent: crate::agents::Agent, task: Option<&str>) -> (String, Option<String>) {
+    let clean_task = task
+        .map(|t| crate::task_id::normalize_task_id_ref(t).to_string())
+        .filter(|t| !t.is_empty());
+    let name = match &clean_task {
+        Some(t) => format!("{}-{t}", agent.as_str()),
+        None => agent.as_str().to_string(),
+    };
+    (name, clean_task)
+}
+
 pub(crate) fn update_subagent_lifecycle(
     subagents: &mut Vec<SubagentDetail>,
     agent: crate::agents::Agent,
@@ -235,15 +251,8 @@ pub(crate) fn update_subagent_lifecycle(
     prompt: Option<String>,
     started: bool,
 ) {
-    let clean_task = task
-        .as_ref()
-        .map(|t| crate::task_id::normalize_task_id_ref(t))
-        .filter(|t| !t.is_empty());
-    let name = match clean_task {
-        Some(t) => format!("{}-{t}", agent.as_str()),
-        None => agent.as_str().to_string(),
-    };
-    let task_str = clean_task.unwrap_or("").to_string();
+    let (name, clean_task) = subagent_row_name(agent, task.as_deref());
+    let task_str = clean_task.clone().unwrap_or_default();
     let log_entry = if started {
         format!("started task {task_str}")
     } else {
@@ -260,6 +269,13 @@ pub(crate) fn update_subagent_lifecycle(
             existing.started_at = Some(now);
         }
         existing.is_active = started;
+        // Closing a delegation takes the queue state down with it, whichever way
+        // it closed — completion, failure or a cancel that landed while the call
+        // was still waiting for a slot. No queue row ever outlives its
+        // delegation (design §7).
+        if !started {
+            existing.queue = None;
+        }
         existing.last_activity_at = Some(now);
         if active_tokens > 0 {
             existing.context_tokens = active_tokens;
@@ -284,8 +300,51 @@ pub(crate) fn update_subagent_lifecycle(
             content: String::new(),
             is_active: started,
             context_tokens: active_tokens,
+            queue: None,
         });
     }
+}
+
+/// Apply a concurrency-slot transition to an existing panel row.
+///
+/// This is the queue-state half of the same single authoritative writer:
+/// [`DelegationEvent::Queued`] passes `Some(..)`, [`DelegationEvent::Running`]
+/// passes `None`. The transition is deliberately orthogonal to
+/// [`update_subagent_lifecycle`]:
+///
+/// * it never touches `is_active` — a queued delegation is still dispatched and
+///   still belongs to the round, so its clocks, panel visibility and selection
+///   stay exactly as the lifecycle path left them;
+/// * it never touches `started_at`/`worked_duration`, so a wait in the queue is
+///   never mistaken for worked time;
+/// * it never **creates** a row — structurally so, since it takes a slice, not a
+///   `Vec`. Rows belong to the lifecycle path, whose `Started` event precedes
+///   any `Queued` transition inside the one event vector. Creating rows here
+///   would let a delegation whose lifecycle this stream does not own (a nested
+///   `delegate_task`, whose own Manager holds those events) leave a permanently
+///   active, permanently queued panel row behind.
+///
+/// Returns whether a row was updated, so callers only re-push the panel when
+/// anything actually changed.
+pub(crate) fn update_subagent_queue(
+    subagents: &mut [SubagentDetail],
+    agent: crate::agents::Agent,
+    task: Option<String>,
+    queue: Option<QueueState>,
+) -> bool {
+    let (name, _) = subagent_row_name(agent, task.as_deref());
+    let Some(existing) = subagents.iter_mut().find(|s| s.name == name) else {
+        tracing::debug!(
+            "queue transition for {name} has no panel row yet; the lifecycle event owns row creation, so it is skipped"
+        );
+        return false;
+    };
+    existing.queue = queue;
+    // A slot transition is real progress on this delegation: it is the one piece
+    // of activity a queued call produces, and it keeps the row's idle accounting
+    // honest without moving any clock.
+    existing.last_activity_at = Some(std::time::Instant::now());
+    true
 }
 
 pub(crate) fn drain_delegation_events_with_transcript(
@@ -297,6 +356,18 @@ pub(crate) fn drain_delegation_events_with_transcript(
     let Some(manager) = manager else {
         return;
     };
+    // Register this Manager's event vector as the process-wide delegation sink.
+    // The concurrency gate in `ChatClient::acquire_slot` cannot thread the
+    // Manager through its signatures, so it appends its `Queued`/`Running`
+    // transitions through that sink — into this very vector, which is what keeps
+    // the authoritative order (`Started -> Queued* -> Running -> Completed |
+    // Failed`) intact and keeps one writer for the panel. The compare-and-set
+    // keeps the write lock off the hot path: only a Manager swap pays for it.
+    if crate::orchestrator::delegation_event_sink()
+        .is_none_or(|sink| !Arc::ptr_eq(&sink, &manager.delegation_events))
+    {
+        crate::orchestrator::set_delegation_event_sink(Arc::clone(&manager.delegation_events));
+    }
     let Ok(mut events) = manager.delegation_events.lock() else {
         return;
     };
@@ -306,6 +377,31 @@ pub(crate) fn drain_delegation_events_with_transcript(
             DelegationEvent::Started { agent, task } => {
                 update_subagent_lifecycle(subagents, *agent, task.clone(), None, true);
                 changed = true;
+            }
+            // Slot state inside an already-dispatched delegation: same row, same
+            // clocks, same active flag — only the queue field moves.
+            DelegationEvent::Queued {
+                agent,
+                task,
+                position,
+                of,
+            } => {
+                if update_subagent_queue(
+                    subagents,
+                    *agent,
+                    task.clone(),
+                    Some(QueueState {
+                        position: *position,
+                        of: *of,
+                    }),
+                ) {
+                    changed = true;
+                }
+            }
+            DelegationEvent::Running { agent, task } => {
+                if update_subagent_queue(subagents, *agent, task.clone(), None) {
+                    changed = true;
+                }
             }
             DelegationEvent::Completed { agent, task } => {
                 update_subagent_lifecycle(subagents, *agent, task.clone(), None, false);
