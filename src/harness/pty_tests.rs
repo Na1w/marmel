@@ -1156,3 +1156,120 @@ fn test_sandbox_gate_reentry_argv_uses_the_resolved_exe() {
     assert!(args[2].ends_with("cargo test"));
     assert_eq!(args.len(), 3);
 }
+
+/// The extras channel is published where — and only where — it has a consumer, and the
+/// config is its single source of truth. The spawn side seeds its builder from
+/// `std::env::vars_os()`, so an ambient value under that name would otherwise be
+/// inherited by the re-entry child (which would widen its own ruleset from it) or by the
+/// plain `sh -c` of the skip branch (and from there into any nested invocation): the
+/// environment deciding how much the sandbox trusts, which is what the config key exists
+/// to prevent.
+///
+/// Asserted as in-process behaviour: the ambient case is modelled exactly the way
+/// portable-pty seeds it — an entry already present in the builder's env map — rather
+/// than by mutating the process environment, which is `unsafe` in edition 2024 and would
+/// need the env lock for no added rigour. `ACTIVE_CONFIG` **is** process-global, so the
+/// config legs run under the same serialization lock the config tests use, and the
+/// previously active config (including "none") is restored on the way out.
+#[test]
+fn test_sandbox_gate_extras_channel_follows_the_config_and_the_decision() {
+    let key = crate::harness::sandbox::SANDBOX_EXTRA_RO_PATHS_ENV;
+    let ambient = "/tmp/ambient-value-in-no-allow-list";
+
+    struct ActiveConfigRestore(Option<crate::config::Config>);
+    impl Drop for ActiveConfigRestore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(cfg) => crate::config::set_active(cfg),
+                None => crate::config::clear_active(),
+            }
+        }
+    }
+    let _serial = crate::config::sandbox_env_test_lock();
+    let _restore = ActiveConfigRestore(crate::config::get_active());
+
+    let seeded = || {
+        let mut builder = CommandBuilder::new("sh");
+        builder.env(key, ambient);
+        builder
+    };
+    let with_paths = |paths: &[&str]| crate::config::Config {
+        sandbox_extra_readonly_paths: paths.iter().map(|path| (*path).to_string()).collect(),
+        ..crate::config::Config::default()
+    };
+    let reentry = should_apply_sandbox(&production_inputs(Path::new(
+        "/usr/local/libexec/mm-renamed-build-7",
+    )));
+    assert!(
+        matches!(reentry, SandboxDecision::Apply { .. }),
+        "these legs need the re-entry branch, got {reentry:?}"
+    );
+
+    // 1. A configured list travels verbatim — trimmed, empty entries dropped — and it
+    //    overwrites whatever the parent's environment happened to carry.
+    crate::config::set_active(with_paths(&[" /opt/toolchain-a ", "", "/opt/toolchain-b"]));
+    let mut cmd = seeded();
+    wire_extra_readonly_paths_env(&mut cmd, &reentry, extra_readonly_paths_env_value());
+    assert_eq!(
+        cmd.get_env(key)
+            .map(|raw| raw.to_string_lossy().into_owned()),
+        Some("/opt/toolchain-a:/opt/toolchain-b".to_string()),
+        "the configured list must be the value the re-entry child sees"
+    );
+
+    // 2. Key present but empty: the variable is REMOVED from the child environment, so
+    //    the inherited value cannot widen the child's ruleset.
+    crate::config::set_active(with_paths(&[]));
+    let mut cmd = seeded();
+    wire_extra_readonly_paths_env(&mut cmd, &reentry, extra_readonly_paths_env_value());
+    assert!(
+        cmd.get_env(key).is_none(),
+        "an ambient value must not survive an empty config list"
+    );
+
+    // 3. No active config at all: same removal — this is the state a re-entry child of a
+    //    config-less parent must be handed.
+    crate::config::clear_active();
+    let mut cmd = seeded();
+    wire_extra_readonly_paths_env(&mut cmd, &reentry, extra_readonly_paths_env_value());
+    assert!(
+        cmd.get_env(key).is_none(),
+        "an ambient value must not survive when no config is active"
+    );
+
+    // 4. The skip branch runs the command through a plain `sh -c`, which has no consumer
+    //    for the channel: with the key configured it must publish nothing, and it must
+    //    not pass the ambient value on either.
+    crate::config::set_active(with_paths(&["/opt/toolchain-a"]));
+    let skipped = should_apply_sandbox(&SandboxInputs {
+        test_harness_exe: true,
+        ..production_inputs(Path::new("/usr/local/libexec/mm-renamed-build-7"))
+    });
+    assert!(
+        matches!(skipped, SandboxDecision::Skip { .. }),
+        "the test-harness input must skip, got {skipped:?}"
+    );
+    let mut cmd = seeded();
+    wire_extra_readonly_paths_env(&mut cmd, &skipped, extra_readonly_paths_env_value());
+    assert!(
+        cmd.get_env(key).is_none(),
+        "the skip branch must publish nothing and inherit nothing"
+    );
+
+    // 5. The public entry point in this binary takes exactly that skip branch, so the
+    //    builder it produces carries no trace of the channel even with the key set —
+    //    and the argv layout is untouched.
+    if !cfg!(windows) {
+        let built =
+            build_sandboxed_command("echo hi", Path::new("/tmp")).expect("the skip always builds");
+        assert!(
+            built.get_env(key).is_none(),
+            "the publish must be decision-scoped at the call site too"
+        );
+        assert_eq!(
+            built.get_argv().len(),
+            3,
+            "the plain-shell argv stays program + flag + payload"
+        );
+    }
+}

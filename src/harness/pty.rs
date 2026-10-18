@@ -670,6 +670,56 @@ fn sandbox_command_argv(
     }
 }
 
+/// The active config's extra read-only sandbox paths, encoded for
+/// [`crate::harness::sandbox::SANDBOX_EXTRA_RO_PATHS_ENV`], or `None` when there is
+/// nothing to hand over (no active config, or a key that is unset or empty).
+///
+/// The ruleset is built by the re-entry child, and that child never loads a config
+/// file — it reads argv and the environment only, so a config value has to travel as
+/// an environment variable. The argv contract is left exactly as it is: the sentinel,
+/// the cwd and the wrapped command, three slots, unchanged.
+///
+/// This is the **only** source of that value: the config list decides what the sandbox
+/// trusts, and [`wire_extra_readonly_paths_env`] makes sure nothing else can reach the
+/// child under the same name.
+fn extra_readonly_paths_env_value() -> Option<String> {
+    crate::config::get_active().and_then(|cfg| {
+        crate::harness::sandbox::extra_readonly_paths_to_env(&cfg.sandbox_extra_readonly_paths)
+    })
+}
+
+/// Wire the extras channel of [`crate::harness::sandbox::SANDBOX_EXTRA_RO_PATHS_ENV`]
+/// into a builder according to the decision that produced it — the publish is
+/// **decision-scoped**, and the config is the single source of truth:
+///
+/// * re-entry (`Apply`): publish the configured list when there is one;
+/// * anything else (`Skip`, i.e. a plain `sh -c` with no re-entry and therefore no
+///   consumer, or the hard-fail branch): **remove** the variable.
+///
+/// Removal is not cosmetic. The builder starts from `std::env::vars_os()`, so a value
+/// that merely happens to sit in the parent's environment is inherited by whatever this
+/// builder spawns — the re-entry child (which would widen its own ruleset from it) and,
+/// on the skip branch, an unsandboxed shell and any nested invocation of this program
+/// that does load a config later. Leaving an ambient value in place would let the
+/// environment decide how much the sandbox trusts, which is exactly what the config key
+/// exists to prevent. So an empty/unset list **clears** the variable instead of leaving
+/// it alone, and a configured list overwrites whatever was inherited.
+fn wire_extra_readonly_paths_env(
+    cmd: &mut CommandBuilder,
+    decision: &SandboxDecision,
+    configured: Option<String>,
+) {
+    match decision {
+        SandboxDecision::Apply { .. } => match configured {
+            Some(paths) => cmd.env(crate::harness::sandbox::SANDBOX_EXTRA_RO_PATHS_ENV, paths),
+            None => cmd.env_remove(crate::harness::sandbox::SANDBOX_EXTRA_RO_PATHS_ENV),
+        },
+        SandboxDecision::Skip { .. } | SandboxDecision::UnresolvedExe => {
+            cmd.env_remove(crate::harness::sandbox::SANDBOX_EXTRA_RO_PATHS_ENV)
+        }
+    }
+}
+
 /// Build the shell command for one `run_command`/PTY execution.
 ///
 /// Landlock is applied on Linux through [`SANDBOX_EXEC_ARG`] re-entry decided by [`should_apply_sandbox`] —
@@ -705,12 +755,16 @@ pub fn build_sandboxed_command(
             Ok(cmd)
         }
     } else {
-        let (program, args) =
-            sandbox_command_argv(&sandbox_decision_for_current_process(), command, cwd)?;
+        let decision = sandbox_decision_for_current_process();
+        let (program, args) = sandbox_command_argv(&decision, command, cwd)?;
         let mut cmd = CommandBuilder::new(program);
         for arg in args {
             cmd.arg(arg);
         }
+        // The extras channel is wired from the decision that produced this argv, never
+        // unconditionally: it is published only for the re-entry child that reads it,
+        // and cleared otherwise so nothing ambient is inherited.
+        wire_extra_readonly_paths_env(&mut cmd, &decision, extra_readonly_paths_env_value());
         cmd.cwd(cwd);
         Ok(cmd)
     }
