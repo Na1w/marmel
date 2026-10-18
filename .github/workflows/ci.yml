@@ -218,3 +218,195 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --verbose
+
+  # Genuine no-trust-store leg (docs/research_storeless_ci.md §5 + §7 option b2,
+  # docs/research_boot_ci_container.md §6). Deliberately standalone: it is not a
+  # `needs:` of any other job and no other job depends on it, so image/apt drift in
+  # this leg can never block lint/test/cross-check/release-build
+  # (docs/cross_platform_gating.md residual risk 7, mirrored here).
+  #
+  # WHY THE STORE IS REMOVED ONLY AFTER THE BUILD: cargo fetches the registry over
+  # https and rustup/cargo-cache restore need TLS, while an already-compiled binary
+  # needs no store at all (research_storeless_ci.md §6: store-less `cargo fetch` →
+  # exit 101 `[60] SSL peer certificate …`, prepared test binary executed store-less
+  # → exit 0). So every TLS-dependent step (checkout, toolchain, cache, build,
+  # `test --no-run`) runs while /etc/ssl/certs still exists; afterwards the legs run
+  # with CARGO_NET_OFFLINE=true + `--offline` so cargo never *tries* to fetch and
+  # turns a missing store into an unrelated network error.
+  #
+  # WHY NO EXIT CODE IS ASSERTED FOR THE STORE VERDICT: the guard is non-fatal by
+  # design (src/main.rs:72-78) — a store-less run exits **0**
+  # (research_storeless_ci.md §3.1), exit 2 in this binary means CLI/session-flag
+  # validation and exit 1 means a config read failure, both *before* the probe at
+  # src/main.rs:78, and exit 101 means a panic. Exit status is therefore never the
+  # signal: the assertions below are on captured stderr CONTENT (the actionable
+  # markers), with `panicked` / 101 as the only exit-status-shaped failures.
+  trust-store:
+    name: No-trust-store guard (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: trust-store
+
+      # Build BEFORE any removal (§6 above). `--all-features` matches the feature set
+      # of the store-less legs below so those legs cannot trigger a recompile once
+      # the store is gone.
+      - name: Build all targets and compile the boot suite (store present)
+        run: |
+          cargo build --all-targets --all-features
+          cargo test --no-run --test test_session_boot --all-features
+
+      # Fail fast: without this, a runner image that already has no store would let
+      # every store-less leg below "pass" against a host that was never modified.
+      - name: Precondition — a trust store exists before removal
+        run: |
+          set -euo pipefail
+          if [ ! -d /etc/ssl/certs ]; then
+            echo "::error::/etc/ssl/certs does not exist — nothing to remove, this job would no-op"
+            exit 1
+          fi
+          entries=$(find /etc/ssl/certs -maxdepth 1 -mindepth 1 2>/dev/null | wc -l || true)
+          if [ "${entries:-0}" -eq 0 ]; then
+            echo "::error::/etc/ssl/certs is already empty (entries=$entries) — nothing to remove"
+            exit 1
+          fi
+          if [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then
+            echo "::error::/etc/ssl/certs/ca-certificates.crt is missing or empty — baseline store absent"
+            exit 1
+          fi
+          echo "pre-removal store: entries=$entries bundle_bytes=$(stat -c%s /etc/ssl/certs/ca-certificates.crt)"
+
+      # The validated removal primitive (research_storeless_ci.md §4 option b2,
+      # reproduced in research_boot_ci_container.md §1.3): move the directory aside
+      # and recreate it as an EMPTY dir — an existing but empty probed dir is still
+      # store-less (measured: entries=0 → 4 verdict lines, real openssl_probe::probe()).
+      # NOT `apt-get remove --purge ca-certificates` (evicts curl/gnupg/wget and
+      # breaks later TLS steps) and NOT `update-ca-certificates --fresh` (measured:
+      # "121 added, 0 removed" → 243 entries again → it does not create the condition).
+      - name: Remove the system trust store (mv + recreate an EMPTY dir)
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /tmp/ca-backup
+          sudo mv /etc/ssl/certs /tmp/ca-backup/certs
+          sudo mkdir -p /etc/ssl/certs
+
+      # Second precondition: the condition must be genuinely in force, otherwise the
+      # legs below assert nothing. Candidate set is openssl-probe 0.2.1 (verified
+      # against the vendored source in research_storeless_ci.md §1.2); bug.md's
+      # 14-directory list describes openssl-probe 0.1.5 and is stale.
+      - name: Precondition — the trust store is genuinely absent
+        run: |
+          set -euo pipefail
+          # `find` on a missing dir exits 1, which under `set -euo pipefail` would abort
+          # this step silently — so every probe is existence-guarded and status-shielded.
+          entries=0
+          if [ -d /etc/ssl/certs ]; then
+            entries=$(find /etc/ssl/certs -maxdepth 1 -mindepth 1 2>/dev/null | wc -l || true)
+          fi
+          if [ "${entries:-0}" -ne 0 ]; then
+            echo "::error::/etc/ssl/certs still holds $entries entries after removal"
+            exit 1
+          fi
+          for p in /etc/ssl/certs/ca-certificates.crt \
+                   /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
+                   /etc/pki/tls/certs/ca-bundle.crt \
+                   /etc/ssl/ca-bundle.pem \
+                   /etc/pki/tls/cacert.pem \
+                   /etc/ssl/cert.pem \
+                   /opt/etc/ssl/certs/ca-certificates.crt \
+                   /etc/ssl/certs/cacert.pem; do
+            if [ -e "$p" ]; then
+              echo "::error file=$p::openssl-probe 0.2.1 file candidate still exists — store not absent"
+              exit 1
+            fi
+          done
+          for d in /etc/ssl/certs /etc/pki/tls/certs /etc/security/certificates; do
+            if [ ! -d "$d" ]; then continue; fi
+            n=$(find "$d" -maxdepth 1 -type f \( -name '*.crt' -o -name '*.pem' \) 2>/dev/null | wc -l || true)
+            if [ "${n:-0}" -ne 0 ]; then
+              echo "::error::$d still holds $n cert files"
+              exit 1
+            fi
+          done
+          dpkg -l ca-certificates 2>/dev/null | tail -n +5 || echo "ca-certificates: not installed"
+          echo "PRECONDITION OK: /etc/ssl/certs entries=0; no openssl-probe 0.2.1 candidate exists"
+
+      # Leg 1 — the process-level boot suite, armed by the marker so the four
+      # trust-store message guards ASSERT instead of self-skipping
+      # (research_boot_ci_container.md §5). Measured store-less: 6/6 pass in 0.60 s,
+      # zero recompiles, cargo exit 0.
+      - name: Store-less boot suite
+        env:
+          MARMEL_EXPECT_NO_TRUST_STORE: "1"
+          CARGO_NET_OFFLINE: "true"
+        run: cargo test --test test_session_boot --all-features --offline
+
+      # Leg 2 — the trust-store unit regressions PINNED BY NAME (never a blanket
+      # `cargo test --lib`: an unrelated store-sensitive test would turn a host drift
+      # into a red leg with no diagnostic value).
+      - name: Store-less trust-store unit regressions
+        env:
+          MARMEL_EXPECT_NO_TRUST_STORE: "1"
+          CARGO_NET_OFFLINE: "true"
+        run: |
+          cargo test --all-features --offline --lib -- --exact \
+            llm::client::tests::test_missing_trust_store_surfaces_as_error_not_a_panic \
+            llm::client::tests::test_trust_store_error_is_terminal_and_non_retryable \
+            llm::client::tests::test_construction_verdict_matches_the_startup_probe
+
+      # The content assertion: the already-built binary run on the now store-less host
+      # must print the actionable verdict (research_storeless_ci.md §2 + §5 binary-level
+      # alternative, §9 recipe). Deliberately NOT `set -e` and the exit status of the run
+      # is recorded, never asserted — the guard is non-fatal, so exit 0 is the EXPECTED
+      # outcome (see the job header comment).
+      - name: Assert the actionable trust-store verdict on stderr
+        run: |
+          set -uo pipefail
+          cfg=/tmp/storeless-cfg.toml
+          printf 'backend_url="http://127.0.0.1:1/v1"\nauth_token="x"\nmodel="probe"\n' >"$cfg"
+          log=/tmp/storeless-cli.log
+          timeout 120 target/debug/marmel --config "$cfg" --raw hi >"$log" 2>&1
+          code=$?
+          echo "store_less_cli_exit=$code (recorded only: the store verdict is non-fatal, never asserted)"
+          sed 's/^/[cli] /' "$log"
+          for marker in 'no TLS trust store' 'ca-certificates' 'SSL_CERT_FILE'; do
+            if ! grep -qF -- "$marker" "$log"; then
+              echo "::error::store-less run printed no \"$marker\" — the actionable verdict is missing (or the store is back)"
+              exit 1
+            fi
+          done
+          if grep -q 'panicked' "$log"; then
+            echo "::error::store-less run panicked — the trust-store verdict must surface as an error, not a panic"
+            exit 1
+          fi
+          if [ "$code" -eq 101 ]; then
+            echo "::error::store-less run exited 101 (panic status)"
+            exit 1
+          fi
+          echo "OK: actionable trust-store verdict present, no panic (exit=$code, expected for a non-fatal guard)"
+
+      # Restore whatever happened above, so no later step in this job can be left
+      # running against a broken host.
+      - name: Restore the system trust store
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ -d /tmp/ca-backup/certs ]; then
+            sudo rm -rf /etc/ssl/certs
+            sudo mv /tmp/ca-backup/certs /etc/ssl/certs
+            if [ -s /etc/ssl/certs/ca-certificates.crt ]; then
+              echo "trust store restored: entries=$(find /etc/ssl/certs -maxdepth 1 -mindepth 1 | wc -l)"
+            else
+              echo "::warning::trust store restore did not bring back ca-certificates.crt"
+            fi
+          else
+            echo "nothing to restore: the removal step never ran"
+          fi

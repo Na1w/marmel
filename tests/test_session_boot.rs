@@ -17,7 +17,14 @@
 //! looks for, `session::bundle_dir(&Plan::at(dir))` — is inside that temp dir.
 //! Nothing here ever touches the workspace's own `.marmel/`, and every worker key
 //! is prefixed `t022-e2e-`.
+//!
+//! Every case clears the child's environment as well, so the child never inherits
+//! the runner's `SSL_CERT_FILE`. On a host with no usable system trust store the
+//! boot path must still be reachable: an ordinary startup error about the missing
+//! CA bundle is acceptable, a panic in HTTP-client construction is not — that is
+//! what `assert_booted_past_the_tls_setup` pins.
 
+use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -225,6 +232,9 @@ fn run_marmel(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Run {
         .env_clear()
         // A minimal, deterministic environment: the binary must not inherit the
         // test runner's `MARMEL_*` variables or its terminal.
+        // Deliberately no `SSL_CERT_FILE` either: a child that needs one to reach
+        // its own session bundle is the bug, not a fixture detail — see
+        // `assert_booted_past_the_tls_setup`.
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", dir)
         // Nothing may reach a real model, and nothing may hang on connect.
@@ -281,6 +291,236 @@ fn workspace(config: &str) -> tempfile::TempDir {
 
 const PLAIN_CONFIG: &str = "session_enabled = true\nsession_resume = false\n";
 const CAPTURE_OFF_CONFIG: &str = "session_enabled = false\nsession_resume = true\n";
+
+// ------------------------------------------------- missing-trust-store guards
+
+/// Marker that **arms** the cert-less leg of this suite: the literal `1` only.
+///
+/// It is set by the harness process and by nothing else — the store-less CI job
+/// (`.github/workflows/ci.yml`, "Store-less boot suite") exports it, and
+/// [`run_marmel`] clears the child environment, so the binary under test never
+/// sees it (it would be inert anyway). Unset, empty, or set to anything other
+/// than `1`, every guard in this file behaves exactly as it did before the
+/// marker existed.
+const EXPECT_NO_TRUST_STORE_ENV: &str = "MARMEL_EXPECT_NO_TRUST_STORE";
+
+/// The trust-store **file** candidates `openssl-probe` **0.2.1** consults on
+/// Linux, verbatim from its vendored source (`docs/research_storeless_ci.md`
+/// §1.2). The first existing one wins, so one survivor is enough to defeat the
+/// cert-less condition. Re-read this list on any `openssl-probe` bump — the
+/// 14-directory list in `bug.md:87` describes 0.1.5 and is stale.
+const PROBE_CERT_FILES: &[&str] = &[
+    "/etc/ssl/certs/ca-certificates.crt", // Debian, Ubuntu, Gentoo
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // CentOS, RHEL 7
+    "/etc/pki/tls/certs/ca-bundle.crt",   // Fedora, RHEL 6
+    "/etc/ssl/ca-bundle.pem",             // OpenSUSE
+    "/etc/pki/tls/cacert.pem",            // OpenELEC
+    "/etc/ssl/cert.pem",                  // Alpine Linux
+    "/opt/etc/ssl/certs/ca-certificates.crt", // Entware
+    "/etc/ssl/certs/cacert.pem",          // OpenHarmony
+];
+
+/// The trust-store **directories** the same probe consults on Linux: every
+/// existing one is read, and an existing but *empty* directory still yields zero
+/// certificates (`docs/research_storeless_ci.md` §1.2, consequence 1).
+const PROBE_CERT_DIRS: &[&str] = &[
+    "/etc/ssl/certs",
+    "/etc/pki/tls/certs",
+    "/etc/security/certificates",
+];
+
+/// True only when the marker is the literal `1`, so arming the leg is always a
+/// deliberate act: an unset variable, an empty value, or a stray `true`/`0`/typo
+/// all keep the suite in its long-standing (self-skipping) mode.
+fn expect_no_trust_store() -> bool {
+    std::env::var_os(EXPECT_NO_TRUST_STORE_ENV).as_deref() == Some(OsStr::new("1"))
+}
+
+/// `dir=<n> entries` / `dir=missing` for every probed directory — the filesystem
+/// snapshot quoted in the precondition failure, so the reader sees what the probe
+/// would have seen without having to go looking.
+fn probe_state() -> String {
+    PROBE_CERT_DIRS
+        .iter()
+        .map(|dir| match std::fs::read_dir(dir) {
+            Ok(entries) => format!("{dir}={} entries", entries.count()),
+            Err(_) => format!("{dir}=missing"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Armed-leg precondition: the host really has no trust store, decided on the
+/// **filesystem** and nowhere else — the exact 8 files + 3 directories of
+/// `openssl-probe` 0.2.1, so this cannot report a greener state than the probe
+/// itself (a missing directory is store-less too; a pristine image has none).
+///
+/// What is deliberately **not** inspected: `SSL_CERT_FILE`/`SSL_CERT_DIR` in this
+/// process. cargo overwrites both variables for every test child it spawns,
+/// keeping only values that exist (`docs/research_storeless_ci.md` §3.3), and
+/// [`run_marmel`] strips them again with `.env_clear()` — so here they describe
+/// cargo's environment rather than the host's, and asserting on them would pass
+/// or fail for reasons unrelated to the store.
+///
+/// Runs once per guarded test, before any child is spawned: a store that is
+/// still present fails here, with the remedy, instead of leaving the actionable
+/// message assertions below to pass vacuously on an empty trigger.
+fn assert_store_really_is_absent() {
+    for candidate in PROBE_CERT_FILES {
+        // Same predicate the probe applies (`.exists()`, symlinks resolved), so the
+        // precondition and the code it guards can never disagree.
+        assert!(
+            !Path::new(candidate).exists(),
+            "{EXPECT_NO_TRUST_STORE_ENV}=1 armed the cert-less leg of this suite, but this host \
+             still ships the openssl-probe 0.2.1 file candidate `{candidate}` — the child would \
+             load a real CA bundle, print no store verdict, and every trust-store assertion below \
+             would test nothing. Either remove the store for real (`sudo mv /etc/ssl/certs \
+             /tmp/ca-backup/certs && sudo mkdir -p /etc/ssl/certs`, or run the leg in an image \
+             without the `ca-certificates` package) and re-check the 8 file candidates above, or \
+             unset {EXPECT_NO_TRUST_STORE_ENV} to run this suite on a cert-bearing host. \
+             Filesystem state the probe sees: {}",
+            probe_state()
+        );
+    }
+    for dir in PROBE_CERT_DIRS {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue; // absent directory = no certificates from it
+        };
+        let certs: Vec<String> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|ext| ext == "crt" || ext == "pem")
+            })
+            .map(|path| path.display().to_string())
+            .collect();
+        assert!(
+            certs.is_empty(),
+            "{EXPECT_NO_TRUST_STORE_ENV}=1 armed the cert-less leg, but the openssl-probe 0.2.1 \
+             directory `{dir}` still holds {} readable certificate(s) — {certs:?} — so the probe \
+             finds roots and the trust-store assertions below would test nothing. Empty the \
+             directory (leaving it in place is fine: an empty probed dir is still store-less) or \
+             unset {EXPECT_NO_TRUST_STORE_ENV}. Filesystem state the probe sees: {}",
+            certs.len(),
+            probe_state()
+        );
+    }
+}
+
+/// Exit status Rust produces when a panic unwinds `main`.
+///
+/// What this guards: the runner clears the environment (see `run_marmel`), so the
+/// child has no `SSL_CERT_FILE` even when the test runner does, and on a host
+/// without a usable system trust store the HTTP client used to be built **twice**
+/// — the second time through `reqwest::Client::default()`, which is
+/// `Client::new()` and `expect()`s the same build that just failed. The run then
+/// aborted inside TLS setup with `panicked at src/async_impl/client.rs…` and exit
+/// `101`, before it ever looked at a session bundle, and the four cases below
+/// observed `101` instead of the exit code they pin.
+///
+/// The verdict is now stored on the client and reported as an ordinary startup
+/// error (`main::report_http_client_verdict`), so the boot path stays reachable
+/// and the run keeps the exit code its session outcome produces. The environment
+/// is deliberately left cleared: forwarding `SSL_CERT_FILE` into the child would
+/// only paper over the panic.
+const PANIC_EXIT_CODE: i32 = 101;
+
+/// The child must reach the session boot path rather than die in TLS setup: no
+/// panic banner, and never the panic exit status — on any host, trust store
+/// present or not.
+fn assert_no_tls_startup_panic(run: &Run, case: &str) {
+    assert!(
+        !run.stderr.contains("panicked"),
+        "{case} must not abort in a panic on a host whose trust store the child cannot \
+         find (the runner clears `SSL_CERT_FILE`); stderr: {:?}",
+        run.stderr
+    );
+    assert!(
+        run.code != Some(PANIC_EXIT_CODE),
+        "{case} must not exit with Rust's panic status {PANIC_EXIT_CODE}: a missing TLS \
+         trust store is a stored client verdict, not an abort in `main`; {run:?}"
+    );
+}
+
+/// A trust-store verdict, once the child produces one, must name something the
+/// user can act on.
+///
+/// Nothing in this file can *make* the trust store empty, and neither does the
+/// store-less CI job: the condition is **supplied by the host** — the cert-less
+/// leg either removes the on-disk store (`mv /etc/ssl/certs` + recreate an EMPTY
+/// dir) or runs on an image that never had `ca-certificates`, and
+/// [`EXPECT_NO_TRUST_STORE_ENV`] merely tells this suite that such a host is
+/// underneath it. Two things are explicitly **not** that condition:
+///
+/// * `.env_clear()` in [`run_marmel`] — it deletes whatever the runner had
+///   inherited before the child starts, but the child then probes the filesystem
+///   and finds the host's bundle, so on a cert-bearing host it changes nothing
+///   about the store;
+/// * masking `SSL_CERT_FILE`/`SSL_CERT_DIR` — `rustls-native-certs` 0.8.4
+///   short-circuits the probe as soon as **either** variable is set, and cargo
+///   overwrites both for every test child it spawns anyway
+///   (`docs/research_storeless_ci.md` §1.1 and §3.3), so an env-masking leg
+///   silently asserts nothing under `cargo test` and is not a substitute.
+///
+/// Marker **unset** ⇒ the long-standing behaviour, unchanged: no trigger marker
+/// in the output ⇒ return without asserting anything. Marker **set** ⇒ the
+/// assertion runs unconditionally, so a run that says nothing about certificates
+/// (because the child really did load a CA bundle) is a failure rather than a
+/// vacuous pass; [`assert_store_really_is_absent`] at the top of each guarded
+/// test is what says *why*, before any child is spawned.
+///
+/// Markers only, never an exact sentence: the underlying reason text (e.g. "No CA
+/// certificates were loaded from the system") belongs to reqwest /
+/// rustls-native-certs and moves with their versions. Every run here is raw mode
+/// (stdout is a file), where `tracing`'s sink **is** stderr, so the line is
+/// checked there.
+fn assert_trust_store_message_is_actionable(run: &Run, case: &str) {
+    let actionable = run.stderr.contains("no TLS trust store")
+        || run.stderr.contains("SSL_CERT_FILE")
+        || run.stderr.contains("ca-certificates");
+
+    if expect_no_trust_store() {
+        let output = format!("{}{}", run.stderr, run.stdout).to_ascii_lowercase();
+        let why = if output.contains("ca certificates") || output.contains("trust store") {
+            "the run did report a CA-bundle problem but named nothing the user can act on — \
+             the original bug shape: the transport's internal reason on its own"
+        } else {
+            "the run said nothing about CA certificates at all, i.e. the child found a usable \
+             trust store: this host is not store-less and the leg is vacuous. Check that the \
+             removal step ran, that no openssl-probe 0.2.1 candidate survived, and that the \
+             marker really is set for this test process"
+        };
+        assert!(
+            actionable,
+            "{case}: {EXPECT_NO_TRUST_STORE_ENV}=1 declares a host with no TLS trust store, so \
+             the child must report that verdict on stderr together with what the user can act on \
+             (`no TLS trust store` / `SSL_CERT_FILE` / `ca-certificates`); {why}; stderr: {:?}",
+            run.stderr
+        );
+        return;
+    }
+
+    let output = format!("{}{}", run.stderr, run.stdout).to_ascii_lowercase();
+    if !output.contains("ca certificates") && !output.contains("trust store") {
+        return;
+    }
+    assert!(
+        actionable,
+        "{case}: a run that mentions a CA-bundle problem must also name what the user can \
+         act on (no TLS trust store / SSL_CERT_FILE / ca-certificates), instead of only \
+         the transport's internal reason; stderr: {:?}",
+        run.stderr
+    );
+}
+
+/// Both guards in one call, for the four cases that run the boot path.
+fn assert_booted_past_the_tls_setup(run: &Run, case: &str) {
+    assert_no_tls_startup_panic(run, case);
+    assert_trust_store_message_is_actionable(run, case);
+}
 
 // ----------------------------------------------------------------------- tests
 
@@ -359,6 +599,12 @@ fn resume_with_capture_disabled_is_a_usage_error_that_exits_two() {
 /// `session::EXIT_RESTORE_REFUSED`.
 #[test]
 fn a_refused_resume_exits_with_the_named_refusal_code_and_says_so_three_times() {
+    // Armed cert-less leg: prove the host really has no store before spawning
+    // anything, so the guards below cannot pass on an empty trigger.
+    if expect_no_trust_store() {
+        assert_store_really_is_absent();
+    }
+
     let dir = workspace(PLAIN_CONFIG);
     let bundle = write_bundle_at(dir.path());
     tamper_format_version(&bundle);
@@ -366,6 +612,9 @@ fn a_refused_resume_exits_with_the_named_refusal_code_and_says_so_three_times() 
 
     let run = run_marmel(dir.path(), &["--config", "marmel.toml", "--resume"], &[]);
     assert!(!run.timed_out, "a refusal stops the run: {run:?}");
+    // The refusal verdict is only meaningful if the child got as far as the
+    // bundle: no trust-store panic in between, whatever the host ships.
+    assert_booted_past_the_tls_setup(&run, "a refused --resume");
     assert_eq!(
         run.code,
         Some(marmennill::session::EXIT_RESTORE_REFUSED),
@@ -411,6 +660,10 @@ fn a_refused_resume_exits_with_the_named_refusal_code_and_says_so_three_times() 
 /// therefore ends the run with the same exit code.
 #[test]
 fn marmel_resume_env_alone_reaches_the_same_refusal_and_the_same_exit_code() {
+    if expect_no_trust_store() {
+        assert_store_really_is_absent();
+    }
+
     let dir = workspace(PLAIN_CONFIG);
     let bundle = write_bundle_at(dir.path());
     tamper_format_version(&bundle);
@@ -422,6 +675,7 @@ fn marmel_resume_env_alone_reaches_the_same_refusal_and_the_same_exit_code() {
         &[("MARMEL_RESUME", "1")],
     );
     assert!(!run.timed_out, "the env trigger stops the run too: {run:?}");
+    assert_booted_past_the_tls_setup(&run, "the MARMEL_RESUME spelling");
     assert_eq!(
         run.code,
         Some(marmennill::session::EXIT_RESTORE_REFUSED),
@@ -441,6 +695,10 @@ fn marmel_resume_env_alone_reaches_the_same_refusal_and_the_same_exit_code() {
 /// refusal verdict appears anywhere.
 #[test]
 fn fresh_beats_the_resume_env_and_the_refused_bundle_is_never_opened() {
+    if expect_no_trust_store() {
+        assert_store_really_is_absent();
+    }
+
     let dir = workspace("session_enabled = true\nsession_resume = true\n");
     let bundle = write_bundle_at(dir.path());
     tamper_format_version(&bundle);
@@ -452,6 +710,7 @@ fn fresh_beats_the_resume_env_and_the_refused_bundle_is_never_opened() {
         &[("MARMEL_RESUME", "1")],
     );
     assert!(!run.timed_out, "a fresh start is not a refusal: {run:?}");
+    assert_booted_past_the_tls_setup(&run, "--fresh over MARMEL_RESUME");
     assert_eq!(
         run.code,
         Some(0),
@@ -479,14 +738,21 @@ fn fresh_beats_the_resume_env_and_the_refused_bundle_is_never_opened() {
 /// verdict, and that the run was never classified as a refusal or a usage error.
 #[test]
 fn a_sound_resume_rehydrates_through_the_cli_and_announces_the_restore() {
+    if expect_no_trust_store() {
+        assert_store_really_is_absent();
+    }
+
     let dir = workspace(PLAIN_CONFIG);
     write_bundle_at(dir.path());
 
     let run = run_marmel(dir.path(), &["--config", "marmel.toml", "--resume"], &[]);
     assert!(!run.timed_out, "the boot path returns promptly: {run:?}");
+    assert_booted_past_the_tls_setup(&run, "a sound --resume");
     assert!(
-        run.code != Some(marmennill::session::EXIT_RESTORE_REFUSED) && run.code != Some(2),
-        "a sound bundle is neither refused nor a usage error: {run:?}"
+        run.code != Some(marmennill::session::EXIT_RESTORE_REFUSED)
+            && run.code != Some(2)
+            && run.code != Some(PANIC_EXIT_CODE),
+        "a sound bundle is neither refused, a usage error, nor a panic in TLS setup: {run:?}"
     );
     assert!(
         run.stdout

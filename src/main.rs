@@ -69,6 +69,14 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
 
+    // One honest line about the shared HTTP client before anything needs it — the
+    // MCP boot, the Manager and every session turn below all talk to a backend
+    // through it. A host with no TLS trust store makes that client impossible to
+    // build; the client then carries the verdict instead of panicking, so this is
+    // a warning about a run whose every LLM turn will fail, not a new verdict:
+    // the process keeps the exit code its session outcome produces.
+    report_http_client_verdict(use_raw);
+
     if !cfg.mcp_servers.is_empty()
         && let Ok(mcp_mgr) = rt.block_on(mcp::McpManager::boot(&cfg.mcp_servers))
     {
@@ -295,6 +303,30 @@ fn session_flag_error(args: &CliArgs, cfg: &config::Config) -> Option<&'static s
 
 fn rotate_log(path: &std::path::Path, max_bytes: u64, backups: u32) {
     harness::workspace::rotate_log_file(path, max_bytes, backups);
+}
+
+/// Report the shared HTTP client's construction verdict exactly once, at startup.
+///
+/// On a host with no TLS trust store the client cannot be built at all: every
+/// LLM turn of this run then fails the same way, because each one is refused with
+/// the non-retryable `ChatError::TrustStore` before a request is ever sent. The
+/// run is not aborted for it (no new exit code, and no panic as happened when the
+/// client build was `unwrap_or_default()`d): it gets one actionable line naming
+/// the missing CA bundles and how to point marmel at them — the
+/// `ca-certificates` package, `SSL_CERT_FILE`, `SSL_CERT_DIR`.
+///
+/// `tracing` is already configured by [`setup_panic_hook`]: in raw mode its sink
+/// **is** stderr, so the single record is the user-facing line; in TUI mode it
+/// goes to `.marmel/marmel.log`, where stderr is the only channel the user can
+/// still see before the alternate screen takes over.
+fn report_http_client_verdict(use_raw: bool) {
+    let Some(message) = llm::http_client_startup_error() else {
+        return;
+    };
+    tracing::error!("{message}");
+    if !use_raw {
+        eprintln!("error: {message}");
+    }
 }
 
 fn setup_panic_hook(use_raw: bool) {
