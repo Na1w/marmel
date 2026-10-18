@@ -161,6 +161,7 @@ Marmel searches for configuration in the following priority order (first match w
 | `preserve_thinking` | `true` | Retain thinking blocks in the session transcript. |
 | `command_timeout_secs` | `60` | Timeout per terminal command or PTY invocation. Valid range `1..=300` seconds; an out-of-range value is logged and clamped into that range, never applied verbatim. |
 | `sandbox_disabled` | `false` | Fail-closed opt-out of the Linux Landlock command sandbox: `true` runs commands unsandboxed and always logs an attributable warning. `MARMEL_DISABLE_SANDBOX=1` is an equivalent escape hatch — either source opts out. |
+| `sandbox_extra_readonly_paths` | `[]` | TOML array of strings: paths the Landlock sandbox additionally allows **read + execute** for, beyond the built-in allow-list (which already covers `/usr`, `/bin`, `/lib`, `/lib64`, `/opt` and the package stores `/nix/store` and `/gnu/store`). For toolchain locations it does not cover — a non-default `store =` prefix in `nix.conf`, a store under another path, another read-only toolchain dir — e.g. `["/mnt/nix/store"]`. Entries must be **absolute**; relative, missing or already-built-in entries are skipped with a warning. Never grants write. Empty ⇒ built-in list only; a non-empty value **replaces** the list rather than appending (same merge semantics as `orchestration.mcp_servers`). See [Extra Sandbox Read-Only Paths](#extra-sandbox-read-only-paths-sandbox_extra_readonly_paths). |
 | `max_repetition_threshold` | `5` | Consecutive identical turns that trigger loop interruption. |
 | `enable_xml_rescue` | `true` | Parse pseudo-XML tool calls into valid JSON tool calls. |
 | `ui_mode` | `"tui"` | Interface mode: `"tui"` (Ratatui) or `"raw"` (streaming stdout). |
@@ -493,6 +494,19 @@ Marmel is designed to prevent accidental modifications outside the target projec
 3. **Non-Linux Platforms:** On macOS and Windows, path confinement and working directory boundaries are actively enforced in-process.
 
 **Sandbox Opt-Out (fail-closed).** The sandbox is always on unless you explicitly opt out: the typed knob `sandbox_disabled` defaults to `false` in `marmel.toml`, and the equivalent environment escape hatch is `MARMEL_DISABLE_SANDBOX`. Either source opts out on its own, and every honoured opt-out is announced with an attributable warning naming the setting that was set (`warning: Landlock sandbox DISABLED by <setting>: this command runs WITHOUT Landlock.`). The parsing is fail-closed — only `1`, `true`, `yes` or `on` (case-insensitive, surrounding blanks ignored) disable the sandbox, while a malformed or falsy value such as `0`, `false`, `off`, `no`, an empty value, or a typo leaves it **enabled**. Opting out is also never a way to make a failed sandbox non-fatal: if Landlock cannot be established, the command is refused instead of running unsandboxed — the sandbox re-entry step prints the reason to stderr and exits with `SANDBOX_REFUSE_EXIT_CODE` (`73`, `sysexits.h` `EX_UNAVAILABLE`) without exec-ing the command.
+
+### Extra Sandbox Read-Only Paths (`sandbox_extra_readonly_paths`)
+
+The read-only part of the ruleset covers the FHS toolchain prefixes (`/usr`, `/bin`, `/lib`, `/lib64`, `/opt`, `/etc`, `/dev`, `/proc`, `/sys`, `/run`, `/var`) **plus the package stores `/nix/store` and `/gnu/store`** — the stores are named explicitly because Landlock resolves symlinks before it matches a rule, and on NixOS or Guix `/bin`, `/usr/bin` and `/lib` are symlink farms whose real targets live in the store. So sandboxed `execve` works out of the box there and nothing has to be configured. Set this key only when your executables resolve somewhere the built-in list does not reach: a custom `store = …` prefix in `nix.conf`, a Guix store under another path, or any other read-only toolchain directory — that is preferable to opting out of the sandbox altogether.
+
+```toml
+# nix.conf says `store = /mnt/nix/store`, so /nix/store is not where the binaries live:
+sandbox_extra_readonly_paths = ["/mnt/nix/store"]
+```
+
+Entries must be **absolute**, and each one joins exactly the **read + execute** grant of the prefixes above: it never grants write and it never weakens the workspace rule or the fail-closed behaviour. An entry that is relative, does not exist on this host, or duplicates a built-in path never becomes a rule and is reported in one line (`warning: ignoring sandbox_extra_readonly_paths entry "./tools": not absolute` — likewise `does not exist` and `already covered by the built-in allow-list`). A refusal is still loud and now names the image it could not reach: `error: failed to exec /nix/store/<hash>-bash/bin/bash under the Landlock sandbox: Permission denied (os error 13). The path is not covered by the sandbox allow-list.`
+
+*Advanced/internal:* the configured list travels to the sandbox re-entry child (which loads no config file) as the `:`-separated environment variable `MARMEL_SANDBOX_EXTRA_RO_PATHS`. It is an internal hand-off, not a supported knob — use the config key; a path containing `:` cannot be transported intact (it arrives split into two entries).
 
 ---
 
