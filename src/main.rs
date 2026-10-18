@@ -218,6 +218,7 @@ fn canonical_sandbox_cwd(raw: &str) -> std::path::PathBuf {
 ///
 /// `None` means the token is nowhere on disk (no `PATH`, or no `PATH` entry holds it): a
 /// not-found failure, which must never be reported as a sandbox denial.
+#[cfg(unix)]
 fn resolve_program_path(token: &str) -> Option<std::path::PathBuf> {
     let candidate = if token.contains('/') {
         Some(std::path::PathBuf::from(token))
@@ -600,6 +601,7 @@ mod tests {
     /// Both documented fallbacks, so the message can never invent a path: an absolute
     /// token that is not on disk is kept as given, and a bare token with no `PATH` hit
     /// is reported as not-found (never as a sandbox denial).
+    #[cfg(unix)]
     #[test]
     fn test_resolve_program_path_falls_back_without_inventing_a_path() {
         let raw = "/definitely/not/a/program/marmel-t052-sh";
