@@ -1328,6 +1328,51 @@ fn fn_region(src: &str, marker: &str) -> String {
     panic!("unterminated body for {marker:?}");
 }
 
+/// Slice out a `static` declaration — marker up to and including its
+/// terminating `;` — so the guard can scan the memoized construction verdict
+/// itself (the `OnceLock` holding the one and only client-build outcome) and
+/// not only the functions around it.
+fn static_region(src: &str, marker: &str) -> String {
+    let start = src
+        .find(marker)
+        .unwrap_or_else(|| panic!("client.rs must still declare {marker:?}"));
+    let decl = &src[start..];
+    let end = decl
+        .find(';')
+        .unwrap_or_else(|| panic!("{marker:?} must end in a terminating semicolon"));
+    decl[..end + 1].to_string()
+}
+
+/// Slice out the store-less early return inside `chat_stream` (the
+/// `if let Err(err) = &self.http { .. }` branch, brace-counted). That branch is
+/// the runtime half of the verdict — it is precisely where the pre-fix code
+/// panicked (`bug.md`), so it is part of the scanned surface even though it is
+/// not a function of its own.
+fn verdict_branch_region(src: &str) -> String {
+    const MARKER: &str = "if let Err(err) = &self.http";
+    let start = src.find(MARKER).unwrap_or_else(|| {
+        panic!("chat_stream must still refuse a client-less process ({MARKER})")
+    });
+    let body = &src[start..];
+    let open = body
+        .find('{')
+        .unwrap_or_else(|| panic!("{MARKER} must be followed by its body"));
+    let mut depth = 0usize;
+    for (idx, ch) in body[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return body[..open + idx + 1].to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unterminated body for {MARKER}");
+}
+
 /// Drop whole-line comments from a scanned region: `client.rs` deliberately
 /// *documents* the removed `unwrap_or_default()` / `Client::new()` trap in the
 /// doc comment of the `http` field, and prose about the bug must not trip the
@@ -1359,9 +1404,20 @@ fn mentions(haystack: &str, needle: &str) -> bool {
 /// that builds a second client when the shared build fails — every one of those
 /// re-runs the failing build and aborts the process (`unwrap_or_default()` →
 /// `Client::default()` → `.expect("Client::new()")`, `reqwest 0.13.4`). The scan
-/// is scoped to the helper, its reason extraction, the startup probe and the
-/// four client-owning constructors, and separately asserts the construction
-/// still goes through the shared builder exactly once per process.
+/// is scoped to the helper, its reason extraction, the startup probe, the
+/// memoized verdict and the store-less refusal in `chat_stream`, plus the four
+/// client-owning constructors, and separately asserts the construction still
+/// goes through the shared builder exactly once per process.
+///
+/// **Blind spot this now closes** (`docs/regression_verdict.md`): the trap list
+/// used to stop at the fallback-client family and did **not** ban the panic
+/// macros themselves, and the scan never reached the memoized `OnceLock` verdict
+/// or the store-less branch of `chat_stream`. A mutation that put a `panic!`
+/// back on that branch — literally the `bug.md` regression this guard is named
+/// for — therefore left this test **GREEN**. Both holes are shut: `panic!(`,
+/// `unreachable!(`, `todo!(` and `unimplemented!(` are now banned inside the
+/// construction/verdict surface, and that surface now includes the `OnceLock`,
+/// the `chat_stream` early return and `trust_store_error`.
 #[test]
 fn test_http_client_construction_path_has_no_panic_on_default_trap() {
     let src = include_str!("client.rs");
@@ -1377,7 +1433,10 @@ fn test_http_client_construction_path_has_no_panic_on_default_trap() {
         "pub fn with_client(",
     ];
     // The panic-on-default family: any of these inside the construction path
-    // either fabricates a client of its own or unwraps the stored verdict.
+    // either fabricates a client of its own or unwraps the stored verdict. The
+    // last four entries are the abort-the-process family itself — the hole the
+    // audit proved (a re-introduced `panic!` on the missing-client branch kept
+    // this guard green).
     let traps = [
         "unwrap_or_default(",
         "unwrap_or_else(",
@@ -1386,18 +1445,85 @@ fn test_http_client_construction_path_has_no_panic_on_default_trap() {
         "Client::default(",
         "Client::new(",
         "Client::builder(",
+        "panic!(",
+        "unreachable!(",
+        "todo!(",
+        "unimplemented!(",
     ];
     for marker in construction_fns {
         let region = code_only(&fn_region(src, marker));
         for trap in traps {
             assert!(
                 !mentions(&region, trap),
-                "{marker} must never reach for a fallback client or unwrap a build \
-                 failure ({trap}); the verdict is stored and reported as \
-                 ChatError::TrustStore"
+                "{marker} must never reach for a fallback client, unwrap a build \
+                 failure or abort the process ({trap}); the verdict is stored and \
+                 reported as ChatError::TrustStore"
             );
         }
     }
+
+    // The verdict surfaces that are not functions: the memoized `OnceLock` that
+    // holds the single build outcome, and the store-less early return in
+    // `chat_stream` that must refuse instead of panicking. `trust_store_error`
+    // is the function that renders that verdict, so it is scanned too.
+    //
+    // Region-scoped **on purpose, never whole-file**: `client.rs` legitimately
+    // contains a panic macro outside the construction path —
+    // `unreachable!("send future never yields None")` inside `try_chat_once`
+    // (the SSE pump invariant, nothing to do with client construction, observed
+    // at src/llm/client.rs:1139 and it is the only panic-family macro in the
+    // file today). Banning those macros file-wide would fail on correct,
+    // unrelated code, so each region is extracted and scanned in isolation.
+    let verdict_branch = verdict_branch_region(src);
+    let extra_regions = [
+        (
+            "static HTTP_CLIENT (memoized verdict)",
+            code_only(&static_region(src, "static HTTP_CLIENT")),
+        ),
+        (
+            "chat_stream store-less early return",
+            code_only(&verdict_branch),
+        ),
+        (
+            "fn trust_store_error(",
+            code_only(&fn_region(src, "fn trust_store_error(")),
+        ),
+    ];
+    for (label, region) in extra_regions {
+        for trap in traps {
+            assert!(
+                !mentions(&region, trap),
+                "{label} must never abort the process or unwrap the stored build \
+                 verdict ({trap}); a store-less host must come back as \
+                 ChatError::TrustStore (bug.md)"
+            );
+        }
+    }
+
+    // Non-vacuity of the new scoping: the extracted regions must really contain
+    // the verdict logic they claim to cover, otherwise a renamed branch would
+    // silently shrink the scan to an empty string and this guard would go green
+    // while covering nothing.
+    assert!(
+        verdict_branch.contains("trust_store_error")
+            && verdict_branch.contains("log_llm_error")
+            && verdict_branch.contains("return Err"),
+        "the store-less branch must still classify, log and return an error; \
+         got: {verdict_branch}"
+    );
+    assert!(
+        static_region(src, "static HTTP_CLIENT").contains("OnceLock"),
+        "the memoized construction verdict must still live in a OnceLock in client.rs"
+    );
+    // The panic-family needles must actually be matched by `mentions` (they are
+    // identifier-led, so they go through the boundary check).
+    assert!(
+        mentions("fn f() { panic!(\"no client\") }", "panic!(")
+            && mentions("unreachable!(\"default arm\")", "unreachable!(")
+            && mentions("todo!()", "todo!(")
+            && mentions("unimplemented!()", "unimplemented!("),
+        "the panic-family traps must be detected by `mentions`, or the guard is vacuous"
+    );
 
     // Positive side of the same guard: one memoized shared build, propagated
     // as an error, and consumed by every constructor.
