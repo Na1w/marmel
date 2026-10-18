@@ -280,6 +280,21 @@ pub struct Config {
     /// [`crate::harness::pty::log_sandbox_decision`]. Read through
     /// [`sandbox_opt_out`].
     pub sandbox_disabled: bool,
+    /// Extra paths the Landlock sandbox must allow **read + execute** for, on top
+    /// of the built-in allow-list (`crate::harness::sandbox`).
+    ///
+    /// Empty by default: the built-in list is used as-is. The key exists for hosts
+    /// whose executables do not live under the FHS prefixes that list covers —
+    /// NixOS (`/nix/store`) and Guix (`/gnu/store`), where `/bin` and friends are
+    /// symlink farms and every program resolves below the store — and for a
+    /// non-default `store = ...` prefix in `nix.conf`.
+    ///
+    /// Merge semantics follow the only other array-of-strings key,
+    /// `OrchestrationConfig::mcp_servers`: a **non-empty** file value replaces this
+    /// field outright (it never appends to an existing value), while an absent key
+    /// — or an explicit `[]`, which serde cannot tell apart — keeps the default.
+    /// Consumed by the sandbox ruleset, not by this module.
+    pub sandbox_extra_readonly_paths: Vec<String>,
     pub max_repetition_threshold: usize,
     pub enable_xml_rescue: bool,
     pub ui_mode: String,
@@ -339,6 +354,7 @@ impl Default for Config {
             preserve_thinking: true,
             command_timeout_secs: DEFAULT_COMMAND_TIMEOUT_SECS,
             sandbox_disabled: false,
+            sandbox_extra_readonly_paths: Vec::new(),
             max_repetition_threshold: 5,
             enable_xml_rescue: true,
             ui_mode: "tui".to_string(),
@@ -753,6 +769,12 @@ struct PartialConfig {
     pub preserve_thinking: Option<bool>,
     pub command_timeout_secs: Option<u64>,
     pub sandbox_disabled: Option<bool>,
+    /// Array-of-strings mirror using the `#[serde(default)]` + plain `Vec` idiom of
+    /// `PartialOrchestrationConfig::mcp_servers`: an absent key yields an empty
+    /// `Vec` (never a parse error) and `merge` reads that empty `Vec` as "unset",
+    /// so the default survives.
+    #[serde(default)]
+    pub sandbox_extra_readonly_paths: Vec<String>,
     pub max_repetition_threshold: Option<usize>,
     pub enable_xml_rescue: Option<bool>,
     pub max_thinking_tokens: Option<usize>,
@@ -858,6 +880,13 @@ fn merge(mut base: Config, partial: PartialConfig) -> Config {
     }
     if let Some(v) = partial.sandbox_disabled {
         base.sandbox_disabled = v;
+    }
+    // List merge mirrors `orchestration.mcp_servers` below (the only other
+    // array-of-strings key): **replace when non-empty, never append**. An absent
+    // key and an explicit `[]` both deserialize to an empty `Vec` and therefore
+    // keep the default — a file can set this list but cannot clear it.
+    if !partial.sandbox_extra_readonly_paths.is_empty() {
+        base.sandbox_extra_readonly_paths = partial.sandbox_extra_readonly_paths;
     }
     if let Some(v) = partial.max_repetition_threshold {
         base.max_repetition_threshold = v;
@@ -2680,6 +2709,195 @@ session_max_bundle_bytes = 4096
                 "marmel.toml.example must document {key}"
             );
         }
+    }
+
+    // ------------------------------------------------- sandbox extra paths key
+    //
+    // `sandbox_extra_readonly_paths` is the first **top-level array-of-strings**
+    // key in `PartialConfig`, so it follows the `#[serde(default)]` + plain `Vec`
+    // mirror idiom of `PartialOrchestrationConfig::mcp_servers` and the same
+    // replace-if-non-empty merge. Same drift risk as above: a key missing from the
+    // mirror or from `merge` is dropped **silently** by `toml`. The plumbing into
+    // the Landlock ruleset is a separate change; these tests cover the config layer
+    // only.
+
+    #[test]
+    fn sandbox_extra_readonly_paths_defaults_to_empty() {
+        assert!(
+            Config::default().sandbox_extra_readonly_paths.is_empty(),
+            "the built-in sandbox allow-list must stay authoritative unless the user \
+             opts into extra paths"
+        );
+        assert!(
+            partial_from("backend_url = \"http://localhost:9000/v1\"\n")
+                .sandbox_extra_readonly_paths
+                .is_empty(),
+            "an absent `sandbox_extra_readonly_paths` keeps the default"
+        );
+        assert!(
+            partial_from("").sandbox_extra_readonly_paths.is_empty(),
+            "an empty file keeps the default"
+        );
+    }
+
+    #[test]
+    fn sandbox_extra_readonly_paths_parses_and_merges() {
+        let cfg = merged("sandbox_extra_readonly_paths = [\"/nix/store\"]\n");
+        assert_eq!(
+            cfg.sandbox_extra_readonly_paths,
+            vec!["/nix/store".to_string()]
+        );
+
+        let cfg = merged("sandbox_extra_readonly_paths = [\"/nix/store\", \"/gnu/store\"]\n");
+        assert_eq!(
+            cfg.sandbox_extra_readonly_paths,
+            vec!["/nix/store".to_string(), "/gnu/store".to_string()]
+        );
+
+        // Merge semantics are `orchestration.mcp_servers`' (replace, not append):
+        // the default is empty, so a non-empty file value becomes the value verbatim.
+        assert_eq!(
+            merged(
+                "sandbox_extra_readonly_paths = [\"/nix/store\"]\n\
+                 [orchestration]\n\
+                 mcp_servers = [\"fs\"]\n"
+            )
+            .sandbox_extra_readonly_paths,
+            vec!["/nix/store".to_string()],
+            "the key must survive alongside a neighbouring table"
+        );
+    }
+
+    #[test]
+    fn sandbox_extra_readonly_paths_empty_array_is_a_noop_and_cannot_clear() {
+        // `#[serde(default)]` on a plain `Vec` cannot tell an absent key from an
+        // explicit `[]`, so the `!is_empty()` guard makes `[]` a no-op — the same
+        // documented limitation as `orchestration.mcp_servers`.
+        assert!(
+            merged("sandbox_extra_readonly_paths = []\n")
+                .sandbox_extra_readonly_paths
+                .is_empty()
+        );
+        let cfg = merge(
+            Config {
+                sandbox_extra_readonly_paths: vec!["/gnu/store".to_string()],
+                ..Config::default()
+            },
+            toml::from_str::<PartialConfig>("sandbox_extra_readonly_paths = []\n").expect("parses"),
+        );
+        assert_eq!(
+            cfg.sandbox_extra_readonly_paths,
+            vec!["/gnu/store".to_string()],
+            "an explicit empty array must not clear an existing list"
+        );
+    }
+    #[test]
+    fn sandbox_extra_readonly_paths_type_mismatch_is_a_toml_error() {
+        // Known key, wrong TOML type: hard parse error, never a silent default
+        // (same contract as `reasoning_effort_type_mismatch_is_a_toml_error_not_a_silent_default`).
+        for (label, toml_str) in [
+            (
+                "bare string instead of array",
+                "sandbox_extra_readonly_paths = \"/nix/store\"\n",
+            ),
+            ("boolean", "sandbox_extra_readonly_paths = true\n"),
+            ("integer array", "sandbox_extra_readonly_paths = [1, 2]\n"),
+            (
+                "mixed array",
+                "sandbox_extra_readonly_paths = [\"/nix/store\", 2]\n",
+            ),
+            (
+                "array of tables",
+                "sandbox_extra_readonly_paths = [{ path = \"/nix/store\" }]\n",
+            ),
+        ] {
+            assert!(
+                toml::from_str::<PartialConfig>(toml_str).is_err(),
+                "{label}: a mistyped `sandbox_extra_readonly_paths` must be a TOML \
+                 parse error, not a silently dropped key"
+            );
+        }
+    }
+
+    /// The "four places" rule for `sandbox_extra_readonly_paths`, scraped from this
+    //  file, plus the `marmel.toml.example` leg this key must satisfy (the file is
+    //  edited in the same change). Sibling of
+    //  `every_session_key_exists_in_config_partial_merge_and_the_example`.
+    #[test]
+    fn sandbox_extra_readonly_paths_exists_in_config_default_partial_merge_and_example() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/config.rs"))
+            .expect("src/config.rs must be readable");
+        let example =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/marmel.toml.example"))
+                .expect("marmel.toml.example must be readable");
+
+        let slice = |start: &str, end: &str| -> String {
+            let from = src
+                .find(start)
+                .unwrap_or_else(|| panic!("{start} must exist in src/config.rs"));
+            let rest = &src[from..];
+            let to = rest.find(end).unwrap_or(rest.len());
+            rest[..to].to_string()
+        };
+
+        let config_struct = slice("pub struct Config {", "impl Default for Config {");
+        let defaults = slice("impl Default for Config {", "static ACTIVE_CONFIG");
+        let partial_struct = slice("struct PartialConfig {", "struct PartialMonitoringConfig {");
+        let merge_body = slice("fn merge(mut base: Config", "impl Config {");
+
+        assert!(
+            config_struct.contains("pub sandbox_extra_readonly_paths: Vec<String>"),
+            "Config must declare sandbox_extra_readonly_paths next to sandbox_disabled"
+        );
+        assert!(
+            config_struct
+                .find("pub sandbox_extra_readonly_paths: Vec<String>")
+                .unwrap()
+                > config_struct.find("pub sandbox_disabled: bool").unwrap(),
+            "sandbox_extra_readonly_paths must sit next to sandbox_disabled so the \
+             sandbox grouping is obvious"
+        );
+        assert!(
+            defaults.contains("sandbox_extra_readonly_paths: Vec::new()"),
+            "impl Default for Config must set sandbox_extra_readonly_paths: Vec::new()"
+        );
+        // Mirror must carry `#[serde(default)]` (a non-Option mirror without it is a
+        // required key) and must not be renamed: the TOML key is the snake_case
+        // field name verbatim, as everywhere else in this file.
+        let mirror_at = partial_struct
+            .find("pub sandbox_extra_readonly_paths: Vec<String>")
+            .expect("PartialConfig must mirror sandbox_extra_readonly_paths as Vec<String>");
+        let before_mirror = partial_struct[..mirror_at].trim_end();
+        assert!(
+            before_mirror.ends_with("#[serde(default)]"),
+            "PartialConfig must mirror sandbox_extra_readonly_paths with \
+             #[serde(default)] immediately above the field"
+        );
+        assert!(
+            !partial_struct.contains("rename"),
+            "no serde rename: config keys are snake_case field names used verbatim"
+        );
+        assert!(
+            merge_body.contains("partial.sandbox_extra_readonly_paths")
+                && merge_body.contains("base.sandbox_extra_readonly_paths ="),
+            "merge must apply sandbox_extra_readonly_paths, otherwise the key is \
+             silently dropped by toml"
+        );
+        // Receiver chains get split across lines by rustfmt, so the list-merge
+        // shape is compared whitespace-insensitively.
+        let tight = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+        assert!(
+            tight(&merge_body).contains(
+                "if!partial.sandbox_extra_readonly_paths.is_empty(){\
+                 base.sandbox_extra_readonly_paths=partial.sandbox_extra_readonly_paths;}"
+            ),
+            "merge must keep the replace-if-non-empty list semantics documented for \
+             this key (same as orchestration.mcp_servers)"
+        );
+        assert!(
+            example.contains("# sandbox_extra_readonly_paths ="),
+            "marmel.toml.example must document sandbox_extra_readonly_paths"
+        );
     }
 
     #[test]
