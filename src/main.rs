@@ -133,6 +133,18 @@ fn run_sandbox_reentry(args: &mut impl Iterator<Item = String>) -> Result<()> {
     let command = args.next().unwrap_or_default();
     let cwd = canonical_sandbox_cwd(&cwd_raw);
 
+    // The extra read-only paths configured by the operator arrive through the
+    // environment: this process is the re-entry child, and it never loads a config
+    // file, so the spawning process published them in the variable named by
+    // harness::sandbox::SANDBOX_EXTRA_RO_PATHS_ENV. Absent means the built-in
+    // allow-list only. They are read once, here, and handed to the enforcement call
+    // below, which turns them into read-only Landlock rules.
+    let extra_readonly_paths = harness::sandbox::extra_readonly_paths_from_env();
+    tracing::debug!(
+        count = extra_readonly_paths.len(),
+        "sandbox re-entry: extra read-only paths received from the spawning process"
+    );
+
     let resolved_exe = harness::pty::resolved_exe_path();
     let decision = harness::pty::should_apply_sandbox(&harness::pty::SandboxInputs {
         landlock_supported: cfg!(target_os = "linux"),
@@ -157,7 +169,10 @@ fn run_sandbox_reentry(args: &mut impl Iterator<Item = String>) -> Result<()> {
                 setting: setting.clone(),
             }
         }
-        _ => match harness::sandbox::apply_sandbox(&cwd) {
+        _ => match harness::sandbox::apply_sandbox_with_extra_readonly_paths(
+            &cwd,
+            &extra_readonly_paths,
+        ) {
             Ok(()) => harness::sandbox::Enforcement::Established,
             Err(err) => harness::sandbox::Enforcement::Failed {
                 reason: err.to_string(),
@@ -194,6 +209,34 @@ fn canonical_sandbox_cwd(raw: &str) -> std::path::PathBuf {
     }
 }
 
+/// Resolve a program token the way a shell would: a token that already contains `/` is
+/// taken as given, otherwise each `PATH` entry is tried in order and the first candidate
+/// found on disk wins. The candidate is then canonicalized — the resolve-and-keep-the-raw
+/// idiom of [`canonical_sandbox_cwd`] — because a sandbox matches the **resolved** target
+/// (the real image behind a symlink farm such as `/bin`), and that resolved path is the
+/// only one a user can act on.
+///
+/// `None` means the token is nowhere on disk (no `PATH`, or no `PATH` entry holds it): a
+/// not-found failure, which must never be reported as a sandbox denial.
+fn resolve_program_path(token: &str) -> Option<std::path::PathBuf> {
+    let candidate = if token.contains('/') {
+        Some(std::path::PathBuf::from(token))
+    } else {
+        std::env::var_os("PATH").and_then(|entries| {
+            std::env::split_paths(&entries)
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .map(|dir| dir.join(token))
+                .find(|candidate| candidate.is_file())
+        })
+    }?;
+    match candidate.canonicalize() {
+        Ok(canonical) => Some(canonical),
+        // Canonicalization failed (unreadable component, or a sandbox that refuses the
+        // symlink read): the unresolved candidate is still the honest answer.
+        Err(_) => Some(candidate),
+    }
+}
+
 /// Exec `sh -c <command>` in `cwd`. Reached only for a
 /// [`harness::sandbox::ReentryAction::Exec`].
 fn exec_pending_command(command: &str, cwd: &std::path::Path) -> Result<()> {
@@ -207,7 +250,19 @@ fn exec_pending_command(command: &str, cwd: &std::path::Path) -> Result<()> {
             .arg(command)
             .current_dir(cwd)
             .exec();
-        eprintln!("Failed to exec shell in sandbox: {err}");
+        // The bare token is unactionable: on a package-store host (`/bin` as a symlink
+        // farm) the exec that was refused is the **resolved** image, not `sh`. Name the
+        // sandbox and that resolved path; fall back to the token when it resolves to
+        // nothing, and keep the cause honest — only a refusal is an allow-list gap.
+        let program = resolve_program_path("sh")
+            .map(|resolved| resolved.display().to_string())
+            .unwrap_or_else(|| "sh".to_string());
+        let cause = if err.kind() == std::io::ErrorKind::PermissionDenied {
+            " The path is not covered by the sandbox allow-list."
+        } else {
+            " Check that the program exists and is executable."
+        };
+        eprintln!("error: failed to exec {program} under the Landlock sandbox: {err}.{cause}");
         std::process::exit(1)
     }
     #[cfg(not(unix))]
@@ -509,6 +564,50 @@ mod tests {
     fn test_canonical_sandbox_cwd_falls_back_to_the_raw_path() {
         let raw = "/definitely/not/a/directory/marmel-t052";
         assert_eq!(canonical_sandbox_cwd(raw), std::path::PathBuf::from(raw));
+    }
+
+    /// The re-entry exec failure prints the **resolved** program, so the lookup is
+    /// pinned directly: a bare token goes through `PATH` and comes back canonical.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_program_path_resolves_a_bare_token_through_path() {
+        let resolved = resolve_program_path("sh").expect("`sh` must resolve on a unix host");
+        assert!(resolved.is_absolute(), "{resolved:?} must be absolute");
+        assert!(resolved.is_file(), "{resolved:?} must be a file");
+        // Already canonical: re-resolving is a no-op, so what gets printed is exactly
+        // the image the exec (and the sandbox check) was about.
+        assert_eq!(resolved, std::fs::canonicalize(&resolved).unwrap());
+    }
+
+    /// A token that already contains `/` skips the `PATH` walk and is resolved to the
+    /// image behind it — the `/bin/sh -> /nix/store/…-bash/bin/sh` case from the report.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_program_path_resolves_an_absolute_symlinked_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real-sh");
+        fs::write(&real, "#!/bin/sh\n").unwrap();
+        let link = temp.path().join("link-sh");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let resolved = resolve_program_path(&link.to_string_lossy())
+            .expect("an absolute token always produces a path");
+        assert_eq!(resolved, std::fs::canonicalize(&real).unwrap());
+        // Not vacuous: the symlink itself is never what gets reported.
+        assert_ne!(resolved, link);
+    }
+
+    /// Both documented fallbacks, so the message can never invent a path: an absolute
+    /// token that is not on disk is kept as given, and a bare token with no `PATH` hit
+    /// is reported as not-found (never as a sandbox denial).
+    #[test]
+    fn test_resolve_program_path_falls_back_without_inventing_a_path() {
+        let raw = "/definitely/not/a/program/marmel-t052-sh";
+        assert_eq!(
+            resolve_program_path(raw),
+            Some(std::path::PathBuf::from(raw))
+        );
+        assert_eq!(resolve_program_path("marmel-no-such-program-t052"), None);
     }
 
     // ------------------------------------------------------------- session flags
