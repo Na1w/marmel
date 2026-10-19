@@ -8,7 +8,7 @@
 //! 4. Automated Validator re-evaluates and approves (`leave_verdict(verdict="APPROVED")`).
 //! 5. Final deliverable is approved and both files exist on disk.
 
-use marmennill::agents::{Agent, IsolatedContext, run_specialist_live};
+use marmennill::agents::{Agent, IsolatedContext, PromptBuilder, run_specialist_live};
 use marmennill::config::Config;
 use marmennill::llm::ChatClient;
 use std::sync::Arc;
@@ -986,6 +986,13 @@ async fn test_delegated_validator_skips_subsequent_tools_in_same_turn_after_leav
 // verdict file (`.marmel/prompts/{task_id}-validation.md`) is a HARD validation
 // failure — its absence never skips validation, so a deliverable is never
 // reported as validated when no validator ran.
+//
+// One exemption exists, and it is an on-disk **record**, never a guess: the plan
+// side writes `.marmel/prompts/{task_id}-validation-skip.md` (one-line reason) for
+// the tasks it designates validation-free, and the read side consults that record
+// ONLY for a verdict file that was never written (`ErrorKind::NotFound`). Every
+// test below therefore states explicitly whether the record exists: without it the
+// gap stays fatal, with it the task completes without ever reaching the validator.
 
 /// Mount a mock backend that replays `turns` in order (falling back to a
 /// sentinel reply) and records every request body, so a test can prove which
@@ -1094,14 +1101,95 @@ fn verdict_call(verdict: &str, comments: &str) -> String {
     tool_call_sse("call_verdict_1", "leave_verdict", &args)
 }
 
+/// Seed an active execution plan from a caller-supplied plan document, so a test
+/// can state the exact spelling of a task line (a trailing `(no-validate)` /
+/// `(validate)` directive included) instead of the plain line `seed_plan` writes.
+fn seed_plan_document(root: &std::path::Path, plan_markdown: &str) -> marmennill::manager::Plan {
+    let dir = root.join(".marmel");
+    std::fs::create_dir_all(&dir).expect("marmel dir");
+    std::fs::write(dir.join("execution_plan.md"), plan_markdown).expect("plan file");
+    marmennill::manager::Plan::at(dir)
+}
+
+/// Researcher specialist config with the validator enabled and a bounded number of
+/// validation passes: the mirror of [`coder_cfg_with_validator`] for a role that
+/// is validated by default (the hard role opt-out covers only `validator` and
+/// `planner`).
+fn researcher_cfg_with_validator(backend_url: &str, max_val_iterations: usize) -> Config {
+    let mut cfg = Config {
+        backend_url: backend_url.to_string(),
+        model: "test-model".to_string(),
+        enable_xml_rescue: true,
+        ..Default::default()
+    };
+    cfg.orchestration.specialists.insert(
+        "researcher".to_string(),
+        marmennill::config::SpecialistConfig {
+            module: "src/agents/researcher.rs".to_string(),
+            tools: vec![
+                "write_file".to_string(),
+                "read_file".to_string(),
+                "grep_search".to_string(),
+                "glob".to_string(),
+            ],
+            enable_validator: Some(true),
+            max_validator_iterations: Some(max_val_iterations),
+            ..Default::default()
+        },
+    );
+    cfg
+}
+
+fn researcher_ctx(task_id: &str) -> IsolatedContext {
+    IsolatedContext {
+        role_system_prompt: "You are the Researcher specialist.".to_string(),
+        brief: format!("Investigate the retry policy for {task_id} and report."),
+        snippets: vec![],
+        task_id: Some(task_id.to_string()),
+        image_urls: vec![],
+        audio_urls: vec![],
+        blueprint: None,
+    }
+}
+
+/// The researcher's two turns: write the note file, then conclude with a
+/// completion marker for `task_id`.
+fn researcher_turns(task_id: &str) -> Vec<String> {
+    let write_args = serde_json::json!({
+        "path": "docs/retry-policy.md",
+        "content": "# Retry policy\n\nExponential backoff with a bounded budget."
+    })
+    .to_string();
+    vec![
+        tool_call_sse("call_write_1", "write_file", &write_args),
+        text_sse(&format!(
+            "Findings recorded.\n\nMISSION COMPLETE ({task_id})"
+        )),
+    ]
+}
+
+/// No verdict brief **and** no `-validation-skip.md` record: the absent
+/// `{tid}-validation.md` is a genuine verdict gap, so the deliverable is reported
+/// as not validated and its plan line stays unchecked (the `5c2231b` guard).
 #[tokio::test]
 async fn test_missing_validation_verdict_file_fails_and_leaves_plan_unchecked() {
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
     marmennill::harness::with_workspace_root(tmp_path.clone(), async move {
-        // A prompt workspace created in advance; its verdict file for t-701 is absent.
-        std::fs::create_dir_all(prompts_dir_of(&tmp_path)).expect("prompts dir");
+        // A prompt workspace created in advance; its verdict file for t-701 is absent
+        // and — decisively — so is its `-validation-skip.md` record. Without that
+        // record the missing brief cannot be read as a plan-designated exemption.
+        let prompts = prompts_dir_of(&tmp_path);
+        std::fs::create_dir_all(&prompts).expect("prompts dir");
+        assert!(
+            !prompts.join("t-701-validation.md").exists(),
+            "fixture: the verdict brief must be absent"
+        );
+        assert!(
+            !prompts.join("t-701-validation-skip.md").exists(),
+            "fixture: no no-validation record may exist for this gap"
+        );
         let plan = seed_plan(&tmp_path, "t-701");
 
         let (server, call_counter, _) = mock_backend(specialist_turns("t-701")).await;
@@ -1158,6 +1246,310 @@ async fn test_missing_validation_verdict_file_fails_and_leaves_plan_unchecked() 
         let plan_text = std::fs::read_to_string(plan.plan_path()).expect("plan file");
         assert!(
             plan_text.contains("- [ ] [t-701]"),
+            "plan line must stay unchecked, got: {plan_text}"
+        );
+    })
+    .await;
+}
+
+/// The mirror image of the case above: the plan side wrote **no** verdict brief and
+/// recorded that decision as `{tid}-validation-skip.md`. The absent brief is then
+/// not a gap — the validator is never contacted (the specialist consumes exactly
+/// its own turns), the deliverable completes with its own marker, the plan line is
+/// checked off like any approved run, the status channel carries the
+/// `[Validator] SKIPPED by design for <tag>` line, and the worker status is the
+/// non-failure label `Completed (validation skipped by design)`.
+#[tokio::test]
+async fn test_validation_skip_record_completes_the_run_and_checks_the_plan_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+
+    marmennill::harness::with_workspace_root(tmp_path.clone(), async move {
+        let prompts = prompts_dir_of(&tmp_path);
+        std::fs::create_dir_all(&prompts).expect("prompts dir");
+        assert!(
+            !prompts.join("t-706-validation.md").exists(),
+            "fixture: a validation-free plan task gets no verdict brief"
+        );
+        // The exact shape `PromptBuilder::write_validation_skip_record` leaves: the
+        // one-line planner reason and nothing else.
+        std::fs::write(
+            prompts.join("t-706-validation-skip.md"),
+            "Planner-designated: no validation required (research/documentation task)\n",
+        )
+        .expect("skip record");
+        let plan = seed_plan(&tmp_path, "t-706");
+
+        // This is the only test in this file that installs the process-global status
+        // sender, so its capture cannot be stolen by a sibling test.
+        let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        marmennill::orchestrator::set_status_sender(status_tx);
+
+        let (server, call_counter, _) = mock_backend(specialist_turns("t-706")).await;
+        let backend_url = format!("{}/v1", server.uri());
+        let cfg = coder_cfg_with_validator(&backend_url, 3);
+        let client = ChatClient::new(&backend_url, "test-model");
+        let token = CancellationToken::new();
+
+        let result = run_specialist_live(&client, Agent::Coder, &coder_ctx("t-706"), &cfg, &token)
+            .await
+            .expect("specialist live run should complete");
+
+        // Zero validator calls: only the specialist's own two turns were served.
+        assert_eq!(
+            call_counter.load(Ordering::SeqCst),
+            2,
+            "a task with a skip record must never reach the validator"
+        );
+
+        // Normal completion, with no trace of the gap or of a rejection.
+        assert!(
+            result.contains("MISSION COMPLETE (t-706)"),
+            "a plan-designated validation-free task must complete, got: {result}"
+        );
+        assert!(!result.contains("FAILED"), "got: {result}");
+        assert!(!result.contains("VALIDATOR REJECTION"), "got: {result}");
+        assert!(
+            !result.contains("Validation was not performed"),
+            "the verdict-gap wording must not appear, got: {result}"
+        );
+        assert!(
+            !result.contains("not validated"),
+            "the deliverable must not be reported as unvalidated, got: {result}"
+        );
+        assert_eq!(
+            marmennill::agents::MissionMarker::parse(&result),
+            Some(marmennill::agents::MissionMarker::Complete {
+                task_id: Some("t-706".to_string())
+            }),
+            "Marker must be Complete: {result}"
+        );
+
+        // The plan line checks off exactly like an approved deliverable.
+        assert!(
+            plan.check_plan_on_deliverable(None, Some("t-706"), &result)
+                .expect("plan check is not an IO error"),
+            "a skipped-validation deliverable must check its plan line off"
+        );
+        let plan_text = std::fs::read_to_string(plan.plan_path()).expect("plan file");
+        assert!(
+            plan_text.contains("- [x] [t-706]"),
+            "plan line must be checked off, got: {plan_text}"
+        );
+
+        // One status line announces the exemption, naming the worker tag and the
+        // reason read off disk.
+        let mut statuses = Vec::new();
+        while let Ok(line) = status_rx.try_recv() {
+            statuses.push(line);
+        }
+        assert!(
+            statuses.iter().any(|line| line == "[Validator] SKIPPED by design for coder-t-706: Planner-designated: no validation required (research/documentation task)"),
+            "the exemption must be announced verbatim on the status channel, got: {statuses:?}"
+        );
+        assert!(
+            !statuses.iter().any(|line| line.contains("NO VERDICT FILE for coder-t-706")),
+            "the gap announcement must not fire for a recorded skip, got: {statuses:?}"
+        );
+
+        // Honest worker status: nothing approved it, nothing rejected it.
+        let state = marmennill::orchestrator::workers::worker_state_snapshot("coder-t-706")
+            .expect("the worker entry survives its run in the completed ring");
+        assert_eq!(
+            state.info.status,
+            "Completed (validation skipped by design)",
+            "the worker must report the skipped-validation completion label"
+        );
+    })
+    .await;
+}
+
+/// A record is a decision only if it says something. A blank
+/// `{tid}-validation-skip.md` reads as `None`, so the fail-closed verdict gap for
+/// the missing `{tid}-validation.md` stays fully intact — the exemption can never
+/// be bought with an empty file.
+#[tokio::test]
+async fn test_blank_validation_skip_record_is_not_a_decision_and_fails_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+
+    marmennill::harness::with_workspace_root(tmp_path.clone(), async move {
+        let prompts = prompts_dir_of(&tmp_path);
+        std::fs::create_dir_all(&prompts).expect("prompts dir");
+        assert!(
+            !prompts.join("t-707-validation.md").exists(),
+            "fixture: the verdict brief must be absent"
+        );
+        std::fs::write(prompts.join("t-707-validation-skip.md"), "   \n\t\n")
+            .expect("blank skip record");
+        let plan = seed_plan(&tmp_path, "t-707");
+
+        let (server, call_counter, _) = mock_backend(specialist_turns("t-707")).await;
+        let backend_url = format!("{}/v1", server.uri());
+        let cfg = coder_cfg_with_validator(&backend_url, 3);
+        let client = ChatClient::new(&backend_url, "test-model");
+        let token = CancellationToken::new();
+
+        let result = run_specialist_live(&client, Agent::Coder, &coder_ctx("t-707"), &cfg, &token)
+            .await
+            .expect("specialist live run should complete");
+
+        assert_eq!(
+            call_counter.load(Ordering::SeqCst),
+            2,
+            "a blank record must not invent a validator pass either"
+        );
+        assert!(
+            result.contains("Validation was not performed"),
+            "a blank record must leave the gap wording in place, got: {result}"
+        );
+        assert!(
+            result.contains("t-707-validation.md does not exist"),
+            "reason must still name the missing verdict file, got: {result}"
+        );
+        assert!(result.contains("not validated"), "got: {result}");
+        assert!(result.contains("FAILED"), "got: {result}");
+        assert!(
+            !result.contains("MISSION COMPLETE (t-707)"),
+            "the completion marker must be revoked, got: {result}"
+        );
+
+        let state = marmennill::orchestrator::workers::worker_state_snapshot("coder-t-707")
+            .expect("the worker entry survives its run in the completed ring");
+        // Unchanged worker label: the runner stamps the interim
+        // `Failed (no validation verdict file)` on the gap, then reports the ordinary
+        // rejection label when it assembles the rejected deliverable. What must never
+        // happen is that an empty record buys the skip label.
+        assert!(
+            !state.info.status.contains("validation skipped by design"),
+            "a blank record must never buy the skipped-by-design label, got: {}",
+            state.info.status
+        );
+        assert_eq!(
+            state.info.status, "Rejected",
+            "a blank record must keep the verdict-gap rejection label"
+        );
+
+        assert!(
+            !plan
+                .check_plan_on_deliverable(None, Some("t-707"), &result)
+                .expect("plan check is not an IO error"),
+            "a blank record must not check the plan line off"
+        );
+        let plan_text = std::fs::read_to_string(plan.plan_path()).expect("plan file");
+        assert!(
+            plan_text.contains("- [ ] [t-707]"),
+            "plan line must stay unchecked, got: {plan_text}"
+        );
+    })
+    .await;
+}
+
+/// Write-side counterpart of the exemption: the validation brief and the
+/// `-validation-skip.md` record are two records written with **one atomic intent**.
+/// When a re-plan flips a task to validated but the `-validation.md` write fails
+/// (IO error, unwritable destination), the stale skip record is dropped instead of
+/// being left behind — otherwise the task would silently be reported as "validation
+/// skipped by design", check its plan line off and lose validation with no error
+/// surfaced. This drives the real writer: round 1 records the skip, round 2 flips
+/// the task to implementation work with a blocked brief destination, and the run on
+/// the resulting state (no brief, **no record**) must stay fail closed.
+#[tokio::test]
+async fn test_failed_validation_brief_write_is_not_reported_as_a_skip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+
+    marmennill::harness::with_workspace_root(tmp_path.clone(), async move {
+        let prompts = prompts_dir_of(&tmp_path);
+        let catalog = marmennill::agents::Catalog::new();
+
+        // Round 1: the plan line declares `(no-validate)` → the plan side records the
+        // decision.
+        PromptBuilder::pregenerate_for_plan_offline(
+            "- [ ] [t-708] Produce the release notes (no-validate) (generalist)\n",
+            &catalog,
+            &prompts,
+        );
+        assert!(
+            prompts.join("t-708-validation-skip.md").exists(),
+            "fixture: round 1 records the no-validation decision"
+        );
+
+        // Round 2: the same id is re-planned with `(validate)`, but its validation
+        // brief cannot be written (something else occupies the destination).
+        std::fs::create_dir(prompts.join("t-708-validation.md")).expect("blocking entry");
+        let generated = PromptBuilder::pregenerate_for_plan_offline(
+            "- [ ] [t-708] Implement the widget factory (validate) (coder)\n",
+            &catalog,
+            &prompts,
+        );
+        assert!(
+            !generated.contains(&"t-708-validation.md".to_string()),
+            "an unwritable brief must not be reported as generated: {generated:?}"
+        );
+        assert!(
+            !generated.contains(&"t-708-validation-skip.md".to_string()),
+            "the failed brief write must not (re-)record a skip decision: {generated:?}"
+        );
+        assert!(
+            !prompts.join("t-708-validation-skip.md").exists(),
+            "a stale skip record must never survive a failed validation-brief write"
+        );
+
+        // Remove the blocker so the disk state matches a real IO failure: neither a
+        // brief nor a record exists for this task.
+        std::fs::remove_dir(prompts.join("t-708-validation.md")).expect("remove blocker");
+        let plan = seed_plan(&tmp_path, "t-708");
+
+        let (server, call_counter, _) = mock_backend(specialist_turns("t-708")).await;
+        let backend_url = format!("{}/v1", server.uri());
+        let cfg = coder_cfg_with_validator(&backend_url, 3);
+        let client = ChatClient::new(&backend_url, "test-model");
+        let token = CancellationToken::new();
+
+        let result = run_specialist_live(&client, Agent::Coder, &coder_ctx("t-708"), &cfg, &token)
+            .await
+            .expect("specialist live run should complete");
+
+        assert_eq!(
+            call_counter.load(Ordering::SeqCst),
+            2,
+            "a lost brief must not be turned into a design-time skip that skips the validator"
+        );
+        assert!(
+            result.contains("Validation was not performed"),
+            "the verdict gap must still be reported, got: {result}"
+        );
+        assert!(
+            result.contains("t-708-validation.md does not exist"),
+            "the reason must name the missing brief, got: {result}"
+        );
+        assert!(result.contains("FAILED"), "got: {result}");
+        assert!(
+            !result.contains("MISSION COMPLETE (t-708)"),
+            "the completion marker must be revoked, got: {result}"
+        );
+        assert!(
+            !result.contains("skipped by design"),
+            "a failed brief write must never be reported as a design-time skip: {result}"
+        );
+
+        let state = marmennill::orchestrator::workers::worker_state_snapshot("coder-t-708")
+            .expect("the worker entry survives its run in the completed ring");
+        assert!(
+            !state.info.status.contains("validation skipped by design"),
+            "the worker must not report the skipped-by-design label, got: {}",
+            state.info.status
+        );
+        assert!(
+            !plan
+                .check_plan_on_deliverable(None, Some("t-708"), &result)
+                .expect("plan check is not an IO error"),
+            "the plan line must not be checked off"
+        );
+        let plan_text = std::fs::read_to_string(plan.plan_path()).expect("plan file");
+        assert!(
+            plan_text.contains("- [ ] [t-708]"),
             "plan line must stay unchecked, got: {plan_text}"
         );
     })
@@ -1310,6 +1702,13 @@ async fn test_unreadable_validation_verdict_file_is_a_hard_failure() {
             [0xFFu8, 0xFE, 0x00, 0x80, 0xC3, 0x28],
         )
         .expect("garbage verdict file");
+        // A skip record explains a brief that was **never written** — it must never
+        // leak into this case. Fixture states the fact out loud: no
+        // `-validation-skip.md` exists, so the unreadable brief stays a hard gap.
+        assert!(
+            !prompts.join("t-704-validation-skip.md").exists(),
+            "fixture: no no-validation record may exist for this gap"
+        );
         let plan = seed_plan(&tmp_path, "t-704");
 
         let (server, call_counter, _) = mock_backend(specialist_turns("t-704")).await;
@@ -1357,6 +1756,13 @@ async fn test_blank_validation_verdict_file_is_a_hard_failure() {
         let prompts = prompts_dir_of(&tmp_path);
         std::fs::create_dir_all(&prompts).expect("prompts dir");
         std::fs::write(prompts.join("t-705-validation.md"), "   \n\t\n").expect("blank file");
+        // Same scoping as the unreadable case: a blank **verdict** file is a gap of
+        // its own, and this task carries no `-validation-skip.md` record at all, so
+        // the skip exemption cannot be blamed for the outcome pinned here.
+        assert!(
+            !prompts.join("t-705-validation-skip.md").exists(),
+            "fixture: no no-validation record may exist for this gap"
+        );
         let plan = seed_plan(&tmp_path, "t-705");
 
         let (server, call_counter, _) = mock_backend(specialist_turns("t-705")).await;
@@ -1381,6 +1787,232 @@ async fn test_blank_validation_verdict_file_is_a_hard_failure() {
                 .check_plan_on_deliverable(None, Some("t-705"), &result)
                 .expect("plan check is not an IO error"),
             "a blank verdict file must not check the plan line off"
+        );
+    })
+    .await;
+}
+
+/// End to end through the **real** writer and the runner: a coder line that
+/// declares `(no-validate)` authors no auditor brief and instead leaves the durable
+/// `{tid}-validation-skip.md` record carrying the directive's own reason. The run
+/// then completes on its own marker, checks its plan line off with the token still
+/// on the line, and the validator is contacted **zero** times — the call counter and
+/// the captured request bodies both prove it, so nothing here rests on wording.
+#[tokio::test]
+async fn test_a_no_validate_coder_line_authors_no_brief_and_never_reaches_the_validator() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+
+    marmennill::harness::with_workspace_root(tmp_path.clone(), async move {
+        let plan_line = "- [ ] [t-709] Deliver the change (no-validate) (coder)";
+        let plan_markdown =
+            format!("# Execution Plan\n\n### Phase 1: Implementation\n{plan_line}\n");
+        let plan = seed_plan_document(&tmp_path, &plan_markdown);
+
+        // The write side is `create_plan`'s own offline pregenerator, not a
+        // hand-written fixture, so the directive → record mapping is the one the
+        // planner path actually performs.
+        let prompts = prompts_dir_of(&tmp_path);
+        let generated = marmennill::agents::PromptBuilder::pregenerate_for_plan_offline(
+            &plan_markdown,
+            &marmennill::agents::Catalog::new(),
+            &prompts,
+        );
+        assert!(
+            generated.contains(&"t-709.md".to_string())
+                && generated.contains(&"t-709-validation-skip.md".to_string()),
+            "the writer must emit the worker prompt and the skip record: {generated:?}"
+        );
+        assert!(
+            !prompts.join("t-709-validation.md").exists(),
+            "a `(no-validate)` line must author no auditor brief"
+        );
+        assert_eq!(
+            std::fs::read_to_string(prompts.join("t-709-validation-skip.md"))
+                .expect("skip record")
+                .trim(),
+            "Plan directive (no-validate): validation not required",
+            "the record must name the plan directive as its reason"
+        );
+
+        let (server, call_counter, bodies) = mock_backend(specialist_turns("t-709")).await;
+        let backend_url = format!("{}/v1", server.uri());
+        let cfg = coder_cfg_with_validator(&backend_url, 3);
+        let client = ChatClient::new(&backend_url, "test-model");
+        let token = CancellationToken::new();
+
+        let result = run_specialist_live(&client, Agent::Coder, &coder_ctx("t-709"), &cfg, &token)
+            .await
+            .expect("specialist live run should complete");
+
+        // ZERO validator calls: the specialist consumed exactly its own two turns.
+        assert_eq!(
+            call_counter.load(Ordering::SeqCst),
+            2,
+            "a `(no-validate)` line may never reach the validator"
+        );
+        let requests = bodies.lock().expect("capture lock").clone();
+        assert_eq!(requests.len(), 2, "one request per served turn");
+        for (index, request) in requests.iter().enumerate() {
+            assert!(
+                !request.contains("Specialist Deliverable"),
+                "request {index} is a validator prompt, but this task has no validator"
+            );
+            assert!(
+                !request.contains(marmennill::tool_names::TOOL_LEAVE_VERDICT),
+                "no verdict-recording turn may be served for a skipped task"
+            );
+        }
+
+        // Normal completion, with no trace of a verdict gap.
+        assert!(
+            result.contains("MISSION COMPLETE (t-709)"),
+            "a directive-declared validation-free task must complete, got: {result}"
+        );
+        assert!(!result.contains("FAILED"), "got: {result}");
+        assert!(
+            !result.contains("Validation was not performed"),
+            "the verdict-gap wording must not appear, got: {result}"
+        );
+
+        // The plan line checks off **with its token intact**: only the checkbox
+        // moves, so the plan stays a faithful record of what it declared.
+        assert!(
+            plan.check_plan_on_deliverable(None, Some("t-709"), &result)
+                .expect("plan check is not an IO error"),
+            "a skipped-validation deliverable must check its plan line off"
+        );
+        let plan_text = std::fs::read_to_string(plan.plan_path()).expect("plan file");
+        assert!(
+            plan_text.contains("- [x] [t-709] Deliver the change (no-validate) (coder)"),
+            "the box flips and the directive survives, got: {plan_text}"
+        );
+
+        // Honest worker status: the plan waived validation, nothing approved it.
+        let state = marmennill::orchestrator::workers::worker_state_snapshot("coder-t-709")
+            .expect("the worker entry survives its run in the completed ring");
+        assert_eq!(
+            state.info.status, "Completed (validation skipped by design)",
+            "the worker must report the skipped-validation completion label"
+        );
+    })
+    .await;
+}
+
+/// The opposite directive on the role that most invites a shortcut: `(validate)`
+/// on a **researcher** line. The auditor brief is authored for it, and the validator
+/// is really driven — one extra backend call whose prompt is the authored brief,
+/// ending in a `leave_verdict` round — so an explicit `(validate)` demonstrably
+/// buys validation rather than only disabling it.
+#[tokio::test]
+async fn test_a_validate_researcher_line_authors_the_brief_and_drives_a_verdict_round() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+
+    marmennill::harness::with_workspace_root(tmp_path.clone(), async move {
+        let plan_line = "- [ ] [t-710] Investigate the retry policy (validate) (researcher)";
+        let plan_markdown =
+            format!("# Execution Plan\n\n### Phase 1: Investigation\n{plan_line}\n");
+        let plan = seed_plan_document(&tmp_path, &plan_markdown);
+
+        let prompts = prompts_dir_of(&tmp_path);
+        let generated = marmennill::agents::PromptBuilder::pregenerate_for_plan_offline(
+            &plan_markdown,
+            &marmennill::agents::Catalog::new(),
+            &prompts,
+        );
+        assert!(
+            generated.contains(&"t-710-validation.md".to_string()),
+            "an explicit `(validate)` must author the auditor brief: {generated:?}"
+        );
+        assert!(
+            !prompts.join("t-710-validation-skip.md").exists(),
+            "the two records stay mutually exclusive"
+        );
+        let brief = std::fs::read_to_string(prompts.join("t-710-validation.md"))
+            .expect("authored auditor brief");
+        assert!(
+            brief.contains("Independent Quality Verification for t-710"),
+            "the brief is the per-task audit protocol: {brief}"
+        );
+        assert!(
+            !brief.contains("(validate)"),
+            "the directive is honoured by the writer, never copied into the brief"
+        );
+
+        let mut turns = researcher_turns("t-710");
+        turns.push(verdict_call(
+            "APPROVED",
+            "The note matches the retry policy in the code.",
+        ));
+        let (server, call_counter, bodies) = mock_backend(turns).await;
+        let backend_url = format!("{}/v1", server.uri());
+        let cfg = researcher_cfg_with_validator(&backend_url, 3);
+        let client = ChatClient::new(&backend_url, "test-model");
+        let token = CancellationToken::new();
+
+        let result = run_specialist_live(
+            &client,
+            Agent::Researcher,
+            &researcher_ctx("t-710"),
+            &cfg,
+            &token,
+        )
+        .await
+        .expect("specialist live run should complete");
+
+        // Researcher (2 turns) + exactly one validator pass driven by the authored
+        // brief, which ends in a verdict round.
+        assert_eq!(
+            call_counter.load(Ordering::SeqCst),
+            3,
+            "an explicit `(validate)` line must reach the validator"
+        );
+        let requests = bodies.lock().expect("capture lock").clone();
+        assert_eq!(
+            requests.len(),
+            3,
+            "two researcher turns + one validator pass"
+        );
+        assert!(
+            requests[2].contains("Specialist Deliverable"),
+            "the third call is the validator, not another researcher turn"
+        );
+        assert!(
+            requests[2].contains("Independent Quality Verification for t-710"),
+            "the validator must be driven by the brief the plan line bought back"
+        );
+
+        assert!(
+            result.contains("MISSION COMPLETE (t-710)"),
+            "an approved research deliverable completes, got: {result}"
+        );
+        assert!(!result.contains("FAILED"), "got: {result}");
+        assert_eq!(
+            marmennill::agents::MissionMarker::parse(&result),
+            Some(marmennill::agents::MissionMarker::Complete {
+                task_id: Some("t-710".to_string())
+            }),
+            "Marker must be Complete: {result}"
+        );
+
+        assert!(
+            plan.check_plan_on_deliverable(None, Some("t-710"), &result)
+                .expect("plan check is not an IO error"),
+            "an approved deliverable must check its plan line off"
+        );
+        let plan_text = std::fs::read_to_string(plan.plan_path()).expect("plan file");
+        assert!(
+            plan_text
+                .contains("- [x] [t-710] Investigate the retry policy (validate) (researcher)"),
+            "the box flips and the directive survives, got: {plan_text}"
+        );
+
+        let state = marmennill::orchestrator::workers::worker_state_snapshot("researcher-t-710")
+            .expect("the worker entry survives its run in the completed ring");
+        assert_eq!(
+            state.info.status, "Approved",
+            "a validated researcher run carries the approved label, not the skip label"
         );
     })
     .await;

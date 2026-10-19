@@ -59,7 +59,7 @@ fn plan_prompt_section(plan: &crate::manager::phase::Plan) -> (String, Option<St
             match plan.read() {
                 Ok(Some(content)) if !content.trim().is_empty() => (
                     format!(
-                        "\n## Active Execution Plan (`.marmel/execution_plan.md`)\nThere is an existing execution plan already active on disk:\n```markdown\n{}\n```\nDo NOT call `create_plan` unless you explicitly intend to overwrite the plan. Proceed directly with `delegate_task` to execute any remaining unchecked `- [ ] [t-xxx]` tasks.\n",
+                        "\n## Active Execution Plan (`.marmel/execution_plan.md`)\nThere is an existing execution plan already active on disk:\n```markdown\n{}\n```\nDo NOT call `create_plan` unless you explicitly intend to overwrite the plan. Proceed directly with `delegate_task` to execute any remaining unchecked `- [ ] [t-xxx]` tasks, honouring each line's optional `(validate)` / `(no-validate)` directive where present.\n",
                         content.trim()
                     ),
                     None,

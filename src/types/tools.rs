@@ -77,7 +77,7 @@ impl ToolDef {
                     "properties": {
                         "plan_markdown": {
                             "type": "string",
-                            "description": "Markdown formatted plan with - [ ] [t-xxx] tasks."
+                            "description": "Markdown formatted plan with - [ ] [t-xxx] tasks. Optional (validate) or (no-validate) directive immediately before the (role) hint, e.g. - [ ] [t-001] Research library X (no-validate) (researcher)."
                         }
                     },
                     "required": ["plan_markdown"]

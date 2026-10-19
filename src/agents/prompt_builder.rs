@@ -7,6 +7,7 @@ use crate::agents::DelegationRequest;
 use crate::agents::catalog::Catalog;
 use crate::markers::{MARKER_COMPLETE, MARKER_FAILED};
 use crate::orchestrator::pool;
+use crate::plan_parse::ValidationDirective;
 use crate::tool_names::{
     TOOL_CREATE_PLAN, TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_READ_FILE, TOOL_REBIRTH,
 };
@@ -14,6 +15,42 @@ use crate::types::{ChatRequest, Message};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+/// Suffix of the durable record stating that a task **needs no validation**.
+///
+/// Written next to the prompts it belongs to (`.marmel/prompts/<task_id>-validation-skip.md`)
+/// for the one decision that may produce it: an explicit `(no-validate)` plan
+/// directive ([`crate::plan_parse::ValidationDirective::NoValidate`]) on the
+/// task's plan line. The record is the authoritative run-time signal for the read
+/// side (`runner/execution.rs`, `agents/validation.rs`, `runner/fix_loop.rs`):
+/// its absence keeps the fail-closed "no verdict file" guard intact, while its
+/// presence means "the plan declared validation unnecessary, nothing to check".
+pub(crate) const VALIDATION_SKIP_FILE_SUFFIX: &str = "-validation-skip.md";
+
+/// One-line human-readable reason stored in the skip record.
+///
+/// It names the **plan line** as the author of the decision, not a keyword
+/// match on the task description: the directive is what disabled validation.
+pub(crate) const VALIDATION_SKIP_REASON: &str =
+    "Plan directive (no-validate): validation not required";
+
+/// The write-side outcome of one plan task line's validation directive.
+///
+/// Only [`Self::SkipRecord`] may ever create a `<task_id>-validation-skip.md`,
+/// and it is reachable from exactly one directive value
+/// ([`ValidationDirective::NoValidate`]). [`Self::Nothing`] exists for the roles
+/// whose deliverables are never validated (`planner`, `validator`): they get
+/// neither a brief nor a record, so their absent brief is never re-read as a
+/// plan-designated skip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteDecision {
+    /// Write `<task_id>-validation.md` and drop any stale skip record.
+    Brief,
+    /// Write `<task_id>-validation-skip.md` and drop any stale brief.
+    SkipRecord,
+    /// Write neither record (role-exempt tasks).
+    Nothing,
+}
 
 /// The synthesized specification for an isolated worker subagent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -562,6 +599,11 @@ impl PromptBuilder {
     /// generated from this list cover exactly the plan lines
     /// `Plan::pending_tasks` reports — bracketed, parenthesised, starred,
     /// numbered and bold-decorated task ids alike, and only unchecked boxes.
+    /// The reserved validation directive (`(validate)` / `(no-validate)`) travels
+    /// along verbatim as [`PlanTaskItem::validation_directive`]: this mapping adds
+    /// no policy of its own, and a blank (`( )`) or unparseable (`(maybe-validate)`)
+    /// paren group arrives as [`ValidationDirective::Auto`] exactly as the parser
+    /// resolved it.
     pub fn parse_tasks_from_plan(markdown: &str) -> Vec<PlanTaskItem> {
         crate::plan_parse::parse_tasks(markdown)
             .into_iter()
@@ -569,11 +611,13 @@ impl PromptBuilder {
             .filter_map(|task| {
                 let description = task.description_without_role_hint().to_string();
                 let role_hint = task.role_hint.clone();
+                let validation_directive = task.validation_directive;
                 let task_id = task.task_id?;
                 Some(PlanTaskItem {
                     task_id,
                     description,
                     role_hint,
+                    validation_directive,
                 })
             })
             .collect()
@@ -596,7 +640,175 @@ impl PromptBuilder {
         Ok(format!("{id}-validation.md"))
     }
 
-    /// Pre-generate prompt pairs (<task_id>.md and optional <task_id>-validation.md) for all tasks in a plan.
+    /// File name of the `<task_id>-validation-skip.md` record.
+    ///
+    /// The record is the durable spelling of the write-side decision taken from
+    /// the plan line's explicit `(no-validate)` directive
+    /// ([`ValidationDirective::NoValidate`]): it says out loud that the plan
+    /// declared this task validation-free, so the read side never mistakes the
+    /// absent `<task_id>-validation.md` for a lost verdict file. Same grammar gate
+    /// as [`Self::validation_prompt_file_name`] — a rejected id is a
+    /// [`crate::task_id::TaskIdError`], never a repaired name, and a rejected id
+    /// therefore never gets a record at all.
+    fn validation_skip_file_name(raw_task_id: &str) -> Result<String, crate::task_id::TaskIdError> {
+        let id = crate::task_id::validate_task_id(raw_task_id)?;
+        Ok(format!("{id}{VALIDATION_SKIP_FILE_SUFFIX}"))
+    }
+
+    /// The single owner of the write-side precedence: plan directive → outcome.
+    ///
+    /// * [`ValidationDirective::NoValidate`] (`(no-validate)`) is the **only**
+    ///   input that can ever yield [`WriteDecision::SkipRecord`].
+    /// * [`ValidationDirective::Validate`] (`(validate)`) forces the brief.
+    /// * [`ValidationDirective::Auto`] (no reserved token on the line) writes the
+    ///   brief too — the plan says nothing, so validation stays on. It is never
+    ///   allowed to produce a skip record.
+    ///
+    /// Fail closed on wording: a blank (`( )`) or unparseable (`(maybe-validate)`)
+    /// parenthetical is already `Auto` because [`ValidationDirective::parse`] maps
+    /// every token outside [`crate::plan_parse::VALIDATION_DIRECTIVES`] to `Auto`.
+    /// The assertion below re-checks that guarantee **on this side** so the write
+    /// path can never fall through to `NoValidate` — not today, and not if the
+    /// parser's default ever moves.
+    fn validation_write_decision(
+        directive: ValidationDirective,
+        agent: crate::agents::Agent,
+    ) -> WriteDecision {
+        debug_assert!(
+            ValidationDirective::parse("").is_auto()
+                && ValidationDirective::parse("   ").is_auto()
+                && ValidationDirective::parse("( )").is_auto()
+                && ValidationDirective::parse("maybe-validate").is_auto(),
+            "a blank or unparseable validation directive must resolve to Auto, never to NoValidate"
+        );
+        // `planner` / `validator` deliverables are exempt from validation by role
+        // (the read side hard-codes that opt-out), so no brief is authored for
+        // them — an explicit `(validate)` cannot buy back a role exemption. An
+        // explicit `(no-validate)` is still recorded, because that is what the
+        // plan line says.
+        let role_exempt = matches!(
+            agent,
+            crate::agents::Agent::Planner | crate::agents::Agent::Validator
+        );
+        match directive {
+            ValidationDirective::NoValidate => WriteDecision::SkipRecord,
+            ValidationDirective::Validate | ValidationDirective::Auto if role_exempt => {
+                WriteDecision::Nothing
+            }
+            ValidationDirective::Validate | ValidationDirective::Auto => WriteDecision::Brief,
+        }
+    }
+
+    /// Remove a stale `<task_id>-validation-skip.md` left over from an earlier plan.
+    ///
+    /// Best effort: the outcome is reported through tracing, never returned, because
+    /// the caller is about to write the contradicting brief and the read side's
+    /// fail-closed guard still holds if the record survives.
+    fn delete_stale_skip_record(prompts_dir: &Path, raw_task_id: &str) {
+        let Ok(skip_name) = Self::validation_skip_file_name(raw_task_id) else {
+            return;
+        };
+        let skip_path = prompts_dir.join(&skip_name);
+        if skip_path.exists()
+            && let Err(err) = std::fs::remove_file(&skip_path)
+        {
+            tracing::error!(
+                "Failed to delete the stale no-validation record {} for task {:?}: {err}. \
+                 Its validation brief is written next, and if that write fails this task \
+                 keeps a contradictory pair of records on disk.",
+                skip_path.display(),
+                raw_task_id
+            );
+        }
+    }
+
+    /// Remove a stale `<task_id>-validation.md` left over from an earlier plan.
+    ///
+    /// `Ok(true)` when a brief really was there and is gone, `Ok(false)` when there
+    /// was nothing to remove (including a grammar-rejected task id, which never had
+    /// a brief name authored here). `Err` only when an existing brief could not be
+    /// deleted — the caller must then **not** write a skip record, so the two
+    /// records can never contradict each other and the task stays fail closed
+    /// against the brief that is still on disk.
+    fn delete_stale_validation_brief(
+        prompts_dir: &Path,
+        raw_task_id: &str,
+    ) -> Result<bool, std::io::Error> {
+        let Ok(name) = Self::validation_prompt_file_name(raw_task_id) else {
+            return Ok(false);
+        };
+        match std::fs::remove_file(prompts_dir.join(name)) {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Write the durable "the plan declared this task validation-free" record and
+    /// return its file name, or `None` when the task id is refused by the grammar
+    /// authority (warned about, never repaired into some other name).
+    fn write_validation_skip_record(prompts_dir: &Path, task_id: &str) -> Option<String> {
+        let name = match Self::validation_skip_file_name(task_id) {
+            Ok(name) => name,
+            Err(err) => {
+                tracing::warn!(
+                    "Rejected task id {task_id:?} while recording its no-validation decision under {}: {err}. \
+                     No `-validation-skip.md` record is written and no substitute name is derived.",
+                    prompts_dir.display()
+                );
+                return None;
+            }
+        };
+        match std::fs::write(
+            prompts_dir.join(&name),
+            format!("{VALIDATION_SKIP_REASON}\n"),
+        ) {
+            Ok(()) => Some(name),
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to record the no-validation decision for task {task_id:?} under {}: {err}. \
+                     The task keeps today's fail-closed verdict behaviour.",
+                    prompts_dir.display()
+                );
+                None
+            }
+        }
+    }
+
+    /// Read the durable no-validation record for `raw_task_id` inside `prompts_dir`.
+    ///
+    /// `Some(reason)` only when a non-blank record exists. A rejected id, a
+    /// missing record and a blank record all read as `None`, so the fail-closed
+    /// verdict guard is never weakened by a corrupt or absent record.
+    pub(crate) fn validation_skip_record(prompts_dir: &Path, raw_task_id: &str) -> Option<String> {
+        let name = Self::validation_skip_file_name(raw_task_id).ok()?;
+        let text = std::fs::read_to_string(prompts_dir.join(name)).ok()?;
+        let reason = text.trim();
+        (!reason.is_empty()).then(|| reason.to_string())
+    }
+
+    /// Convenience lookup for read paths that do not already hold the prompts
+    /// directory: resolves `<workspace root>/.marmel/prompts` and normalizes the
+    /// task id exactly as the `{tid}-validation.md` verdict lookup does.
+    pub(crate) fn validation_skip_record_for_task(task_id: Option<&str>) -> Option<String> {
+        let raw = task_id?;
+        let prompts_dir = crate::harness::get_workspace_root()
+            .join(crate::manager::phase::MARMEL_DIR)
+            .join("prompts");
+        let normalized = crate::task_id::normalize_task_id_ref(raw);
+        Self::validation_skip_record(&prompts_dir, normalized)
+    }
+
+    /// Pre-generate prompt pairs (`<task_id>.md` and, unless the plan line says
+    /// `(no-validate)`, `<task_id>-validation.md`) for all tasks in a plan.
+    ///
+    /// The outcome per task comes from [`PlanTaskItem::validation_directive`]
+    /// through [`Self::validation_write_decision`], and each write also clears the
+    /// contradicting record from any earlier plan: `(validate)`/`Auto` delete a
+    /// stale `<task_id>-validation-skip.md` **before** the brief is attempted,
+    /// `(no-validate)` deletes a stale `<task_id>-validation.md` before its record
+    /// is written. A task id refused by the grammar authority contributes neither
+    /// record.
     pub fn pregenerate_for_plan_offline(
         plan_markdown: &str,
         catalog: &Catalog,
@@ -633,59 +845,119 @@ impl PromptBuilder {
                 );
             }
 
-            let desc_lower = item.description.to_ascii_lowercase();
-            let is_doc_or_config = desc_lower.contains("readme")
-                || desc_lower.contains("docs")
-                || desc_lower.contains("documentation")
-                || desc_lower.contains("markdown")
-                || desc_lower.contains("report")
-                || desc_lower.contains("summary")
-                || desc_lower.contains("summariz");
+            // The **plan line** decides, never its wording: `(no-validate)` is the
+            // only spelling that may produce a `-validation-skip.md` record,
+            // `(validate)` forces the brief, and a line carrying no reserved token
+            // (`Auto`) keeps validation on. The directive is parsed by
+            // [`crate::plan_parse`] and carried here on
+            // [`PlanTaskItem::validation_directive`]; a blank (`( )`) or
+            // unparseable (`(maybe-validate)`) paren group is `Auto` and can never
+            // reach the skip arm.
+            let decision = Self::validation_write_decision(item.validation_directive, agent);
 
-            let needs_validation = !is_doc_or_config
-                && (agent == crate::agents::Agent::Coder
-                    || agent == crate::agents::Agent::Debugger
-                    || desc_lower.contains("implement")
-                    || desc_lower.contains("refactor")
-                    || desc_lower.contains("fix")
-                    || desc_lower.contains("patch")
-                    || (desc_lower.contains("build") && !desc_lower.contains("verify"))
-                    || desc_lower.contains("unit test"));
-
-            if needs_validation
-                && agent != crate::agents::Agent::Planner
-                && agent != crate::agents::Agent::Validator
-            {
-                // The `<task_id>-validation.md` name is a WRITE whose file stem
-                // is an LLM-authored plan id, so it is checked by
-                // [`Self::validation_prompt_file_name`] before any join. A
-                // rejected id writes nothing and never gets a substitute name;
-                // the runner verdict path and `agents::validation` then see
-                // exactly what they see for an absent validation prompt.
-                let val_filename = match Self::validation_prompt_file_name(&item.task_id) {
-                    Ok(name) => name,
-                    Err(err) => {
-                        tracing::warn!(
-                            "Rejected task id {:?} while pre-generating its validation prompt under {}: {err}. \
-                             No `-validation.md` file is written and no substitute name is derived.",
-                            item.task_id,
-                            prompts_dir.display()
-                        );
-                        continue;
+            match decision {
+                // `planner` / `validator` deliverables are exempt from validation by
+                // role on the read side, so neither record is authored for them.
+                WriteDecision::Nothing => {}
+                WriteDecision::SkipRecord => {
+                    // Stale-record lifecycle on re-plan, flip-to-skipped direction:
+                    // a task that was validated under an earlier plan and is re-planned
+                    // with `(no-validate)` must not keep the previous plan's
+                    // `<tid>-validation.md`, because the read side ranks a readable
+                    // brief above the record and would audit the deliverable against a
+                    // **stale** brief. The brief is therefore deleted first, together
+                    // with the flipped decision.
+                    match Self::delete_stale_validation_brief(prompts_dir, &item.task_id) {
+                        Ok(true) => tracing::info!(
+                            "Deleted the validation brief an earlier plan left for task {:?}: \
+                             its plan line now carries `(no-validate)`.",
+                            item.task_id
+                        ),
+                        Ok(false) => {}
+                        Err(err) => {
+                            // Half-applied flips are never allowed to contradict
+                            // themselves: while a brief is still readable on disk the
+                            // skip record would be ignored anyway, so recording a
+                            // plan-designated skip on top of it would misreport what the
+                            // read side does. The task keeps its fail-closed handling.
+                            tracing::error!(
+                                "Failed to delete the stale validation brief of task {:?} under {}: {err}. \
+                                 No `-validation-skip.md` record is written for this task.",
+                                item.task_id,
+                                prompts_dir.display()
+                            );
+                            continue;
+                        }
                     }
-                };
-                let val_dest = prompts_dir.join(&val_filename);
-                let val_content = format!(
-                    "---\nrole_name: \"validator\"\ntask_id: \"{}\"\ntarget_brief: \"{}\"\ncreated_at: \"{}\"\nallowed_tools:\n  - \"read_file\"\n  - \"grep_search\"\n  - \"glob\"\n  - \"run_command\"\n  - \"leave_verdict\"\n  - \"rebirth\"\n---\n\n# Independent Quality Verification for {}\n\n**Mission:** Independently audit the deliverable for task `{}`.\n**Brief:** {}\n\n## Verification Protocol:\n1. Inspect created or modified files to verify correctness and conformance. Keep inspection targeted and concise (aim for 2–5 inspection tool calls; avoid exhaustive codebase exploration).\n2. Execute test suites or checks if applicable.\n3. Conclude promptly by calling `leave_verdict(verdict=\"APPROVED\" | \"REJECTED\", comments=\"...\")`.\n",
-                    item.task_id,
-                    item.description.replace('"', "\\\""),
-                    chrono::Utc::now().to_rfc3339(),
-                    item.task_id,
-                    item.task_id,
-                    item.description
-                );
-                if std::fs::write(&val_dest, val_content).is_ok() {
-                    generated.push(val_filename);
+                    // The absence of a validation brief is a **decision made by the plan
+                    // line**, so it is recorded durably rather than left for the read
+                    // side to infer. A task with neither record — e.g. a task id refused
+                    // by the grammar authority below — keeps the fail-closed verdict
+                    // guard instead of a manufactured exemption.
+                    if let Some(skip_name) =
+                        Self::write_validation_skip_record(prompts_dir, &item.task_id)
+                    {
+                        generated.push(skip_name);
+                    }
+                }
+                WriteDecision::Brief => {
+                    // The `<task_id>-validation.md` name is a WRITE whose file stem
+                    // is an LLM-authored plan id, so it is checked by
+                    // [`Self::validation_prompt_file_name`] before any join. A
+                    // rejected id writes nothing and never gets a substitute name;
+                    // the runner verdict path and `agents::validation` then see
+                    // exactly what they see for an absent validation prompt.
+                    let val_filename = match Self::validation_prompt_file_name(&item.task_id) {
+                        Ok(name) => name,
+                        Err(err) => {
+                            tracing::warn!(
+                                "Rejected task id {:?} while pre-generating its validation prompt under {}: {err}. \
+                             No `-validation.md` file is written and no substitute name is derived.",
+                                item.task_id,
+                                prompts_dir.display()
+                            );
+                            continue;
+                        }
+                    };
+                    let val_dest = prompts_dir.join(&val_filename);
+                    let val_content = format!(
+                        "---\nrole_name: \"validator\"\ntask_id: \"{}\"\ntarget_brief: \"{}\"\ncreated_at: \"{}\"\nallowed_tools:\n  - \"read_file\"\n  - \"grep_search\"\n  - \"glob\"\n  - \"run_command\"\n  - \"leave_verdict\"\n  - \"rebirth\"\n---\n\n# Independent Quality Verification for {}\n\n**Mission:** Independently audit the deliverable for task `{}`.\n**Brief:** {}\n\n## Verification Protocol:\n1. Inspect created or modified files to verify correctness and conformance. Keep inspection targeted and concise (aim for 2–5 inspection tool calls; avoid exhaustive codebase exploration).\n2. Execute test suites or checks if applicable.\n3. Conclude promptly by calling `leave_verdict(verdict=\"APPROVED\" | \"REJECTED\", comments=\"...\")`.\n",
+                        item.task_id,
+                        item.description.replace('"', "\\\""),
+                        chrono::Utc::now().to_rfc3339(),
+                        item.task_id,
+                        item.task_id,
+                        item.description
+                    );
+                    // The two records are written as one atomic **intent**: a task that
+                    // is meant to be validated must never keep a no-validation record,
+                    // and it must not keep one when the brief cannot be written either.
+                    // A validation prompt now exists (or is about to be attempted) for
+                    // this task, so any stale `{tid}-validation-skip.md` from an earlier
+                    // plan is dropped **first** — deleting it up front means a failed
+                    // `-validation.md` write below can never leave the task looking
+                    // "skipped by design".
+                    Self::delete_stale_skip_record(prompts_dir, &item.task_id);
+                    if let Err(err) = std::fs::write(&val_dest, &val_content) {
+                        // Fail closed, never fail open: the write of the validation brief
+                        // failed (IO error, read-only directory, rejected destination), so
+                        // this task has **no** brief and — by the deletion above — **no**
+                        // skip record either. The read side therefore keeps the fail-closed
+                        // verdict gap instead of silently reporting the task as
+                        // "validation skipped by design" and checking off its plan line.
+                        // The failure is reported like every other prompt-write failure in
+                        // this file, so it is never swallowed.
+                        tracing::warn!(
+                            "Failed to write the validation prompt {} for task {:?}: {err}. \
+                         No `-validation-skip.md` record is left behind for this task, so its missing \
+                         `-validation.md` stays a fail-closed verdict gap and is never re-read as a \
+                         plan-designated skip.",
+                            val_dest.display(),
+                            item.task_id
+                        );
+                    } else {
+                        generated.push(val_filename);
+                    }
                 }
             }
         }
@@ -700,6 +972,15 @@ pub struct PlanTaskItem {
     pub task_id: String,
     pub description: String,
     pub role_hint: Option<String>,
+    /// The reserved validation directive of the plan line, copied verbatim from
+    /// [`crate::plan_parse::TaskLine::validation_directive`]: `(validate)` /
+    /// `(no-validate)`, or [`ValidationDirective::Auto`] when the line carries no
+    /// reserved token — including a blank (`( )`) or unparseable
+    /// (`(maybe-validate)`) parenthetical, which the parser resolves to `Auto`
+    /// and this mapping never upgrades into `NoValidate`. It is what decides
+    /// whether a validation brief or a no-validation record is written; the
+    /// description wording no longer decides anything.
+    pub validation_directive: ValidationDirective,
 }
 
 #[cfg(test)]
@@ -770,6 +1051,11 @@ mod tests {
         assert_eq!(loaded.system_prompt, "You are a test agent.");
     }
 
+    /// The plan **directive** decides which prompt files exist, not the wording of
+    /// the task line: `(no-validate)` records the skip and writes no brief,
+    /// `(validate)` writes the brief, and a line carrying no reserved token
+    /// (`Auto`) writes the brief too — even when its wording reads like research or
+    /// documentation, because task wording never gates validation on its own.
     #[test]
     fn test_pregenerate_for_plan_offline() {
         let catalog = Catalog::new();
@@ -778,10 +1064,11 @@ mod tests {
 # Execution Plan
 
 ### Phase 1: Research
-- [ ] [t-001] Investigate API contracts (researcher)
+- [ ] [t-001] Investigate API contracts (no-validate) (researcher)
 
 ### Phase 2: Implementation
-- [ ] [t-002] Implement parser logic (coder)
+- [ ] [t-002] Implement parser logic (validate) (coder)
+- [ ] [t-004] Migrate the schema index (coder)
 
 ### Phase 3: Documentation
 - [ ] [t-003] Produce documentation in README.md (generalist)
@@ -790,11 +1077,482 @@ mod tests {
         assert!(generated.contains(&"t-001.md".to_string()));
         assert!(generated.contains(&"t-002.md".to_string()));
         assert!(generated.contains(&"t-003.md".to_string()));
-        // The coder task ("implement") must also get its validation prompt
+        assert!(generated.contains(&"t-004.md".to_string()));
+        // `(validate)` on the coder task: the brief, and never a skip record.
         assert!(generated.contains(&"t-002-validation.md".to_string()));
-        // Pure research and pure documentation get no validation prompt
+        assert!(!generated.contains(&"t-002-validation-skip.md".to_string()));
+        // `(no-validate)` on the researcher task: no brief at all.
         assert!(!generated.contains(&"t-001-validation.md".to_string()));
-        assert!(!generated.contains(&"t-003-validation.md".to_string()));
+        assert!(generated.contains(&"t-001-validation-skip.md".to_string()));
+        // `Auto` lines are validated whatever their wording says, so both the
+        // keyword-free coder line and the README-documentation line get a brief and
+        // neither carries a record.
+        assert!(generated.contains(&"t-004-validation.md".to_string()));
+        assert!(generated.contains(&"t-003-validation.md".to_string()));
+        assert!(!generated.contains(&"t-003-validation-skip.md".to_string()));
+        assert!(!generated.contains(&"t-004-validation-skip.md".to_string()));
+    }
+
+    /// The decision not to write a validation prompt comes from the plan line and is
+    /// recorded durably, so the read side can tell "the plan declared this
+    /// validation-free" apart from a lost verdict file. A `(no-validate)` line gets
+    /// `<tid>-validation-skip.md` with the one-line reason naming the **directive**
+    /// as the author — including on a coder task, where neither role nor wording
+    /// buys validation back — while `(validate)` and `Auto` get the brief and
+    /// **no** record.
+    #[test]
+    fn test_pregenerate_records_the_no_validation_decision() {
+        let catalog = Catalog::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let prompts = tmp.path().join("prompts");
+        let plan = "\
+# Execution Plan
+- [ ] [t-001] Investigate API contracts (no-validate) (researcher)
+- [ ] [t-002] Implement parser logic (coder)
+- [ ] [t-003] Produce documentation in README.md (no-validate) (generalist)
+- [ ] [t-004] Fix the parser crash (no-validate) (coder)
+";
+
+        let generated = PromptBuilder::pregenerate_for_plan_offline(plan, &catalog, &prompts);
+
+        assert!(generated.contains(&"t-001-validation-skip.md".to_string()));
+        assert!(generated.contains(&"t-003-validation-skip.md".to_string()));
+        // `(no-validate)` on a **coder** task: the directive outranks the role, and
+        // neither the role nor the description wording can buy validation back.
+        assert!(generated.contains(&"t-004-validation-skip.md".to_string()));
+        assert!(!prompts.join("t-004-validation.md").exists());
+        // An `Auto` coder line is validated and contributes no record.
+        assert!(!generated.contains(&"t-002-validation-skip.md".to_string()));
+        assert_eq!(
+            std::fs::read_to_string(prompts.join("t-001-validation-skip.md"))
+                .unwrap()
+                .trim(),
+            crate::agents::prompt_builder::VALIDATION_SKIP_REASON,
+            "the skip record is a one-line reason naming the plan directive"
+        );
+        assert!(
+            crate::agents::prompt_builder::VALIDATION_SKIP_REASON.contains("Plan directive"),
+            "the reason must credit the plan line, not a keyword match on the description"
+        );
+        assert!(!prompts.join("t-002-validation-skip.md").exists());
+        // A validation prompt and a skip record never coexist for one task.
+        assert!(prompts.join("t-002-validation.md").exists());
+    }
+
+    /// Regression pin (t-014b): the reserved plan-line directive never reaches
+    /// model-facing prompt text. Both authored files of a directive-bearing task —
+    /// the `<tid>.md` blueprint and the `<tid>-validation.md` whose `target_brief`
+    /// is the task brief — are free of the `(validate)` / `(no-validate)`
+    /// vocabulary, while still naming the task id, the role and the plan wording.
+    /// The directive stays honoured where it belongs: as the write-side decision
+    /// (skip record for `(no-validate)`, brief for `(validate)` and for a line with
+    /// no token at all).
+    #[test]
+    fn test_generated_prompts_never_carry_the_reserved_directive() {
+        let catalog = Catalog::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let prompts = tmp.path().join("prompts");
+        let plan = "\
+# Execution Plan
+- [ ] [t-070] Investigate API contracts (no-validate) (researcher)
+- [ ] [t-071] Implement the parser core (validate) (coder)
+- [ ] [t-072] Refactor the schema index (coder)
+";
+        // The parsed description is already directive-free, so nothing downstream
+        // (blueprint prompt, target brief) can re-spell the token.
+        let items = PromptBuilder::parse_tasks_from_plan(plan);
+        assert_eq!(items[0].description, "Investigate API contracts");
+        assert_eq!(items[1].description, "Implement the parser core");
+
+        let generated = PromptBuilder::pregenerate_for_plan_offline(plan, &catalog, &prompts);
+
+        // 1. The directive still decides.
+        assert!(generated.contains(&"t-070-validation-skip.md".to_string()));
+        assert!(
+            !prompts.join("t-070-validation.md").exists(),
+            "a `(no-validate)` task must not get a validation brief"
+        );
+        assert!(generated.contains(&"t-071-validation.md".to_string()));
+        assert!(generated.contains(&"t-072-validation.md".to_string()));
+
+        // 2. No authored **prompt** file spells the reserved vocabulary. (The
+        //    `<tid>-validation-skip.md` record is a provenance record naming the
+        //    plan directive by design, and is deliberately not a prompt.)
+        for name in [
+            "t-070.md",
+            "t-071.md",
+            "t-072.md",
+            "t-071-validation.md",
+            "t-072-validation.md",
+        ] {
+            let text = std::fs::read_to_string(prompts.join(name))
+                .unwrap_or_else(|err| panic!("{name} must exist: {err}"));
+            let lowered = text.to_ascii_lowercase();
+            assert!(
+                !lowered.contains("(no-validate)"),
+                "{name} leaked the reserved directive:\n{text}"
+            );
+            assert!(
+                !lowered.contains("(validate)"),
+                "{name} leaked the reserved directive:\n{text}"
+            );
+        }
+
+        // 3. The stripped text still identifies the right task and role.
+        let blueprint =
+            std::fs::read_to_string(prompts.join("t-070.md")).expect("t-070.md must exist");
+        assert!(blueprint.contains("task_id: \"t-070\""), "{blueprint}");
+        assert!(
+            blueprint.contains("role_name: \"researcher_specialist\""),
+            "the role hint must still route the task:\n{blueprint}"
+        );
+        let brief = std::fs::read_to_string(prompts.join("t-071-validation.md"))
+            .expect("t-071-validation.md must exist");
+        assert!(brief.contains("task_id: \"t-071\""), "{brief}");
+        assert!(
+            brief.contains("target_brief: \"Implement the parser core\""),
+            "the target brief must be the directive-free plan wording:\n{brief}"
+        );
+        assert!(
+            brief.contains("**Brief:** Implement the parser core"),
+            "the validator mission must carry the directive-free wording:\n{brief}"
+        );
+    }
+
+    /// Re-plan flip **no-validate → validate**: the task that carried a
+    /// `-validation-skip.md` record gets its validation brief and the stale record
+    /// is dropped, so the two records cannot disagree on disk. The read-side lookup
+    /// follows the record (present / absent / blank), never the wording.
+    #[test]
+    fn test_validation_skip_record_lookup_and_stale_cleanup() {
+        let catalog = Catalog::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let prompts = tmp.path().join("prompts");
+
+        // First plan: the plan line declares `(no-validate)` → skip record, no brief.
+        PromptBuilder::pregenerate_for_plan_offline(
+            "- [ ] [t-056] Write the release notes (no-validate) (generalist)\n",
+            &catalog,
+            &prompts,
+        );
+        assert!(prompts.join("t-056-validation-skip.md").exists());
+        assert_eq!(
+            PromptBuilder::validation_skip_record(&prompts, "t-056").as_deref(),
+            Some(crate::agents::prompt_builder::VALIDATION_SKIP_REASON)
+        );
+
+        // Re-planned with `(validate)`: the validation prompt wins and the stale
+        // record is dropped.
+        PromptBuilder::pregenerate_for_plan_offline(
+            "- [ ] [t-056] Implement the widget factory (validate) (coder)\n",
+            &catalog,
+            &prompts,
+        );
+        assert!(prompts.join("t-056-validation.md").exists());
+        assert!(
+            !prompts.join("t-056-validation-skip.md").exists(),
+            "a stale skip record must not outlive the validation prompt"
+        );
+        assert_eq!(
+            PromptBuilder::validation_skip_record(&prompts, "t-056"),
+            None
+        );
+
+        // No record at all, and a blank record, both read as "no decision".
+        assert_eq!(
+            PromptBuilder::validation_skip_record(&prompts, "t-057"),
+            None
+        );
+        std::fs::write(prompts.join("t-057-validation-skip.md"), " \n").expect("blank skip record");
+        assert_eq!(
+            PromptBuilder::validation_skip_record(&prompts, "t-057"),
+            None
+        );
+        // A hostile id is refused by the grammar authority, never repaired.
+        assert_eq!(
+            PromptBuilder::validation_skip_record(&prompts, "../x"),
+            None
+        );
+    }
+
+    /// Re-plan flip **validate → no-validate**: when the new plan line declares
+    /// `(no-validate)`, the `<tid>-validation.md` authored by the previous plan MUST
+    /// be deleted. The read side ranks a readable brief above the record, so leaving
+    /// that file behind makes the next run audit the deliverable against a **stale**
+    /// brief from another plan instead of honouring the directive.
+    #[test]
+    fn test_replan_to_no_validate_drops_the_stale_validation_brief() {
+        let catalog = Catalog::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let prompts = tmp.path().join("prompts");
+
+        // First plan: `(validate)` → brief on disk, no record.
+        PromptBuilder::pregenerate_for_plan_offline(
+            "- [ ] [t-058] Implement the widget factory (validate) (coder)\n",
+            &catalog,
+            &prompts,
+        );
+        assert!(prompts.join("t-058-validation.md").exists());
+        assert!(!prompts.join("t-058-validation-skip.md").exists());
+
+        // Re-planned with `(no-validate)`: the record is written AND the previous
+        // plan's brief is deleted.
+        PromptBuilder::pregenerate_for_plan_offline(
+            "- [ ] [t-058] Summarize the findings for the release (no-validate) (researcher)\n",
+            &catalog,
+            &prompts,
+        );
+        assert!(
+            !prompts.join("t-058-validation.md").exists(),
+            "a stale validation brief must not outlive the `(no-validate)` directive"
+        );
+        assert!(prompts.join("t-058-validation-skip.md").exists());
+        assert_eq!(
+            PromptBuilder::validation_skip_record(&prompts, "t-058").as_deref(),
+            Some(crate::agents::prompt_builder::VALIDATION_SKIP_REASON)
+        );
+        // The read side's own probe now sees a genuinely absent brief — the only
+        // state a skip record is allowed to explain.
+        assert!(
+            crate::agents::validation::probe_validation_brief(&prompts, "t-058").is_absent(),
+            "the re-planned task must not be audited against a brief from an earlier plan"
+        );
+    }
+
+    /// An `Auto` plan line (no reserved token) writes its brief and **no** record,
+    /// so a re-plan can never leave the task with a stale record or with a missing
+    /// brief — the fail-closed verdict gap and the plan-designated exemption are both
+    /// reserved for lines that say something explicit.
+    #[test]
+    fn test_auto_directive_yields_neither_a_stale_record_nor_a_missing_brief() {
+        let catalog = Catalog::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let prompts = tmp.path().join("prompts");
+
+        for plan in [
+            "- [ ] [t-059] Implement the widget factory (coder)\n",
+            "- [ ] [t-059] Write the release notes (generalist)\n",
+        ] {
+            PromptBuilder::pregenerate_for_plan_offline(plan, &catalog, &prompts);
+            assert!(
+                prompts.join("t-059-validation.md").exists(),
+                "an Auto line must always have its brief: {plan}"
+            );
+            assert!(
+                !prompts.join("t-059-validation-skip.md").exists(),
+                "Auto must never produce a skip record: {plan}"
+            );
+            assert_eq!(
+                PromptBuilder::validation_skip_record(&prompts, "t-059"),
+                None
+            );
+        }
+    }
+
+    /// A `(no-validate)` line never fabricates a record for a task id the grammar
+    /// authority refuses: no record name is returned, no file is created, and no
+    /// substitute name is derived.
+    #[test]
+    fn test_no_validate_writes_no_record_for_a_rejected_task_id() {
+        let catalog = Catalog::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let prompts = tmp.path().join("prompts");
+        let long = format!("t-{}", "z".repeat(70));
+        let plan = format!("- [ ] [{long}] Fix the parser crash (no-validate) (coder)\n");
+
+        let generated = PromptBuilder::pregenerate_for_plan_offline(&plan, &catalog, &prompts);
+
+        assert!(
+            !generated.iter().any(|name| name.contains(&long)),
+            "a rejected plan id must contribute no file name: {generated:?}"
+        );
+        let strays: Vec<String> = std::fs::read_dir(&prompts)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("validation"))
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "a rejected id must never get a validation record of any kind: {strays:?}"
+        );
+    }
+
+    /// The two records are written with one atomic **intent**: a task that is meant
+    /// to be validated must never keep a no-validation record — not even when the
+    /// `-validation.md` write itself fails (IO error, read-only directory, rejected
+    /// destination). The stale record is dropped **before** the brief is attempted,
+    /// so the task ends with neither record and the read side keeps its fail-closed
+    /// verdict gap instead of reporting the task as "validation skipped by design".
+    /// The fixture blocks the brief destination with a directory, which fails the
+    /// write while leaving the prompts directory itself writable.
+    #[test]
+    fn test_failed_validation_brief_write_leaves_no_skip_record_and_warns() {
+        let catalog = Catalog::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let prompts = tmp.path().join("prompts");
+
+        // Round 1: the plan line declares `(no-validate)` → the record is written.
+        PromptBuilder::pregenerate_for_plan_offline(
+            "- [ ] [t-060] Produce the release notes (no-validate) (generalist)\n",
+            &catalog,
+            &prompts,
+        );
+        assert!(prompts.join("t-060-validation-skip.md").exists());
+
+        // Round 2: the same id is re-planned with `(validate)`, but its
+        // validation brief cannot be written.
+        std::fs::create_dir(prompts.join("t-060-validation.md")).expect("blocking dir");
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _tracing_lock = crate::orchestrator::workers::TEST_TRACING_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let generated = tracing::subscriber::with_default(
+            PromptWriteWarns(counter.clone(), "Failed to write the validation prompt"),
+            || {
+                tracing::callsite::rebuild_interest_cache();
+                PromptBuilder::pregenerate_for_plan_offline(
+                    "- [ ] [t-060] Implement the widget factory (validate) (coder)\n",
+                    &catalog,
+                    &prompts,
+                )
+            },
+        );
+        drop(_tracing_lock);
+
+        assert!(
+            !generated.contains(&"t-060-validation.md".to_string()),
+            "a brief that could not be written must not be reported as generated: {generated:?}"
+        );
+        assert!(
+            !generated.contains(&"t-060-validation-skip.md".to_string()),
+            "a failed brief write must never (re-)record a skip decision: {generated:?}"
+        );
+        assert!(
+            !prompts.join("t-060-validation-skip.md").exists(),
+            "a stale skip record must never outlive a failed validation-brief write"
+        );
+        // The read side's authoritative lookup now finds no decision at all, so the
+        // task is NOT exempted from the verdict check: it stays fail closed.
+        assert_eq!(
+            PromptBuilder::validation_skip_record(&prompts, "t-060"),
+            None,
+            "no surviving skip record may rescue the task after a failed brief write"
+        );
+        assert!(
+            counter.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "the failed validation-brief write must be reported, never swallowed"
+        );
+    }
+
+    /// The **directive** is the single owner of the write-side outcome; the
+    /// description wording decides nothing. `(no-validate)` on a coder task records
+    /// the skip, `(validate)` on a researcher task writes the brief, and `Auto`
+    /// writes the brief without ever recording a skip. Blank and unparseable
+    /// directive values resolve to `Auto` — asserted here on the write side as well,
+    /// so nothing can fall through to `NoValidate`.
+    #[test]
+    fn test_validation_directive_is_the_owner_not_the_wording() {
+        // The mapping itself: `NoValidate` is the only route to a skip record.
+        assert_eq!(
+            PromptBuilder::validation_write_decision(ValidationDirective::NoValidate, Agent::Coder),
+            WriteDecision::SkipRecord
+        );
+        assert_eq!(
+            PromptBuilder::validation_write_decision(ValidationDirective::Validate, Agent::Coder),
+            WriteDecision::Brief
+        );
+        assert_eq!(
+            PromptBuilder::validation_write_decision(ValidationDirective::Auto, Agent::Coder),
+            WriteDecision::Brief
+        );
+        // A blank or unparseable directive value can only ever be `Auto` on this
+        // side too — never `NoValidate`, and therefore never a skip record.
+        for blank_or_junk in [
+            "",
+            " ",
+            "  \t ",
+            "( )",
+            "maybe-validate",
+            "no validate",
+            "auto",
+            "validate?",
+            "skip validation",
+        ] {
+            let parsed = ValidationDirective::parse(blank_or_junk);
+            assert!(
+                parsed.is_auto(),
+                "{blank_or_junk:?} must resolve to Auto, got {parsed:?}"
+            );
+            assert_eq!(
+                PromptBuilder::validation_write_decision(parsed, Agent::Coder),
+                WriteDecision::Brief,
+                "{blank_or_junk:?} must never reach the skip-record arm"
+            );
+        }
+        // Only the exact reserved token flips the outcome.
+        assert_eq!(
+            PromptBuilder::validation_write_decision(
+                ValidationDirective::parse("NO-VALIDATE"),
+                Agent::Researcher
+            ),
+            WriteDecision::SkipRecord
+        );
+
+        // On disk, the same precedence: role and wording are irrelevant.
+        let catalog = Catalog::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let prompts = tmp.path().join("prompts");
+        let plan = "\
+- [ ] [t-010] Fix the parser crash (no-validate) (coder)
+- [ ] [t-011] Investigate the vendored crates (validate) (researcher)
+- [ ] [t-012] Read the README and summarize it (researcher)
+";
+        let generated = PromptBuilder::pregenerate_for_plan_offline(plan, &catalog, &prompts);
+
+        // `(no-validate)` on a coder task → record, no brief.
+        assert!(generated.contains(&"t-010-validation-skip.md".to_string()));
+        assert!(!prompts.join("t-010-validation.md").exists());
+        // `(validate)` on a researcher task → brief, no record.
+        assert!(generated.contains(&"t-011-validation.md".to_string()));
+        assert!(!prompts.join("t-011-validation-skip.md").exists());
+        // `Auto` → brief, no record, whatever the wording of the line is.
+        assert!(generated.contains(&"t-012-validation.md".to_string()));
+        assert!(!prompts.join("t-012-validation-skip.md").exists());
+    }
+
+    /// The directive also survives the plan-line mapping, in every spelling the
+    /// grammar accepts, and never leaks into the description body.
+    #[test]
+    fn test_parse_tasks_from_plan_carries_the_validation_directive() {
+        let markdown = "\
+# Execution Plan
+- [ ] [t-001] Investigate library X (no-validate) (researcher)
+- [ ] [t-002] Ship the parser (validate) (coder)
+- [ ] [t-003] Migrate the index (coder)
+- [ ] [t-004] Sketch the outline (maybe-validate)
+- [ ] [t-005] Write the report ( )
+";
+        let items = PromptBuilder::parse_tasks_from_plan(markdown);
+        assert_eq!(items.len(), 5);
+        assert_eq!(
+            items[0].validation_directive,
+            ValidationDirective::NoValidate,
+            "the reserved token must survive the mapping"
+        );
+        assert_eq!(items[0].description, "Investigate library X");
+        assert_eq!(items[0].role_hint.as_deref(), Some("researcher"));
+        assert_eq!(
+            items[1].validation_directive,
+            ValidationDirective::Validate,
+            "the reserved token must survive the mapping"
+        );
+        assert_eq!(items[1].description, "Ship the parser");
+        // No directive, an unparseable paren group and a blank paren group all stay
+        // `Auto` — and none of them turns into a role hint either.
+        assert_eq!(items[2].validation_directive, ValidationDirective::Auto);
+        assert_eq!(items[3].validation_directive, ValidationDirective::Auto);
+        assert_eq!(items[4].validation_directive, ValidationDirective::Auto);
     }
 
     /// `parse_tasks_from_plan` must see every accepted task-line spelling —
@@ -943,9 +1701,11 @@ mod tests {
         found
     }
 
-    /// WARN capture counting only the rejections emitted by the prompt writes.
-    #[derive(Clone, Default)]
-    struct PromptWriteWarns(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    /// WARN capture counting only the prompt-write events whose message contains
+    /// `needle` — the grammar rejections in one test, the failed
+    /// validation-brief write in another.
+    #[derive(Clone)]
+    struct PromptWriteWarns(std::sync::Arc<std::sync::atomic::AtomicUsize>, &'static str);
 
     struct WarnMessageVisitor<'a> {
         found: &'a mut Option<String>,
@@ -996,7 +1756,7 @@ mod tests {
             let mut found = None;
             event.record(&mut WarnMessageVisitor { found: &mut found });
             if let Some(message) = found
-                && message.contains("Rejected task id")
+                && message.contains(self.1)
             {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -1028,11 +1788,13 @@ mod tests {
             );
 
             let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let result =
-                tracing::subscriber::with_default(PromptWriteWarns(counter.clone()), || {
+            let result = tracing::subscriber::with_default(
+                PromptWriteWarns(counter.clone(), "Rejected task id"),
+                || {
                     tracing::callsite::rebuild_interest_cache();
                     bp.save_to_disk(&prompts)
-                });
+                },
+            );
             let err = result.expect_err("a hostile task id must never be persisted");
             assert_eq!(
                 err.kind(),
