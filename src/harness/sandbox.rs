@@ -1190,6 +1190,7 @@ mod tests {
     /// stores — is skipped as a duplicate instead of granted twice, and the built-in grant
     /// itself is untouched.
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_extra_readonly_paths_repeating_a_builtin_entry_are_skipped() {
         assert!(
             BUILTIN_READONLY_PATHS.contains(&"/nix/store")
@@ -1454,6 +1455,7 @@ mod tests {
     /// `test_extra_readonly_paths_repeating_a_builtin_entry_are_skipped`), and the read-only grant
     /// itself (asserted as behaviour by `test_internal_sandbox_extra_readonly_paths_never_grant_write`).
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_builtin_readonly_paths_stay_declared_and_wired_into_the_ruleset() {
         let src = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
