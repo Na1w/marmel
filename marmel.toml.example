@@ -42,6 +42,22 @@ command_timeout_secs = 60
 # attributable warning. `MARMEL_DISABLE_SANDBOX=1` remains an equivalent escape hatch.
 sandbox_disabled = false
 
+# Extra paths the Landlock sandbox additionally allows read + execute for, on top
+# of the built-in read-only allow-list (/usr, /bin, /lib, /lib64, /opt, /etc,
+# /dev, /proc, /sys, /run, /var, plus the package stores /nix/store and
+# /gnu/store — named explicitly because Landlock resolves symlinks before it
+# matches a rule, so on NixOS or Guix a rule on /bin does not reach the real
+# binary in the store). Shown commented out at its default: [] means the
+# built-in list only, which already covers stock NixOS and Guix. Use this key
+# when your executables resolve somewhere that list does not reach: a custom
+# `store = ...` prefix in nix.conf, a Guix store under another path, or any
+# other read-only toolchain directory. Entries must be ABSOLUTE paths and join
+# the read + execute grant only — never write, and the workspace rule is
+# unchanged. A relative, missing or already-built-in entry is skipped with
+# `warning: ignoring sandbox_extra_readonly_paths entry "...": <reason>`.
+# A non-empty list replaces this field's default instead of appending to it.
+# sandbox_extra_readonly_paths = ["/mnt/nix/store"]  # e.g. nix.conf `store = /mnt/nix/store`
+
 # Number of semantically-identical consecutive turns that trigger cycle breaking.
 max_repetition_threshold = 5
 

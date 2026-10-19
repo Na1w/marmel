@@ -1,8 +1,19 @@
 //! Landlock LSM sandbox for Linux process isolation.
 //!
 //! Restricts child processes (such as spawned PTY shells) to the workspace root, /tmp and standard build
-//! caches (~/.cargo, ~/.cache); system toolchains (/usr, /bin, /lib, ~/.rustup) stay strictly read-only and
-//! sensitive directories (~/.ssh, ~/.gnupg, other projects) are blocked outright.
+//! caches (~/.cargo, ~/.cache); system toolchains (/usr, /bin, /lib, ~/.rustup) and the package stores
+//! (/nix/store, /gnu/store) stay strictly read-only, and sensitive directories (~/.ssh, ~/.gnupg, other
+//! projects) are blocked outright. The stores are named explicitly because Landlock resolves symlinks before
+//! it matches a rule: where /bin and /usr are symlink farms, a rule on /bin does not reach the target under
+//! the store.
+//!
+//! On top of that built-in allow-list the operator can widen the **read-only** part of it with the
+//! `sandbox_extra_readonly_paths` config key: the spawning process publishes the list in
+//! [`SANDBOX_EXTRA_RO_PATHS_ENV`], and the re-entry child merges it into the same read+execute
+//! grant as `/usr` and friends ([`apply_sandbox`], [`apply_sandbox_with_extra_readonly_paths`]).
+//! An extra can only ever *add* read-only rights: entries that are relative, absent on this host,
+//! or already covered by a built-in rule never become rules at all, and each such entry is
+//! announced in one line on stderr ([`extra_path_skip_note`]).
 //!
 //! [`apply_sandbox`] returns `Ok(())` **only when Landlock enforcement is actually in effect for
 //! the calling process**; every way an attempt falls short is a [`SandboxError`] naming the reason —
@@ -20,6 +31,7 @@
 //! about ([`optout_warning`]).
 
 use crate::harness::pty::{SANDBOX_OPTOUT_ENV, SandboxDecision, SandboxSkip, is_optout_value};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 #[cfg(target_os = "linux")]
@@ -139,8 +151,41 @@ pub fn sandbox_outcome(attempt: &SandboxAttempt) -> Result<(), SandboxError> {
 /// wanted is decided by the caller ([`crate::harness::pty::should_apply_sandbox`] on the spawn side,
 /// [`reentry_action`] on the re-entry side), which is what makes an enforcement failure impossible
 /// to mistake for success.
+///
+/// The operator's extra read-only paths are read here through [`extra_readonly_paths_from_env`]:
+/// the sandbox is only ever established in the re-entry child, which gets them through the
+/// environment. A caller that already parsed them uses [`apply_sandbox_with_extra_readonly_paths`].
 pub fn apply_sandbox(workspace_root: &Path) -> Result<(), SandboxError> {
-    let attempt = attempt_landlock(workspace_root);
+    apply_sandbox_with_extra_readonly_paths(workspace_root, &extra_readonly_paths_from_env())
+}
+
+/// [`apply_sandbox`] with the extra read-only paths handed in instead of read back from the
+/// environment, so the re-entry child reads the variable exactly once.
+///
+/// The contract is identical to [`apply_sandbox`]. Extras are merged into the read-only grant of
+/// the built-in FHS entries — they can add read+execute rights and nothing else — and an entry
+/// that cannot become a rule (relative, absent on this host, or already covered by a built-in
+/// entry) is announced in one stderr line rather than silently dropped, because no logging
+/// subscriber exists on the re-entry path yet. A rule the kernel refuses for an extra keeps the
+/// fail-closed behaviour of every other required rule: [`SandboxError::RuleSetup`], never a
+/// partially built policy that would still let the command run.
+pub fn apply_sandbox_with_extra_readonly_paths(
+    workspace_root: &Path,
+    extra_readonly_paths: &[String],
+) -> Result<(), SandboxError> {
+    let (granted, skipped) =
+        extra_readonly_rule_paths(extra_readonly_paths, BUILTIN_READONLY_PATHS);
+    for (path, skip) in &skipped {
+        eprintln!("{}", extra_path_skip_note(path, *skip));
+    }
+    if !granted.is_empty() {
+        tracing::debug!(
+            count = granted.len(),
+            "Landlock: extending the read-only allow-list with operator-configured paths"
+        );
+    }
+
+    let attempt = attempt_landlock(workspace_root, &granted);
     let outcome = sandbox_outcome(&attempt);
 
     match &outcome {
@@ -187,6 +232,170 @@ pub fn opt_out_from_value(raw: Option<&str>) -> crate::harness::pty::OptOut {
         },
         _ => crate::harness::pty::OptOut::None,
     }
+}
+
+/// The environment channel carrying the operator's extra read-only sandbox paths
+/// from the spawning process to the re-entry child, which never loads a config file.
+///
+/// The value is the configured list joined by `SANDBOX_EXTRA_RO_PATHS_SEP` in the
+/// configured order, published by `crate::harness::pty::build_sandboxed_command` and
+/// read back by [`extra_readonly_paths_from_env`]. Unset or empty means "no
+/// additions", so a run without the key sees no variable at all. The argv contract is
+/// deliberately untouched: it stays the sentinel, the cwd and the wrapped command,
+/// because a new slot would change the arity both ends of the protocol depend on.
+/// Note the separator limitation: a configured path that itself contains `:` cannot
+/// be transported intact — it arrives split into two entries.
+pub const SANDBOX_EXTRA_RO_PATHS_ENV: &str = "MARMEL_SANDBOX_EXTRA_RO_PATHS";
+
+/// Separator between the entries of [`SANDBOX_EXTRA_RO_PATHS_ENV`]: the same one
+/// `PATH` uses on every platform this sandbox runs on.
+const SANDBOX_EXTRA_RO_PATHS_SEP: &str = ":";
+
+/// The extra read-only paths published by the spawning process, read from the
+/// environment. Call sites must use this instead of re-reading the variable.
+#[must_use]
+pub fn extra_readonly_paths_from_env() -> Vec<String> {
+    extra_readonly_paths_from_value(std::env::var(SANDBOX_EXTRA_RO_PATHS_ENV).ok().as_deref())
+}
+
+/// Pure half of [`extra_readonly_paths_from_env`]: split on
+/// `SANDBOX_EXTRA_RO_PATHS_SEP`, trim each entry and drop the empty ones, keeping
+/// the configured order. Unset, empty or a value made only of separators and blanks
+/// yields no paths at all.
+#[must_use]
+pub fn extra_readonly_paths_from_value(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(SANDBOX_EXTRA_RO_PATHS_SEP)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Pure half of the publish side, the inverse of [`extra_readonly_paths_from_value`]:
+/// the value to publish for `paths`, trimmed and with empty entries dropped, or `None`
+/// when there is nothing to publish — the common case, in which the variable must stay
+/// unset so the child behaves exactly as it did before this channel existed.
+#[must_use]
+pub fn extra_readonly_paths_to_env(paths: &[String]) -> Option<String> {
+    let joined = paths
+        .iter()
+        .map(|path| path.trim())
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<&str>>()
+        .join(SANDBOX_EXTRA_RO_PATHS_SEP);
+    (!joined.is_empty()).then_some(joined)
+}
+
+/// The built-in read-only allow-list: system toolchains, device nodes, runtime files (the DNS
+/// socket under `/run/systemd/resolve`), binaries, and the package stores (Nix `/nix/store`, Guix
+/// `/gnu/store`).
+///
+/// The stores are listed explicitly because Landlock resolves symlinks before it matches a rule,
+/// and these are `PathBeneath` rules anchored on an opened directory fd: on a host where `/bin`
+/// and `/usr` are symlink farms a rule on `/bin` does not cover the real target below the store
+/// and every execve there fails with EACCES. A host without a store simply skips those entries,
+/// exactly like `/lib64`.
+///
+/// This is also the single source of truth for what an operator-supplied extra path duplicates,
+/// which is why it lives here rather than inside [`build_ruleset`].
+const BUILTIN_READONLY_PATHS: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/lib",
+    "/lib64",
+    "/opt",
+    "/etc",
+    "/dev",
+    "/proc",
+    "/sys",
+    "/run",
+    "/var",
+    "/nix/store",
+    "/gnu/store",
+];
+
+/// Why one operator-supplied extra read-only path does not become a Landlock rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtraPathSkip {
+    /// The entry is relative. A Landlock rule is anchored on an opened directory, so resolving
+    /// a relative entry against whatever cwd the command happens to inherit would grant rights
+    /// nobody asked for.
+    NotAbsolute,
+    /// The entry is already covered by `BUILTIN_READONLY_PATHS`, or repeats an entry accepted
+    /// earlier in the same list, so a second rule for it would change nothing.
+    Duplicate,
+    /// Nothing exists at that path on this host — treated exactly like a missing `/lib64`.
+    Missing,
+}
+
+impl ExtraPathSkip {
+    /// The operator-facing reason: one short phrase, no trailing punctuation.
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            ExtraPathSkip::NotAbsolute => "not absolute",
+            ExtraPathSkip::Duplicate => "already covered by the built-in allow-list",
+            ExtraPathSkip::Missing => "does not exist",
+        }
+    }
+}
+
+/// The single-line note printed for one skipped extra path. Like [`optout_warning`] it goes to
+/// stderr rather than to `tracing`, because the re-entry child has no logging subscriber yet
+/// when the ruleset is built, and it names the config key the entry came from so the operator
+/// can trace it back to their own settings.
+#[must_use]
+pub fn extra_path_skip_note(path: &str, skip: ExtraPathSkip) -> String {
+    format!(
+        "warning: ignoring sandbox_extra_readonly_paths entry \"{path}\": {}",
+        skip.reason()
+    )
+}
+
+/// Decide which operator-supplied extra read-only paths can become rules: the grantable list —
+/// trimmed, absolute, existing on this host, deduplicated and lexicographically ordered — plus
+/// one reason per entry that cannot, in the order the operator wrote them.
+///
+/// The de-duplication uses a `BTreeSet`, which gives de-duplication and a deterministic order for
+/// free, so the Landlock rule order never depends on the order of the environment value. Nothing
+/// here can widen the policy: the caller grants the result with the same read+execute rights as
+/// the built-in FHS entries, and every rejected entry stays rejected.
+#[must_use]
+fn extra_readonly_rule_paths(
+    extras: &[String],
+    builtin: &[&str],
+) -> (Vec<String>, Vec<(String, ExtraPathSkip)>) {
+    let builtin: BTreeSet<&str> = builtin.iter().copied().collect();
+    let mut granted: BTreeSet<String> = BTreeSet::new();
+    let mut skipped: Vec<(String, ExtraPathSkip)> = Vec::new();
+
+    for raw in extras {
+        let entry = raw.trim();
+        if entry.is_empty() {
+            continue;
+        }
+
+        let reason = if !Path::new(entry).is_absolute() {
+            Some(ExtraPathSkip::NotAbsolute)
+        } else if builtin.contains(entry) {
+            Some(ExtraPathSkip::Duplicate)
+        } else if !Path::new(entry).exists() {
+            Some(ExtraPathSkip::Missing)
+        } else {
+            None
+        };
+
+        if let Some(reason) = reason {
+            skipped.push((entry.to_string(), reason));
+            continue;
+        }
+        if !granted.insert(entry.to_string()) {
+            skipped.push((entry.to_string(), ExtraPathSkip::Duplicate));
+        }
+    }
+
+    (granted.into_iter().collect(), skipped)
 }
 
 /// What the enforcement step achieved on the re-entry path, as reported back to
@@ -278,15 +487,15 @@ pub fn optout_warning(setting: &str) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn attempt_landlock(workspace_root: &Path) -> SandboxAttempt {
+fn attempt_landlock(workspace_root: &Path, extra_readonly_paths: &[String]) -> SandboxAttempt {
     let abi = ABI::V5;
 
-    let ruleset = match build_ruleset(workspace_root, abi) {
+    let ruleset = match build_ruleset(workspace_root, abi, extra_readonly_paths) {
         Ok(ruleset) => ruleset,
         Err(failure) => return failure,
     };
 
-    // 6. Enforce. `Ok` alone is *not* success: the kernel reports what it actually
+    // 7. Enforce. `Ok` alone is *not* success: the kernel reports what it actually
     //    enforces, and a ruleset it declined to honour restricts nothing.
     match ruleset.restrict_self() {
         Ok(status) => match status.ruleset {
@@ -310,8 +519,16 @@ fn attempt_landlock(workspace_root: &Path) -> SandboxAttempt {
 /// because a partially built policy is not the policy the caller asked for — the workspace root is such a
 /// rule, and silently dropping it would enforce a policy nobody chose. Rules for paths that simply do not
 /// exist on this host (no `~/.npm`, no `/var/tmp`, …) stay optional: an absent allow-list entry widens nothing.
+///
+/// `extra_readonly_paths` is the operator's own additions, already filtered and deduplicated by
+/// [`extra_readonly_rule_paths`]: they join the read-only grant of [`BUILTIN_READONLY_PATHS`] and can
+/// therefore never widen anything beyond read+execute, and never the workspace read/write rule.
 #[cfg(target_os = "linux")]
-fn build_ruleset(workspace_root: &Path, abi: ABI) -> Result<RulesetCreated, SandboxAttempt> {
+fn build_ruleset(
+    workspace_root: &Path,
+    abi: ABI,
+    extra_readonly_paths: &[String],
+) -> Result<RulesetCreated, SandboxAttempt> {
     let ruleset = Ruleset::default()
         .handle_access(AccessFs::from_all(abi))
         .map_err(|err| SandboxAttempt::Unavailable {
@@ -413,11 +630,26 @@ fn build_ruleset(workspace_root: &Path, abi: ABI) -> Result<RulesetCreated, Sand
         }
     }
 
-    // 5. System toolchains, device nodes, runtime files (DNS /run/systemd/resolve), and binaries (Read-Only + Execute)
-    let ro_paths = [
-        "/usr", "/bin", "/lib", "/lib64", "/opt", "/etc", "/dev", "/proc", "/sys", "/run", "/var",
-    ];
-    for p in ro_paths {
+    // 5. System toolchains, device nodes, runtime files (DNS /run/systemd/resolve), and binaries (Read-Only + Execute),
+    //    including the package stores — see [`BUILTIN_READONLY_PATHS`] for why the stores are named explicitly.
+    for p in BUILTIN_READONLY_PATHS {
+        if Path::new(p).exists()
+            && let Ok(fd) = PathFd::new(p)
+        {
+            ruleset = add_rule(
+                ruleset,
+                Path::new(p),
+                PathBeneath::new(fd, AccessFs::from_read(abi)),
+            )?;
+        }
+    }
+
+    // 6. The operator's extra read-only paths, merged with exactly the same grant as the
+    //    entries above, so a configured path can only ever add read+execute rights. Entries
+    //    that are relative, absent here, or duplicates were filtered out by
+    //    [`extra_readonly_rule_paths`] and announced on stderr; an entry that cannot be
+    //    opened stays optional (like `/lib64` above) rather than silently widening anything.
+    for p in extra_readonly_paths {
         if Path::new(p).exists()
             && let Ok(fd) = PathFd::new(p)
         {
@@ -466,7 +698,7 @@ fn error_chain<E: std::error::Error>(err: &E) -> String {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn attempt_landlock(_workspace_root: &Path) -> SandboxAttempt {
+fn attempt_landlock(_workspace_root: &Path, _extra_readonly_paths: &[String]) -> SandboxAttempt {
     // No Landlock exists on this platform, so the sandbox cannot be established at
     // all. That is reported as a failure: the caller must refuse rather than pretend
     // the command ran protected.
@@ -782,6 +1014,300 @@ mod tests {
         );
     }
 
+    /// The extra read-only path list survives the environment channel unchanged:
+    /// nothing in is nothing out, and separators, blanks and padding never invent an
+    /// entry.
+    #[test]
+    fn test_extra_readonly_paths_parsing_of_an_absent_or_empty_value_yields_nothing() {
+        for raw in [None, Some(""), Some("   "), Some(":"), Some(":: :")] {
+            assert_eq!(
+                extra_readonly_paths_from_value(raw),
+                Vec::<String>::new(),
+                "{raw:?} must not produce a single path"
+            );
+        }
+    }
+
+    /// One entry, several entries, and the order the operator wrote them in.
+    #[test]
+    fn test_extra_readonly_paths_parsing_keeps_every_entry_in_order() {
+        assert_eq!(
+            extra_readonly_paths_from_value(Some("/nix/store")),
+            vec!["/nix/store".to_string()],
+            "a single entry is a single path"
+        );
+        assert_eq!(
+            extra_readonly_paths_from_value(Some("/nix/store:/gnu/store")),
+            vec!["/nix/store".to_string(), "/gnu/store".to_string()],
+            "entries must keep their order, not be sorted"
+        );
+        assert_eq!(
+            extra_readonly_paths_from_value(Some("/gnu/store:/nix/store")),
+            vec!["/gnu/store".to_string(), "/nix/store".to_string()],
+            "order must follow the value, whatever it is"
+        );
+        assert_eq!(
+            extra_readonly_paths_from_value(Some("/opt/a:/opt/b:/opt/c")),
+            vec![
+                "/opt/a".to_string(),
+                "/opt/b".to_string(),
+                "/opt/c".to_string()
+            ],
+            "no entry may be dropped between the first and the last"
+        );
+    }
+
+    /// Padding, a leading or trailing separator and an empty middle entry are all
+    /// tolerated without producing an empty path that the ruleset would choke on.
+    #[test]
+    fn test_extra_readonly_paths_parsing_trims_and_drops_empty_entries() {
+        assert_eq!(
+            extra_readonly_paths_from_value(Some("  /nix/store  :  /gnu/store  ")),
+            vec!["/nix/store".to_string(), "/gnu/store".to_string()],
+            "surrounding blanks are padding, not part of the path"
+        );
+        assert_eq!(
+            extra_readonly_paths_from_value(Some("/nix/store:")),
+            vec!["/nix/store".to_string()],
+            "a trailing separator must not add an empty entry"
+        );
+        assert_eq!(
+            extra_readonly_paths_from_value(Some(":/gnu:/nix/store::/gnu/store")),
+            vec![
+                "/gnu".to_string(),
+                "/nix/store".to_string(),
+                "/gnu/store".to_string()
+            ],
+            "an empty entry anywhere is dropped, the rest is kept in order"
+        );
+    }
+
+    /// The publish side is the exact inverse: what the spawn side encodes is what the
+    /// child parses, and an empty list publishes nothing at all.
+    #[test]
+    fn test_extra_readonly_paths_env_encoding_round_trips() {
+        for empty in [&[] as &[String], &[String::new()], &["  ".to_string()]] {
+            assert_eq!(
+                extra_readonly_paths_to_env(empty),
+                None,
+                "nothing to say must leave the variable unset"
+            );
+        }
+        let paths = vec!["/nix/store".to_string(), "/gnu/store".to_string()];
+        let encoded = extra_readonly_paths_to_env(&paths).expect("a non-empty list is published");
+        assert_eq!(encoded, "/nix/store:/gnu/store");
+        assert_eq!(
+            extra_readonly_paths_from_value(Some(&encoded)),
+            paths,
+            "the value must parse back to exactly the list that produced it"
+        );
+    }
+
+    /// The variable name is a fixed contract between the two processes, and it must
+    /// stay distinguishable from the opt-out channel.
+    #[test]
+    fn test_extra_readonly_paths_env_name_is_the_published_contract() {
+        assert_eq!(SANDBOX_EXTRA_RO_PATHS_ENV, "MARMEL_SANDBOX_EXTRA_RO_PATHS");
+        assert_ne!(
+            SANDBOX_EXTRA_RO_PATHS_ENV, SANDBOX_OPTOUT_ENV,
+            "the path channel must never be confused with the opt-out channel"
+        );
+    }
+
+    // Which extras actually become Landlock rules.
+
+    /// An absolute path to a directory that really exists, under a tempdir the caller
+    /// must keep alive for as long as the path is used.
+    fn existing_extra_path(name: &str) -> (tempfile::TempDir, String) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join(name);
+        std::fs::create_dir(&dir).expect("the fixture directory must be creatable");
+        (tmp, dir.to_string_lossy().into_owned())
+    }
+
+    /// Accepted extras are trimmed, deduplicated and ordered by the path itself, never by
+    /// the order they arrived in: the resulting rule order must be the same on every host.
+    #[test]
+    fn test_extra_readonly_paths_are_accepted_trimmed_and_deterministically_ordered() {
+        let (_tmp_a, a) = existing_extra_path("extra-a");
+        let (_tmp_b, b) = existing_extra_path("extra-b");
+
+        let extras = vec![
+            format!("  {b}  "),
+            a.clone(),
+            b.clone(),
+            "   ".to_string(),
+            "".to_string(),
+        ];
+        let (granted, skipped) = extra_readonly_rule_paths(&extras, BUILTIN_READONLY_PATHS);
+
+        let mut expected = vec![a.clone(), b.clone()];
+        expected.sort();
+        assert_eq!(
+            granted, expected,
+            "both real entries are granted exactly once, in lexicographic order"
+        );
+        assert_eq!(
+            skipped,
+            vec![(b.clone(), ExtraPathSkip::Duplicate)],
+            "a repeated entry is reported once, as a duplicate"
+        );
+        assert!(
+            granted.iter().all(|path| Path::new(path).is_absolute()),
+            "only absolute paths may reach the ruleset: {granted:?}"
+        );
+    }
+
+    /// A relative entry can never be granted: it would be resolved against whatever cwd the
+    /// command inherits, so it is skipped even when it names a directory that exists there.
+    #[test]
+    fn test_extra_readonly_paths_relative_entries_are_skipped() {
+        let relatives = [
+            "relative/dir".to_string(),
+            "./relative".to_string(),
+            "../relative".to_string(),
+            // Exists relative to the test's own working directory, and still must not be
+            // granted: absoluteness is decided before any existence check.
+            "src".to_string(),
+        ];
+        let (granted, skipped) = extra_readonly_rule_paths(&relatives, BUILTIN_READONLY_PATHS);
+
+        assert!(
+            granted.is_empty(),
+            "no relative entry may become a rule: {granted:?}"
+        );
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|(_, reason)| *reason)
+                .collect::<Vec<_>>(),
+            vec![ExtraPathSkip::NotAbsolute; relatives.len()],
+            "every relative entry is skipped, and says why"
+        );
+    }
+
+    /// An extra that repeats a built-in allow-list entry — every entry, including the package
+    /// stores — is skipped as a duplicate instead of granted twice, and the built-in grant
+    /// itself is untouched.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_extra_readonly_paths_repeating_a_builtin_entry_are_skipped() {
+        assert!(
+            BUILTIN_READONLY_PATHS.contains(&"/nix/store")
+                && BUILTIN_READONLY_PATHS.contains(&"/gnu/store"),
+            "the stores stay built-in: an operator must not have to repeat them"
+        );
+        for builtin in BUILTIN_READONLY_PATHS {
+            let (granted, skipped) =
+                extra_readonly_rule_paths(&[(*builtin).to_string()], BUILTIN_READONLY_PATHS);
+            assert!(
+                granted.is_empty(),
+                "{builtin} is already granted by the built-in list, twice is not more allowed"
+            );
+            assert_eq!(
+                skipped,
+                vec![((*builtin).to_string(), ExtraPathSkip::Duplicate)],
+                "{builtin} must be reported as a duplicate, whatever this host has at that path"
+            );
+        }
+    }
+
+    /// A path that does not exist on this host is skipped, exactly like a missing `/lib64`:
+    /// it never becomes a rule and never fails the whole attempt.
+    #[test]
+    fn test_extra_readonly_paths_that_do_not_exist_are_skipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp
+            .path()
+            .join("never-created")
+            .to_string_lossy()
+            .into_owned();
+
+        let (granted, skipped) =
+            extra_readonly_rule_paths(std::slice::from_ref(&missing), BUILTIN_READONLY_PATHS);
+        assert!(
+            granted.is_empty(),
+            "a missing path must not reach the ruleset: {granted:?}"
+        );
+        assert_eq!(skipped, vec![(missing, ExtraPathSkip::Missing)]);
+    }
+
+    /// Every skipped entry gets exactly one single-line, attributable note: naming the entry,
+    /// the config key it came from, and the reason.
+    #[test]
+    fn test_extra_path_skip_notes_name_the_entry_and_the_reason_in_one_line() {
+        let cases = [
+            ("relative/dir", ExtraPathSkip::NotAbsolute),
+            ("/usr", ExtraPathSkip::Duplicate),
+            ("/definitely/not/a/path", ExtraPathSkip::Missing),
+        ];
+        for (path, reason) in cases {
+            let note = extra_path_skip_note(path, reason);
+            assert!(
+                note.starts_with("warning: ignoring sandbox_extra_readonly_paths entry "),
+                "the note must read like the other sandbox warnings: {note}"
+            );
+            assert!(
+                note.contains(&format!("\"{path}\"")),
+                "the note must name the entry the operator wrote: {note}"
+            );
+            assert!(
+                note.contains(reason.reason()),
+                "the note must say why: {note}"
+            );
+            assert_eq!(
+                note.lines().count(),
+                1,
+                "one line per skipped entry: {note}"
+            );
+        }
+
+        let reasons = [
+            ExtraPathSkip::NotAbsolute,
+            ExtraPathSkip::Duplicate,
+            ExtraPathSkip::Missing,
+        ];
+        let texts: Vec<&str> = reasons.iter().map(|reason| reason.reason()).collect();
+        assert!(
+            texts.iter().all(|text| !text.is_empty())
+                && texts.windows(2).all(|pair| pair[0] != pair[1]),
+            "the reasons must be distinct and non-empty: {texts:?}"
+        );
+    }
+
+    /// The real ruleset builder must accept an extra read-only path alongside the built-in
+    /// ones (skips visibly when this kernel has no Landlock).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_landlock_ruleset_builds_with_an_extra_readonly_path() {
+        if !kernel_has_landlock() {
+            eprintln!(
+                "SKIP test_landlock_ruleset_builds_with_an_extra_readonly_path: the running kernel has no usable Landlock"
+            );
+            return;
+        }
+
+        let (tmp, extra) = existing_extra_path("extra-read-only");
+        let extras = vec![extra.clone(), "/usr".to_string()];
+        let (granted, skipped) = extra_readonly_rule_paths(&extras, BUILTIN_READONLY_PATHS);
+        assert_eq!(
+            granted,
+            vec![extra.clone()],
+            "the extra is granted, the built-in repeat is not"
+        );
+        assert_eq!(
+            skipped,
+            vec![("/usr".to_string(), ExtraPathSkip::Duplicate)]
+        );
+
+        let abi = ABI::V5;
+        let ruleset = build_ruleset(tmp.path(), abi, &granted)
+            .expect("a ruleset with an extra read-only path must build");
+        // Nothing was ever enforced, so dropping the ruleset leaves the test process
+        // unrestricted.
+        drop(ruleset);
+    }
+
     // Source guards.
 
     /// The re-entry path in `main.rs` must never discard the enforcement result and must
@@ -838,9 +1364,55 @@ mod tests {
             src.contains("SANDBOX_EXEC_ARG"),
             "main.rs must reference the shared SANDBOX_EXEC_ARG constant"
         );
+        // Scoped to the call site: `canonicalize` on its own is matched by unrelated code
+        // (`resolve_program_path` canonicalizes the exec target), and a needle that any
+        // helper satisfies proves nothing about the cwd contract.
         assert!(
-            src.contains("canonicalize"),
-            "the re-entry cwd must be derived canonically"
+            src.contains("let cwd = canonical_sandbox_cwd("),
+            "the re-entry cwd must be derived canonically, at the one place the protocol reads it"
+        );
+    }
+
+    /// The one line a user sees when the allow-list misses the program the sandboxed shell
+    /// tries to exec. Nothing on this host can reproduce it — there is no package store here,
+    /// so no ruleset test can ever reach an exec denial — so the diagnostic promised in
+    /// `bug.md` is pinned at the source: it must name Landlock, print the **resolved**
+    /// program rather than the bare token, attribute a refusal to the allow-list, and keep
+    /// terminating the child. The pre-fix wording named neither Landlock nor a path and is
+    /// asserted away; it is spelled only here, never in `main.rs`, whose text is the scanned
+    /// side.
+    #[test]
+    fn test_main_rs_exec_failure_names_the_sandbox_and_the_resolved_program() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("main.rs must be readable from the crate manifest dir");
+        let exec_step = src
+            .find("fn exec_pending_command(")
+            .map(|from| {
+                let rest = &src[from..];
+                rest[..rest.find("fn boot_manager(").unwrap_or(rest.len())].to_string()
+            })
+            .expect("the exec step must stay one function");
+
+        assert!(
+            exec_step.contains("under the Landlock sandbox"),
+            "the failure must say which sandbox refused the exec"
+        );
+        assert!(
+            exec_step.contains("resolve_program_path(\"sh\")"),
+            "the message must name the resolved image, not the bare token the shell was asked for"
+        );
+        assert!(
+            exec_step.contains("not covered by the sandbox allow-list")
+                && exec_step.contains("std::io::ErrorKind::PermissionDenied"),
+            "a refusal must be attributed to the allow-list, and only a refusal may be"
+        );
+        assert!(
+            exec_step.contains("std::process::exit(1)"),
+            "a failed exec must terminate the re-entry child, never fall through"
+        );
+        assert!(
+            !exec_step.contains("shell in sandbox"),
+            "the unactionable pre-fix message must not come back"
         );
     }
 
@@ -869,6 +1441,74 @@ mod tests {
             src.contains("SKIP "),
             "a skipped integration test must announce itself as a skip"
         );
+    }
+
+    /// The package stores are the one part of the allow-list this host cannot exercise: with no
+    /// `/nix/store` on disk, `build_ruleset` simply skips the entry exactly like a missing
+    /// `/lib64`, so no ruleset test here can notice the entry being dropped — and dropping it is
+    /// what turns every exec into EACCES on a NixOS or Guix host. That guarantee is therefore
+    /// pinned at the source, in the style of the guards above: the store entries live inside the
+    /// built-in declaration itself, and the ruleset builder keeps walking that same constant.
+    ///
+    /// Deliberately *not* re-asserted here: that the extras channel treats the stores as built-in
+    /// entries (already pinned by
+    /// `test_extra_readonly_paths_repeating_a_builtin_entry_are_skipped`), and the read-only grant
+    /// itself (asserted as behaviour by `test_internal_sandbox_extra_readonly_paths_never_grant_write`).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_builtin_readonly_paths_stay_declared_and_wired_into_the_ruleset() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/harness/sandbox.rs"
+        ))
+        .expect("sandbox.rs must be readable from the crate manifest dir");
+
+        // Quoted needles are assembled from parts, like the executable-name guard above, so this
+        // file never contains the needle it is looking for. The declaration anchor is assembled for
+        // the same reason: spelled out here it would be the first match in the file, and the cut
+        // block would then be test text that mentions the stores itself.
+        let quote = char::from(34);
+        let declaration = format!("const BUILTIN_READONLY_{} &[&str] = &[", "PATHS:");
+        let block = src
+            .find(&declaration)
+            .map(|from| {
+                let rest = &src[from..];
+                rest[..rest.find("];").unwrap_or(rest.len())].to_string()
+            })
+            .expect("the built-in allow-list must stay one declared constant");
+        for store in ["/nix/store", "/gnu/store"] {
+            assert!(
+                block.contains(&format!("{quote}{store}{quote}")),
+                "{store} must stay an entry of the built-in read-only list: this host has no \
+                 package store, so nothing else catches it being dropped"
+            );
+        }
+        // The same constant must still be what the ruleset builder walks. Scoped to the builder
+        // body because test loops iterate the constant too, and a needle matched by a test proves
+        // nothing about the policy.
+        let builder = src
+            .find("fn build_ruleset(")
+            .map(|from| {
+                let rest = &src[from..];
+                rest[..rest.find("fn add_rule(").unwrap_or(rest.len())].to_string()
+            })
+            .expect("the ruleset builder must stay one function");
+        assert!(
+            builder.contains("in BUILTIN_READONLY_PATHS {"),
+            "the ruleset builder must keep granting the built-in list — an entry that nothing \
+             walks grants nothing"
+        );
+
+        // Constant-level well-formedness, host-independent: every entry is an absolute anchor and
+        // no entry is listed twice.
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for entry in BUILTIN_READONLY_PATHS {
+            assert!(
+                !entry.is_empty() && Path::new(entry).is_absolute(),
+                "a built-in rule must be a non-empty absolute path: {entry}"
+            );
+            assert!(seen.insert(*entry), "{entry} must not be listed twice");
+        }
     }
 
     // Landlock integration: the real re-entry protocol, driven end to end.
@@ -1122,6 +1762,37 @@ mod tests {
         );
     }
 
+    // Decision note for the two enforced-behaviour tests below (exec, then rename, inside a real
+    // sandbox). Their skip logic is deliberately unchanged: `#[cfg(target_os = "linux")]` at
+    // compile time plus the runtime `integration_host(name, true)` probe; no `#[ignore]`, no
+    // environment gate. An invisible skip is the failure mode these tests exist to avoid, and a
+    // skip is always announced as `SKIP ` (spelling pinned by the self-scan guard above).
+    //
+    // What the bug was: on a NixOS or Guix host these two tests did not skip, they failed. Both
+    // drive the re-entry host, which execs the bare token `sh` *after* `restrict_self()`; Landlock
+    // matches the resolved inode, and there `/bin` and `/usr` are symlink farms into the package
+    // store, so the exec target was covered by no rule, `exec()` returned EACCES, the host exited
+    // 1, and the `status.success()` assertions failed. A FHS host already covers `/bin/sh`, which
+    // is why CI never saw it.
+    //
+    // What the fix changes for them: `/nix/store` and `/gnu/store` are now built-in entries of the
+    // read-only grant (`BUILTIN_READONLY_PATHS`), and an operator can add further store roots via
+    // `sandbox_extra_readonly_paths`. The exec half of both tests therefore now runs on a
+    // store-based host: a Nixpkgs maintainer can un-skip the exec without editing either test.
+    //
+    // What a Nixpkgs maintainer should still expect:
+    // - the `/etc/resolv.conf` half of the DNS test is a fixture question, not a policy one: `/etc`
+    //   is allow-listed, but a network-less build sandbox may have no readable `/etc/resolv.conf`,
+    //   so that half may still need a fixture (or an existence check splitting it out into its own
+    //   test) even though the exec itself succeeds;
+    // - the rename test probes `python3` and falls back to `mv`, and both live in the store, so
+    //   that leg depends on the same store rule; a package set exposing neither is a fixture
+    //   problem, not a Landlock one;
+    // - both tests exec the re-entry *binary* discovered next to the test binary and require it to
+    //   be at least as new as the newest source file (`candidate_is_current`), so a checkPhase that
+    //   builds the bin in another phase, or from a copied tree, yields a visible `SKIP` instead of
+    //   a pass: build the bin and run the tests from the same source tree.
+
     /// The allow-list itself still works: inside a real sandbox a shell may write to
     /// the workspace and `/dev/null` and read DNS config.
     #[cfg(target_os = "linux")]
@@ -1202,6 +1873,158 @@ mod tests {
         assert!(
             !d1.join("test.txt").exists(),
             "original file must no longer exist in source"
+        );
+    }
+
+    /// The negative security assertion for the operator channel, as behaviour rather than as a
+    /// promise in a comment: an extra read-only path can only ever **add read access**, and the
+    /// value the spawning process encodes is the value the re-entry child understands, because
+    /// both ends key on [`SANDBOX_EXTRA_RO_PATHS_ENV`] — the producer here is
+    /// [`extra_readonly_paths_to_env`], the consumer is [`extra_readonly_paths_from_env`] in the
+    /// re-entry child, and a mismatch on either the name or the encoding breaks leg 2 below.
+    ///
+    /// One fixture directory, four legs: a fresh tempdir under Cargo's own scratch dir, i.e. inside
+    /// this package and therefore outside every built-in allow-list entry, and outside the run-time
+    /// workspace rule as well (that one is anchored on a separate tempdir), so nothing can reach it
+    /// unless the extras channel grants it.
+    ///
+    /// 1. nothing published → the sandboxed read is denied: the fixture really is unlisted, so a
+    ///    later success is attributable to the channel and not to the fixture;
+    /// 2. published → the same read succeeds through the real ruleset;
+    /// 3. published, write attempted → denied, and no file appears: the grant for a configured
+    ///    path is the same read-only grant as `/usr` or the package stores, never the workspace
+    ///    grant, so a configured path can never widen the policy;
+    /// 4. the same write with an explicit opt-out (no sandbox at all) → succeeds, which proves
+    ///    the denials in 1 and 3 came from Landlock and not from the fixture or the shell.
+    ///
+    /// Every leg also insists the exit code is not [`SANDBOX_REFUSE_EXIT_CODE`]: a refusal to run
+    /// the command is not evidence about the ruleset. Skips visibly, like the tests above, when
+    /// this host has no usable Landlock or no current re-entry binary.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_internal_sandbox_extra_readonly_paths_never_grant_write() {
+        let name = "test_internal_sandbox_extra_readonly_paths_never_grant_write";
+        let Some(exe) = integration_host(name, true) else {
+            return;
+        };
+        // The fixture needs a place this test process can create that the child's ruleset has no
+        // rule for. Cargo's own scratch dir under `target/` is inside the package, and the package
+        // is deliberately not part of the built-in allow-list — unlike `/tmp`, `/var/tmp` or the
+        // HOME build caches, which the policy grants read-write on its own and which would
+        // therefore make every leg below meaningless.
+        let scratch = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_dir())
+            .or_else(|| {
+                let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+                target.is_dir().then_some(target)
+            });
+        let Some(scratch) = scratch else {
+            eprintln!("SKIP {name}: no scratch directory outside the allow-list is available");
+            return;
+        };
+        let Ok(unlisted) = tempfile::tempdir_in(scratch.as_path()) else {
+            eprintln!(
+                "SKIP {name}: {} is not writable, so the fixture cannot be created",
+                scratch.display()
+            );
+            return;
+        };
+        let workspace = tempfile::tempdir().expect("tempdir");
+
+        // A fixture the built-in policy already reaches would make legs 2 and 3 meaningless.
+        if BUILTIN_READONLY_PATHS
+            .iter()
+            .any(|builtin| unlisted.path().starts_with(builtin))
+            || unlisted.path().starts_with(workspace.path())
+        {
+            eprintln!(
+                "SKIP {name}: {} is already covered by the built-in allow-list",
+                unlisted.path().display()
+            );
+            return;
+        }
+
+        let extra = unlisted.path().to_string_lossy().into_owned();
+        let payload = unlisted.path().join("payload.txt");
+        let child_write = unlisted.path().join("child-wrote-this.txt");
+        std::fs::write(&payload, "unlisted payload").expect("the fixture payload must be writable");
+        let published = extra_readonly_paths_to_env(std::slice::from_ref(&extra))
+            .expect("one absolute entry must be publishable");
+
+        let run = |command: &str, extras: Option<&str>, opt_out: bool| {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.arg(SANDBOX_EXEC_ARG)
+                .arg(workspace.path())
+                .arg(command)
+                .env_remove(SANDBOX_OPTOUT_ENV)
+                .env_remove(SANDBOX_EXTRA_RO_PATHS_ENV);
+            if let Some(value) = extras {
+                cmd.env(SANDBOX_EXTRA_RO_PATHS_ENV, value);
+            }
+            if opt_out {
+                cmd.env(SANDBOX_OPTOUT_ENV, "1");
+            }
+            cmd.output().expect("re-entry host must be runnable")
+        };
+        let stderr_of =
+            |out: &std::process::Output| String::from_utf8_lossy(&out.stderr).into_owned();
+
+        // 1. Unlisted: not readable, and not because the host refused to run anything.
+        let unlisted_read = run(&format!("cat '{}'", payload.display()), None, false);
+        assert_ne!(
+            unlisted_read.status.code(),
+            Some(SANDBOX_REFUSE_EXIT_CODE),
+            "the sandbox must be established for this leg to mean anything, stderr: {}",
+            stderr_of(&unlisted_read)
+        );
+        assert!(
+            !unlisted_read.status.success()
+                && !String::from_utf8_lossy(&unlisted_read.stdout).contains("unlisted payload"),
+            "a path outside the allow-list must not be readable inside the sandbox, stderr: {}",
+            stderr_of(&unlisted_read)
+        );
+
+        // 2. Published by the spawn side, honoured by the child through the shared constant.
+        let listed_read = run(
+            &format!("cat '{}'", payload.display()),
+            Some(&published),
+            false,
+        );
+        assert!(
+            listed_read.status.success()
+                && String::from_utf8_lossy(&listed_read.stdout) == "unlisted payload",
+            "an extra read-only path must be readable in the re-entry child, stderr: {}",
+            stderr_of(&listed_read)
+        );
+
+        // 3. Same published entry, write attempted: still read-only.
+        let attempt = format!("printf %s not-allowed > '{}'", child_write.display());
+        let listed_write = run(&attempt, Some(&published), false);
+        assert_ne!(
+            listed_write.status.code(),
+            Some(SANDBOX_REFUSE_EXIT_CODE),
+            "the command must have run under the sandbox for the denial to mean anything, stderr: {}",
+            stderr_of(&listed_write)
+        );
+        assert!(
+            !listed_write.status.success(),
+            "an extra read-only path must never grant write access, stderr: {}",
+            stderr_of(&listed_write)
+        );
+        assert!(
+            !child_write.exists(),
+            "the sandboxed command must not have been able to create {} in the extra path",
+            child_write.display()
+        );
+
+        // 4. Control: without any sandbox the same write succeeds, so 1 and 3 measured Landlock.
+        let unsandboxed_write = run(&attempt, Some(&published), true);
+        assert!(
+            unsandboxed_write.status.success() && child_write.exists(),
+            "the fixture must be writable unsandboxed, otherwise the denials above prove nothing: \
+             stderr {}",
+            stderr_of(&unsandboxed_write)
         );
     }
 
