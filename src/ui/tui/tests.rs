@@ -2373,6 +2373,184 @@ This is a quadratic equation in the form $at^2 + bt + c = 0$ where:
     assert!(formatted.contains("at² + bt + c = 0"));
 }
 
+/// True positives: the math-context gates (`has_complete_latex_command`,
+/// `has_delimited_script`, `has_math_operator`, `looks_like_math_span`) must not
+/// stop genuine LaTeX from converting.
+#[test]
+fn test_format_terminal_math_converts_genuine_math() {
+    let display = format_terminal_math(r"$$\|(O + tD) - C\|^2 = r^2$$");
+    assert!(
+        display.contains("|(O + tD) - C|² = r²"),
+        "display math lost absolute-value bars or superscripts, got:\n{display}"
+    );
+    assert!(
+        !display.contains("$$"),
+        "display delimiters survived: {display}"
+    );
+
+    assert_eq!(
+        format_terminal_math(r"$\alpha + \beta = \gamma$"),
+        "α + β = γ"
+    );
+
+    let frac = format_terminal_math(r"$\frac{a}{b} + \sqrt{2}$");
+    assert!(frac.contains("(a)/(b)"), "frac not rewritten, got:\n{frac}");
+    assert!(frac.contains("√(2)"), "sqrt not rewritten, got:\n{frac}");
+
+    assert_eq!(format_terminal_math(r"\cdot"), "·");
+    assert_eq!(format_terminal_math(r"\leq"), "≤");
+
+    let pythagoras = format_terminal_math(r"$x^2 + y^2 = z^2$");
+    assert!(
+        pythagoras.contains("x²"),
+        "caret swallowed, got:\n{pythagoras}"
+    );
+    assert!(
+        pythagoras.contains("z²"),
+        "caret swallowed, got:\n{pythagoras}"
+    );
+}
+
+/// Regression guard for the original bug: snake_case identifiers were rewritten
+/// into subscripts and silently mangled. They must come back byte-for-byte.
+#[test]
+fn test_format_terminal_math_keeps_identifiers_verbatim() {
+    for raw in [
+        "let task_id = subagent_name;",
+        "handle_input",
+        "read_config_2",
+        "x_y_z",
+    ] {
+        assert_eq!(
+            format_terminal_math(raw),
+            raw,
+            "identifier mangled: {raw:?}"
+        );
+    }
+}
+
+/// A markdown table row carries pipes and underscore-heavy cells; nothing there
+/// is math.
+#[test]
+fn test_format_terminal_math_keeps_markdown_table_row_verbatim() {
+    let row = "| _id | name_2 |";
+    assert_eq!(format_terminal_math(row), row, "table row mangled");
+}
+
+/// Windows-style paths (and their backslash separators) and unix source paths
+/// must survive untouched.
+#[test]
+fn test_format_terminal_math_keeps_paths_verbatim() {
+    for raw in [
+        r"C:\tools\build",
+        r"C:\Users\me\project",
+        "src/ui/tui/formatting.rs",
+    ] {
+        assert_eq!(format_terminal_math(raw), raw, "path mangled: {raw:?}");
+    }
+}
+
+/// Shell snippets and regex character classes contain carets attached to nothing
+/// (`'[^0-9]'`); the caret must not be treated as a superscript.
+#[test]
+fn test_format_terminal_math_keeps_shell_and_regex_verbatim() {
+    for raw in [r"grep '^TODO' src", r"sed 's/[^0-9]//g'", r"a[^b]c"] {
+        assert_eq!(
+            format_terminal_math(raw),
+            raw,
+            "shell/regex mangled: {raw:?}"
+        );
+    }
+}
+
+/// Words that merely start with a backslash (`\todo`, `\get`, `\internal`) only
+/// share a prefix with real commands (`\to`, `\ge`, `\int`) and must not convert.
+#[test]
+fn test_format_terminal_math_keeps_backslash_prose_verbatim() {
+    let raw = r"\todo \get \internal";
+    assert_eq!(format_terminal_math(raw), raw, "prose backslashes mangled");
+}
+
+/// Markdown emphasis uses `_`, which must never become a subscript.
+#[test]
+fn test_format_terminal_math_keeps_emphasis_verbatim() {
+    let raw = "markdown *bold* and _emph_ text";
+    assert_eq!(format_terminal_math(raw), raw, "emphasis mangled");
+}
+
+/// Numeric digit separators must stay as written.
+#[test]
+fn test_format_terminal_math_keeps_numeric_separators_verbatim() {
+    for raw in ["1_000_000", "id_1", "2^10"] {
+        assert_eq!(format_terminal_math(raw), raw, "number mangled: {raw:?}");
+    }
+}
+
+/// Dollar signs are money and shell variables far more often than they are math
+/// delimiters; they must never be deleted or rewritten.
+#[test]
+fn test_format_terminal_math_preserves_currency_and_shell_variables() {
+    for raw in [
+        "it costs $5 and $10",
+        "echo $HOME and $PATH",
+        "prices range $100 - $200 total",
+    ] {
+        assert_eq!(
+            format_terminal_math(raw),
+            raw,
+            "currency/shell dollars lost: {raw:?}"
+        );
+    }
+}
+
+/// Inline backtick code spans pass through verbatim, while math written outside
+/// the backticks still converts.
+#[test]
+fn test_format_terminal_math_keeps_inline_code_spans_verbatim() {
+    for raw in ["`task_id`", "call `read_config_2` now", "`x_1` and `a^b`"] {
+        assert_eq!(format_terminal_math(raw), raw, "code span mangled: {raw:?}");
+    }
+
+    assert_eq!(
+        format_terminal_math("`x^2` and $x^2$"),
+        "`x^2` and x²",
+        "code span was converted, or the math outside it was not"
+    );
+
+    // An unterminated backtick run stays verbatim to the end of its line, so a
+    // stray opening fence can never swallow the rest of the line.
+    assert_eq!(format_terminal_math("```x^2"), "```x^2");
+}
+
+/// Self-contained fenced code — a fence marker line (with or without an info
+/// string) and a fence that opens and closes on one line — is emitted untouched.
+#[test]
+fn test_format_terminal_math_keeps_self_contained_fenced_code_verbatim() {
+    for raw in [
+        "```rust",
+        "```x_1 = 2```",
+        "~~~py\nlet x_1 = 2\n~~~",
+        "```rust\nlet x_1 = 2;\nlet y^2 = 3;\n```",
+    ] {
+        assert_eq!(
+            format_terminal_math(raw),
+            raw,
+            "fenced code mangled: {raw:?}"
+        );
+    }
+}
+
+/// `format_terminal_math` deliberately stays stateless — its public signature
+/// takes no `in_code_block` flag — so fence state cannot be tracked across
+/// separate calls, and a body line handed over on its own is still math-scanned.
+#[test]
+fn test_format_terminal_math_fence_state_is_line_local_known_limitation() {
+    // known limitation: the fence exemption is line-local, so a code line taken
+    // out of a multi-line block still converts (`x_1` → `x₁`). The block itself
+    // (previous test) stays verbatim because it is handed over in one call.
+    assert_eq!(format_terminal_math("let x_1 = 2;"), "let x₁ = 2;");
+}
+
 #[test]
 fn test_tui_submit_empty_line_sends_to_channel_for_enter_resume() {
     let mut r = TuiRenderer::new();
