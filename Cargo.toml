@@ -11,11 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 # Async runtime & Streams
-tokio = { version = "1.44", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-futures = "0.3.31"
-futures-util = "0.3.31"
-async-trait = "0.1.86"
+futures = "0.3.34"
+futures-util = "0.3.34"
+async-trait = "0.1.92"
 
 # HTTP & Streaming
 reqwest = { version = "0.13", features = ["json", "stream"] }
@@ -36,15 +36,15 @@ tui-markdown = "0.3"
 
 # Text Processing, Tokenization & Search
 tiktoken-rs = "0.12"
-regex = "1.11"
+regex = "1.13"
 ignore = "0.4"
 unicode-width = "0.2"
-unicode-segmentation = "1.12"
+unicode-segmentation = "1.13"
 
-uuid = { version = "1.25", features = ["v4"] }
+uuid = { version = "1.28", features = ["v4"] }
 
 # System Diagnostics & Errors
-dashmap = "6"
+dashmap = "6.2"
 anyhow = "1.0"
 thiserror = "2.0"
 tracing = "0.1"
@@ -58,7 +58,7 @@ libc = "0.2"
 landlock = "0.4"
 
 [dev-dependencies]
-tempfile = "3.17"
+tempfile = "3.27"
 wiremock = "0.6"
 
 # Escalate target-specific unused/dead findings (only visible on some cfg branch)
