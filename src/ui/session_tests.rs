@@ -1077,6 +1077,11 @@ fn resume_trigger_precedence_is_fresh_then_resume_then_env_then_config() {
 /// prompt this process composed stays at `[0]`.
 #[test]
 fn fresh_boot_never_reads_a_bundle_and_keeps_the_live_prompt() {
+    let _resume_guard = RESUME_FLAGS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    set_resume_request(false, false);
+
     let tmp = tempfile::tempdir().expect("tempdir");
     let plan = crate::manager::phase::Plan::at(tmp.path());
     let bundle = write_boot_bundle(
@@ -1668,10 +1673,18 @@ fn resume_without_a_bundle_is_a_loud_fresh_start() {
 /// with no system prompt, silently, exit `0`. Asserted on the request that is
 /// really sent, through a wiremock backend: `[0]` is byte-identical to a plain
 /// fresh start and is the composed prompt. The trigger here is
-/// `Config::session_resume`, **not** [`set_resume_request`], so this test never
-/// writes the process-wide CLI statics.
+/// `Config::session_resume`, but because `run_session` reads [`resume_requested`]
+/// (which consults the process-wide `FRESH_REQUESTED` and `RESUME_REQUESTED`
+/// statics), this test must hold [`RESUME_FLAGS_LOCK`] to avoid racing with
+/// tests that mutate those flags.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn resume_without_a_bundle_sends_the_same_request_as_a_fresh_start() {
+    let _resume_guard = RESUME_FLAGS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    set_resume_request(false, false);
+
     const GOAL: &str = "the same goal in both runs";
 
     /// One one-turn session. Returns the parsed backend requests, the `Status`
@@ -1921,6 +1934,11 @@ fn run_boot(
 /// nothing, and leaves every byte under the plan directory alone.
 #[test]
 fn fresh_boot_never_opens_the_bundle_dir_even_when_it_would_refuse() {
+    let _resume_guard = RESUME_FLAGS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    set_resume_request(false, false);
+
     let tmp = tempfile::tempdir().expect("tempdir");
     let plan = crate::manager::phase::Plan::at(tmp.path());
     let key = "t022-fresh-unread";
