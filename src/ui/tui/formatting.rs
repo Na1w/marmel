@@ -133,14 +133,339 @@ pub fn strip_think_tags(line: &str) -> String {
         .replace("</thought>", "")
 }
 
+/// Byte that can act as the operand a superscript/subscript attaches to.
+/// Byte-wise checks below are UTF-8 safe: continuation bytes are >= 0x80 and
+/// never match these ASCII values.
+fn is_math_operand_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b')' | b'}' | b']')
+}
+
+/// True if `s` contains a *complete* LaTeX command: a backslash followed by a
+/// run of at least two ASCII letters terminated by a non-letter (`\cdot`,
+/// `\frac`, `\alpha`). A bare escape (`\n` in code, a path separator in
+/// `C:\Users\me`, the `\|` pipe escape) is deliberately **not** evidence.
+fn has_complete_latex_command(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        let mut end = i + 1;
+        while end < bytes.len() && bytes[end].is_ascii_alphabetic() {
+            end += 1;
+        }
+        if end - (i + 1) >= 2 {
+            return true;
+        }
+        i = end.max(i + 1);
+    }
+    false
+}
+
+/// True if `s` contains a properly delimited superscript/subscript, i.e. a `^`
+/// or `_` that
+/// 1. hangs off an operand (`x^2`, `2^3`, `(a+b)^2`, `x_1`), and
+/// 2. is followed either by a closed brace group (`x^{ij}`) or by exactly one
+///    alphanumeric script character terminated by a non-word character
+///    (`x^2 `, trailing `x_1`).
+///
+/// The single-character requirement is what keeps snake_case identifiers such as
+/// `subagent_name` or `handle_input` out of the math path: their `_` is followed
+/// by a word run, not by a delimited script body.
+fn has_delimited_script(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    for (i, &byte) in bytes.iter().enumerate() {
+        if byte != b'^' && byte != b'_' {
+            continue;
+        }
+        if i == 0 || !is_math_operand_byte(bytes[i - 1]) {
+            continue; // nothing for the script to attach to
+        }
+        let body = &s[i + 1..];
+        let Some(first) = body.chars().next() else {
+            continue;
+        };
+        if first == '{' {
+            if body[1..].contains('}') {
+                return true;
+            }
+            continue;
+        }
+        if first.is_ascii_alphanumeric() {
+            // `first` is ASCII here, so a one-byte offset is a char boundary.
+            match body[1..].chars().next() {
+                // Script body ends the span, or is followed by a delimiter.
+                None => return true,
+                Some(next) if !next.is_ascii_alphanumeric() && next != '_' && next != '{' => {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// True if `s` contains an explicit relational or arithmetic operator token.
+fn has_math_operator(s: &str) -> bool {
+    // Relational/typographic operators are unambiguous math evidence.
+    if s.chars().any(|c| {
+        matches!(
+            c,
+            '=' | '≤'
+                | '≥'
+                | '≈'
+                | '≠'
+                | '→'
+                | '←'
+                | '×'
+                | '÷'
+                | '·'
+                | '±'
+                | '∓'
+                | '∑'
+                | '∏'
+                | '∫'
+                | '√'
+                | '∞'
+        )
+    }) {
+        return true;
+    }
+    // ASCII arithmetic only counts when it sits directly between two operands,
+    // so prose dashes and money ranges ("cost - estimate", "100 - ") stay prose.
+    let bytes = s.as_bytes();
+    bytes.iter().enumerate().any(|(i, &byte)| {
+        matches!(byte, b'+' | b'-' | b'*' | b'/')
+            && i > 0
+            && i + 1 < bytes.len()
+            && is_math_operand_byte(bytes[i - 1])
+            && is_math_operand_byte(bytes[i + 1])
+    })
+}
+
+/// Decide whether the inside of a `$...$` span is genuine math.
+///
+/// Dollar signs must never be deleted from currency, shell variables or ordinary
+/// prose, so a span only qualifies as math when it carries positive evidence: a
+/// complete LaTeX command, a delimited superscript/subscript, or an explicit
+/// operator token. Pure prose carries none of these.
+fn looks_like_math_span(inner: &str) -> bool {
+    has_complete_latex_command(inner) || has_delimited_script(inner) || has_math_operator(inner)
+}
+
+/// True when offset `at` in `s` is where a LaTeX command *ends*: end of string, or
+/// a non-alphanumeric delimiter (space, punctuation, `$`, `{`). A letter or digit
+/// means the table entry is only the prefix of a longer word (`\todo`, `\get`,
+/// `\internal`, `\product`), which must be emitted verbatim.
+fn is_command_end(s: &str, at: usize) -> bool {
+    match s.as_bytes().get(at) {
+        None => true,
+        Some(&byte) => !byte.is_ascii_alphanumeric(),
+    }
+}
+
+/// True when offset `at` in `s` is where a bare script body ends (`x^2 `, a
+/// trailing `x_1`). A letter, digit, `_` or `{` means the body keeps going
+/// (`2^10`, `x_y_z`), so the caret/underscore is ordinary text, not a script.
+fn is_script_body_end(s: &str, at: usize) -> bool {
+    match s.as_bytes().get(at) {
+        None => true,
+        Some(&byte) => !byte.is_ascii_alphanumeric() && byte != b'_' && byte != b'{',
+    }
+}
+
+/// Whether the text written so far ends with something a `^` or `_` can attach
+/// to. The rendered absolute-value bar counts: by the time `C\|^2` reaches the
+/// caret branch, `\|` has already been rewritten to `|`.
+fn ends_with_math_operand(out: &str) -> bool {
+    match out.chars().next_back() {
+        Some(ch) => ch.is_alphanumeric() || matches!(ch, ')' | '}' | ']' | '|'),
+        None => false,
+    }
+}
+
+/// Whether `out` ends with a *standalone* operand symbol: a lone letter or digit,
+/// or a closing group such as `)`. The tail of a longer word never qualifies, so
+/// `snake_case` words (`task_id`, `read_config_2`, `id_1`) stay out of the
+/// subscript table while `x_1`, `\sigma_1` and `(a+b)_{2}` still convert.
+fn ends_with_lone_math_operand(out: &str) -> bool {
+    let Some(last) = out.chars().next_back() else {
+        return false;
+    };
+    if matches!(last, ')' | '}' | ']' | '|') {
+        return true;
+    }
+    if !last.is_alphanumeric() {
+        return false;
+    }
+    let before = &out[..out.len() - last.len_utf8()];
+    !before
+        .chars()
+        .next_back()
+        .is_some_and(|prev| prev.is_alphanumeric())
+}
+
+/// Length of the backtick run that starts at byte `at` (0 when `at` is not a
+/// backtick). Backticks are ASCII, so byte indexing stays on char boundaries.
+fn backtick_run_at(text: &str, at: usize) -> usize {
+    let bytes = text.as_bytes();
+    if bytes.get(at) != Some(&b'`') {
+        return 0;
+    }
+    let mut end = at;
+    while end < bytes.len() && bytes[end] == b'`' {
+        end += 1;
+    }
+    end - at
+}
+
+/// Split `text` into `(is_code_span, chunk)` pieces, alternating between prose
+/// (safe to math-convert) and inline code spans (must stay verbatim, backticks
+/// included).
+///
+/// A span is a run of N backticks closed by a run of exactly N backticks *on the
+/// same line*, so both `` `task_id` `` and `` ``task_id`` `` are protected while
+/// markdown bold (`**word**`) is never mistaken for code because it uses
+/// asterisks, not backticks. An unterminated span stays verbatim up to the end of
+/// its line: every character survives and the rest of the line is never
+/// swallowed by the opening backtick.
+fn split_on_inline_code_spans(text: &str) -> Vec<(bool, &str)> {
+    let bytes = text.as_bytes();
+    let mut parts: Vec<(bool, &str)> = Vec::new();
+    let mut plain_start = 0;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let open_len = backtick_run_at(text, i);
+        if open_len == 0 {
+            i += 1;
+            continue;
+        }
+        let line_end = text[i..].find('\n').map_or(bytes.len(), |rel| i + rel);
+        let marker = &text[i..i + open_len];
+
+        // Look for a closing run of the *same* length on this line only.
+        let mut search = i + open_len;
+        let mut span_end = None;
+        while let Some(rel) = text[search..line_end].find(marker) {
+            let close = search + rel;
+            let run = backtick_run_at(text, close);
+            if run == open_len {
+                span_end = Some(close + run);
+                break;
+            }
+            search = close + run;
+        }
+        let span_end = span_end.unwrap_or(line_end);
+
+        if i > plain_start {
+            parts.push((false, &text[plain_start..i]));
+        }
+        parts.push((true, &text[i..span_end]));
+        i = span_end;
+        plain_start = i;
+    }
+
+    if plain_start < bytes.len() {
+        parts.push((false, &text[plain_start..]));
+    }
+    parts
+}
+
+/// If `line` is a fenced-code block marker — ``` or ~~~ with an optional info
+/// string such as `rust` — return the length of the fence run. Anything carrying
+/// other trailing text (`x^2`, `~~~ broken`) is not a marker.
+fn fence_marker_len(line: &str) -> Option<usize> {
+    let trimmed = line.trim_start_matches(' ');
+    let bytes = trimmed.as_bytes();
+    let fence = *bytes.first()?;
+    if fence != b'`' && fence != b'~' {
+        return None;
+    }
+    let run = bytes.iter().take_while(|&&b| b == fence).count();
+    if run < 3 {
+        return None;
+    }
+    let rest = trimmed[run..].trim();
+    let info_string_ok = rest
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    (rest.is_empty() || info_string_ok).then_some(run)
+}
+
+/// True when one single line opens *and* closes a fence, e.g. ```` ```x_1 = 2``` ````.
+fn is_single_line_fenced_code(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let fence = match bytes.first() {
+        Some(&b'`') | Some(&b'~') => bytes[0],
+        _ => return false,
+    };
+    let open = bytes.iter().take_while(|&&b| b == fence).count();
+    if open < 3 {
+        return false;
+    }
+    let body = line[open..].trim_end();
+    let close = body.bytes().rev().take_while(|&b| b == fence).count();
+    close >= open && close < body.len()
+}
+
+/// Stateless, line-local fenced-code guard.
+///
+/// The message-wide fence exemption (see `render_message_lines`, which detours to
+/// `render_markdown_lines` when the message contains ```` ``` ````) is skipped
+/// entirely for `has_special_style` messages (`User: `, `[Status] `,
+/// `Marmennill: `), so those lines still reach `format_terminal_math`. This guard
+/// therefore handles what a single call can recognise on its own: a fence marker
+/// line (together with any code content handed over with it) and a fence that
+/// opens and closes within one line.
+fn looks_like_fenced_code(text: &str) -> bool {
+    let Some(first_line) = text.lines().next() else {
+        return false;
+    };
+    fence_marker_len(first_line).is_some() || is_single_line_fenced_code(first_line)
+}
+
 /// Format LaTeX math expressions ($$...$$, $...$, and common math symbols)
 /// into clean, readable terminal Unicode text.
+///
+/// Code is protected before any math heuristic runs, so every production call
+/// site (thinking/tool/CLI lines here and `render.rs`) inherits the exemption:
+/// * inline code spans delimited by backticks are emitted byte-for-byte, and
+/// * self-contained fenced code (a fence marker line, or a fence that opens and
+///   closes on one line) is emitted untouched.
+///
+/// Known limitation: `format_terminal_math` is called once per line and is kept
+/// deliberately stateless — the public signature takes no `in_code_block` flag,
+/// so a *multi-line* fenced block cannot be tracked across calls. A line inside
+/// such a block (e.g. `x_1 = 2`) is still math-scanned; only the fence markers
+/// themselves and single-line fences are guaranteed verbatim. Extending this
+/// would require threading fence state through the seven call sites.
 pub fn format_terminal_math(text: &str) -> String {
     // Fast path: if there are no math delimiters or symbols, return unmodified text immediately.
     if !text.contains('$') && !text.contains('\\') && !text.contains('^') && !text.contains('_') {
         return text.to_string();
     }
+    // Fenced code never becomes math.
+    if looks_like_fenced_code(text) {
+        return text.to_string();
+    }
+    // Everything outside inline code spans keeps the math treatment.
+    let mut out = String::with_capacity(text.len());
+    for (is_code_span, chunk) in split_on_inline_code_spans(text) {
+        if is_code_span {
+            out.push_str(chunk);
+        } else {
+            out.push_str(&format_math_outside_code(chunk));
+        }
+    }
+    out
+}
 
+/// The `$`-driven math conversion, applied to a slice known to hold no code.
+fn format_math_outside_code(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut i = 0;
     let bytes = text.as_bytes();
@@ -170,11 +495,13 @@ pub fn format_terminal_math(text: &str) -> String {
                 if let Some(end_rel) = text[start..].find('$') {
                     let end = start + end_rel;
                     let inner = &text[start..end];
-                    if !inner.trim().is_empty()
-                        && !inner
+                    let is_plain_number = !inner.trim().is_empty()
+                        && inner
                             .chars()
-                            .all(|c| c.is_ascii_digit() || c == '.' || c == ',')
-                    {
+                            .all(|c| c.is_ascii_digit() || c == '.' || c == ',');
+                    // Only rewrite spans that actually look like math; currency, shell
+                    // variables and prose keep their dollar signs.
+                    if !is_plain_number && looks_like_math_span(inner) {
                         let formatted = format_math_expr(inner);
                         result.push_str(&formatted);
                         i = end + 1;
@@ -193,7 +520,11 @@ pub fn format_terminal_math(text: &str) -> String {
         } else {
             let next_dollar = text[i..].find('$').map(|rel| i + rel).unwrap_or(text.len());
             let chunk = &text[i..next_dollar];
-            if chunk.contains('\\') || chunk.contains('^') || chunk.contains('_') {
+            // Only hand the chunk to the converter when it really contains math the
+            // converter can rewrite: a complete LaTeX command or a delimited
+            // `^`/`_` construct. A stray `\`, `^` or `_` in prose, paths or
+            // snake_case identifiers must pass through untouched.
+            if has_complete_latex_command(chunk) || has_delimited_script(chunk) {
                 result.push_str(&format_math_expr(chunk));
             } else {
                 result.push_str(chunk);
@@ -293,7 +624,13 @@ pub fn format_math_expr(expr: &str) -> String {
 
             let mut matched = false;
             for &(cmd, repl) in SYMBOLS {
-                if rest.starts_with(cmd) {
+                // Only a *complete* command may convert: the byte right after it
+                // must be a delimiter. Table order keeps the longer spelling first
+                // (`\leftarrow` before `\le`, `\cdots` before `\cdot`, `\prod`
+                // before `\pi`), so an unfinished match such as `\todo`, `\get`,
+                // `\internal` or `\product` falls through and the backslash is
+                // emitted verbatim.
+                if rest.starts_with(cmd) && is_command_end(rest, cmd.len()) {
                     out.push_str(repl);
                     cursor += cmd.len();
                     matched = true;
@@ -335,12 +672,21 @@ pub fn format_math_expr(expr: &str) -> String {
                 ("^T", "ᵀ"),
             ];
             let mut matched = false;
-            for &(pattern, repl) in SUPERSCRIPTS {
-                if rest.starts_with(pattern) {
-                    out.push_str(repl);
-                    cursor += pattern.len();
-                    matched = true;
-                    break;
+            // A caret is only a superscript when it hangs off an operand and its
+            // body is delimited: either a closed brace group (every `^{…}` entry
+            // carries its own `}`) or a single script character followed by a
+            // delimiter. Anything else is emitted verbatim: `2^10` (body keeps
+            // going) or a caret attached to nothing, as in `'TODO` and `[^0-9]`.
+            if ends_with_math_operand(&out) {
+                for &(pattern, repl) in SUPERSCRIPTS {
+                    if rest.starts_with(pattern)
+                        && (pattern.ends_with('}') || is_script_body_end(rest, pattern.len()))
+                    {
+                        out.push_str(repl);
+                        cursor += pattern.len();
+                        matched = true;
+                        break;
+                    }
                 }
             }
             if matched {
@@ -379,12 +725,22 @@ pub fn format_math_expr(expr: &str) -> String {
                 ("_y", "ᵧ"),
             ];
             let mut matched = false;
-            for &(pattern, repl) in SUBSCRIPTS {
-                if rest.starts_with(pattern) {
-                    out.push_str(repl);
-                    cursor += pattern.len();
-                    matched = true;
-                    break;
+            // Underscores are overwhelmingly identifier punctuation, so they are
+            // held to the stricter rule: the script must attach to a *standalone*
+            // operand (`x_1`, `\sigma_1`, `(a+b)_{2}`) and carry a delimited body.
+            // The tail of a word does not qualify, which leaves `task_id`,
+            // `subagent_name`, `handle_input`, `read_config_2`, `1_000_000`,
+            // `_italic_` and `x_y_z` byte-for-byte untouched.
+            if ends_with_lone_math_operand(&out) {
+                for &(pattern, repl) in SUBSCRIPTS {
+                    if rest.starts_with(pattern)
+                        && (pattern.ends_with('}') || is_script_body_end(rest, pattern.len()))
+                    {
+                        out.push_str(repl);
+                        cursor += pattern.len();
+                        matched = true;
+                        break;
+                    }
                 }
             }
             if matched {
