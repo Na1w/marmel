@@ -129,30 +129,52 @@ pub(crate) fn drain_steer_arbitration_events_with_transcript(
                     // Never compare the raw `action` string: route every subtask through the
                     // orchestrator's single normalizer (see `super::action`).
                     for (st, subtask_action) in action::routed(Some(d)) {
-                        if subtask_action == action::ACTION_CANCEL {
-                            let target = st.agent_name.as_deref().unwrap_or(&st.tool_call_id);
-                            let cancelled = crate::orchestrator::cancel_active_worker(
-                                st.agent_name.as_deref(),
-                                Some(&st.tool_call_id),
-                            );
-                            if cancelled {
-                                renderer.on_event(&Event::Status(format!(
-                                    "[Arbitrator] Cancelled specialist subagent '{target}'"
-                                )));
-                            }
-                            if let Some(sub) = subagents.as_deref_mut() {
-                                for s in sub.iter_mut() {
-                                    let matches_id = s.task_id.as_deref() == Some(&st.tool_call_id);
-                                    let matches_agent = st
-                                        .agent_name
-                                        .as_ref()
-                                        .map(|a| a.eq_ignore_ascii_case(&s.name))
-                                        .unwrap_or(false);
-                                    if s.is_active && (matches_id || matches_agent) {
-                                        s.is_active = false;
-                                        s.logs.push("[cancelled by arbitrator]".to_string());
-                                    }
+                        if subtask_action != action::ACTION_CANCEL {
+                            continue;
+                        }
+                        // **One match rule** (cancel and post-to-worker share it, see
+                        // `super::action::addressed_worker_keys`): the `(agent, task)` pair is
+                        // resolved against the worker registry with whole-token AND semantics —
+                        // the same rule `orchestrator::workers::cancel_active_worker` applies and
+                        // the same rule notice routing uses. The old OR-of-names scan over pane
+                        // rows is gone: it closed every sibling row that merely shared an agent
+                        // name, and it could close rows no worker was behind at all.
+                        let addressed = action::addressed_worker_keys(
+                            st.agent_name.as_deref(),
+                            Some(&st.tool_call_id),
+                        );
+                        let target = match addressed.as_slice() {
+                            [] => st
+                                .agent_name
+                                .clone()
+                                .unwrap_or_else(|| st.tool_call_id.clone()),
+                            keys => keys.join(", "),
+                        };
+                        let cancelled = crate::orchestrator::cancel_active_worker(
+                            st.agent_name.as_deref(),
+                            Some(&st.tool_call_id),
+                        );
+                        if cancelled {
+                            renderer.on_event(&Event::Status(format!(
+                                "[Arbitrator] Cancelled specialist subagent '{target}'"
+                            )));
+                        }
+                        if let Some(sub) = subagents.as_deref_mut() {
+                            // Row state is never hand-written here: the rows are re-derived from
+                            // the registry (`helpers::project_subagent_rows` — the same projection
+                            // the pane runs on its loop edges), and only the rows whose name is an
+                            // **addressed effective key** get the audit line. Whether a row stays
+                            // open is the registry's call (`WorkerEntry::is_active`), so a cancelled
+                            // worker closes when its guard drops, exactly as the Manager sees it.
+                            let refreshed = crate::ui::helpers::project_subagent_rows(sub);
+                            let mut annotated = false;
+                            for s in sub.iter_mut() {
+                                if addressed.contains(&s.name) {
+                                    s.logs.push("[cancelled by arbitrator]".to_string());
+                                    annotated = true;
                                 }
+                            }
+                            if refreshed || annotated {
                                 renderer.set_subagents(sub.clone());
                             }
                         }
@@ -207,8 +229,8 @@ pub(crate) fn drain_steer_arbitration_events_with_transcript(
                                     action::first(Some(d), action::ACTION_FORWARD_NOTICE)
                                         .map(action::notice_target)
                                 })
-                                .unwrap_or("worker");
-                            let posted = arbiter::post_notice_observable(target, &user_msg);
+                                .unwrap_or_else(|| "worker".to_string());
+                            let posted = arbiter::post_notice_observable(&target, &user_msg);
                             let notice = posted.notice;
                             renderer.on_event(&Event::Status(format!(
                                 "Notice {} forwarded to {} — waiting for specialist reply...",
@@ -218,7 +240,7 @@ pub(crate) fn drain_steer_arbitration_events_with_transcript(
                                 // Capacity backpressure is kept (drop-oldest at INBOX_CAPACITY)
                                 // but never silent: the dropped notice ids are surfaced.
                                 let drop_text =
-                                    arbiter::capacity_drop_text(target, &posted.dropped_older);
+                                    arbiter::capacity_drop_text(&target, &posted.dropped_older);
                                 renderer
                                     .on_event(&Event::Status(format!("[Arbitrator] {drop_text}")));
                             }

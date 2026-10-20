@@ -5,7 +5,7 @@ use super::arbiter::{self, ArbitrationChannel, SleepNotice};
 use super::drain::drain_steer_arbitration_events;
 use super::steer::{SharedSteeringHistory, SteerArbEvent};
 use crate::llm::{ChatClient, PauseAction, StreamControl, StreamEvent, StreamSink};
-use crate::ui::helpers::{format_active_subtasks, is_abort_command, is_reset_command};
+use crate::ui::helpers::{is_abort_command, is_reset_command};
 use crate::ui::{Event, Renderer, SubagentDetail};
 use std::sync::Arc;
 
@@ -28,6 +28,10 @@ pub struct RendererSink<'a> {
     pub client: &'a ChatClient,
     pub stats: Arc<crate::harness::HarnessStats>,
     pub goal: &'a str,
+    /// The host's current subagent **pane rows**. This is never an arbitration input: the
+    /// arbitrator reads the worker registry, and a pane row is a projection of that same
+    /// registry (`ui::helpers::project_subagent_rows`). The host hands the rows over so the
+    /// sink can report a pane/registry divergence, not to decide what is running.
     pub subagents: &'a [SubagentDetail],
     pub plan: Option<&'a crate::manager::phase::Plan>,
     pub ctx: Option<&'a mut crate::manager::context::ContextEngine>,
@@ -57,6 +61,12 @@ impl StreamSink for RendererSink<'_> {
 
     fn poll_control(&mut self) -> StreamControl {
         let _ = self.renderer.flush();
+        // `None` for the row buffer here is correct, not an omission: the drain no longer
+        // hand-writes row state at all (it cancels through the registry and, when a buffer is
+        // available, only *re-projects* rows and annotates the addressed one). A mid-turn drain
+        // therefore changes registry state; the pane catches up on the session loop's projection
+        // edge (`session.rs` -> `helpers::project_subagent_rows`), which is the only writer of
+        // `is_active`.
         drain_steer_arbitration_events(
             self.arb_rx,
             self.renderer,
@@ -88,11 +98,22 @@ impl StreamSink for RendererSink<'_> {
     }
 
     async fn on_pause(&mut self, user_msg: &str) -> PauseAction {
+        // Diagnostic only — and deliberately not an input: the arbitration snapshot comes from
+        // the worker registry, so a pane row whose `is_active` flag went stale cannot make the
+        // arbitrator believe work is running. When pane rows and registry disagree, the pane is
+        // simply behind, and the session loop's projection edge re-derives it.
+        if self.subagents.iter().any(|s| s.is_active) && !crate::orchestrator::has_active_workers()
+        {
+            tracing::debug!(
+                stale_pane_rows = self.subagents.iter().filter(|s| s.is_active).count(),
+                "Steer arbitration: pane rows are ahead of the registry; the arbitrator is \
+                 told what the registry says"
+            );
+        }
         // The arbitration round machine (context snapshot, SYSTEM NOTICE wake-up rounds,
         // preemption, decision application and sleep/re-evaluation) lives in `arbiter`.
         let mut channel = RendererChannel {
             renderer: &mut *self.renderer,
-            subagents: self.subagents,
         };
         let arbiter::ArbitrationOutcome {
             decision,
@@ -289,8 +310,8 @@ impl StreamSink for RendererSink<'_> {
                             action::first(Some(d), action::ACTION_FORWARD_NOTICE)
                                 .map(action::notice_target)
                         })
-                        .unwrap_or("worker");
-                    let posted = arbiter::post_notice_observable(target, user_msg);
+                        .unwrap_or_else(|| "worker".to_string());
+                    let posted = arbiter::post_notice_observable(&target, user_msg);
                     let notice = posted.notice;
                     self.renderer.on_event(&Event::Status(format!(
                         "Notice {} forwarded to {} — resuming stream...",
@@ -298,8 +319,8 @@ impl StreamSink for RendererSink<'_> {
                     )));
                     if !posted.dropped_older.is_empty() {
                         // Backpressure is kept (drop-oldest at INBOX_CAPACITY) but never silent.
-                        let drop_text = arbiter::capacity_drop_text(target, &posted.dropped_older);
-                        tracing::warn!(target_worker = target, reason = %drop_text, "Steering notice dropped by inbox capacity");
+                        let drop_text = arbiter::capacity_drop_text(&target, &posted.dropped_older);
+                        tracing::warn!(target_worker = %target, reason = %drop_text, "Steering notice dropped by inbox capacity");
                         self.renderer
                             .on_event(&Event::Status(format!("[Arbitrator] {drop_text}")));
                     }
@@ -357,27 +378,13 @@ impl StreamSink for RendererSink<'_> {
 }
 
 /// Arbitration channel of the paused-stream host: progress is rendered straight into the
-/// renderer (status events + streamed steer responses).
+/// renderer (status events + streamed steer responses). Progress only — the execution
+/// snapshot the arbitrator is shown is the worker registry, not the renderer's pane.
 struct RendererChannel<'a> {
     renderer: &'a mut dyn Renderer,
-    subagents: &'a [SubagentDetail],
 }
 
 impl ArbitrationChannel for RendererChannel<'_> {
-    fn active_subtasks(&self, round: usize) -> String {
-        if round == 1 {
-            format_active_subtasks(self.subagents)
-        } else {
-            crate::orchestrator::get_active_subtasks_str()
-        }
-    }
-
-    fn has_active_work(&self, _round: usize) -> bool {
-        // The renderer's subagent table cannot change during a paused turn, so it
-        // counts as active work in every round.
-        crate::orchestrator::has_active_workers() || self.subagents.iter().any(|s| s.is_active)
-    }
-
     fn round_started(&mut self, _round: usize) {
         self.renderer.on_event(&Event::Status(
             "Stream paused — evaluating steering instruction...".to_string(),

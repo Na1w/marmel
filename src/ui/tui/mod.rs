@@ -568,14 +568,18 @@ impl Renderer for TuiRenderer {
                 self.waiting_for_token_since = None;
                 let tok_count = estimate_stream_tokens(text);
                 self.tokens_out = self.tokens_out.saturating_add(tok_count);
-                self.subagent_turn_thinking.remove(agent_tag);
-                self.subagent_is_thinking.insert(agent_tag.clone(), false);
-                if let Some(sa) = self.subagents.iter_mut().find(|s| s.name == *agent_tag) {
+                // The tag is a stream spelling, the row is keyed by the effective
+                // registry key: resolve first so the text, the thinking flag and
+                // the row are all the same object.
+                let key = self.resolve_row_key(agent_tag);
+                self.subagent_turn_thinking.remove(&key);
+                self.subagent_is_thinking.insert(key.clone(), false);
+                if let Some(sa) = self.subagents.iter_mut().find(|s| s.name == key) {
                     sa.content.push_str(text);
                     sa.last_activity_at = Some(std::time::Instant::now());
                 } else {
-                    self.upsert_subagent(agent_tag, true, "running");
-                    if let Some(sa) = self.subagents.iter_mut().find(|s| s.name == *agent_tag) {
+                    self.upsert_subagent(&key, true, "running");
+                    if let Some(sa) = self.subagents.iter_mut().find(|s| s.name == key) {
                         sa.content.push_str(text);
                         sa.last_activity_at = Some(std::time::Instant::now());
                     }
@@ -585,17 +589,18 @@ impl Renderer for TuiRenderer {
                 self.waiting_for_token_since = None;
                 let tok_count = estimate_stream_tokens(text);
                 self.tokens_out = self.tokens_out.saturating_add(tok_count);
-                self.subagent_is_thinking.insert(agent_tag.clone(), true);
+                let key = self.resolve_row_key(agent_tag);
+                self.subagent_is_thinking.insert(key.clone(), true);
                 self.subagent_turn_thinking
-                    .entry(agent_tag.clone())
+                    .entry(key.clone())
                     .or_default()
                     .push_str(text);
-                if let Some(sa) = self.subagents.iter_mut().find(|s| s.name == *agent_tag) {
+                if let Some(sa) = self.subagents.iter_mut().find(|s| s.name == key) {
                     sa.thinking.push_str(text);
                     sa.last_activity_at = Some(std::time::Instant::now());
                 } else {
-                    self.upsert_subagent(agent_tag, true, "running");
-                    if let Some(sa) = self.subagents.iter_mut().find(|s| s.name == *agent_tag) {
+                    self.upsert_subagent(&key, true, "running");
+                    if let Some(sa) = self.subagents.iter_mut().find(|s| s.name == key) {
                         sa.thinking.push_str(text);
                         sa.last_activity_at = Some(std::time::Instant::now());
                     }
@@ -779,6 +784,11 @@ impl Renderer for TuiRenderer {
                             Some(t) => format!("{agent}-{t}"),
                             None => format!("{agent}"),
                         };
+                        // The derived spelling is only a search key: the row it
+                        // belongs to is the one named by the effective registry
+                        // key, which may carry a `-wN` / `#N` handle this event
+                        // can never spell.
+                        let name = self.resolve_row_key(&name);
                         self.active_agent = name.clone();
                         let t = clean_task.unwrap_or("(no task id)");
                         if let Some(tid) = clean_task {
@@ -806,6 +816,7 @@ impl Renderer for TuiRenderer {
                             Some(t) => format!("{agent}-{t}"),
                             None => format!("{agent}"),
                         };
+                        let name = self.resolve_row_key(&name);
                         let t = clean_task.unwrap_or("(no task id)");
                         self.upsert_subagent(&name, false, &format!("completed task {t}"));
                         self.subagent_turn_thinking.remove(&name);
@@ -871,7 +882,8 @@ impl Renderer for TuiRenderer {
                             Some(t) => format!("{agent}-{t}"),
                             None => format!("{agent}"),
                         };
-                        if let Some(s) = self.subagents.iter_mut().find(|s| s.name == name) {
+                        let key = self.resolve_row_key(&name);
+                        if let Some(s) = self.subagents.iter_mut().find(|s| s.name == key) {
                             s.queue = Some(crate::ui::QueueState {
                                 position: *position,
                                 of: *of,
@@ -892,7 +904,8 @@ impl Renderer for TuiRenderer {
                             Some(t) => format!("{agent}-{t}"),
                             None => format!("{agent}"),
                         };
-                        if let Some(s) = self.subagents.iter_mut().find(|s| s.name == name) {
+                        let key = self.resolve_row_key(&name);
+                        if let Some(s) = self.subagents.iter_mut().find(|s| s.name == key) {
                             s.queue = None;
                             s.last_activity_at = Some(std::time::Instant::now());
                         }
@@ -910,6 +923,7 @@ impl Renderer for TuiRenderer {
                             Some(t) => format!("{agent}-{t}"),
                             None => format!("{agent}"),
                         };
+                        let name = self.resolve_row_key(&name);
                         let t = clean_task.unwrap_or("(no task id)");
                         let log_entry = match reason.as_deref().filter(|r| !r.is_empty()) {
                             Some(r) => format!("failed task {t}: {r}"),
@@ -1067,6 +1081,13 @@ impl Renderer for TuiRenderer {
                         activated_name = Some(incoming.name.clone());
                     }
                     existing.logs = incoming.logs.clone();
+                    // The clocks belong to the registry, not to whoever created the
+                    // row: the loop's row carries the entry's own start stamp while
+                    // it is live and its finished total once it is not, so a
+                    // renderer-created row and the authoritative row for the same
+                    // worker can no longer show two different clocks.
+                    existing.started_at = incoming.started_at;
+                    existing.worked_duration = incoming.worked_duration;
                     if incoming.last_activity_at.is_some() {
                         existing.last_activity_at = incoming.last_activity_at;
                     }

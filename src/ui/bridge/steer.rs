@@ -7,7 +7,6 @@
 use super::action;
 use super::arbiter::{self, ArbitrationChannel, SleepNotice};
 use crate::llm::ChatClient;
-use crate::ui::helpers::format_active_subtasks;
 use crate::ui::{Event, Renderer, SubagentDetail};
 use std::sync::Arc;
 
@@ -42,30 +41,13 @@ pub enum SteerArbEvent {
 pub use crate::orchestrator::SharedSteeringHistory;
 
 /// Arbitration channel of the spawned-task host: progress is pushed onto the steer-arbitration
-/// event channel and rendered by [`super::drain`] on the UI side.
+/// event channel and rendered by [`super::drain`] on the UI side. It carries progress only —
+/// the arbitrator's execution snapshot comes from the registry ([`arbiter::active_subtasks_render`]).
 struct EventChannel<'a> {
     tx: &'a tokio::sync::mpsc::UnboundedSender<SteerArbEvent>,
-    first_round_active_subtasks: String,
-    first_round_has_active: bool,
 }
 
 impl ArbitrationChannel for EventChannel<'_> {
-    fn active_subtasks(&self, round: usize) -> String {
-        if round == 1 {
-            self.first_round_active_subtasks.clone()
-        } else {
-            crate::orchestrator::get_active_subtasks_str()
-        }
-    }
-
-    fn has_active_work(&self, round: usize) -> bool {
-        if round == 1 {
-            self.first_round_has_active
-        } else {
-            crate::orchestrator::has_active_workers()
-        }
-    }
-
     fn round_started(&mut self, _round: usize) {
         // "Arbitrating user steering instruction..." is emitted once, before the task is
         // spawned; later rounds surface through the streamed deltas only.
@@ -94,9 +76,15 @@ pub fn spawn_steer_arbitration(
     let client = client.clone();
     let stats = stats.clone();
     let goal = goal.to_string();
-    let active_subtasks_str = format_active_subtasks(subagents);
-    let initial_has_active =
-        crate::orchestrator::has_active_workers() || subagents.iter().any(|s| s.is_active);
+    // The pane rows are **not** a snapshot source any more: the arbitrator reads the worker
+    // registry (see [`arbiter::active_subtasks_render`] / [`arbiter::orchestrator_status_label`]),
+    // which is the same table the pane is projected from. A stale `is_active` row can therefore
+    // no longer make the arbitrator believe work is running. The parameter stays because the host
+    // still hands over its pane state; it is only logged here for diagnostics.
+    tracing::debug!(
+        pane_rows = subagents.len(),
+        "Steer arbitration: execution snapshot comes from the worker registry, not from pane rows"
+    );
     let tx = arb_tx.clone();
     let msg = user_msg.clone();
 
@@ -108,11 +96,7 @@ pub fn spawn_steer_arbitration(
     tokio::spawn(async move {
         let mut synthesized_answer_opt = None;
 
-        let mut channel = EventChannel {
-            tx: &tx,
-            first_round_active_subtasks: active_subtasks_str,
-            first_round_has_active: initial_has_active,
-        };
+        let mut channel = EventChannel { tx: &tx };
         // A cancelled sleep does not end this host's work: the arbitration result is still
         // post-processed (delegations, notices, history entry, `Finished` event).
         let arbiter::ArbitrationOutcome {
@@ -198,7 +182,7 @@ pub fn spawn_steer_arbitration(
                 }
                 let target = action::notice_target(st);
                 let msg_to_send = st.message.as_deref().unwrap_or(&msg);
-                let posted = arbiter::post_notice_observable(target, msg_to_send);
+                let posted = arbiter::post_notice_observable(&target, msg_to_send);
                 let _ = tx.send(SteerArbEvent::Delta(format!(
                     "\n[Arbitrator]: Forwarded notice {} to {} — awaiting specialist reply.\n",
                     posted.notice.notice_id, target
@@ -206,10 +190,10 @@ pub fn spawn_steer_arbitration(
                 if !posted.dropped_older.is_empty() {
                     // Inbox backpressure stays (drop-oldest at INBOX_CAPACITY) but is surfaced
                     // instead of silently losing steering instructions.
-                    let drop_text = arbiter::capacity_drop_text(target, &posted.dropped_older);
+                    let drop_text = arbiter::capacity_drop_text(&target, &posted.dropped_older);
                     let _ = tx.send(SteerArbEvent::Delta(format!("[Arbitrator]: {drop_text}\n")));
                 }
-                forwarded_notices.push((posted.notice.notice_id, target.to_string()));
+                forwarded_notices.push((posted.notice.notice_id, target.clone()));
             }
         }
 

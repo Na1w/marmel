@@ -1221,13 +1221,13 @@ pub fn boot(
     let live_ui = renderer.capture_ui();
     renderer.restore_panes(&session.ui);
     // A renderer with no pane model gets a no-op `restore_panes`, so the subagent
-    // list is handed through the loop's own channel as well.
-    let panels: Vec<SubagentDetail> = session
-        .ui
-        .subagent_panels
-        .iter()
-        .map(subagent_detail_from_panel)
-        .collect();
+    // list is handed through the loop's own channel as well. The journaled panels
+    // keep their order and length (the restore contract pins both); the rows the
+    // **restored registry** says are open are then joined on by their effective
+    // key, so a `{agent}-wN` / `{base}#N` worker restored under its real key gets
+    // a row of the same name instead of an unaddressable panel name.
+    let panels: Vec<SubagentDetail> =
+        seed_restored_subagent_rows(&session.ui.subagent_panels, &worker_report.interrupted_keys);
     renderer.set_subagents(panels);
     // A panel that was showing an in-flight subagent keeps its byte:
     // `is_active: true` is never flipped — the pane must keep saying what the
@@ -1598,6 +1598,45 @@ fn subagent_detail_from_panel(panel: &SubagentPanel) -> SubagentDetail {
     }
 }
 
+/// Restore-side row set: the journaled panels keep their exact order and length
+/// (the restore contract pins both), and every registry key the restored worker
+/// journal reports as **interrupted while open** then joins the list on its
+/// effective key if no panel already carries that name.
+///
+/// This is what fixes the restore misnaming: a `{agent}-wN` / `{base}#N` worker
+/// is journaled under its effective registry key, and a pane rebuilt from the
+/// stream tag would be unaddressable by the token/thinking lookups that key on
+/// the registry entry.
+fn seed_restored_subagent_rows(
+    panels: &[SubagentPanel],
+    interrupted_keys: &[String],
+) -> Vec<SubagentDetail> {
+    let mut rows: Vec<SubagentDetail> = panels.iter().map(subagent_detail_from_panel).collect();
+    for key in interrupted_keys {
+        if rows.iter().any(|row| &row.name == key) {
+            continue;
+        }
+        match crate::ui::helpers::subagent_row_for_registry_key(key) {
+            Some(row) => rows.push(row),
+            None => tracing::debug!(
+                key = %key,
+                "restored worker key has no registry entry to project a subagent row from"
+            ),
+        }
+    }
+    rows
+}
+
+/// The single refresh edge for the subagent pane: the pane is rebuilt from the
+/// worker registry (`helpers::project_subagent_rows`) and the authoritative row
+/// set is pushed to the renderer whenever the projected set changed.
+/// No new channel and no new timer: this runs on edges the loop already has.
+fn project_subagent_pane(subagents: &mut Vec<SubagentDetail>, renderer: &mut dyn Renderer) {
+    if crate::ui::helpers::project_subagent_rows(subagents) {
+        renderer.set_subagents(subagents.clone());
+    }
+}
+
 /// `Duration::from_secs_f64` panics on a negative/NaN/infinite input, so a corrupt
 /// number degrades to zero instead of taking a restored session down.
 fn duration_from_secs(secs: f64) -> Duration {
@@ -1800,10 +1839,7 @@ pub async fn run_session_with_bounds_report(
     let mut subagents: Vec<SubagentDetail> = boot
         .as_ref()
         .map(|boot| {
-            boot.subagent_panels
-                .iter()
-                .map(subagent_detail_from_panel)
-                .collect()
+            seed_restored_subagent_rows(&boot.subagent_panels, &boot.interrupted_worker_keys)
         })
         .unwrap_or_default();
 
@@ -1965,6 +2001,11 @@ pub async fn run_session_with_bounds_report(
             &mut subagents,
             Some(&mut ui_transcript),
         );
+        // The pane's row set is a pure projection of the worker registry, rebuilt
+        // on an edge the loop already has: a worker registered / finished since
+        // the last harvest can now be joined, closed or pruned by key.
+        // No new channel, no timer.
+        project_subagent_pane(&mut subagents, &mut *renderer);
 
         if let Some(steer) = renderer.poll_input() {
             if is_abort_command(&steer) {
@@ -1989,9 +2030,34 @@ pub async fn run_session_with_bounds_report(
                 ui_transcript.append(UiRecord::User {
                     text: steer.clone(),
                 });
-                if crate::orchestrator::has_active_workers()
-                    || subagents.iter().any(|s| s.is_active)
-                {
+                // Whether a mid-flight steer gets its own arbitration round is
+                // decided by **registry truth only** — the same single source the
+                // pane rows, the arbitration snapshot and the status label now
+                // come from.
+                //
+                // The old union added `|| subagents.iter().any(|s| s.is_active)`.
+                // That term is dead here, and where it is not dead it is wrong:
+                // `project_subagent_pane` rebuilt `subagents` from
+                // `orchestrator::worker_entries()` a few statements above (same
+                // iteration of this loop, before `poll_input`), so a row can only
+                // be active **because** a registry entry is active — the term can
+                // never add a case `has_active_workers()` does not already cover.
+                // The one case where pane and registry disagree is a row that is
+                // stale by design: a journaled panel restored with
+                // `is_active: true` while the task behind it died with the
+                // previous process (restore path above,
+                // `NonRestorableKind::JoinHandle`). There the term only bought a
+                // full arbitration round with nothing to arbitrate.
+                //
+                // A genuinely in-flight delegation is not lost either way: an
+                // event-only row (a `Started` that beat its own registration) is
+                // dropped by that same projection before this guard runs, so the
+                // term never covered the window; and while a delegation really is
+                // running the Manager is parked inside the tool call, where the
+                // inner `poll_input` sites arbitrate unconditionally. A steer with
+                // no live worker is applied at the next turn boundary through
+                // `steer_queue` instead.
+                if crate::orchestrator::has_active_workers() {
                     spawn_steer_arbitration(
                         &client,
                         harness_stats.clone(),
@@ -2025,6 +2091,11 @@ pub async fn run_session_with_bounds_report(
             // `orchestrator::workers`, possibly on a worker thread — harvesting
             // and writing happen HERE, on the session thread.
             if take_worker_lifecycle_edge() {
+                // The same edge that asks for a commit also re-projects the pane:
+                // a worker registration, completion, failure or preemption just
+                // happened, and the row set follows the registry — it is never
+                // opened or closed by an event handler.
+                project_subagent_pane(&mut subagents, &mut *renderer);
                 commit_pump.request(CommitTrigger::WorkerEdge, &ctx, &*renderer);
             }
 
@@ -2784,8 +2855,13 @@ pub async fn run_session_with_bounds_report(
                             ));
                             ui_transcript.append(UiRecord::TaskCompleted { task_id: tid });
                         }
+                        // Registry first, then the authoritative push: a delegation
+                        // tool result is exactly the edge where the worker entry
+                        // appears (nested `delegate_task`) or goes inactive.
+                        project_subagent_pane(&mut subagents, &mut *renderer);
                         renderer.set_subagents(subagents.clone());
                     } else {
+                        project_subagent_pane(&mut subagents, &mut *renderer);
                         renderer.on_event(&Event::ToolResult(result_content.clone()));
                         ui_transcript.append(UiRecord::ToolResult {
                             display: result_content.clone(),
@@ -3351,8 +3427,10 @@ pub async fn run_session_with_bounds_report(
                             ));
                             ui_transcript.append(UiRecord::TaskCompleted { task_id: tid });
                         }
+                        project_subagent_pane(&mut subagents, &mut *renderer);
                         renderer.set_subagents(subagents.clone());
                     } else {
+                        project_subagent_pane(&mut subagents, &mut *renderer);
                         renderer.on_event(&Event::ToolResult(result_content.clone()));
                         ui_transcript.append(UiRecord::ToolResult {
                             display: result_content.clone(),
@@ -3569,12 +3647,16 @@ pub async fn run_session_with_bounds_report(
                 steer_abort_requested = false;
                 renderer.clear_abort();
                 crate::orchestrator::reset_cancellation();
+                // No row is closed or rewritten here: the row disappears when the
+                // worker registry entry goes inactive (the cancellation lands on
+                // the worker thread), and the projection below folds that in.
+                // What is renderer-local — the visible log line — is still written.
                 for s in subagents.iter_mut() {
                     if s.is_active {
-                        s.is_active = false;
                         s.logs.push("[aborted by user]".to_string());
                     }
                 }
+                project_subagent_pane(&mut subagents, &mut *renderer);
                 renderer.set_subagents(subagents.clone());
                 for steer in steer_queue.drain(..) {
                     ctx.append(Message::User { content: steer });
@@ -4093,5 +4175,161 @@ mod budget_tests {
         assert_eq!(sync_manager_tool_schema(&mut ctx, &cfg), exact);
         assert_eq!(sync_manager_tool_schema(&mut ctx, &cfg), exact);
         assert_eq!(ctx.tool_schema_tokens(), exact);
+    }
+}
+
+#[cfg(test)]
+mod restored_subagent_row_tests {
+    use super::{seed_restored_subagent_rows, subagent_detail_from_panel};
+    use crate::orchestrator::workers;
+    use crate::session::format::{SubagentPanel, TimePoint};
+
+    fn panel(name: &str) -> SubagentPanel {
+        SubagentPanel {
+            name: name.to_string(),
+            task_id: None,
+            prompt: format!("brief for {name}"),
+            logs: vec![format!("log line for {name}")],
+            thinking: String::new(),
+            content: String::new(),
+            is_active: true,
+            context_tokens: 7,
+            worked_duration_secs: 1.5,
+            started_at: Some(TimePoint::now()),
+            last_activity_at: Some(TimePoint::now()),
+            turn_thinking: None,
+            is_thinking: None,
+        }
+    }
+
+    /// A restored pane and a restored registry must name the same object: the
+    /// journaled panels keep their stored order and length, and every registry
+    /// key reported as interrupted
+    /// while open joins the list under its **effective** key — including the
+    /// `{agent}-wN` / `{base}#N` spellings a stream tag can never produce.
+    #[test]
+    fn restored_rows_keep_panel_order_and_join_in_on_the_effective_registry_key() {
+        // The same seam every other test that registers into the process-global
+        // `WORKERS` table takes (see `orchestrator::workers::TEST_WORKERS_MUTEX`).
+        let _workers = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let first = workers::register_active_worker(
+            Some("t-9101".to_string()),
+            "coder".to_string(),
+            "brief one".to_string(),
+        );
+        let second = workers::register_active_worker(
+            Some("t-9101".to_string()),
+            "coder".to_string(),
+            "brief two".to_string(),
+        );
+        let (key_a, key_b) = (first.0.clone(), second.0.clone());
+
+        let panels = vec![panel("planner-t-9100"), panel(&key_a)];
+        let interrupted = vec![
+            key_a.clone(),
+            key_b.clone(),
+            "coder-t-9199".to_string(), // never registered: no row may be invented
+        ];
+        let rows = seed_restored_subagent_rows(&panels, &interrupted);
+
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            vec!["planner-t-9100", key_a.as_str(), key_b.as_str()],
+            "stored panels first in stored order, then each restored key exactly once"
+        );
+        let joined = rows
+            .iter()
+            .find(|row| row.name == key_b)
+            .expect("key B row");
+        assert!(joined.is_active, "an interrupted worker comes back running");
+        assert!(
+            joined.started_at.is_some(),
+            "its clock comes from the registry"
+        );
+        assert_eq!(joined.prompt, "brief two", "and so does its brief");
+
+        for key in [&key_a, &key_b] {
+            workers::remove_worker_entry_for_test(key);
+        }
+    }
+
+    /// Whether a mid-flight steer gets its own arbitration round is asked of the
+    /// **worker registry only** — the loop's old
+    /// `|| subagents.iter().any(|s| s.is_active)` term is gone (see the guard in
+    /// `run_session_with_bounds_report`). That is sound because the loop
+    /// re-projects the pane on the very edge it reads input on, which pins two
+    /// things this test guards:
+    ///
+    /// * every active row has an **active registry entry** behind it, so the pane
+    ///   term could never add a case `has_active_workers()` missed while work was
+    ///   really running;
+    /// * a journaled panel restored with `is_active: true` in front of a task
+    ///   that died with the previous process is not a row at all, so it can no
+    ///   longer re-open arbitration for work that does not exist.
+    #[test]
+    fn projected_rows_never_claim_liveness_the_registry_denies() {
+        // Process-global `WORKERS` table: same seam as every other test that
+        // registers into it (`orchestrator::workers::TEST_WORKERS_MUTEX`).
+        let _workers = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let guard = workers::register_active_worker(
+            Some("t-9200".to_string()),
+            "coder".to_string(),
+            "brief under test".to_string(),
+        );
+        let key = guard.0.clone();
+
+        // Exactly the row shape the steering guard can be handed: one live
+        // worker, plus a journaled panel for a delegation this process holds no
+        // registry entry for (both restored with `is_active: true`).
+        let mut rows = vec![
+            subagent_detail_from_panel(&panel("planner-t-9299")),
+            subagent_detail_from_panel(&panel(&key)),
+        ];
+        assert!(
+            rows.iter().any(|row| row.is_active),
+            "before the projection the pane looks busy"
+        );
+
+        // `project_subagent_pane` is this call plus the renderer push, so the
+        // projection alone decides what the guard is allowed to see.
+        crate::ui::helpers::project_subagent_rows(&mut rows);
+        assert!(
+            rows.iter().all(|row| row.name != "planner-t-9299"),
+            "a panel with no registry entry behind it never survives as a live row"
+        );
+        assert!(
+            rows.iter().any(|row| row.name == key && row.is_active),
+            "the live worker keeps its row under its effective registry key"
+        );
+        assert!(
+            !rows.iter().any(|row| row.is_active) || workers::has_active_workers(),
+            "an active row always implies an active entry — the removed term was a subset of registry truth"
+        );
+
+        // The stale half: once the entry stops being active, nothing in the row
+        // set may still look busy.
+        drop(guard);
+        crate::ui::helpers::project_subagent_rows(&mut rows);
+        let entries = crate::orchestrator::worker_entries();
+        for row in rows.iter().filter(|row| row.is_active) {
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.key == row.name && entry.is_active),
+                "row {} is drawn active with no active registry entry behind it",
+                row.name
+            );
+        }
+        assert!(
+            rows.iter()
+                .all(|row| row.name != key.as_str() || !row.is_active),
+            "a finished worker never leaves an active row to re-open arbitration"
+        );
+
+        workers::remove_worker_entry_for_test(&key);
     }
 }

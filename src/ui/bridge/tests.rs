@@ -398,6 +398,9 @@ fn test_drain_steer_fallback_with_response_does_not_queue() {
 
 #[test]
 fn test_drain_steer_cancel_subtask_cancels_worker_and_updates_subagents() {
+    let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut renderer = TestRenderer::new();
     let mut steer_queue = Vec::new();
@@ -411,13 +414,16 @@ fn test_drain_steer_cancel_subtask_cancels_worker_and_updates_subagents() {
         Some(token.clone()),
     );
 
-    let mut subagents = vec![SubagentDetail {
-        name: "coder".to_string(),
-        task_id: Some("t-steer-cancel-001".to_string()),
-        prompt: "Running long build".to_string(),
-        is_active: true,
-        ..Default::default()
-    }];
+    // Production shape: after the pane became a projection of the registry, a row's name **is**
+    // the effective registry key. The old version of this test hand-named the row `"coder"` and
+    // kept a separate `task_id` — the exact drift (row not addressable by the token the
+    // arbitrator and the Manager use) that the single match rule now refuses to work with.
+    let key = "coder-t-steer-cancel-001".to_string();
+    let mut subagents = vec![
+        crate::ui::helpers::subagent_row_for_registry_key(&key)
+            .expect("the registered worker must project a pane row under its effective key"),
+    ];
+    assert_eq!(subagents[0].name, key);
 
     assert!(!token.is_cancelled());
 
@@ -453,19 +459,431 @@ fn test_drain_steer_cancel_subtask_cancels_worker_and_updates_subagents() {
         token.is_cancelled(),
         "Active worker token must be cancelled"
     );
+    let row = subagents
+        .iter()
+        .find(|s| s.name == key)
+        .expect("the addressed row must still be there after the registry projection");
     assert!(
-        !subagents[0].is_active,
-        "Subagent in UI must be marked inactive"
-    );
-    assert!(
-        subagents[0]
-            .logs
+        row.logs
             .iter()
             .any(|l| l.contains("cancelled by arbitrator")),
         "Subagent logs should contain cancellation note"
     );
+    assert!(
+        renderer.events.iter().any(|e| matches!(
+            e,
+            Event::Status(s) if s.contains(&format!("Cancelled specialist subagent '{key}'"))
+        )),
+        "the status line must name the effective registry key, got {:?}",
+        renderer.events
+    );
+
+    // Liveness is the registry's call, not the bridge's: the worker's guard is still alive, so
+    // the row must still read as open — the drain may annotate it, it may not close it.
+    assert!(
+        crate::orchestrator::has_active_workers(),
+        "the registry still holds the cancelled worker while its guard is alive"
+    );
+    let registry_row_is_active = crate::orchestrator::worker_entries()
+        .into_iter()
+        .find(|entry| entry.key == key)
+        .expect("the worker is still in the registry read model")
+        .is_active;
+    assert_eq!(
+        row.is_active, registry_row_is_active,
+        "the pane row must mirror the registry's liveness authority"
+    );
+
+    // Closing the row happens through the registry: dropping the guard completes the worker,
+    // and the next projection flips the row to inactive.
+    drop(guard);
+    crate::ui::helpers::project_subagent_rows(&mut subagents);
+    let closed = subagents
+        .iter()
+        .find(|s| s.name == key)
+        .expect("the completed worker is still in the recently-completed ring");
+    assert!(
+        !closed.is_active,
+        "the row closes when the registry says the worker is done, not before"
+    );
+}
+
+/// (a) The single match rule is an **AND over whole tokens**, so a cancel addressed to one
+/// task cancels exactly one registry entry and leaves a sibling worker of the **same agent**
+/// — and its pane row — untouched. The old OR-of-names rule closed both rows.
+#[test]
+fn test_drain_steer_cancel_addresses_one_entry_and_leaves_the_sibling_row_open() {
+    let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let token_a = tokio_util::sync::CancellationToken::new();
+    let guard_a = crate::orchestrator::register_active_worker_with_token(
+        Some("t-sibling-a".to_string()),
+        "coder".to_string(),
+        "First build".to_string(),
+        Some(token_a.clone()),
+    );
+    let token_b = tokio_util::sync::CancellationToken::new();
+    let guard_b = crate::orchestrator::register_active_worker_with_token(
+        Some("t-sibling-b".to_string()),
+        "coder".to_string(),
+        "Second build".to_string(),
+        Some(token_b.clone()),
+    );
+
+    let key_a = "coder-t-sibling-a".to_string();
+    let key_b = "coder-t-sibling-b".to_string();
+    let mut subagents = Vec::new();
+    crate::ui::helpers::project_subagent_rows(&mut subagents);
+    for key in [&key_a, &key_b] {
+        assert!(
+            subagents.iter().any(|row| &row.name == key),
+            "both sibling rows must be projected from the registry, got {:?}",
+            subagents.iter().map(|r| r.name.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut renderer = TestRenderer::new();
+    let mut steer_queue = Vec::new();
+    let mut steer_abort = false;
+    tx.send(SteerArbEvent::Finished {
+        decision: Some(crate::orchestrator::SteerDecision {
+            decision: "ForwardToWorker".to_string(),
+            response: None,
+            tier: None,
+            model: None,
+            subtasks: vec![crate::orchestrator::SteerSubtaskDecision {
+                tool_call_id: "t-sibling-b".to_string(),
+                action: "Cancel".to_string(),
+                message: None,
+                agent_name: Some("coder".to_string()),
+                prompt: None,
+                sleep_seconds: None,
+            }],
+            sleep_seconds: None,
+        }),
+        user_msg: "cancel only the second coder".to_string(),
+    })
+    .unwrap();
+
+    drain_steer_arbitration_events(
+        &mut rx,
+        &mut renderer,
+        &mut steer_queue,
+        &mut steer_abort,
+        Some(&mut subagents),
+    );
+
+    assert!(
+        token_b.is_cancelled(),
+        "the addressed worker (whole effective key {key_b}) must be cancelled"
+    );
+    assert!(
+        !token_a.is_cancelled(),
+        "a sibling worker sharing only the agent name must not be cancelled"
+    );
+
+    let row_a = subagents
+        .iter()
+        .find(|row| row.name == key_a)
+        .expect("the sibling row must survive the projection");
+    let row_b = subagents
+        .iter()
+        .find(|row| row.name == key_b)
+        .expect("the addressed row must survive the projection");
+    assert!(
+        !row_a
+            .logs
+            .iter()
+            .any(|l| l.contains("cancelled by arbitrator")),
+        "the sibling row must not be annotated: the cancel addressed {key_b} only, got {:?}",
+        row_a.logs
+    );
+    assert!(
+        row_b
+            .logs
+            .iter()
+            .any(|l| l.contains("cancelled by arbitrator")),
+        "the addressed row carries the audit line"
+    );
+    assert!(
+        row_a.is_active,
+        "the sibling worker is still running in the registry, so its row must stay open"
+    );
+
+    drop(guard_a);
+    drop(guard_b);
+}
+
+/// (a2) One rule, one target: the whole **effective** key — including a `{base}#N` collision
+/// key — addresses exactly that registry entry, and a token that is not a whole token
+/// addresses nothing (no prefix/substring match, no OR fallback).
+#[test]
+fn test_bridge_match_rule_resolves_whole_effective_tokens_with_and_semantics() {
+    let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let token = tokio_util::sync::CancellationToken::new();
+    let guard = crate::orchestrator::register_active_worker_with_token(
+        Some("t-token-1".to_string()),
+        "coder".to_string(),
+        "Whole token addressing".to_string(),
+        Some(token.clone()),
+    );
+    let key = crate::orchestrator::active_worker_entries()
+        .into_iter()
+        .find(|(_, info)| info.task_id.as_deref() == Some("t-token-1"))
+        .expect("the worker must be in the active read model")
+        .0;
+
+    // Whole effective key, no agent name.
+    assert_eq!(
+        action::addressed_worker_keys(None, Some(&key)),
+        vec![key.clone()],
+        "the effective key must address exactly its own worker"
+    );
+    // Whole effective key spelled in the task slot together with the agent name (AND).
+    assert_eq!(
+        action::addressed_worker_keys(Some("coder"), Some("t-token-1")),
+        vec![key.clone()],
+        "agent + task must both match the same worker"
+    );
+    // AND semantics: one argument that matches nothing cancels nothing (the old OR rule did).
+    assert!(
+        action::addressed_worker_keys(Some("coder"), Some("t-does-not-exist")).is_empty(),
+        "an unmatched task token must not fall back to the agent-name half"
+    );
+    assert!(
+        action::addressed_worker_keys(Some("architect"), Some("t-token-1")).is_empty(),
+        "an unmatched agent name must not fall back to the task half"
+    );
+    // Whole-token equality only: a prefix of the key is not an address.
+    assert!(
+        action::addressed_worker_keys(None, Some("coder-t-token")).is_empty(),
+        "a prefix of the effective key must never address a worker"
+    );
+    // No address at all addresses nothing.
+    assert!(action::addressed_worker_keys(None, None).is_empty());
+
+    // A forwarded notice addressed to one worker is posted under that worker's effective key.
+    let addressed = action::notice_target(&crate::orchestrator::SteerSubtaskDecision {
+        tool_call_id: "t-token-1".to_string(),
+        action: "ForwardNotice".to_string(),
+        message: Some("use postgres".to_string()),
+        agent_name: Some("coder".to_string()),
+        prompt: None,
+        sleep_seconds: None,
+    });
+    assert_eq!(
+        addressed, key,
+        "the notice target must be the effective registry key the pane row is named by"
+    );
 
     drop(guard);
+}
+
+/// (b) A **stale pane row** can no longer make the arbitrator believe subagents are executing:
+/// both the status label and the active-subtask table come from the registry read model.
+#[test]
+fn test_bridge_stale_pane_row_cannot_report_subagents_executing() {
+    let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    // A row that outlived its worker — the shape that used to feed the round-1 snapshot and the
+    // `has_active_workers() || rows.any(is_active)` union.
+    let stale_rows = vec![SubagentDetail {
+        name: "coder-t-stale-row".to_string(),
+        task_id: Some("t-stale-row".to_string()),
+        prompt: "finished a long time ago".to_string(),
+        is_active: true,
+        ..Default::default()
+    }];
+    assert!(
+        stale_rows.iter().any(|s| s.is_active),
+        "the fixture must really be a stale, 'active-looking' pane row"
+    );
+    assert!(
+        !crate::orchestrator::has_active_workers(),
+        "the registry must report no running worker for this fixture"
+    );
+
+    assert_eq!(
+        arbiter::orchestrator_status_label(crate::orchestrator::has_active_workers()),
+        "Active (planning/turn)",
+        "a stale pane row must not push the arbitrator status to 'subagents executing'"
+    );
+    assert!(
+        !arbiter::active_subtasks_render().contains("Active Background Subagents"),
+        "the arbitrator's subtask table must not list an active worker the registry does not \
+         have, got {:?}",
+        arbiter::active_subtasks_render()
+    );
+
+    // And the drain does not resurrect the stale row either: the projection drops rows the
+    // registry no longer holds.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut renderer = TestRenderer::new();
+    let mut steer_queue = Vec::new();
+    let mut steer_abort = false;
+    let mut subagents = stale_rows;
+    tx.send(SteerArbEvent::Finished {
+        decision: Some(crate::orchestrator::SteerDecision {
+            decision: "ForwardToWorker".to_string(),
+            response: None,
+            tier: None,
+            model: None,
+            subtasks: vec![crate::orchestrator::SteerSubtaskDecision {
+                tool_call_id: "t-stale-row".to_string(),
+                action: "Cancel".to_string(),
+                message: None,
+                agent_name: Some("coder".to_string()),
+                prompt: None,
+                sleep_seconds: None,
+            }],
+            sleep_seconds: None,
+        }),
+        user_msg: "cancel the stale row".to_string(),
+    })
+    .unwrap();
+    drain_steer_arbitration_events(
+        &mut rx,
+        &mut renderer,
+        &mut steer_queue,
+        &mut steer_abort,
+        Some(&mut subagents),
+    );
+    assert!(
+        !subagents.iter().any(|row| row.name == "coder-t-stale-row"),
+        "the bridge must re-derive rows from the registry, not keep a row with no worker \
+         behind it, got {:?}",
+        subagents.iter().map(|r| r.name.clone()).collect::<Vec<_>>()
+    );
+    assert!(
+        !subagents
+            .iter()
+            .any(|row| row.name == "coder-t-stale-row" && row.is_active),
+        "no bridge path may hand-write an `is_active` flag"
+    );
+}
+
+/// (c) The paused-stream host drains with **no row buffer** (`sink.rs::poll_control`). That is
+/// the correct shape now: the drain cannot hand-close rows, so the only thing it does is the
+/// registry cancel — and the pane follows on the session loop's projection edge.
+#[test]
+fn test_drain_steer_cancel_without_a_row_buffer_still_uses_registry_truth() {
+    let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let token = tokio_util::sync::CancellationToken::new();
+    let guard = crate::orchestrator::register_active_worker_with_token(
+        Some("t-no-buffer".to_string()),
+        "coder".to_string(),
+        "Drained from poll_control".to_string(),
+        Some(token.clone()),
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut renderer = TestRenderer::new();
+    let mut steer_queue = Vec::new();
+    let mut steer_abort = false;
+    tx.send(SteerArbEvent::Finished {
+        decision: Some(crate::orchestrator::SteerDecision {
+            decision: "ForwardToWorker".to_string(),
+            response: None,
+            tier: None,
+            model: None,
+            subtasks: vec![crate::orchestrator::SteerSubtaskDecision {
+                tool_call_id: "coder-t-no-buffer".to_string(),
+                action: "Cancel".to_string(),
+                message: None,
+                agent_name: None,
+                prompt: None,
+                sleep_seconds: None,
+            }],
+            sleep_seconds: None,
+        }),
+        user_msg: "cancel it".to_string(),
+    })
+    .unwrap();
+
+    drain_steer_arbitration_events(
+        &mut rx,
+        &mut renderer,
+        &mut steer_queue,
+        &mut steer_abort,
+        None,
+    );
+
+    assert!(
+        token.is_cancelled(),
+        "a drain with `subagents: None` must still reach the registry — the pane is not the \
+         thing being cancelled"
+    );
+    assert!(
+        renderer.events.iter().any(|e| matches!(
+            e,
+            Event::Status(s) if s.contains("Cancelled specialist subagent 'coder-t-no-buffer'")
+        )),
+        "the status line must still name the effective key, got {:?}",
+        renderer.events
+    );
+    // The registry keeps the worker live (and therefore its row open) until the guard drops.
+    assert!(
+        crate::orchestrator::has_active_workers(),
+        "the cancelled worker stays live in the registry until its guard is dropped"
+    );
+
+    drop(guard);
+}
+
+/// Regression guard for the union feedback loop: no bridge file may re-read pane rows as a
+/// source of truth for what is running, and none may hand-write row liveness.
+#[test]
+fn test_bridge_tree_reads_execution_state_from_the_registry_only() {
+    let production: Vec<(&str, String)> = vec![
+        ("action.rs", include_str!("action.rs")),
+        ("arbiter.rs", include_str!("arbiter.rs")),
+        ("drain.rs", include_str!("drain.rs")),
+        ("sink.rs", include_str!("sink.rs")),
+        ("steer.rs", include_str!("steer.rs")),
+    ]
+    .into_iter()
+    .map(|(name, src)| {
+        (
+            name,
+            src.split(&["#[cfg(", "test)", "]"].concat())
+                .next()
+                .unwrap_or(src)
+                .to_string(),
+        )
+    })
+    .collect();
+
+    for (name, production) in &production {
+        // Comments explain the history (and name the removed helper), so only code counts.
+        let code: String = production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("format_active_subtasks"),
+            "src/ui/bridge/{name} must not feed pane rows into the arbitrator snapshot again"
+        );
+        assert!(
+            !code.contains("is_active ="),
+            "src/ui/bridge/{name} must not write row liveness: the registry owns it"
+        );
+        assert!(
+            !code.contains("has_active_work("),
+            "src/ui/bridge/{name} must not reintroduce a host-side 'is work running' rule"
+        );
+    }
 }
 
 #[test]
@@ -484,6 +902,17 @@ fn test_drain_steer_abort_cancels_all_active_workers() {
         "researcher".to_string(),
         "Researching...".to_string(),
         Some(token.clone()),
+    );
+
+    // Production shape again: the pane rows are the registry projection, so the row is named by
+    // the effective key rather than by an invented `"researcher"` display name.
+    let mut subagents = Vec::new();
+    crate::ui::helpers::project_subagent_rows(&mut subagents);
+    let key = "researcher-t-steer-abort-002".to_string();
+    assert!(
+        subagents.iter().any(|row| row.name == key),
+        "the registered worker must be projected as a row under its effective key, got {:?}",
+        subagents.iter().map(|r| r.name.clone()).collect::<Vec<_>>()
     );
 
     assert!(!token.is_cancelled());
@@ -506,7 +935,7 @@ fn test_drain_steer_abort_cancels_all_active_workers() {
         &mut renderer,
         &mut steer_queue,
         &mut steer_abort,
-        None,
+        Some(&mut subagents),
     );
 
     assert!(steer_abort);
@@ -514,6 +943,10 @@ fn test_drain_steer_abort_cancels_all_active_workers() {
     assert!(
         token.is_cancelled(),
         "Active worker token must be cancelled on AbortImmediately"
+    );
+    assert!(
+        subagents.iter().any(|row| row.name == key),
+        "an abort must not hand-close or drop the row either — the registry still holds it"
     );
 
     drop(guard);
@@ -568,14 +1001,6 @@ struct RecordingChannel {
 }
 
 impl arbiter::ArbitrationChannel for RecordingChannel {
-    fn active_subtasks(&self, round: usize) -> String {
-        format!("snapshot of round {round}")
-    }
-
-    fn has_active_work(&self, _round: usize) -> bool {
-        true
-    }
-
     fn round_started(&mut self, round: usize) {
         self.rounds_started.push(round);
     }
@@ -1092,13 +1517,13 @@ fn test_bridge_drain_cancel_action_spellings_take_the_same_branch() {
         let mut renderer = TestRenderer::new();
         let mut steer_queue = Vec::new();
         let mut steer_abort = false;
-        let mut subagents = vec![SubagentDetail {
-            name: "coder".to_string(),
-            task_id: Some(task_id.clone()),
-            prompt: "Running a long build".to_string(),
-            is_active: true,
-            ..Default::default()
-        }];
+        // Production shape: the row is the registry projection under the effective key, so the
+        // single match rule can address it at all.
+        let key = format!("coder-{task_id}");
+        let mut subagents = vec![
+            crate::ui::helpers::subagent_row_for_registry_key(&key)
+                .expect("the registered worker must project a pane row"),
+        ];
 
         tx.send(SteerArbEvent::Finished {
             decision: Some(crate::orchestrator::SteerDecision {
@@ -1125,9 +1550,31 @@ fn test_bridge_drain_cancel_action_spellings_take_the_same_branch() {
             token.is_cancelled(),
             "action spelling {spelling:?} must reach the same Cancel branch in the UI bridge"
         );
+        let row = subagents
+            .iter()
+            .find(|row| row.name == key)
+            .unwrap_or_else(|| {
+                panic!(
+                    "action spelling {spelling:?} must keep the addressed row in the registry \
+                     projection, got {:?}",
+                    subagents.iter().map(|r| r.name.clone()).collect::<Vec<_>>()
+                )
+            });
         assert!(
-            !subagents[0].is_active,
-            "action spelling {spelling:?} must mark the subagent inactive"
+            row.logs
+                .iter()
+                .any(|l| l.contains("cancelled by arbitrator")),
+            "action spelling {spelling:?} must annotate the addressed row in the same branch"
+        );
+        assert_eq!(
+            row.is_active,
+            crate::orchestrator::worker_entries()
+                .into_iter()
+                .find(|entry| entry.key == key)
+                .expect("the worker is still in the registry read model")
+                .is_active,
+            "action spelling {spelling:?}: row liveness must mirror the registry, never be \
+             written by the bridge"
         );
         assert!(
             renderer.events.iter().any(|e| matches!(

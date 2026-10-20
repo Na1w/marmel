@@ -229,10 +229,17 @@ pub(crate) fn classify_llm_error(e: &anyhow::Error) -> &'static str {
     }
 }
 
-/// The panel row a delegation event addresses: `{agent}-{normalized task}`, or
-/// the bare role id when the delegation carries no task id. Every writer of
-/// [`SubagentDetail`] state derives it through here so the lifecycle writer and
-/// the queue writer always land on the same row.
+/// The **display** spelling of a delegation: `{agent}-{normalized task}`, or the
+/// bare role id when the delegation carries no task id.
+///
+/// It is a formatter, **not** an identity: the row identity is the **effective
+/// registry key** ([`crate::orchestrator::WorkerEntry::key`]), which this
+/// function can never produce on its own (`{agent}-wN` for a taskless worker and
+/// `{base}#N` for a live-key collision are allocated by the registry). It survives
+/// only as
+/// 1. the fallback row name when a lifecycle event arrives for a worker the
+///    registry does not (yet) hold, and
+/// 2. the natural-key half of [`registry_entry_for_event`]'s resolution.
 fn subagent_row_name(agent: crate::agents::Agent, task: Option<&str>) -> (String, Option<String>) {
     let clean_task = task
         .map(|t| crate::task_id::normalize_task_id_ref(t).to_string())
@@ -244,6 +251,236 @@ fn subagent_row_name(agent: crate::agents::Agent, task: Option<&str>) -> (String
     (name, clean_task)
 }
 
+/// Whether a registry entry is a **registration** the pane may show, as opposed to
+/// a token-count mirror.
+///
+/// [`crate::orchestrator::WorkerCallClass::Placeholder`] is the registry's own
+/// marker and is the class filter the design mandates. The structural half is kept
+/// as well because the marker is an id value: `update_active_worker_context` writes
+/// a stub whose `agent_name` **is** the key, and no real registration can be shaped
+/// like that (a key always carries a task id, a `-wN` id or a `#…` handle). A bundle
+/// written before the id-`0` reservation journaled a real registration with that
+/// id, and the pane must not lose a live worker over a marker collision.
+fn entry_is_registering(entry: &crate::orchestrator::WorkerEntry) -> bool {
+    if !matches!(
+        entry.call_class,
+        crate::orchestrator::WorkerCallClass::Placeholder
+    ) {
+        return true;
+    }
+    entry.agent_name != entry.key
+}
+
+/// Resolve the **registry entry** a delegation event addresses, through the
+/// registry's own read model rather than through a rendered row name.
+///
+/// The lookup is whole-field (`agent_name` equal, `task_id` equal after
+/// decoration stripping) and prefers the entry holding the **natural** key, so
+/// a `Started` for `coder-t-01` lands on `coder-t-01` and never on the
+/// `{base}#N` duplicate the runner registers under. `Placeholder` stubs are
+/// never an addressable worker (they are token-count mirrors, not
+/// registrations), and neither is any internal/reserve call class — the registry
+/// simply has no such entry.
+///
+/// `None` means "the registry has no such worker" — the honest answer for an
+/// event that arrives before its registration, and the reason the callers keep a
+/// derived-name fallback instead of dropping the event.
+pub(crate) fn registry_entry_for_event(
+    agent: crate::agents::Agent,
+    task: Option<&str>,
+) -> Option<crate::orchestrator::WorkerEntry> {
+    let agent_name = agent.as_str();
+    let clean_task = task
+        .map(|t| crate::task_id::normalize_task_id_ref(t).to_string())
+        .filter(|t| !t.is_empty());
+    let mut collided: Option<crate::orchestrator::WorkerEntry> = None;
+    for entry in crate::orchestrator::worker_entries() {
+        if !entry_is_registering(&entry) {
+            continue;
+        }
+        if !entry.agent_name.eq_ignore_ascii_case(agent_name) {
+            continue;
+        }
+        let task_matches = match (&entry.task_id, &clean_task) {
+            (Some(held), Some(wanted)) => {
+                crate::task_id::normalize_task_id_ref(held) == wanted.as_str()
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if !task_matches {
+            continue;
+        }
+        if !entry.disambiguated {
+            return Some(entry);
+        }
+        if collided.is_none() {
+            collided = Some(entry);
+        }
+    }
+    collided
+}
+
+/// The row set the pane must show, rebuilt from the worker registry.
+///
+/// This is the projection that replaces the event-derived row list:
+/// **which rows exist** and **whether they are running** come from `WORKERS`,
+/// and nothing else. What survives from the previous vector is presentation only — streamed `thinking`/`content`,
+/// logs, clocks not yet derived from the registry, and the queue field, which is
+/// pool state and stays orthogonal to running.
+///
+/// Membership rules:
+/// * rows are created for the registering classes only — `Specialist`
+///   (Manager-dispatched, nested `delegate_task`, and restored alike) and
+///   `ValidatorAudit`; a `Placeholder` stub never gets a row;
+/// * the row **name is the effective registry key**, so a `{agent}-wN` or a
+///   `{base}#N` worker is addressable and its token lookup can never miss;
+/// * a row is closed by the registry flipping `is_active` (completion, guard
+///   drop after a cancel, or eviction from the completed ring) — never by a
+///   writer that decided on its own;
+/// * row order is the registry's key order, which is byte-stable across a
+///   restore.
+///
+/// Returns whether anything a viewer can see actually moved, so callers push to
+/// the renderer on real edges only.
+pub(crate) fn project_subagent_rows(subagents: &mut Vec<SubagentDetail>) -> bool {
+    let before = subagent_row_signature(subagents);
+    let previous = std::mem::take(subagents);
+    let mut projected: Vec<SubagentDetail> = Vec::new();
+    for entry in crate::orchestrator::worker_entries() {
+        // Rows are created for registering classes only: `Specialist` (Manager,
+        // runner, nested `delegate_task`, restored) and `ValidatorAudit`. An
+        // internal/reserve class has no entry here at all, and a token mirror never
+        // becomes a row.
+        if !entry_is_registering(&entry) {
+            continue;
+        }
+        let mut row = match previous.iter().position(|row| row.name == entry.key) {
+            Some(idx) => previous[idx].clone(),
+            None => SubagentDetail {
+                name: entry.key.clone(),
+                last_activity_at: Some(std::time::Instant::now()),
+                ..Default::default()
+            },
+        };
+        apply_registry_entry(&mut row, &entry);
+        projected.push(row);
+    }
+    // Rows the registry no longer holds are gone; that is how a row closes.
+    *subagents = projected;
+    before != subagent_row_signature(subagents)
+}
+
+/// Fold one authoritative registry entry onto a row, leaving every
+/// renderer-owned field (thinking, content, logs, selection, queue) alone.
+fn apply_registry_entry(row: &mut SubagentDetail, entry: &crate::orchestrator::WorkerEntry) {
+    row.name = entry.key.clone();
+    row.task_id = entry.task_id.clone();
+    if !entry.prompt.is_empty() {
+        row.prompt = entry.prompt.clone();
+    }
+    row.is_active = entry.is_active;
+    let tokens = if entry.is_active {
+        entry.context_tokens
+    } else {
+        entry.last_tokens.max(entry.context_tokens)
+    };
+    if tokens > 0 {
+        row.context_tokens = tokens;
+    }
+    // The clock is the registry's clock, which is the only one that can still be
+    // right after the row was created by stream traffic (or restored with the
+    // pane's own re-anchored instant).
+    if entry.is_active {
+        row.started_at = Some(entry.started_at);
+    } else {
+        row.started_at = None;
+        row.worked_duration = std::time::Duration::from_secs(entry.elapsed_secs);
+    }
+    // A row that was never running still needs a start stamp for its own clock,
+    // and only a live entry can supply one.
+    if row.last_activity_at.is_none() {
+        row.last_activity_at = Some(std::time::Instant::now());
+    }
+    // A row that stopped running can never keep a queue position behind: the
+    // queue belongs to a live delegation only, and this is the path every
+    // non-event teardown (cancel, preemption, guard drop) goes through.
+    if !entry.is_active {
+        row.queue = None;
+    }
+}
+
+/// The class/handle badge a row label carries, **derived at render time** from
+/// the row's registry key — never stored on the row, because the row is a
+/// projection and this is a fact about the registry entry behind it. `entry` is
+/// that entry when the caller already holds the snapshot it rendered from.
+///
+/// * `Audit` — the entry is a validator/plan-audit run
+///   ([`crate::orchestrator::WorkerCallClass::ValidatorAudit`]), which registers
+///   in the validator role family (`validator-coder`, `validator-planner`) and
+///   therefore never appears in a `delegate_task` event stream.
+/// * `Dup #N` — the entry had to take a `{base}#N` collision handle because a
+///   live worker already owned the natural key (the Manager registers
+///   `{agent}-{task}` at dispatch and the runner registers it again at execution).
+///
+/// When the key is not (or no longer) in the registry, the same two facts are read
+/// off the key's own structure, so a transient row is labelled consistently.
+pub(crate) fn subagent_row_badge(
+    entry: Option<&crate::orchestrator::WorkerEntry>,
+    name: &str,
+) -> Option<String> {
+    if let Some(entry) = entry {
+        if matches!(
+            entry.call_class,
+            crate::orchestrator::WorkerCallClass::ValidatorAudit
+        ) {
+            return Some("Audit".to_string());
+        }
+        return entry
+            .collision_handle
+            .as_ref()
+            .map(|handle| format!("Dup #{handle}"));
+    }
+    match name.split_once('#') {
+        Some((_, handle)) if !handle.is_empty() => return Some(format!("Dup #{handle}")),
+        _ => {}
+    }
+    let head = name.split('-').next().unwrap_or("");
+    if head.eq_ignore_ascii_case("validator") {
+        return Some("Audit".to_string());
+    }
+    None
+}
+
+/// What a viewer can see about the row **set**: identity, liveness and ctx.
+/// Deliberately blind to clocks and streamed text, which move on their own.
+fn subagent_row_signature(rows: &[SubagentDetail]) -> Vec<(String, bool, usize)> {
+    rows.iter()
+        .map(|row| (row.name.clone(), row.is_active, row.context_tokens))
+        .collect()
+}
+
+/// One authoritative row for a **restored** registry key — the restore-side half
+/// of the same projection, so a restored pane and a restored registry name the
+/// same object.
+///
+/// `None` when the key is not in the registry (the bundle recorded a panel with
+/// no worker behind it, which is a real and reported case).
+pub(crate) fn subagent_row_for_registry_key(key: &str) -> Option<SubagentDetail> {
+    let entry = crate::orchestrator::worker_entries()
+        .into_iter()
+        .find(|entry| entry.key == key)?;
+    if !entry_is_registering(&entry) {
+        return None;
+    }
+    let mut row = SubagentDetail {
+        name: key.to_string(),
+        ..Default::default()
+    };
+    apply_registry_entry(&mut row, &entry);
+    Some(row)
+}
+
 pub(crate) fn update_subagent_lifecycle(
     subagents: &mut Vec<SubagentDetail>,
     agent: crate::agents::Agent,
@@ -251,16 +488,44 @@ pub(crate) fn update_subagent_lifecycle(
     prompt: Option<String>,
     started: bool,
 ) {
-    let (name, clean_task) = subagent_row_name(agent, task.as_deref());
+    // Identity first comes from the registry, so two live workers never collapse
+    // into one row and a `{base}#N` / `{agent}-wN` worker is addressed by the
+    // key the Manager and the arbitrator use.
+    let entry = registry_entry_for_event(agent, task.as_deref());
+    let (name, clean_task) = match entry.as_ref() {
+        Some(entry) => (
+            entry.key.clone(),
+            entry
+                .task_id
+                .as_deref()
+                .map(|t| crate::task_id::normalize_task_id_ref(t).to_string())
+                .filter(|t| !t.is_empty()),
+        ),
+        None => subagent_row_name(agent, task.as_deref()),
+    };
     let task_str = clean_task.clone().unwrap_or_default();
     let log_entry = if started {
         format!("started task {task_str}")
     } else {
         format!("completed task {task_str}")
     };
-    let active_tokens = crate::orchestrator::get_active_worker_tokens(&name).unwrap_or(0);
+    // Tokens come from the same snapshot as the row identity — never from a
+    // per-field read keyed on a display name (`get_active_worker_tokens`).
+    let active_tokens = entry
+        .as_ref()
+        .map(|entry| {
+            if entry.is_active {
+                entry.context_tokens
+            } else {
+                entry.last_tokens.max(entry.context_tokens)
+            }
+        })
+        .unwrap_or(0);
     let now = std::time::Instant::now();
     if let Some(existing) = subagents.iter_mut().find(|s| s.name == name) {
+        if let Some(entry) = entry.as_ref() {
+            apply_registry_entry(existing, entry);
+        }
         if existing.is_active && !started {
             if let Some(st) = existing.started_at.take() {
                 existing.worked_duration += st.elapsed();
@@ -288,7 +553,7 @@ pub(crate) fn update_subagent_lifecycle(
         }
         existing.logs.push(log_entry);
     } else {
-        subagents.push(SubagentDetail {
+        let mut row = SubagentDetail {
             name,
             task_id: task,
             prompt: prompt.unwrap_or_default(),
@@ -301,7 +566,11 @@ pub(crate) fn update_subagent_lifecycle(
             is_active: started,
             context_tokens: active_tokens,
             queue: None,
-        });
+        };
+        if let Some(entry) = entry.as_ref() {
+            apply_registry_entry(&mut row, entry);
+        }
+        subagents.push(row);
     }
 }
 
@@ -332,10 +601,18 @@ pub(crate) fn update_subagent_queue(
     task: Option<String>,
     queue: Option<QueueState>,
 ) -> bool {
-    let (name, _) = subagent_row_name(agent, task.as_deref());
-    let Some(existing) = subagents.iter_mut().find(|s| s.name == name) else {
+    // Same identity rule as the lifecycle path: the effective registry key wins,
+    // and the derived spelling is only a fallback. A queue transition still
+    // cannot create a row — queue state is orthogonal to running and attaches to
+    // a row the projection already owns.
+    let derived = subagent_row_name(agent, task.as_deref()).0;
+    let key = registry_entry_for_event(agent, task.as_deref())
+        .map(|entry| entry.key)
+        .filter(|key| subagents.iter().any(|row| row.name == *key))
+        .unwrap_or_else(|| derived.clone());
+    let Some(existing) = subagents.iter_mut().find(|s| s.name == key) else {
         tracing::debug!(
-            "queue transition for {name} has no panel row yet; the lifecycle event owns row creation, so it is skipped"
+            "queue transition for {key} has no panel row yet; the worker registry owns row existence, so it is skipped"
         );
         return false;
     };
@@ -864,6 +1141,165 @@ mod tests {
         assert!(find_subagent_mut(&mut subs, "coder", Some("[t-001]")).is_some());
         assert!(find_subagent_mut(&mut subs, "coder", Some("t-001")).is_some());
         assert!(find_subagent_mut(&mut subs, "coder", Some("[]")).is_none());
+    }
+
+    /// Regression guard: the pane's row set is a **projection of the worker
+    /// registry**. Rows exist only for registering classes, are named by the
+    /// **effective registry key** (so two live workers for one agent+task get two
+    /// rows instead of merging into one), keep their presentation state, and go
+    /// idle or disappear exactly when the registry says so — never because an
+    /// event handler decided so.
+    ///
+    /// `WORKERS` is a process-wide table, so every assertion here is scoped to the
+    /// keys this test owns; other tests may hold their own entries at the same time.
+    #[test]
+    fn subagent_rows_are_a_projection_of_the_worker_registry() {
+        use crate::orchestrator::workers;
+        // `WORKERS` is process-global and other suites assert **global** invariants over
+        // it (the completed-ring cap), so a test that registers live workers takes the
+        // crate's own serialization seam for that table.
+        let _workers = workers::TEST_WORKERS_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Private task ids keep these keys out of the way of any other test that
+        // reads the shared registry.
+        let first = workers::register_active_worker(
+            Some("t-9001".to_string()),
+            "coder".to_string(),
+            "brief one".to_string(),
+        );
+        let second = workers::register_active_worker(
+            Some("t-9001".to_string()),
+            "coder".to_string(),
+            "brief two".to_string(),
+        );
+        let (key_a, key_b) = (first.0.clone(), second.0.clone());
+        // A token-count stub is not a registration, so it must never become a row.
+        workers::update_active_worker_context("coder-t-9002", 4242);
+        let stub = "coder-t-9002".to_string();
+        assert_ne!(key_a, key_b, "two live workers hold two distinct keys");
+        let mine = |rows: &[SubagentDetail]| -> Vec<SubagentDetail> {
+            rows.iter()
+                .filter(|r| r.name == key_a || r.name == key_b || r.name == stub)
+                .cloned()
+                .collect()
+        };
+        let mut names = vec![key_a.clone(), key_b.clone()];
+        names.sort();
+
+        let mut rows = vec![SubagentDetail {
+            name: key_a.clone(),
+            thinking: "streamed thought".to_string(),
+            logs: vec!["started task t-9001".to_string()],
+            queue: Some(crate::ui::QueueState { position: 2, of: 3 }),
+            ..Default::default()
+        }];
+        assert!(
+            project_subagent_rows(&mut rows),
+            "the registry holds live workers the pane did not know about"
+        );
+        let scoped: Vec<String> = mine(&rows).iter().map(|r| r.name.clone()).collect();
+        assert_eq!(
+            scoped, names,
+            "one row per registry entry, in registry key order, and never one for a stub"
+        );
+        let row_a = rows.iter().find(|r| r.name == key_a).expect("row A");
+        let row_b = rows.iter().find(|r| r.name == key_b).expect("row B");
+        assert_eq!(
+            row_a.thinking, "streamed thought",
+            "presentation state survives the rebuild"
+        );
+        assert!(
+            row_a.is_active && row_b.is_active,
+            "both workers are running for the Manager and the arbitrator"
+        );
+        assert!(
+            row_a.started_at.is_some() && row_b.started_at.is_some(),
+            "the clock comes from the registry entry"
+        );
+        assert_eq!(row_b.prompt, "brief two", "the brief comes along");
+
+        // The badges a viewer needs to tell the rows apart: a duplicate-key
+        // registration says `Dup #N`, a validator-family key says `Audit`.
+        for key in [&key_a, &key_b] {
+            match key.split_once('#') {
+                Some((_, handle)) => assert_eq!(
+                    subagent_row_badge(None, key),
+                    Some(format!("Dup #{handle}")),
+                    "a duplicate-key row says so"
+                ),
+                None => assert_eq!(
+                    subagent_row_badge(None, key),
+                    None,
+                    "a plain key has no badge"
+                ),
+            }
+        }
+        assert_eq!(
+            subagent_row_badge(None, "validator-coder-t-9"),
+            Some("Audit".to_string()),
+            "a validator-family row reads as an audit"
+        );
+
+        // Identity: a lifecycle event naming agent+task resolves through the
+        // registry, so it never opens a third row for a worker that has one.
+        update_subagent_lifecycle(
+            &mut rows,
+            crate::agents::Agent::Coder,
+            Some("t-9001".to_string()),
+            None,
+            true,
+        );
+        assert_eq!(
+            mine(&rows).len(),
+            2,
+            "the event folds into a registry row instead of adding one"
+        );
+        // And a queue transition never creates a row either.
+        assert!(
+            !update_subagent_queue(
+                &mut rows,
+                crate::agents::Agent::Coder,
+                Some("t-9003".to_string()),
+                Some(crate::ui::QueueState { position: 1, of: 2 })
+            ),
+            "queue state is orthogonal to row existence"
+        );
+        assert_eq!(mine(&rows).len(), 2);
+
+        // One worker's guard drops: the registry flips its entry to completed, and
+        // THAT is what closes the row.
+        drop(second);
+        assert!(
+            project_subagent_rows(&mut rows),
+            "a completed entry changes what the pane shows"
+        );
+        let closed = rows
+            .iter()
+            .find(|r| r.name == key_b)
+            .expect("the completed ring still holds the entry, so the row stays");
+        assert!(!closed.is_active, "the registry closed the row");
+        assert!(
+            closed.started_at.is_none(),
+            "no live clock for a finished run"
+        );
+        assert!(closed.queue.is_none(), "no queue position outlives the run");
+        assert!(
+            rows.iter()
+                .find(|r| r.name == key_a)
+                .is_some_and(|r| r.is_active),
+            "the other live worker keeps its row"
+        );
+
+        // The entry leaving the registry is the other half of closing: no entry, no row.
+        for key in [&key_a, &key_b, &stub] {
+            workers::remove_worker_entry_for_test(key);
+        }
+        assert!(project_subagent_rows(&mut rows));
+        assert!(
+            mine(&rows).is_empty(),
+            "a row whose entry left the registry is gone"
+        );
     }
 
     // The system prompt must read the plan fail-closed: a plan file that exists

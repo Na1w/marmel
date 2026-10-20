@@ -31,7 +31,11 @@ pub struct QueueState {
 /// Detailed status of an active specialist subagent.
 #[derive(Debug, Clone, Default)]
 pub struct SubagentDetail {
-    /// The specialist role id (e.g. `coder`, `researcher`).
+    /// The **effective registry key** of the worker this row projects:
+    /// `WorkerEntry::key` (`{agent}-{task}`, `{agent}-wN`, or the `{base}#N` form a
+    /// duplicate registration takes). Row identity, selection, the presentation
+    /// maps (`subagent_is_thinking`, `subagent_turn_thinking`) and every registry
+    /// lookup all use this string — never a name derived from the agent enum.
     pub name: String,
     pub task_id: Option<String>,
     pub prompt: String,
@@ -44,7 +48,10 @@ pub struct SubagentDetail {
     pub logs: Vec<String>,
     pub thinking: String,
     pub content: String,
-    /// Whether this subagent is currently running (between Started/Completed).
+    /// Whether this subagent is currently running. Written by the registry
+    /// projection only (`helpers::apply_registry_entry`): it mirrors
+    /// `WorkerEntry::is_active`, so a row is open exactly while the Manager and the
+    /// steering arbitrator consider that worker running.
     pub is_active: bool,
     /// Concurrency-slot queue state, when this subagent is waiting for a slot.
     /// Set by a `Queued` delegation event, cleared by `Running`, `Completed` and

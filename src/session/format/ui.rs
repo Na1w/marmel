@@ -143,8 +143,11 @@ pub struct UiSection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubagentPanel {
-    /// The specialist role id (`coder`, `researcher`, …) — the join key the live
-    /// merge uses.
+    /// The **effective registry key** of the worker this panel projects — the same
+    /// string `WorkerEntry::key` carries (`{agent}-{task}`, `{agent}-wN` or the
+    /// `{base}#N` form a duplicate registration takes), and therefore the join key
+    /// the live merge and every registry lookup use. It is never a display name
+    /// derived from the agent enum.
     pub name: String,
     pub task_id: Option<String>,
     /// Never rendered, but required to re-advertise the same subagent.
