@@ -728,6 +728,53 @@ fn set_subagents_adopts_authoritative_queue_state() {
     assert!(r.subagents[0].is_active);
 }
 
+// ---- row identity: the effective registry key ----
+
+/// A stream tag spells the **natural** key (`{agent}-{task}`, or bare `{agent}`),
+/// while a row is named by the **effective registry key**, which may carry a
+/// `-wN` / `#N` handle the tag can never spell. Resolving the tag to the row key
+/// is what keeps streamed thinking/content and the thinking flag on the same
+/// object the Manager and the steering arbitrator address.
+#[test]
+fn a_stream_tag_resolves_to_the_row_key_the_registry_allocated() {
+    let mut r = TuiRenderer::new();
+    r.subagents.push(SubagentDetail {
+        name: "coder-t-011#7".to_string(),
+        task_id: Some("t-011".to_string()),
+        is_active: true,
+        ..SubagentDetail::default()
+    });
+    r.subagents.push(SubagentDetail {
+        name: "researcher-w42".to_string(),
+        is_active: true,
+        ..SubagentDetail::default()
+    });
+
+    assert_eq!(r.resolve_row_key("coder-t-011"), "coder-t-011#7");
+    assert_eq!(r.resolve_row_key("coder-t-011#7"), "coder-t-011#7");
+    assert_eq!(r.resolve_row_key("researcher"), "researcher-w42");
+    assert_eq!(r.resolve_row_key("debugger"), "debugger");
+
+    r.on_event(&Event::SubagentThinking {
+        agent_tag: "coder-t-011".to_string(),
+        text: "reasoning about the collision handle".to_string(),
+    });
+    assert_eq!(
+        r.subagents.len(),
+        2,
+        "the tag must never open a second row for a worker that already has one"
+    );
+    assert_eq!(
+        r.subagents[0].thinking,
+        "reasoning about the collision handle"
+    );
+    assert_eq!(
+        r.subagent_is_thinking.get("coder-t-011#7").copied(),
+        Some(true),
+        "the thinking flag is keyed on the row key, not on the tag"
+    );
+}
+
 // ---- queued state and queue position in the Subagents panel ----
 
 /// Fixture for the queue-label tests: the fields the row label is built from are
@@ -1299,6 +1346,13 @@ fn test_subagent_thinking_visibility_controlled_by_show_thought() {
         queue: None,
     });
 
+    // The pane's thinking flag is set explicitly here, not inferred from the
+    // `thinking` buffer: inferring liveness from leftover pane text is the defect
+    // removed, so the collapsed bar now needs the flag the stream sets
+    // (`Event::SubagentThinking`) or a live registry entry. Everything this
+    // test pins — the `show_thought` gate — is unchanged.
+    r.subagent_is_thinking.insert("coder".to_string(), true);
+
     // 1. By default, show_thought is false -> [Thinking] must not appear
     assert!(!r.show_thought);
     terminal
@@ -1377,6 +1431,78 @@ fn test_subagent_thinking_visibility_controlled_by_show_thought() {
         text_on.contains("deliverable code"),
         "subagent output content should be shown when show_thought=true"
     );
+}
+
+/// Regression guard: the collapsed `[Thinking: …]` bar and its spinner are a claim about
+/// the **worker**, so the inferred form requires the registry entry behind the row to be
+/// live. A cancel, a preemption or a guard drop emits no stream event at all, so the pane
+/// would otherwise keep a stale spinner over a worker the Manager and the arbitrator no
+/// longer consider running.
+#[test]
+fn a_finished_worker_with_leftover_thinking_stops_claiming_to_be_thinking() {
+    use crate::orchestrator::workers;
+    // Registration touches the process-global table other suites assert over.
+    let _workers = workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let worker = workers::register_active_worker(
+        Some("t-9503".to_string()),
+        "coder".to_string(),
+        "brief".to_string(),
+    );
+    let key = worker.0.clone();
+
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.subagents.push(SubagentDetail {
+        name: key.clone(),
+        task_id: Some("t-9503".to_string()),
+        thinking: "half a thought, still on screen".to_string(),
+        is_active: true,
+        ..Default::default()
+    });
+
+    let backend = ratatui::backend::TestBackend::new(100, 20);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    let draw = |terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+                r: &mut TuiRenderer| {
+        terminal
+            .draw(|frame| {
+                let area = ratatui::layout::Rect::new(0, 0, 100, 20);
+                r.render_subagents(frame, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..20)
+            .map(|y| {
+                (0..100)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let while_running = draw(&mut terminal, &mut r);
+    assert!(
+        while_running.contains("[Thinking:"),
+        "a live worker with streamed thinking shows the thinking bar, got:\n{while_running}"
+    );
+
+    // The guard drops: the registry closes the entry. Nothing else in the pane changed —
+    // the row still claims `is_active` and still holds its text — and that is the defect.
+    drop(worker);
+    let after_done = draw(&mut terminal, &mut r);
+    assert!(
+        !after_done.contains("[Thinking:"),
+        "a completed registry entry must never be drawn as still thinking, got:\n{after_done}"
+    );
+    assert!(
+        after_done.contains(&key),
+        "the row itself stays visible: the completed ring still holds the entry"
+    );
+
+    workers::remove_worker_entry_for_test(&key);
 }
 
 #[test]
@@ -2135,6 +2261,94 @@ fn test_subagent_time_counter_rendering_in_list() {
         full_text.contains("researcher-t-2 (Idle, 1.2k ctx, 1m 25s)"),
         "expected 'researcher-t-2 (Idle, 1.2k ctx, 1m 25s)' in subagents panel, got:\n{full_text}"
     );
+}
+
+/// Regression guard: every fact on a list line is resolved through the row's
+/// **effective registry key**, and the two registry facts a viewer needs to tell rows
+/// apart are spelled in the label.
+///
+/// The collided `{base}#N` row is built with `context_tokens: 0`, so its ctx can only
+/// come from the registry entry behind that key — which is exactly the lookup the old
+/// name-based read (`get_active_worker_tokens(&sa.name)`) missed.
+#[test]
+fn a_collided_row_renders_from_its_registry_entry_and_the_label_says_what_it_is() {
+    use crate::orchestrator::workers;
+    // Registration touches the process-global table other suites assert over.
+    let _workers = workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // Private task ids keep these keys out of every other test's way.
+    let first = workers::register_active_worker(
+        Some("t-9501".to_string()),
+        "coder".to_string(),
+        "brief one".to_string(),
+    );
+    let second = workers::register_active_worker(
+        Some("t-9501".to_string()),
+        "coder".to_string(),
+        "brief two".to_string(),
+    );
+    let audit = workers::register_active_worker(
+        Some("t-9502".to_string()),
+        "validator-coder".to_string(),
+        "audit brief".to_string(),
+    );
+    let (plain, collided, audit_key) = (first.0.clone(), second.0.clone(), audit.0.clone());
+    workers::update_active_worker_context(&collided, 4321);
+    assert_ne!(plain, collided, "the second worker took a collision key");
+
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    for key in [&plain, &collided, &audit_key] {
+        r.subagents.push(SubagentDetail {
+            name: key.clone(),
+            is_active: true,
+            ..Default::default()
+        });
+    }
+
+    let backend = ratatui::backend::TestBackend::new(120, 20);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 0, 120, 20);
+            r.render_subagents(frame, area);
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let full_text = (0..20)
+        .map(|y| {
+            (0..120)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        full_text.contains(&format!("{collided} (Active, 4.3k ctx)")),
+        "the ctx of a `{collided}` row comes from the entry holding that exact key, got:\n{full_text}"
+    );
+    let handle = collided.split_once('#').expect("collision key").1;
+    assert!(
+        full_text.contains(&format!("Dup #{handle}")),
+        "a duplicate-key row labels its collision handle, got:\n{full_text}"
+    );
+    assert!(
+        full_text.contains(&format!("{audit_key} (Active) Audit")),
+        "a validator-family row reads as an audit run, got:\n{full_text}"
+    );
+    assert!(
+        full_text.contains(&format!("{plain} (Active)")),
+        "a plain key carries no badge and no invented ctx, got:\n{full_text}"
+    );
+
+    drop(first);
+    drop(second);
+    drop(audit);
+    for key in [&plain, &collided, &audit_key] {
+        workers::remove_worker_entry_for_test(key);
+    }
 }
 
 #[test]

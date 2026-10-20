@@ -72,13 +72,82 @@ pub(crate) fn first(
         .find(|st| route(st) == action)
 }
 
-/// The worker a forwarded notice is addressed to: the agent name when the arbitrator supplied
-/// one, otherwise the subtask's tool-call id.
-pub(crate) fn notice_target(subtask: &SteerSubtaskDecision) -> &str {
-    subtask
-        .agent_name
+/// The **one** worker-addressing rule the bridge uses — cancel *and* post-to-worker.
+///
+/// The pair `(agent, task)` is resolved against the worker registry, never against pane rows
+/// and never by an OR of name fields: each non-empty argument must match the **same** entry
+/// as a whole token, which is exactly the rule the registry itself applies when cancelling
+/// (`orchestrator::workers::worker_matches`) and when routing a notice
+/// ([`crate::orchestrator::notice::WorkerRoutingIdentity::routes`]). Both arguments empty
+/// addresses nothing.
+///
+/// The identity is built by the single authority the orchestrator defers to,
+/// [`crate::orchestrator::notice::worker_routing_identity`], with the authoritative
+/// `agent_name` / `task_id` pinned off the registry entry — the same two steps
+/// `workers::worker_identity` performs, so the bridge cannot grow a third identity model.
+///
+/// Returns the **effective registry keys** (`{agent}-{task}`, `{agent}-wN`, `{base}#N`) of the
+/// matching *active* entries in registry order; those are the keys the pane rows are named by.
+pub(crate) fn addressed_worker_keys(agent: Option<&str>, task: Option<&str>) -> Vec<String> {
+    let clean_agent =
+        crate::task_id::normalize_task_id_ref(agent.unwrap_or("")).to_ascii_lowercase();
+    let clean_task = crate::task_id::normalize_task_id_ref(task.unwrap_or("")).to_ascii_lowercase();
+    if clean_agent.is_empty() && clean_task.is_empty() {
+        return Vec::new();
+    }
+
+    crate::orchestrator::worker_entries()
+        .into_iter()
+        .filter(|entry| entry.is_active)
+        .filter(|entry| {
+            let identity = routing_identity(entry);
+            let agent_matches = clean_agent.is_empty() || identity.routes(&clean_agent);
+            let task_matches = clean_task.is_empty() || identity.routes(&clean_task);
+            agent_matches && task_matches
+        })
+        .map(|entry| entry.key)
+        .collect()
+}
+
+/// Registry identity of one entry, resolved through the notice router's single authority.
+fn routing_identity(
+    entry: &crate::orchestrator::WorkerEntry,
+) -> crate::orchestrator::notice::WorkerRoutingIdentity {
+    let mut identity = crate::orchestrator::notice::worker_routing_identity(&entry.key);
+
+    let authoritative_agent = entry.agent_name.trim();
+    if !authoritative_agent.is_empty() {
+        identity.agent_name = authoritative_agent.to_ascii_lowercase();
+    }
+
+    let authoritative_task = entry
+        .task_id
         .as_deref()
-        .unwrap_or(&subtask.tool_call_id)
+        .map(|raw| crate::task_id::normalize_task_id_ref(raw).to_ascii_lowercase())
+        .filter(|clean| !clean.is_empty());
+    identity.task_id = authoritative_task.or(identity.task_id);
+
+    identity
+}
+
+/// The worker a forwarded notice is addressed to: the **effective registry key** when the
+/// arbitrator's `(agent, task)` pair addresses exactly one running worker, otherwise the raw
+/// token the arbitrator supplied (agent name, else the subtask's tool-call id).
+///
+/// The fallback is what keeps an explicit broadcast (`worker` / `*`) or an address with no
+/// live worker behind it behaving as before — the notice router applies the same whole-token
+/// rules to it — while a precisely addressed notice is posted under the exact key the pane
+/// row and the registry use.
+pub(crate) fn notice_target(subtask: &SteerSubtaskDecision) -> String {
+    match addressed_worker_keys(subtask.agent_name.as_deref(), Some(&subtask.tool_call_id))
+        .as_slice()
+    {
+        [only] => only.clone(),
+        _ => subtask
+            .agent_name
+            .clone()
+            .unwrap_or_else(|| subtask.tool_call_id.clone()),
+    }
 }
 
 #[cfg(test)]

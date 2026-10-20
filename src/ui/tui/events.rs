@@ -586,6 +586,61 @@ impl TuiRenderer {
         }
     }
 
+    /// Resolve a stream/preemption **tag** to the key of the row it belongs to.
+    ///
+    /// A tag is spelled `{agent}-{task}` or bare `{agent}`
+    /// (`orchestrator/execution.rs:255`), while a row is named by the **effective
+    /// registry key** (`WorkerEntry::key`), which may carry a handle the tag can
+    /// never spell: `{agent}-wN` for a taskless worker, `{base}#N` when a live
+    /// worker already owned the natural key. Without this resolution the
+    /// presentation maps (`subagent_is_thinking`, `subagent_turn_thinking`) and
+    /// the streamed text land on a *second* row for the same worker — or on no
+    /// row at all, which is the failed lookup the pane used to hit.
+    ///
+    /// Order, strongest first: exact key, natural key (the tag with the `#…`
+    /// collision handle stripped), the `{agent}-wN` form of a bare agent tag,
+    /// then task-id equality. Falling back to the tag itself is what keeps the
+    /// first event for a not-yet-registered worker working: the row is then
+    /// created under the tag and re-labelled by `set_subagents` when the
+    /// registry publishes the real key.
+    pub(crate) fn resolve_row_key(&self, tag: &str) -> String {
+        if self.subagents.iter().any(|s| s.name == tag) {
+            return tag.to_string();
+        }
+        let digit_run = |rest: &str| {
+            rest.strip_prefix("-w").is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+            })
+        };
+        let natural = self
+            .subagents
+            .iter()
+            .find(|s| match s.name.split_once('#') {
+                Some((head, handle)) => head == tag && !handle.is_empty(),
+                None => false,
+            })
+            .or_else(|| {
+                self.subagents
+                    .iter()
+                    .find(|s| s.name.strip_prefix(tag).is_some_and(digit_run))
+            });
+        if let Some(row) = natural {
+            return row.name.clone();
+        }
+        let by_task = self.subagents.iter().find(|s| {
+            let clean = s
+                .task_id
+                .as_deref()
+                .map(|t| crate::task_id::normalize_task_id_ref(t).to_string())
+                .unwrap_or_default();
+            !clean.is_empty() && (tag == clean.as_str() || tag.ends_with(&format!("-{clean}")))
+        });
+        if let Some(row) = by_task {
+            return row.name.clone();
+        }
+        tag.to_string()
+    }
+
     /// Create or update a subagent entry in the local list. Used by the
     /// `Delegation` event handler so the panel reflects Started/Completed
     /// transitions immediately, and by `set_subagents` to adopt the

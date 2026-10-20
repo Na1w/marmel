@@ -7,10 +7,13 @@
 //! adapters: they supply their differing inputs and surface progress through their own channel
 //! (renderer events vs. the [`super::drain`] event channel).
 //!
-//! Deliberately *not* unified: the per-channel wording of the sleep notices and the per-round
-//! notion of "is work active" differ between the two hosts, and both differences are expressed
-//! explicitly (see [`SleepNotice::status_text`] / [`SleepNotice::delta_text`] and the
-//! `ArbitrationChannel` snapshot methods).
+//! Deliberately *not* unified: only the **per-channel wording** of the sleep notices differs
+//! between the two hosts ([`SleepNotice::status_text`] / [`SleepNotice::delta_text`]). The
+//! execution snapshot the arbitrator is shown is **not** a host input at all: subtasks and
+//! orchestrator status are read from the worker registry here, in every round, for both hosts
+//! ([`active_subtasks_render`] / [`orchestrator_status_label`]), because the pane is a projection
+//! of that same registry (`ui::helpers::project_subagent_rows`). A host therefore cannot hand the
+//! arbitrator a stale pane row and make it believe work is running.
 
 use super::action;
 use crate::agents::{Agent, Deliverable, MissionMarker};
@@ -369,14 +372,38 @@ impl SleepNotice {
     }
 }
 
+/// The active-subtask table the arbitrator is shown — the worker registry's own render,
+/// in **every** round and for **both** hosts.
+///
+/// There is deliberately no host hook for this any more. Before this the round-1 snapshot
+/// came from the renderer's pane (`format_active_subtasks` over `SubagentDetail` rows), so
+/// the arbitrator could be shown — and act on — a set of running agents the Manager and the
+/// registry did not agree with. One table, one render, every round.
+pub(crate) fn active_subtasks_render() -> String {
+    let rendered = crate::orchestrator::get_active_subtasks_str();
+    if rendered.trim().is_empty() {
+        return "None".to_string();
+    }
+    rendered
+}
+
+/// The single `orchestrator_status` label, decided by **registry liveness only**
+/// ([`crate::orchestrator::has_active_workers`]) — never by a pane row's `is_active` flag.
+pub(crate) fn orchestrator_status_label(has_active_workers: bool) -> &'static str {
+    if has_active_workers {
+        "Active (subagents executing)"
+    } else {
+        "Active (planning/turn)"
+    }
+}
+
 /// Host-side surface of one steering arbitration.
+///
+/// The channel exists to surface **progress** (rounds, streamed deltas, sleep notices) in the
+/// wording each host owns. It carries no execution snapshot: the snapshot is registry state
+/// ([`active_subtasks_render`]), which is what keeps the Manager, the pane and the arbitrator
+/// looking at one set of running agents.
 pub(crate) trait ArbitrationChannel {
-    /// Active-subtask table presented to the arbitrator for the given 1-based round.
-    fn active_subtasks(&self, round: usize) -> String;
-
-    /// Whether the arbitrator is told that work is executing in the given 1-based round.
-    fn has_active_work(&self, round: usize) -> bool;
-
     /// A new arbitration round is starting.
     fn round_started(&mut self, round: usize);
 
@@ -434,8 +461,11 @@ pub(crate) async fn arbitrate_steering<C: ArbitrationChannel>(
             .unwrap_or(None)
             .unwrap_or_default();
         let plan_progress_str = format_plan_progress_summary(&plan_content);
-        let active_subtasks_str = channel.active_subtasks(round);
-        let has_active = channel.has_active_work(round);
+        // Registry truth, every round, for every host: the arbitrator's view of what is
+        // running is the same read model the pane and the Manager use.
+        let active_subtasks_str = active_subtasks_render();
+        let orchestrator_status =
+            orchestrator_status_label(crate::orchestrator::has_active_workers());
         let history_str = request
             .steering_history
             .and_then(|history| history.read().ok())
@@ -449,11 +479,7 @@ pub(crate) async fn arbitrate_steering<C: ArbitrationChannel>(
 
         let ctx = SteerContext {
             main_goal: request.goal,
-            orchestrator_status: if !has_active {
-                "Active (planning/turn)"
-            } else {
-                "Active (subagents executing)"
-            },
+            orchestrator_status,
             pending_approval: "None",
             plan_progress: &plan_progress_str,
             plan_content: &plan_content,
@@ -681,14 +707,6 @@ mod tests {
     }
 
     impl ArbitrationChannel for RecordingChannel {
-        fn active_subtasks(&self, round: usize) -> String {
-            format!("active subtasks of round {round}")
-        }
-
-        fn has_active_work(&self, _round: usize) -> bool {
-            true
-        }
-
         fn round_started(&mut self, round: usize) {
             self.rounds.push(round);
         }

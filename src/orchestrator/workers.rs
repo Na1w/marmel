@@ -121,7 +121,13 @@ static COMPLETED_SEQ: LazyLock<std::sync::atomic::AtomicU64> = LazyLock::new(|| 
 /// workers registered in the same tick can never share a key. It is also the
 /// disambiguator used when a registration would otherwise overwrite a *live*
 /// registry entry (see [`claim_worker_slot`]).
-static WORKER_ID_SEQ: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
+///
+/// **The counter starts at 1, not 0:** id `0` is the reserved marker of "no id was
+/// ever drawn", which is how a token-count placeholder written by
+/// [`update_active_worker_context`] is recognised (see [`classify_call_class`]).
+/// Starting at 0 would hand the very first registration of a process that marker
+/// and make a real worker look like a stub to every class-aware consumer.
+static WORKER_ID_SEQ: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(1));
 
 /// Next monotonic worker id. Never reused within a process.
 fn next_worker_id() -> u64 {
@@ -331,6 +337,209 @@ pub fn live_worker_states() -> Vec<(String, WorkerState)> {
         .map(|e| (e.key().clone(), e.value().clone()))
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Role-family marker of a validation pass. Validators register under
+/// `validator-{agent}` / `validator-planner` (see `src/agents/validation.rs`), so
+/// the **leading segment** of the agent name identifies the class — anchored at a
+/// segment boundary exactly like the notice router's role-family rule
+/// ([`crate::orchestrator::notice::WorkerRoutingIdentity::routes`]), never an
+/// unanchored prefix match.
+const VALIDATOR_ROLE_FAMILY: &str = "validator";
+
+/// What kind of work a registry entry represents.
+///
+/// Derived from fields the registry already holds — the read model adds **no new
+/// state**. These are the classes the table can actually distinguish today:
+/// * [`WorkerCallClass::Specialist`] — a `delegate_task` run, whether dispatched
+///   by the Manager, nested inside another specialist, or restored from a session
+///   bundle.
+/// * [`WorkerCallClass::ValidatorAudit`] — a validator / plan-audit pass, i.e. a
+///   worker in the `validator` role family.
+/// * [`WorkerCallClass::Placeholder`] — the token-count stub
+///   [`update_active_worker_context`] leaves behind for a key with no live entry:
+///   never a registration (`worker_id_seq_value == 0`), never active.
+///
+/// **Nesting depth is deliberately absent**: nothing in [`WorkerState`] records a
+/// parent or a depth, so this surface refuses to invent one. A nested child is
+/// reported as `Specialist` — correct membership, no fabricated label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerCallClass {
+    Specialist,
+    ValidatorAudit,
+    Placeholder,
+}
+
+/// One row of the **public worker read model**: everything a consumer (the TUI
+/// subagent pane, the arbitrator prompt surface) needs to render one worker,
+/// projected out of the private `WORKERS` table so the pane can become a pure
+/// projection of the registry instead of a parallel, event-derived list.
+///
+/// Every field is cloned out of the private [`WorkerState`]; the struct leaks no
+/// private type (no `WorkerState`, no `DashMap` guard, no `CancellationToken`).
+#[derive(Debug, Clone)]
+pub struct WorkerEntry {
+    /// The **effective** registry key — the [`ActiveWorkerGuard`] handle:
+    /// `{agent}-{task}`, `{agent}-w{n}` or `{base}#{id}`. Consumers must key on
+    /// this, never on a display name derived from the agent enum.
+    pub key: String,
+    /// The effective key with the `#…` collision handle removed.
+    pub natural_key: String,
+    /// The `#…` collision handle itself (`Some` only for a disambiguated key).
+    pub collision_handle: Option<String>,
+    /// Shorthand for `collision_handle.is_some()`: this registration had to take
+    /// a distinct key because a live worker already owned the natural one.
+    pub disambiguated: bool,
+    pub agent_name: String,
+    pub task_id: Option<String>,
+    /// Specialist / validator-audit / token-placeholder (see [`WorkerCallClass`]).
+    pub call_class: WorkerCallClass,
+    /// The **liveness authority**: `completed_seq.is_none()`
+    /// ([`WorkerState::is_active`]). A terminal *label* (`Aborted`, `Approved`,
+    /// `Rejected`) never flips this, so a consumer reads this field and never has
+    /// to infer liveness from `status_label`.
+    pub is_active: bool,
+    /// Descriptive status string as stored (mirrors the `Status:` line of
+    /// [`get_active_subtasks_str`]).
+    pub status_label: String,
+    pub prompt: String,
+    pub started_at: Instant,
+    pub started_wall: chrono::DateTime<chrono::Local>,
+    /// Seconds of work time: live elapsed while [`Self::is_active`], total run
+    /// duration once completed — the same two numbers the active and completed
+    /// sections of [`get_active_subtasks_str`] print.
+    pub elapsed_secs: u64,
+    /// Monotonic completion sequence (`None` while active). Callers that want the
+    /// prompt's most-recent-first layout sort on this.
+    pub completed_seq: Option<u64>,
+    pub completed_wall: Option<chrono::DateTime<chrono::Local>>,
+    /// Context tokens as tracked right now for an active worker.
+    pub context_tokens: usize,
+    /// Last-seen token count, preserved after completion — the value
+    /// [`get_active_worker_tokens`] returns for this key.
+    pub last_tokens: usize,
+    pub implementation_turns: usize,
+    pub validation_rounds: usize,
+    pub latest_validator_feedback: Option<String>,
+}
+
+/// Classify one entry from data the registry already stores.
+fn classify_call_class(agent_name: &str, worker_id_seq_value: u64) -> WorkerCallClass {
+    // `0` is the marker of a token-count placeholder, which is not a registration.
+    // Real registrations draw from `WORKER_ID_SEQ`, which starts at 1 precisely so
+    // this marker can never collide with a live worker's id.
+    if worker_id_seq_value == 0 {
+        return WorkerCallClass::Placeholder;
+    }
+    let name = agent_name.trim().to_ascii_lowercase();
+    let in_validator_family = name == VALIDATOR_ROLE_FAMILY
+        || name
+            .strip_prefix(VALIDATOR_ROLE_FAMILY)
+            .is_some_and(|rest| rest.starts_with('-'));
+    if in_validator_family {
+        WorkerCallClass::ValidatorAudit
+    } else {
+        WorkerCallClass::Specialist
+    }
+}
+
+/// Project one registry entry into the public read model. Infallible, and it
+/// takes **no map guard**, so it is safe to call from inside a `WORKERS.iter()`
+/// scan (the module's single-guard rule).
+fn project_worker_entry(key: &str, state: &WorkerState) -> WorkerEntry {
+    // Structural split on the disambiguator — `#…` is an opaque collision handle,
+    // so everything before it is the natural key and everything after it is the
+    // handle, with no substring guessing about agent or task names.
+    let (natural_key, collision_handle) = match key.find(KEY_DISAMBIGUATOR) {
+        Some(idx) => (
+            key[..idx].to_string(),
+            Some(key[idx + KEY_DISAMBIGUATOR.len_utf8()..].to_string()),
+        ),
+        None => (key.to_string(), None),
+    };
+
+    let elapsed_secs = match state.completed_at {
+        Some(finished) => finished
+            .saturating_duration_since(state.info.started_at)
+            .as_secs(),
+        None => state.info.started_at.elapsed().as_secs(),
+    };
+
+    WorkerEntry {
+        key: key.to_string(),
+        natural_key,
+        collision_handle,
+        disambiguated: key.contains(KEY_DISAMBIGUATOR),
+        agent_name: state.info.agent_name.clone(),
+        task_id: state.info.task_id.clone(),
+        call_class: classify_call_class(&state.info.agent_name, state.worker_id_seq_value),
+        is_active: state.is_active(),
+        status_label: state.info.status.clone(),
+        prompt: state.info.prompt.clone(),
+        started_at: state.info.started_at,
+        started_wall: state.info.started_wall,
+        elapsed_secs,
+        completed_seq: state.completed_seq,
+        completed_wall: state.completed_wall,
+        context_tokens: state.info.context_tokens,
+        last_tokens: state.last_tokens,
+        implementation_turns: state.info.implementation_turns,
+        validation_rounds: state.info.validation_rounds,
+        latest_validator_feedback: state.info.latest_validator_feedback.clone(),
+    }
+}
+
+/// The registry's **live** entries as `(effective key, info)` pairs, sorted by
+/// key (the same order [`live_worker_states`] and the active section of
+/// [`get_active_subtasks_str`] use).
+///
+/// The key is the **effective** handle allocated by [`claim_worker_slot`] — it
+/// includes the synthetic `{agent}-w{n}` form for taskless registrations and the
+/// `{base}#N` form for registrations whose natural key was already owned by a
+/// live worker. Consumers therefore never have to reconstruct a key, and a
+/// per-field key lookup can never miss a disambiguated worker.
+///
+/// One item per matching entry: nothing is merged, deduplicated or renamed.
+pub fn active_worker_entries() -> Vec<(String, ActiveWorkerInfo)> {
+    let mut out: Vec<(String, ActiveWorkerInfo)> = WORKERS
+        .iter()
+        .filter(|e| e.value().is_active())
+        .map(|e| (e.key().clone(), e.value().info.clone()))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// The **recently completed** ring as `(effective key, info)` pairs — the same
+/// entries the `Recently Completed Subagents:` section of
+/// [`get_active_subtasks_str`] surfaces, kept for [`MAX_RECENT_COMPLETED`]
+/// evictions. Sorted by key for stable rendering; sort on
+/// [`WorkerEntry::completed_seq`] via [`worker_entries`] for the prompt's
+/// most-recent-first layout.
+pub fn recent_completed_entries() -> Vec<(String, ActiveWorkerInfo)> {
+    let mut out: Vec<(String, ActiveWorkerInfo)> = WORKERS
+        .iter()
+        .filter(|e| !e.value().is_active())
+        .map(|e| (e.key().clone(), e.value().info.clone()))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// The whole registry as one deterministic read model: every entry — live **and**
+/// the recently completed ring — as a single key-sorted projection with liveness
+/// spelled out by [`WorkerEntry::is_active`].
+///
+/// This is the surface a projection consumer (pane / arbitrator view) is meant to
+/// render: no label-string parsing for liveness, no key reconstruction, and
+/// `WORKERS` / [`WorkerState`] stay private to this module.
+pub fn worker_entries() -> Vec<WorkerEntry> {
+    let mut out: Vec<WorkerEntry> = WORKERS
+        .iter()
+        .map(|e| project_worker_entry(e.key(), e.value()))
+        .collect();
+    out.sort_by(|a, b| a.key.cmp(&b.key));
     out
 }
 
@@ -2547,5 +2756,284 @@ mod tests {
         drop(g_dup_a);
         drop(g_dup_b);
         drop(g_broadcast);
+    }
+
+    /// Task A read model: `active_worker_entries()`, `recent_completed_entries()`
+    /// and `worker_entries()` hand out the **effective** registry key (including
+    /// the `{agent}-wN` and `{base}#N` forms), an explicit `is_active` boolean,
+    /// the token counters and a call class — and they leak neither `WORKERS` nor
+    /// `WorkerState`.
+    #[test]
+    fn test_worker_read_model_exposes_effective_keys_and_explicit_liveness() {
+        let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let base_ids = worker_id_seq_floor();
+        seed_worker_id_seq_floor(base_ids + 700);
+
+        let g_specialist = register_active_worker(
+            Some("t-701".to_string()),
+            "rdmodelspecialist".to_string(),
+            "read model specialist".to_string(),
+        );
+        let g_taskless = register_active_worker(
+            None,
+            "rdmodeltaskless".to_string(),
+            "read model taskless worker".to_string(),
+        );
+        let g_dup_natural = register_active_worker(
+            Some("t-702".to_string()),
+            "rdmodeldup".to_string(),
+            "natural key holder".to_string(),
+        );
+        let g_dup_disambiguated = register_active_worker(
+            Some("t-702".to_string()),
+            "rdmodeldup".to_string(),
+            "collision-handle twin".to_string(),
+        );
+        let g_validator = register_active_worker(
+            Some("t-703".to_string()),
+            "validator-rdmodelcoder".to_string(),
+            "validation pass".to_string(),
+        );
+        // A finished worker must show up too — the same entries the
+        // `Recently Completed Subagents:` section surfaces — but with liveness
+        // spelled out by a boolean, never inferred from a label.
+        let g_finished = register_active_worker(
+            Some("t-704".to_string()),
+            "rdmodelfinished".to_string(),
+            "already done".to_string(),
+        );
+        let finished_key = g_finished.0.clone();
+        drop(g_finished);
+
+        // A terminal label must not flip liveness.
+        set_active_worker_status(&g_specialist.0, "Aborted");
+        // Token counters travel with the row.
+        update_active_worker_context(&g_specialist.0, 1_234);
+        // A key with no live entry leaves a token-count placeholder behind.
+        update_active_worker_context("rdmodelphantom-t-705", 991);
+
+        let entries = worker_entries();
+        let mine: Vec<&WorkerEntry> = entries
+            .iter()
+            .filter(|e| e.key.contains("rdmodel"))
+            .collect();
+        assert_eq!(
+            mine.len(),
+            7,
+            "five live workers, one completed worker, one token-count placeholder"
+        );
+
+        // Deterministic, key-sorted order for every read API.
+        assert!(
+            entries.windows(2).all(|w| w[0].key <= w[1].key),
+            "worker_entries() must be key-sorted so a projection renders stably"
+        );
+
+        let active_keys: Vec<String> = active_worker_entries()
+            .into_iter()
+            .map(|(key, _info)| key)
+            .filter(|key| key.contains("rdmodel"))
+            .collect();
+        let completed_keys: Vec<String> = recent_completed_entries()
+            .into_iter()
+            .map(|(key, _info)| key)
+            .filter(|key| key.contains("rdmodel"))
+            .collect();
+        let mut expected_active = vec![
+            g_dup_disambiguated.0.clone(),
+            g_dup_natural.0.clone(),
+            g_specialist.0.clone(),
+            g_taskless.0.clone(),
+            g_validator.0.clone(),
+        ];
+        expected_active.sort();
+        assert_eq!(
+            active_keys, expected_active,
+            "one item per live entry, keyed by the effective key, in key order"
+        );
+        assert_eq!(
+            completed_keys,
+            vec![finished_key.clone(), "rdmodelphantom-t-705".to_string()],
+            "the same entries the `Recently Completed Subagents:` section surfaces \
+             are part of the read model, in key order"
+        );
+
+        // `is_active` is the liveness authority and agrees with the phase-split
+        // read APIs — a consumer never has to infer liveness from a label string.
+        let mut mine_active: Vec<String> = mine
+            .iter()
+            .filter(|e| e.is_active)
+            .map(|e| e.key.clone())
+            .collect();
+        mine_active.sort();
+        assert_eq!(
+            mine_active, expected_active,
+            "`is_active` == the active phase"
+        );
+        let mut mine_completed: Vec<String> = mine
+            .iter()
+            .filter(|e| !e.is_active)
+            .map(|e| e.key.clone())
+            .collect();
+        mine_completed.sort();
+        assert_eq!(
+            mine_completed, completed_keys,
+            "`!is_active` == the completed phase"
+        );
+
+        let find = |key: &str| {
+            entries
+                .iter()
+                .find(|e| e.key == key)
+                .unwrap_or_else(|| panic!("the read model must carry the key {key}"))
+        };
+
+        // `{agent}-wN`: the synthetic key is exposed verbatim.
+        assert!(
+            g_taskless.0.starts_with("rdmodeltaskless-w"),
+            "a taskless registration keeps its monotonic key: {}",
+            g_taskless.0
+        );
+        let taskless = find(&g_taskless.0);
+        assert_eq!(taskless.call_class, WorkerCallClass::Specialist);
+        assert!(taskless.task_id.is_none());
+        assert!(!taskless.disambiguated);
+
+        // `{base}#N`: the collision handle is exposed as its own field, and the
+        // natural key stays addressable.
+        assert!(
+            g_dup_disambiguated.0.starts_with("rdmodeldup-t-702#"),
+            "the collision twin keeps its disambiguated key: {}",
+            g_dup_disambiguated.0
+        );
+        let dup = find(&g_dup_disambiguated.0);
+        assert!(dup.disambiguated);
+        assert_eq!(dup.natural_key, g_dup_natural.0);
+        assert_eq!(
+            dup.collision_handle.as_deref(),
+            g_dup_disambiguated.0.split('#').nth(1),
+            "everything after `#` is the opaque collision handle"
+        );
+        assert_eq!(find(&g_dup_natural.0).collision_handle, None);
+
+        // Call class: the validator family is distinguishable from a specialist.
+        assert_eq!(
+            find(&g_validator.0).call_class,
+            WorkerCallClass::ValidatorAudit
+        );
+        assert_eq!(
+            find(&g_specialist.0).call_class,
+            WorkerCallClass::Specialist
+        );
+
+        // Liveness is a boolean, not a label reading.
+        let specialist = find(&g_specialist.0);
+        assert!(
+            specialist.is_active,
+            "a label change never completes a worker"
+        );
+        assert_eq!(specialist.status_label, "Aborted");
+        assert_eq!(specialist.context_tokens, 1_234);
+        assert_eq!(specialist.last_tokens, 1_234);
+        assert_eq!(get_active_worker_tokens(&g_specialist.0), Some(1_234));
+        assert!(specialist.completed_seq.is_none());
+
+        // Completed entries: closed, sequenced, still carrying their tokens.
+        let finished = find(&finished_key);
+        assert!(
+            !finished.is_active,
+            "a completed entry is not a live worker"
+        );
+        assert!(finished.completed_seq.is_some());
+        assert!(finished.completed_wall.is_some());
+
+        // A token-count placeholder is never a live worker and is labelled as
+        // what it is.
+        let phantom = find("rdmodelphantom-t-705");
+        assert_eq!(phantom.call_class, WorkerCallClass::Placeholder);
+        assert!(!phantom.is_active);
+        assert_eq!(phantom.last_tokens, 991);
+
+        for key in [
+            &g_specialist.0,
+            &g_taskless.0,
+            &g_dup_natural.0,
+            &g_dup_disambiguated.0,
+            &g_validator.0,
+            &finished_key,
+        ] {
+            remove_worker_entry_for_test(key);
+        }
+        remove_worker_entry_for_test("rdmodelphantom-t-705");
+        drop(g_specialist);
+        drop(g_taskless);
+        drop(g_dup_natural);
+        drop(g_dup_disambiguated);
+        drop(g_validator);
+    }
+
+    /// The read model's classification and key split are structural, never
+    /// substring-based: the validator family is anchored at a segment boundary,
+    /// `worker_id_seq_value == 0` marks a placeholder, and everything after `#`
+    /// is an opaque collision handle (numeric **or** the UUID fallback).
+    #[test]
+    fn test_worker_read_model_classification_and_key_split_are_structural() {
+        let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        assert_eq!(
+            classify_call_class("validator", 1),
+            WorkerCallClass::ValidatorAudit
+        );
+        assert_eq!(
+            classify_call_class("Validator-Coder", 3),
+            WorkerCallClass::ValidatorAudit,
+            "family matching is case-insensitive"
+        );
+        assert_eq!(
+            classify_call_class("validatorx", 3),
+            WorkerCallClass::Specialist,
+            "an unanchored prefix must not classify a worker as a validator"
+        );
+        assert_eq!(
+            classify_call_class("planner-validator", 3),
+            WorkerCallClass::Specialist,
+            "only a leading segment is a role family"
+        );
+        assert_eq!(classify_call_class("coder", 3), WorkerCallClass::Specialist);
+        assert_eq!(
+            classify_call_class("coder", 0),
+            WorkerCallClass::Placeholder,
+            "the token-count stub is not a registration"
+        );
+
+        let state = new_worker_state(
+            Some("t-01".to_string()),
+            "coder",
+            "brief",
+            &None,
+            Instant::now(),
+            7,
+            41,
+        );
+        let plain = project_worker_entry("coder-t-01", &state);
+        assert_eq!(plain.natural_key, "coder-t-01");
+        assert_eq!(plain.collision_handle, None);
+        assert!(!plain.disambiguated);
+        assert!(plain.is_active, "a fresh state is active on registration");
+        assert_eq!(plain.last_tokens, 7);
+
+        let numbered = project_worker_entry("coder-t-01#7", &state);
+        assert_eq!(numbered.natural_key, "coder-t-01");
+        assert_eq!(numbered.collision_handle.as_deref(), Some("7"));
+        assert!(numbered.disambiguated);
+
+        let uuided =
+            project_worker_entry("coder-t-01#u11111111-2222-3333-4444-555555555555", &state);
+        assert_eq!(uuided.natural_key, "coder-t-01");
+        assert_eq!(
+            uuided.collision_handle.as_deref(),
+            Some("u11111111-2222-3333-4444-555555555555"),
+            "a hyphenated UUID handle is opaque, not a task id"
+        );
     }
 }

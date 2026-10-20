@@ -652,8 +652,14 @@ impl TuiRenderer {
             .constraints([Constraint::Length(list_len), Constraint::Min(3)])
             .split(inner_area);
 
+        // One registry snapshot per frame: the row set was projected from these
+        // entries, and the ctx mirror, the class/handle badge and the thinking
+        // flag all read the same ones, so a `{agent}-wN` / `{base}#N` key can
+        // never miss the way a per-field lookup by display name used to.
+        let entries = crate::orchestrator::worker_entries();
         let mut list_lines = Vec::new();
         for (i, sa) in self.subagents.iter().enumerate() {
+            let entry = entries.iter().find(|e| e.key == sa.name);
             let prefix = if i == self.selected_subagent_idx {
                 "> "
             } else {
@@ -666,10 +672,13 @@ impl TuiRenderer {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let ctx_tokens = if sa.is_active {
-                crate::orchestrator::get_active_worker_tokens(&sa.name).unwrap_or(sa.context_tokens)
-            } else {
+            // The row carries the ctx mirror the projection wrote into it. The
+            // registry is consulted only when the row has nothing to show, and
+            // then through the **same key** the row is named by.
+            let ctx_tokens = if sa.context_tokens > 0 {
                 sa.context_tokens
+            } else {
+                entry.map(|e| e.context_tokens).unwrap_or(0)
             };
             let ctx_info = if ctx_tokens > 0 {
                 format!(", {} ctx", Self::format_count(ctx_tokens))
@@ -715,10 +724,26 @@ impl TuiRenderer {
                     Style::default().fg(Color::DarkGray),
                 )
             };
+            // A validator/audit run and a duplicate-key registration are both
+            // real workers the Manager and the arbitrator can see, so the label
+            // says which kind of row it is. The badge is derived from the registry
+            // entry, never stored on the row, and it is appended after the status
+            // so the `(Active)` / `(Idle)` / `(Queued n/m)` label keeps its shape.
+            let badge = crate::ui::helpers::subagent_row_badge(entry, &sa.name)
+                .map(|text| {
+                    Span::styled(
+                        format!(" {text}"),
+                        Style::default()
+                            .fg(Color::LightMagenta)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                })
+                .unwrap_or_else(|| Span::raw(""));
             list_lines.push(Line::from(vec![
                 Span::raw(prefix),
                 Span::styled(sa.name.clone(), name_style),
                 status,
+                badge,
             ]));
         }
         if list_lines.is_empty() {
@@ -878,12 +903,21 @@ impl TuiRenderer {
                 .subagent_turn_thinking
                 .get(&sa.name)
                 .map(|s| s.as_str());
-            let is_thinking = self
-                .subagent_is_thinking
-                .get(&sa.name)
-                .copied()
-                .unwrap_or_else(|| turn_think.map_or(!sa.thinking.is_empty(), |t| !t.is_empty()))
-                && sa.is_active;
+            // Liveness of the thinking bar comes from the registry, never from
+            // leftover pane text. An explicit flag — set by the stream, cleared by
+            // the tool and lifecycle arms — is honoured while the row is active.
+            // With no flag the pane would be inferring "still streaming" from a
+            // `thinking` buffer that outlives the worker (a cancel or a guard drop
+            // produces no event at all), so that inference additionally requires
+            // the registry entry to be a live worker.
+            let is_thinking = match self.subagent_is_thinking.get(&sa.name).copied() {
+                Some(flag) => flag && sa.is_active,
+                None => {
+                    sa.is_active
+                        && (turn_think.map_or(!sa.thinking.is_empty(), |t| !t.is_empty()))
+                        && entries.iter().any(|e| e.key == sa.name && e.is_active)
+                }
+            };
             let active_think = match turn_think {
                 Some(t) => t,
                 None => sa.thinking.as_str(),
