@@ -58,6 +58,22 @@ pub struct SubagentDetail {
     /// `Failed` alike — so a row that finishes, fails or is cancelled never keeps
     /// a stale `(n/m)` behind.
     pub queue: Option<QueueState>,
+    /// Whether a **stream of this worker is currently paused by steering
+    /// arbitration** (its model slot was yielded to the Steer Arbitrator).
+    ///
+    /// Orthogonal to [`SubagentDetail::is_active`]: a paused worker is still
+    /// registered, still dispatched and still visible — only its stream is held
+    /// while the arbitrator runs. `is_active` is never overloaded with it.
+    ///
+    /// Set by exactly one thing: the typed pause transition that the preemption
+    /// handshake emits when a stream really yielded its slot
+    /// ([`Event::SubagentStreamPause`]). A steering round that **skipped**
+    /// pausing because the arbitrator had spare session capacity emits no such
+    /// event, so the row keeps reading `(Active)`. Cleared by the matching
+    /// resumption transition and by every teardown that closes the row
+    /// (`apply_registry_entry`, the lifecycle arm, `set_subagents`), so a stale
+    /// `Paused` can never outlive the stream that produced it.
+    pub paused: bool,
     /// The context tokens used by this subagent.
     pub context_tokens: usize,
 }
@@ -79,6 +95,20 @@ pub enum Event {
     SubagentThinking {
         agent_tag: String,
         text: String,
+    },
+    /// A **stream-pause transition** for one registered worker, delivered by the
+    /// preemption handshake itself (`orchestrator::preemption`) rather than by
+    /// status wording: `paused: true` the moment the stream yields its model slot
+    /// to the Steer Arbitrator, `paused: false` when the handshake hands the slot
+    /// back.
+    ///
+    /// `agent_tag` is the stream spelling the sink already routes its
+    /// `SubagentMessage` / `SubagentThinking` traffic under — never a name parsed
+    /// out of a status line — and it resolves to a panel row through the same
+    /// row-key resolution those events use.
+    SubagentStreamPause {
+        agent_tag: String,
+        paused: bool,
     },
     /// A tool invocation (rendered as `name(arguments)`).
     ToolCall(String),

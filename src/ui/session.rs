@@ -1594,7 +1594,14 @@ fn subagent_detail_from_panel(panel: &SubagentPanel) -> SubagentDetail {
         content: panel.content.clone(),
         is_active: panel.is_active,
         context_tokens: panel.context_tokens,
+        // Neither slot state survives a restore: `queue` belongs to a live
+        // delegation and `paused` to a stream the preemption handshake is holding.
+        // A journaled pane records a round that was interrupted, never a stream
+        // that is parked behind the arbitrator right now, so both start clean and
+        // only a fresh typed transition (`Event::SubagentStreamPause`) or a fresh
+        // queue event can set them again.
         queue: None,
+        paused: false,
     }
 }
 
@@ -1635,6 +1642,33 @@ fn project_subagent_pane(subagents: &mut Vec<SubagentDetail>, renderer: &mut dyn
     if crate::ui::helpers::project_subagent_rows(subagents) {
         renderer.set_subagents(subagents.clone());
     }
+}
+
+/// Hand one UI event to the active renderer, folding in the panel state the event
+/// carries **before** it is handed over.
+///
+/// The loop's `subagents` vector is the authoritative row set every host renders
+/// from, so a transition that *is* panel state has to land there rather than only
+/// in a renderer's local copy. That is what this seam is for: it is the single
+/// place each host drains its event channel, so the fold happens once per event
+/// for the TUI panel and the bridge pane alike — no new channel, no timer, no
+/// background task; the event the preemption handshake already emits carries it.
+///
+/// Only the stream-arbitration pause transition is panel state today (a queue
+/// transition arrives through the delegation vector instead, which is drained
+/// right after this). A real change re-pushes the rows, exactly like the
+/// projection and the delegation drain next to it.
+pub(crate) fn forward_ui_event(
+    subagents: &mut [SubagentDetail],
+    renderer: &mut dyn Renderer,
+    event: &Event,
+) {
+    if let Event::SubagentStreamPause { agent_tag, paused } = event
+        && crate::ui::helpers::update_subagent_paused(subagents, agent_tag, *paused)
+    {
+        renderer.set_subagents(subagents.to_vec());
+    }
+    renderer.on_event(event);
 }
 
 /// `Duration::from_secs_f64` panics on a negative/NaN/infinite input, so a corrupt
@@ -1980,7 +2014,7 @@ pub async fn run_session_with_bounds_report(
             if let Event::SteerResponse(ref text) = ev {
                 ui_transcript.append(UiRecord::SteerResponse { text: text.clone() });
             }
-            renderer.on_event(&ev);
+            forward_ui_event(&mut subagents, &mut *renderer, &ev);
             had_events = true;
         }
         if had_events {
@@ -2621,7 +2655,7 @@ pub async fn run_session_with_bounds_report(
                                 ui_transcript
                                     .append(UiRecord::SteerResponse { text: text.clone() });
                             }
-                            renderer.on_event(&ev);
+                            forward_ui_event(&mut subagents, &mut *renderer, &ev);
                             had_events = true;
                         }
                         if had_events {
@@ -2724,7 +2758,7 @@ pub async fn run_session_with_bounds_report(
                                         ui_transcript
                                             .append(UiRecord::SteerResponse { text: text.clone() });
                                     }
-                                    renderer.on_event(&ev);
+                                    forward_ui_event(&mut subagents, &mut *renderer, &ev);
                                     had_events = true;
                                 }
                                 if had_events {
@@ -3214,7 +3248,7 @@ pub async fn run_session_with_bounds_report(
                                 ui_transcript
                                     .append(UiRecord::SteerResponse { text: text.clone() });
                             }
-                            renderer.on_event(&ev);
+                            forward_ui_event(&mut subagents, &mut *renderer, &ev);
                             had_events = true;
                         }
                         if had_events {
@@ -3300,7 +3334,7 @@ pub async fn run_session_with_bounds_report(
                                         ui_transcript
                                             .append(UiRecord::SteerResponse { text: text.clone() });
                                     }
-                                    renderer.on_event(&ev);
+                                    forward_ui_event(&mut subagents, &mut *renderer, &ev);
                                     had_events = true;
                                 }
                                 if had_events {

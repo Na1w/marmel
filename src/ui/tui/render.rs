@@ -706,8 +706,21 @@ impl TuiRenderer {
             // the running round — it is simply waiting behind the cap. The
             // `(Queued n/m)` half is a stable shape built from the pool's FIFO
             // ticket, so a position change swaps digits and nothing else here.
+            //
+            // An arbitration pause is the other orthogonal state a live row can
+            // carry, and it wins the label over a queue position: the row that
+            // yielded its model slot to the Steer Arbitrator is not waiting behind
+            // the concurrency cap, it is parked inside the arbitration handshake,
+            // and the operator needs to see that the round is being held — the
+            // stream resumes on the slot it gave up. `is_active` stays true, so the
+            // name keeps its green/bold spelling and the clock keeps running.
             let queued = sa.queue.filter(|_| sa.is_active);
-            let status = if let Some(q) = queued {
+            let status = if sa.paused && sa.is_active {
+                Span::styled(
+                    format!(" (Paused{ctx_info}{elapsed_str})"),
+                    Style::default().fg(Color::LightBlue),
+                )
+            } else if let Some(q) = queued {
                 let (position, of) = (q.position, q.of);
                 Span::styled(
                     format!(" (Queued {position}/{of}{ctx_info}{elapsed_str})"),
@@ -923,7 +936,21 @@ impl TuiRenderer {
                 None => sa.thinking.as_str(),
             };
 
-            let (bar_text, bar_style) = if let Some(q) = sa.queue.filter(|_| sa.is_active) {
+            let (bar_text, bar_style) = if sa.paused && sa.is_active {
+                // The arbitration pause takes the bar over from the queue position
+                // and the thinking bar for the same reason it takes the label: a
+                // stream that yielded its model slot is neither queued for a permit
+                // nor producing tokens, so whatever thinking text the row still
+                // carries is already stale, and the fact worth reading is that the
+                // slot is on loan to the arbitrator. The spinner keeps turning
+                // because `is_active` stays true through the handshake.
+                (
+                    format!(
+                        " [Status: Paused - model slot yielded to the steering arbitrator...] {spinner}"
+                    ),
+                    Style::default().bg(Color::DarkGray).fg(Color::LightBlue),
+                )
+            } else if let Some(q) = sa.queue.filter(|_| sa.is_active) {
                 // The queue position wins over the thinking bar for one reason:
                 // a row can only stream thinking while it holds its slot, so the
                 // moment this arm fires the previous turn's thinking state is
@@ -1044,6 +1071,25 @@ impl TuiRenderer {
                 active_agents.join(", ")
             );
             status_str.push_str(&count_suffix);
+            // An arbitration pause is spelled out in its own segment instead of
+            // being subtracted from the active list: a row whose stream yielded its
+            // model slot to the Steer Arbitrator is still part of the running round
+            // — which is exactly what the `[N active: …]` count means. Derived from
+            // the same row model the panel label reads, so the two can never
+            // disagree about which worker is held.
+            let paused_agents: Vec<&str> = self
+                .subagents
+                .iter()
+                .filter(|s| s.is_active && s.paused)
+                .map(|s| s.name.as_str())
+                .collect();
+            if !paused_agents.is_empty() {
+                status_str.push_str(&format!(
+                    " [{} paused: {}]",
+                    paused_agents.len(),
+                    paused_agents.join(", ")
+                ));
+            }
         }
         // Animated activity indicator. When the status line indicates an
         // active phase, append a cycling suffix derived from `session_start`.

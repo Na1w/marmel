@@ -46,6 +46,7 @@ use marmennill::orchestrator::notice::{SteerNotice, evaluate_worker_reply};
 use marmennill::orchestrator::pool;
 use marmennill::orchestrator::preemption::{
     PreemptHandle, PreemptibleStreamSink, preempt_conflicting_stream,
+    preempt_conflicting_stream_on_backend,
 };
 use marmennill::orchestrator::steer::{
     SteerContext, arbitrate_steer_context_stream, synthesize_steer_subtask_response,
@@ -824,4 +825,132 @@ async fn test_queued_session_is_not_a_preemption_target_and_live_streams_still_y
     );
 
     deactivate();
+}
+
+/// Conditional stream pause on steering, end to end through the arbitrator's own
+/// backend+model pair:
+///
+/// * no cap configured (unlimited) => pause, exactly as before;
+/// * a capped pair with a free slot and nobody queued => **no pause at all**
+///   (no `StreamControl::Pause`, no handshake, stream untouched);
+/// * the same pair saturated => the original pause handshake, ack escalation
+///   included;
+/// * a queued session blocks the skip path even with a permit free.
+#[tokio::test]
+async fn test_pause_is_skipped_only_while_the_pair_has_spare_capacity() {
+    let _serial = FAST_TEST_MUTEX.lock().await;
+    reset_cancellation();
+
+    let backend = "http://steer-conditional-pause:9101/v1";
+    let model = "model-conditional-pause";
+
+    // Drive one arbitration round that must pause, and prove the stream yields
+    // its slot and is handed back.
+    async fn pause_round(backend: &str, model: &str, agent_tag: &str) {
+        let token = CancellationToken::new();
+        let mut sink = PreemptibleStreamSink::register_full(
+            agent_tag,
+            Some(agent_tag.to_string()),
+            Some(format!("t-{}", agent_tag)),
+            Some(token.clone()),
+            model,
+        );
+        let backend = backend.to_string();
+        let model = model.to_string();
+        let handle_task = tokio::spawn(async move {
+            preempt_conflicting_stream_on_backend(&backend, &model, "steer now").await
+        });
+        let pause_task = loop {
+            if let StreamControl::Pause { user_input } = sink.poll_control() {
+                assert_eq!(user_input, "steer now");
+                break tokio::spawn(async move { sink.on_pause("steer now").await });
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let handle = handle_task.await.expect("preemption task ran");
+        assert!(
+            matches!(handle, PreemptHandle::Active(_)),
+            "a full or uncapped pair must still preempt the running stream"
+        );
+        assert!(
+            !token.is_cancelled(),
+            "a stream that acknowledges in time must not be cancelled"
+        );
+        handle.complete_all(PauseAction::Resume);
+        assert_eq!(
+            pause_task.await.expect("pause task ran"),
+            PauseAction::Resume,
+            "the stream resumes on the slot it yielded"
+        );
+    }
+
+    // 1. `max_sessions` unset => unlimited => never the skip path.
+    deactivate();
+    assert!(
+        !pool::has_spare_session_capacity(backend, model),
+        "an unconfigured cap must never read as spare capacity"
+    );
+    pause_round(backend, model, "uncapped").await;
+
+    // 2. A cap with two free slots => the arbitrator takes its own capacity and
+    //    the running stream is never touched.
+    activate(2);
+    assert!(
+        pool::has_spare_session_capacity(backend, model),
+        "an untouched capped pair has spare capacity"
+    );
+    let spare_token = CancellationToken::new();
+    let mut spare_sink = PreemptibleStreamSink::register_full(
+        "coder-t-902",
+        Some("coder".to_string()),
+        Some("t-902".to_string()),
+        Some(spare_token.clone()),
+        model,
+    );
+    let handle = preempt_conflicting_stream_on_backend(backend, model, "steer now").await;
+    assert!(
+        matches!(handle, PreemptHandle::Running(_)),
+        "spare capacity must leave the conflicting stream running instead of preempting it"
+    );
+    for _ in 0..5 {
+        assert_eq!(
+            spare_sink.poll_control(),
+            StreamControl::Continue,
+            "StreamControl::Pause must never be sent when pausing is skipped"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    handle.complete_with_subtask_decision(None);
+    assert!(
+        !spare_token.is_cancelled(),
+        "a decision with no Cancel subtask leaves the stream running"
+    );
+    drop(spare_sink);
+
+    // 3. Same pair with both slots held => pause exactly as before.
+    let entry = pool::entry_for(backend, model).expect("a configured cap opens a pool");
+    let first = pool::wait_for_slot(&entry, None, Duration::from_secs(5), None)
+        .await
+        .expect("first slot");
+    let second = pool::wait_for_slot(&entry, None, Duration::from_secs(5), None)
+        .await
+        .expect("second slot");
+    assert!(
+        !pool::has_spare_session_capacity(backend, model),
+        "a saturated pair has no spare capacity"
+    );
+    pause_round(backend, model, "capped").await;
+
+    // 4. A session queued for a freed slot still means "no spare capacity".
+    drop(first);
+    let ticket = pool::queue_ticket(&entry);
+    assert!(
+        !pool::has_spare_session_capacity(backend, model),
+        "a queued session blocks the skip path even with a permit free"
+    );
+    drop(ticket);
+    drop((second, entry));
+
+    deactivate();
+    reset_cancellation();
 }

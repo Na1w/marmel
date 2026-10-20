@@ -37,7 +37,7 @@ pub use notice::{
 
 pub use preemption::{
     PreemptHandle, PreemptibleStreamSink, StreamIdentity, models_conflict,
-    preempt_conflicting_stream,
+    preempt_conflicting_stream, preempt_conflicting_stream_on_backend,
 };
 
 pub use crate::agents::{

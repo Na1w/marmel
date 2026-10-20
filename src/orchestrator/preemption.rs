@@ -5,6 +5,13 @@
 //! model) are temporarily paused, freeing the GPU/LLM slot for the Steer Arbitrator.
 //! Upon arbitration completion, the paused specialist stream is resumed with
 //! Assistant Prefill (prefix caching), or aborted if cancelled.
+//!
+//! Slot borrowing is conditional on capacity: when the arbitrator's own
+//! backend+model pair still has a free session slot
+//! ([`pool::has_spare_session_capacity`]), the arbitrator runs on that spare
+//! capacity and conflicting streams are **not** paused at all. Only a full pool,
+//! a queued session, or a pair with no configured cap (unlimited) falls back to
+//! pausing. Cancel/abort semantics are identical either way.
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashMap;
@@ -16,6 +23,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::llm::{PauseAction, StreamControl, StreamEvent, StreamSink};
+use crate::orchestrator::pool;
 use crate::orchestrator::steer::{
     SteerDecision, SteerSubtaskAction, SteerSubtaskDecision, normalize_steer_subtask_action,
 };
@@ -190,6 +198,23 @@ impl PreemptibleStreamSink {
     pub fn model(&self) -> &str {
         &self.model
     }
+
+    /// Report one **stream-pause transition** for this worker to the UI.
+    ///
+    /// This is the typed counterpart of the "Yielded model slot … — stream paused"
+    /// / "Model slot reclaimed — resuming stream..." status wording, carrying the
+    /// stream's own routing tag instead of asking a renderer to recognise that
+    /// wording. It is emitted **only from inside the preemption handshake**, i.e.
+    /// only for a stream that really yielded (and took back) its model slot: when
+    /// the arbitrator ran on spare session capacity no pause signal is ever sent,
+    /// `on_pause` is never entered, and the subagent panel therefore keeps reading
+    /// `(Active)`.
+    fn emit_pause_transition(&self, paused: bool) {
+        crate::orchestrator::emit_event(crate::ui::Event::SubagentStreamPause {
+            agent_tag: self.identity.agent_tag.clone(),
+            paused,
+        });
+    }
 }
 
 impl Drop for PreemptibleStreamSink {
@@ -248,21 +273,42 @@ impl StreamSink for PreemptibleStreamSink {
                 "[{}] Yielded model slot ({}) to Steer Arbitrator — stream paused",
                 self.identity.agent_tag, self.model
             ));
+            // The panel transition belongs to the handshake, not to the status
+            // line: this is the only place that knows a stream *actually* yielded
+            // its slot, and it is what the `(Paused)` row label is driven by.
+            self.emit_pause_transition(true);
             let (action_tx, action_rx) = oneshot::channel();
             if signal.yielded_tx.send(action_tx).is_err() {
+                // Nobody owns the acknowledgement any more, so this stream is left
+                // running: the pause is over the instant it failed, and the row must
+                // not stay held on a handshake that will never be answered.
+                self.emit_pause_transition(false);
                 return PauseAction::Resume;
             }
             match action_rx.await {
                 Ok(action) => {
-                    if matches!(action, PauseAction::Resume) {
-                        crate::orchestrator::emit_status(format!(
-                            "[{}] Model slot reclaimed — resuming stream...",
-                            self.identity.agent_tag
-                        ));
+                    match action {
+                        PauseAction::Resume => {
+                            crate::orchestrator::emit_status(format!(
+                                "[{}] Model slot reclaimed — resuming stream...",
+                                self.identity.agent_tag
+                            ));
+                        }
+                        // An aborted stream is no longer parked behind the
+                        // arbitrator either: the cancellation tears the worker down,
+                        // so the panel takes the pause back down here rather than
+                        // waiting on the registry edge that closes the row.
+                        PauseAction::Abort => {}
                     }
+                    self.emit_pause_transition(false);
                     action
                 }
-                Err(_) => PauseAction::Resume,
+                // The arbitrator gave up before deciding: this sink resumes its own
+                // stream, so the pause it reported has ended too.
+                Err(_) => {
+                    self.emit_pause_transition(false);
+                    PauseAction::Resume
+                }
             }
         } else {
             PauseAction::Resume
@@ -273,59 +319,109 @@ impl StreamSink for PreemptibleStreamSink {
 /// Handle representing an in-flight preempted model stream.
 pub enum PreemptHandle {
     None,
+    /// Streams that yielded their model slot and are waiting on the handshake.
     Active(Vec<(StreamIdentity, oneshot::Sender<PauseAction>)>),
+    /// Streams left running because the arbitrator had spare capacity of its
+    /// own: no pause was ever sent to them, so there is nothing to resume, but a
+    /// decision may still cancel them by identity (see
+    /// [`PreemptHandle::complete_with_subtask_decision`] and
+    /// [`PreemptHandle::complete_all`]).
+    Running(Vec<StreamIdentity>),
+}
+
+/// The subtasks an arbitration decision explicitly orders cancelled, routed
+/// through the single shared subtask-action normalizer.
+///
+/// Shared by the paused ([`PreemptHandle::Active`]) and the never-paused
+/// ([`PreemptHandle::Running`]) paths so cancellation semantics are identical
+/// whether or not the stream yielded its slot.
+fn cancel_subtasks_of(decision: Option<&SteerDecision>) -> Vec<&SteerSubtaskDecision> {
+    decision
+        .map(|d| {
+            d.subtasks
+                .iter()
+                .filter(|st| {
+                    normalize_steer_subtask_action(&st.action, &st.tool_call_id)
+                        == SteerSubtaskAction::Cancel
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl PreemptHandle {
     pub fn complete_all(self, action: PauseAction) {
-        if let PreemptHandle::Active(list) = self {
-            for (identity, tx) in list {
-                if matches!(action, PauseAction::Abort)
-                    && let Some(ref token) = identity.cancel_token
-                {
-                    token.cancel();
+        match self {
+            PreemptHandle::None => {}
+            // Never paused, so nothing to hand an action to — only the global
+            // abort has any effect here, and it fires the same tokens it always
+            // would have.
+            PreemptHandle::Running(identities) => {
+                if matches!(action, PauseAction::Abort) {
+                    for identity in identities {
+                        if let Some(ref token) = identity.cancel_token {
+                            token.cancel();
+                        }
+                    }
                 }
-                let _ = tx.send(action);
+            }
+            PreemptHandle::Active(list) => {
+                for (identity, tx) in list {
+                    if matches!(action, PauseAction::Abort)
+                        && let Some(ref token) = identity.cancel_token
+                    {
+                        token.cancel();
+                    }
+                    let _ = tx.send(action);
+                }
             }
         }
     }
 
     pub fn complete_with_subtask_decision(self, decision: Option<&SteerDecision>) {
-        if let PreemptHandle::Active(list) = self {
-            // `steer` owns the subtask `action` vocabulary, so every action is
-            // normalized once through the single shared normalizer (which rejects
-            // and logs unrecognized spellings) instead of being compared raw here.
-            let cancel_subtasks: Vec<&SteerSubtaskDecision> = decision
-                .map(|d| {
-                    d.subtasks
-                        .iter()
-                        .filter(|st| {
-                            normalize_steer_subtask_action(&st.action, &st.tool_call_id)
-                                == SteerSubtaskAction::Cancel
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            for (identity, tx) in list {
-                let cancelled = cancel_subtasks
-                    .iter()
-                    .any(|st| identity.matches(st.agent_name.as_deref(), &st.tool_call_id));
-                let action = if cancelled {
-                    if let Some(ref token) = identity.cancel_token {
+        // `steer` owns the subtask `action` vocabulary, so every action is
+        // normalized once through the single shared normalizer (which rejects
+        // and logs unrecognized spellings) instead of being compared raw here.
+        let cancel_subtasks = cancel_subtasks_of(decision);
+        match self {
+            PreemptHandle::None => {}
+            // Pausing was skipped for spare capacity: a `Cancel` still cancels
+            // the worker through its own token, everything else leaves the
+            // stream running.
+            PreemptHandle::Running(identities) => {
+                for identity in identities {
+                    if cancels_subtask(&identity, &cancel_subtasks)
+                        && let Some(ref token) = identity.cancel_token
+                    {
                         token.cancel();
                     }
-                    PauseAction::Abort
-                } else {
-                    // Defined fallback for every non-Cancel action — including a
-                    // rejected/unknown action, whose rejection is logged by the
-                    // normalizer: keep the stream alive instead of guessing.
-                    PauseAction::Resume
-                };
-                let _ = tx.send(action);
+                }
+            }
+            PreemptHandle::Active(list) => {
+                for (identity, tx) in list {
+                    let action = if cancels_subtask(&identity, &cancel_subtasks) {
+                        if let Some(ref token) = identity.cancel_token {
+                            token.cancel();
+                        }
+                        PauseAction::Abort
+                    } else {
+                        // Defined fallback for every non-Cancel action — including a
+                        // rejected/unknown action, whose rejection is logged by the
+                        // normalizer: keep the stream alive instead of guessing.
+                        PauseAction::Resume
+                    };
+                    let _ = tx.send(action);
+                }
             }
         }
     }
+}
+
+/// Whether this stream is addressed by one of the decision's `Cancel` subtasks.
+fn cancels_subtask(identity: &StreamIdentity, cancel_subtasks: &[&SteerSubtaskDecision]) -> bool {
+    cancel_subtasks
+        .iter()
+        .any(|st| identity.matches(st.agent_name.as_deref(), &st.tool_call_id))
 }
 
 /// Upper bound for the whole preemption acknowledgement handshake.
@@ -373,7 +469,61 @@ impl Future for PendingAck {
 /// has its own `cancel_token` fired and is excluded from the returned handle, so
 /// the call always returns in bounded time and each acknowledgement stays paired
 /// with the stream that produced it. The handle must be completed after steering.
+///
+/// The arbitrator's backend is unknown to this entry point, so capacity cannot
+/// be checked and every conflicting stream is paused — the original behaviour.
+/// Callers that know the arbitrator's backend should use
+/// [`preempt_conflicting_stream_on_backend`].
 pub async fn preempt_conflicting_stream(target_model: &str, user_msg: &str) -> PreemptHandle {
+    preempt_on_backend(None, target_model, user_msg).await
+}
+
+/// Preempt any active specialist stream conflicting with `target_model`, with
+/// the arbitrator's backend known so its own spare capacity can be honoured.
+///
+/// When the `backend_url` + `target_model` pair still has a free session slot
+/// ([`crate::orchestrator::pool::has_spare_session_capacity`]), the arbitrator
+/// runs on its own capacity and **no stream is paused**: no
+/// [`StreamControl::Pause`] is ever sent, no pause/resume status line is
+/// emitted, and the returned handle is [`PreemptHandle::Running`], which still
+/// applies `Cancel` / abort decisions to those streams exactly as before.
+///
+/// When the pool is full, has someone queued, or has **no configured cap**
+/// (unlimited capacity), this behaves identically to
+/// [`preempt_conflicting_stream`] — including the acknowledgement timeout and
+/// its cancel escalation.
+pub async fn preempt_conflicting_stream_on_backend(
+    backend_url: &str,
+    target_model: &str,
+    user_msg: &str,
+) -> PreemptHandle {
+    preempt_on_backend(Some(backend_url), target_model, user_msg).await
+}
+
+/// The shared preemption path. `arbitrator_backend` of `None` means "capacity
+/// unknown", which always takes the pause path.
+async fn preempt_on_backend(
+    arbitrator_backend: Option<&str>,
+    target_model: &str,
+    user_msg: &str,
+) -> PreemptHandle {
+    // Spare capacity for the arbitrator's own pair means it never needs to
+    // borrow anyone's slot. An unknown backend means unknown capacity, which
+    // always falls back to pausing.
+    let spare_capacity = arbitrator_backend
+        .is_some_and(|backend| pool::has_spare_session_capacity(backend, target_model));
+    preempt_streams(spare_capacity, arbitrator_backend, target_model, user_msg).await
+}
+
+/// The single pause gate: `spare_capacity` decides whether conflicting streams
+/// are asked to yield their model slot at all. Split out from the capacity
+/// lookup so the gate is testable without process-global config state.
+async fn preempt_streams(
+    spare_capacity: bool,
+    arbitrator_backend: Option<&str>,
+    target_model: &str,
+    user_msg: &str,
+) -> PreemptHandle {
     let entries: Vec<(StreamIdentity, mpsc::UnboundedSender<PauseSignal>)> = {
         let Ok(map) = ACTIVE_STREAMS.read() else {
             return PreemptHandle::None;
@@ -386,6 +536,24 @@ pub async fn preempt_conflicting_stream(target_model: &str, user_msg: &str) -> P
 
     if entries.is_empty() {
         return PreemptHandle::None;
+    }
+
+    // The arbitrator runs on its own reserved capacity: conflicting streams keep
+    // running untouched and never receive a pause signal, so no pause/resume
+    // status line is emitted for them either.
+    if spare_capacity {
+        tracing::debug!(
+            backend = arbitrator_backend.unwrap_or(""),
+            model = target_model,
+            streams = entries.len(),
+            "Steer arbitration took spare session capacity — conflicting streams left running"
+        );
+        return PreemptHandle::Running(
+            entries
+                .into_iter()
+                .map(|(identity, _pause_tx)| identity)
+                .collect(),
+        );
     }
 
     // 1. Signal every conflicting stream up front — signalling one at a time
@@ -1222,5 +1390,179 @@ mod tests {
             tokens[7].is_cancelled(),
             "H2: the stream that never acknowledged must be cancelled"
         );
+    }
+
+    /// Spare capacity means the arbitrator never borrows a slot: the conflicting
+    /// stream is left running, is never handed a `StreamControl::Pause`, and has
+    /// no pause handshake to acknowledge (so no pause/resume status line exists
+    /// for it either).
+    #[tokio::test]
+    async fn test_spare_capacity_skips_the_pause_entirely() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut sink = PreemptibleStreamSink::register_full(
+            "coder-t-990",
+            Some("coder".to_string()),
+            Some("t-990".to_string()),
+            Some(token.clone()),
+            "model-spare-skip",
+        );
+
+        let handle = preempt_streams(
+            true,
+            Some("http://spare:8080/v1"),
+            "model-spare-skip",
+            "steer now",
+        )
+        .await;
+        assert!(
+            matches!(handle, PreemptHandle::Running(_)),
+            "a conflicting stream with spare capacity must be tracked as running, not preempted"
+        );
+
+        for _ in 0..5 {
+            assert_eq!(
+                sink.poll_control(),
+                StreamControl::Continue,
+                "spare capacity must never send StreamControl::Pause"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            sink.on_pause("steer now").await,
+            PauseAction::Resume,
+            "there is no outstanding pause handshake to acknowledge"
+        );
+        assert!(
+            !token.is_cancelled(),
+            "skipping the pause must not cancel the worker"
+        );
+
+        handle.complete_all(PauseAction::Resume);
+        assert!(
+            !token.is_cancelled(),
+            "resuming a stream that was never paused is a no-op"
+        );
+    }
+
+    /// A stream on another model is not a preemption target at all, spare
+    /// capacity or not.
+    #[tokio::test]
+    async fn test_spare_capacity_still_respects_the_model_predicate() {
+        let _sink = PreemptibleStreamSink::register("coder", "model-spare-other");
+        let handle = preempt_streams(
+            true,
+            Some("http://spare:8080/v1"),
+            "model-spare-unrelated",
+            "steer now",
+        )
+        .await;
+        assert!(
+            matches!(handle, PreemptHandle::None),
+            "a stream on a different model is never a preemption target"
+        );
+    }
+
+    /// Cancellation is unchanged by the skipped pause: a `Cancel` subtask still
+    /// fires exactly the addressed worker's token, and nothing else.
+    #[tokio::test]
+    async fn test_cancel_subtask_still_cancels_a_never_paused_stream() {
+        let cancelled_token = tokio_util::sync::CancellationToken::new();
+        let running_token = tokio_util::sync::CancellationToken::new();
+        let _cancelled = PreemptibleStreamSink::register_full(
+            "coder-t-991",
+            Some("coder".to_string()),
+            Some("t-991".to_string()),
+            Some(cancelled_token.clone()),
+            "model-spare-cancel",
+        );
+        let _running = PreemptibleStreamSink::register_full(
+            "tester-t-992",
+            Some("tester".to_string()),
+            Some("t-992".to_string()),
+            Some(running_token.clone()),
+            "model-spare-cancel",
+        );
+
+        let handle = preempt_streams(
+            true,
+            Some("http://spare:8080/v1"),
+            "model-spare-cancel",
+            "cancel coder",
+        )
+        .await;
+        let PreemptHandle::Running(identities) = &handle else {
+            panic!("spare capacity must return the running-streams handle");
+        };
+        assert_eq!(
+            identities.len(),
+            2,
+            "both conflicting streams must be carried by the handle"
+        );
+
+        let decision = SteerDecision {
+            decision: "ForwardToWorker".to_string(),
+            response: Some("Cancelling coder".to_string()),
+            tier: None,
+            model: None,
+            subtasks: vec![crate::orchestrator::steer::SteerSubtaskDecision {
+                tool_call_id: "coder".to_string(),
+                action: "Cancel".to_string(),
+                message: None,
+                agent_name: Some("coder".to_string()),
+                prompt: None,
+                sleep_seconds: None,
+            }],
+            sleep_seconds: None,
+        };
+        handle.complete_with_subtask_decision(Some(&decision));
+
+        assert!(
+            cancelled_token.is_cancelled(),
+            "a Cancel subtask must still cancel the stream even though it was never paused"
+        );
+        assert!(
+            !running_token.is_cancelled(),
+            "a stream the decision does not address keeps running"
+        );
+    }
+
+    /// A global abort (`AbortImmediately` / `RejectPlan`) still cancels every
+    /// conflicting stream when the pause was skipped.
+    #[tokio::test]
+    async fn test_global_abort_cancels_streams_that_were_never_paused() {
+        let tokens: Vec<tokio_util::sync::CancellationToken> = (0..2)
+            .map(|_| tokio_util::sync::CancellationToken::new())
+            .collect();
+        let _first = PreemptibleStreamSink::register_full(
+            "coder-t-993",
+            Some("coder".to_string()),
+            Some("t-993".to_string()),
+            Some(tokens[0].clone()),
+            "model-spare-abort",
+        );
+        let _second = PreemptibleStreamSink::register_full(
+            "tester-t-994",
+            Some("tester".to_string()),
+            Some("t-994".to_string()),
+            Some(tokens[1].clone()),
+            "model-spare-abort",
+        );
+
+        let handle = preempt_streams(
+            true,
+            Some("http://spare:8080/v1"),
+            "model-spare-abort",
+            "abort everything",
+        )
+        .await;
+        assert!(matches!(handle, PreemptHandle::Running(_)));
+        handle.complete_all(PauseAction::Abort);
+
+        for (label, token) in tokens.iter().enumerate() {
+            assert!(
+                token.is_cancelled(),
+                "global abort must cancel stream {label} even with pausing skipped"
+            );
+        }
     }
 }
