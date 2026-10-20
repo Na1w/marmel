@@ -2,7 +2,7 @@
 
 use super::assembly::{assemble_final_deliverable, update_revision};
 use crate::agents::validation::{
-    NO_EXPLICIT_APPROVAL_REASON, is_leave_verdict_tool, parse_verdict_args,
+    NO_EXPLICIT_APPROVAL_REASON, is_leave_verdict_tool, parse_verdict_args, probe_validation_brief,
     run_automated_validation,
 };
 use crate::agents::{Agent, IsolatedContext};
@@ -18,6 +18,56 @@ const MAX_CONSECUTIVE_MALFORMED_TOOL_CALLS: u32 = 5;
 /// deliverable is failed outright. Bounded so a model that insists on approving
 /// itself cannot spin the turn loop forever.
 const MAX_CONSECUTIVE_VERDICT_ROLE_REJECTIONS: u32 = 3;
+
+/// The **highest-precedence** validation rule: the hard role opt-out.
+///
+/// A `validator` or `planner` deliverable is never validated, whatever the config
+/// says and whatever is on disk: neither `enable_validator = true` nor any
+/// combination of records (`{tid}-validation.md`, `{tid}-validation-skip.md`, or
+/// both) can put these roles into the validated posture, start a validator pass,
+/// or turn their absent verdict brief into a verdict gap. Every other rule — the
+/// config knob, the iteration cap and the on-disk probe — is evaluated only
+/// *inside* this gate.
+#[must_use]
+pub(crate) fn validation_configured_for_role(agent: Agent, enable_validator: bool) -> bool {
+    enable_validator && !matches!(agent, Agent::Validator | Agent::Planner)
+}
+
+/// Is the on-disk verdict-brief probe worth running for this run at all? Nothing
+/// on disk is consulted when the role opt-out, the config knob, the iteration cap
+/// or a missing prompts directory already settles the question — so for a
+/// `validator` or `planner` run no record is ever read, and no record can be read
+/// as an approval or as a gap.
+#[must_use]
+pub(crate) fn validation_probe_engaged(
+    agent: Agent,
+    enable_validator: bool,
+    max_val_iterations: usize,
+    has_prompts_dir: bool,
+) -> bool {
+    has_prompts_dir
+        && validation_configured_for_role(agent, enable_validator)
+        && max_val_iterations > 0
+}
+
+/// Does this run have to produce a recorded validation verdict?
+///
+/// The conjunction lives here once: role gate (highest precedence, see
+/// [`validation_configured_for_role`]) ∧ iteration cap ∧ **no** durable
+/// no-validation record. A skip record can only ever take validation **off** for a
+/// role that is validation-eligible, and no record combination can force
+/// validation on for the hard opt-out roles.
+#[must_use]
+pub(crate) fn validation_verdict_required(
+    agent: Agent,
+    enable_validator: bool,
+    max_val_iterations: usize,
+    validation_skip_reason: Option<&str>,
+) -> bool {
+    validation_configured_for_role(agent, enable_validator)
+        && max_val_iterations > 0
+        && validation_skip_reason.is_none()
+}
 
 /// Deliverable handed back when the user cancels a specialist mid-turn. The
 /// whole body — the `Task …` sentence as well as the verdict trailer — comes
@@ -282,6 +332,12 @@ async fn run_specialist_live_inner(
     let mut tools_executed_count = 0usize;
     let mut _turn = 0usize;
 
+    // `enable_validator` is the config knob; the **highest-precedence** rule sits
+    // on top of it — the hard role opt-out for `validator` / `planner`, which no
+    // config knob and no on-disk record can override. It is applied inside
+    // [`validation_probe_engaged`] (so those roles never read a record at all) and
+    // inside [`validation_verdict_required`] (so they never land in the validated
+    // posture), and it outranks everything below.
     let auto_validate_enabled = specialist_cfg
         .and_then(|sc| sc.enable_validator)
         .unwrap_or(true);
@@ -295,59 +351,114 @@ async fn run_specialist_live_inner(
         .join("prompts");
     let has_prompts_dir = prompts_dir.is_dir();
 
-    let validation_configured =
-        auto_validate_enabled && agent != Agent::Validator && agent != Agent::Planner;
-
     // Fail closed: an absent, unreadable or blank verdict file
     // (`{tid}-validation.md` under the prompts directory) is an unconditional
     // validation failure for every task that requires validation: the deliverable is
     // reported as not validated and its plan line stays unchecked. No plan lookup, no
     // exception for untracked task ids; only `max_validator_iterations = 0` /
-    // `enable_validator = false` opt out. The id is validated as a single path segment
-    // before joining, so `../../etc/x` or `a/b` cannot reach a verdict file outside
-    // the prompts directory; a rejected id is a verdict gap, never sanitized/clamped.
-    let verdict_gap: Option<String> = if has_prompts_dir
-        && validation_configured
-        && max_val_iterations > 0
-    {
-        match clean_task_id.as_deref() {
-            None => Some(format!(
-                "the run carries no task id, so no `-validation.md` verdict file could be located under {}",
-                prompts_dir.display()
-            )),
-            Some(tid) => match crate::task_id::validate_task_id(tid) {
-                Err(err) => Some(format!(
-                    "the task id {tid:?} was rejected as a single path segment ({err}), so no `-validation.md` verdict file could be located under {}",
-                    prompts_dir.display()
-                )),
-                Ok(id) => {
-                    let verdict_path = prompts_dir.join(format!("{id}-validation.md"));
-                    match std::fs::read_to_string(&verdict_path) {
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(format!(
-                            "{} does not exist, so no validation verdict is recorded for this task",
-                            verdict_path.display()
-                        )),
-                        Err(err) => Some(format!(
-                            "{} could not be read ({err}), so its validation verdict is unreadable",
-                            verdict_path.display()
-                        )),
-                        Ok(text) if text.trim().is_empty() => Some(format!(
-                            "{} is empty, so no validation verdict is recorded for this task",
-                            verdict_path.display()
-                        )),
-                        Ok(_) => None,
+    // `enable_validator = false` / the hard role opt-out keep the probe from running.
+    // The id is validated as a single path segment before joining, so `../../etc/x`
+    // or `a/b` cannot reach a verdict file outside the prompts directory; a rejected
+    // id is a verdict gap, never sanitized/clamped.
+    //
+    // One legitimate exception exists, and it is **read from disk, not re-derived**:
+    // when the plan side decided a task needs no validation (pure research or
+    // documentation work, spelled `(no-validate)` on the plan line) it wrote no
+    // verdict brief **and** recorded that decision durably as
+    // `{tid}-validation-skip.md` beside the prompts
+    // (`PromptBuilder::pregenerate_for_plan_offline`). A present record means the
+    // missing brief was deliberate — no verdict gap, no validator, a normal
+    // completion. A missing record leaves the gap exactly as before. The record is
+    // only ever consulted for a brief that was **never written**, because the shared
+    // probe ([`crate::agents::validation::probe_validation_brief`]) hands it back as
+    // a field of its `NotFound` arm alone — the same rule the other two read sites
+    // (`agents::validation`, `runner::fix_loop`) get from that one probe.
+    let (validation_skip_reason, verdict_gap): (Option<String>, Option<String>) =
+        if validation_probe_engaged(
+            agent,
+            auto_validate_enabled,
+            max_val_iterations,
+            has_prompts_dir,
+        ) {
+            match clean_task_id.as_deref() {
+                None => (
+                    None,
+                    Some(format!(
+                        "the run carries no task id, so no `-validation.md` verdict file could be located under {}",
+                        prompts_dir.display()
+                    )),
+                ),
+                Some(tid) => {
+                    use crate::agents::validation::ValidationBrief;
+                    match probe_validation_brief(&prompts_dir, tid) {
+                        // A brief that was never written **may** have been left out
+                        // on purpose: the durable record is consulted in this arm
+                        // only, exactly as `agents::validation` and
+                        // `runner::fix_loop` consult it through the same probe.
+                        ValidationBrief::Absent { path } => {
+                            match crate::agents::PromptBuilder::validation_skip_record_for_task(
+                                Some(tid),
+                            ) {
+                                Some(reason) => (Some(reason), None),
+                                None => (
+                                    None,
+                                    Some(format!(
+                                        "{} does not exist, so no validation verdict is recorded for this task",
+                                        path.display()
+                                    )),
+                                ),
+                            }
+                        }
+                        ValidationBrief::Unreadable { path, error } => (
+                            None,
+                            Some(format!(
+                                "{} could not be read ({error}), so its validation verdict is unreadable",
+                                path.display()
+                            )),
+                        ),
+                        ValidationBrief::Blank { path } => (
+                            None,
+                            Some(format!(
+                                "{} is empty, so no validation verdict is recorded for this task",
+                                path.display()
+                            )),
+                        ),
+                        ValidationBrief::Present { .. } => (None, None),
+                        ValidationBrief::InvalidTaskId { error } => (
+                            None,
+                            Some(format!(
+                                "the task id {tid:?} was rejected as a single path segment ({error}), so no `-validation.md` verdict file could be located under {}",
+                                prompts_dir.display()
+                            )),
+                        ),
                     }
                 }
-            },
-        }
-    } else {
-        None
-    };
+            }
+        } else {
+            (None, None)
+        };
+
+    // A plan-designated validation-free task never enters the validator: the
+    // deliverable completes on its own terms and its plan line is checked off.
+    let validation_skipped_by_design = validation_skip_reason.is_some();
+    if let Some(reason) = validation_skip_reason.as_deref() {
+        tracing::info!("{agent_tag}: {reason} — the validator is not engaged for this task");
+        crate::orchestrator::emit_status(format!(
+            "[Validator] SKIPPED by design for {agent_tag}: {reason}"
+        ));
+    }
 
     // Every task that requires validation is checked, and a verdict gap is carried
     // into that check as a hard failure regardless of whether the execution plan
-    // happens to track the task id.
-    let requires_validation = validation_configured && max_val_iterations > 0;
+    // happens to track the task id. A task the plan recorded as needing no
+    // validation requires none, so it is exempt from that check by record, not by
+    // keyword guesswork — and the role opt-out outranks every record on disk.
+    let requires_validation = validation_verdict_required(
+        agent,
+        auto_validate_enabled,
+        max_val_iterations,
+        validation_skip_reason.as_deref(),
+    );
     let missing_verdict_reason: Option<String> = verdict_gap;
 
     // `max_val_iterations == 0` is already folded into `requires_validation`
@@ -1073,7 +1184,14 @@ async fn run_specialist_live_inner(
         ));
     }
 
-    if validation_passed {
+    if validation_skipped_by_design {
+        // Honest, non-failure status: the plan recorded that this task needs no
+        // validation, so nothing approved it and nothing rejected it.
+        crate::orchestrator::set_active_worker_status(
+            &_active_guard.0,
+            "Completed (validation skipped by design)",
+        );
+    } else if validation_passed {
         crate::orchestrator::set_active_worker_status(&_active_guard.0, "Approved");
     } else if validator_critique.is_some() {
         crate::orchestrator::set_active_worker_status(&_active_guard.0, "Rejected");
@@ -1107,5 +1225,91 @@ async fn run_specialist_live_inner(
             &final_content,
             ctx.task_id.as_deref(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        validation_configured_for_role, validation_probe_engaged, validation_verdict_required,
+    };
+    use crate::agents::Agent;
+
+    /// Precedence pin: the hard role opt-out in `validation_configured_for_role` is
+    /// the **highest-precedence** validation rule. No combination of the config
+    /// knob (`enable_validator = true`), the iteration cap and the on-disk records
+    /// (`{tid}-validation.md` and/or `{tid}-validation-skip.md`) can put a
+    /// `validator` or `planner` deliverable into the validated posture, start a
+    /// validator pass, or read any record at all for it.
+    #[test]
+    fn hard_opt_out_roles_are_never_validation_eligible_under_any_record_combination() {
+        for role in [Agent::Validator, Agent::Planner] {
+            for enable_validator in [true, false] {
+                for max_val_iterations in [0usize, 1, 5] {
+                    for skip_reason in [None, Some("plan recorded (no-validate)")] {
+                        assert!(
+                            !validation_configured_for_role(role, enable_validator),
+                            "{} must never be validation-configured (enable_validator={enable_validator})",
+                            role.as_str()
+                        );
+                        assert!(
+                            !validation_probe_engaged(
+                                role,
+                                enable_validator,
+                                max_val_iterations,
+                                true,
+                            ),
+                            "{} must never read a validation record from disk",
+                            role.as_str()
+                        );
+                        assert!(
+                            !validation_verdict_required(
+                                role,
+                                enable_validator,
+                                max_val_iterations,
+                                skip_reason,
+                            ),
+                            "{} must never be held to a recorded verdict \
+                             (iterations={max_val_iterations}, record={skip_reason:?})",
+                            role.as_str()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The mirror half of the same precedence: a validation-eligible role IS held
+    /// to a recorded verdict, and a durable no-validation record is the only lever
+    /// that takes validation **off** — it can never force validation on, and an
+    /// absent record never excuses a verdict gap.
+    #[test]
+    fn a_skip_record_only_ever_takes_validation_off_for_an_eligible_role() {
+        assert!(validation_verdict_required(Agent::Coder, true, 5, None));
+        assert!(validation_verdict_required(
+            Agent::Researcher,
+            true,
+            1,
+            None
+        ));
+        assert!(!validation_verdict_required(
+            Agent::Coder,
+            true,
+            5,
+            Some("plan recorded (no-validate)"),
+        ));
+        assert!(!validation_verdict_required(Agent::Coder, true, 0, None));
+        assert!(!validation_verdict_required(
+            Agent::Generalist,
+            false,
+            5,
+            None
+        ));
+
+        assert!(validation_probe_engaged(Agent::Debugger, true, 5, true));
+        assert!(!validation_probe_engaged(Agent::Debugger, true, 0, true));
+        assert!(!validation_probe_engaged(Agent::Debugger, true, 5, false));
+        assert!(!validation_probe_engaged(Agent::Debugger, false, 5, true));
+        assert!(!validation_probe_engaged(Agent::Coder, true, 5, false));
     }
 }

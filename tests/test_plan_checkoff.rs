@@ -532,3 +532,140 @@ async fn each_check_off_reason_classifies_and_only_the_bad_ones_warn() {
     })
     .await;
 }
+
+/// (e) A validation directive that sits **before** the task id is outside the
+/// trailing grammar position, so the line yields no task id at all: the plan
+/// cannot locate that box and the check-off fails closed. A delegated run bound
+/// to the id is reported as `NotInPlan` (never `Flipped`, never a warning that
+/// claims success), the line keeps its unchecked box and its token, and the plan
+/// never self-completes around the orphan line.
+#[tokio::test]
+async fn a_directive_before_the_task_id_owns_no_box_and_fails_closed() {
+    let tmp = tempfile::tempdir().expect("isolated workspace root");
+    let root = tmp.path().to_path_buf();
+
+    marmennill::harness::with_workspace_root(root.clone(), async move {
+        let plan = plan_at(&root);
+        plan.create(
+            "# Execution Plan\n\
+             - [ ] (no-validate) [t-050] Rework the parser (coder)\n\
+             - [ ] [t-051] Land the sibling change (coder)\n",
+        )
+        .expect("create plan");
+
+        // A perfectly well-formed completion marker for that id: the refusal is
+        // about the malformed plan line, never about the deliverable.
+        let (outcome, warning) = gate(&plan, Some("t-050"), &decorated(MARKER_COMPLETE, "t-050"));
+        assert_eq!(
+            outcome,
+            CheckOffOutcome::NotInPlan,
+            "a line whose id never parsed owns no check-off target: {outcome:?}"
+        );
+        assert!(
+            warning.is_none(),
+            "a delegation that was never bound to a plan line must not warn:\n{warning:?}"
+        );
+        assert!(
+            !plan
+                .check_plan_on_deliverable(
+                    None,
+                    Some("t-050"),
+                    &decorated(MARKER_COMPLETE, "t-050")
+                )
+                .expect("not an IO error"),
+            "the plan layer must reach the same fail-closed verdict"
+        );
+
+        let disk = on_disk(&plan);
+        assert!(
+            disk.contains("- [ ] (no-validate) [t-050] Rework the parser (coder)"),
+            "the orphan line keeps its box unchecked and its token intact:\n{disk}"
+        );
+        assert!(
+            !disk.contains("- [x]"),
+            "no box may move for an id the plan never resolved:\n{disk}"
+        );
+        assert_eq!(
+            plan.pending_tasks(),
+            vec!["t-051".to_string()],
+            "the malformed line contributes no id the orchestrator can retry"
+        );
+        assert!(
+            !plan.is_complete(),
+            "an orphan line must never let the plan report itself finished"
+        );
+
+        // Non-vacuity witness: the raw mutation cannot find the id either, so no
+        // nearby box is ticked as a side effect — the failure is a real miss.
+        let (rewritten, flipped) = marmennill::plan_parse::check_off_content(&disk, "t-050");
+        assert!(
+            !flipped && rewritten == disk,
+            "witness: the id is simply absent from the grammar's reach:\n{rewritten}"
+        );
+        assert_eq!(
+            marmennill::plan_parse::pending_lines(&disk).len(),
+            2,
+            "both checklist lines remain pending, orphan included"
+        );
+    })
+    .await;
+}
+
+/// (f) A CRLF plan whose line carries a directive at the trailing position: the
+/// check-off must flip **only** the box, leaving `\r\n` terminators, the
+/// directive token and the role hint byte-for-byte where they were. A rewrite
+/// that re-normalized line endings or trimmed the token would silently destroy
+/// the directive the user just wrote.
+#[tokio::test]
+async fn a_crlf_plan_with_a_directive_flips_only_the_box() {
+    let tmp = tempfile::tempdir().expect("isolated workspace root");
+    let root = tmp.path().to_path_buf();
+
+    marmennill::harness::with_workspace_root(root.clone(), async move {
+        let plan = plan_at(&root);
+        // `Plan::create` normalizes line endings, so the CRLF document is placed
+        // on disk directly — exactly what an editor or a Windows planner leaves.
+        std::fs::create_dir_all(root.join(".marmel")).expect("marmel dir");
+        std::fs::write(
+            plan.plan_path(),
+            "# Execution Plan\r\n\r\n\
+             - [ ] [t-052] Rework the parser (no-validate) (coder)\r\n\
+             - [ ] [t-053] Land the sibling change (validate) (coder)\r\n",
+        )
+        .expect("write a CRLF plan with directives");
+
+        let (outcome, warning) = gate(&plan, Some("t-052"), &decorated(MARKER_COMPLETE, "t-052"));
+        assert_eq!(
+            outcome,
+            CheckOffOutcome::Flipped,
+            "a directive-bearing CRLF line is an ordinary check-off target: {outcome:?}"
+        );
+        assert!(warning.is_none(), "a clean flip stays silent: {warning:?}");
+
+        let bytes = std::fs::read(plan.plan_path()).expect("plan file must exist");
+        assert_eq!(
+            String::from_utf8_lossy(&bytes),
+            "# Execution Plan\r\n\r\n\
+             - [x] [t-052] Rework the parser (no-validate) (coder)\r\n\
+             - [ ] [t-053] Land the sibling change (validate) (coder)\r\n",
+            "the CRLF document must be rewritten byte-faithfully: only the box moved"
+        );
+        let disk = on_disk(&plan);
+        assert!(
+            disk.contains("\r\n") && !disk.contains("\r\r\n"),
+            "every terminator survives exactly once:\n{disk:?}"
+        );
+        assert!(
+            !disk.contains("- [ ] [t-052]"),
+            "the target box flipped:\n{disk}"
+        );
+
+        assert_eq!(
+            plan.pending_tasks(),
+            vec!["t-053".to_string()],
+            "the untouched sibling stays pending"
+        );
+        assert!(!plan.is_complete(), "one box still open, plan not complete");
+    })
+    .await;
+}

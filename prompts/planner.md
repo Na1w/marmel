@@ -23,13 +23,13 @@ Every task in the plan is assigned to an archetype that best fits the scope of w
 4. **PLAN FORMAT (MANDATORY):**
    - You MUST call the `create_plan` tool with the markdown text of the execution plan.
    - The plan MUST begin with `# Execution Plan`.
-   - Every executable task MUST be formatted with markdown checkboxes and task IDs: `- [ ] [t-xxx] <Actionable task brief> (<agent_archetype>)`.
+   - Every executable task MUST be formatted with markdown checkboxes and task IDs: `- [ ] [t-xxx] <Actionable task brief> (validate|no-validate)? (<agent_archetype>)`. The optional directive sits immediately before the role hint — never after it.
    - Example:
      ```markdown
      # Execution Plan
 
      ### Phase 1: Discovery & Interface Design
-     - [ ] [t-001] Audit existing AST parser types in src/parser.rs (researcher)
+     - [ ] [t-001] Audit existing AST parser types in src/parser.rs (no-validate) (researcher)
      - [ ] [t-002] Define streaming chunk interfaces in src/types.rs (coder)
 
      ### Phase 2: Core Implementation
@@ -38,5 +38,6 @@ Every task in the plan is assigned to an archetype that best fits the scope of w
      ### Phase 3: Verification
      - [ ] [t-004] Run test suite and audit boundary edge cases (validator)
      ```
+   - Use `no-validate` only where nothing can be audited: pure research reports, documentation, configuration notes. Never use it to dodge validation on code, bug fixes, refactors, or tests. `validate` forces the audit on; omit the directive otherwise.
 5. **LANGUAGE POLICY:**
    - All internal planning, `.marmel/execution_plan.md` tasks, task briefs, and tool calls MUST ALWAYS be in English only.

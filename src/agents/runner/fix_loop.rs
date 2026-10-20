@@ -27,7 +27,7 @@ use crate::agents::Agent;
 use crate::agents::runner::execution::may_record_verdict;
 use crate::agents::runner::formatting::{format_tool_args_full, format_tool_args_preview};
 use crate::agents::validation::{
-    NO_EXPLICIT_APPROVAL_REASON, is_leave_verdict_tool, parse_verdict_args,
+    NO_EXPLICIT_APPROVAL_REASON, is_leave_verdict_tool, parse_verdict_args, validation_brief_absent,
 };
 use crate::harness::ToolError;
 use crate::harness::monitor::{HarnessMonitor, Intervention, RepetitionDetector};
@@ -440,6 +440,68 @@ fn verdict_role_rejection(caller: &harness::ToolCaller, tool: &str) -> String {
         Agent::Validator.as_str(),
         caller.role_name(),
     )
+}
+
+/// The never-meant-to-be-validated guard at the fail-closed collapse site, gated
+/// by the crate's **one** validation-brief probe
+/// ([`crate::agents::validation::validation_brief_absent`]).
+///
+/// `Some(Verdict { approved: true, … })` only when the durable
+/// `{tid}-validation-skip.md` record explains a brief that was **never written**
+/// (`ErrorKind::NotFound`): the task is validation-free by design, so this pass
+/// can neither certify nor reject it and it ends not-rejected with the recorded
+/// reason. A brief that exists but came back **blank** or **unreadable** is a
+/// different brief state, never explained by a record — the guard returns `None`
+/// and the caller fails closed with [`no_verdict_outcome`]. Restating those brief
+/// states here is not an option: they all come back from the one probe, so this
+/// site can no longer be wider than `runner/execution.rs` or
+/// `agents::validation::run_automated_validation`.
+fn validation_skip_verdict(task_id: Option<&str>, tag: &str) -> Option<FixLoopResult> {
+    let raw = task_id?;
+    // Genuinely absent brief only — blank, unreadable, present or a refused id
+    // all fall through to the fail-closed collapse.
+    if !validation_brief_absent(raw) {
+        return None;
+    }
+    let reason = crate::agents::PromptBuilder::validation_skip_record_for_task(Some(raw))?;
+    let note = format!("Validation skipped by design: {reason}");
+    tracing::info!("{tag}: {note} — no verdict expected for this task");
+    emit_status(format!("{tag}: VALIDATION SKIPPED by design — {reason}"));
+    Some(FixLoopResult::Verdict {
+        approved: true,
+        critique: note,
+    })
+}
+
+/// The fail-closed outcome of a run that ends with **no recorded verdict**:
+/// `(reason, operator_note)`. The reason always carries
+/// [`NO_EXPLICIT_APPROVAL_REASON`], so a missing verdict can never be read as an
+/// approval and the plan line stays unchecked.
+fn no_verdict_outcome(
+    tag: &str,
+    caller: &harness::ToolCaller,
+    verdict_authority: bool,
+) -> (String, String) {
+    let reason = if verdict_authority {
+        format!(
+            "{tag} did not call {} after {VERDICT_REMINDERS} reminders: no validation verdict was recorded. {NO_EXPLICIT_APPROVAL_REASON}",
+            tool_names::TOOL_LEAVE_VERDICT,
+        )
+    } else {
+        // A caller the public verdict check refuses can never conclude
+        // this run with a verdict, so there is nothing to wait for —
+        // carry the typed rejection as the reason.
+        format!(
+            "{} — {NO_EXPLICIT_APPROVAL_REASON}",
+            verdict_role_rejection(caller, tool_names::TOOL_LEAVE_VERDICT),
+        )
+    };
+    let outcome_note = if verdict_authority {
+        format!("no verdict after {VERDICT_REMINDERS} reminders")
+    } else {
+        format!("caller '{}' has no verdict authority", caller.role_name())
+    };
+    (reason, outcome_note)
 }
 
 /// Role-aware blueprint allow-list: an explicit prompt/blueprint allow-list may
@@ -1088,31 +1150,30 @@ pub async fn run_fix_loop(
                 mirror_append_here(p.engine, Message::User { content: notice });
                 continue;
             } else {
+                // Never-meant-to-be-validated guard: a task the plan recorded as
+                // needing no validation has no verdict to wait for, so it can
+                // never be certified *or* rejected by this pass. It ends
+                // not-rejected with the recorded reason instead of the fail-closed
+                // outcome below — but only when the durable
+                // `{tid}-validation-skip.md` record explains a validation brief
+                // that was **never written**: the guard goes through the one shared
+                // brief probe, so it is exactly as wide as the runner's probe in
+                // `runner/execution.rs` and as the guard in
+                // `agents::validation::run_automated_validation`. A brief that
+                // exists but came back blank or unreadable is **not** rescued; the
+                // run falls through to the fail-closed collapse below.
+                // (Normally the runner never starts this pass for such a task —
+                // see `runner/execution.rs` — this is the same guard at the
+                // duplicated collapse site.)
+                if let Some(verdict) = validation_skip_verdict(p.task_id.as_deref(), &p.tag) {
+                    return Ok(verdict);
+                }
                 // **Fail closed.** A missing verdict is never approval: after
                 // `VERDICT_REMINDERS` reminders the run ends NOT approved with an
                 // explicit reason, so a deliverable cannot be certified by a
                 // validator that recorded no verdict, and its plan line stays
                 // unchecked.
-                let reason = if verdict_authority {
-                    format!(
-                        "{} did not call {} after {VERDICT_REMINDERS} reminders: no validation verdict was recorded. {NO_EXPLICIT_APPROVAL_REASON}",
-                        p.tag,
-                        tool_names::TOOL_LEAVE_VERDICT,
-                    )
-                } else {
-                    // A caller the public verdict check refuses can never conclude
-                    // this run with a verdict, so there is nothing to wait for —
-                    // carry the typed rejection as the reason.
-                    format!(
-                        "{} — {NO_EXPLICIT_APPROVAL_REASON}",
-                        verdict_role_rejection(&caller, tool_names::TOOL_LEAVE_VERDICT),
-                    )
-                };
-                let outcome_note = if verdict_authority {
-                    format!("no verdict after {VERDICT_REMINDERS} reminders")
-                } else {
-                    format!("caller '{}' has no verdict authority", caller.role_name())
-                };
+                let (reason, outcome_note) = no_verdict_outcome(&p.tag, &caller, verdict_authority);
                 tracing::warn!(
                     "{}: failing closed — {outcome_note} (deliverable NOT approved)",
                     p.tag
@@ -2528,5 +2589,157 @@ mod tests {
         let ctx = fix_loop_call_context(&no_task);
         assert_eq!(ctx.class, pool::CallClass::Validator);
         assert_eq!(ctx.describe(), "validator validator-planner");
+    }
+
+    // ── The never-meant-to-be-validated guard ──────────────────
+
+    use super::{no_verdict_outcome, validation_skip_verdict};
+
+    /// Drive the collapse-site guard with the workspace root pointed at `root`, so
+    /// the shared brief probe and the skip-record lookup both resolve the scratch
+    /// `.marmel/prompts` directory.
+    async fn guard_verdict(
+        root: &std::path::Path,
+        task_id: &str,
+        tag: &str,
+    ) -> Option<FixLoopResult> {
+        let root = root.to_path_buf();
+        crate::harness::with_workspace_root(root, async {
+            validation_skip_verdict(Some(task_id), tag)
+        })
+        .await
+    }
+
+    /// `<root>/.marmel/prompts`, created.
+    fn prompts_of(root: &std::path::Path) -> std::path::PathBuf {
+        let prompts = root.join(crate::manager::phase::MARMEL_DIR).join("prompts");
+        std::fs::create_dir_all(&prompts).expect("prompts dir");
+        prompts
+    }
+
+    fn skip_record_body() -> String {
+        format!(
+            "{}\n",
+            crate::agents::prompt_builder::VALIDATION_SKIP_REASON
+        )
+    }
+
+    /// Guard test (a): the validation brief for this task was **never written**
+    /// (`NotFound`) and the durable `{tid}-validation-skip.md` record explains the
+    /// omission. The pass then ends not-rejected with the recorded reason — and the
+    /// reason never claims a validation that did not happen.
+    #[tokio::test]
+    async fn absent_brief_plus_skip_record_ends_the_pass_not_rejected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prompts = prompts_of(tmp.path());
+        std::fs::write(prompts.join("t-800-validation-skip.md"), skip_record_body())
+            .expect("skip record");
+        assert!(
+            !prompts.join("t-800-validation.md").exists(),
+            "the brief must be genuinely absent for this case"
+        );
+
+        let verdict = guard_verdict(tmp.path(), "t-800", "validator-coder-t-800").await;
+
+        match verdict {
+            Some(FixLoopResult::Verdict { approved, critique }) => {
+                assert!(
+                    approved,
+                    "a task recorded as validation-free is not a failure: {critique}"
+                );
+                assert!(
+                    critique.starts_with("Validation skipped by design:"),
+                    "the skip outcome must name its recorded reason: {critique}"
+                );
+                assert!(
+                    !critique.contains("not validated"),
+                    "the skip outcome must never read as a validation result: {critique}"
+                );
+                assert!(
+                    !critique.contains(NO_EXPLICIT_APPROVAL_REASON),
+                    "the skip outcome must never carry the fail-closed wording: {critique}"
+                );
+            }
+            other => panic!(
+                "an absent brief explained by a skip record must not fail closed, got {other:?}"
+            ),
+        }
+    }
+
+    /// Guard test (b): the brief **exists** but records nothing — blank or
+    /// unreadable — and a valid skip record sits beside it. The `NotFound`-only rule
+    /// refuses the record, so the guard defers to the fail-closed collapse and its
+    /// "no verdict recorded ⇒ not approved" wording stays intact.
+    #[tokio::test]
+    async fn blank_or_unreadable_brief_is_never_rescued_by_a_skip_record() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prompts = prompts_of(tmp.path());
+        std::fs::write(prompts.join("t-801-validation.md"), "   \n\t\n \n").expect("blank brief");
+        std::fs::write(prompts.join("t-801-validation-skip.md"), skip_record_body())
+            .expect("skip record");
+        std::fs::write(
+            prompts.join("t-802-validation.md"),
+            [0xFFu8, 0xFE, 0x00, 0x80],
+        )
+        .expect("unreadable brief");
+        std::fs::write(prompts.join("t-802-validation-skip.md"), skip_record_body())
+            .expect("skip record");
+
+        for (id, label) in [("t-801", "blank"), ("t-802", "unreadable")] {
+            let tag = format!("validator-coder-{id}");
+            let verdict = guard_verdict(tmp.path(), id, &tag).await;
+            assert!(
+                verdict.is_none(),
+                "a {label} brief must not be rescued by a skip record (got {verdict:?})"
+            );
+
+            // The collapse site the guard defers to keeps spelling the documented
+            // fail-closed reason for this run.
+            let caller = super::harness::ToolCaller::Specialist(super::Agent::Validator);
+            let (reason, note) = no_verdict_outcome(&tag, &caller, true);
+            assert!(
+                reason.contains("no validation verdict was recorded"),
+                "fail-closed reason must name the missing verdict: {reason}"
+            );
+            assert!(
+                reason.contains(NO_EXPLICIT_APPROVAL_REASON),
+                "fail-closed reason must use the documented wording: {reason}"
+            );
+            assert!(
+                reason.contains("not approved"),
+                "fail-closed reason must report the deliverable as not approved: {reason}"
+            );
+            assert!(
+                note.contains(&format!("no verdict after {VERDICT_REMINDERS} reminders")),
+                "operator note must name the exhausted reminders: {note}"
+            );
+        }
+    }
+
+    /// Boundary cases of the same guard: an absent brief with **no** record and a
+    /// task id the grammar authority refuses must both fail closed — a record
+    /// planted outside the prompts directory is never reached, and no approval is
+    /// ever invented.
+    #[tokio::test]
+    async fn absent_brief_without_record_or_with_a_refused_id_fails_closed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // The prompts directory exists; the refused id below never reaches it.
+        prompts_of(tmp.path());
+        // Reachable only through `../`: refused ids must never read it.
+        std::fs::write(
+            tmp.path()
+                .join(crate::manager::phase::MARMEL_DIR)
+                .join("t-803-validation-skip.md"),
+            skip_record_body(),
+        )
+        .expect("skip record outside the prompts dir");
+
+        for id in ["t-804", "../t-803"] {
+            let verdict = guard_verdict(tmp.path(), id, "validator-coder-t-804").await;
+            assert!(
+                verdict.is_none(),
+                "no approval may be invented for {id:?} (got {verdict:?})"
+            );
+        }
     }
 }

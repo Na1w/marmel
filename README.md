@@ -32,9 +32,9 @@ A terminal-driven autonomous coding assistant in Rust. Marmel connects to any Op
 
 Marmel is designed for autonomous multi-step software engineering with continuous user supervision:
 
-- **Plan-Driven Execution:** When given a goal, the Manager creates a disk-backed execution plan at `.marmel/execution_plan.md` using a checkbox format (`- [ ] [t-xxx]`). Tasks are automatically checked off as they finish, and interrupted sessions resume seamlessly from the next unchecked task.
+- **Plan-Driven Execution:** When given a goal, the Manager creates a disk-backed execution plan at `.marmel/execution_plan.md` using a checkbox format (`- [ ] [t-xxx]`), and a task line may additionally carry an optional validation directive from a closed set — `(validate)` or `(no-validate)` — written **immediately before** the `(role)` hint and never after it: `- [ ] [t-001] Audit the parser (no-validate) (researcher)`. No directive means the role/config default, a blank or unrecognised paren group is never read as `(no-validate)`, and the token decides validation — not the wording of the brief. Tasks are checked off only when the deliverable carries its `MISSION COMPLETE (t-xxx)` marker — `FAILED`, `REPLAN REQUIRED`, or a marker-less result leaves the box unchecked — so a resumed run continues from the next unchecked task.
 - **Dynamic Subagents & JIT Prompt Architect:** Tasks are not sent to static prompts. An Agent Architect dynamically synthesizes a bespoke subagent blueprint (`.marmel/prompts/<task_id>.md`) combining archetype capabilities, domain skills (`skills/`), and least-privilege tool allowlists before delegation.
-- **Automated Validation:** Work produced by specialists is audited by an independent Validator subagent. If tests fail or requirements are missed, feedback is returned for revision.
+- **Automated Validation:** Work produced by specialists is audited by an independent Validator subagent. If tests fail or requirements are missed, feedback is returned for revision. The audit is not unconditional: precedence runs role opt-out (`validator` / `planner`), then operator config (`enable_validator = false` or `max_validator_iterations = 0`), then the per-task `(no-validate)` / `(validate)` plan directive, then the role/config default — and a task designated validation-free still completes normally and checks its box off.
 - **Real-Time Steering & Interactive Dialogue:** You can type into the prompt at any point. Marmel pauses active subagents to answer questions, adjust the execution plan, or converse directly with working agents in real time.
 - **Model Context Protocol (MCP):** Connect external tool servers via stdio or HTTP/SSE using standard MCP configurations.
 - **Workspace Security:** File operations are strictly confined to the workspace. On Linux, terminal commands are isolated using Linux Landlock LSM to protect sensitive directories like `~/.ssh` and `~/.gnupg`.
@@ -117,12 +117,16 @@ The compiled binary will be placed at `target/release/marmel`.
 Marmel requires reliable JSON schema tool calling and solid instruction-following to successfully drive autonomous loops:
 
 - **Recommended:**
-  - **Qwen 2.5 / 3.8 27B** (`qwen-3.8-27b`) — solid balance of speed, reasoning depth, and dependable tool invocation on local hardware.
-  - **DeepSeek v3 / v4 Flash** — fast prefill, accurate code generation, and strong multi-turn stability.
+  - **Qwen 3.8 27B** (`qwen-3.8-27b`) — the built-in default (`src/config.rs`), and the value used by the examples in this file. Solid balance of reasoning depth and dependable tool invocation on local hardware.
+  - **Qwen 3.8 Flash Next** (`qwen-3.8-flash-next`) — When run on modern inference engines such as Strata, this model is significantly faster than Qwen 3.8 27B while offering a similar level of overall performance.
+  - **DeepSeek v4.1 Flash** — Offers a similar level of performance to both models above.
 - **Minimum:**
-  - **Gemma 4 12B** — minimum viable model size. Smaller parameter sizes or aggressive quantizations frequently fail JSON tool schemas or drift from task scopes.
+  - Models around the lighter recommended size. Smaller parameter sizes or aggressive quantizations frequently fail JSON tool schemas or drift from task scopes.
 - **Not Recommended:**
-  - **Qwen 3.6 35B** — exhibits known regressions in tool schema reliability during multi-turn agent loops.
+  - **Qwen 3.6 35B A3B** — While this model works most of the time, it tends to struggle with certain tool calls that cause tasks to take an artificially long time or fail altogether; it is therefore recommended to avoid it for now.
+  - Models that drop or malform JSON tool-call schemas during multi-turn loops. Marmel recovers pseudo-XML calls when it can (`enable_xml_rescue`), but a model that never emits a valid schema cannot drive the plan, the validator loop, or the fix loop at all.
+
+Note that Marmel is heavily KV-cache optimized, which benefits both local and cloud inference: it increases turnaround speed for local setups and reduces costs in the cloud.
 
 ---
 
@@ -130,7 +134,7 @@ Marmel requires reliable JSON schema tool calling and solid instruction-followin
 
 ### Lookup Order
 
-Marmel searches for configuration in the following priority order (first match wins):
+Marmel reads exactly one configuration file — the first candidate below wins, files are never layered — and then applies environment variables on top of it, so an environment variable overrides the file for the keys it covers:
 
 1. `--config <path>` CLI flag.
 2. `./marmel.toml` (current workspace root).
@@ -141,8 +145,9 @@ Marmel searches for configuration in the following priority order (first match w
 7. `~/.marmel/config.toml`
 8. `~/.config/marmel/config.toml`
 9. `~/.config/marmel/marmel.toml`
-10. Environment variables (`MARMEL_BACKEND_URL`, `MARMEL_MODEL`, `MARMEL_AUTH_TOKEN`).
-11. Built-in defaults.
+10. Environment variables (`MARMEL_BACKEND_URL`, `MARMEL_MODEL`, `MARMEL_AUTH_TOKEN`) — applied after the file, so they override it; `MARMEL_AUTH_TOKEN` applies only when the resolved token is still empty.
+11. Session environment variables (`MARMEL_RESUME`, one-way `MARMEL_SESSION_DISABLE`, `MARMEL_SESSION_COMMIT_MIN_MS`) — they fold into the `session_*` keys the same way, with `--resume` / `--fresh` beating all three.
+12. Built-in defaults.
 
 ### Configuration Reference (`marmel.toml`)
 
@@ -150,7 +155,7 @@ Marmel searches for configuration in the following priority order (first match w
 |---|---|---|
 | `backend_url` | `http://localhost:8000/v1` | Base URL for OpenAI-compatible chat completions (no trailing slash). |
 | `auth_token` | `""` | Optional Bearer token for authentication. |
-| `model` | `qwen-3.8-27b` | Model identifier to request from the backend. |
+| `model` | `qwen-3.8-27b` | Model identifier to request from the backend, sent verbatim (no validation, alias table, or allow-list). See [Model Recommendations](#model-recommendations). |
 | `temperature` | `0.7` | Sampling temperature. |
 | `top_p` | `0.9` | Nucleus sampling probability. |
 | `frequency_penalty` | `0.0` | Repetition penalty. |
@@ -162,14 +167,24 @@ Marmel searches for configuration in the following priority order (first match w
 | `command_timeout_secs` | `60` | Timeout per terminal command or PTY invocation. Valid range `1..=300` seconds; an out-of-range value is logged and clamped into that range, never applied verbatim. |
 | `sandbox_disabled` | `false` | Fail-closed opt-out of the Linux Landlock command sandbox: `true` runs commands unsandboxed and always logs an attributable warning. `MARMEL_DISABLE_SANDBOX=1` is an equivalent escape hatch — either source opts out. |
 | `sandbox_extra_readonly_paths` | `[]` | TOML array of strings: paths the Landlock sandbox additionally allows **read + execute** for, beyond the built-in allow-list (which already covers `/usr`, `/bin`, `/lib`, `/lib64`, `/opt` and the package stores `/nix/store` and `/gnu/store`). For toolchain locations it does not cover — a non-default `store =` prefix in `nix.conf`, a store under another path, another read-only toolchain dir — e.g. `["/mnt/nix/store"]`. Entries must be **absolute**; relative, missing or already-built-in entries are skipped with a warning. Never grants write. Empty ⇒ built-in list only; a non-empty value **replaces** the list rather than appending (same merge semantics as `orchestration.mcp_servers`). See [Extra Sandbox Read-Only Paths](#extra-sandbox-read-only-paths-sandbox_extra_readonly_paths). |
-| `max_repetition_threshold` | `5` | Consecutive identical turns that trigger loop interruption. |
+| `max_repetition_threshold` | `5` | Accepted for compatibility and merged, but no longer read: the effective threshold is `[monitoring] repetition_threshold`. |
 | `enable_xml_rescue` | `true` | Parse pseudo-XML tool calls into valid JSON tool calls. |
-| `ui_mode` | `"tui"` | Interface mode: `"tui"` (Ratatui) or `"raw"` (streaming stdout). |
-| `debug` | `false` | Write detailed debug logs to `debug.log`. |
-| `[orchestration]` | — | Top-level settings: `max_recursion_depth` (default 3), `mcp_servers`. |
+| `ui_mode` | `"tui"` | Interface mode: `"tui"` (Ratatui) or `"raw"` (streaming stdout). Raw mode is selected automatically whenever stdout is not a terminal — a pipe or a redirect — even with `"tui"` set. |
+| `debug` | `false` | Not a `marmel.toml` key: it is absent from the deserializing mirror, so only the `--debug` flag sets it. Logs all LLM and tool traffic to `.marmel/debug.log`. |
+| `session_enabled` | `true` | Capture the session bundle at all. `MARMEL_SESSION_DISABLE` can only turn it **off**; a disabled capture makes `--resume` a usage error (`exit 2`). |
+| `session_resume` | `false` | Resume automatically on every launch. Overridden by `--resume` / `--fresh` and by `MARMEL_RESUME`. |
+| `session_commit_min_interval_ms` | `250` | Floor between throttled commits (UI and worker-edge triggers only). Never delays turn boundaries, tool results, or ending commits. |
+| `session_commit_on_tool_result` | `true` | Commit after each tool result. |
+| `session_worker_mirror_max_messages` | `4000` | Cap on the mirrored conversation history stored per specialist. |
+| `session_max_bundle_bytes` | `33554432` | Bundle size ceiling (32 MiB). |
+| `system_prompt_path` | `prompts/system.md` | Replacement Manager prompt file; `~` is expanded and a relative path resolves against the current directory. |
+| `base_prompt` | _unset_ | Extra text appended to the Manager prompt under `## Machine Specific Guidance`. |
+| `[monitoring]` | — | Loop-breaker and stream-budget block: `enabled`, `repetition_threshold` (default `5`), `min_pattern_len` (`5`), `max_stream_tokens` (`32768`), `max_thinking_tokens` (`32768`). |
+| `[orchestration]` | — | Top-level settings: `max_recursion_depth` (default `3`; `0` restores the default), `mcp_servers` (Manager-visible server names), `manager_module`. |
 | `[orchestration.concurrency]` | _unset_ | Simultaneous-session cap per **backend URL + model** pair: `max_sessions` plus quoted per-URL overrides (e.g. `"http://host:8080/v1" = 2`). Unset ⇒ **unlimited** (nothing is metered); `0` ⇒ unlimited plus a warning. See [Session Concurrency](#session-concurrency-orchestrationconcurrency). |
-| `[orchestration.specialists.<role>]` | — | Per-role overrides for `model`, `backend_url`, `auth_token`, `tools`, `mcp_servers`, `reasoning_effort`, and validator settings (`validator_model`, `validator_backend_url`, `validator_auth_token`, `validator_reasoning_effort`, `max_validator_iterations`, `max_fix_loop_rounds`, `enable_validator`). |
-| `[mcp_servers.<name>]` | — | External MCP server registration (`command`, `args`, `env`, `url`). |
+| `[orchestration.specialists.<role>]` | — | Per-role overrides for `model`, `backend_url`, `auth_token`, `tools`, `mcp_servers`, `reasoning_effort`, and validator settings (`validator_model`, `validator_backend_url`, `validator_auth_token`, `validator_reasoning_effort`, `max_validator_iterations`, `max_fix_loop_rounds`, `enable_validator`). Top-level `max_fix_loop_rounds` is silently dropped — declare it per role (precedence: role, then `[orchestration.specialists.validator]`, then the built-in `200`). |
+| Role ids | — | `coder`, `researcher`, `debugger`, `validator`, `generalist`, `planner` — the only names that resolve. `deepbrain` aliases `generalist`. These are also the `(role)` hints of a plan line; `validator` and `planner` deliverables are never validated, a role opt-out that outranks any `(validate)` directive. |
+| `[mcp_servers.<name>]` | — | External MCP server registration (`command`, `args`, `env`, `url`): exactly one transport, and `command` wins if both `command` and `url` are set. Tools arrive named `<server>__<tool>`. No `enabled`, `timeout`, or `headers` key exists. |
 
 ### Example `marmel.toml`
 
@@ -194,13 +209,14 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
 
 # Specialist overrides
 [orchestration.specialists.coder]
-model = "deepseek-coder-v2"
+model = "qwen-3.8-27b"
 backend_url = "http://localhost:11434/v1"
 mcp_servers = ["fs"]
 max_validator_iterations = 5
+# Up to 5 audit passes by default; point the auditor at another endpoint to give it its own cap.
 
 [orchestration.specialists.researcher]
-model = "deepseek-v4-flash"
+model = "qwen-3.8-flash-next"
 tools = ["read_file", "run_command", "grep_search", "glob"]
 ```
 
@@ -225,15 +241,15 @@ reasoning_effort = "medium"
 
 # A strong model with high effort for coding.
 [orchestration.specialists.coder]
-model = "deepseek-v4-flash:cloud"
+model = "qwen-3.8-27b"
 reasoning_effort = "high"
 
 # A cheap model with low effort for research, and an even cheaper dial for the
 # validator passes that audit it.
 [orchestration.specialists.researcher]
-model = "qwen-3.8-27b"
+model = "qwen-3.8-flash-next"
 reasoning_effort = "low"
-validator_model = "gemma4:cloud"
+validator_model = "qwen-3.8-flash-next"
 validator_reasoning_effort = "minimal"
 ```
 
@@ -254,6 +270,10 @@ unset and falls through to the next level):
 - **Dial vs. ceiling.** `max_thinking_tokens` stays the hard cap and is read independently
   per turn; both knobs can be set at once. Selecting an effort level never derives a
   thinking budget — no effort level implies a `max_thinking_tokens` default.
+- **Aliases.** Only inside `[orchestration.specialists.<role>]`: `max_thinking_tokens` also
+  accepts `reasoning_budget` and `thinking_budget`, and `enable_validator` accepts
+  `auto_validate` and `enable_validation`. Those spellings are not recognized at the top
+  level, where an unrecognized key is dropped silently.
 - **Cost.** Each task runs up to `max_validator_iterations` (default `5`) validator passes,
   each a full session against the validator model, so a low-effort validator multiplies the
   saving: it is billed five times per task, not once.
@@ -344,9 +364,13 @@ aimed at another one.
 |---|---|
 | `--config <path>` | Path to an explicit configuration file. |
 | `--raw` | Force headless stdout streaming mode (no TUI). |
-| `--debug` | Enable detailed logging of tool and LLM exchanges to `debug.log`. |
+| `--debug` | Log every LLM and tool exchange to `.marmel/debug.log`. The only way to set `debug` at all. |
+| `--resume` | Rehydrate the previous run from `.marmel/session/`. A bundle that exists but is refused exits with code `3`; combining it with `--fresh`, or resuming while capture is disabled, is a usage error with exit `2`. |
+| `--fresh` | Force a fresh start even when `session_resume` or `MARMEL_RESUME` is set — the escape hatch, and always the winner. |
 | `-h`, `--help` | Show command-line help. |
 | `[PROMPT]` | Optional initial prompt to immediately start the session. |
+
+Model, backend URL, and auth token are configuration keys and environment variables, never flags. There is no `--model`, `--temperature`, `--no-tui`, `--version`, or short flag other than `-h`: the parser has a catch-all arm that turns the first unrecognized token into the session goal, so `marmel --model gpt-x "task"` silently runs with `--model` as the goal and `ignoring extra argument: gpt-x` on stderr.
 
 ### Interactive TUI
 
@@ -355,38 +379,41 @@ The interactive TUI contains three main panels:
 2. **Plan:** The active execution plan (`.marmel/execution_plan.md`) with task checkboxes.
 3. **Subagents:** Real-time log and deliverables from delegated specialists. A specialist waiting for a concurrency slot is labelled `(Queued n/m)` — its queue position out of the sessions queued for that backend URL + model pair (see [Session Concurrency](#session-concurrency-orchestrationconcurrency)).
 
+The Plan panel opens by itself at startup when `.marmel/execution_plan.md` is non-empty; `Tab` cycles only panels that are visible.
+
 ### Keyboard Shortcuts
 
 | Shortcut | Action |
 |---|---|
 | `Enter` | Send message. |
-| `Shift+Enter` / `Alt+Enter` / `Ctrl+J` | Insert newline in multi-line prompt. |
+| `Shift+Enter` / `Alt+Enter` / `Ctrl+Enter` / `Ctrl+J` | Insert newline in multi-line prompt. |
 | `Ctrl+Z` / `Ctrl+Y` | Undo / redo text in input box. |
 | `Tab` | Cycle focus between Chat, Plan, and Subagents panels. |
 | `Ctrl+P` | Toggle visibility of the Plan panel. |
 | `Ctrl+A` | Toggle visibility of the Subagents panel. |
 | `Ctrl+T` | Toggle visibility of reasoning / thinking blocks. |
 | `Esc` / `Ctrl+C` | Arm abort (press twice within 3 seconds to exit). |
+| Any printable key | Disarm a pending abort after `Esc` or `Ctrl+C`. |
 | `Ctrl+D` | Immediate exit. |
 | `Ctrl+Up` / `Ctrl+Down` | Browse input history. |
+| `←` / `→` | With the Subagents panel focused: previous / next subagent. |
 | `PageUp` / `PageDown` | Scroll focused panel up / down by 10 lines. |
 | `Home` / `End` | Jump to start / end of line (Chat) or top / bottom of panel. |
-| `Mouse Click / Scroll` | Click to focus panel or cursor; scroll to navigate panels. |
 
 ### Slash Commands
 
-Type these directly into the chat input:
+Type these directly into the chat input (they match case-insensitively, and they exist only in the TUI — raw mode reads no input at all):
 
 | Command | Action |
 |---|---|
 | `/help` | Print keybinding and command reference in the chat pane. |
 | `/thought` | Toggle display of reasoning and thinking content. |
-| `/reset` (`/clear_plan`) | Clear the current execution plan and return to conversational mode. |
-| `/abort` (`/quit`, `:q`) | Exit the current session. |
+| `/reset` (`/reset_plan`, `/reset-plan`, `/clear_plan`, `/clear-plan`, `/reset_execution_plan`) | Clear the execution plan, delete the session bundle and the legacy journals, and revert to conversational mode. |
+| `/abort` (`abort`, `/exit`, `exit`, `/quit`, `quit`, `/q`, `:q`, `:q!`, `/stop`, `stop`, `/cancel`, `cancel`) | Exit the session, cancel running workers, and stamp a `userAbort` ending on the bundle. |
 
 ### Headless Raw Mode
 
-When redirected or invoked with `--raw`, Marmel outputs structured, pipe-friendly events:
+Marmel runs in raw mode when invoked with `--raw`, when `ui_mode` is `"raw"`, or whenever stdout is not a terminal — a pipe or a redirect — and then outputs structured, pipe-friendly events:
 
 ```bash
 marmel --raw "Summarize the repository structure"
@@ -401,6 +428,10 @@ Output format:
 [done]
 ```
 
+- **No input, no commands.** Raw mode never reads stdin: `marmel --raw` with no `[PROMPT]` exits `0` immediately, and slash commands, keyboard shortcuts, and mid-flight steering are unreachable.
+- **Full event vocabulary.** Besides the tags above there are `[steer]`, `[thinking]`, `[status]`, `<agent_tag>:content`, `<agent_tag>:thinking`, and `[delegation] STARTED → …` / `DONE    …` / `FAILED  …`. Token counters and queue-state transitions are silent, so headless output is byte-stable.
+- **Logs go to stderr.** In raw mode `tracing` writes to stderr instead of the rotating `.marmel/marmel.log`.
+
 ### Runtime Directory (`.marmel/`)
 
 Internal session files are stored in `.marmel/` within the workspace root:
@@ -408,14 +439,20 @@ Internal session files are stored in `.marmel/` within the workspace root:
 | File / Folder | Purpose |
 |---|---|
 | `.marmel/execution_plan.md` | Active execution plan with checked/unchecked tasks. |
+| `.marmel/execution_plan_archive.md` | Copy of the latest archived plan, kept alongside the timestamped snapshot. |
 | `.marmel/prompts/` | Synthesized agent prompts and tool grants (`<task_id>.md`). |
-| `.marmel/marmel.log` | Rotating application log (5MB limit, 3 backups kept). |
+| `.marmel/prompts/<task_id>-validation.md` | Auditor brief for the validator pass of that task. It is authored for every task whose plan line carries `(validate)` or **no** directive — the directive alone decides, and the wording of the task line or of the brief decides nothing. The `validator` and `planner` roles are role-level opt-outs and are never briefed, whatever their line says. A missing, blank or unreadable file fails closed: the task is reported as not validated and its plan line stays unchecked. The single exemption is a task carrying a `-validation-skip.md` record, and it explains only a brief that was never written — a blank or unreadable brief is never exempted. |
+| `.marmel/prompts/<task_id>-validation-skip.md` | The plan side's record that this task needs **no** validation, written in place of the auditor brief when that task's plan line carries the explicit `(no-validate)` directive — the only input that can ever produce this file — and it holds exactly one line: `Plan directive (no-validate): validation not required`. The two files are mutually exclusive: a `(validate)` or directive-free line deletes a stale record **before** the brief is attempted, so a brief write that fails leaves no record behind (and is logged) and its missing brief stays a fail-closed verdict gap instead of a declared skip. For such a task no validator runs and no fix loop fires: the task completes normally with `MISSION COMPLETE (<task-id>)`, its plan line is checked off, and the worker panel reads `Completed (validation skipped by design)`. Fail-closed is preserved when neither file exists, when the record is blank, or when the task id is rejected; the per-role switches (`enable_validator` / `auto_validate`, `max_validator_iterations = 0`) remain the operator-level opt-out, and they outrank the directive. |
+| `.marmel/marmel.log` | Rotating application log for TUI mode (5 MiB, 3 backups). Raw mode logs to stderr instead. |
+| `.marmel/debug.log` | LLM and tool traffic, written only under `--debug`. |
 | `.marmel/archive/` | Archived completed execution plans. |
 | `.marmel/session/` | The **session bundle**: the split-file snapshot that `--resume` reads back (see [Session Restore](docs/session_restore.md)). It is a directory, never a single file. |
 | `.marmel/session/manifest.json` | The bundle's root document and **commit point**: format/schema versions, session id, wall/monotonic anchors, how the previous process ended, the identity floors, and the member list with each member's byte length and fingerprint. It is written **LAST** — that rename *is* the commit — and it is the only file that names the member set. |
 | `.marmel/session/manager.json` | Manager member: the message history (pinned system prompt and goal preserved byte-for-byte), the pin witness, and the engine scalars. |
 | `.marmel/session/ui.json` | UI member: pane text (chat, subagents, plan panel), status line, composer text + caret + history, scroll / selection / focus, subagent panels, and the token witnesses. |
 | `.marmel/session/workers/<key>.json` | One member per subagent, named after its registry key with escaping (e.g. `coder-t-018%237.json`): full mirrored conversation history, status, counters, and pending/dangling tool-call state. |
+| `.marmel/session/.<member>.tmp.<pid>.<nanos>.<seq>` | Staging name every atomic member write goes through: written there, then renamed into place. A leftover from another process is deleted by the commit sweep; one carrying this process's own id belongs to a write in flight and is left alone. |
+| `.marmel/forced_phase.txt` | **LEGACY.** Nothing reads or writes it; a stale copy is deleted by `/reset`. |
 | `.marmel/.session_transcript.json` | **LEGACY.** Written by older releases only; never written again, never merged or upgraded into a bundle. It is named in the "legacy journals found, not restorable" report on a fresh boot, and swept by `/reset`, `Plan::clear()` and `Plan::archive()`. |
 | `.marmel/.ui_transcript.json` | **LEGACY.** Same handling as `.marmel/.session_transcript.json`: never written again, only named on a fresh boot, and deleted with the plan by `/reset`, `Plan::clear()` and `Plan::archive()`. |
 
@@ -423,12 +460,14 @@ Internal session files are stored in `.marmel/` within the workspace root:
 
 ## Real-Time Steering & Live Dialogue
 
-Marmel allows you to interact with the assistant at any time—even while subagents are running commands or streaming output:
+Marmel allows you to interact with the assistant at any time—even while subagents are running commands or streaming output. The chat input of the TUI is the only steering entry point (raw mode reads no input at all), and anything you type there that is not one of the slash commands listed above goes to the Steer Arbitrator while a stream or worker is active; when nothing is running it is queued into the Manager's context as a plain user message:
 
-- **Immediate Pausing:** Submitting a message while an agent is working immediately pauses execution.
+- **Immediate Pausing:** A line typed mid-flight is arbitrated on the spot, interrupting the live model call at its next chunk boundary. The arbitrator borrows the model slot: streams on its own model are paused, then resumed with the partial output carried over — unless the decision cancels them. A stream on a different model keeps running, and one that has not acknowledged the pause within 2 seconds — typically a worker blocked inside a long tool call — is cancelled rather than waited for. The arbitrator's own call never queues behind specialist work: it draws one reserved slot per backend + model pair and proceeds un-metered with a warning if that slot stays busy for 20 seconds.
 - **Direct Answers & Status:** Ask questions (e.g. *"What are you currently doing?"* or *"Why SQLite?"*) to get instant answers without disrupting the agent's work.
-- **Course Correction:** Provide feedback, reject an approach, adjust the plan, or abort the current subtask mid-flight.
-- **Direct Dialogue with Workers:** If your inquiry concerns an active subagent's internal reasoning, Marmel communicates directly with the working agent, retrieves its explanation, and reports back to you before resuming.
+- **Steering Decisions:** The arbitrator can answer directly (`RespondDirectly`), queue the instruction (`QueueAndContinue`), forward it to a worker (`ForwardToWorker`), approve or reject the plan (`ApprovePlan` / `RejectPlan`), delegate a fresh subtask (`DelegateTask`), sleep and re-evaluate (`Sleep`, capped at 5 arbitration rounds and a 300-second cumulative sleep budget), or abort the turn outright (`AbortImmediately`). A per-subtask action outside `ForwardNotice` / `Cancel` / `DelegateTask` / `Sleep` is rejected with a warning and never silently defaulted, a decision outside the list above falls through to the queue-or-answer fallback, and the `SwitchTier` / `SwitchModel` fields are accepted by the JSON shape but map to no action.
+- **Course Correction:** Provide feedback, cancel one running subtask mid-flight (`Cancel` fires that worker's cancellation token and aborts its stream), or have the turn aborted outright (`AbortImmediately` / `RejectPlan` cancel every active worker). No steering decision rewrites the plan — an instruction aimed at the plan reaches the Manager as a user message at the next turn boundary, and it is the Manager that rewrites `.marmel/execution_plan.md` from there.
+- **Direct Dialogue with Workers:** If your inquiry concerns an active subagent's internal reasoning, the arbitrator posts a numbered notice (`notice-1`, `notice-2`, …) addressed to that one worker and resumes the stream straight away — your answer is not awaited before the work continues. The worker reads the notice at the start of its next turn or right after its current tool round, so a notice posted mid-turn reaches it inside that same turn.
+- **Notice Ids & Reply Contract:** The worker answers with `reply_to_arbitrator` naming that exact notice id; a missing, unknown, expired, already-answered or another worker's id comes back to it as a tool error naming the rejection class, records nothing, and spends no arbitrator turn. A valid reply is evaluated by the arbitrator, which either synthesizes the user-facing answer or posts a follow-up notice. Notices stay deliverable for 10 minutes, one worker inbox holds 64 undelivered notices under a drop-oldest bound (the drop is reported, never silent), and at most 256 worker inboxes are retained.
 
 ---
 
@@ -436,23 +475,25 @@ Marmel allows you to interact with the assistant at any time—even while subage
 
 ### Built-In Archetypes
 
-Marmel comes with 6 built-in archetypes preconfigured in the binary. You do not need to create any configuration files to use them:
+Marmel comes with 6 built-in archetypes preconfigured in the binary, and they are the only delegatable roles: `delegate_task` resolves exactly the ids of the six rows below, with `deepbrain` accepted as an alias for `generalist`. You do not need to create any configuration files to use them:
 
 | Archetype | Description | Default Tools |
 |---|---|---|
-| **Coder** | System architecture, implementation, refactoring, test suites. | `read_file`, `write_file`, `replace`, `run_command`, `grep_search`, `glob`, `rebirth`, `sleep`, `reply_to_arbitrator` |
-| **Researcher** | Codebase reconnaissance, documentation inspection, API contracts. | `read_file`, `write_file`, `replace`, `run_command`, `grep_search`, `glob`, `rebirth`, `sleep`, `reply_to_arbitrator` |
-| **Debugger** | Crash forensics, regression isolation, minimal fixes, interactive PTY. | `read_file`, `write_file`, `replace`, `run_command`, `grep_search`, `glob`, `pty_*`, `rebirth`, `sleep`, `reply_to_arbitrator` |
-| **Validator** | Independent auditor; runs test suites and issues formal verdicts. | `read_file`, `grep_search`, `glob`, `run_command`, `leave_verdict`, `rebirth`, `sleep`, `reply_to_arbitrator` |
-| **Generalist** | Polymath for cross-cutting logic and multi-disciplinary tasks. | All tools, `rebirth`, `sleep`, `reply_to_arbitrator` |
+| **Coder** | System architecture, implementation, refactoring, test suites. | `delegate_task`, `read_file`, `write_file`, `replace`, `run_command`, `grep_search`, `glob`, `rebirth`, `sleep`, `reply_to_arbitrator` |
+| **Researcher** | Codebase reconnaissance, documentation inspection, API contracts. | `delegate_task`, `read_file`, `write_file`, `replace`, `run_command`, `grep_search`, `glob`, `rebirth`, `sleep`, `reply_to_arbitrator` |
+| **Debugger** | Crash forensics, regression isolation, minimal fixes, interactive PTY. | `delegate_task`, `read_file`, `write_file`, `replace`, `run_command`, `grep_search`, `glob`, `pty_*`, `rebirth`, `sleep`, `reply_to_arbitrator` |
+| **Validator** | Independent auditor; runs test suites and issues formal verdicts. | `delegate_task`, `read_file`, `grep_search`, `glob`, `run_command`, `pty_*`, `leave_verdict`, `rebirth`, `sleep`, `reply_to_arbitrator` — no `write_file` or `replace` |
+| **Generalist** | Polymath for cross-cutting logic and multi-disciplinary tasks. | `*` (every tool, `delegate_task` included) |
 | **Planner** | Mission architect for workspace reconnaissance and phased planning. | `read_file`, `grep_search`, `glob`, `create_plan`, `rebirth`, `sleep`, `reply_to_arbitrator` |
 
 > [!NOTE]
 > The Manager is restricted to planning (`create_plan`), reading (`read_file`, `grep_search`, `glob`), and delegation (`delegate_task`). It cannot directly modify files (`write_file`, `replace`) or execute commands (`run_command`).
 
+Two rules are enforced ahead of any allowlist: `leave_verdict` is Validator-only, and `create_plan` executes only through the Manager — the same call routed through a specialist is refused even when its allowlist or a synthesized blueprint names it. `reply_to_arbitrator` is granted to every specialist unconditionally. A specialist can delegate at all only because `delegate_task` sits in its own allowlist — every built-in except the **Planner** carries it — and only the **Coder** and **Generalist** declare recursion; nested delegation stays bounded by `max_recursion_depth`. A plan line's `(validate)` / `(no-validate)` directive changes only whether that task's deliverable is audited — never which role receives the task — and the **Validator** and **Planner** rows are exempt from validation by role, so no directive buys their audit back.
+
 ### Custom Archetypes (`AGENTS.md`)
 
-To override default roles or define new specialist archetypes for your project, add an `AGENTS.md` file to your workspace root (or globally at `~/.marmel/AGENTS.md`):
+To adjust what the built-in roles advertise, add an `AGENTS.md` file to your workspace root (or globally at `~/.marmel/AGENTS.md`). A section whose heading maps onto a built-in id overrides that role's default skills and tools; a new heading is surfaced to the planner as guidance but cannot itself be delegated to, because `delegate_task` resolves only the six built-in ids:
 
 ```markdown
 ## SecurityAuditor
@@ -461,9 +502,11 @@ skills: verification, research
 tools: read_file, grep_search, glob, run_command, leave_verdict, reply_to_arbitrator
 ```
 
+Only `description:`, `skills:`, and `tools:` are read; every other `key:` line and all free text are ignored. `##` and `###` headings both work, and the role id is the heading lowercased with spaces and hyphens turned into underscores — so the section above registers as `securityauditor`, which matches no built-in id and is therefore planner guidance only. `~/.marmel/AGENTS.md` is read first and `<workspace>/AGENTS.md` second, both keyed by id, so the project file wins on a collision.
+
 ### Custom Skills (`skills/`)
 
-Skills provide reusable domain knowledge and automatically grant suggested tools. Place skills in `<workspace>/skills/*.md` or `~/.marmel/skills/*.md`:
+Skills provide reusable domain knowledge and automatically grant suggested tools. A skill is a top-level `*.md` file or a subdirectory holding a `SKILL.md` — the file stem or directory name becomes its id, and a top-level `README.md` is skipped — inside `<workspace>/skills/` or `~/.marmel/skills/`. Registration runs built-ins first, then `~/.marmel/skills/`, then `<workspace>/skills/`, always keyed by id, so a project skill shadows a user skill, which shadows a built-in:
 
 ```markdown
 ---
@@ -481,7 +524,9 @@ tools:
 - Verify migration status with the CLI before proceeding.
 ```
 
-When tasks related to database migrations are delegated, the skill content is dynamically injected into the specialist's prompt and its `tools` are granted to the agent's allowlist.
+Only the `id`, `name`, `description`, and `suggested_tools` (or `tools`) front matter keys are read; any other key is ignored, and the body below the front matter is the content that gets injected. The compiled-in skills are `clean_code`, `debugging`, `research`, `verification`, and `testing`.
+
+When a matching task is delegated, the skill content is injected into the specialist's prompt and its `tools` widen the allowlist for that run; `rebirth` is always appended, and neither a skill nor a synthesized blueprint can widen the verdict class — `leave_verdict` stays Validator-only.
 
 ---
 
@@ -490,7 +535,7 @@ When tasks related to database migrations are delegated, the skill content is dy
 Marmel is designed to prevent accidental modifications outside the target project:
 
 1. **Path Confinement:** All file tools (`read_file`, `write_file`, `replace`, `grep_search`, `glob`) validate paths against the workspace root. Path traversal attempts (e.g. `../../etc/passwd` or `~/.ssh`) are blocked.
-2. **Process Sandboxing (Linux Landlock LSM):** Terminal commands (`run_command` and PTY sessions) execute inside an unprivileged Landlock sandbox on Linux. Read/write access is restricted to the workspace, temporary build directories (`/tmp`, `/var/tmp`), and language caches (`~/.cargo`, `~/.cache`, `~/.npm`). Access to sensitive directories such as `~/.ssh` and `~/.gnupg` is denied by the kernel.
+2. **Process Sandboxing (Linux Landlock LSM):** Terminal commands (`run_command` and PTY sessions) execute inside an unprivileged Landlock sandbox on Linux. Read/write access is restricted to the workspace, temporary build directories (`/tmp`, `/var/tmp`), and language caches (`~/.cargo`, `~/.cache`, `~/.npm`). Read-only grants additionally cover `~/.rustup`, `~/.config`, `~/.local`, and `~/.gitconfig`, and the device nodes `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/tty`, `/dev/urandom`, `/dev/random`, `/dev/pts`, and `/dev/shm` are read/write; the FHS prefixes are read-only (see [Extra Sandbox Read-Only Paths](#extra-sandbox-read-only-paths-sandbox_extra_readonly_paths)). A `CARGO_HOME` or `RUSTUP_HOME` set outside `~/.cargo` / `~/.rustup` is granted the matching read/write or read-only rule. Access to sensitive directories such as `~/.ssh` and `~/.gnupg` is denied by the kernel.
 3. **Non-Linux Platforms:** On macOS and Windows, path confinement and working directory boundaries are actively enforced in-process.
 
 **Sandbox Opt-Out (fail-closed).** The sandbox is always on unless you explicitly opt out: the typed knob `sandbox_disabled` defaults to `false` in `marmel.toml`, and the equivalent environment escape hatch is `MARMEL_DISABLE_SANDBOX`. Either source opts out on its own, and every honoured opt-out is announced with an attributable warning naming the setting that was set (`warning: Landlock sandbox DISABLED by <setting>: this command runs WITHOUT Landlock.`). The parsing is fail-closed — only `1`, `true`, `yes` or `on` (case-insensitive, surrounding blanks ignored) disable the sandbox, while a malformed or falsy value such as `0`, `false`, `off`, `no`, an empty value, or a typo leaves it **enabled**. Opting out is also never a way to make a failed sandbox non-fatal: if Landlock cannot be established, the command is refused instead of running unsandboxed — the sandbox re-entry step prints the reason to stderr and exits with `SANDBOX_REFUSE_EXIT_CODE` (`73`, `sysexits.h` `EX_UNAVAILABLE`) without exec-ing the command.
@@ -518,12 +563,18 @@ Run the test suite:
 cargo test
 ```
 
+The tests live in two places: integration tests under `tests/` (`test_orchestrator.rs`, `test_role_gating.rs`, `test_validation_loop.rs`, `test_dynamic_prompts.rs`, `test_llm_pool.rs`, `test_session_boot.rs`, and the `test_session_restore_*.rs` family) and unit tests beside the code they cover — modules named `*_tests.rs` (`src/harness/fs_tests.rs`, `src/harness/pty_tests.rs`, `src/manager/phase_tests.rs`, `src/orchestrator/steer_tests.rs`, `src/mcp/http_tests.rs`) and inline `#[cfg(test)]` modules inside files such as `src/plan_parse.rs` and `src/agents/prompt_builder.rs`.
+
 The test suite covers:
 - Core orchestration and recursive delegation bounds.
 - Tool allowlists, role gating, and path confinement.
 - Stream preemption and steer arbitration.
 - Repetition breakers and XML tool call rescue.
 - Per-backend session concurrency caps, queue accounting, and queue timeouts.
+- Session bundle commit, boot, abort-flush, and restore ladder behaviour, including refused restores (exit `3`).
+- Validator and fix-loop verdict bounds, including the auditor that is reminded three times and then fails closed without a verdict.
+- The plan-line validation directive end to end: `(no-validate)` writes `<task_id>-validation-skip.md` and no auditor brief, `(validate)` or a directive-free line writes the brief and clears the stale counterpart, a blank or unrecognised token stays no directive at all (`src/plan_parse.rs`), a durable record lets the task complete and check its box off, and neither record on disk still fails closed with the plan line unchecked (`tests/test_dynamic_prompts.rs`, `tests/test_validation_loop.rs`).
+- Internal fast calls and reserved concurrency slots.
 
 To verify linting and formatting:
 

@@ -643,11 +643,14 @@ fn snapshot_dir(dir: &std::path::Path) -> Vec<(String, u64, std::time::SystemTim
     out
 }
 
-/// A prompts directory that exists but holds **no** `{tid}-validation.md`, and
-/// **no execution plan at all**: the task id is not plan-tracked. A missing
-/// verdict is an unconditional hard failure — the validator must not run, the
-/// deliverable must be reported as not validated, and no MISSION COMPLETE may be
-/// reported.
+/// A prompts directory that exists but holds **no** `{tid}-validation.md` **and no**
+/// `{tid}-validation-skip.md` record, and **no execution plan at all**: the task id
+/// is not plan-tracked and nothing designates the task validation-free. Only in that
+/// combination is a missing verdict an unconditional hard failure — the validator
+/// must not run, the deliverable must be reported as not validated, and no MISSION
+/// COMPLETE may be reported. With a skip record on disk the same absence is a
+/// deliberate exemption; see
+/// [`test_validation_skip_record_is_an_exemption_not_a_verdict_gap`].
 #[tokio::test]
 async fn test_missing_verdict_file_is_an_unconditional_hard_failure() {
     let _guard = TEST_BUS_MUTEX.lock().await;
@@ -656,6 +659,12 @@ async fn test_missing_verdict_file_is_an_unconditional_hard_failure() {
     let root = tmp.path().to_path_buf();
     std::fs::create_dir_all(root.join(".marmel").join("prompts"))
         .expect("prompts dir without any -validation.md");
+    assert!(
+        !root
+            .join(".marmel/prompts/t-901-validation-skip.md")
+            .exists(),
+        "fixture: no no-validation record may exist for this gap"
+    );
 
     marmennill::harness::with_workspace_root(root.clone(), async move {
         let validator_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -741,6 +750,169 @@ async fn test_missing_verdict_file_is_an_unconditional_hard_failure() {
         assert!(
             !deliverable.contains("MISSION COMPLETE"),
             "a hard verdict gap must never report MISSION COMPLETE, got: {deliverable}"
+        );
+    })
+    .await;
+}
+
+/// Counterpart of [`test_missing_verdict_file_is_an_unconditional_hard_failure`]:
+/// the same absent `{tid}-validation.md`, but **with** the `{tid}-validation-skip.md`
+/// record the plan side writes for a validation-free task, is not a verdict gap.
+/// The validator is never contacted (its call counter stays at zero while the
+/// specialist consumes exactly its own two turns), the deliverable reports MISSION
+/// COMPLETE, the plan line checks off, the status channel carries the
+/// `[Validator] SKIPPED by design for <tag>` line, and the worker status becomes
+/// `Completed (validation skipped by design)`.
+#[tokio::test]
+async fn test_validation_skip_record_is_an_exemption_not_a_verdict_gap() {
+    let _guard = TEST_BUS_MUTEX.lock().await;
+
+    let tmp = tempfile::tempdir().expect("isolated temporary workspace root");
+    let root = tmp.path().to_path_buf();
+    let prompts = root.join(".marmel").join("prompts");
+    std::fs::create_dir_all(&prompts).expect("scoped prompts dir");
+    assert!(
+        !prompts.join("t-902-validation.md").exists(),
+        "fixture: a plan-designated validation-free task gets no verdict brief"
+    );
+    std::fs::write(
+        prompts.join("t-902-validation-skip.md"),
+        "Planner-designated: no validation required (research/documentation task)\n",
+    )
+    .expect("no-validation record");
+
+    marmennill::harness::with_workspace_root(root.clone(), async move {
+        // One unchecked plan line so the check-off is observable on disk.
+        std::fs::write(
+            root.join(".marmel").join("execution_plan.md"),
+            "# Execution Plan\n\n### Phase 1: Documentation\n- [ ] [t-902] Write the audit note\n",
+        )
+        .expect("plan file");
+        let plan = marmennill::manager::Plan::at(root.join(".marmel"));
+
+        let validator_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let vc = validator_calls.clone();
+        let turns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tc = turns.clone();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(move |req: &Request| {
+                let body = String::from_utf8_lossy(&req.body).to_string();
+                if body.contains(marmennill::tool_names::TOOL_LEAVE_VERDICT)
+                    || body.contains("Specialist Deliverable")
+                {
+                    vc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return ResponseTemplate::new(200).set_body_string(text_sse(
+                        "validation must not run for a task holding a skip record",
+                    ));
+                }
+                if tc.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    let args = serde_json::json!({
+                        "path": "validation-skip-exemption.txt",
+                        "content": "written by the specialist"
+                    })
+                    .to_string();
+                    return ResponseTemplate::new(200).set_body_string(tool_call_sse(
+                        "call_write_1",
+                        marmennill::tool_names::TOOL_WRITE_FILE,
+                        &args,
+                    ));
+                }
+                ResponseTemplate::new(200)
+                    .set_body_string(text_sse("Work delivered.\n\nMISSION COMPLETE (t-902)"))
+            })
+            .mount(&server)
+            .await;
+
+        let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        marmennill::orchestrator::set_status_sender(status_tx);
+
+        let client = marmennill::llm::ChatClient::new(format!("{}/v1", server.uri()), "test-model");
+        let req = marmennill::agents::DelegationRequest {
+            agent_name: marmennill::agents::Agent::Coder,
+            prompt: "Write a file; the plan designated this task validation-free".to_string(),
+            snippets: vec![],
+            task_id: Some("t-902".to_string()),
+            image_urls: None,
+            audio_urls: None,
+            recursion_granted: false,
+        };
+        let ctx =
+            marmennill::agents::IsolatedContext::from_request("You are the Coder.".to_string(), &req);
+        let cfg = marmennill::config::Config {
+            backend_url: format!("{}/v1", server.uri()),
+            model: "test-model".to_string(),
+            ..Default::default()
+        };
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let deliverable = marmennill::agents::run_specialist_live(
+            &client,
+            marmennill::agents::Agent::Coder,
+            &ctx,
+            &cfg,
+            &token,
+        )
+        .await
+        .expect("a recorded skip is a normal completion, not an error");
+
+        // Zero validator calls, and only the specialist's own two turns served.
+        assert_eq!(
+            validator_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the validator may not be engaged for a recorded skip, got deliverable: {deliverable}"
+        );
+        assert_eq!(
+            turns.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "only the specialist's own turns may be served, got deliverable: {deliverable}"
+        );
+        assert!(
+            deliverable.contains("MISSION COMPLETE (t-902)"),
+            "a plan-designated validation-free task must complete, got: {deliverable}"
+        );
+        assert!(!deliverable.contains("FAILED"), "got: {deliverable}");
+        assert!(
+            !deliverable.contains("Validation was not performed"),
+            "the verdict-gap wording must not appear, got: {deliverable}"
+        );
+        assert!(
+            !deliverable.contains("not validated"),
+            "the deliverable must not be reported as unvalidated, got: {deliverable}"
+        );
+
+        // The plan line checks off like any approved deliverable.
+        assert!(
+            plan
+                .check_plan_on_deliverable(None, Some("t-902"), &deliverable)
+                .expect("plan check is not an IO error"),
+            "a skipped-validation deliverable must check its plan line off"
+        );
+        let plan_text = std::fs::read_to_string(plan.plan_path()).expect("plan file");
+        assert!(
+            plan_text.contains("- [x] [t-902]"),
+            "plan line must be checked off, got: {plan_text}"
+        );
+
+        // The exemption is announced once on the status channel, naming the worker
+        // tag and the reason read off disk — and the worker label is honest: nothing
+        // approved the deliverable, nothing rejected it.
+        let mut statuses = Vec::new();
+        while let Ok(line) = status_rx.try_recv() {
+            statuses.push(line);
+        }
+        assert!(
+            statuses.iter().any(|line| line == "[Validator] SKIPPED by design for coder-t-902: Planner-designated: no validation required (research/documentation task)"),
+            "the exemption must be announced verbatim on the status channel, got: {statuses:?}"
+        );
+        let state = marmennill::orchestrator::workers::worker_state_snapshot("coder-t-902")
+            .expect("the worker entry survives its run in the completed ring");
+        assert_eq!(
+            state.info.status,
+            "Completed (validation skipped by design)",
+            "the worker must report the skipped-validation completion label"
         );
     })
     .await;
@@ -953,4 +1125,308 @@ async fn test_scoped_runs_never_read_or_write_the_repository_marmel_prompts() {
         before, after,
         "the repository's .marmel/prompts/ must be untouched (name/size/mtime snapshot)"
     );
+}
+
+/// A **reversed** directive spelling on the plan line — `(researcher) (no-validate)`
+/// — is not a directive, so the write side authors the auditor brief exactly as for
+/// any other line, and a live run under that plan is validated normally: the
+/// validator is engaged once, no `-validation-skip.md` record exists, and the plan
+/// line checks off with the mistyped token still on it. A syntax error must be safe,
+/// never a silent way to switch validation off.
+#[tokio::test]
+async fn test_a_reversed_directive_order_still_engages_the_validator() {
+    let _guard = TEST_BUS_MUTEX.lock().await;
+
+    let tmp = tempfile::tempdir().expect("isolated temporary workspace root");
+    let root = tmp.path().to_path_buf();
+    let prompts = root.join(".marmel").join("prompts");
+    std::fs::create_dir_all(&prompts).expect("scoped prompts dir");
+
+    let plan_line = "- [ ] [t-904] Audit the vendor API (researcher) (no-validate)";
+    let plan_markdown = format!("# Execution Plan\n\n### Phase 1: Research\n{plan_line}\n");
+    std::fs::write(
+        root.join(".marmel").join("execution_plan.md"),
+        &plan_markdown,
+    )
+    .expect("plan file");
+    let plan = marmennill::manager::Plan::at(root.join(".marmel"));
+
+    marmennill::harness::with_workspace_root(root.clone(), async move {
+        // The plan side runs for real, so the record layout below is what the
+        // planner path actually leaves for this line.
+        marmennill::agents::PromptBuilder::pregenerate_for_plan_offline(
+            &plan_markdown,
+            &marmennill::agents::Catalog::new(),
+            &prompts,
+        );
+        assert!(
+            prompts.join("t-904-validation.md").exists(),
+            "an inert `(no-validate)` placement keeps validation on"
+        );
+        assert!(
+            !prompts.join("t-904-validation-skip.md").exists(),
+            "and leaves no skip record behind"
+        );
+
+        let validator_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let vc = validator_calls.clone();
+        let turns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tc = turns.clone();
+        let validator_bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let vb = validator_bodies.clone();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(move |req: &Request| {
+                let body = String::from_utf8_lossy(&req.body).to_string();
+                if body.contains(marmennill::tool_names::TOOL_LEAVE_VERDICT)
+                    || body.contains("Specialist Deliverable")
+                {
+                    vc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    vb.lock().expect("capture lock").push(body.clone());
+                    let args = serde_json::json!({
+                        "verdict": "APPROVED",
+                        "comments": "The audit note matches the vendor API."
+                    })
+                    .to_string();
+                    return ResponseTemplate::new(200).set_body_string(tool_call_sse(
+                        "call_verdict_1",
+                        marmennill::tool_names::TOOL_LEAVE_VERDICT,
+                        &args,
+                    ));
+                }
+                if tc.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    let args = serde_json::json!({
+                        "path": "reversed-directive-audit.md",
+                        "content": "written by the specialist"
+                    })
+                    .to_string();
+                    return ResponseTemplate::new(200).set_body_string(tool_call_sse(
+                        "call_write_1",
+                        marmennill::tool_names::TOOL_WRITE_FILE,
+                        &args,
+                    ));
+                }
+                ResponseTemplate::new(200)
+                    .set_body_string(text_sse("Findings recorded.\n\nMISSION COMPLETE (t-904)"))
+            })
+            .mount(&server)
+            .await;
+
+        let client = marmennill::llm::ChatClient::new(format!("{}/v1", server.uri()), "test-model");
+        let req = marmennill::agents::DelegationRequest {
+            agent_name: marmennill::agents::Agent::Coder,
+            prompt: "Audit the vendor API; the plan line mistyped its directive".to_string(),
+            snippets: vec![],
+            task_id: Some("t-904".to_string()),
+            image_urls: None,
+            audio_urls: None,
+            recursion_granted: false,
+        };
+        let ctx = marmennill::agents::IsolatedContext::from_request(
+            "You are the Coder.".to_string(),
+            &req,
+        );
+        let cfg = marmennill::config::Config {
+            backend_url: format!("{}/v1", server.uri()),
+            model: "test-model".to_string(),
+            ..Default::default()
+        };
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let deliverable = marmennill::agents::run_specialist_live(
+            &client,
+            marmennill::agents::Agent::Coder,
+            &ctx,
+            &cfg,
+            &token,
+        )
+        .await
+        .expect("an inert directive is a normally validated run");
+
+        assert_eq!(
+            turns.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the specialist serves its own two turns"
+        );
+        assert_eq!(
+            validator_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the mistyped line must still be validated"
+        );
+        let bodies = validator_bodies.lock().expect("capture lock").clone();
+        assert!(
+            bodies[0].contains("Independent Quality Verification for t-904"),
+            "the validator is driven by the brief the plan side authored"
+        );
+        assert!(
+            deliverable.contains("MISSION COMPLETE (t-904)"),
+            "an approved run completes, got: {deliverable}"
+        );
+        assert!(
+            !deliverable.contains("Validation was not performed"),
+            "no verdict gap may be reported for an authored brief, got: {deliverable}"
+        );
+
+        assert!(
+            plan.check_plan_on_deliverable(None, Some("t-904"), &deliverable)
+                .expect("plan check is not an IO error"),
+            "a validated deliverable checks its plan line off"
+        );
+        let plan_text = std::fs::read_to_string(plan.plan_path()).expect("plan file");
+        assert!(
+            plan_text.contains("- [x] [t-904] Audit the vendor API (researcher) (no-validate)"),
+            "only the checkbox moves; the mistyped token stays on the line:\n{plan_text}"
+        );
+    })
+    .await;
+}
+
+/// A reserved-looking token that sits **inside** the description is prose, so the
+/// brief is authored and its wording is handed to the auditor verbatim. The pin is
+/// twofold: validation stays on, and the token never reaches the validator as a
+/// directive — it reaches it as the description text of the task being audited.
+#[tokio::test]
+async fn test_a_directive_token_inside_the_description_reaches_the_auditor_as_prose() {
+    let _guard = TEST_BUS_MUTEX.lock().await;
+
+    let tmp = tempfile::tempdir().expect("isolated temporary workspace root");
+    let root = tmp.path().to_path_buf();
+    let prompts = root.join(".marmel").join("prompts");
+    std::fs::create_dir_all(&prompts).expect("scoped prompts dir");
+
+    let plan_line = "- [ ] [t-905] Ship (no-validate) the parser (coder)";
+    let plan_markdown = format!("# Execution Plan\n\n### Phase 1: Implementation\n{plan_line}\n");
+    std::fs::write(
+        root.join(".marmel").join("execution_plan.md"),
+        &plan_markdown,
+    )
+    .expect("plan file");
+    let plan = marmennill::manager::Plan::at(root.join(".marmel"));
+
+    marmennill::harness::with_workspace_root(root.clone(), async move {
+        marmennill::agents::PromptBuilder::pregenerate_for_plan_offline(
+            &plan_markdown,
+            &marmennill::agents::Catalog::new(),
+            &prompts,
+        );
+        assert!(
+            prompts.join("t-905-validation.md").exists(),
+            "a mid-description token is prose and cannot disable validation"
+        );
+        assert!(
+            !prompts.join("t-905-validation-skip.md").exists(),
+            "no skip record may be written from prose wording"
+        );
+
+        let validator_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let vc = validator_calls.clone();
+        let turns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tc = turns.clone();
+        let validator_bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let vb = validator_bodies.clone();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(move |req: &Request| {
+                let body = String::from_utf8_lossy(&req.body).to_string();
+                if body.contains(marmennill::tool_names::TOOL_LEAVE_VERDICT)
+                    || body.contains("Specialist Deliverable")
+                {
+                    vc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    vb.lock().expect("capture lock").push(body.clone());
+                    let args = serde_json::json!({
+                        "verdict": "APPROVED",
+                        "comments": "The parser is shipped behind a flag."
+                    })
+                    .to_string();
+                    return ResponseTemplate::new(200).set_body_string(tool_call_sse(
+                        "call_verdict_1",
+                        marmennill::tool_names::TOOL_LEAVE_VERDICT,
+                        &args,
+                    ));
+                }
+                if tc.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    let args = serde_json::json!({
+                        "path": "mid-description-prose.txt",
+                        "content": "written by the specialist"
+                    })
+                    .to_string();
+                    return ResponseTemplate::new(200).set_body_string(tool_call_sse(
+                        "call_write_1",
+                        marmennill::tool_names::TOOL_WRITE_FILE,
+                        &args,
+                    ));
+                }
+                ResponseTemplate::new(200)
+                    .set_body_string(text_sse("Work delivered.\n\nMISSION COMPLETE (t-905)"))
+            })
+            .mount(&server)
+            .await;
+
+        let client = marmennill::llm::ChatClient::new(format!("{}/v1", server.uri()), "test-model");
+        let req = marmennill::agents::DelegationRequest {
+            agent_name: marmennill::agents::Agent::Coder,
+            prompt: "Ship (no-validate) the parser".to_string(),
+            snippets: vec![],
+            task_id: Some("t-905".to_string()),
+            image_urls: None,
+            audio_urls: None,
+            recursion_granted: false,
+        };
+        let ctx = marmennill::agents::IsolatedContext::from_request(
+            "You are the Coder.".to_string(),
+            &req,
+        );
+        let cfg = marmennill::config::Config {
+            backend_url: format!("{}/v1", server.uri()),
+            model: "test-model".to_string(),
+            ..Default::default()
+        };
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let deliverable = marmennill::agents::run_specialist_live(
+            &client,
+            marmennill::agents::Agent::Coder,
+            &ctx,
+            &cfg,
+            &token,
+        )
+        .await
+        .expect("a prose token is not a directive: the run is validated");
+
+        assert_eq!(
+            turns.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the specialist serves its own two turns"
+        );
+        assert_eq!(
+            validator_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the prose spelling must leave validation on"
+        );
+        let bodies = validator_bodies.lock().expect("capture lock").clone();
+        assert!(
+            bodies[0].contains("Ship (no-validate) the parser"),
+            "the description reaches the auditor verbatim, as prose"
+        );
+        assert!(
+            deliverable.contains("MISSION COMPLETE (t-905)"),
+            "an approved run completes, got: {deliverable}"
+        );
+
+        assert!(
+            plan.check_plan_on_deliverable(None, Some("t-905"), &deliverable)
+                .expect("plan check is not an IO error"),
+            "a validated deliverable checks its plan line off"
+        );
+        let plan_text = std::fs::read_to_string(plan.plan_path()).expect("plan file");
+        assert!(
+            plan_text.contains("- [x] [t-905] Ship (no-validate) the parser (coder)"),
+            "the plan line keeps its prose token through the check-off:\n{plan_text}"
+        );
+    })
+    .await;
 }

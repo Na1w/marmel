@@ -38,6 +38,133 @@ impl ValidationOutcome {
     }
 }
 
+// ── The one validation-brief probe ────────────────────────────
+
+/// The state of a task's on-disk validation brief (`{tid}-validation.md`).
+///
+/// This is the **single** classification of brief state on the read side, shared
+/// by the three sites that may treat a `{tid}-validation-skip.md` record as
+/// approval — [`crate::agents::runner::execution`], [`run_automated_validation`]
+/// and [`crate::agents::runner::fix_loop`] — so the rule cannot drift between
+/// them again. The rule is [`ValidationBrief::is_absent`]: a durable skip record
+/// explains a brief that was **never written**
+/// ([`std::io::ErrorKind::NotFound`]) and nothing else. A brief that was written
+/// and came back blank records no verdict, an unreadable brief records no
+/// verdict, and neither is ever rescued by a record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationBrief {
+    /// The task id was refused by the grammar authority
+    /// ([`crate::task_id::validate_task_id`]): nothing was read and no path was
+    /// joined.
+    InvalidTaskId {
+        /// Why the id was refused, surfaced verbatim in the verdict-gap reason.
+        error: crate::task_id::TaskIdError,
+    },
+    /// The brief was **never written** (`NotFound`) — the only brief state a
+    /// durable no-validation record can explain.
+    Absent {
+        /// The path the probe looked at, so reasons name a real file.
+        path: std::path::PathBuf,
+    },
+    /// The brief exists but is blank: it records no verdict, and it is not a
+    /// brief that was never written.
+    Blank {
+        /// The path the probe read.
+        path: std::path::PathBuf,
+    },
+    /// The brief exists but could not be read: its verdict is unreadable.
+    Unreadable {
+        /// The path the probe tried to read.
+        path: std::path::PathBuf,
+        /// Read failure, surfaced verbatim in the verdict-gap reason.
+        error: String,
+    },
+    /// The brief exists, is readable and non-blank: the recorded verdict brief.
+    Present {
+        /// The path the probe read.
+        path: std::path::PathBuf,
+        /// Verbatim brief content.
+        text: String,
+    },
+}
+
+impl ValidationBrief {
+    /// The brief path the probe resolved, or `None` when the task id was refused
+    /// before anything was joined onto the prompts directory.
+    pub fn path(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::InvalidTaskId { .. } => None,
+            Self::Absent { path }
+            | Self::Blank { path }
+            | Self::Unreadable { path, .. }
+            | Self::Present { path, .. } => Some(path),
+        }
+    }
+
+    /// The one spelling of the gate a no-validation record must pass before it
+    /// may excuse a missing verdict: the brief has to be genuinely **absent**
+    /// (`NotFound`). Blank, unreadable, present and refused-id briefs all answer
+    /// `false`, so a corrupt or half-written brief is never talked out of its
+    /// fail-closed verdict gap.
+    #[must_use]
+    pub fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent { .. })
+    }
+}
+
+/// `<workspace root>/.marmel/prompts` — the one spelling of the prompts
+/// directory, shared by the read side and by the write side.
+#[must_use]
+pub fn validation_prompts_dir() -> std::path::PathBuf {
+    crate::harness::get_workspace_root()
+        .join(crate::manager::phase::MARMEL_DIR)
+        .join("prompts")
+}
+
+/// Probe the validation brief of `raw_task_id` inside `prompts_dir`.
+///
+/// The id goes through [`crate::task_id::normalize_task_id_ref`] and then
+/// [`crate::task_id::validate_task_id`] **before** it is joined onto
+/// `prompts_dir`, so `../x` or `a/b` can never reach a file outside that
+/// directory; a refused id is [`ValidationBrief::InvalidTaskId`], never a
+/// repaired or clamped name. Read failures are told apart exactly once —
+/// `NotFound` vs. unreadable vs. blank — so no read site has to restate those
+/// arms (and no read site may widen the [`ValidationBrief::is_absent`] gate).
+#[must_use]
+pub fn probe_validation_brief(prompts_dir: &std::path::Path, raw_task_id: &str) -> ValidationBrief {
+    let normalized = crate::task_id::normalize_task_id_ref(raw_task_id);
+    let id = match crate::task_id::validate_task_id(normalized) {
+        Ok(id) => id,
+        Err(error) => return ValidationBrief::InvalidTaskId { error },
+    };
+    let path = prompts_dir.join(format!("{id}-validation.md"));
+    match std::fs::read_to_string(&path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => ValidationBrief::Absent { path },
+        Err(err) => ValidationBrief::Unreadable {
+            path,
+            error: err.to_string(),
+        },
+        Ok(text) if text.trim().is_empty() => ValidationBrief::Blank { path },
+        Ok(text) => ValidationBrief::Present { path, text },
+    }
+}
+
+/// [`probe_validation_brief`] for read sites that do not already hold the prompts
+/// directory: resolves [`validation_prompts_dir`] and probes there.
+#[must_use]
+pub fn probe_validation_brief_for_task(raw_task_id: &str) -> ValidationBrief {
+    probe_validation_brief(&validation_prompts_dir(), raw_task_id)
+}
+
+/// `true` when the validation brief for `raw_task_id` was genuinely never written
+/// (`NotFound`) — the one state a durable `{tid}-validation-skip.md` record can
+/// explain. A blank or unreadable brief answers `false`, so the answer never
+/// rescues a brief that records no verdict.
+#[must_use]
+pub fn validation_brief_absent(raw_task_id: &str) -> bool {
+    probe_validation_brief_for_task(raw_task_id).is_absent()
+}
+
 /// `true` when a tool name refers to the verdict tool (`leave_verdict`).
 ///
 /// This module owns no verdict vocabulary: the matcher is a thin wrapper over
@@ -193,46 +320,56 @@ async fn run_automated_validation_inner(
     token: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<(bool, String)> {
     // `{tid}-validation.md` is an on-disk path derived from a task id, so the id
-    // is validated as a single path segment before any join. A rejected id is
-    // recorded as a hard verdict gap — the same fail-closed outcome as a
-    // missing, unreadable or blank verdict file — and the id is never sanitized,
-    // trimmed or clamped into some other file name.
-    let validation_verdict_file = match task_id {
-        Some(raw) => {
-            let normalized = crate::task_id::normalize_task_id_ref(raw);
-            match crate::task_id::validate_task_id(normalized) {
-                Ok(id) => Some(format!("{id}-validation.md")),
-                Err(err) => {
-                    let reason = format!(
-                        "Rejected task id {raw:?}: {err}. No `-validation.md` verdict file could be located for this task, so the deliverable was not validated.",
-                    );
-                    tracing::error!("{reason}");
-                    return Ok((false, reason));
-                }
-            }
-        }
-        None => None,
+    // goes through the shared brief probe, which validates it as a single path
+    // segment before any join. A rejected id is recorded as a hard verdict gap —
+    // the same fail-closed outcome as a missing, unreadable or blank verdict
+    // file — and the id is never sanitized, trimmed or clamped into some other
+    // file name.
+    let prompts_dir = validation_prompts_dir();
+    let brief = task_id.map(|raw| probe_validation_brief(&prompts_dir, raw));
+    if let (Some(raw), Some(ValidationBrief::InvalidTaskId { error })) = (task_id, brief.as_ref()) {
+        let reason = format!(
+            "Rejected task id {raw:?}: {error}. No `-validation.md` verdict file could be located for this task, so the deliverable was not validated.",
+        );
+        tracing::error!("{reason}");
+        return Ok((false, reason));
+    }
+    let custom_validation_prompt = match brief.as_ref() {
+        Some(ValidationBrief::Present { text, .. }) => Some(text.clone()),
+        _ => None,
     };
-    let custom_validation_prompt = validation_verdict_file.as_deref().and_then(|name| {
-        let path = crate::harness::get_workspace_root()
-            .join(crate::manager::phase::MARMEL_DIR)
-            .join("prompts")
-            .join(name);
-        // A blank verdict file records no verdict: treat it exactly like an
-        // absent one instead of auditing against an empty brief.
-        std::fs::read_to_string(&path)
-            .ok()
-            .filter(|text| !text.trim().is_empty())
-    });
+    // A `{tid}-validation-skip.md` record explains a brief that was **never
+    // written** (`NotFound`) and nothing else — the same `NotFound`-only rule the
+    // read side applies in `runner/execution.rs`. The gate is the shared probe's
+    // [`ValidationBrief::is_absent`], spelled once, so a present-but-blank or
+    // unreadable `-validation.md` can never be rescued by a skip record: it keeps
+    // the fail-closed "no verdict recorded ⇒ not validated" collapse below.
+    let validation_skip_reason = if brief.as_ref().is_some_and(ValidationBrief::is_absent) {
+        crate::agents::PromptBuilder::validation_skip_record_for_task(task_id)
+    } else {
+        None
+    };
 
     let default_role_prompt = crate::agents::validator::role_prompt_for(agent);
     let validator_prompt = match custom_validation_prompt.as_deref() {
         Some(prompt) => prompt,
         None => {
-            let prompts_dir = crate::harness::get_workspace_root()
-                .join(crate::manager::phase::MARMEL_DIR)
-                .join("prompts");
             if prompts_dir.is_dir() {
+                // Never-meant-to-be-validated guard: the plan side records a
+                // validation-free decision durably
+                // (`{tid}-validation-skip.md` beside the prompts), so the absent
+                // verdict file is not a lost verdict. Such a task must never
+                // reach the "no verdict recorded ⇒ not validated" collapse below —
+                // the pass ends not-rejected with the recorded reason, without a
+                // validator backend ever being contacted. `validation_skip_reason`
+                // can only come from the `Absent` (i.e. `NotFound`) arm of the
+                // shared brief probe above, so a blank or unreadable verdict file
+                // falls through to the collapse.
+                if let Some(reason) = validation_skip_reason.as_deref() {
+                    let note = format!("Validation skipped by design: {reason}");
+                    tracing::info!("{note}");
+                    return Ok((true, note));
+                }
                 // Fail closed: the prompts directory exists, yet this task has
                 // no readable, non-empty `{tid}-validation.md` verdict file.
                 // Absence of a recorded verdict is not an approval, so this arm
@@ -241,9 +378,12 @@ async fn run_automated_validation_inner(
                 // arm above) behaves as documented, and a workspace without a
                 // prompts directory falls back to the generic validator role
                 // prompt.
-                let verdict_ref = validation_verdict_file
-                    .as_deref()
-                    .unwrap_or("<task-id>-validation.md");
+                let verdict_ref = brief
+                    .as_ref()
+                    .and_then(ValidationBrief::path)
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "<task-id>-validation.md".to_string());
                 let reason = format!(
                     "No validation verdict recorded for {} under {}: the deliverable was not validated.",
                     verdict_ref,
@@ -479,7 +619,7 @@ async fn run_plan_validation_inner(
          Instructions:\n\
          1. Inspect the workspace and examine files using available inspection tools (`read_file`, `grep_search`, `glob`) if needed to evaluate feasibility and existing structure.\n\
          2. You are an auditor: you cannot execute shell commands or modify files. Solely analyze, inspect, and evaluate the proposed plan.\n\
-         3. Audit the plan against dynamic criteria: proper format (# Execution Plan, `- [ ] [t-xxx]`), phase headers, atomic task granularity (no monolithic catch-all tasks), and contextual testing/verification (unit/integration tests ONLY when relevant to the project scope and deliverable — do not demand tests for docs, scripts, or simple configs).\n\
+         3. Audit the plan against dynamic criteria: proper format (# Execution Plan, `- [ ] [t-xxx]`, optionally carrying a `(validate)` / `(no-validate)` directive immediately before the `(role)` hint — that directive is honoured downstream and its presence or absence is never itself a rejection reason), phase headers, atomic task granularity (no monolithic catch-all tasks), and contextual testing/verification (unit/integration tests ONLY when relevant to the project scope and deliverable — do not demand tests for docs, scripts, or simple configs).\n\
          4. When your verification is complete, you MUST call the `leave_verdict` tool with `verdict` ('APPROVED' or 'REJECTED') and detailed `comments`.\n\
          5. If rejected, provide clear, actionable critique explaining what must be decomposed or fixed so the Manager can revise the plan.",
         plan_markdown
@@ -1032,6 +1172,117 @@ mod tests {
             "a blank verdict file must not be approved: {blank_reason}"
         );
         assert!(blank_reason.contains("No validation verdict recorded"));
+    }
+
+    /// A task the plan designated validation-free carries a durable
+    /// `{tid}-validation-skip.md` record next to the prompts. The absent
+    /// `{tid}-validation.md` is then a deliberate omission, never the
+    /// "no verdict recorded ⇒ not validated" collapse, and no validator backend
+    /// is contacted.
+    #[tokio::test]
+    async fn plan_designated_skip_record_is_not_a_rejection() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prompts = tmp
+            .path()
+            .join(crate::manager::phase::MARMEL_DIR)
+            .join("prompts");
+        std::fs::create_dir_all(&prompts).expect("prompts dir");
+        std::fs::write(
+            prompts.join("t-903-validation-skip.md"),
+            format!(
+                "{}\n",
+                crate::agents::prompt_builder::VALIDATION_SKIP_REASON
+            ),
+        )
+        .expect("skip record");
+
+        let (approved, reason) = verdict_for(tmp.path(), "t-903").await;
+
+        assert!(
+            approved,
+            "a validation-free task must not be reported as rejected: {reason}"
+        );
+        assert!(
+            reason.contains("Validation skipped by design"),
+            "reason must name the skip decision: {reason}"
+        );
+        assert!(
+            !reason.contains("not validated"),
+            "the skip record must never surface the not-validated collapse: {reason}"
+        );
+    }
+
+    /// The exemption is the **record**, not a guess: a blank skip record carries
+    /// no decision and keeps the fail-closed verdict gap intact.
+    #[tokio::test]
+    async fn blank_skip_record_keeps_the_fail_closed_verdict_gap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prompts = tmp
+            .path()
+            .join(crate::manager::phase::MARMEL_DIR)
+            .join("prompts");
+        std::fs::create_dir_all(&prompts).expect("prompts dir");
+        std::fs::write(prompts.join("t-904-validation-skip.md"), "  \n\t\n")
+            .expect("blank skip record");
+
+        let (approved, reason) = verdict_for(tmp.path(), "t-904").await;
+
+        assert!(
+            !approved,
+            "a blank skip record must not exempt the verdict check"
+        );
+        assert!(reason.contains("No validation verdict recorded"));
+    }
+
+    /// The skip record explains a verdict brief that was **never written**, never
+    /// one that exists but records nothing. `runner/execution.rs` consults the
+    /// record only in its `NotFound` arm, so this collapse site must not be wider:
+    /// a blank or unreadable `{tid}-validation.md` sitting next to a perfectly
+    /// valid `{tid}-validation-skip.md` keeps the fail-closed verdict gap and is
+    /// never reported as "Validation skipped by design".
+    #[tokio::test]
+    async fn blank_or_unreadable_verdict_file_is_not_rescued_by_a_skip_record() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prompts = tmp
+            .path()
+            .join(crate::manager::phase::MARMEL_DIR)
+            .join("prompts");
+        std::fs::create_dir_all(&prompts).expect("prompts dir");
+        let reason_body = format!(
+            "{}\n",
+            crate::agents::prompt_builder::VALIDATION_SKIP_REASON
+        );
+        std::fs::write(prompts.join("t-905-validation.md"), "   \n\t\n \n")
+            .expect("blank verdict file");
+        std::fs::write(prompts.join("t-905-validation-skip.md"), &reason_body)
+            .expect("skip record");
+        std::fs::write(
+            prompts.join("t-906-validation.md"),
+            [0xFFu8, 0xFE, 0x00, 0x80],
+        )
+        .expect("unreadable verdict file");
+        std::fs::write(prompts.join("t-906-validation-skip.md"), &reason_body)
+            .expect("skip record");
+
+        for (id, label) in [("t-905", "blank"), ("t-906", "unreadable")] {
+            let (approved, reason) = verdict_for(tmp.path(), id).await;
+            assert!(
+                !approved,
+                "a {label} verdict file must not be approved even with a skip record: {reason}"
+            );
+            assert!(
+                reason.contains("No validation verdict recorded"),
+                "a {label} verdict file must keep the fail-closed gap wording: {reason}"
+            );
+            assert!(
+                reason.contains("not validated"),
+                "a {label} verdict file must report the deliverable as not validated: {reason}"
+            );
+            assert!(
+                !reason.contains("Validation skipped by design"),
+                "a {label} verdict file must never be rescued by a skip record: {reason}"
+            );
+        }
     }
 
     /// Drive the validation entry point for one task id inside `root`. The
