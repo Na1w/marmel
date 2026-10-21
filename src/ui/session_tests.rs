@@ -660,6 +660,35 @@ fn test_is_reset_command_matches_aliases() {
     assert!(!is_reset_command("hello world"));
 }
 
+/// The shapes a paste + one Enter hand to the session loop's steering branch
+/// (`run_session` -> `renderer.poll_input()` -> `is_abort_command` /
+/// `is_reset_command`): a multi-line block is delivered verbatim as ONE
+/// instruction, and only a padded single line is still a command.
+#[test]
+fn test_multi_line_pasted_steer_is_never_a_reset_or_abort_command() {
+    // A pasted snippet that merely starts with a command word: verbatim text.
+    for pasted in [
+        "/reset\nnästa rad",
+        "/reset\n- [ ] [t-1] keep the plan",
+        "stop\nplease stop",
+        "/abort\nmen fortsätt",
+    ] {
+        assert!(
+            !is_reset_command(pasted),
+            "multi-line submission must not reset: {pasted:?}"
+        );
+        assert!(
+            !is_abort_command(pasted),
+            "multi-line submission must not abort: {pasted:?}"
+        );
+    }
+
+    // A pasted command line still works: its trailing newline is padding, not a
+    // second line (`paste_text` strips exactly one trailing newline).
+    assert!(is_reset_command("/reset\n"));
+    assert!(is_abort_command("/abort\n"));
+}
+
 #[test]
 fn test_handle_reset_command_clears_plan_and_notifies() {
     let tmp = tempfile::tempdir().expect("tempdir");

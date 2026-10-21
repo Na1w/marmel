@@ -164,7 +164,29 @@ pub fn chunk_utf8(s: &str, max: usize) -> Vec<&str> {
     chunks
 }
 
+/// True when a submitted input buffer is **single-line**, i.e. it still carries no
+/// line break after surrounding whitespace is dropped.
+///
+/// Command interpretation is deliberately restricted to single-line submissions: a
+/// submitted block that spans more than one line (what a pasted snippet or a
+/// multi-paragraph note produces, once the composer re-joins its editor lines with
+/// `\n`) is always delivered verbatim as **one** user message / **one** steering
+/// instruction, never parsed as a command — even when its first line happens to be
+/// `/reset`, `/abort` or the bare word `stop`. A trailing newline coming from a
+/// pasted command line is only padding, so `"/reset\n"` keeps working: the test
+/// looks at what is left after trimming, which is exactly the "content on more than
+/// one line" case.
+fn submission_is_single_line(line: &str) -> bool {
+    let t = line.trim();
+    !t.contains('\n') && !t.contains('\r')
+}
+
+/// Whole-string command test — see [`submission_is_single_line`] for why a
+/// multi-line submission is never a command.
 pub(crate) fn is_abort_command(line: &str) -> bool {
+    if !submission_is_single_line(line) {
+        return false;
+    }
     let t = line.trim();
     t.eq_ignore_ascii_case("/abort")
         || t.eq_ignore_ascii_case("abort")
@@ -181,7 +203,12 @@ pub(crate) fn is_abort_command(line: &str) -> bool {
         || t.eq_ignore_ascii_case("cancel")
 }
 
+/// Whole-string command test — see [`submission_is_single_line`] for why a
+/// multi-line submission is never a command.
 pub(crate) fn is_reset_command(line: &str) -> bool {
+    if !submission_is_single_line(line) {
+        return false;
+    }
     let t = line.trim();
     t.eq_ignore_ascii_case("/reset")
         || t.eq_ignore_ascii_case("/reset_plan")
@@ -957,6 +984,68 @@ mod tests {
         assert!(is_abort_command("cancel"));
         assert!(!is_abort_command("continue"));
         assert!(!is_abort_command("status"));
+    }
+
+    /// Command interpretation is restricted to **single-line** submissions: a
+    /// submitted block that spans more than one line — what a pasted snippet
+    /// produces, delivered as ONE steering message — is never parsed as a command,
+    /// even when its first line is the command word.
+    #[test]
+    fn test_is_abort_command_rejects_multi_line_submissions() {
+        // Single-line variants keep working, padding included.
+        assert!(is_abort_command("  STOP  "));
+        assert!(is_abort_command("/abort\n"));
+        // Multi-line submissions are ordinary text, never an abort.
+        assert!(!is_abort_command("stop\nplease stop"));
+        assert!(!is_abort_command("/abort\nmen fortsätt"));
+        assert!(!is_abort_command("please stop\nnow"));
+        assert!(!is_abort_command("stop\r\nnow"));
+        assert!(!is_abort_command("/abort\n\n/abort"));
+    }
+
+    /// Same single-line gate for the reset aliases: the first line of a pasted
+    /// block must not be able to wipe the execution plan.
+    #[test]
+    fn test_is_reset_command_rejects_multi_line_submissions() {
+        assert!(is_reset_command("/reset"));
+        assert!(is_reset_command("  /RESET  \n"));
+        assert!(!is_reset_command("/reset\nnästa rad"));
+        assert!(!is_reset_command("/reset\n/reset"));
+        assert!(!is_reset_command("reset the plan\n/reset"));
+        assert!(!is_reset_command("/reset_plan\r\nkeep the plan"));
+    }
+
+    /// The gate itself: trailing/leading newlines are padding, a line break
+    /// **between content** is what makes a submission multi-line.
+    #[test]
+    fn test_submission_is_single_line_separates_padding_from_a_second_line() {
+        for single in [
+            "",
+            "   ",
+            "/reset",
+            "  /RESET  \n",
+            "/abort\n",
+            "/abort\r\n",
+            "en rad",
+            "\n/reset\n",
+        ] {
+            assert!(
+                submission_is_single_line(single),
+                "{single:?} is single-line"
+            );
+        }
+        for multi in [
+            "/reset\nnästa rad",
+            "stop\nplease stop",
+            "a\r\nb",
+            "x\ny\nz",
+            "\n\n/reset\n\nmen mer\n",
+        ] {
+            assert!(
+                !submission_is_single_line(multi),
+                "{multi:?} spans more than one line"
+            );
+        }
     }
 
     #[test]

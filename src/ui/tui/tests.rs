@@ -3593,6 +3593,214 @@ fn test_submit_multiline_input() {
     assert_eq!(r.textarea.lines(), &[""]);
 }
 
+// ============================================================================
+// Bracketed paste — one pasted block must become ONE composer buffer and ONE
+// submitted message, never one steering command per line. `init()` turns on
+// SGR mode 2004 so the terminal hands the whole body over as a single
+// `Event::Paste`, whose arm calls `paste_text()` (which never calls `submit()`);
+// Enter remains the only submit trigger.
+// ============================================================================
+
+/// Drain every string the composer has handed to the session loop so far, so a
+/// test can assert on "exactly one submission" instead of "at least one".
+fn drain_submissions(r: &mut TuiRenderer) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Ok(line) = r.rx.try_recv() {
+        out.push(line);
+    }
+    out
+}
+
+#[test]
+fn test_paste_text_inserts_multiline_block_as_one_buffer_without_submitting() {
+    let block = "rad ett\nrad två\nrad tre";
+    let mut r = TuiRenderer::new();
+    r.focused_panel = FocusedPanel::Chat;
+
+    r.paste_text(block);
+
+    // The whole block lands in the composer verbatim ...
+    assert_eq!(r.input_text, block);
+    // ... as ONE entry: a single widget whose editor lines were spliced in by one
+    // `insert_str`, re-joined into exactly the buffer Enter would submit.
+    assert_eq!(r.textarea.lines(), &["rad ett", "rad två", "rad tre"]);
+    assert_eq!(r.textarea.lines().join("\n"), r.input_text);
+    // The paste repaints the composer instead of sending anything.
+    assert!(r.dirty, "a paste must mark the composer dirty");
+
+    // Nothing was submitted: the mpsc channel is still empty ...
+    assert!(
+        matches!(r.rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+        "a paste must never submit on its own"
+    );
+    // ... and the seam the session loop steers on reports no input. `dirty` is
+    // cleared first so the poll has nothing to repaint.
+    r.dirty = false;
+    assert_eq!(r.poll_input(), None);
+
+    // Still draft input: no `User:` echo in chat, no input-history entry.
+    assert!(r.history.is_empty());
+    assert!(!r.messages.iter().any(|m| m.starts_with("User:")));
+}
+
+#[test]
+fn test_paste_text_normalises_line_endings_and_strips_one_trailing_newline() {
+    let cases: &[(&str, &str)] = &[
+        // CRLF (Windows / many terminals) and a terminal-appended final CR
+        ("a\r\nb\r\n", "a\nb"),
+        // lone CR (classic Mac / some terminals)
+        ("x\ry\r", "x\ny"),
+        // mixed
+        ("b1\nb2\r\nb3\r", "b1\nb2\nb3"),
+        // plain LF
+        ("rad ett\nrad två\n", "rad ett\nrad två"),
+        // only ONE trailing newline is padding: an inner blank line is content
+        ("a\nb\n\n", "a\nb\n"),
+    ];
+
+    for (pasted, expected) in cases {
+        let mut r = TuiRenderer::new();
+        r.focused_panel = FocusedPanel::Chat;
+
+        r.paste_text(pasted);
+
+        assert_eq!(r.input_text, *expected, "paste of {pasted:?}");
+        assert_eq!(
+            r.textarea.lines().join("\n"),
+            *expected,
+            "widget/buffer drift for paste of {pasted:?}"
+        );
+        assert!(
+            drain_submissions(&mut r).is_empty(),
+            "paste of {pasted:?} must not submit a line"
+        );
+    }
+}
+
+#[test]
+fn test_paste_text_of_only_line_endings_leaves_the_buffer_untouched() {
+    for pasted in ["", "\r\n", "\n", "\r"] {
+        let mut r = TuiRenderer::new();
+        r.focused_panel = FocusedPanel::Chat;
+        r.set_input_content("befintligt innehåll");
+        let cursor_before = r.cursor;
+
+        r.paste_text(pasted);
+
+        assert_eq!(r.input_text, "befintligt innehåll", "paste of {pasted:?}");
+        assert_eq!(
+            r.textarea.lines(),
+            &["befintligt innehåll"],
+            "paste of {pasted:?}"
+        );
+        assert_eq!(
+            r.cursor, cursor_before,
+            "caret must not move for {pasted:?}"
+        );
+        assert!(
+            drain_submissions(&mut r).is_empty(),
+            "paste of {pasted:?} must not submit"
+        );
+    }
+}
+
+#[test]
+fn test_paste_then_enter_submits_the_whole_block_as_one_message() {
+    let block = "rad ett\nrad två\nrad tre";
+    let mut r = TuiRenderer::new();
+    r.focused_panel = FocusedPanel::Chat;
+
+    r.paste_text(block);
+    // Enter is the only submit trigger (`KeyCode::Enter` arm -> `submit()`), so one
+    // Enter stands for the whole pasted block.
+    r.submit();
+
+    // Exactly one submission, equal to the whole block, then nothing left.
+    // `dirty` is cleared before each poll so the throttled flush has nothing to
+    // repaint and the test stays free of real render I/O.
+    r.dirty = false;
+    assert_eq!(r.poll_input().as_deref(), Some(block));
+    r.dirty = false;
+    assert_eq!(r.poll_input(), None);
+    assert!(
+        drain_submissions(&mut r).is_empty(),
+        "a paste + one Enter must produce exactly one message, not one per line"
+    );
+
+    // One composer entry became one history entry and one chat echo.
+    assert_eq!(r.history, vec![block.to_string()]);
+    assert_eq!(
+        r.messages.last().map(String::as_str),
+        Some("User: rad ett\nrad två\nrad tre")
+    );
+    // The composer is empty again.
+    assert_eq!(r.input_text, "");
+    assert_eq!(r.textarea.lines(), &[""]);
+}
+
+#[test]
+fn test_paste_with_trailing_newline_then_enter_yields_exactly_one_submission() {
+    // Regression guard for the reported bug: terminals end a paste with a newline,
+    // so without bracketed paste every embedded CR parsed as Enter and steered one
+    // command per line. The trailing newline must not survive as a blank line and
+    // must not become extra submissions.
+    let mut r = TuiRenderer::new();
+    r.focused_panel = FocusedPanel::Chat;
+
+    r.paste_text("rad ett\nrad två\n");
+
+    assert_eq!(r.input_text, "rad ett\nrad två");
+    assert!(
+        !r.input_text.ends_with('\n'),
+        "the buffer must not end on an empty line the next Enter would swallow"
+    );
+    assert!(
+        matches!(r.rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+        "the trailing newline alone must not submit"
+    );
+
+    r.submit();
+
+    let submitted = drain_submissions(&mut r);
+    assert_eq!(submitted.len(), 1, "expected exactly one submission");
+    assert_eq!(submitted[0], "rad ett\nrad två");
+    assert_eq!(r.history, vec!["rad ett\nrad två".to_string()]);
+}
+
+#[test]
+fn test_paste_of_a_command_shaped_block_is_not_interpreted_per_line() {
+    // A pasted snippet whose FIRST line looks like a command is still delivered
+    // verbatim as one message: command predicates refuse multi-line submissions
+    // (see `submission_is_single_line`), and the composer never splits the block.
+    let block = "/reset\nnästa rad";
+    let mut r = TuiRenderer::new();
+    r.focused_panel = FocusedPanel::Chat;
+    r.plan_content = "## Active plan\n- [ ] [t-1] keep me".to_string();
+
+    r.paste_text(block);
+    assert_eq!(r.input_text, block);
+    assert!(
+        matches!(r.rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+        "the `/reset` line inside a paste must not act as a command"
+    );
+
+    r.submit();
+
+    let submitted = drain_submissions(&mut r);
+    assert_eq!(submitted, vec![block.to_string()]);
+    // No `/reset` side effects fired ...
+    assert!(
+        !r.messages
+            .iter()
+            .any(|m| m.contains("Execution plan reset"))
+    );
+    assert_eq!(r.plan_content, "## Active plan\n- [ ] [t-1] keep me");
+    assert_eq!(r.status_line, "Ready");
+    // ... and no line acted as `/abort` either.
+    assert!(!r.input_state.aborted);
+    assert!(!r.input_state.user_exit);
+}
+
 #[test]
 fn test_clean_task_id_delegates_to_task_id_normalizer() {
     // This borrowed UI seam must stay a pure delegation to `crate::task_id`:

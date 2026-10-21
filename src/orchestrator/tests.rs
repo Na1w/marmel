@@ -694,6 +694,9 @@ async fn test_orchestr_delegation_events_emitted() {
 
 #[test]
 fn test_active_specialist_context_formatting() {
+    let _workers = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let guard = register_active_worker(
         Some("t-123".to_string()),
         "coder".to_string(),
@@ -714,6 +717,9 @@ fn test_active_specialist_context_formatting() {
 
 #[test]
 fn test_active_worker_context_tokens_rebirth_reduction() {
+    let _workers = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let guard = register_active_worker(
         Some("t-456".to_string()),
         "coder".to_string(),
