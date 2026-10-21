@@ -351,10 +351,12 @@ pub(crate) fn registry_entry_for_event(
 /// The row set the pane must show, rebuilt from the worker registry.
 ///
 /// This is the projection that replaces the event-derived row list:
-/// **which rows exist** and **whether they are running** come from `WORKERS`,
-/// and nothing else. What survives from the previous vector is presentation only — streamed `thinking`/`content`,
-/// logs, clocks not yet derived from the registry, and the queue field, which is
-/// pool state and stays orthogonal to running.
+/// **which rows exist**, **whether they are running** and **which backend-slot rank a
+/// running worker is waiting at** come from `WORKERS`, and nothing else. What survives
+/// from the previous vector is presentation only — streamed `thinking`/`content`, logs,
+/// clocks not yet derived from the registry, and a queue position that the registry has
+/// not reported (which the event path may still have folded, and which a re-projection
+/// must never erase; see [`apply_registry_entry`]).
 ///
 /// Membership rules:
 /// * rows are created for the registering classes only — `Specialist`
@@ -365,6 +367,10 @@ pub(crate) fn registry_entry_for_event(
 /// * a row is closed by the registry flipping `is_active` (completion, guard
 ///   drop after a cancel, or eviction from the completed ring) — never by a
 ///   writer that decided on its own;
+/// * a row's `(Queued n/m)` label is **mirrored from the registry** for a live entry, so
+///   rebuilding a row re-derives it: this is what repairs a queue state an earlier drain
+///   dropped (fix #3, `docs/diagnose_subpane_stale_refresh.md` §3) and what keeps a
+///   queued row honest across every re-projection until the wait ends;
 /// * row order is the registry's key order, which is byte-stable across a
 ///   restore.
 ///
@@ -398,8 +404,39 @@ pub(crate) fn project_subagent_rows(subagents: &mut Vec<SubagentDetail>) -> bool
     before != subagent_row_signature(subagents)
 }
 
-/// Fold one authoritative registry entry onto a row, leaving every
-/// renderer-owned field (thinking, content, logs, selection, queue) alone.
+/// Fold one authoritative registry entry onto a row.
+///
+/// **The registry owns row existence, and the queue position is mirrored from the
+/// registry.** This fold writes what the registry is authoritative for (`name`,
+/// `task_id`, `prompt`, `is_active`, `context_tokens`, the clock and — since fix #3 —
+/// the slot rank: [`crate::orchestrator::WorkerEntry::queue_position`]), and leaves
+/// the rest of the renderer-owned fields (thinking, content, logs, selection,
+/// **paused**) exactly as the writer that produced them left it: the registry holds no
+/// arbitration handshake, so a state it never reported must never be reset by a
+/// rebuild.
+///
+/// `queue` is the field that changed hands. It used to be reachable only through the
+/// delegation-event path, which made it **unrecoverable**: `Queued` is one-shot, the
+/// session drains its vector with `events.drain(..)`, and a transition that reached the
+/// drain before this projection had opened the row was simply gone (`update_subagent_queue`
+/// never creates rows). Now the pool's rank lives on the registry entry itself, so every
+/// projection of a live worker **re-derives** the label from the registry: a dropped
+/// event self-heals on the next projection, a row that is stale for "no queue" is
+/// repaired, and a session restore gets the label back from the first report after the
+/// restore instead of needing a persisted copy. The event path stays a writer too (it is
+/// what makes the pane react within one drain), but it is no longer the only one.
+///
+/// A live entry with **no** recorded rank writes nothing here: the pool only ever
+/// reports a rank at queue entry and on a rank change, so "no rank on the entry" is not
+/// evidence that a delivered position was wrong — it can simply mean the report predates
+/// this registration. Clearing a live row's position from the registry would delete a
+/// state the pool did not retract.
+///
+/// The one place this fold may clear either field is the teardown at the end, and it
+/// fires **only** for an entry the registry closed (`!entry.is_active`): a row that
+/// stopped running can never keep a queue position or a pause behind — the queue belongs
+/// to a live delegation only, and this is the path every non-event teardown (cancel,
+/// preemption, guard drop) goes through.
 fn apply_registry_entry(row: &mut SubagentDetail, entry: &crate::orchestrator::WorkerEntry) {
     row.name = entry.key.clone();
     row.task_id = entry.task_id.clone();
@@ -429,13 +466,34 @@ fn apply_registry_entry(row: &mut SubagentDetail, entry: &crate::orchestrator::W
     if row.last_activity_at.is_none() {
         row.last_activity_at = Some(std::time::Instant::now());
     }
-    // A row that stopped running can never keep a queue position behind: the
-    // queue belongs to a live delegation only, and this is the path every
-    // non-event teardown (cancel, preemption, guard drop) goes through. The same
-    // holds for a paused stream — the pause belongs to a live stream, so a row the
-    // registry closed (completion, guard drop after a cancel, eviction) can never
-    // keep a stale `Paused` behind.
-    if !entry.is_active {
+    // The registry's own rank for a **live** worker — the durable half of the
+    // `(Queued n/m)` label, and the reason a lost `Queued` event is no longer lost: the
+    // next projection re-derives the label from the entry instead of leaving the row
+    // reading "not waiting" for the rest of the slot wait. Written for a live entry only
+    // (a closed entry goes to the teardown in the `else` branch), and only when the entry
+    // actually carries a rank: the pool reports a rank at queue entry and on a rank
+    // change, so an entry with no rank is not a retraction of a rank another writer
+    // folded — it usually means this worker is simply not waiting right now, and a
+    // retraction always arrives as `Running`, as a close, or as this entry going stale.
+    //
+    // `queue` is part of the row signature at [`subagent_row_signature`], so a rank the
+    // registry newly reports (or a stale one the teardown takes down) is reported to the
+    // host as a change instead of going out unseen.
+    if entry.is_active {
+        if let Some(queue) = entry.queue_position {
+            row.queue = Some(crate::ui::QueueState {
+                position: queue.position,
+                of: queue.of,
+            });
+        }
+    } else {
+        // The single teardown that may clear renderer-owned state, and it is gated on
+        // the registry having **closed** the row. A row that stopped running can never
+        // keep a queue position behind: the queue belongs to a live delegation only, and
+        // this is the path every non-event teardown (cancel, preemption, guard drop) goes
+        // through. The same holds for a paused stream — the pause belongs to a live
+        // stream, so a row the registry closed (completion, guard drop after a cancel,
+        // eviction) can never keep a stale `Paused` behind either.
         row.queue = None;
         row.paused = false;
     }
@@ -483,12 +541,31 @@ pub(crate) fn subagent_row_badge(
     None
 }
 
+/// One row as the pane's change detector sees it (see
+/// [`subagent_row_signature`]). Named once because the tuple is what both the
+/// projection and the tests around it have to spell.
+type RowSignature = (String, bool, bool, usize, Option<(usize, usize)>);
+
 /// What a viewer can see about the row **set**: identity, liveness, arbitration
-/// pause and ctx. Deliberately blind to clocks and streamed text, which move on
-/// their own. `paused` is part of it because the panel's label word changes with
-/// it: a row that flips to or out of a arbitration pause must be re-pushed even
-/// when nothing else about it moved.
-fn subagent_row_signature(rows: &[SubagentDetail]) -> Vec<(String, bool, bool, usize)> {
+/// pause, queue position and ctx. Deliberately blind to clocks and streamed text,
+/// which move on their own.
+///
+/// `paused` is part of it because the panel's label word changes with it: a row
+/// that flips to or out of a arbitration pause must be re-pushed even when nothing
+/// else about it moved.
+///
+/// `queue` is part of it for exactly the same reason, and its absence was a blind
+/// spot the pane could not recover from: the draw condition is
+/// `sa.queue.filter(|_| sa.is_active)` (`tui::render`), so `None -> Some(..)`, a
+/// rank move and `Some(..) -> None` are each a label change the operator sees. The
+/// queue half of the pane is pushed by the delegation-event drain (which pushes on
+/// any fold), but the **projection** path pushes only on what this tuple reports:
+/// `session::project_subagent_pane` gates its `set_subagents` on
+/// [`project_subagent_rows`]' verdict, and `project_subagent_rows` now **writes**
+/// `queue` from the registry rank a live entry carries (fix #3,
+/// `docs/diagnose_subpane_stale_refresh.md` §3). A detector blind to `queue` would
+/// swallow that write — and hide a queue state a rebuild took down.
+fn subagent_row_signature(rows: &[SubagentDetail]) -> Vec<RowSignature> {
     rows.iter()
         .map(|row| {
             (
@@ -496,6 +573,7 @@ fn subagent_row_signature(rows: &[SubagentDetail]) -> Vec<(String, bool, bool, u
                 row.is_active,
                 row.paused,
                 row.context_tokens,
+                row.queue.map(|queue| (queue.position, queue.of)),
             )
         })
         .collect()
@@ -650,14 +728,56 @@ pub(crate) fn update_subagent_queue(
     // cannot create a row — queue state is orthogonal to running and attaches to
     // a row the projection already owns.
     let derived = subagent_row_name(agent, task.as_deref()).0;
-    let key = registry_entry_for_event(agent, task.as_deref())
-        .map(|entry| entry.key)
+    let entry = registry_entry_for_event(agent, task.as_deref());
+    let key = entry
+        .as_ref()
+        .map(|entry| entry.key.clone())
         .filter(|key| subagents.iter().any(|row| row.name == *key))
         .unwrap_or_else(|| derived.clone());
     let Some(existing) = subagents.iter_mut().find(|s| s.name == key) else {
+        // The skip stays (row existence belongs to the registry — see the doc above
+        // and the `queue state is orthogonal to row existence` guard in the suite),
+        // but it is a **dropped** edge, not a deferred one: the caller reads this
+        // vector with `events.drain(..)`, so what is skipped here is gone. Log it
+        // with everything that separates the two ways to get here: a delegation the
+        // registry does not hold (yet), versus a delegation whose row is spelled
+        // under a key this event cannot address.
+        let (registry_key, why) = match entry.as_ref() {
+            Some(entry) => (
+                entry.key.as_str(),
+                "the registry entry behind it has no row: rows open at the projection \
+                 edge, and this transition reached the drain before that projection ran",
+            ),
+            None => (
+                "",
+                "the worker registry holds no entry for this delegation at all, so no \
+                 projection could have opened a row for it",
+            ),
+        };
+        let slot = match queue {
+            Some(state) => format!("queued {}/{}", state.position, state.of),
+            None => "leaving the queue".to_string(),
+        };
         tracing::debug!(
-            "queue transition for {key} has no panel row yet; the worker registry owns row existence, so it is skipped"
+            agent = agent.as_str(),
+            task = task.as_deref().unwrap_or(""),
+            row = key.as_str(),
+            derived_row = derived.as_str(),
+            registry_key,
+            transition = %slot,
+            "queue transition for {key} has no panel row yet and is dropped — {why}"
         );
+        // A **dropped** edge, but no longer an unrecoverable one. The same pool report
+        // also wrote this rank onto the registry entry
+        // (`orchestrator::workers::set_worker_queue_position`, driven by the
+        // `PositionReporter` closure in `llm::client::ChatClient::acquire_slot`), and
+        // `apply_registry_entry` re-derives `row.queue` from that field for any **live**
+        // entry. So the row opens — or a stale "not waiting" row is repaired — at the very
+        // next `project_subagent_rows`, no matter which side of the drain the transition
+        // lost. This fold still never creates a row, and nothing here may re-project
+        // mid-drain: that would delete every row the **event** stream had opened for a
+        // worker the registry does not hold yet (rows the registry no longer holds are how
+        // a row closes).
         return false;
     };
     existing.queue = queue;
@@ -742,8 +862,31 @@ pub(crate) fn update_subagent_paused(
 ) -> bool {
     let key = subagent_row_key_for_tag(subagents, agent_tag);
     let Some(existing) = subagents.iter_mut().find(|s| s.name == key) else {
+        // Same skip as [`update_subagent_queue`], and the same ordering answer, held
+        // on purpose: this fold runs in `session::forward_ui_event`, which folds the
+        // UI event channel in **arrival order** at the head of a boundary, while the
+        // registry projection runs on that same boundary immediately after it
+        // (`session::project_then_drain_delegation_events`). A pause transition is the
+        // preemption handshake's own report that a stream really yielded its model
+        // slot, so it keeps folding at the seam that received it — putting the seam
+        // behind the projection would reorder what the arbitrator's conditional-pause
+        // gate reports to the pane, and projecting from inside this fold would delete
+        // every row the event stream opened for a worker the registry does not hold
+        // yet. So the row gate stays and the drop is logged with the identity it tried
+        // to resolve. Fix #3 gave the queue position a durable home on the registry
+        // entry, and deliberately did **not** do the same for a pause: whether this
+        // stream yielded its model slot is the outcome of the arbitration handshake,
+        // not a property the registry ever owned, so a dropped pause stays an
+        // observable-only loss (the next handshake re-reports it) rather than a
+        // mirrored field. That is a smaller hole than the queue one was, and closing it
+        // would mean putting the preemption handshake in the registry — not a
+        // reordering here.
         tracing::debug!(
-            "stream-pause transition for {key} has no panel row yet; the worker registry owns row existence, so it is skipped"
+            agent_tag,
+            row = key.as_str(),
+            paused,
+            "stream-pause transition for {key} has no panel row yet and is dropped — no row \
+             resolves for this stream tag, and the worker registry owns row existence"
         );
         return false;
     };
@@ -1682,6 +1825,324 @@ mod tests {
                 .paused,
             "and the rebuild clears it"
         );
+
+        workers::remove_worker_entry_for_test(&key);
+    }
+
+    /// The `(Queued p/of)` label is a label the operator sees, so it belongs in the
+    /// tuple the pane's **only** change detector compares: every queue-only move —
+    /// `None -> Some`, a rank move, a depth move, `Some -> None` — must produce a
+    /// different signature, and only an unchanged queue state may produce the same
+    /// one. A detector blind to `queue` silently swallows a queue state that the
+    /// projection itself carries or rebuilds — and since fix #3 the projection really
+    /// does rebuild it, mirroring the rank off the registry entry, so a blind detector
+    /// would hide a self-heal from the pane.
+    #[test]
+    fn a_queue_only_change_is_visible_to_the_panes_change_detector() {
+        let rows = |state: Option<(usize, usize)>| {
+            vec![SubagentDetail {
+                name: "coder-t-9120".to_string(),
+                is_active: true,
+                queue: state.map(|(position, of)| crate::ui::QueueState { position, of }),
+                ..Default::default()
+            }]
+        };
+        let sig = |state: Option<(usize, usize)>| subagent_row_signature(&rows(state));
+
+        assert_eq!(
+            sig(None),
+            sig(None),
+            "an unchanged row is the one case that must not re-push"
+        );
+        assert_ne!(
+            sig(None),
+            sig(Some((1, 1))),
+            "None -> Some(QueueState{{position, of}}) arms the queued label"
+        );
+        assert_ne!(
+            sig(Some((1, 1))),
+            sig(Some((2, 2))),
+            "a rank the pool reports moves the label"
+        );
+        assert_ne!(
+            sig(Some((1, 1))),
+            sig(Some((1, 2))),
+            "so does the queue depth alone"
+        );
+        assert_ne!(
+            sig(Some((1, 2))),
+            sig(None),
+            "Some -> None (the `Running` edge) takes the label down"
+        );
+        // The queue component is what makes the difference: strip it and these row
+        // sets are byte-identical to the detector, which is exactly the blind spot.
+        let stripped = |state: Option<(usize, usize)>| {
+            subagent_row_signature(&rows(state))
+                .into_iter()
+                .map(|(name, is_active, paused, tokens, _queue)| (name, is_active, paused, tokens))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            stripped(None),
+            stripped(Some((1, 1))),
+            "the only component that tells these two apart is the queue"
+        );
+    }
+
+    /// **Registry owns row existence, and a live row's queue position is mirrored from
+    /// the registry.** A live entry that reports **no** rank deliberately writes nothing
+    /// over `row.queue`, so a position the delegation-event path folded onto the row
+    /// survives every re-projection — and the rebuild reports no change, because nothing
+    /// a viewer can see moved. Only the registry closing the row may take it down, and
+    /// that is a visible change. `WORKERS` is process-global, so the verdict is taken on
+    /// the detector's own tuple scoped to the key this test owns.
+    #[test]
+    fn a_live_rows_queue_position_survives_every_reprojection() {
+        use crate::orchestrator::workers;
+        let _workers = workers::TEST_WORKERS_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let guard = workers::register_active_worker(
+            Some("t-9121".to_string()),
+            "coder".to_string(),
+            "brief for a delegation waiting on a backend slot".to_string(),
+        );
+        let key = guard.0.clone();
+
+        // The detector's verdict is `before != after` over the whole row set; this
+        // scopes that same tuple to the row this test owns so a noisy registry cannot
+        // move it.
+        let mine = |rows: &[SubagentDetail]| -> Vec<RowSignature> {
+            subagent_row_signature(rows)
+                .into_iter()
+                .filter(|tuple| tuple.0 == key)
+                .collect()
+        };
+
+        let mut rows = vec![SubagentDetail {
+            name: key.clone(),
+            is_active: true,
+            queue: Some(crate::ui::QueueState { position: 1, of: 2 }),
+            ..Default::default()
+        }];
+        let before = mine(&rows);
+        let _ = project_subagent_rows(&mut rows);
+        let after = mine(&rows);
+        assert_eq!(
+            before, after,
+            "a re-projection of a still-live worker may neither erase its queue \
+             position nor claim the row moved"
+        );
+        let live = rows.iter().find(|r| r.name == key).expect("live row");
+        assert!(live.is_active, "the registry still holds the worker");
+        assert_eq!(
+            live.queue.map(|q| (q.position, q.of)),
+            Some((1, 2)),
+            "the queued label is exactly where the event path left it"
+        );
+
+        // The next position the pool reports folds onto the same row, and the
+        // detector now reports the move on the queue component alone — which is what
+        // makes a `set_subagents` push happen on the projection path too, not only on
+        // the drain path that folds the transition.
+        assert!(
+            update_subagent_queue(
+                &mut rows,
+                crate::agents::Agent::Coder,
+                Some("t-9121".to_string()),
+                Some(crate::ui::QueueState { position: 1, of: 1 }),
+            ),
+            "the row is addressed by its effective registry key"
+        );
+        let moved = mine(&rows);
+        assert_ne!(
+            after, moved,
+            "a queue-only move is a visible change to the pane"
+        );
+
+        // The guard drops: the registry closed the delegation, and only THAT may
+        // clear a position that would otherwise outlive its wait.
+        drop(guard);
+        let _ = project_subagent_rows(&mut rows);
+        let closed = rows.iter().find(|r| r.name == key).expect("closed row");
+        assert!(!closed.is_active, "the registry closed the row");
+        assert!(
+            closed.queue.is_none(),
+            "a queue position belongs to a live delegation and never outlives it"
+        );
+        assert_ne!(
+            moved,
+            mine(&rows),
+            "and the teardown is a visible change, not a silent one"
+        );
+
+        // The queue component carries a verdict **on its own**: with the registry
+        // already reporting this row closed, a position left behind by any other
+        // writer is the only thing that separates the two signatures below, and the
+        // pane has to be told about it instead of quietly keeping a `(Queued 1/1)`
+        // nobody handed it. While `queue` was outside the tuple this was an invisible
+        // change.
+        if let Some(stale) = rows.iter_mut().find(|r| r.name == key) {
+            stale.queue = Some(crate::ui::QueueState { position: 1, of: 1 });
+        }
+        let injected = mine(&rows);
+        let moved = project_subagent_rows(&mut rows);
+        assert!(
+            moved,
+            "the projection itself must report the queue-only difference, which is \
+             exactly what session::project_subagent_pane gates its set_subagents push on"
+        );
+        assert_ne!(
+            injected,
+            mine(&rows),
+            "a queue-only difference is a change the pane reports"
+        );
+        assert!(
+            rows.iter()
+                .find(|r| r.name == key)
+                .expect("the closed row is still projected")
+                .queue
+                .is_none(),
+            "and the rebuild takes the stale position down"
+        );
+
+        workers::remove_worker_entry_for_test(&key);
+    }
+
+    /// **The durability proof for fix #3.** A `Queued` transition that reaches the drain
+    /// while no row exists is consumed and never replayed — but the same pool report also
+    /// wrote that rank onto the **registry entry**, so the next projection must open the
+    /// row with `(Queued n/m)` already on it, repair a row that stale-ly reads "not
+    /// waiting", and still take the label down when the delegation closes. Everything runs
+    /// through the production writer (`set_worker_queue_position`, the function
+    /// `llm::client::ChatClient::acquire_slot` calls on a rank report) and the production
+    /// readers (`update_subagent_queue`, `project_subagent_rows`).
+    #[test]
+    fn a_dropped_queued_event_is_re_derived_from_the_registry_by_the_next_projection() {
+        use crate::orchestrator::workers;
+        let _workers = workers::TEST_WORKERS_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let guard = workers::register_active_worker(
+            Some("t-9131".to_string()),
+            "coder".to_string(),
+            "brief for a delegation waiting on a backend slot".to_string(),
+        );
+        let key = guard.0.clone();
+        let rank = crate::ui::QueueState { position: 2, of: 3 };
+        // `WORKERS` is process-global, so the change verdict is the detector's own tuple
+        // scoped to this key: a concurrent test's row may move, this one may not be.
+        let mine = |rows: &[SubagentDetail]| -> Vec<RowSignature> {
+            subagent_row_signature(rows)
+                .into_iter()
+                .filter(|tuple| tuple.0 == key)
+                .collect()
+        };
+        let queue_of = |rows: &[SubagentDetail]| {
+            rows.iter()
+                .find(|row| row.name == key)
+                .and_then(|row| row.queue)
+                .map(|q| (q.position, q.of))
+        };
+
+        // 1. One pool report: one one-shot event on the wire, one rank on the entry.
+        assert!(
+            workers::set_worker_queue_position(
+                "coder",
+                Some("t-9131"),
+                Some(crate::orchestrator::pool::QueuePosition { position: 2, of: 3 }),
+            ),
+            "the live entry of this delegation is addressable by agent + plan task"
+        );
+
+        // 2. The event is folded into a row set that has no row for it yet — the exact
+        //    hole fix #2 left a TODO for: the fold declines (rows belong to the
+        //    registry) and the drain consumes the event, so the panel can never learn
+        //    about this wait from the event stream again.
+        let mut rows: Vec<SubagentDetail> = Vec::new();
+        assert!(
+            !update_subagent_queue(
+                &mut rows,
+                crate::agents::Agent::Coder,
+                Some("t-9131".to_string()),
+                Some(rank),
+            ),
+            "the queue fold still never creates a row"
+        );
+        assert!(
+            rows.iter().all(|row| row.name != key),
+            "and the transition was dropped, not deferred"
+        );
+
+        // 3. The next projection re-derives the whole state from the registry alone.
+        assert!(
+            project_subagent_rows(&mut rows),
+            "a rank the event path never delivered is a visible change to the pane"
+        );
+        let row = rows
+            .iter()
+            .find(|row| row.name == key)
+            .expect("the projection opened the row");
+        assert!(row.is_active, "the registry still holds the delegation");
+        assert_eq!(
+            queue_of(&rows),
+            Some((2, 3)),
+            "and the row reads `(Queued 2/3)` with nothing but the registry to read it from"
+        );
+
+        // 4. The other half of the same hole: a row that exists but stale-ly reads "not
+        //    waiting" (a lost event, a hand-built row, a restore) is repaired rather than
+        //    left to mislead for the rest of the slot wait.
+        if let Some(stale) = rows.iter_mut().find(|row| row.name == key) {
+            stale.queue = None;
+        }
+        let stale = mine(&rows);
+        assert!(
+            project_subagent_rows(&mut rows),
+            "the repair is reported to the pane, not applied silently"
+        );
+        assert_ne!(stale, mine(&rows), "the detector sees the repaired label");
+        assert_eq!(queue_of(&rows), Some((2, 3)), "and the label is back");
+
+        // 5. The wait ends. `Running` writes the rank off the entry and folds `None`
+        //    onto the row; from then on a projection of an entry with no rank must not
+        //    re-raise the label — the pool retracts a wait, it does not re-report one.
+        assert!(workers::set_worker_queue_position(
+            "coder",
+            Some("t-9131"),
+            None
+        ));
+        assert!(
+            update_subagent_queue(
+                &mut rows,
+                crate::agents::Agent::Coder,
+                Some("t-9131".to_string()),
+                None,
+            ),
+            "the `Running` edge reaches the row that exists now"
+        );
+        assert_eq!(queue_of(&rows), None, "a running call is not queued");
+        let running = mine(&rows);
+        let _ = project_subagent_rows(&mut rows);
+        assert_eq!(
+            running,
+            mine(&rows),
+            "re-projecting a live entry that reports no rank changes nothing, and \
+             re-derives no phantom `(Queued 2/3)`"
+        );
+
+        // 6. The label never outlives the delegation: the guard drop is the teardown.
+        drop(guard);
+        assert!(
+            project_subagent_rows(&mut rows),
+            "closing a delegation that had been queued is a visible change"
+        );
+        let closed = rows
+            .iter()
+            .find(|row| row.name == key)
+            .expect("the closed row is still projected");
+        assert!(!closed.is_active, "the registry closed the row");
+        assert_eq!(queue_of(&rows), None, "and no queue state survives it");
 
         workers::remove_worker_entry_for_test(&key);
     }

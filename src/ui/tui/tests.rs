@@ -1230,6 +1230,388 @@ fn a_restored_row_never_shows_a_stale_queue_position() {
     );
 }
 
+/// Removes one registry entry when the guard goes out of scope, so a panicking assertion in a
+/// registry-touching test can never leave a live worker behind for the rest of the test binary
+/// (the table is process-global, and a leaked row shows up in every other suite's projection).
+struct EntryCleanup {
+    key: String,
+}
+
+impl Drop for EntryCleanup {
+    fn drop(&mut self) {
+        crate::orchestrator::workers::remove_worker_entry_for_test(&self.key);
+    }
+}
+
+/// Regression guard for fix #3 + fix #2 (`docs/diagnose_subpane_stale_refresh.md` §3):
+/// a queued row rebuilt **purely from the worker registry** — the pool's rank sits on the
+/// registry entry, and no `Queued` delegation event reaches the panel at all — must carry
+/// the whole pane, not just a row.
+///
+/// Three separate things used to go wrong here, and all three are asserted:
+/// * the projection wrote no `queue` field at all (`apply_registry_entry` ignored
+///   `WorkerEntry::queue_position`), so the row read `coder-… (Active)` while the pool kept
+///   the same delegation in line;
+/// * the pane's change detector ignored `queue`, so even a projection that *did* write it
+///   reported "no change" and the host was never handed the new row set;
+/// * the detail pane (thinking / output / logs) plus the slot-wait bar were never checked
+///   for a queued row at all — the queued detail-pane test asserted only the bottom bar.
+#[test]
+fn a_queued_rows_whole_pane_is_rebuilt_from_the_registry_alone() {
+    use crate::orchestrator::workers;
+    // Registration touches the process-global table other suites assert over.
+    let _workers = workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let worker = workers::register_active_worker(
+        Some("t-9511".to_string()),
+        "coder".to_string(),
+        "hold the line and wait for a backend slot".to_string(),
+    );
+    let key = worker.0.clone();
+    let _cleanup = EntryCleanup { key: key.clone() };
+
+    // The pool's rank, recorded where fix #3 records it: on the live registry entry.
+    assert!(
+        workers::set_active_worker_queue_position(
+            &key,
+            Some(crate::orchestrator::pool::QueuePosition { position: 2, of: 3 }),
+        ),
+        "a live entry must accept a pool rank"
+    );
+    assert_eq!(
+        workers::active_worker_queue_position(&key),
+        Some(crate::orchestrator::pool::QueuePosition { position: 2, of: 3 }),
+        "the rank the pool reported is readable on the entry a projection rebuilds from"
+    );
+
+    // The session loop's authoritative row buffer: the row was opened by an earlier
+    // projection and a lifecycle fold already put a log line on it. It carries **no queue
+    // state** — that is the state a dropped `Queued` event leaves behind.
+    let mut loop_rows = vec![SubagentDetail {
+        name: key.clone(),
+        task_id: Some("t-9511".to_string()),
+        logs: vec!["started task t-9511".to_string()],
+        is_active: true,
+        ..Default::default()
+    }];
+
+    // The pane itself already holds streamed text for that row.
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.show_thought = true;
+    r.subagents.push(SubagentDetail {
+        name: key.clone(),
+        task_id: Some("t-9511".to_string()),
+        thinking: "waiting for the permit, then patching the projection".to_string(),
+        content: "inspected three files".to_string(),
+        is_active: true,
+        ..Default::default()
+    });
+
+    // The loop's refresh edge, in the fixed order (fix #1: project, then drain). Only the
+    // projection runs here: no delegation event exists for this transition at all.
+    assert!(
+        crate::ui::helpers::project_subagent_rows(&mut loop_rows),
+        "a rank the registry newly reports is a change the host must be handed (fix #2 put \
+         `queue` in the row signature); the row set before the rebuild was {loop_rows:?}"
+    );
+    // The registry is process-global, so the projection legitimately sees other suites'
+    // entries; keep this delegation's row and address it by key.
+    loop_rows.retain(|row| row.name == key);
+    assert_eq!(
+        loop_rows
+            .iter()
+            .find(|row| row.name == key)
+            .expect("the live entry has a row after the rebuild")
+            .queue,
+        Some(crate::ui::QueueState { position: 2, of: 3 }),
+        "the projection re-derives the label from the entry (fix #3)"
+    );
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let before = rows.join("\n");
+    assert!(
+        before.contains(&format!("{key} (Active)")),
+        "the pane still reads the pre-projection row as a running row, got:\n{before}"
+    );
+
+    r.set_subagents(loop_rows.clone());
+    assert_eq!(
+        r.subagents.len(),
+        1,
+        "the panel holds exactly this delegation's row, got {:?}",
+        r.subagents
+            .iter()
+            .map(|row| row.name.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        r.subagents[0].queue,
+        Some(crate::ui::QueueState { position: 2, of: 3 }),
+        "the host's push must land on the row the panel is drawing"
+    );
+    assert_eq!(
+        r.subagents[0].logs,
+        vec!["started task t-9511".to_string()],
+        "the loop owns the log lines and hands them over with the row"
+    );
+
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+
+    // 1. the row label
+    assert!(
+        text.contains(&format!("{key} (Queued 2/3")),
+        "the row must read `(Queued 2/3 …)`, got:\n{text}"
+    );
+    assert!(
+        !text.contains(&format!("{key} (Active")),
+        "a queued delegation must not be drawn as holding its slot, got:\n{text}"
+    );
+
+    // 2. the detail pane is neither empty nor stale while the row is queued
+    assert!(
+        text.contains("[Thinking]") && text.contains("waiting for the permit"),
+        "the thinking half of the detail pane must survive the queued push, got:\n{text}"
+    );
+    assert!(
+        text.contains("[Output]") && text.contains("inspected three files"),
+        "the output half of the detail pane must survive the queued push, got:\n{text}"
+    );
+    assert!(
+        text.contains("[Logs]") && text.contains("started task t-9511"),
+        "the log half of the detail pane must survive the queued push, got:\n{text}"
+    );
+
+    // 3. the slot wait, spelled out on the row's own bar
+    const WAIT: &str = "[Status: Queued 2/3 - waiting for a backend slot...]";
+    assert!(
+        text.contains(WAIT),
+        "expected {WAIT:?} in the subagent status bar, got:\n{text}"
+    );
+    assert!(
+        !text.contains("waiting for model response") && !text.contains("[Thinking:"),
+        "a row waiting for a slot must not claim it is waiting on the model or streaming, \
+         got:\n{text}"
+    );
+
+    // The guard dropping is what closes the entry in production; `_cleanup` takes the entry
+    // out of the table for good, on this path and on a panicking one.
+    drop(worker);
+}
+
+/// Regression guard for the coverage gap the repro left open: a queued row is not a frozen
+/// row. Text keeps streaming into it between slot waits (the previous turn's tokens, a nested
+/// tool round), and the pane must show **both** the slot state and the new text — the label
+/// must never be traded for the content, and the content must never be traded for the label.
+#[test]
+fn a_queued_row_keeps_its_label_while_thinking_and_output_stream_into_it() {
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.show_thought = true;
+    r.subagents.push(queue_row(
+        "coder-t-1",
+        true,
+        Some(crate::ui::QueueState { position: 2, of: 4 }),
+    ));
+
+    // The lifecycle fold sets the row's active agent and its first log line, and must not
+    // disturb the queue state it says nothing about.
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Started {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-1".to_string()),
+        },
+    ));
+    assert_eq!(
+        r.subagents[0].queue,
+        Some(crate::ui::QueueState { position: 2, of: 4 }),
+        "a lifecycle fold never retracts a slot position"
+    );
+
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("coder-t-1 (Queued 2/4"),
+        "the queued label is on screen before any stream traffic, got:\n{text}"
+    );
+    assert!(
+        text.contains("[Logs]") && text.contains("started task t-1"),
+        "the lifecycle log line is on screen, got:\n{text}"
+    );
+    assert!(
+        !text.contains("[Thinking]"),
+        "nothing has streamed yet, got:\n{text}"
+    );
+
+    // Stream traffic for the very same row: reasoning, a tool call (log line), then output.
+    r.on_event(&Event::SubagentThinking {
+        agent_tag: "coder-t-1".to_string(),
+        text: "the permit is still behind two callers".to_string(),
+    });
+    r.on_event(&Event::ToolCall("read(src/ui/helpers.rs)".to_string()));
+    r.on_event(&Event::SubagentMessage {
+        agent_tag: "coder-t-1".to_string(),
+        text: "patched the signature".to_string(),
+    });
+
+    assert_eq!(
+        r.subagents[0].queue,
+        Some(crate::ui::QueueState { position: 2, of: 4 }),
+        "streamed text never clears the slot state"
+    );
+
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("coder-t-1 (Queued 2/4"),
+        "the queued label must survive streamed traffic, got:\n{text}"
+    );
+    assert!(
+        text.contains("[Thinking]") && text.contains("the permit is still behind two callers"),
+        "the newly streamed reasoning must be in the detail pane, got:\n{text}"
+    );
+    assert!(
+        text.contains("[Output]") && text.contains("patched the signature"),
+        "the newly streamed output must be in the detail pane, got:\n{text}"
+    );
+    assert!(
+        text.contains("[Logs]") && text.contains("read(src/ui/helpers.rs)"),
+        "the tool-call log line must be in the detail pane, got:\n{text}"
+    );
+    const WAIT: &str = "[Status: Queued 2/4 - waiting for a backend slot...]";
+    assert!(
+        text.contains(WAIT),
+        "the slot wait keeps the bottom bar while text streams into the row, got:\n{text}"
+    );
+    assert!(
+        !text.contains("[Thinking:"),
+        "a row waiting for a slot is not streaming thinking tokens, got:\n{text}"
+    );
+
+    // An authoritative push that carries no text (the loop folds lifecycle events only)
+    // must not wipe what the stream already put on the row.
+    r.set_subagents(vec![queue_row(
+        "coder-t-1",
+        true,
+        Some(crate::ui::QueueState { position: 2, of: 4 }),
+    )]);
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("the permit is still behind two callers")
+            && text.contains("patched the signature")
+            && text.contains("coder-t-1 (Queued 2/4"),
+        "a text-free push keeps both the pane text and the queued label, got:\n{text}"
+    );
+}
+
+/// Regression guard for fix #2: the label follows **every** queue edge. `Queued -> Running`
+/// (slot acquired) must take the label down, and a **re-queue** with a different rank must
+/// put it back with the new digits and no residue of the old ones — through both writers of
+/// that field: the loop's authoritative push and the delegation-event fold.
+#[test]
+fn a_re_queued_row_follows_every_rank_edge_in_its_label_and_its_bar() {
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.show_thought = true;
+
+    // Edge 1: queued 2/3, pushed authoritatively by the session loop.
+    r.set_subagents(vec![SubagentDetail {
+        name: "coder-t-1".to_string(),
+        is_active: true,
+        queue: Some(crate::ui::QueueState { position: 2, of: 3 }),
+        content: "first round of the delegation".to_string(),
+        logs: vec!["started task t-1".to_string()],
+        ..Default::default()
+    }]);
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("coder-t-1 (Queued 2/3")
+            && text.contains("[Status: Queued 2/3 - waiting for a backend slot...]"),
+        "a queued row is labelled and barred with its rank, got:\n{text}"
+    );
+
+    // Edge 2: slot acquired (`Some -> None`). A stale label would tell the operator the
+    // round is still stuck behind the cap.
+    r.set_subagents(vec![SubagentDetail {
+        name: "coder-t-1".to_string(),
+        is_active: true,
+        queue: None,
+        logs: vec!["started task t-1".to_string()],
+        ..Default::default()
+    }]);
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("coder-t-1 (Active"),
+        "the slot is held, so the row reads `(Active)` again, got:\n{text}"
+    );
+    assert!(
+        !text.contains("Queued"),
+        "no stale queue label may outlive the slot, got:\n{text}"
+    );
+    assert!(
+        text.contains("first round of the delegation"),
+        "the text-free re-push keeps the pane's content, got:\n{text}"
+    );
+
+    // Edge 3: re-queued at a new rank. The digits change and nothing else about the row does.
+    r.set_subagents(vec![SubagentDetail {
+        name: "coder-t-1".to_string(),
+        is_active: true,
+        queue: Some(crate::ui::QueueState { position: 1, of: 2 }),
+        logs: vec!["started task t-1".to_string()],
+        ..Default::default()
+    }]);
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("coder-t-1 (Queued 1/2")
+            && text.contains("[Status: Queued 1/2 - waiting for a backend slot...]"),
+        "a re-queued row shows its new rank, got:\n{text}"
+    );
+    assert!(
+        !text.contains("2/3"),
+        "no residue of the previous rank, got:\n{text}"
+    );
+
+    // The same three edges through the other writer: the delegation-event fold.
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Running {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-1".to_string()),
+        },
+    ));
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+    assert!(
+        !text.contains("Queued") && text.contains("coder-t-1 (Active"),
+        "the `Running` fold takes the label down, got:\n{text}"
+    );
+
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Queued {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-1".to_string()),
+            position: 3,
+            of: 5,
+        },
+    ));
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("coder-t-1 (Queued 3/5")
+            && text.contains("[Status: Queued 3/5 - waiting for a backend slot...]"),
+        "the `Queued` fold restores the label with the new rank, got:\n{text}"
+    );
+    assert!(
+        text.contains("first round of the delegation") && text.contains("[Logs]"),
+        "a queue edge never empties the detail pane, got:\n{text}"
+    );
+}
+
 // ---- steering arbitration pause in the Subagents panel ----
 
 /// A row whose stream yielded its model slot is labelled `Paused` and is

@@ -912,6 +912,7 @@ async fn test_stream_preemption_on_synchronous_bridge() {
     let (arb_tx, _arb_rx) = tokio::sync::mpsc::unbounded_channel();
     let (_arb_tx2, mut arb_rx2) = tokio::sync::mpsc::unbounded_channel();
     let steering_history = Arc::new(std::sync::RwLock::new(Vec::new()));
+    let mut panel_rows = Vec::new();
 
     let mut bridge = marmennill::ui::bridge::RendererSink {
         renderer: &mut renderer,
@@ -922,7 +923,7 @@ async fn test_stream_preemption_on_synchronous_bridge() {
         client: &client,
         stats,
         goal: "test goal",
-        subagents: &[],
+        subagents: &mut panel_rows,
         plan: None,
         ctx: None,
         steering_history: Some(steering_history),

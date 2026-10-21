@@ -19,6 +19,69 @@ pub(crate) fn host_sleep_request(decision: Option<&crate::orchestrator::SteerDec
     arbiter::clamped_sleep_secs(decision.and_then(|d| d.sleep_seconds))
 }
 
+/// Cadence of the in-sink panel pump (see [`await_with_panel_pump`]).
+///
+/// It matches the pool's own rank-refresh cadence (`QUEUE_POSITION_REFRESH` in
+/// `src/orchestrator/pool.rs`), which is the only source of the `(Queued n/m)` rank the pump
+/// can surface: pumping faster than the pool re-reports can only produce byte-identical row
+/// sets, which the projection's signature compare throws away anyway.
+const PANEL_PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Re-project the host's subagent rows from the worker registry and push them when a visible
+/// edge moved — the sink-side twin of the session loop's own refresh edge
+/// (`session.rs::project_subagent_pane`), calling the same single projection owner
+/// (`helpers::project_subagent_rows`).
+///
+/// Returns whether anything was pushed. This is deliberately a *projection*, not a second event
+/// consumer: the delegation-event vector, the pool's status channel and the transcript all stay
+/// owned by the session loop, so nothing here can steal a record the loop still has to fold, and
+/// the steer-arbitration drain in [`RendererSink::poll_control`] keeps its exact position and
+/// ordering.
+pub(crate) fn pump_subagent_panel(
+    rows: &mut Vec<SubagentDetail>,
+    renderer: &mut dyn Renderer,
+) -> bool {
+    if crate::ui::helpers::project_subagent_rows(rows) {
+        renderer.set_subagents(rows.clone());
+        let _ = renderer.flush();
+        true
+    } else {
+        false
+    }
+}
+
+/// Await `work` while keeping the subagent pane alive.
+///
+/// The reason this exists is structural: an await **inside the sink** (the inline
+/// `arbiter::run_delegated_subtask` of a steering-delegated subtask, pool slot wait included)
+/// runs while the session loop is parked on the very turn that owns the sink, so the loop
+/// cannot come back to its own drain/projection edge for the whole duration. `poll_control`
+/// does not help either — it is only called per streamed chunk. The pane would therefore sit
+/// on the start line and show nothing about a child that is queued for a backend slot.
+///
+/// So the pump runs here instead, on the loop below: the future is pinned, and every
+/// [`PANEL_PUMP_INTERVAL`] the pane is re-projected from the registry (which since fix #3 owns
+/// the queue rank, so a `Queued` the loop never drained self-heals without any event).
+pub(crate) async fn await_with_panel_pump<F>(
+    rows: &mut Vec<SubagentDetail>,
+    renderer: &mut dyn Renderer,
+    work: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut work => return out,
+            _ = tokio::time::sleep(PANEL_PUMP_INTERVAL) => {
+                pump_subagent_panel(rows, renderer);
+            }
+        }
+    }
+}
+
 pub struct RendererSink<'a> {
     pub renderer: &'a mut dyn Renderer,
     pub steer_queue: &'a mut Vec<String>,
@@ -28,11 +91,17 @@ pub struct RendererSink<'a> {
     pub client: &'a ChatClient,
     pub stats: Arc<crate::harness::HarnessStats>,
     pub goal: &'a str,
-    /// The host's current subagent **pane rows**. This is never an arbitration input: the
-    /// arbitrator reads the worker registry, and a pane row is a projection of that same
-    /// registry (`ui::helpers::project_subagent_rows`). The host hands the rows over so the
-    /// sink can report a pane/registry divergence, not to decide what is running.
-    pub subagents: &'a [SubagentDetail],
+    /// The host's **authoritative** subagent pane row buffer (`session.rs`'s `subagents`),
+    /// i.e. the same vector the session loop projects from the worker registry and pushes to
+    /// the renderer.
+    ///
+    /// It is still never an arbitration input: the arbitrator reads the worker registry, and a
+    /// pane row is only a projection of that registry. The sink is handed the buffer so it can
+    /// (a) report a pane/registry divergence and (b) run the **same** sanctioned projection
+    /// while an await inside the sink has the session loop blocked ([`PANEL_PUMP_INTERVAL`]).
+    /// That is not a second panel model: it is one buffer, one projection function, and it
+    /// writes only what the registry is authoritative for.
+    pub subagents: &'a mut Vec<SubagentDetail>,
     pub plan: Option<&'a crate::manager::phase::Plan>,
     pub ctx: Option<&'a mut crate::manager::context::ContextEngine>,
     pub steering_history: Option<SharedSteeringHistory>,
@@ -67,6 +136,15 @@ impl StreamSink for RendererSink<'_> {
         // therefore changes registry state; the pane catches up on the session loop's projection
         // edge (`session.rs` -> `helpers::project_subagent_rows`), which is the only writer of
         // `is_active`.
+        //
+        // Fix #4 deliberately does **not** add a panel pump here either: `poll_control` runs once
+        // per streamed chunk, so a pump here would move the pane while the Manager's own turn is
+        // still in flight — mid-way between two loop drains. That contract (a turn in flight is a
+        // drain-free window the loop closes at its next boundary) is pinned by
+        // `tests/test_subpane_queued_refresh.rs`, and the loop's boundary drain folds the same
+        // state one edge later anyway. The window this sink *can* fix safely is the one where the
+        // loop is not merely streaming but blocked inside an await owned by the sink itself — the
+        // inline delegated-subtask await below (see [`await_with_panel_pump`]).
         drain_steer_arbitration_events(
             self.arb_rx,
             self.renderer,
@@ -173,12 +251,17 @@ impl StreamSink for RendererSink<'_> {
                 )));
                 let _ = self.renderer.flush();
 
-                let deliverable = arbiter::run_delegated_subtask(
-                    self.client,
-                    &self.stats,
-                    agent,
-                    &task_id,
-                    &prompt,
+                // C1 (docs/diagnose_subpane_stale_refresh.md): this await holds the session
+                // loop hostage — the loop is parked on the turn that owns this sink, so it
+                // cannot reach its own drain/projection edge for the whole subtask, pool slot
+                // wait included. Pump the pane from here, or the child shows its start line and
+                // then nothing at all while it is genuinely waiting for a backend slot.
+                let client = self.client;
+                let stats = &self.stats;
+                let deliverable = await_with_panel_pump(
+                    &mut *self.subagents,
+                    &mut *self.renderer,
+                    arbiter::run_delegated_subtask(client, stats, agent, &task_id, &prompt),
                 )
                 .await;
 

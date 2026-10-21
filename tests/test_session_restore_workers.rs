@@ -1164,6 +1164,7 @@ fn ac_w3_every_declared_field_is_restored_verbatim_and_an_unrecognized_label_kee
         completed_at: Some(Instant::now()),
         completed_wall: Some(chrono::Local::now()),
         worker_id_seq_value: 41,
+        queue_position: None,
     };
     assert_eq!(
         project_status(&live),

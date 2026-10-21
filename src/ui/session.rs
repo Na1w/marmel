@@ -1644,6 +1644,41 @@ fn project_subagent_pane(subagents: &mut Vec<SubagentDetail>, renderer: &mut dyn
     }
 }
 
+/// The panel's two writers in the one order that keeps queue state: project the
+/// row set from the worker registry **first**, then drain the delegation events.
+///
+/// Both halves are needed, and the order is the whole point:
+///
+/// * the drain is the only writer of a row's `queue` field, and it deliberately
+///   never creates a row (`helpers::update_subagent_queue` skips a transition
+///   whose row does not exist yet);
+/// * the projection is the only writer of row **existence** — and for a nested
+///   `delegate_task` / steering child that existence comes from the registry,
+///   because that child's own `Started`/`Completed` are pushed into the throw-away
+///   manager it builds, not into this vector;
+/// * `helpers::drain_delegation_events_with_transcript` consumes what it reads
+///   (`events.drain(..)`), and nothing replays a skipped transition: the pool
+///   re-reports only on a rank change — but the rank is mirrored onto
+///   `WorkerEntry::queue_position` (fix #3), so a lost `Queued` is re-derived by the next
+///   projection.
+///
+/// So draining first loses the transition permanently, and the row opens one edge
+/// later with no queue information at all — the pane shows the start line and then
+/// nothing while the child waits for a backend slot.
+///
+/// `project_subagent_rows` is idempotent and self-gated by its signature compare,
+/// so a call inside a wait loop costs one registry read plus a row clone and only
+/// pushes on a real edge.
+fn project_then_drain_delegation_events(
+    manager: Option<&OrchestratorManager>,
+    renderer: &mut dyn Renderer,
+    subagents: &mut Vec<SubagentDetail>,
+    ui_transcript: Option<&mut UiTranscript>,
+) {
+    project_subagent_pane(subagents, renderer);
+    drain_delegation_events_with_transcript(manager, renderer, subagents, ui_transcript);
+}
+
 /// Hand one UI event to the active renderer, folding in the panel state the event
 /// carries **before** it is handed over.
 ///
@@ -2029,17 +2064,18 @@ pub async fn run_session_with_bounds_report(
             Some(&mut subagents),
             Some(&mut ui_transcript),
         );
-        drain_delegation_events_with_transcript(
+        // Rows first, then the events that fold onto them: the row set is a pure
+        // projection of the worker registry, rebuilt on an edge the loop already
+        // has (a worker registered / finished since the last harvest can now be
+        // joined, closed or pruned by key — no new channel, no timer), and the
+        // projection has to be the side that **opens** the row before the queue
+        // transition of that same worker is consumed by the drain.
+        project_then_drain_delegation_events(
             manager.as_deref(),
             &mut *renderer,
             &mut subagents,
             Some(&mut ui_transcript),
         );
-        // The pane's row set is a pure projection of the worker registry, rebuilt
-        // on an edge the loop already has: a worker registered / finished since
-        // the last harvest can now be joined, closed or pruned by key.
-        // No new channel, no timer.
-        project_subagent_pane(&mut subagents, &mut *renderer);
 
         if let Some(steer) = renderer.poll_input() {
             if is_abort_command(&steer) {
@@ -2202,7 +2238,11 @@ pub async fn run_session_with_bounds_report(
                 Some(&mut subagents),
                 Some(&mut ui_transcript),
             );
-            drain_delegation_events_with_transcript(
+            // Rows first, then the events that fold onto them. This is the first
+            // seam after a whole Manager turn — the turn itself runs no delegation
+            // drain — so a specialist that registered and queued during it arrives
+            // here as one vector of lifecycle-blind queue edges.
+            project_then_drain_delegation_events(
                 manager.as_deref(),
                 &mut *renderer,
                 &mut subagents,
@@ -2258,7 +2298,7 @@ pub async fn run_session_with_bounds_report(
                 client: &client,
                 stats: harness_stats.clone(),
                 goal: &goal,
-                subagents: &subagents,
+                subagents: &mut subagents,
                 plan: Some(&plan),
                 ctx: Some(&mut ctx),
                 steering_history: Some(Arc::clone(&steering_history)),
@@ -2670,7 +2710,7 @@ pub async fn run_session_with_bounds_report(
                             Some(&mut subagents),
                             Some(&mut ui_transcript),
                         );
-                        drain_delegation_events_with_transcript(
+                        project_then_drain_delegation_events(
                             manager.as_deref(),
                             &mut *renderer,
                             &mut subagents,
@@ -2773,7 +2813,7 @@ pub async fn run_session_with_bounds_report(
                                     Some(&mut subagents),
                                     Some(&mut ui_transcript),
                                 );
-                                drain_delegation_events_with_transcript(
+                                project_then_drain_delegation_events(
                                     manager.as_deref(),
                                     &mut *renderer,
                                     &mut subagents,
@@ -3049,7 +3089,10 @@ pub async fn run_session_with_bounds_report(
                     }
                     renderer.flush()?;
 
-                    drain_delegation_events_with_transcript(
+                    // Rows first, then the events that fold onto them: this is the
+                    // seam a sequential tool round opens a nested worker at, and the
+                    // `Queued` transition of that child arrives in this very vector.
+                    project_then_drain_delegation_events(
                         manager.as_deref(),
                         &mut *renderer,
                         &mut subagents,
@@ -3263,7 +3306,7 @@ pub async fn run_session_with_bounds_report(
                             Some(&mut subagents),
                             Some(&mut ui_transcript),
                         );
-                        drain_delegation_events_with_transcript(
+                        project_then_drain_delegation_events(
                             manager.as_deref(),
                             &mut *renderer,
                             &mut subagents,
@@ -3349,7 +3392,7 @@ pub async fn run_session_with_bounds_report(
                                     Some(&mut subagents),
                                     Some(&mut ui_transcript),
                                 );
-                                drain_delegation_events_with_transcript(
+                                project_then_drain_delegation_events(
                                     manager.as_deref(),
                                     &mut *renderer,
                                     &mut subagents,

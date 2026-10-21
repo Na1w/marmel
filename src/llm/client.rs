@@ -609,6 +609,32 @@ enum SlotAbort {
     Closed(String),
 }
 
+/// Mirror one pool queue-position report onto the **worker registry** entry this call
+/// belongs to — the durable half of the queue state (fix #3,
+/// `docs/diagnose_subpane_stale_refresh.md` §3).
+///
+/// `position: Some(..)` is a rank report, `None` is the verdict "this call is not
+/// waiting for a slot any more". Both land on the registry because the registry is
+/// what the subagent pane rebuilds its rows from: the `Queued` / `Running` delegation
+/// events are one-shot and can be consumed by a drain that has no row for them yet,
+/// while the pool reports a rank once per acquisition and afterwards only when the
+/// rank actually moves. With the rank on the entry, a later projection re-derives the
+/// panel's `(Queued n/m)` label instead of losing it for the rest of the wait.
+///
+/// `owner: None` — an unclassified call, or a call class whose delegation the panel
+/// tracks no row for — is a no-op: there is no entry to put a rank on, and inventing
+/// one is exactly the phantom-row hazard the event path's identity rule exists to
+/// avoid (see [`crate::orchestrator::delegation_identity`]).
+fn publish_worker_queue_position(
+    owner: &Option<(String, Option<String>)>,
+    position: Option<pool::QueuePosition>,
+) {
+    let Some((agent, task)) = owner else {
+        return;
+    };
+    crate::orchestrator::workers::set_worker_queue_position(agent, task.as_deref(), position);
+}
+
 impl SlotGuard {
     /// Report the queued → running transition this guard represents.
     ///
@@ -895,6 +921,20 @@ impl ChatClient {
         // slot does not falsely trip the idle watchdogs (design §6). No-op when
         // no UI renderer is listening.
         let queued_delegation = delegation.clone();
+        // The **durable** half of the same transition (fix #3,
+        // `docs/diagnose_subpane_stale_refresh.md` §3): the position is mirrored onto
+        // the worker registry entry, which is the structure the subagent pane rebuilds
+        // its rows from. The delegation event is one-shot — the session drains it with
+        // `events.drain(..)`, and a `Queued` that reaches the drain before the row
+        // projection has opened the row is gone for the whole slot wait — so a viewer
+        // that missed it must be able to re-read the rank from the registry instead.
+        // Keyed on the same identity the event pair is emitted for (canonical agent
+        // label + plan task), never on a derived spelling, so the two halves of one
+        // transition can only ever address the same entry.
+        let queue_owner = delegation
+            .as_ref()
+            .map(|(agent, task)| (agent.as_str().to_string(), task.clone()));
+        let reported_owner = queue_owner.clone();
         let reporter = move |position: pool::QueuePosition| {
             let attribution = attribution
                 .as_deref()
@@ -916,6 +956,9 @@ impl ChatClient {
                     },
                 );
             }
+            // The registry-facing half: the same rank, kept where a later projection
+            // can re-derive it.
+            publish_worker_queue_position(&reported_owner, Some(position));
         };
 
         // Steer-arbitrator and notice-evaluation calls take the per-key reserve
@@ -949,15 +992,24 @@ impl ChatClient {
             };
         }
 
-        match pool::acquire_session_with_wait(
+        let acquired = pool::acquire_session_with_wait(
             &self.backend_url,
             &self.model,
             token,
             self.queue_wait,
             Some(&reporter),
         )
-        .await
-        {
+        .await;
+        // Durable half of the queued → running edge, taken back down here rather than
+        // only through the `Running` event below: the moment this wait returns, this
+        // call holds no rank in a FIFO any more — whether it got the permit, was
+        // cancelled, timed out or found the pool closed. The event half can be dropped
+        // by a panel drain that has no row for it yet (which is why the event carries
+        // no `Running` for a wait that never reached this arm), so the registry alone
+        // has to say "no longer waiting" for the panel to stop reading a stale rank at
+        // its next projection.
+        publish_worker_queue_position(&queue_owner, None);
+        match acquired {
             Ok(None) => Ok(SlotGuard::Unmetered),
             Ok(Some(permit)) => {
                 // The queued → running edge, paired with the `Queued` the

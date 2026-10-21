@@ -78,6 +78,26 @@ pub struct WorkerState {
     /// never re-registers, so the id embedded in `{agent}-wN` / the `#N`
     /// collision handle must stay readable without re-drawing it.
     pub worker_id_seq_value: u64,
+    /// Where this worker's **current backend call** stands in its pool key's FIFO,
+    /// or `None` while it is not sitting in a queue wait.
+    ///
+    /// The durable half of the `Queued` transition (fix #3,
+    /// `docs/diagnose_subpane_stale_refresh.md` §3). The delegation-event stream is
+    /// one-shot — a `Queued` read by `events.drain(..)` before its panel row exists
+    /// is gone, and the pool re-reports only when the rank actually moves — so the
+    /// same position is mirrored here, on the structure the row projection rebuilds
+    /// from. A viewer can then re-derive the `(Queued n/m)` label from the registry
+    /// instead of only from an event that happened to arrive in the right order.
+    ///
+    /// Written by [`set_worker_queue_position`] /
+    /// [`set_active_worker_queue_position`] from the pool's
+    /// [`crate::orchestrator::pool::PositionReporter`] inside
+    /// `llm::client::ChatClient::acquire_slot`, and taken back down when the slot is
+    /// acquired, when the wait is abandoned, and when the entry closes. It is
+    /// deliberately **not** persisted: a queue rank belongs to a wait inside one
+    /// process's pool, and a restored worker gets a fresh one the moment it queues
+    /// again.
+    pub queue_position: Option<crate::orchestrator::pool::QueuePosition>,
 }
 
 impl WorkerState {
@@ -180,6 +200,11 @@ impl Drop for ActiveWorkerGuard {
             entry.completed_seq = Some(seq);
             entry.completed_at = Some(Instant::now());
             entry.completed_wall = Some(chrono::Local::now());
+            // A closed delegation owns no slot wait: whatever rank this worker had
+            // in a FIFO died with the run, and a completed entry must never report
+            // one to the read model (the panel's teardown clear keys on
+            // `is_active`, but the registry itself must not hold the stale rank).
+            entry.queue_position = None;
         }
         // Bounded completed ring: evict oldest completed entries while over cap.
         evict_completed_ring();
@@ -313,6 +338,9 @@ pub fn retire_restored_worker(worker_key: &str, status_label: &str) -> Option<u6
             entry.completed_at = Some(Instant::now());
             entry.completed_wall = Some(chrono::Local::now());
             entry.info.status = status_label.to_string();
+            // Same teardown as an [`ActiveWorkerGuard`] drop: a closed entry never
+            // reports a slot rank.
+            entry.queue_position = None;
             Some(seq)
         }
     };
@@ -422,6 +450,18 @@ pub struct WorkerEntry {
     pub implementation_turns: usize,
     pub validation_rounds: usize,
     pub latest_validator_feedback: Option<String>,
+    /// Where this worker's current backend call stands in its pool key's FIFO
+    /// (`position` = 1-based rank, `of` = queue depth including this caller), or
+    /// `None` while it is not waiting for a slot.
+    ///
+    /// The registry is the **durable source of truth** for this state, which is what
+    /// lets a row projection re-derive a `(Queued n/m)` label instead of keeping only
+    /// what a one-shot delegation event happened to fold onto the row (fix #3,
+    /// `docs/diagnose_subpane_stale_refresh.md` §3). Written on the pool's
+    /// position-report edge by [`set_worker_queue_position`], and taken back down on
+    /// slot acquisition, on an abandoned wait and when the entry closes — so a
+    /// consumer reads it together with [`Self::is_active`] and never has to guess.
+    pub queue_position: Option<crate::orchestrator::pool::QueuePosition>,
 }
 
 /// Classify one entry from data the registry already stores.
@@ -487,6 +527,7 @@ fn project_worker_entry(key: &str, state: &WorkerState) -> WorkerEntry {
         implementation_turns: state.info.implementation_turns,
         validation_rounds: state.info.validation_rounds,
         latest_validator_feedback: state.info.latest_validator_feedback.clone(),
+        queue_position: state.queue_position,
     }
 }
 
@@ -638,6 +679,9 @@ fn new_worker_state(
         completed_at: None,
         completed_wall: None,
         worker_id_seq_value,
+        // A fresh registration is not waiting for a slot: the pool reports a rank
+        // only when a backend call actually has to queue.
+        queue_position: None,
     }
 }
 
@@ -754,6 +798,9 @@ pub fn update_active_worker_context(key: &str, tokens: usize) {
                 // `worker_id_seq_value` stays meaningful for real
                 // registrations only.
                 worker_id_seq_value: 0,
+                // A token-count stub is never a live worker, so it never has a
+                // slot rank.
+                queue_position: None,
             });
         }
     }
@@ -794,6 +841,120 @@ pub fn set_active_worker_status(key: &str, status: &str) {
     if updated {
         crate::ui::session::mark_worker_lifecycle_edge();
     }
+}
+
+/// Record — or take back down — the concurrency-slot **queue position** of a live
+/// worker, addressed by its effective registry key.
+///
+/// The registry is the durable source of truth for this state (fix #3,
+/// `docs/diagnose_subpane_stale_refresh.md` §3): the pool reports a rank once per
+/// acquisition and afterwards only when the rank moves, and the matching
+/// [`crate::orchestrator::DelegationEvent::Queued`] is a **one-shot** event that the
+/// session drains with `events.drain(..)` — a `Queued` that reaches the drain before
+/// the row projection has opened the row is consumed and never replayed. Mirroring
+/// the position here is what lets any later projection re-derive the panel's
+/// `(Queued n/m)` label from the registry alone.
+///
+/// `None` means "this worker holds no slot wait" — written when the permit is
+/// acquired, when a wait is abandoned, and on entry teardown. Only a **live** entry
+/// is touched: an entry the registry already closed has no wait to report (its own
+/// teardown cleared the field), so this returns `false` rather than resurrecting a
+/// rank on a completed worker.
+///
+/// No lifecycle edge is marked: `queue_position` is not a persisted worker field, and
+/// the panel is driven by its projection boundaries, which every queue transition
+/// sits inside.
+pub fn set_active_worker_queue_position(
+    key: &str,
+    position: Option<crate::orchestrator::pool::QueuePosition>,
+) -> bool {
+    match WORKERS.get_mut(key) {
+        Some(mut entry) if entry.is_active() => {
+            entry.queue_position = position;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Resolve the **live** registry entry a pool queue report belongs to, and write its
+/// position.
+///
+/// Queue reports reach this from the concurrency gate (`llm::client::ChatClient::acquire_slot`),
+/// which knows the agent and plan task of the call that is waiting — never a registry
+/// key. The correlation rule must therefore be the one
+/// [`register_active_worker_with_token`] uses to **build** the key, so a report can
+/// only ever land on the entry the panel row of that delegation is named after:
+///
+/// * the **natural** key `{agent}-{normalized task}` when a live entry holds it — the
+///   same preference `ui::helpers::registry_entry_for_event` applies to a delegation
+///   event, which keeps the event half and the registry half of one transition on the
+///   same entry;
+/// * otherwise a `{base}#…` collision handle, and only when **exactly one** live entry
+///   carries it: two live registrations of one identity are two workers, and guessing
+///   which one is waiting would pin one delegation's rank to the other's row.
+///
+/// `false` is the honest answer for everything the report cannot address: no task id
+/// (a task-less worker's key carries a drawn `WORKER_ID_SEQ` id no report can spell),
+/// no live entry for that identity, or an ambiguous one.
+pub fn set_worker_queue_position(
+    agent_name: &str,
+    task_id: Option<&str>,
+    position: Option<crate::orchestrator::pool::QueuePosition>,
+) -> bool {
+    let clean_task = task_id.and_then(crate::task_id::normalize_task_id);
+    let Some(clean_task) = clean_task else {
+        return false;
+    };
+    let base_key = format!("{agent_name}-{clean_task}");
+    // Natural key first, and only a live entry. The lookup is bound to a `bool` so no
+    // map guard can possibly outlive the expression before the write below (the
+    // module's single-guard rule).
+    let natural_is_live = WORKERS
+        .get(&base_key)
+        .is_some_and(|entry| entry.value().is_active());
+    if natural_is_live {
+        return set_active_worker_queue_position(&base_key, position);
+    }
+    // No live natural key: a duplicate registration of the same identity took a
+    // `{base}#…` handle instead. The disambiguator is the anchor, so this is a
+    // structural match on the whole `{base}` segment and never a prefix guess about
+    // an agent or task name.
+    let prefixed = format!("{base_key}{KEY_DISAMBIGUATOR}");
+    let mut candidates = WORKERS
+        .iter()
+        .filter(|entry| entry.value().is_active() && entry.key().starts_with(&prefixed))
+        .map(|entry| entry.key().clone())
+        .collect::<Vec<String>>()
+        .into_iter();
+    match (candidates.next(), candidates.next()) {
+        // Exactly one live registration behind this identity: that is the entry waiting.
+        (Some(key), None) => set_active_worker_queue_position(&key, position),
+        // Two or more: ambiguous, and a rank pinned to the wrong row is worse than no
+        // rank at all.
+        (Some(_), Some(_)) => {
+            tracing::debug!(
+                agent = agent_name,
+                task = %clean_task,
+                "queue report is ambiguous across live registrations of this identity; \
+                 leaving the registry queue state untouched"
+            );
+            false
+        }
+        // Nothing live to write.
+        (None, _) => false,
+    }
+}
+
+/// The queue position currently recorded for one live registry entry, if any.
+///
+/// A read model for consumers (tests, diagnostics) that must not reach into
+/// [`WorkerState`].
+pub fn active_worker_queue_position(key: &str) -> Option<crate::orchestrator::pool::QueuePosition> {
+    WORKERS
+        .get(key)
+        .filter(|entry| entry.value().is_active())
+        .and_then(|entry| entry.value().queue_position)
 }
 
 /// Get the context token count for an active specialist worker by its registry
@@ -3039,5 +3200,234 @@ mod tests {
             Some("u11111111-2222-3333-4444-555555555555"),
             "a hyphenated UUID handle is opaque, not a task id"
         );
+    }
+
+    /// **Queue-state durability (fix #3).** The registry must be a durable source of
+    /// truth for a slot rank, not a pass-through: a rank reported through
+    /// [`set_worker_queue_position`] is readable from the projected entry every later
+    /// consumer sees, it is replaced (never accumulated) by the next report, and each
+    /// way a wait ends — permit acquired, guard dropped, entry already closed — takes
+    /// it back down instead of pinning a rank to a dead delegation.
+    #[test]
+    fn test_queue_position_is_durable_on_the_registry_entry() {
+        let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let rank =
+            |position: usize, of: usize| crate::orchestrator::pool::QueuePosition { position, of };
+        let projected = |key: &str| {
+            worker_entries()
+                .into_iter()
+                .find(|entry| entry.key == key)
+                .expect("the registry holds this worker")
+        };
+
+        let guard = register_active_worker(
+            Some("t-9301".to_string()),
+            "coder".to_string(),
+            "brief for a delegation waiting on a backend slot".to_string(),
+        );
+        let key = guard.0.clone();
+        assert_eq!(key, "coder-t-9301", "the natural key is the row name");
+        assert_eq!(
+            projected(&key).queue_position,
+            None,
+            "a fresh registration holds no slot wait"
+        );
+
+        // The pool's report at queue-entry time lands on the entry — and it resolves
+        // through the *decorated* spelling a caller may carry, because the correlation
+        // rule normalizes exactly like the registration did.
+        assert!(
+            set_worker_queue_position("coder", Some("[t-9301]"), Some(rank(2, 3))),
+            "a live natural key is addressable by agent + plan task"
+        );
+        assert_eq!(
+            projected(&key).queue_position,
+            Some(rank(2, 3)),
+            "the rank survives the projection that reads it back"
+        );
+        assert_eq!(active_worker_queue_position(&key), Some(rank(2, 3)));
+
+        // A later rank move replaces it for as long as the wait lasts.
+        assert!(set_worker_queue_position(
+            "coder",
+            Some("t-9301"),
+            Some(rank(1, 3))
+        ));
+        assert_eq!(
+            projected(&key).queue_position,
+            Some(rank(1, 3)),
+            "the rank is replaced, never accumulated"
+        );
+
+        // Acquiring the permit clears it: the panel must never keep showing
+        // `(Queued 1/3)` for a call that is running.
+        assert!(set_active_worker_queue_position(&key, None));
+        assert_eq!(
+            projected(&key).queue_position,
+            None,
+            "running is not waiting"
+        );
+
+        // A wait that ends by teardown is cleared **by the teardown**, so a completed
+        // entry never reports a rank to the read model or to a projection.
+        set_worker_queue_position("coder", Some("t-9301"), Some(rank(3, 4)));
+        assert_eq!(projected(&key).queue_position, Some(rank(3, 4)));
+        drop(guard);
+        let closed = projected(&key);
+        assert!(!closed.is_active, "the guard closed the entry");
+        assert_eq!(closed.queue_position, None, "and cleared the rank");
+        assert_eq!(
+            active_worker_queue_position(&key),
+            None,
+            "the read model agrees"
+        );
+        assert!(
+            !set_active_worker_queue_position(&key, Some(rank(1, 1))),
+            "a closed entry never gets a rank back"
+        );
+        remove_worker_entry_for_test(&key);
+    }
+
+    /// A queue report spells an agent and a plan task, never a registry key, so the
+    /// correlation rule has to be the one [`claim_worker_slot`] used to **build** the
+    /// key: a live natural key wins, a lone `{base}#…` handle is resolved, and two live
+    /// registrations of one identity are refused rather than guessed.
+    #[test]
+    fn test_queue_position_report_resolves_a_disambiguated_key_and_refuses_an_ambiguous_one() {
+        let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let rank = crate::orchestrator::pool::QueuePosition { position: 1, of: 2 };
+        let brief = "brief for a queued delegation".to_string();
+
+        let first = register_active_worker(
+            Some("t-9302".to_string()),
+            "coder".to_string(),
+            brief.clone(),
+        );
+        let second = register_active_worker(
+            Some("t-9302".to_string()),
+            "coder".to_string(),
+            brief.clone(),
+        );
+        let third = register_active_worker(Some("t-9302".to_string()), "coder".to_string(), brief);
+        let (first_key, second_key, third_key) =
+            (first.0.clone(), second.0.clone(), third.0.clone());
+        assert_eq!(
+            first_key, "coder-t-9302",
+            "the first registration owns the natural key"
+        );
+        assert!(
+            second_key.starts_with("coder-t-9302#") && third_key.starts_with("coder-t-9302#"),
+            "a live natural key forces `{{base}}#…` handles, got {second_key} and {third_key}"
+        );
+
+        // Three live registrations of one identity: the natural key is what the row of
+        // *that* delegation is named after, so the rank goes there and nowhere else.
+        assert!(set_worker_queue_position(
+            "coder",
+            Some("t-9302"),
+            Some(rank)
+        ));
+        assert_eq!(active_worker_queue_position(&first_key), Some(rank));
+        assert_eq!(
+            active_worker_queue_position(&second_key),
+            None,
+            "a report never spreads across registrations"
+        );
+        assert_eq!(active_worker_queue_position(&third_key), None);
+
+        // The natural holder closes: two live `{base}#…` registrations remain and the
+        // report cannot tell which one is waiting. A rank pinned to the wrong row is
+        // worse than no rank, so the registry is left untouched.
+        drop(first);
+        assert_eq!(
+            active_worker_queue_position(&second_key),
+            None,
+            "the closed natural holder keeps no rank either"
+        );
+        assert!(
+            !set_worker_queue_position("coder", Some("t-9302"), Some(rank)),
+            "an ambiguous identity is refused"
+        );
+        assert_eq!(active_worker_queue_position(&second_key), None);
+        assert_eq!(active_worker_queue_position(&third_key), None);
+
+        // One live registration remains: exactly the entry the panel row names, so the
+        // report resolves its collision handle.
+        drop(second);
+        assert!(
+            set_worker_queue_position("coder", Some("t-9302"), Some(rank)),
+            "a lone `{{base}}#…` registration is addressable"
+        );
+        assert_eq!(active_worker_queue_position(&third_key), Some(rank));
+        assert_eq!(
+            worker_entries()
+                .into_iter()
+                .find(|entry| entry.key == third_key)
+                .expect("the disambiguated entry is still registered")
+                .queue_position,
+            Some(rank),
+            "and it reaches the projection like any other rank"
+        );
+
+        drop(third);
+        remove_worker_entry_for_test(&first_key);
+        remove_worker_entry_for_test(&second_key);
+        remove_worker_entry_for_test(&third_key);
+    }
+
+    /// The report must never invent or guess an entry: a task-less worker's key carries
+    /// a drawn `WORKER_ID_SEQ` id no report can spell, an id that normalizes away is no
+    /// identity at all, and an identity with no live entry has nothing to write.
+    #[test]
+    fn test_queue_position_report_refuses_an_identity_it_cannot_address() {
+        let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let rank = crate::orchestrator::pool::QueuePosition { position: 1, of: 1 };
+
+        assert!(
+            !set_worker_queue_position("coder", None, Some(rank)),
+            "a task-less worker is not addressable by agent name alone"
+        );
+        assert!(
+            !set_worker_queue_position("coder", Some("  []  "), Some(rank)),
+            "an id that normalizes away is no identity"
+        );
+        assert!(
+            !set_worker_queue_position("coder", Some("t-9303-never-registered"), Some(rank)),
+            "no live entry, no write"
+        );
+        assert!(
+            !set_active_worker_queue_position("coder-t-9303-never-registered", Some(rank)),
+            "and no write to a key the registry does not hold"
+        );
+        assert_eq!(
+            active_worker_queue_position("coder-t-9303-never-registered"),
+            None,
+            "nothing was resurrected"
+        );
+
+        let guard = register_active_worker(None, "coder".to_string(), "no plan task".to_string());
+        let key = guard.0.clone();
+        assert!(
+            key.starts_with("coder-w"),
+            "a task-less registration gets a drawn id: {}",
+            key
+        );
+        assert!(
+            !set_worker_queue_position("coder", None, Some(rank)),
+            "and its key cannot be spelled from a queue report"
+        );
+        assert_eq!(
+            active_worker_queue_position(&key),
+            None,
+            "so it keeps no rank, and no phantom entry was created for the report"
+        );
+        assert!(
+            worker_entries()
+                .iter()
+                .all(|entry| !entry.key.starts_with("coder-t-9303")),
+            "a refused report never invents a registry entry to put a rank on"
+        );
+        drop(guard);
+        remove_worker_entry_for_test(&key);
     }
 }

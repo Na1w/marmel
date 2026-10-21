@@ -1650,12 +1650,17 @@ fn subagent_detail_from_panel(panel: &crate::session::format::SubagentPanel) -> 
         content: panel.content.clone(),
         is_active: panel.is_active,
         context_tokens: panel.context_tokens,
-        // Neither slot state survives a restore: `queue` belongs to a live
-        // delegation and `paused` to a stream the preemption handshake is holding.
-        // A journaled pane records a round that was interrupted, never a stream
-        // that is parked behind the arbitrator right now, so both start clean and
-        // only a fresh typed transition (`Event::SubagentStreamPause`) or a fresh
-        // queue event can set them again.
+        // Neither slot state is **persisted**: `queue` belongs to a live delegation's
+        // wait in a pool ledger that exists only inside this process, and `paused` to a
+        // stream the preemption handshake is holding right now. A journaled pane records
+        // a round that was interrupted, never a stream parked behind the arbitrator, so
+        // both start clean. How each is recovered afterwards is the difference fix #3
+        // made: a pause comes back only from a fresh `Event::SubagentStreamPause`, while
+        // a queue label comes back by itself as soon as the pool reports a rank for the
+        // live entry behind the row — the projection mirrors
+        // `orchestrator::WorkerEntry::queue_position` (fix #3), so the persisted format
+        // needs no queue field and a restored row is never left claiming — or hiding — a
+        // position the registry knows about.
         queue: None,
         paused: false,
     }

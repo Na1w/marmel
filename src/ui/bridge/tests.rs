@@ -1740,7 +1740,7 @@ fn test_bridge_paused_stream_sink_terminal_sleep_queues_the_instruction() {
         let mut renderer = TestRenderer::new();
         let mut steer_queue = Vec::new();
         let mut steer_abort = false;
-        let subagents: Vec<SubagentDetail> = Vec::new();
+        let mut subagents: Vec<SubagentDetail> = Vec::new();
         let instruction = "use postgres instead and say so";
 
         {
@@ -1753,7 +1753,7 @@ fn test_bridge_paused_stream_sink_terminal_sleep_queues_the_instruction() {
                 client: &client,
                 stats: stats.clone(),
                 goal: "keep the suite green",
-                subagents: &subagents,
+                subagents: &mut subagents,
                 plan: None,
                 ctx: None,
                 steering_history: Some(history),
@@ -2435,7 +2435,7 @@ fn test_bridge_sink_host_and_arbitrator_agree_on_a_steered_zero_second_sleep() {
         let mut renderer = TestRenderer::new();
         let mut steer_queue = Vec::new();
         let mut steer_abort = false;
-        let subagents: Vec<SubagentDetail> = Vec::new();
+        let mut subagents: Vec<SubagentDetail> = Vec::new();
 
         {
             let mut sink = super::sink::RendererSink {
@@ -2447,7 +2447,7 @@ fn test_bridge_sink_host_and_arbitrator_agree_on_a_steered_zero_second_sleep() {
                 client: &client,
                 stats: stats.clone(),
                 goal: "keep the suite green",
-                subagents: &subagents,
+                subagents: &mut subagents,
                 plan: None,
                 ctx: None,
                 steering_history: Some(history.clone()),
@@ -2661,4 +2661,319 @@ fn test_no_raw_tool_name_literals_in_bridge_tree() {
         "raw tool-name literals in src/ui/bridge/:\n{}",
         violations.join("\n")
     );
+}
+
+// ---------------------------------------------------------------------------
+// fix #4 — the panel pump that keeps the subpane alive inside the sink
+// (C1 in docs/diagnose_subpane_stale_refresh.md)
+// ---------------------------------------------------------------------------
+
+use super::sink::{await_with_panel_pump, pump_subagent_panel};
+
+/// A [`TestRenderer`] that also records every authoritative panel push
+/// (`Renderer::set_subagents`), optionally into a shared witness so an async test can look at
+/// the panel from inside a future that is still pending.
+#[derive(Default)]
+struct PanelProbeRenderer {
+    events: Vec<Event>,
+    pushes: Vec<Vec<SubagentDetail>>,
+    witness: Option<std::sync::Arc<std::sync::Mutex<Vec<Vec<SubagentDetail>>>>>,
+    input_state: crate::ui::InputState,
+}
+
+impl PanelProbeRenderer {
+    /// The panel's own draw predicate for the queue marker, verbatim from
+    /// `src/ui/tui/render.rs:717` (`row.is_active && row.queue.is_some()`). A row failing this
+    /// shows no queue information at all, whatever the pool ledger says.
+    fn draws_queued(rows: &[SubagentDetail], name: &str) -> bool {
+        rows.iter()
+            .any(|row| row.name == name && row.is_active && row.queue.is_some())
+    }
+}
+
+impl Renderer for PanelProbeRenderer {
+    fn init(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn on_event(&mut self, event: &Event) {
+        self.events.push(event.clone());
+    }
+    fn flush(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn set_subagents(&mut self, subagents: Vec<SubagentDetail>) {
+        if let Some(witness) = &self.witness {
+            witness
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(subagents.clone());
+        }
+        self.pushes.push(subagents);
+    }
+    fn input_state(&mut self) -> &mut crate::ui::InputState {
+        &mut self.input_state
+    }
+    fn input_state_shared(&self) -> &crate::ui::InputState {
+        &self.input_state
+    }
+    fn shutdown(&mut self) {}
+}
+
+/// The pump is a **registry projection**, not a second event consumer: a live worker whose pool
+/// rank landed on its registry entry (fix #3) reaches the pane with no delegation event at all.
+#[test]
+fn test_sink_panel_pump_surfaces_a_queued_worker_from_the_registry_alone() {
+    let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let guard = crate::orchestrator::register_active_worker_with_token(
+        Some("t-panel-pump-1".to_string()),
+        "coder".to_string(),
+        "waiting for a backend slot".to_string(),
+        None,
+    );
+    let key = guard.0.clone();
+
+    let mut rows: Vec<SubagentDetail> = Vec::new();
+    let mut renderer = PanelProbeRenderer::default();
+
+    // First edge: row existence itself comes from the projection.
+    assert!(
+        pump_subagent_panel(&mut rows, &mut renderer),
+        "a live worker with no row yet is a visible edge"
+    );
+    let row = rows
+        .iter()
+        .find(|row| row.name == key)
+        .expect("the live worker has a row after one projection");
+    assert!(row.is_active, "a live registry entry opens its row");
+    assert!(
+        row.queue.is_none(),
+        "no rank has been recorded on this entry yet, got {row:?}"
+    );
+    assert_eq!(renderer.pushes.len(), 1);
+
+    // The pool's rank lands on the **registry entry** only — no delegation event is produced,
+    // which is exactly the state a lost `Queued` leaves behind.
+    assert!(
+        crate::orchestrator::workers::set_active_worker_queue_position(
+            &key,
+            Some(crate::orchestrator::pool::QueuePosition { position: 1, of: 1 }),
+        ),
+        "a live entry must accept a pool rank"
+    );
+
+    assert!(
+        pump_subagent_panel(&mut rows, &mut renderer),
+        "a rank the registry newly reports is a visible edge; pushes: {}",
+        renderer.pushes.len()
+    );
+    let row = rows
+        .iter()
+        .find(|row| row.name == key)
+        .expect("the row is still on the panel");
+    assert!(
+        PanelProbeRenderer::draws_queued(&rows, &key),
+        "the panel's own draw predicate must now hold, got {row:?}"
+    );
+    let queue = row.queue.as_ref().expect("queue state re-derived");
+    assert_eq!((queue.position, queue.of), (1, 1));
+    assert_eq!(renderer.pushes.len(), 2);
+
+    // Self-gated: with nothing moved, the pump must not push again — this is what makes it
+    // cheap enough to run on every streamed chunk.
+    assert!(
+        !pump_subagent_panel(&mut rows, &mut renderer),
+        "an unchanged row set must not re-push"
+    );
+    assert_eq!(renderer.pushes.len(), 2);
+}
+
+/// `poll_control` deliberately stays **panel-silent**, and this pins that decision.
+///
+/// A pump here would move the pane while the Manager's own turn is still in flight, i.e. between
+/// two loop drains — which is precisely the contract `tests/test_subpane_queued_refresh.rs::
+/// no_delegation_drain_runs_while_the_manager_turn_is_in_flight` pins (a turn in flight is a
+/// drain-free window that the loop closes at its next boundary, folding the same state then). A
+/// future change that adds a pump here must update that repro **and** this test on purpose, not
+/// by accident. The arbitration drain itself keeps running first, on the same channel, with the
+/// same arguments.
+#[tokio::test]
+async fn test_poll_control_stays_panel_silent_and_keeps_owning_the_arbitration_drain() {
+    let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let guard = crate::orchestrator::register_active_worker_with_token(
+        Some("t-panel-pump-2".to_string()),
+        "coder".to_string(),
+        "delegated while the Manager's own turn is streaming".to_string(),
+        None,
+    );
+    let key = guard.0.clone();
+    assert!(
+        crate::orchestrator::workers::set_active_worker_queue_position(
+            &key,
+            Some(crate::orchestrator::pool::QueuePosition { position: 2, of: 3 }),
+        ),
+        "a live entry must accept a pool rank"
+    );
+
+    let client = crate::llm::ChatClient::new("http://localhost:11434/v1", "test".to_string());
+    let stats = std::sync::Arc::new(crate::harness::HarnessStats::new());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut renderer = PanelProbeRenderer::default();
+    let mut steer_queue = Vec::new();
+    let mut steer_abort = false;
+    let mut rows: Vec<SubagentDetail> = Vec::new();
+
+    tx.send(SteerArbEvent::DelegationStarted {
+        agent: Agent::Coder,
+        task_id: "t-panel-pump-2".to_string(),
+        prompt: "Check files".to_string(),
+    })
+    .expect("the arbitration channel is open");
+
+    let control = {
+        let mut sink = super::sink::RendererSink {
+            renderer: &mut renderer,
+            steer_queue: &mut steer_queue,
+            steer_abort_requested: &mut steer_abort,
+            arb_tx: &tx,
+            arb_rx: &mut rx,
+            client: &client,
+            stats: stats.clone(),
+            goal: "keep the suite green",
+            subagents: &mut rows,
+            plan: None,
+            ctx: None,
+            steering_history: None,
+        };
+        crate::llm::StreamSink::poll_control(&mut sink)
+    };
+
+    assert!(
+        matches!(control, crate::llm::StreamControl::Continue),
+        "poll_control must not change the stream control decision, got {control:?}"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "the steer-arbitration drain must still be the one consuming its channel"
+    );
+    assert!(
+        renderer.events.iter().any(|e| matches!(
+            e,
+            Event::Delegation(crate::orchestrator::DelegationEvent::Started { task, .. })
+                if task.as_deref() == Some("t-panel-pump-2")
+        )),
+        "the arbitration event must still reach the host through the drain, got {:?}",
+        renderer.events
+    );
+    assert!(
+        steer_queue.is_empty() && !steer_abort,
+        "poll_control must not feed the instruction queue or request an abort"
+    );
+    assert!(
+        renderer.pushes.is_empty() && rows.is_empty(),
+        "poll_control must not push or build panel rows: the loop's boundary drain folds this \
+         state one edge later (see the repro control named in this test's doc); pushes: {}",
+        renderer.pushes.len()
+    );
+
+    drop(guard);
+}
+
+/// The C1 window itself: while the sink awaits something long (a steering-delegated subtask
+/// including its pool slot wait), the session loop is parked on the turn that owns the sink and
+/// cannot reach its own projection edge. The in-sink pump must therefore move the pane **while
+/// the awaited work is still pending** — proven by sampling the panel from inside the pending
+/// future itself, so no sleep-based ordering is involved.
+#[tokio::test]
+// The guard serializes the process-wide worker registry for the whole scenario, and the
+// scenario is the await: holding it across that await is the point, not a bug (same shape as
+// `session_tests::resume_without_a_bundle_sends_the_same_request_as_a_fresh_start`).
+#[allow(clippy::await_holding_lock)]
+async fn test_sink_panel_pump_moves_the_pane_while_its_own_await_is_in_flight() {
+    let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let guard = crate::orchestrator::register_active_worker_with_token(
+        Some("t-panel-pump-3".to_string()),
+        "coder".to_string(),
+        "steering-delegated child waiting for a backend slot".to_string(),
+        None,
+    );
+    let key = guard.0.clone();
+    // The child is already queued when the sink's await starts: this is the state the pane
+    // never used to learn anything about until the turn ended.
+    assert!(
+        crate::orchestrator::workers::set_active_worker_queue_position(
+            &key,
+            Some(crate::orchestrator::pool::QueuePosition { position: 1, of: 1 }),
+        ),
+        "a live entry must accept a pool rank"
+    );
+
+    let witness: std::sync::Arc<std::sync::Mutex<Vec<Vec<SubagentDetail>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut renderer = PanelProbeRenderer {
+        witness: Some(std::sync::Arc::clone(&witness)),
+        ..PanelProbeRenderer::default()
+    };
+    let mut rows: Vec<SubagentDetail> = Vec::new();
+
+    // Sampled by the pending future at the exact instant its own work finished, i.e. strictly
+    // inside the window in which the session loop cannot reach its projection edge.
+    let mid_window: std::sync::Arc<std::sync::Mutex<Option<Vec<Vec<SubagentDetail>>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let sampled = std::sync::Arc::clone(&mid_window);
+    let witness_inside = std::sync::Arc::clone(&witness);
+    let row_key = key.clone();
+
+    let deliverable = await_with_panel_pump(&mut rows, &mut renderer, async move {
+        // Stands in for `arbiter::run_delegated_subtask`: the pool slot wait is the long part.
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        *sampled.lock().unwrap_or_else(|e| e.into_inner()) = Some(
+            witness_inside
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        );
+        format!("deliverable for {row_key}")
+    })
+    .await;
+
+    assert_eq!(deliverable, format!("deliverable for {key}"));
+    assert!(
+        renderer.events.is_empty(),
+        "the pump re-projects rows from the registry; it must not fabricate stream events, got \
+         {:?}",
+        renderer.events
+    );
+
+    let pushes = mid_window
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .expect("the awaited work must have sampled the panel");
+    assert!(
+        pushes
+            .iter()
+            .any(|rows| PanelProbeRenderer::draws_queued(rows, &key)),
+        "the queued row must already have reached the pane while the awaited subtask was still \
+         in flight (that is the C1 window); pushes seen at that instant: {pushes:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.name == key
+            && row.is_active
+            && row
+                .queue
+                .as_ref()
+                .is_some_and(|q| (q.position, q.of) == (1, 1))),
+        "the loop's own row buffer must have caught up too, got {rows:?}"
+    );
+
+    drop(guard);
 }

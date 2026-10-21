@@ -738,6 +738,7 @@ async fn test_renderer_sink_handles_reset_command() {
     let client = ChatClient::new("http://localhost:11434/v1", "test".to_string());
     let stats = Arc::new(crate::harness::HarnessStats::new());
     let mut ctx = ContextEngine::new(4096);
+    let mut panel_rows = Vec::new();
 
     let mut sink = RendererSink {
         renderer: &mut renderer,
@@ -748,7 +749,7 @@ async fn test_renderer_sink_handles_reset_command() {
         client: &client,
         stats,
         goal: "goal",
-        subagents: &[],
+        subagents: &mut panel_rows,
         plan: Some(&plan),
         ctx: Some(&mut ctx),
         steering_history: None,
