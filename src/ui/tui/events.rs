@@ -287,15 +287,7 @@ impl TuiRenderer {
                 },
                 Ok(TermEvent::Paste(text)) => {
                     if self.focused_panel == FocusedPanel::Chat {
-                        self.ensure_textarea_in_sync();
-                        for ch in text.chars() {
-                            if ch == '\n' {
-                                self.textarea.insert_newline();
-                            } else if ch != '\r' {
-                                self.textarea.insert_char(ch);
-                            }
-                        }
-                        self.sync_input_from_textarea();
+                        self.paste_text(&text);
                     }
                 }
                 Ok(TermEvent::Resize(_, _)) => {
@@ -312,6 +304,37 @@ impl TuiRenderer {
             }
         }
         handled
+    }
+
+    /// Insert a pasted block into the composer as one contiguous edit.
+    ///
+    /// With bracketed paste enabled (see `init()`) the terminal delivers the whole
+    /// body in a single `Event::Paste`, so nothing inside it can reach the
+    /// `KeyCode::Enter` arm — a multi-line paste can never fire one steering command
+    /// per line, and this helper never calls `submit()`.
+    ///
+    /// Line endings are normalised (`\r\n` and lone `\r` become `\n`) and a single
+    /// trailing newline, which terminals commonly append to a paste, is dropped so the
+    /// buffer does not end on an empty line that the next Enter would swallow.
+    pub(crate) fn paste_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let normalised = if text.contains('\r') {
+            text.replace("\r\n", "\n").replace('\r', "\n")
+        } else {
+            text.to_string()
+        };
+        let body = normalised.strip_suffix('\n').unwrap_or(&normalised);
+        if body.is_empty() {
+            return;
+        }
+        self.ensure_textarea_in_sync();
+        // A single insert_str splices the block in one edit: one undo record and one
+        // line rewrite, so a very large paste cannot trigger a per-char re-render storm.
+        self.textarea.insert_str(body);
+        self.sync_input_from_textarea();
+        self.dirty = true;
     }
 
     pub(crate) fn sync_input_from_textarea(&mut self) {

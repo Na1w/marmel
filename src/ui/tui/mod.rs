@@ -14,8 +14,8 @@ use crate::config::Config;
 use crate::orchestrator::OrchestratorManager;
 use anyhow::Result;
 use crossterm::event::{
-    DisableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -470,6 +470,16 @@ impl Renderer for TuiRenderer {
         let stdout = io::stdout();
         let backend = CrosstermBackend::new(stdout);
         self.terminal = Some(Terminal::new(backend)?);
+        // Bracketed paste (SGR mode 2004): without it a multi-line paste arrives as
+        // ordinary key events, where every embedded CR parses as KeyCode::Enter and
+        // fires one steering command per line. Placed after every fallible step and
+        // error-tolerant (`let _ =`): init() propagates failures with `?` and never
+        // rolls back modes it has already switched on, so enabling paste last means an
+        // aborted startup can never leave 2004 stuck on, and a terminal that rejects
+        // the request still starts the app (degrading to the old per-key behaviour).
+        // Every successful enable is mirrored by DisableBracketedPaste in shutdown()
+        // and leave_alt_screen() so the flag never leaks into the user's shell.
+        let _ = execute!(io::stdout(), EnableBracketedPaste);
 
         let plan = crate::manager::phase::Plan::default();
         if let Ok(Some(content)) = plan.read()
@@ -1100,7 +1110,8 @@ impl Renderer for TuiRenderer {
             io::stdout(),
             PopKeyboardEnhancementFlags,
             LeaveAlternateScreen,
-            DisableMouseCapture
+            DisableMouseCapture,
+            DisableBracketedPaste
         );
         let _ = disable_raw_mode();
     }
@@ -1764,11 +1775,14 @@ impl Drop for TuiRenderer {
 /// Leave the alternate screen (best-effort, from the panic hook).
 pub fn leave_alt_screen() -> std::io::Result<()> {
     let _ = disable_raw_mode();
+    // Mirror every mode init() switched on, including bracketed paste, because the
+    // panic path bypasses shutdown() and must not leak mode 2004 into the user's shell.
     execute!(
         io::stdout(),
         PopKeyboardEnhancementFlags,
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        DisableBracketedPaste
     )
 }
 
