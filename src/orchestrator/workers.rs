@@ -1264,6 +1264,7 @@ mod tests {
 
     #[test]
     fn test_worker_progress_and_completed_history() {
+        let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let guard = register_active_worker(
             Some("task-test-1".to_string()),
             "coder".to_string(),
@@ -1333,6 +1334,7 @@ mod tests {
 
     #[test]
     fn test_format_workers_summary_utf8_char_boundary_no_panic() {
+        let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let prefix = "e".repeat(296);
         let fb = format!(
             "{prefix}—feedback text that exceeds 300 characters easily and has em-dash right at the cut boundary"
@@ -1362,7 +1364,9 @@ mod tests {
     /// batch must finish well within a generous wall-clock bound (no
     /// deadlock), and the completed ring must stay capped at 10 entries.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_workers_stress_concurrent_register_update_drop() {
+        let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let n = 50;
         let mut handles = Vec::with_capacity(n);
         for i in 0..n {
