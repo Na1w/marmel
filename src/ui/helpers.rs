@@ -404,9 +404,13 @@ fn apply_registry_entry(row: &mut SubagentDetail, entry: &crate::orchestrator::W
     }
     // A row that stopped running can never keep a queue position behind: the
     // queue belongs to a live delegation only, and this is the path every
-    // non-event teardown (cancel, preemption, guard drop) goes through.
+    // non-event teardown (cancel, preemption, guard drop) goes through. The same
+    // holds for a paused stream — the pause belongs to a live stream, so a row the
+    // registry closed (completion, guard drop after a cancel, eviction) can never
+    // keep a stale `Paused` behind.
     if !entry.is_active {
         row.queue = None;
+        row.paused = false;
     }
 }
 
@@ -452,11 +456,21 @@ pub(crate) fn subagent_row_badge(
     None
 }
 
-/// What a viewer can see about the row **set**: identity, liveness and ctx.
-/// Deliberately blind to clocks and streamed text, which move on their own.
-fn subagent_row_signature(rows: &[SubagentDetail]) -> Vec<(String, bool, usize)> {
+/// What a viewer can see about the row **set**: identity, liveness, arbitration
+/// pause and ctx. Deliberately blind to clocks and streamed text, which move on
+/// their own. `paused` is part of it because the panel's label word changes with
+/// it: a row that flips to or out of a arbitration pause must be re-pushed even
+/// when nothing else about it moved.
+fn subagent_row_signature(rows: &[SubagentDetail]) -> Vec<(String, bool, bool, usize)> {
     rows.iter()
-        .map(|row| (row.name.clone(), row.is_active, row.context_tokens))
+        .map(|row| {
+            (
+                row.name.clone(),
+                row.is_active,
+                row.paused,
+                row.context_tokens,
+            )
+        })
         .collect()
 }
 
@@ -537,9 +551,11 @@ pub(crate) fn update_subagent_lifecycle(
         // Closing a delegation takes the queue state down with it, whichever way
         // it closed — completion, failure or a cancel that landed while the call
         // was still waiting for a slot. No queue row ever outlives its
-        // delegation (design §7).
+        // delegation (design §7). The arbitration pause goes down the same way: a
+        // stream of a closed delegation cannot be held by the arbitrator any more.
         if !started {
             existing.queue = None;
+            existing.paused = false;
         }
         existing.last_activity_at = Some(now);
         if active_tokens > 0 {
@@ -566,6 +582,7 @@ pub(crate) fn update_subagent_lifecycle(
             is_active: started,
             context_tokens: active_tokens,
             queue: None,
+            paused: false,
         };
         if let Some(entry) = entry.as_ref() {
             apply_registry_entry(&mut row, entry);
@@ -620,6 +637,95 @@ pub(crate) fn update_subagent_queue(
     // A slot transition is real progress on this delegation: it is the one piece
     // of activity a queued call produces, and it keeps the row's idle accounting
     // honest without moving any clock.
+    existing.last_activity_at = Some(std::time::Instant::now());
+    true
+}
+
+/// Resolve the **panel row** a stream spelling belongs to.
+///
+/// A stream tag is spelled `{agent}-{task}` or bare `{agent}`
+/// (`orchestrator/execution.rs`), while a row is named by the **effective registry
+/// key** (`WorkerEntry::key`), which may carry a handle the tag can never spell:
+/// `{agent}-wN` for a taskless worker, `{base}#N` when a live worker already owned
+/// the natural key. Every consumer of a stream spelling — the streamed text, the
+/// thinking flags and the arbitration pause — must land on the same row, so the
+/// rule is owned once here instead of per call site.
+///
+/// Order, strongest first: exact key, natural key (the tag with the `#…` collision
+/// handle stripped), the `{agent}-wN` form of a bare agent tag, then task-id
+/// equality. Falling back to the tag itself is what keeps the first event for a
+/// not-yet-registered worker working: the row is then created under the tag and
+/// re-labelled by `set_subagents` when the registry publishes the real key.
+pub(crate) fn subagent_row_key_for_tag(rows: &[SubagentDetail], tag: &str) -> String {
+    if rows.iter().any(|s| s.name == tag) {
+        return tag.to_string();
+    }
+    let digit_run = |rest: &str| {
+        rest.strip_prefix("-w")
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let natural = rows
+        .iter()
+        .find(|s| match s.name.split_once('#') {
+            Some((head, handle)) => head == tag && !handle.is_empty(),
+            None => false,
+        })
+        .or_else(|| {
+            rows.iter()
+                .find(|s| s.name.strip_prefix(tag).is_some_and(digit_run))
+        });
+    if let Some(row) = natural {
+        return row.name.clone();
+    }
+    let by_task = rows.iter().find(|s| {
+        let clean = s
+            .task_id
+            .as_deref()
+            .map(|t| crate::task_id::normalize_task_id_ref(t).to_string())
+            .unwrap_or_default();
+        !clean.is_empty() && (tag == clean.as_str() || tag.ends_with(&format!("-{clean}")))
+    });
+    if let Some(row) = by_task {
+        return row.name.clone();
+    }
+    tag.to_string()
+}
+
+/// Apply a **stream-arbitration pause transition** to an existing panel row.
+///
+/// The transition is emitted by the preemption handshake itself, so it is a fact
+/// about a stream that really yielded (or took back) its model slot — never an
+/// inference from an active row, which is what keeps the conditional-pause gate
+/// honest: when steering arbitration skipped pausing because the arbitrator had
+/// spare session capacity, no transition is emitted at all and this row keeps
+/// reading `(Active)`.
+///
+/// Like [`update_subagent_queue`] it is deliberately orthogonal to the lifecycle
+/// path and structurally cannot **create** a row (it takes a slice): rows belong
+/// to the registry projection, and a pause for a worker with no row is a no-op.
+/// Every teardown that closes a row (`apply_registry_entry`, the lifecycle arm)
+/// takes `paused` back down with it, so the flag never goes stale.
+///
+/// Returns whether a row was updated, so callers only re-push the panel when
+/// anything actually changed.
+pub(crate) fn update_subagent_paused(
+    subagents: &mut [SubagentDetail],
+    agent_tag: &str,
+    paused: bool,
+) -> bool {
+    let key = subagent_row_key_for_tag(subagents, agent_tag);
+    let Some(existing) = subagents.iter_mut().find(|s| s.name == key) else {
+        tracing::debug!(
+            "stream-pause transition for {key} has no panel row yet; the worker registry owns row existence, so it is skipped"
+        );
+        return false;
+    };
+    if existing.paused == paused {
+        return false;
+    }
+    existing.paused = paused;
+    // Yielding or reclaiming a model slot is real activity on this row — it is the
+    // only thing a paused stream produces — so the idle accounting stays honest.
     existing.last_activity_at = Some(std::time::Instant::now());
     true
 }
@@ -1192,6 +1298,7 @@ mod tests {
             thinking: "streamed thought".to_string(),
             logs: vec!["started task t-9001".to_string()],
             queue: Some(crate::ui::QueueState { position: 2, of: 3 }),
+            paused: false,
             ..Default::default()
         }];
         assert!(
@@ -1300,6 +1407,194 @@ mod tests {
             mine(&rows).is_empty(),
             "a row whose entry left the registry is gone"
         );
+    }
+
+    /// The arbitration pause is a **row slot orthogonal to liveness**: it is set
+    /// and cleared only by the transition the preemption handshake actually
+    /// delivered, it never overloads `is_active`, and it always lands on the row
+    /// the stream tag resolves to — including the spellings a tag can never
+    /// produce on its own (`{base}#N`, `{agent}-wN`).
+    #[test]
+    fn pause_transitions_fold_into_the_row_a_stream_tag_names() {
+        let rows = || {
+            vec![
+                SubagentDetail {
+                    name: "coder-t-9100".to_string(),
+                    is_active: true,
+                    ..Default::default()
+                },
+                SubagentDetail {
+                    name: "planner-t-9101#2".to_string(),
+                    is_active: true,
+                    ..Default::default()
+                },
+                SubagentDetail {
+                    name: "researcher-w4".to_string(),
+                    is_active: true,
+                    ..Default::default()
+                },
+            ]
+        };
+        let mut subagents = rows();
+
+        assert!(
+            update_subagent_paused(&mut subagents, "coder-t-9100", true),
+            "a delivered pause is a visible change"
+        );
+        assert!(
+            subagents[0].paused,
+            "the row the tag spells is the row that pauses"
+        );
+        assert!(
+            !subagents[1].paused && !subagents[2].paused,
+            "sibling rows of the same agent are untouched"
+        );
+        assert!(
+            subagents[0].is_active,
+            "a parked stream is still a live worker: `paused` never overloads `is_active`"
+        );
+        assert!(
+            !update_subagent_paused(&mut subagents, "coder-t-9100", true),
+            "a repeat of the same transition changes nothing, so nothing is re-pushed"
+        );
+
+        // A collision handle the stream tag can never spell still resolves.
+        assert!(update_subagent_paused(
+            &mut subagents,
+            "planner-t-9101",
+            true
+        ));
+        assert!(subagents[1].paused);
+        // So does the `{agent}-wN` key behind a bare agent tag.
+        assert!(update_subagent_paused(&mut subagents, "researcher", true));
+        assert!(subagents[2].paused);
+        assert_eq!(
+            subagent_row_key_for_tag(&subagents, "planner-t-9101"),
+            "planner-t-9101#2"
+        );
+        assert_eq!(
+            subagent_row_key_for_tag(&subagents, "researcher"),
+            "researcher-w4"
+        );
+        // Unknown spellings fall back to the tag, which is what keeps the
+        // pre-registration path working without inventing a row here.
+        assert_eq!(
+            subagent_row_key_for_tag(&subagents, "manager-t-9102"),
+            "manager-t-9102"
+        );
+
+        // The resume handshake clears it.
+        assert!(update_subagent_paused(
+            &mut subagents,
+            "coder-t-9100",
+            false
+        ));
+        assert!(!subagents[0].paused);
+        assert!(
+            subagents[1].paused && subagents[2].paused,
+            "one stream resuming says nothing about the others"
+        );
+
+        // A pause for a worker with no row is a no-op: rows belong to the
+        // registry projection, so this can never open a panel row by itself.
+        let mut subagents = rows();
+        assert!(
+            !update_subagent_paused(&mut subagents, "validator-coder-t-9103", true),
+            "no row, no pause"
+        );
+        assert_eq!(
+            subagents.iter().filter(|r| r.paused).count(),
+            0,
+            "and nothing was created behind the scenes"
+        );
+        assert_eq!(subagents.len(), 3);
+    }
+
+    /// A paused row survives a projection rebuild while the worker is live, and
+    /// the **registry closing the row** is what takes `Paused` back down — so the
+    /// label can never linger after a completion, cancel or guard drop.
+    #[test]
+    fn a_paused_row_is_cleared_by_the_registry_that_closed_it() {
+        use crate::orchestrator::workers;
+        let _workers = workers::TEST_WORKERS_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let guard = workers::register_active_worker(
+            Some("t-9110".to_string()),
+            "coder".to_string(),
+            "brief for a parked stream".to_string(),
+        );
+        let key = guard.0.clone();
+
+        let mut rows = vec![SubagentDetail {
+            name: key.clone(),
+            is_active: true,
+            paused: true,
+            queue: Some(crate::ui::QueueState { position: 1, of: 2 }),
+            ..Default::default()
+        }];
+        // The pause was delivered by the handshake, so a projection rebuild has to
+        // keep it: the registry knows nothing about the arbitration handshake and
+        // must not silently reset a state it never reported. (The change verdict is
+        // deliberately not asserted here — `WORKERS` is process-global, so other
+        // suites' entries move it; the scoped rows are what matter.)
+        let _ = project_subagent_rows(&mut rows);
+        let row = rows.iter().find(|r| r.name == key).expect("live row");
+        assert!(row.paused, "the projection preserves a delivered pause");
+        assert!(row.is_active, "and the worker is still running");
+
+        // The delivered transitions themselves flow through the same row.
+        assert!(
+            !update_subagent_paused(&mut rows, "coder-t-9110", true),
+            "already paused: a repeat is not a change"
+        );
+        assert!(
+            update_subagent_paused(&mut rows, "coder-t-9110", false),
+            "the reclaim handshake clears it"
+        );
+        assert!(
+            update_subagent_paused(&mut rows, "coder-t-9110", true),
+            "and the next arbitration round arms it again"
+        );
+
+        // The guard drops: the registry closes the entry, and that is what clears
+        // a `Paused` that would otherwise be stale forever.
+        drop(guard);
+        assert!(
+            project_subagent_rows(&mut rows),
+            "a paused row whose worker completed is a visible change"
+        );
+        let closed = rows
+            .iter()
+            .find(|r| r.name == key)
+            .expect("the completed ring keeps the row visible");
+        assert!(!closed.is_active, "the registry closed the row");
+        assert!(
+            !closed.paused,
+            "a pause belongs to a live stream and never outlives it"
+        );
+        assert!(closed.queue.is_none(), "and neither does a queue position");
+
+        // `paused` is part of what the projection compares **on its own**: with the
+        // registry already reporting the row closed, a stale flag left behind by any
+        // other writer is itself a visible change, and the rebuild takes it down.
+        if let Some(stale) = rows.iter_mut().find(|r| r.name == key) {
+            stale.paused = true;
+        }
+        assert!(
+            project_subagent_rows(&mut rows),
+            "a stale pause on an already-closed row is a visible change"
+        );
+        assert!(
+            !rows
+                .iter()
+                .find(|r| r.name == key)
+                .expect("the closed row is still projected")
+                .paused,
+            "and the rebuild clears it"
+        );
+
+        workers::remove_worker_entry_for_test(&key);
     }
 
     // The system prompt must read the plan fail-closed: a plan file that exists

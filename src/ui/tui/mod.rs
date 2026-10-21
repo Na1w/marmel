@@ -64,6 +64,15 @@ pub(crate) const ACTIVITY_STATUS_KEYWORDS: &[&str] = &[
     "Arbitrating",
     "queued",
     "Queued",
+    // Both spellings of the arbitration-pause keyword, for the same reason as the
+    // queue pair: the preemption handshake reports a yielded slot as lowercase
+    // status traffic (`"… Yielded model slot (…) to Steer Arbitrator — stream
+    // paused"`) while the Subagents panel labels the same row `(Paused)`. A round
+    // whose streams are parked behind the arbitrator is still an in-flight round —
+    // the work resumes the moment the slot is handed back — so it must keep
+    // animating exactly like a streaming round.
+    "paused",
+    "Paused",
 ];
 
 pub struct TuiRenderer {
@@ -606,6 +615,31 @@ impl Renderer for TuiRenderer {
                     }
                 }
             }
+            Event::SubagentStreamPause { agent_tag, paused } => {
+                // The transition is typed and carries the worker's own stream tag,
+                // so no status wording is ever sniffed here. It is a state word on
+                // the row, never a log line: the `(Paused)` label and the detail
+                // bar read `SubagentDetail::paused`.
+                //
+                // The session loop already folded the same transition into its
+                // authoritative rows (and pushes them through `set_subagents`); this
+                // arm keeps a renderer that is driven without that fold — and the
+                // frame drawn before that push lands — honest. It deliberately never
+                // creates a row: the registry projection owns row existence, so a
+                // pause for a worker with no row is a no-op.
+                let key = self.resolve_row_key(agent_tag);
+                match self.subagents.iter_mut().find(|s| s.name == key) {
+                    Some(sa) => {
+                        sa.paused = *paused;
+                        sa.last_activity_at = Some(std::time::Instant::now());
+                    }
+                    None => {
+                        tracing::debug!(
+                            "stream-pause transition for {key} has no panel row yet; the worker registry owns row existence, so it is skipped"
+                        );
+                    }
+                }
+            }
             Event::ToolCall(text) => {
                 self.waiting_for_token_since = None;
                 let tok_count = estimate_stream_tokens(text);
@@ -688,12 +722,15 @@ impl Renderer for TuiRenderer {
                 // The elapsed "(n.ns)" counter covers every wait for the backend,
                 // including a wait for a concurrency slot: the queue traffic the
                 // gate emits (`"queued for a backend slot (n of m) …"`) is exactly
-                // the silence that would otherwise read as a stalled turn.
+                // the silence that would otherwise read as a stalled turn. A stream
+                // parked behind the Steer Arbitrator (`"… — stream paused"`) is the
+                // same kind of deliberate silence, so the counter covers it too.
                 let is_waiting = self.status_line.contains("Running")
                     || self.status_line.contains("thinking")
                     || self.status_line.contains("calling backend")
                     || self.status_line.contains("Arbitrating")
-                    || self.status_line.contains("queued");
+                    || self.status_line.contains("queued")
+                    || self.status_line.contains("paused");
                 if is_waiting {
                     if self.waiting_for_token_since.is_none() {
                         self.waiting_for_token_since = Some(std::time::Instant::now());
@@ -1103,8 +1140,14 @@ impl Renderer for TuiRenderer {
                     // Queue state is owned by the session loop's authoritative
                     // list (it is the only writer of the delegation event
                     // stream), so the loop's view always wins here — that is what
-                    // keeps a queue row from surviving a completion locally.
+                    // keeps a queue row from surviving a completion locally. The
+                    // arbitration pause follows the same rule: the loop folds the
+                    // typed transition from the preemption handshake into its own
+                    // rows, and every loop-side teardown of a row takes the flag
+                    // back down, so a `Paused` label can never be kept alive by a
+                    // renderer that missed the closing edge.
                     existing.queue = incoming.queue;
+                    existing.paused = incoming.paused;
                     // Keep locally-streamed thinking/content if the incoming
                     // entry has none yet (the loop only folds lifecycle events).
                     if !incoming.thinking.is_empty() {
@@ -1596,7 +1639,14 @@ fn subagent_detail_from_panel(panel: &crate::session::format::SubagentPanel) -> 
         content: panel.content.clone(),
         is_active: panel.is_active,
         context_tokens: panel.context_tokens,
+        // Neither slot state survives a restore: `queue` belongs to a live
+        // delegation and `paused` to a stream the preemption handshake is holding.
+        // A journaled pane records a round that was interrupted, never a stream
+        // that is parked behind the arbitrator right now, so both start clean and
+        // only a fresh typed transition (`Event::SubagentStreamPause`) or a fresh
+        // queue event can set them again.
         queue: None,
+        paused: false,
     }
 }
 

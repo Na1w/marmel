@@ -27,7 +27,7 @@ use crate::orchestrator::steer::{
 use crate::orchestrator::{
     SharedSteeringHistory, SteerDecision, cancel_active_worker, cancel_all,
     extract_tasks_to_delegate, format_steering_history, normalize_steer_decision,
-    preempt_conflicting_stream,
+    preempt_conflicting_stream_on_backend,
 };
 use crate::tool_args::{SLEEP_DEFAULT_SECS, SLEEP_MIN_SECS};
 use crate::ui::helpers::format_plan_progress_summary;
@@ -489,8 +489,16 @@ pub(crate) async fn arbitrate_steering<C: ArbitrationChannel>(
             active_subtasks: &active_subtasks_str,
         };
 
-        let preempt_handle =
-            preempt_conflicting_stream(request.client.model(), &effective_msg).await;
+        // Slot borrowing is conditional: on a capped pair that still has a free
+        // session slot the arbitrator uses its own spare capacity and running
+        // streams are never paused. A full pool, a queued session, or a pair
+        // with no configured cap keeps today's pause handshake.
+        let preempt_handle = preempt_conflicting_stream_on_backend(
+            request.client.backend_url(),
+            request.client.model(),
+            &effective_msg,
+        )
+        .await;
 
         let cur_decision =
             arbitrate_steer_context_stream(request.client, request.stats, ctx, |delta| {

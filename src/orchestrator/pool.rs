@@ -368,6 +368,40 @@ pub fn pool_snapshot(backend_url: &str, model: &str) -> Option<PoolSnapshot> {
     entry_for(backend_url, model).map(|entry| entry.snapshot())
 }
 
+/// `true` when a new call on this pair gets a free session slot without queueing.
+///
+/// Read-only: unlike [`entry_for`] this never opens a pool entry, so asking the
+/// question has no effect on what it measures. The three cases:
+///
+/// - **unlimited** — no cap configured for this backend (`max_sessions` unset,
+///   no active config, or a rejected cap): `false`. There is no bounded spare
+///   slot to reason about, so callers must keep the existing pause behaviour;
+///   an unconfigured limit can never take the "spare capacity" path.
+/// - **spare** — a cap is configured and at least one permit is free with
+///   nobody already queued for it: `true`.
+/// - **full / waiting** — no free permit, or a session is already in the FIFO
+///   queue: `false`.
+///
+/// A capped pair whose pool has not been opened yet holds every permit free, so
+/// it reports spare capacity. The free test is the pool's own
+/// (see [`wait_for_slot`]'s fast path): `available > 0 && waiting == 0`.
+///
+/// A best-effort snapshot, **not** a reservation: a concurrent caller can take
+/// the slot between this read and the caller's own acquisition.
+pub fn has_spare_session_capacity(backend_url: &str, model: &str) -> bool {
+    let Some(limit) = config::effective_max_sessions(backend_url) else {
+        return false;
+    };
+    if limit < config::MIN_MAX_SESSIONS {
+        // Mirrors `entry_for`: a sub-minimum cap is never a real pool.
+        return false;
+    }
+    let key = pool_key(backend_url, model);
+    POOLS
+        .get(&key)
+        .is_none_or(|entry| entry.waiting() == 0 && entry.available() > 0)
+}
+
 /// Number of pool entries currently open. Test/diagnostic only.
 pub fn open_pool_count() -> usize {
     POOLS.len()
@@ -1128,6 +1162,120 @@ mod tests {
             let permit = acquire_session(url, "m", None, None).await.unwrap();
             assert!(permit.is_none(), "unlimited calls get no guard at all");
             assert_eq!(open_pool_count(), 0, "unlimited calls create no pool");
+        });
+    }
+
+    /// An unlimited pair — no cap configured, or a cap rejected as unusable —
+    /// never reports spare capacity, so a caller gating on it keeps the pause
+    /// behaviour. The query must not register a pool entry either.
+    #[test]
+    fn unlimited_pairs_report_no_spare_capacity() {
+        for max_sessions in [None, Some(0)] {
+            config_pool_test(max_sessions, vec![], async {
+                let url = "http://pool-spare-open:8080/v1";
+                assert!(
+                    !has_spare_session_capacity(url, "m"),
+                    "no usable cap ({max_sessions:?}) means unlimited, so there is no spare slot to hand out"
+                );
+                assert_eq!(
+                    open_pool_count(),
+                    0,
+                    "asking about capacity must not open a pool entry"
+                );
+            });
+        }
+
+        // A per-URL override is what makes a pair capped at all when the global
+        // key is unset; the lookup goes through the same URL normalization.
+        config_pool_test(
+            None,
+            vec![("http://pool-spare-override:8080/v1".to_string(), 1usize)],
+            async {
+                assert!(has_spare_session_capacity(
+                    "http://pool-spare-override:8080/v1/",
+                    "m"
+                ));
+                assert!(
+                    !has_spare_session_capacity("http://pool-spare-open:8080/v1", "m"),
+                    "a backend with no override and no global cap is unlimited"
+                );
+                assert_eq!(open_pool_count(), 0, "still no entry created by the query");
+            },
+        );
+    }
+
+    /// A capped pair mirrors the pool's own free test: spare while a permit is
+    /// free and nobody is queued, not spare once it is saturated or someone is
+    /// already waiting for a slot.
+    #[test]
+    fn spare_capacity_mirrors_the_pool_free_test() {
+        config_pool_test(Some(2), vec![], async {
+            let url = "http://pool-spare:8080/v1";
+            // Capped but never used: every permit is free, and the query still
+            // created nothing.
+            assert!(
+                has_spare_session_capacity(url, "m"),
+                "a capped pair with an unopened pool has spare capacity"
+            );
+            assert_eq!(open_pool_count(), 0, "the query must not open a pool entry");
+
+            let entry = entry_for(url, "m").expect("configured cap");
+            assert_eq!(
+                open_pool_count(),
+                1,
+                "only the acquiring path opens an entry"
+            );
+
+            let held = wait_for_slot(&entry, None, Duration::from_millis(50), None)
+                .await
+                .unwrap();
+            assert!(
+                has_spare_session_capacity(url, "m"),
+                "one free permit of two is still spare"
+            );
+
+            let full = wait_for_slot(&entry, None, Duration::from_millis(50), None)
+                .await
+                .unwrap();
+            assert!(
+                !has_spare_session_capacity(url, "m"),
+                "a saturated pair has no spare slot"
+            );
+            drop(held);
+            assert!(
+                has_spare_session_capacity(url, "m"),
+                "a freed permit is spare again"
+            );
+
+            // A session already in line owns the pool even with a permit free.
+            let ticket = queue_ticket(&entry);
+            assert!(
+                !has_spare_session_capacity(url, "m"),
+                "a queued session means no spare capacity"
+            );
+            drop(ticket);
+            assert!(
+                has_spare_session_capacity(url, "m"),
+                "leaving the queue restores spare capacity"
+            );
+
+            // The cap, and therefore the answer, is per `backend + model`.
+            let other = entry_for(url, "model-two").expect("configured cap");
+            let other_first = wait_for_slot(&other, None, Duration::from_millis(50), None)
+                .await
+                .unwrap();
+            let other_second = wait_for_slot(&other, None, Duration::from_millis(50), None)
+                .await
+                .unwrap();
+            assert!(
+                !has_spare_session_capacity(url, "model-two"),
+                "the saturated model reports no spare capacity"
+            );
+            assert!(
+                has_spare_session_capacity(url, "m"),
+                "the other model behind the same backend is a separate pool"
+            );
+            drop((full, other_first, other_second));
         });
     }
 

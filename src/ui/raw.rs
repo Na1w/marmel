@@ -104,6 +104,11 @@ impl Renderer for RawRenderer {
             Event::SubagentThinking { agent_tag, text } => {
                 self.push_line(&format!("{agent_tag}:thinking"), text);
             }
+            // A stream-arbitration pause transition stays silent here: it is
+            // Subagents-panel state, and the headless run already reports the same
+            // handshake through the status traffic the preemption emit point emits.
+            // Printing it would change raw output for no viewer.
+            Event::SubagentStreamPause { .. } => {}
             Event::ToolCall(text) => self.push_line("tool", text),
             Event::ToolResult(text) => self.push_line("tool-result", text),
             Event::Status(text) => self.push_line("status", text),

@@ -604,41 +604,10 @@ impl TuiRenderer {
     /// created under the tag and re-labelled by `set_subagents` when the
     /// registry publishes the real key.
     pub(crate) fn resolve_row_key(&self, tag: &str) -> String {
-        if self.subagents.iter().any(|s| s.name == tag) {
-            return tag.to_string();
-        }
-        let digit_run = |rest: &str| {
-            rest.strip_prefix("-w").is_some_and(|digits| {
-                !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
-            })
-        };
-        let natural = self
-            .subagents
-            .iter()
-            .find(|s| match s.name.split_once('#') {
-                Some((head, handle)) => head == tag && !handle.is_empty(),
-                None => false,
-            })
-            .or_else(|| {
-                self.subagents
-                    .iter()
-                    .find(|s| s.name.strip_prefix(tag).is_some_and(digit_run))
-            });
-        if let Some(row) = natural {
-            return row.name.clone();
-        }
-        let by_task = self.subagents.iter().find(|s| {
-            let clean = s
-                .task_id
-                .as_deref()
-                .map(|t| crate::task_id::normalize_task_id_ref(t).to_string())
-                .unwrap_or_default();
-            !clean.is_empty() && (tag == clean.as_str() || tag.ends_with(&format!("-{clean}")))
-        });
-        if let Some(row) = by_task {
-            return row.name.clone();
-        }
-        tag.to_string()
+        // The rule is owned by the projection layer (`ui::helpers`) so the
+        // streamed text, the thinking flags and the arbitration pause can never
+        // resolve the same tag onto different rows.
+        crate::ui::helpers::subagent_row_key_for_tag(&self.subagents, tag)
     }
 
     /// Create or update a subagent entry in the local list. Used by the
@@ -667,9 +636,12 @@ impl TuiRenderer {
                 existing.is_active = is_active;
                 // A row that stops running can never keep a queue position
                 // behind: completion, failure and cancel all land here, and the
-                // queue state belongs to a live delegation only.
+                // queue state belongs to a live delegation only. The arbitration
+                // pause likewise belongs to a live stream, so it goes down here
+                // too instead of waiting for the next projection edge.
                 if !is_active {
                     existing.queue = None;
+                    existing.paused = false;
                 }
                 existing.last_activity_at = Some(now);
                 existing.logs.push(log.to_string());
@@ -690,6 +662,7 @@ impl TuiRenderer {
                     is_active,
                     context_tokens: 0,
                     queue: None,
+                    paused: false,
                 });
                 idx
             }

@@ -211,6 +211,7 @@ fn estimated_subagent_lines_counts_sections() {
         is_active: true,
         context_tokens: 0,
         queue: None,
+        paused: false,
     });
     // Default (show_thought = false, thinking moved to bottom status bar):
     // 1 (header) + 1 ([Output]) + 1 (out) + 1 ([Logs]) + 1 (- log1) = 5
@@ -315,6 +316,7 @@ fn cycle_focus_obeys_panel_visibility() {
         is_active: true,
         context_tokens: 0,
         queue: None,
+        paused: false,
     });
 
     r.focused_panel = FocusedPanel::Chat;
@@ -446,6 +448,7 @@ fn set_subagents_adopts_authoritative_list() {
         is_active: true,
         context_tokens: 0,
         queue: None,
+        paused: false,
     });
 
     // Authoritative list from the loop (no thinking/content, just lifecycle).
@@ -462,6 +465,7 @@ fn set_subagents_adopts_authoritative_list() {
         is_active: true,
         context_tokens: 0,
         queue: None,
+        paused: false,
     }];
     r.set_subagents(authoritative);
 
@@ -485,6 +489,7 @@ fn set_subagents_adopts_authoritative_list() {
         is_active: false,
         context_tokens: 0,
         queue: None,
+        paused: false,
     });
     r.set_subagents(vec![SubagentDetail {
         name: "coder".to_string(),
@@ -499,6 +504,7 @@ fn set_subagents_adopts_authoritative_list() {
         is_active: false,
         context_tokens: 0,
         queue: None,
+        paused: false,
     }]);
     assert_eq!(r.subagents.len(), 1);
     assert_eq!(r.subagents[0].name, "coder");
@@ -683,6 +689,7 @@ fn set_subagents_adopts_authoritative_queue_state() {
         is_active: true,
         context_tokens: 0,
         queue: Some(crate::ui::QueueState { position: 5, of: 9 }),
+        paused: false,
     });
 
     // The loop says the slot is held: the stale local position must go.
@@ -699,6 +706,7 @@ fn set_subagents_adopts_authoritative_queue_state() {
         is_active: true,
         context_tokens: 0,
         queue: None,
+        paused: false,
     }]);
     assert_eq!(r.subagents[0].queue, None);
     assert_eq!(
@@ -720,6 +728,7 @@ fn set_subagents_adopts_authoritative_queue_state() {
         is_active: true,
         context_tokens: 0,
         queue: Some(crate::ui::QueueState { position: 1, of: 2 }),
+        paused: false,
     }]);
     assert_eq!(
         r.subagents[0].queue,
@@ -1221,6 +1230,415 @@ fn a_restored_row_never_shows_a_stale_queue_position() {
     );
 }
 
+// ---- steering arbitration pause in the Subagents panel ----
+
+/// A row whose stream yielded its model slot is labelled `Paused` and is
+/// otherwise untouched: the name keeps the live green/bold spelling, the ctx
+/// count and the work clock keep their place in the label, and a neighbour is
+/// never relabelled because one row is held. A stale flag on a closed row still
+/// reads `(Idle)` — the label word is gated on liveness, never on the flag alone.
+#[test]
+fn a_held_stream_is_labelled_paused_and_keeps_its_live_shape() {
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    let now = std::time::Instant::now();
+
+    let mut held = queue_row("coder-t-1", true, None);
+    held.paused = true;
+    held.task_id = Some("t-1".to_string());
+    held.context_tokens = 3500;
+    held.started_at = Some(now - Duration::from_secs(5));
+    let mut running = queue_row("coder-t-2", true, None);
+    running.task_id = Some("t-2".to_string());
+    let mut closed = queue_row("researcher-t-3", false, None);
+    closed.task_id = Some("t-3".to_string());
+    closed.paused = true;
+    r.subagents.extend([held, running, closed]);
+
+    let (rows, styles) = draw_subagent_panel(&mut r, 100, 20);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("coder-t-1 (Paused, 3.5k ctx, 5s)"),
+        "expected 'coder-t-1 (Paused, 3.5k ctx, 5s)' in the subagents panel, got:\n{text}"
+    );
+    assert!(
+        text.contains("coder-t-2 (Active)"),
+        "the row that kept its slot still reads (Active), got:\n{text}"
+    );
+
+    let held_line = rows
+        .iter()
+        .find(|line| line.contains("coder-t-1"))
+        .expect("the held row is drawn");
+    assert!(
+        !held_line.contains("(Active"),
+        "a row parked inside the arbitration handshake must not claim it is streaming, got: {held_line:?}"
+    );
+    assert!(
+        !held_line.contains("(Queued"),
+        "a yielded model slot is not a wait behind the concurrency cap, got: {held_line:?}"
+    );
+    assert!(
+        !held_line.contains("(Idle"),
+        "a paused stream is still part of the round, got: {held_line:?}"
+    );
+
+    // A flag that outlived its stream must never produce the label word.
+    let closed_line = rows
+        .iter()
+        .find(|line| line.contains("researcher-t-3"))
+        .expect("the closed row is drawn");
+    assert!(
+        closed_line.contains("(Idle)"),
+        "a finished row reads Idle whatever flag it still carries, got: {closed_line:?}"
+    );
+    assert!(
+        !closed_line.contains("Paused"),
+        "the pause label is gated on liveness, got: {closed_line:?}"
+    );
+
+    // The name stays green/bold — the worker is still live — and only the state
+    // word changes colour, so the pause cannot be mistaken for a dead row.
+    let held_y = rows
+        .iter()
+        .position(|line| line.contains("coder-t-1"))
+        .expect("the held row is drawn");
+    let name_x = rows[held_y].find("coder-t-1").unwrap();
+    let label_x = rows[held_y].find("(Paused").unwrap();
+    let name = styles[held_y][name_x];
+    assert_eq!(
+        name.fg,
+        Some(Color::Green),
+        "a held row keeps its live name colour"
+    );
+    assert!(
+        name.add_modifier.contains(Modifier::BOLD),
+        "a held row keeps its bold name"
+    );
+    assert_eq!(
+        styles[held_y][label_x].fg,
+        Some(Color::LightBlue),
+        "the pause state word gets its own colour"
+    );
+
+    let running_y = rows
+        .iter()
+        .position(|line| line.contains("coder-t-2"))
+        .expect("the running row is drawn");
+    let running_x = rows[running_y].find("(Active").unwrap();
+    assert_eq!(
+        styles[running_y][running_x].fg,
+        Some(Color::LightGreen),
+        "the pause colour is never applied to a neighbour"
+    );
+}
+
+/// The detail pane says which slot the row handed up instead of the generic
+/// "waiting for model response" line — and it wins over both the queue position
+/// and the previous turn's thinking bar, which are both stale once the stream is
+/// parked. The spinner keeps turning because the worker is still live.
+#[test]
+fn the_detail_pane_spells_out_the_held_model_slot() {
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    let mut held = queue_row(
+        "coder-t-1",
+        true,
+        Some(crate::ui::QueueState { position: 1, of: 2 }),
+    );
+    held.paused = true;
+    r.subagents.push(held);
+    r.subagent_is_thinking.insert("coder-t-1".to_string(), true);
+    r.subagent_turn_thinking.insert(
+        "coder-t-1".to_string(),
+        "reasoning from before the yield".to_string(),
+    );
+
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 20);
+    let text = rows.join("\n");
+    const HELD: &str = "[Status: Paused - model slot yielded to the steering arbitrator...]";
+    assert!(
+        text.contains(HELD),
+        "expected {HELD:?} in the subagent status bar, got:\n{text}"
+    );
+    assert!(
+        !text.contains("waiting for model response"),
+        "a row whose slot is on loan to the arbitrator is not waiting on the model:\n{text}"
+    );
+    assert!(
+        !text.contains("[Status: Queued"),
+        "the handshake wins the bar over a stale queue position:\n{text}"
+    );
+    assert!(
+        !text.contains("[Thinking:"),
+        "thinking text from before the yield is stale, so the thinking bar must go:\n{text}"
+    );
+
+    let bar = rows
+        .iter()
+        .find(|line| line.contains(HELD))
+        .expect("the status bar row");
+    let spinner = bar[bar.find(HELD).unwrap() + HELD.len()..]
+        .trim_start()
+        .chars()
+        .next()
+        .unwrap_or(' ');
+    assert!(
+        SPINNER_FRAMES.contains(&spinner),
+        "a held stream keeps a live spinner, got {spinner:?} in {bar:?}"
+    );
+}
+
+/// The typed transition carries the stream's own tag, so it lands on the row that
+/// tag resolves to — including the registry spellings a tag can never produce —
+/// and it can never open or close a row by itself.
+#[test]
+fn a_pause_transition_lands_on_the_row_its_stream_tag_names() {
+    let mut r = TuiRenderer::new();
+    r.subagents.push(queue_row("coder-t-11#7", true, None));
+    r.subagents.push(queue_row("researcher-w42", true, None));
+
+    r.on_event(&Event::SubagentStreamPause {
+        agent_tag: "coder-t-11".to_string(),
+        paused: true,
+    });
+    r.on_event(&Event::SubagentStreamPause {
+        agent_tag: "researcher".to_string(),
+        paused: true,
+    });
+    assert_eq!(
+        r.subagents.len(),
+        2,
+        "a pause for a worker that has a row never opens a second one"
+    );
+    assert!(
+        r.subagents[0].paused && r.subagents[1].paused,
+        "both spellings resolve to the row that already exists"
+    );
+    assert!(
+        r.subagents[0].is_active && r.subagents[1].is_active,
+        "the transition never touches liveness"
+    );
+
+    r.on_event(&Event::SubagentStreamPause {
+        agent_tag: "coder-t-11#7".to_string(),
+        paused: false,
+    });
+    assert!(
+        !r.subagents[0].paused && r.subagents[1].paused,
+        "the reclaim edge clears one row and says nothing about the other"
+    );
+
+    r.on_event(&Event::SubagentStreamPause {
+        agent_tag: "validator-coder-t-99".to_string(),
+        paused: true,
+    });
+    assert_eq!(
+        r.subagents.len(),
+        2,
+        "a pause for a worker with no row is a no-op: the registry owns row existence"
+    );
+}
+
+/// Guard against the cheap wrong implementation: the panel flag is **never**
+/// derived from the status sentence the handshake also emits. Recognition of
+/// that wording is what made the state invisible in the first place, and a
+/// skipped pause would have produced the very same sentence-shaped traffic with
+/// nothing parked behind it.
+#[test]
+fn the_panel_pause_is_never_sniffed_out_of_the_status_line() {
+    let mut r = TuiRenderer::new();
+    r.subagents.push(queue_row("coder-t-1", true, None));
+    r.active_agent = "coder-t-1".to_string();
+
+    for sentence in [
+        "[coder] Yielded model slot (gpt-x) to Steer Arbitrator — stream paused",
+        "[coder-t-1] Yielded model slot (gpt-x) to Steer Arbitrator — stream paused",
+        "[coder-t-1] Model slot reclaimed — resuming stream...",
+    ] {
+        r.on_event(&Event::Status(sentence.to_string()));
+        assert!(
+            !r.subagents[0].paused,
+            "the status wording alone never pauses a row, got {:?}",
+            r.subagents[0]
+        );
+        assert_eq!(r.subagents.len(), 1, "and it never creates one");
+    }
+
+    // The other direction: an unrelated status line cannot clear a real pause
+    // either, so the label outlives the traffic around it and not the handshake.
+    r.subagents[0].paused = true;
+    r.on_event(&Event::Status(
+        "[coder-t-1] Model slot reclaimed — resuming stream...".to_string(),
+    ));
+    r.on_event(&Event::Status("Running steer round".to_string()));
+    assert!(
+        r.subagents[0].paused,
+        "only the typed transition moves the flag"
+    );
+}
+
+/// The session loop holds the authoritative row set, so its view of the pause
+/// wins in both directions — including the teardown it performs when the registry
+/// closes the row, which is what stops a `Paused` from lingering.
+#[test]
+fn the_authoritative_rows_from_the_loop_own_the_pause_label() {
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.subagents.push(queue_row("coder-t-1", true, None));
+
+    // A renderer-local pause ...
+    r.on_event(&Event::SubagentStreamPause {
+        agent_tag: "coder-t-1".to_string(),
+        paused: true,
+    });
+    assert!(r.subagents[0].paused);
+    // ... cannot outlive a loop push that says otherwise.
+    let mut authoritative = r.subagents.clone();
+    authoritative[0].paused = false;
+    r.set_subagents(authoritative);
+    assert!(
+        !r.subagents[0].paused,
+        "the loop folds the typed transition, so its resume edge wins"
+    );
+
+    let mut authoritative = r.subagents.clone();
+    authoritative[0].paused = true;
+    r.set_subagents(authoritative);
+    assert!(
+        r.subagents[0].paused,
+        "and adopting a pause works the same way"
+    );
+
+    // The loop's teardown of a finished worker takes the flag down with it, and a
+    // renderer that missed the closing edge still loses its stale `Paused`.
+    let mut authoritative = r.subagents.clone();
+    authoritative[0].is_active = false;
+    authoritative[0].paused = false;
+    r.set_subagents(authoritative);
+    assert!(!r.subagents[0].is_active);
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 20);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("coder-t-1 (Idle)"),
+        "the closed row reads Idle, got:\n{text}"
+    );
+    assert!(
+        !text.contains("Paused"),
+        "no stale pause survives the loop's teardown, got:\n{text}"
+    );
+}
+
+/// A restart drops the arbitration handshake exactly like it drops the queue
+/// ledger: a journaled pane records a round that was interrupted, never a stream
+/// the arbitrator is holding right now.
+#[test]
+fn a_restored_row_never_shows_a_stale_pause() {
+    let mut live = TuiRenderer::new();
+    live.show_subagent_panel = true;
+    let mut held = queue_row("coder-t-1", true, None);
+    held.paused = true;
+    held.task_id = Some("t-1".to_string());
+    live.subagents.push(held);
+
+    let section = live.capture_ui();
+    let mut restored = TuiRenderer::new();
+    restored.restore_panes(&section);
+
+    assert_eq!(restored.subagents.len(), 1);
+    assert!(
+        !restored.subagents[0].paused,
+        "the preemption handshake does not survive a restart, so the panel may not claim a pause"
+    );
+    let (rows, _) = draw_subagent_panel(&mut restored, 100, 20);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("coder-t-1 (Active)"),
+        "a restored row comes back as a running row, got:\n{text}"
+    );
+    assert!(
+        !text.contains("Paused"),
+        "no stale pause may survive a restore, got:\n{text}"
+    );
+}
+
+/// A held stream stays in the `[N active: …]` group — it really is part of the
+/// running round — and is additionally named in its own segment, derived from the
+/// same rows the panel label reads.
+#[test]
+fn the_main_status_line_names_held_streams_without_dropping_them_from_the_round() {
+    let mut r = TuiRenderer::new();
+    let mut held = queue_row("coder-t-1", true, None);
+    held.paused = true;
+    r.subagents
+        .extend([held, queue_row("coder-t-2", true, None)]);
+    r.status_line = "Delegating to specialist coder-t-1 for t-1".to_string();
+
+    let content = draw_status_line(&mut r, 160);
+    assert!(
+        content.contains("[2 active: coder-t-1, coder-t-2]"),
+        "a parked stream is still part of the round, got: {content:?}"
+    );
+    assert!(
+        content.contains("[1 paused: coder-t-1]"),
+        "the held stream is named in its own segment, got: {content:?}"
+    );
+
+    let mut plain = TuiRenderer::new();
+    plain.subagents.push(queue_row("coder-t-2", true, None));
+    plain.status_line = "Delegating to specialist coder-t-2 for t-2".to_string();
+    let plain_line = draw_status_line(&mut plain, 160);
+    assert!(
+        plain_line.contains("[1 active: coder-t-2]"),
+        "the control group is unchanged, got: {plain_line:?}"
+    );
+    assert!(
+        !plain_line.contains("paused"),
+        "a round with nothing parked shows no pause segment, got: {plain_line:?}"
+    );
+}
+
+/// The animation keyword set is shared by the render-loop throttle tier and the
+/// status-line indicator, so a round whose streams are parked behind the
+/// arbitrator keeps animating in both — exactly like a queued round.
+#[test]
+fn the_arbitration_pause_keyword_is_shared_by_both_animation_tiers() {
+    assert!(
+        ACTIVITY_STATUS_KEYWORDS.contains(&"paused"),
+        "the handshake reports a yielded slot in lower case"
+    );
+    assert!(
+        ACTIVITY_STATUS_KEYWORDS.contains(&"Paused"),
+        "the panel spells the same state (Paused)"
+    );
+}
+
+/// The exact sentence the preemption handshake puts on the status channel has to
+/// hold the spinner up: a stream parked inside the handshake produces no tokens,
+/// and that deliberate silence must not read as a stalled turn.
+#[test]
+fn a_round_with_a_parked_stream_keeps_the_status_line_animating() {
+    let mut r = TuiRenderer::new();
+    r.on_event(&Event::Status(
+        "[coder] Yielded model slot (gpt-x) to Steer Arbitrator — stream paused".to_string(),
+    ));
+    assert!(
+        r.waiting_for_token_since.is_some(),
+        "a stream held by the arbitrator counts as waiting on the backend"
+    );
+
+    let content = draw_status_line(&mut r, 160);
+    assert!(
+        content.contains("stream paused"),
+        "the yielded slot is surfaced in the status line, got: {content:?}"
+    );
+    let tail = content.trim_end();
+    assert!(
+        tail.ends_with(SPINNER_FRAMES),
+        "the activity spinner must keep turning while a stream is parked, got: {tail:?}"
+    );
+}
+
 #[test]
 fn test_orchestrator_content_is_white_and_steer_is_yellow() {
     let (white_style, special_white) = message_style("Orchestrator answer");
@@ -1344,6 +1762,7 @@ fn test_subagent_thinking_visibility_controlled_by_show_thought() {
         is_active: true,
         context_tokens: 0,
         queue: None,
+        paused: false,
     });
 
     // The pane's thinking flag is set explicitly here, not inferred from the
@@ -1521,6 +1940,7 @@ fn test_subagent_tool_calls_logged_with_arguments_and_stripped_prefix() {
         context_tokens: 0,
         worked_duration: Duration::ZERO,
         queue: None,
+        paused: false,
     });
     r.active_agent = "coder-t-001".to_string();
 
@@ -1886,6 +2306,7 @@ fn test_subagent_scrolling_and_focus() {
         context_tokens: 0,
         worked_duration: Duration::ZERO,
         queue: None,
+        paused: false,
     });
 
     r.show_thought = true;
@@ -1952,6 +2373,7 @@ fn test_subagent_switch_scrolls_to_bottom_and_autoscrolls() {
         context_tokens: 0,
         worked_duration: Duration::ZERO,
         queue: None,
+        paused: false,
     });
     r.subagents.push(SubagentDetail {
         name: "coder-2".to_string(),
@@ -1971,6 +2393,7 @@ fn test_subagent_switch_scrolls_to_bottom_and_autoscrolls() {
         context_tokens: 0,
         worked_duration: Duration::ZERO,
         queue: None,
+        paused: false,
     });
 
     r.subagent_width.set(40);
@@ -2139,6 +2562,7 @@ fn test_subagent_context_tokens_rendering_in_list() {
         context_tokens: 3500,
         worked_duration: Duration::ZERO,
         queue: None,
+        paused: false,
     });
     r.subagents.push(SubagentDetail {
         name: "researcher-t-2".to_string(),
@@ -2153,6 +2577,7 @@ fn test_subagent_context_tokens_rendering_in_list() {
         context_tokens: 1200,
         worked_duration: Duration::ZERO,
         queue: None,
+        paused: false,
     });
     r.subagents.push(SubagentDetail {
         name: "validator".to_string(),
@@ -2167,6 +2592,7 @@ fn test_subagent_context_tokens_rendering_in_list() {
         context_tokens: 0,
         worked_duration: Duration::ZERO,
         queue: None,
+        paused: false,
     });
 
     let backend = ratatui::backend::TestBackend::new(100, 20);
@@ -2219,6 +2645,7 @@ fn test_subagent_time_counter_rendering_in_list() {
         context_tokens: 3500,
         worked_duration: Duration::ZERO,
         queue: None,
+        paused: false,
     });
     r.subagents.push(SubagentDetail {
         name: "researcher-t-2".to_string(),
@@ -2233,6 +2660,7 @@ fn test_subagent_time_counter_rendering_in_list() {
         context_tokens: 1200,
         worked_duration: Duration::from_secs(85),
         queue: None,
+        paused: false,
     });
 
     let backend = ratatui::backend::TestBackend::new(100, 20);
@@ -2777,6 +3205,7 @@ fn test_tui_renders_subagent_thinking_progress_and_output_during_streaming() {
         is_active: true,
         context_tokens: 0,
         queue: None,
+        paused: false,
     }]);
 
     // 1. When subagent is active but has not produced tokens yet:
@@ -2935,6 +3364,7 @@ fn test_subagent_thinking_shows_remaining_budget_countdown() {
         is_active: true,
         context_tokens: 0,
         queue: None,
+        paused: false,
     });
 
     // 1. Stream 4000 characters in Turn 1: ~1000 tokens. 10000 - 1000 = 9000 remaining (~9.0k remaining).
@@ -3045,6 +3475,7 @@ fn test_manager_output_routes_to_chat_when_specialist_inactive() {
         is_active: false,
         context_tokens: 0,
         queue: None,
+        paused: false,
     });
     r.active_agent = "researcher-steer-task-1".to_string();
 
@@ -3102,6 +3533,7 @@ fn test_set_subagents_preserves_manager_active_agent() {
         is_active: true,
         context_tokens: 0,
         queue: None,
+        paused: false,
     }];
     r.set_subagents(active_list);
 
@@ -3230,6 +3662,7 @@ fn rich_subagent(name: &str) -> SubagentDetail {
         is_active: true,
         context_tokens: 18_431,
         queue: None,
+        paused: false,
     }
 }
 

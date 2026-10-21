@@ -157,6 +157,9 @@ struct RecordingRenderer {
     subagents: Vec<SubagentDetail>,
     delegation_events: Vec<DelegationEvent>,
     events: Vec<Event>,
+    /// How many times the loop pushed an authoritative row set. A fold that
+    /// changes nothing must not push, so the count is part of the contract.
+    subagent_pushes: usize,
     input_queue: std::collections::VecDeque<String>,
     /// Abort / user-exit flags (the `Renderer` trait's abort surface).
     input_state: crate::ui::InputState,
@@ -168,6 +171,7 @@ impl RecordingRenderer {
             subagents: Vec::new(),
             delegation_events: Vec::new(),
             events: Vec::new(),
+            subagent_pushes: 0,
             input_queue: std::collections::VecDeque::new(),
             input_state: crate::ui::InputState::default(),
         }
@@ -200,6 +204,7 @@ impl Renderer for RecordingRenderer {
     }
     fn shutdown(&mut self) {}
     fn set_subagents(&mut self, subagents: Vec<SubagentDetail>) {
+        self.subagent_pushes += 1;
         self.subagents = subagents;
     }
 }
@@ -368,6 +373,96 @@ fn queue_transitions_never_create_panel_rows() {
     ));
     assert_eq!(subagents[0].queue, None);
     assert_eq!(subagents.len(), 1);
+}
+
+/// The loop's event pump is the seam that turns a delivered arbitration-pause
+/// transition into **authoritative panel state**: it folds the transition into the
+/// rows every host renders from, re-pushes only on a real change, and still hands
+/// the event to the host. That is what lets the TUI panel and the bridge pane
+/// agree without a second channel, a timer or a background task.
+#[test]
+fn forward_ui_event_folds_a_pause_transition_into_the_authoritative_rows() {
+    let mut subagents = Vec::<SubagentDetail>::new();
+    update_subagent_lifecycle(
+        &mut subagents,
+        crate::agents::Agent::Coder,
+        Some("t-011".to_string()),
+        None,
+        true,
+    );
+    assert_eq!(subagents.len(), 1);
+    assert!(!subagents[0].paused, "a running row starts unpaused");
+
+    let mut renderer = RecordingRenderer::new();
+    let pause = |renderer: &mut RecordingRenderer,
+                 subagents: &mut Vec<SubagentDetail>,
+                 tag: &str,
+                 paused: bool| {
+        super::session::forward_ui_event(
+            subagents,
+            renderer,
+            &Event::SubagentStreamPause {
+                agent_tag: tag.to_string(),
+                paused,
+            },
+        );
+    };
+
+    pause(&mut renderer, &mut subagents, "coder-t-011", true);
+    assert!(subagents[0].paused, "the loop's row carries the pause");
+    assert!(
+        subagents[0].is_active,
+        "the pause is orthogonal to the lifecycle row it folds into"
+    );
+    assert_eq!(
+        subagents[0].queue, None,
+        "and it says nothing about the queue"
+    );
+    assert!(
+        renderer.subagents.first().is_some_and(|r| r.paused),
+        "a real change is pushed to the host"
+    );
+    assert_eq!(renderer.subagent_pushes, 1);
+    assert_eq!(
+        renderer.events.len(),
+        1,
+        "the event still reaches the host's own handler"
+    );
+
+    // The same transition twice is not a change, so nothing is re-pushed.
+    pause(&mut renderer, &mut subagents, "coder-t-011", true);
+    assert_eq!(
+        renderer.subagent_pushes, 1,
+        "a repeat of a delivered transition must not re-push the pane"
+    );
+    assert_eq!(renderer.events.len(), 2);
+
+    // The reclaim edge (arbitrator handed the slot back).
+    pause(&mut renderer, &mut subagents, "coder-t-011", false);
+    assert!(
+        !subagents[0].paused,
+        "the resume handshake clears the flag on the authoritative row"
+    );
+    assert_eq!(renderer.subagent_pushes, 2);
+
+    // A pause for a worker this stream owns no row for is dropped on the floor:
+    // the registry projection owns row existence.
+    pause(&mut renderer, &mut subagents, "coder-t-999", true);
+    assert_eq!(subagents.len(), 1, "no row is invented by a pause");
+    assert_eq!(
+        renderer.subagent_pushes, 2,
+        "and nothing is pushed for a row that does not exist"
+    );
+
+    // Every other event passes straight through the seam untouched.
+    super::session::forward_ui_event(
+        &mut subagents,
+        &mut renderer,
+        &Event::Status("Ready".into()),
+    );
+    assert_eq!(renderer.subagent_pushes, 2);
+    assert_eq!(renderer.events.len(), 5);
+    assert!(!subagents[0].paused, "a status line never pauses a row");
 }
 
 /// Normal completion through the authoritative drain: the row carries its queue
