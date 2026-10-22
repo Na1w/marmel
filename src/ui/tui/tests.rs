@@ -3388,6 +3388,312 @@ fn a_collided_row_renders_from_its_registry_entry_and_the_label_says_what_it_is(
     }
 }
 
+/// Panel-tier regression guard for the `Dup #N` suppression
+/// (`docs/investigation/dup_rows_root_cause.md` §7, gates 1/2/3): the **real**
+/// projection (`ui::helpers::project_subagent_rows`) and the **real** renderer are run
+/// end to end, so the user-visible half of the claim is pinned rather than inferred from
+/// the row vector.
+///
+/// The shape is the measured one: the Manager registers the delegation at dispatch
+/// (`src/orchestrator/mod.rs:302-307`) and the pane already follows that row; the runner
+/// then registers the **same identity** mid-flight
+/// (`src/agents/runner/execution.rs:302-307`) while the Manager guard is alive, so
+/// `claim_worker_slot` hands it `{base}#N`. That second edge used to open a permanent
+/// row with **0 log lines** and yank `selected_subagent_idx` onto it. Pinned here:
+/// * the re-registration opens **no** panel row (gate 1);
+/// * the selection stays on the row that has lines to draw (gate 3);
+/// * the panel's total log line count does not move, measured against the **unsuppressed
+///   baseline the same code produces** for the same panel (gate 2).
+#[test]
+fn the_runners_second_registration_opens_no_panel_row_and_never_steals_the_selection() {
+    use crate::orchestrator::workers;
+    // The projection enumerates the process-global registry, so it is serialized with the
+    // other suites that assert over that table.
+    let _workers = workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let manager = workers::register_active_worker(
+        Some("t-9530".to_string()),
+        "coder".to_string(),
+        "brief one".to_string(),
+    );
+    let plain = manager.0.clone();
+    let _cleanup_plain = EntryCleanup { key: plain.clone() };
+
+    // The loop's authoritative buffer as the shipped panel leaves it: all of the
+    // delegation's status traffic lands on the plain key (nothing on the status path
+    // spells a tag carrying a collision handle), so 16 lines live on one row.
+    let lines: Vec<String> = (0..16)
+        .map(|i| format!("thinking / calling model {i}"))
+        .collect();
+    let mut loop_rows = vec![SubagentDetail {
+        name: plain.clone(),
+        is_active: true,
+        logs: lines.clone(),
+        ..Default::default()
+    }];
+
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+
+    // Refresh edge #1 — project, then push, the order
+    // `project_then_drain_delegation_events` uses. One delegated task, one row, and the
+    // pane is following a row that has content.
+    let _ = crate::ui::helpers::project_subagent_rows(&mut loop_rows);
+    loop_rows.retain(|row| row.name == plain);
+    r.set_subagents(loop_rows.clone());
+    {
+        let ui = r.capture_ui();
+        assert_eq!(
+            ui.subagent_panels.len(),
+            1,
+            "one delegated task, one panel row"
+        );
+        assert_eq!(ui.subagent_panels[0].name, plain);
+        assert_eq!(
+            ui.view.selected_subagent_idx, 0,
+            "the pane follows the live row"
+        );
+        assert_eq!(
+            ui.subagent_panels[0].logs, lines,
+            "and that row carries its lines"
+        );
+    }
+    let lines_before = r
+        .capture_ui()
+        .subagent_panels
+        .iter()
+        .map(|p| p.logs.len())
+        .sum::<usize>();
+
+    // Refresh edge #2 — the runner re-registers the same identity while the Manager guard
+    // is still held, so the registry now also holds the `{base}#N` twin.
+    let runner = workers::register_active_worker(
+        Some("t-9530".to_string()),
+        "coder".to_string(),
+        "brief two".to_string(),
+    );
+    let twin = runner.0.clone();
+    let _cleanup_twin = EntryCleanup { key: twin.clone() };
+    assert!(
+        twin.contains('#'),
+        "the second registration took a collision key: {twin}"
+    );
+
+    let _ = crate::ui::helpers::project_subagent_rows(&mut loop_rows);
+    loop_rows.retain(|row| row.name == plain || row.name == twin);
+    r.set_subagents(loop_rows.clone());
+
+    let ui = r.capture_ui();
+    let names: Vec<&str> = ui.subagent_panels.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(
+        ui.subagent_panels.len(),
+        1,
+        "gate 1: one delegated task keeps exactly one panel row across the re-registration, \
+         got {names:?}"
+    );
+    assert!(
+        names.iter().all(|name| !name.contains('#')),
+        "no `{twin}` row ever reaches the panel, got {names:?}"
+    );
+    // Gate 3 — the selection steal: whatever the pane has selected must be a row with lines.
+    let selected = ui
+        .subagent_panels
+        .get(ui.view.selected_subagent_idx)
+        .unwrap_or_else(|| {
+            panic!(
+                "selection index {} names no drawn row: {names:?}",
+                ui.view.selected_subagent_idx
+            )
+        });
+    assert_eq!(
+        selected.name, plain,
+        "the selection still follows the delegated task's row"
+    );
+    assert!(
+        !selected.logs.is_empty(),
+        "and it lands on a row the panel has lines to draw for"
+    );
+    let lines_after = ui
+        .subagent_panels
+        .iter()
+        .map(|p| p.logs.len())
+        .sum::<usize>();
+    assert_eq!(
+        lines_after, lines_before,
+        "gate 2: the re-registration moved no log line ({lines_before} before, {lines_after} after)"
+    );
+
+    // What the operator sees: the live row is the marked list entry, and the drawn
+    // `[Logs]` block belongs to it.
+    let (rows, _) = draw_subagent_panel(&mut r, 120, 30);
+    let text = rows.join("\n");
+    assert!(
+        text.contains(&format!("> {plain}")),
+        "the delegated task's row is the selected list entry, got:\n{text}"
+    );
+    assert!(
+        text.contains("[Logs]") && text.contains("thinking / calling model 15"),
+        "the drawn detail pane shows the selected row's newest line, got:\n{text}"
+    );
+    assert!(
+        !text.contains(&twin),
+        "the phantom key {twin} is nowhere in the drawn panel, got:\n{text}"
+    );
+
+    // Gate 2 measured against the **unsuppressed baseline of this same panel**, produced
+    // by the production code rather than assumed: drop the plain half and the redundancy
+    // rule is inert, so the very same projection hands the panel BOTH rows — the shipped
+    // shape. The panel's total line count must be identical on both sides of the
+    // suppression edge, and the extra row must be the empty one.
+    drop(manager);
+    let _ = crate::ui::helpers::project_subagent_rows(&mut loop_rows);
+    loop_rows.retain(|row| row.name == plain || row.name == twin);
+    r.set_subagents(loop_rows.clone());
+    let ui = r.capture_ui();
+    let names: Vec<&str> = ui.subagent_panels.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(
+        ui.subagent_panels.len(),
+        2,
+        "control: without a live plain sibling the same projection does yield the phantom \
+         row too, got {names:?}"
+    );
+    assert_eq!(
+        ui.subagent_panels
+            .iter()
+            .map(|p| p.logs.len())
+            .sum::<usize>(),
+        lines_before,
+        "gate 2 measured against the unsuppressed baseline: suppressing the row is \
+         line-neutral, got {names:?}"
+    );
+    let phantom = ui
+        .subagent_panels
+        .iter()
+        .find(|p| p.name == twin)
+        .expect("the unsuppressed shape shows the twin");
+    assert!(
+        phantom.logs.is_empty() && phantom.is_active,
+        "witness: that unsuppressed row is a **live row with no lines at all** — the row the \
+         suppression removes"
+    );
+    assert_eq!(
+        ui.subagent_panels
+            .get(ui.view.selected_subagent_idx)
+            .map(|p| p.name.as_str()),
+        Some(twin.as_str()),
+        "witness: with no suppression the pane's selection really does jump onto that empty \
+         row — the reported symptom, pinned so a regression cannot quietly re-open it"
+    );
+
+    drop(runner);
+}
+
+/// The session-restore half of the accepted rule at the panel tier (gate 4): a lone
+/// `{base}#N` record — the truthful half of a restored pair, while its plain sibling came
+/// back as an `Interrupted by restart` shell
+/// (`docs/investigation/dup_rows_root_cause.md` §5) — must still be projected, must still
+/// be **drawn** with its journal history and its `Dup #N` badge, and the pane's selection
+/// must sit on that row. This is the control that keeps the suppression from degrading
+/// into "always prefer the plain key".
+#[test]
+fn a_restored_collision_row_is_still_drawn_with_its_history_and_its_badge() {
+    use crate::orchestrator::workers;
+    let _workers = workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // The restore seam verbatim: the record is installed under its stored key and never
+    // re-draws an id, and no plain half is registered for this task at all.
+    let restored_key = "coder-t-9531#88".to_string();
+    let started = std::time::Instant::now();
+    assert!(workers::install_restored_worker(
+        restored_key.clone(),
+        workers::WorkerState {
+            info: workers::ActiveWorkerInfo {
+                task_id: Some("t-9531".to_string()),
+                agent_name: "coder".to_string(),
+                prompt: "restored brief".to_string(),
+                started_at: started,
+                started_wall: chrono::Local::now(),
+                context_tokens: 2345,
+                implementation_turns: 4,
+                validation_rounds: 1,
+                latest_validator_feedback: None,
+                status: "Approved".to_string(),
+                cancel_token: None,
+            },
+            last_tokens: 2345,
+            completed_seq: Some(9531),
+            completed_at: Some(started),
+            completed_wall: Some(chrono::Local::now()),
+            worker_id_seq_value: 88,
+            queue_position: None,
+        }
+    ));
+    let _cleanup = EntryCleanup {
+        key: restored_key.clone(),
+    };
+
+    // The journaled pane the restore hands the loop: the history the plain half lost.
+    let history: Vec<String> = (1..=12).map(|i| format!("history line {i}")).collect();
+    let mut loop_rows = vec![SubagentDetail {
+        name: restored_key.clone(),
+        is_active: false,
+        logs: history.clone(),
+        ..Default::default()
+    }];
+
+    let _ = crate::ui::helpers::project_subagent_rows(&mut loop_rows);
+    loop_rows.retain(|row| row.name == restored_key);
+    assert_eq!(
+        loop_rows.len(),
+        1,
+        "a lone `{restored_key}` record keeps its row — the suppression is per-live-sibling, \
+         never \"always prefer the plain key\""
+    );
+    assert_eq!(
+        loop_rows[0].logs, history,
+        "with its full journaled history"
+    );
+
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.set_subagents(loop_rows.clone());
+    let ui = r.capture_ui();
+    let selected = ui
+        .subagent_panels
+        .get(ui.view.selected_subagent_idx)
+        .unwrap_or_else(|| {
+            panic!(
+                "selection index {} names no drawn row",
+                ui.view.selected_subagent_idx
+            )
+        });
+    assert_eq!(
+        selected.name, restored_key,
+        "the restored record is the selected row"
+    );
+    assert_eq!(
+        selected.logs, history,
+        "and the panel holds every history line"
+    );
+
+    let (rows, _) = draw_subagent_panel(&mut r, 120, 40);
+    let text = rows.join("\n");
+    assert!(
+        text.contains(&format!("> {restored_key}")),
+        "the restored collision row is drawn as the selected list entry, got:\n{text}"
+    );
+    assert!(
+        text.contains("Dup #88"),
+        "and its label still spells what it is, got:\n{text}"
+    );
+    assert!(
+        text.contains("[Logs]") && text.contains("history line 12"),
+        "with its history drawn for that row, got:\n{text}"
+    );
+}
+
 #[test]
 fn test_format_terminal_math() {
     let raw = r#"$$\|(O + tD) - C\|^2 = r^2$$
