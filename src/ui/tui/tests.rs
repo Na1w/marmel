@@ -1556,8 +1556,7 @@ fn repeated_authoritative_pushes_never_duplicate_or_drop_a_log_line() {
             ..Default::default()
         }]);
         assert_eq!(
-            r.subagents[0].logs,
-            streamed,
+            r.subagents[0].logs, streamed,
             "push #{round} must neither duplicate the lifecycle line nor erase a streamed line, \
              got {:?}",
             r.subagents[0].logs
@@ -1725,7 +1724,11 @@ fn the_per_row_log_cap_keeps_the_newest_lines() {
             ],
         );
     }
-    assert_eq!(row.len(), MAX_SUBAGENT_ROW_LOGS, "a capped row stays capped");
+    assert_eq!(
+        row.len(),
+        MAX_SUBAGENT_ROW_LOGS,
+        "a capped row stays capped"
+    );
     assert_eq!(
         row.last().map(String::as_str),
         Some("line cap+4"),
