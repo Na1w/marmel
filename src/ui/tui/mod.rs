@@ -459,6 +459,58 @@ fn estimate_stream_tokens(text: &str) -> usize {
     }
 }
 
+/// Upper bound on the log lines one Subagents panel row keeps in the renderer.
+///
+/// Live log text has exactly one writer — this renderer (`Event::Status` / `ToolCall` /
+/// `ToolResult` routing plus [`TuiRenderer::upsert_subagent`]) — while the session loop's
+/// rows can only ever carry the lifecycle lines of `helpers::update_subagent_lifecycle`.
+/// A merge can therefore only ever *add* text, and a long-running round would grow one
+/// row's list without limit. The newest lines win because the detail pane is read from
+/// its tail: dropping the oldest lines keeps the activity the operator is watching.
+pub(crate) const MAX_SUBAGENT_ROW_LOGS: usize = 200;
+
+/// Merge the renderer's live log lines with the ones an authoritative push carries.
+///
+/// `logs` needs the same kind of merge guard `thinking` and `content` already have in
+/// [`Renderer::set_subagents`]: the loop's rows are a registry projection, the registry
+/// read model (`orchestrator::WorkerEntry`) has no log field, and the projection never
+/// writes the field — so the incoming list can only ever hold lifecycle lines
+/// (`started/completed task …`, `[aborted by user]`, `[cancelled by arbitrator]`). A
+/// wholesale replace deletes every streamed line the operator is looking at, which is the
+/// "subagent LOG LINES are erased from the Subagents panel" defect.
+///
+/// Rules, in order:
+/// 1. **Monotone adoption.** The incoming list becomes the base only when it is at least
+///    as long as the renderer's list. That is the only case in which the loop can
+///    genuinely know more, and it is what keeps the pinned contract "the loop owns the log
+///    lines and hands them over with the row" intact for a row the renderer opened empty.
+/// 2. **The shorter list never loses lines.** Every line the base does not already carry
+///    is kept, so the lifecycle lines a longer renderer list never saw survive, and so
+///    does the renderer's own streamed tail when the loop's list wins rule 1.
+/// 3. **Dedup.** A line present in both lists appears once, so re-pushing the same row
+///    (every delegation drain, every 250 ms in-sink pump) can never duplicate it.
+/// 4. **Cap.** Only the newest [`MAX_SUBAGENT_ROW_LOGS`] lines survive.
+///
+/// Deterministic and order-stable: the base keeps its own order and the other list's
+/// missing lines follow it in their own order, so draw-tier assertions stay assertable.
+pub(crate) fn merge_logs(existing: &[String], incoming: &[String]) -> Vec<String> {
+    let incoming_wins = incoming.len() >= existing.len();
+    let base = if incoming_wins { incoming } else { existing };
+    let other = if incoming_wins { existing } else { incoming };
+
+    let mut merged = base.to_vec();
+    for line in other {
+        if !merged.contains(line) {
+            merged.push(line.clone());
+        }
+    }
+    if merged.len() > MAX_SUBAGENT_ROW_LOGS {
+        let stale = merged.len() - MAX_SUBAGENT_ROW_LOGS;
+        merged.drain(..stale);
+    }
+    merged
+}
+
 impl Renderer for TuiRenderer {
     fn init(&mut self) -> Result<()> {
         enable_raw_mode()?;
@@ -1128,7 +1180,10 @@ impl Renderer for TuiRenderer {
                     if was_inactive && incoming.is_active {
                         activated_name = Some(incoming.name.clone());
                     }
-                    existing.logs = incoming.logs.clone();
+                    // The loop's rows can only ever carry lifecycle lines, so the
+                    // incoming list is merged (monotone adoption + dedup + cap)
+                    // instead of replacing the renderer's live log list wholesale.
+                    existing.logs = merge_logs(&existing.logs, &incoming.logs);
                     // The clocks belong to the registry, not to whoever created the
                     // row: the loop's row carries the entry's own start stamp while
                     // it is live and its finished total once it is not, so a
