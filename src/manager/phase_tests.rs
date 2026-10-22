@@ -1673,3 +1673,292 @@ fn test_unreadable_plan_reports_an_error_and_is_not_complete() {
 
     fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------
+// t-021 archive regression probes (defects D1-D8 report,
+// `docs/investigation/archive_plan_mechanism.md`).
+//
+// These reproduce the operator-reported "archive plan does not work" symptom
+// against the real `Plan` code paths in isolated temp dirs. Each probe names the
+// defect it falsifies. They are kept as the seed of the regression suite.
+// ---------------------------------------------------------------------------
+
+/// The archived-snapshot file names currently living under `dir/archive/`.
+fn snapshot_names(dir: &std::path::Path) -> Vec<String> {
+    let archive = dir.join("archive");
+    if !archive.is_dir() {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = fs::read_dir(&archive)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// D1 — the completion gate must judge **task-checkbox syntax**, not prose.
+///
+/// A real plan spells function names (`archive_plan()`, `Plan::archive()`) and
+/// bracket placeholders in its Context and task text. Every task here is ticked,
+/// so `pending_tasks()` is empty and the plan must be archivable; the
+/// whole-document `\[\s*\]|\(\s*\)` scan used to see that prose as pending boxes
+/// and refuse forever (witness W8/W9 of the report).
+#[test]
+fn d1_archive_succeeds_when_prose_holds_parens_and_brackets() {
+    let dir = temp_marmel();
+    let plan = Plan::at(&dir);
+    plan.create(
+        "# Plan\n\
+Context: `archive_plan()` calls `Plan::archive()` (see notes) and keeps [] placeholders.\n\
+- [x] [t-001] Fix the gate () so prose is ignored\n\
+- [x] [t-002] Prove [] prose never holds the plan open\n",
+    )
+    .unwrap();
+
+    assert!(
+        plan.pending_tasks().is_empty(),
+        "every task line is ticked, so nothing is pending"
+    );
+    assert!(
+        plan.is_complete(),
+        "D1: prose `()` / `[]` must not make a fully ticked plan incomplete"
+    );
+
+    let dest = plan
+        .archive()
+        .unwrap()
+        .expect("D1: a completed plan must archive, not return Ok(None)");
+    assert!(dest.exists(), "the snapshot must exist");
+    assert!(
+        !plan.exists(),
+        "D1: the active plan must be removed by a successful archive"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// D2 — the documented end state must be reachable through the completion flow.
+///
+/// `create_plan` -> `check_off` (which auto-snapshots but deliberately keeps the
+/// active plan) -> explicit `archive()`: afterwards the active plan is gone and
+/// exactly one snapshot exists. The recorded session log shows this never
+/// happened once: the gate refused every attempt and the completed plan was
+/// later overwritten by the next `create_plan`.
+#[test]
+fn d2_completion_flow_reaches_the_documented_archived_end_state() {
+    let dir = temp_marmel();
+    let plan = Plan::at(&dir);
+    plan.create(
+        "# Plan\n\
+- [ ] [t-001] Inspect archive_plan() and Plan::archive()\n\
+- [ ] [t-002] Fix the gate, then archive the plan []\n",
+    )
+    .unwrap();
+
+    assert!(plan.check_off("t-001").unwrap());
+    assert!(plan.check_off("t-002").unwrap());
+    assert!(
+        plan.is_complete(),
+        "D2: after the final check-off the plan is complete"
+    );
+
+    let dest = plan
+        .archive()
+        .unwrap()
+        .expect("D2: the explicit archive of a completed plan must succeed");
+    assert!(dest.exists());
+    assert!(
+        !plan.exists(),
+        "D2: documented end state — active plan file removed"
+    );
+    assert_eq!(
+        snapshot_names(&dir).len(),
+        1,
+        "D2: exactly one snapshot for one completed plan"
+    );
+    assert!(
+        dir.join("execution_plan_archive.md").is_file(),
+        "D2: the latest-archive convenience copy must exist"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// D2 — a completed plan must never be silently clobbered by the next
+/// `create_plan`.
+///
+/// `create` writes unconditionally, so a plan that reached completion without a
+/// successful `archive()` used to vanish without any archive artifact (log line
+/// `create_plan` at 01:48:25 in the report's forensics).
+#[test]
+fn d2_create_preserves_a_completed_plan_it_overwrites() {
+    let dir = temp_marmel();
+    let plan = Plan::at(&dir);
+    // Created fully ticked: no `check_off` ever fires, so no auto snapshot.
+    plan.create("# Plan A\n- [x] [t-001] Finished work\n")
+        .unwrap();
+    assert!(plan.is_complete());
+
+    plan.create("# Plan B\n- [ ] [t-002] Fresh mission\n")
+        .unwrap();
+
+    let names = snapshot_names(&dir);
+    assert_eq!(
+        names.len(),
+        1,
+        "D2: the completed plan A must survive as exactly one snapshot, got {names:?}"
+    );
+    let snapshot = fs::read_to_string(dir.join("archive").join(&names[0])).unwrap();
+    assert!(
+        snapshot.contains("[t-001]"),
+        "D2: the preserved snapshot must be plan A:\n{snapshot}"
+    );
+    // The new mission is untouched: still the live, pending plan.
+    assert_eq!(plan.pending_tasks(), vec!["t-002".to_string()]);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Guard on the D2 fix: `create` must still replace an **undecodable** active
+/// plan. Preservation before an overwrite is best-effort — there is nothing
+/// snapshot-worthy in bytes that cannot be decoded, and a corrupt checkpoint must
+/// never block the documented recovery path (`create_plan` replacing it).
+#[test]
+fn d2_create_still_replaces_an_undecodable_plan() {
+    let dir = temp_marmel();
+    let plan = Plan::at(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    // `- [ ]` followed by 0xff 0xfe: a plan file that cannot be decoded.
+    fs::write(plan.plan_path(), [0x2d, 0x20, 0x5b, 0x20, 0x5d, 0xff, 0xfe]).unwrap();
+
+    plan.create("# Plan B\n- [ ] [t-002] Recover the mission\n")
+        .expect("create_plan must still replace an undecodable plan");
+
+    assert_eq!(plan.pending_tasks(), vec!["t-002".to_string()]);
+    assert!(
+        snapshot_names(&dir).is_empty(),
+        "nothing preservable was snapshotted"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// D3 — a snapshot name that is already taken by **different** bytes must never
+/// be silently truncated. The writer has to pick a fresh, unique name.
+#[test]
+fn d3_snapshot_name_collision_never_overwrites_a_different_snapshot() {
+    let dir = temp_marmel();
+    let plan = Plan::at(&dir);
+    plan.create("# Plan\n- [x] [t-001] Done\n").unwrap();
+
+    let archive = dir.join("archive");
+    fs::create_dir_all(&archive).unwrap();
+    // Reserve the names the second-resolution clock will produce in this test
+    // (and one second later, to stay deterministic across a second boundary).
+    let now = chrono::Utc::now();
+    let ts0 = now.format("%Y%m%d_%H%M%S").to_string();
+    let ts1 = (now + chrono::Duration::seconds(1))
+        .format("%Y%m%d_%H%M%S")
+        .to_string();
+    let kept_a = archive.join(format!("execution_plan_{ts0}.md"));
+    let kept_b = archive.join(format!("execution_plan_{ts1}.md"));
+    fs::write(&kept_a, "EARLIER SNAPSHOT A").unwrap();
+    fs::write(&kept_b, "EARLIER SNAPSHOT B").unwrap();
+
+    let dest = plan
+        .archive()
+        .unwrap()
+        .expect("a completed plan must archive");
+
+    assert_eq!(
+        fs::read_to_string(&kept_a).unwrap(),
+        "EARLIER SNAPSHOT A",
+        "D3: an existing snapshot must never be silently truncated"
+    );
+    assert_eq!(
+        fs::read_to_string(&kept_b).unwrap(),
+        "EARLIER SNAPSHOT B",
+        "D3: an existing snapshot must never be silently truncated"
+    );
+    assert_eq!(
+        snapshot_names(&dir).len(),
+        3,
+        "D3: the new snapshot must get its own unique name"
+    );
+    assert!(dest.is_file(), "the reported snapshot must exist");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// D3 — the `check_off` auto-snapshot and the explicit archive of the **same**
+/// completed plan must not accumulate byte-equivalent duplicates when the clock
+/// moves past the second boundary.
+#[test]
+fn d3_identical_completed_plan_is_snapshotted_once() {
+    let dir = temp_marmel();
+    let plan = Plan::at(&dir);
+    plan.create("# Plan\n- [x] [t-001] Done\n").unwrap();
+    let bytes = plan.read().unwrap().unwrap();
+
+    let archive = dir.join("archive");
+    fs::create_dir_all(&archive).unwrap();
+    // Stand in for an auto-snapshot taken at an earlier second (>1s apart is what
+    // the report reproduces as two byte-equivalent snapshots).
+    let prior = archive.join("execution_plan_20200101_000000.md");
+    fs::write(&prior, &bytes).unwrap();
+
+    let dest = plan.archive().unwrap().expect("must archive");
+
+    assert_eq!(
+        snapshot_names(&dir).len(),
+        1,
+        "D3: one completed plan must leave exactly one snapshot"
+    );
+    assert_eq!(
+        dest, prior,
+        "D3: the identical existing snapshot must be reused, not duplicated"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// D4 — when the active plan file cannot be removed, `archive()` must report the
+/// failure instead of claiming success, and must not pretend the plan is gone.
+///
+/// The read-only marmel directory lets the snapshot inside `archive/` be written
+/// while the `execution_plan_archive.md` copy and the active-plan removal fail.
+#[cfg(unix)]
+#[test]
+fn d4_archive_reports_failure_when_the_active_plan_is_not_removed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_marmel();
+    let plan = Plan::at(&dir);
+    plan.create("# Plan\n- [x] [t-001] Done\n").unwrap();
+    fs::create_dir_all(dir.join("archive")).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let result = plan.archive();
+
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let err = match result {
+        Ok(other) => panic!(
+            "D4: archive() must not report success while the active plan is still \
+             on disk, got {other:?}"
+        ),
+        Err(err) => err,
+    };
+    assert!(
+        plan.exists(),
+        "the active plan is still on disk, so the verdict must have been an error"
+    );
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("execution_plan"),
+        "the error must name what could not be written/removed: {msg}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}

@@ -3830,15 +3830,53 @@ pub async fn run_session_with_bounds_report(
 /// budget. Everything else is keyed by tool name plus a truncated argument
 /// signature, which is what makes "the same failing call over and over"
 /// detectable without holding on to unbounded history.
-fn failure_key_for(name: &str, args: &serde_json::Value, task_id: Option<&str>) -> String {
+///
+/// `archive_current_plan` is the one tool that takes **no arguments**, so its
+/// signature is the constant `{}`: every attempt — the premature ones (the plan
+/// genuinely has open tasks) and the later legitimate one (the plan is complete)
+/// — would share the key `tool:archive_current_plan:{}`. Two early refusals then
+/// spend the budget and the third call is never dispatched, so the session
+/// punishes the correct archive for the earlier wrong ones. Its key therefore
+/// carries the plan state the attempt was made against ([`archive_attempt_state`])
+/// instead of an argument signature; repeated attempts against an **unchanged**
+/// plan still escalate exactly like any other tool.
+pub(crate) fn failure_key_for(
+    name: &str,
+    args: &serde_json::Value,
+    task_id: Option<&str>,
+) -> String {
     if let Some(raw) = task_id {
         let task = clean_task_id(raw);
         if !task.is_empty() {
             return format!("task:{task}");
         }
     }
+    if name == crate::tool_names::TOOL_ARCHIVE_PLAN {
+        // The same plan authority `harness::plan::archive_plan()` acts on, so the
+        // key cannot describe a different plan than the call would archive.
+        return archive_failure_key(&archive_attempt_state(
+            &crate::manager::phase::Plan::default(),
+        ));
+    }
     let signature = crate::text_util::truncate_with_ellipsis(&args.to_string(), 120);
     format!("tool:{name}:{signature}")
+}
+
+/// The plan state an `archive_current_plan` attempt was made against, spelled as
+/// a failure-key discriminator: `complete`, or `pending<n>` while the plan still
+/// has open tasks (an absent plan is `pending0`).
+pub(crate) fn archive_attempt_state(plan: &crate::manager::phase::Plan) -> String {
+    if plan.is_complete() {
+        "complete".to_string()
+    } else {
+        format!("pending{}", plan.pending_tasks().len())
+    }
+}
+
+/// The failure key of an `archive_current_plan` attempt against a given plan
+/// state ([`archive_attempt_state`]).
+pub(crate) fn archive_failure_key(state: &str) -> String {
+    format!("tool:{}:{state}", crate::tool_names::TOOL_ARCHIVE_PLAN)
 }
 
 /// User-facing rendering of a [`failure_key_for`] key.

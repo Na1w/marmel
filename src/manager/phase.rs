@@ -59,6 +59,22 @@ use std::path::{Path, PathBuf};
 pub const MARMEL_DIR: &str = ".marmel";
 /// Plan file name inside the marmel directory.
 pub const PLAN_FILE: &str = "execution_plan.md";
+/// Subdirectory of the marmel directory holding the completed-plan snapshots.
+///
+/// This is the authority for the plan module's own writers (`archive`,
+/// `check_off`'s auto-snapshot, `create`'s pre-overwrite preservation); the
+/// name matches [`crate::harness::workspace::ARCHIVE_DIR`].
+pub const ARCHIVE_SUBDIR: &str = "archive";
+/// Prefix of a timestamped completed-plan snapshot inside [`ARCHIVE_SUBDIR`].
+pub const SNAPSHOT_PREFIX: &str = "execution_plan_";
+/// Name of the **latest** archived-plan convenience copy inside the marmel
+/// directory.
+///
+/// `archive` writes it, the auto-snapshot refreshes it and [`Plan::clear`]
+/// deletes it — which is exactly what lets `ui::session` tell an archive from a
+/// reset (`plan_archived_during_round` looks for the plan file being gone **and**
+/// this file present).
+pub const LATEST_ARCHIVE_FILE: &str = "execution_plan_archive.md";
 /// Name of the legacy phase-override file inside the marmel directory.
 ///
 /// Nothing writes or reads it. The name survives so a **stale** override left on
@@ -294,10 +310,17 @@ impl Plan {
     /// newline **here, once, at write time**: `create` and `check_off` are the
     /// only writers of the active plan file and `check_off` is byte-faithful, so
     /// the bytes on disk are the normalized bytes written here.
+    ///
+    /// A **completed** plan that was never archived is snapshotted to
+    /// `.marmel/archive/` first (see [`Plan::preserve_completed_plan_unlocked`]):
+    /// `create` overwrites unconditionally, and a finished plan silently
+    /// disappearing under the next `create_plan` is a recorded archive failure.
     pub fn create(&self, plan_markdown: &str) -> Result<()> {
         let _guard = PLAN_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("creating {}", self.dir.display()))?;
+
+        self.preserve_completed_plan_unlocked()?;
 
         let mut content = crate::plan_parse::normalize_newlines(plan_markdown);
         if !content.is_empty() && !content.ends_with('\n') {
@@ -361,7 +384,7 @@ impl Plan {
             );
             let _ = std::fs::remove_file(&path);
         }
-        let archive = self.dir.join("execution_plan_archive.md");
+        let archive = self.latest_archive_path();
         if archive.exists() {
             tracing::warn!(
                 "Plan::clear: deleting archive plan file at {}",
@@ -469,6 +492,16 @@ impl Plan {
         self.is_complete_unlocked()
     }
 
+    /// The single completion authority over plan **content**: complete when the
+    /// plan has at least one checked task checkbox and no open one. Every gate
+    /// that decides "is this plan finished" (`is_complete`, the `check_off`
+    /// auto-snapshot, the `create` pre-overwrite preservation) goes through here,
+    /// so they can never disagree.
+    fn completion_of(content: &str) -> bool {
+        !crate::plan_parse::has_unchecked_box(content)
+            && crate::plan_parse::has_checked_box(content)
+    }
+
     /// [`Plan::is_complete`] for call sites that already hold `PLAN_MUTEX`
     /// (`archive`, `check_off`) — see [`Plan::read_unlocked`].
     fn is_complete_unlocked(&self) -> bool {
@@ -480,19 +513,169 @@ impl Plan {
                 return false;
             }
         };
-        if crate::plan_parse::has_unchecked_box(&content) {
-            return false;
+        Self::completion_of(&content)
+    }
+
+    /// Directory holding the completed-plan snapshots (`.marmel/archive/`).
+    fn archive_dir(&self) -> PathBuf {
+        self.dir.join(ARCHIVE_SUBDIR)
+    }
+
+    /// Path of the latest archived-plan convenience copy
+    /// (`.marmel/execution_plan_archive.md`).
+    fn latest_archive_path(&self) -> PathBuf {
+        self.dir.join(LATEST_ARCHIVE_FILE)
+    }
+
+    /// Pick the destination for a completed-plan snapshot inside `archive_dir`.
+    ///
+    /// Collision-safe by construction (the second-resolution UTC name is not
+    /// unique on its own):
+    ///
+    /// * a snapshot holding **exactly these bytes** is reused, so one completed
+    ///   plan leaves exactly one snapshot — the `check_off` auto-snapshot and a
+    ///   later explicit `archive()` no longer accumulate byte-equivalent
+    ///   duplicates (>1 s apart) or silently truncate each other (same second);
+    /// * a name already taken by **different** bytes is never truncated: the
+    ///   writer steps to `execution_plan_<ts>_2.md`, `_3.md`, … until the name is
+    ///   free, so an earlier snapshot can never be overwritten.
+    ///
+    /// Returns the destination plus whether it already holds these bytes (then no
+    /// write is needed). Callers must hold [`PLAN_MUTEX`].
+    fn snapshot_dest(archive_dir: &Path, content: &str) -> Result<(PathBuf, bool)> {
+        let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut identical: Option<PathBuf> = None;
+        match std::fs::read_dir(archive_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    if !name.starts_with(SNAPSHOT_PREFIX) || !name.ends_with(".md") {
+                        continue;
+                    }
+                    taken.insert(name.to_owned());
+                    if identical.is_none()
+                        && path.is_file()
+                        && std::fs::read(&path).is_ok_and(|bytes| bytes == content.as_bytes())
+                    {
+                        identical = Some(path);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(
+                "Plan: could not list {} to check snapshot names for collisions: {e}",
+                archive_dir.display()
+            ),
         }
-        crate::plan_parse::has_checked_box(&content)
+        if let Some(existing) = identical {
+            return Ok((existing, true));
+        }
+        let mut name = format!("{SNAPSHOT_PREFIX}{stamp}.md");
+        let mut suffix = 1_u32;
+        while taken.contains(&name) {
+            suffix += 1;
+            name = format!("{SNAPSHOT_PREFIX}{stamp}_{suffix}.md");
+            if suffix > 100_000 {
+                anyhow::bail!(
+                    "no free snapshot name for {} in {}",
+                    stamp,
+                    archive_dir.display()
+                );
+            }
+        }
+        Ok((archive_dir.join(name), false))
+    }
+
+    /// Write (or reuse — see [`Plan::snapshot_dest`]) a completed-plan snapshot
+    /// of `content` under `.marmel/archive/`. Never touches the active plan
+    /// file. Callers must hold [`PLAN_MUTEX`] and have created the marmel
+    /// directory.
+    fn write_snapshot_unlocked(&self, content: &str) -> Result<PathBuf> {
+        let archive_dir = self.archive_dir();
+        std::fs::create_dir_all(&archive_dir)
+            .with_context(|| format!("creating {}", archive_dir.display()))?;
+        let (dest, reused) = Self::snapshot_dest(&archive_dir, content)?;
+        if reused {
+            tracing::info!(
+                "Completed execution plan snapshot already present at {} (not written twice)",
+                dest.display()
+            );
+        } else {
+            std::fs::write(&dest, content)
+                .with_context(|| format!("writing {}", dest.display()))?;
+        }
+        Ok(dest)
+    }
+
+    /// Preserve a **completed** active plan before `create` replaces it, so a
+    /// finished plan can never be silently clobbered by the next `create_plan`.
+    ///
+    /// Only a complete plan is snapshotted: an incomplete plan is the working
+    /// checkpoint and is deliberately left for whoever is executing it. The
+    /// active file is not removed and no session state is swept — `create` is
+    /// installing a new mission in the same directory, this is a copy, not an
+    /// archive. A snapshot that already holds these bytes (the `check_off`
+    /// auto-snapshot normally did exactly that) costs nothing.
+    ///
+    /// A snapshot/write failure is propagated: losing the only copy of a
+    /// completed plan silently is the bug this closes, so the caller must see it.
+    /// An **undecodable** active plan is the one exception — there is nothing
+    /// preservable to snapshot, and a corrupt checkpoint must never block a new
+    /// `create_plan` (replacing it is the documented recovery path), so it is
+    /// reported as an error and preservation is skipped.
+    fn preserve_completed_plan_unlocked(&self) -> Result<()> {
+        let content = match self.read_unlocked() {
+            Ok(Some(content)) => content,
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                tracing::error!(
+                    "Plan: the active plan at {} could not be read before `create_plan` replaced \
+                     it, so it was NOT preserved: {e:#}",
+                    self.plan_path().display()
+                );
+                return Ok(());
+            }
+        };
+        if !Self::completion_of(&content) {
+            return Ok(());
+        }
+        let dest = self.write_snapshot_unlocked(&content)?;
+        let latest = self.latest_archive_path();
+        if let Err(e) = std::fs::write(&latest, &content) {
+            tracing::warn!(
+                "Plan: {} could not be refreshed before create_plan overwrote the completed \
+                 plan: {e}",
+                latest.display()
+            );
+        }
+        tracing::warn!(
+            "Completed execution plan snapshotted to {} before create_plan replaced the active \
+             plan file {}",
+            dest.display(),
+            self.plan_path().display()
+        );
+        Ok(())
     }
 
     /// Archive the current execution plan to `.marmel/archive/execution_plan_<timestamp>.md`
     /// and `.marmel/execution_plan_archive.md`, and clean up `.marmel/execution_plan.md`.
     ///
     /// A plan is only archived once it is complete. An incomplete plan (one with
-    /// at least one unchecked box) is the working checkpoint — archiving it would
-    /// silently lose it — so this returns `Ok(None)` when `is_complete()` is false
-    /// and leaves every file untouched.
+    /// at least one open task checkbox) is the working checkpoint — archiving it
+    /// would silently lose it — so this returns `Ok(None)` when `is_complete()`
+    /// is false and leaves every file untouched.
+    ///
+    /// IO failures are **propagated, not swallowed**: if the latest-archive copy
+    /// or the removal of the active plan file fails, this returns `Err` naming
+    /// the failed step instead of reporting a success the disk does not show (a
+    /// swallowed removal left the plan phase EXECUTING, kept
+    /// `ui::session::plan_archived_during_round` from ever firing, and let the
+    /// next `create_plan` stack on top). The snapshot name is collision-safe
+    /// ([`Plan::snapshot_dest`]), so retrying after such a failure reuses the
+    /// snapshot already written instead of writing a second copy.
     pub fn archive(&self) -> Result<Option<PathBuf>> {
         let _guard = PLAN_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         if !self.is_complete_unlocked() {
@@ -509,17 +692,15 @@ impl Plan {
             );
             return Ok(None);
         };
-        let archive_dir = self.dir.join("archive");
-        std::fs::create_dir_all(&archive_dir)
-            .with_context(|| format!("creating {}", archive_dir.display()))?;
-        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-        let dest = archive_dir.join(format!("execution_plan_{ts}.md"));
-        std::fs::write(&dest, &content).with_context(|| format!("writing {}", dest.display()))?;
-        let latest = self.dir.join("execution_plan_archive.md");
-        let _ = std::fs::write(&latest, &content);
-        let _ = std::fs::remove_file(&path);
+        let dest = self.write_snapshot_unlocked(&content)?;
+        let latest = self.latest_archive_path();
+        std::fs::write(&latest, &content)
+            .with_context(|| format!("writing {}", latest.display()))?;
+        std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
         // An archived plan is a finished session: the superseded manager journal,
-        // the superseded UI journal and the session bundle go with it.
+        // the superseded UI journal and the session bundle go with it. Only now —
+        // every artifact this contract promises is on disk and the active plan is
+        // really gone.
         self.sweep_session_state();
         clear_plan_start();
         tracing::warn!(
@@ -572,10 +753,17 @@ impl Plan {
         // When this flip completes the plan, write a completion snapshot to
         // `.marmel/archive/` (the promise in the `archive` docstring) but KEEP the
         // active file readable until the caller archives explicitly. This is a
-        // best-effort snapshot: failing here must not fail the check-off itself.
+        // best-effort snapshot: failing here must not fail the check-off itself —
+        // but it must be said out loud, because the snapshot is the only copy of
+        // this completed plan if the explicit archive never runs.
         if complete {
             record_plan_completed();
-            let _ = self.write_completed_snapshot(&updated);
+            if let Err(e) = self.write_completed_snapshot(&updated) {
+                tracing::error!(
+                    "check_off({task_id}): plan is complete but the completion snapshot failed \
+                     (the check-off itself succeeded): {e:#}"
+                );
+            }
         }
         Ok(true)
     }
@@ -584,15 +772,20 @@ impl Plan {
     /// `.marmel/archive/execution_plan_<timestamp>.md`, leaving the active
     /// `.marmel/execution_plan.md` untouched. Used by `check_off` when the last
     /// task is flipped and the plan becomes complete.
+    ///
+    /// The name is collision-safe and deduplicated ([`Plan::snapshot_dest`]): the
+    /// explicit `archive()` that follows cannot silently truncate this snapshot
+    /// inside the same second, and cannot leave a second byte-equivalent copy
+    /// behind when the clock has moved on.
     fn write_completed_snapshot(&self, content: &str) -> Result<PathBuf> {
-        let archive_dir = self.dir.join("archive");
-        std::fs::create_dir_all(&archive_dir)
-            .with_context(|| format!("creating {}", archive_dir.display()))?;
-        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-        let dest = archive_dir.join(format!("execution_plan_{ts}.md"));
-        std::fs::write(&dest, content).with_context(|| format!("writing {}", dest.display()))?;
-        let latest = self.dir.join("execution_plan_archive.md");
-        let _ = std::fs::write(&latest, content);
+        let dest = self.write_snapshot_unlocked(content)?;
+        let latest = self.latest_archive_path();
+        if let Err(e) = std::fs::write(&latest, content) {
+            tracing::warn!(
+                "Plan: {} could not be refreshed by the completion snapshot: {e}",
+                latest.display()
+            );
+        }
         tracing::info!(
             "Auto-saved completed execution plan snapshot to {}",
             dest.display()

@@ -101,9 +101,20 @@ pub(crate) fn archive_plan() -> Result<ToolResult, ToolError> {
         ))),
         Ok(None) => {
             if plan.plan_path().exists() {
-                Ok(ToolResult::err(
-                    "plan is not complete and cannot be archived yet",
-                ))
+                // Actionable refusal: name what is still open, instead of the
+                // same opaque sentence for every plan state.
+                let pending = plan.pending_tasks();
+                if pending.is_empty() {
+                    return Ok(ToolResult::err(
+                        "plan is not complete and cannot be archived yet: no task is checked off \
+                         `[x]`, so nothing in this plan has been completed",
+                    ));
+                }
+                Ok(ToolResult::err(format!(
+                    "plan is not complete and cannot be archived yet — {} task(s) still pending: {}",
+                    pending.len(),
+                    pending.join(", ")
+                )))
             } else {
                 Ok(ToolResult::ok("no plan file to archive"))
             }
