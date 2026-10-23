@@ -34,6 +34,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Lock shared with the notice-layer tests so the (process-global) notice store is
 /// not mutated underneath the per-id assertions here.
+///
+/// The same lock also owns the process-global `EVENT_SENDER` registration
+/// (`src/orchestrator/bus.rs`): every test in this crate that swaps that sender takes this
+/// lock, so exactly one of them holds the registration at a time and an assertion about "what
+/// the user was told" cannot be stolen by — or flooded with — another test's round trip.
 async fn notice_lock() -> tokio::sync::MutexGuard<'static, ()> {
     crate::orchestrator::notice::TEST_NOTICE_MUTEX.lock().await
 }
@@ -169,12 +174,19 @@ async fn test_reply_without_notice_id_is_rejected_and_no_notice_is_guessed() {
     assert!(get_worker_reply("notice-t051-guess").is_none());
 
     // No arbitrator turn: nothing was emitted to the user, so there is no
-    // `Event::SteerResponse`-style success for a reply that was never recorded.
-    match event_rx.try_recv() {
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {}
-        Ok(event) => panic!("a rejected reply must emit no UI event, got {event:?}"),
+    // `Event::SteerResponse`-style success for a reply that was never recorded. Only an answer
+    // counts — the bus is process-global, so a test that merely emits (never swaps the sender,
+    // e.g. preemption) may still put an unrelated event in this channel.
+    let mut answers: Vec<String> = Vec::new();
+    while let Ok(event) = event_rx.try_recv() {
+        if let crate::ui::Event::SteerResponse(text) = event {
+            answers.push(text);
+        }
     }
+    assert!(
+        answers.is_empty(),
+        "a rejected reply must produce no arbitrator answer, got {answers:?}"
+    );
 }
 
 #[tokio::test]

@@ -830,21 +830,33 @@ fn test_bridge_stale_pane_row_cannot_report_subagents_executing() {
         stale_rows.iter().any(|s| s.is_active),
         "the fixture must really be a stale, 'active-looking' pane row"
     );
-    assert!(
-        !crate::orchestrator::has_active_workers(),
-        "the registry must report no running worker for this fixture"
+    // The registry is process-global and tests outside this lock set can register a live
+    // worker while this one runs, so the arbitrator's two reads are pinned to **one**
+    // snapshot of it. What must never depend on that snapshot is the pane-row fixture: the
+    // stale row's identity may not reach either read model, and with the registry reporting
+    // no worker — the fixture's own case — the status stays on 'planning/turn'.
+    assert_eq!(
+        arbiter::orchestrator_status_label(false),
+        "Active (planning/turn)",
+        "with no worker in the registry, a stale pane row must not push the arbitrator status \
+         to 'subagents executing'"
     );
 
+    let registry_says_active = crate::orchestrator::has_active_workers();
     assert_eq!(
-        arbiter::orchestrator_status_label(crate::orchestrator::has_active_workers()),
-        "Active (planning/turn)",
-        "a stale pane row must not push the arbitrator status to 'subagents executing'"
+        arbiter::orchestrator_status_label(registry_says_active),
+        if registry_says_active {
+            "Active (subagents executing)"
+        } else {
+            "Active (planning/turn)"
+        },
+        "the arbitrator's status must track the registry alone"
     );
+    let subtask_table = arbiter::active_subtasks_render();
     assert!(
-        !arbiter::active_subtasks_render().contains("Active Background Subagents"),
-        "the arbitrator's subtask table must not list an active worker the registry does not \
-         have, got {:?}",
-        arbiter::active_subtasks_render()
+        !subtask_table.contains("t-stale-row") && !subtask_table.contains("coder-t-stale-row"),
+        "the arbitrator's subtask table must never list a pane row the registry no longer \
+         holds, got {subtask_table:?}"
     );
 
     // And the drain does not resurrect the stale row either: the projection drops rows the
@@ -2326,6 +2338,19 @@ fn test_bridge_sleep_chain_host_sleep_refuses_a_sub_minimum_budget_and_floors_th
     }
 }
 
+/// Serialise against every other holder of the process-global notice store.
+///
+/// Notices are filed per addressed worker, and a `*` / `worker` **broadcast** notice is
+/// drained by *any* worker — so a sibling test's drain can quietly steal the notice this
+/// file's steer tests just posted (and `clear_all_notices()` in `notice_tests` can wipe
+/// it outright). Taking the same `TEST_NOTICE_MUTEX` the notice tests hold removes that
+/// cross-talk. Ordering rule for the crate: **workers → notice**; no test takes them the
+/// other way round, so this cannot deadlock. Taken outside any runtime, because tokio's
+/// `blocking_lock` refuses to park inside one.
+fn notice_store_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    crate::orchestrator::notice::TEST_NOTICE_MUTEX.blocking_lock()
+}
+
 /// (d) A notice dropped by the inbox capacity bound is never lost silently: the bound stays
 /// intact, the drop is counted (delta, not an absolute global) and the drop text names which
 /// notice id was dropped — while the newest instruction survives.
@@ -2341,6 +2366,8 @@ fn test_bridge_notice_capacity_drop_is_observable_and_inbox_stays_bounded() {
     let _workers = crate::orchestrator::workers::TEST_WORKERS_MUTEX
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+
+    let _notices = notice_store_lock();
 
     // The notice must land where a live worker actually drains it: a registered worker,
     // addressed by task token, filed under its effective key.
@@ -2526,6 +2553,8 @@ fn test_bridge_forward_notice_posts_exactly_one_notice_per_steer() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
 
+    let _notices = notice_store_lock();
+
     let guard = crate::orchestrator::register_active_worker_with_token(
         Some("t-035c-one".to_string()),
         "coder".to_string(),
@@ -2650,6 +2679,8 @@ fn test_bridge_forward_notice_survives_an_omitted_tool_call_id() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
 
+    let _notices = notice_store_lock();
+
     let guard = crate::orchestrator::register_active_worker_with_token(
         Some("t-035c-nohandle".to_string()),
         "coder".to_string(),
@@ -2695,7 +2726,13 @@ fn test_bridge_sink_host_posts_exactly_one_notice_for_a_forward_notice_decision(
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    // The notice lock is taken **inside** `with_arbitration_test_lock`, which is where
+    // `TEST_WORKERS_MUTEX` is held: the crate's order is workers → notice, and inverting
+    // it here would deadlock against the sibling tests that hold the registry lock and
+    // then wait for the notice store.
     with_arbitration_test_lock(async {
+        let _notices = crate::orchestrator::notice::TEST_NOTICE_MUTEX.lock().await;
+
         let task = "t-035c-sink";
         let raw_user_text = "ask the coder about the rebase t035c-sink";
         let body = serde_json::json!({
