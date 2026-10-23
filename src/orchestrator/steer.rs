@@ -759,6 +759,31 @@ pub async fn execute_steer_subtask(
     prompt: &str,
 ) -> Result<Deliverable, anyhow::Error> {
     let plan = Plan::default();
+    // Provenance: an ad-hoc steering/arbitrator delegation has **no plan line**, so
+    // the write side (`create_plan` → `pregenerate_for_plan_offline`) never took a
+    // validation decision for it. Without a decision on disk the read side sees
+    // neither `<task_id>-validation.md` nor a `-validation-skip.md` record and fails
+    // the deliverable closed (`MISSION COMPLETE` revoked → `FAILED`). Record the
+    // ad-hoc default — **no validation** — durably BEFORE the run, so the read side
+    // reads an exemption instead of a verdict gap.
+    //
+    // `validation_prompts_dir()` is used on purpose, not `plan.dir().join("prompts")`:
+    // `Plan::default()` is the CWD-relative `.marmel`, while the read side resolves
+    // `<workspace root>/.marmel/prompts`. Under a scoped workspace root the two
+    // disagree, and a record written where nobody reads it is the same bug with an
+    // extra file. Best effort by design: a refused id, a role opt-out, a plan-id
+    // collision or a failed write all author no record, which leaves today's
+    // fail-closed behaviour intact — never a fail-open success.
+    if let Some(raw_task_id) = task_id.as_deref() {
+        let prompts_dir = crate::agents::validation::validation_prompts_dir();
+        let plan_markdown = plan.read().ok().flatten();
+        crate::agents::PromptBuilder::record_adhoc_no_validation(
+            &prompts_dir,
+            raw_task_id,
+            agent,
+            plan_markdown.as_deref(),
+        );
+    }
     let mut manager = OrchestratorManager::new(client.clone(), plan, stats);
     manager.cancellation_token = crate::orchestrator::bus::global_cancellation_token();
     let req = DelegationRequest {

@@ -273,6 +273,71 @@ async fn test_execute_steer_subtask_runs_specialist() {
     assert!(d.content.contains("Inspect git status"));
 }
 
+/// The steer seam must record the **ad-hoc no-validation default** where the read side
+/// looks for it. Under `cargo test` the live runner short-circuits to a canned deliverable
+/// (`agents::runner::try_run_specialist_live` returns `None` because the test exe lives under
+/// `/deps/`), so `test_execute_steer_subtask_runs_specialist` proves nothing about validation —
+/// this test therefore asserts the durable write that the fix actually adds.
+///
+/// Two things are pinned: the record lands in `<scoped workspace root>/.marmel/prompts` (the
+/// spelling `agents::validation::validation_prompts_dir()` resolves to, i.e. the one the verdict
+/// probe reads) and **not** in the CWD-relative `.marmel` that `Plan::default()` is rooted at.
+/// A record nobody reads is the same bug with an extra file. The id is unique so the repository's
+/// own plan can never collide with it and trigger the plan-collision guard.
+#[tokio::test]
+async fn test_execute_steer_subtask_authors_the_adhoc_record_for_a_unique_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scoped_root = tmp.path().to_path_buf();
+    let prompts = scoped_root.join(".marmel").join("prompts");
+
+    crate::harness::with_workspace_root(scoped_root.clone(), async move {
+        let client = ChatClient::new_with_token("http://127.0.0.1:11434", "mock", "tok");
+        let stats = Arc::new(HarnessStats::new());
+        let res = execute_steer_subtask(
+            &client,
+            stats,
+            Agent::Coder,
+            Some("steer-test-adhoc-1".to_string()),
+            "Inspect git status",
+        )
+        .await;
+        assert!(res.is_ok(), "the delegated steer subtask still runs: {res:?}");
+
+        let record = prompts.join("steer-test-adhoc-1-validation-skip.md");
+        assert!(
+            record.exists(),
+            "the steer seam must record the ad-hoc no-validation default under the workspace-root \
+             prompts dir the verdict probe reads, expected at {}",
+            record.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&record)
+                .expect("record")
+                .trim(),
+            crate::agents::prompt_builder::VALIDATION_SKIP_REASON_ADHOC,
+            "the record must carry the ad-hoc provenance"
+        );
+        assert!(
+            !crate::agents::prompt_builder::VALIDATION_SKIP_REASON_ADHOC.contains("Plan directive"),
+            "an ad-hoc delegation never had a plan directive to cite"
+        );
+        assert!(
+            !prompts.join("steer-test-adhoc-1-validation.md").exists(),
+            "the ad-hoc default authors no auditor brief"
+        );
+
+        // Nothing was written to the CWD-relative plan dir (`Plan::default()`), which is a
+        // different directory from `validation_prompts_dir()` under a scoped root.
+        let cwd_prompts = std::path::Path::new(".marmel").join("prompts");
+        assert!(
+            !cwd_prompts.join("steer-test-adhoc-1-validation-skip.md").exists(),
+            "the record must not be dropped where the read side never looks: {}",
+            cwd_prompts.display()
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn test_synthesize_steer_subtask_response_streams_answer() {
     use wiremock::matchers::{method, path};

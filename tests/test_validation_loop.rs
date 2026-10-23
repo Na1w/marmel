@@ -2017,3 +2017,344 @@ async fn test_a_validate_researcher_line_authors_the_brief_and_drives_a_verdict_
     })
     .await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Ad-hoc (steering/arbitrator) delegations default to **no validation** — write side only.
+//
+// A subtask created by the Steer Arbitrator carries a synthetic `steer-task-N` id and **no plan
+// line**, so `create_plan`'s offline pregenerator never took a validation decision for it. The
+// read side then saw neither `<task_id>-validation.md>` nor a `-validation-skip.md` record and
+// revoked `MISSION COMPLETE` on every such deliverable. The chosen design records the ad-hoc
+// default on disk (`PromptBuilder::record_adhoc_no_validation`, invoked at the steering call site)
+// instead of teaching the read side to guess. Everything below therefore contrasts an id the plan
+// does not contain (record authored → completes, zero validator traffic) with every case that must
+// keep failing closed: no record at all, a blank brief, and an id that **is** a plan line.
+// ---------------------------------------------------------------------------------------------
+
+/// The ad-hoc default, end to end: the record is authored by the **real writer** for an id the
+/// plan does not contain, and the run then never reaches the validator, keeps its own
+/// `MISSION COMPLETE`, carries the honest skip label, and checks no plan line off (there is
+/// none for that id).
+#[tokio::test]
+async fn test_adhoc_steering_task_defaults_to_no_validate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+
+    marmennill::harness::with_workspace_root(tmp_path.clone(), async move {
+        let prompts = prompts_dir_of(&tmp_path);
+        std::fs::create_dir_all(&prompts).expect("prompts dir");
+        // A plan is active, and its only line is **another** task: the ad-hoc id below is a
+        // synthetic steering id that no plan line ever produced.
+        let plan = seed_plan(&tmp_path, "t-711");
+        let plan_markdown = std::fs::read_to_string(plan.plan_path()).expect("plan file");
+
+        assert!(
+            !prompts.join("steer-task-7-validation.md").exists(),
+            "fixture: an ad-hoc delegation gets no auditor brief"
+        );
+        assert!(
+            !prompts.join("steer-task-7-validation-skip.md").exists(),
+            "fixture: the record is authored by the writer under test, not by this fixture"
+        );
+
+        let record = PromptBuilder::record_adhoc_no_validation(
+            &prompts,
+            "steer-task-7",
+            Agent::Coder,
+            Some(&plan_markdown),
+        )
+        .expect("an un-planned id must get the ad-hoc no-validation record");
+        assert_eq!(record, "steer-task-7-validation-skip.md");
+        assert_eq!(
+            std::fs::read_to_string(prompts.join(&record))
+                .expect("record")
+                .trim(),
+            "Ad-hoc delegated task (no plan line): validation not required",
+            "the record must name the ad-hoc provenance, never a plan directive that never existed"
+        );
+        assert!(
+            !prompts.join("steer-task-7-validation.md").exists(),
+            "recording the ad-hoc default must never fabricate a brief"
+        );
+
+        let (server, call_counter, bodies) = mock_backend(specialist_turns("steer-task-7")).await;
+        let backend_url = format!("{}/v1", server.uri());
+        let cfg = coder_cfg_with_validator(&backend_url, 3);
+        let client = ChatClient::new(&backend_url, "test-model");
+        let token = CancellationToken::new();
+
+        let result = run_specialist_live(&client, Agent::Coder, &coder_ctx("steer-task-7"), &cfg, &token)
+            .await
+            .expect("specialist live run should complete");
+
+        // Zero validator passes: only the specialist's own two turns were served.
+        assert_eq!(
+            call_counter.load(Ordering::SeqCst),
+            2,
+            "an ad-hoc task with the record may never reach the validator"
+        );
+        let requests = bodies.lock().expect("capture lock").clone();
+        assert_eq!(requests.len(), 2, "one request per served turn");
+        for (index, request) in requests.iter().enumerate() {
+            assert!(
+                !request.contains("Specialist Deliverable"),
+                "request {index} is a validator prompt, but this task has no validator"
+            );
+            assert!(
+                !request.contains(marmennill::tool_names::TOOL_LEAVE_VERDICT),
+                "no verdict-recording turn may be served for an ad-hoc no-validation task"
+            );
+        }
+
+        // The revoked-marker bug is gone: the deliverable keeps its own completion marker and
+        // no trace of a verdict gap appears.
+        assert!(
+            result.contains("MISSION COMPLETE (steer-task-7)"),
+            "an ad-hoc no-validation task must complete, got: {result}"
+        );
+        assert!(!result.contains("FAILED"), "got: {result}");
+        assert!(
+            !result.contains("Validation was not performed"),
+            "the verdict-gap wording must not appear, got: {result}"
+        );
+        assert_eq!(
+            marmennill::agents::MissionMarker::parse(&result).map(
+                |marker| matches!(marker, marmennill::agents::MissionMarker::Complete { .. })
+            ),
+            Some(true),
+            "Marker must be a completion, got: {result}"
+        );
+
+        // The exemption is not a check-off: the id has no plan line, so nothing is flipped and
+        // the plan's own line stays untouched.
+        assert!(
+            !plan
+                .check_plan_on_deliverable(None, Some("steer-task-7"), &result)
+                .expect("plan check is not an IO error"),
+            "an id absent from the plan must not check anything off"
+        );
+        let plan_text = std::fs::read_to_string(plan.plan_path()).expect("plan file");
+        assert!(
+            plan_text.contains("- [ ] [t-711]"),
+            "the plan's own line must stay unchecked, got: {plan_text}"
+        );
+
+        // Honest worker status: nothing approved this deliverable, validation was waived.
+        let state = marmennill::orchestrator::workers::worker_state_snapshot("coder-steer-task-7")
+            .expect("the worker entry survives its run in the completed ring");
+        assert_eq!(
+            state.info.status, "Completed (validation skipped by design)",
+            "the worker must report the skipped-validation completion label"
+        );
+    })
+    .await;
+}
+
+/// The guard against a read-side shortcut: the **absence** of a brief for a synthetic
+/// steering id is still a verdict gap when no record was authored. No plan-less id is exempted
+/// by inference — only a record on disk exempts it, which is exactly why the exemption is not
+/// implemented in the delegation/typo path either.
+#[tokio::test]
+async fn test_adhoc_plan_absent_id_without_a_record_still_fails_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+
+    marmennill::harness::with_workspace_root(tmp_path.clone(), async move {
+        let prompts = prompts_dir_of(&tmp_path);
+        std::fs::create_dir_all(&prompts).expect("prompts dir");
+        let plan = seed_plan(&tmp_path, "t-712");
+
+        assert!(
+            !prompts.join("steer-task-8-validation.md").exists(),
+            "fixture: no auditor brief"
+        );
+        assert!(
+            !prompts.join("steer-task-8-validation-skip.md").exists(),
+            "fixture: and no ad-hoc record — this is the state of a typo'd or un-recorded id"
+        );
+
+        let (server, call_counter, _) = mock_backend(specialist_turns("steer-task-8")).await;
+        let backend_url = format!("{}/v1", server.uri());
+        let cfg = coder_cfg_with_validator(&backend_url, 3);
+        let client = ChatClient::new(&backend_url, "test-model");
+        let token = CancellationToken::new();
+
+        let result = run_specialist_live(&client, Agent::Coder, &coder_ctx("steer-task-8"), &cfg, &token)
+            .await
+            .expect("specialist live run should complete");
+
+        assert_eq!(
+            call_counter.load(Ordering::SeqCst),
+            2,
+            "no validator pass may be invented to fill the gap"
+        );
+        assert!(
+            result.contains("Validation was not performed"),
+            "an un-recorded plan-less id must still report the gap, got: {result}"
+        );
+        assert!(
+            result.contains("steer-task-8-validation.md does not exist"),
+            "the gap must name the missing verdict file, got: {result}"
+        );
+        assert!(
+            result.contains("FAILED"),
+            "the gap must produce a failed deliverable, got: {result}"
+        );
+        assert!(
+            !result.contains("MISSION COMPLETE (steer-task-8)"),
+            "the completion marker must stay revoked, got: {result}"
+        );
+        assert!(
+            !plan
+                .check_plan_on_deliverable(None, Some("steer-task-8"), &result)
+                .expect("plan check is not an IO error"),
+            "nothing may be checked off for a failed deliverable"
+        );
+        // The run itself must not have minted a record retroactively.
+        assert!(
+            !prompts.join("steer-task-8-validation-skip.md").exists(),
+            "a failed run must not leave an ad-hoc exemption behind, got: {:?}",
+            std::fs::read_dir(&prompts)
+                .map(|entries| entries.filter_map(|e| e.ok().map(|e| e.file_name())).collect::<Vec<_>>())
+        );
+    })
+    .await;
+}
+
+/// A record is a waiver of the lookup, never a substitute verdict: with the ad-hoc record
+/// present **and** a blank `<task_id>-validation.md` on disk, the blank brief still reads as
+/// "no verdict recorded" and the deliverable still fails closed.
+#[tokio::test]
+async fn test_adhoc_record_never_rescues_a_blank_brief() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+
+    marmennill::harness::with_workspace_root(tmp_path.clone(), async move {
+        let prompts = prompts_dir_of(&tmp_path);
+        std::fs::create_dir_all(&prompts).expect("prompts dir");
+        let plan = seed_plan(&tmp_path, "t-713");
+
+        // The writer clears a stale brief as part of authoring the record, so the blank brief
+        // is laid down **after** the record: the contradicting pair is what this test probes.
+        let record = PromptBuilder::record_adhoc_no_validation(
+            &prompts,
+            "steer-task-9",
+            Agent::Coder,
+            Some(&std::fs::read_to_string(plan.plan_path()).expect("plan file")),
+        )
+        .expect("ad-hoc record");
+        assert_eq!(record, "steer-task-9-validation-skip.md");
+        std::fs::write(prompts.join("steer-task-9-validation.md"), "\n \n\t\n").expect("blank brief");
+
+        let (server, call_counter, _) = mock_backend(specialist_turns("steer-task-9")).await;
+        let backend_url = format!("{}/v1", server.uri());
+        let cfg = coder_cfg_with_validator(&backend_url, 3);
+        let client = ChatClient::new(&backend_url, "test-model");
+        let token = CancellationToken::new();
+
+        let result = run_specialist_live(&client, Agent::Coder, &coder_ctx("steer-task-9"), &cfg, &token)
+            .await
+            .expect("specialist live run should complete");
+
+        assert_eq!(
+            call_counter.load(Ordering::SeqCst),
+            2,
+            "a blank brief may not be answered with an invented validator pass"
+        );
+        assert!(
+            result.contains("steer-task-9-validation.md is empty, so no validation verdict is recorded"),
+            "the blank brief must still be reported as the gap, got: {result}"
+        );
+        assert!(
+            result.contains("Validation was not performed"),
+            "the deliverable must be reported as not validated, got: {result}"
+        );
+        assert!(
+            result.contains("FAILED"),
+            "a blank brief must still fail the deliverable, got: {result}"
+        );
+        assert!(
+            !result.contains("MISSION COMPLETE (steer-task-9)"),
+            "the completion marker must stay revoked, got: {result}"
+        );
+    })
+    .await;
+}
+
+/// The collision rule, end to end: when a steering id **is** a line of the active plan, the
+/// ad-hoc default is refused and plan semantics stay authoritative — that planned task still
+/// needs a readable `<task_id>-validation.md`, and a missing one still fails closed. The
+/// exemption can never be smuggled in through the ad-hoc path.
+#[tokio::test]
+async fn test_adhoc_record_never_exempts_an_id_that_is_a_plan_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+
+    marmennill::harness::with_workspace_root(tmp_path.clone(), async move {
+        let prompts = prompts_dir_of(&tmp_path);
+        std::fs::create_dir_all(&prompts).expect("prompts dir");
+        // A planned line with **no** validation directive: validation stays on, and the brief
+        // is what the read side requires.
+        let plan = seed_plan(&tmp_path, "t-042");
+        let plan_markdown = std::fs::read_to_string(plan.plan_path()).expect("plan file");
+
+        assert_eq!(
+            PromptBuilder::record_adhoc_no_validation(
+                &prompts,
+                "t-042",
+                Agent::Coder,
+                Some(&plan_markdown),
+            ),
+            None,
+            "an id that is a plan line must not get the ad-hoc default"
+        );
+        assert!(
+            !prompts.join("t-042-validation-skip.md").exists(),
+            "the refused collision must write no record at all"
+        );
+        assert!(
+            !prompts.join("t-042-validation.md").exists(),
+            "fixture: the planned task's brief was never authored, which is the gap"
+        );
+
+        let (server, call_counter, _) = mock_backend(specialist_turns("t-042")).await;
+        let backend_url = format!("{}/v1", server.uri());
+        let cfg = coder_cfg_with_validator(&backend_url, 3);
+        let client = ChatClient::new(&backend_url, "test-model");
+        let token = CancellationToken::new();
+
+        let result = run_specialist_live(&client, Agent::Coder, &coder_ctx("t-042"), &cfg, &token)
+            .await
+            .expect("specialist live run should complete");
+
+        assert_eq!(
+            call_counter.load(Ordering::SeqCst),
+            2,
+            "the missing brief is a gap, not a validator invitation"
+        );
+        assert!(
+            result.contains("t-042-validation.md does not exist"),
+            "a planned id keeps the fail-closed verdict guard, got: {result}"
+        );
+        assert!(
+            result.contains("FAILED"),
+            "the planned deliverable must fail closed, got: {result}"
+        );
+        assert!(
+            !result.contains("MISSION COMPLETE (t-042)"),
+            "the completion marker must stay revoked, got: {result}"
+        );
+        assert!(
+            !plan
+                .check_plan_on_deliverable(None, Some("t-042"), &result)
+                .expect("plan check is not an IO error"),
+            "the planned line must stay unchecked"
+        );
+        let plan_text = std::fs::read_to_string(plan.plan_path()).expect("plan file");
+        assert!(
+            plan_text.contains("- [ ] [t-042]"),
+            "plan line must stay unchecked, got: {plan_text}"
+        );
+    })
+    .await;
+}
