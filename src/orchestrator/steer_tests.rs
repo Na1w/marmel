@@ -301,7 +301,10 @@ async fn test_execute_steer_subtask_authors_the_adhoc_record_for_a_unique_id() {
             "Inspect git status",
         )
         .await;
-        assert!(res.is_ok(), "the delegated steer subtask still runs: {res:?}");
+        assert!(
+            res.is_ok(),
+            "the delegated steer subtask still runs: {res:?}"
+        );
 
         let record = prompts.join("steer-test-adhoc-1-validation-skip.md");
         assert!(
@@ -311,9 +314,7 @@ async fn test_execute_steer_subtask_authors_the_adhoc_record_for_a_unique_id() {
             record.display()
         );
         assert_eq!(
-            std::fs::read_to_string(&record)
-                .expect("record")
-                .trim(),
+            std::fs::read_to_string(&record).expect("record").trim(),
             crate::agents::prompt_builder::VALIDATION_SKIP_REASON_ADHOC,
             "the record must carry the ad-hoc provenance"
         );
@@ -330,7 +331,9 @@ async fn test_execute_steer_subtask_authors_the_adhoc_record_for_a_unique_id() {
         // different directory from `validation_prompts_dir()` under a scoped root.
         let cwd_prompts = std::path::Path::new(".marmel").join("prompts");
         assert!(
-            !cwd_prompts.join("steer-test-adhoc-1-validation-skip.md").exists(),
+            !cwd_prompts
+                .join("steer-test-adhoc-1-validation-skip.md")
+                .exists(),
             "the record must not be dropped where the read side never looks: {}",
             cwd_prompts.display()
         );

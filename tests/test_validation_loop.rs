@@ -2083,9 +2083,15 @@ async fn test_adhoc_steering_task_defaults_to_no_validate() {
         let client = ChatClient::new(&backend_url, "test-model");
         let token = CancellationToken::new();
 
-        let result = run_specialist_live(&client, Agent::Coder, &coder_ctx("steer-task-7"), &cfg, &token)
-            .await
-            .expect("specialist live run should complete");
+        let result = run_specialist_live(
+            &client,
+            Agent::Coder,
+            &coder_ctx("steer-task-7"),
+            &cfg,
+            &token,
+        )
+        .await
+        .expect("specialist live run should complete");
 
         // Zero validator passes: only the specialist's own two turns were served.
         assert_eq!(
@@ -2118,9 +2124,8 @@ async fn test_adhoc_steering_task_defaults_to_no_validate() {
             "the verdict-gap wording must not appear, got: {result}"
         );
         assert_eq!(
-            marmennill::agents::MissionMarker::parse(&result).map(
-                |marker| matches!(marker, marmennill::agents::MissionMarker::Complete { .. })
-            ),
+            marmennill::agents::MissionMarker::parse(&result)
+                .map(|marker| matches!(marker, marmennill::agents::MissionMarker::Complete { .. })),
             Some(true),
             "Marker must be a completion, got: {result}"
         );
@@ -2179,9 +2184,15 @@ async fn test_adhoc_plan_absent_id_without_a_record_still_fails_closed() {
         let client = ChatClient::new(&backend_url, "test-model");
         let token = CancellationToken::new();
 
-        let result = run_specialist_live(&client, Agent::Coder, &coder_ctx("steer-task-8"), &cfg, &token)
-            .await
-            .expect("specialist live run should complete");
+        let result = run_specialist_live(
+            &client,
+            Agent::Coder,
+            &coder_ctx("steer-task-8"),
+            &cfg,
+            &token,
+        )
+        .await
+        .expect("specialist live run should complete");
 
         assert_eq!(
             call_counter.load(Ordering::SeqCst),
@@ -2214,8 +2225,9 @@ async fn test_adhoc_plan_absent_id_without_a_record_still_fails_closed() {
         assert!(
             !prompts.join("steer-task-8-validation-skip.md").exists(),
             "a failed run must not leave an ad-hoc exemption behind, got: {:?}",
-            std::fs::read_dir(&prompts)
-                .map(|entries| entries.filter_map(|e| e.ok().map(|e| e.file_name())).collect::<Vec<_>>())
+            std::fs::read_dir(&prompts).map(|entries| entries
+                .filter_map(|e| e.ok().map(|e| e.file_name()))
+                .collect::<Vec<_>>())
         );
     })
     .await;
@@ -2244,7 +2256,8 @@ async fn test_adhoc_record_never_rescues_a_blank_brief() {
         )
         .expect("ad-hoc record");
         assert_eq!(record, "steer-task-9-validation-skip.md");
-        std::fs::write(prompts.join("steer-task-9-validation.md"), "\n \n\t\n").expect("blank brief");
+        std::fs::write(prompts.join("steer-task-9-validation.md"), "\n \n\t\n")
+            .expect("blank brief");
 
         let (server, call_counter, _) = mock_backend(specialist_turns("steer-task-9")).await;
         let backend_url = format!("{}/v1", server.uri());
@@ -2252,9 +2265,15 @@ async fn test_adhoc_record_never_rescues_a_blank_brief() {
         let client = ChatClient::new(&backend_url, "test-model");
         let token = CancellationToken::new();
 
-        let result = run_specialist_live(&client, Agent::Coder, &coder_ctx("steer-task-9"), &cfg, &token)
-            .await
-            .expect("specialist live run should complete");
+        let result = run_specialist_live(
+            &client,
+            Agent::Coder,
+            &coder_ctx("steer-task-9"),
+            &cfg,
+            &token,
+        )
+        .await
+        .expect("specialist live run should complete");
 
         assert_eq!(
             call_counter.load(Ordering::SeqCst),
@@ -2262,7 +2281,9 @@ async fn test_adhoc_record_never_rescues_a_blank_brief() {
             "a blank brief may not be answered with an invented validator pass"
         );
         assert!(
-            result.contains("steer-task-9-validation.md is empty, so no validation verdict is recorded"),
+            result.contains(
+                "steer-task-9-validation.md is empty, so no validation verdict is recorded"
+            ),
             "the blank brief must still be reported as the gap, got: {result}"
         );
         assert!(

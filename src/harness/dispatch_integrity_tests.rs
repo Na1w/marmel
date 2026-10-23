@@ -1016,7 +1016,7 @@ fn test_reply_contract_wording_is_pinned_in_schema_prompt_and_notice() {
         "Address This Worker With",
         "refused as unroutable",
         "no routable target",
-        "reply_to_arbitrator",
+        TOOL_REPLY_TO_ARBITRATOR,
         "quoting that exact notice id",
     ] {
         assert!(

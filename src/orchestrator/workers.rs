@@ -3534,9 +3534,18 @@ mod tests {
     /// match the token in scope and the reply used to degrade to the bare role name —
     /// a key the notice store never files notices under. The rule therefore resolves
     /// the role against the live registry, and only when it pins exactly one entry.
-    #[tokio::test]
-    async fn test_reply_identity_resolves_a_tokenless_registration_to_its_effective_key() {
+    #[test]
+    fn test_reply_identity_resolves_a_tokenless_registration_to_its_effective_key() {
+        // A plain `#[test]` with its own current-thread runtime, the shape already
+        // used by the `worker_prompt_path` probes above: the registry lock is a
+        // std mutex and must be held for the whole probe without ever crossing an
+        // `await` point, so this test stays mutually exclusive with every sibling
+        // test that takes the same lock for as long as its entries are live.
         let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime to scope the worker token");
 
         let lone = register_active_worker(
             Some("t-7701".to_string()),
@@ -3550,15 +3559,15 @@ mod tests {
         );
 
         let token = tokio_util::sync::CancellationToken::new();
-        let (token_step, role_step, trimmed) = crate::orchestrator::CURRENT_WORKER_TOKEN
-            .scope(token.clone(), async {
+        let (token_step, role_step, trimmed) = rt.block_on(
+            crate::orchestrator::CURRENT_WORKER_TOKEN.scope(token.clone(), async {
                 (
                     active_worker_key_for_current_token(),
                     active_worker_key_for_reply("replykeyless"),
                     active_worker_key_for_reply("  ReplyKeyLess  "),
                 )
-            })
-            .await;
+            }),
+        );
         assert_eq!(
             token_step, None,
             "a token-less registration carries no token that can match the turn"
@@ -3591,11 +3600,11 @@ mod tests {
         );
         let twin_key = twin.0.clone();
         assert_eq!(
-            crate::orchestrator::CURRENT_WORKER_TOKEN
-                .scope(token.clone(), async {
+            rt.block_on(
+                crate::orchestrator::CURRENT_WORKER_TOKEN.scope(token.clone(), async {
                     active_worker_key_for_reply("replykeyless")
-                })
-                .await,
+                }),
+            ),
             None,
             "two live entries addressed by one role name are never resolved by guess"
         );
@@ -3615,12 +3624,12 @@ mod tests {
         );
         let tokened_key = tokened.0.clone();
         assert_eq!(
-            crate::orchestrator::CURRENT_WORKER_TOKEN
-                .scope(token.clone(), async {
+            rt.block_on(
+                crate::orchestrator::CURRENT_WORKER_TOKEN.scope(token.clone(), async {
                     active_worker_key_for_reply("replykeyboth")
-                })
-                .await
-                .as_deref(),
+                }),
+            )
+            .as_deref(),
             Some(tokened_key.as_str()),
             "the entry owning the scoped token wins, ambiguously registered or not"
         );
@@ -3629,18 +3638,19 @@ mod tests {
         // under a token no entry owns, so the exact-token step cannot answer first.
         let stray = tokio_util::sync::CancellationToken::new();
         assert_eq!(
-            crate::orchestrator::CURRENT_WORKER_TOKEN
-                .scope(stray.clone(), async {
+            rt.block_on(
+                crate::orchestrator::CURRENT_WORKER_TOKEN.scope(stray.clone(), async {
                     active_worker_key_for_reply("replykeynobody")
-                })
-                .await,
+                }),
+            ),
             None,
             "no live entry, no invented key"
         );
         assert_eq!(
-            crate::orchestrator::CURRENT_WORKER_TOKEN
-                .scope(stray, async { active_worker_key_for_reply("   ") })
-                .await,
+            rt.block_on(
+                crate::orchestrator::CURRENT_WORKER_TOKEN
+                    .scope(stray, async { active_worker_key_for_reply("   ") }),
+            ),
             None,
             "an empty role name is no identity"
         );

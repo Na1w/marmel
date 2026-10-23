@@ -2054,13 +2054,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let prompts = tmp.path().join("prompts");
 
-        let name = PromptBuilder::record_adhoc_no_validation(
-            &prompts,
-            "steer-task-9",
-            Agent::Coder,
-            None,
-        )
-        .expect("a valid ad-hoc id on a validation-eligible role records the ad-hoc default");
+        let name =
+            PromptBuilder::record_adhoc_no_validation(&prompts, "steer-task-9", Agent::Coder, None)
+                .expect(
+                    "a valid ad-hoc id on a validation-eligible role records the ad-hoc default",
+                );
         assert_eq!(name, "steer-task-9-validation-skip.md");
         assert_eq!(
             std::fs::read_to_string(prompts.join(&name))
@@ -2095,7 +2093,9 @@ mod tests {
             Some("steer-task-10-validation-skip.md")
         );
         // The brief really is absent afterwards — the only state a record explains.
-        assert!(crate::agents::validation::probe_validation_brief(&prompts, "steer-task-9").is_absent());
+        assert!(
+            crate::agents::validation::probe_validation_brief(&prompts, "steer-task-9").is_absent()
+        );
     }
 
     /// `planner` / `validator` are role-level opt-outs: the read side never probes
@@ -2118,7 +2118,10 @@ mod tests {
                 "{agent} is a role-level opt-out and must get no ad-hoc record"
             );
             assert_eq!(
-                PromptBuilder::validation_skip_record(&prompts, &format!("steer-task-{}", agent.as_str())),
+                PromptBuilder::validation_skip_record(
+                    &prompts,
+                    &format!("steer-task-{}", agent.as_str())
+                ),
                 None,
                 "{agent} must have no record on disk"
             );
@@ -2132,7 +2135,9 @@ mod tests {
             })
             .unwrap_or_default();
         assert!(
-            files.iter().all(|name| !name.ends_with("-validation-skip.md")),
+            files
+                .iter()
+                .all(|name| !name.ends_with("-validation-skip.md")),
             "role-exempt ad-hoc tasks must create no skip record at all: {files:?}"
         );
         // A validation-eligible role in the same directory does get one, so the
@@ -2209,10 +2214,16 @@ mod tests {
         std::fs::create_dir_all(&prompts).expect("prompts dir");
 
         // Deletable stale brief → gone, record written, brief really absent.
-        std::fs::write(prompts.join("steer-task-11-validation.md"), "stale\n").expect("stale brief");
+        std::fs::write(prompts.join("steer-task-11-validation.md"), "stale\n")
+            .expect("stale brief");
         assert_eq!(
-            PromptBuilder::record_adhoc_no_validation(&prompts, "steer-task-11", Agent::Coder, None)
-                .as_deref(),
+            PromptBuilder::record_adhoc_no_validation(
+                &prompts,
+                "steer-task-11",
+                Agent::Coder,
+                None
+            )
+            .as_deref(),
             Some("steer-task-11-validation-skip.md")
         );
         assert!(
@@ -2220,14 +2231,20 @@ mod tests {
             "a stale brief must not coexist with the ad-hoc record"
         );
         assert!(
-            crate::agents::validation::probe_validation_brief(&prompts, "steer-task-11").is_absent()
+            crate::agents::validation::probe_validation_brief(&prompts, "steer-task-11")
+                .is_absent()
         );
 
         // Undeletable brief (the destination is a directory) → no record at all, and
         // the contradicting pair is never left on disk.
         std::fs::create_dir(prompts.join("steer-task-12-validation.md")).expect("blocking dir");
         assert_eq!(
-            PromptBuilder::record_adhoc_no_validation(&prompts, "steer-task-12", Agent::Coder, None),
+            PromptBuilder::record_adhoc_no_validation(
+                &prompts,
+                "steer-task-12",
+                Agent::Coder,
+                None
+            ),
             None,
             "a brief that cannot be deleted must not be papered over with a record"
         );
@@ -2272,7 +2289,10 @@ mod tests {
             !prompts.join("t-077-validation-skip.md").exists(),
             "a plan-authored task must not inherit the earlier ad-hoc exemption"
         );
-        assert_eq!(PromptBuilder::validation_skip_record(&prompts, "t-077"), None);
+        assert_eq!(
+            PromptBuilder::validation_skip_record(&prompts, "t-077"),
+            None
+        );
     }
 
     /// An id the grammar authority refuses can never be given an exemption: no
