@@ -11,6 +11,10 @@
 //!    except the validator, even when the role's allowlist admits it (the
 //!    Generalist namespace is `"*"`, and a blueprint allowlist can name the tool
 //!    for any role).
+//! 3. **Contract wording.** The reply contract is also a promise handed to the model — the
+//!    `reply_to_arbitrator` schema, the arbitrator prompt and the rendered notice block are
+//!    pinned against the rejection classes the store actually produces, so an edit cannot
+//!    regress the arbitrator into unroutable targets or fictitious notice ids.
 //!
 //! Plus the output-shape guarantee: `read_file`'s `[read_file truncated]` report
 //! survives the generic tool-output clip, at dispatch and in isolation.
@@ -21,7 +25,8 @@
 use super::*;
 use crate::agents::Agent;
 use crate::orchestrator::{
-    clear_all_notices, get_pending_notice, get_worker_reply, post_notice_to_worker,
+    NoticeReplyRejection, SteerNotice, clear_all_notices, get_pending_notice, get_worker_reply,
+    post_notice_to_worker,
 };
 use crate::tool_names::{TOOL_LEAVE_VERDICT, TOOL_READ_FILE, TOOL_REPLY_TO_ARBITRATOR};
 use wiremock::matchers::{method, path};
@@ -759,5 +764,262 @@ fn test_output_length_limit_does_not_widen_the_tail_when_the_report_is_already_i
         clipped
             .content
             .contains(&format!("[... TRUNCATED {omitted} CHARACTERS"))
+    );
+}
+
+// 1c. The same round trip for a worker registered **without** a cancellation token.
+//
+// [`crate::orchestrator::register_active_worker`] hands every entry a fresh child of the
+// global token, so the token the runner scoped around the turn never matches the registry
+// entry and the reply identity used to degrade to the bare role name. A notice filed under
+// the worker's effective key — or addressed by the task id the arbitrator's own worker table
+// renders — then disagreed with that reply: either the reply was recorded against a role name
+// no single worker owns, or it was refused as `worker-mismatch` outright. Reply identity and
+// notice addressing must be the same key, and the strict contract must not loosen as a result.
+#[tokio::test]
+async fn test_reply_from_a_tokenless_registration_is_keyed_to_the_notice_key() {
+    let _notice_lock = notice_lock().await;
+    clear_all_notices();
+    let history = HistoryGuard::install();
+
+    let server = MockServer::start().await;
+    let received_bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let rb = std::sync::Arc::clone(&received_bodies);
+    let decision = serde_json::json!({
+        "decision": "SynthesizeResponse",
+        "response": "The worker confirmed the suite is green.",
+        "follow_up_prompt": null,
+        "user_status": null
+    });
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(move |req: &wiremock::Request| {
+            rb.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&req.body).to_string());
+            ResponseTemplate::new(200).set_body_string(sse_delta(&decision.to_string()))
+        })
+        .mount(&server)
+        .await;
+    let _config = ActiveConfigGuard::with_backend(server.uri());
+
+    // No token is registered, and the token below is the one the turn runs under.
+    let token = tokio_util::sync::CancellationToken::new();
+    let worker = crate::orchestrator::register_active_worker(
+        Some("t-0532".to_string()),
+        "tokenlessreply".to_string(),
+        "hold the hand-written parser".to_string(),
+    );
+    let worker_key = worker.0.clone();
+    assert_eq!(
+        worker_key, "tokenlessreply-t-0532",
+        "the effective key is what the notice store files this worker's notices under"
+    );
+
+    // Addressed by the task id — a token a bare role name cannot route in either direction.
+    let posted = post_notice_to_worker(
+        "t-0532",
+        "Did the suite go green?",
+        Some("notice-t0532-tokenless"),
+    );
+    assert_eq!(posted.target_worker, "t-0532");
+    let delivered = crate::orchestrator::notice::drain_worker_notices(&worker_key);
+    assert_eq!(
+        delivered.len(),
+        1,
+        "the task-id address must route to this worker's effective key"
+    );
+    assert!(
+        crate::orchestrator::notice::render_notice_for_worker(&delivered[0])
+            .contains("ID: notice-t0532-tokenless"),
+        "the id the worker is told to echo back"
+    );
+
+    let res = crate::orchestrator::CURRENT_WORKER_TOKEN
+        .scope(
+            token.clone(),
+            handle_reply_to_arbitrator_async(
+                "tokenlessreply",
+                &serde_json::json!({
+                    "notice_id": "notice-t0532-tokenless",
+                    "message": "Green: the crate suite passed."
+                }),
+            ),
+        )
+        .await
+        .expect("a token-less registration must still be attributed to its own key");
+    assert!(!res.is_error);
+    assert!(
+        get_pending_notice("notice-t0532-tokenless").is_none(),
+        "the named notice was the one consumed"
+    );
+    let reply = get_worker_reply("notice-t0532-tokenless").expect("reply must be recorded");
+    assert_eq!(
+        reply.worker_tag, worker_key,
+        "the reply must be recorded under the key the notice was filed under, not under a \
+         role name no single worker owns"
+    );
+    assert_eq!(
+        received_bodies.lock().unwrap().len(),
+        1,
+        "one accepted reply, exactly one arbitrator turn"
+    );
+
+    // The contract is not loosened: a notice addressed to a different worker stays refused.
+    let foreign = post_notice_to_worker(
+        "t-0533",
+        "Another worker's question",
+        Some("notice-t0533-foreign"),
+    );
+    assert_eq!(foreign.target_worker, "t-0533");
+    let rejected = crate::orchestrator::CURRENT_WORKER_TOKEN
+        .scope(
+            token.clone(),
+            handle_reply_to_arbitrator_async(
+                "tokenlessreply",
+                &serde_json::json!({
+                    "notice_id": "notice-t0533-foreign",
+                    "message": "answering another worker's notice"
+                }),
+            ),
+        )
+        .await
+        .expect_err("a notice addressed to another worker must stay refused");
+    let detail = rejected.to_string();
+    assert!(
+        detail.contains("worker-mismatch"),
+        "the rejection class must still be named, got: {detail}"
+    );
+    assert!(get_pending_notice("notice-t0533-foreign").is_some());
+    assert!(get_worker_reply("notice-t0533-foreign").is_none());
+    assert_eq!(
+        received_bodies.lock().unwrap().len(),
+        1,
+        "a rejected reply must spend no arbitrator turn"
+    );
+    assert_eq!(
+        history.snapshot().len(),
+        1,
+        "one accepted dialogue, one steering-history entry"
+    );
+
+    drop(worker);
+}
+
+// 3. Contract wording. The reply rules above are only half the contract: the other half is
+// the text the arbitrator and the specialist are actually handed. Nothing else in the suite
+// reads it, so an edit to the schema description or to the arbitrator prompt could silently
+// hand the model a fictitious notice id (the old `'steer-1'`) or an unroutable target and the
+// tests would stay green. This test pins the wording against the code that enforces it.
+#[test]
+fn test_reply_contract_wording_is_pinned_in_schema_prompt_and_notice() {
+    // (a) The four rejection classes are what the store produces, by name.
+    let classes = [
+        NoticeReplyRejection::MissingNoticeId.kind(),
+        NoticeReplyRejection::UnknownNoticeId {
+            notice_id: "notice-pin".to_string(),
+            worker_tag: "coder-pin".to_string(),
+        }
+        .kind(),
+        NoticeReplyRejection::AlreadyReplied {
+            notice_id: "notice-pin".to_string(),
+            worker_tag: "coder-pin".to_string(),
+        }
+        .kind(),
+        NoticeReplyRejection::WorkerMismatch {
+            notice_id: "notice-pin".to_string(),
+            worker_tag: "coder-pin".to_string(),
+            addressed_to: "validator-pin-t-9500".to_string(),
+        }
+        .kind(),
+    ];
+    assert_eq!(
+        classes,
+        [
+            "missing-notice-id",
+            "unknown-notice-id",
+            "already-replied",
+            "worker-mismatch"
+        ],
+        "the rejection classes of the reply contract"
+    );
+
+    // (b) The schema handed to every specialist states the one legal id form, names every
+    // rejection class above, and offers no invented example id.
+    let def = crate::types::ToolDef::reply_to_arbitrator();
+    assert_eq!(def.function.name, TOOL_REPLY_TO_ARBITRATOR);
+    let notice_id_desc = def.function.parameters["properties"]["notice_id"]["description"]
+        .as_str()
+        .expect("notice_id must carry a description");
+    assert!(
+        notice_id_desc.contains("ID: <notice-id>"),
+        "the schema must point at the id line of the delivered notice, got: {notice_id_desc}"
+    );
+    for class in classes {
+        assert!(
+            notice_id_desc.contains(class),
+            "the schema must name the rejection class {class}, got: {notice_id_desc}"
+        );
+    }
+    assert!(
+        notice_id_desc.contains("records nothing"),
+        "the schema must state that a rejected reply records nothing, got: {notice_id_desc}"
+    );
+    assert!(
+        !notice_id_desc.contains("steer-1") && !def.function.description.contains("steer-1"),
+        "the schema must never offer an example notice id the system cannot issue"
+    );
+    assert_eq!(
+        def.function.parameters["required"]
+            .as_array()
+            .map(|a| a.len()),
+        Some(2),
+        "`notice_id` and `message` stay the required pair"
+    );
+
+    // (c) The block a worker actually receives spells the id the schema promises back.
+    let rendered = crate::orchestrator::notice::render_notice_for_worker(&SteerNotice {
+        notice_id: "notice-pin-1".to_string(),
+        user_inquiry: "Is the parser still hand-written?".to_string(),
+        target_worker: "coder-t-9501".to_string(),
+        created_at_ms: 0,
+    });
+    assert!(
+        rendered.contains("ID: notice-pin-1"),
+        "the delivered notice shows the id verbatim, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("`notice_id: \"notice-pin-1\"`")
+            && rendered.contains("Reply to this notice id only"),
+        "the block must demand that exact id back, got: {rendered}"
+    );
+
+    // (d) The arbitrator prompt: both addressing handles, verbatim from the worker table,
+    // the key delivery uses, the refusal of an unroutable target, and the exact reply id.
+    let prompt = crate::orchestrator::steer::STEER_ARBITRATOR_SYSTEM_PROMPT;
+    for required in [
+        "'agent_name'",
+        "'tool_call_id'",
+        "copied verbatim from its entry under 'Active Subtasks'",
+        "Address This Worker With",
+        "refused as unroutable",
+        "no routable target",
+        "reply_to_arbitrator",
+        "quoting that exact notice id",
+    ] {
+        assert!(
+            prompt.contains(required),
+            "the arbitrator prompt must state {required:?}, it is missing from the prompt"
+        );
+    }
+    assert!(
+        !prompt.contains("steer-1"),
+        "the prompt must never show a notice id the system cannot issue"
+    );
+    // The compiled-in copy the rest of the app embeds is the same text.
+    assert_eq!(
+        prompt,
+        crate::prompts::STEER_ARBITRATOR_PROMPT,
+        "one prompt file, one contract"
     );
 }

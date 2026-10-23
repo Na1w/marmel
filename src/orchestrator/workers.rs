@@ -595,8 +595,8 @@ pub fn worker_entries() -> Vec<WorkerEntry> {
 /// token matches and a parent/child token does not).
 ///
 /// `None` when no worker token is in scope (a Manager turn, the UI bridge, a unit test) or
-/// when the registration carries no token: callers then fall back to the role name they
-/// already have.
+/// when the registration carries no token: [`active_worker_key_for_reply`] is the surface
+/// reply callers use, because it adds the tokenless fallback.
 pub fn active_worker_key_for_current_token() -> Option<String> {
     let token = crate::orchestrator::CURRENT_WORKER_TOKEN
         .try_with(|t| t.clone())
@@ -612,6 +612,68 @@ pub fn active_worker_key_for_current_token() -> Option<String> {
                     .is_some_and(|t| *t == token)
         })
         .map(|e| e.key().clone())
+}
+
+/// Whether a worker cancellation token is in scope, i.e. the calling code runs
+/// inside a specialist/validator turn rather than on a Manager turn, in the UI
+/// bridge, or in a unit test.
+pub fn worker_token_in_scope() -> bool {
+    crate::orchestrator::CURRENT_WORKER_TOKEN
+        .try_with(|_| ())
+        .is_ok()
+}
+
+/// The identity a specialist **reply** must be attributed to, so that it matches
+/// the key the notice store filed the notice under.
+///
+/// Two resolution steps, in strictness order:
+///
+/// 1. Exact token match — [`active_worker_key_for_current_token`]. The runner path:
+///    the worker registered itself with the very token the runner scoped around its
+///    turn, so the effective registry key is known exactly.
+/// 2. A registration that carries **no** token of the running turn
+///    ([`register_active_worker`] hands every entry a fresh child of the global token,
+///    which never equals the token in scope). Resolving such a worker by its bare
+///    role name is what let a reply and a notice disagree: the notice sits under the
+///    effective key (`{agent}-{task}`) while the reply arrives keyed by `coder`, so
+///    the store either mis-attributes the reply (its `worker_tag` is a role name, and
+///    any same-role worker passes the bidirectional tolerance) or rejects it outright
+///    (`worker-mismatch`) when the notice was addressed by a token a bare role name
+///    cannot route, e.g. a task id. The role name is therefore resolved against the
+///    **active** registry entries with the notice router's own rules
+///    ([`super::notice::worker_routing_identity`] + `routes`) and a single match yields
+///    that entry's effective key — the very key the worker drains with.
+///
+/// Deliberate limits, both of them safety:
+/// * Step 2 runs only when a worker token is in scope. A Manager turn, the bridge or a
+///   unit test has no worker turn to resolve and keeps the identity the dispatcher
+///   already reports, instead of being silently re-keyed onto some unrelated live entry.
+/// * Two live entries addressed by the same role name stay **ambiguous** and resolve to
+///   `None`: guessing one of them would invent an attribution the registry cannot
+///   support, so the caller keeps the bare role name and the notice layer's
+///   bidirectional tolerance stays a compatibility path, not a per-worker claim.
+pub fn active_worker_key_for_reply(role: &str) -> Option<String> {
+    if let Some(key) = active_worker_key_for_current_token() {
+        return Some(key);
+    }
+    if !worker_token_in_scope() {
+        return None;
+    }
+    let role = role.trim();
+    if role.is_empty() {
+        return None;
+    }
+    let matches: Vec<String> = WORKERS
+        .iter()
+        .filter(|e| e.value().is_active())
+        .filter(|e| super::notice::worker_routing_identity(e.key()).routes(role))
+        .map(|e| e.key().clone())
+        .collect();
+    if matches.len() == 1 {
+        matches.into_iter().next()
+    } else {
+        None
+    }
 }
 
 /// Test-only: drop one entry from the table outright (no `COMPLETED_SEQ` draw,
@@ -2250,6 +2312,11 @@ mod tests {
     #[tokio::test]
     async fn test_guard_drop_reclaim_does_not_panic_or_deadlock_under_concurrent_teardown() {
         let _notice_lock = crate::orchestrator::notice::TEST_NOTICE_MUTEX.lock().await;
+        // 24 registrations and 24 teardowns churn the process-global registry and its
+        // bounded completed ring, so this storm must be serialised against every other
+        // registry test: unsynchronised, its ring evictions erase the completed row a
+        // sibling test is in the middle of reading back.
+        let _workers_lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
         let (tx, rx) = std::sync::mpsc::channel::<(u8, String)>();
         for i in 0..24u8 {
@@ -3459,5 +3526,136 @@ mod tests {
         );
         drop(guard);
         remove_worker_entry_for_test(&key);
+    }
+
+    /// Reply identity and notice addressing must agree **also for a registration made
+    /// without a cancel token**. [`register_active_worker`] gives every entry a fresh
+    /// child of the global token, so [`active_worker_key_for_current_token`] can never
+    /// match the token in scope and the reply used to degrade to the bare role name —
+    /// a key the notice store never files notices under. The rule therefore resolves
+    /// the role against the live registry, and only when it pins exactly one entry.
+    #[tokio::test]
+    async fn test_reply_identity_resolves_a_tokenless_registration_to_its_effective_key() {
+        let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let lone = register_active_worker(
+            Some("t-7701".to_string()),
+            "replykeyless".to_string(),
+            "tokenless registration".to_string(),
+        );
+        let lone_key = lone.0.clone();
+        assert_eq!(
+            lone_key, "replykeyless-t-7701",
+            "the natural key is what the notice store addresses this worker by"
+        );
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let (token_step, role_step, trimmed) = crate::orchestrator::CURRENT_WORKER_TOKEN
+            .scope(token.clone(), async {
+                (
+                    active_worker_key_for_current_token(),
+                    active_worker_key_for_reply("replykeyless"),
+                    active_worker_key_for_reply("  ReplyKeyLess  "),
+                )
+            })
+            .await;
+        assert_eq!(
+            token_step, None,
+            "a token-less registration carries no token that can match the turn"
+        );
+        assert_eq!(
+            role_step.as_deref(),
+            Some(lone_key.as_str()),
+            "the lone live entry for that role name IS the replying worker"
+        );
+        assert_eq!(
+            trimmed.as_deref(),
+            Some(lone_key.as_str()),
+            "and the role name is judged by whole fields, case- and whitespace-insensitively"
+        );
+
+        // No worker turn, no claim on a registry entry: a Manager turn, the bridge or a
+        // unit test keeps the identity the dispatcher reports.
+        assert_eq!(
+            active_worker_key_for_reply("replykeyless"),
+            None,
+            "outside a worker turn the caller keeps its bare role name"
+        );
+
+        // Two live entries for one role name stay ambiguous — guessing one of them would
+        // invent an attribution the registry cannot support.
+        let twin = register_active_worker(
+            Some("t-7702".to_string()),
+            "replykeyless".to_string(),
+            "same-role sibling".to_string(),
+        );
+        let twin_key = twin.0.clone();
+        assert_eq!(
+            crate::orchestrator::CURRENT_WORKER_TOKEN
+                .scope(token.clone(), async {
+                    active_worker_key_for_reply("replykeyless")
+                })
+                .await,
+            None,
+            "two live entries addressed by one role name are never resolved by guess"
+        );
+
+        // The exact-token step keeps priority: with a tokened and a tokenless entry of
+        // the same role, the reply is keyed to the entry owning the token in scope.
+        let tokened = register_active_worker_with_token(
+            Some("t-7703".to_string()),
+            "replykeyboth".to_string(),
+            "registered with the turn's token".to_string(),
+            Some(token.clone()),
+        );
+        let tokenless = register_active_worker(
+            Some("t-7704".to_string()),
+            "replykeyboth".to_string(),
+            "same role, no such token".to_string(),
+        );
+        let tokened_key = tokened.0.clone();
+        assert_eq!(
+            crate::orchestrator::CURRENT_WORKER_TOKEN
+                .scope(token.clone(), async {
+                    active_worker_key_for_reply("replykeyboth")
+                })
+                .await
+                .as_deref(),
+            Some(tokened_key.as_str()),
+            "the entry owning the scoped token wins, ambiguously registered or not"
+        );
+
+        // A role name the registry cannot address at all resolves to nothing — judged
+        // under a token no entry owns, so the exact-token step cannot answer first.
+        let stray = tokio_util::sync::CancellationToken::new();
+        assert_eq!(
+            crate::orchestrator::CURRENT_WORKER_TOKEN
+                .scope(stray.clone(), async {
+                    active_worker_key_for_reply("replykeynobody")
+                })
+                .await,
+            None,
+            "no live entry, no invented key"
+        );
+        assert_eq!(
+            crate::orchestrator::CURRENT_WORKER_TOKEN
+                .scope(stray, async { active_worker_key_for_reply("   ") })
+                .await,
+            None,
+            "an empty role name is no identity"
+        );
+
+        // Leave the shared table exactly as this test found it: the entries go outright
+        // (no `COMPLETED_SEQ` draw, no ring eviction) and the guards are forgotten, so
+        // this test never adds to — or evicts from — the bounded completed ring a
+        // sibling test reads back.
+        let keys = [lone_key, twin_key, tokened_key, tokenless.0.clone()];
+        for key in &keys {
+            remove_worker_entry_for_test(key);
+        }
+        std::mem::forget(lone);
+        std::mem::forget(twin);
+        std::mem::forget(tokened);
+        std::mem::forget(tokenless);
     }
 }

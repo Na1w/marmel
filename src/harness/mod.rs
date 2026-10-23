@@ -723,15 +723,22 @@ async fn dispatch_specialist_async(
 /// same dialogue id, so it must stay a compatibility path, not the only thing keeping replies
 /// attached to the right worker.
 ///
-/// The key is resolved from the task-local worker token the runner scoped around the whole
-/// turn ([`crate::orchestrator::CURRENT_WORKER_TOKEN`], registered by
-/// [`crate::orchestrator::register_active_worker_with_token`]), which is exactly how the
-/// runner itself identifies the worker when it drains notices. Falls back to the caller's role
-/// name when no worker token is in scope (a Manager turn, the UI bridge, a unit test) — the
-/// identity dispatch could see before, and [`crate::orchestrator::notice::WorkerRoutingIdentity::routes`]
-/// still judges it by whole fields only, never by a substring.
+/// [`crate::orchestrator::active_worker_key_for_reply`] resolves that key: first from the
+/// task-local worker token the runner scoped around the whole turn
+/// ([`crate::orchestrator::CURRENT_WORKER_TOKEN`], registered by
+/// [`crate::orchestrator::register_active_worker_with_token`]) — exactly how the runner itself
+/// identifies the worker when it drains notices — and, for a registration that carries no token
+/// of the running turn, from the single **active** registry entry the caller's role name
+/// addresses. Both answers are the key the notice was filed under, so reply identity and notice
+/// addressing cannot disagree.
+///
+/// Falls back to the caller's role name when neither step can pin one entry (no worker token in
+/// scope — a Manager turn, the UI bridge, a unit test — or two live entries sharing one role
+/// name): identity dispatch could see before, and
+/// [`crate::orchestrator::notice::WorkerRoutingIdentity::routes`] still judges it by whole
+/// fields only, never by a substring.
 fn reply_worker_identity(caller: &str) -> String {
-    crate::orchestrator::active_worker_key_for_current_token()
+    crate::orchestrator::active_worker_key_for_reply(caller)
         .unwrap_or_else(|| caller.trim().to_string())
 }
 
