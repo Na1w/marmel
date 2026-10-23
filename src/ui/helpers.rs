@@ -298,6 +298,76 @@ fn entry_is_registering(entry: &crate::orchestrator::WorkerEntry) -> bool {
     entry.agent_name != entry.key
 }
 
+/// Whether a registry entry had to take a **collision-disambiguated** key —
+/// `{base}#N` — because the natural key was already held by a live worker
+/// (`claim_worker_slot`, `src/orchestrator/workers.rs:696-730`, key built at `:717`).
+///
+/// This is a fact about the **key**, not about the worker: one delegated task
+/// registers its identity twice — the Manager at dispatch
+/// (`src/orchestrator/mod.rs:302-307`, whose guard is held across `worker.run` at
+/// `:327`) and the runner again at execution
+/// (`src/agents/runner/execution.rs:302-307`) — so the second registration is
+/// pushed onto `{base}#N`. Both entries are the **same worker**: one
+/// `CancellationToken`, one task, one record (`docs/investigation/dup_rows_root_cause.md`
+/// §1/§5). The registry keeps both on purpose — deleting the second registration
+/// would orphan the ~17 `set_active_worker_status(&_active_guard.0)` call sites and
+/// the journal/notice paths that write to the runner's own guard key — so what the
+/// pane must do is stop projecting the redundant **row**
+/// ([`duplicate_row_is_redundant`]).
+///
+/// Both fields are consulted: `disambiguated` is the registry's own shorthand and
+/// `collision_handle` is the `#…` half it was built from, and a bundle restored
+/// under its stored key carries both verbatim
+/// ([`crate::orchestrator::workers::install_restored_worker`]).
+fn entry_is_disambiguated(entry: &crate::orchestrator::WorkerEntry) -> bool {
+    entry.disambiguated || entry.collision_handle.is_some()
+}
+
+/// The natural keys a **live, plain** registration holds inside one projection pass.
+///
+/// The keys come from the same snapshot the pass enumerates, and liveness is the
+/// registry's own authority (`WorkerEntry::is_active`) filtered through the same
+/// register-live predicate the projection uses ([`entry_is_registering`]) — a
+/// `Placeholder` token mirror must never be able to hide a real row.
+///
+/// Key, not task id, is the join field: the collision key is built as
+/// `{natural_key}#{id}`, so `WorkerEntry::natural_key` of the duplicate and
+/// `WorkerEntry::key` of the plain entry are the same string by construction, and
+/// matching stays whole-key (never prefix- or substring-based — everything after
+/// `#` is an opaque handle).
+fn live_plain_natural_keys(
+    entries: &[crate::orchestrator::WorkerEntry],
+) -> std::collections::HashSet<&str> {
+    entries
+        .iter()
+        .filter(|entry| !entry_is_disambiguated(entry) && entry.is_active)
+        .map(|entry| entry.key.as_str())
+        .collect()
+}
+
+/// Whether the row behind a disambiguated entry is **redundant** in this pass, i.e.
+/// the same natural identity is already on screen as a live plain row.
+///
+/// The rule is deliberately **per-live-sibling**, never "always prefer the plain
+/// key", and that is what protects a session restore. A restored entry keeps its
+/// stored key, and a plain half restored with an uncaptured status is re-labelled
+/// `Interrupted by restart` (`src/session/worker_journal.rs:806-841`) while the
+/// `{base}#N` half holds the truthful record (measured: 0 vs 30–166 journal history
+/// lines, `docs/investigation/dup_rows_root_cause.md` §5). Dropping a `#N` row whose
+/// plain sibling is **not live** would therefore hide the only accurate row the pane
+/// has, so it is kept (measured control: `coder-t-903` + `coder-t-999#77` both stay).
+///
+/// What is suppressed is exactly the case the user sees as a broken row: a
+/// double-registered delegation whose plain sibling is running, whose `#N` row is
+/// permanent, gets **0 log lines** (nothing ever emits a tag containing `#N`), and
+/// steals the pane's selection (`docs/investigation/dup_rows_root_cause.md` §2).
+fn duplicate_row_is_redundant(
+    entry: &crate::orchestrator::WorkerEntry,
+    live_plain: &std::collections::HashSet<&str>,
+) -> bool {
+    entry_is_disambiguated(entry) && live_plain.contains(entry.natural_key.as_str())
+}
+
 /// Resolve the **registry entry** a delegation event addresses, through the
 /// registry's own read model rather than through a rendered row name.
 ///
@@ -351,10 +421,12 @@ pub(crate) fn registry_entry_for_event(
 /// The row set the pane must show, rebuilt from the worker registry.
 ///
 /// This is the projection that replaces the event-derived row list:
-/// **which rows exist** and **whether they are running** come from `WORKERS`,
-/// and nothing else. What survives from the previous vector is presentation only — streamed `thinking`/`content`,
-/// logs, clocks not yet derived from the registry, and the queue field, which is
-/// pool state and stays orthogonal to running.
+/// **which rows exist**, **whether they are running** and **which backend-slot rank a
+/// running worker is waiting at** come from `WORKERS`, and nothing else. What survives
+/// from the previous vector is presentation only — streamed `thinking`/`content`, logs,
+/// clocks not yet derived from the registry, and a queue position that the registry has
+/// not reported (which the event path may still have folded, and which a re-projection
+/// must never erase; see [`apply_registry_entry`]).
 ///
 /// Membership rules:
 /// * rows are created for the registering classes only — `Specialist`
@@ -365,21 +437,50 @@ pub(crate) fn registry_entry_for_event(
 /// * a row is closed by the registry flipping `is_active` (completion, guard
 ///   drop after a cancel, or eviction from the completed ring) — never by a
 ///   writer that decided on its own;
+/// * a row's `(Queued n/m)` label is **mirrored from the registry** for a live entry, so
+///   rebuilding a row re-derives it: this is what repairs a queue state an earlier drain
+///   dropped (fix #3, `docs/diagnose_subpane_stale_refresh.md` §3) and what keeps a
+///   queued row honest across every re-projection until the wait ends;
 /// * row order is the registry's key order, which is byte-stable across a
-///   restore.
+///   restore;
+/// * **one row per worker, not one row per registration**: a
+///   `{base}#N` entry whose natural key is held by another **live** entry of the
+///   same pass is not projected — the plain row already is that worker
+///   ([`duplicate_row_is_redundant`]). A `#N` entry with no live plain sibling
+///   keeps its row, which is what a session restore produces and what keeps the
+///   truthful half of a restored pair visible.
 ///
 /// Returns whether anything a viewer can see actually moved, so callers push to
 /// the renderer on real edges only.
 pub(crate) fn project_subagent_rows(subagents: &mut Vec<SubagentDetail>) -> bool {
     let before = subagent_row_signature(subagents);
     let previous = std::mem::take(subagents);
+    // Rows are created for registering classes only: `Specialist` (Manager,
+    // runner, nested `delegate_task`, restored) and `ValidatorAudit`. An
+    // internal/reserve class has no entry here at all, and a token mirror never
+    // becomes a row. Taken as **one snapshot** for the whole pass: the redundancy
+    // rule below compares entries with each other, so re-reading the registry per
+    // entry could let a registration slip in between the sibling check and the row
+    // it guards.
+    let entries: Vec<crate::orchestrator::WorkerEntry> = crate::orchestrator::worker_entries()
+        .into_iter()
+        .filter(entry_is_registering)
+        .collect();
+    let live_plain = live_plain_natural_keys(&entries);
+
     let mut projected: Vec<SubagentDetail> = Vec::new();
-    for entry in crate::orchestrator::worker_entries() {
-        // Rows are created for registering classes only: `Specialist` (Manager,
-        // runner, nested `delegate_task`, restored) and `ValidatorAudit`. An
-        // internal/reserve class has no entry here at all, and a token mirror never
-        // becomes a row.
-        if !entry_is_registering(&entry) {
+    // Lines the suppressed rows were carrying, parked under the natural key of the
+    // row that does project their worker. Folding them is what makes the filter
+    // line-neutral: the panel's total line count never moves, and a row the pane
+    // was reading can never go quiet because its twin was hidden.
+    let mut carried_logs: Vec<(String, Vec<String>)> = Vec::new();
+    for entry in &entries {
+        if duplicate_row_is_redundant(entry, &live_plain) {
+            if let Some(row) = previous.iter().find(|row| row.name == entry.key)
+                && !row.logs.is_empty()
+            {
+                carried_logs.push((entry.natural_key.clone(), row.logs.clone()));
+            }
             continue;
         }
         let mut row = match previous.iter().position(|row| row.name == entry.key) {
@@ -390,16 +491,58 @@ pub(crate) fn project_subagent_rows(subagents: &mut Vec<SubagentDetail>) -> bool
                 ..Default::default()
             },
         };
-        apply_registry_entry(&mut row, &entry);
+        apply_registry_entry(&mut row, entry);
         projected.push(row);
+    }
+    // The plain sibling is a registering entry of this very pass, so its row is
+    // always in `projected` and nothing is ever parked into nothing.
+    for (natural_key, logs) in carried_logs {
+        match projected.iter_mut().find(|row| row.name == natural_key) {
+            Some(row) => row.logs.extend(logs),
+            None => tracing::debug!(
+                key = %natural_key,
+                "suppressed a duplicate subagent row but found no row to fold its log lines into"
+            ),
+        }
     }
     // Rows the registry no longer holds are gone; that is how a row closes.
     *subagents = projected;
     before != subagent_row_signature(subagents)
 }
 
-/// Fold one authoritative registry entry onto a row, leaving every
-/// renderer-owned field (thinking, content, logs, selection, queue) alone.
+/// Fold one authoritative registry entry onto a row.
+///
+/// **The registry owns row existence, and the queue position is mirrored from the
+/// registry.** This fold writes what the registry is authoritative for (`name`,
+/// `task_id`, `prompt`, `is_active`, `context_tokens`, the clock and — since fix #3 —
+/// the slot rank: [`crate::orchestrator::WorkerEntry::queue_position`]), and leaves
+/// the rest of the renderer-owned fields (thinking, content, logs, selection,
+/// **paused**) exactly as the writer that produced them left it: the registry holds no
+/// arbitration handshake, so a state it never reported must never be reset by a
+/// rebuild.
+///
+/// `queue` is the field that changed hands. It used to be reachable only through the
+/// delegation-event path, which made it **unrecoverable**: `Queued` is one-shot, the
+/// session drains its vector with `events.drain(..)`, and a transition that reached the
+/// drain before this projection had opened the row was simply gone (`update_subagent_queue`
+/// never creates rows). Now the pool's rank lives on the registry entry itself, so every
+/// projection of a live worker **re-derives** the label from the registry: a dropped
+/// event self-heals on the next projection, a row that is stale for "no queue" is
+/// repaired, and a session restore gets the label back from the first report after the
+/// restore instead of needing a persisted copy. The event path stays a writer too (it is
+/// what makes the pane react within one drain), but it is no longer the only one.
+///
+/// A live entry with **no** recorded rank writes nothing here: the pool only ever
+/// reports a rank at queue entry and on a rank change, so "no rank on the entry" is not
+/// evidence that a delivered position was wrong — it can simply mean the report predates
+/// this registration. Clearing a live row's position from the registry would delete a
+/// state the pool did not retract.
+///
+/// The one place this fold may clear either field is the teardown at the end, and it
+/// fires **only** for an entry the registry closed (`!entry.is_active`): a row that
+/// stopped running can never keep a queue position or a pause behind — the queue belongs
+/// to a live delegation only, and this is the path every non-event teardown (cancel,
+/// preemption, guard drop) goes through.
 fn apply_registry_entry(row: &mut SubagentDetail, entry: &crate::orchestrator::WorkerEntry) {
     row.name = entry.key.clone();
     row.task_id = entry.task_id.clone();
@@ -429,13 +572,34 @@ fn apply_registry_entry(row: &mut SubagentDetail, entry: &crate::orchestrator::W
     if row.last_activity_at.is_none() {
         row.last_activity_at = Some(std::time::Instant::now());
     }
-    // A row that stopped running can never keep a queue position behind: the
-    // queue belongs to a live delegation only, and this is the path every
-    // non-event teardown (cancel, preemption, guard drop) goes through. The same
-    // holds for a paused stream — the pause belongs to a live stream, so a row the
-    // registry closed (completion, guard drop after a cancel, eviction) can never
-    // keep a stale `Paused` behind.
-    if !entry.is_active {
+    // The registry's own rank for a **live** worker — the durable half of the
+    // `(Queued n/m)` label, and the reason a lost `Queued` event is no longer lost: the
+    // next projection re-derives the label from the entry instead of leaving the row
+    // reading "not waiting" for the rest of the slot wait. Written for a live entry only
+    // (a closed entry goes to the teardown in the `else` branch), and only when the entry
+    // actually carries a rank: the pool reports a rank at queue entry and on a rank
+    // change, so an entry with no rank is not a retraction of a rank another writer
+    // folded — it usually means this worker is simply not waiting right now, and a
+    // retraction always arrives as `Running`, as a close, or as this entry going stale.
+    //
+    // `queue` is part of the row signature at [`subagent_row_signature`], so a rank the
+    // registry newly reports (or a stale one the teardown takes down) is reported to the
+    // host as a change instead of going out unseen.
+    if entry.is_active {
+        if let Some(queue) = entry.queue_position {
+            row.queue = Some(crate::ui::QueueState {
+                position: queue.position,
+                of: queue.of,
+            });
+        }
+    } else {
+        // The single teardown that may clear renderer-owned state, and it is gated on
+        // the registry having **closed** the row. A row that stopped running can never
+        // keep a queue position behind: the queue belongs to a live delegation only, and
+        // this is the path every non-event teardown (cancel, preemption, guard drop) goes
+        // through. The same holds for a paused stream — the pause belongs to a live
+        // stream, so a row the registry closed (completion, guard drop after a cancel,
+        // eviction) can never keep a stale `Paused` behind either.
         row.queue = None;
         row.paused = false;
     }
@@ -483,12 +647,31 @@ pub(crate) fn subagent_row_badge(
     None
 }
 
+/// One row as the pane's change detector sees it (see
+/// [`subagent_row_signature`]). Named once because the tuple is what both the
+/// projection and the tests around it have to spell.
+type RowSignature = (String, bool, bool, usize, Option<(usize, usize)>);
+
 /// What a viewer can see about the row **set**: identity, liveness, arbitration
-/// pause and ctx. Deliberately blind to clocks and streamed text, which move on
-/// their own. `paused` is part of it because the panel's label word changes with
-/// it: a row that flips to or out of a arbitration pause must be re-pushed even
-/// when nothing else about it moved.
-fn subagent_row_signature(rows: &[SubagentDetail]) -> Vec<(String, bool, bool, usize)> {
+/// pause, queue position and ctx. Deliberately blind to clocks and streamed text,
+/// which move on their own.
+///
+/// `paused` is part of it because the panel's label word changes with it: a row
+/// that flips to or out of a arbitration pause must be re-pushed even when nothing
+/// else about it moved.
+///
+/// `queue` is part of it for exactly the same reason, and its absence was a blind
+/// spot the pane could not recover from: the draw condition is
+/// `sa.queue.filter(|_| sa.is_active)` (`tui::render`), so `None -> Some(..)`, a
+/// rank move and `Some(..) -> None` are each a label change the operator sees. The
+/// queue half of the pane is pushed by the delegation-event drain (which pushes on
+/// any fold), but the **projection** path pushes only on what this tuple reports:
+/// `session::project_subagent_pane` gates its `set_subagents` on
+/// [`project_subagent_rows`]' verdict, and `project_subagent_rows` now **writes**
+/// `queue` from the registry rank a live entry carries (fix #3,
+/// `docs/diagnose_subpane_stale_refresh.md` §3). A detector blind to `queue` would
+/// swallow that write — and hide a queue state a rebuild took down.
+fn subagent_row_signature(rows: &[SubagentDetail]) -> Vec<RowSignature> {
     rows.iter()
         .map(|row| {
             (
@@ -496,6 +679,7 @@ fn subagent_row_signature(rows: &[SubagentDetail]) -> Vec<(String, bool, bool, u
                 row.is_active,
                 row.paused,
                 row.context_tokens,
+                row.queue.map(|queue| (queue.position, queue.of)),
             )
         })
         .collect()
@@ -650,14 +834,56 @@ pub(crate) fn update_subagent_queue(
     // cannot create a row — queue state is orthogonal to running and attaches to
     // a row the projection already owns.
     let derived = subagent_row_name(agent, task.as_deref()).0;
-    let key = registry_entry_for_event(agent, task.as_deref())
-        .map(|entry| entry.key)
+    let entry = registry_entry_for_event(agent, task.as_deref());
+    let key = entry
+        .as_ref()
+        .map(|entry| entry.key.clone())
         .filter(|key| subagents.iter().any(|row| row.name == *key))
         .unwrap_or_else(|| derived.clone());
     let Some(existing) = subagents.iter_mut().find(|s| s.name == key) else {
+        // The skip stays (row existence belongs to the registry — see the doc above
+        // and the `queue state is orthogonal to row existence` guard in the suite),
+        // but it is a **dropped** edge, not a deferred one: the caller reads this
+        // vector with `events.drain(..)`, so what is skipped here is gone. Log it
+        // with everything that separates the two ways to get here: a delegation the
+        // registry does not hold (yet), versus a delegation whose row is spelled
+        // under a key this event cannot address.
+        let (registry_key, why) = match entry.as_ref() {
+            Some(entry) => (
+                entry.key.as_str(),
+                "the registry entry behind it has no row: rows open at the projection \
+                 edge, and this transition reached the drain before that projection ran",
+            ),
+            None => (
+                "",
+                "the worker registry holds no entry for this delegation at all, so no \
+                 projection could have opened a row for it",
+            ),
+        };
+        let slot = match queue {
+            Some(state) => format!("queued {}/{}", state.position, state.of),
+            None => "leaving the queue".to_string(),
+        };
         tracing::debug!(
-            "queue transition for {key} has no panel row yet; the worker registry owns row existence, so it is skipped"
+            agent = agent.as_str(),
+            task = task.as_deref().unwrap_or(""),
+            row = key.as_str(),
+            derived_row = derived.as_str(),
+            registry_key,
+            transition = %slot,
+            "queue transition for {key} has no panel row yet and is dropped — {why}"
         );
+        // A **dropped** edge, but no longer an unrecoverable one. The same pool report
+        // also wrote this rank onto the registry entry
+        // (`orchestrator::workers::set_worker_queue_position`, driven by the
+        // `PositionReporter` closure in `llm::client::ChatClient::acquire_slot`), and
+        // `apply_registry_entry` re-derives `row.queue` from that field for any **live**
+        // entry. So the row opens — or a stale "not waiting" row is repaired — at the very
+        // next `project_subagent_rows`, no matter which side of the drain the transition
+        // lost. This fold still never creates a row, and nothing here may re-project
+        // mid-drain: that would delete every row the **event** stream had opened for a
+        // worker the registry does not hold yet (rows the registry no longer holds are how
+        // a row closes).
         return false;
     };
     existing.queue = queue;
@@ -742,8 +968,31 @@ pub(crate) fn update_subagent_paused(
 ) -> bool {
     let key = subagent_row_key_for_tag(subagents, agent_tag);
     let Some(existing) = subagents.iter_mut().find(|s| s.name == key) else {
+        // Same skip as [`update_subagent_queue`], and the same ordering answer, held
+        // on purpose: this fold runs in `session::forward_ui_event`, which folds the
+        // UI event channel in **arrival order** at the head of a boundary, while the
+        // registry projection runs on that same boundary immediately after it
+        // (`session::project_then_drain_delegation_events`). A pause transition is the
+        // preemption handshake's own report that a stream really yielded its model
+        // slot, so it keeps folding at the seam that received it — putting the seam
+        // behind the projection would reorder what the arbitrator's conditional-pause
+        // gate reports to the pane, and projecting from inside this fold would delete
+        // every row the event stream opened for a worker the registry does not hold
+        // yet. So the row gate stays and the drop is logged with the identity it tried
+        // to resolve. Fix #3 gave the queue position a durable home on the registry
+        // entry, and deliberately did **not** do the same for a pause: whether this
+        // stream yielded its model slot is the outcome of the arbitration handshake,
+        // not a property the registry ever owned, so a dropped pause stays an
+        // observable-only loss (the next handshake re-reports it) rather than a
+        // mirrored field. That is a smaller hole than the queue one was, and closing it
+        // would mean putting the preemption handshake in the registry — not a
+        // reordering here.
         tracing::debug!(
-            "stream-pause transition for {key} has no panel row yet; the worker registry owns row existence, so it is skipped"
+            agent_tag,
+            row = key.as_str(),
+            paused,
+            "stream-pause transition for {key} has no panel row yet and is dropped — no row \
+             resolves for this stream tag, and the worker registry owns row existence"
         );
         return false;
     };
@@ -1340,10 +1589,18 @@ mod tests {
 
     /// Regression guard: the pane's row set is a **projection of the worker
     /// registry**. Rows exist only for registering classes, are named by the
-    /// **effective registry key** (so two live workers for one agent+task get two
-    /// rows instead of merging into one), keep their presentation state, and go
+    /// **effective registry key**, keep their presentation state, and go
     /// idle or disappear exactly when the registry says so — never because an
     /// event handler decided so.
+    ///
+    /// One half of this guard changed with the `Dup #N` fix
+    /// (`docs/investigation/dup_rows_root_cause.md` §6, option B): "one row per
+    /// registry **entry**" was never what the operator saw. One delegated task
+    /// registers its identity twice (the Manager at dispatch, the runner at
+    /// execution) and the second registration is pushed onto `{base}#N`, so the
+    /// projection is now **one row per worker**: the `{base}#N` twin of a live plain
+    /// row is skipped, while a genuinely distinct second worker — whose natural key
+    /// was free, so it never took a collision handle — still gets its own row.
     ///
     /// `WORKERS` is a process-wide table, so every assertion here is scoped to the
     /// keys this test owns; other tests may hold their own entries at the same time.
@@ -1358,28 +1615,47 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         // Private task ids keep these keys out of the way of any other test that
         // reads the shared registry.
-        let first = workers::register_active_worker(
+        let manager = workers::register_active_worker(
             Some("t-9001".to_string()),
             "coder".to_string(),
             "brief one".to_string(),
         );
-        let second = workers::register_active_worker(
+        // The same identity registered a second time — the shape one delegation
+        // really produces (Manager, then runner) — so this guard holds the
+        // `{base}#N` twin.
+        let runner = workers::register_active_worker(
             Some("t-9001".to_string()),
             "coder".to_string(),
             "brief two".to_string(),
         );
-        let (key_a, key_b) = (first.0.clone(), second.0.clone());
+        // A second **worker**, whose natural key was free, takes its own key and is
+        // never a twin of anything.
+        let other = workers::register_active_worker(
+            Some("t-9004".to_string()),
+            "coder".to_string(),
+            "brief three".to_string(),
+        );
+        let (key_a, key_b, key_other) = (manager.0.clone(), runner.0.clone(), other.0.clone());
         // A token-count stub is not a registration, so it must never become a row.
         workers::update_active_worker_context("coder-t-9002", 4242);
         let stub = "coder-t-9002".to_string();
-        assert_ne!(key_a, key_b, "two live workers hold two distinct keys");
+        assert_ne!(
+            key_a, key_b,
+            "two live registrations hold two distinct keys"
+        );
+        assert!(
+            key_b.contains('#'),
+            "the second registration of one identity took a collision key: {key_b}"
+        );
         let mine = |rows: &[SubagentDetail]| -> Vec<SubagentDetail> {
             rows.iter()
-                .filter(|r| r.name == key_a || r.name == key_b || r.name == stub)
+                .filter(|r| {
+                    r.name == key_a || r.name == key_b || r.name == key_other || r.name == stub
+                })
                 .cloned()
                 .collect()
         };
-        let mut names = vec![key_a.clone(), key_b.clone()];
+        let mut names = vec![key_a.clone(), key_other.clone()];
         names.sort();
 
         let mut rows = vec![SubagentDetail {
@@ -1397,26 +1673,45 @@ mod tests {
         let scoped: Vec<String> = mine(&rows).iter().map(|r| r.name.clone()).collect();
         assert_eq!(
             scoped, names,
-            "one row per registry entry, in registry key order, and never one for a stub"
+            "one row per worker, in registry key order: never one for a stub, and never a \
+             second for the `{{base}}#N` twin of a live plain row"
         );
         let row_a = rows.iter().find(|r| r.name == key_a).expect("row A");
-        let row_b = rows.iter().find(|r| r.name == key_b).expect("row B");
+        let row_other = rows
+            .iter()
+            .find(|r| r.name == key_other)
+            .expect("row OTHER");
         assert_eq!(
             row_a.thinking, "streamed thought",
             "presentation state survives the rebuild"
         );
         assert!(
-            row_a.is_active && row_b.is_active,
+            row_a.is_active && row_other.is_active,
             "both workers are running for the Manager and the arbitrator"
         );
         assert!(
-            row_a.started_at.is_some() && row_b.started_at.is_some(),
+            row_a.started_at.is_some() && row_other.started_at.is_some(),
             "the clock comes from the registry entry"
         );
-        assert_eq!(row_b.prompt, "brief two", "the brief comes along");
+        assert_eq!(
+            row_a.prompt, "brief one",
+            "the surviving row carries the brief of the entry it projects"
+        );
+        assert_eq!(
+            row_a.logs,
+            vec!["started task t-9001".to_string()],
+            "and the lines it was carrying"
+        );
+        assert!(
+            rows.iter().all(|r| r.name != key_b),
+            "the twin of a live plain row is not projected ({key_b})"
+        );
 
-        // The badges a viewer needs to tell the rows apart: a duplicate-key
-        // registration says `Dup #N`, a validator-family key says `Audit`.
+        // The badges a viewer needs to tell rows apart stay derived from the key: a
+        // duplicate-key registration still says `Dup #N`, a validator-family key
+        // still says `Audit`. The fix hides the redundant row; it does not relabel
+        // anything (`docs/investigation/dup_rows_root_cause.md` §7: option C is not
+        // taken), so a lone `{base}#N` row — the restore case — still labels itself.
         for key in [&key_a, &key_b] {
             match key.split_once('#') {
                 Some((_, handle)) => assert_eq!(
@@ -1437,6 +1732,40 @@ mod tests {
             "a validator-family row reads as an audit"
         );
 
+        // The rule is decided by the **snapshot of the pass**, and both halves of it
+        // are worth pinning directly: the twin is redundant against the live plain
+        // entry, and neither the plain entry nor the distinct worker is redundant
+        // against anything.
+        {
+            let entries: Vec<_> = workers::worker_entries()
+                .into_iter()
+                .filter(entry_is_registering)
+                .collect();
+            let live_plain = live_plain_natural_keys(&entries);
+            let by_key = |key: &str| {
+                entries
+                    .iter()
+                    .find(|entry| entry.key == key)
+                    .expect("the registry holds this test's entry")
+            };
+            assert!(
+                duplicate_row_is_redundant(by_key(&key_b), &live_plain),
+                "the twin's natural key is held by a live plain entry"
+            );
+            assert!(
+                !duplicate_row_is_redundant(by_key(&key_a), &live_plain),
+                "a plain entry is never its own twin"
+            );
+            assert!(
+                !duplicate_row_is_redundant(by_key(&key_other), &live_plain),
+                "a distinct worker takes no collision handle, so it is never hidden"
+            );
+            assert!(
+                !live_plain.contains(key_b.as_str()),
+                "a collision key is not a natural key"
+            );
+        }
+
         // Identity: a lifecycle event naming agent+task resolves through the
         // registry, so it never opens a third row for a worker that has one.
         update_subagent_lifecycle(
@@ -1456,30 +1785,22 @@ mod tests {
             !update_subagent_queue(
                 &mut rows,
                 crate::agents::Agent::Coder,
-                Some("t-9003".to_string()),
+                Some("t-9005".to_string()),
                 Some(crate::ui::QueueState { position: 1, of: 2 })
             ),
             "queue state is orthogonal to row existence"
         );
         assert_eq!(mine(&rows).len(), 2);
 
-        // One worker's guard drops: the registry flips its entry to completed, and
-        // THAT is what closes the row.
-        drop(second);
+        // The twin's guard drops first — the runner finishes while the Manager's
+        // guard is still held. Nothing appears: the plain row is still live, so the
+        // closed twin stays hidden.
+        drop(runner);
+        let _ = project_subagent_rows(&mut rows);
         assert!(
-            project_subagent_rows(&mut rows),
-            "a completed entry changes what the pane shows"
+            rows.iter().all(|r| r.name != key_b),
+            "a closed twin of a still-live plain row stays unprojected"
         );
-        let closed = rows
-            .iter()
-            .find(|r| r.name == key_b)
-            .expect("the completed ring still holds the entry, so the row stays");
-        assert!(!closed.is_active, "the registry closed the row");
-        assert!(
-            closed.started_at.is_none(),
-            "no live clock for a finished run"
-        );
-        assert!(closed.queue.is_none(), "no queue position outlives the run");
         assert!(
             rows.iter()
                 .find(|r| r.name == key_a)
@@ -1487,8 +1808,26 @@ mod tests {
             "the other live worker keeps its row"
         );
 
+        // The plain guard drops too. With its sibling no longer live the twin's row
+        // is projected again — the same half of the rule that keeps a restored
+        // `{base}#N` record on screen, and why the filter is never "always prefer the
+        // plain key".
+        drop(manager);
+        let _ = project_subagent_rows(&mut rows);
+        assert!(
+            rows.iter().any(|r| r.name == key_b),
+            "with no live plain sibling, the `{key_b}` row is shown"
+        );
+        assert!(
+            rows.iter()
+                .find(|r| r.name == key_a)
+                .is_some_and(|r| !r.is_active),
+            "and the row the operator follows is now closed"
+        );
+
         // The entry leaving the registry is the other half of closing: no entry, no row.
-        for key in [&key_a, &key_b, &stub] {
+        drop(other);
+        for key in [&key_a, &key_b, &key_other, &stub] {
             workers::remove_worker_entry_for_test(key);
         }
         assert!(project_subagent_rows(&mut rows));
@@ -1496,6 +1835,461 @@ mod tests {
             mine(&rows).is_empty(),
             "a row whose entry left the registry is gone"
         );
+    }
+
+    /// The measured root cause of the spurious `Dup #N` rows
+    /// (`docs/investigation/dup_rows_root_cause.md` §1/§2): one delegated task
+    /// registers its identity twice — the Manager at dispatch, the runner at
+    /// execution — the second half is pushed onto `{base}#N`, and the pane projected
+    /// **one row per registry entry**, so every delegation carried a second row that
+    /// gets 0 log lines forever and steals the pane's selection. Option B suppresses
+    /// that row at the projection, and the acceptance gate is that **nothing else
+    /// moves**: same event stream, one row, the same 16 lines.
+    #[test]
+    fn a_double_registered_delegation_projects_one_row_and_keeps_every_line() {
+        use crate::orchestrator::workers;
+        let _workers = workers::TEST_WORKERS_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let manager = workers::register_active_worker(
+            Some("t-9020".to_string()),
+            "coder".to_string(),
+            "prompt-from-Manager".to_string(),
+        );
+        let runner = workers::register_active_worker(
+            Some("t-9020".to_string()),
+            "coder".to_string(),
+            "brief-from-runner".to_string(),
+        );
+        let (plain, twin) = (manager.0.clone(), runner.0.clone());
+        assert!(twin.contains('#'), "the runner took {twin}");
+
+        // The pane's read model as the shipped projection left it: the plain row
+        // carries the status traffic, the twin carries none — nothing on the status
+        // path ever spells a tag with the collision handle.
+        let lines: Vec<String> = (0..16)
+            .map(|i| format!("thinking / calling model {i}"))
+            .collect();
+        let mut rows = vec![
+            SubagentDetail {
+                name: plain.clone(),
+                is_active: true,
+                logs: lines.clone(),
+                ..Default::default()
+            },
+            SubagentDetail {
+                name: twin.clone(),
+                is_active: true,
+                ..Default::default()
+            },
+        ];
+        let scoped = |rows: &[SubagentDetail]| -> Vec<SubagentDetail> {
+            rows.iter()
+                .filter(|row| row.name == plain || row.name == twin)
+                .cloned()
+                .collect()
+        };
+        let scoped_lines = |rows: &[SubagentDetail]| -> usize {
+            scoped(rows).iter().map(|row| row.logs.len()).sum()
+        };
+        assert_eq!(scoped(&rows).len(), 2, "as shipped: two rows for one task");
+        assert_eq!(scoped_lines(&rows), 16);
+
+        let _ = project_subagent_rows(&mut rows);
+
+        let kept = scoped(&rows);
+        assert_eq!(kept.len(), 1, "one delegated task, one row");
+        assert_eq!(kept[0].name, plain, "the plain row is the one that wins");
+        assert!(
+            kept.iter().all(|row| !row.name.contains('#')),
+            "nothing on screen needs a `#N` to be understood any more"
+        );
+        assert_eq!(
+            scoped_lines(&rows),
+            16,
+            "the panel's total line count does not move: no line was lost"
+        );
+        assert_eq!(
+            kept[0].logs, lines,
+            "the surviving row keeps every line it had"
+        );
+        assert!(
+            kept[0].is_active,
+            "and it is the running row, not a closed shell"
+        );
+
+        // Idempotent: a second pass over an unchanged registry re-opens nothing, so
+        // the hidden row cannot leak back in on the next refresh.
+        let _ = project_subagent_rows(&mut rows);
+        let _ = project_subagent_rows(&mut rows);
+        assert_eq!(
+            scoped(&rows).len(),
+            1,
+            "the suppression is stable across pushes"
+        );
+        assert_eq!(scoped_lines(&rows), 16);
+
+        for key in [&plain, &twin] {
+            workers::remove_worker_entry_for_test(key);
+        }
+    }
+
+    /// The filter must be **line-neutral** even in the configuration the shipped
+    /// panel never reaches: if a line really did land on the twin (mechanically
+    /// possible — spell the tag with the effective key and the `{base}#N` row
+    /// receives it, `docs/investigation/dup_rows_root_cause.md` §1 claim 4), hiding
+    /// the row folds those lines into the row that survives instead of deleting them
+    /// with it.
+    #[test]
+    fn suppressing_a_duplicate_row_folds_its_lines_into_the_surviving_row() {
+        use crate::orchestrator::workers;
+        let _workers = workers::TEST_WORKERS_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let manager = workers::register_active_worker(
+            Some("t-9021".to_string()),
+            "coder".to_string(),
+            "prompt-from-Manager".to_string(),
+        );
+        let runner = workers::register_active_worker(
+            Some("t-9021".to_string()),
+            "coder".to_string(),
+            "brief-from-runner".to_string(),
+        );
+        let (plain, twin) = (manager.0.clone(), runner.0.clone());
+
+        let mut rows = vec![
+            SubagentDetail {
+                name: plain.clone(),
+                is_active: true,
+                logs: vec!["started task t-9021".to_string()],
+                ..Default::default()
+            },
+            SubagentDetail {
+                name: twin.clone(),
+                is_active: true,
+                logs: vec![
+                    "thinking / calling model (spelled with the effective key)".to_string(),
+                    "run_command(cargo test)".to_string(),
+                ],
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.name == plain || row.name == twin)
+                .map(|row| row.logs.len())
+                .sum::<usize>(),
+            3
+        );
+
+        let _ = project_subagent_rows(&mut rows);
+
+        let kept: Vec<&SubagentDetail> = rows
+            .iter()
+            .filter(|row| row.name == plain || row.name == twin)
+            .collect();
+        assert_eq!(kept.len(), 1, "the twin is still hidden");
+        assert_eq!(
+            kept[0].logs.len(),
+            3,
+            "and the total line count is exactly what it was"
+        );
+        assert_eq!(
+            kept[0].logs,
+            vec![
+                "started task t-9021".to_string(),
+                "thinking / calling model (spelled with the effective key)".to_string(),
+                "run_command(cargo test)".to_string(),
+            ],
+            "in order, oldest first"
+        );
+
+        for key in [&plain, &twin] {
+            workers::remove_worker_entry_for_test(key);
+        }
+    }
+
+    /// The half of the rule that keeps a **session restore** honest: a `{base}#N`
+    /// entry whose plain sibling is not live keeps its row and its lines. Per
+    /// `docs/investigation/dup_rows_root_cause.md` §5 the `#N` half of a restored
+    /// pair is the truthful record (0 vs 30–166 journal history lines) while the
+    /// plain half comes back as an `Interrupted by restart` shell, so an
+    /// unconditional "prefer the plain key" rule would hide the only accurate row.
+    #[test]
+    fn a_collision_row_without_a_live_plain_sibling_keeps_its_row() {
+        use crate::orchestrator::workers;
+        let _workers = workers::TEST_WORKERS_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // (1) Both halves live: the twin is hidden…
+        let manager = workers::register_active_worker(
+            Some("t-9022".to_string()),
+            "researcher".to_string(),
+            "prompt-from-Manager".to_string(),
+        );
+        let runner = workers::register_active_worker(
+            Some("t-9022".to_string()),
+            "researcher".to_string(),
+            "brief-from-runner".to_string(),
+        );
+        let (plain, twin) = (manager.0.clone(), runner.0.clone());
+        let mut rows = vec![SubagentDetail {
+            name: plain.clone(),
+            is_active: true,
+            logs: vec![
+                "started task t-9022".to_string(),
+                "thinking out loud".to_string(),
+            ],
+            ..Default::default()
+        }];
+        let _ = project_subagent_rows(&mut rows);
+        assert!(
+            rows.iter().any(|row| row.name == plain),
+            "the plain row of the pair is on screen ({plain})"
+        );
+        assert!(
+            rows.iter().all(|row| row.name != twin),
+            "with a live plain sibling the twin is not projected"
+        );
+
+        // (2) …and the moment the plain sibling stops being live it is. This is what
+        // a restart leaves behind: the plain half closed, the `{base}#N` half holding
+        // the record.
+        drop(manager);
+        let _ = project_subagent_rows(&mut rows);
+        assert!(
+            rows.iter().any(|row| row.name == twin),
+            "a `{twin}` row with no live plain sibling must be projected"
+        );
+        drop(runner);
+
+        // (3) The restore shape proper: one `{base}#N` half installed under its
+        // stored key (`install_restored_worker` never re-draws an id), with no plain
+        // half in the pass at all.
+        let restored_key = "coder-t-9023#77".to_string();
+        let started = std::time::Instant::now();
+        assert!(workers::install_restored_worker(
+            restored_key.clone(),
+            workers::WorkerState {
+                info: workers::ActiveWorkerInfo {
+                    task_id: Some("t-9023".to_string()),
+                    agent_name: "coder".to_string(),
+                    prompt: "restored brief".to_string(),
+                    started_at: started,
+                    started_wall: chrono::Local::now(),
+                    context_tokens: 1234,
+                    implementation_turns: 3,
+                    validation_rounds: 0,
+                    latest_validator_feedback: None,
+                    status: "Approved".to_string(),
+                    cancel_token: None,
+                },
+                last_tokens: 1234,
+                completed_seq: Some(9023),
+                completed_at: Some(started),
+                completed_wall: Some(chrono::Local::now()),
+                worker_id_seq_value: 77,
+                queue_position: None,
+            }
+        ));
+        let mut rows = vec![SubagentDetail {
+            name: restored_key.clone(),
+            is_active: false,
+            logs: vec!["history line 1".to_string(); 30],
+            ..Default::default()
+        }];
+        let _ = project_subagent_rows(&mut rows);
+        let row = rows
+            .iter()
+            .find(|row| row.name == restored_key)
+            .expect("a lone restored `{base}#N` row is projected");
+        assert_eq!(
+            row.logs.len(),
+            30,
+            "the restored record stays readable, badge and all"
+        );
+        assert_eq!(
+            subagent_row_badge(None, &row.name),
+            Some("Dup #77".to_string()),
+            "and a row that is genuinely alone still labels what it is"
+        );
+
+        workers::remove_worker_entry_for_test(&restored_key);
+    }
+
+    /// A genuinely **second worker** never loses its row to the rule: its natural key
+    /// was free, so the registry gave it a plain `{agent}-wN` key and it carries no
+    /// collision handle at all. This is the risk boundary the fix was accepted on
+    /// (`docs/investigation/dup_rows_root_cause.md` §6).
+    #[test]
+    fn a_second_worker_with_its_own_key_is_never_hidden_by_the_rule() {
+        use crate::orchestrator::workers;
+        let _workers = workers::TEST_WORKERS_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let first = workers::register_active_worker(
+            Some("t-9024".to_string()),
+            "debugger".to_string(),
+            "brief one".to_string(),
+        );
+        let taskless =
+            workers::register_active_worker(None, "debugger".to_string(), "brief two".to_string());
+        let (plain, taskless_key) = (first.0.clone(), taskless.0.clone());
+        assert!(
+            !taskless_key.contains('#'),
+            "a taskless registration takes `{taskless_key}`, not a collision handle"
+        );
+
+        let mut rows: Vec<SubagentDetail> = Vec::new();
+        let _ = project_subagent_rows(&mut rows);
+        assert!(
+            rows.iter().any(|row| row.name == plain),
+            "the delegated worker has its row"
+        );
+        assert!(
+            rows.iter().any(|row| row.name == taskless_key),
+            "and so does the second, genuinely distinct worker"
+        );
+
+        for key in [&plain, &taskless_key] {
+            workers::remove_worker_entry_for_test(key);
+        }
+    }
+
+    /// Line neutrality **measured**, not assumed: the baseline the suppression is held
+    /// against is produced by the production projection itself instead of hand-written.
+    /// The identical fixture is projected twice by the same code —
+    ///
+    /// * once while the plain sibling is **live**, where the rule fires and the
+    ///   `{base}#N` half is hidden, and
+    /// * once after that sibling stopped being live, where the rule is inert and the
+    ///   pre-fix one-row-per-registry-entry enumeration is exactly what comes back,
+    ///
+    /// and the panel's **total** log line count must be identical on both sides of that
+    /// edge: hiding a row may not retire a line with it, and folding may not invent one.
+    /// The fixture is deliberately asymmetric (16 lines on the plain half, 1 on the twin)
+    /// so a fold that drops or duplicates a line cannot hide inside a symmetric count.
+    #[test]
+    fn the_suppression_is_line_neutral_against_the_unsuppressed_projection_of_the_same_fixture() {
+        use crate::orchestrator::workers;
+        let _workers = workers::TEST_WORKERS_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let manager = workers::register_active_worker(
+            Some("t-9025".to_string()),
+            "coder".to_string(),
+            "prompt-from-Manager".to_string(),
+        );
+        let runner = workers::register_active_worker(
+            Some("t-9025".to_string()),
+            "coder".to_string(),
+            "brief-from-runner".to_string(),
+        );
+        let (plain, twin) = (manager.0.clone(), runner.0.clone());
+        assert!(twin.contains('#'), "the runner took {twin}");
+
+        // The shipped read model for one double-registered delegation: the status
+        // traffic all lands on the plain row (nothing spells a tag carrying the
+        // collision handle), and the twin holds the single line the effective-key
+        // spelling can mechanically deliver.
+        let plain_lines: Vec<String> = (0..16)
+            .map(|i| format!("thinking / calling model {i}"))
+            .collect();
+        let twin_lines: Vec<String> =
+            vec![format!("run_command(cargo test) (spelled with {twin})")];
+        let fixture = || -> Vec<SubagentDetail> {
+            vec![
+                SubagentDetail {
+                    name: plain.clone(),
+                    is_active: true,
+                    logs: plain_lines.clone(),
+                    ..Default::default()
+                },
+                SubagentDetail {
+                    name: twin.clone(),
+                    is_active: true,
+                    logs: twin_lines.clone(),
+                    ..Default::default()
+                },
+            ]
+        };
+        let scoped = |rows: &[SubagentDetail]| -> Vec<SubagentDetail> {
+            rows.iter()
+                .filter(|row| row.name == plain || row.name == twin)
+                .cloned()
+                .collect()
+        };
+        let line_count = |rows: &[SubagentDetail]| -> usize {
+            scoped(rows).iter().map(|row| row.logs.len()).sum()
+        };
+        assert_eq!(
+            line_count(&fixture()),
+            17,
+            "control: the read model the panel starts from carries 17 lines"
+        );
+
+        // (1) The suppressed run: a live plain sibling hides the `{base}#N` half.
+        let mut suppressed = fixture();
+        let _ = project_subagent_rows(&mut suppressed);
+        let suppressed = scoped(&suppressed);
+        assert_eq!(
+            suppressed.len(),
+            1,
+            "with a live plain sibling the twin is hidden"
+        );
+        assert_eq!(
+            suppressed[0].logs.len(),
+            17,
+            "the surviving row carries the whole panel, so the row the operator is reading \
+             can never go quiet because its twin was hidden"
+        );
+
+        // (2) The unsuppressed baseline of the **same fixture**, measured through the
+        // same projection: with the plain half no longer live the rule is inert, so the
+        // shipped one-row-per-entry shape is what the code returns.
+        drop(manager);
+        let mut baseline = fixture();
+        let _ = project_subagent_rows(&mut baseline);
+        let baseline = scoped(&baseline);
+        assert_eq!(
+            baseline.len(),
+            2,
+            "control: the same projection without the suppression still shows both rows"
+        );
+        assert!(
+            baseline
+                .iter()
+                .any(|row| row.name == twin && row.logs.len() == 1),
+            "and the hidden half really does carry its own line in the unsuppressed shape"
+        );
+
+        // The gate: same total, and the same lines, counted once.
+        assert_eq!(
+            suppressed.iter().map(|row| row.logs.len()).sum::<usize>(),
+            baseline.iter().map(|row| row.logs.len()).sum::<usize>(),
+            "the panel's total log line count is unchanged by the suppression"
+        );
+        let mut suppressed_lines: Vec<&str> = suppressed
+            .iter()
+            .flat_map(|row| row.logs.iter().map(String::as_str))
+            .collect();
+        let mut baseline_lines: Vec<&str> = baseline
+            .iter()
+            .flat_map(|row| row.logs.iter().map(String::as_str))
+            .collect();
+        suppressed_lines.sort_unstable();
+        baseline_lines.sort_unstable();
+        assert_eq!(
+            suppressed_lines, baseline_lines,
+            "line for line: nothing lost to the suppression, nothing invented by the fold"
+        );
+
+        drop(runner);
+        for key in [&plain, &twin] {
+            workers::remove_worker_entry_for_test(key);
+        }
     }
 
     /// The arbitration pause is a **row slot orthogonal to liveness**: it is set
@@ -1682,6 +2476,324 @@ mod tests {
                 .paused,
             "and the rebuild clears it"
         );
+
+        workers::remove_worker_entry_for_test(&key);
+    }
+
+    /// The `(Queued p/of)` label is a label the operator sees, so it belongs in the
+    /// tuple the pane's **only** change detector compares: every queue-only move —
+    /// `None -> Some`, a rank move, a depth move, `Some -> None` — must produce a
+    /// different signature, and only an unchanged queue state may produce the same
+    /// one. A detector blind to `queue` silently swallows a queue state that the
+    /// projection itself carries or rebuilds — and since fix #3 the projection really
+    /// does rebuild it, mirroring the rank off the registry entry, so a blind detector
+    /// would hide a self-heal from the pane.
+    #[test]
+    fn a_queue_only_change_is_visible_to_the_panes_change_detector() {
+        let rows = |state: Option<(usize, usize)>| {
+            vec![SubagentDetail {
+                name: "coder-t-9120".to_string(),
+                is_active: true,
+                queue: state.map(|(position, of)| crate::ui::QueueState { position, of }),
+                ..Default::default()
+            }]
+        };
+        let sig = |state: Option<(usize, usize)>| subagent_row_signature(&rows(state));
+
+        assert_eq!(
+            sig(None),
+            sig(None),
+            "an unchanged row is the one case that must not re-push"
+        );
+        assert_ne!(
+            sig(None),
+            sig(Some((1, 1))),
+            "None -> Some(QueueState{{position, of}}) arms the queued label"
+        );
+        assert_ne!(
+            sig(Some((1, 1))),
+            sig(Some((2, 2))),
+            "a rank the pool reports moves the label"
+        );
+        assert_ne!(
+            sig(Some((1, 1))),
+            sig(Some((1, 2))),
+            "so does the queue depth alone"
+        );
+        assert_ne!(
+            sig(Some((1, 2))),
+            sig(None),
+            "Some -> None (the `Running` edge) takes the label down"
+        );
+        // The queue component is what makes the difference: strip it and these row
+        // sets are byte-identical to the detector, which is exactly the blind spot.
+        let stripped = |state: Option<(usize, usize)>| {
+            subagent_row_signature(&rows(state))
+                .into_iter()
+                .map(|(name, is_active, paused, tokens, _queue)| (name, is_active, paused, tokens))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            stripped(None),
+            stripped(Some((1, 1))),
+            "the only component that tells these two apart is the queue"
+        );
+    }
+
+    /// **Registry owns row existence, and a live row's queue position is mirrored from
+    /// the registry.** A live entry that reports **no** rank deliberately writes nothing
+    /// over `row.queue`, so a position the delegation-event path folded onto the row
+    /// survives every re-projection — and the rebuild reports no change, because nothing
+    /// a viewer can see moved. Only the registry closing the row may take it down, and
+    /// that is a visible change. `WORKERS` is process-global, so the verdict is taken on
+    /// the detector's own tuple scoped to the key this test owns.
+    #[test]
+    fn a_live_rows_queue_position_survives_every_reprojection() {
+        use crate::orchestrator::workers;
+        let _workers = workers::TEST_WORKERS_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let guard = workers::register_active_worker(
+            Some("t-9121".to_string()),
+            "coder".to_string(),
+            "brief for a delegation waiting on a backend slot".to_string(),
+        );
+        let key = guard.0.clone();
+
+        // The detector's verdict is `before != after` over the whole row set; this
+        // scopes that same tuple to the row this test owns so a noisy registry cannot
+        // move it.
+        let mine = |rows: &[SubagentDetail]| -> Vec<RowSignature> {
+            subagent_row_signature(rows)
+                .into_iter()
+                .filter(|tuple| tuple.0 == key)
+                .collect()
+        };
+
+        let mut rows = vec![SubagentDetail {
+            name: key.clone(),
+            is_active: true,
+            queue: Some(crate::ui::QueueState { position: 1, of: 2 }),
+            ..Default::default()
+        }];
+        let before = mine(&rows);
+        let _ = project_subagent_rows(&mut rows);
+        let after = mine(&rows);
+        assert_eq!(
+            before, after,
+            "a re-projection of a still-live worker may neither erase its queue \
+             position nor claim the row moved"
+        );
+        let live = rows.iter().find(|r| r.name == key).expect("live row");
+        assert!(live.is_active, "the registry still holds the worker");
+        assert_eq!(
+            live.queue.map(|q| (q.position, q.of)),
+            Some((1, 2)),
+            "the queued label is exactly where the event path left it"
+        );
+
+        // The next position the pool reports folds onto the same row, and the
+        // detector now reports the move on the queue component alone — which is what
+        // makes a `set_subagents` push happen on the projection path too, not only on
+        // the drain path that folds the transition.
+        assert!(
+            update_subagent_queue(
+                &mut rows,
+                crate::agents::Agent::Coder,
+                Some("t-9121".to_string()),
+                Some(crate::ui::QueueState { position: 1, of: 1 }),
+            ),
+            "the row is addressed by its effective registry key"
+        );
+        let moved = mine(&rows);
+        assert_ne!(
+            after, moved,
+            "a queue-only move is a visible change to the pane"
+        );
+
+        // The guard drops: the registry closed the delegation, and only THAT may
+        // clear a position that would otherwise outlive its wait.
+        drop(guard);
+        let _ = project_subagent_rows(&mut rows);
+        let closed = rows.iter().find(|r| r.name == key).expect("closed row");
+        assert!(!closed.is_active, "the registry closed the row");
+        assert!(
+            closed.queue.is_none(),
+            "a queue position belongs to a live delegation and never outlives it"
+        );
+        assert_ne!(
+            moved,
+            mine(&rows),
+            "and the teardown is a visible change, not a silent one"
+        );
+
+        // The queue component carries a verdict **on its own**: with the registry
+        // already reporting this row closed, a position left behind by any other
+        // writer is the only thing that separates the two signatures below, and the
+        // pane has to be told about it instead of quietly keeping a `(Queued 1/1)`
+        // nobody handed it. While `queue` was outside the tuple this was an invisible
+        // change.
+        if let Some(stale) = rows.iter_mut().find(|r| r.name == key) {
+            stale.queue = Some(crate::ui::QueueState { position: 1, of: 1 });
+        }
+        let injected = mine(&rows);
+        let moved = project_subagent_rows(&mut rows);
+        assert!(
+            moved,
+            "the projection itself must report the queue-only difference, which is \
+             exactly what session::project_subagent_pane gates its set_subagents push on"
+        );
+        assert_ne!(
+            injected,
+            mine(&rows),
+            "a queue-only difference is a change the pane reports"
+        );
+        assert!(
+            rows.iter()
+                .find(|r| r.name == key)
+                .expect("the closed row is still projected")
+                .queue
+                .is_none(),
+            "and the rebuild takes the stale position down"
+        );
+
+        workers::remove_worker_entry_for_test(&key);
+    }
+
+    /// **The durability proof for fix #3.** A `Queued` transition that reaches the drain
+    /// while no row exists is consumed and never replayed — but the same pool report also
+    /// wrote that rank onto the **registry entry**, so the next projection must open the
+    /// row with `(Queued n/m)` already on it, repair a row that stale-ly reads "not
+    /// waiting", and still take the label down when the delegation closes. Everything runs
+    /// through the production writer (`set_worker_queue_position`, the function
+    /// `llm::client::ChatClient::acquire_slot` calls on a rank report) and the production
+    /// readers (`update_subagent_queue`, `project_subagent_rows`).
+    #[test]
+    fn a_dropped_queued_event_is_re_derived_from_the_registry_by_the_next_projection() {
+        use crate::orchestrator::workers;
+        let _workers = workers::TEST_WORKERS_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let guard = workers::register_active_worker(
+            Some("t-9131".to_string()),
+            "coder".to_string(),
+            "brief for a delegation waiting on a backend slot".to_string(),
+        );
+        let key = guard.0.clone();
+        let rank = crate::ui::QueueState { position: 2, of: 3 };
+        // `WORKERS` is process-global, so the change verdict is the detector's own tuple
+        // scoped to this key: a concurrent test's row may move, this one may not be.
+        let mine = |rows: &[SubagentDetail]| -> Vec<RowSignature> {
+            subagent_row_signature(rows)
+                .into_iter()
+                .filter(|tuple| tuple.0 == key)
+                .collect()
+        };
+        let queue_of = |rows: &[SubagentDetail]| {
+            rows.iter()
+                .find(|row| row.name == key)
+                .and_then(|row| row.queue)
+                .map(|q| (q.position, q.of))
+        };
+
+        // 1. One pool report: one one-shot event on the wire, one rank on the entry.
+        assert!(
+            workers::set_worker_queue_position(
+                "coder",
+                Some("t-9131"),
+                Some(crate::orchestrator::pool::QueuePosition { position: 2, of: 3 }),
+            ),
+            "the live entry of this delegation is addressable by agent + plan task"
+        );
+
+        // 2. The event is folded into a row set that has no row for it yet — the exact
+        //    hole fix #2 left a TODO for: the fold declines (rows belong to the
+        //    registry) and the drain consumes the event, so the panel can never learn
+        //    about this wait from the event stream again.
+        let mut rows: Vec<SubagentDetail> = Vec::new();
+        assert!(
+            !update_subagent_queue(
+                &mut rows,
+                crate::agents::Agent::Coder,
+                Some("t-9131".to_string()),
+                Some(rank),
+            ),
+            "the queue fold still never creates a row"
+        );
+        assert!(
+            rows.iter().all(|row| row.name != key),
+            "and the transition was dropped, not deferred"
+        );
+
+        // 3. The next projection re-derives the whole state from the registry alone.
+        assert!(
+            project_subagent_rows(&mut rows),
+            "a rank the event path never delivered is a visible change to the pane"
+        );
+        let row = rows
+            .iter()
+            .find(|row| row.name == key)
+            .expect("the projection opened the row");
+        assert!(row.is_active, "the registry still holds the delegation");
+        assert_eq!(
+            queue_of(&rows),
+            Some((2, 3)),
+            "and the row reads `(Queued 2/3)` with nothing but the registry to read it from"
+        );
+
+        // 4. The other half of the same hole: a row that exists but stale-ly reads "not
+        //    waiting" (a lost event, a hand-built row, a restore) is repaired rather than
+        //    left to mislead for the rest of the slot wait.
+        if let Some(stale) = rows.iter_mut().find(|row| row.name == key) {
+            stale.queue = None;
+        }
+        let stale = mine(&rows);
+        assert!(
+            project_subagent_rows(&mut rows),
+            "the repair is reported to the pane, not applied silently"
+        );
+        assert_ne!(stale, mine(&rows), "the detector sees the repaired label");
+        assert_eq!(queue_of(&rows), Some((2, 3)), "and the label is back");
+
+        // 5. The wait ends. `Running` writes the rank off the entry and folds `None`
+        //    onto the row; from then on a projection of an entry with no rank must not
+        //    re-raise the label — the pool retracts a wait, it does not re-report one.
+        assert!(workers::set_worker_queue_position(
+            "coder",
+            Some("t-9131"),
+            None
+        ));
+        assert!(
+            update_subagent_queue(
+                &mut rows,
+                crate::agents::Agent::Coder,
+                Some("t-9131".to_string()),
+                None,
+            ),
+            "the `Running` edge reaches the row that exists now"
+        );
+        assert_eq!(queue_of(&rows), None, "a running call is not queued");
+        let running = mine(&rows);
+        let _ = project_subagent_rows(&mut rows);
+        assert_eq!(
+            running,
+            mine(&rows),
+            "re-projecting a live entry that reports no rank changes nothing, and \
+             re-derives no phantom `(Queued 2/3)`"
+        );
+
+        // 6. The label never outlives the delegation: the guard drop is the teardown.
+        drop(guard);
+        assert!(
+            project_subagent_rows(&mut rows),
+            "closing a delegation that had been queued is a visible change"
+        );
+        let closed = rows
+            .iter()
+            .find(|row| row.name == key)
+            .expect("the closed row is still projected");
+        assert!(!closed.is_active, "the registry closed the row");
+        assert_eq!(queue_of(&rows), None, "and no queue state survives it");
 
         workers::remove_worker_entry_for_test(&key);
     }

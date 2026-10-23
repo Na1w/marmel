@@ -934,6 +934,12 @@ fn restored_worker_state(section: &WorkerSection) -> WorkerState {
         completed_at: section.completed.as_ref().map(TimePoint::to_instant),
         completed_wall: section.completed.as_ref().map(|point| point.wall),
         worker_id_seq_value: section.worker_id_seq_value,
+        // Queue state is **not** persisted and is deliberately not carried here: a
+        // queue rank belongs to a slot wait inside one process's pool, and a restored
+        // worker that queues again gets a fresh report from the pool (mirrored onto
+        // this entry by `set_worker_queue_position`), which is what the panel's
+        // projection re-reads. Nothing stale survives the round-trip.
+        queue_position: None,
     }
 }
 
@@ -1318,6 +1324,7 @@ mod tests {
             completed_at: None,
             completed_wall: None,
             worker_id_seq_value: 3,
+            queue_position: None,
         }
     }
 

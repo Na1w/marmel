@@ -469,7 +469,8 @@ fn set_subagents_adopts_authoritative_list() {
     }];
     r.set_subagents(authoritative);
 
-    // Local thinking/content preserved; logs adopted.
+    // Local thinking/content preserved, and so are the log lines: an authoritative push merges
+    // (`merge_logs`) instead of replacing, and a push that carries no log lines changes nothing.
     assert_eq!(r.subagents.len(), 1);
     assert_eq!(r.subagents[0].thinking, "local think");
     assert_eq!(r.subagents[0].content, "local content");
@@ -1227,6 +1228,617 @@ fn a_restored_row_never_shows_a_stale_queue_position() {
     assert!(
         !text.contains("Queued"),
         "no stale queue position may survive a restore, got:\n{text}"
+    );
+}
+
+/// Removes one registry entry when the guard goes out of scope, so a panicking assertion in a
+/// registry-touching test can never leave a live worker behind for the rest of the test binary
+/// (the table is process-global, and a leaked row shows up in every other suite's projection).
+struct EntryCleanup {
+    key: String,
+}
+
+impl Drop for EntryCleanup {
+    fn drop(&mut self) {
+        crate::orchestrator::workers::remove_worker_entry_for_test(&self.key);
+    }
+}
+
+/// Regression guard for fix #3 + fix #2 (`docs/diagnose_subpane_stale_refresh.md` §3):
+/// a queued row rebuilt **purely from the worker registry** — the pool's rank sits on the
+/// registry entry, and no `Queued` delegation event reaches the panel at all — must carry
+/// the whole pane, not just a row.
+///
+/// Three separate things used to go wrong here, and all three are asserted:
+/// * the projection wrote no `queue` field at all (`apply_registry_entry` ignored
+///   `WorkerEntry::queue_position`), so the row read `coder-… (Active)` while the pool kept
+///   the same delegation in line;
+/// * the pane's change detector ignored `queue`, so even a projection that *did* write it
+///   reported "no change" and the host was never handed the new row set;
+/// * the detail pane (thinking / output / logs) plus the slot-wait bar were never checked
+///   for a queued row at all — the queued detail-pane test asserted only the bottom bar.
+#[test]
+fn a_queued_rows_whole_pane_is_rebuilt_from_the_registry_alone() {
+    use crate::orchestrator::workers;
+    // Registration touches the process-global table other suites assert over.
+    let _workers = workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let worker = workers::register_active_worker(
+        Some("t-9511".to_string()),
+        "coder".to_string(),
+        "hold the line and wait for a backend slot".to_string(),
+    );
+    let key = worker.0.clone();
+    let _cleanup = EntryCleanup { key: key.clone() };
+
+    // The pool's rank, recorded where fix #3 records it: on the live registry entry.
+    assert!(
+        workers::set_active_worker_queue_position(
+            &key,
+            Some(crate::orchestrator::pool::QueuePosition { position: 2, of: 3 }),
+        ),
+        "a live entry must accept a pool rank"
+    );
+    assert_eq!(
+        workers::active_worker_queue_position(&key),
+        Some(crate::orchestrator::pool::QueuePosition { position: 2, of: 3 }),
+        "the rank the pool reported is readable on the entry a projection rebuilds from"
+    );
+
+    // The session loop's authoritative row buffer: the row was opened by an earlier
+    // projection and a lifecycle fold already put a log line on it. It carries **no queue
+    // state** — that is the state a dropped `Queued` event leaves behind.
+    let mut loop_rows = vec![SubagentDetail {
+        name: key.clone(),
+        task_id: Some("t-9511".to_string()),
+        logs: vec!["started task t-9511".to_string()],
+        is_active: true,
+        ..Default::default()
+    }];
+
+    // The pane itself already holds streamed text for that row.
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.show_thought = true;
+    r.subagents.push(SubagentDetail {
+        name: key.clone(),
+        task_id: Some("t-9511".to_string()),
+        thinking: "waiting for the permit, then patching the projection".to_string(),
+        content: "inspected three files".to_string(),
+        is_active: true,
+        ..Default::default()
+    });
+
+    // The loop's refresh edge, in the fixed order (fix #1: project, then drain). Only the
+    // projection runs here: no delegation event exists for this transition at all.
+    assert!(
+        crate::ui::helpers::project_subagent_rows(&mut loop_rows),
+        "a rank the registry newly reports is a change the host must be handed (fix #2 put \
+         `queue` in the row signature); the row set before the rebuild was {loop_rows:?}"
+    );
+    // The registry is process-global, so the projection legitimately sees other suites'
+    // entries; keep this delegation's row and address it by key.
+    loop_rows.retain(|row| row.name == key);
+    assert_eq!(
+        loop_rows
+            .iter()
+            .find(|row| row.name == key)
+            .expect("the live entry has a row after the rebuild")
+            .queue,
+        Some(crate::ui::QueueState { position: 2, of: 3 }),
+        "the projection re-derives the label from the entry (fix #3)"
+    );
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let before = rows.join("\n");
+    assert!(
+        before.contains(&format!("{key} (Active)")),
+        "the pane still reads the pre-projection row as a running row, got:\n{before}"
+    );
+
+    r.set_subagents(loop_rows.clone());
+    assert_eq!(
+        r.subagents.len(),
+        1,
+        "the panel holds exactly this delegation's row, got {:?}",
+        r.subagents
+            .iter()
+            .map(|row| row.name.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        r.subagents[0].queue,
+        Some(crate::ui::QueueState { position: 2, of: 3 }),
+        "the host's push must land on the row the panel is drawing"
+    );
+    assert_eq!(
+        r.subagents[0].logs,
+        vec!["started task t-9511".to_string()],
+        "the loop owns the log lines and hands them over with the row"
+    );
+
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+
+    // 1. the row label
+    assert!(
+        text.contains(&format!("{key} (Queued 2/3")),
+        "the row must read `(Queued 2/3 …)`, got:\n{text}"
+    );
+    assert!(
+        !text.contains(&format!("{key} (Active")),
+        "a queued delegation must not be drawn as holding its slot, got:\n{text}"
+    );
+
+    // 2. the detail pane is neither empty nor stale while the row is queued
+    assert!(
+        text.contains("[Thinking]") && text.contains("waiting for the permit"),
+        "the thinking half of the detail pane must survive the queued push, got:\n{text}"
+    );
+    assert!(
+        text.contains("[Output]") && text.contains("inspected three files"),
+        "the output half of the detail pane must survive the queued push, got:\n{text}"
+    );
+    assert!(
+        text.contains("[Logs]") && text.contains("started task t-9511"),
+        "the log half of the detail pane must survive the queued push, got:\n{text}"
+    );
+
+    // 3. the slot wait, spelled out on the row's own bar
+    const WAIT: &str = "[Status: Queued 2/3 - waiting for a backend slot...]";
+    assert!(
+        text.contains(WAIT),
+        "expected {WAIT:?} in the subagent status bar, got:\n{text}"
+    );
+    assert!(
+        !text.contains("waiting for model response") && !text.contains("[Thinking:"),
+        "a row waiting for a slot must not claim it is waiting on the model or streaming, \
+         got:\n{text}"
+    );
+
+    // The guard dropping is what closes the entry in production; `_cleanup` takes the entry
+    // out of the table for good, on this path and on a panicking one.
+    drop(worker);
+}
+
+/// Regression guard for the coverage gap the repro left open: a queued row is not a frozen
+/// row. Text keeps streaming into it between slot waits (the previous turn's tokens, a nested
+/// tool round), and the pane must show **both** the slot state and the new text — the label
+/// must never be traded for the content, and the content must never be traded for the label.
+#[test]
+fn a_queued_row_keeps_its_label_while_thinking_and_output_stream_into_it() {
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.show_thought = true;
+    r.subagents.push(queue_row(
+        "coder-t-1",
+        true,
+        Some(crate::ui::QueueState { position: 2, of: 4 }),
+    ));
+
+    // The lifecycle fold sets the row's active agent and its first log line, and must not
+    // disturb the queue state it says nothing about.
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Started {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-1".to_string()),
+        },
+    ));
+    assert_eq!(
+        r.subagents[0].queue,
+        Some(crate::ui::QueueState { position: 2, of: 4 }),
+        "a lifecycle fold never retracts a slot position"
+    );
+
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("coder-t-1 (Queued 2/4"),
+        "the queued label is on screen before any stream traffic, got:\n{text}"
+    );
+    assert!(
+        text.contains("[Logs]") && text.contains("started task t-1"),
+        "the lifecycle log line is on screen, got:\n{text}"
+    );
+    assert!(
+        !text.contains("[Thinking]"),
+        "nothing has streamed yet, got:\n{text}"
+    );
+
+    // Stream traffic for the very same row: reasoning, a tool call (log line), then output.
+    r.on_event(&Event::SubagentThinking {
+        agent_tag: "coder-t-1".to_string(),
+        text: "the permit is still behind two callers".to_string(),
+    });
+    r.on_event(&Event::ToolCall("read(src/ui/helpers.rs)".to_string()));
+    r.on_event(&Event::SubagentMessage {
+        agent_tag: "coder-t-1".to_string(),
+        text: "patched the signature".to_string(),
+    });
+
+    assert_eq!(
+        r.subagents[0].queue,
+        Some(crate::ui::QueueState { position: 2, of: 4 }),
+        "streamed text never clears the slot state"
+    );
+
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("coder-t-1 (Queued 2/4"),
+        "the queued label must survive streamed traffic, got:\n{text}"
+    );
+    assert!(
+        text.contains("[Thinking]") && text.contains("the permit is still behind two callers"),
+        "the newly streamed reasoning must be in the detail pane, got:\n{text}"
+    );
+    assert!(
+        text.contains("[Output]") && text.contains("patched the signature"),
+        "the newly streamed output must be in the detail pane, got:\n{text}"
+    );
+    assert!(
+        text.contains("[Logs]") && text.contains("read(src/ui/helpers.rs)"),
+        "the tool-call log line must be in the detail pane, got:\n{text}"
+    );
+    const WAIT: &str = "[Status: Queued 2/4 - waiting for a backend slot...]";
+    assert!(
+        text.contains(WAIT),
+        "the slot wait keeps the bottom bar while text streams into the row, got:\n{text}"
+    );
+    assert!(
+        !text.contains("[Thinking:"),
+        "a row waiting for a slot is not streaming thinking tokens, got:\n{text}"
+    );
+
+    // An authoritative push that carries no text (the loop folds lifecycle events only)
+    // must not wipe what the stream already put on the row.
+    r.set_subagents(vec![queue_row(
+        "coder-t-1",
+        true,
+        Some(crate::ui::QueueState { position: 2, of: 4 }),
+    )]);
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("the permit is still behind two callers")
+            && text.contains("patched the signature")
+            && text.contains("coder-t-1 (Queued 2/4"),
+        "a text-free push keeps both the pane text and the queued label, got:\n{text}"
+    );
+}
+
+// ---- the merge contract for `logs` (gap G10, closed with R1) ----
+
+/// G10/G1: `logs` now has ONE documented merge policy instead of four (the loop appends, the
+/// renderer dedupes consecutive duplicates, the projection never writes the field, and
+/// `set_subagents` used to replace it). An authoritative push — the ordinary cadence at HEAD:
+/// every delegation drain plus the 250 ms in-sink pump — must never duplicate the lifecycle
+/// line it carries nor take back a line the renderer streamed into the row.
+#[test]
+fn repeated_authoritative_pushes_never_duplicate_or_drop_a_log_line() {
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+
+    // The loop opens the row with its one lifecycle line.
+    r.set_subagents(vec![SubagentDetail {
+        name: "coder-t-9400".to_string(),
+        task_id: Some("t-9400".to_string()),
+        is_active: true,
+        logs: vec!["started task t-9400".to_string()],
+        ..Default::default()
+    }]);
+
+    // Live traffic: the renderer routes both sentences onto that row itself.
+    r.on_event(&Event::Status(
+        "coder-t-9400: thinking / calling model (gpt-6-x)...".to_string(),
+    ));
+    r.on_event(&Event::Status(
+        "coder-t-9400: calling backend (gpt-6-x) for t-9400".to_string(),
+    ));
+    let streamed = r.subagents[0].logs.clone();
+    assert_eq!(
+        streamed,
+        vec![
+            "started task t-9400".to_string(),
+            "thinking / calling model (gpt-6-x)...".to_string(),
+            "calling backend (gpt-6-x) for t-9400".to_string(),
+        ],
+        "control: the renderer appends the child's live traffic itself"
+    );
+
+    // The same row, re-projected with lifecycle content only, three times in a row.
+    for round in 0..3 {
+        r.set_subagents(vec![SubagentDetail {
+            name: "coder-t-9400".to_string(),
+            task_id: Some("t-9400".to_string()),
+            is_active: true,
+            logs: vec!["started task t-9400".to_string()],
+            ..Default::default()
+        }]);
+        assert_eq!(
+            r.subagents[0].logs, streamed,
+            "push #{round} must neither duplicate the lifecycle line nor erase a streamed line, \
+             got {:?}",
+            r.subagents[0].logs
+        );
+    }
+}
+
+/// G1/G2/G4: the push the report actually complained about, asserted at both tiers. A
+/// projection-shaped row carries **no** log channel at all (`helpers::apply_registry_entry`
+/// never writes `logs`; a fresh projected row is `logs: vec![]`), so a text-free re-push must
+/// leave the drawable log list alone — and must not trade the slot label for the content.
+#[test]
+fn a_push_carrying_no_log_lines_never_empties_a_row_that_has_them() {
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.show_thought = true;
+    r.subagents.push(SubagentDetail {
+        name: "coder-t-9401".to_string(),
+        is_active: true,
+        queue: Some(crate::ui::QueueState { position: 1, of: 2 }),
+        logs: vec![
+            "started task t-9401".to_string(),
+            "calling backend (gpt-6-x) for t-9401".to_string(),
+        ],
+        ..Default::default()
+    });
+
+    r.set_subagents(vec![queue_row(
+        "coder-t-9401",
+        true,
+        Some(crate::ui::QueueState { position: 1, of: 2 }),
+    )]);
+    assert_eq!(
+        r.subagents[0].logs,
+        vec![
+            "started task t-9401".to_string(),
+            "calling backend (gpt-6-x) for t-9401".to_string(),
+        ],
+        "a log-free push leaves the row's drawable log list alone"
+    );
+
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("[Logs]")
+            && text.contains("started task t-9401")
+            && text.contains("calling backend (gpt-6-x) for t-9401"),
+        "the log half of the detail pane is still drawn after the log-free push, got:\n{text}"
+    );
+    assert!(
+        text.contains("coder-t-9401 (Queued 1/2"),
+        "keeping the content never costs the queued label, got:\n{text}"
+    );
+}
+
+/// The merge rule in both directions, pinned at the seam itself: the loop stays authoritative
+/// when it genuinely knows more (this is what
+/// `a_queued_rows_whole_pane_is_rebuilt_from_the_registry_alone` depends on — a "renderer always
+/// wins" guard would break it), and a shorter lifecycle list can never take back streamed text.
+#[test]
+fn the_logs_merge_adopts_a_longer_loop_list_and_keeps_the_renderers_tail() {
+    // Loop knows more: its list is the base, in its own order, and the renderer's line is
+    // appended rather than dropped.
+    let merged = merge_logs(
+        &["thinking / calling model (gpt-6-x)...".to_string()],
+        &[
+            "started task t-9403".to_string(),
+            "completed task t-9403".to_string(),
+        ],
+    );
+    assert_eq!(
+        merged,
+        vec![
+            "started task t-9403".to_string(),
+            "completed task t-9403".to_string(),
+            "thinking / calling model (gpt-6-x)...".to_string(),
+        ],
+        "monotone adoption: the longer authoritative list leads, nothing is lost"
+    );
+
+    // Loop knows less: its one lifecycle line is already on the row, so the merge is a no-op.
+    let merged = merge_logs(
+        &[
+            "started task t-9403".to_string(),
+            "thinking / calling model (gpt-6-x)...".to_string(),
+        ],
+        &["started task t-9403".to_string()],
+    );
+    assert_eq!(
+        merged,
+        vec![
+            "started task t-9403".to_string(),
+            "thinking / calling model (gpt-6-x)...".to_string(),
+        ],
+        "a shorter authoritative list never erases streamed traffic"
+    );
+
+    // A row the renderer opened empty still adopts the loop's list verbatim.
+    let merged = merge_logs(&[], &["started task t-9403".to_string()]);
+    assert_eq!(merged, vec!["started task t-9403".to_string()]);
+
+    // And a lifecycle line the renderer never saw survives either way.
+    let merged = merge_logs(
+        &[
+            "started task t-9403".to_string(),
+            "calling backend (gpt-6-x) for t-9403".to_string(),
+            "read(src/ui/tui/mod.rs)".to_string(),
+        ],
+        &[
+            "started task t-9403".to_string(),
+            "completed task t-9403".to_string(),
+        ],
+    );
+    assert_eq!(
+        merged,
+        vec![
+            "started task t-9403".to_string(),
+            "calling backend (gpt-6-x) for t-9403".to_string(),
+            "read(src/ui/tui/mod.rs)".to_string(),
+            "completed task t-9403".to_string(),
+        ],
+        "the loop's closing lifecycle line is retained, the renderer's tail keeps its order"
+    );
+}
+
+/// The merge only ever adds lines, so the per-row cap is what bounds a long run. The detail
+/// pane is read from its tail, so the cap must drop the OLDEST lines.
+#[test]
+fn the_per_row_log_cap_keeps_the_newest_lines() {
+    let streamed: Vec<String> = (0..MAX_SUBAGENT_ROW_LOGS + 5)
+        .map(|n| format!("line {n}"))
+        .collect();
+    let incoming = vec!["started task t-9402".to_string()];
+
+    let merged = merge_logs(&streamed, &incoming);
+    assert_eq!(
+        merged.len(),
+        MAX_SUBAGENT_ROW_LOGS,
+        "a merged row never keeps more than the cap"
+    );
+    assert_eq!(
+        merged.last().map(String::as_str),
+        Some("started task t-9402"),
+        "the newest line always survives the cap"
+    );
+    let dropped = streamed.len() + incoming.len() - MAX_SUBAGENT_ROW_LOGS;
+    assert_eq!(
+        merged.first().map(String::as_str),
+        streamed.get(dropped).map(String::as_str),
+        "the cap drops exactly the oldest `dropped` lines"
+    );
+    assert!(
+        !merged.iter().any(|line| line == "line 0"),
+        "the oldest line is the first one gone"
+    );
+
+    // Repeated capped merges stay bounded instead of growing.
+    let mut row = merged;
+    for round in 0..5 {
+        row = merge_logs(
+            &row,
+            &[
+                "started task t-9402".to_string(),
+                format!("line cap+{round}"),
+            ],
+        );
+    }
+    assert_eq!(
+        row.len(),
+        MAX_SUBAGENT_ROW_LOGS,
+        "a capped row stays capped"
+    );
+    assert_eq!(
+        row.last().map(String::as_str),
+        Some("line cap+4"),
+        "the newest line of the last push is on the row"
+    );
+}
+
+/// Regression guard for fix #2: the label follows **every** queue edge. `Queued -> Running`
+/// (slot acquired) must take the label down, and a **re-queue** with a different rank must
+/// put it back with the new digits and no residue of the old ones — through both writers of
+/// that field: the loop's authoritative push and the delegation-event fold.
+#[test]
+fn a_re_queued_row_follows_every_rank_edge_in_its_label_and_its_bar() {
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.show_thought = true;
+
+    // Edge 1: queued 2/3, pushed authoritatively by the session loop.
+    r.set_subagents(vec![SubagentDetail {
+        name: "coder-t-1".to_string(),
+        is_active: true,
+        queue: Some(crate::ui::QueueState { position: 2, of: 3 }),
+        content: "first round of the delegation".to_string(),
+        logs: vec!["started task t-1".to_string()],
+        ..Default::default()
+    }]);
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("coder-t-1 (Queued 2/3")
+            && text.contains("[Status: Queued 2/3 - waiting for a backend slot...]"),
+        "a queued row is labelled and barred with its rank, got:\n{text}"
+    );
+
+    // Edge 2: slot acquired (`Some -> None`). A stale label would tell the operator the
+    // round is still stuck behind the cap.
+    r.set_subagents(vec![SubagentDetail {
+        name: "coder-t-1".to_string(),
+        is_active: true,
+        queue: None,
+        logs: vec!["started task t-1".to_string()],
+        ..Default::default()
+    }]);
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("coder-t-1 (Active"),
+        "the slot is held, so the row reads `(Active)` again, got:\n{text}"
+    );
+    assert!(
+        !text.contains("Queued"),
+        "no stale queue label may outlive the slot, got:\n{text}"
+    );
+    assert!(
+        text.contains("first round of the delegation"),
+        "the text-free re-push keeps the pane's content, got:\n{text}"
+    );
+
+    // Edge 3: re-queued at a new rank. The digits change and nothing else about the row does.
+    r.set_subagents(vec![SubagentDetail {
+        name: "coder-t-1".to_string(),
+        is_active: true,
+        queue: Some(crate::ui::QueueState { position: 1, of: 2 }),
+        logs: vec!["started task t-1".to_string()],
+        ..Default::default()
+    }]);
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("coder-t-1 (Queued 1/2")
+            && text.contains("[Status: Queued 1/2 - waiting for a backend slot...]"),
+        "a re-queued row shows its new rank, got:\n{text}"
+    );
+    assert!(
+        !text.contains("2/3"),
+        "no residue of the previous rank, got:\n{text}"
+    );
+
+    // The same three edges through the other writer: the delegation-event fold.
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Running {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-1".to_string()),
+        },
+    ));
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+    assert!(
+        !text.contains("Queued") && text.contains("coder-t-1 (Active"),
+        "the `Running` fold takes the label down, got:\n{text}"
+    );
+
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Queued {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-1".to_string()),
+            position: 3,
+            of: 5,
+        },
+    ));
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("coder-t-1 (Queued 3/5")
+            && text.contains("[Status: Queued 3/5 - waiting for a backend slot...]"),
+        "the `Queued` fold restores the label with the new rank, got:\n{text}"
+    );
+    assert!(
+        text.contains("first round of the delegation") && text.contains("[Logs]"),
+        "a queue edge never empties the detail pane, got:\n{text}"
     );
 }
 
@@ -2777,6 +3389,312 @@ fn a_collided_row_renders_from_its_registry_entry_and_the_label_says_what_it_is(
     for key in [&plain, &collided, &audit_key] {
         workers::remove_worker_entry_for_test(key);
     }
+}
+
+/// Panel-tier regression guard for the `Dup #N` suppression
+/// (`docs/investigation/dup_rows_root_cause.md` §7, gates 1/2/3): the **real**
+/// projection (`ui::helpers::project_subagent_rows`) and the **real** renderer are run
+/// end to end, so the user-visible half of the claim is pinned rather than inferred from
+/// the row vector.
+///
+/// The shape is the measured one: the Manager registers the delegation at dispatch
+/// (`src/orchestrator/mod.rs:302-307`) and the pane already follows that row; the runner
+/// then registers the **same identity** mid-flight
+/// (`src/agents/runner/execution.rs:302-307`) while the Manager guard is alive, so
+/// `claim_worker_slot` hands it `{base}#N`. That second edge used to open a permanent
+/// row with **0 log lines** and yank `selected_subagent_idx` onto it. Pinned here:
+/// * the re-registration opens **no** panel row (gate 1);
+/// * the selection stays on the row that has lines to draw (gate 3);
+/// * the panel's total log line count does not move, measured against the **unsuppressed
+///   baseline the same code produces** for the same panel (gate 2).
+#[test]
+fn the_runners_second_registration_opens_no_panel_row_and_never_steals_the_selection() {
+    use crate::orchestrator::workers;
+    // The projection enumerates the process-global registry, so it is serialized with the
+    // other suites that assert over that table.
+    let _workers = workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let manager = workers::register_active_worker(
+        Some("t-9530".to_string()),
+        "coder".to_string(),
+        "brief one".to_string(),
+    );
+    let plain = manager.0.clone();
+    let _cleanup_plain = EntryCleanup { key: plain.clone() };
+
+    // The loop's authoritative buffer as the shipped panel leaves it: all of the
+    // delegation's status traffic lands on the plain key (nothing on the status path
+    // spells a tag carrying a collision handle), so 16 lines live on one row.
+    let lines: Vec<String> = (0..16)
+        .map(|i| format!("thinking / calling model {i}"))
+        .collect();
+    let mut loop_rows = vec![SubagentDetail {
+        name: plain.clone(),
+        is_active: true,
+        logs: lines.clone(),
+        ..Default::default()
+    }];
+
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+
+    // Refresh edge #1 — project, then push, the order
+    // `project_then_drain_delegation_events` uses. One delegated task, one row, and the
+    // pane is following a row that has content.
+    let _ = crate::ui::helpers::project_subagent_rows(&mut loop_rows);
+    loop_rows.retain(|row| row.name == plain);
+    r.set_subagents(loop_rows.clone());
+    {
+        let ui = r.capture_ui();
+        assert_eq!(
+            ui.subagent_panels.len(),
+            1,
+            "one delegated task, one panel row"
+        );
+        assert_eq!(ui.subagent_panels[0].name, plain);
+        assert_eq!(
+            ui.view.selected_subagent_idx, 0,
+            "the pane follows the live row"
+        );
+        assert_eq!(
+            ui.subagent_panels[0].logs, lines,
+            "and that row carries its lines"
+        );
+    }
+    let lines_before = r
+        .capture_ui()
+        .subagent_panels
+        .iter()
+        .map(|p| p.logs.len())
+        .sum::<usize>();
+
+    // Refresh edge #2 — the runner re-registers the same identity while the Manager guard
+    // is still held, so the registry now also holds the `{base}#N` twin.
+    let runner = workers::register_active_worker(
+        Some("t-9530".to_string()),
+        "coder".to_string(),
+        "brief two".to_string(),
+    );
+    let twin = runner.0.clone();
+    let _cleanup_twin = EntryCleanup { key: twin.clone() };
+    assert!(
+        twin.contains('#'),
+        "the second registration took a collision key: {twin}"
+    );
+
+    let _ = crate::ui::helpers::project_subagent_rows(&mut loop_rows);
+    loop_rows.retain(|row| row.name == plain || row.name == twin);
+    r.set_subagents(loop_rows.clone());
+
+    let ui = r.capture_ui();
+    let names: Vec<&str> = ui.subagent_panels.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(
+        ui.subagent_panels.len(),
+        1,
+        "gate 1: one delegated task keeps exactly one panel row across the re-registration, \
+         got {names:?}"
+    );
+    assert!(
+        names.iter().all(|name| !name.contains('#')),
+        "no `{twin}` row ever reaches the panel, got {names:?}"
+    );
+    // Gate 3 — the selection steal: whatever the pane has selected must be a row with lines.
+    let selected = ui
+        .subagent_panels
+        .get(ui.view.selected_subagent_idx)
+        .unwrap_or_else(|| {
+            panic!(
+                "selection index {} names no drawn row: {names:?}",
+                ui.view.selected_subagent_idx
+            )
+        });
+    assert_eq!(
+        selected.name, plain,
+        "the selection still follows the delegated task's row"
+    );
+    assert!(
+        !selected.logs.is_empty(),
+        "and it lands on a row the panel has lines to draw for"
+    );
+    let lines_after = ui
+        .subagent_panels
+        .iter()
+        .map(|p| p.logs.len())
+        .sum::<usize>();
+    assert_eq!(
+        lines_after, lines_before,
+        "gate 2: the re-registration moved no log line ({lines_before} before, {lines_after} after)"
+    );
+
+    // What the operator sees: the live row is the marked list entry, and the drawn
+    // `[Logs]` block belongs to it.
+    let (rows, _) = draw_subagent_panel(&mut r, 120, 30);
+    let text = rows.join("\n");
+    assert!(
+        text.contains(&format!("> {plain}")),
+        "the delegated task's row is the selected list entry, got:\n{text}"
+    );
+    assert!(
+        text.contains("[Logs]") && text.contains("thinking / calling model 15"),
+        "the drawn detail pane shows the selected row's newest line, got:\n{text}"
+    );
+    assert!(
+        !text.contains(&twin),
+        "the phantom key {twin} is nowhere in the drawn panel, got:\n{text}"
+    );
+
+    // Gate 2 measured against the **unsuppressed baseline of this same panel**, produced
+    // by the production code rather than assumed: drop the plain half and the redundancy
+    // rule is inert, so the very same projection hands the panel BOTH rows — the shipped
+    // shape. The panel's total line count must be identical on both sides of the
+    // suppression edge, and the extra row must be the empty one.
+    drop(manager);
+    let _ = crate::ui::helpers::project_subagent_rows(&mut loop_rows);
+    loop_rows.retain(|row| row.name == plain || row.name == twin);
+    r.set_subagents(loop_rows.clone());
+    let ui = r.capture_ui();
+    let names: Vec<&str> = ui.subagent_panels.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(
+        ui.subagent_panels.len(),
+        2,
+        "control: without a live plain sibling the same projection does yield the phantom \
+         row too, got {names:?}"
+    );
+    assert_eq!(
+        ui.subagent_panels
+            .iter()
+            .map(|p| p.logs.len())
+            .sum::<usize>(),
+        lines_before,
+        "gate 2 measured against the unsuppressed baseline: suppressing the row is \
+         line-neutral, got {names:?}"
+    );
+    let phantom = ui
+        .subagent_panels
+        .iter()
+        .find(|p| p.name == twin)
+        .expect("the unsuppressed shape shows the twin");
+    assert!(
+        phantom.logs.is_empty() && phantom.is_active,
+        "witness: that unsuppressed row is a **live row with no lines at all** — the row the \
+         suppression removes"
+    );
+    assert_eq!(
+        ui.subagent_panels
+            .get(ui.view.selected_subagent_idx)
+            .map(|p| p.name.as_str()),
+        Some(twin.as_str()),
+        "witness: with no suppression the pane's selection really does jump onto that empty \
+         row — the reported symptom, pinned so a regression cannot quietly re-open it"
+    );
+
+    drop(runner);
+}
+
+/// The session-restore half of the accepted rule at the panel tier (gate 4): a lone
+/// `{base}#N` record — the truthful half of a restored pair, while its plain sibling came
+/// back as an `Interrupted by restart` shell
+/// (`docs/investigation/dup_rows_root_cause.md` §5) — must still be projected, must still
+/// be **drawn** with its journal history and its `Dup #N` badge, and the pane's selection
+/// must sit on that row. This is the control that keeps the suppression from degrading
+/// into "always prefer the plain key".
+#[test]
+fn a_restored_collision_row_is_still_drawn_with_its_history_and_its_badge() {
+    use crate::orchestrator::workers;
+    let _workers = workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // The restore seam verbatim: the record is installed under its stored key and never
+    // re-draws an id, and no plain half is registered for this task at all.
+    let restored_key = "coder-t-9531#88".to_string();
+    let started = std::time::Instant::now();
+    assert!(workers::install_restored_worker(
+        restored_key.clone(),
+        workers::WorkerState {
+            info: workers::ActiveWorkerInfo {
+                task_id: Some("t-9531".to_string()),
+                agent_name: "coder".to_string(),
+                prompt: "restored brief".to_string(),
+                started_at: started,
+                started_wall: chrono::Local::now(),
+                context_tokens: 2345,
+                implementation_turns: 4,
+                validation_rounds: 1,
+                latest_validator_feedback: None,
+                status: "Approved".to_string(),
+                cancel_token: None,
+            },
+            last_tokens: 2345,
+            completed_seq: Some(9531),
+            completed_at: Some(started),
+            completed_wall: Some(chrono::Local::now()),
+            worker_id_seq_value: 88,
+            queue_position: None,
+        }
+    ));
+    let _cleanup = EntryCleanup {
+        key: restored_key.clone(),
+    };
+
+    // The journaled pane the restore hands the loop: the history the plain half lost.
+    let history: Vec<String> = (1..=12).map(|i| format!("history line {i}")).collect();
+    let mut loop_rows = vec![SubagentDetail {
+        name: restored_key.clone(),
+        is_active: false,
+        logs: history.clone(),
+        ..Default::default()
+    }];
+
+    let _ = crate::ui::helpers::project_subagent_rows(&mut loop_rows);
+    loop_rows.retain(|row| row.name == restored_key);
+    assert_eq!(
+        loop_rows.len(),
+        1,
+        "a lone `{restored_key}` record keeps its row — the suppression is per-live-sibling, \
+         never \"always prefer the plain key\""
+    );
+    assert_eq!(
+        loop_rows[0].logs, history,
+        "with its full journaled history"
+    );
+
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.set_subagents(loop_rows.clone());
+    let ui = r.capture_ui();
+    let selected = ui
+        .subagent_panels
+        .get(ui.view.selected_subagent_idx)
+        .unwrap_or_else(|| {
+            panic!(
+                "selection index {} names no drawn row",
+                ui.view.selected_subagent_idx
+            )
+        });
+    assert_eq!(
+        selected.name, restored_key,
+        "the restored record is the selected row"
+    );
+    assert_eq!(
+        selected.logs, history,
+        "and the panel holds every history line"
+    );
+
+    let (rows, _) = draw_subagent_panel(&mut r, 120, 40);
+    let text = rows.join("\n");
+    assert!(
+        text.contains(&format!("> {restored_key}")),
+        "the restored collision row is drawn as the selected list entry, got:\n{text}"
+    );
+    assert!(
+        text.contains("Dup #88"),
+        "and its label still spells what it is, got:\n{text}"
+    );
+    assert!(
+        text.contains("[Logs]") && text.contains("history line 12"),
+        "with its history drawn for that row, got:\n{text}"
+    );
 }
 
 #[test]
@@ -5064,5 +5982,810 @@ fn the_hooks_are_object_safe_and_need_no_sync() {
     assert_eq!(
         moved.chat_messages,
         vec!["from the session thread".to_string()]
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Dedup / interleaved-push regression coverage driven through the REAL push path
+// (`Renderer::set_subagents` -> `merge_logs`), the way the session loop actually
+// hands rows over. The two unit tests above (`the_logs_merge_adopts_a_longer_loop
+// _list_and_keeps_the_renderers_tail`, `the_per_row_log_cap_keeps_the_newest_lines`)
+// pin the pure function; these pin the same contract as observed on a live
+// renderer across a push sequence, including the renderer's own appended lines.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// One authoritative row exactly as the session loop projects it: identity, liveness and
+/// the log lines the row carries — and nothing else (`helpers::apply_registry_entry` never
+/// writes `thinking`/`content`, and a projection-only push carries `logs: vec![]`).
+fn auth_row(name: &str, logs: &[&str]) -> SubagentDetail {
+    SubagentDetail {
+        name: name.to_string(),
+        is_active: true,
+        logs: logs.iter().map(|line| line.to_string()).collect(),
+        ..Default::default()
+    }
+}
+
+/// The detail pane draws every log line of the selected row as its own `- <line>` terminal
+/// row (render.rs, the `[Logs]` block), so counting the terminal rows that carry that
+/// prefix counts **drawable** occurrences — a duplicate merge product would show up here.
+fn drawn_occurrences(rows: &[String], line: &str) -> usize {
+    let needle = format!("- {line}");
+    rows.iter().filter(|row| row.contains(&needle)).count()
+}
+
+/// The terminal row on which that log line is drawn, `None` when it is not drawn at all.
+fn drawn_row_of(rows: &[String], line: &str) -> Option<usize> {
+    let needle = format!("- {line}");
+    rows.iter().position(|row| row.contains(&needle))
+}
+
+/// The shape the report actually described: the loop pushes log lines, a projection lands
+/// in the middle of the round carrying none, the renderer streams another line onto the row
+/// in between, and the loop then re-pushes its original lines. Through the real push path
+/// the row must end up with exactly the ordered union — no duplicate of the re-pushed
+/// prefix, no reorder, nothing dropped — and that must be what is drawn.
+#[test]
+fn an_interleaved_push_sequence_leaves_exactly_the_ordered_union_of_log_lines() {
+    const ROW: &str = "coder-t-9520";
+    const L1: &str = "started task t-9520";
+    const L2: &str = "read src/a.rs";
+    const L3: &str = "calling backend for t-9520";
+
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+
+    // Push A — the loop opens the row and carries [l1, l2].
+    r.set_subagents(vec![auth_row(ROW, &[L1, L2])]);
+    assert_eq!(
+        r.subagents[0].logs,
+        vec![L1.to_string(), L2.to_string()],
+        "control: the first push for a row the renderer never opened adopts the loop's list"
+    );
+
+    // Push B — the projection-only push. `helpers::apply_registry_entry` never writes the
+    // log field, so the row arrives with `logs: []`.
+    r.set_subagents(vec![auth_row(ROW, &[])]);
+    assert_eq!(
+        r.subagents[0].logs,
+        vec![L1.to_string(), L2.to_string()],
+        "a log-free push must leave the row's log list alone"
+    );
+
+    // Between B and C the renderer itself appends l3 by routing the child's traffic.
+    r.on_event(&Event::Status(format!("{ROW}: {L3}")));
+    assert_eq!(
+        r.subagents[0].logs,
+        vec![L1.to_string(), L2.to_string(), L3.to_string()],
+        "control: the renderer is the only writer of l3"
+    );
+
+    // Push C — the loop re-pushes its original [l1, l2] (another drain of the same entry).
+    r.set_subagents(vec![auth_row(ROW, &[L1, L2])]);
+    assert_eq!(
+        r.subagents[0].logs,
+        vec![L1.to_string(), L2.to_string(), L3.to_string()],
+        "the interleaved sequence must end on exactly [l1, l2, l3], got {:?}",
+        r.subagents[0].logs
+    );
+
+    // Draw tier: each line is on screen once, and in that order.
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+    assert!(
+        text.contains("[Logs]"),
+        "the log half of the pane must still be drawn, got:\n{text}"
+    );
+    for line in [L1, L2, L3] {
+        assert_eq!(
+            drawn_occurrences(&rows, line),
+            1,
+            "`{line}` must be drawable exactly once (no duplicate merge product), got:\n{text}"
+        );
+    }
+    let at1 = drawn_row_of(&rows, L1).expect("l1 is drawable");
+    let at2 = drawn_row_of(&rows, L2).expect("l2 is drawable");
+    let at3 = drawn_row_of(&rows, L3).expect("l3 is drawable");
+    assert!(
+        at1 < at2 && at2 < at3,
+        "the merged list must reach the pane in order l1, l2, l3, got rows {at1}, {at2}, {at3}"
+    );
+}
+
+/// The 250 ms in-sink pump re-pushes the *same* row vector over and over. Beyond "no
+/// duplicates" this pins idempotence of the whole merge: after the first push the log list
+/// is byte-identical, push after push, and the pane keeps drawing each line once.
+#[test]
+fn the_same_authoritative_row_pushed_five_times_leaves_the_log_list_byte_identical() {
+    const ROW: &str = "coder-t-9530";
+    const L1: &str = "started task t-9530";
+    const L2: &str = "patched src/a.rs";
+    const L3: &str = "read src/b.rs";
+
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.subagents.push(SubagentDetail {
+        name: ROW.to_string(),
+        is_active: true,
+        logs: vec![L1.to_string()],
+        ..Default::default()
+    });
+    // Live traffic the loop has never seen, so every push below is a merge against a row
+    // strictly longer than the loop's list.
+    r.on_event(&Event::Status(format!("{ROW}: {L2}")));
+    r.on_event(&Event::Status(format!("{ROW}: {L3}")));
+
+    let identical = vec![auth_row(ROW, &[L1])];
+    r.set_subagents(identical.clone());
+    let snapshot = r.subagents[0].logs.clone();
+    let snapshot_bytes = snapshot.join("\n").into_bytes();
+    assert_eq!(
+        snapshot.len(),
+        3,
+        "control: the row holds l1, l2, l3 after push 1"
+    );
+
+    for round in 2..=5 {
+        r.set_subagents(identical.clone());
+        assert_eq!(
+            r.subagents[0].logs.join("\n").into_bytes(),
+            snapshot_bytes,
+            "push #{round} of the identical row must leave the log list byte-identical, got {:?}",
+            r.subagents[0].logs
+        );
+        assert_eq!(
+            r.subagents[0].logs,
+            vec![L1.to_string(), L2.to_string(), L3.to_string()],
+            "push #{round} must not duplicate, drop or reorder a line"
+        );
+
+        let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+        let text = rows.join("\n");
+        for line in [L1, L2, L3] {
+            assert_eq!(
+                drawn_occurrences(&rows, line),
+                1,
+                "push #{round}: `{line}` must still be drawable exactly once, got:\n{text}"
+            );
+        }
+    }
+}
+
+/// The merge contract the `set_subagents_adopts_authoritative_list` comment states (a push
+/// merges instead of replacing) seen from the other side: when the loop genuinely knows
+/// more, its longer list is adopted as the base **without duplicating the prefix the row
+/// already carries**, and the renderer's own tail lines stay behind it.
+#[test]
+fn a_longer_incoming_list_sharing_a_prefix_is_adopted_without_duplicating_that_prefix() {
+    const ROW: &str = "coder-t-9540";
+    const P1: &str = "started task t-9540";
+    const P2: &str = "read src/a.rs";
+    const P3: &str = "read src/b.rs";
+    const P4: &str = "read src/c.rs";
+    const P5: &str = "read src/d.rs";
+    const TAIL: &str = "calling backend for t-9540";
+
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+
+    // The row as it stands mid-round: the loop's two lifecycle lines plus the renderer's
+    // own streamed tail.
+    r.set_subagents(vec![auth_row(ROW, &[P1, P2])]);
+    r.on_event(&Event::Status(format!("{ROW}: {TAIL}")));
+    assert_eq!(
+        r.subagents[0].logs,
+        vec![P1.to_string(), P2.to_string(), TAIL.to_string()],
+        "control: prefix + renderer tail before the longer push"
+    );
+
+    // A longer list sharing the [P1, P2] prefix: adopted, prefix counted once each, tail kept.
+    r.set_subagents(vec![auth_row(ROW, &[P1, P2, P3])]);
+    assert_eq!(
+        r.subagents[0].logs,
+        vec![
+            P1.to_string(),
+            P2.to_string(),
+            P3.to_string(),
+            TAIL.to_string(),
+        ],
+        "the shared prefix must not be duplicated by the adopted list, got {:?}",
+        r.subagents[0].logs
+    );
+
+    // And again with a still longer list: the whole prefix collapses, the tail survives.
+    r.set_subagents(vec![auth_row(ROW, &[P1, P2, P3, P4, P5])]);
+    assert_eq!(
+        r.subagents[0].logs,
+        vec![
+            P1.to_string(),
+            P2.to_string(),
+            P3.to_string(),
+            P4.to_string(),
+            P5.to_string(),
+            TAIL.to_string(),
+        ],
+        "adoption grows the row by the new lines only, the renderer tail stays last, got {:?}",
+        r.subagents[0].logs
+    );
+
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+    for line in [P1, P2, P3, P4, P5, TAIL] {
+        assert_eq!(
+            drawn_occurrences(&rows, line),
+            1,
+            "`{line}` must be drawable exactly once after prefix adoption, got:\n{text}"
+        );
+    }
+    let positions: Vec<usize> = [P1, P2, P3, P4, P5, TAIL]
+        .iter()
+        .map(|line| drawn_row_of(&rows, line).expect("the line is drawable"))
+        .collect();
+    assert_eq!(
+        positions,
+        {
+            let mut sorted = positions.clone();
+            sorted.sort();
+            sorted
+        },
+        "adopted prefix lines and the surviving tail must reach the pane in merge order, got {positions:?}"
+    );
+}
+
+/// Dedup is content-sensitive and order-stable. Pinned against the actual body of
+/// `merge_logs` (`src/ui/tui/mod.rs:496`), whose test is `merged.contains(line)` over the
+/// whole merged list — not a "previous line" test. Two consequences, in both directions:
+/// 1. A repeat that already sits **inside the winning base** is copied verbatim: two
+///    legitimate occurrences of the same text at different positions in the stream stay
+///    two separate lines. That is the shape the renderer itself creates, because its own
+///    append path only skips an *immediate* repeat (`logs.last()` guard on the
+///    `Event::Status` / `ToolCall` / `ToolResult` arms), so a tool call that legitimately
+///    recurs later in the stream is on the row twice.
+/// 2. A repeat carried by the **losing** side never manufactures a second copy: it
+///    collapses into the copy the base already holds. Lines the base lacks are appended in
+///    the losing list's own order, so nothing ever reorders.
+#[test]
+fn dedup_is_content_sensitive_and_order_stable_across_a_legitimately_repeating_line() {
+    const ROW: &str = "researcher-t-9550";
+    const R1: &str = "read src/a.rs";
+    const M1: &str = "patched src/b.rs";
+    const S1: &str = "started task t-9550";
+    const R3: &str = "read src/c.rs";
+
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+
+    r.set_subagents(vec![auth_row(ROW, &[R1])]);
+    r.on_event(&Event::Status(format!("{ROW}: {M1}")));
+    r.on_event(&Event::Status(format!("{ROW}: {R1}")));
+    assert_eq!(
+        r.subagents[0].logs,
+        vec![R1.to_string(), M1.to_string(), R1.to_string()],
+        "control: the renderer keeps two distinct occurrences of a legitimately repeating line"
+    );
+
+    // A projection-only push: the renderer's list is the base, so both occurrences of R1
+    // survive verbatim — content dedup never collapses a repeat that is already inside the
+    // winning base.
+    r.set_subagents(vec![auth_row(ROW, &[])]);
+    assert_eq!(
+        r.subagents[0].logs,
+        vec![R1.to_string(), M1.to_string(), R1.to_string()],
+        "a log-free push must not fold the two legitimate occurrences into one"
+    );
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+    assert_eq!(
+        drawn_occurrences(&rows, R1),
+        2,
+        "both occurrences of `{R1}` are drawable, on their own rows, got:\n{text}"
+    );
+    assert_eq!(drawn_occurrences(&rows, M1), 1, "got:\n{text}");
+
+    // Now the loop wins (its list is at least as long) and carries R1 once: its list is the
+    // base, the renderer's missing line is appended in its own order, and the renderer's
+    // second R1 collapses into the base's single copy instead of being appended again.
+    r.set_subagents(vec![auth_row(ROW, &[S1, R1, R3])]);
+    assert_eq!(
+        r.subagents[0].logs,
+        vec![
+            S1.to_string(),
+            R1.to_string(),
+            R3.to_string(),
+            M1.to_string()
+        ],
+        "the loop's list leads, the renderer's missing line follows in its own order, and no \
+         second copy of a text the base already holds is appended, got {:?}",
+        r.subagents[0].logs
+    );
+    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let text = rows.join("\n");
+    assert_eq!(
+        drawn_occurrences(&rows, R1),
+        1,
+        "the losing side's repeat collapsed into the base's copy, got:\n{text}"
+    );
+    let at = [S1, R1, R3, M1]
+        .iter()
+        .map(|line| drawn_row_of(&rows, line).expect("the line is drawable"))
+        .collect::<Vec<_>>();
+    assert!(
+        at.windows(2).all(|pair| pair[0] < pair[1]),
+        "the merge is order-stable in the pane ({at:?}), got:\n{text}"
+    );
+
+    // Idempotence of that content dedup: re-pushing the shorter list again changes nothing.
+    r.set_subagents(vec![auth_row(ROW, &[S1, R1, R3])]);
+    assert_eq!(
+        r.subagents[0].logs,
+        vec![
+            S1.to_string(),
+            R1.to_string(),
+            R3.to_string(),
+            M1.to_string()
+        ],
+        "re-pushing a list whose lines the row already carries is a no-op, got {:?}",
+        r.subagents[0].logs
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Per-row LOG-CAP coverage driven through the REAL push path: the session loop's pump
+// hands over the same authoritative row vector again and again
+// (`Renderer::set_subagents` -> `merge_logs`, src/ui/tui/mod.rs:1186 / :496) while the
+// renderer's own `Event::Status` routing streams a long-running worker's traffic onto
+// that row (src/ui/tui/mod.rs:776+). `the_per_row_log_cap_keeps_the_newest_lines`
+// above pins the cap inside the pure function only; the tests below pin what a worker
+// running for hours does on a live renderer: bounded at EVERY pump rather than only at
+// the end, newest lines kept in stream order, the cap binding per row, and the capped
+// list surviving an authoritative push whose log list is empty.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// A test terminal tall enough that the detail pane draws **every** retained log line
+/// of the selected row (cap + `=== Details … ===` + `[Logs]` = 202 lines), so the
+/// count of drawn log rows is the drawable log count rather than a scrolled window.
+const CAP_TALL: u16 = 240;
+
+/// The log lines the detail pane draws for the selected row, in draw order, as their
+/// position in the stream. Every line streamed by the tests below is spelled
+/// `<prefix><n>`, and the detail pane draws each retained log line as its own
+/// `- <line>` terminal row (render.rs, the `[Logs]` block) — so this counts drawable
+/// occurrences on the terminal, not model entries.
+fn drawn_line_numbers(rows: &[String], prefix: &str) -> Vec<usize> {
+    let needle = format!("- {prefix}");
+    rows.iter()
+        .filter_map(|row| {
+            let at = row.find(&needle)?;
+            let digits: String = row[at + needle.len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse::<usize>().ok()
+        })
+        .collect()
+}
+
+/// A worker that never stops streaming: the pump re-pushes the same authoritative row
+/// vector (log-free, the shape `helpers::apply_registry_entry` produces) after every
+/// chunk of status traffic, and the renderer routes each line onto the row. Past the cap
+/// the row must sit exactly AT it after every single pump — not merely at the end of the
+/// run — both in the model and on the terminal, and what it retains must be exactly the
+/// newest `MAX_SUBAGENT_ROW_LOGS` lines in stream order, with the oldest ones gone.
+#[test]
+fn a_long_running_worker_stays_at_the_per_row_log_cap_at_every_pump_and_keeps_the_newest_lines() {
+    const ROW: &str = "coder-t-9660";
+    const CHUNK: usize = 10;
+    const PUMPS: usize = 30; // 300 streamed lines, 100 past the cap
+    const MAX: usize = MAX_SUBAGENT_ROW_LOGS;
+
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.set_subagents(vec![auth_row(ROW, &[])]);
+    assert_eq!(r.subagents.len(), 1, "control: the pump opens the row");
+    assert!(
+        r.subagents[0].logs.is_empty(),
+        "control: a projection-only push carries no log lines of its own"
+    );
+
+    let mut streamed: Vec<String> = Vec::new();
+
+    for pump in 1..=PUMPS {
+        for k in 0..CHUNK {
+            let n = (pump - 1) * CHUNK + k;
+            r.on_event(&Event::Status(format!("{ROW}: line {n}")));
+            streamed.push(format!("line {n}"));
+            // The streaming arm has no cap of its own — only `merge_logs` trims — so
+            // between two pumps a row may sit above the cap by at most the traffic that
+            // arrived since the last pump, never by the whole run.
+            assert!(
+                r.subagents[0].logs.len() <= MAX + CHUNK,
+                "streamed line {n} (pump #{pump}): the row ran away to {} lines, more than \
+                 the cap of {MAX} plus one chunk of traffic",
+                r.subagents[0].logs.len()
+            );
+        }
+
+        // The same authoritative vector, handed over again.
+        r.set_subagents(vec![auth_row(ROW, &[])]);
+        let logs = r.subagents[0].logs.clone();
+        assert!(
+            logs.len() <= MAX,
+            "pump #{pump}: the row holds {} log lines after the push, above the cap of {MAX}",
+            logs.len()
+        );
+
+        let (rows, _) = draw_subagent_panel(&mut r, 100, CAP_TALL);
+        let drawn = drawn_line_numbers(&rows, "line ");
+        assert!(
+            drawn.len() <= MAX,
+            "pump #{pump}: the pane draws {} log lines after the push, above the cap of {MAX}",
+            drawn.len()
+        );
+
+        if streamed.len() > MAX {
+            let expected: Vec<String> = streamed[(streamed.len() - MAX)..].to_vec();
+            assert_eq!(
+                logs.len(),
+                MAX,
+                "pump #{pump}: once past the cap the row must sit exactly AT it, got {} lines",
+                logs.len()
+            );
+            assert_eq!(
+                logs, expected,
+                "pump #{pump}: past the cap the row must retain exactly the newest {MAX} lines \
+                 in their original stream order — no oldest survivor, no reorder — got {logs:?}"
+            );
+            assert!(
+                !logs.iter().any(|line| line == "line 0"),
+                "pump #{pump}: the oldest streamed line must be the first thing the cap drops"
+            );
+            let expected_drawn: Vec<usize> = ((streamed.len() - MAX)..streamed.len()).collect();
+            assert_eq!(
+                drawn, expected_drawn,
+                "pump #{pump}: the pane must draw exactly the newest {MAX} lines, in stream order"
+            );
+        } else {
+            assert_eq!(
+                logs.len(),
+                streamed.len(),
+                "pump #{pump}: below the cap nothing is dropped yet"
+            );
+            assert_eq!(
+                drawn.len(),
+                streamed.len(),
+                "pump #{pump}: below the cap every streamed line stays drawable"
+            );
+        }
+    }
+}
+
+/// The cap is per row, not per renderer. Two workers stream at the same time and
+/// asymmetrically — one ends 60 lines past the cap, the other 34 — and every pump
+/// carries BOTH rows in one vector. Neither row may spend the other's budget: each must
+/// sit exactly at the cap holding its own newest lines, and each must still show a full
+/// capped log when it is the selected row.
+#[test]
+fn the_per_row_log_cap_binds_each_row_on_its_own_stream() {
+    const A: &str = "coder-t-9670";
+    const B: &str = "researcher-t-9671";
+    const A_PER_PUMP: usize = 10;
+    const B_PER_PUMP: usize = 9;
+    const PUMPS: usize = 26; // A: 260 lines (cap+60), B: 234 lines (cap+34)
+    const MAX: usize = MAX_SUBAGENT_ROW_LOGS;
+
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.set_subagents(vec![auth_row(A, &[]), auth_row(B, &[])]);
+    assert_eq!(r.subagents.len(), 2, "control: both rows are open");
+
+    let mut a_stream: Vec<String> = Vec::new();
+    let mut b_stream: Vec<String> = Vec::new();
+    let capped_tail = |stream: &[String]| -> Vec<String> {
+        let keep = MAX.min(stream.len());
+        stream[(stream.len() - keep)..].to_vec()
+    };
+
+    for pump in 1..=PUMPS {
+        for k in 0..A_PER_PUMP.max(B_PER_PUMP) {
+            if k < A_PER_PUMP {
+                let n = (pump - 1) * A_PER_PUMP + k;
+                r.on_event(&Event::Status(format!("{A}: step {n}")));
+                a_stream.push(format!("step {n}"));
+            }
+            if k < B_PER_PUMP {
+                let n = (pump - 1) * B_PER_PUMP + k;
+                r.on_event(&Event::Status(format!("{B}: probe {n}")));
+                b_stream.push(format!("probe {n}"));
+            }
+        }
+
+        // Routing control: interleaved traffic never crosses rows, and each row's newest
+        // line is the line just streamed for it.
+        assert!(
+            r.subagents[0]
+                .logs
+                .iter()
+                .all(|line| line.starts_with("step ")),
+            "pump #{pump}: not one line of {B}'s stream may land on {A}'s row, got {:?}",
+            r.subagents[0].logs
+        );
+        assert!(
+            r.subagents[1]
+                .logs
+                .iter()
+                .all(|line| line.starts_with("probe ")),
+            "pump #{pump}: not one line of {A}'s stream may land on {B}'s row, got {:?}",
+            r.subagents[1].logs
+        );
+
+        r.set_subagents(vec![auth_row(A, &[]), auth_row(B, &[])]);
+        let a = r.subagents[0].logs.clone();
+        let b = r.subagents[1].logs.clone();
+
+        assert_eq!(
+            a,
+            capped_tail(&a_stream),
+            "pump #{pump}: row {A} must retain exactly its own newest lines, got {a:?}"
+        );
+        assert_eq!(
+            b,
+            capped_tail(&b_stream),
+            "pump #{pump}: row {B} must retain exactly its own newest lines — its budget is \
+             never spent by {A}'s stream — got {b:?}",
+        );
+        assert_eq!(
+            a.len() + b.len(),
+            capped_tail(&a_stream).len() + capped_tail(&b_stream).len(),
+            "pump #{pump}: the two rows are capped independently"
+        );
+
+        // Draw tier, for both rows, at every pump.
+        r.selected_subagent_idx = 0;
+        let (rows, _) = draw_subagent_panel(&mut r, 100, CAP_TALL);
+        let drawn_a = drawn_line_numbers(&rows, "step ");
+        assert_eq!(
+            drawn_a.len(),
+            capped_tail(&a_stream).len(),
+            "pump #{pump}: the pane draws exactly {A}'s retained log lines"
+        );
+        assert!(
+            drawn_line_numbers(&rows, "probe ").is_empty(),
+            "pump #{pump}: selecting {A} must never draw {B}'s log lines"
+        );
+
+        r.selected_subagent_idx = 1;
+        let (rows, _) = draw_subagent_panel(&mut r, 100, CAP_TALL);
+        let drawn_b = drawn_line_numbers(&rows, "probe ");
+        assert_eq!(
+            drawn_b.len(),
+            capped_tail(&b_stream).len(),
+            "pump #{pump}: the pane draws exactly {B}'s retained log lines"
+        );
+        assert!(
+            drawn_line_numbers(&rows, "step ").is_empty(),
+            "pump #{pump}: selecting {B} must never draw {A}'s log lines"
+        );
+    }
+
+    // Both workers ended past the cap; both sit exactly at it, neither starved.
+    assert_eq!(
+        r.subagents[0].logs.len(),
+        MAX,
+        "row {A} streamed {} lines and must end at the cap",
+        a_stream.len()
+    );
+    assert_eq!(
+        r.subagents[1].logs.len(),
+        MAX,
+        "row {B} streamed {} lines and must end at the cap",
+        b_stream.len()
+    );
+    assert_eq!(
+        r.subagents[0].logs.last().map(String::as_str),
+        a_stream.last().map(String::as_str),
+        "row {A} still ends on its own newest line"
+    );
+    assert_eq!(
+        r.subagents[1].logs.last().map(String::as_str),
+        b_stream.last().map(String::as_str),
+        "row {B} still ends on its own newest line"
+    );
+    assert!(
+        !r.subagents[0].logs.iter().any(|line| line == "step 0")
+            && !r.subagents[1].logs.iter().any(|line| line == "probe 0"),
+        "each row dropped its own oldest lines, not the other row's"
+    );
+}
+
+/// Cross-push stability: once a row is capped, an authoritative push carrying an EMPTY
+/// log list must not shrink or clear it. That is the ordinary shape of the pump (the
+/// registry projection never writes the log field), so a capped list that such a push
+/// truncated would throw away the operator's whole visible log between two chunks of
+/// traffic. Pushed repeatedly with no new traffic in between, the list must stay
+/// byte-identical — and fully drawable — push after push.
+#[test]
+fn an_empty_log_push_after_the_cap_neither_shrinks_nor_clears_the_capped_list() {
+    const ROW: &str = "coder-t-9680";
+    const STREAM: usize = MAX_SUBAGENT_ROW_LOGS + 40;
+    const MAX: usize = MAX_SUBAGENT_ROW_LOGS;
+
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.set_subagents(vec![auth_row(ROW, &[])]);
+    for n in 0..STREAM {
+        r.on_event(&Event::Status(format!("{ROW}: line {n}")));
+        if n % 10 == 9 {
+            r.set_subagents(vec![auth_row(ROW, &[])]);
+        }
+    }
+    r.set_subagents(vec![auth_row(ROW, &[])]);
+    assert_eq!(
+        r.subagents[0].logs.len(),
+        MAX,
+        "control: the row is capped before the empty pushes"
+    );
+    let capped = r.subagents[0].logs.clone();
+    let capped_bytes = capped.join("\n").into_bytes();
+
+    for push in 1..=5 {
+        r.set_subagents(vec![auth_row(ROW, &[])]);
+        assert_eq!(
+            r.subagents[0].logs.join("\n").into_bytes(),
+            capped_bytes,
+            "empty-log push #{push}: the capped list must stay byte-identical, got {:?}",
+            r.subagents[0].logs
+        );
+        assert_eq!(
+            r.subagents[0].logs.len(),
+            MAX,
+            "empty-log push #{push}: still exactly at the cap, never shrunk or cleared"
+        );
+        assert_eq!(
+            r.subagents[0].logs.first(),
+            capped.first(),
+            "empty-log push #{push}: the retained oldest line is unchanged"
+        );
+        assert_eq!(
+            r.subagents[0].logs.last(),
+            capped.last(),
+            "empty-log push #{push}: the newest line is unchanged"
+        );
+        let (rows, _) = draw_subagent_panel(&mut r, 100, CAP_TALL);
+        assert_eq!(
+            drawn_line_numbers(&rows, "line ").len(),
+            MAX,
+            "empty-log push #{push}: the whole capped list is still drawable"
+        );
+    }
+
+    // A push carrying a line the capped row already holds is just as harmless: the list
+    // neither grows past the cap nor reorders.
+    let newest = r.subagents[0]
+        .logs
+        .last()
+        .cloned()
+        .expect("a capped row has a last line");
+    r.set_subagents(vec![auth_row(ROW, &[newest.as_str()])]);
+    assert_eq!(
+        r.subagents[0].logs.join("\n").into_bytes(),
+        capped_bytes,
+        "re-pushing a line the capped row already holds must not grow or reorder it, got {:?}",
+        r.subagents[0].logs
+    );
+
+    // And the cap still holds once traffic resumes after those pushes.
+    for n in STREAM..(STREAM + 30) {
+        r.on_event(&Event::Status(format!("{ROW}: line {n}")));
+    }
+    r.set_subagents(vec![auth_row(ROW, &[])]);
+    assert_eq!(
+        r.subagents[0].logs.len(),
+        MAX,
+        "the row is back at the cap once traffic resumes"
+    );
+    assert_eq!(
+        r.subagents[0].logs.last().map(String::as_str),
+        Some(format!("line {}", STREAM + 29)).as_deref(),
+        "and it ends on the newest streamed line"
+    );
+}
+
+/// PINNED FINDING, not an endorsement — no production code was changed. The merge rule
+/// "the losing side's missing lines are appended" (`merge_logs`) meets the cap: a
+/// lifecycle line the loop's row still carries can be trimmed OUT of the row by the cap,
+/// and the very next pump appends it again — at the TAIL — so a line reappears long after
+/// it scrolled past, at the cost of one genuinely newer line. Bounded and deterministic,
+/// so the assertions below pin today's behaviour for review rather than change it.
+#[test]
+fn a_lifecycle_line_the_cap_has_already_trimmed_is_re_appended_at_the_tail_by_the_next_pump() {
+    const ROW: &str = "coder-t-9690";
+    const LIFECYCLE: &str = "started task t-9690";
+    const MAX: usize = MAX_SUBAGENT_ROW_LOGS;
+
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+
+    // The loop opens the row with the one lifecycle line its row carries.
+    r.set_subagents(vec![auth_row(ROW, &[LIFECYCLE])]);
+    assert_eq!(
+        r.subagents[0].logs,
+        vec![LIFECYCLE.to_string()],
+        "control: the first push adopts the loop's lifecycle line"
+    );
+
+    for n in 0..MAX {
+        r.on_event(&Event::Status(format!("{ROW}: line {n}")));
+    }
+    assert_eq!(
+        r.subagents[0].logs.len(),
+        MAX + 1,
+        "control: the streaming arm itself never trims"
+    );
+
+    // Pump 1: the lifecycle line is already on the row, so nothing is appended and the
+    // trim takes the oldest entry — the lifecycle line itself.
+    r.set_subagents(vec![auth_row(ROW, &[LIFECYCLE])]);
+    let after_first: Vec<String> = (0..MAX).map(|n| format!("line {n}")).collect();
+    assert_eq!(
+        r.subagents[0].logs, after_first,
+        "the trim drops the oldest entry, which here is the loop's own lifecycle line"
+    );
+
+    // Pump 2: the loop still carries that line and the row no longer holds it, so the
+    // merge appends it at the tail and a genuinely newer line pays for it.
+    r.set_subagents(vec![auth_row(ROW, &[LIFECYCLE])]);
+    assert_eq!(
+        r.subagents[0].logs.len(),
+        MAX,
+        "the row is still exactly at the cap"
+    );
+    assert_eq!(
+        r.subagents[0].logs.last().map(String::as_str),
+        Some(LIFECYCLE),
+        "the trimmed lifecycle line is re-appended at the TAIL by the next pump"
+    );
+    assert_eq!(
+        r.subagents[0].logs.first().map(String::as_str),
+        Some("line 1"),
+        "the line the cap drops is the oldest streamed one, not the re-appended stale line"
+    );
+
+    // From then on it behaves like any other line: it drifts forward through the stream
+    // and is only dropped when it reaches the front again.
+    r.on_event(&Event::Status(format!("{ROW}: line {MAX}")));
+    r.set_subagents(vec![auth_row(ROW, &[LIFECYCLE])]);
+    assert_eq!(r.subagents[0].logs.len(), MAX);
+    assert_eq!(
+        r.subagents[0].logs.first().map(String::as_str),
+        Some("line 2"),
+        "one more line is trimmed to make room"
+    );
+    assert_eq!(
+        r.subagents[0].logs.last().map(String::as_str),
+        Some("line 200"),
+        "the newest streamed line is still last"
+    );
+    let at = r.subagents[0]
+        .logs
+        .iter()
+        .position(|line| line == LIFECYCLE)
+        .expect("the re-appended lifecycle line is still on the row");
+    assert_eq!(
+        at,
+        MAX - 2,
+        "it now sits in the middle of the stream, between the traffic it displaced and the \
+         newest line"
+    );
+
+    let (rows, _) = draw_subagent_panel(&mut r, 100, CAP_TALL);
+    assert_eq!(
+        drawn_occurrences(&rows, LIFECYCLE),
+        1,
+        "the resurrected lifecycle line is drawn once, inside the capped window"
+    );
+    assert_eq!(
+        drawn_line_numbers(&rows, "line ").len(),
+        MAX - 1,
+        "the resurrected line costs one drawable line of real traffic"
     );
 }

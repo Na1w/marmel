@@ -738,6 +738,7 @@ async fn test_renderer_sink_handles_reset_command() {
     let client = ChatClient::new("http://localhost:11434/v1", "test".to_string());
     let stats = Arc::new(crate::harness::HarnessStats::new());
     let mut ctx = ContextEngine::new(4096);
+    let mut panel_rows = Vec::new();
 
     let mut sink = RendererSink {
         renderer: &mut renderer,
@@ -748,7 +749,7 @@ async fn test_renderer_sink_handles_reset_command() {
         client: &client,
         stats,
         goal: "goal",
-        subagents: &[],
+        subagents: &mut panel_rows,
         plan: Some(&plan),
         ctx: Some(&mut ctx),
         steering_history: None,
@@ -3919,4 +3920,100 @@ fn ac_c3_view_offsets_and_toggles_come_back_verbatim_when_the_clamp_has_room() {
         renderer.plan_scroll, 4,
         "the clamp must still be running in this process (plan_max_scroll = 4)"
     );
+}
+
+/// D7 (archive investigation): `archive_current_plan` takes **no arguments**, so
+/// every attempt used to share the one constant key `tool:archive_current_plan:{}`.
+/// Two premature refusals (a plan that genuinely still has open tasks) then spent
+/// the session's failure budget and the third call — the legitimate archive after
+/// the last task was ticked — was never dispatched at all
+/// (`"ERROR: failure budget exhausted …"`).
+///
+/// The key now carries the plan state the attempt was made against: identical
+/// attempts against an unchanged plan keep one identity (blind repetition still
+/// escalates), while an attempt against a **changed** plan state is a different
+/// unit of work and is dispatched.
+#[test]
+fn archive_failure_key_is_keyed_on_plan_state_not_a_constant_signature() {
+    use crate::manager::r#loop::FailureBudget;
+    use crate::manager::phase::Plan;
+    use crate::ui::session::{archive_attempt_state, archive_failure_key};
+
+    let dir = std::env::temp_dir().join(format!(
+        "marmel_d7_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let plan = Plan::at(&dir);
+
+    // No plan file at all.
+    let missing = archive_attempt_state(&plan);
+    // A plan with two open tasks — an archive call now is a genuine refusal.
+    plan.create("# Plan\n- [ ] [t-001] One\n- [ ] [t-002] Two\n")
+        .unwrap();
+    let open = archive_attempt_state(&plan);
+    let open_again = archive_attempt_state(&plan);
+    plan.check_off("t-001").unwrap();
+    let progressed = archive_attempt_state(&plan);
+    plan.check_off("t-002").unwrap();
+    let complete = archive_attempt_state(&plan);
+
+    assert_eq!(open, "pending2", "two open tasks are named");
+    assert_eq!(progressed, "pending1", "progress changes the state");
+    assert_eq!(complete, "complete", "a completed plan is its own state");
+    assert_ne!(missing, complete, "no plan and a complete plan differ");
+    assert_eq!(
+        open, open_again,
+        "the same unchanged plan state keeps one identity"
+    );
+
+    // Failure-budget behaviour at the archive seam: the two refusals against the
+    // open plan are spent, and the archive that becomes legitimate after
+    // completion is still dispatched.
+    let key_open = archive_failure_key(&open);
+    let key_done = archive_failure_key(&complete);
+    assert_ne!(key_open, key_done, "D7: the keys must differ");
+    assert!(
+        key_done.starts_with("tool:archive_current_plan:"),
+        "the label the operator sees is unchanged: {key_done}"
+    );
+
+    let mut budget = FailureBudget::new(2);
+    budget.record(&key_open);
+    budget.record(&key_open);
+    assert!(
+        !budget.retry_allowed(&key_open),
+        "repeating the identical refusal still escalates and is refused"
+    );
+    assert!(
+        budget.retry_allowed(&key_done),
+        "D7: a later legitimate archive against a changed plan state must still run"
+    );
+
+    // Non-vacuity: witness of the pre-fix key. Because `archive_current_plan`
+    // has no arguments, every attempt collapsed onto the constant signature
+    // `tool:archive_current_plan:{}`, so the two refusals above had already
+    // locked out the archive that became legitimate at completion.
+    let mut pre_fix = FailureBudget::new(2);
+    let constant = "tool:archive_current_plan:{}";
+    pre_fix.record(constant);
+    pre_fix.record(constant);
+    assert!(
+        !pre_fix.retry_allowed(constant),
+        "witness: the old constant key locked the correct archive out"
+    );
+
+    // Other tools keep the argument-signature identity untouched.
+    let other = crate::ui::session::failure_key_for(
+        crate::tool_names::TOOL_READ_FILE,
+        &serde_json::json!({"path": "nope"}),
+        None,
+    );
+    assert_eq!(other, "tool:read_file:{\"path\":\"nope\"}");
+
+    std::fs::remove_dir_all(&dir).ok();
 }

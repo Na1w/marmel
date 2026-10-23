@@ -228,14 +228,18 @@ static TASK_ID_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
 static TASK_ID_STRICT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^t-[A-Za-z0-9_-]+$").expect("valid strict task id regex"));
 
-/// Whole-document unchecked-box scan (`\[\s*\]|\(\s*\)`). Completion is a
-/// whole-document text property, not a task-line grammar concern.
+/// The **naive** whole-document unchecked-box scan (`\[\s*\]|\(\s*\)`), kept
+/// **only** as the witness of the pre-fix completion gate in the tests below.
+///
+/// It is deliberately not used by any production path: read over a whole document
+/// it matches `()` / `[]` sitting in **prose** — a plan that names
+/// `archive_plan()` or quotes a `[]` placeholder anywhere looked permanently
+/// incomplete while `pending_tasks()` reported nothing pending, so
+/// `Plan::archive()` refused forever. Completion is decided from the task-line
+/// grammar instead, see [`has_unchecked_box`] / [`has_checked_box`].
+#[cfg(test)]
 static UNCHECKED_BOX_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[\s*\]|\(\s*\)").expect("valid unchecked box regex"));
-
-/// Whole-document checked-box scan (`\[[xX]\]|\([xX]\)`).
-static CHECKED_BOX_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[[xX]\]|\([xX]\)").expect("valid checked box regex"));
 
 /// Decoration stripped from the front of a task id sitting after a checkbox:
 /// markdown bold/italic, brackets, parentheses, backticks and quotes.
@@ -627,24 +631,39 @@ pub fn line_matches_task_id(line: &str, task_id: &str) -> bool {
     false
 }
 
-/// `true` when the text contains an unchecked checkbox anywhere (plan
+/// `true` when the plan has at least one **open task checkbox** (plan
 /// completion check).
 ///
-/// Scanned line by line so a `- [ ]` template sitting **inside a fenced code
-/// block** cannot hold a plan open forever: a fence-only match would keep
-/// `has_unchecked_box == true` while every real task is ticked, so
-/// `Plan::is_complete` would never fire and the plan would never archive. `\s`
-/// inside a checkbox never matches a line break — no writer produces that.
+/// The decision comes from the single task-line grammar ([`parse_tasks`]), so
+/// only checkbox **syntax** counts. Two recorded false positives are closed by
+/// that (both made a real plan unarchivable):
+///
+/// * **prose** `()` / `[]` — a Context line naming `archive_plan()` or a task
+///   description quoting `[]` used to read as an open box (`\[\s*\]|\(\s*\)`
+///   scanned the whole document), so `Plan::is_complete` stayed `false` while
+///   `unchecked_task_ids` was empty and `Plan::archive()` refused forever;
+/// * a `- [ ] [t-xxx]` **template inside a fenced block** — skipped by
+///   [`parse_tasks`] through the fence-aware [`scannable_lines`], exactly as the
+///   pending-task readers skip it, so completion and "nothing pending" can no
+///   longer disagree.
+///
+/// A checkbox line that carries no task id still counts: it is an open checklist
+/// item the grammar can see but no id can tick, which is what [`pending_lines`]
+/// reports as well.
 #[must_use]
 pub fn has_unchecked_box(text: &str) -> bool {
-    scannable_lines(text).any(|(_, line)| UNCHECKED_BOX_RE.is_match(line))
+    parse_tasks(text).into_iter().any(|task| task.is_pending())
 }
 
-/// `true` when the text contains a checked checkbox anywhere (plan completion
-/// check). Fence-aware for the same reason as [`has_unchecked_box`].
+/// `true` when the plan has at least one **checked task checkbox** (plan
+/// completion check: something has actually been completed). Decided by the same
+/// task-line grammar as [`has_unchecked_box`], so the two predicates can never
+/// disagree about what a checkbox is.
 #[must_use]
 pub fn has_checked_box(text: &str) -> bool {
-    scannable_lines(text).any(|(_, line)| CHECKED_BOX_RE.is_match(line))
+    parse_tasks(text)
+        .into_iter()
+        .any(|task| task.is_completed())
 }
 
 /// Strip a leading list marker / blockquote / table gutter from a plan line for
@@ -2570,6 +2589,49 @@ The plan format is:
         assert!(has_checked_box("- [x] [t-001] a"));
         assert!(has_checked_box("- (X) (t-001) a"));
         assert!(!has_checked_box("- [ ] [t-001] a"));
+    }
+
+    /// D1 of the archive investigation: the completion gate reads **task-checkbox
+    /// syntax**, never prose.
+    ///
+    /// A plan that names a function (`archive_plan()`) or quotes a `[]`
+    /// placeholder — the house style of these plans — used to look permanently
+    /// open to the whole-document `\[\s*\]|\(\s*\)` scan, so `Plan::archive()`
+    /// refused forever while `unchecked_task_ids` reported nothing pending.
+    #[test]
+    fn prose_parens_and_brackets_are_never_open_checkboxes() {
+        let plan = "\
+# Execution Plan
+Context: `archive_plan()` calls `Plan::archive()` (see notes) and keeps [] placeholders.
+- [x] [t-001] Fix the gate () so prose is ignored
+- [x] [t-002] Prove [] prose never holds the plan open
+";
+        assert!(
+            !has_unchecked_box(plan),
+            "D1: prose `()` / `[]` must not read as an open box:\n{plan}"
+        );
+        assert!(has_checked_box(plan), "the ticked tasks still count");
+        assert!(unchecked_task_ids(plan).is_empty());
+
+        // Non-vacuity: the naive whole-document scan really does see that prose.
+        assert!(
+            UNCHECKED_BOX_RE.is_match(plan),
+            "witness: the pre-fix scan read prose as an open box"
+        );
+
+        // A box inside a task description is prose too — the head checkbox is the
+        // task's state, exactly as `parse_task_line` reads it.
+        assert!(!has_unchecked_box(
+            "- [x] [t-003] call f() and keep [] here"
+        ));
+        assert!(has_checked_box("- [x] [t-003] call f() and keep [] here"));
+
+        // Real open boxes still count, in every accepted spelling.
+        assert!(has_unchecked_box("- [ ] [t-004] a"));
+        assert!(has_unchecked_box("* [ ] t-004 a"));
+        assert!(has_unchecked_box("1. [ ] (t-004) a"));
+        assert!(has_unchecked_box("- [ ] no task id at all"));
+        assert!(!has_checked_box("- [ ] [t-004] a"));
     }
 
     // Cross-site agreement + on-disk regression guards.
