@@ -124,7 +124,11 @@ pub(crate) fn drain_steer_arbitration_events_with_transcript(
                 steer_queue.push(user_msg);
                 renderer.on_event(&Event::Status(arbiter::durable_steer_status(&reason)));
             }
-            SteerArbEvent::Finished { decision, user_msg } => {
+            SteerArbEvent::Finished {
+                decision,
+                user_msg,
+                forwarded,
+            } => {
                 if let Some(ref d) = decision {
                     // Never compare the raw `action` string: route every subtask through the
                     // orchestrator's single normalizer (see `super::action`).
@@ -143,21 +147,30 @@ pub(crate) fn drain_steer_arbitration_events_with_transcript(
                             st.agent_name.as_deref(),
                             Some(&st.tool_call_id),
                         );
-                        let target = match addressed.as_slice() {
-                            [] => st
-                                .agent_name
-                                .clone()
-                                .unwrap_or_else(|| st.tool_call_id.clone()),
-                            keys => keys.join(", "),
+                        // One status line per addressed **effective key**. Joining the keys
+                        // into a single label suggested one worker named `a, b` was cancelled,
+                        // and the `agent_name`-less fallback label was a token no registry
+                        // entry owns.
+                        let named: Vec<String> = if addressed.is_empty() {
+                            vec![
+                                st.agent_name
+                                    .as_deref()
+                                    .unwrap_or(&st.tool_call_id)
+                                    .to_string(),
+                            ]
+                        } else {
+                            addressed.clone()
                         };
                         let cancelled = crate::orchestrator::cancel_active_worker(
                             st.agent_name.as_deref(),
                             Some(&st.tool_call_id),
                         );
                         if cancelled {
-                            renderer.on_event(&Event::Status(format!(
-                                "[Arbitrator] Cancelled specialist subagent '{target}'"
-                            )));
+                            for key in &named {
+                                renderer.on_event(&Event::Status(format!(
+                                    "[Arbitrator] Cancelled specialist subagent '{key}'"
+                                )));
+                            }
                         }
                         if let Some(sub) = subagents.as_deref_mut() {
                             // Row state is never hand-written here: the rows are re-derived from
@@ -223,28 +236,27 @@ pub(crate) fn drain_steer_arbitration_events_with_transcript(
                             steer_queue.push(user_msg);
                         }
                         "ForwardToWorker" => {
-                            let target = decision
-                                .as_ref()
-                                .and_then(|d| {
-                                    action::first(Some(d), action::ACTION_FORWARD_NOTICE)
-                                        .map(action::notice_target)
-                                })
-                                .unwrap_or_else(|| "worker".to_string());
-                            let posted = arbiter::post_notice_observable(&target, &user_msg);
-                            let notice = posted.notice;
-                            renderer.on_event(&Event::Status(format!(
-                                "Notice {} forwarded to {} — waiting for specialist reply...",
-                                notice.notice_id, target
-                            )));
-                            if !posted.dropped_older.is_empty() {
-                                // Capacity backpressure is kept (drop-oldest at INBOX_CAPACITY)
-                                // but never silent: the dropped notice ids are surfaced.
-                                let drop_text =
-                                    arbiter::capacity_drop_text(&target, &posted.dropped_older);
-                                renderer
-                                    .on_event(&Event::Status(format!("[Arbitrator] {drop_text}")));
+                            // The arbitration round owns the posting (see
+                            // `arbiter::post_forward_notices`); this host only renders the
+                            // outcome it was handed. Rendering — not re-posting — is the
+                            // whole point: the second copy used to be filed under a `worker`
+                            // broadcast with the raw user text, so one steer left two pending
+                            // notices, and answering one left the phantom copy pending until
+                            // the TTL while a second reply came back `already-replied`.
+                            if forwarded.is_empty() {
+                                // Nothing reached a specialist. The instruction must still
+                                // survive, so it is queued for the next seam rather than lost.
+                                steer_queue.push(user_msg.clone());
+                                renderer.on_event(&Event::Status(
+                                    "No forwarding notice was posted for this steering \
+                                     instruction — queued for the next turn instead"
+                                        .to_string(),
+                                ));
+                            } else {
+                                renderer.on_event(&Event::Status(arbiter::forwarded_status(
+                                    &forwarded, false,
+                                )));
                             }
-                            steer_queue.push(user_msg);
                         }
                         "ApprovePlan" => {
                             steer_queue.push("User approved plan.".to_string());

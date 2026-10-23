@@ -29,6 +29,14 @@ pub const STEER_ARBITRATOR_SYSTEM_PROMPT: &str = include_str!("../../prompts/ste
 /// A per-subtask decision, matching caesar `SteerSubtaskDecision`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteerSubtaskDecision {
+    /// The arbitrator's handle for the target subagent. **Tolerant by design**: every
+    /// sibling field already carries `#[serde(default)]`, and a missing handle must not
+    /// make the *whole* decision unparseable — that silently degrades the steer to
+    /// `RespondDirectly` and no notice is ever posted. An empty handle is rejected where
+    /// it matters, by target resolution
+    /// ([`crate::ui::bridge::action::notice_targets`]), which refuses to file a notice
+    /// under a token no worker can drain and surfaces that refusal instead.
+    #[serde(default)]
     pub tool_call_id: String,
     /// Raw action string from the arbitrator. Canonicalized through
     /// [`SteerSubtaskAction`] / [`normalize_steer_subtask_action`] — the vocabulary is
@@ -278,36 +286,56 @@ where
         &raw
     };
 
-    let parsed_decision = if let Ok(mut decision) = serde_json::from_str::<SteerDecision>(json_text)
-    {
-        if decision.decision.eq_ignore_ascii_case("Sleep") && decision.sleep_seconds.is_none() {
-            // The fallback duration is the owner's constant, not a
-            // steer-local literal re-typed next to the extraction it pairs with.
-            decision.sleep_seconds = Some(crate::tool_args::SLEEP_DEFAULT_SECS);
+    let parsed_decision = match serde_json::from_str::<SteerDecision>(json_text) {
+        Ok(mut decision) => {
+            if decision.decision.eq_ignore_ascii_case("Sleep") && decision.sleep_seconds.is_none() {
+                // The fallback duration is the owner's constant, not a
+                // steer-local literal re-typed next to the extraction it pairs with.
+                decision.sleep_seconds = Some(crate::tool_args::SLEEP_DEFAULT_SECS);
+            }
+            Some(decision)
         }
-        Some(decision)
-    } else if let Some(tc) = reply
-        .tool_calls
-        .iter()
-        .find(|tc| crate::tool_names::is_sleep_tool_name(&tc.function.name))
-    {
-        Some(sleep_steer_decision(&tc.function.arguments))
-    } else if did_stream_response || !raw.is_empty() {
-        let resp = if !raw.is_empty() {
-            raw
-        } else {
-            raw_stream_accum
-        };
-        Some(SteerDecision {
-            decision: "RespondDirectly".to_string(),
-            response: Some(resp),
-            tier: None,
-            model: None,
-            subtasks: Vec::new(),
-            sleep_seconds: None,
-        })
-    } else {
-        None
+        Err(err) => {
+            // A decision that does not parse used to vanish: the round degraded into
+            // `RespondDirectly` and any `ForwardNotice` subtask inside it was never
+            // posted, with nothing recorded anywhere. The fallback is still the safe
+            // direction (an answer to the user beats a phantom action), but it is now
+            // logged and surfaced, so a lost notice is at least observable.
+            tracing::warn!(
+                error = %err,
+                decision_text = %crate::text_util::truncate_with_ellipsis(json_text, 400),
+                "Steer arbitrator decision did not parse — no subtask action from it can run; \
+                 falling back to a direct answer"
+            );
+            crate::orchestrator::emit_status(
+                "Steer arbitrator returned an unreadable decision — the instruction was NOT \
+                 forwarded to any specialist (see logs)"
+                    .to_string(),
+            );
+            if let Some(tc) = reply
+                .tool_calls
+                .iter()
+                .find(|tc| crate::tool_names::is_sleep_tool_name(&tc.function.name))
+            {
+                Some(sleep_steer_decision(&tc.function.arguments))
+            } else if did_stream_response || !raw.is_empty() {
+                let resp = if !raw.is_empty() {
+                    raw
+                } else {
+                    raw_stream_accum
+                };
+                Some(SteerDecision {
+                    decision: "RespondDirectly".to_string(),
+                    response: Some(resp),
+                    tier: None,
+                    model: None,
+                    subtasks: Vec::new(),
+                    sleep_seconds: None,
+                })
+            } else {
+                None
+            }
+        }
     };
 
     if let Some(decision) = parsed_decision {

@@ -303,6 +303,125 @@ pub(crate) fn capacity_drop_text(target: &str, dropped: &[SteerNotice]) -> Strin
     )
 }
 
+/// One `ForwardNotice` subtask that was carried out by the arbitration round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ForwardedNotice {
+    pub notice_id: String,
+    pub target: String,
+    /// Notices evicted oldest-first by the inbox capacity bound to make room for this one.
+    pub dropped_older: Vec<SteerNotice>,
+}
+
+/// What one `ForwardNotice` subtask produced: a posted notice per resolved target, or an
+/// explicit refusal to post (see [`super::action::notice_targets`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ForwardOutcome {
+    /// The notice was filed under this inbox key.
+    Posted(ForwardedNotice),
+    /// Nothing was filed: the arbitrator addressed a token no live worker drains. Filing it
+    /// anyway would create an inbox nobody reads and make the worker's later reply
+    /// `worker-mismatch`, so the refusal is what the host must surface.
+    Unroutable { token: String },
+}
+
+/// Post every `ForwardNotice` subtask of a `ForwardToWorker` decision **exactly once**.
+///
+/// This is the single posting owner for both bridge hosts. The old shape posted the
+/// arbitrator-rewritten inquiry here *and* the raw user text again in each host's
+/// `Finished` / `on_pause` arm (the raw copy under a `worker` broadcast default), so one
+/// steer produced two notices for the same decision plus a third delivery as a Manager
+/// turn: the worker answered one id, the phantom copy stayed pending until the TTL, and a
+/// second reply for the same steer came back `already-replied`. A host that receives the
+/// result of this function must render it, never post again.
+pub(crate) fn post_forward_notices(
+    decision: Option<&SteerDecision>,
+    user_msg: &str,
+) -> Vec<ForwardOutcome> {
+    let Some(d) = decision else {
+        return Vec::new();
+    };
+    if normalize_steer_decision(Some(&d.decision)) != "ForwardToWorker" {
+        return Vec::new();
+    }
+
+    let mut outcomes = Vec::new();
+    for (st, subtask_action) in action::routed(Some(d)) {
+        if subtask_action != action::ACTION_FORWARD_NOTICE {
+            continue;
+        }
+        // The arbitrator's rewritten inquiry is the instruction; the raw user text only as
+        // a fallback when the subtask carries none.
+        let inquiry = st.message.as_deref().unwrap_or(user_msg);
+        match action::notice_targets(st) {
+            action::NoticeTargeting::Addresses(targets) => {
+                for target in targets {
+                    let posted = post_notice_observable(&target, inquiry);
+                    outcomes.push(ForwardOutcome::Posted(ForwardedNotice {
+                        notice_id: posted.notice.notice_id,
+                        target,
+                        dropped_older: posted.dropped_older,
+                    }));
+                }
+            }
+            action::NoticeTargeting::Unroutable { token } => {
+                tracing::warn!(
+                    target_worker = %token,
+                    "Steer arbitrator addressed a ForwardNotice at a token no active worker \
+                     drains — nothing was posted (filing it would orphan the instruction and \
+                     make any later reply worker-mismatch)"
+                );
+                outcomes.push(ForwardOutcome::Unroutable { token });
+            }
+        }
+    }
+    outcomes
+}
+
+/// The ids actually filed, as the steering-history / status consumers need them.
+pub(crate) fn posted_notices(outcomes: &[ForwardOutcome]) -> Vec<(String, String)> {
+    outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            ForwardOutcome::Posted(posted) => {
+                Some((posted.notice_id.clone(), posted.target.clone()))
+            }
+            ForwardOutcome::Unroutable { .. } => None,
+        })
+        .collect()
+}
+
+/// The tokens whose notice was refused.
+pub(crate) fn unroutable_targets(outcomes: &[ForwardOutcome]) -> Vec<String> {
+    outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            ForwardOutcome::Unroutable { token } => Some(token.clone()),
+            ForwardOutcome::Posted { .. } => None,
+        })
+        .collect()
+}
+
+/// One visible line per posted notice, worded identically in both hosts.
+pub(crate) fn forwarded_status(forwarded: &[(String, String)], resuming: bool) -> String {
+    let ids: Vec<String> = forwarded
+        .iter()
+        .map(|(notice_id, target)| format!("{notice_id} → {target}"))
+        .collect();
+    format!(
+        "Notice(s) {} forwarded — waiting for specialist reply{}...",
+        ids.join(", "),
+        if resuming { " — resuming stream" } else { "" }
+    )
+}
+
+/// One visible line per refused target, worded identically in both hosts.
+pub(crate) fn unroutable_target_text(token: &str) -> String {
+    format!(
+        "notice NOT forwarded: no active specialist is addressed by '{token}' — the \
+         instruction was not filed into an inbox no worker drains"
+    )
+}
+
 /// The notice appended to the user instruction on every round after the arbitrator slept.
 ///
 /// Single source of truth for this wording — both bridge hosts build their round > 1 payload
@@ -641,15 +760,26 @@ pub(crate) async fn run_delegated_subtask(
     }
 }
 
+/// Prefixes `text` with the arbitrator's own note when it has one.
+fn with_prefix(note: Option<&str>, text: &str) -> String {
+    match note.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(note) => format!("{note} — {text}"),
+        None => text.to_string(),
+    }
+}
+
 /// The entry recorded in the steering history for a finished arbitration.
 ///
 /// `synthesized` is the synthesized answer of delegated subtasks (only the spawned arbitrator
-/// produces one) and `forwarded` the notices forwarded to workers in posting order (only the
-/// spawned arbitrator forwards them — the sink does that in its own decision handling).
+/// produces one) and `forwarded` the notices posted for this decision in posting order — posted
+/// by the single posting owner ([`post_forward_notices`]) and reported to the drain host through
+/// the `Finished` event, so both hosts record the same thing. `unroutable` names the targets
+/// that could not be resolved to a live worker.
 pub(crate) fn recorded_response(
     decision: Option<&SteerDecision>,
     synthesized: Option<&str>,
     forwarded: &[(String, String)],
+    unroutable: &[String],
 ) -> String {
     if let Some(answer) = synthesized {
         return answer.to_string();
@@ -657,23 +787,51 @@ pub(crate) fn recorded_response(
     let Some(d) = decision else {
         return "No decision".to_string();
     };
-    if let Some(response) = d.response.as_ref() {
-        return response.clone();
-    }
     match normalize_steer_decision(Some(&d.decision)) {
+        // **One notice per `ForwardNotice` subtask, and the entry names those ids.** The
+        // reply correlation in `orchestrator::bus` looks an entry up by the notice id the
+        // specialist echoes back, so an entry that names nothing can never be resolved by a
+        // reply: it would sit "awaiting specialist reply" until the 10-minute TTL while the
+        // worker's real answer got appended as a second entry. The arbitrator's own note to
+        // the user is kept in front of it.
+        "ForwardToWorker" if !forwarded.is_empty() => {
+            let pending = forwarded
+                .iter()
+                .map(|(notice_id, target)| {
+                    format!("Forwarded notice {notice_id} to {target} (awaiting specialist reply)")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            with_prefix(d.response.as_deref(), &pending)
+        }
+        // Nothing was filed. Claiming "awaiting specialist reply" here would leave a history
+        // entry waiting for a reply that can never come, so the recorded text says what
+        // actually happened.
+        "ForwardToWorker" if !unroutable.is_empty() => with_prefix(
+            d.response.as_deref(),
+            &format!(
+                "notice not forwarded: {} (nothing is awaiting a specialist reply)",
+                unroutable
+                    .iter()
+                    .map(|token| format!("no active specialist is addressed by '{token}'"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        ),
+        "ForwardToWorker" => with_prefix(
+            d.response.as_deref(),
+            "ForwardToWorker decision carried no forwarded notice (nothing is awaiting a \
+             specialist reply)",
+        ),
         // The wording must describe the sleep that was actually taken, so it
         // goes through the same floor/ceiling the loop slept with.
-        "Sleep" => format!("Slept for {}s", clamped_sleep_secs(d.sleep_seconds)),
-        // `forwarded` is only ever populated for a `ForwardToWorker` decision.
-        "ForwardToWorker" if !forwarded.is_empty() => forwarded
-            .iter()
-            .map(|(notice_id, target)| {
-                format!("Forwarded notice {notice_id} to {target} (awaiting specialist reply)")
-            })
-            .collect::<Vec<_>>()
-            .join(", "),
-        "ForwardToWorker" => "Forwarded notice to worker (awaiting specialist reply)".to_string(),
-        _ => format!("Decision: {}", d.decision),
+        "Sleep" if d.response.is_none() => {
+            format!("Slept for {}s", clamped_sleep_secs(d.sleep_seconds))
+        }
+        _ => d
+            .response
+            .clone()
+            .unwrap_or_else(|| format!("Decision: {}", d.decision)),
     }
 }
 
@@ -926,7 +1084,7 @@ mod tests {
             sleep_seconds: Some(0),
         };
         assert_eq!(
-            recorded_response(Some(&no_response), None, &[]),
+            recorded_response(Some(&no_response), None, &[], &[]),
             format!("Slept for {SLEEP_MIN_SECS}s")
         );
         let missing = SteerDecision {
@@ -938,7 +1096,7 @@ mod tests {
             sleep_seconds: None,
         };
         assert_eq!(
-            recorded_response(Some(&missing), None, &[]),
+            recorded_response(Some(&missing), None, &[], &[]),
             format!("Slept for {SLEEP_DEFAULT_SECS}s")
         );
     }

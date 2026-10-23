@@ -158,6 +158,43 @@ fn exact_notice_id_updates_the_recorded_entry_in_place() {
     );
 }
 
+/// The pending entry a real `ForwardNotice` steer records is addressed to the
+/// **effective worker key** (`coder-t-0520`), not to a bare role name — that key is
+/// what the notice was filed under, and the reply that resolves the dialogue is
+/// attributed to the same key. One steer must therefore stay one entry, and the
+/// addressed worker's reply must clear it: afterwards no entry in the history may
+/// still sit `awaiting specialist reply` (the stale-pending symptom of a duplicated
+/// or unroutable notice).
+#[test]
+fn a_worker_key_addressed_pending_entry_is_cleared_by_the_reply() {
+    let _guard = lock_history_bus();
+    let worker_key = "coder-t-0520";
+    let history = install_history_with(&[(
+        "ask the coder why it chose SQLite",
+        &pending("notice-520", worker_key),
+    )]);
+
+    record_steering_exchange(
+        Some("notice-520"),
+        "ask the coder why it chose SQLite",
+        "SQLite was chosen for transactional integrity.\n[Specialist coder]: WAL mode is on.",
+    );
+
+    let hist = snapshot(&history);
+    assert_eq!(hist.len(), 1, "one steer, one entry: {hist:?}");
+    assert_eq!(hist[0].0, "ask the coder why it chose SQLite");
+    assert!(
+        hist[0].1.contains("[Specialist coder]:"),
+        "the reply replaces the pending marker: {:?}",
+        hist[0].1
+    );
+    assert!(
+        hist.iter()
+            .all(|(_q, resp)| !resp.contains("awaiting specialist reply")),
+        "nothing may stay pending once the addressed worker has replied: {hist:?}"
+    );
+}
+
 /// The prose inquiry is a legitimate lookup key, but only as a *whole string*
 /// (documented normalization: trim + ASCII case-fold). A prefix of a recorded
 /// inquiry must never suppress the incoming entry.

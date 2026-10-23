@@ -530,7 +530,7 @@ const WORKER_KEY_DISAMBIGUATOR: char = '#';
 const WORKER_KEY_SEGMENT: char = '-';
 
 /// Addresses that every worker drains (broadcast steering).
-const BROADCAST_TARGETS: [&str; 2] = ["*", "worker"];
+pub(crate) const BROADCAST_TARGETS: [&str; 2] = ["*", "worker"];
 
 /// The exact routing identity of one worker, resolved from its registry key.
 ///

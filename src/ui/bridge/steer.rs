@@ -4,7 +4,6 @@
 //! [`super::arbiter`]; this module is the adapter that feeds it the spawned-task inputs and
 //! surfaces its progress as [`SteerArbEvent`]s.
 
-use super::action;
 use super::arbiter::{self, ArbitrationChannel, SleepNotice};
 use crate::llm::ChatClient;
 use crate::ui::{Event, Renderer, SubagentDetail};
@@ -35,6 +34,11 @@ pub enum SteerArbEvent {
     Finished {
         decision: Option<crate::orchestrator::SteerDecision>,
         user_msg: String,
+        /// The notices this arbitration already posted, as `(notice_id, target)` in posting
+        /// order. The host renders them; it must never post again for the same decision.
+        /// Empty means nothing was filed — either the decision carried no `ForwardNotice`
+        /// subtask, or every target was refused as unroutable.
+        forwarded: Vec<(String, String)>,
     },
 }
 
@@ -172,35 +176,42 @@ pub fn spawn_steer_arbitration(
             }
         }
 
-        let mut forwarded_notices = Vec::new();
-        if let Some(ref d) = decision
-            && crate::orchestrator::normalize_steer_decision(Some(&d.decision)) == "ForwardToWorker"
-        {
-            for (st, subtask_action) in action::routed(Some(d)) {
-                if subtask_action != action::ACTION_FORWARD_NOTICE {
-                    continue;
+        // **One notice per `ForwardNotice` subtask, posted once, here.** This host is the
+        // owner for the spawned-task path; the drain host only renders what comes back in
+        // `Finished::forwarded`. Posting again downstream is what used to file the raw user
+        // text as a second (broadcast) notice for the same decision.
+        let outcomes = arbiter::post_forward_notices(decision.as_ref(), &msg);
+        for outcome in &outcomes {
+            match outcome {
+                arbiter::ForwardOutcome::Posted(posted) => {
+                    let _ = tx.send(SteerArbEvent::Delta(format!(
+                        "\n[Arbitrator]: Forwarded notice {} to {} — awaiting specialist reply.\n",
+                        posted.notice_id, posted.target
+                    )));
+                    if !posted.dropped_older.is_empty() {
+                        // Inbox backpressure stays (drop-oldest at INBOX_CAPACITY) but is surfaced
+                        // instead of silently losing steering instructions.
+                        let drop_text =
+                            arbiter::capacity_drop_text(&posted.target, &posted.dropped_older);
+                        let _ =
+                            tx.send(SteerArbEvent::Delta(format!("[Arbitrator]: {drop_text}\n")));
+                    }
                 }
-                let target = action::notice_target(st);
-                let msg_to_send = st.message.as_deref().unwrap_or(&msg);
-                let posted = arbiter::post_notice_observable(&target, msg_to_send);
-                let _ = tx.send(SteerArbEvent::Delta(format!(
-                    "\n[Arbitrator]: Forwarded notice {} to {} — awaiting specialist reply.\n",
-                    posted.notice.notice_id, target
-                )));
-                if !posted.dropped_older.is_empty() {
-                    // Inbox backpressure stays (drop-oldest at INBOX_CAPACITY) but is surfaced
-                    // instead of silently losing steering instructions.
-                    let drop_text = arbiter::capacity_drop_text(&target, &posted.dropped_older);
-                    let _ = tx.send(SteerArbEvent::Delta(format!("[Arbitrator]: {drop_text}\n")));
+                arbiter::ForwardOutcome::Unroutable { token } => {
+                    // Never filed into an inbox nobody drains: the failure is told to the user.
+                    let text = arbiter::unroutable_target_text(token);
+                    let _ = tx.send(SteerArbEvent::Delta(format!("\n[Arbitrator]: {text}\n")));
                 }
-                forwarded_notices.push((posted.notice.notice_id, target.clone()));
             }
         }
+        let forwarded_notices = arbiter::posted_notices(&outcomes);
+        let unroutable = arbiter::unroutable_targets(&outcomes);
 
         let recorded_resp = arbiter::recorded_response(
             decision.as_ref(),
             synthesized_answer_opt.as_deref(),
             &forwarded_notices,
+            &unroutable,
         );
 
         if let Some(ref hist_lock) = steering_history
@@ -212,6 +223,7 @@ pub fn spawn_steer_arbitration(
         let _ = tx.send(SteerArbEvent::Finished {
             decision,
             user_msg: msg,
+            forwarded: forwarded_notices,
         });
     })
 }

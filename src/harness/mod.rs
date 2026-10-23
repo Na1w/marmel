@@ -713,18 +713,26 @@ async fn dispatch_specialist_async(
     }
 }
 
-/// The worker identity a specialist reply is attributed to: the caller's role name,
-/// judged in both directions by [`crate::orchestrator::notice_addresses_worker`]
-/// against either spelling of that worker — the `ActiveWorkerGuard` registry key
-/// (`coder-t-001`, or the collision-resolved `coder-t-001#7`) or the bare role name
-/// (`coder`). Never a substring match. Dispatch sees only a [`ToolCaller`] (a role,
-/// not a key) and the worker registry stays private behind key-*in* readers
-/// ([`crate::orchestrator::get_active_worker_tokens`],
-/// [`crate::orchestrator::set_active_worker_status`]) and display formatters
-/// ([`crate::orchestrator::get_active_subtasks_str`]), so the role name is the best
-/// available identity.
+/// The worker identity a specialist reply is attributed to.
+///
+/// A notice is filed under the **effective registry key** the runner drains its inbox with
+/// (`coder-t-001`, or the collision-resolved `coder-t-001#7`), so a reply has to be attributed
+/// to that same key for the strict reply contract to hold: [`crate::orchestrator::notice::notice_addresses_worker`]
+/// then matches exact key to exact key instead of relying on its bidirectional role-name
+/// tolerance. That tolerance is what made two workers of the **same role** able to answer the
+/// same dialogue id, so it must stay a compatibility path, not the only thing keeping replies
+/// attached to the right worker.
+///
+/// The key is resolved from the task-local worker token the runner scoped around the whole
+/// turn ([`crate::orchestrator::CURRENT_WORKER_TOKEN`], registered by
+/// [`crate::orchestrator::register_active_worker_with_token`]), which is exactly how the
+/// runner itself identifies the worker when it drains notices. Falls back to the caller's role
+/// name when no worker token is in scope (a Manager turn, the UI bridge, a unit test) — the
+/// identity dispatch could see before, and [`crate::orchestrator::notice::WorkerRoutingIdentity::routes`]
+/// still judges it by whole fields only, never by a substring.
 fn reply_worker_identity(caller: &str) -> String {
-    caller.trim().to_string()
+    crate::orchestrator::active_worker_key_for_current_token()
+        .unwrap_or_else(|| caller.trim().to_string())
 }
 
 /// Handle one `reply_to_arbitrator` call under the strict reply contract: a reply
@@ -801,20 +809,35 @@ pub async fn handle_reply_to_arbitrator_async(
             if eval.decision.eq_ignore_ascii_case("AskFollowUp")
                 && let Some(follow_up) = eval.follow_up_prompt
             {
-                let follow_up_notice =
-                    crate::orchestrator::post_notice_to_worker(caller, &follow_up, Some(notice_id));
+                // Round two of one dialogue must reach **the worker that was addressed**, not
+                // the bare role name. A follow-up filed under `coder` is drained by every
+                // coder worker in the process, so with two of them the question goes to a
+                // worker that never saw the first round — and that worker can then answer the
+                // reused dialogue id, because the notice it drained addresses it. The store
+                // already handed back the notice with the key it was filed under, so that key
+                // is the addressing token for the follow-up too.
+                let follow_up_target = if notice.target_worker.trim().is_empty() {
+                    caller
+                } else {
+                    notice.target_worker.as_str()
+                };
+                let follow_up_notice = crate::orchestrator::post_notice_to_worker(
+                    follow_up_target,
+                    &follow_up,
+                    Some(notice_id),
+                );
                 if let Some(user_status) = eval.user_status {
                     crate::orchestrator::emit_event(crate::ui::Event::SteerResponse(format!(
                         "\n[Arbitrator]: {user_status}\n\n"
                     )));
                 } else {
                     crate::orchestrator::emit_status(format!(
-                        "[Arbitrator]: Follow-up question sent to {caller} ({})",
+                        "[Arbitrator]: Follow-up question sent to {follow_up_target} ({})",
                         follow_up_notice.notice_id
                     ));
                 }
                 let follow_up_record = format!(
-                    "Forwarded follow-up {} to {caller}: \"{follow_up}\" (awaiting specialist reply)\n[Specialist {caller} prior reply]: {message}",
+                    "Forwarded follow-up {} to {follow_up_target}: \"{follow_up}\" (awaiting specialist reply)\n[Specialist {caller} prior reply]: {message}",
                     follow_up_notice.notice_id
                 );
                 crate::orchestrator::record_steering_exchange(

@@ -584,6 +584,36 @@ pub fn worker_entries() -> Vec<WorkerEntry> {
     out
 }
 
+/// The **effective registry key** of the worker that owns the cancellation token
+/// currently in scope ([`crate::orchestrator::CURRENT_WORKER_TOKEN`]).
+///
+/// The specialist runner registers itself under that key
+/// ([`register_active_worker_with_token`]) and drains its notice inbox with it, so a tool
+/// that must speak *as* the running worker — `reply_to_arbitrator` above all — has to name
+/// the same identity the notice store filed the notice under. Token identity is exact
+/// (`CancellationToken::eq` compares the shared inner state, so a clone of the worker's own
+/// token matches and a parent/child token does not).
+///
+/// `None` when no worker token is in scope (a Manager turn, the UI bridge, a unit test) or
+/// when the registration carries no token: callers then fall back to the role name they
+/// already have.
+pub fn active_worker_key_for_current_token() -> Option<String> {
+    let token = crate::orchestrator::CURRENT_WORKER_TOKEN
+        .try_with(|t| t.clone())
+        .ok()?;
+    WORKERS
+        .iter()
+        .find(|e| {
+            e.value().is_active()
+                && e.value()
+                    .info
+                    .cancel_token
+                    .as_ref()
+                    .is_some_and(|t| *t == token)
+        })
+        .map(|e| e.key().clone())
+}
+
 /// Test-only: drop one entry from the table outright (no `COMPLETED_SEQ` draw,
 /// no ring eviction) so a restore test can leave the shared table exactly as it
 /// found it. Never used by production code paths.
@@ -1079,8 +1109,8 @@ pub fn get_active_subtasks_str() -> String {
             let task_id_str = info.task_id.as_deref().unwrap_or(id);
             let start_wall_str = info.started_wall.format("%H:%M:%S");
             out.push_str(&format!(
-                "- Tool Call ID: {}\n  Subagent Tag: {}\n  Subagent: {}\n  Status: {}\n  Task Prompt: {}\n  Started At: {} (running for {}, {elapsed_secs} total seconds)\n  Implementation Turns: {}\n  Validation Rounds: {}\n",
-                task_id_str, id, info.agent_name, info.status, info.prompt, start_wall_str,
+                "- Tool Call ID: {}\n  Subagent Tag: {}\n  Address This Worker With: {}\n  Subagent: {}\n  Status: {}\n  Task Prompt: {}\n  Started At: {} (running for {}, {elapsed_secs} total seconds)\n  Implementation Turns: {}\n  Validation Rounds: {}\n",
+                task_id_str, id, id, info.agent_name, info.status, info.prompt, start_wall_str,
                 duration_str, info.implementation_turns, info.validation_rounds
             ));
             // The per-worker prompt read is grammar-validated (see
