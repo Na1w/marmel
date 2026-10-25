@@ -992,31 +992,63 @@ mod tests {
     /// The **steered** path, end to end: a `Sleep` decision carrying
     /// `sleep_seconds: 0` sleeps the floor instead of nothing, both hosts report
     /// the floor, and the history text names the seconds actually slept.
+    ///
+    /// The two-round handshake is pinned so that only a real production failure can fail
+    /// this test:
+    /// * the round-1 mock is mounted **first** and is the one capped by `up_to_n_times(1)`.
+    ///   wiremock answers the first matching mock in mount order
+    ///   (`wiremock-0.6.5/src/mock_set.rs:57-73`), so prompt text the loop pulls out of
+    ///   workspace-global state (`Plan::default().read()` reads the CWD
+    ///   `.marmel/execution_plan.md`) can never let the wake-up mock steal round 1;
+    /// * the round-2 mock requires the wake-up notice, and that needle is read back out of
+    ///   the production builder [`wake_up_notice`] instead of a re-typed literal, so it can
+    ///   never drift from what the loop actually sends;
+    /// * both mocks are `named` + `expect(1)` and verified after the run, so a lost or
+    ///   mis-routed round trip is named at the mock rather than surfacing as `rounds == [1]`.
     #[test]
     fn steered_sleep_with_zero_seconds_sleeps_the_floor_not_nothing() {
         use wiremock::matchers::{body_string_contains, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        // The round-2 discriminator is the notice the loop itself appends from round 2 on,
+        // taken from [`wake_up_notice`]'s own rendering of "<msg> (<notice>)" — a matcher
+        // may only test text this test owns, never something a workspace file contributes.
+        let wake_up_needle = {
+            let probe = "wake-up-needle-probe";
+            let rendered = wake_up_notice(probe);
+            rendered
+                .strip_prefix(&format!("{probe} ("))
+                .and_then(|notice| notice.strip_suffix(')'))
+                .unwrap_or_else(|| {
+                    panic!("wake_up_notice must render \"<msg> (<notice>)\", got {rendered:?}")
+                })
+                .to_string()
+        };
+
         arbitration_test(async {
             let server = MockServer::start().await;
-            // Round 2 (the wake-up round) answers instead of sleeping again.
-            Mock::given(method("POST"))
-                .and(path("/chat/completions"))
-                .and(body_string_contains(
-                    "SYSTEM NOTICE: You already slept as requested",
-                ))
-                .respond_with(ResponseTemplate::new(200).set_body_string(sse_chunk(
-                    r#"{"decision": "RespondDirectly", "response": "woke and answered"}"#,
-                )))
-                .mount(&server)
-                .await;
-            // Round 1: a Sleep that asks for ZERO seconds.
+            // Round 1: a Sleep that asks for ZERO seconds. Mounted first and answered at
+            // most once, so round 1 is answered by this mock whatever else the body carries.
             Mock::given(method("POST"))
                 .and(path("/chat/completions"))
                 .respond_with(ResponseTemplate::new(200).set_body_string(sse_chunk(
                     r#"{"decision": "Sleep", "response": "waiting for the build", "sleep_seconds": 0}"#,
                 )))
                 .up_to_n_times(1)
+                .named("round-1-sleep")
+                .expect(1)
+                .mount(&server)
+                .await;
+            // Round 2 (the wake-up round) answers instead of sleeping again — reachable only
+            // by a body the loop built for round > 1.
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .and(body_string_contains(wake_up_needle.as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_string(sse_chunk(
+                    r#"{"decision": "RespondDirectly", "response": "woke and answered"}"#,
+                )))
+                .named("round-2-wake-up")
+                .expect(1)
                 .mount(&server)
                 .await;
 
@@ -1026,7 +1058,6 @@ mod tests {
                 std::sync::Arc::new(std::sync::RwLock::new(Vec::<(String, String)>::new()));
             let mut channel = RecordingChannel::default();
 
-            let started = std::time::Instant::now();
             let outcome = arbitrate_steering(
                 &mut channel,
                 &ArbitrationRequest {
@@ -1038,13 +1069,60 @@ mod tests {
                 },
             )
             .await;
-            let waited = started.elapsed();
 
-            assert!(!outcome.sleep_cancelled);
+            // The handshake is itself part of what this test asserts: a round answered by the
+            // wrong mock, or lost to a failed round trip, must be named at the mock — never
+            // reported as a truncated round list.
+            let calls = server.received_requests().await.unwrap_or_default().len();
+            assert_eq!(
+                calls, 2,
+                "two arbitration rounds must make exactly two arbitrator calls, got {calls} — \
+                 a lost or extra round trip is not a sleep-floor failure"
+            );
+            // Both mocks declared `expect(1)`, so this pins that each of them answered exactly
+            // one round and names the one that did not. Which round each mock answered is
+            // proven behaviourally below, by the answer only that mock can produce — never by
+            // what a request body happened to contain, because the loop's prompt embeds
+            // workspace-global text this test does not own.
+            server.verify().await;
+
+            assert!(
+                !outcome.sleep_cancelled,
+                "the floored sleep must run to the end, not be cancelled: decision={:?} \
+                 notices={:?} sleep={:?}",
+                outcome.decision, channel.notices, outcome.sleep,
+            );
+            let decision = outcome.decision.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "the arbitration ended with no decision at all, i.e. an arbitrator round \
+                     trip produced nothing (every failed steer call collapses to `None` in \
+                     src/orchestrator/steer.rs) — that is not a sleep-floor failure: \
+                     decision={:?} notices={:?} sleep={:?}",
+                    outcome.decision, channel.notices, outcome.sleep,
+                )
+            });
             assert_eq!(
                 channel.rounds,
                 vec![1, 2],
-                "a floored sleep must still re-evaluate in a second round"
+                "a floored sleep must still re-evaluate in a second round — decision={:?} \
+                 notices={:?} sleep={:?}",
+                outcome.decision,
+                channel.notices,
+                outcome.sleep,
+            );
+            assert_eq!(
+                normalize_steer_decision(Some(&decision.decision)),
+                "RespondDirectly",
+                "round 2 must have ended the chain with the wake-up mock's answer — \
+                 decision={:?} notices={:?}",
+                outcome.decision,
+                channel.notices,
+            );
+            assert_eq!(
+                decision.response.as_deref(),
+                Some("woke and answered"),
+                "only the round-2 wake-up mock can produce this answer: a different one means \
+                 a round was answered by the wrong mock"
             );
             assert_eq!(
                 channel.notices,
@@ -1058,14 +1136,23 @@ mod tests {
                 ],
                 "the requested 0s must be reported as the floored sleep"
             );
-            assert!(
-                waited >= std::time::Duration::from_millis(500),
-                "the loop must actually wait, not spin: slept {waited:?} \
-                 for a {SLEEP_MIN_SECS}s floor"
-            );
+            // Behavioural proof that the loop waited instead of spinning, deliberately free of
+            // any wall-clock threshold (load-sensitive on CI, and `tokio::time::pause()` would
+            // fast-forward the 50 ms SSE poll, the 2 s preempt-ack and the 60 s call timeout
+            // living on this same current-thread runtime). The clock-independent half of the
+            // invariant lives in `floored_sleep_is_allowed_by_the_budget_at_any_clock`, which
+            // drives the injected-clock seam (`SleepBudget::new_at` / `allow_at`).
             assert_eq!(
                 outcome.sleep.slept_secs, SLEEP_MIN_SECS,
                 "the chained budget accounts the floored sleep"
+            );
+            assert_eq!(
+                outcome.sleep.extensions, 1,
+                "the floored sleep is exactly one accounted extension"
+            );
+            assert_eq!(
+                outcome.sleep.stop, None,
+                "no documented cap ended the chain — the re-evaluation round did run"
             );
 
             let hist = history.read().unwrap();
@@ -1102,6 +1189,46 @@ mod tests {
         assert_eq!(
             recorded_response(Some(&missing), None, &[], &[]),
             format!("Slept for {SLEEP_DEFAULT_SECS}s")
+        );
+    }
+
+    /// Clock-proof half of the same invariant: a **floored** sleep (the `sleep_seconds: 0`
+    /// request of [`steered_sleep_with_zero_seconds_sleeps_the_floor_not_nothing`], taken
+    /// through [`clamped_sleep_secs`]) is granted by a freshly armed chain budget at **any**
+    /// injected `now`, so the second round of that handshake can never depend on how long a
+    /// round trip happened to take. What ends a chain is its own documented cap — never the
+    /// floor. Driven through the injected-clock seam ([`SleepBudget::new_at`] /
+    /// [`SleepBudget::allow_at`]), so no wall clock is involved at all.
+    #[test]
+    fn floored_sleep_is_allowed_by_the_budget_at_any_clock() {
+        let start = Instant::now();
+        let floored = clamped_sleep_secs(Some(0));
+        assert_eq!(
+            floored, SLEEP_MIN_SECS,
+            "0s is floored before the budget sees it"
+        );
+
+        for elapsed_secs in [0u64, 1, 60, MAX_CHAINED_SLEEP_SECONDS - SLEEP_MIN_SECS] {
+            let budget = SleepBudget::new_at(start);
+            assert_eq!(
+                budget.allow_at(floored, start + Duration::from_secs(elapsed_secs)),
+                Ok(SLEEP_MIN_SECS),
+                "a {elapsed_secs}s round trip must not stop the first floored sleep — \
+                 without it there is no re-evaluation round at all"
+            );
+        }
+
+        // The chain keeps re-evaluating while its documented extension cap allows it.
+        let mut budget = SleepBudget::new_at(start);
+        let mut extensions_taken = 0usize;
+        while let Ok(secs) = budget.allow_at(floored, start) {
+            assert_eq!(secs, SLEEP_MIN_SECS);
+            budget.note_slept(secs);
+            extensions_taken += 1;
+        }
+        assert_eq!(
+            extensions_taken, MAX_CHAINED_SLEEP_EXTENSIONS,
+            "the extension cap, not the floor, is what stops the chain"
         );
     }
 

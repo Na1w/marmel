@@ -10,7 +10,10 @@ use crate::markers::{MARKER_COMPLETE, MARKER_REPLAN, has_replan_marker, has_term
 use crate::session::worker_journal::{
     self, WorkerSeed, mirror_append, mirror_collapse, mirror_replace_last,
 };
-use crate::tool_names::TOOL_LEAVE_VERDICT;
+use crate::tool_names::{
+    TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_LEAVE_VERDICT, TOOL_READ_FILE, TOOL_REBIRTH, TOOL_REPLACE,
+    TOOL_RUN_COMMAND, TOOL_WRITE_FILE,
+};
 
 const MAX_CONSECUTIVE_THINKING_NUDGES: u32 = 5;
 const MAX_CONSECUTIVE_MALFORMED_TOOL_CALLS: u32 = 5;
@@ -267,13 +270,13 @@ async fn run_specialist_live_inner(
         super::fix_loop::role_filtered_blueprint(&caller, &bp.allowed_tools)
     } else {
         vec![
-            "write_file".to_string(),
-            "replace".to_string(),
-            "read_file".to_string(),
-            "run_command".to_string(),
-            "grep_search".to_string(),
-            "glob".to_string(),
-            "rebirth".to_string(),
+            TOOL_WRITE_FILE.to_string(),
+            TOOL_REPLACE.to_string(),
+            TOOL_READ_FILE.to_string(),
+            TOOL_RUN_COMMAND.to_string(),
+            TOOL_GREP_SEARCH.to_string(),
+            TOOL_GLOB.to_string(),
+            TOOL_REBIRTH.to_string(),
         ]
     };
     for mcp_tool in crate::harness::allowed_mcp_tools(&mcp_servers) {

@@ -26,6 +26,11 @@ use std::sync::Arc;
 
 pub const STEER_ARBITRATOR_SYSTEM_PROMPT: &str = include_str!("../../prompts/steer_arbitrator.md");
 
+/// Wall-clock bound on one arbitrator decision call, in seconds. Named because the WARN that
+/// reports a lost round trip must be able to state it (see
+/// [`arbitrate_steer_context_stream`]).
+const STEER_CALL_TIMEOUT_SECS: u64 = 60;
+
 /// A per-subtask decision, matching caesar `SteerSubtaskDecision`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteerSubtaskDecision {
@@ -244,8 +249,9 @@ where
     // Nothing is acquired here: `ChatClient::chat_stream` is the single
     // acquisition site, and the scope is discharged when the call returns,
     // times out or is cancelled, so the class never leaks outward.
+    let call_started = std::time::Instant::now();
     let reply = match tokio::time::timeout(
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(STEER_CALL_TIMEOUT_SECS),
         pool::with_call_context(
             steer_arbitrator_call_context(),
             client.chat_stream(&req, |chunk| {
@@ -266,7 +272,32 @@ where
     .await
     {
         Ok(Ok(r)) => r,
-        _ => return None,
+        // A round that produced nothing used to be silent: `None` makes the arbitration loop
+        // stop exactly as if the arbitrator had answered something else, so a dead backend, a
+        // 404 from an unmatched mock or a hit deadline was indistinguishable from a real
+        // decision — in the logs and in CI triage alike. Same WARN discipline as the
+        // "decision did not parse" fallback below; the returned `None` is unchanged.
+        Ok(Err(err)) => {
+            tracing::warn!(
+                backend = %client.backend_url(),
+                model = %client.model(),
+                elapsed_ms = call_started.elapsed().as_millis() as u64,
+                error = %err,
+                "Steer arbitrator call failed — this arbitration round produced no decision"
+            );
+            return None;
+        }
+        Err(elapsed) => {
+            tracing::warn!(
+                backend = %client.backend_url(),
+                model = %client.model(),
+                elapsed_ms = call_started.elapsed().as_millis() as u64,
+                timeout_secs = STEER_CALL_TIMEOUT_SECS,
+                error = %elapsed,
+                "Steer arbitrator call timed out — this arbitration round produced no decision"
+            );
+            return None;
+        }
     };
     demux.finish_delta(|kind, piece| {
         if kind == crate::llm::thinking::DeltaKind::Content {
