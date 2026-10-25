@@ -243,6 +243,9 @@ pub struct SpecialistConfig {
     pub reasoning_effort: Option<String>,
     /// MCP servers whose tools this specialist is allowed to see.
     pub mcp_servers: Vec<String>,
+    /// Optional custom prompt / instructions appended to this specialist's system prompt.
+    #[serde(alias = "instructions", alias = "system_prompt", alias = "base_prompt")]
+    pub prompt: Option<String>,
 }
 
 /// Resolved runtime configuration.

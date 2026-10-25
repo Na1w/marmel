@@ -421,16 +421,6 @@ async fn run_automated_validation_inner(
         task_brief, deliverable
     );
 
-    let mut engine = crate::manager::ContextEngineFactory::new(cfg.max_context_tokens)
-        .specialist_context(validator_prompt.to_string(), brief);
-
-    let custom_blueprint = custom_validation_prompt
-        .as_deref()
-        .and_then(|p| crate::agents::AgentBlueprint::parse_from_markdown(p).ok());
-    let prompt_allowed_tools = custom_blueprint
-        .as_ref()
-        .map(|bp| bp.allowed_tools.as_slice());
-
     let registry = crate::orchestrator::SpecialistRegistry::canonical();
     let val_entry = registry
         .resolve(Agent::Validator)
@@ -448,6 +438,23 @@ async fn run_automated_validation_inner(
                 .map(|sc| sc.mcp_servers.clone())
         })
         .unwrap_or_default();
+
+    let mut full_validator_prompt = validator_prompt.to_string();
+    let mcp_block = crate::prompts::format_mcp_prompt_block(cfg, &mcp_servers);
+    if !mcp_block.is_empty() {
+        full_validator_prompt.push_str(&mcp_block);
+    }
+
+    let mut engine = crate::manager::ContextEngineFactory::new(cfg.max_context_tokens)
+        .specialist_context(full_validator_prompt, brief);
+
+    let custom_blueprint = custom_validation_prompt
+        .as_deref()
+        .and_then(|p| crate::agents::AgentBlueprint::parse_from_markdown(p).ok());
+    let prompt_allowed_tools = custom_blueprint
+        .as_ref()
+        .map(|bp| bp.allowed_tools.as_slice());
+
     let tools = assemble_tools(
         prompt_allowed_tools,
         |name| val_entry.allows(name),

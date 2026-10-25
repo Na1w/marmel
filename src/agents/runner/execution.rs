@@ -212,22 +212,6 @@ async fn run_specialist_live_inner(
     // Resolve the caller identity once, before anything is advertised.
     let caller = specialist_caller(agent, ctx);
 
-    let tools_list = if let Some(ref bp) = ctx.blueprint {
-        // The prose tool list is advertising too: a verdict-recording tool is
-        // dropped for every caller the public verdict check refuses, through the
-        // same helper the fix-loop blueprint path uses (no second filter).
-        super::fix_loop::role_filtered_blueprint(&caller, &bp.allowed_tools).join("`, `")
-    } else {
-        "write_file`, `replace`, `read_file`, `run_command`, `grep_search`, `glob`, `rebirth"
-            .to_string()
-    };
-
-    let env_block = crate::prompts::format_environment_block();
-    let enhanced_system_prompt = format!(
-        "{}\n\n{}\n- Tools available: `{}`.\n- You MUST save files and execute real work to complete the task.\n- Context Preservation: If context usage is high (>= 80%) or advised, call `rebirth` with a detailed summary capturing all pertinent state (including active file paths, current read offsets or line numbers reached in `read_file`, intermediate findings, and next actions) so work resumes seamlessly without starting over.",
-        ctx.role_system_prompt, env_block, tools_list
-    );
-
     let specialist_cfg = cfg.orchestration.specialists.get(agent.as_str());
     let specialist_model = specialist_cfg
         .and_then(|sc| sc.model.as_ref())
@@ -275,6 +259,48 @@ async fn run_specialist_live_inner(
         .map(|sc| sc.mcp_servers.clone())
         .unwrap_or_default();
     let tools = specialist_advertised_tools(&caller, |name| reg_entry.allows(name), &mcp_servers);
+
+    let mut advertised_names = if let Some(ref bp) = ctx.blueprint {
+        // The prose tool list is advertising too: a verdict-recording tool is
+        // dropped for every caller the public verdict check refuses, through the
+        // same helper the fix-loop blueprint path uses (no second filter).
+        super::fix_loop::role_filtered_blueprint(&caller, &bp.allowed_tools)
+    } else {
+        vec![
+            "write_file".to_string(),
+            "replace".to_string(),
+            "read_file".to_string(),
+            "run_command".to_string(),
+            "grep_search".to_string(),
+            "glob".to_string(),
+            "rebirth".to_string(),
+        ]
+    };
+    for mcp_tool in crate::harness::allowed_mcp_tools(&mcp_servers) {
+        let qname = mcp_tool.qualified_name();
+        if !advertised_names.contains(&qname) {
+            advertised_names.push(qname);
+        }
+    }
+    let tools_list = advertised_names.join("`, `");
+
+    let env_block = crate::prompts::format_environment_block();
+    let mut enhanced_system_prompt = format!(
+        "{}\n\n{}\n- Tools available: `{}`.\n- You MUST save files and execute real work to complete the task.\n- Context Preservation: If context usage is high (>= 80%) or advised, call `rebirth` with a detailed summary capturing all pertinent state (including active file paths, current read offsets or line numbers reached in `read_file`, intermediate findings, and next actions) so work resumes seamlessly without starting over.",
+        ctx.role_system_prompt, env_block, tools_list
+    );
+    if let Some(custom_specialist_prompt) = specialist_cfg
+        .and_then(|sc| sc.prompt.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        enhanced_system_prompt.push_str("\n\n");
+        enhanced_system_prompt.push_str(custom_specialist_prompt);
+    }
+    let mcp_block = crate::prompts::format_mcp_prompt_block(cfg, &mcp_servers);
+    if !mcp_block.is_empty() {
+        enhanced_system_prompt.push_str(&mcp_block);
+    }
 
     // The engine is built **through** `build_specialist_context`, on the very line
     // the advertised list exists, so it is charged with exactly that list before the

@@ -33,6 +33,10 @@ pub struct McpServerConfig {
     pub env: HashMap<String, String>,
     /// Remote URL endpoint (for HTTP/SSE transport).
     pub url: Option<String>,
+    /// Optional prompt or usage instructions injected into the system prompt of
+    /// every agent allowed to use this MCP server.
+    #[serde(alias = "instructions", alias = "system_prompt")]
+    pub prompt: Option<String>,
 }
 
 /// Discovered MCP Tool definition.
