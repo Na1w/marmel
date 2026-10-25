@@ -21,8 +21,9 @@
 use crate::harness::{ToolError, ToolResult};
 use crate::tool_names::{TOOL_READ_FILE, TOOL_REPLACE, TOOL_WRITE_FILE};
 use serde_json::Value;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The canonical container workspace path prefix used by marmennill-cli.
@@ -41,62 +42,398 @@ pub fn map_path(path: &str) -> PathBuf {
     }
 }
 
-/// Resolve a path securely, ensuring it stays confined inside the workspace root.
+// ── Windows-safe spelling normalization & containment ─────────────────────
+//
+// `Path::starts_with` compares *components byte-exactly*: `Prefix::VerbatimDisk('C')`
+// never equals `Prefix::Disk('C')`, and `RUNNER~1` never equals `runneradmin`
+// (`Component` derives `PartialEq` over the raw `OsStr`; there is no case
+// folding anywhere in `std`'s `Path`). On Windows the two operands of the
+// containment test below are produced by *different* pipelines:
+//
+// * `std::fs::canonicalize` = `CreateFileW` + `GetFinalPathNameByHandleW
+//   (VOLUME_NAME_DOS | FILE_NAME_NORMALIZED)` → a `\\?\` **verbatim** path with
+//   every 8.3 short name expanded to its long name and the casing stored on disk;
+// * `std::env::temp_dir()` = `GetTempPath2W`, which returns the `%TEMP%`
+//   environment variable **verbatim as a string** — non-verbatim, and on
+//   GitHub-hosted Windows runners routinely 8.3-shortened
+//   (`C:\Users\RUNNER~1\AppData\Local\Temp`).
+//
+// Comparing one spelling against the other is a spelling-equality test masquerading
+// as a containment test, which is what made a file that really is inside the temp
+// root look like an escape on `windows-latest` only (docs/windows_ci_root_cause.md
+// §1). Everything below exists so both sides of every containment decision — and
+// every lock-shard key — is the *same* spelling-derived key.
+
+/// Windows verbatim / device-namespace prefixes that `Path::canonicalize()` can
+/// introduce (`\\?\`, `\\.\`, `\\localhost\`) plus the namespace spellings that
+/// must never be mistaken for an ordinary volume path (`\\?\UNC\`,
+/// `\\?\GLOBALROOT`), and their `/` spellings. Every entry is ASCII, so a prefix
+/// match always ends on a `char` boundary.
 ///
-/// Prevents path traversal attacks (e.g. `../../etc/passwd` or absolute escapes).
+/// Longest-first on purpose: [`strip_windows_path_prefix`] returns on the first
+/// hit, so `\\?\UNC\server\share` is trimmed as one unit instead of leaving a
+/// stray `UNC\` component behind.
+pub(crate) const WINDOWS_PATH_PREFIXES: &[&str] = &[
+    "\\\\?\\UNC\\",
+    "\\\\?\\GLOBALROOT\\",
+    "\\\\?\\",
+    "\\\\.\\",
+    "\\\\localhost\\",
+    "//?/UNC/",
+    "//?/GLOBALROOT/",
+    "//?/",
+    "//./",
+    "//localhost/",
+];
+
+/// Drop a leading [`WINDOWS_PATH_PREFIXES`] entry, case-insensitively.
+pub(crate) fn strip_windows_path_prefix(raw: &str) -> &str {
+    let bytes = raw.as_bytes();
+    for prefix in WINDOWS_PATH_PREFIXES {
+        let p = prefix.as_bytes();
+        if bytes.len() >= p.len() && bytes[..p.len()].eq_ignore_ascii_case(p) {
+            return &raw[p.len()..];
+        }
+    }
+    raw
+}
+
+/// Which spelling rules apply to a path: the Windows rules (`\\?\` verbatim
+/// prefixes, 8.3 short names, case- and separator-insensitive volumes) or the
+/// Unix rules (the canonical spelling *is* the only spelling, byte-exact and
+/// case-sensitive).
+///
+/// The containment helpers take this as a parameter instead of reading `cfg!`
+/// inline so the **Windows** branch is unit-testable on a Linux runner — that is
+/// the whole reason the Windows spelling bug could ship: nothing on Linux could
+/// ever exercise the Windows comparison. Production always passes
+/// [`PathFamily::current`], so live behaviour is exactly what the platform
+/// requires; the parameterized entry points exist for tests.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PathFamily {
+    Unix,
+    Windows,
+}
+
+impl PathFamily {
+    /// The family of the platform this binary was **built** for — the value every
+    /// production call site passes.
+    pub(crate) const fn current() -> Self {
+        if cfg!(windows) {
+            PathFamily::Windows
+        } else {
+            PathFamily::Unix
+        }
+    }
+
+    /// Windows volumes are ASCII-case-insensitive; Unix ones are case-sensitive.
+    fn folds_case(self) -> bool {
+        matches!(self, PathFamily::Windows)
+    }
+}
+
+/// [`normalize_for_compare`] with an explicit [`PathFamily`] (see the type for why).
+pub(crate) fn normalize_for_compare_in_family(raw: &str, family: PathFamily) -> String {
+    if family == PathFamily::Unix {
+        return raw.to_owned();
+    }
+    strip_windows_path_prefix(raw).replace('\\', "/")
+}
+
+/// Test-facing alias for [`normalize_for_compare_in_family`] pinned to the build
+/// platform, kept because `src/harness/search_tests.rs` reuses exactly this shape
+/// instead of carrying its own copy of the Windows spelling rules (one
+/// implementation, no duplication). Production containment calls
+/// [`normalize_for_compare_in_family`] directly with an explicit [`PathFamily`],
+/// which is why this alias is compiled only for tests.
+///
+/// **No-op on Unix**: under [`PathFamily::current`] = [`PathFamily::Unix`] the
+/// input is returned untouched, byte for byte, so a Unix run compares exactly the
+/// strings it always compared.
+#[cfg(test)]
+pub(crate) fn normalize_for_compare(raw: &str) -> String {
+    normalize_for_compare_in_family(raw, PathFamily::current())
+}
+
+/// The only spelling [`path_within`] and [`lock_shard_for`] are allowed to look
+/// at: a platform-normalized comparison key derived from `path`.
+///
+/// **Unix: identity**, byte for byte — there the canonical spelling *is* the
+/// unique spelling, so containment and sharding keep exactly the semantics they
+/// always had.
+///
+/// **Windows**: strip the verbatim / device / namespace prefix, unify `\` and
+/// `/`, uppercase the drive letter and ASCII-fold the rest of the case, so
+/// `\\?\C:\Users\runneradmin\AppData\Local\Temp\f` (canonicalized) and
+/// `c:/users/RUNNERADMIN/appdata/local/temp/F` (raw `%TEMP%` spelling, DOS vs
+/// verbatim, any case) collapse onto one key. The key deliberately does **not**
+/// expand 8.3 aliases (`RUNNER~1` ≠ `runneradmin`): that expansion is what
+/// [`canonical_existing_prefix`] (i.e. `GetFinalPathNameByHandleW`) does, and the
+/// gate feeds it **both** operands — the fold only removes spelling noise, so it
+/// can never merge two different files. Device/namespace spellings survive as
+/// plain relative-looking keys (`Device/HarddiskVolume1/…`, `PhysicalDrive0`),
+/// which can never component-match a rooted key (`C:/…`) — so they stay denied.
+///
+/// The key is built from `to_string_lossy()` (like the pre-existing `hash_path`);
+/// a path component that is not valid UTF-8 renders as `U+FFFD`, which can in
+/// principle alias two distinct exotic components onto one key. Both containment
+/// and sharding compare full component lists, so this is not a containment bypass
+/// for any UTF-8 path.
+pub(crate) fn containment_key(path: &Path) -> String {
+    containment_key_in_family(path, PathFamily::current())
+}
+
+/// [`containment_key`] with an explicit [`PathFamily`], so the Windows spelling
+/// rules are unit-testable on a Linux runner (this is the
+/// `containment_key(&Path, PathFamily)` shape named in
+/// `docs/windows_ci_root_cause.md` §RECOMMENDED FIX, split into two names because
+/// production needs a zero-argument entry point). Production only ever calls
+/// [`containment_key`].
+pub(crate) fn containment_key_in_family(path: &Path, family: PathFamily) -> String {
+    let raw = path.to_string_lossy();
+    if family == PathFamily::Unix {
+        return raw.into_owned();
+    }
+    let mut key = normalize_for_compare_in_family(&raw, family);
+    // `x:` → `X:`. `normalize_for_compare_in_family` already removed any verbatim
+    // prefix and unified separators, so a `:` at byte 1 can only be an ASCII drive
+    // letter, and indices 0..2 are `char` boundaries.
+    if key.as_bytes().get(1) == Some(&b':') {
+        key[..1].make_ascii_uppercase();
+        key[2..].make_ascii_lowercase();
+    } else {
+        key.make_ascii_lowercase();
+    }
+    key
+}
+
+/// Component list of a [`containment_key`]: the key has already unified `\` to
+/// `/`, and empty pieces plus `.` carry no information. Splitting into components
+/// (rather than taking a byte prefix) is what keeps the sibling-prefix bypass
+/// dead: `/tmp/foobar` is **not** inside `/tmp/foo`.
+fn key_components(key: &str) -> Vec<&str> {
+    key.split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect()
+}
+
+/// Is `target` inside `root`, comparing **only** [`containment_key`] spellings,
+/// component by component?
+///
+/// Argument order is **(anchor/allow-list entry, candidate)** — i.e.
+/// `path_within(root, target)`, the reverse of a `(child, parent)` reading. The
+/// parameter names are load-bearing: swapping them turns an allow into a deny.
+///
+/// Never `Path::starts_with` on operands that came from different normalization
+/// pipelines: a `\\?\`-verbatim / long-name side can never prefix-match a raw
+/// 8.3-short-name side (`Prefix::VerbatimDisk != Prefix::Disk`, byte-exact
+/// component equality). Callers must therefore hand in operands that all went
+/// through [`canonical_existing_prefix`].
+pub(crate) fn path_within(root: &Path, target: &Path) -> bool {
+    path_within_in_family(root, target, PathFamily::current())
+}
+
+/// [`path_within`] with an explicit [`PathFamily`], so the Windows spelling rules
+/// (`\\?\` verbatim prefixes, drive letters, case- and separator-insensitive
+/// volumes) are unit-testable on a Linux runner (the `path_within(…, family)`
+/// shape named in `docs/windows_ci_root_cause.md` §RECOMMENDED FIX). Same
+/// argument order: `path_within_in_family(root, target, family)`. Production
+/// calls [`path_within`], which pins the family to the build platform.
+pub(crate) fn path_within_in_family(root: &Path, target: &Path, family: PathFamily) -> bool {
+    let root_key = containment_key_in_family(root, family);
+    let target_key = containment_key_in_family(target, family);
+    let root_parts = key_components(&root_key);
+    let target_parts = key_components(&target_key);
+    // Fail closed: an anchor with no components at all proves nothing — it must
+    // not become a wildcard "everything is inside" allowance.
+    if root_parts.is_empty() {
+        return false;
+    }
+    // Fail closed on an operand that still carries a literal `..`. The gate feeds
+    // this function only operands normalized by [`canonical_existing_prefix`],
+    // whose [`join_normalized`] already folded `.` and `..` lexically, so a
+    // surviving `..` means a caller skipped normalization. Refusing is the only
+    // sound answer: a plain component-wise prefix match would happily accept
+    // `C:\Temp\..\..\Windows\x` under `C:\Temp` (its *leading* components match),
+    // and folding here would need anchor semantics this function does not own.
+    // (`Vec<&str>::contains` is *component equality* on the split key, never the
+    // substring `str::contains` — so it cannot weaken the component-wise rule.)
+    if root_parts.contains(&"..") || target_parts.contains(&"..") {
+        return false;
+    }
+    root_parts.len() <= target_parts.len()
+        && root_parts
+            .iter()
+            .zip(target_parts.iter())
+            // Windows file systems are case-insensitive and the key already
+            // folded; folding again here is belt-and-braces and keeps the fold
+            // *Windows-only*, because Unix file systems are case-sensitive and
+            // Unix containment must stay byte-exact.
+            .all(|(anchor, candidate)| {
+                if family.folds_case() {
+                    anchor.eq_ignore_ascii_case(candidate)
+                } else {
+                    anchor == candidate
+                }
+            })
+}
+
+/// Canonicalize the **deepest existing ancestor** of `path` and re-join the
+/// missing tail onto it — and *never* fall back to a raw spelling.
+///
+/// Two silent raw fallbacks used to live here (`temp_dir().canonicalize()
+/// .unwrap_or_else(|_| temp_dir())` and `cur.canonicalize().unwrap_or(cur)`), and
+/// either one is enough to inject the raw 8.3/`%TEMP%` spelling into the
+/// containment comparison and deny a legitimately allowed path. A path whose
+/// deepest existing ancestor cannot be canonicalized is therefore an error: the
+/// caller must deny rather than guess.
+///
+/// The walk is `try-canonicalize → one component up`, not `exists()` first:
+/// `exists()` is a `stat` of a file that concurrent `replace` calls are renaming,
+/// and on Windows `MoveFileExW(..., MOVEFILE_REPLACE_EXISTING)` leaves the target
+/// transiently unresolvable (`ERROR_SHARING_VIOLATION` / delete-pending), so an
+/// `exists()`-based branch is both a TOCTOU race and a needless syscall.
+fn canonical_existing_prefix(tool: &str, path: &Path) -> Result<PathBuf, ToolError> {
+    let components: Vec<Component<'_>> = path.components().collect();
+    for split in (0..=components.len()).rev() {
+        // The anchor must be non-empty, and the tail must never start with the
+        // anchor's own `Prefix`/`RootDir`: re-joining past that point would
+        // rebuild a *drive-relative* `C:foo` on Windows.
+        if split == 0
+            || matches!(
+                components.get(split),
+                Some(Component::RootDir) | Some(Component::Prefix(_))
+            )
+        {
+            continue;
+        }
+        let anchor = components_to_path(&components[..split]);
+        if let Ok(canonical) = anchor.canonicalize() {
+            return Ok(join_normalized(&canonical, &components[split..]));
+        }
+    }
+    Err(ToolError::BadArguments {
+        tool: tool.to_string(),
+        detail: format!(
+            "cannot resolve an existing ancestor of '{}'",
+            path.display()
+        ),
+    })
+}
+
+/// Rebuild a `PathBuf` from a leading slice of [`Component`]s (prefix, root and
+/// normals in their original order).
+fn components_to_path(components: &[Component<'_>]) -> PathBuf {
+    let mut path = PathBuf::new();
+    for component in components {
+        path.push(component.as_os_str());
+    }
+    path
+}
+
+/// Re-join the missing tail of a path onto a canonicalized anchor, folding `.`
+/// and `..` **lexically**.
+///
+/// The tail used to be appended verbatim, so a spelling such as
+/// `<root>/newdir/../../outside` reached the containment test with literal `..`
+/// components in it — and a component-wise prefix match still accepted it because
+/// the *leading* components were inside the root. Folding makes that escape
+/// visible to [`path_within`] instead of hiding it. `..` is clamped at the
+/// anchor's own root: it can never pop the volume prefix or the root separator
+/// off the anchor.
+fn join_normalized(anchor: &Path, tail: &[Component<'_>]) -> PathBuf {
+    let mut parts: Vec<OsString> = anchor
+        .components()
+        .map(|component| component.as_os_str().to_os_string())
+        .collect();
+    for component in tail {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match parts.last() {
+                Some(last) if !is_anchor_component(last) => {
+                    parts.pop();
+                }
+                // Nothing left to pop: stay put, [`path_within`] decides.
+                _ => {}
+            },
+            other => parts.push(other.as_os_str().to_os_string()),
+        }
+    }
+    let mut joined = PathBuf::new();
+    for part in parts {
+        joined.push(part);
+    }
+    joined
+}
+
+/// Is this component an anchor (`/`, `\`, a drive letter or a UNC/verbatim
+/// prefix) that a `..` must never remove?
+fn is_anchor_component(part: &OsStr) -> bool {
+    part == OsStr::new("/")
+        || part == OsStr::new("\\")
+        || part == OsStr::new(".")
+        || part.as_encoded_bytes().ends_with(b":")
+}
+
+/// The single deny wording used by [`resolve_safe_path`]: the message format is
+/// part of the contract asserted by the tests, so it lives in one place.
+fn escape_denied(path: &str, tool: &str) -> ToolError {
+    ToolError::Forbidden {
+        tool: tool.to_string(),
+        caller: format!("access denied: path '{}' escapes workspace root", path),
+    }
+}
+
+/// Resolve a path securely, ensuring it stays confined inside the workspace root
+/// (or the process temp dir) — the **only** gate in front of the file tools.
+///
+/// Prevents path traversal attacks (e.g. `../../etc/passwd` or absolute escapes),
+/// symlink/reparse escapes and Windows device/namespace escapes (`\\.\`,
+/// `\\?\UNC\`, `\\?\GLOBALROOT`).
+///
+/// Every operand of the containment test — root, temp dir and target — goes
+/// through the *same* [`canonical_existing_prefix`] pipeline (no raw fallback
+/// anywhere: an anchor that cannot be normalized is a denial, never a raw
+/// comparison), and the comparison is [`path_within`], which is spelling-
+/// invariant (`\\?\`-verbatim vs DOS, long name vs 8.3 short name, `\` vs `/`,
+/// drive-letter and ASCII case) instead of byte-exact `Path::starts_with`.
+///
+/// The returned `PathBuf` is that fully normalized form, so anything derived from
+/// it — in particular the per-path lock shard in [`lock_shard_for`] — is the same
+/// for every spelling of the same file.
 pub fn resolve_safe_path(path: &str, tool: &str) -> Result<PathBuf, ToolError> {
-    let canonical_root = crate::harness::get_workspace_root();
-    let canonical_temp = std::env::temp_dir()
-        .canonicalize()
-        .unwrap_or_else(|_| std::env::temp_dir());
+    let raw_root = crate::harness::get_workspace_root();
+    let canonical_root = canonical_existing_prefix(tool, &raw_root)?;
+    // Exactly two allow-list entries, unchanged: the workspace root and
+    // `std::env::temp_dir()`. A temp anchor that cannot be normalized is *absent*
+    // from the allow-list for this call (fail closed) instead of being compared in
+    // its raw `%TEMP%` spelling.
+    let canonical_temp = canonical_existing_prefix(tool, &std::env::temp_dir()).ok();
 
     let raw_target = if path.starts_with(WORKSPACE_PREFIX) {
         let relative = path.strip_prefix(WORKSPACE_PREFIX).unwrap_or(path);
         let clean_relative = relative.strip_prefix('/').unwrap_or(relative);
-        canonical_root.join(clean_relative)
+        raw_root.join(clean_relative)
     } else if Path::new(path).is_absolute() {
         PathBuf::from(path)
     } else {
-        canonical_root.join(path)
+        raw_root.join(path)
     };
 
-    let canonical_target = if raw_target.exists() {
-        raw_target
-            .canonicalize()
-            .map_err(|e| ToolError::BadArguments {
-                tool: tool.to_string(),
-                detail: format!("failed to resolve path '{path}': {e}"),
-            })?
-    } else {
-        let mut cur = raw_target.clone();
-        let mut components = Vec::new();
-        while !cur.exists() {
-            if let Some(name) = cur.file_name() {
-                components.push(name.to_os_string());
-                if let Some(parent) = cur.parent() {
-                    cur = parent.to_path_buf();
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-        let canonical_ancestor = cur.canonicalize().unwrap_or(cur);
-        let mut resolved = canonical_ancestor;
-        for part in components.into_iter().rev() {
-            resolved.push(part);
-        }
-        resolved
+    let canonical_target = match canonical_existing_prefix(tool, &raw_target) {
+        Ok(resolved) => resolved,
+        // Fail closed: a path with no canonicalizable ancestor at all cannot be
+        // proven inside either entry, so it is denied with the standard wording
+        // (that is what keeps `\\?\GLOBALROOT\Device\…` and friends denied even
+        // when the namespace refuses to canonicalize).
+        Err(_) => return Err(escape_denied(path, tool)),
     };
 
-    if !canonical_target.starts_with(&canonical_root)
-        && !canonical_target.starts_with(&canonical_temp)
-    {
-        return Err(ToolError::Forbidden {
-            tool: tool.to_string(),
-            caller: format!("access denied: path '{}' escapes workspace root", path),
-        });
+    let within_temp = canonical_temp
+        .as_ref()
+        .is_some_and(|temp| path_within(temp, &canonical_target));
+    if !path_within(&canonical_root, &canonical_target) && !within_temp {
+        return Err(escape_denied(path, tool));
     }
 
     Ok(canonical_target)
@@ -326,12 +663,26 @@ static REPLACE_LOCKS: [std::sync::Mutex<()>; REPLACE_LOCK_SHARDS] =
 /// same base content, each stage a complete file, and the later `rename`
 /// silently discards the earlier edit — an edit lost with no error.
 fn replace_path_lock(path: &Path) -> std::sync::MutexGuard<'static, ()> {
-    let shard = &REPLACE_LOCKS[hash_path(path) % REPLACE_LOCK_SHARDS];
+    let shard = &REPLACE_LOCKS[lock_shard_for(path)];
     match shard.lock() {
         Ok(guard) => guard,
         // A panic somewhere else must not wedge every later write to this path.
         Err(poisoned) => poisoned.into_inner(),
     }
+}
+
+/// Pick the shard that serialises writers of `path`.
+///
+/// The key is [`containment_key`], never the raw spelling: `replace` calls that
+/// address the *same file* through different spellings — 8.3 short name vs long
+/// name, `\\?\`-verbatim vs DOS, different case or separators — must land on the
+/// same shard, or the serialization above that stops concurrent edits from being
+/// silently lost is bypassed by nothing more than how the caller typed the path.
+/// `resolve_safe_path` already returns a normalized path, so on Unix this hashes
+/// exactly the bytes it always hashed (identity key).
+pub(crate) fn lock_shard_for(path: &Path) -> usize {
+    let key = containment_key(path);
+    hash_path(Path::new(&key)) % REPLACE_LOCK_SHARDS
 }
 
 /// FNV-1a over the path text; picks a lock shard deterministically.
@@ -676,3 +1027,7 @@ pub(crate) fn usize_arg(
 #[cfg(test)]
 #[path = "fs_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "fs_path_tests.rs"]
+mod path_tests;
