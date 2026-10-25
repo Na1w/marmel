@@ -230,6 +230,7 @@ where
         tools: None,
     };
 
+    let mut demux = crate::llm::thinking::ThinkingDemuxer::new();
     let mut extractor = StreamingResponseExtractor::new();
     let mut did_stream_response = false;
     let mut raw_stream_accum = String::new();
@@ -249,11 +250,15 @@ where
             steer_arbitrator_call_context(),
             client.chat_stream(&req, |chunk| {
                 raw_stream_accum.push_str(chunk);
-                let (delta, _) = extractor.push_chunk(chunk);
-                if !delta.is_empty() {
-                    did_stream_response = true;
-                    on_delta(&delta);
-                }
+                demux.push_delta(chunk, |kind, piece| {
+                    if kind == crate::llm::thinking::DeltaKind::Content {
+                        let (delta, _) = extractor.push_chunk(piece);
+                        if !delta.is_empty() {
+                            did_stream_response = true;
+                            on_delta(&delta);
+                        }
+                    }
+                });
                 true
             }),
         ),
@@ -263,6 +268,15 @@ where
         Ok(Ok(r)) => r,
         _ => return None,
     };
+    demux.finish_delta(|kind, piece| {
+        if kind == crate::llm::thinking::DeltaKind::Content {
+            let (delta, _) = extractor.push_chunk(piece);
+            if !delta.is_empty() {
+                did_stream_response = true;
+                on_delta(&delta);
+            }
+        }
+    });
 
     let mut raw = reply.content.trim().to_string();
     if raw.is_empty() && !reply.raw.is_empty() {
@@ -270,6 +284,12 @@ where
     }
     if raw.is_empty() && !raw_stream_accum.is_empty() {
         raw = raw_stream_accum.trim().to_string();
+    }
+    let demuxed_raw = crate::llm::thinking::demux_stream(&raw);
+    if !demuxed_raw.content().trim().is_empty() {
+        raw = demuxed_raw.content().trim().to_string();
+    } else if !demuxed_raw.thinking().trim().is_empty() {
+        raw = demuxed_raw.thinking().trim().to_string();
     }
 
     let json_text = if let Some(stripped) = raw.strip_prefix("```json") {
@@ -286,7 +306,18 @@ where
         &raw
     };
 
-    let parsed_decision = match serde_json::from_str::<SteerDecision>(json_text) {
+    let parsed_candidate = serde_json::from_str::<SteerDecision>(json_text).or_else(|first_err| {
+        if let Some(end) = raw.rfind('}') {
+            for (start, _) in raw[..=end].match_indices('{') {
+                if let Ok(decision) = serde_json::from_str::<SteerDecision>(&raw[start..=end]) {
+                    return Ok(decision);
+                }
+            }
+        }
+        Err(first_err)
+    });
+
+    let parsed_decision = match parsed_candidate {
         Ok(mut decision) => {
             if decision.decision.eq_ignore_ascii_case("Sleep") && decision.sleep_seconds.is_none() {
                 // The fallback duration is the owner's constant, not a
@@ -853,6 +884,7 @@ Your task: Formulate a direct, helpful, and concise answer to the user in the EX
         tools: None,
     };
 
+    let mut demux = crate::llm::thinking::ThinkingDemuxer::new();
     let mut full_response = String::new();
     // Same internal-fast-call class as the arbitrator decision itself (see
     // [`steer_arbitrator_call_context`]): this synthesis is part of the steering
@@ -863,8 +895,12 @@ Your task: Formulate a direct, helpful, and concise answer to the user in the EX
         pool::with_call_context(
             steer_arbitrator_call_context(),
             client.chat_stream(&req, |chunk| {
-                full_response.push_str(chunk);
-                on_delta(chunk);
+                demux.push_delta(chunk, |kind, piece| {
+                    if kind == crate::llm::thinking::DeltaKind::Content {
+                        full_response.push_str(piece);
+                        on_delta(piece);
+                    }
+                });
                 true
             }),
         ),
@@ -875,11 +911,20 @@ Your task: Formulate a direct, helpful, and concise answer to the user in the EX
         Ok(Err(e)) => return Err(e),
         Err(e) => return Err(e.into()),
     };
+    demux.finish_delta(|kind, piece| {
+        if kind == crate::llm::thinking::DeltaKind::Content {
+            full_response.push_str(piece);
+            on_delta(piece);
+        }
+    });
 
     let final_text = if !full_response.trim().is_empty() {
         full_response.trim().to_string()
     } else {
-        reply.content.trim().to_string()
+        crate::llm::thinking::demux_stream(&reply.content)
+            .content()
+            .trim()
+            .to_string()
     };
 
     Ok(final_text)

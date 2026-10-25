@@ -1815,3 +1815,63 @@ fn test_rendered_notice_surfaces_the_id_the_reply_must_name() {
     assert!(rendered.contains(crate::tool_names::TOOL_REPLY_TO_ARBITRATOR));
     assert!(rendered.contains("Which allocator did you pick?"));
 }
+
+#[tokio::test]
+async fn test_evaluate_worker_reply_strips_thinking_with_draft_json_and_extracts_response() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let reasoning = "We need to evaluate the worker reply. Draft JSON:\n{\n  \"decision\": \"SynthesizeResponse\",\n  \"response\": \"DRAFT INSIDE THINK\"\n}\nNow emit final JSON.";
+    let content = "{\n  \"decision\": \"SynthesizeResponse\",\n  \"response\": \"The researcher has finished gathering git evidence and is writing docs/review_scope.md.\",\n  \"follow_up_prompt\": \"\",\n  \"user_status\": \"\"\n}";
+    let sse1 = serde_json::json!({
+        "id": "chatcmpl-eval-1",
+        "choices": [{"delta": {"reasoning_content": reasoning}, "finish_reason": null}]
+    });
+    let sse2 = serde_json::json!({
+        "id": "chatcmpl-eval-1",
+        "choices": [{"delta": {"content": content}, "finish_reason": "stop"}]
+    });
+    let body = format!("data: {sse1}\n\ndata: {sse2}\n\ndata: [DONE]\n\n");
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new_with_token(server.uri(), "mock", "tok");
+    let stats = HarnessStats::new();
+    let notice = SteerNotice {
+        notice_id: "notice-eval-1".to_string(),
+        user_inquiry: "What is t-001 doing?".to_string(),
+        target_worker: "researcher-t-001".to_string(),
+        created_at_ms: 0,
+    };
+
+    let mut deltas = String::new();
+    let eval = evaluate_worker_reply(
+        &client,
+        &stats,
+        &notice,
+        "researcher",
+        "Status: writing docs/review_scope.md",
+        |d| deltas.push_str(d),
+    )
+    .await
+    .expect("evaluation should succeed");
+
+    assert_eq!(eval.decision, "SynthesizeResponse");
+    assert_eq!(
+        eval.response.as_deref(),
+        Some(
+            "The researcher has finished gathering git evidence and is writing docs/review_scope.md."
+        )
+    );
+    assert_eq!(
+        deltas,
+        "The researcher has finished gathering git evidence and is writing docs/review_scope.md."
+    );
+    assert!(!deltas.contains("<think>"));
+    assert!(!deltas.contains("\"decision\""));
+}

@@ -345,6 +345,7 @@ pub(crate) fn post_forward_notices(
     }
 
     let mut outcomes = Vec::new();
+    let mut seen_target_inquiry = std::collections::HashSet::new();
     for (st, subtask_action) in action::routed(Some(d)) {
         if subtask_action != action::ACTION_FORWARD_NOTICE {
             continue;
@@ -355,6 +356,9 @@ pub(crate) fn post_forward_notices(
         match action::notice_targets(st) {
             action::NoticeTargeting::Addresses(targets) => {
                 for target in targets {
+                    if !seen_target_inquiry.insert((target.clone(), inquiry.to_string())) {
+                        continue;
+                    }
                     let posted = post_notice_observable(&target, inquiry);
                     outcomes.push(ForwardOutcome::Posted(ForwardedNotice {
                         notice_id: posted.notice.notice_id,

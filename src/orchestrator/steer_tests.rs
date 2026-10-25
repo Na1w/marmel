@@ -1359,6 +1359,62 @@ async fn test_arbitrate_steer_json_sleep_without_duration_uses_the_owner_default
     assert_eq!(d.sleep_seconds, Some(SLEEP_DEFAULT_SECS));
 }
 
+#[tokio::test]
+async fn test_arbitrate_steer_context_stream_ignores_thinking_draft_json() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let reasoning = "Drafting: {\"decision\": \"RespondDirectly\", \"response\": \"WRONG DRAFT FROM THINKING\"}";
+    let payload = serde_json::json!({
+        "decision": "RespondDirectly",
+        "response": "Clean synthesized response to the user."
+    });
+    let sse1 = serde_json::json!({
+        "id": "chatcmpl-think-1",
+        "choices": [{"delta": {"reasoning_content": reasoning}, "finish_reason": null}]
+    });
+    let sse2 = serde_json::json!({
+        "id": "chatcmpl-think-1",
+        "choices": [{"delta": {"content": payload.to_string()}, "finish_reason": "stop"}]
+    });
+    let body = format!("data: {sse1}\n\ndata: {sse2}\n\ndata: [DONE]\n\n");
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new_with_token(server.uri(), "mock", "tok");
+    let stats = HarnessStats::new();
+    let ctx = SteerContext {
+        main_goal: "test goal",
+        orchestrator_status: "Active",
+        pending_approval: "None",
+        plan_progress: "None",
+        plan_content: "None",
+        available_agents: "",
+        steering_history: "None",
+        user_message: "status?",
+        active_subtasks: "None",
+    };
+
+    let mut streamed = String::new();
+    let d = arbitrate_steer_context_stream(&client, &stats, ctx, |delta| {
+        streamed.push_str(delta);
+    })
+    .await
+    .expect("decision should parse cleanly after thinking block");
+
+    assert_eq!(d.decision, "RespondDirectly");
+    assert_eq!(
+        d.response.as_deref(),
+        Some("Clean synthesized response to the user.")
+    );
+    assert_eq!(streamed, "Clean synthesized response to the user.");
+}
+
 /// Source guard for the collapse: the production region of `steer.rs` must not
 /// keep a sleep default/clamp literal (`unwrap_or(5)` + `Some(5)` without a
 /// clamp), nor re-type the duration-key lookups or the arbitrator's own budget
