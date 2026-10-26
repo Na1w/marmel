@@ -7846,8 +7846,9 @@ fn the_worker_lifecycle_the_registry_keeps_lands_on_the_pane_row() {
 }
 
 /// §8.5: a failure outlives the status line that carried it. The renderer keeps the
-/// categorical cause and the full text, and the `e` handler — which reads the
-/// transcript and the status line, not a buffer of its own — finds the same bytes back.
+/// categorical cause and the full text, and `e` reads **that buffer** — the transcript
+/// and status-line scan is only the fallback — so the recalled line carries the
+/// category and every line of the report, not the one line §7.4 lets the status keep.
 #[test]
 fn a_reported_error_stays_recallable_after_the_status_line_moved_on() {
     let mut r = TuiRenderer::new();
@@ -7857,7 +7858,7 @@ fn a_reported_error_stays_recallable_after_the_status_line_moved_on() {
         "LLM error: rate limit exceeded (Ready)\nsecond line of the report".to_string(),
     ));
 
-    // The transcript is honest about the failure — this is what `e` recalls today.
+    // The transcript is honest about the failure — the fallback path's source.
     assert!(
         r.messages
             .iter()
@@ -7882,12 +7883,68 @@ fn a_reported_error_stays_recallable_after_the_status_line_moved_on() {
     // `e` with an empty composer is never a silent key (§5, G5).
     assert!(press(&mut r, KeyCode::Char('e'), KeyModifiers::NONE));
     let recalled = r.messages.last().cloned().unwrap_or_default();
-    assert!(recalled.starts_with("✗ LLM error:"), "{recalled:?}");
+    // The recalled line is the buffer: `✗ <category>`, then the report verbatim.
+    assert!(
+        recalled.starts_with("✗ rate limit exceeded\nLLM error:"),
+        "{recalled:?}"
+    );
+    assert!(
+        recalled.contains("second line of the report"),
+        "the multi-line detail must survive the recall: {recalled:?}"
+    );
     assert!(recalled.contains("see .marmel/marmel.log"), "{recalled:?}");
     assert!(
         !recalled.contains("No error recorded"),
         "the pending-plumbing message must not survive the plumbing: {recalled:?}"
     );
+}
+
+/// §8.5 + work item 3: the buffer, not the transcript, is what `e` reads. A
+/// transcript clear — what `/reset` and a restore can do — must not cost the
+/// operator the cause of the failure that ended the last turn.
+#[test]
+fn an_error_recalled_with_e_survives_a_transcript_clear() {
+    let mut r = TuiRenderer::new();
+    r.on_event(&Event::Status(
+        "LLM error: http (Ready)\nrequest to the backend was refused".to_string(),
+    ));
+    assert!(r.last_error.is_some(), "the report was remembered");
+
+    // Everything the transcript scan could have read is gone.
+    r.messages.clear();
+    r.status_line = "Ready".to_string();
+    assert!(r.messages.is_empty(), "the transcript was cleared");
+
+    assert!(press(&mut r, KeyCode::Char('e'), KeyModifiers::NONE));
+    let recalled = r.messages.last().cloned().unwrap_or_default();
+    assert_eq!(
+        recalled,
+        "✗ http\nLLM error: http (Ready)\nrequest to the backend was refused\n\
+         see .marmel/marmel.log",
+        "the whole report is recalled from the buffer"
+    );
+
+    // With no buffer and no transcript either, `e` still says so (G5).
+    let mut clean = TuiRenderer::new();
+    assert!(press(&mut clean, KeyCode::Char('e'), KeyModifiers::NONE));
+    assert!(
+        clean
+            .messages
+            .last()
+            .is_some_and(|m| m.contains("No error recorded")),
+        "{:?}",
+        clean.messages
+    );
+
+    // The transcript scan stays the fallback: traffic pushed straight into the
+    // transcript is recalled verbatim when no buffer was ever filled.
+    let mut legacy = TuiRenderer::new();
+    legacy
+        .messages
+        .push("LLM error: timeout (Ready) — stream cut".to_string());
+    assert!(press(&mut legacy, KeyCode::Char('e'), KeyModifiers::NONE));
+    let fallback = legacy.messages.last().cloned().unwrap_or_default();
+    assert!(fallback.starts_with("✗ LLM error: timeout"), "{fallback:?}");
 }
 
 /// A non-error status report never leaves an error behind, and a repeated report of the
@@ -8765,13 +8822,70 @@ fn both_quit_requests_route_through_the_renderers_existing_exit() {
 
     let request_quit = body(source, "fn request_quit(&mut self)");
     assert!(
-        request_quit.contains("self.show_confirm()"),
-        "Ctrl+D opens the confirm surface"
+        request_quit.contains("show_request(ConfirmAction::Quit)"),
+        "Ctrl+D routes onto the confirm surface through the one arming helper"
     );
     assert!(
         !request_quit.contains("request_user_exit")
             && !request_quit.contains("confirm_abort = true"),
         "Ctrl+D neither exits nor arms on its own"
+    );
+    let show_request = body(source, "fn show_request(&mut self, action: ConfirmAction)");
+    assert!(
+        show_request.contains("self.show_confirm()")
+            && show_request.contains("self.confirm_action = Some(action)"),
+        "the surface is opened with the request it will run, from one place"
+    );
+    assert!(
+        !show_request.contains("request_user_exit")
+            && !show_request.contains("cancel_active_worker"),
+        "opening the surface runs nothing (G3)"
+    );
+
+    // t-013: the two bulk-cancellation spellings are woken only by their own arm,
+    // so a single-worker request can never reach the broadcast (§10 item 17).
+    let cancel_all_body = body(source, "fn cancel_every_worker(&mut self)");
+    assert!(
+        cancel_all_body.contains("crate::orchestrator::cancel_all()"),
+        "`/cancel-all` runs the cancellation §6 names, in a function of its own"
+    );
+    assert!(
+        !body(source, "fn request_cancel_selected_worker").contains("cancel_all")
+            && !body(source, "fn request_cancel_worker_by_argument").contains("cancel_all"),
+        "a one-worker request never names the broadcast cancellation"
+    );
+    let handoff = body(source, "fn confirm_pending(&mut self)");
+    assert!(
+        handoff.contains("self.tx.send(line)"),
+        "a confirmed slash command is handed to the session loop rather than \
+         re-implemented in the renderer (unified `/reset`, spec §6)"
+    );
+    let arm = body(source, "fn arm_destructive_command(&mut self, line: &str)");
+    for spelling in [
+        "/cancel-all",
+        "/cancel",
+        "is_reset_command",
+        "is_abort(&token)",
+    ] {
+        assert!(arm.contains(spelling), "arm gate missing {spelling}");
+    }
+    assert!(
+        !arm.contains("Plan::default")
+            && !arm.contains("request_user_exit")
+            && !arm.contains("self.tx.send"),
+        "the gate arms the surface only: no plan clear, no exit, no send"
+    );
+    let submit = body(source, "pub(crate) fn submit(&mut self)");
+    assert!(
+        !submit.contains("Plan::default()") && !submit.contains("plan.clear()"),
+        "the renderer-local `/reset` short-circuit is gone: all six spellings take \
+         the loop's full path (spec §6)"
+    );
+    assert!(
+        submit.contains("arm_destructive_command")
+            && submit.contains("is_bare_abort_word")
+            && !submit.contains("Renderer::request_user_exit"),
+        "`submit` hands destructive spellings to the surface and never exits by itself"
     );
 }
 
@@ -9155,4 +9269,599 @@ fn a_key_release_is_not_a_second_press() {
         }))
     );
     assert_eq!(r.input_text, "k", "a repeat inserts, like the press does");
+}
+// ============================================================================
+// t-013: the confirm overlay is the only route a destructive action takes.
+//
+// Three things are pinned here that the key path alone cannot show:
+//   * the surface is **drawn** — centred over the body, naming the pending
+//     action, its consequence and the `y` / `n` affordance — while the live
+//     metrics outside the body keep counting (spec §7.3, G4);
+//   * every destructive slash command stops at that surface, and `n` leaves the
+//     session alive with nothing sent to the loop (spec §6, G3);
+//   * the bare words §5 removes are ordinary steering text (UX friction 6).
+// ============================================================================
+
+/// Every row of the frame outside the given rects — the chrome an overlay is not
+/// allowed to move.
+fn rows_outside(rows: &[String], skip: &[ratatui::layout::Rect]) -> Vec<String> {
+    rows.iter()
+        .enumerate()
+        .filter(|(y, _)| {
+            let y = *y as u16;
+            !skip
+                .iter()
+                .any(|rect| y >= rect.y && y < rect.y + rect.height)
+        })
+        .map(|(_, row)| row.clone())
+        .collect()
+}
+
+/// Mask every digit run in a drawn row to `#`.
+///
+/// Two draws of the *same* renderer may legitimately print different numbers, and
+/// that is not a regression: status row 1 shows `tokens_in.max(global_in)` /
+/// `tokens_out.max(global_out)` against the process-wide
+/// `crate::llm::get_global_token_counts()` witness (`tui/mod.rs:805-815`), and the
+/// header carries the renderer's own session clock. Inside a parallel test process
+/// other tests move those witnesses between two frames, and the clock ticks with
+/// machine speed. G4 and §7.3 are about the chrome and the metric **fields**
+/// staying on screen and in place under an overlay — not about the counter values —
+/// so the frame comparisons mask the digits and compare the field set.
+fn steady(row: &str) -> String {
+    let mut out = String::with_capacity(row.len());
+    let mut in_digits = false;
+    for ch in row.chars() {
+        if ch.is_ascii_digit() {
+            if !in_digits {
+                out.push('#');
+                in_digits = true;
+            }
+        } else {
+            out.push(ch);
+            in_digits = false;
+        }
+    }
+    out
+}
+
+/// [`steady`] applied to a row set, for whole-region frame comparisons.
+fn steady_rows(rows: &[String]) -> Vec<String> {
+    rows.iter().map(|row| steady(row)).collect()
+}
+
+/// The §2.2 metrics of status row 1, with the wall-clock field dropped and the
+/// remaining values masked by [`steady`]. Keeping the raw figures in a whole-row
+/// comparison would make the test depend on what the rest of the test process is
+/// doing to the global token witness and on how fast the machine is.
+fn metrics_of(rows: &[String], status: &ratatui::layout::Rect) -> String {
+    let row = rows[usize::from(status.y)].as_str();
+    let without_clock = row
+        .split(" elapsed ")
+        .next()
+        .unwrap_or(row)
+        .trim()
+        .to_string();
+    steady(&without_clock)
+}
+
+/// Split a drawn frame at the body rect (§2.1): the rows the overlay may cover,
+/// and the rows it may not — header, status bar, composer and footer legend.
+fn body_and_chest(rows: &[String], body: &ratatui::layout::Rect) -> (Vec<String>, Vec<String>) {
+    let top = body.y as usize;
+    let bottom = (body.y + body.height) as usize;
+    let inside = rows[top..bottom].to_vec();
+    let mut outside = rows[..top].to_vec();
+    outside.extend_from_slice(&rows[bottom..]);
+    (inside, outside)
+}
+
+/// §7.3 + G4 + §10 item 16: `Ctrl+D` paints the Quit confirm **modally** — a
+/// `Clear`ed, bordered, centred paragraph over the body — carrying the action's
+/// name, its consequence and the `y` / `n` affordance. The rows outside the body
+/// are pixel-identical to the frame without the overlay, so the metrics stay
+/// live under it. `n` takes it off and leaves the session running.
+#[test]
+fn the_quit_confirm_is_painted_modally_over_the_body_with_the_metrics_live() {
+    let mut r = m4_renderer();
+    r.tokens_in = 1234;
+    r.tokens_out = 567;
+    let view = state::UiView::from_renderer(&r);
+    let rects = layout::compute_layout(ratatui::layout::Rect::new(0, 0, 100, 30), &view);
+    let body = rects.body.expect("the body rect exists at 100x30");
+    let status = rects.status.expect("the status rect exists at 100x30");
+
+    let plain = draw_new_frame(&mut r, 100, 30);
+    assert!(
+        plain.iter().any(|row| row.contains("in /")),
+        "the metrics row counts before the overlay: {}",
+        plain.join("\n")
+    );
+
+    assert!(press(&mut r, KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert_eq!(r.overlay, state::OverlayState::Confirm);
+    let rows = draw_new_frame(&mut r, 100, 30);
+    let frame = rows.join("\n");
+
+    // The surface names the request it holds (§3, §7.3).
+    assert!(frame.contains("Confirm"), "overlay title missing:\n{frame}");
+    assert!(
+        frame.contains("Quit the session"),
+        "the pending action is not named:\n{frame}"
+    );
+    assert!(
+        frame.contains("cancels every running worker"),
+        "the consequence is missing:\n{frame}"
+    );
+    assert!(
+        frame.contains("y / n"),
+        "the y/n affordance is missing:\n{frame}"
+    );
+    assert!(
+        frame.contains("Esc close"),
+        "the close hint is missing:\n{frame}"
+    );
+
+    // It is a modal drawn over the body, not a line smuggled into the chrome: the
+    // body rows changed, the chrome around it did not, and the §2.2 metrics row
+    // still carries its counters underneath (§7.3, G4).
+    let (plain_body, _) = body_and_chest(&plain, &body);
+    let (shown_body, _) = body_and_chest(&rows, &body);
+    assert_ne!(
+        plain_body, shown_body,
+        "the overlay did not paint over the body:\n{frame}"
+    );
+    assert_eq!(
+        steady_rows(&rows_outside(&plain, &[body, status])),
+        steady_rows(&rows_outside(&rows, &[body, status])),
+        "the header, status bar, composer and footer legend must be untouched \
+         under a confirm overlay"
+    );
+    let shown_metrics = metrics_of(&rows, &status);
+    assert_eq!(
+        metrics_of(&plain, &status),
+        shown_metrics,
+        "the metrics keep counting underneath the overlay (G4)"
+    );
+    assert!(
+        shown_metrics.contains("in /") && shown_metrics.contains("#a"),
+        "the row underneath is the live metrics row: {shown_metrics}"
+    );
+    // Centred, not flush left (§7.3): the overlay's top border row starts well
+    // inside the body rather than at its first column.
+    let title_row = shown_body
+        .iter()
+        .find(|row| row.contains("Confirm"))
+        .expect("the title row inside the body");
+    let box_start = title_row
+        .find('┌')
+        .expect("the overlay draws its own bordered box");
+    assert!(
+        box_start > 10 && box_start < 45,
+        "the box is centred inside a 100-cell body, not flush left: {title_row:?}"
+    );
+
+    // `n` closes it and nothing has run (§10 item 6).
+    assert!(press(&mut r, KeyCode::Char('n'), KeyModifiers::NONE));
+    assert_eq!(r.overlay, state::OverlayState::None);
+    assert!(!r.user_exit_requested() && !r.input_state.aborted);
+    let after = draw_new_frame(&mut r, 100, 30);
+    assert_eq!(
+        body_and_chest(&after, &body).0,
+        plain_body,
+        "`n` puts the body back exactly as it was"
+    );
+    assert!(!after.join("\n").contains("y / n"), "the surface is gone");
+}
+
+/// §7.3 + §10 item 17: `x` names the **selected** worker on the surface, so the
+/// operator sees which row `y` will stop before stopping it.
+#[test]
+fn the_cancel_worker_confirm_names_the_row_it_will_stop() {
+    let mut r = m4_renderer();
+    r.set_focus(state::FocusPane::Workers);
+    let view = state::UiView::from_renderer(&r);
+    let rects = layout::compute_layout(ratatui::layout::Rect::new(0, 0, 100, 30), &view);
+    let body = rects.body.expect("the body rect exists at 100x30");
+    let status = rects.status.expect("the status rect exists at 100x30");
+    let plain = draw_new_frame(&mut r, 100, 30);
+
+    assert!(press(&mut r, KeyCode::Char('x'), KeyModifiers::NONE));
+    assert_eq!(
+        r.confirm_action,
+        Some(events::ConfirmAction::CancelWorker {
+            key: "coder_specialist-t-004".to_string(),
+            task_id: Some("t-004".to_string()),
+        })
+    );
+    let rows = draw_new_frame(&mut r, 100, 30);
+    let frame = rows.join("\n");
+    assert!(
+        frame.contains("Cancel worker 'coder_specialist-t-004'"),
+        "the action names the selected row:\n{frame}"
+    );
+    assert!(
+        frame.contains("every other worker keeps running"),
+        "the consequence of a one-worker cancel is stated:\n{frame}"
+    );
+    assert!(
+        frame.contains("y / n"),
+        "the y/n affordance is missing:\n{frame}"
+    );
+    let (plain_body, _) = body_and_chest(&plain, &body);
+    let (shown_body, _) = body_and_chest(&rows, &body);
+    assert_ne!(plain_body, shown_body, "drawn over the body:\n{frame}");
+    assert_eq!(
+        steady_rows(&rows_outside(&plain, &[body, status])),
+        steady_rows(&rows_outside(&rows, &[body, status])),
+        "the chrome around the body is untouched"
+    );
+    assert_eq!(
+        metrics_of(&plain, &status),
+        metrics_of(&rows, &status),
+        "the metrics row stays live under the confirm (G4)"
+    );
+
+    // `n` leaves the worker running: no cancel request survives the dismissal.
+    assert!(press(&mut r, KeyCode::Char('n'), KeyModifiers::NONE));
+    assert!(r.confirm_action.is_none());
+    assert!(
+        r.status_line.contains("was left running"),
+        "{}",
+        r.status_line
+    );
+    assert!(!after_cancelled(&r));
+}
+
+/// The tell that no cancellation was fired from the renderer: the session was
+/// never asked to exit and the roster row is untouched.
+fn after_cancelled(r: &TuiRenderer) -> bool {
+    r.user_exit_requested() || r.status_line.starts_with("Cancelled worker")
+}
+
+/// The armed-abort prompt shares the surface (§8.5) but holds no request: it is
+/// drawn as the same modal over the body, says it is an arm rather than a pending
+/// request, and moves the **prompt** onto status row 2 while status row 1 keeps
+/// counting (§7.3, UX friction 11).
+#[test]
+fn the_armed_abort_prompt_occupies_the_same_surface_and_holds_no_request() {
+    let mut r = m4_renderer();
+    let view = state::UiView::from_renderer(&r);
+    let rects = layout::compute_layout(ratatui::layout::Rect::new(0, 0, 100, 30), &view);
+    let body = rects.body.expect("the body rect exists at 100x30");
+    let status = rects.status.expect("the status rect exists at 100x30");
+    let plain = draw_new_frame(&mut r, 100, 30);
+
+    assert!(press(&mut r, KeyCode::Esc, KeyModifiers::NONE));
+    assert!(r.is_abort_armed());
+    assert!(
+        r.confirm_action.is_none(),
+        "the arm holds no y/n request (§5)"
+    );
+    let rows = draw_new_frame(&mut r, 100, 30);
+    let frame = rows.join("\n");
+    assert!(
+        frame.contains("Confirm"),
+        "the surface is on screen:\n{frame}"
+    );
+    assert!(
+        frame.contains("Abort armed"),
+        "the armed wording is on the surface:\n{frame}"
+    );
+    assert!(
+        !frame.contains("Quit the session"),
+        "an arm is not a pending request:\n{frame}"
+    );
+
+    // The body carries the modal …
+    let (plain_body, _) = body_and_chest(&plain, &body);
+    let (shown_body, _) = body_and_chest(&rows, &body);
+    assert_ne!(plain_body, shown_body, "drawn over the body:\n{frame}");
+
+    // … and the prompt itself lives on status row 2 (§8.5), which is the one row
+    // the arming is allowed to change: row 1 keeps the counters, and the header,
+    // composer and footer legend are untouched.
+    let prompt_row = usize::from(status.y) + 1;
+    assert_eq!(
+        metrics_of(&plain, &status),
+        metrics_of(&rows, &status),
+        "status row 1 keeps counting under an armed prompt"
+    );
+    assert!(
+        metrics_of(&rows, &status).contains("in /"),
+        "{}",
+        metrics_of(&rows, &status)
+    );
+    assert!(
+        rows[prompt_row].contains("abort armed"),
+        "the prompt lives on status row 2: {:?}",
+        rows[prompt_row]
+    );
+    let excluded = [
+        body,
+        ratatui::layout::Rect {
+            x: status.x,
+            y: status.y + 1,
+            width: status.width,
+            height: 1,
+        },
+    ];
+    assert_eq!(
+        steady_rows(&rows_outside(&plain, &excluded)),
+        steady_rows(&rows_outside(&rows, &excluded)),
+        "only the body and status row 2 move while an abort is armed"
+    );
+    assert!(r.status_line.contains("Abort armed"), "{}", r.status_line);
+}
+
+/// §6 + G3: every destructive slash command — the quit family, `/cancel`,
+/// `/cancel <id>`, `/cancel-all` and all six `/reset` spellings — stops at the
+/// confirm surface. Nothing is sent to the loop, nothing is cancelled, no exit
+/// is requested, and `n` leaves the session alive with the transcript untouched.
+#[test]
+fn every_destructive_slash_command_stops_at_the_confirm_surface() {
+    let commands = [
+        "/exit",
+        "/quit",
+        "/q",
+        "/abort",
+        "/stop",
+        ":q",
+        ":q!",
+        "/cancel",
+        "/cancel t-004",
+        "/cancel-all",
+        "/reset",
+        "/reset_plan",
+        "/reset-plan",
+        "/clear_plan",
+        "/clear-plan",
+        "/reset_execution_plan",
+    ];
+    for command in commands {
+        let mut r = m4_renderer();
+        r.set_input_content(command);
+        r.submit();
+        assert!(
+            r.confirm_action.is_some(),
+            "`{command}` must open the confirm surface"
+        );
+        assert_eq!(r.overlay, state::OverlayState::Confirm, "`{command}`");
+        assert!(
+            drain_submissions(&mut r).is_empty(),
+            "`{command}` reached the session loop un-confirmed"
+        );
+        assert!(
+            !r.user_exit_requested() && !r.input_state.aborted,
+            "`{command}` ended the session by itself"
+        );
+        assert!(
+            r.plan_content.contains("t-004"),
+            "`{command}` cleared the plan before `y`"
+        );
+
+        assert!(
+            press(&mut r, KeyCode::Char('n'), KeyModifiers::NONE),
+            "`{command}`: `n` is a binding"
+        );
+        assert!(
+            r.confirm_action.is_none(),
+            "`{command}`: `n` dropped the request"
+        );
+        assert_eq!(r.overlay, state::OverlayState::None, "`{command}`");
+        assert!(
+            drain_submissions(&mut r).is_empty(),
+            "`{command}` reached the loop after `n`"
+        );
+        assert!(
+            !r.user_exit_requested() && !r.input_state.aborted,
+            "`{command}` ended the session despite `n`"
+        );
+        assert!(!r.is_abort_armed(), "`{command}` + `n` armed nothing");
+        assert!(
+            r.plan_content.contains("t-004"),
+            "`{command}` + `n` left the plan alone"
+        );
+    }
+}
+
+/// §6 (unified `/reset`) + the quit spellings: `y` hands the **exact** command
+/// back to the session loop, which owns the destructive path. The renderer no
+/// longer clears the plan behind the loop, and no `/reset` spelling is answered
+/// locally any more.
+#[test]
+fn a_confirmed_command_is_handed_to_the_session_loop_verbatim() {
+    let spellings = [
+        "/reset",
+        "/reset_plan",
+        "/reset-plan",
+        "/clear_plan",
+        "/clear-plan",
+        "/reset_execution_plan",
+        "/exit",
+        "/quit",
+        "/q",
+        "/abort",
+        "/stop",
+        ":q",
+        ":q!",
+    ];
+    for spelling in spellings {
+        let mut r = m4_renderer();
+        r.set_input_content(spelling);
+        r.submit();
+        assert_eq!(
+            r.confirm_action,
+            Some(events::ConfirmAction::Command {
+                line: spelling.to_string()
+            }),
+            "`{spelling}` is confirmed as a command hand-off"
+        );
+        // Every spelling takes the one path, and the surface describes it.
+        let request = r
+            .confirm_action
+            .as_ref()
+            .map(|action| action.describe())
+            .expect("a request is pending");
+        assert!(
+            request.action.contains(spelling),
+            "the surface names the spelling it will run: {request:?}"
+        );
+
+        assert!(press(&mut r, KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(
+            drain_submissions(&mut r),
+            vec![spelling.to_string()],
+            "`{spelling}` reaches the loop exactly as typed"
+        );
+        assert_eq!(r.overlay, state::OverlayState::None);
+        assert!(
+            r.plan_content.contains("t-004"),
+            "`{spelling}`: the renderer no longer clears the plan itself — the \
+             loop's reset path does"
+        );
+        assert!(
+            !r.user_exit_requested(),
+            "`{spelling}`: the loop owns the exit, the renderer does not"
+        );
+        assert_eq!(
+            r.history.last().map(String::as_str),
+            Some(spelling),
+            "a confirmed command is remembered in the composer history"
+        );
+    }
+}
+
+/// §6: `/cancel <worker key or task id>` resolves its argument against the
+/// roster and confirms **one** worker; `y` addresses that identity through the
+/// registry's exact-identity matching and never exits the session.
+#[test]
+fn cancel_with_an_argument_confirms_one_named_worker() {
+    for argument in ["coder_specialist-t-004", "t-004", "CODER_SPECIALIST-t-004"] {
+        let mut r = m4_renderer();
+        r.set_input_content(&format!("/cancel {argument}"));
+        r.submit();
+        assert_eq!(
+            r.confirm_action,
+            Some(events::ConfirmAction::CancelWorker {
+                key: "coder_specialist-t-004".to_string(),
+                task_id: Some("t-004".to_string()),
+            }),
+            "`/cancel {argument}` resolves to the roster row"
+        );
+        assert!(press(&mut r, KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(
+            r.status_line.contains("coder_specialist-t-004"),
+            "the outcome names the worker: {}",
+            r.status_line
+        );
+        assert!(
+            !r.user_exit_requested(),
+            "cancelling one worker never exits the session (§10 item 17)"
+        );
+        assert!(drain_submissions(&mut r).is_empty(), "nothing was sent");
+    }
+
+    // An unknown argument is confirmed as typed, never retargeted onto another row.
+    let mut r = m4_renderer();
+    r.set_input_content("/cancel t-999");
+    r.submit();
+    assert_eq!(
+        r.confirm_action,
+        Some(events::ConfirmAction::CancelWorker {
+            key: "t-999".to_string(),
+            task_id: None,
+        }),
+        "the string the operator typed is the identity `y` addresses"
+    );
+
+    // `/cancel-all` is the one request that carries the broadcast cancellation,
+    // and it is held behind the same surface. `y` is not fired here for the same
+    // reason the quit `y` is pinned by wiring above: `cancel_all()` is
+    // process-wide and would race the `ui::bridge` wall-clock tests.
+    let mut r = m4_renderer();
+    r.set_input_content("/cancel-all");
+    r.submit();
+    assert_eq!(r.confirm_action, Some(events::ConfirmAction::CancelAll));
+    assert!(r.status_line.contains("every worker"), "{}", r.status_line);
+    assert!(press(&mut r, KeyCode::Char('n'), KeyModifiers::NONE));
+    assert_eq!(r.status_line, "Every worker was left running.");
+    assert!(!r.user_exit_requested());
+}
+
+/// §5: the bare words `stop / cancel / exit / quit / q / abort` are ordinary
+/// steering text in the TUI. They reach the loop as text, arm nothing, and the
+/// renderer says which spelling does open a confirm (UX friction 6).
+#[test]
+fn a_bare_abort_word_is_steering_text_and_never_ends_the_session() {
+    for word in [
+        "stop", "cancel", "exit", "quit", "q", "abort", "STOP", "Stop",
+    ] {
+        let mut r = m4_renderer();
+        r.set_input_content(word);
+        r.submit();
+        let sent = drain_submissions(&mut r);
+        assert_eq!(
+            sent.iter().map(|line| line.trim()).collect::<Vec<_>>(),
+            vec![word],
+            "`{word}` is delivered as one steering message"
+        );
+        assert!(
+            !r.user_exit_requested() && !r.input_state.aborted,
+            "the bare word `{word}` ended the session"
+        );
+        assert!(
+            r.confirm_action.is_none(),
+            "steering text arms no confirm: `{word}`"
+        );
+        assert!(
+            r.messages.iter().any(|message| {
+                message.contains("steering text")
+                    && message.contains("/exit")
+                    && message.contains("Esc twice")
+            }),
+            "`{word}`: the hint names the confirmed spelling: {:?}",
+            r.messages
+        );
+        assert!(
+            r.status_line.contains("Steering text"),
+            "`{word}`: {}",
+            r.status_line
+        );
+        // The word still lands in history, like any other instruction.
+        assert_eq!(r.history.last().map(String::as_str), Some(word));
+    }
+}
+
+/// The gate is the TUI's, not the command vocabulary's: a multi-line submission
+/// whose first line is a destructive command is still delivered verbatim, and a
+/// renderer that gates nothing keeps the pre-rebuild bare-word behaviour.
+#[test]
+fn the_gate_keeps_pasted_blocks_intact_and_the_tui_the_only_gating_renderer() {
+    let block = "/reset\nnästa rad";
+    let mut r = m4_renderer();
+    r.paste_text(block);
+    r.submit();
+    assert!(
+        r.confirm_action.is_none(),
+        "a pasted block is not a command"
+    );
+    assert_eq!(drain_submissions(&mut r), vec![block.to_string()]);
+    assert!(
+        r.plan_content.contains("t-004"),
+        "the plan survived the paste"
+    );
+
+    // The headless renderer keeps the pre-rebuild vocabulary (its behaviour is
+    // byte-unchanged); the TUI is the only one that gates.
+    let raw = crate::ui::raw::RawRenderer::new();
+    assert!(
+        !crate::ui::Renderer::gates_destructive_commands(&raw),
+        "the headless renderer must not change its abort vocabulary"
+    );
+    let tui = TuiRenderer::new();
+    assert!(
+        crate::ui::Renderer::gates_destructive_commands(&tui),
+        "the TUI gates, which is what lets the loop drop the bare words"
+    );
 }

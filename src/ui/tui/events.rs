@@ -35,13 +35,16 @@ use std::time::{Duration, Instant};
 
 /// The destructive action the confirm surface is holding for `y` / `n` (spec §3,
 /// G3). The surface carries a tag, not a closure: `y` either runs the quit path the
-/// armed-abort flow already runs, or cancels **one** named worker — nothing else is
-/// reachable from a keystroke.
+/// armed-abort flow already runs, cancels **one** named worker, cancels every
+/// worker, or hands one already-confirmed slash command back to the session loop —
+/// nothing else is reachable from a keystroke.
 ///
 /// The worker identity is captured at request time, so a roster that changes under
 /// the overlay (a worker finishing, a new one registered) can never retarget `y`
-/// onto a different row, and `orchestrator::cancel_all()` is never reachable from
-/// here (spec §5, `bus.rs:38`).
+/// onto a different row, and `orchestrator::cancel_all()` is never reachable from a
+/// **single-worker** request (spec §5, `bus.rs:38`). It is reachable from
+/// [`ConfirmAction::CancelAll`] alone, which is what the `/cancel-all` row of §6
+/// documents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConfirmAction {
     /// End the session through [`Renderer::request_user_exit`] — the same exit path
@@ -54,6 +57,61 @@ pub(crate) enum ConfirmAction {
         /// Its task id, when the row carries one.
         task_id: Option<String>,
     },
+    /// `/cancel-all` (§6): cancel every running worker.
+    CancelAll,
+    /// A destructive **slash command** the operator has already confirmed. `y`
+    /// sends this exact spelling to the session loop over `tx`, so the loop's own
+    /// command path runs — the quit spellings through its abort branch, and every
+    /// `/reset` spelling through `handle_reset_command_and_commit` (plan clear,
+    /// session bundle, steering history, transcript, `[System]` context note).
+    /// That is the unified `/reset` route of §6: one path for all six spellings,
+    /// and no renderer-side short-circuit that leaves the transcript behind.
+    Command {
+        /// The command verbatim, as the operator typed it.
+        line: String,
+    },
+}
+
+impl ConfirmAction {
+    /// Project the request onto the confirm surface's body (spec §3, §7.3): the
+    /// action's **name** and its **consequence**, both one line. The renderer draws
+    /// this, so the text can never describe an action other than the one `y` runs.
+    pub(crate) fn describe(&self) -> help::ConfirmRequest {
+        match self {
+            ConfirmAction::Quit => help::ConfirmRequest::new(
+                "Quit the session (Ctrl+D)",
+                "Ends the session and cancels every running worker.",
+            ),
+            ConfirmAction::CancelWorker { key, .. } => help::ConfirmRequest::new(
+                format!("Cancel worker '{key}'"),
+                "Stops that one worker; every other worker keeps running.",
+            ),
+            ConfirmAction::CancelAll => help::ConfirmRequest::new(
+                "Cancel every worker (/cancel-all)",
+                "Cancels every running worker and every in-flight stream.",
+            ),
+            ConfirmAction::Command { line } => {
+                let token = line.trim();
+                if crate::ui::helpers::is_reset_command(token) {
+                    help::ConfirmRequest::new(
+                        format!("Reset the execution plan ({token})"),
+                        "Clears plan, session bundle, steering history and \
+                         transcript, and tells the model.",
+                    )
+                } else if crate::ui::helpers::is_abort_command(token) {
+                    help::ConfirmRequest::new(
+                        format!("Quit the session ({token})"),
+                        "Ends the session and cancels every running worker.",
+                    )
+                } else {
+                    help::ConfirmRequest::new(
+                        format!("Run {token}"),
+                        "Sends the command to the session loop.",
+                    )
+                }
+            }
+        }
+    }
 }
 
 impl TuiRenderer {
@@ -538,11 +596,7 @@ impl TuiRenderer {
     /// the rule acceptance criterion 6 states for the slash-spelling of the same
     /// request.
     fn request_quit(&mut self) {
-        self.disarm_abort();
-        self.confirm_action = Some(ConfirmAction::Quit);
-        self.show_confirm();
-        self.status_line = "Confirm quit — y to quit, n or Esc to keep working.".to_string();
-        self.dirty = true;
+        self.show_request(ConfirmAction::Quit);
     }
 
     /// `x` (§5): ask to cancel the **selected** worker of the Workers pane.
@@ -561,25 +615,138 @@ impl TuiRenderer {
         let row = &self.subagents[index];
         let key = row.name.clone();
         let task_id = row.task_id.clone();
+        self.show_request(ConfirmAction::CancelWorker { key, task_id })
+    }
+
+    /// Put one destructive request on the confirm surface and state it in the
+    /// status line. This is the single place the surface is armed, so every entry
+    /// point — `Ctrl+D`, `x`, a slash command — ends on the same surface with the
+    /// same `y` / `n` affordance, and none of them arms abort on the way.
+    fn show_request(&mut self, action: ConfirmAction) -> bool {
+        let status = Self::confirm_status_line(&action);
         self.disarm_abort();
-        self.confirm_action = Some(ConfirmAction::CancelWorker {
-            key: key.clone(),
-            task_id,
-        });
+        self.confirm_action = Some(action);
         self.show_confirm();
-        self.status_line = format!(
-            "Confirm cancel of worker '{key}' — y to cancel it, n or Esc to leave it running."
-        );
+        self.status_line = status;
         self.dirty = true;
         true
+    }
+
+    /// The status-line echo of a pending request. Every form says the same three
+    /// things the overlay says (spec §7.3): which action, what it touches, and that
+    /// `y` runs it while `n` or `Esc` leaves the session alone.
+    fn confirm_status_line(action: &ConfirmAction) -> String {
+        match action {
+            ConfirmAction::Quit => {
+                "Confirm quit — y to quit, n or Esc to keep working.".to_string()
+            }
+            ConfirmAction::CancelWorker { key, .. } => format!(
+                "Confirm cancel of worker '{key}' — y to cancel it, n or Esc to leave it running."
+            ),
+            ConfirmAction::CancelAll => {
+                "Confirm cancel of every worker — y to cancel them, n or Esc to leave them running."
+                    .to_string()
+            }
+            ConfirmAction::Command { line } => format!(
+                "Confirm {} — y to run it, n or Esc to keep working.",
+                line.trim()
+            ),
+        }
+    }
+
+    /// `/cancel <worker key or task id>` (§6): resolve the argument against the
+    /// roster and ask to cancel **that one** worker.
+    ///
+    /// An argument that names no row is still confirmed rather than guessed at: the
+    /// surface prints the string the operator typed and `y` hands the same string to
+    /// the registry's exact-identity matching, so an unknown name reports "not
+    /// running any more" instead of cancelling a different row.
+    fn request_cancel_worker_by_argument(&mut self, argument: &str) -> bool {
+        let argument = argument.trim();
+        let row = self.subagents.iter().find(|row| {
+            row.name.eq_ignore_ascii_case(argument)
+                || row
+                    .task_id
+                    .as_deref()
+                    .is_some_and(|task| task.eq_ignore_ascii_case(argument))
+        });
+        let key = row
+            .map(|row| row.name.clone())
+            .unwrap_or_else(|| argument.to_string());
+        let task_id = row.and_then(|row| row.task_id.clone());
+        self.show_request(ConfirmAction::CancelWorker { key, task_id })
+    }
+
+    /// §6 / §10 item 17: is `line` a destructive slash command? If so the request is
+    /// put on the confirm surface and **nothing else happens** — nothing is sent to
+    /// the session loop, no plan is cleared, no worker is cancelled and no exit is
+    /// requested. `y` runs it, `n` or `Esc` drops it.
+    ///
+    /// This is the single gate for the whole destructive family, which is what makes
+    /// the routing auditable:
+    ///
+    /// * `/exit` `/quit` `/q` `/abort` `/stop` (`:q`, `:q!`) and a bare `/cancel`
+    ///   outside the Workers pane → a `Command` request: `y` sends that exact
+    ///   spelling back to the session loop, whose own abort branch ends the run.
+    /// * `/cancel <worker key or task id>` → one [`ConfirmAction::CancelWorker`];
+    ///   `/cancel` with no argument while the Workers pane is focused names the
+    ///   selected row (spec §6).
+    /// * `/cancel-all` → [`ConfirmAction::CancelAll`].
+    /// * **all six** `/reset` spellings → a `Command` request, so the reset takes the
+    ///   one path §6 asks for: confirm, then the session loop runs
+    ///   `handle_reset_command_and_commit`. The renderer-local short-circuit that
+    ///   used to answer five of the spellings is gone.
+    ///
+    /// Multi-line submissions are never commands (`submission_is_single_line`), so a
+    /// pasted block whose first line is `/reset` still arrives verbatim.
+    fn arm_destructive_command(&mut self, line: &str) -> bool {
+        if !crate::ui::helpers::submission_is_single_line(line) {
+            return false;
+        }
+        let trimmed = line.trim();
+        let token = trimmed.to_ascii_lowercase();
+        if crate::ui::helpers::is_reset_command(&token) {
+            return self.show_request(ConfirmAction::Command {
+                line: trimmed.to_string(),
+            });
+        }
+        if token == "/cancel-all" {
+            return self.show_request(ConfirmAction::CancelAll);
+        }
+        if token == "/cancel" {
+            // §6: `/cancel` names one worker. With no argument the selected Workers
+            // row is its subject; anywhere else the spelling keeps the meaning it
+            // already had in the loop — a quit — which is why it is confirmed too.
+            if self.focus == FocusPane::Workers && !self.subagents.is_empty() {
+                return self.request_cancel_selected_worker();
+            }
+            return self.show_request(ConfirmAction::Command {
+                line: trimmed.to_string(),
+            });
+        }
+        if let Some(argument) = token.strip_prefix("/cancel ")
+            && !argument.trim().is_empty()
+        {
+            return self.request_cancel_worker_by_argument(argument);
+        }
+        if is_abort(&token) {
+            return self.show_request(ConfirmAction::Command {
+                line: trimmed.to_string(),
+            });
+        }
+        false
     }
 
     /// `y` inside the confirm surface: run the pending request.
     ///
     /// `Quit` takes the same exit path the armed-abort flow uses today, and
     /// `CancelWorker` addresses one worker by name through the registry's
-    /// exact-identity matching. `confirm_all()`-style bulk cancellation is not
-    /// reachable from a keystroke (spec §5).
+    /// exact-identity matching. `Command` hands the confirmed slash command back to
+    /// the session loop — the unified `/reset` route of §6, and the quit
+    /// spellings' own abort branch. Bulk cancellation is reachable from
+    /// [`ConfirmAction::CancelAll`] (`/cancel-all`, §6) and from nowhere else; the
+    /// call itself lives in [`Self::cancel_every_worker`] so a single-worker
+    /// request can never reach it (spec §5, §10 item 17).
     fn confirm_pending(&mut self) -> bool {
         let action = self.confirm_action.take();
         self.confirm_abort = false;
@@ -597,12 +764,38 @@ impl TuiRenderer {
                     format!("Worker '{key}' is not running any more.")
                 };
             }
+            Some(ConfirmAction::CancelAll) => {
+                self.cancel_every_worker();
+            }
+            Some(ConfirmAction::Command { line }) => {
+                // The command is already confirmed: the loop's own command path is
+                // the executor, so the renderer never re-implements it. It is
+                // echoed and remembered like any other submission, so the composer
+                // history still holds the command the operator ran.
+                let trimmed = line.trim().to_string();
+                if self.history.last() != Some(&trimmed) {
+                    self.history.push(trimmed.clone());
+                }
+                self.history_index = None;
+                self.input_draft.clear();
+                self.messages.push(format!("User: {trimmed}"));
+                self.chat_auto_scroll = true;
+                let _ = self.tx.send(line);
+            }
             Some(ConfirmAction::Quit) | None => {
                 Renderer::request_user_exit(self);
             }
         }
         self.dirty = true;
         true
+    }
+
+    /// `/cancel-all` (§6): cancel every running worker. Deliberately its own
+    /// function, so the broadcast cancellation appears nowhere in the body that
+    /// handles a single-worker request.
+    fn cancel_every_worker(&mut self) {
+        crate::orchestrator::cancel_all();
+        self.status_line = "Cancelled every running worker.".to_string();
     }
 
     /// `n` inside the confirm surface: drop the request and keep working
@@ -615,6 +808,10 @@ impl TuiRenderer {
         self.status_line = match action {
             Some(ConfirmAction::CancelWorker { key, .. }) => {
                 format!("Worker '{key}' was left running.")
+            }
+            Some(ConfirmAction::CancelAll) => "Every worker was left running.".to_string(),
+            Some(ConfirmAction::Command { line }) => {
+                format!("{} cancelled — nothing was sent.", line.trim())
             }
             Some(ConfirmAction::Quit) => "Quit cancelled.".to_string(),
             None => "Abort cancelled.".to_string(),
@@ -702,14 +899,25 @@ impl TuiRenderer {
         true
     }
 
-    /// `e` (§5): show the last error again.
+    /// `e` / `/error`: print the sticky last error again (spec §8.5).
     ///
-    /// Spec §8.5 gives the renderer a dedicated `last_error` buffer that stores the
-    /// categorical text verbatim; that buffer does not exist yet and needs the t-012
-    /// plumbing, so this recalls the error traffic the session loop has already
-    /// pushed into the transcript and the status line, and says so out loud when
-    /// there is nothing to recall (G5 — `e` is never a silent key).
+    /// The §8.5 buffer comes first, because it is the report as it was made: the
+    /// categorical cause plus the **whole** text, multi-line included. `status_line`
+    /// keeps only the first line of that traffic (§7.4) and the transcript can be
+    /// cleared (`/reset`, a restore, a pruning), so a transcript-only scan loses the
+    /// cause exactly when the operator needs it — which is why the scan below is the
+    /// fallback, not the source. Saying so out loud when the buffer is empty is what
+    /// keeps `e` from ever being a silent key (G5).
     fn recall_last_error(&mut self) {
+        if let Some(error) = self.last_error.clone() {
+            self.messages.push(format!(
+                "✗ {}\n{}\nsee .marmel/marmel.log",
+                error.category, error.detail
+            ));
+            self.chat_auto_scroll = true;
+            self.dirty = true;
+            return;
+        }
         let found = Self::error_line(&self.messages, &self.status_line);
         match found {
             Some(text) => {
@@ -717,12 +925,12 @@ impl TuiRenderer {
                     .push(format!("✗ {text}\nsee .marmel/marmel.log"));
             }
             None => self.messages.push(
-                "[CLI] No error recorded to recall. The sticky last-error buffer \
-                 (spec §8.5) is still pending plumbing: once it lands, `e` and `/error` \
-                 print the stored cause here."
+                "[CLI] No error recorded to recall: the sticky last-error buffer (§8.5) is \
+                 empty and the transcript carries no error traffic."
                     .to_string(),
             ),
         }
+        self.chat_auto_scroll = true;
         self.dirty = true;
     }
 
@@ -1149,25 +1357,13 @@ impl TuiRenderer {
             self.chat_auto_scroll = true;
             return;
         }
-        let trimmed_lower = line.trim().to_ascii_lowercase();
-        if trimmed_lower == "/reset"
-            || trimmed_lower == "/reset_plan"
-            || trimmed_lower == "/reset-plan"
-            || trimmed_lower == "/clear_plan"
-            || trimmed_lower == "/clear-plan"
-        {
-            let plan = crate::manager::phase::Plan::default();
-            let _ = plan.clear();
-            self.show_plan_panel = false;
-            self.had_active_plan = false;
-            self.plan_content.clear();
-            self.focused_panel = FocusedPanel::Chat;
-            self.status_line = "Ready".to_string();
-            self.messages.push(
-                "[CLI] Execution plan reset and cleared. Phase reverted to Conversational."
-                    .to_string(),
-            );
-            self.chat_auto_scroll = true;
+        // §6 + §10 item 17: every destructive slash command — the quit family,
+        // `/cancel <id>`, `/cancel-all` and all six `/reset` spellings — stops here
+        // and waits on the confirm surface. Nothing is sent, no plan is cleared and
+        // no exit is requested by the keystroke that typed it. This also removes the
+        // renderer-local `/reset` short-circuit that used to answer five of the six
+        // spellings by hand: they now all take the loop's full path on `y`.
+        if self.arm_destructive_command(&line) {
             return;
         }
         self.commit_turn_content();
@@ -1182,8 +1378,21 @@ impl TuiRenderer {
         self.tokens_in = self.tokens_in.saturating_add(user_tokens);
         self.messages.push(format!("User: {trimmed}"));
         self.chat_auto_scroll = true;
-        if is_abort(&line) {
-            Renderer::request_user_exit(self);
+        // §5: the bare words `stop / cancel / exit / quit / q / abort` are ordinary
+        // steering text again — a one-word instruction must not end a run (UX
+        // friction 6). They are still delivered verbatim, and the hint says which
+        // spelling does open a confirm. The session loop reads them as text too,
+        // because it asks [`Renderer::gates_destructive_commands`] before applying
+        // its own whole-string abort test (see `session.rs::is_abort_for_renderer`).
+        if crate::ui::helpers::is_bare_abort_word(&line) {
+            self.messages.push(
+                "[CLI] That is steering text, not a command: a bare stop / cancel / exit / \
+                 quit / q / abort never ends the session. Use /exit (or Ctrl+D) for a \
+                 confirmed quit, or Esc twice to arm abort."
+                    .to_string(),
+            );
+            self.status_line = format!("Steering text: {trimmed} — use /exit for a confirmed quit");
+            self.chat_auto_scroll = true;
         }
         let _ = self.tx.send(line);
     }

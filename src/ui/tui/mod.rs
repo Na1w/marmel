@@ -827,18 +827,31 @@ impl TuiRenderer {
             let data = components::help::HelpData {
                 kind: components::help::HelpKind::Legend,
                 compact,
+                confirm: None,
             };
             components::help::render(frame, rect, &data);
         }
-        // Overlays draw last (§7.3). The armed-abort surface is drawn as the
-        // status row-2 prompt of §8.5, never as a modal, so only the help
-        // overlay reaches this point until the `?`/`F1` binding lands in t-010.
-        if view.overlay == state::OverlayState::Help
+        // 8. Overlays draw last, centred over the body (§7.3): `Clear` plus a
+        // content-sized bordered `Paragraph` clamped to 80 % of this rect. Only the
+        // body is covered — the header, the two status rows, the composer and the
+        // footer legend are already painted and stay readable underneath, which is
+        // what keeps the live metrics counting while a confirm is on screen (§7.3,
+        // G4) and leaves the armed prompt on status row 2. A pending request names
+        // itself on the surface (its action and its consequence, plus the `y` / `n`
+        // affordance); with no request the surface is the armed-abort prompt of
+        // §8.5, which honours no `y`/`n` (§5).
+        if view.overlay != state::OverlayState::None
             && let Some(rect) = rects.body
         {
+            let request = self
+                .confirm_action
+                .as_ref()
+                .filter(|_| view.overlay == state::OverlayState::Confirm)
+                .map(|action| action.describe());
             let data = components::help::HelpData {
                 kind: components::help::HelpKind::Overlay(view.overlay),
                 compact,
+                confirm: request,
             };
             components::help::render(frame, rect, &data);
         }
@@ -1878,6 +1891,16 @@ impl Renderer for TuiRenderer {
         self.abort_armed_at = None;
         self.dirty = true;
         crate::orchestrator::reset_cancellation();
+    }
+
+    /// The TUI is the renderer that gates destructive commands (spec §5, §6, G3):
+    /// `events.rs::arm_destructive_command` puts every destructive slash spelling on
+    /// the confirm surface before anything is sent, and the bare words §5 removes are
+    /// handed over as ordinary steering text. The session loop therefore reads only
+    /// the slash spellings here (`helpers::is_abort_command`); the headless
+    /// `RawRenderer` and the test renderers keep the pre-rebuild vocabulary.
+    fn gates_destructive_commands(&self) -> bool {
+        true
     }
 
     /// Tear the terminal back down (spec §6.1 entry-path contract).

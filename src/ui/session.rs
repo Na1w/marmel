@@ -927,6 +927,25 @@ pub fn confirm_bundle_swept(
     false
 }
 
+/// The whole-string abort test with the **renderer's destructive-command gate**
+/// applied (spec §5, §6, G3).
+///
+/// The session loop is shared by every renderer, so this is the one place the
+/// gate is read: a renderer that confirms every destructive action itself (the
+/// rebuilt TUI) has already put `y` behind the slash spellings and must not have
+/// a bare word like `stop` — which it deliberately hands over as ordinary
+/// steering text — end the run underneath it. Every other renderer (headless
+/// `RawRenderer`, the CLI, the test renderers) keeps the pre-rebuild vocabulary
+/// verbatim, because [`helpers::is_legacy_abort_command`] is exactly what
+/// `is_abort_command` was before §5 shrank it.
+fn is_abort_for_renderer(renderer: &dyn Renderer, line: &str) -> bool {
+    if renderer.gates_destructive_commands() {
+        is_abort_command(line)
+    } else {
+        is_legacy_abort_command(line)
+    }
+}
+
 /// T-10 end to end: one `/reset`. Mark the bundle with `reset`, run the plan
 /// clear (`Plan::clear()` → `sweep_session_state()`), then confirm the bundle
 /// really was deleted. The order is the contract: a crash between the mark and
@@ -1973,7 +1992,7 @@ pub async fn run_session_with_bounds_report(
             None => loop {
                 match renderer.read_input() {
                     Some(line) => {
-                        if is_abort_command(&line) {
+                        if is_abort_for_renderer(renderer, &line) {
                             crate::debug_log::log_user_input("command", &line);
                             // An abort here is still an exit path and gets a mandatory ending
                             // commit — but only if THIS run already wrote the bundle. Marking it
@@ -2087,7 +2106,7 @@ pub async fn run_session_with_bounds_report(
         );
 
         if let Some(steer) = renderer.poll_input() {
-            if is_abort_command(&steer) {
+            if is_abort_for_renderer(renderer, &steer) {
                 crate::debug_log::log_user_input("command", &steer);
                 renderer.request_user_exit();
                 break;
@@ -2829,7 +2848,7 @@ pub async fn run_session_with_bounds_report(
                                     Some(&mut ui_transcript),
                                 );
                                 if let Some(input) = renderer.poll_input() {
-                                    if is_abort_command(&input) {
+                                    if is_abort_for_renderer(renderer, &input) {
                                         crate::debug_log::log_user_input("command", &input);
                                         renderer.request_user_exit();
                                     } else if is_reset_command(&input) {
@@ -3408,7 +3427,7 @@ pub async fn run_session_with_bounds_report(
                                     Some(&mut ui_transcript),
                                 );
                                 if let Some(input) = renderer.poll_input() {
-                                    if is_abort_command(&input) {
+                                    if is_abort_for_renderer(renderer, &input) {
                                         crate::debug_log::log_user_input("command", &input);
                                         renderer.request_user_exit();
                                     } else if is_reset_command(&input) {
@@ -3774,7 +3793,7 @@ pub async fn run_session_with_bounds_report(
 
         match renderer.read_input() {
             Some(line) => {
-                if is_abort_command(&line) {
+                if is_abort_for_renderer(renderer, &line) {
                     crate::debug_log::log_user_input("command", &line);
                     renderer.request_user_exit();
                     break;

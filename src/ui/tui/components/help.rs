@@ -12,10 +12,11 @@
 //! listed by [`removed`] under the table so an operator with the old keymap in
 //! muscle memory learns what replaced them.
 //!
-//! needs plumb for t-009b: the confirm overlay body. `HelpData` carries only
-//! [`OverlayState`], not the `ConfirmRequest` of §3 (which action is pending,
-//! what it touches), so the confirm body prints the keys that overlay honours,
-//! read from the same table. The action text needs the request plumbed in.
+//! The confirm body is plumbed (t-013): `HelpData` carries the `ConfirmRequest`
+//! the renderer's pending `events::ConfirmAction` projects onto — the action's
+//! name and its consequence — and [`confirm_lines`] pairs those with the
+//! overlay-scope rows of the same table, so the surface always names what `y`
+//! will run.
 
 use super::{fit_spans, pane_block};
 use crate::ui::tui::components::input::slash_commands;
@@ -320,15 +321,53 @@ pub fn help_text() -> String {
     lines.join("\n")
 }
 
-/// The confirm overlay body until the `ConfirmRequest` is plumbed (see the
-/// module docs): the keys the overlay honours, read from the same table as the
-/// legend, so the prompt cannot drift from the binding.
-fn confirm_lines() -> Vec<String> {
-    legend()
-        .into_iter()
-        .filter(|row| row.scope == "overlay")
-        .map(|row| format!("{} — {}", row.keys, row.action))
-        .collect()
+/// The request a confirm overlay is holding (spec §3, §7.3): the **name** of the
+/// destructive action and the **consequence** the operator is being asked to
+/// accept, as one-line strings. The renderer builds one from its
+/// [`ConfirmAction`](super::super::events::ConfirmAction) so the surface can never
+/// describe an action other than the one `y` will run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmRequest {
+    /// What the request is, e.g. `Cancel worker 'coder_specialist-t-004' (x)`.
+    pub action: String,
+    /// What running it does, e.g. `Stops that one worker; the rest keep running.`
+    pub consequence: String,
+}
+
+impl ConfirmRequest {
+    /// Build the two lines the surface prints.
+    pub fn new(action: impl Into<String>, consequence: impl Into<String>) -> Self {
+        Self {
+            action: action.into(),
+            consequence: consequence.into(),
+        }
+    }
+}
+
+/// The wording of the confirm surface while it holds **no** request: the armed
+/// abort prompt of §8.5 occupies the same surface, and it honours no `y`/`n` (§5
+/// disarms on printables instead of treating them as answers).
+const ARMED_LINES: [&str; 2] = [
+    "Abort armed — Esc / Ctrl+C again to abort",
+    "any other key cancels the arm; Esc once closes this surface",
+];
+
+/// The confirm overlay body: the pending request's name and consequence (or the
+/// armed-abort wording when the surface holds no request), then the keys the
+/// overlay honours read from the same table as the legend — so the prompt cannot
+/// drift from the binding (§5: `y` / `n` are honoured only inside this surface).
+fn confirm_lines(request: Option<&ConfirmRequest>) -> Vec<String> {
+    let mut lines: Vec<String> = match request {
+        Some(request) => vec![request.action.clone(), request.consequence.clone()],
+        None => ARMED_LINES.iter().map(|line| line.to_string()).collect(),
+    };
+    lines.extend(
+        legend()
+            .into_iter()
+            .filter(|row| row.scope == "overlay")
+            .map(|row| format!("{} — {}", row.keys, row.action)),
+    );
+    lines
 }
 
 /// `value` cells as a percentage of `of` (§7.3 clamps overlays to 80 %).
@@ -417,7 +456,7 @@ pub fn render(frame: &mut Frame, rect: Rect, data: &HelpData) {
                 OverlayState::Confirm => (
                     "Confirm",
                     theme::frame_confirm(),
-                    confirm_lines().join("\n"),
+                    confirm_lines(data.confirm.as_ref()).join("\n"),
                 ),
                 OverlayState::None => return,
             };
@@ -428,7 +467,10 @@ pub fn render(frame: &mut Frame, rect: Rect, data: &HelpData) {
             let area = overlay_rect(rect, &source);
             // Content-sized, then clamped: each line is clipped to the inner
             // width and the tail the clamp cut is marked, so the drawn body
-            // always fits the rect it is given (§2.4, §7.4).
+            // always fits the rect it is given (§2.4, §7.4). The mark is keyed on
+            // the **source** length rather than on the drawn count: a body that
+            // fills the room exactly is not clipped, and printing the hint there
+            // would drop a real line to advertise a remainder that does not exist.
             let inner_width = area.width.saturating_sub(2);
             let room = usize::from(area.height).saturating_sub(2);
             let mut lines: Vec<String> = source
@@ -436,7 +478,7 @@ pub fn render(frame: &mut Frame, rect: Rect, data: &HelpData) {
                 .map(|line| clip(line, inner_width))
                 .take(room)
                 .collect();
-            if lines.len() == room && room > 1 {
+            if source.len() > room && room > 1 {
                 lines.truncate(room - 1);
                 lines.push(format!("{} see /help for the full table", theme::ELLIPSIS));
             }
@@ -463,12 +505,17 @@ pub enum HelpKind {
 }
 
 /// What this help surface draws.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct HelpData {
     /// Legend row or modal overlay.
     pub kind: HelpKind,
     /// Short legend form (`width < 70`, §2.5).
     pub compact: bool,
+    /// The request a confirm overlay is holding (§3, §7.3): `Some` names the
+    /// action and its consequence, `None` means the surface on screen is the
+    /// armed-abort prompt of §8.5, which honours no `y`/`n` (§5). Ignored by the
+    /// legend and the `F1` overlay.
+    pub confirm: Option<ConfirmRequest>,
 }
 
 #[cfg(test)]
@@ -688,6 +735,7 @@ mod tests {
         let data = HelpData {
             kind: HelpKind::Overlay(OverlayState::Help),
             compact: false,
+            confirm: None,
         };
         let rows = draw(120, 40, &data);
         let frame: String = rows.concat();
@@ -707,6 +755,7 @@ mod tests {
         let data = HelpData {
             kind: HelpKind::Overlay(OverlayState::None),
             compact: false,
+            confirm: None,
         };
         let rows = draw(80, 20, &data);
         assert!(rows.iter().all(|row| row.trim().is_empty()));
@@ -717,16 +766,51 @@ mod tests {
         let data = HelpData {
             kind: HelpKind::Overlay(OverlayState::Confirm),
             compact: false,
+            confirm: None,
         };
         let rows = draw(120, 12, &data);
         let frame: String = rows.concat();
         assert!(frame.contains("Confirm"), "title missing");
         assert!(frame.contains("y / n"), "y/n prompt missing");
+        // The surface holding no request is the armed-abort prompt of §8.5, and it
+        // says so — it honours no `y`/`n`, so an armed `y` must read as typing.
+        assert!(
+            frame.contains("Abort armed"),
+            "the armed wording is missing: {frame}"
+        );
         // The keys of other scopes are not prompt text for this overlay.
         assert!(
             !frame.contains("PageUp"),
             "wrong scope in the confirm prompt"
         );
+    }
+
+    #[test]
+    fn confirm_overlay_names_the_pending_action_and_its_consequence() {
+        // §3, §7.3, G3: the surface states which action is pending, what running it
+        // does, and the `y` / `n` affordance — all three, or `y` is a blind press.
+        let data = HelpData {
+            kind: HelpKind::Overlay(OverlayState::Confirm),
+            compact: false,
+            confirm: Some(ConfirmRequest::new(
+                "Cancel worker 'coder_specialist-t-004' (x)",
+                "Stops that one worker; every other worker keeps running.",
+            )),
+        };
+        let rows = draw(120, 12, &data);
+        let frame: String = rows.concat();
+        assert!(frame.contains("Confirm"), "title missing");
+        assert!(
+            frame.contains("Cancel worker 'coder_specialist-t-004'"),
+            "action name missing: {frame}"
+        );
+        assert!(
+            frame.contains("every other worker keeps running"),
+            "consequence missing: {frame}"
+        );
+        assert!(frame.contains("y / n"), "y/n affordance missing");
+        // A named request is not the armed prompt.
+        assert!(!frame.contains("Abort armed"), "wrong surface body");
     }
 
     #[test]
@@ -761,6 +845,7 @@ mod tests {
         let data = HelpData {
             kind: HelpKind::Overlay(OverlayState::Help),
             compact: false,
+            confirm: None,
         };
         let rows = draw(6, 20, &data);
         assert!(rows.iter().all(|row| row.trim().is_empty()));
@@ -771,6 +856,7 @@ mod tests {
         let data = HelpData {
             kind: HelpKind::Overlay(OverlayState::Help),
             compact: false,
+            confirm: None,
         };
         let rows = draw(100, 12, &data);
         let frame: String = rows.concat();
@@ -787,6 +873,7 @@ mod tests {
         let data = HelpData {
             kind: HelpKind::Overlay(OverlayState::Help),
             compact: false,
+            confirm: None,
         };
         let drawn = draw(160, 60, &data).concat();
         let inner = overlay_rect(Rect::new(0, 0, 160, 60), &rows).width - 2;
