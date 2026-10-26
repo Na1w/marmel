@@ -1,0 +1,183 @@
+Marmel new-UI preview - deterministic TestBackend frames of TuiRenderer::draw_new_ui
+Captured on branch feature/new-ui by a temporary `preview_dump` test in src/ui/tui/tests.rs,
+built from a seeded scenario (7-task plan with 3 checked; three live worker rows running /
+queued / paused; tokens 12.4k in / 3.2k out; ctx 13.5k of 30k; project clock 10m 12s; draft
+"add the focus badge to every pane title"). The scaffolding test is deleted again after this
+file is written; the seeded scenario survives unchanged as `live_worker_scenario()` in
+src/ui/tui/tests.rs, and the frame tests in that file pin the annotated rows cell by cell.
+Frames are cell-by-cell symbol dumps (style/colour stripped), trailing blanks trimmed.
+
+Same six cases as the t-009c audit recorded, regenerated after the t-009d fixes. The rows the
+audit called out are annotated on the `>>` lines under the frame they belong to; the "was:"
+text is the same cell of the same case in the t-009c capture.
+
+### case a - idle/empty boot state (fresh renderer) | size 100x30
+ Marmel M1 Transcript ✓ 0/0 done  elapsed 0s
+┌ Transcript ● ────────────────────────────────────────────────────────────────────────────────────┐
+│No output yet. Type an instruction and press Enter (? for keys).                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└  ● LIVE ─────────────────────────────────────────────────────────────────────────────────────────┘
+ Tokens 0 in / 0 out | 0a | elapsed 0s
+ plan:off  workers:off  think:off  0a 0p 0q
+┌ Input (Enter send, Alt/Shift+Enter newline, Ctrl+Z undo) ────────────────────────────────────────┐
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ F1 help  Tab focus  F2 mode  F3/F4/F5 panes  x cancel-worker  e last error  Esc arm  Ctrl+A/P panes
+
+>> Idle boot row 2 used to read ` ● LIVE  plan:off  workers:off  think:off  0a 0p 0q`: the
+   `● LIVE` chip is the transcript's scroll state and was printed a second time here. Now
+   one chip, on the transcript's own bottom border (defect 4).
+
+### case b - running: 7-task plan 3 checked, 3 live workers (running/queued/paused) | size 100x30
+ Marmel M4 Split ✓ 3/7 done ▶ t-004 ctx 45% elapsed 10m 12s
+┌ Transcript ● ────────────────────────────────────────────┐┌ Execution Plan ─────3/7 done ▶ t-004 ┐
+│User: rebuild the TUI so plan, workers and progress stay  ││# Plan                               ▲│
+│legible                                                   ││                                     █│
+│Marmennill: I split the work into seven tasks and started ││- [x] [t-001] research UX baseline   █│
+│with the audit.                                           ││- [x] [t-002] audit TUI architecture █│
+│[Status] delegating validator_specialist (t-003)          ││- [x] [t-003] draft the design spec  █│
+│Tool: read_file(src/ui/tui/mod.rs)                        ││- [ ] [t-004] scaffold state, layout,█│
+│Marmennill: every pane is now drawn by its own component  ││theme                                █│
+│renderer.                                                 ││- [ ] [t-005] pane chrome and chips  █│
+│Streaming: the status bar chips ar                        ││- [ ] [t-006] wire the roster rank   ║│
+│                                                          ││into the status row                  ▼│
+│                                                          │└ ✓ 3 done ⧗ 4 open ▶ in flight ───────┘
+│                                                          │┌ Workers ─────────────────────────────┐
+│                                                          ││ > ▶ running coder_specialist t-004 3…│
+│                                                          ││   ⧗ queued 2/3 researcher_specialist…│
+│                                                          ││   ⏸ paused validator_specialist t-00…│
+│                                                          ││                                      │
+│                                                          ││                                      │
+│                                                          ││──────────────────────────────────────│
+│                                                          ││▶ running coder_specialist t-004 3m 1…│
+│                                                          ││[Output]                              │
+│                                                          ││wrote layout.rs, 292 lines            │
+└  ● LIVE ─────────────────────────────────────────────────┘└ ▶ 1 ⏸ 1 ⧗ 1 ✓ 0  1/3  detail 0/0 ────┘
+ Tokens 12.4k in / 3.2k out | 3a | ctx 45% | 1p | 1q | coder_specialist-t-004… | elapsed 10m 12s
+ plan:on  workers:on  think:off  3a 1p 1q
+┌ Input (Enter send, Alt/Shift+Enter newline, Ctrl+Z undo) ────────────────────────────────────────┐
+│add the focus badge to every pane title                                                           │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ F1 help  Tab focus  F2 mode  F3/F4/F5 panes  x cancel-worker  e last error  Esc arm  Ctrl+A/P panes
+
+>> Defect 1 — Workers bottom tally. Was `└ ▶ running 1 ⏸ paused 1 ⧗ queued 1 ✓ d┘`: the tally
+   was fitted to `rect.width` (40) while a border row is `width - 2` (38), so ratatui cut the
+   last 2 cells silently — `✓ done N`, the `1/3` position and the detail chip were gone and
+   nothing marked the cut. Now: `└ ▶ 1 ⏸ 1 ⧗ 1 ✓ 0  1/3  detail 0/0 ────┘` (fitted to
+   `title_width`, and §7.2 drops the word labels before it drops a count).
+>> Defect 3 — queued roster row. Was `⧗ queued researcher_specialist t-0…`: the `(2/3)` rank
+   was a tail field and never survived a clipped row. Now `⧗ queued 2/3 researcher_specialist…`
+   — the rank rides the state field, as in the §2.2 sample row `validator ⏸ (Queued 2/3)`.
+>> Defect 2 — status row 1. Was ` Tokens 12.4k in / 3.2k out | 3a | ctx 45%`: 41 cells of a
+   100-cell row, with ~58 free, because `fit_fields` deleted whole fields — `1p`, `1q`, the
+   worker names and the clock. Now ` Tokens 12.4k in / 3.2k out | 3a | ctx 45% | 1p | 1q | coder_specialist-t-004… | elapsed 10m 12s`
+   = 92 cells: counts kept, name list clipped with `…`, clock back on the row.
+>> Defect 4 — status row 2. Was ` ● LIVE  plan:on  workers:on  think:off  3a 1p 1q`; the
+   scroll-state chip now lives only on the transcript border row above.
+
+### case c - help overlay open (overlay forced; key binding is t-010) | size 80x24 | help overlay: forced
+ Marmel M4 Split ✓ 3/7 done ▶ t-004 ctx 45% elapsed 10m 12s
+┌ Transcript ● ────────────────────────────────────────────────────────────────┐
+│User: rebuild the TUI so plan, workers and progress stay legible              │
+│Marmenn┌ Keys ────────────────────────────────────────────────────────┐t.     │
+│[Status│Keys                                                          │       │
+│Tool: r│Enter                   submit the composer (composer)        │       │
+│Marmenn│Shift+Enter / Alt+Enter insert a newline (composer)           │       │
+│Streami│Ctrl+Enter / Ctrl+J     insert a newline (composer)           │       │
+│       │Printable / paste       insert in the composer, any focus (co…│       │
+└  ● LIV│Backspace / Delete      edit the composer, any focus (compose…│───────┘
+┌ Execut│Ctrl+Z / Ctrl+Y         undo / redo the draft (composer)      │ t-004 ┐
+│# Plan │Ctrl+Up / Ctrl+Down     input history previous / next (compos…│      ▲│
+│       │Up / Down               history, else scroll the pane by 1 (c…│      █│
+│- [x] [│Left / Right            previous / next worker, else caret (c…│      █│
+│- [x] [│… see /help for the full table                                │      █│
+│- [x] [└ Esc close ────────────────────── /help prints the full table ┘      ║│
+│- [ ] [t-004] scaffold state, layout, theme                                  ▼│
+└ ✓ 3 done ⧗ 4 open ▶ in flight ───────────────────────────────────────────────┘
+ Tokens 12.4k in / 3.2k out | 3a | ctx 45% | 1p | 1q | coder_… | elapsed 10m 12s
+ plan:on  workers:narrow  think:off  3a 1p 1q
+┌ Input (Enter send, Alt/Shift+Enter newline, Ctrl+Z undo) ────────────────────┐
+│add the focus badge to every pane title                                       │
+└──────────────────────────────────────────────────────────────────────────────┘
+ F1 help  Tab focus  F2 mode  F3/F4/F5 panes  x cancel-worker  e last error  Es…
+
+>> Defect 5 — status row 2 at 80x24. Was ` ● LIVE  plan:on  workers:on  think:off  3a 1p 1q`
+   while the §2.5 ladder (`width < 90`) had stacked the transcript over the *plan* pane alone:
+   `workers:on` announced a pane that was not on screen. Now
+   ` plan:on  workers:narrow  think:off  3a 1p 1q` — the pane chips come from
+   `layout::PaneRects`, so `narrow` says the toggle is on and the ladder took the pane away.
+>> Defect 2 — row 1 at 80 columns keeps every count: ` Tokens 12.4k in / 3.2k out | 3a |
+   ctx 45% | 1p | 1q | coder_… | elapsed 10m 12s`; the name list is the field that is cut.
+>> Defect 4 — no `● LIVE` on this row any more (one chip, in the transcript pane).
+
+### case d - narrow 60x16 (degradation ladder) | size 60x16
+ Marmel ✓ 3/7 done ▶ t-004
+┌ Transcript ● ────────────────────────────────────────────┐
+│User: rebuild the TUI so plan, workers and progress stay  │
+│legible                                                   │
+│Marmennill: I split the work into seven tasks and started │
+│with the audit.                                           │
+│[Status] delegating validator_specialist (t-003)          │
+│Tool: read_file(src/ui/tui/mod.rs)                        │
+│Marmennill: every pane is now drawn by its own component  │
+│renderer.                                                 │
+│Streaming: the status bar chips ar                        │
+└  ● LIVE ─────────────────────────────────────────────────┘
+ Tokens 12.4k in / 3.2k out | 3a | ctx 45% | 1p | 1q
+┌ Input (Enter send, Alt/Shift+Enter newline, Ctrl+Z undo) ┐
+│add the focus badge to every pane title                   │
+└──────────────────────────────────────────────────────────┘
+
+>> Defect 2 — the single row of a 16-row terminal keeps `3a`, `1p` and `1q` (was
+   ` Tokens 12.4k in / 3.2k out | 3a | ctx 45%`). §2.5 keeps tokens plus the counts; the
+   clock and the roster are what the ladder gives up here, and the cut is marked.
+>> Defect 4 — `● LIVE` appears once: the transcript border row.
+
+### case e - 40x10 (exactly at the MIN_COLS x MIN_ROWS floor) | size 40x10
+ Marmel ✓ 3/7 done ▶ t-004
+┌ Transcript ● ────────────────────────┐
+│Marmennill: every pane is now drawn  ▲│
+│by its own component renderer.       █│
+│Streaming: the status bar chips ar   ▼│
+└  ● LIVE  scroll 8/8 ─────────────────┘
+ Tokens 12.4k in / 3.2k out | 3a
+┌ Input (Enter send, Alt/Shift+Enter ne┐
+│d the focus badge to every pane title │
+└──────────────────────────────────────┘
+
+>> The 40x10 floor still shows the transcript's own scroll chip (`● LIVE  scroll 8/8`) and the
+   mandatory metrics (` Tokens 12.4k in / 3.2k out | 3a`); everything the ladder drops it drops
+   one field at a time.
+
+### case e2 (supplementary) - 39x9, one cell below the floor: the too-small notice | size 39x9
+┌ Marmel ─────────────────────────────┐
+│Terminal too small — Marmel needs at │
+│least 40x10 (currently 39x9). Resize │
+│            to continue.             │
+│                                     │
+│                                     │
+│                                     │
+│                                     │
+└─────────────────────────────────────┘
+
+>> Unchanged: below 40x10 exactly one pane is drawn (§2.5), and no chip lies about a pane that
+   does not exist.

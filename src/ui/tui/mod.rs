@@ -147,10 +147,13 @@ pub struct TuiRenderer {
     pub(crate) subagent_width: std::cell::Cell<usize>,
     /// Cached subagent details height. Defaults to `15`.
     pub(crate) subagent_height: std::cell::Cell<usize>,
-    /// Cached plan panel width. Defaults to `40`.
-    pub(crate) plan_width: std::cell::Cell<usize>,
-    /// Cached plan panel height. Defaults to `15`.
-    pub(crate) plan_height: std::cell::Cell<usize>,
+    /// `config.max_context_tokens`: the denominator of the `ctx %` chip (spec
+    /// §2.2). `0` means no config was ever handed over, and the panes then print
+    /// the raw token count instead of a percentage of an unknown budget.
+    pub(crate) max_context_tokens: usize,
+    /// Wrapped transcript lines the body reported on the frame where the viewport
+    /// last sat at its bottom — the baseline for the `↓ N new` count (spec G7).
+    pub(crate) transcript_baseline_lines: Option<usize>,
     /// Width used for the current line cache. Defaults to `0`.
     pub(crate) cached_chat_width: std::cell::Cell<usize>,
     /// `show_thought` value used for the current line cache.
@@ -189,7 +192,6 @@ pub struct TuiRenderer {
     pub(crate) plan_mtime: Option<std::time::SystemTime>,
     pub(crate) archive_mtime: Option<std::time::SystemTime>,
     pub(crate) plan_is_archived: bool,
-    #[allow(dead_code)]
     pub(crate) session_start: std::time::Instant,
 
     /// Estimated total input (prompt) tokens across the session.
@@ -252,8 +254,8 @@ impl TuiRenderer {
             chat_height: std::cell::Cell::new(15),
             subagent_width: std::cell::Cell::new(40),
             subagent_height: std::cell::Cell::new(15),
-            plan_width: std::cell::Cell::new(40),
-            plan_height: std::cell::Cell::new(15),
+            max_context_tokens: 0,
+            transcript_baseline_lines: None,
             cached_chat_width: std::cell::Cell::new(0),
             cached_show_thought: std::cell::Cell::new(false),
             cached_message_lines: std::cell::RefCell::new(Vec::new()),
@@ -296,6 +298,10 @@ impl TuiRenderer {
     }
 
     /// Populate thinking budget limits per specialist and globally from config.
+    ///
+    /// The context budget (`max_context_tokens`) rides the same hand-over: it is
+    /// the denominator of the `ctx %` chip both the header and the status bar print
+    /// (spec §2.2), and this is the only place a `Config` reaches the renderer.
     pub fn set_thinking_budgets(&mut self, cfg: &Config) {
         let global_budget = if cfg.max_thinking_tokens != crate::config::DEFAULT_MAX_THINKING_TOKENS
         {
@@ -307,6 +313,7 @@ impl TuiRenderer {
                 .unwrap_or(cfg.max_thinking_tokens)
         };
         self.default_thinking_budget = global_budget;
+        self.max_context_tokens = cfg.max_context_tokens;
         self.thinking_budgets.clear();
         for (role, spec) in &cfg.orchestration.specialists {
             if let Some(b) = spec.max_thinking_tokens {
@@ -416,12 +423,14 @@ impl TuiRenderer {
     /// render every pane component of [`components`] (spec §3) and return the
     /// rects so [`Self::draw`] can write the geometry caches back.
     ///
-    /// The text bodies of the transcript / plan / worker / status / composer
-    /// panes are still produced by the existing `render.rs` panes (which are also
-    /// what keep `formatting::*` — markdown, ANSI, wrapping — in use): they fill
-    /// the **new** rects first, and the component chrome (border, title, `●`
-    /// focus badge, state chips) is drawn over them afterwards. t-007..t-009 move
-    /// that content behind the component `render` functions.
+    /// Each pane is drawn **exactly once, by its own component**: the component
+    /// `render` functions own body and chrome together (body first, then the block
+    /// that frames it), so there is no legacy content pass filling the new rects
+    /// underneath a chrome pass any more. Every value a pane needs arrives in its
+    /// `*Data` struct — the renderer hands the conversation, the plan text, the
+    /// worker rows, the composer buffer, the session counters and its own clocks
+    /// over, and reads the viewport each pass established back out of the report
+    /// each `render` returns. The help overlay is drawn last, over the body (§7.3).
     pub(crate) fn draw_new_ui(&mut self, frame: &mut ratatui::Frame) -> layout::PaneRects {
         let view = state::UiView::from_renderer(self);
         let area = frame.area();
@@ -432,82 +441,158 @@ impl TuiRenderer {
             return rects;
         }
 
-        // 1. Content pass: the pane bodies.
-        if let Some(rect) = rects.transcript {
-            self.render_chat(frame, rect);
-        }
-        if let Some(rect) = rects.plan {
-            let plan = self.plan_content.clone();
-            let archived = self.plan_is_archived;
-            self.render_plan(frame, rect, &plan, archived);
-        }
-        if let Some(rect) = rects.workers {
-            self.render_subagents(frame, rect);
-        }
-        if let Some(rect) = rects.status {
-            self.render_status(frame, rect);
-        }
-        if let Some(rect) = rects.input {
-            self.render_input(frame, rect);
+        let compact = layout::compact_legend(area.width);
+        let elapsed = self.elapsed_clock();
+
+        // 1. Header: one borderless row of §2.2 chips, §7.4 drop ladder.
+        if let Some(rect) = rects.header {
+            let data = components::header::HeaderData {
+                mode: rects.mode,
+                plan: &view.plan,
+                budget: layout::header_budget(area.width),
+                ctx_tokens: self.orchestrator_context_tokens,
+                ctx_limit: self.max_context_tokens,
+                elapsed,
+            };
+            components::header::render(frame, rect, &data);
         }
 
-        // 2. Chrome pass: header, status chips, pane frames, legend, overlays.
-        let header = components::header::HeaderData {
-            mode: rects.mode,
-            plan: &view.plan,
-            budget: layout::header_budget(area.width),
-            ctx_tokens: self.orchestrator_context_tokens,
-        };
-        if let Some(rect) = rects.header {
-            components::header::render(frame, rect, &header);
-        }
-        let status = components::status_bar::StatusData {
-            workers: &self.subagents,
-            follow: view.follow,
-            show_thought: view.show_thought,
-            plan_visible: view.plan_visible,
-            workers_visible: view.workers_visible,
-            abort_armed: view.abort_armed,
-        };
-        if let Some(rect) = rects.status {
-            components::status_bar::render(frame, rect, &status);
-        }
-        if let Some(rect) = rects.plan {
-            let data = components::plan_pane::PlanData {
-                focus: view.focused(state::FocusPane::Plan),
-                progress: &view.plan,
-                scroll: view.scroll.plan,
-            };
-            components::plan_pane::render(frame, rect, &data);
-        }
+        // 2. Transcript. The pane is handed the conversation and the renderer's own
+        // rendered-line cache, and reports back where the viewport landed; the
+        // write-back keeps `chat_scroll` / `chat_width` / `chat_height` — which the
+        // autoscroll preparation above and the scroll keys in `events.rs` read —
+        // pointing at what was actually drawn. The unseen-line count stays inside
+        // the pane: it is the transcript's own scroll state, and the status row that
+        // used to echo it put a second `● LIVE` on the frame.
         if let Some(rect) = rects.transcript {
-            let data = components::transcript::TranscriptData {
-                focus: view.focused(state::FocusPane::Transcript),
-                follow: view.follow,
-                scroll: view.scroll.transcript,
+            self.ensure_rendered_message_cache();
+            let report = {
+                let body = components::transcript::TranscriptBody {
+                    messages: &self.messages,
+                    rendered: Some(&self.cached_rendered_messages.borrow()),
+                    thought: &self.current_thought,
+                    content: &self.current_content,
+                    steer: &self.steer_sentence_buffer,
+                    show_thought: self.show_thought,
+                };
+                let data = components::transcript::TranscriptData {
+                    focus: view.focused(state::FocusPane::Transcript),
+                    follow: view.follow,
+                    scroll: view.scroll.transcript,
+                    body,
+                    unseen_baseline: self.transcript_baseline_lines,
+                };
+                components::transcript::render(frame, rect, &data)
             };
-            components::transcript::render(frame, rect, &data);
+            self.chat_width
+                .set(usize::from(rect.width.saturating_sub(2)));
+            self.chat_height
+                .set(usize::from(rect.height.saturating_sub(2)));
+            self.chat_scroll = report.scroll;
+            // The `↓ N new` baseline (G7): whenever the viewport sits at the bottom
+            // of the body, every line that exists has been on screen, so the body's
+            // own line count becomes the baseline the next frame measures growth
+            // against.
+            if view.follow || usize::from(report.scroll) >= report.max_scroll {
+                self.transcript_baseline_lines = Some(report.total_lines);
+            }
         }
+
+        // 3. Execution Plan: body, chrome, and the scroll geometry that
+        // `plan_auto_scroll` and the `↑`/`↓` clamps share.
+        if let Some(rect) = rects.plan {
+            let active_tasks = self.active_plan_tasks();
+            let target_task = self.plan_target_task();
+            let geometry = {
+                let data = components::plan_pane::PlanData {
+                    focus: view.focused(state::FocusPane::Plan),
+                    progress: &view.plan,
+                    scroll: view.scroll.plan,
+                    text: &self.plan_content,
+                    active_tasks: &active_tasks,
+                    auto_scroll: self.plan_auto_scroll,
+                    target_task: target_task.as_deref(),
+                };
+                components::plan_pane::render(frame, rect, &data)
+            };
+            self.plan_scroll = geometry.scroll;
+            self.plan_max_scroll = geometry.max_scroll;
+        }
+
+        // 4. Workers: roster + detail half, with both offsets and the detail
+        // measure written back for the autoscroll estimate and the key clamps.
         if let Some(rect) = rects.workers {
-            let data = components::activity::ActivityData {
-                focus: view.focused(state::FocusPane::Workers),
-                rows: &self.subagents,
-                selected: self.selected_subagent_idx,
-                detail_present: layout::workers_detail_present(area.width),
-                scroll: view.scroll.workers,
+            let selected = self
+                .selected_subagent_idx
+                .min(self.subagents.len().saturating_sub(1));
+            let thinking_budget = self
+                .subagents
+                .get(selected)
+                .map(|row| self.get_thinking_budget(row));
+            let geometry = {
+                let data = components::activity::ActivityData {
+                    focus: view.focused(state::FocusPane::Workers),
+                    rows: &self.subagents,
+                    selected: self.selected_subagent_idx,
+                    detail_present: layout::workers_detail_present(area.width),
+                    scroll: view.scroll.workers,
+                    list_scroll: self.subagent_list_scroll,
+                    show_thought: self.show_thought,
+                    thinking_budget,
+                };
+                components::activity::render(frame, rect, &data)
             };
-            components::activity::render(frame, rect, &data);
+            self.subagent_list_scroll = geometry.roster_scroll;
+            self.subagent_scroll = geometry.detail_scroll;
+            if geometry.detail_present {
+                self.subagent_width.set(geometry.detail_width);
+                self.subagent_height.set(geometry.detail_height);
+            }
         }
+
+        // 5. Composer: the `TextArea` body first, then the frame that owns every
+        // border row. `prepare_textarea` synchronises the widget and strips the
+        // block off it, which is what lets a single border be drawn.
         if let Some(rect) = rects.input {
+            self.prepare_textarea();
+            let buffer = self.textarea.lines().join("\n");
+            let history = self.history_position();
             let data = components::input::InputData {
                 focus: view.focused(state::FocusPane::Input),
                 active: view.composer_active(),
                 armed: view.abort_armed,
                 draft_lines: view.input_lines,
+                buffer: Some(&buffer),
+                history,
+                textarea: Some(&self.textarea),
             };
             components::input::render(frame, rect, &data);
         }
-        let compact = layout::compact_legend(area.width);
+
+        // 6. Status: metrics row + chip row, from the session counters the renderer
+        // owns and the pane rects this frame actually produced — a pane the §2.5
+        // ladder took away must not still be announced as `on` (§2.5, G5).
+        if let Some(rect) = rects.status {
+            let (global_in, global_out) = crate::llm::get_global_token_counts();
+            let data = components::status_bar::StatusData {
+                workers: &self.subagents,
+                show_thought: view.show_thought,
+                plan_visible: view.plan_visible,
+                workers_visible: view.workers_visible,
+                plan_present: rects.plan.is_some(),
+                workers_present: rects.workers.is_some(),
+                abort_armed: view.abort_armed,
+                tokens_in: self.tokens_in.max(global_in),
+                tokens_out: self.tokens_out.max(global_out),
+                ctx_tokens: self.orchestrator_context_tokens,
+                ctx_limit: self.max_context_tokens,
+                elapsed,
+            };
+            components::status_bar::render(frame, rect, &data);
+        }
+
+        // 7. Footer legend: `components::help::footer_legend` is the single source
+        // for this row, the same table the help overlay reads (§6, §7.3).
         if let Some(rect) = rects.footer {
             let data = components::help::HelpData {
                 kind: components::help::HelpKind::Legend,
@@ -528,6 +613,90 @@ impl TuiRenderer {
             components::help::render(frame, rect, &data);
         }
         rects
+    }
+
+    /// Task ids the plan pane must highlight: every active worker's task plus the
+    /// task the plan itself names in flight, cleaned and deduplicated. The set the
+    /// legacy plan pane built inline (`render.rs:458-485`) — moved here so the pane
+    /// receives it as data.
+    pub(crate) fn active_plan_tasks(&self) -> Vec<String> {
+        let mut active: Vec<String> = Vec::new();
+        for sa in &self.subagents {
+            if !sa.is_active {
+                continue;
+            }
+            let tid = sa.task_id.as_deref().or_else(|| {
+                sa.name
+                    .find("-t-")
+                    .map(|pos| &sa.name[pos + 1..])
+            });
+            if let Some(tid) = tid {
+                let clean = crate::ui::tui::formatting::clean_task_id(tid);
+                if !clean.is_empty()
+                    && !active.iter().any(|t| t.eq_ignore_ascii_case(clean))
+                {
+                    active.push(clean.to_string());
+                }
+            }
+        }
+        if let Some(tid) = &self.active_plan_task {
+            let clean = crate::ui::tui::formatting::clean_task_id(tid);
+            if !clean.is_empty() && !active.iter().any(|t| t.eq_ignore_ascii_case(clean)) {
+                active.push(clean.to_string());
+            }
+        }
+        active
+    }
+
+    /// The task the plan auto-scroll centres on: the plan's own active task, else
+    /// the task of the first active worker.
+    pub(crate) fn plan_target_task(&self) -> Option<String> {
+        self.active_plan_task
+            .clone()
+            .or_else(|| {
+                self.subagents
+                    .iter()
+                    .find(|sa| sa.is_active && sa.task_id.is_some())
+                    .and_then(|sa| sa.task_id.clone())
+            })
+    }
+
+    /// Where the composer is standing in the input history, for the `history n/m`
+    /// chip (spec §5). `None` while the operator is editing their own draft.
+    pub(crate) fn history_position(&self) -> Option<components::input::HistoryPos> {
+        let index = self.history_index?;
+        let len = self.history.len();
+        if len == 0 || index >= len {
+            return None;
+        }
+        Some(components::input::HistoryPos {
+            entry: index + 1,
+            len,
+        })
+    }
+
+    /// Get the composer's `TextArea` ready for a component-owned body pass: the
+    /// widget is synchronised with `input_text`, its cursor line carries no style
+    /// of its own, and its block is cleared — the composer component draws the one
+    /// border, title and chip row, so a block on the widget would paint a second
+    /// frame over it.
+    pub(crate) fn prepare_textarea(&mut self) {
+        self.ensure_textarea_in_sync();
+        self.textarea.set_block(ratatui::widgets::Block::default());
+        self.textarea
+            .set_cursor_line_style(ratatui::style::Style::default());
+    }
+
+    /// The elapsed clock both chrome panes print, as whole seconds.
+    ///
+    /// The execution-plan project clock while one owns the run — the value the
+    /// legacy status bar right-aligned, freezing at plan completion — and the
+    /// session clock (`session_start`, spec §3) otherwise, so a session that has
+    /// not reached a plan yet still counts up instead of printing nothing.
+    pub(crate) fn elapsed_clock(&self) -> Option<u64> {
+        self.total_project_elapsed()
+            .map(|elapsed| elapsed.as_secs())
+            .or_else(|| Some(self.session_start.elapsed().as_secs()))
     }
 
     /// Check whether abort is actively armed and within the 3-second confirmation window.

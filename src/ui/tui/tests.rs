@@ -7147,3 +7147,234 @@ fn the_focused_pane_badges_its_title_and_every_other_pane_does_not() {
         "only the focused pane is badged in its title"
     );
 }
+
+// ---- t-009d regression frames: chip clipping, status ladder, roster rank ------
+
+/// The running scenario of `docs/new_ui_preview.txt` case b: a 7-task plan with 3
+/// checked and three live worker rows — running, queued at rank `2/3`, paused —
+/// under real session counters. The frames the t-009d defect fixes are asserted
+/// against this fixture, so a fix can never be proved only at component level.
+fn live_worker_scenario() -> TuiRenderer {
+    let mut r = TuiRenderer::new();
+    r.messages = vec![
+        "User: rebuild the TUI so plan, workers and progress stay legible".to_string(),
+        "Marmennill: I split the work into seven tasks and started with the audit.".to_string(),
+        "[Status] delegating validator_specialist (t-003)".to_string(),
+        "Tool: read_file(src/ui/tui/mod.rs)".to_string(),
+        "Marmennill: every pane is now drawn by its own component renderer.".to_string(),
+        "Streaming: the status bar chips ar".to_string(),
+    ];
+    r.plan_content = [
+        "# Plan",
+        "",
+        "- [x] [t-001] research UX baseline",
+        "- [x] [t-002] audit TUI architecture",
+        "- [x] [t-003] draft the design spec",
+        "- [ ] [t-004] scaffold state, layout, theme",
+        "- [ ] [t-005] pane chrome and chips",
+        "- [ ] [t-006] wire the roster rank into the status row",
+        "- [ ] [t-009b] rewire the render pipeline",
+        "",
+    ]
+    .join("\n");
+    r.show_plan_panel = true;
+    r.show_subagent_panel = true;
+    r.input_text = "add the focus badge to every pane title".to_string();
+    r.tokens_in = 12_400;
+    r.tokens_out = 3_200;
+    r.orchestrator_context_tokens = 13_500;
+    r.max_context_tokens = 30_000;
+    r.plan_start_time = Some(std::time::Instant::now() - Duration::from_secs(612));
+    r.subagents = vec![
+        SubagentDetail {
+            name: "coder_specialist-t-004".to_string(),
+            task_id: Some("t-004".to_string()),
+            is_active: true,
+            worked_duration: Duration::from_secs(192),
+            content: "wrote layout.rs, 292 lines".to_string(),
+            ..SubagentDetail::default()
+        },
+        SubagentDetail {
+            name: "researcher_specialist-t-005".to_string(),
+            task_id: Some("t-005".to_string()),
+            is_active: true,
+            worked_duration: Duration::from_secs(30),
+            queue: Some(crate::ui::QueueState { position: 2, of: 3 }),
+            ..SubagentDetail::default()
+        },
+        SubagentDetail {
+            name: "validator_specialist-t-003".to_string(),
+            task_id: Some("t-003".to_string()),
+            is_active: true,
+            paused: true,
+            worked_duration: Duration::from_secs(12),
+            ..SubagentDetail::default()
+        },
+    ];
+    r
+}
+
+/// The one frame row that carries `needle`, or the whole frame in the message.
+fn only_row(rows: &[String], needle: &str, size: (u16, u16)) -> String {
+    rows.iter()
+        .find(|row| row.contains(needle))
+        .cloned()
+        .unwrap_or_else(|| panic!("no {size:?} row carries {needle:?}:\n{}", rows.join("\n")))
+}
+
+#[test]
+fn the_workers_tally_keeps_the_done_count_the_position_and_the_detail_chip() {
+    // Defect 1 (§7.1/§7.4): the bottom tally was measured and fitted against
+    // `rect.width` although a border row is `rect.width - 2` cells, so ratatui cut
+    // the last 2 cells silently — the `✓` count, the `1/3` position and the detail
+    // chip were all gone and nothing marked the cut.
+    let mut r = live_worker_scenario();
+    let rows = draw_new_frame(&mut r, 100, 30);
+    let tally = only_row(&rows, "detail", (100, 30));
+    for glyph in ['▶', '⏸', '⧗', '✓'] {
+        assert!(
+            tally.contains(glyph),
+            "the tally keeps the {glyph} count: {tally:?}"
+        );
+    }
+    assert!(
+        tally.contains("1/3") && tally.contains("detail"),
+        "the roster position and the detail chip survive to the corner: {tally:?}"
+    );
+    assert!(
+        tally.trim_end().ends_with('┘'),
+        "the row stops at the pane's right corner instead of running past it: {tally:?}"
+    );
+}
+
+#[test]
+fn a_queued_worker_keeps_its_rank_where_the_ladder_cannot_cut_it() {
+    // Defect 3 (§2.2/§2.5): the rank was the last field of the roster row, so in a
+    // clipped row `(2/3)` was never readable — the queue depth the §2.5 ladder is
+    // supposed to make legible. It now rides the state fields, before the name.
+    let mut r = live_worker_scenario();
+    let rows = draw_new_frame(&mut r, 100, 30);
+    let roster = only_row(&rows, "researcher_specialist", (100, 30));
+    let rank = roster
+        .find("2/3")
+        .unwrap_or_else(|| panic!("the queue rank is readable at all: {roster:?}"));
+    let name = roster
+        .find("researcher_specialist")
+        .expect("the row still names the worker");
+    assert!(
+        rank < name,
+        "the rank is placed before the fields the ladder clips: {roster:?}"
+    );
+    assert!(
+        roster.contains(theme::ELLIPSIS),
+        "the cut is marked, never silent: {roster:?}"
+    );
+}
+
+#[test]
+fn the_status_row_keeps_every_count_and_clips_names_into_the_free_columns() {
+    // Defect 2 (§2.5/§7.4): `fit_fields` deleted whole fields rather than clipping
+    // one, so a 100-column row read `Tokens 12.4k in / 3.2k out | 3a | ctx 45%`
+    // with ~58 columns free — `1p`, `1q` and every active name were lost.
+    for (width, height) in [(100u16, 30u16), (80, 24), (60, 16)] {
+        let mut r = live_worker_scenario();
+        let rows = draw_new_frame(&mut r, width, height);
+        let row = rows
+            .iter()
+            .map(|row| row.trim_end())
+            .find(|row| row.trim_start().starts_with("Tokens"))
+            .unwrap_or_else(|| panic!("no metrics row at {width}x{height}:\n{}", rows.join("\n")))
+            .to_string();
+        for count in ["3a", "1p", "1q"] {
+            assert!(
+                row.contains(count),
+                "{width}x{height}: the {count} count survives the ladder: {row:?}"
+            );
+        }
+        assert!(
+            row.starts_with(" Tokens ") && row.contains(" in / ") && row.contains(" out"),
+            "{width}x{height}: the mandatory token field stays: {row:?}"
+        );
+        if width >= 80 {
+            assert!(
+                row.contains("ctx 45%"),
+                "{width}x{height}: the ctx ratio is on the row: {row:?}"
+            );
+            assert!(
+                row.contains(theme::ELLIPSIS),
+                "{width}x{height}: the name list is clipped with a mark instead of dropped: {row:?}"
+            );
+            assert!(
+                row.contains("coder"),
+                "{width}x{height}: the name list is cut inside a name, not deleted: {row:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_status_row_uses_the_columns_it_is_given() {
+    // The audit's measurement: 41 used cells of a 100-cell row, ~58 free. The
+    // repaired row fills the width it owns before it drops anything.
+    let mut r = live_worker_scenario();
+    let rows = draw_new_frame(&mut r, 100, 30);
+    let row = only_row(&rows, "Tokens", (100, 30)).trim_end().to_string();
+    // The audit measured 41 used cells of a 100-cell row. The repaired row must
+    // use the width it is given, so it is comfortably more than twice that.
+    assert!(
+        row.chars().count() > 41 * 2,
+        "the 100-column row is used, not left mostly empty: {} cells: {row:?}",
+        row.chars().count()
+    );
+    assert!(row.contains("elapsed"), "the clock came back: {row:?}");
+}
+
+#[test]
+fn a_pane_the_ladder_removed_is_reported_narrow_and_never_on() {
+    // Defect 5 (§8): the pane chips came from the mode alone, so an 80-column frame
+    // announced `workers:on` while the Workers pane had been ladder-absent.
+    let wide = draw_new_frame(&mut live_worker_scenario(), 100, 30).concat();
+    assert!(
+        wide.contains("plan:on") && wide.contains("workers:on"),
+        "both panes are drawn at 100 columns, and both say so"
+    );
+    assert!(
+        !wide.contains("narrow") && !wide.contains("plan:off") && !wide.contains("workers:off"),
+        "nothing is announced as absent that is on screen"
+    );
+
+    let narrow = draw_new_frame(&mut live_worker_scenario(), 80, 24).concat();
+    assert!(
+        narrow.contains("workers:narrow"),
+        "the pane the §2.5 width ladder took away says why: {narrow}"
+    );
+    assert!(
+        !narrow.contains("workers:on"),
+        "a pane that is not drawn is never announced as on"
+    );
+    assert!(
+        narrow.contains("plan:on"),
+        "the side pane that did survive is still reported on"
+    );
+}
+
+#[test]
+fn the_scroll_state_chip_is_drawn_once_in_the_transcript_pane() {
+    // Defect 4 (§7.3, §8): `● LIVE` was printed twice per frame — on the transcript
+    // border row and on the status chip row — so two rows claimed the scroll state.
+    for (width, height) in [(100u16, 30u16), (80, 24), (60, 16), (40, 10)] {
+        let rows = draw_new_frame(&mut live_worker_scenario(), width, height);
+        let live: Vec<&String> = rows.iter().filter(|row| row.contains("LIVE")).collect();
+        assert_eq!(
+            live.len(),
+            1,
+            "{width}x{height} draws exactly one scroll-state chip:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            live[0].contains('└') || live[0].contains('┌'),
+            "{width}x{height}: the one chip belongs to the transcript border: {:?}",
+            live[0]
+        );
+    }
+}

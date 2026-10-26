@@ -42,6 +42,27 @@ pub fn pane_block(title: &str, focused: bool, border: Style) -> Block<'static> {
         .title(Line::from(Span::styled(title, title_style)))
 }
 
+/// The cells a title may use on a bordered block's border row.
+///
+/// A `Block` border row is `rect.width - 2` cells wide: the two corner cells are
+/// border, not title. A chip row fitted to `rect.width` is therefore 2 cells too
+/// long, and ratatui cuts those 2 cells *silently* — the `…` that `fit_spans`
+/// appended is one of them, so the operator sees a chip row that simply stops
+/// mid-word with no mark that anything was lost. Every pane that puts spans on a
+/// border row fits against this width instead.
+pub const fn title_width(rect: Rect) -> u16 {
+    rect.width.saturating_sub(2)
+}
+
+/// Terminal cells a run of spans occupies, measured with `unicode-width` (§7.2:
+/// glyph widths are measured, never assumed to be one cell).
+pub fn spans_width(spans: &[Span<'static>]) -> usize {
+    spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum()
+}
+
 /// Clip a run of styled spans to `width` terminal cells, marking the cut with
 /// `…` (§7.4: header/status/roster lines are single-row and never exceed the
 /// rect; widths are measured with `unicode-width`, never assumed to be 1 cell).

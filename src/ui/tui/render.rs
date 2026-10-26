@@ -1,18 +1,14 @@
 //! Ratatui frame drawing and panel rendering for TuiRenderer.
 
 use super::formatting::*;
-use super::{ACTIVITY_STATUS_KEYWORDS, FocusedPanel, TuiRenderer};
+use super::TuiRenderer;
 use anyhow::Result;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
-};
 use std::io;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 impl TuiRenderer {
     /// Ensure the per-message wrapped-line cache is up to date for `width`.
@@ -368,776 +364,797 @@ impl TuiRenderer {
         Ok(())
     }
 
-    pub(crate) fn render_chat(&mut self, frame: &mut ratatui::Frame, area: Rect) {
-        let chat_border_color = if self.focused_panel == FocusedPanel::Chat {
-            Color::Cyan
-        } else {
-            Color::DarkGray
-        };
-        let chat_block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(chat_border_color))
-            .title(" Chat & Logs (Focus: Tab) ");
+}
 
-        let chat_w = area.width.saturating_sub(2) as usize;
-        let chat_h = area.height.saturating_sub(2) as usize;
-        self.chat_width.set(chat_w);
-        self.chat_height.set(chat_h);
+/// The legacy panes the component renderers of `t-009b` replaced.
+///
+/// They are no longer part of the live frame: `draw` routes every pane through the
+/// component `render` functions, so in a normal build these bodies would be dead
+/// code. Retirement is task t-014; until then the bodies stay verbatim — they are
+/// the reference the new panes were matched against, and `src/ui/tui/tests.rs`
+/// still exercises them directly — kept out of the shipped binary by compiling them
+/// only where they are used.
+#[cfg(test)]
+mod legacy_panes {
+    use super::*;
+    use crate::ui::tui::{ACTIVITY_STATUS_KEYWORDS, FocusedPanel};
+    use ratatui::layout::{Constraint, Direction, Layout};
+    use ratatui::widgets::{
+        Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+    };
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-        let mut chat_lines = Vec::new();
-        self.ensure_rendered_message_cache();
-        {
-            let cached = self.cached_rendered_messages.borrow();
-            for msg_lines in &*cached {
-                chat_lines.extend(msg_lines.iter().cloned());
-            }
-        }
+    impl TuiRenderer {
 
-        if self.show_thought && !self.current_thought.is_empty() {
-            chat_lines.extend(self.render_streaming_thought());
-        }
-
-        // Streaming content (Orchestrator output - WHITE or syntax highlighted).
-        if !self.current_content.is_empty() {
-            chat_lines.extend(self.render_streaming_content());
-        }
-
-        // Streaming steer sentence (Steer Arbitrator output - YELLOW BOLD).
-        if !self.steer_sentence_buffer.is_empty() {
-            chat_lines.extend(self.render_streaming_steer());
-        }
-
-        let total_chat_lines = self.estimated_chat_lines(chat_w);
-
-        let max_scroll = total_chat_lines.saturating_sub(chat_h);
-        if self.chat_auto_scroll || (self.chat_scroll as usize) > max_scroll {
-            self.chat_scroll = max_scroll as u16;
-        }
-
-        let chat_paragraph = Paragraph::new(chat_lines)
-            .block(chat_block)
-            .wrap(Wrap { trim: false })
-            .scroll((self.chat_scroll, 0));
-        frame.render_widget(chat_paragraph, area);
-
-        // Vertical scrollbar on the chat pane.
-        if max_scroll > 0 {
-            let inner = Rect {
-                x: area.x + 1,
-                y: area.y + 1,
-                width: area.width.saturating_sub(2),
-                height: area.height.saturating_sub(2),
-            };
-            let mut scrollbar_state =
-                ScrollbarState::new(max_scroll).position(self.chat_scroll as usize);
-            frame.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight),
-                inner,
-                &mut scrollbar_state,
-            );
-        }
-    }
-
-    pub(crate) fn render_plan(
-        &mut self,
-        frame: &mut ratatui::Frame,
-        area: Rect,
-        plan: &str,
-        _is_archived: bool,
-    ) {
-        let plan_border_color = if self.focused_panel == FocusedPanel::Plan {
-            Color::Cyan
-        } else {
-            Color::DarkGray
-        };
-        let plan_block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(plan_border_color))
-            .title(" Execution Plan ");
-
-        // Gather ALL active tasks across active subagents and active_plan_task
-        let mut active_tasks: Vec<String> = Vec::new();
-        for s in &self.subagents {
-            if s.is_active {
-                let tid_opt = s.task_id.as_deref().or_else(|| {
-                    if let Some(pos) = s.name.find("-t-") {
-                        Some(&s.name[pos + 1..])
-                    } else {
-                        None
-                    }
-                });
-                if let Some(tid) = tid_opt {
-                    let clean = clean_task_id(tid);
-                    if !clean.is_empty()
-                        && !active_tasks.iter().any(|t| t.eq_ignore_ascii_case(clean))
-                    {
-                        active_tasks.push(clean.to_string());
-                    }
-                }
-            }
-        }
-        if let Some(tid) = &self.active_plan_task {
-            let clean = clean_task_id(tid);
-            if !clean.is_empty() && !active_tasks.iter().any(|t| t.eq_ignore_ascii_case(clean)) {
-                active_tasks.push(clean.to_string());
-            }
-        }
-
-        let target_task = self.active_plan_task.as_deref().or_else(|| {
-            self.subagents
-                .iter()
-                .find(|s| s.is_active && s.task_id.is_some())
-                .and_then(|s| s.task_id.as_deref())
-        });
-
-        let mut plan_lines = Vec::new();
-        for raw_line in plan.lines() {
-            let line = raw_line.replace('\t', "    ");
-            let is_active_task = active_tasks
-                .iter()
-                .any(|tid| line_matches_task_id(&line, tid));
-
-            let style = if line.starts_with("# ") || line.starts_with("## ") {
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD)
-            } else if is_active_task && (line.contains("[ ]") || line.contains("( )")) {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else if line.contains("[x]") || line.contains("[X]") {
-                Style::default().fg(Color::Green)
-            } else if line.contains("[ ]") {
-                Style::default().fg(Color::LightRed)
+        pub(crate) fn render_chat(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+            let chat_border_color = if self.focused_panel == FocusedPanel::Chat {
+                Color::Cyan
             } else {
-                Style::default()
+                Color::DarkGray
             };
-            plan_lines.push(Line::styled(line, style));
-        }
+            let chat_block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(chat_border_color))
+                .title(" Chat & Logs (Focus: Tab) ");
 
-        let plan_w = area.width.saturating_sub(2) as usize;
-        let plan_h = area.height.saturating_sub(2) as usize;
-        self.plan_width.set(plan_w);
-        self.plan_height.set(plan_h);
+            let chat_w = area.width.saturating_sub(2) as usize;
+            let chat_h = area.height.saturating_sub(2) as usize;
+            self.chat_width.set(chat_w);
+            self.chat_height.set(chat_h);
 
-        let total_plan_lines = wrapped_lines(plan, plan_w.max(1));
-        self.plan_max_scroll = total_plan_lines.saturating_sub(plan_h) as u16;
-        let scroll_y = if self.plan_auto_scroll {
-            let target_scroll = if let Some(task_id) = target_task
-                && let Some(task_visual) = visual_line_offset_of_task(plan, task_id, plan_w.max(1))
+            let mut chat_lines = Vec::new();
+            self.ensure_rendered_message_cache();
             {
-                // Position the active started task comfortably in view (leaving 1 line of context above if possible)
-                let desired = task_visual.saturating_sub(1);
-                (desired as u16).min(self.plan_max_scroll)
-            } else if let Some(first_pending_visual) =
-                visual_line_offset_of_first_pending(plan, plan_w.max(1))
-            {
-                // Position the first pending task comfortably in view (leaving 1 line of context above if possible)
-                let desired = first_pending_visual.saturating_sub(1);
-                (desired as u16).min(self.plan_max_scroll)
-            } else {
-                // If all tasks are completed or no pending tasks, scroll to bottom to show completed progress
-                self.plan_max_scroll
-            };
-            self.plan_scroll = target_scroll;
-            target_scroll
-        } else {
-            self.plan_scroll.min(self.plan_max_scroll)
-        };
-
-        let paragraph = Paragraph::new(plan_lines)
-            .block(plan_block)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll_y, 0));
-        frame.render_widget(paragraph, area);
-
-        // Vertical scrollbar on the plan pane.
-        if self.plan_max_scroll > 0 {
-            let inner = Rect {
-                x: area.x + 1,
-                y: area.y + 1,
-                width: area.width.saturating_sub(2),
-                height: area.height.saturating_sub(2),
-            };
-            let mut scrollbar_state = ScrollbarState::new(self.plan_max_scroll as usize)
-                .position(self.plan_scroll as usize);
-            frame.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight),
-                inner,
-                &mut scrollbar_state,
-            );
-        }
-    }
-
-    pub(crate) fn render_subagents(&mut self, frame: &mut ratatui::Frame, area: Rect) {
-        let subagent_border_color = if self.focused_panel == FocusedPanel::Subagents {
-            Color::Cyan
-        } else {
-            Color::DarkGray
-        };
-
-        let total = self.subagents.len();
-        let title = if total == 0 {
-            " Specialist Subagents (Ctrl-A | ◄/► Agent | ▲/▼ Scroll) ".to_string()
-        } else {
-            let current = (self.selected_subagent_idx + 1).min(total);
-            format!(" Specialist Subagents [{current}/{total}] (Ctrl-A | ◄/► Agent | ▲/▼ Scroll) ")
-        };
-
-        let subagent_block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(subagent_border_color))
-            .title(title);
-
-        let inner_area = subagent_block.inner(area);
-        let list_len = (self.subagents.len() as u16)
-            .clamp(1, 3)
-            .min(inner_area.height.saturating_sub(3).max(1));
-        let subagent_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(list_len), Constraint::Min(3)])
-            .split(inner_area);
-
-        // One registry snapshot per frame: the row set was projected from these
-        // entries, and the ctx mirror, the class/handle badge and the thinking
-        // flag all read the same ones, so a `{agent}-wN` / `{base}#N` key can
-        // never miss the way a per-field lookup by display name used to.
-        let entries = crate::orchestrator::worker_entries();
-        let mut list_lines = Vec::new();
-        for (i, sa) in self.subagents.iter().enumerate() {
-            let entry = entries.iter().find(|e| e.key == sa.name);
-            let prefix = if i == self.selected_subagent_idx {
-                "> "
-            } else {
-                "  "
-            };
-            let name_style = if sa.is_active {
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            // The row carries the ctx mirror the projection wrote into it. The
-            // registry is consulted only when the row has nothing to show, and
-            // then through the **same key** the row is named by.
-            let ctx_tokens = if sa.context_tokens > 0 {
-                sa.context_tokens
-            } else {
-                entry.map(|e| e.context_tokens).unwrap_or(0)
-            };
-            let ctx_info = if ctx_tokens > 0 {
-                format!(", {} ctx", Self::format_count(ctx_tokens))
-            } else {
-                String::new()
-            };
-            let total_secs = if sa.is_active {
-                (sa.worked_duration + sa.started_at.map(|st| st.elapsed()).unwrap_or_default())
-                    .as_secs()
-            } else {
-                sa.worked_duration.as_secs()
-            };
-            let elapsed_str = if total_secs > 0 {
-                if total_secs >= 60 {
-                    format!(", {}m {}s", total_secs / 60, total_secs % 60)
-                } else {
-                    format!(", {}s", total_secs)
+                let cached = self.cached_rendered_messages.borrow();
+                for msg_lines in &*cached {
+                    chat_lines.extend(msg_lines.iter().cloned());
                 }
+            }
+
+            if self.show_thought && !self.current_thought.is_empty() {
+                chat_lines.extend(self.render_streaming_thought());
+            }
+
+            // Streaming content (Orchestrator output - WHITE or syntax highlighted).
+            if !self.current_content.is_empty() {
+                chat_lines.extend(self.render_streaming_content());
+            }
+
+            // Streaming steer sentence (Steer Arbitrator output - YELLOW BOLD).
+            if !self.steer_sentence_buffer.is_empty() {
+                chat_lines.extend(self.render_streaming_steer());
+            }
+
+            let total_chat_lines = self.estimated_chat_lines(chat_w);
+
+            let max_scroll = total_chat_lines.saturating_sub(chat_h);
+            if self.chat_auto_scroll || (self.chat_scroll as usize) > max_scroll {
+                self.chat_scroll = max_scroll as u16;
+            }
+
+            let chat_paragraph = Paragraph::new(chat_lines)
+                .block(chat_block)
+                .wrap(Wrap { trim: false })
+                .scroll((self.chat_scroll, 0));
+            frame.render_widget(chat_paragraph, area);
+
+            // Vertical scrollbar on the chat pane.
+            if max_scroll > 0 {
+                let inner = Rect {
+                    x: area.x + 1,
+                    y: area.y + 1,
+                    width: area.width.saturating_sub(2),
+                    height: area.height.saturating_sub(2),
+                };
+                let mut scrollbar_state =
+                    ScrollbarState::new(max_scroll).position(self.chat_scroll as usize);
+                frame.render_stateful_widget(
+                    Scrollbar::new(ScrollbarOrientation::VerticalRight),
+                    inner,
+                    &mut scrollbar_state,
+                );
+            }
+        }
+
+        pub(crate) fn render_plan(
+            &mut self,
+            frame: &mut ratatui::Frame,
+            area: Rect,
+            plan: &str,
+            _is_archived: bool,
+        ) {
+            let plan_border_color = if self.focused_panel == FocusedPanel::Plan {
+                Color::Cyan
             } else {
-                String::new()
+                Color::DarkGray
             };
-            // Slot state changes the label only. A queued delegation keeps the
-            // green/bold name, the live clock, the live ctx lookup and its place
-            // in the "[N active: …]" status line, because it really is part of
-            // the running round — it is simply waiting behind the cap. The
-            // `(Queued n/m)` half is a stable shape built from the pool's FIFO
-            // ticket, so a position change swaps digits and nothing else here.
-            //
-            // An arbitration pause is the other orthogonal state a live row can
-            // carry, and it wins the label over a queue position: the row that
-            // yielded its model slot to the Steer Arbitrator is not waiting behind
-            // the concurrency cap, it is parked inside the arbitration handshake,
-            // and the operator needs to see that the round is being held — the
-            // stream resumes on the slot it gave up. `is_active` stays true, so the
-            // name keeps its green/bold spelling and the clock keeps running.
-            let queued = sa.queue.filter(|_| sa.is_active);
-            let status = if sa.paused && sa.is_active {
-                Span::styled(
-                    format!(" (Paused{ctx_info}{elapsed_str})"),
-                    Style::default().fg(Color::LightBlue),
-                )
-            } else if let Some(q) = queued {
-                let (position, of) = (q.position, q.of);
-                Span::styled(
-                    format!(" (Queued {position}/{of}{ctx_info}{elapsed_str})"),
-                    Style::default().fg(Color::LightYellow),
-                )
-            } else if sa.is_active {
-                Span::styled(
-                    format!(" (Active{ctx_info}{elapsed_str})"),
-                    Style::default().fg(Color::LightGreen),
-                )
-            } else {
-                Span::styled(
-                    format!(" (Idle{ctx_info}{elapsed_str})"),
-                    Style::default().fg(Color::DarkGray),
-                )
-            };
-            // A validator/audit run and a duplicate-key registration are both
-            // real workers the Manager and the arbitrator can see, so the label
-            // says which kind of row it is. The badge is derived from the registry
-            // entry, never stored on the row, and it is appended after the status
-            // so the `(Active)` / `(Idle)` / `(Queued n/m)` label keeps its shape.
-            let badge = crate::ui::helpers::subagent_row_badge(entry, &sa.name)
-                .map(|text| {
-                    Span::styled(
-                        format!(" {text}"),
-                        Style::default()
-                            .fg(Color::LightMagenta)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                })
-                .unwrap_or_else(|| Span::raw(""));
-            list_lines.push(Line::from(vec![
-                Span::raw(prefix),
-                Span::styled(sa.name.clone(), name_style),
-                status,
-                badge,
-            ]));
-        }
-        if list_lines.is_empty() {
-            list_lines.push(Line::raw("No subagents."));
-        }
+            let plan_block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(plan_border_color))
+                .title(" Execution Plan ");
 
-        // Auto-adjust list scroll to keep the selected subagent visible.
-        let list_height = subagent_chunks[0].height as usize;
-        let mut list_scroll = self.subagent_list_scroll as usize;
-        if list_height > 0 {
-            if self.selected_subagent_idx < list_scroll {
-                list_scroll = self.selected_subagent_idx;
-            } else if self.selected_subagent_idx >= list_scroll + list_height {
-                list_scroll = self.selected_subagent_idx + 1 - list_height;
-            }
-            let max_scroll = self.subagents.len().saturating_sub(list_height);
-            if list_scroll > max_scroll {
-                list_scroll = max_scroll;
-            }
-        } else {
-            list_scroll = 0;
-        }
-        self.subagent_list_scroll = list_scroll as u16;
-
-        let list_paragraph = Paragraph::new(list_lines)
-            .wrap(Wrap { trim: false })
-            .scroll((list_scroll as u16, 0));
-        frame.render_widget(list_paragraph, subagent_chunks[0]);
-
-        let separator = Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::default().fg(Color::DarkGray));
-
-        let sa_opt = self.subagents.get(self.selected_subagent_idx);
-        let show_status_bar = if let Some(sa) = sa_opt {
-            sa.is_active || !sa.thinking.is_empty()
-        } else {
-            false
-        };
-
-        let (details_area, status_area_opt) = if show_status_bar && subagent_chunks[1].height >= 4 {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(1), // Top separator border
-                    Constraint::Min(2),    // Scrollable details area
-                    Constraint::Length(1), // Bottom subagent status bar
-                ])
-                .split(subagent_chunks[1]);
-            frame.render_widget(separator, chunks[0]);
-            (chunks[1], Some(chunks[2]))
-        } else {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(1), // Top separator border
-                    Constraint::Min(2),    // Scrollable details area
-                ])
-                .split(subagent_chunks[1]);
-            frame.render_widget(separator, chunks[0]);
-            (chunks[1], None)
-        };
-
-        let mut detail_lines = Vec::new();
-        if let Some(sa) = sa_opt {
-            detail_lines.push(Line::styled(
-                format!("=== Details for {} ===", sa.name),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ));
-
-            if !sa.thinking.is_empty() && self.show_thought {
-                detail_lines.push(Line::styled(
-                    "[Thinking]",
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                let think_style = Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC);
-                detail_lines.push(Line::styled(" thinking", think_style));
-                for line in sa.thinking.lines() {
-                    let line = format_terminal_math(line);
-                    detail_lines.push(Line::styled(line, think_style));
-                }
-                detail_lines.push(Line::styled(" response", think_style));
-            }
-
-            if !sa.content.is_empty() {
-                detail_lines.push(Line::styled(
-                    "[Output]",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                if sa.content.contains("```") {
-                    detail_lines.extend(render_markdown_lines(&sa.content));
-                } else {
-                    for line in sa.content.lines() {
-                        let line = format_terminal_math(line);
-                        detail_lines.push(Line::raw(line));
+            // Gather ALL active tasks across active subagents and active_plan_task
+            let mut active_tasks: Vec<String> = Vec::new();
+            for s in &self.subagents {
+                if s.is_active {
+                    let tid_opt = s.task_id.as_deref().or_else(|| {
+                        if let Some(pos) = s.name.find("-t-") {
+                            Some(&s.name[pos + 1..])
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(tid) = tid_opt {
+                        let clean = clean_task_id(tid);
+                        if !clean.is_empty()
+                            && !active_tasks.iter().any(|t| t.eq_ignore_ascii_case(clean))
+                        {
+                            active_tasks.push(clean.to_string());
+                        }
                     }
                 }
             }
+            if let Some(tid) = &self.active_plan_task {
+                let clean = clean_task_id(tid);
+                if !clean.is_empty() && !active_tasks.iter().any(|t| t.eq_ignore_ascii_case(clean)) {
+                    active_tasks.push(clean.to_string());
+                }
+            }
 
-            if !sa.logs.is_empty() {
-                detail_lines.push(Line::styled(
-                    "[Logs]",
+            let target_task = self.active_plan_task.as_deref().or_else(|| {
+                self.subagents
+                    .iter()
+                    .find(|s| s.is_active && s.task_id.is_some())
+                    .and_then(|s| s.task_id.as_deref())
+            });
+
+            let mut plan_lines = Vec::new();
+            for raw_line in plan.lines() {
+                let line = raw_line.replace('\t', "    ");
+                let is_active_task = active_tasks
+                    .iter()
+                    .any(|tid| line_matches_task_id(&line, tid));
+
+                let style = if line.starts_with("# ") || line.starts_with("## ") {
                     Style::default()
                         .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
+                } else if is_active_task && (line.contains("[ ]") || line.contains("( )")) {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else if line.contains("[x]") || line.contains("[X]") {
+                    Style::default().fg(Color::Green)
+                } else if line.contains("[ ]") {
+                    Style::default().fg(Color::LightRed)
+                } else {
+                    Style::default()
+                };
+                plan_lines.push(Line::styled(line, style));
+            }
+
+            let plan_w = area.width.saturating_sub(2) as usize;
+            let plan_h = area.height.saturating_sub(2) as usize;
+
+            let total_plan_lines = wrapped_lines(plan, plan_w.max(1));
+            self.plan_max_scroll = total_plan_lines.saturating_sub(plan_h) as u16;
+            let scroll_y = if self.plan_auto_scroll {
+                let target_scroll = if let Some(task_id) = target_task
+                    && let Some(task_visual) = visual_line_offset_of_task(plan, task_id, plan_w.max(1))
+                {
+                    // Position the active started task comfortably in view (leaving 1 line of context above if possible)
+                    let desired = task_visual.saturating_sub(1);
+                    (desired as u16).min(self.plan_max_scroll)
+                } else if let Some(first_pending_visual) =
+                    visual_line_offset_of_first_pending(plan, plan_w.max(1))
+                {
+                    // Position the first pending task comfortably in view (leaving 1 line of context above if possible)
+                    let desired = first_pending_visual.saturating_sub(1);
+                    (desired as u16).min(self.plan_max_scroll)
+                } else {
+                    // If all tasks are completed or no pending tasks, scroll to bottom to show completed progress
+                    self.plan_max_scroll
+                };
+                self.plan_scroll = target_scroll;
+                target_scroll
+            } else {
+                self.plan_scroll.min(self.plan_max_scroll)
+            };
+
+            let paragraph = Paragraph::new(plan_lines)
+                .block(plan_block)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll_y, 0));
+            frame.render_widget(paragraph, area);
+
+            // Vertical scrollbar on the plan pane.
+            if self.plan_max_scroll > 0 {
+                let inner = Rect {
+                    x: area.x + 1,
+                    y: area.y + 1,
+                    width: area.width.saturating_sub(2),
+                    height: area.height.saturating_sub(2),
+                };
+                let mut scrollbar_state = ScrollbarState::new(self.plan_max_scroll as usize)
+                    .position(self.plan_scroll as usize);
+                frame.render_stateful_widget(
+                    Scrollbar::new(ScrollbarOrientation::VerticalRight),
+                    inner,
+                    &mut scrollbar_state,
+                );
+            }
+        }
+
+        pub(crate) fn render_subagents(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+            let subagent_border_color = if self.focused_panel == FocusedPanel::Subagents {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            };
+
+            let total = self.subagents.len();
+            let title = if total == 0 {
+                " Specialist Subagents (Ctrl-A | ◄/► Agent | ▲/▼ Scroll) ".to_string()
+            } else {
+                let current = (self.selected_subagent_idx + 1).min(total);
+                format!(" Specialist Subagents [{current}/{total}] (Ctrl-A | ◄/► Agent | ▲/▼ Scroll) ")
+            };
+
+            let subagent_block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(subagent_border_color))
+                .title(title);
+
+            let inner_area = subagent_block.inner(area);
+            let list_len = (self.subagents.len() as u16)
+                .clamp(1, 3)
+                .min(inner_area.height.saturating_sub(3).max(1));
+            let subagent_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(list_len), Constraint::Min(3)])
+                .split(inner_area);
+
+            // One registry snapshot per frame: the row set was projected from these
+            // entries, and the ctx mirror, the class/handle badge and the thinking
+            // flag all read the same ones, so a `{agent}-wN` / `{base}#N` key can
+            // never miss the way a per-field lookup by display name used to.
+            let entries = crate::orchestrator::worker_entries();
+            let mut list_lines = Vec::new();
+            for (i, sa) in self.subagents.iter().enumerate() {
+                let entry = entries.iter().find(|e| e.key == sa.name);
+                let prefix = if i == self.selected_subagent_idx {
+                    "> "
+                } else {
+                    "  "
+                };
+                let name_style = if sa.is_active {
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                // The row carries the ctx mirror the projection wrote into it. The
+                // registry is consulted only when the row has nothing to show, and
+                // then through the **same key** the row is named by.
+                let ctx_tokens = if sa.context_tokens > 0 {
+                    sa.context_tokens
+                } else {
+                    entry.map(|e| e.context_tokens).unwrap_or(0)
+                };
+                let ctx_info = if ctx_tokens > 0 {
+                    format!(", {} ctx", Self::format_count(ctx_tokens))
+                } else {
+                    String::new()
+                };
+                let total_secs = if sa.is_active {
+                    (sa.worked_duration + sa.started_at.map(|st| st.elapsed()).unwrap_or_default())
+                        .as_secs()
+                } else {
+                    sa.worked_duration.as_secs()
+                };
+                let elapsed_str = if total_secs > 0 {
+                    if total_secs >= 60 {
+                        format!(", {}m {}s", total_secs / 60, total_secs % 60)
+                    } else {
+                        format!(", {}s", total_secs)
+                    }
+                } else {
+                    String::new()
+                };
+                // Slot state changes the label only. A queued delegation keeps the
+                // green/bold name, the live clock, the live ctx lookup and its place
+                // in the "[N active: …]" status line, because it really is part of
+                // the running round — it is simply waiting behind the cap. The
+                // `(Queued n/m)` half is a stable shape built from the pool's FIFO
+                // ticket, so a position change swaps digits and nothing else here.
+                //
+                // An arbitration pause is the other orthogonal state a live row can
+                // carry, and it wins the label over a queue position: the row that
+                // yielded its model slot to the Steer Arbitrator is not waiting behind
+                // the concurrency cap, it is parked inside the arbitration handshake,
+                // and the operator needs to see that the round is being held — the
+                // stream resumes on the slot it gave up. `is_active` stays true, so the
+                // name keeps its green/bold spelling and the clock keeps running.
+                let queued = sa.queue.filter(|_| sa.is_active);
+                let status = if sa.paused && sa.is_active {
+                    Span::styled(
+                        format!(" (Paused{ctx_info}{elapsed_str})"),
+                        Style::default().fg(Color::LightBlue),
+                    )
+                } else if let Some(q) = queued {
+                    let (position, of) = (q.position, q.of);
+                    Span::styled(
+                        format!(" (Queued {position}/{of}{ctx_info}{elapsed_str})"),
+                        Style::default().fg(Color::LightYellow),
+                    )
+                } else if sa.is_active {
+                    Span::styled(
+                        format!(" (Active{ctx_info}{elapsed_str})"),
+                        Style::default().fg(Color::LightGreen),
+                    )
+                } else {
+                    Span::styled(
+                        format!(" (Idle{ctx_info}{elapsed_str})"),
+                        Style::default().fg(Color::DarkGray),
+                    )
+                };
+                // A validator/audit run and a duplicate-key registration are both
+                // real workers the Manager and the arbitrator can see, so the label
+                // says which kind of row it is. The badge is derived from the registry
+                // entry, never stored on the row, and it is appended after the status
+                // so the `(Active)` / `(Idle)` / `(Queued n/m)` label keeps its shape.
+                let badge = crate::ui::helpers::subagent_row_badge(entry, &sa.name)
+                    .map(|text| {
+                        Span::styled(
+                            format!(" {text}"),
+                            Style::default()
+                                .fg(Color::LightMagenta)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                    })
+                    .unwrap_or_else(|| Span::raw(""));
+                list_lines.push(Line::from(vec![
+                    Span::raw(prefix),
+                    Span::styled(sa.name.clone(), name_style),
+                    status,
+                    badge,
+                ]));
+            }
+            if list_lines.is_empty() {
+                list_lines.push(Line::raw("No subagents."));
+            }
+
+            // Auto-adjust list scroll to keep the selected subagent visible.
+            let list_height = subagent_chunks[0].height as usize;
+            let mut list_scroll = self.subagent_list_scroll as usize;
+            if list_height > 0 {
+                if self.selected_subagent_idx < list_scroll {
+                    list_scroll = self.selected_subagent_idx;
+                } else if self.selected_subagent_idx >= list_scroll + list_height {
+                    list_scroll = self.selected_subagent_idx + 1 - list_height;
+                }
+                let max_scroll = self.subagents.len().saturating_sub(list_height);
+                if list_scroll > max_scroll {
+                    list_scroll = max_scroll;
+                }
+            } else {
+                list_scroll = 0;
+            }
+            self.subagent_list_scroll = list_scroll as u16;
+
+            let list_paragraph = Paragraph::new(list_lines)
+                .wrap(Wrap { trim: false })
+                .scroll((list_scroll as u16, 0));
+            frame.render_widget(list_paragraph, subagent_chunks[0]);
+
+            let separator = Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(Color::DarkGray));
+
+            let sa_opt = self.subagents.get(self.selected_subagent_idx);
+            let show_status_bar = if let Some(sa) = sa_opt {
+                sa.is_active || !sa.thinking.is_empty()
+            } else {
+                false
+            };
+
+            let (details_area, status_area_opt) = if show_status_bar && subagent_chunks[1].height >= 4 {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1), // Top separator border
+                        Constraint::Min(2),    // Scrollable details area
+                        Constraint::Length(1), // Bottom subagent status bar
+                    ])
+                    .split(subagent_chunks[1]);
+                frame.render_widget(separator, chunks[0]);
+                (chunks[1], Some(chunks[2]))
+            } else {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1), // Top separator border
+                        Constraint::Min(2),    // Scrollable details area
+                    ])
+                    .split(subagent_chunks[1]);
+                frame.render_widget(separator, chunks[0]);
+                (chunks[1], None)
+            };
+
+            let mut detail_lines = Vec::new();
+            if let Some(sa) = sa_opt {
+                detail_lines.push(Line::styled(
+                    format!("=== Details for {} ===", sa.name),
+                    Style::default()
+                        .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ));
-                for log in &sa.logs {
-                    if log.contains('\x1b') {
-                        let parsed = parse_ansi_lines(log);
-                        for line in parsed {
-                            let mut spans = vec![Span::raw("- ")];
-                            spans.extend(line.spans);
-                            detail_lines.push(Line::from(spans));
-                        }
+
+                if !sa.thinking.is_empty() && self.show_thought {
+                    detail_lines.push(Line::styled(
+                        "[Thinking]",
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    let think_style = Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC);
+                    detail_lines.push(Line::styled(" thinking", think_style));
+                    for line in sa.thinking.lines() {
+                        let line = format_terminal_math(line);
+                        detail_lines.push(Line::styled(line, think_style));
+                    }
+                    detail_lines.push(Line::styled(" response", think_style));
+                }
+
+                if !sa.content.is_empty() {
+                    detail_lines.push(Line::styled(
+                        "[Output]",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    if sa.content.contains("```") {
+                        detail_lines.extend(render_markdown_lines(&sa.content));
                     } else {
-                        detail_lines.push(Line::raw(format!("- {log}")));
+                        for line in sa.content.lines() {
+                            let line = format_terminal_math(line);
+                            detail_lines.push(Line::raw(line));
+                        }
                     }
                 }
-            }
-        } else {
-            detail_lines.push(Line::raw("No subagents active or selected."));
-        }
 
-        let details_w = details_area.width.saturating_sub(1) as usize;
-        let details_h = details_area.height as usize;
-        self.subagent_width.set(details_w);
-        self.subagent_height.set(details_h);
-
-        let total_detail_lines = count_wrapped_rendered_lines(&detail_lines, details_w);
-
-        let max_scroll = total_detail_lines.saturating_sub(details_h);
-        if self.subagent_autoscroll || (self.subagent_scroll as usize) > max_scroll {
-            self.subagent_scroll = max_scroll as u16;
-        }
-
-        let detail_paragraph = Paragraph::new(detail_lines)
-            .wrap(Wrap { trim: false })
-            .scroll((self.subagent_scroll, 0));
-        frame.render_widget(detail_paragraph, details_area);
-
-        // Subagent bottom status bar (rendered like main UI status bar).
-        if let (Some(status_area), Some(sa)) = (status_area_opt, sa_opt) {
-            let frames = ["-", "\\", "|", "/"];
-            let idx =
-                ((self.session_start.elapsed().as_millis() / 125) % frames.len() as u128) as usize;
-            let spinner = if sa.is_active { frames[idx] } else { "" };
-
-            let turn_think = self
-                .subagent_turn_thinking
-                .get(&sa.name)
-                .map(|s| s.as_str());
-            // Liveness of the thinking bar comes from the registry, never from
-            // leftover pane text. An explicit flag — set by the stream, cleared by
-            // the tool and lifecycle arms — is honoured while the row is active.
-            // With no flag the pane would be inferring "still streaming" from a
-            // `thinking` buffer that outlives the worker (a cancel or a guard drop
-            // produces no event at all), so that inference additionally requires
-            // the registry entry to be a live worker.
-            let is_thinking = match self.subagent_is_thinking.get(&sa.name).copied() {
-                Some(flag) => flag && sa.is_active,
-                None => {
-                    sa.is_active
-                        && (turn_think.map_or(!sa.thinking.is_empty(), |t| !t.is_empty()))
-                        && entries.iter().any(|e| e.key == sa.name && e.is_active)
+                if !sa.logs.is_empty() {
+                    detail_lines.push(Line::styled(
+                        "[Logs]",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    for log in &sa.logs {
+                        if log.contains('\x1b') {
+                            let parsed = parse_ansi_lines(log);
+                            for line in parsed {
+                                let mut spans = vec![Span::raw("- ")];
+                                spans.extend(line.spans);
+                                detail_lines.push(Line::from(spans));
+                            }
+                        } else {
+                            detail_lines.push(Line::raw(format!("- {log}")));
+                        }
+                    }
                 }
-            };
-            let active_think = match turn_think {
-                Some(t) => t,
-                None => sa.thinking.as_str(),
-            };
-
-            let (bar_text, bar_style) = if sa.paused && sa.is_active {
-                // The arbitration pause takes the bar over from the queue position
-                // and the thinking bar for the same reason it takes the label: a
-                // stream that yielded its model slot is neither queued for a permit
-                // nor producing tokens, so whatever thinking text the row still
-                // carries is already stale, and the fact worth reading is that the
-                // slot is on loan to the arbitrator. The spinner keeps turning
-                // because `is_active` stays true through the handshake.
-                (
-                    format!(
-                        " [Status: Paused - model slot yielded to the steering arbitrator...] {spinner}"
-                    ),
-                    Style::default().bg(Color::DarkGray).fg(Color::LightBlue),
-                )
-            } else if let Some(q) = sa.queue.filter(|_| sa.is_active) {
-                // The queue position wins over the thinking bar for one reason:
-                // a row can only stream thinking while it holds its slot, so the
-                // moment this arm fires the previous turn's thinking state is
-                // already stale, and the useful fact is how long the row is still
-                // waiting and how many are ahead of it. The spinner keeps turning
-                // because `is_active` stays true through a slot wait.
-                let (position, of) = (q.position, q.of);
-                (
-                    format!(
-                        " [Status: Queued {position}/{of} - waiting for a backend slot...] {spinner}"
-                    ),
-                    Style::default().bg(Color::DarkGray).fg(Color::LightYellow),
-                )
-            } else if is_thinking {
-                let budget = self.get_thinking_budget(sa);
-                let chars = active_think.len();
-                let tok_count = chars.div_ceil(4);
-                let remaining = budget.saturating_sub(tok_count);
-                let text = format!(
-                    " [Thinking: ~{} tokens ({} remaining) / {} chars] {}",
-                    Self::format_count(tok_count),
-                    Self::format_count(remaining),
-                    Self::format_count(chars),
-                    spinner
-                );
-                let fg_color = if remaining <= budget / 5 {
-                    Color::LightRed
-                } else {
-                    Color::Yellow
-                };
-                (
-                    text,
-                    Style::default()
-                        .bg(Color::DarkGray)
-                        .fg(fg_color)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else if sa.is_active && !sa.content.is_empty() {
-                let text = format!(" [Status: Active - streaming output...] {}", spinner);
-                (text, Style::default().bg(Color::DarkGray).fg(Color::Green))
-            } else if sa.is_active {
-                let text = format!(
-                    " [Status: Active - waiting for model response...] {}",
-                    spinner
-                );
-                (text, Style::default().bg(Color::DarkGray).fg(Color::Cyan))
             } else {
-                (
-                    " [Status: Idle]".to_string(),
-                    Style::default().bg(Color::DarkGray).fg(Color::DarkGray),
-                )
-            };
-
-            let status_p = Paragraph::new(bar_text)
-                .style(bar_style)
-                .alignment(ratatui::layout::Alignment::Left);
-            frame.render_widget(status_p, status_area);
-        }
-
-        // Vertical scrollbar on the subagent-details pane.
-        if max_scroll > 0 {
-            let inner = Rect {
-                x: details_area.x,
-                y: details_area.y,
-                width: details_area.width,
-                height: details_area.height,
-            };
-            let mut scrollbar_state =
-                ScrollbarState::new(max_scroll).position(self.subagent_scroll as usize);
-            frame.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight),
-                inner,
-                &mut scrollbar_state,
-            );
-        }
-
-        frame.render_widget(subagent_block, area);
-    }
-
-    pub(crate) fn format_count(n: usize) -> String {
-        if n >= 1_000_000 {
-            format!("{:.1}M", n as f64 / 1_000_000.0)
-        } else if n >= 1_000 {
-            format!("{:.1}k", n as f64 / 1_000.0)
-        } else {
-            format!("{n}")
-        }
-    }
-
-    pub(crate) fn format_token_counts(tokens_in: usize, tokens_out: usize) -> String {
-        let total = tokens_in.saturating_add(tokens_out);
-        format!(
-            "{} in / {} out ({} total)",
-            Self::format_count(tokens_in),
-            Self::format_count(tokens_out),
-            Self::format_count(total)
-        )
-    }
-
-    pub(crate) fn render_status(&self, frame: &mut ratatui::Frame, area: Rect) {
-        // Always surface the live running-subagent count, independent of
-        // `status_line`, whenever any specialist is active.
-        let active_agents: Vec<&str> = self
-            .subagents
-            .iter()
-            .filter(|s| s.is_active)
-            .map(|s| s.name.as_str())
-            .collect();
-        let mut status_str = self.status_line.clone();
-        if active_agents.is_empty() {
-            if let Some((prefix, _)) = status_str.split_once(". Active: ") {
-                status_str = prefix.to_string();
+                detail_lines.push(Line::raw("No subagents active or selected."));
             }
-        } else {
-            let count_suffix = format!(
-                " [{} active: {}]",
-                active_agents.len(),
-                active_agents.join(", ")
-            );
-            status_str.push_str(&count_suffix);
-            // An arbitration pause is spelled out in its own segment instead of
-            // being subtracted from the active list: a row whose stream yielded its
-            // model slot to the Steer Arbitrator is still part of the running round
-            // — which is exactly what the `[N active: …]` count means. Derived from
-            // the same row model the panel label reads, so the two can never
-            // disagree about which worker is held.
-            let paused_agents: Vec<&str> = self
+
+            let details_w = details_area.width.saturating_sub(1) as usize;
+            let details_h = details_area.height as usize;
+            self.subagent_width.set(details_w);
+            self.subagent_height.set(details_h);
+
+            let total_detail_lines = count_wrapped_rendered_lines(&detail_lines, details_w);
+
+            let max_scroll = total_detail_lines.saturating_sub(details_h);
+            if self.subagent_autoscroll || (self.subagent_scroll as usize) > max_scroll {
+                self.subagent_scroll = max_scroll as u16;
+            }
+
+            let detail_paragraph = Paragraph::new(detail_lines)
+                .wrap(Wrap { trim: false })
+                .scroll((self.subagent_scroll, 0));
+            frame.render_widget(detail_paragraph, details_area);
+
+            // Subagent bottom status bar (rendered like main UI status bar).
+            if let (Some(status_area), Some(sa)) = (status_area_opt, sa_opt) {
+                let frames = ["-", "\\", "|", "/"];
+                let idx =
+                    ((self.session_start.elapsed().as_millis() / 125) % frames.len() as u128) as usize;
+                let spinner = if sa.is_active { frames[idx] } else { "" };
+
+                let turn_think = self
+                    .subagent_turn_thinking
+                    .get(&sa.name)
+                    .map(|s| s.as_str());
+                // Liveness of the thinking bar comes from the registry, never from
+                // leftover pane text. An explicit flag — set by the stream, cleared by
+                // the tool and lifecycle arms — is honoured while the row is active.
+                // With no flag the pane would be inferring "still streaming" from a
+                // `thinking` buffer that outlives the worker (a cancel or a guard drop
+                // produces no event at all), so that inference additionally requires
+                // the registry entry to be a live worker.
+                let is_thinking = match self.subagent_is_thinking.get(&sa.name).copied() {
+                    Some(flag) => flag && sa.is_active,
+                    None => {
+                        sa.is_active
+                            && (turn_think.map_or(!sa.thinking.is_empty(), |t| !t.is_empty()))
+                            && entries.iter().any(|e| e.key == sa.name && e.is_active)
+                    }
+                };
+                let active_think = match turn_think {
+                    Some(t) => t,
+                    None => sa.thinking.as_str(),
+                };
+
+                let (bar_text, bar_style) = if sa.paused && sa.is_active {
+                    // The arbitration pause takes the bar over from the queue position
+                    // and the thinking bar for the same reason it takes the label: a
+                    // stream that yielded its model slot is neither queued for a permit
+                    // nor producing tokens, so whatever thinking text the row still
+                    // carries is already stale, and the fact worth reading is that the
+                    // slot is on loan to the arbitrator. The spinner keeps turning
+                    // because `is_active` stays true through the handshake.
+                    (
+                        format!(
+                            " [Status: Paused - model slot yielded to the steering arbitrator...] {spinner}"
+                        ),
+                        Style::default().bg(Color::DarkGray).fg(Color::LightBlue),
+                    )
+                } else if let Some(q) = sa.queue.filter(|_| sa.is_active) {
+                    // The queue position wins over the thinking bar for one reason:
+                    // a row can only stream thinking while it holds its slot, so the
+                    // moment this arm fires the previous turn's thinking state is
+                    // already stale, and the useful fact is how long the row is still
+                    // waiting and how many are ahead of it. The spinner keeps turning
+                    // because `is_active` stays true through a slot wait.
+                    let (position, of) = (q.position, q.of);
+                    (
+                        format!(
+                            " [Status: Queued {position}/{of} - waiting for a backend slot...] {spinner}"
+                        ),
+                        Style::default().bg(Color::DarkGray).fg(Color::LightYellow),
+                    )
+                } else if is_thinking {
+                    let budget = self.get_thinking_budget(sa);
+                    let chars = active_think.len();
+                    let tok_count = chars.div_ceil(4);
+                    let remaining = budget.saturating_sub(tok_count);
+                    let text = format!(
+                        " [Thinking: ~{} tokens ({} remaining) / {} chars] {}",
+                        Self::format_count(tok_count),
+                        Self::format_count(remaining),
+                        Self::format_count(chars),
+                        spinner
+                    );
+                    let fg_color = if remaining <= budget / 5 {
+                        Color::LightRed
+                    } else {
+                        Color::Yellow
+                    };
+                    (
+                        text,
+                        Style::default()
+                            .bg(Color::DarkGray)
+                            .fg(fg_color)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else if sa.is_active && !sa.content.is_empty() {
+                    let text = format!(" [Status: Active - streaming output...] {}", spinner);
+                    (text, Style::default().bg(Color::DarkGray).fg(Color::Green))
+                } else if sa.is_active {
+                    let text = format!(
+                        " [Status: Active - waiting for model response...] {}",
+                        spinner
+                    );
+                    (text, Style::default().bg(Color::DarkGray).fg(Color::Cyan))
+                } else {
+                    (
+                        " [Status: Idle]".to_string(),
+                        Style::default().bg(Color::DarkGray).fg(Color::DarkGray),
+                    )
+                };
+
+                let status_p = Paragraph::new(bar_text)
+                    .style(bar_style)
+                    .alignment(ratatui::layout::Alignment::Left);
+                frame.render_widget(status_p, status_area);
+            }
+
+            // Vertical scrollbar on the subagent-details pane.
+            if max_scroll > 0 {
+                let inner = Rect {
+                    x: details_area.x,
+                    y: details_area.y,
+                    width: details_area.width,
+                    height: details_area.height,
+                };
+                let mut scrollbar_state =
+                    ScrollbarState::new(max_scroll).position(self.subagent_scroll as usize);
+                frame.render_stateful_widget(
+                    Scrollbar::new(ScrollbarOrientation::VerticalRight),
+                    inner,
+                    &mut scrollbar_state,
+                );
+            }
+
+            frame.render_widget(subagent_block, area);
+        }
+
+        pub(crate) fn format_count(n: usize) -> String {
+            if n >= 1_000_000 {
+                format!("{:.1}M", n as f64 / 1_000_000.0)
+            } else if n >= 1_000 {
+                format!("{:.1}k", n as f64 / 1_000.0)
+            } else {
+                format!("{n}")
+            }
+        }
+
+        pub(crate) fn format_token_counts(tokens_in: usize, tokens_out: usize) -> String {
+            let total = tokens_in.saturating_add(tokens_out);
+            format!(
+                "{} in / {} out ({} total)",
+                Self::format_count(tokens_in),
+                Self::format_count(tokens_out),
+                Self::format_count(total)
+            )
+        }
+
+        pub(crate) fn render_status(&self, frame: &mut ratatui::Frame, area: Rect) {
+            // Always surface the live running-subagent count, independent of
+            // `status_line`, whenever any specialist is active.
+            let active_agents: Vec<&str> = self
                 .subagents
                 .iter()
-                .filter(|s| s.is_active && s.paused)
+                .filter(|s| s.is_active)
                 .map(|s| s.name.as_str())
                 .collect();
-            if !paused_agents.is_empty() {
-                status_str.push_str(&format!(
-                    " [{} paused: {}]",
-                    paused_agents.len(),
-                    paused_agents.join(", ")
-                ));
-            }
-        }
-        // Animated activity indicator. When the status line indicates an
-        // active phase, append a cycling suffix derived from `session_start`.
-        // The keyword set is shared with the render-loop throttle tier so the
-        // two can never disagree about what counts as activity — including a
-        // round where every session is waiting for a backend slot.
-        let active_phase = ACTIVITY_STATUS_KEYWORDS
-            .iter()
-            .any(|k| status_str.contains(k));
-        if let Some(start) = self.waiting_for_token_since {
-            let elapsed = start.elapsed().as_secs_f32();
-            status_str.push_str(&format!(" ({:.1}s)", elapsed));
-        }
-        if active_phase {
-            let frames = ["-", "\\", "|", "/"];
-            let idx =
-                ((self.session_start.elapsed().as_millis() / 125) % frames.len() as u128) as usize;
-            status_str.push(' ');
-            status_str.push_str(frames[idx]);
-        }
-        let (global_in, global_out) = crate::llm::get_global_token_counts();
-        let tokens_in = self.tokens_in.max(global_in);
-        let tokens_out = self.tokens_out.max(global_out);
-        let tokens_str = Self::format_token_counts(tokens_in, tokens_out);
-        let (status_text, status_style) = if self.is_abort_armed() {
-            (
-                " ⚠ [ABORT ARMED] Press ESC or Ctrl+C again to abort | Any other key to cancel "
-                    .to_string(),
-                Style::default()
-                    .bg(Color::Red)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            let left_text = if self.orchestrator_context_tokens > 0 {
-                let ctx_str = Self::format_count(self.orchestrator_context_tokens);
-                format!(
-                    " Ctx: {} | Tokens: {} | Status: {}",
-                    ctx_str, tokens_str, status_str
-                )
-            } else {
-                format!(" Tokens: {} | Status: {}", tokens_str, status_str)
-            };
-
-            let right_text = if let Some(dur) = self.total_project_elapsed() {
-                format!(
-                    "Elapsed: {} ",
-                    crate::orchestrator::workers::format_duration_human(dur.as_secs())
-                )
-            } else {
-                String::new()
-            };
-
-            let total_width = area.width as usize;
-            let left_w = UnicodeWidthStr::width(left_text.as_str());
-            let right_w = UnicodeWidthStr::width(right_text.as_str());
-
-            let status_text = if total_width > left_w + right_w {
-                let padding = total_width - left_w - right_w;
-                format!("{}{:width$}{}", left_text, "", right_text, width = padding)
-            } else if total_width > right_w {
-                let avail_left = total_width - right_w;
-                let mut truncated = String::new();
-                let mut cur_w = 0;
-                for ch in left_text.chars() {
-                    let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
-                    if cur_w + ch_w > avail_left {
-                        break;
-                    }
-                    truncated.push(ch);
-                    cur_w += ch_w;
+            let mut status_str = self.status_line.clone();
+            if active_agents.is_empty() {
+                if let Some((prefix, _)) = status_str.split_once(". Active: ") {
+                    status_str = prefix.to_string();
                 }
-                let padding = avail_left - cur_w;
-                format!("{}{:width$}{}", truncated, "", right_text, width = padding)
             } else {
-                left_text
+                let count_suffix = format!(
+                    " [{} active: {}]",
+                    active_agents.len(),
+                    active_agents.join(", ")
+                );
+                status_str.push_str(&count_suffix);
+                // An arbitration pause is spelled out in its own segment instead of
+                // being subtracted from the active list: a row whose stream yielded its
+                // model slot to the Steer Arbitrator is still part of the running round
+                // — which is exactly what the `[N active: …]` count means. Derived from
+                // the same row model the panel label reads, so the two can never
+                // disagree about which worker is held.
+                let paused_agents: Vec<&str> = self
+                    .subagents
+                    .iter()
+                    .filter(|s| s.is_active && s.paused)
+                    .map(|s| s.name.as_str())
+                    .collect();
+                if !paused_agents.is_empty() {
+                    status_str.push_str(&format!(
+                        " [{} paused: {}]",
+                        paused_agents.len(),
+                        paused_agents.join(", ")
+                    ));
+                }
+            }
+            // Animated activity indicator. When the status line indicates an
+            // active phase, append a cycling suffix derived from `session_start`.
+            // The keyword set is shared with the render-loop throttle tier so the
+            // two can never disagree about what counts as activity — including a
+            // round where every session is waiting for a backend slot.
+            let active_phase = ACTIVITY_STATUS_KEYWORDS
+                .iter()
+                .any(|k| status_str.contains(k));
+            if let Some(start) = self.waiting_for_token_since {
+                let elapsed = start.elapsed().as_secs_f32();
+                status_str.push_str(&format!(" ({:.1}s)", elapsed));
+            }
+            if active_phase {
+                let frames = ["-", "\\", "|", "/"];
+                let idx =
+                    ((self.session_start.elapsed().as_millis() / 125) % frames.len() as u128) as usize;
+                status_str.push(' ');
+                status_str.push_str(frames[idx]);
+            }
+            let (global_in, global_out) = crate::llm::get_global_token_counts();
+            let tokens_in = self.tokens_in.max(global_in);
+            let tokens_out = self.tokens_out.max(global_out);
+            let tokens_str = Self::format_token_counts(tokens_in, tokens_out);
+            let (status_text, status_style) = if self.is_abort_armed() {
+                (
+                    " ⚠ [ABORT ARMED] Press ESC or Ctrl+C again to abort | Any other key to cancel "
+                        .to_string(),
+                    Style::default()
+                        .bg(Color::Red)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                let left_text = if self.orchestrator_context_tokens > 0 {
+                    let ctx_str = Self::format_count(self.orchestrator_context_tokens);
+                    format!(
+                        " Ctx: {} | Tokens: {} | Status: {}",
+                        ctx_str, tokens_str, status_str
+                    )
+                } else {
+                    format!(" Tokens: {} | Status: {}", tokens_str, status_str)
+                };
+
+                let right_text = if let Some(dur) = self.total_project_elapsed() {
+                    format!(
+                        "Elapsed: {} ",
+                        crate::orchestrator::workers::format_duration_human(dur.as_secs())
+                    )
+                } else {
+                    String::new()
+                };
+
+                let total_width = area.width as usize;
+                let left_w = UnicodeWidthStr::width(left_text.as_str());
+                let right_w = UnicodeWidthStr::width(right_text.as_str());
+
+                let status_text = if total_width > left_w + right_w {
+                    let padding = total_width - left_w - right_w;
+                    format!("{}{:width$}{}", left_text, "", right_text, width = padding)
+                } else if total_width > right_w {
+                    let avail_left = total_width - right_w;
+                    let mut truncated = String::new();
+                    let mut cur_w = 0;
+                    for ch in left_text.chars() {
+                        let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                        if cur_w + ch_w > avail_left {
+                            break;
+                        }
+                        truncated.push(ch);
+                        cur_w += ch_w;
+                    }
+                    let padding = avail_left - cur_w;
+                    format!("{}{:width$}{}", truncated, "", right_text, width = padding)
+                } else {
+                    left_text
+                };
+
+                (
+                    status_text,
+                    Style::default().bg(Color::DarkGray).fg(Color::White),
+                )
             };
+            let status_paragraph = Paragraph::new(status_text).style(status_style);
+            frame.render_widget(status_paragraph, area);
+        }
 
-            (
-                status_text,
-                Style::default().bg(Color::DarkGray).fg(Color::White),
-            )
-        };
-        let status_paragraph = Paragraph::new(status_text).style(status_style);
-        frame.render_widget(status_paragraph, area);
-    }
+        pub(crate) fn render_input(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+            self.ensure_textarea_in_sync();
 
-    pub(crate) fn render_input(&mut self, frame: &mut ratatui::Frame, area: Rect) {
-        self.ensure_textarea_in_sync();
+            let border_color = if self.is_abort_armed() {
+                Color::Red
+            } else {
+                Color::Cyan
+            };
+            let input_block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color))
+                .title(" Input (Enter: Send, Alt/Shift+Enter: Newline, Ctrl+Z: Undo) ");
 
-        let border_color = if self.is_abort_armed() {
-            Color::Red
-        } else {
-            Color::Cyan
-        };
-        let input_block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_color))
-            .title(" Input (Enter: Send, Alt/Shift+Enter: Newline, Ctrl+Z: Undo) ");
-
-        self.textarea.set_block(input_block);
-        self.textarea.set_cursor_line_style(Style::default());
-        frame.render_widget(&self.textarea, area);
+            self.textarea.set_block(input_block);
+            self.textarea.set_cursor_line_style(Style::default());
+            frame.render_widget(&self.textarea, area);
+        }
     }
 }
