@@ -1,7 +1,19 @@
 use super::*;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::style::{Color, Modifier};
 use std::time::Duration;
+
+/// Feed one synthetic key press through the same seam the live event loop calls
+/// ([`TuiRenderer::apply_terminal_event`]), and report whether the key meant
+/// something. The §10.3 legend-parity test and every keymap test below drive real
+/// events rather than calling private helpers, so a legend row cannot name a key
+/// the handler does not actually bind.
+fn press(r: &mut TuiRenderer, code: KeyCode, modifiers: KeyModifiers) -> bool {
+    r.apply_terminal_event(&crossterm::event::Event::Key(KeyEvent::new(
+        code, modifiers,
+    )))
+}
 
 #[test]
 fn extract_sentences_splits_on_newline() {
@@ -297,35 +309,42 @@ fn history_navigation_recalls_and_restores_draft() {
     assert_eq!(r.history_index, None);
 }
 
+/// `Tab` / `Shift+Tab` walk the §4.2 focus ring through the key handler, skipping
+/// the panes the current mode does not present, and the legacy `focused_panel`
+/// mirror moves with the stored focus.
 #[test]
 fn cycle_focus_obeys_panel_visibility() {
-    let mut r = TuiRenderer::new();
-    r.show_plan_panel = true;
-    r.plan_content = "plan".to_string();
-    r.show_subagent_panel = true;
-    r.subagents.push(SubagentDetail {
-        name: "coder".to_string(),
-        task_id: None,
-        prompt: String::new(),
-        started_at: None,
-        worked_duration: std::time::Duration::ZERO,
-        last_activity_at: None,
-        logs: vec![],
-        thinking: String::new(),
-        content: String::new(),
-        is_active: true,
-        context_tokens: 0,
-        queue: None,
-        paused: false,
-    });
+    let mut r = m4_renderer();
 
-    r.focused_panel = FocusedPanel::Chat;
-    r.cycle_focus();
-    assert_eq!(r.focused_panel, FocusedPanel::Plan);
-    r.cycle_focus();
-    assert_eq!(r.focused_panel, FocusedPanel::Subagents);
-    r.cycle_focus();
+    // M4 presents all four panes: Input -> Transcript -> Plan -> Workers -> Input.
+    assert_eq!(r.focus, state::FocusPane::Input);
+    press(&mut r, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(r.focus, state::FocusPane::Transcript);
     assert_eq!(r.focused_panel, FocusedPanel::Chat);
+    press(&mut r, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(r.focus, state::FocusPane::Plan);
+    assert_eq!(r.focused_panel, FocusedPanel::Plan);
+    press(&mut r, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(r.focus, state::FocusPane::Workers);
+    assert_eq!(r.focused_panel, FocusedPanel::Subagents);
+    press(&mut r, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(r.focus, state::FocusPane::Input);
+
+    // `Shift+Tab` walks it backwards, spelled both ways terminals deliver it.
+    press(&mut r, KeyCode::BackTab, KeyModifiers::NONE);
+    assert_eq!(r.focus, state::FocusPane::Workers);
+    press(&mut r, KeyCode::Tab, KeyModifiers::SHIFT);
+    assert_eq!(r.focus, state::FocusPane::Plan);
+
+    // An absent pane is never a landing pane (G6): M1 has no Plan or Workers, and
+    // switching to a mode that removes the focused pane pulls focus back onto a
+    // pane that is actually on screen.
+    r.set_view_mode(state::ViewMode::Transcript);
+    assert_eq!(r.focus, state::FocusPane::Input);
+    press(&mut r, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(r.focus, state::FocusPane::Transcript);
+    press(&mut r, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(r.focus, state::FocusPane::Input);
 }
 
 /// A `Delegation(Started)` event creates an active subagent entry and routes
@@ -3044,28 +3063,35 @@ fn test_subagents_auto_focuses_latest_activated_agent() {
     assert_eq!(r.selected_subagent_idx, 2);
 }
 
+/// Caret stepping, insertion and deletion are key handler behaviour now (§5): the
+/// same keys the operator presses drive them, and they work whatever pane is
+/// focused.
 #[test]
 fn test_input_cursor_stepping_left_and_right() {
     let mut r = TuiRenderer::new();
-    r.focused_panel = FocusedPanel::Chat;
+    r.set_focus(state::FocusPane::Transcript);
     r.input_text = "hello world".to_string();
     r.cursor = "hello world".len();
+    r.ensure_textarea_in_sync();
 
     for _ in 0..5 {
-        r.cursor_left();
+        press(&mut r, KeyCode::Left, KeyModifiers::NONE);
     }
     assert_eq!(r.cursor, "hello ".len());
 
-    r.insert_char('X');
+    press(&mut r, KeyCode::Char('X'), KeyModifiers::NONE);
     assert_eq!(r.input_text, "hello Xworld");
     assert_eq!(r.cursor, "hello X".len());
 
-    r.cursor_right();
-    r.cursor_right();
+    press(&mut r, KeyCode::Right, KeyModifiers::NONE);
+    press(&mut r, KeyCode::Right, KeyModifiers::NONE);
     assert_eq!(r.cursor, "hello Xwo".len());
 
-    r.delete_backward();
+    press(&mut r, KeyCode::Backspace, KeyModifiers::NONE);
     assert_eq!(r.input_text, "hello Xwrld");
+
+    press(&mut r, KeyCode::Delete, KeyModifiers::NONE);
+    assert_eq!(r.input_text, "hello Xwld");
 }
 
 #[test]
@@ -4252,6 +4278,9 @@ fn test_tui_renders_subagent_thinking_progress_and_output_during_streaming() {
     );
 }
 
+/// `/help` prints the one shared legend (§10 item 3): the same text the `F1`
+/// overlay and the footer legend are built from, so the three surfaces cannot
+/// drift apart.
 #[test]
 fn test_tui_help_command_includes_ctrl_t() {
     let mut r = TuiRenderer::new();
@@ -4262,7 +4291,12 @@ fn test_tui_help_command_includes_ctrl_t() {
         .messages
         .last()
         .expect("should have emitted /help message");
-    assert!(help_msg.contains("Ctrl+T - toggle the thinking block display"));
+    let body = help_msg
+        .strip_prefix("[CLI] ")
+        .expect("/help prints the CLI-prefixed legend");
+    assert_eq!(body, components::help::help_text().as_str());
+    assert!(help_msg.contains("Ctrl+T"));
+    assert!(help_msg.contains("toggle the thinking chip"));
 }
 
 #[test]
@@ -6817,8 +6851,8 @@ fn draw_new_frame(r: &mut TuiRenderer, width: u16, height: u16) -> Vec<String> {
 /// leave the stored mode on M1 until the adoption bridge folded them in.
 fn m4_renderer() -> TuiRenderer {
     let mut r = TuiRenderer::new();
-    r.plan_content = "## Tasks\n\n- [x] [t-001] research baseline\n- [ ] [t-004] wireframe\n"
-        .to_string();
+    r.plan_content =
+        "## Tasks\n\n- [x] [t-001] research baseline\n- [ ] [t-004] wireframe\n".to_string();
     r.messages = vec!["User: rebuild the TUI".to_string()];
     r.set_view_mode(state::ViewMode::Split);
     r.subagents = vec![SubagentDetail {
@@ -6856,8 +6890,7 @@ fn plan_progress_is_the_checked_box_split_of_the_same_plan_text() {
 
 #[test]
 fn plan_progress_active_task_prefers_the_explicit_task_then_a_running_row() {
-    let explicit =
-        state::PlanProgress::from_plan("- [ ] [t-004] b\n", Some("t-004"), &[]);
+    let explicit = state::PlanProgress::from_plan("- [ ] [t-004] b\n", Some("t-004"), &[]);
     assert_eq!(explicit.active_task.as_deref(), Some("t-004"));
 
     let running = vec![SubagentDetail {
@@ -6890,7 +6923,11 @@ fn view_mode_is_stored_state_and_the_pane_toggles_follow_it() {
         state::ViewMode::Transcript,
         "boot: both side panes closed is M1"
     );
-    assert_eq!(r.focus, state::FocusPane::Input, "boot: the composer is focused");
+    assert_eq!(
+        r.focus,
+        state::FocusPane::Input,
+        "boot: the composer is focused"
+    );
 
     for (mode, plan, workers) in [
         (state::ViewMode::Plan, true, false),
@@ -7028,7 +7065,10 @@ fn the_view_model_mirrors_focus_follow_scroll_and_the_armed_surface() {
     r.abort_armed_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(4));
     r.adopt_legacy_view_writes();
     assert!(!state::UiView::from_renderer(&r).abort_armed);
-    assert_eq!(state::UiView::from_renderer(&r).overlay, state::OverlayState::None);
+    assert_eq!(
+        state::UiView::from_renderer(&r).overlay,
+        state::OverlayState::None
+    );
     assert!(!r.confirm_open);
 }
 
@@ -7038,7 +7078,10 @@ fn the_help_overlay_is_state_and_a_confirm_underneath_it_returns_it() {
     // `Esc` closes one overlay and never arms abort.
     let mut r = m4_renderer();
     assert!(!r.help_open);
-    assert_eq!(state::UiView::from_renderer(&r).overlay, state::OverlayState::None);
+    assert_eq!(
+        state::UiView::from_renderer(&r).overlay,
+        state::OverlayState::None
+    );
 
     r.open_help();
     assert!(r.help_open);
@@ -7054,12 +7097,18 @@ fn the_help_overlay_is_state_and_a_confirm_underneath_it_returns_it() {
 
     // A confirm drawn over the legend wins the single overlay slot (§7.3) ...
     r.show_confirm();
-    assert_eq!(state::UiView::from_renderer(&r).overlay, state::OverlayState::Confirm);
+    assert_eq!(
+        state::UiView::from_renderer(&r).overlay,
+        state::OverlayState::Confirm
+    );
     // ... and closing it returns the legend that was still toggled on.
     r.close_overlay();
     assert!(!r.confirm_open);
     assert!(r.help_open);
-    assert_eq!(state::UiView::from_renderer(&r).overlay, state::OverlayState::Help);
+    assert_eq!(
+        state::UiView::from_renderer(&r).overlay,
+        state::OverlayState::Help
+    );
 
     // Closing the legend closes it; closing with nothing open is a no-op.
     r.close_overlay();
@@ -7093,7 +7142,9 @@ fn every_view_mode_changes_the_rects_compute_layout_actually_produces() {
         let view = state::UiView::from_renderer(&r);
         let rects = layout::compute_layout(area, &view);
         let body = rects.body.expect("100x30 clears every floor");
-        let transcript = rects.transcript.expect("the transcript is present in every mode");
+        let transcript = rects
+            .transcript
+            .expect("the transcript is present in every mode");
         assert_eq!(rects.mode, mode, "the frame reports the mode it drew");
 
         match mode {
@@ -7134,7 +7185,10 @@ fn every_view_mode_changes_the_rects_compute_layout_actually_produces() {
                     transcript.width,
                     plan.width
                 );
-                assert_eq!(plan.width, workers.width, "the side column stacks two panes");
+                assert_eq!(
+                    plan.width, workers.width,
+                    "the side column stacks two panes"
+                );
                 assert_eq!(plan.height + workers.height, body.height);
             }
         }
@@ -7154,9 +7208,7 @@ fn capture_ui_and_restore_panes_round_trip_mode_focus_and_follow() {
     // boots into. The persisted `ViewState` spells the state in its pre-rebuild
     // fields, so the round-trip is checked on both spellings.
     let mut source = m4_renderer();
-    source.messages = (0..40)
-        .map(|i| format!("pane line {i}"))
-        .collect();
+    source.messages = (0..40).map(|i| format!("pane line {i}")).collect();
     source.set_focus(state::FocusPane::Workers);
     source.set_follow(false);
     source.chat_scroll = 4;
@@ -7173,7 +7225,11 @@ fn capture_ui_and_restore_panes_round_trip_mode_focus_and_follow() {
     assert_eq!(target.view_mode, state::ViewMode::Transcript);
     target.restore_panes(&section);
 
-    assert_eq!(target.view_mode, state::ViewMode::Split, "M4 comes back as M4");
+    assert_eq!(
+        target.view_mode,
+        state::ViewMode::Split,
+        "M4 comes back as M4"
+    );
     assert_eq!(target.focus, state::FocusPane::Workers);
     assert!(!target.follow);
     assert_eq!(
@@ -7188,7 +7244,10 @@ fn capture_ui_and_restore_panes_round_trip_mode_focus_and_follow() {
         state::UiView::from_renderer(&target).mode,
         state::ViewMode::Split
     );
-    assert_eq!(state::UiView::from_renderer(&target).focus, state::FocusPane::Workers);
+    assert_eq!(
+        state::UiView::from_renderer(&target).focus,
+        state::FocusPane::Workers
+    );
     assert!(!state::UiView::from_renderer(&target).follow);
     // The restored renderer re-captures the identical section: nothing in the
     // round-trip is invented and nothing is lost a second time.
@@ -7230,7 +7289,10 @@ fn a_help_overlay_the_operator_opened_survives_a_restore() {
         state::OverlayState::Help
     );
     let rows = draw_new_frame(&mut target, 100, 30).concat();
-    assert!(rows.contains("Keys"), "the restored frame still carries the legend");
+    assert!(
+        rows.contains("Keys"),
+        "the restored frame still carries the legend"
+    );
 
     // A renderer that had nothing open keeps nothing open — the restore does not
     // invent an overlay either.
@@ -7434,7 +7496,10 @@ fn the_header_chip_budget_drops_val_then_ctx_then_elapsed() {
     );
     let narrow = layout::header_budget(69);
     assert!(!narrow.show_ctx && !narrow.show_elapsed && !narrow.show_mode);
-    assert!(narrow.show_task, "the active task id outlives the optional chips");
+    assert!(
+        narrow.show_task,
+        "the active task id outlives the optional chips"
+    );
 
     let tiny = layout::header_budget(40);
     assert!(tiny.show_task);
@@ -7486,7 +7551,10 @@ fn fit_spans_clips_to_the_rect_and_marks_the_cut() {
         ],
         12,
     );
-    assert_eq!(wide.iter().map(|s| s.content.as_ref()).collect::<String>(), "abcdefghijkl");
+    assert_eq!(
+        wide.iter().map(|s| s.content.as_ref()).collect::<String>(),
+        "abcdefghijkl"
+    );
 
     let clipped = components::fit_spans(
         vec![
@@ -7495,11 +7563,20 @@ fn fit_spans_clips_to_the_rect_and_marks_the_cut() {
         ],
         8,
     );
-    let text = clipped.iter().map(|s| s.content.as_ref()).collect::<String>();
-    assert_eq!(text, "abcdefg…", "the cut is cell-granular, not span-granular");
+    let text = clipped
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+    assert_eq!(
+        text, "abcdefg…",
+        "the cut is cell-granular, not span-granular"
+    );
 
     let one = components::fit_spans(
-        vec![ratatui::text::Span::raw("abcdef"), ratatui::text::Span::raw("g")],
+        vec![
+            ratatui::text::Span::raw("abcdef"),
+            ratatui::text::Span::raw("g"),
+        ],
         3,
     );
     let text = one.iter().map(|s| s.content.as_ref()).collect::<String>();
@@ -7783,4 +7860,862 @@ fn the_scroll_state_chip_is_drawn_once_in_the_transcript_pane() {
             live[0]
         );
     }
+}
+
+// ==== t-011: the §5 keymap, focus navigation and the shared help legend =====
+
+/// §10 item 3: the legend must name no key the handler does not bind, and every
+/// binding must appear in the legend. Each row of `components::help::legend()` is
+/// paired here with a driver that feeds the synthetic event the row names through
+/// [`TuiRenderer::apply_terminal_event`] — the same seam the live loop calls — and
+/// asserts the state change the row promises. A stale legend row therefore fails the
+/// test, and so does a handler that quietly gains an undocumented binding.
+#[test]
+fn every_legend_row_is_a_real_handler_path() {
+    type Driver = fn(&mut TuiRenderer) -> bool;
+
+    let drivers: Vec<(&'static str, Driver)> = vec![
+        ("Enter", |r| {
+            r.set_input_content("ship it");
+            press(r, KeyCode::Enter, KeyModifiers::NONE)
+                && r.messages.last().map(String::as_str) == Some("User: ship it")
+        }),
+        ("Shift+Enter / Alt+Enter", |r| {
+            r.set_input_content("line one");
+            press(r, KeyCode::Enter, KeyModifiers::SHIFT)
+                && press(r, KeyCode::Enter, KeyModifiers::ALT)
+                && r.input_text == "line one\n\n"
+        }),
+        ("Ctrl+Enter / Ctrl+J", |r| {
+            r.set_input_content("a");
+            if !press(r, KeyCode::Enter, KeyModifiers::CONTROL) || r.input_text != "a\n" {
+                return false;
+            }
+            if !press(r, KeyCode::Char('j'), KeyModifiers::CONTROL) || r.input_text != "a\n\n" {
+                return false;
+            }
+            // The raw `Char('\n')` some terminals produce is the same binding.
+            press(r, KeyCode::Char('\n'), KeyModifiers::NONE) && r.input_text == "a\n\n\n"
+        }),
+        ("Printable / paste", |r| {
+            r.set_focus(state::FocusPane::Workers);
+            let typed = press(r, KeyCode::Char('q'), KeyModifiers::NONE) && r.input_text == "q";
+            let pasted = r
+                .apply_terminal_event(&crossterm::event::Event::Paste("pasted block".to_string()))
+                && r.input_text == "qpasted block";
+            typed && pasted
+        }),
+        ("Backspace / Delete", |r| {
+            r.set_focus(state::FocusPane::Plan);
+            r.set_input_content("abc");
+            if !press(r, KeyCode::Backspace, KeyModifiers::NONE) || r.input_text != "ab" {
+                return false;
+            }
+            press(r, KeyCode::Left, KeyModifiers::NONE);
+            press(r, KeyCode::Delete, KeyModifiers::NONE) && r.input_text == "a"
+        }),
+        ("Ctrl+Z / Ctrl+Y", |r| {
+            r.set_input_content("");
+            press(r, KeyCode::Char('x'), KeyModifiers::NONE);
+            let undo =
+                press(r, KeyCode::Char('z'), KeyModifiers::CONTROL) && r.input_text.is_empty();
+            let redo = press(r, KeyCode::Char('y'), KeyModifiers::CONTROL) && r.input_text == "x";
+            undo && redo
+        }),
+        ("Ctrl+Up / Ctrl+Down", |r| {
+            r.history = vec!["earlier note".to_string()];
+            let back =
+                press(r, KeyCode::Up, KeyModifiers::CONTROL) && r.input_text == "earlier note";
+            let fwd = press(r, KeyCode::Down, KeyModifiers::CONTROL) && r.input_text.is_empty();
+            back && fwd
+        }),
+        ("Up / Down", |r| {
+            // With a draft the keys scroll the focused pane by one ...
+            r.messages = (0..120).map(|i| format!("User: filler {i}")).collect();
+            r.chat_width.set(100);
+            r.chat_height.set(10);
+            r.set_focus(state::FocusPane::Transcript);
+            r.set_input_content("a draft");
+            press(r, KeyCode::End, KeyModifiers::NONE);
+            let bottom = r.chat_scroll;
+            if bottom == 0 {
+                return false;
+            }
+            if !press(r, KeyCode::Up, KeyModifiers::NONE) || r.chat_scroll >= bottom {
+                return false;
+            }
+            // ... and with an empty composer they walk the history (§5).
+            r.set_input_content("");
+            r.history = vec!["earlier note".to_string()];
+            press(r, KeyCode::Up, KeyModifiers::NONE) && r.input_text == "earlier note"
+        }),
+        ("Left / Right", |r| {
+            // Workers focus: the roster selection moves ...
+            r.subagents.push(SubagentDetail {
+                name: "coder-t-009".to_string(),
+                task_id: Some("t-009".to_string()),
+                ..SubagentDetail::default()
+            });
+            r.set_focus(state::FocusPane::Workers);
+            let next = press(r, KeyCode::Right, KeyModifiers::NONE) && r.selected_subagent_idx == 1;
+            let prev = press(r, KeyCode::Left, KeyModifiers::NONE) && r.selected_subagent_idx == 0;
+            // ... everywhere else it is the caret.
+            r.set_focus(state::FocusPane::Input);
+            r.set_input_content("hello");
+            let caret = press(r, KeyCode::Left, KeyModifiers::NONE)
+                && r.cursor == "hell".len()
+                && r.input_text == "hello";
+            next && prev && caret
+        }),
+        ("Home / End", |r| {
+            r.set_input_content("hello");
+            let home = press(r, KeyCode::Home, KeyModifiers::NONE) && r.cursor == 0;
+            let end = press(r, KeyCode::End, KeyModifiers::NONE) && r.cursor == "hello".len();
+            r.set_focus(state::FocusPane::Plan);
+            r.plan_max_scroll = 30;
+            let pane_end = press(r, KeyCode::End, KeyModifiers::NONE) && r.plan_scroll == 30;
+            let pane_home = press(r, KeyCode::Home, KeyModifiers::NONE) && r.plan_scroll == 0;
+            home && end && pane_end && pane_home
+        }),
+        ("PageUp / PageDown", |r| {
+            r.messages = (0..120).map(|i| format!("User: filler {i}")).collect();
+            r.chat_width.set(100);
+            r.chat_height.set(10);
+            r.set_focus(state::FocusPane::Transcript);
+            r.set_input_content("a draft");
+            press(r, KeyCode::End, KeyModifiers::NONE);
+            let bottom = r.chat_scroll;
+            if bottom == 0 {
+                return false;
+            }
+            if !press(r, KeyCode::PageUp, KeyModifiers::NONE)
+                || r.chat_scroll != bottom.saturating_sub(10)
+            {
+                return false;
+            }
+            press(r, KeyCode::PageDown, KeyModifiers::NONE) && r.chat_scroll == bottom
+        }),
+        ("Tab / Shift+Tab", |r| {
+            let fwd = press(r, KeyCode::Tab, KeyModifiers::NONE)
+                && r.focus == state::FocusPane::Transcript;
+            let back = press(r, KeyCode::BackTab, KeyModifiers::NONE)
+                && r.focus == state::FocusPane::Input;
+            fwd && back
+        }),
+        ("F1 / ?", |r| {
+            let f1 = press(r, KeyCode::F(1), KeyModifiers::NONE)
+                && r.help_open
+                && r.overlay == state::OverlayState::Help;
+            r.close_overlay();
+            let question = press(r, KeyCode::Char('?'), KeyModifiers::NONE)
+                && r.help_open
+                && r.input_text.is_empty();
+            f1 && question
+        }),
+        ("F2", |r| {
+            let before = r.view_mode;
+            press(r, KeyCode::F(2), KeyModifiers::NONE)
+                && r.view_mode == state::ViewMode::Transcript
+                && r.view_mode != before
+        }),
+        ("F3 / F4 / F5", |r| {
+            if !press(r, KeyCode::F(3), KeyModifiers::NONE)
+                || r.view_mode != state::ViewMode::Transcript
+            {
+                return false;
+            }
+            if !press(r, KeyCode::F(4), KeyModifiers::NONE)
+                || !r.show_plan_panel
+                || r.show_subagent_panel
+            {
+                return false;
+            }
+            press(r, KeyCode::F(5), KeyModifiers::NONE)
+                && r.view_mode == state::ViewMode::Workers
+                && r.show_subagent_panel
+                && !r.show_plan_panel
+        }),
+        ("Ctrl+P / Ctrl+A", |r| {
+            r.set_view_mode(state::ViewMode::Transcript);
+            let plan = press(r, KeyCode::Char('p'), KeyModifiers::CONTROL)
+                && r.show_plan_panel
+                && r.view_mode == state::ViewMode::Plan;
+            let workers = press(r, KeyCode::Char('a'), KeyModifiers::CONTROL)
+                && r.show_subagent_panel
+                && r.view_mode == state::ViewMode::Split;
+            plan && workers
+        }),
+        ("Ctrl+T", |r| {
+            // §5: the echo is a chip, never a chat line (G5).
+            press(r, KeyCode::Char('t'), KeyModifiers::CONTROL)
+                && r.show_thought
+                && r.messages.iter().all(|m| !m.contains("Thinking display"))
+        }),
+        ("Ctrl+F", |r| {
+            let off = press(r, KeyCode::Char('f'), KeyModifiers::CONTROL)
+                && !r.follow
+                && !r.chat_auto_scroll;
+            let on = press(r, KeyCode::Char('f'), KeyModifiers::CONTROL)
+                && r.follow
+                && r.chat_auto_scroll;
+            off && on
+        }),
+        ("x", |r| {
+            r.set_focus(state::FocusPane::Workers);
+            press(r, KeyCode::Char('x'), KeyModifiers::NONE)
+                && r.overlay == state::OverlayState::Confirm
+                && r.confirm_action
+                    == Some(events::ConfirmAction::CancelWorker {
+                        key: "coder_specialist-t-004".to_string(),
+                        task_id: Some("t-004".to_string()),
+                    })
+                && r.input_text.is_empty()
+        }),
+        ("e", |r| {
+            r.messages
+                .push("LLM error: rate limit exceeded".to_string());
+            press(r, KeyCode::Char('e'), KeyModifiers::NONE)
+                && r.messages
+                    .last()
+                    .is_some_and(|m| m.starts_with("✗ LLM error: rate limit exceeded"))
+        }),
+        ("Esc", |r| {
+            r.open_help();
+            press(r, KeyCode::Esc, KeyModifiers::NONE)
+                && r.overlay == state::OverlayState::None
+                && !r.is_abort_armed()
+        }),
+        ("Ctrl+C", |r| {
+            press(r, KeyCode::Char('c'), KeyModifiers::CONTROL)
+                && r.is_abort_armed()
+                && r.overlay == state::OverlayState::Confirm
+                && r.status_line.contains("Abort armed")
+        }),
+        ("Ctrl+D", |r| {
+            press(r, KeyCode::Char('d'), KeyModifiers::CONTROL)
+                && r.confirm_action == Some(events::ConfirmAction::Quit)
+                && r.overlay == state::OverlayState::Confirm
+                && !r.user_exit_requested()
+        }),
+        ("Printable while armed", |r| {
+            press(r, KeyCode::Esc, KeyModifiers::NONE);
+            let armed = r.is_abort_armed();
+            press(r, KeyCode::Char('k'), KeyModifiers::NONE)
+                && armed
+                && !r.is_abort_armed()
+                && r.input_text == "k"
+                && r.status_line == "Abort cancelled."
+                && r.overlay == state::OverlayState::None
+        }),
+        ("y / n", |r| {
+            press(r, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            press(r, KeyCode::Char('n'), KeyModifiers::NONE)
+                && r.overlay == state::OverlayState::None
+                && r.confirm_action.is_none()
+                && r.status_line == "Quit cancelled."
+                && !r.user_exit_requested()
+        }),
+        ("Resize", |r| {
+            r.messages = (0..50).map(|i| format!("User: filler {i}")).collect();
+            r.chat_width.set(100);
+            r.chat_height.set(10);
+            r.chat_scroll = 999;
+            r.apply_terminal_event(&crossterm::event::Event::Resize(100, 24)) && r.chat_scroll < 999
+        }),
+    ];
+
+    let rows = components::help::legend();
+    let documented: Vec<&str> = rows.iter().map(|row| row.keys).collect();
+    let driven: Vec<&str> = drivers.iter().map(|(keys, _)| *keys).collect();
+
+    for keys in &driven {
+        assert!(
+            documented.contains(keys),
+            "a driver drives {keys:?}, which the legend does not document: {documented:?}"
+        );
+    }
+    for row in &rows {
+        assert!(
+            driven.contains(&row.keys),
+            "the legend documents {:?} with no handler behind it: {driven:?}",
+            row.keys
+        );
+    }
+    assert_eq!(
+        rows.len(),
+        drivers.len(),
+        "exactly one driver per legend row"
+    );
+
+    for (keys, drive) in &drivers {
+        let mut renderer = m4_renderer();
+        assert!(
+            drive(&mut renderer),
+            "the {keys:?} legend row promises a state change the handler does not produce"
+        );
+    }
+}
+
+/// §5 + §10 item 16: `Esc` spends itself on an open overlay and never arms; with
+/// nothing open it arms the 3 s window, and the window is *not* an exit.
+///
+/// The third press — the one that takes the exit path — is pinned by
+/// [`both_quit_requests_route_through_the_renderers_existing_exit`] rather than
+/// pressed here: [`Renderer::request_user_exit`] calls `orchestrator::cancel_all()`,
+/// a process-wide cancellation that races with the wall-clock arbitration sleeps of
+/// the `ui::bridge` tests in the same test binary (it flips their
+/// `sleep_cancelled`). The end-to-end exit is asserted by the session integration
+/// harness instead.
+#[test]
+fn esc_closes_an_open_overlay_without_arming_then_arms_abort() {
+    let mut r = m4_renderer();
+
+    r.open_help();
+    assert!(press(&mut r, KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(r.overlay, state::OverlayState::None);
+    assert!(!r.help_open, "the legend closed");
+    assert!(!r.confirm_abort, "closing an overlay never arms abort");
+    assert!(!r.is_abort_armed());
+    assert_eq!(
+        r.focus,
+        state::FocusPane::Input,
+        "Esc no longer re-focuses Chat as a side effect (UX friction 8)"
+    );
+
+    assert!(press(&mut r, KeyCode::Esc, KeyModifiers::NONE));
+    assert!(
+        r.is_abort_armed(),
+        "nothing was open, so the key armed abort"
+    );
+    assert!(r.status_line.contains("Abort armed"));
+    assert!(
+        !r.user_exit_requested() && !r.input_state.aborted,
+        "arming is not an exit"
+    );
+    assert_eq!(
+        r.overlay,
+        state::OverlayState::Confirm,
+        "the armed prompt occupies the confirm surface (§8.5)"
+    );
+    assert!(
+        r.confirm_action.is_none(),
+        "the armed prompt holds no y/n request: a printable is typing, not consent"
+    );
+}
+
+/// §5 + §10 item 8: `Ctrl+D` never exits un-armed. It opens the Quit confirm, a
+/// second press is the same request, `n`/`Esc` leave the session alive and un-armed,
+/// and only `y` takes the existing quit path.
+#[test]
+fn ctrl_d_opens_the_quit_confirm_and_never_exits_un_armed() {
+    let mut r = TuiRenderer::new();
+
+    assert!(press(&mut r, KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert_eq!(r.confirm_action, Some(events::ConfirmAction::Quit));
+    assert_eq!(r.overlay, state::OverlayState::Confirm);
+    assert!(!r.user_exit_requested(), "one keystroke never ends it");
+    assert!(!r.is_abort_armed(), "Ctrl+D arms nothing");
+
+    press(&mut r, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    assert!(!r.user_exit_requested(), "a second Ctrl+D still needs y");
+
+    assert!(press(&mut r, KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(r.overlay, state::OverlayState::None);
+    assert!(
+        !r.is_abort_armed(),
+        "Esc out of the confirm leaves it un-armed"
+    );
+    assert!(!r.user_exit_requested());
+
+    press(&mut r, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    assert!(press(&mut r, KeyCode::Char('n'), KeyModifiers::NONE));
+    assert!(r.confirm_action.is_none());
+    assert_eq!(r.status_line, "Quit cancelled.");
+    assert!(
+        !r.user_exit_requested() && !r.input_state.aborted,
+        "`n` leaves the session alive"
+    );
+    assert!(
+        !r.is_abort_armed(),
+        "and `n` arms nothing either (§10 item 6)"
+    );
+}
+
+/// §10 item 13: printables and editing keys mutate the composer whatever pane is
+/// focused, and `x` is only a mnemonic while the composer is empty.
+#[test]
+fn printables_and_editing_keys_reach_the_composer_from_every_focus() {
+    let mut r = m4_renderer();
+
+    for pane in [
+        state::FocusPane::Input,
+        state::FocusPane::Transcript,
+        state::FocusPane::Plan,
+        state::FocusPane::Workers,
+    ] {
+        r.set_focus(pane);
+        r.set_input_content("abc");
+        assert!(press(&mut r, KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(press(&mut r, KeyCode::Left, KeyModifiers::NONE));
+        assert!(press(&mut r, KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(press(&mut r, KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(
+            r.input_text, "ab",
+            "{pane:?} must not swallow printable or editing keys"
+        );
+    }
+
+    // `?` types while there is a draft, and only opens the legend when empty (§4).
+    r.set_input_content("what");
+    assert!(press(&mut r, KeyCode::Char('?'), KeyModifiers::NONE));
+    assert_eq!(r.input_text, "what?");
+    assert!(!r.help_open, "a typed `?` is not the overlay key");
+
+    // `x` with an empty composer in the Workers pane is the cancel mnemonic (§5).
+    r.set_focus(state::FocusPane::Workers);
+    r.set_input_content("");
+    assert!(press(&mut r, KeyCode::Char('x'), KeyModifiers::NONE));
+    assert_eq!(r.overlay, state::OverlayState::Confirm);
+    assert_eq!(
+        r.confirm_action,
+        Some(events::ConfirmAction::CancelWorker {
+            key: "coder_specialist-t-004".to_string(),
+            task_id: Some("t-004".to_string()),
+        })
+    );
+    assert_eq!(r.input_text, "", "the mnemonic consumed the character");
+    assert_eq!(
+        r.status_line,
+        "Confirm cancel of worker 'coder_specialist-t-004' — y to cancel it, n or Esc to leave it running."
+    );
+}
+
+/// §10 item 16: `y` / `n` are honoured only inside a confirm surface that holds a
+/// request; everywhere else they are ordinary characters.
+#[test]
+fn y_and_n_are_honoured_only_inside_the_confirm_overlay() {
+    let mut r = TuiRenderer::new();
+
+    // Outside any confirm they type: typing `no` still types.
+    assert!(press(&mut r, KeyCode::Char('y'), KeyModifiers::NONE));
+    assert!(press(&mut r, KeyCode::Char('n'), KeyModifiers::NONE));
+    assert_eq!(r.input_text, "yn", "typing `no` still types");
+    assert_eq!(r.overlay, state::OverlayState::None);
+
+    // The armed-abort prompt occupies the same surface but holds no request (§8.5),
+    // so a `y` there types and disarms rather than consenting (§5).
+    press(&mut r, KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(r.overlay, state::OverlayState::Confirm);
+    assert!(r.is_abort_armed());
+    assert!(press(&mut r, KeyCode::Char('y'), KeyModifiers::NONE));
+    assert_eq!(r.input_text, "yny", "`y` did not confirm the armed prompt");
+    assert!(!r.is_abort_armed(), "and the printable disarmed it instead");
+    assert!(!r.user_exit_requested());
+
+    // Inside a confirm that does hold a request, `n` is the dismissal binding.
+    press(&mut r, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    assert_eq!(r.confirm_action, Some(events::ConfirmAction::Quit));
+    assert!(press(&mut r, KeyCode::Char('n'), KeyModifiers::NONE));
+    assert_eq!(r.input_text, "yny", "the pending request ate the `n`");
+    assert!(r.confirm_action.is_none());
+    assert_eq!(r.overlay, state::OverlayState::None);
+}
+
+/// The two exit requests are pinned by wiring, because firing them would cancel the
+/// whole process (`orchestrator::cancel_all()` in `Renderer::request_user_exit`,
+/// mod.rs:1726) and thereby flip the `sleep_cancelled` of the wall-clock arbitration
+/// tests in `ui::bridge` that share this test binary. Both routes must land on the
+/// renderer's **existing** quit path — the one the armed-abort flow already used —
+/// and no key may exit un-armed.
+#[test]
+fn both_quit_requests_route_through_the_renderers_existing_exit() {
+    fn body(source: &str, signature: &str) -> String {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("events.rs no longer has `{signature}`"));
+        let rest = &source[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .map(|at| at + 1)
+            .unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    let source = include_str!("events.rs");
+
+    let escape = body(source, "fn escape_pressed(&mut self, chord: &str)");
+    assert!(
+        escape.contains("if self.is_abort_armed()"),
+        "the armed window is checked first, so the second press exits"
+    );
+    assert!(
+        escape.contains("self.close_overlay()"),
+        "an open overlay is closed before anything is armed"
+    );
+    assert!(
+        escape.contains("Renderer::request_user_exit(self)"),
+        "the exit press reuses the renderer's existing quit path"
+    );
+    assert!(
+        !escape.contains("set_focus(") && !escape.contains("focused_panel ="),
+        "Esc never re-focuses a pane (UX friction 8)"
+    );
+
+    let confirm = body(source, "fn confirm_pending(&mut self)");
+    assert!(
+        confirm.contains("ConfirmAction::Quit"),
+        "the Quit request is one of the two the surface can hold"
+    );
+    assert!(
+        confirm.contains("Renderer::request_user_exit(self)"),
+        "`y` on the Quit confirm takes the same existing quit path"
+    );
+    assert!(
+        confirm.contains("cancel_active_worker"),
+        "`y` on a cancel request addresses one worker by key"
+    );
+    assert!(
+        !confirm.contains("cancel_all"),
+        "and never the broadcast cancellation (spec §5, bus.rs:38)"
+    );
+
+    let request_quit = body(source, "fn request_quit(&mut self)");
+    assert!(
+        request_quit.contains("self.show_confirm()"),
+        "Ctrl+D opens the confirm surface"
+    );
+    assert!(
+        !request_quit.contains("request_user_exit")
+            && !request_quit.contains("confirm_abort = true"),
+        "Ctrl+D neither exits nor arms on its own"
+    );
+}
+
+/// §5 `x` + §10 items 9/17: the confirm carries the selected row's identity, and
+/// `y` cancels that one worker without ever touching the exit path.
+#[test]
+fn x_then_y_cancels_the_selected_worker_by_name() {
+    let mut r = m4_renderer();
+    r.subagents.push(SubagentDetail {
+        name: "researcher-t-009".to_string(),
+        task_id: Some("t-009".to_string()),
+        is_active: true,
+        ..SubagentDetail::default()
+    });
+    r.set_focus(state::FocusPane::Workers);
+    r.selected_subagent_idx = 1;
+
+    assert!(press(&mut r, KeyCode::Char('x'), KeyModifiers::NONE));
+    assert_eq!(
+        r.confirm_action,
+        Some(events::ConfirmAction::CancelWorker {
+            key: "researcher-t-009".to_string(),
+            task_id: Some("t-009".to_string()),
+        }),
+        "the request names the row that was selected when the key was pressed"
+    );
+    assert!(r.status_line.contains("researcher-t-009"));
+
+    assert!(press(&mut r, KeyCode::Char('y'), KeyModifiers::NONE));
+    assert!(r.confirm_action.is_none());
+    assert_eq!(r.overlay, state::OverlayState::None);
+    assert!(
+        r.status_line.contains("researcher-t-009"),
+        "the outcome of the cancel is stated: {}",
+        r.status_line
+    );
+    assert!(
+        !r.user_exit_requested(),
+        "cancelling one worker never exits the session"
+    );
+    assert!(!r.is_abort_armed());
+}
+
+/// §6: `Tab` accepts the composer's ghost completion — the longest common prefix,
+/// never a guessed command — and only falls through to focus cycling when there is
+/// nothing to accept.
+#[test]
+fn tab_accepts_the_ghost_completion_of_a_slash_command() {
+    let mut r = TuiRenderer::new();
+    assert_eq!(r.focus, state::FocusPane::Input, "boot focus");
+
+    r.set_input_content("/tho");
+    assert!(press(&mut r, KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(r.input_text, "/thought");
+    assert_eq!(
+        r.focus,
+        state::FocusPane::Input,
+        "completing does not move focus"
+    );
+
+    // Several candidates: only the shared prefix is inserted (§6).
+    r.set_input_content("/rese");
+    assert!(press(&mut r, KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(r.input_text, "/reset");
+
+    // A bare `/` names nothing, so `Tab` is the focus key again.
+    r.set_input_content("/");
+    assert!(press(&mut r, KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(r.input_text, "/");
+    assert_eq!(r.focus, state::FocusPane::Transcript);
+
+    // An unknown command completes nothing.
+    r.set_input_content("/notacommand");
+    assert!(press(&mut r, KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(r.input_text, "/notacommand");
+    assert_eq!(r.focus, state::FocusPane::Input);
+}
+
+/// §10 items 10 and 11: every toggle leaves a chip on status row 2, and an empty
+/// pane turns on and says so instead of doing nothing.
+#[test]
+fn every_toggle_leaves_a_chip_and_an_empty_pane_says_so() {
+    let mut r = TuiRenderer::new();
+
+    let boot = draw_new_frame(&mut r, 100, 30).concat();
+    assert!(
+        boot.contains("plan:off") && boot.contains("workers:off") && boot.contains("think:off"),
+        "the boot chips name every toggle: {boot}"
+    );
+
+    assert!(press(&mut r, KeyCode::Char('t'), KeyModifiers::CONTROL));
+    let thought = draw_new_frame(&mut r, 100, 30);
+    assert!(
+        thought
+            .iter()
+            .any(|row| row.contains("think:on") && row.contains("plan:off")),
+        "Ctrl+T leaves a chip: {thought:?}"
+    );
+
+    assert!(press(&mut r, KeyCode::Char('p'), KeyModifiers::CONTROL));
+    assert!(press(&mut r, KeyCode::Char('a'), KeyModifiers::CONTROL));
+    let panes = draw_new_frame(&mut r, 100, 30);
+    let chips = panes
+        .iter()
+        .find(|row| row.contains("plan:"))
+        .expect("a plan chip row");
+    assert!(
+        chips.contains("plan:on") && chips.contains("workers:on") && chips.contains("think:on"),
+        "Ctrl+P / Ctrl+A / Ctrl+T each leave a distinct chip: {chips:?}"
+    );
+
+    // Ctrl+A with zero workers: the chip flips and the pane draws its empty state.
+    let mut empty = TuiRenderer::new();
+    assert!(press(&mut empty, KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert!(
+        empty.show_subagent_panel,
+        "the pane turned on, no silent no-op"
+    );
+    let rows = draw_new_frame(&mut empty, 100, 30);
+    let joined = rows.concat();
+    assert!(joined.contains("workers:on"), "the chip flipped: {joined}");
+    assert!(
+        rows.iter().any(|row| row.contains("No specialist")),
+        "the empty Workers pane states why it is empty: {joined}"
+    );
+    assert_eq!(
+        components::activity::EMPTY_STATE,
+        "No specialist launched yet."
+    );
+}
+
+/// G7: `Ctrl+F` moves the follow chip in the transcript pane — one chip, one place.
+#[test]
+fn ctrl_f_moves_the_follow_chip_in_the_transcript_pane() {
+    let mut r = m4_renderer();
+    let live = draw_new_frame(&mut r, 100, 30).concat();
+    assert!(live.contains("LIVE"), "boot follows the tail: {live}");
+
+    assert!(press(&mut r, KeyCode::Char('f'), KeyModifiers::CONTROL));
+    let off = draw_new_frame(&mut r, 100, 30).concat();
+    assert!(
+        off.contains("follow off"),
+        "the chip restates the state: {off}"
+    );
+    assert!(!r.follow);
+
+    assert!(press(&mut r, KeyCode::Char('f'), KeyModifiers::CONTROL));
+    let on = draw_new_frame(&mut r, 100, 30).concat();
+    assert!(on.contains("LIVE"), "and comes back: {on}");
+    assert!(r.follow);
+}
+
+/// §10 item 15 from the key side: every roster row is reachable with the arrows —
+/// no 3-row clamp survives the keymap.
+#[test]
+fn every_worker_row_is_reachable_with_the_arrow_keys() {
+    let mut r = TuiRenderer::new();
+    r.set_view_mode(state::ViewMode::Workers);
+    r.set_focus(state::FocusPane::Workers);
+    r.subagents = (0..12)
+        .map(|i| SubagentDetail {
+            name: format!("coder-t-{i:03}"),
+            task_id: Some(format!("t-{i:03}")),
+            is_active: true,
+            ..SubagentDetail::default()
+        })
+        .collect();
+
+    for step in 1..12 {
+        assert!(
+            press(&mut r, KeyCode::Right, KeyModifiers::NONE),
+            "row {step} is reachable"
+        );
+        assert_eq!(r.selected_subagent_idx, step, "row {step} is selected");
+    }
+    press(&mut r, KeyCode::Right, KeyModifiers::NONE);
+    assert_eq!(
+        r.selected_subagent_idx, 11,
+        "the selection stops on the last row, it never wraps into a lie"
+    );
+
+    for step in (0..11).rev() {
+        assert!(press(&mut r, KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(r.selected_subagent_idx, step);
+    }
+    press(&mut r, KeyCode::Left, KeyModifiers::NONE);
+    assert_eq!(r.selected_subagent_idx, 0);
+}
+
+/// §5: `e` is never silent. It replays the last error traffic, and when nothing is
+/// recorded it says the sticky buffer still needs the t-012 plumbing.
+#[test]
+fn e_recalls_the_last_error_or_reports_what_is_missing() {
+    let mut r = TuiRenderer::new();
+    assert!(press(&mut r, KeyCode::Char('e'), KeyModifiers::NONE));
+    let nothing = r.messages.last().cloned().unwrap_or_default();
+    assert!(
+        nothing.contains("No error recorded"),
+        "an unrecorded error is reported, not ignored: {nothing}"
+    );
+    assert!(
+        nothing.contains("§8.5"),
+        "and named as pending plumbing: {nothing}"
+    );
+
+    r.messages
+        .push("LLM error: rate limit exceeded after 3 retries".to_string());
+    assert!(press(&mut r, KeyCode::Char('e'), KeyModifiers::NONE));
+    let recalled = r.messages.last().cloned().unwrap_or_default();
+    assert!(
+        recalled.starts_with("✗ LLM error: rate limit exceeded after 3 retries"),
+        "the recorded line is replayed verbatim: {recalled}"
+    );
+    assert!(recalled.contains("marmel.log"), "and points at the log");
+}
+
+/// §10 item 20: mouse reports are ignored outright. Mouse capture is never enabled
+/// anywhere in `src/`, so the deleted arms were unreachable; a report must move
+/// nothing, and must not even count as a handled event.
+#[test]
+fn a_mouse_report_is_ignored_and_moves_nothing() {
+    let mut r = m4_renderer();
+    r.set_input_content("untouched");
+    r.set_focus(state::FocusPane::Plan);
+    let focus = r.focus;
+    let mode = r.view_mode;
+    let scroll = r.plan_scroll;
+
+    for kind in [
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        crossterm::event::MouseEventKind::ScrollDown,
+        crossterm::event::MouseEventKind::ScrollUp,
+        crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+    ] {
+        let report = crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column: 12,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            !r.apply_terminal_event(&report),
+            "a mouse report is not a binding: {kind:?}"
+        );
+    }
+
+    assert_eq!(r.focus, focus);
+    assert_eq!(r.view_mode, mode);
+    assert_eq!(r.plan_scroll, scroll);
+    assert_eq!(r.input_text, "untouched");
+    assert_eq!(r.overlay, state::OverlayState::None);
+}
+
+/// Work item 5: the composer is the typing target at boot, so the boot frame must
+/// badge the composer and never claim the transcript is the focus target.
+#[test]
+fn the_boot_frame_badges_the_composer_not_the_transcript() {
+    let r_new = TuiRenderer::new();
+    assert_eq!(r_new.focus, state::FocusPane::Input);
+    assert_eq!(r_new.focused_panel, FocusedPanel::Chat);
+    assert_eq!(r_new.view_mode, state::ViewMode::Transcript);
+    assert!(r_new.follow);
+    assert_eq!(r_new.overlay, state::OverlayState::None);
+
+    let mut r = TuiRenderer::new();
+    let rows = draw_new_frame(&mut r, 100, 30);
+    let joined = rows.concat();
+
+    // Exactly one pane carries the §7.3 focus badge, and it is the composer: the
+    // boot defect was the frame claiming the Transcript was the typing target.
+    let badgeed: Vec<&String> = rows
+        .iter()
+        .filter(|row| row.contains(theme::FOCUS_BADGE))
+        .collect();
+    let focus_badged: Vec<&String> = badgeed
+        .iter()
+        .filter(|row| !row.contains("LIVE"))
+        .copied()
+        .collect();
+    assert_eq!(
+        focus_badged.len(),
+        1,
+        "exactly one pane is badged at boot (the `● LIVE` follow chip is the only other badge glyph):\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        focus_badged[0].contains("Input"),
+        "the composer is the boot focus target: {:?}",
+        focus_badged[0]
+    );
+    assert!(
+        !joined.contains(&format!("Transcript {}", theme::FOCUS_BADGE)),
+        "the transcript is never badged as the focus target at boot:\n{}",
+        rows.join("\n")
+    );
+    // M1 draws no side panes at all (§4.3), so it can never badge one either.
+    for pane in [
+        state::FocusPane::Plan.label(),
+        state::FocusPane::Workers.label(),
+    ] {
+        assert!(
+            !joined.contains(pane),
+            "{pane} is not on screen at boot, so it is not badged either"
+        );
+    }
+}
+
+/// A key release is not a binding: acting on it would double every press on
+/// terminals that report releases.
+#[test]
+fn a_key_release_is_not_a_second_press() {
+    let mut r = TuiRenderer::new();
+    let key = crossterm::event::KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
+    assert!(
+        !r.apply_terminal_event(&crossterm::event::Event::Key(crossterm::event::KeyEvent {
+            kind: crossterm::event::KeyEventKind::Release,
+            ..key
+        })),
+        "a release does nothing"
+    );
+    assert_eq!(r.input_text, "");
+
+    assert!(
+        r.apply_terminal_event(&crossterm::event::Event::Key(crossterm::event::KeyEvent {
+            kind: crossterm::event::KeyEventKind::Repeat,
+            ..key
+        }))
+    );
+    assert_eq!(r.input_text, "k", "a repeat inserts, like the press does");
 }

@@ -1,17 +1,66 @@
-//! Keyboard, mouse, and input editing events for TuiRenderer.
+//! Keyboard and composer editing for [`TuiRenderer`] — the spec §5 keymap.
+//!
+//! One entry point per event, one function per binding: [`TuiRenderer::handle_events`]
+//! drains crossterm, [`TuiRenderer::apply_terminal_event`] routes exactly one event
+//! (and is the seam the §10.3 legend-parity test feeds synthetic events through), and
+//! [`TuiRenderer::on_key_event`] holds the keymap in precedence order.
+//!
+//! Three rules shape the file:
+//!
+//! * **The composer is never starved (§4.4).** Printables, paste, `Backspace`,
+//!   `Delete`, `Ctrl+Z/Y/J` and the caret keys reach `textarea.input(key)` in every
+//!   mode and every focus state. The pre-rebuild gating — editing keys and printables
+//!   were dead unless Chat held focus — is gone (UX friction 14, G6).
+//! * **View state moves only through the transitions** of `mod.rs` (`set_view_mode`,
+//!   `set_focus`, `cycle_focus_pane`, `set_follow`, `open_help`, `show_confirm`,
+//!   `close_overlay`). No key arm writes `view_mode` / `focus` / `follow` / `overlay`
+//!   by hand, so the stored state and the legacy pane mirrors cannot drift apart.
+//! * **No silent key press (G5).** Every toggle ends in a visible chip: `plan:`,
+//!   `workers:` and `think:` on status row 2, `● LIVE` / `↓ N new` in the transcript
+//!   pane that owns the viewport. An empty pane toggles **on** and renders its empty
+//!   state (§8.1), so `Ctrl+A` with no workers is never a no-op.
+//!
+//! There is deliberately **no mouse handling**: mouse capture is never switched on
+//! anywhere in `src/`, so the pre-rebuild mouse arms were unreachable in practice,
+//! and §5 / §9.2 delete them. The capture-off teardown call stays in the two
+//! teardown paths only (§0), as defensive cleanup for a terminal that inherited
+//! mouse mode elsewhere.
 
-use super::formatting::*;
+use super::components::{help, input};
+use super::state::{self, FocusPane, ViewMode};
 use super::{FocusedPanel, TuiRenderer, is_abort};
 use crate::ui::{Renderer, SubagentDetail};
-use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::Rect;
-use std::time::Duration;
-use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use std::time::{Duration, Instant};
+
+/// The destructive action the confirm surface is holding for `y` / `n` (spec §3,
+/// G3). The surface carries a tag, not a closure: `y` either runs the quit path the
+/// armed-abort flow already runs, or cancels **one** named worker — nothing else is
+/// reachable from a keystroke.
+///
+/// The worker identity is captured at request time, so a roster that changes under
+/// the overlay (a worker finishing, a new one registered) can never retarget `y`
+/// onto a different row, and `orchestrator::cancel_all()` is never reachable from
+/// here (spec §5, `bus.rs:38`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConfirmAction {
+    /// End the session through [`Renderer::request_user_exit`] — the same exit path
+    /// the armed-abort flow uses today.
+    Quit,
+    /// Cancel one worker by its effective registry key and task id.
+    CancelWorker {
+        /// The selected roster row's key (`SubagentDetail::name`).
+        key: String,
+        /// Its task id, when the row carries one.
+        task_id: Option<String>,
+    },
+}
 
 impl TuiRenderer {
-    /// Drain any pending crossterm events, updating the input line / focus /
-    /// abort state and forwarding completed lines to the session loop.
+    /// Drain pending crossterm events (a 30 ms poll budget when `blocking`, §0) and
+    /// route each one through [`Self::apply_terminal_event`]. Returns whether any
+    /// event meant something, which is what lets the entry path repaint exactly once
+    /// per meaningful event instead of on every key release.
     pub(crate) fn handle_events(&mut self, blocking: bool) -> bool {
         let mut handled = false;
         loop {
@@ -23,280 +72,8 @@ impl TuiRenderer {
             if !available {
                 break;
             }
-            handled = true;
             match event::read() {
-                Ok(TermEvent::Key(key))
-                    if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat =>
-                {
-                    match key.code {
-                        KeyCode::Enter => {
-                            if key.modifiers.contains(KeyModifiers::SHIFT)
-                                || key.modifiers.contains(KeyModifiers::ALT)
-                                || key.modifiers.contains(KeyModifiers::CONTROL)
-                            {
-                                self.ensure_textarea_in_sync();
-                                self.textarea.insert_newline();
-                                self.sync_input_from_textarea();
-                            } else {
-                                self.submit();
-                            }
-                        }
-                        KeyCode::Esc => {
-                            // Esc arms confirm-abort (or aborts if already armed within 3s).
-                            if self.is_abort_armed() {
-                                self.confirm_abort = false;
-                                self.abort_armed_at = None;
-                                Renderer::request_user_exit(self);
-                            } else {
-                                if self.focused_panel != FocusedPanel::Chat {
-                                    self.focused_panel = FocusedPanel::Chat;
-                                }
-                                self.confirm_abort = true;
-                                self.abort_armed_at = Some(std::time::Instant::now());
-                                self.status_line =
-                                    "Abort armed. Press ESC again to abort.".to_string();
-                                self.dirty = true;
-                            }
-                        }
-                        KeyCode::Tab => self.cycle_focus(),
-                        KeyCode::PageUp => self.scroll_up(10),
-                        KeyCode::PageDown => self.scroll_down(10),
-                        KeyCode::Up => {
-                            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                                self.history_prev();
-                            } else if self.focused_panel == FocusedPanel::Chat
-                                && self.textarea.cursor().0 > 0
-                            {
-                                self.ensure_textarea_in_sync();
-                                self.textarea.input(key);
-                                self.sync_input_from_textarea();
-                            } else {
-                                self.scroll_up(1);
-                            }
-                        }
-                        KeyCode::Down => {
-                            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                                self.history_next();
-                            } else if self.focused_panel == FocusedPanel::Chat
-                                && self.textarea.cursor().0 + 1 < self.textarea.lines().len()
-                            {
-                                self.ensure_textarea_in_sync();
-                                self.textarea.input(key);
-                                self.sync_input_from_textarea();
-                            } else {
-                                self.scroll_down(1);
-                            }
-                        }
-                        KeyCode::Left => {
-                            if self.focused_panel == FocusedPanel::Subagents
-                                && self.selected_subagent_idx > 0
-                            {
-                                self.selected_subagent_idx -= 1;
-                                self.subagent_autoscroll = true;
-                                let w = self.subagent_width.get();
-                                let n = self.estimated_subagent_lines(w);
-                                let h = self.subagent_height.get();
-                                self.subagent_scroll = n.saturating_sub(h) as u16;
-                            } else if self.focused_panel == FocusedPanel::Chat {
-                                self.ensure_textarea_in_sync();
-                                self.textarea.input(key);
-                                self.sync_input_from_textarea();
-                            }
-                        }
-                        KeyCode::Right => {
-                            if self.focused_panel == FocusedPanel::Subagents
-                                && !self.subagents.is_empty()
-                                && self.selected_subagent_idx + 1 < self.subagents.len()
-                            {
-                                self.selected_subagent_idx += 1;
-                                self.subagent_autoscroll = true;
-                                let w = self.subagent_width.get();
-                                let n = self.estimated_subagent_lines(w);
-                                let h = self.subagent_height.get();
-                                self.subagent_scroll = n.saturating_sub(h) as u16;
-                            } else if self.focused_panel == FocusedPanel::Chat {
-                                self.ensure_textarea_in_sync();
-                                self.textarea.input(key);
-                                self.sync_input_from_textarea();
-                            }
-                        }
-                        KeyCode::Home => {
-                            if self.focused_panel == FocusedPanel::Chat {
-                                self.ensure_textarea_in_sync();
-                                self.textarea.input(key);
-                                self.sync_input_from_textarea();
-                            } else {
-                                self.scroll_to_top();
-                            }
-                        }
-                        KeyCode::End => {
-                            if self.focused_panel == FocusedPanel::Chat {
-                                self.ensure_textarea_in_sync();
-                                self.textarea.input(key);
-                                self.sync_input_from_textarea();
-                            } else {
-                                self.scroll_to_bottom();
-                            }
-                        }
-                        KeyCode::Delete => {
-                            if self.focused_panel == FocusedPanel::Chat {
-                                self.ensure_textarea_in_sync();
-                                self.textarea.input(key);
-                                self.sync_input_from_textarea();
-                            }
-                        }
-                        KeyCode::Backspace | KeyCode::Char('\x08') | KeyCode::Char('\x7f') => {
-                            if self.focused_panel == FocusedPanel::Chat {
-                                self.ensure_textarea_in_sync();
-                                self.textarea.input(key);
-                                self.sync_input_from_textarea();
-                            }
-                        }
-                        KeyCode::Char(c) => {
-                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                            if ctrl && (c == 'c' || c == 'C') {
-                                // Ctrl+C arms/triggers confirm-abort.
-                                if self.is_abort_armed() {
-                                    self.confirm_abort = false;
-                                    self.abort_armed_at = None;
-                                    Renderer::request_user_exit(self);
-                                } else {
-                                    self.confirm_abort = true;
-                                    self.abort_armed_at = Some(std::time::Instant::now());
-                                    self.status_line =
-                                        "Abort armed. Press Ctrl+C or ESC again to abort."
-                                            .to_string();
-                                    self.dirty = true;
-                                }
-                            } else if ctrl && (c == 'd' || c == 'D') {
-                                // Ctrl+D is treated as abort.
-                                self.abort_armed_at = None;
-                                Renderer::request_user_exit(self);
-                            } else if ctrl && (c == 'p' || c == 'P') {
-                                self.confirm_abort = false;
-                                self.abort_armed_at = None;
-                                // Single Ctrl+P handler (toggle plan panel).
-                                self.show_plan_panel = !self.show_plan_panel;
-                                if !self.show_plan_panel && self.focused_panel == FocusedPanel::Plan
-                                {
-                                    self.focused_panel = FocusedPanel::Chat;
-                                }
-                            } else if ctrl && (c == 'a' || c == 'A') {
-                                self.confirm_abort = false;
-                                self.abort_armed_at = None;
-                                // Single Ctrl+A handler (toggle subagents).
-                                self.toggle_subagent_panel();
-                                if !self.show_subagent_panel
-                                    && self.focused_panel == FocusedPanel::Subagents
-                                {
-                                    self.focused_panel = FocusedPanel::Chat;
-                                }
-                            } else if ctrl && (c == 't' || c == 'T') {
-                                self.confirm_abort = false;
-                                self.abort_armed_at = None;
-                                self.show_thought = !self.show_thought;
-                                let state = if self.show_thought { "ON" } else { "OFF" };
-                                self.messages
-                                    .push(format!("[CLI] Thinking display: {state}"));
-                                self.chat_auto_scroll = true;
-                            } else if ctrl && (c == 'z' || c == 'Z') {
-                                self.ensure_textarea_in_sync();
-                                self.textarea.undo();
-                                self.sync_input_from_textarea();
-                            } else if ctrl && (c == 'y' || c == 'Y') {
-                                self.ensure_textarea_in_sync();
-                                self.textarea.redo();
-                                self.sync_input_from_textarea();
-                            } else if (ctrl && (c == 'j' || c == 'J')) || c == '\n' {
-                                self.ensure_textarea_in_sync();
-                                self.textarea.insert_newline();
-                                self.sync_input_from_textarea();
-                            } else if self.focused_panel == FocusedPanel::Chat && !c.is_control() {
-                                self.confirm_abort = false;
-                                self.abort_armed_at = None;
-                                self.ensure_textarea_in_sync();
-                                self.textarea.input(key);
-                                self.sync_input_from_textarea();
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(TermEvent::Mouse(mouse)) => match mouse.kind {
-                    crossterm::event::MouseEventKind::ScrollUp => {
-                        let (x, y) = (mouse.column, mouse.row);
-                        if rect_contains(self.chat_area, x, y) {
-                            let old_focus = self.focused_panel;
-                            self.focused_panel = FocusedPanel::Chat;
-                            self.scroll_up(3);
-                            self.focused_panel = old_focus;
-                        } else if rect_contains(self.plan_area, x, y) {
-                            let old_focus = self.focused_panel;
-                            self.focused_panel = FocusedPanel::Plan;
-                            self.scroll_up(3);
-                            self.focused_panel = old_focus;
-                        } else if rect_contains(self.subagent_area, x, y) {
-                            let old_focus = self.focused_panel;
-                            self.focused_panel = FocusedPanel::Subagents;
-                            self.scroll_up(3);
-                            self.focused_panel = old_focus;
-                        } else {
-                            self.scroll_up(3);
-                        }
-                    }
-                    crossterm::event::MouseEventKind::ScrollDown => {
-                        let (x, y) = (mouse.column, mouse.row);
-                        if rect_contains(self.chat_area, x, y) {
-                            let old_focus = self.focused_panel;
-                            self.focused_panel = FocusedPanel::Chat;
-                            self.scroll_down(3);
-                            self.focused_panel = old_focus;
-                        } else if rect_contains(self.plan_area, x, y) {
-                            let old_focus = self.focused_panel;
-                            self.focused_panel = FocusedPanel::Plan;
-                            self.scroll_down(3);
-                            self.focused_panel = old_focus;
-                        } else if rect_contains(self.subagent_area, x, y) {
-                            let old_focus = self.focused_panel;
-                            self.focused_panel = FocusedPanel::Subagents;
-                            self.scroll_down(3);
-                            self.focused_panel = old_focus;
-                        } else {
-                            self.scroll_down(3);
-                        }
-                    }
-                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                        let (x, y) = (mouse.column, mouse.row);
-                        if rect_contains(self.chat_area, x, y) {
-                            self.focused_panel = FocusedPanel::Chat;
-                        } else if rect_contains(self.plan_area, x, y) {
-                            self.focused_panel = FocusedPanel::Plan;
-                        } else if rect_contains(self.subagent_area, x, y) {
-                            self.focused_panel = FocusedPanel::Subagents;
-                        }
-                        // Click within the input area places the cursor at the
-                        // nearest grapheme boundary. The input area occupies the
-                        // bottom 3 rows of the terminal.
-                        let input_area = self.input_area;
-                        if rect_contains(input_area, x, y) {
-                            self.focused_panel = FocusedPanel::Chat;
-                            self.click_to_cursor(x, input_area);
-                        }
-                    }
-                    _ => {}
-                },
-                Ok(TermEvent::Paste(text)) => {
-                    if self.focused_panel == FocusedPanel::Chat {
-                        self.paste_text(&text);
-                    }
-                }
-                Ok(TermEvent::Resize(_, _)) => {
-                    // Explicit resize handling — clamp all scroll offsets and
-                    // trigger a flush so no stale viewport shows blank space.
-                    self.clamp_scrolls();
-                    let _ = self.flush();
-                }
-                Ok(_) => {}
+                Ok(event) => handled |= self.apply_terminal_event(&event),
                 Err(_) => break,
             }
             if blocking {
@@ -304,6 +81,681 @@ impl TuiRenderer {
             }
         }
         handled
+    }
+
+    /// Apply exactly one terminal event.
+    ///
+    /// This is the whole event surface, and therefore the seam a test can drive:
+    /// acceptance criterion 3 asks that the legend name no key the handler does not
+    /// bind, and the only honest way to answer that is to feed a synthetic event for
+    /// every legend row through the same function the live loop calls.
+    pub(crate) fn apply_terminal_event(&mut self, event: &TermEvent) -> bool {
+        match event {
+            // Release events are not bindings: on terminals without the kitty
+            // protocol they never arrive, and acting on them would double every
+            // press.
+            TermEvent::Key(key)
+                if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat =>
+            {
+                self.on_key_event(*key)
+            }
+            // §4.4: a paste always goes to the composer, whatever pane is focused.
+            TermEvent::Paste(text) => {
+                self.paste_text(text);
+                true
+            }
+            TermEvent::Resize(_, _) => {
+                // Clamp every scroll offset to its recomputed maximum, then mark the
+                // frame dirty: the entry path force-flushes for any handled event, so
+                // a resized viewport is redrawn immediately and never shows blank
+                // space below a stale offset.
+                self.clamp_scrolls();
+                self.dirty = true;
+                true
+            }
+            // Anything else — including a mouse report, which the terminal is never
+            // asked to send — is ignored rather than guessed at.
+            _ => false,
+        }
+    }
+
+    /// The §5 keymap, in precedence order. Returns whether the key did something.
+    ///
+    /// The order is the contract, because two rules otherwise collide:
+    ///
+    /// 1. `y` / `n` belong to the **confirm overlay** and are read only while a
+    ///    request is pending there (§5). Outside it they are ordinary characters, so
+    ///    typing `no` still types.
+    /// 2. Global view keys, then Ctrl chords.
+    /// 3. Single-letter mnemonics (`?`, `x`, `e`) only with an **empty composer**;
+    ///    with a draft they insert literally — protecting typing outranks mnemonics
+    ///    (§4.4).
+    /// 4. Navigation and editing keys, then the printable insert, which happens in
+    ///    every mode and every focus state.
+    ///
+    /// An abort arm is disarmed by any printable before that character is inserted
+    /// (§5), so the 3 s window can never swallow what the operator is typing.
+    pub(crate) fn on_key_event(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+        // 1. `y` / `n` — overlay scope, and only for a request the surface actually
+        //    holds. The armed-abort prompt occupies the same surface (§8.5) without
+        //    holding a request, which is why an armed `y` is typing, not consent:
+        //    §5 disarms on printables rather than treating them as answers.
+        if !ctrl
+            && !alt
+            && self.confirm_action.is_some()
+            && matches!(self.overlay, state::OverlayState::Confirm)
+            && let KeyCode::Char(c) = key.code
+        {
+            if matches!(c, 'y' | 'Y') {
+                return self.confirm_pending();
+            }
+            if matches!(c, 'n' | 'N') {
+                return self.dismiss_pending();
+            }
+        }
+
+        // 2. Global view keys (scope: global).
+        match key.code {
+            KeyCode::F(1) => {
+                self.open_help();
+                return true;
+            }
+            KeyCode::F(2) => {
+                self.cycle_view_mode();
+                return true;
+            }
+            KeyCode::F(3) => {
+                self.set_view_mode(ViewMode::Transcript);
+                return true;
+            }
+            KeyCode::F(4) => {
+                self.set_view_mode(ViewMode::Plan);
+                return true;
+            }
+            KeyCode::F(5) => {
+                self.set_view_mode(ViewMode::Workers);
+                return true;
+            }
+            KeyCode::Esc => {
+                self.escape_pressed("ESC");
+                return true;
+            }
+            // `Shift+Tab` arrives as `BackTab` on kitty-protocol terminals and as
+            // `Tab`+SHIFT elsewhere (§4.2); both walk the ring backwards.
+            KeyCode::BackTab => {
+                self.cycle_focus_pane(false);
+                return true;
+            }
+            KeyCode::Tab if shift => {
+                self.cycle_focus_pane(false);
+                return true;
+            }
+            KeyCode::Tab => {
+                // §6: with a `/` draft `Tab` accepts the ghost completion; with
+                // nothing to accept it cycles focus (§4.2). One key, disambiguated
+                // by the leading slash.
+                if self.accept_ghost_completion() {
+                    return true;
+                }
+                self.cycle_focus_pane(true);
+                return true;
+            }
+            _ => {}
+        }
+
+        // 3. Ctrl chords. Every one of them is named in §5; an unbound Ctrl chord is
+        //    deliberately not a key press at all, because the composer must not
+        //    receive a character the operator never typed.
+        if ctrl
+            && !alt
+            && let KeyCode::Char(c) = key.code
+        {
+            match c.to_ascii_lowercase() {
+                // §5: `Ctrl+C` means the same as `Esc`, so it must not be
+                //     pre-disarmed — the second press is the exit.
+                'c' => {
+                    self.escape_pressed("Ctrl+C");
+                    return true;
+                }
+                'd' => {
+                    self.request_quit();
+                    return true;
+                }
+                'p' => {
+                    self.disarm_abort();
+                    self.toggle_pane(true);
+                    return true;
+                }
+                'a' => {
+                    self.disarm_abort();
+                    self.toggle_pane(false);
+                    return true;
+                }
+                't' => {
+                    self.disarm_abort();
+                    self.toggle_thinking();
+                    return true;
+                }
+                'f' => {
+                    self.disarm_abort();
+                    self.toggle_follow();
+                    return true;
+                }
+                'z' => {
+                    self.disarm_abort();
+                    self.ensure_textarea_in_sync();
+                    self.textarea.undo();
+                    self.sync_input_from_textarea();
+                    self.dirty = true;
+                    return true;
+                }
+                'y' => {
+                    self.disarm_abort();
+                    self.ensure_textarea_in_sync();
+                    self.textarea.redo();
+                    self.sync_input_from_textarea();
+                    self.dirty = true;
+                    return true;
+                }
+                'j' => {
+                    self.disarm_abort();
+                    self.newline();
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+
+        // 4. Enter submits; a modified Enter (and the raw `Char('\n')` some
+        //    terminals produce) is a newline (§5).
+        if let KeyCode::Enter = key.code {
+            if ctrl || alt || shift {
+                self.newline();
+            } else {
+                self.submit();
+            }
+            return true;
+        }
+        if let KeyCode::Char('\n') = key.code {
+            self.newline();
+            return true;
+        }
+
+        // 5. Navigation and composer editing.
+        match key.code {
+            KeyCode::Up | KeyCode::Down => return self.scroll_or_history(key, ctrl),
+            KeyCode::PageUp => {
+                self.scroll_by(true, 10);
+                return true;
+            }
+            KeyCode::PageDown => {
+                self.scroll_by(false, 10);
+                return true;
+            }
+            KeyCode::Left => {
+                if self.focus == FocusPane::Workers && self.select_worker(false) {
+                    return true;
+                }
+                self.edit_key(key);
+                return true;
+            }
+            KeyCode::Right => {
+                if self.focus == FocusPane::Workers && self.select_worker(true) {
+                    return true;
+                }
+                self.edit_key(key);
+                return true;
+            }
+            KeyCode::Home => {
+                if self.focus == FocusPane::Input {
+                    self.edit_key(key);
+                } else {
+                    self.scroll_to_top();
+                    self.set_follow(self.chat_auto_scroll);
+                    self.dirty = true;
+                }
+                return true;
+            }
+            KeyCode::End => {
+                if self.focus == FocusPane::Input {
+                    self.edit_key(key);
+                } else {
+                    self.scroll_to_bottom();
+                    self.set_follow(self.chat_auto_scroll);
+                    self.dirty = true;
+                }
+                return true;
+            }
+            // §5: `Backspace`, `Delete` and the two control spellings some terminals
+            // produce edit the composer in every focus state.
+            KeyCode::Backspace
+            | KeyCode::Delete
+            | KeyCode::Char('\x08')
+            | KeyCode::Char('\x7f') => {
+                self.edit_key(key);
+                return true;
+            }
+            _ => {}
+        }
+
+        // 6. Printables. With an empty composer a mnemonic wins; otherwise — and for
+        //    every other printable — the character is typed, in any mode and any
+        //    focus (§4.4).
+        if let KeyCode::Char(c) = key.code {
+            if !ctrl && !alt && self.composer_is_empty() {
+                match c {
+                    '?' => {
+                        self.open_help();
+                        return true;
+                    }
+                    'x' if self.request_cancel_selected_worker() => return true,
+                    'e' => {
+                        self.recall_last_error();
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            // §5: a printable press cancels a pending abort arm before it inserts.
+            if self.is_abort_armed() {
+                self.status_line = "Abort cancelled.".to_string();
+            }
+            self.disarm_abort();
+            self.edit_key(key);
+            return true;
+        }
+
+        false
+    }
+
+    // ---- view-mode and pane toggles (spec §4.1, §5, G5) ----------------------
+
+    /// `F2`: walk M4 → M1 → M2 → M3 → M4 (§4.1). The mode carries its pane
+    /// inventory, so the key is never a silent no-op: the toggles move with it and a
+    /// focus the new mode would orphan is pulled back onto a pane that is on screen.
+    fn cycle_view_mode(&mut self) {
+        let next = match self.view_mode {
+            ViewMode::Split => ViewMode::Transcript,
+            ViewMode::Transcript => ViewMode::Plan,
+            ViewMode::Plan => ViewMode::Workers,
+            ViewMode::Workers => ViewMode::Split,
+        };
+        self.set_view_mode(next);
+    }
+
+    /// `Ctrl+P` / `Ctrl+A` (§5): show or hide the Plan / Workers pane. The pane
+    /// toggles are the mode's inventory spelled out, so the route is
+    /// [`Self::set_view_mode`]: in M1 the key changes the mode instead of doing
+    /// nothing (UX friction 3, G5), and an empty pane turns **on** and draws its
+    /// empty state (§8.1). The `plan:` / `workers:` chip on status row 2 is the
+    /// persistent echo.
+    fn toggle_pane(&mut self, plan: bool) {
+        let plan_visible = if plan {
+            !self.show_plan_panel
+        } else {
+            self.show_plan_panel
+        };
+        let workers_visible = if plan {
+            self.show_subagent_panel
+        } else {
+            !self.show_subagent_panel
+        };
+        self.set_view_mode(ViewMode::for_panes(plan_visible, workers_visible));
+    }
+
+    /// `Ctrl+T`: toggle the thinking block. The chip is the echo (§5: "state chip,
+    /// not a chat line") — the pre-rebuild handler pushed `[CLI] Thinking display:`
+    /// into the transcript, which trained the operator to read the chat pane for a
+    /// setting rather than the status row.
+    fn toggle_thinking(&mut self) {
+        self.show_thought = !self.show_thought;
+        self.dirty = true;
+    }
+
+    /// `Ctrl+F`: toggle transcript follow (G7). The transcript pane owns the
+    /// `● LIVE` / `↓ N new` chip, so this leaves one chip in one place; the stored
+    /// flag and its legacy mirror move together through [`Self::set_follow`].
+    fn toggle_follow(&mut self) {
+        self.set_follow(!self.follow);
+    }
+
+    /// Scroll the focused pane and restate follow from what the scroll path decided
+    /// (G7): scrolling back off the tail turns follow **off**, and returning to the
+    /// tail turns it back on, so the chip can never lag the viewport.
+    fn scroll_by(&mut self, up: bool, amount: u16) {
+        if up {
+            self.scroll_up(amount);
+        } else {
+            self.scroll_down(amount);
+        }
+        self.set_follow(self.chat_auto_scroll);
+        self.dirty = true;
+    }
+
+    /// `Up` / `Down` (§5): `Ctrl+Up`/`Ctrl+Down` are history; inside a multi-line
+    /// draft the caret keeps moving; with an empty draft the key walks the history;
+    /// otherwise it scrolls the focused pane by one, which is what the pre-rebuild
+    /// handler did and what keeps `Down` useful with a one-line draft.
+    fn scroll_or_history(&mut self, key: KeyEvent, ctrl: bool) -> bool {
+        if ctrl {
+            if key.code == KeyCode::Up {
+                self.history_prev();
+            } else {
+                self.history_next();
+            }
+            self.dirty = true;
+            return true;
+        }
+        self.ensure_textarea_in_sync();
+        let last_line = self.textarea.lines().len().saturating_sub(1);
+        let line = self.textarea.cursor().0;
+        let up = key.code == KeyCode::Up;
+        let caret_moves = (up && line > 0) || (!up && line < last_line);
+        if caret_moves {
+            self.edit_key(key);
+            return true;
+        }
+        if self.composer_is_empty() {
+            if up {
+                self.history_prev();
+            } else {
+                self.history_next();
+            }
+            self.dirty = true;
+            return true;
+        }
+        self.scroll_by(up, 1);
+        true
+    }
+
+    /// `Left` / `Right` in the Workers pane: move the roster selection, keeping the
+    /// selected row's detail in view exactly as the pre-rebuild Subagents handler did.
+    fn select_worker(&mut self, forward: bool) -> bool {
+        if self.subagents.is_empty() {
+            return false;
+        }
+        let last = self.subagents.len() - 1;
+        if forward {
+            if self.selected_subagent_idx >= last {
+                return false;
+            }
+            self.selected_subagent_idx += 1;
+        } else {
+            if self.selected_subagent_idx == 0 {
+                return false;
+            }
+            self.selected_subagent_idx -= 1;
+        }
+        self.subagent_autoscroll = true;
+        let w = self.subagent_width.get();
+        let n = self.estimated_subagent_lines(w);
+        let h = self.subagent_height.get();
+        self.subagent_scroll = n.saturating_sub(h) as u16;
+        self.dirty = true;
+        true
+    }
+
+    // ---- overlays, abort arming and the confirm surface (spec §5, §8.5, G3) ---
+
+    /// `Esc` / `Ctrl+C`: close an open overlay, else arm abort, else — while the 3 s
+    /// window is live — take the exit path.
+    ///
+    /// The pre-rebuild side effect of silently re-focusing Chat is gone (UX friction
+    /// 8), and closing an overlay never arms anything (acceptance criterion 16): the
+    /// key is spent on the surface, which is what makes `Esc` out of `F1` and `Esc`
+    /// out of a Quit confirm safe.
+    fn escape_pressed(&mut self, chord: &str) {
+        if self.is_abort_armed() {
+            self.confirm_abort = false;
+            self.abort_armed_at = None;
+            self.confirm_action = None;
+            Renderer::request_user_exit(self);
+            return;
+        }
+        if self.overlay.is_open() {
+            self.confirm_action = None;
+            self.close_overlay();
+            return;
+        }
+        self.confirm_abort = true;
+        self.abort_armed_at = Some(Instant::now());
+        self.status_line = format!("Abort armed. Press {chord} again to abort.");
+        // §8.5: the armed prompt occupies the confirm surface but holds no `y`/`n`
+        // request — `confirm_action` stays empty, so a printable is typing, not
+        // consent, and disarms.
+        self.confirm_action = None;
+        self.show_confirm();
+        self.dirty = true;
+    }
+
+    /// `Ctrl+D` (§5): open the Quit confirm surface. It never exits un-armed, and a
+    /// second `Ctrl+D` only refreshes the same surface (acceptance criterion 8). It
+    /// also does not arm abort, so `Esc` closes it and leaves the session running —
+    /// the rule acceptance criterion 6 states for the slash-spelling of the same
+    /// request.
+    fn request_quit(&mut self) {
+        self.disarm_abort();
+        self.confirm_action = Some(ConfirmAction::Quit);
+        self.show_confirm();
+        self.status_line = "Confirm quit — y to quit, n or Esc to keep working.".to_string();
+        self.dirty = true;
+    }
+
+    /// `x` (§5): ask to cancel the **selected** worker of the Workers pane.
+    ///
+    /// The precondition is part of the binding, not an implementation detail: the key
+    /// is scoped to the pane, and when it is not met the character falls through and
+    /// is typed, which is what keeps `x` usable as a letter (acceptance criterion
+    /// 13). The cancel itself waits for `y`.
+    fn request_cancel_selected_worker(&mut self) -> bool {
+        if self.focus != FocusPane::Workers || self.subagents.is_empty() {
+            return false;
+        }
+        let index = self
+            .selected_subagent_idx
+            .min(self.subagents.len().saturating_sub(1));
+        let row = &self.subagents[index];
+        let key = row.name.clone();
+        let task_id = row.task_id.clone();
+        self.disarm_abort();
+        self.confirm_action = Some(ConfirmAction::CancelWorker {
+            key: key.clone(),
+            task_id,
+        });
+        self.show_confirm();
+        self.status_line = format!(
+            "Confirm cancel of worker '{key}' — y to cancel it, n or Esc to leave it running."
+        );
+        self.dirty = true;
+        true
+    }
+
+    /// `y` inside the confirm surface: run the pending request.
+    ///
+    /// `Quit` takes the same exit path the armed-abort flow uses today, and
+    /// `CancelWorker` addresses one worker by name through the registry's
+    /// exact-identity matching. `confirm_all()`-style bulk cancellation is not
+    /// reachable from a keystroke (spec §5).
+    fn confirm_pending(&mut self) -> bool {
+        let action = self.confirm_action.take();
+        self.confirm_abort = false;
+        self.abort_armed_at = None;
+        self.close_overlay();
+        match action {
+            Some(ConfirmAction::CancelWorker { key, task_id }) => {
+                let cancelled = crate::orchestrator::cancel_active_worker(
+                    Some(key.as_str()),
+                    task_id.as_deref(),
+                );
+                self.status_line = if cancelled {
+                    format!("Cancelled worker '{key}'.")
+                } else {
+                    format!("Worker '{key}' is not running any more.")
+                };
+            }
+            Some(ConfirmAction::Quit) | None => {
+                Renderer::request_user_exit(self);
+            }
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// `n` inside the confirm surface: drop the request and keep working
+    /// (acceptance criteria 6 and 16). Nothing here arms abort either.
+    fn dismiss_pending(&mut self) -> bool {
+        let action = self.confirm_action.take();
+        self.confirm_abort = false;
+        self.abort_armed_at = None;
+        self.close_overlay();
+        self.status_line = match action {
+            Some(ConfirmAction::CancelWorker { key, .. }) => {
+                format!("Worker '{key}' was left running.")
+            }
+            Some(ConfirmAction::Quit) => "Quit cancelled.".to_string(),
+            None => "Abort cancelled.".to_string(),
+        };
+        self.dirty = true;
+        true
+    }
+
+    /// Take an abort arm off without exiting.
+    ///
+    /// The armed prompt occupies the confirm surface (§8.5), so taking the arm off
+    /// takes the prompt off with it. A confirm the operator opened themselves
+    /// (`Ctrl+D`, `x`) holds a `confirm_action` and is a different request, so it is
+    /// left alone — which is why the guard is the request, not the surface.
+    fn disarm_abort(&mut self) {
+        if !self.confirm_abort && self.abort_armed_at.is_none() {
+            return;
+        }
+        self.confirm_abort = false;
+        self.abort_armed_at = None;
+        if self.confirm_action.is_none() && self.overlay == state::OverlayState::Confirm {
+            self.close_overlay();
+        }
+        self.dirty = true;
+    }
+
+    // ---- composer helpers (spec §4.4, §6) ------------------------------------
+
+    /// Route one key to the composer widget. This is the single place the §4.4 rule
+    /// lives, and it contains no focus test anywhere.
+    fn edit_key(&mut self, key: KeyEvent) {
+        self.ensure_textarea_in_sync();
+        self.textarea.input(key);
+        self.sync_input_from_textarea();
+        self.dirty = true;
+    }
+
+    /// Insert a newline at the caret (§5: modified Enter and `Ctrl+J`).
+    fn newline(&mut self) {
+        self.ensure_textarea_in_sync();
+        self.textarea.insert_newline();
+        self.sync_input_from_textarea();
+        self.dirty = true;
+    }
+
+    /// Whether the draft is empty — the precondition that turns `?`, `x` and `e` from
+    /// typed characters into mnemonics (§4.4).
+    fn composer_is_empty(&self) -> bool {
+        self.input_text.is_empty() && self.textarea.lines().iter().all(|line| line.is_empty())
+    }
+
+    /// `Tab` with a `/` draft: accept the ghost completion §6 offers.
+    ///
+    /// Only the *remainder* of the token is inserted, at the end of what the operator
+    /// typed, because `components::input::suggest` completes no further than the
+    /// longest common prefix of the candidates and never guesses a command. Returns
+    /// `false` when the draft is not in command mode or has nothing to complete, which
+    /// is what lets `Tab` fall through to focus cycling.
+    fn accept_ghost_completion(&mut self) -> bool {
+        self.ensure_textarea_in_sync();
+        let buffer = self.textarea.lines().join("\n");
+        let Some(token) = input::command_token(&buffer) else {
+            return false;
+        };
+        let Some(completion) = input::suggest(&buffer) else {
+            return false;
+        };
+        let token_len = token.len();
+        let Some(tail) = completion.get(token_len..) else {
+            return false;
+        };
+        if tail.is_empty() {
+            return false;
+        }
+        // The caret goes to the end of the typed token on line 1, so a draft with a
+        // caret in the middle of the command still completes in place.
+        let first_line = self.textarea.lines().first().cloned().unwrap_or_default();
+        let leading = first_line.chars().count() - first_line.trim_start().chars().count();
+        let column = (leading + token.chars().count()) as u16;
+        self.textarea
+            .move_cursor(ratatui_textarea::CursorMove::Jump(0, column));
+        self.textarea.insert_str(tail);
+        self.sync_input_from_textarea();
+        self.dirty = true;
+        true
+    }
+
+    /// `e` (§5): show the last error again.
+    ///
+    /// Spec §8.5 gives the renderer a dedicated `last_error` buffer that stores the
+    /// categorical text verbatim; that buffer does not exist yet and needs the t-012
+    /// plumbing, so this recalls the error traffic the session loop has already
+    /// pushed into the transcript and the status line, and says so out loud when
+    /// there is nothing to recall (G5 — `e` is never a silent key).
+    fn recall_last_error(&mut self) {
+        let found = Self::error_line(&self.messages, &self.status_line);
+        match found {
+            Some(text) => {
+                self.messages
+                    .push(format!("✗ {text}\nsee .marmel/marmel.log"));
+            }
+            None => self.messages.push(
+                "[CLI] No error recorded to recall. The sticky last-error buffer \
+                 (spec §8.5) is still pending plumbing: once it lands, `e` and `/error` \
+                 print the stored cause here."
+                    .to_string(),
+            ),
+        }
+        self.dirty = true;
+    }
+
+    /// The last error-looking line in the transcript, else in the status line.
+    ///
+    /// The spellings are the ones the session loop actually emits today
+    /// (`LLM error: <category>`, `System Error …`, and the `✗` line this method
+    /// itself produces), so the recall stays honest even for a session that only
+    /// carries old traffic.
+    fn error_line(messages: &[String], status_line: &str) -> Option<String> {
+        let looks_like_error = |text: &str| {
+            let trimmed = text.trim_start();
+            trimmed.starts_with("LLM error")
+                || trimmed.starts_with("System Error")
+                || trimmed.starts_with('✗')
+                || trimmed.contains("LLM error:")
+        };
+        messages
+            .iter()
+            .rev()
+            .find(|message| message.lines().any(looks_like_error))
+            .and_then(|message| {
+                message
+                    .lines()
+                    .find(|line| looks_like_error(line))
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                status_line
+                    .lines()
+                    .find(|line| looks_like_error(line))
+                    .map(str::to_string)
+            })
     }
 
     /// Insert a pasted block into the composer as one contiguous edit.
@@ -392,96 +844,6 @@ impl TuiRenderer {
             }
             self.cursor -= 1;
         }
-    }
-
-    /// Move the input cursor one grapheme to the left.
-    #[allow(dead_code)]
-    pub(crate) fn cursor_left(&mut self) {
-        self.sanitize_cursor();
-        let before = &self.input_text[..self.cursor];
-        let graphemes: Vec<&str> = before.graphemes(true).collect();
-        if let Some(last) = graphemes.last() {
-            self.cursor -= last.len();
-        }
-        self.sanitize_cursor();
-        self.ensure_textarea_in_sync();
-        self.textarea.input(crossterm::event::KeyEvent::new(
-            KeyCode::Left,
-            KeyModifiers::NONE,
-        ));
-    }
-
-    /// Move the input cursor one grapheme to the right.
-    #[allow(dead_code)]
-    pub(crate) fn cursor_right(&mut self) {
-        self.sanitize_cursor();
-        let after = &self.input_text[self.cursor..];
-        if let Some(first) = after.graphemes(true).next() {
-            self.cursor += first.len();
-        }
-        self.sanitize_cursor();
-        self.ensure_textarea_in_sync();
-        self.textarea.input(crossterm::event::KeyEvent::new(
-            KeyCode::Right,
-            KeyModifiers::NONE,
-        ));
-    }
-
-    /// Delete the grapheme immediately before the cursor (Backspace).
-    #[allow(dead_code)]
-    pub(crate) fn delete_backward(&mut self) {
-        self.sanitize_cursor();
-        let before = &self.input_text[..self.cursor];
-        let graphemes: Vec<&str> = before.graphemes(true).collect();
-        if let Some(last) = graphemes.last() {
-            let start = self.cursor - last.len();
-            self.input_text.replace_range(start..self.cursor, "");
-            self.cursor = start;
-        }
-        self.sanitize_cursor();
-        self.ensure_textarea_in_sync();
-    }
-
-    /// Delete the grapheme immediately after the cursor (Delete).
-    #[allow(dead_code)]
-    pub(crate) fn delete_forward(&mut self) {
-        self.sanitize_cursor();
-        let after = &self.input_text[self.cursor..];
-        if let Some(first) = after.graphemes(true).next() {
-            self.input_text
-                .replace_range(self.cursor..self.cursor + first.len(), "");
-        }
-        self.sanitize_cursor();
-        self.ensure_textarea_in_sync();
-    }
-
-    /// Insert a character at the cursor position.
-    #[allow(dead_code)]
-    pub(crate) fn insert_char(&mut self, c: char) {
-        self.sanitize_cursor();
-        self.input_text.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
-        self.ensure_textarea_in_sync();
-    }
-
-    /// Click within the input area places the cursor at the nearest
-    /// grapheme boundary.
-    pub(crate) fn click_to_cursor(&mut self, x: u16, area: Rect) {
-        let relative_x = x.saturating_sub(area.x);
-        let mut byte_offset = 0;
-        let mut visual_x = 0;
-        for grapheme in self.input_text.graphemes(true) {
-            if visual_x >= relative_x {
-                break;
-            }
-            byte_offset += grapheme.len();
-            visual_x += UnicodeWidthStr::width(grapheme) as u16;
-        }
-        self.cursor = byte_offset.min(self.input_text.len());
-        self.sanitize_cursor();
-        self.ensure_textarea_in_sync();
-        self.textarea
-            .move_cursor(ratatui_textarea::CursorMove::Jump(0, self.cursor as u16));
     }
 
     /// Clamp all scroll offsets to their recomputed maxima.
@@ -590,21 +952,6 @@ impl TuiRenderer {
                 let h = self.subagent_height.get();
                 self.subagent_scroll = n.saturating_sub(h) as u16;
                 self.subagent_autoscroll = true;
-            }
-        }
-    }
-
-    /// Toggle the subagents panel; when turned on, scroll to bottom and focus it.
-    pub(crate) fn toggle_subagent_panel(&mut self) {
-        self.show_subagent_panel = !self.show_subagent_panel;
-        if self.show_subagent_panel {
-            self.subagent_autoscroll = true;
-            let w = self.subagent_width.get();
-            let n = self.estimated_subagent_lines(w);
-            let h = self.subagent_height.get();
-            self.subagent_scroll = n.saturating_sub(h) as u16;
-            if !self.subagents.is_empty() {
-                self.focused_panel = FocusedPanel::Subagents;
             }
         }
     }
@@ -784,30 +1131,15 @@ impl TuiRenderer {
             self.chat_auto_scroll = true;
             return;
         }
-        // Handle the `/help` command locally: print the command/keybinding
-        // legend into the chat pane and do not forward to the session loop.
+        // §5 + acceptance criterion 3: `/help`, the `F1` overlay and the footer
+        // print **one** table. The legend used to be a hard-coded string here and had
+        // already gone stale (it advertised mouse bindings the handler never had), so
+        // the text now comes from `components::help::help_text()`, which is built
+        // from `legend()` plus the slash-command table the composer's autocomplete
+        // reads. Printing this rather than a copy is what makes the three surfaces
+        // byte-identical.
         if line.trim().eq_ignore_ascii_case("/help") {
-            self.messages.push(
-                "[CLI] Available slash commands:\n\
-                 /help - show this help\n\
-                 /thought - toggle the thinking block display\n\
-                 /reset, /reset_plan, /reset-plan, /clear_plan, /clear-plan - clear the execution plan\n\
-                 /abort, /exit, /quit, /q, :q, :q! - abort the current session\n\n\
-                 [CLI] Keybindings:\n\
-                 Enter - send input message\n\
-                 Shift+Enter / Alt+Enter / Ctrl+J - insert newline\n\
-                 Tab - cycle focus (Chat / Plan / Subagents)\n\
-                 Ctrl+P - toggle the plan panel\n\
-                 Ctrl+A - toggle the subagents panel\n\
-                 Ctrl+T - toggle the thinking block display\n\
-                 Ctrl+Z / Ctrl+Y - undo / redo input\n\
-                 Ctrl+Up / Ctrl+Down - input history navigation\n\
-                 Esc / Ctrl+C - confirm-abort (first press arms, second aborts; Esc first returns focus to Chat)\n\
-                 Mouse scroll / click - scroll panels / change focus\n\
-                 Left / Right / Home / End / Delete - move the input cursor\n\
-                 Backspace - delete the grapheme before the cursor"
-                    .to_string(),
-            );
+            self.messages.push(format!("[CLI] {}", help::help_text()));
             self.chat_auto_scroll = true;
             return;
         }
@@ -848,31 +1180,6 @@ impl TuiRenderer {
             Renderer::request_user_exit(self);
         }
         let _ = self.tx.send(line);
-    }
-
-    /// Cycle focus: Chat → Plan → Subagents → Chat.
-    pub(crate) fn cycle_focus(&mut self) {
-        let has_plan = !self.plan_content.trim().is_empty() && self.show_plan_panel;
-        let has_subagents = self.show_subagent_panel && !self.subagents.is_empty();
-        self.focused_panel = match self.focused_panel {
-            FocusedPanel::Chat => {
-                if has_plan {
-                    FocusedPanel::Plan
-                } else if has_subagents {
-                    FocusedPanel::Subagents
-                } else {
-                    FocusedPanel::Chat
-                }
-            }
-            FocusedPanel::Plan => {
-                if has_subagents {
-                    FocusedPanel::Subagents
-                } else {
-                    FocusedPanel::Chat
-                }
-            }
-            FocusedPanel::Subagents => FocusedPanel::Chat,
-        };
     }
 
     /// Append a completed steer sentence as a `Marmennill: ` message.

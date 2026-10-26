@@ -142,13 +142,21 @@ pub fn render(frame: &mut Frame, rect: Rect, data: &StatusData<'_>) {
 
     if rect.height == 1 {
         // Metrics stay; the armed prompt shares the row when it is armed (§2.5).
-        paint_row(frame, rect, metrics_line(data, rect.width, data.abort_armed));
+        paint_row(
+            frame,
+            rect,
+            metrics_line(data, rect.width, data.abort_armed),
+        );
         return;
     }
 
     let rows = status_rows(rect);
     if let Some(metrics_row) = rows.metrics {
-        paint_row(frame, metrics_row, metrics_line(data, metrics_row.width, false));
+        paint_row(
+            frame,
+            metrics_row,
+            metrics_line(data, metrics_row.width, false),
+        );
     }
     if let Some(chip_row) = rows.chips {
         paint_row(frame, chip_row, chip_line(data, chip_row.width));
@@ -236,11 +244,18 @@ fn build_metrics_line(
     width: u16,
     prompt_first: bool,
 ) -> Vec<Span<'static>> {
-    let prompt = if prompt_first { armed_prompt() } else { Vec::new() };
+    let prompt = if prompt_first {
+        armed_prompt()
+    } else {
+        Vec::new()
+    };
     let mut fields = metrics(data, tokens, elapsed);
     // The prompt reserves its cells before the ladder runs, so the counters are
     // what degrade when the row cannot hold both.
-    fit_fields(&mut fields, usize::from(width).saturating_sub(spans_width(&prompt)));
+    fit_fields(
+        &mut fields,
+        usize::from(width).saturating_sub(spans_width(&prompt)),
+    );
     let mut spans = prompt;
     spans.extend(fields.into_iter().flat_map(|field| field.spans));
     fit_spans(spans, width)
@@ -264,7 +279,11 @@ fn metrics(data: &StatusData<'_>, tokens: (usize, usize), elapsed: Option<u64>) 
         .collect();
     let active = active_names.len();
     let paused = data.workers.iter().filter(|row| row.paused).count();
-    let queued = data.workers.iter().filter(|row| row.queue.is_some()).count();
+    let queued = data
+        .workers
+        .iter()
+        .filter(|row| row.queue.is_some())
+        .count();
 
     let mut fields = vec![
         Field {
@@ -403,7 +422,11 @@ fn chips(data: &StatusData<'_>) -> Vec<Field> {
     if !data.abort_armed {
         let active = data.workers.iter().filter(|row| row.is_active).count();
         let paused = data.workers.iter().filter(|row| row.paused).count();
-        let queued = data.workers.iter().filter(|row| row.queue.is_some()).count();
+        let queued = data
+            .workers
+            .iter()
+            .filter(|row| row.queue.is_some())
+            .count();
         chips.push(Field {
             drop: Some(DROP_COUNTS_CHIP),
             flex: false,
@@ -433,9 +456,16 @@ fn presence(visible: bool, present: bool) -> &'static str {
 /// The chip row, fitted so the armed prompt is never the part that gets cut: the
 /// prompt reserves its cells first and the chips drop in ladder order (§7.3).
 fn chip_line(data: &StatusData<'_>, width: u16) -> Vec<Span<'static>> {
-    let prompt = if data.abort_armed { armed_prompt() } else { Vec::new() };
+    let prompt = if data.abort_armed {
+        armed_prompt()
+    } else {
+        Vec::new()
+    };
     let mut fields = chips(data);
-    fit_fields(&mut fields, usize::from(width).saturating_sub(spans_width(&prompt)));
+    fit_fields(
+        &mut fields,
+        usize::from(width).saturating_sub(spans_width(&prompt)),
+    );
     let mut spans: Vec<Span<'static>> = fields.into_iter().flat_map(|field| field.spans).collect();
     spans.extend(prompt);
     fit_spans(spans, width)
@@ -606,7 +636,11 @@ mod tests {
 
     /// The same bar with the session metrics t-009b plumbs, for the tests that
     /// assert on the `ctx %` ratio or the project clock.
-    fn metered<'a>(workers: &'a [SubagentDetail], tokens: (usize, usize), ctx: (usize, usize)) -> StatusData<'a> {
+    fn metered<'a>(
+        workers: &'a [SubagentDetail],
+        tokens: (usize, usize),
+        ctx: (usize, usize),
+    ) -> StatusData<'a> {
         StatusData {
             tokens_in: tokens.0,
             tokens_out: tokens.1,
@@ -702,7 +736,8 @@ mod tests {
         // The legacy bar wrote the row as a full-width paragraph, so the counters
         // have to repaint every cell: a banner longer than the metrics line must
         // not leave its tail standing behind them.
-        let banner = " ⚠ [ABORT ARMED] Press ESC or Ctrl+C again to abort | Any other key to cancel ";
+        let banner =
+            " ⚠ [ABORT ARMED] Press ESC or Ctrl+C again to abort | Any other key to cancel ";
         let workers = [worker("coder_specialist", true, false, false)];
         let d = data(&workers, true);
         let backend = ratatui::backend::TestBackend::new(80, 2);
@@ -757,7 +792,10 @@ mod tests {
         let rows = draw(90, 1, &data(&workers, true));
         assert_eq!(rows.len(), 1, "one row for a one-row rect: {rows:?}");
         assert!(rows[0].starts_with('✗'), "prompt leads the row: {rows:?}");
-        assert!(rows[0].contains("abort armed"), "prompt on the row: {rows:?}");
+        assert!(
+            rows[0].contains("abort armed"),
+            "prompt on the row: {rows:?}"
+        );
         assert!(rows[0].contains("Tokens"), "metrics survive: {rows:?}");
         assert!(rows[0].contains("1a"), "counts survive: {rows:?}");
 
@@ -835,7 +873,10 @@ mod tests {
             ..data(&workers, false)
         };
         let rows = draw(80, 2, &off);
-        assert!(rows[1].contains("plan:off") && rows[1].contains("workers:off"), "{rows:?}");
+        assert!(
+            rows[1].contains("plan:off") && rows[1].contains("workers:off"),
+            "{rows:?}"
+        );
     }
 
     #[test]
@@ -914,7 +955,10 @@ mod tests {
             }
         }
         assert_eq!(
-            disappeared.iter().map(|(field, _)| *field).collect::<Vec<_>>(),
+            disappeared
+                .iter()
+                .map(|(field, _)| *field)
+                .collect::<Vec<_>>(),
             ["names", "clock", "queued", "paused"],
             "row-1 ladder: {disappeared:?}"
         );
@@ -944,7 +988,12 @@ mod tests {
     fn armed_prompt_survives_a_narrow_single_row_bar() {
         // The prompt reserves its cells before the ladder runs and leads the row, so
         // the counters degrade instead of the actionable signal being cut.
-        let workers = [worker("coder_specialist_with_a_long_name", true, true, true)];
+        let workers = [worker(
+            "coder_specialist_with_a_long_name",
+            true,
+            true,
+            true,
+        )];
         let d = data(&workers, true);
         for width in [40u16, 60, 80] {
             let row = text(build_metrics_line(&d, (0, 0), Some(75), width, true));
@@ -963,7 +1012,12 @@ mod tests {
         // Spec §8.4 plus gate (c): `val N` waits for D1 and the arbitration round
         // is not data, so neither may appear at any width or row count.
         let workers = [worker("coder_specialist", true, true, true)];
-        for (width, height, armed) in [(120, 2, false), (120, 2, true), (70, 1, true), (64, 2, true)] {
+        for (width, height, armed) in [
+            (120, 2, false),
+            (120, 2, true),
+            (70, 1, true),
+            (64, 2, true),
+        ] {
             let joined = draw(width, height, &data(&workers, armed)).join("\n");
             assert!(!joined.contains("val"), "{joined:?}");
             assert!(!joined.contains("round"), "{joined:?}");

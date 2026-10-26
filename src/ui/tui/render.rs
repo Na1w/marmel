@@ -1,7 +1,7 @@
 //! Ratatui frame drawing and panel rendering for TuiRenderer.
 
-use super::formatting::*;
 use super::TuiRenderer;
+use super::formatting::*;
 use anyhow::Result;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -363,7 +363,6 @@ impl TuiRenderer {
         self.input_area = input_area;
         Ok(())
     }
-
 }
 
 /// The legacy panes the component renderers of `t-009b` replaced.
@@ -385,7 +384,6 @@ mod legacy_panes {
     use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
     impl TuiRenderer {
-
         pub(crate) fn render_chat(&mut self, frame: &mut ratatui::Frame, area: Rect) {
             let chat_border_color = if self.focused_panel == FocusedPanel::Chat {
                 Color::Cyan
@@ -496,7 +494,8 @@ mod legacy_panes {
             }
             if let Some(tid) = &self.active_plan_task {
                 let clean = clean_task_id(tid);
-                if !clean.is_empty() && !active_tasks.iter().any(|t| t.eq_ignore_ascii_case(clean)) {
+                if !clean.is_empty() && !active_tasks.iter().any(|t| t.eq_ignore_ascii_case(clean))
+                {
                     active_tasks.push(clean.to_string());
                 }
             }
@@ -540,7 +539,8 @@ mod legacy_panes {
             self.plan_max_scroll = total_plan_lines.saturating_sub(plan_h) as u16;
             let scroll_y = if self.plan_auto_scroll {
                 let target_scroll = if let Some(task_id) = target_task
-                    && let Some(task_visual) = visual_line_offset_of_task(plan, task_id, plan_w.max(1))
+                    && let Some(task_visual) =
+                        visual_line_offset_of_task(plan, task_id, plan_w.max(1))
                 {
                     // Position the active started task comfortably in view (leaving 1 line of context above if possible)
                     let desired = task_visual.saturating_sub(1);
@@ -597,7 +597,9 @@ mod legacy_panes {
                 " Specialist Subagents (Ctrl-A | ◄/► Agent | ▲/▼ Scroll) ".to_string()
             } else {
                 let current = (self.selected_subagent_idx + 1).min(total);
-                format!(" Specialist Subagents [{current}/{total}] (Ctrl-A | ◄/► Agent | ▲/▼ Scroll) ")
+                format!(
+                    " Specialist Subagents [{current}/{total}] (Ctrl-A | ◄/► Agent | ▲/▼ Scroll) "
+                )
             };
 
             let subagent_block = Block::default()
@@ -759,28 +761,29 @@ mod legacy_panes {
                 false
             };
 
-            let (details_area, status_area_opt) = if show_status_bar && subagent_chunks[1].height >= 4 {
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(1), // Top separator border
-                        Constraint::Min(2),    // Scrollable details area
-                        Constraint::Length(1), // Bottom subagent status bar
-                    ])
-                    .split(subagent_chunks[1]);
-                frame.render_widget(separator, chunks[0]);
-                (chunks[1], Some(chunks[2]))
-            } else {
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(1), // Top separator border
-                        Constraint::Min(2),    // Scrollable details area
-                    ])
-                    .split(subagent_chunks[1]);
-                frame.render_widget(separator, chunks[0]);
-                (chunks[1], None)
-            };
+            let (details_area, status_area_opt) =
+                if show_status_bar && subagent_chunks[1].height >= 4 {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(1), // Top separator border
+                            Constraint::Min(2),    // Scrollable details area
+                            Constraint::Length(1), // Bottom subagent status bar
+                        ])
+                        .split(subagent_chunks[1]);
+                    frame.render_widget(separator, chunks[0]);
+                    (chunks[1], Some(chunks[2]))
+                } else {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(1), // Top separator border
+                            Constraint::Min(2),    // Scrollable details area
+                        ])
+                        .split(subagent_chunks[1]);
+                    frame.render_widget(separator, chunks[0]);
+                    (chunks[1], None)
+                };
 
             let mut detail_lines = Vec::new();
             if let Some(sa) = sa_opt {
@@ -870,8 +873,8 @@ mod legacy_panes {
             // Subagent bottom status bar (rendered like main UI status bar).
             if let (Some(status_area), Some(sa)) = (status_area_opt, sa_opt) {
                 let frames = ["-", "\\", "|", "/"];
-                let idx =
-                    ((self.session_start.elapsed().as_millis() / 125) % frames.len() as u128) as usize;
+                let idx = ((self.session_start.elapsed().as_millis() / 125) % frames.len() as u128)
+                    as usize;
                 let spinner = if sa.is_active { frames[idx] } else { "" };
 
                 let turn_think = self
@@ -1067,8 +1070,8 @@ mod legacy_panes {
             }
             if active_phase {
                 let frames = ["-", "\\", "|", "/"];
-                let idx =
-                    ((self.session_start.elapsed().as_millis() / 125) % frames.len() as u128) as usize;
+                let idx = ((self.session_start.elapsed().as_millis() / 125) % frames.len() as u128)
+                    as usize;
                 status_str.push(' ');
                 status_str.push_str(frames[idx]);
             }

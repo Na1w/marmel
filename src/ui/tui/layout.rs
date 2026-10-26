@@ -177,29 +177,20 @@ pub fn compute_layout(area: Rect, view: &UiView) -> PaneRects {
         (ViewMode::Plan, Shape::Full) => rects.plan = Some(body),
         (ViewMode::Workers, Shape::Full) => rects.workers = Some(body),
         (ViewMode::Plan, _) => {
-            let cols = Layout::horizontal([
-                Constraint::Percentage(55),
-                Constraint::Percentage(45),
-            ])
-            .split(body);
+            let cols = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .split(body);
             rects.plan = Some(cols[0]);
             rects.transcript = Some(cols[1]);
         }
         (ViewMode::Workers, _) => {
-            let cols = Layout::horizontal([
-                Constraint::Percentage(55),
-                Constraint::Percentage(45),
-            ])
-            .split(body);
+            let cols = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .split(body);
             rects.workers = Some(cols[0]);
             rects.transcript = Some(cols[1]);
         }
         (ViewMode::Split, Shape::Stacked) => {
-            let stack = Layout::vertical([
-                Constraint::Min(BODY_MIN),
-                Constraint::Min(BODY_MIN),
-            ])
-            .split(body);
+            let stack = Layout::vertical([Constraint::Min(BODY_MIN), Constraint::Min(BODY_MIN)])
+                .split(body);
             rects.transcript = Some(stack[0]);
             match side_pane(view) {
                 Some(FocusPane::Plan) => rects.plan = Some(stack[1]),
@@ -208,20 +199,15 @@ pub fn compute_layout(area: Rect, view: &UiView) -> PaneRects {
             }
         }
         (ViewMode::Split, _) => {
-            let cols = Layout::horizontal([
-                Constraint::Percentage(60),
-                Constraint::Percentage(40),
-            ])
-            .split(body);
+            let cols = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
+                .split(body);
             rects.transcript = Some(cols[0]);
             let side = cols[1];
             match (view.plan_visible, view.workers_visible) {
                 (true, true) if side.height >= 2 * BODY_MIN => {
-                    let stack = Layout::vertical([
-                        Constraint::Min(BODY_MIN),
-                        Constraint::Min(BODY_MIN),
-                    ])
-                    .split(side);
+                    let stack =
+                        Layout::vertical([Constraint::Min(BODY_MIN), Constraint::Min(BODY_MIN)])
+                            .split(side);
                     rects.plan = Some(stack[0]);
                     rects.workers = Some(stack[1]);
                 }
@@ -262,10 +248,13 @@ fn resolve_body(body: Rect, view: &UiView) -> (ViewMode, Shape) {
             ViewMode::Transcript => (ViewMode::Transcript, Shape::Full),
         };
     }
-    (view.mode, match view.mode {
-        ViewMode::Transcript => Shape::Full,
-        ViewMode::Plan | ViewMode::Workers | ViewMode::Split => Shape::Columns,
-    })
+    (
+        view.mode,
+        match view.mode {
+            ViewMode::Transcript => Shape::Full,
+            ViewMode::Plan | ViewMode::Workers | ViewMode::Split => Shape::Columns,
+        },
+    )
 }
 
 /// The side pane a frame singles out when the ladder removes the other one: the

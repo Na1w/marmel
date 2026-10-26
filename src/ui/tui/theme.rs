@@ -133,10 +133,7 @@ impl Glyph {
 
     /// Glyph plus word label as a styled span.
     pub fn tagged(self) -> Span<'static> {
-        Span::styled(
-            format!("{} {}", self.symbol(), self.label()),
-            self.style(),
-        )
+        Span::styled(format!("{} {}", self.symbol(), self.label()), self.style())
     }
 }
 

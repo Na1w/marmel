@@ -33,7 +33,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// badge that makes focus readable without colour (§7.3, G6).
 pub fn pane_block(title: &str, focused: bool, border: Style) -> Block<'static> {
     let (title, title_style) = if focused {
-        (format!(" {title} {} ", theme::FOCUS_BADGE), theme::frame_focus())
+        (
+            format!(" {title} {} ", theme::FOCUS_BADGE),
+            theme::frame_focus(),
+        )
     } else {
         (format!(" {title} "), theme::text_dim())
     };

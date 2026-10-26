@@ -52,7 +52,6 @@ use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
 
-
 /// The §8.1 workers empty state, spelled once — reached by `Ctrl+A`/`F5` with
 /// zero rows, which is what fixes the silent no-op (G5, UX friction 3).
 pub const EMPTY_STATE: &str = "No specialist launched yet.";
@@ -187,8 +186,8 @@ fn draw_body(
     frame.render_widget(Clear, inner);
 
     if data.rows.is_empty() {
-        let paragraph = Paragraph::new(Line::styled(EMPTY_STATE, theme::text_dim()))
-            .wrap(Wrap { trim: true });
+        let paragraph =
+            Paragraph::new(Line::styled(EMPTY_STATE, theme::text_dim())).wrap(Wrap { trim: true });
         frame.render_widget(paragraph, inner);
         return (
             DetailReport {
@@ -218,11 +217,8 @@ fn split_inner(inner: Rect, detail_present: bool) -> (Rect, Rect) {
     if !detail_present || inner.height < ROSTER_MIN + DETAIL_MIN {
         return (inner, Rect::default());
     }
-    let chunks = Layout::vertical([
-        Constraint::Min(ROSTER_MIN),
-        Constraint::Min(DETAIL_MIN),
-    ])
-    .split(inner);
+    let chunks =
+        Layout::vertical([Constraint::Min(ROSTER_MIN), Constraint::Min(DETAIL_MIN)]).split(inner);
     (chunks[0], chunks[1])
 }
 
@@ -267,10 +263,7 @@ fn draw_roster(
         })
         .collect();
 
-    frame.render_widget(
-        Paragraph::new(lines).scroll((scroll as u16, 0)),
-        roster,
-    );
+    frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), roster);
     if max_scroll > 0 {
         let mut state = ScrollbarState::new(max_scroll).position(scroll);
         frame.render_stateful_widget(
@@ -333,7 +326,9 @@ fn row_spans(row: &SubagentDetail, entry: Option<&WorkerEntry>) -> Vec<Span<'sta
     if let Some(task) = task_id(row, entry) {
         spans.push(Span::styled(format!(" {task}"), theme::text_dim()));
     }
-    if let Some(turns) = entry.map(|entry| entry.implementation_turns).filter(|turns| *turns > 0)
+    if let Some(turns) = entry
+        .map(|entry| entry.implementation_turns)
+        .filter(|turns| *turns > 0)
     {
         spans.push(Span::styled(format!(" turn {turns}"), theme::text_dim()));
     }
@@ -387,7 +382,13 @@ fn draw_detail(
     // the header line has to be rebuilt: it is the single-row line §7.4 pins to
     // the rect, while every other line wraps inside the paragraph.
     let height = usize::from(body.height);
-    let mut lines = detail_lines(row, entry, body.width, data.show_thought, data.thinking_budget);
+    let mut lines = detail_lines(
+        row,
+        entry,
+        body.width,
+        data.show_thought,
+        data.thinking_budget,
+    );
     let total = count_wrapped_rendered_lines(&lines, usize::from(body.width));
     let scrollbar = total > height && body.width > 1;
     let text_width = if scrollbar {
@@ -651,7 +652,9 @@ fn task_id(row: &SubagentDetail, entry: Option<&WorkerEntry>) -> Option<String> 
 /// fallback for a restored row.
 fn elapsed_secs(row: &SubagentDetail, entry: Option<&WorkerEntry>) -> u64 {
     if row.is_active {
-        let since_start = row.started_at.map_or(0, |started| started.elapsed().as_secs());
+        let since_start = row
+            .started_at
+            .map_or(0, |started| started.elapsed().as_secs());
         row.worked_duration.as_secs().saturating_add(since_start)
     } else {
         let worked = row.worked_duration.as_secs();
@@ -669,11 +672,7 @@ fn token_count(row: &SubagentDetail, entry: Option<&WorkerEntry>) -> usize {
     if row.context_tokens > 0 {
         return row.context_tokens;
     }
-    entry.map_or(0, |entry| {
-        entry
-            .context_tokens
-            .max(entry.last_tokens)
-    })
+    entry.map_or(0, |entry| entry.context_tokens.max(entry.last_tokens))
 }
 
 /// `12345` reads `12.3k`, as the roster has always spelled a token count.
@@ -719,8 +718,8 @@ mod tests {
     }
 
     fn rows_text(width: u16, height: u16, data: &ActivityData<'_>) -> Vec<String> {
-        let backend = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
-            .unwrap();
+        let backend =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         let mut terminal = backend;
         terminal
             .draw(|frame| {
@@ -755,7 +754,10 @@ mod tests {
             let task = format!("t-{index:03}");
             assert!(text.contains(&task), "worker {index} missing from: {text}");
         }
-        assert!(text.contains("1/12"), "roster position chip expected: {text}");
+        assert!(
+            text.contains("1/12"),
+            "roster position chip expected: {text}"
+        );
     }
 
     #[test]
@@ -774,7 +776,10 @@ mod tests {
         let seen = rows_text(70, 12, &data);
         let text = seen.join("\n");
         // The selected row is kept on screen, and the scrollbar says more exist.
-        assert!(text.contains("t-012"), "selected row must be visible: {text}");
+        assert!(
+            text.contains("t-012"),
+            "selected row must be visible: {text}"
+        );
         assert!(!text.contains("t-001"), "older rows scroll out: {text}");
         assert!(
             seen.iter().any(|row| row.ends_with('\u{2502}')),
@@ -873,7 +878,10 @@ mod tests {
             thinking_budget: None,
         };
         let text = rows_text(70, 20, &data).join("\n");
-        assert!(!text.contains("val "), "no validation round may be printed: {text}");
+        assert!(
+            !text.contains("val "),
+            "no validation round may be printed: {text}"
+        );
         assert!(!text.contains("round"), "no round counter: {text}");
     }
 
@@ -921,7 +929,10 @@ mod tests {
         assert!(text.contains("[Logs]"), "logs header expected: {text}");
         assert!(text.contains("started task t-001"), "log expected: {text}");
         assert!(text.contains("green log line"), "ansi log expected: {text}");
-        assert!(!text.contains('\x1b'), "escape bytes never reach the screen");
+        assert!(
+            !text.contains('\x1b'),
+            "escape bytes never reach the screen"
+        );
     }
 
     #[test]
@@ -940,7 +951,10 @@ mod tests {
         };
         let text = rows_text(70, 20, &data).join("\n");
         assert!(!text.contains("private chain of thought"), "got: {text}");
-        assert!(text.contains("[Thinking]"), "presence still reported: {text}");
+        assert!(
+            text.contains("[Thinking]"),
+            "presence still reported: {text}"
+        );
     }
 
     #[test]
@@ -1141,7 +1155,10 @@ mod tests {
             let seen = rows_text(70, 12, &data);
             let text = seen.join("\n");
             let task = format!("t-{:03}", selected + 1);
-            assert!(text.contains(&task), "worker {selected} unreachable: {text}");
+            assert!(
+                text.contains(&task),
+                "worker {selected} unreachable: {text}"
+            );
             let markers = seen
                 .iter()
                 .filter(|line| line.contains(SELECTION_MARKER.trim()))
@@ -1181,12 +1198,13 @@ mod tests {
                 show_thought: false,
                 thinking_budget: None,
             };
-            let backend = ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 10)).unwrap();
+            let backend =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 10)).unwrap();
             let mut terminal = backend;
             terminal
                 .draw(|frame| {
-                render(frame, Rect::new(0, 0, 70, 10), &data);
-            })
+                    render(frame, Rect::new(0, 0, 70, 10), &data);
+                })
                 .unwrap();
             let buffer = terminal.backend().buffer();
             let mut markers = 0usize;
@@ -1284,17 +1302,31 @@ mod tests {
         assert_eq!(geometry(70, 12, &scrolled).roster_scroll, 5);
 
         // An offset past the end is lowered, never wrapped.
-        let past = ActivityData { selected: 11, list_scroll: 999, ..scrolled };
+        let past = ActivityData {
+            selected: 11,
+            list_scroll: 999,
+            ..scrolled
+        };
         let seen = geometry(70, 12, &past);
-        assert_eq!(seen.roster_scroll, 7, "clamped to `rows - height`: {seen:?}");
+        assert_eq!(
+            seen.roster_scroll, 7,
+            "clamped to `rows - height`: {seen:?}"
+        );
         let text = rows_text(70, 12, &past).join("\n");
         assert!(text.contains("t-012"), "the tail is on screen: {text}");
 
         // The minimal reveal survives: an offset that would hide the selection is
         // pulled back only as far as it must be.
-        let hidden = ActivityData { selected: 11, list_scroll: 0, ..scrolled };
+        let hidden = ActivityData {
+            selected: 11,
+            list_scroll: 0,
+            ..scrolled
+        };
         let seen = geometry(70, 12, &hidden);
-        assert_eq!(seen.roster_scroll, 7, "selection pulls just enough: {seen:?}");
+        assert_eq!(
+            seen.roster_scroll, 7,
+            "selection pulls just enough: {seen:?}"
+        );
         assert!(rows_text(70, 12, &hidden).join("\n").contains("t-012"));
     }
 
@@ -1361,4 +1393,3 @@ mod tests {
         seen
     }
 }
-

@@ -219,14 +219,12 @@ impl PlanProgress {
             .iter()
             .filter(|task| task.checkbox == CheckboxState::Checked)
             .count();
-        let active_task = active_plan_task
-            .map(str::to_string)
-            .or_else(|| {
-                subagents
-                    .iter()
-                    .find(|row| row.is_active)
-                    .and_then(|row| row.task_id.clone())
-            });
+        let active_task = active_plan_task.map(str::to_string).or_else(|| {
+            subagents
+                .iter()
+                .find(|row| row.is_active)
+                .and_then(|row| row.task_id.clone())
+        });
         Self {
             done,
             total,

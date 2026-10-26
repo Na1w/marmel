@@ -167,6 +167,12 @@ pub struct TuiRenderer {
     /// The armed-abort prompt of §8.5 occupies the same surface while its 3 s
     /// window is live; `close_overlay` dismisses whichever surface is on top.
     pub(crate) confirm_open: bool,
+    /// Which request the confirm surface is holding (spec §3, G3): the tag the key
+    /// path needs so `y` runs exactly what `x` or `Ctrl+D` asked for instead of
+    /// re-guessing it from whatever pane happens to be focused. `None` means the
+    /// surface on screen is the armed-abort prompt, which honours no `y`/`n` at all
+    /// (§5 disarms on printables).
+    pub(crate) confirm_action: Option<events::ConfirmAction>,
     /// What [`Self::adopt_legacy_view_writes`] last saw on the legacy view
     /// fields, so a write the transition helpers made is never mistaken for a
     /// write the legacy key path made.
@@ -316,6 +322,7 @@ impl TuiRenderer {
             overlay: state::OverlayState::None,
             help_open: false,
             confirm_open: false,
+            confirm_action: None,
             legacy_view: LegacyViewMirror {
                 plan_visible: false,
                 workers_visible: false,
@@ -734,16 +741,13 @@ impl TuiRenderer {
             if !sa.is_active {
                 continue;
             }
-            let tid = sa.task_id.as_deref().or_else(|| {
-                sa.name
-                    .find("-t-")
-                    .map(|pos| &sa.name[pos + 1..])
-            });
+            let tid = sa
+                .task_id
+                .as_deref()
+                .or_else(|| sa.name.find("-t-").map(|pos| &sa.name[pos + 1..]));
             if let Some(tid) = tid {
                 let clean = crate::ui::tui::formatting::clean_task_id(tid);
-                if !clean.is_empty()
-                    && !active.iter().any(|t| t.eq_ignore_ascii_case(clean))
-                {
+                if !clean.is_empty() && !active.iter().any(|t| t.eq_ignore_ascii_case(clean)) {
                     active.push(clean.to_string());
                 }
             }
@@ -760,14 +764,12 @@ impl TuiRenderer {
     /// The task the plan auto-scroll centres on: the plan's own active task, else
     /// the task of the first active worker.
     pub(crate) fn plan_target_task(&self) -> Option<String> {
-        self.active_plan_task
-            .clone()
-            .or_else(|| {
-                self.subagents
-                    .iter()
-                    .find(|sa| sa.is_active && sa.task_id.is_some())
-                    .and_then(|sa| sa.task_id.clone())
-            })
+        self.active_plan_task.clone().or_else(|| {
+            self.subagents
+                .iter()
+                .find(|sa| sa.is_active && sa.task_id.is_some())
+                .and_then(|sa| sa.task_id.clone())
+        })
     }
 
     /// Where the composer is standing in the input history, for the `history n/m`

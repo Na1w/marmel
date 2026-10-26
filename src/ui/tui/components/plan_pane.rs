@@ -140,7 +140,8 @@ fn draw_body(frame: &mut Frame, rect: Rect, data: &PlanData<'_>) -> PlanGeometry
             .scroll((scroll, 0));
         frame.render_widget(paragraph, inner);
         if max_scroll > 0 {
-            let mut state = ScrollbarState::new(usize::from(max_scroll)).position(usize::from(scroll));
+            let mut state =
+                ScrollbarState::new(usize::from(max_scroll)).position(usize::from(scroll));
             frame.render_stateful_widget(
                 Scrollbar::new(ScrollbarOrientation::VerticalRight),
                 inner,
@@ -247,7 +248,10 @@ fn state_spans(data: &PlanData<'_>, geometry: PlanGeometry) -> Vec<Span<'static>
         ));
         if progress.active_task.is_some() {
             spans.push(Glyph::Active.badge());
-            spans.push(Span::styled(" in flight ".to_string(), theme::chip_active()));
+            spans.push(Span::styled(
+                " in flight ".to_string(),
+                theme::chip_active(),
+            ));
         }
     } else {
         // §8.1: an empty plan is stated, never left blank. The body carries the
@@ -338,7 +342,11 @@ mod tests {
     }
 
     /// Each body row paired with the style of its first non-blank cell.
-    fn body_styles(width: u16, height: u16, data: &PlanData<'_>) -> Vec<(String, ratatui::style::Style)> {
+    fn body_styles(
+        width: u16,
+        height: u16,
+        data: &PlanData<'_>,
+    ) -> Vec<(String, ratatui::style::Style)> {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
@@ -379,10 +387,7 @@ mod tests {
         // exactly the `CheckboxState::Checked` / total split of the same string.
         let fixtures = [
             ("", "0/0 done"),
-            (
-                "- [x] [t-001] one\n- [x] [t-002] two\n",
-                "2/2 done",
-            ),
+            ("- [x] [t-001] one\n- [x] [t-002] two\n", "2/2 done"),
             (MIXED, "3/7 done"),
         ];
         for (plan_text, label) in fixtures {
@@ -431,9 +436,18 @@ mod tests {
         assert!(top.contains("t-004"), "active task id: {top:?}");
         assert!(top.contains('●'), "focus badge (G6): {top:?}");
 
-        assert!(bottom.contains('✓') && bottom.contains("3 done "), "{bottom:?}");
-        assert!(bottom.contains('⧗') && bottom.contains("4 open "), "{bottom:?}");
-        assert!(bottom.contains('▶') && bottom.contains("in flight"), "{bottom:?}");
+        assert!(
+            bottom.contains('✓') && bottom.contains("3 done "),
+            "{bottom:?}"
+        );
+        assert!(
+            bottom.contains('⧗') && bottom.contains("4 open "),
+            "{bottom:?}"
+        );
+        assert!(
+            bottom.contains('▶') && bottom.contains("in flight"),
+            "{bottom:?}"
+        );
     }
 
     #[test]
@@ -443,7 +457,12 @@ mod tests {
         let cases = [
             (MIXED, None, '⧗', "open, nothing running"),
             (MIXED, Some("t-004"), '▶', "one task in flight"),
-            ("- [x] [t-001] one\n- [x] [t-002] two\n", None, '✓', "every task checked off"),
+            (
+                "- [x] [t-001] one\n- [x] [t-002] two\n",
+                None,
+                '✓',
+                "every task checked off",
+            ),
         ];
         for (plan_text, active, glyph, why) in cases {
             let progress = PlanProgress::from_plan(plan_text, active, &[]);
@@ -476,10 +495,22 @@ mod tests {
         };
         let (top, bottom) = draw(60, 8, &data);
         assert!(top.contains("2/2 done"), "{top:?}");
-        assert!(bottom.contains('✓') && bottom.contains("2 done "), "{bottom:?}");
-        assert!(bottom.contains('⧗') && bottom.contains("0 open "), "{bottom:?}");
-        assert!(!bottom.contains("in flight"), "nothing is running: {bottom:?}");
-        assert!(!bottom.contains("no tasks"), "the plan is not empty: {bottom:?}");
+        assert!(
+            bottom.contains('✓') && bottom.contains("2 done "),
+            "{bottom:?}"
+        );
+        assert!(
+            bottom.contains('⧗') && bottom.contains("0 open "),
+            "{bottom:?}"
+        );
+        assert!(
+            !bottom.contains("in flight"),
+            "nothing is running: {bottom:?}"
+        );
+        assert!(
+            !bottom.contains("no tasks"),
+            "the plan is not empty: {bottom:?}"
+        );
     }
 
     #[test]
@@ -530,7 +561,10 @@ mod tests {
 
         // An offset past the end is lowered to the largest legal one, and both the
         // readout and the geometry report the offset actually drawn.
-        let past = PlanData { scroll: 999, ..top_of_plan };
+        let past = PlanData {
+            scroll: 999,
+            ..top_of_plan
+        };
         let (rows, bottom) = draw_body_only(60, 10, &past);
         assert_eq!(rows.scroll, rows.max_scroll, "clamped into range: {rows:?}");
         assert!(
@@ -585,7 +619,10 @@ mod tests {
             theme::chip_active().fg,
             "and uses the active slot, not a raw colour"
         );
-        assert_eq!(styled("[t-001] research baseline").fg, theme::chip_done().fg);
+        assert_eq!(
+            styled("[t-001] research baseline").fg,
+            theme::chip_done().fg
+        );
         assert_eq!(
             styled("[t-005] header pane").fg,
             theme::chip_pending().fg,
@@ -609,7 +646,10 @@ mod tests {
             target_task: Some("t-020"),
         };
         let (geometry, _) = draw_body_only(60, 10, &data);
-        assert_eq!(geometry.scroll, 19, "one line of context above t-020: {geometry:?}");
+        assert_eq!(
+            geometry.scroll, 19,
+            "one line of context above t-020: {geometry:?}"
+        );
 
         // No target: the first open task leads instead.
         let no_target = PlanData {
@@ -617,10 +657,16 @@ mod tests {
             ..data
         };
         let (geometry, _) = draw_body_only(60, 10, &no_target);
-        assert_eq!(geometry.scroll, 0, "first pending task is on line 0: {geometry:?}");
+        assert_eq!(
+            geometry.scroll, 0,
+            "first pending task is on line 0: {geometry:?}"
+        );
 
         // Auto-scroll overrides a stale manual offset rather than honouring it.
-        let stale = PlanData { scroll: 999, ..no_target };
+        let stale = PlanData {
+            scroll: 999,
+            ..no_target
+        };
         let (geometry, _) = draw_body_only(60, 10, &stale);
         assert_eq!(geometry.scroll, 0, "{geometry:?}");
     }
@@ -669,7 +715,11 @@ mod tests {
         for width in [40u16, 60, 80, 100] {
             let (top, bottom) = draw(width, 10, &data);
             assert_eq!(top.chars().count(), usize::from(width), "top row: {top:?}");
-            assert_eq!(bottom.chars().count(), usize::from(width), "bottom: {bottom:?}");
+            assert_eq!(
+                bottom.chars().count(),
+                usize::from(width),
+                "bottom: {bottom:?}"
+            );
             assert!(top.contains("3/7 done"), "{width}: {top:?}");
             assert!(
                 top.contains("t-004"),
@@ -701,6 +751,10 @@ mod tests {
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
-        assert_eq!(buffer[(0, 0)].symbol(), " ", "nothing was painted into the frame");
+        assert_eq!(
+            buffer[(0, 0)].symbol(),
+            " ",
+            "nothing was painted into the frame"
+        );
     }
 }

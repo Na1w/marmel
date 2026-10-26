@@ -783,7 +783,9 @@ mod tests {
             "the draft body is drawn by the component: {rows:?}"
         );
         assert_eq!(
-            rows.iter().filter(|row| row.contains("rebuild the TUI")).count(),
+            rows.iter()
+                .filter(|row| row.contains("rebuild the TUI"))
+                .count(),
             1,
             "and not twice: {rows:?}"
         );
@@ -802,8 +804,7 @@ mod tests {
 
     #[test]
     fn the_draft_body_is_drawn_inside_the_frame_it_owns() {
-        let textarea =
-            ratatui_textarea::TextArea::new(vec![String::from("wireframe the header")]);
+        let textarea = ratatui_textarea::TextArea::new(vec![String::from("wireframe the header")]);
         let buffer = textarea.lines().join("\n");
         let data = InputData {
             focus: true,

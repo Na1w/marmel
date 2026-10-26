@@ -101,7 +101,11 @@ pub fn render(frame: &mut Frame, rect: Rect, data: &HeaderData<'_>) {
 /// Split out from [`render`] so the ladder is a pure function of the values that
 /// reach the pane — which is what makes the §7.4 order testable at 100, 90 and 70
 /// columns without driving the whole render loop.
-pub(crate) fn header_line(data: &HeaderData<'_>, elapsed: Option<u64>, width: u16) -> Vec<Span<'static>> {
+pub(crate) fn header_line(
+    data: &HeaderData<'_>,
+    elapsed: Option<u64>,
+    width: u16,
+) -> Vec<Span<'static>> {
     let mut fields = fields(data, elapsed);
     drop_to_fit(&mut fields, usize::from(width));
     let spans: Vec<Span<'static>> = fields.into_iter().flat_map(|field| field.spans).collect();
@@ -113,16 +117,17 @@ pub(crate) fn header_line(data: &HeaderData<'_>, elapsed: Option<u64>, width: u1
 /// Build the header fields in the display order of §2.2: brand, mode name,
 /// `done/total`, active task id, (`val N`), `ctx …`, elapsed.
 fn fields(data: &HeaderData<'_>, elapsed: Option<u64>) -> Vec<Field> {
-    let mut fields = vec![
-        Field {
-            drop: None,
-            spans: vec![Span::styled(" Marmel".to_string(), theme::chip_done())],
-        },
-    ];
+    let mut fields = vec![Field {
+        drop: None,
+        spans: vec![Span::styled(" Marmel".to_string(), theme::chip_done())],
+    }];
     if data.budget.show_mode {
         fields.push(Field {
             drop: Some(Drop::Mode),
-            spans: vec![Span::styled(format!(" {}", data.mode.label()), theme::text_dim())],
+            spans: vec![Span::styled(
+                format!(" {}", data.mode.label()),
+                theme::text_dim(),
+            )],
         });
     }
     fields.push(Field {
@@ -295,8 +300,14 @@ mod tests {
             elapsed: None,
         };
         let line = text(&header_line(&data, Some(723), 90));
-        assert!(line.contains("M4 Split") && line.contains("3/7 done"), "{line:?}");
-        assert!(line.contains("t-004") && line.contains("ctx 12.4k"), "{line:?}");
+        assert!(
+            line.contains("M4 Split") && line.contains("3/7 done"),
+            "{line:?}"
+        );
+        assert!(
+            line.contains("t-004") && line.contains("ctx 12.4k"),
+            "{line:?}"
+        );
         assert!(line.contains("elapsed 12m 3s"), "{line:?}");
     }
 
@@ -321,20 +332,35 @@ mod tests {
         let at_70 = text(&header_line(&data, Some(723), 70));
         assert!(!at_70.contains("ctx "), "ctx is first out: {at_70:?}");
         assert!(!at_70.contains("elapsed"), "then the clock: {at_70:?}");
-        assert!(at_70.contains("M4 Split"), "the mode name outlives both: {at_70:?}");
-        assert!(at_70.contains("t-004"), "the task id outlives the mode name: {at_70:?}");
+        assert!(
+            at_70.contains("M4 Split"),
+            "the mode name outlives both: {at_70:?}"
+        );
+        assert!(
+            at_70.contains("t-004"),
+            "the task id outlives the mode name: {at_70:?}"
+        );
         assert!(
             UnicodeWidthStr::width(at_70.as_str()) <= 70,
             "70 columns: {at_70:?}"
         );
 
         let at_56 = text(&header_line(&data, Some(723), 56));
-        assert!(!at_56.contains("M4 Split"), "the mode name goes next: {at_56:?}");
+        assert!(
+            !at_56.contains("M4 Split"),
+            "the mode name goes next: {at_56:?}"
+        );
         assert!(at_56.contains("t-004"), "{at_56:?}");
 
         let at_40 = text(&header_line(&data, Some(723), 40));
-        assert!(!at_40.contains("t-004"), "the task id is last out: {at_40:?}");
-        assert!(at_40.contains("3/7 done"), "done/total is never dropped: {at_40:?}");
+        assert!(
+            !at_40.contains("t-004"),
+            "the task id is last out: {at_40:?}"
+        );
+        assert!(
+            at_40.contains("3/7 done"),
+            "done/total is never dropped: {at_40:?}"
+        );
 
         // Ladder invariant while narrowing: a chip that has left never comes back.
         let mut previous: Option<String> = None;
@@ -370,11 +396,7 @@ mod tests {
         // of the same plan string the plan pane draws.
         let fixtures = [
             ("", 0, 0),
-            (
-                "- [x] [t-001] done one\n- [x] [t-002] done two\n",
-                2,
-                2,
-            ),
+            ("- [x] [t-001] done one\n- [x] [t-002] done two\n", 2, 2),
             (MIXED, 3, 7),
         ];
         for (plan_text, done, total) in fixtures {
@@ -448,7 +470,10 @@ mod tests {
         let row = draw(40, &data);
         assert!(row.contains("Marmel"), "{row:?}");
         assert!(row.contains("3/7 done"), "{row:?}");
-        assert!(!row.contains("ctx "), "40 cols is below the ctx band: {row:?}");
+        assert!(
+            !row.contains("ctx "),
+            "40 cols is below the ctx band: {row:?}"
+        );
     }
 
     #[test]
@@ -501,7 +526,10 @@ mod tests {
         let row = draw(120, &data);
         assert!(row.contains("elapsed 12m 3s"), "{row:?}");
 
-        let idle = HeaderData { elapsed: None, ..data };
+        let idle = HeaderData {
+            elapsed: None,
+            ..data
+        };
         assert!(!draw(120, &idle).contains("elapsed"), "no clock, no chip");
     }
 
@@ -526,6 +554,10 @@ mod tests {
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
-        assert_eq!(buffer[(0, 0)].symbol(), " ", "nothing was painted into the frame");
+        assert_eq!(
+            buffer[(0, 0)].symbol(),
+            " ",
+            "nothing was painted into the frame"
+        );
     }
 }

@@ -133,11 +133,9 @@ pub fn render(frame: &mut Frame, rect: Rect, data: &TranscriptData<'_>) -> BodyR
     } else {
         theme::frame_idle()
     };
-    let block = pane_block(FocusPane::Transcript.label(), data.focus, border)
-        .title_bottom(Line::from(fit_spans(
-            chip_row(data.follow, report),
-            title_width(rect),
-        )));
+    let block = pane_block(FocusPane::Transcript.label(), data.focus, border).title_bottom(
+        Line::from(fit_spans(chip_row(data.follow, report), title_width(rect))),
+    );
     frame.render_widget(block, rect);
     report
 }
@@ -199,8 +197,8 @@ pub(crate) fn draw_body(
             // A pane that is handed no conversation at all leaves the frame to its
             // owner rather than painting over it.
             if !occupied(frame, inner) {
-                let paragraph =
-                    Paragraph::new(Line::styled(EMPTY_STATE, theme::text_dim())).wrap(Wrap { trim: true });
+                let paragraph = Paragraph::new(Line::styled(EMPTY_STATE, theme::text_dim()))
+                    .wrap(Wrap { trim: true });
                 frame.render_widget(paragraph, inner);
             }
         } else {
@@ -248,7 +246,10 @@ fn body_lines(body: &TranscriptBody<'_>) -> Vec<Line<'static>> {
         }
     } else {
         for message in body.messages {
-            lines.extend(verdict_marks(render_message_lines(message, body.show_thought)));
+            lines.extend(verdict_marks(render_message_lines(
+                message,
+                body.show_thought,
+            )));
         }
     }
     if body.show_thought && !body.thought.is_empty() {
@@ -315,7 +316,12 @@ fn steer_lines(steer: &str, messages: &[String]) -> Vec<Line<'static>> {
     let prefix = if already_labelled { "" } else { "Marmennill: " };
     let text = format!("{prefix}{steer}");
     text.lines()
-        .map(|line| Line::from(Span::styled(line.replace('\t', "    "), theme::chip_active())))
+        .map(|line| {
+            Line::from(Span::styled(
+                line.replace('\t', "    "),
+                theme::chip_active(),
+            ))
+        })
         .collect()
 }
 
@@ -388,7 +394,11 @@ impl Verdict {
 /// whole line takes the verdict colour, which is what makes a verdict readable
 /// apart from body text at a glance.
 fn verdict_mark(line: Line<'static>) -> Line<'static> {
-    let text: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
     let Some(verdict) = verdict_of(&text) else {
         return line;
     };
@@ -474,10 +484,7 @@ fn chip_row(follow: bool, report: BodyReport) -> Vec<Span<'static>> {
 /// so no key press is ever silent (G5).
 fn scroll_chip(follow: bool, unseen: usize) -> Span<'static> {
     if follow {
-        Span::styled(
-            format!(" {} LIVE ", theme::FOCUS_BADGE),
-            theme::chip_done(),
-        )
+        Span::styled(format!(" {} LIVE ", theme::FOCUS_BADGE), theme::chip_done())
     } else if unseen > 0 {
         Span::styled(format!(" \u{2193} {unseen} new "), theme::chip_pending())
     } else {
@@ -580,7 +587,14 @@ mod tests {
         };
         terminal
             .draw(|frame| {
-                report = draw_body(frame, Rect::new(0, 0, width, height), body, follow, scroll, None);
+                report = draw_body(
+                    frame,
+                    Rect::new(0, 0, width, height),
+                    body,
+                    follow,
+                    scroll,
+                    None,
+                );
             })
             .unwrap();
         (rows(terminal.backend().buffer(), width, height), report)
@@ -660,8 +674,7 @@ mod tests {
         // Five more messages arrive while follow is off.
         let mut grown = messages.clone();
         grown.extend(fixture(30..35));
-        let (second_seen, second) =
-            draw_body_rows(50, 12, &body_of(&grown), false, first.scroll);
+        let (second_seen, second) = draw_body_rows(50, 12, &body_of(&grown), false, first.scroll);
 
         // The text columns are identical: with follow off the viewport must not
         // move. Only the scrollbar thumb on the last column re-proportions.
@@ -677,7 +690,10 @@ mod tests {
         );
         assert_eq!(first.scroll, second.scroll);
         assert_eq!(second.unseen, 5);
-        assert!(second.max_scroll > first.max_scroll, "scroll range must grow");
+        assert!(
+            second.max_scroll > first.max_scroll,
+            "scroll range must grow"
+        );
         let chip = scroll_chip(false, second.unseen);
         assert_eq!(chip.content.as_ref(), " \u{2193} 5 new ");
     }
@@ -724,7 +740,8 @@ mod tests {
         assert_eq!(report.max_scroll, 20);
         assert_eq!(report.scroll, 20);
         assert!(
-            seen.iter().any(|row| row.ends_with('\u{2502}') || row.contains('\u{25bc}')),
+            seen.iter()
+                .any(|row| row.ends_with('\u{2502}') || row.contains('\u{25bc}')),
             "scrollbar expected: {seen:?}"
         );
         assert_eq!(position_chip(report).content.as_ref(), " scroll 20/20 ");
@@ -806,8 +823,7 @@ mod tests {
         for left in 0..styles.len() {
             for right in (left + 1)..styles.len() {
                 assert_ne!(
-                    styles[left].fg,
-                    styles[right].fg,
+                    styles[left].fg, styles[right].fg,
                     "verdict colours collide: {styles:?}"
                 );
             }
@@ -818,7 +834,10 @@ mod tests {
     fn a_revoked_completion_is_a_verdict_but_never_a_completion() {
         let revoked = format!("{} (t-007)", markers::REVOCATION_TOKEN);
         assert_eq!(verdict_of(&revoked), Some(Verdict::Revoked));
-        assert_eq!(verdict_of(markers::MARKER_COMPLETE), Some(Verdict::Complete));
+        assert_eq!(
+            verdict_of(markers::MARKER_COMPLETE),
+            Some(Verdict::Complete)
+        );
         // A revoked claim is badged with the failure glyph in its own colour, so
         // it can never be read as the green completion it used to claim.
         let line = verdict_mark(Line::raw(revoked));
@@ -910,7 +929,11 @@ mod tests {
             unseen: 8,
             total_lines: 18,
         };
-        assert_eq!(chip_row(false, overflowing).len(), 3, "readout when clipped");
+        assert_eq!(
+            chip_row(false, overflowing).len(),
+            3,
+            "readout when clipped"
+        );
     }
 
     #[test]
@@ -936,10 +959,7 @@ mod tests {
                 );
                 // The follow chip is the first thing dropped from the right, so
                 // the state echo survives at every width (§7.4 drop order).
-                let text: String = fitted
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect();
+                let text: String = fitted.iter().map(|span| span.content.as_ref()).collect();
                 assert!(
                     text.contains(if follow { "LIVE" } else { "new" }),
                     "follow chip lost at width {width}: {text:?}"
@@ -1020,7 +1040,10 @@ mod tests {
             .join("\n");
         assert!(text.contains("fn main() {}"), "got: {text}");
         assert!(text.contains("red ansi text"), "got: {text}");
-        assert!(!text.contains('\x1b'), "escape bytes must never reach the screen");
+        assert!(
+            !text.contains('\x1b'),
+            "escape bytes must never reach the screen"
+        );
     }
 
     #[test]
