@@ -770,6 +770,223 @@ async fn test_renderer_sink_handles_reset_command() {
     );
 }
 
+/// A renderer that gates destructive commands behind its own confirm surface —
+/// the contract the rebuilt TUI implements
+/// (`tui/mod.rs::gates_destructive_commands`), with the same mid-turn
+/// `poll_input` shape as [`RecordingRenderer`].
+struct GatingRenderer {
+    input_queue: std::collections::VecDeque<String>,
+    input_state: crate::ui::InputState,
+}
+
+impl GatingRenderer {
+    fn new() -> Self {
+        Self {
+            input_queue: std::collections::VecDeque::new(),
+            input_state: crate::ui::InputState::default(),
+        }
+    }
+}
+
+impl Renderer for GatingRenderer {
+    fn init(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn on_event(&mut self, _event: &Event) {}
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn poll_input(&mut self) -> Option<String> {
+        self.input_queue.pop_front()
+    }
+    fn input_state(&mut self) -> &mut crate::ui::InputState {
+        &mut self.input_state
+    }
+    fn input_state_shared(&self) -> &crate::ui::InputState {
+        &self.input_state
+    }
+    fn shutdown(&mut self) {}
+    fn gates_destructive_commands(&self) -> bool {
+        true
+    }
+}
+
+/// Drive exactly one `poll_control` round of the stream sink — the mid-turn input
+/// path (`bridge::sink::RendererSink::poll_control`) — with whatever the renderer
+/// has queued.
+fn sink_poll_control(renderer: &mut dyn Renderer) -> crate::llm::StreamControl {
+    use crate::llm::StreamSink;
+    use crate::ui::bridge::RendererSink;
+
+    let mut steer_queue = Vec::new();
+    let mut steer_abort_requested = false;
+    let (arb_tx, _arb_tx_kept) = tokio::sync::mpsc::unbounded_channel();
+    let (_arb_tx2, mut arb_rx) = tokio::sync::mpsc::unbounded_channel();
+    let client = ChatClient::new("http://localhost:11434/v1", "test".to_string());
+    let stats = Arc::new(crate::harness::HarnessStats::new());
+    let mut panel_rows = Vec::new();
+
+    let mut sink = RendererSink {
+        renderer,
+        steer_queue: &mut steer_queue,
+        steer_abort_requested: &mut steer_abort_requested,
+        arb_tx: &arb_tx,
+        arb_rx: &mut arb_rx,
+        client: &client,
+        stats,
+        goal: "goal",
+        subagents: &mut panel_rows,
+        plan: None,
+        ctx: None,
+        steering_history: None,
+    };
+    sink.poll_control()
+}
+
+/// t-013, the shared-input regression: the stream sink is the **second** consumer
+/// of renderer input (the session loop being the first), so it must read the
+/// destructive-command gate through the same owner
+/// (`helpers::is_abort_for_renderer`). For an un-gated renderer — headless
+/// `RawRenderer`, the CLI, these test doubles — the mid-turn bare words that were
+/// abort commands before spec §5 still abort the stream and ask for the exit,
+/// byte-unchanged.
+#[test]
+fn test_sink_mid_turn_abort_keeps_the_legacy_vocabulary_for_an_ungated_renderer() {
+    for word in ["stop", "cancel", "exit", "quit", "abort", "/abort", "/exit"] {
+        let mut renderer = RecordingRenderer::new();
+        renderer.input_queue.push_back(word.to_string());
+        assert!(
+            is_abort_for_renderer(&renderer, word),
+            "an un-gated renderer must still read {word:?} as an abort"
+        );
+
+        let ctrl = sink_poll_control(&mut renderer);
+        assert!(
+            matches!(ctrl, crate::llm::StreamControl::Abort),
+            "{word:?} must abort the stream for an un-gated renderer, got {ctrl:?}"
+        );
+        assert!(
+            renderer.aborted() || renderer.user_exit_requested(),
+            "{word:?} must still request the exit for an un-gated renderer"
+        );
+    }
+}
+
+/// …and for a renderer that **does** gate, the same mid-turn bare word is ordinary
+/// steering text (`StreamControl::Pause`) rather than an exit, while the deliberate
+/// slash spelling — which in the TUI only arrives here after `y` on the confirm
+/// surface — still aborts.
+#[test]
+fn test_sink_mid_turn_hands_a_gating_renderers_bare_word_to_steering() {
+    for word in ["stop", "cancel", "exit", "quit", "abort"] {
+        let mut renderer = GatingRenderer::new();
+        renderer.input_queue.push_back(word.to_string());
+        assert!(
+            !is_abort_for_renderer(&renderer, word),
+            "a gated renderer must not read {word:?} as an abort"
+        );
+
+        let ctrl = sink_poll_control(&mut renderer);
+        match ctrl {
+            crate::llm::StreamControl::Pause { user_input } => {
+                assert_eq!(user_input, word, "{word:?} is delivered as steering");
+            }
+            other => panic!("{word:?} must be steered, not {other:?}"),
+        }
+        assert!(
+            !renderer.aborted() && !renderer.user_exit_requested(),
+            "a bare word may not request the exit for a gated renderer"
+        );
+    }
+
+    // The confirmed spellings keep their meaning on both paths.
+    let mut renderer = GatingRenderer::new();
+    renderer.input_queue.push_back("/abort".to_string());
+    let ctrl = sink_poll_control(&mut renderer);
+    assert!(
+        matches!(ctrl, crate::llm::StreamControl::Abort),
+        "the slash spelling still aborts mid-turn for a gated renderer: {ctrl:?}"
+    );
+    assert!(
+        renderer.aborted() || renderer.user_exit_requested(),
+        "the slash spelling must still request the exit"
+    );
+}
+
+/// The owner itself: the gate is what picks the vocabulary, and a multi-line
+/// submission is never a command on either side of it.
+#[test]
+fn test_is_abort_for_renderer_selects_the_vocabulary_by_gate() {
+    let un_gated = RecordingRenderer::new();
+    let gated = GatingRenderer::new();
+    for word in ["stop", "cancel", "exit", "quit", "abort"] {
+        assert!(
+            is_abort_for_renderer(&un_gated, word),
+            "legacy vocabulary for the un-gated renderer: {word:?}"
+        );
+        assert!(
+            !is_abort_for_renderer(&gated, word),
+            "bare words are steering text for a gating renderer: {word:?}"
+        );
+    }
+    // Bare `q` was never a command before §5, and stays out of the legacy set.
+    assert!(!is_abort_for_renderer(&un_gated, "q"));
+    for spelling in [
+        "/abort", "/exit", "/quit", "/q", "/stop", "/cancel", ":q", ":q!",
+    ] {
+        assert!(
+            is_abort_for_renderer(&un_gated, spelling),
+            "slash spellings on both sides: {spelling:?}"
+        );
+        assert!(
+            is_abort_for_renderer(&gated, spelling),
+            "slash spellings on both sides: {spelling:?}"
+        );
+    }
+    for pasted in ["stop\nplease stop", "/abort\nmen fortsätt"] {
+        assert!(
+            !is_abort_for_renderer(&un_gated, pasted),
+            "a multi-line submission is never a command: {pasted:?}"
+        );
+        assert!(
+            !is_abort_for_renderer(&gated, pasted),
+            "a multi-line submission is never a command: {pasted:?}"
+        );
+    }
+
+    // The real headless renderer behind the CLI: un-gated, so every shared input
+    // path keeps reading its pre-rebuild vocabulary, bare words included.
+    let raw = RawRenderer::new();
+    assert!(
+        !raw.gates_destructive_commands(),
+        "the headless renderer has no confirm surface to gate with"
+    );
+    for word in ["stop", "cancel", "exit", "quit", "abort", "/abort", "/exit"] {
+        assert!(
+            is_abort_for_renderer(&raw, word),
+            "headless behaviour must stay byte-unchanged for {word:?}"
+        );
+    }
+    assert!(
+        !is_abort_for_renderer(&raw, "q"),
+        "bare `q` was not a command before §5 either"
+    );
+
+    // The wiring pin: the stream sink is the second consumer of shared renderer
+    // input, so it must go through this owner rather than a vocabulary predicate of
+    // its own. Without it a bare word silently becomes steering text for the
+    // un-gated renderers (the exact regression this task introduced and fixed).
+    let sink = include_str!("bridge/sink.rs");
+    assert!(
+        sink.contains("is_abort_for_renderer(self.renderer, &input)"),
+        "sink.rs no longer routes its mid-turn abort through the shared owner"
+    );
+    assert!(
+        !sink.contains("if is_abort_command(&input)"),
+        "sink.rs must not call the narrowed predicate directly"
+    );
+}
+
 fn multiple_tool_calls_sse(calls: &[(&str, &str, &str)]) -> String {
     let tool_calls_json: Vec<_> = calls
         .iter()

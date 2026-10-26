@@ -4,7 +4,7 @@ use super::arbiter::{self, ArbitrationChannel, SleepNotice};
 use super::drain::drain_steer_arbitration_events;
 use super::steer::{SharedSteeringHistory, SteerArbEvent};
 use crate::llm::{ChatClient, PauseAction, StreamControl, StreamEvent, StreamSink};
-use crate::ui::helpers::{is_abort_command, is_reset_command};
+use crate::ui::helpers::{is_abort_for_renderer, is_reset_command};
 use crate::ui::{Event, Renderer, SubagentDetail};
 use std::sync::Arc;
 
@@ -152,11 +152,33 @@ impl StreamSink for RendererSink<'_> {
             None,
         );
         if let Some(input) = self.renderer.poll_input() {
-            if is_abort_command(&input) {
+            // The **same** gate-aware dispatch the session loop applies to shared
+            // renderer input (`helpers::is_abort_for_renderer`, §5 §6 G3). This is
+            // a second consumer of that input, so it must read the gate too: a
+            // renderer that gates destructive commands (the rebuilt TUI) hands a
+            // bare `stop`/`cancel`/`exit`/`quit`/`abort` over as ordinary steering
+            // text and has put `y` behind the slash spellings, while every other
+            // renderer (headless `RawRenderer`, the CLI, the test renderers) keeps
+            // the pre-rebuild vocabulary — calling the narrowed
+            // `is_abort_command` here instead would silently turn a legacy bare
+            // word into steering text for those renderers.
+            if is_abort_for_renderer(self.renderer, &input) {
                 crate::debug_log::log_user_input("command", &input);
                 self.renderer.request_user_exit();
                 return StreamControl::Abort;
             } else if is_reset_command(&input) {
+                // NOTE (t-013): `/reset` still has a second, host-local
+                // implementation here — this branch answers the reset inside the
+                // stream (plan clear + context notice) instead of handing the line
+                // to the session loop, which is what the TUI's confirm surface does
+                // on `y` (`events.rs::confirm_pending`). The work item unified the
+                // `/reset*` **spellings** on the TUI submit path (all six now arm
+                // the same confirm and then take the loop's path); this mid-turn
+                // branch is the non-interactive host, which has no confirm surface
+                // to arm. Unifying it with the loop's
+                // `handle_reset_command_and_commit` is a follow-up, not part of
+                // t-013, and it stays reachable only for renderers that do not arm
+                // a confirm themselves.
                 crate::debug_log::log_user_input("command", &input);
                 let default_plan = crate::manager::phase::Plan::default();
                 let plan = self.plan.unwrap_or(&default_plan);

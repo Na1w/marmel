@@ -927,25 +927,6 @@ pub fn confirm_bundle_swept(
     false
 }
 
-/// The whole-string abort test with the **renderer's destructive-command gate**
-/// applied (spec §5, §6, G3).
-///
-/// The session loop is shared by every renderer, so this is the one place the
-/// gate is read: a renderer that confirms every destructive action itself (the
-/// rebuilt TUI) has already put `y` behind the slash spellings and must not have
-/// a bare word like `stop` — which it deliberately hands over as ordinary
-/// steering text — end the run underneath it. Every other renderer (headless
-/// `RawRenderer`, the CLI, the test renderers) keeps the pre-rebuild vocabulary
-/// verbatim, because [`helpers::is_legacy_abort_command`] is exactly what
-/// `is_abort_command` was before §5 shrank it.
-fn is_abort_for_renderer(renderer: &dyn Renderer, line: &str) -> bool {
-    if renderer.gates_destructive_commands() {
-        is_abort_command(line)
-    } else {
-        is_legacy_abort_command(line)
-    }
-}
-
 /// T-10 end to end: one `/reset`. Mark the bundle with `reset`, run the plan
 /// clear (`Plan::clear()` → `sweep_session_state()`), then confirm the bundle
 /// really was deleted. The order is the contract: a crash between the mark and
@@ -2105,6 +2086,11 @@ pub async fn run_session_with_bounds_report(
             Some(&mut ui_transcript),
         );
 
+        // The loop's own mid-flight poll. It shares its abort dispatch with the
+        // stream sink's mid-turn poll (`bridge::sink::RendererSink::poll_control`)
+        // through the single owner [`helpers::is_abort_for_renderer`], so the
+        // destructive-command gate (§5, §6, G3) cannot be applied on one path and
+        // missed on the other.
         if let Some(steer) = renderer.poll_input() {
             if is_abort_for_renderer(renderer, &steer) {
                 crate::debug_log::log_user_input("command", &steer);

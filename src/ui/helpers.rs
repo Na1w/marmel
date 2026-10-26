@@ -245,6 +245,32 @@ pub(crate) fn is_legacy_abort_command(line: &str) -> bool {
     LEGACY_BARE.iter().any(|word| t.eq_ignore_ascii_case(word))
 }
 
+/// The whole-string abort test with the **renderer's destructive-command gate**
+/// applied (spec §5, §6, G3) — the single owner of that decision.
+///
+/// Every consumer of renderer input shares this one function, because the input
+/// paths are shared by all renderers: the session loop's own reads
+/// (`session.rs`, `read_input` and the mid-flight `poll_input` polls) and the
+/// stream sink's mid-turn poll (`bridge::sink::RendererSink::poll_control`). A
+/// renderer that confirms every destructive action itself (the rebuilt TUI) has
+/// already put `y` behind the slash spellings, so a bare word such as `stop` —
+/// which it deliberately hands over as ordinary steering text — must not end the
+/// run underneath it. Every other renderer (headless `RawRenderer`, the CLI, the
+/// test renderers) keeps the pre-rebuild vocabulary verbatim, because
+/// [`is_legacy_abort_command`] is exactly what [`is_abort_command`] was before
+/// spec §5 shrank it.
+///
+/// Reading the gate rather than one predicate is what keeps the brief's promise
+/// that non-TUI behaviour stays byte-unchanged: an un-gated consumer of the
+/// narrowed predicate would silently turn a legacy bare word into steering text.
+pub(crate) fn is_abort_for_renderer(renderer: &dyn Renderer, line: &str) -> bool {
+    if renderer.gates_destructive_commands() {
+        is_abort_command(line)
+    } else {
+        is_legacy_abort_command(line)
+    }
+}
+
 /// Whole-string command test — see [`submission_is_single_line`] for why a
 /// multi-line submission is never a command.
 pub(crate) fn is_reset_command(line: &str) -> bool {

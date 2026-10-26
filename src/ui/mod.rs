@@ -218,15 +218,17 @@ pub trait Renderer: Send {
 
     // ---- destructive-command gate (spec §5, §6, G3) ----
     //
-    // The session loop is shared by every renderer, and until t-013 its
-    // whole-string abort test (`helpers::is_abort_command`) also matched the bare
-    // words `stop / cancel / exit / quit / abort`. Spec §5 removes those: in the
+    // The session loop and the stream sink (`bridge::sink::RendererSink`) are
+    // shared by every renderer, and until t-013 their whole-string abort test
+    // (`helpers::is_abort_command`) also matched the bare words
+    // `stop / cancel / exit / quit / abort`. Spec §5 removes those: in the
     // interactive TUI a bare word is ordinary steering text and **every**
     // destructive spelling goes through the confirm overlay first. A renderer
     // that cannot draw that overlay must keep the old behaviour untouched, so the
-    // loop asks instead of assuming. Default `false` = pre-rebuild vocabulary
-    // (`is_legacy_abort_command`); the TUI overrides it to `true`, which is the
-    // only thing that changes the shared loop's reading of a submitted line.
+    // shared input paths ask instead of assuming — through the single owner
+    // `helpers::is_abort_for_renderer`, which both consumers call. Default `false`
+    // = pre-rebuild vocabulary (`is_legacy_abort_command`); the TUI overrides it to
+    // `true`, which is the only thing that changes how a submitted line is read.
 
     /// Whether this renderer gates destructive commands behind its own confirm
     /// surface, so the session loop must only recognise the deliberate slash
