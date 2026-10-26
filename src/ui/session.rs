@@ -4306,7 +4306,7 @@ mod budget_tests {
 mod restored_subagent_row_tests {
     use super::{seed_restored_subagent_rows, subagent_detail_from_panel};
     use crate::orchestrator::workers;
-    use crate::session::format::{SubagentPanel, TimePoint};
+    use crate::session::format::{QueuePanel, SubagentPanel, TimePoint, UiSection};
 
     fn panel(name: &str) -> SubagentPanel {
         SubagentPanel {
@@ -4379,6 +4379,84 @@ mod restored_subagent_row_tests {
         for key in [&key_a, &key_b] {
             workers::remove_worker_entry_for_test(key);
         }
+    }
+
+    /// The other half of the D2 restore: the **live seam** must turn a journaled
+    /// queue rank and arbitration pause back into a UI row that still carries both.
+    ///
+    /// `session::format::ui` pins that the durable bytes keep the pair; nothing here
+    /// pinned that `subagent_detail_from_panel` reads them — with the fixture pinned
+    /// at `queue: None, paused: false`, a dropped field in the restore projection
+    /// was invisible: a `(Queued 2/3)` row came back as a running row and a paused
+    /// row came back unheld. So this round-trips a panel written **with** both states
+    /// through the same seam the session loop calls on restore.
+    #[test]
+    fn a_journaled_queue_rank_and_pause_restore_into_the_row_the_pane_was_showing() {
+        // One fixture value: `panel()` re-samples `TimePoint::now()`, so building the
+        // expectation twice would compare two different clocks.
+        let mut held = panel("coder-t-9301");
+        held.queue = Some(QueuePanel { position: 2, of: 3 });
+        held.paused = true;
+
+        // Persist: `UiSection` is what the `ui.json` member holds, and the read side
+        // re-parses exactly these bytes.
+        let encoded = serde_json::to_string(&UiSection {
+            subagent_panels: vec![held.clone()],
+            ..UiSection::default()
+        })
+        .expect("a captured section always serialises");
+        let decoded: UiSection =
+            serde_json::from_str(&encoded).expect("the session's own bytes re-read");
+        assert_eq!(decoded.subagent_panels, vec![held], "{encoded}");
+
+        // Restore through the seam the loop actually calls. No interrupted registry
+        // key is joined in, so no process-global `WORKERS` state is touched.
+        let rows = seed_restored_subagent_rows(&decoded.subagent_panels, &[]);
+        assert_eq!(rows.len(), 1, "one panel in, one row out");
+        let row = &rows[0];
+        assert_eq!(
+            row.queue,
+            Some(crate::ui::QueueState { position: 2, of: 3 }),
+            "the rank the pane was showing must survive the restore: {encoded}"
+        );
+        assert!(row.paused, "a stream held by arbitration comes back held");
+        assert!(row.is_active, "and it is still the same row");
+        assert_eq!(row.name, "coder-t-9301");
+        assert_eq!(row.context_tokens, 7, "the untouched fields still arrive");
+
+        // The non-queue case still restores cleanly: nothing journaled, nothing
+        // claimed — never an invented rank or pause.
+        let plain = seed_restored_subagent_rows(&[panel("coder-t-9302")], &[]);
+        assert_eq!(plain.len(), 1);
+        assert_eq!(
+            plain[0].queue, None,
+            "no rank was journaled, none is claimed"
+        );
+        assert!(!plain[0].paused, "no pause was journaled, none is claimed");
+
+        // And a panel written before the two fields existed still restores — that is
+        // the compatibility promise `#[serde(default)]` bought, proven at the seam
+        // rather than at the format layer.
+        let legacy_bytes =
+            serde_json::to_value(&decoded.subagent_panels[0]).expect("a panel is serialisable");
+        let mut legacy_value = legacy_bytes;
+        let object = legacy_value.as_object_mut().expect("a panel object");
+        for field in ["queue", "paused"] {
+            assert!(
+                object.remove(field).is_some(),
+                "the fixture must really carry {field} before it is stripped"
+            );
+        }
+        let legacy: SubagentPanel =
+            serde_json::from_value(legacy_value).expect("a pre-D2 panel must still load");
+        let legacy_rows = seed_restored_subagent_rows(&[legacy], &[]);
+        assert_eq!(legacy_rows.len(), 1);
+        assert_eq!(
+            legacy_rows[0].name, "coder-t-9301",
+            "the row itself survives"
+        );
+        assert_eq!(legacy_rows[0].queue, None, "no rank, so none is invented");
+        assert!(!legacy_rows[0].paused, "no pause, so none is invented");
     }
 
     /// Whether a mid-flight steer gets its own arbitration round is asked of the

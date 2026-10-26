@@ -1080,7 +1080,6 @@ fn boot_payload(workers: Vec<WorkerSection>) -> CapturePayload {
                 last_activity_at: None,
                 turn_thinking: Some("turn thinking".to_string()),
                 is_thinking: Some(true),
-
                 queue: None,
                 paused: false,
             }],
@@ -2498,7 +2497,6 @@ fn resume_boot_assigns_every_pane_string_verbatim_including_the_plan_pane() {
             last_activity_at: None,
             turn_thinking: Some("turn thinking".to_string()),
             is_thinking: Some(true),
-
             queue: None,
             paused: false,
         }],

@@ -205,34 +205,48 @@ pub(crate) fn notice_targets(subtask: &SteerSubtaskDecision) -> NoticeTargeting 
 ///
 /// The line is deliberately **marker-led**: `transcript::verdict_of` emphasises a line
 /// only when it opens with a marker, which is what keeps a prose mention of a verdict
-/// word unbadged. A `REVOKED` verdict keeps coming from the assembled deliverable,
-/// because revocation is applied to the marker inside that text by the runner — the
-/// content is printed too, so the revocation still reaches the pane as the runner wrote
-/// it.
+/// word unbadged.
+///
+/// **Revocation is the one verdict the typed marker cannot express.** `MissionMarker`
+/// has only Complete/Failed/Replan, and a rejection is applied to the *content*
+/// (`agents::runner::assembly` rewrites the completion marker with
+/// [`crate::markers::REVOCATION_TOKEN`]), so a rejected deliverable reaches this seam
+/// carrying `MissionMarker::Failed` and a body that says the completion was revoked.
+/// Leading with `FAILED:` there would mis-report the outcome — the pane's `Verdict::Revoked`
+/// badge is unreachable, and the reader is told the worker failed rather than that its
+/// claimed completion was withdrawn. [`crate::markers::has_revocation_marker`] is therefore
+/// consulted (the grammar stays in `markers`, never spelled here) and a revoked
+/// deliverable is rendered revocation-led, in the same decorated shape the body carries.
+/// A `Replan` marker outranks it exactly as the precedence table orders it: a deliverable
+/// that demands replanning is never reported as a mere withdrawal.
 pub(crate) fn deliverable_verdict_line(
     task_id: &str,
     deliverable: &crate::agents::Deliverable,
 ) -> String {
     use crate::markers::{self, MissionMarker};
     let task = task_id.trim();
-    match &deliverable.marker {
-        MissionMarker::Complete { .. } => {
-            if task.is_empty() {
-                markers::MARKER_COMPLETE.to_string()
-            } else {
-                markers::decorated(markers::MARKER_COMPLETE, task)
-            }
+    // The decorated form when a task id is known, the bare marker when it is not:
+    // an empty `()` decoration is never rendered.
+    let lead = |marker: &str| {
+        if task.is_empty() {
+            marker.to_string()
+        } else {
+            markers::decorated(marker, task)
         }
+    };
+    match &deliverable.marker {
+        // Revocation first for the two verdicts a rejection can masquerade as.
+        MissionMarker::Complete { .. } | MissionMarker::Failed { .. }
+            if markers::has_revocation_marker(&deliverable.content) =>
+        {
+            lead(markers::REVOCATION_TOKEN)
+        }
+        MissionMarker::Complete { .. } => lead(markers::MARKER_COMPLETE),
         MissionMarker::Failed { reason } => {
             format!("{}: {}", markers::MARKER_FAILED, reason.trim())
         }
         MissionMarker::Replan { reason } => {
-            let head = if task.is_empty() {
-                markers::MARKER_REPLAN.to_string()
-            } else {
-                markers::decorated(markers::MARKER_REPLAN, task)
-            };
-            format!("{head}: {}", reason.trim())
+            format!("{}: {}", lead(markers::MARKER_REPLAN), reason.trim())
         }
     }
 }
@@ -415,5 +429,109 @@ mod tests {
             task_id: None,
         };
         assert_eq!(deliverable_verdict_line("", &taskless), MARKER_COMPLETE);
+    }
+
+    /// A **revoked** deliverable must be reported as revoked.
+    ///
+    /// `MissionMarker` has no revocation variant and the rejection is written into
+    /// the *content* by the runner, so a rejected run reaches this seam typed
+    /// `Failed` with a body saying its own completion was withdrawn. Leading with
+    /// `FAILED:` then mis-states the outcome the pane is allowed to show
+    /// (`transcript::Verdict::Revoked` becomes unreachable), so the verdict is
+    /// revocation-led, spelled through the `markers` vocabulary only.
+    #[test]
+    fn a_revoked_deliverable_leads_with_the_revocation_not_with_a_completion_or_a_failure() {
+        use crate::agents::Deliverable;
+        use crate::markers::{
+            self, MissionMarker, REVOCATION_TOKEN, decorated, has_revocation_marker,
+            revoke_completion,
+        };
+
+        // The byte-for-byte residue of a rejected run: the assembler revoked the
+        // completion marker inside the body and appended its failure trailer, which
+        // is what types the marker as `Failed`.
+        let revoked_body = revoke_completion("inspected the panes\n\nMISSION COMPLETE (t-012)");
+        let rejected = Deliverable {
+            marker: MissionMarker::Failed {
+                reason: "Validator rejected deliverable".to_string(),
+            },
+            content: format!(
+                "VALIDATOR REJECTION: no evidence offered\n---------------\n{revoked_body}\n\n\
+                 FAILED (Validator rejected deliverable)"
+            ),
+            task_id: Some("t-012".to_string()),
+        };
+        assert!(
+            has_revocation_marker(&rejected.content),
+            "the fixture must really be a revoked deliverable: {}",
+            rejected.content
+        );
+
+        let line = deliverable_verdict_line("t-012", &rejected);
+        assert_eq!(line, decorated(REVOCATION_TOKEN, "t-012"), "{line}");
+        assert!(has_revocation_marker(&line), "{line}");
+        // Neither of the two verdicts it used to masquerade as.
+        assert!(
+            !line.starts_with(markers::MARKER_FAILED),
+            "a withdrawal is not a failure: {line}"
+        );
+        assert!(
+            !markers::has_complete_marker(&line) && !markers::has_failure_marker(&line),
+            "a revocation-led line carries no completion or failure marker: {line}"
+        );
+
+        // A completion typed deliverable whose body was revoked the same way is
+        // revoked too — the marker alone never decided this.
+        let typed_complete = Deliverable {
+            marker: MissionMarker::Complete {
+                task_id: Some("t-012".to_string()),
+            },
+            content: revoked_body.to_string(),
+            task_id: Some("t-012".to_string()),
+        };
+        assert_eq!(
+            deliverable_verdict_line("t-012", &typed_complete),
+            decorated(REVOCATION_TOKEN, "t-012")
+        );
+
+        // Not every mention of the word is a revocation: a failure *reason* or body
+        // prose that merely says "revoked" keeps its `FAILED:` verdict.
+        let prose = Deliverable {
+            marker: MissionMarker::Failed {
+                reason: "the arbitrator revoked the steer".to_string(),
+            },
+            content: "the arbitrator revoked the earlier instruction mid-flight".to_string(),
+            task_id: Some("t-012".to_string()),
+        };
+        assert_eq!(
+            deliverable_verdict_line("t-012", &prose),
+            "FAILED: the arbitrator revoked the steer"
+        );
+
+        // `REPLAN REQUIRED` outranks a withdrawal, exactly as the precedence table
+        // orders it: the strongest statement the worker made is the one rendered.
+        let replan = Deliverable {
+            marker: MissionMarker::Replan {
+                reason: "the plan misses the migration".to_string(),
+            },
+            content: format!(
+                "REPLAN REQUIRED (t-012): the plan misses the migration\n\n{revoked_body}"
+            ),
+            task_id: Some("t-012".to_string()),
+        };
+        assert_eq!(
+            deliverable_verdict_line("t-012", &replan),
+            "REPLAN REQUIRED (t-012): the plan misses the migration"
+        );
+
+        // No task id: the bare token, never an empty `()` decoration.
+        let taskless = Deliverable {
+            marker: MissionMarker::Failed {
+                reason: "Validator rejected deliverable".to_string(),
+            },
+            content: revoked_body.to_string(),
+            task_id: None,
+        };
+        assert_eq!(deliverable_verdict_line("", &taskless), REVOCATION_TOKEN);
     }
 }
