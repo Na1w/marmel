@@ -270,6 +270,63 @@ fn trailing_separator_on_the_root_never_changes_containment() {
     ));
 }
 
+/// Pins the **same spelling variants the `#[cfg(windows)]` leg builds**, but through
+/// the family-pinned helpers so they actually *execute* on the Linux leg (CI only
+/// compiles the Windows target, so a `#[cfg(windows)]` body is a guard that never
+/// runs). Each variant is derived from a DOS spelling — never by rewriting the
+/// `\\?\`-verbatim string, which produces `//?/C:/…` (misreadable as UNC host `?`)
+/// or an invalid trailing separator inside the verbatim namespace.
+///
+/// Pins: case and separators are noise (one containment key), a trailing separator
+/// stays inside the same component list, and a verbatim-rooted allow-list entry still
+/// contains the `/`-separated DOS spelling — the exact CI relationship.
+#[test]
+fn windows_spelling_variants_fold_onto_one_containment_key() {
+    let verbatim = Path::new(VERBATIM_CI_TARGET);
+    let dos = PathBuf::from(strip_windows_path_prefix(&spell(verbatim)));
+    let upper = spell(verbatim).to_uppercase();
+    let slashed = spell(&dos).replace('\\', "/");
+    let with_trailing = format!("{}\\", spell(&dos));
+
+    for (label, spelling) in [("upper", upper.as_str()), ("slashed", slashed.as_str())] {
+        assert_eq!(
+            containment_key_in_family(Path::new(spelling), PathFamily::Windows),
+            containment_key_in_family(verbatim, PathFamily::Windows),
+            "the '{label}' spelling of the CI target must fold onto the canonical key"
+        );
+        assert!(
+            path_within_in_family(
+                Path::new(VERBATIM_TEMP_ROOT),
+                Path::new(spelling),
+                PathFamily::Windows
+            ),
+            "the '{label}' spelling must stay inside the verbatim temp root"
+        );
+    }
+    // The trailing separator is not a separate component, so the two spellings are
+    // mutually contained (keys differ only by the dropped empty piece).
+    assert!(
+        path_within_in_family(verbatim, Path::new(&with_trailing), PathFamily::Windows),
+        "'{with_trailing}' must stay inside the canonical target"
+    );
+    assert!(
+        path_within_in_family(Path::new(&with_trailing), verbatim, PathFamily::Windows),
+        "one path with and without a trailing separator must contain itself"
+    );
+    // Negative half: none of these variants may smuggle the target under a *sibling*
+    // root that merely shares a byte prefix.
+    for spelling in [&upper, &slashed, &with_trailing] {
+        assert!(
+            !path_within_in_family(
+                Path::new(r"C:\Users\runneradmin\AppData\Local\Templ"),
+                Path::new(spelling),
+                PathFamily::Windows
+            ),
+            "'{spelling}' must not be contained in a sibling-prefix root"
+        );
+    }
+}
+
 /// Pins bug class: the guard must not become an **over-allowing wildcard** while it
 /// is being made spelling-invariant.
 #[test]
@@ -1001,14 +1058,30 @@ fn resolve_safe_path_allows_an_in_root_parent_mix_that_never_escapes() {
 #[test]
 fn resolve_safe_path_allows_a_missing_leaf_inside_a_real_directory() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let leaf = dir.path().join("nested/not-yet-there.txt");
+    // The fixture is written with native `join`s so the *input* never carries a
+    // foreign separator (on Windows a `/` inside a joined tail survives into the
+    // string the gate is handed, while `join_normalized` re-builds the tail with `\`).
+    let leaf = dir.path().join("nested").join("not-yet-there.txt");
     let resolved =
         resolve_safe_path(&spell(&leaf), TOOL_REPLACE).expect("a missing leaf must stay allowed");
+    // The expected value must be derived from the **same canonical primitive
+    // production uses** (`docs/crossplatform_path_test_failures.md` §1.3/§4.1): the
+    // gate returns the OS-canonical anchor (`realpath`, i.e. `/private/var/...` on
+    // macOS, and `\\?\`+long-name on Windows) plus the lexically re-joined tail.
+    // Asserting `dir.path() + tail` instead pinned the host's filesystem layout
+    // (`/tmp` not a symlink, `%TEMP%` not 8.3-shortened) — that was the off-Linux
+    // failure, not a behaviour change. Two separate `join`s, never `join("a/b")`.
+    let expected = fs::canonicalize(dir.path())
+        .expect("canonical tempdir")
+        .join("nested")
+        .join("not-yet-there.txt");
+    // Pins: missing leaf stays allowed AND the returned path is canonical anchor +
+    // re-joined tail (byte-identical to the canonical expectation).
     assert_eq!(
-        resolved, leaf,
+        resolved, expected,
         "canonical anchor + lexically re-joined tail"
     );
-    assert!(!leaf.exists(), "the gate must not create the leaf");
+    assert!(!expected.exists(), "the gate must not create the leaf");
 
     // And it must not be *loosened* into an escape: the same missing leaf outside
     // both allow-list entries is denied.
@@ -1060,12 +1133,34 @@ fn resolve_safe_path_fails_closed_when_no_existing_ancestor_can_be_resolved() {
     // by `device_namespace_and_unc_spellings_are_never_inside_a_volume_root` (pure
     // helper, runs here) and by
     // `resolve_safe_path_denies_device_namespace_and_unc_escapes` (`#[cfg(windows)]`).
-    assert!(
-        resolve_safe_path(r"\\.\PhysicalDrive0", TOOL_READ_FILE)
-            .is_ok_and(|path| path.to_string_lossy().ends_with(r"\\.\PhysicalDrive0")),
-        "the Unix family must treat the device-looking spelling as an ordinary name, \
-         not silently rewrite it"
-    );
+    //
+    // Compile-time family split, NOT `PathFamily`: the branch this pins is
+    // `Path::new(path).is_absolute()` (`fs.rs`, the absolute-vs-relative decision),
+    // which is raw platform grammar and cannot be parameterized by `PathFamily`
+    // (`docs/crossplatform_path_test_failures.md` §3.2). `cfg!` (runtime) rather
+    // than `#[cfg]` so both arms stay type-checked on every target and the
+    // `unused = "deny"` lint cannot be tripped on either leg.
+    if cfg!(unix) {
+        // Unix grammar: `\\.\PhysicalDrive0` is one ordinary `Normal` component, so
+        // the workspace-relative join puts it *inside* the root — allowing it is the
+        // correct Unix verdict, and it must not be silently rewritten.
+        assert!(
+            resolve_safe_path(r"\\.\PhysicalDrive0", TOOL_READ_FILE)
+                .is_ok_and(|path| path.to_string_lossy().ends_with(r"\\.\PhysicalDrive0")),
+            "the Unix family must treat the device-looking spelling as an ordinary name, \
+             not silently rewrite it"
+        );
+    } else {
+        // Windows grammar: `\\.\X` parses as `Prefix::DeviceNS`, i.e. an **absolute**
+        // path whose containment key is relative-looking (`physicaldrive0`) and can
+        // therefore never component-match a rooted key → deny. Same input, opposite
+        // verdict, both correct per family; the authoritative Windows device pin is
+        // `resolve_safe_path_denies_device_namespace_and_unc_escapes` below.
+        assert_escape_denied(
+            resolve_safe_path(r"\\.\PhysicalDrive0", TOOL_READ_FILE),
+            r"\\.\PhysicalDrive0",
+        );
+    }
     let base = scoped_root_outside_temp();
     let root = base.join("ws");
     fs::create_dir_all(&root).expect("create scoped root");
@@ -1166,6 +1261,32 @@ fn short_path_name(path: &Path) -> Option<String> {
     None
 }
 
+/// Do these two spellings name the **same on-disk file**? Identity, not text.
+///
+/// The `(volume_serial_number, file_id)` pair the portability audit suggests is not
+/// available on stable Windows std: `MetadataExt` exposes `file_index` /
+/// `volume_serial_number` / `number_of_links` only behind the unstable
+/// `windows_by_handle` feature, and there is no `file_id` at all. So identity is
+/// decided with what the target *does* provide: `fs::canonicalize`
+/// (`GetFinalPathNameByHandleW`, i.e. the OS resolving 8.3, case, the verbatim
+/// prefix and reparse points down to one final name for one handle) plus the stable
+/// `file_size` / `creation_time` metadata fields as a corroborating FS-level check
+/// taken through each spelling's own pipeline.
+#[cfg(windows)]
+fn same_file_on_disk(left: &Path, right: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    let (Ok(left_can), Ok(right_can)) = (fs::canonicalize(left), fs::canonicalize(right)) else {
+        return false;
+    };
+    if left_can != right_can {
+        return false;
+    }
+    let (Ok(a), Ok(b)) = (fs::metadata(left), fs::metadata(right)) else {
+        return false;
+    };
+    a.file_size() == b.file_size() && a.creation_time() == b.creation_time()
+}
+
 /// Pins bug class: **the CI input itself** — the `\\?\`-verbatim spelling produced
 /// by `canonicalize` of a file inside the temp root must be accepted.
 #[test]
@@ -1184,7 +1305,25 @@ fn resolve_safe_path_accepts_a_verbatim_prefixed_file_in_the_temp_root() {
     );
     let resolved = resolve_safe_path(&verbatim_str, TOOL_READ_FILE)
         .expect("verbatim spelling must be allowed");
-    assert_eq!(resolved, verbatim);
+    // Pinned property: ONE file, decided through ONE pipeline — equal containment
+    // key (the key containment and sharding actually look at) plus equal on-disk
+    // identity. Deliberately NOT `assert_eq!(resolved, verbatim)`: that compared the
+    // *returned spelling* byte-for-byte between two pipelines, so an on-disk-case or
+    // 8.3 delta in the temp root (`RUNNER~1` vs `runneradmin`) broke the test while
+    // containment stayed correct. A containment regression still fails: if the
+    // verbatim operand were normalized differently the keys differ, and if it were
+    // rejected the `expect` above fires.
+    assert_eq!(
+        containment_key_in_family(&resolved, PathFamily::Windows),
+        containment_key_in_family(&verbatim, PathFamily::Windows),
+        "the returned path and the canonicalized fixture must share one containment key"
+    );
+    assert!(
+        same_file_on_disk(&resolved, &verbatim),
+        "'{}' and '{}' must be one file on disk",
+        resolved.display(),
+        verbatim.display()
+    );
     // The DOS spelling of the same file resolves to the identical path.
     let dos = spell(&PathBuf::from(strip_windows_path_prefix(&verbatim_str)));
     let resolved_dos =
@@ -1193,7 +1332,16 @@ fn resolve_safe_path_accepts_a_verbatim_prefixed_file_in_the_temp_root() {
 }
 
 /// Pins bug class: **device / namespace escapes on the real platform** — they must
-/// be denied, not canonicalized into an allow.
+/// never be canonicalized into an allow.
+///
+/// The *outcome class* is machine-dependent (`docs/test_portability_audit_windows_leg.md`
+/// row 9): `\\.\PhysicalDrive0` can die inside `GetFinalPathNameByHandleW` with
+/// `ERROR_ACCESS_DENIED`, a bare UNC can die with `ERROR_BAD_NETPATH`, and a
+/// `\\?\Device\HarddiskVolumeN\…` name may legitimately canonicalize on a runner
+/// where that volume path resolves. So the invariant asserted for **every** spelling
+/// is the one that actually matters — never `Ok` — while the exact deny wording is
+/// pinned only for spellings the OS itself cannot resolve (probed below), where
+/// production provably reaches its own `escape_denied`.
 #[test]
 #[cfg(windows)]
 fn resolve_safe_path_denies_device_namespace_and_unc_escapes() {
@@ -1204,13 +1352,40 @@ fn resolve_safe_path_denies_device_namespace_and_unc_escapes() {
         r"\\?\Device\HarddiskVolume1\Windows\x",
         r"\\server\share\x",
     ] {
-        assert_escape_denied(resolve_safe_path(spelling, TOOL_READ_FILE), spelling);
+        // Capability probe: can this machine resolve the namespace/device name at all?
+        let resolvable = fs::canonicalize(spelling).is_ok();
+        let outcome = resolve_safe_path(spelling, TOOL_READ_FILE);
+        // Pins: no spelling of the device/namespace/UNC family is ever allowed,
+        // whatever error class the platform reports underneath.
+        if let Ok(path) = outcome {
+            panic!(
+                "'{spelling}' must never be allowed, but resolve_safe_path returned {}",
+                path.display()
+            );
+        }
+        if resolvable {
+            eprintln!(
+                "skip deny-wording pin for '{spelling}': this machine resolves it, \
+                 so only the never-allowed invariant is asserted"
+            );
+            continue;
+        }
+        // The OS cannot resolve it, so production's `canonical_existing_prefix`
+        // cannot either → the single documented deny wording.
+        assert_escape_denied(outcome, spelling);
     }
 }
 
 /// Pins bug class: **the 8.3 short name** against a real alias, i.e. the exact
 /// `C:\Users\RUNNER~1\…` vs long-name split from CI. The boundary is respected:
 /// acceptance comes from canonicalizing both operands, not from the string fold.
+///
+/// 8.3 aliases are a *capability* of the volume, not a guarantee
+/// (`NtfsDisable8dot3NameCreation=1` on some runners: `GetShortPathNameW` then
+/// returns the long name or fails, and an existing alias can vanish at any time).
+/// The probe below therefore decides whether the test runs, and what it asserts is
+/// **identity** (`containment_key`, same file, same lock shard), never an alias
+/// spelling.
 #[test]
 #[cfg(windows)]
 fn eight_dot_three_alias_of_a_temp_directory_resolves_to_the_same_file() {
@@ -1222,28 +1397,79 @@ fn eight_dot_three_alias_of_a_temp_directory_resolves_to_the_same_file() {
     fs::write(&file, "x\n").expect("write fixture");
     let canonical = fs::canonicalize(&file).expect("canonicalize fixture");
 
-    let Some(short) = short_path_name(&long) else {
+    // ── Capability probe (audit row 10) ────────────────────────────────────────
+    // Take the short name of the **canonicalized** long name, so "the alias differs
+    // from the long name" is decided on one canonical basis — the old guard compared
+    // a raw `dir.path()` (which may itself carry an 8.3 component, e.g. `RUNNER~1`)
+    // against its own short name and could pass while the *tail* had no alias.
+    let long_canonical = fs::canonicalize(&long).expect("canonicalize long-named dir");
+    let long_canonical_str = spell(&long_canonical);
+    let Some(short) = short_path_name(&long_canonical) else {
         eprintln!(
-            "skip: this volume reports no 8.3 alias for {}",
-            long.display()
+            "skip: this volume reports no 8.3 name for {}",
+            long_canonical.display()
         );
         return;
     };
-    if short == long.to_string_lossy() {
-        eprintln!("skip: 8.3 name generation is disabled ({short} == long name)");
+    if Path::new(&short) == long_canonical.as_path()
+        || short.eq_ignore_ascii_case(&long_canonical_str)
+    {
+        eprintln!(
+            "skip: 8.3 name generation is disabled on this volume \
+             ({short} == canonical long name {long_canonical_str})"
+        );
         return;
     }
     let short_file = Path::new(&short).join("shared_target.txt");
+    let Ok(short_canonical) = fs::canonicalize(&short_file) else {
+        eprintln!(
+            "skip: the 8.3 alias '{}' does not resolve on this volume \
+             (NtfsDisable8dot3NameCreation?)",
+            short_file.display()
+        );
+        return;
+    };
+
+    // Pins: the string fold still does NOT expand the alias it just obtained — the
+    // alias spelling and the canonical long spelling stay distinguishable at key
+    // level (compared against the canonical long spelling, never the raw fixture).
     assert_ne!(
         containment_key_in_family(&short_file, PathFamily::Windows),
-        containment_key_in_family(&file, PathFamily::Windows),
+        containment_key_in_family(&canonical, PathFamily::Windows),
         "the fold alone must not expand the alias it just obtained"
     );
     let resolved_short =
-        resolve_safe_path(&spell(&short_file), TOOL_READ_FILE).expect("8.3 alias must resolve");
+        resolve_safe_path(&spell(&short_file), TOOL_READ_FILE).unwrap_or_else(|err| {
+            panic!(
+                "the 8.3 alias '{}' must be allowed, got {err}",
+                short_file.display()
+            )
+        });
+    // Pins: the gate hands back the OS-canonical spelling of the alias operand — the
+    // same value an independent canonicalize of that operand produces.
     assert_eq!(
-        resolved_short, canonical,
-        "canonicalizing both sides is what carries the 8.3 alias"
+        resolved_short, short_canonical,
+        "canonicalizing the alias is what carries it through the gate"
+    );
+    // Pins: the alias spelling and the long-name spelling canonicalize onto ONE file
+    // — the identity the containment decision (and the lock shard) rests on.
+    assert_eq!(
+        short_canonical, canonical,
+        "the 8.3 alias and the long name must canonicalize onto one file"
+    );
+    // Pins: alias spelling and long spelling are ONE file for containment, for file
+    // identity and for the lock shard — i.e. the containment/shard bug cannot come
+    // back through an 8.3 operand.
+    assert_eq!(
+        containment_key_in_family(&resolved_short, PathFamily::Windows),
+        containment_key_in_family(&canonical, PathFamily::Windows),
+        "the 8.3 alias and the long name must share one containment key"
+    );
+    assert!(
+        same_file_on_disk(&resolved_short, &canonical),
+        "'{}' and '{}' must be one file on disk",
+        resolved_short.display(),
+        canonical.display()
     );
     assert_eq!(
         lock_shard_for(&resolved_short),
@@ -1252,27 +1478,144 @@ fn eight_dot_three_alias_of_a_temp_directory_resolves_to_the_same_file() {
     );
 }
 
-/// Pins bug class: **case and trailing-separator spellings of an allowed file**
-/// (docs §5 item 14) — the same file must be allowed and must normalize identically.
-#[test]
+/// Shared fixture for the per-spelling variants below: a file inside the process
+/// temp root plus its OS-canonical (`\\?\`-verbatim, long-name) spelling. The
+/// `TempDir` is returned so it outlives the caller's assertions.
 #[cfg(windows)]
-fn resolve_safe_path_accepts_case_variants_and_trailing_separator() {
+fn temp_file_in_temp_root() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let file = dir.path().join("shared_target.txt");
     fs::write(&file, "x\n").expect("write fixture");
     let canonical = fs::canonicalize(&file).expect("canonicalize fixture");
-    let canonical_str = spell(&canonical);
+    (dir, canonical)
+}
 
-    let upper = canonical_str.to_uppercase();
-    let with_trailing = format!(r"{canonical_str}\");
-    let slashed = canonical_str.replace('\\', "/");
-    for spelling in [&upper, &with_trailing, &slashed] {
-        let resolved = resolve_safe_path(spelling, TOOL_READ_FILE)
-            .unwrap_or_else(|err| panic!("'{spelling}' must be allowed, got {err}"));
-        assert_eq!(
-            containment_key_in_family(&resolved, PathFamily::Windows),
-            containment_key_in_family(&canonical, PathFamily::Windows),
-            "'{spelling}' must normalize onto the canonical file"
-        );
+/// Pins bug class: **an upper-case spelling of an allowed file** (docs §5 item 14)
+/// — same file, same verdict, same containment key. Own test + own probe so one
+/// rejected spelling cannot sink the other spellings.
+#[test]
+#[cfg(windows)]
+fn resolve_safe_path_accepts_an_upper_case_spelling_of_an_allowed_file() {
+    let (_dir, canonical) = temp_file_in_temp_root();
+    let upper = spell(&canonical).to_uppercase();
+
+    // Pins (pure fold, no file system involved): the `\\?\` prefix and ASCII case
+    // are noise, so the upper-case spelling folds onto the canonical key.
+    assert_eq!(
+        containment_key_in_family(Path::new(&upper), PathFamily::Windows),
+        containment_key_in_family(&canonical, PathFamily::Windows),
+        "'{upper}' must fold onto the canonical key"
+    );
+
+    // Probe: if the file system itself refuses the spelling, the verdict is a
+    // platform rejection, not a containment decision.
+    if let Err(err) = fs::canonicalize(&upper) {
+        eprintln!("skip: this platform rejects '{upper}' ({err}); the fold pin above still runs");
+        return;
     }
+    let resolved = resolve_safe_path(&upper, TOOL_READ_FILE)
+        .unwrap_or_else(|err| panic!("'{upper}' must be allowed, got {err}"));
+    // Pins: the gate normalizes the upper-case spelling onto the canonical file.
+    assert_eq!(
+        containment_key_in_family(&resolved, PathFamily::Windows),
+        containment_key_in_family(&canonical, PathFamily::Windows),
+        "'{upper}' must normalize onto the canonical file"
+    );
+    assert!(
+        same_file_on_disk(&resolved, &canonical),
+        "'{upper}' must resolve to the canonical file"
+    );
+}
+
+/// Pins bug class: **a trailing separator below a plain DOS root** (docs §5 item
+/// 14). The spelling is deliberately built from the DOS (prefix-stripped) form:
+/// appending `\` to the `\\?\` **verbatim** spelling is not a name at all — the
+/// namespace performs no normalization, so the open dies with `ERROR_INVALID_NAME`
+/// and the test would pin a platform rejection instead of a policy decision.
+#[test]
+#[cfg(windows)]
+fn resolve_safe_path_accepts_a_trailing_separator_below_a_dos_root() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let canonical_dir = fs::canonicalize(dir.path()).expect("canonical tempdir");
+    let canonical_str = spell(&canonical_dir);
+    let dos = PathBuf::from(strip_windows_path_prefix(&canonical_str));
+    let with_trailing = format!("{}\\", spell(&dos));
+
+    // Pins: the containment key splits into components and drops empty pieces, so a
+    // trailing separator can neither move a path out of the root nor smuggle a
+    // second entry in — the two spellings are mutually contained.
+    assert!(
+        path_within_in_family(
+            &canonical_dir,
+            Path::new(&with_trailing),
+            PathFamily::Windows
+        ),
+        "'{with_trailing}' must stay inside the canonical root"
+    );
+    assert!(
+        path_within_in_family(
+            Path::new(&with_trailing),
+            &canonical_dir,
+            PathFamily::Windows
+        ),
+        "the canonical root and its trailing-separator spelling must contain each other"
+    );
+
+    // Probe: some Windows builds reject a trailing separator on open even below a
+    // DOS root (`ERROR_INVALID_NAME` / `ERROR_DIRECTORY`).
+    if let Err(err) = fs::canonicalize(&with_trailing) {
+        eprintln!(
+            "skip: this platform rejects '{with_trailing}' ({err}); \
+             the containment-key pin above still runs"
+        );
+        return;
+    }
+    let resolved = resolve_safe_path(&with_trailing, TOOL_READ_FILE)
+        .unwrap_or_else(|err| panic!("'{with_trailing}' must be allowed, got {err}"));
+    // Pins: the trailing separator must not change which file is named.
+    assert_eq!(
+        containment_key_in_family(&resolved, PathFamily::Windows),
+        containment_key_in_family(&canonical_dir, PathFamily::Windows),
+        "'{with_trailing}' must normalize onto the canonical root"
+    );
+}
+
+/// Pins bug class: **`/` separators below a plain DOS root** (docs §5 item 14). The
+/// spelling is built from the DOS (prefix-stripped) form, never by
+/// `canonical_str.replace('\\', "/")`: that turns `\\?\C:\…` into `//?/C:/…`, which
+/// a `\\?\`-literal prefix table can misread as UNC host `?`.
+#[test]
+#[cfg(windows)]
+fn resolve_safe_path_accepts_forward_slash_separators_below_a_dos_root() {
+    let (_dir, canonical) = temp_file_in_temp_root();
+    let canonical_str = spell(&canonical);
+    let dos = PathBuf::from(strip_windows_path_prefix(&canonical_str));
+    let slashed = spell(&dos).replace('\\', "/");
+
+    // Pins (pure fold, no file system involved): separators are noise.
+    assert_eq!(
+        containment_key_in_family(Path::new(&slashed), PathFamily::Windows),
+        containment_key_in_family(&canonical, PathFamily::Windows),
+        "'{slashed}' must fold onto the canonical key"
+    );
+
+    // Probe: Win32 accepts `/` below a DOS root, but that is a platform courtesy
+    // this suite must not assume.
+    if let Err(err) = fs::canonicalize(&slashed) {
+        eprintln!("skip: this platform rejects '{slashed}' ({err}); the fold pin above still runs");
+        return;
+    }
+    let resolved = resolve_safe_path(&slashed, TOOL_READ_FILE)
+        .unwrap_or_else(|err| panic!("'{slashed}' must be allowed, got {err}"));
+    // Pins: `/` vs `\` must not change which file is named, nor its shard.
+    assert_eq!(
+        containment_key_in_family(&resolved, PathFamily::Windows),
+        containment_key_in_family(&canonical, PathFamily::Windows),
+        "'{slashed}' must normalize onto the canonical file"
+    );
+    assert_eq!(
+        lock_shard_for(&resolved),
+        lock_shard_for(&canonical),
+        "'{slashed}' must land on the canonical file's lock shard"
+    );
 }
