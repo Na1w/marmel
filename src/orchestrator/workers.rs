@@ -132,6 +132,15 @@ const MAX_RECENT_COMPLETED: usize = 10;
 /// Single sharded map holding every worker (active and recently completed).
 static WORKERS: LazyLock<DashMap<String, WorkerState>> = LazyLock::new(DashMap::new);
 
+/// Reference count of live [`ActiveWorkerGuard`]s per registry key.
+///
+/// A Manager-delegated task registers its identity at dispatch (`OrchestratorManager::delegate`)
+/// and again inside the specialist runner (`run_specialist_live_inner`) using the exact same
+/// `CancellationToken`. Sharing the slot and counting both guards keeps a single delegation on
+/// one registry key instead of allocating a redundant `{base}#N` shadow entry, and ensures the
+/// entry only transitions to completed when the outermost guard drops.
+static ACTIVE_GUARD_REFS: LazyLock<DashMap<String, usize>> = LazyLock::new(DashMap::new);
+
 /// Monotonic sequence handed out to completed entries (oldest = smallest).
 static COMPLETED_SEQ: LazyLock<std::sync::atomic::AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
 
@@ -186,6 +195,22 @@ pub struct ActiveWorkerGuard(pub String);
 
 impl Drop for ActiveWorkerGuard {
     fn drop(&mut self) {
+        let still_held = match ACTIVE_GUARD_REFS.entry(self.0.clone()) {
+            Entry::Occupied(mut occ) => {
+                if *occ.get() > 1 {
+                    *occ.get_mut() -= 1;
+                    true
+                } else {
+                    occ.remove();
+                    false
+                }
+            }
+            Entry::Vacant(_) => false,
+        };
+        if still_held {
+            return;
+        }
+
         // Single entry mutation: flip this worker to completed in place,
         // preserving the key and its last-seen token count. Only a *live* entry
         // is flipped, which makes the drop idempotent: a stale/duplicate guard
@@ -345,6 +370,7 @@ pub fn retire_restored_worker(worker_key: &str, status_label: &str) -> Option<u6
         }
     };
     // Guards released above before any further lookup (single-guard rule).
+    ACTIVE_GUARD_REFS.remove(worker_key);
     evict_completed_ring();
     super::notice::reclaim_worker_inbox(worker_key);
     seq
@@ -584,11 +610,143 @@ pub fn worker_entries() -> Vec<WorkerEntry> {
     out
 }
 
+/// The **effective registry key** of the worker that owns the cancellation token
+/// currently in scope ([`crate::orchestrator::CURRENT_WORKER_TOKEN`]).
+///
+/// The specialist runner registers itself under that key
+/// ([`register_active_worker_with_token`]) and drains its notice inbox with it, so a tool
+/// that must speak *as* the running worker — `reply_to_arbitrator` above all — has to name
+/// the same identity the notice store filed the notice under. Token identity is exact
+/// (`CancellationToken::eq` compares the shared inner state, so a clone of the worker's own
+/// token matches and a parent/child token does not).
+///
+/// `None` when no worker token is in scope (a Manager turn, the UI bridge, a unit test) or
+/// when the registration carries no token: [`active_worker_key_for_reply`] is the surface
+/// reply callers use, because it adds the tokenless fallback.
+pub fn active_worker_key_for_current_token() -> Option<String> {
+    active_worker_key_for_current_token_and_role(None)
+}
+
+fn active_worker_key_for_current_token_and_role(role: Option<&str>) -> Option<String> {
+    let token = crate::orchestrator::CURRENT_WORKER_TOKEN
+        .try_with(|t| t.clone())
+        .ok()?;
+    let clean_role = role.map(str::trim).filter(|r| !r.is_empty());
+    let mut candidates: Vec<(String, String, Instant)> = WORKERS
+        .iter()
+        .filter(|e| {
+            e.value().is_active()
+                && e.value()
+                    .info
+                    .cancel_token
+                    .as_ref()
+                    .is_some_and(|t| *t == token)
+        })
+        .map(|e| {
+            (
+                e.key().clone(),
+                e.value().info.agent_name.clone(),
+                e.value().info.started_at,
+            )
+        })
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort_by(|a, b| {
+        let a_role_match = clean_role.is_some_and(|r| {
+            a.1.eq_ignore_ascii_case(r) || super::notice::worker_routing_identity(&a.0).routes(r)
+        });
+        let b_role_match = clean_role.is_some_and(|r| {
+            b.1.eq_ignore_ascii_case(r) || super::notice::worker_routing_identity(&b.0).routes(r)
+        });
+        let a_exact_role = clean_role.is_some_and(|r| a.1.eq_ignore_ascii_case(r));
+        let b_exact_role = clean_role.is_some_and(|r| b.1.eq_ignore_ascii_case(r));
+        let a_plain = !a.0.contains(KEY_DISAMBIGUATOR);
+        let b_plain = !b.0.contains(KEY_DISAMBIGUATOR);
+        b_exact_role
+            .cmp(&a_exact_role)
+            .then_with(|| b_role_match.cmp(&a_role_match))
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| b_plain.cmp(&a_plain))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    candidates.into_iter().next().map(|(key, _, _)| key)
+}
+
+/// Whether a worker cancellation token is in scope, i.e. the calling code runs
+/// inside a specialist/validator turn rather than on a Manager turn, in the UI
+/// bridge, or in a unit test.
+pub fn worker_token_in_scope() -> bool {
+    crate::orchestrator::CURRENT_WORKER_TOKEN
+        .try_with(|_| ())
+        .is_ok()
+}
+
+/// The identity a specialist **reply** must be attributed to, so that it matches
+/// the key the notice store filed the notice under.
+///
+/// Two resolution steps, in strictness order:
+///
+/// 1. Exact token match — [`active_worker_key_for_current_token`]. The runner path:
+///    the worker registered itself with the very token the runner scoped around its
+///    turn, so the effective registry key is known exactly.
+/// 2. A registration that carries **no** token of the running turn
+///    ([`register_active_worker`] hands every entry a fresh child of the global token,
+///    which never equals the token in scope). Resolving such a worker by its bare
+///    role name is what let a reply and a notice disagree: the notice sits under the
+///    effective key (`{agent}-{task}`) while the reply arrives keyed by `coder`, so
+///    the store either mis-attributes the reply (its `worker_tag` is a role name, and
+///    any same-role worker passes the bidirectional tolerance) or rejects it outright
+///    (`worker-mismatch`) when the notice was addressed by a token a bare role name
+///    cannot route, e.g. a task id. The role name is therefore resolved against the
+///    **active** registry entries with the notice router's own rules
+///    ([`super::notice::worker_routing_identity`] + `routes`) and a single match yields
+///    that entry's effective key — the very key the worker drains with.
+///
+/// Deliberate limits, both of them safety:
+/// * Step 2 runs only when a worker token is in scope. A Manager turn, the bridge or a
+///   unit test has no worker turn to resolve and keeps the identity the dispatcher
+///   already reports, instead of being silently re-keyed onto some unrelated live entry.
+/// * Two live entries addressed by the same role name stay **ambiguous** and resolve to
+///   `None`: guessing one of them would invent an attribution the registry cannot
+///   support, so the caller keeps the bare role name and the notice layer's
+///   bidirectional tolerance stays a compatibility path, not a per-worker claim.
+pub fn active_worker_key_for_reply(role: &str) -> Option<String> {
+    if let Some(key) = active_worker_key_for_current_token_and_role(Some(role)) {
+        return Some(key);
+    }
+    if !worker_token_in_scope() {
+        return None;
+    }
+    let role = role.trim();
+    if role.is_empty() {
+        return None;
+    }
+    let matches: Vec<String> = WORKERS
+        .iter()
+        .filter(|e| e.value().is_active())
+        .filter(|e| {
+            e.value().info.agent_name.eq_ignore_ascii_case(role)
+                || super::notice::worker_routing_identity(e.key())
+                    .agent_name
+                    .eq_ignore_ascii_case(role)
+        })
+        .map(|e| e.key().clone())
+        .collect();
+    if matches.len() == 1 {
+        matches.into_iter().next()
+    } else {
+        None
+    }
+}
+
 /// Test-only: drop one entry from the table outright (no `COMPLETED_SEQ` draw,
 /// no ring eviction) so a restore test can leave the shared table exactly as it
 /// found it. Never used by production code paths.
 #[cfg(test)]
 pub fn remove_worker_entry_for_test(worker_key: &str) -> Option<WorkerState> {
+    ACTIVE_GUARD_REFS.remove(worker_key);
     WORKERS.remove(worker_key).map(|(_, state)| state)
 }
 
@@ -618,6 +776,37 @@ pub fn register_active_worker_with_token(
         .as_deref()
         .and_then(crate::task_id::normalize_task_id);
 
+    // If an explicit cancellation token was provided and a live entry for the exact
+    // same `(agent_name, task_id, cancel_token)` already exists (e.g. `OrchestratorManager::delegate`
+    // registered the outer delegation guard and `run_specialist_live_inner` is now
+    // registering the inner runner for that same delegation), attach to that existing
+    // slot rather than allocating a duplicate `#N` or `-wN` shadow entry.
+    if let Some(ref tok) = cancel_token {
+        let existing_key = WORKERS
+            .iter()
+            .find(|e| {
+                e.value().is_active()
+                    && e.value().info.agent_name == agent_name
+                    && e.value().info.task_id == clean_task_id
+                    && e.value()
+                        .info
+                        .cancel_token
+                        .as_ref()
+                        .is_some_and(|existing| existing == tok)
+            })
+            .map(|e| e.key().clone());
+        if let Some(key) = existing_key {
+            if let Some(mut entry) = WORKERS.get_mut(&key)
+                && entry.is_active()
+            {
+                entry.info.prompt = prompt;
+            }
+            *ACTIVE_GUARD_REFS.entry(key.clone()).or_insert(1) += 1;
+            crate::ui::session::mark_worker_lifecycle_edge();
+            return ActiveWorkerGuard(key);
+        }
+    }
+
     // Correlation key: agent name + normalized task id (public format is
     // stable). Workers *without* a task id get the monotonic id from
     // `WORKER_ID_SEQ`, so two registrations inside the same clock tick cannot
@@ -642,6 +831,7 @@ pub fn register_active_worker_with_token(
         started_at,
         worker_id,
     );
+    ACTIVE_GUARD_REFS.insert(key.clone(), 1);
     // A worker started: only the edge is recorded here — the journal is opened
     // by the runner and harvested/written by the session thread at its next
     // commit, never from this thread.
@@ -1079,8 +1269,8 @@ pub fn get_active_subtasks_str() -> String {
             let task_id_str = info.task_id.as_deref().unwrap_or(id);
             let start_wall_str = info.started_wall.format("%H:%M:%S");
             out.push_str(&format!(
-                "- Tool Call ID: {}\n  Subagent Tag: {}\n  Subagent: {}\n  Status: {}\n  Task Prompt: {}\n  Started At: {} (running for {}, {elapsed_secs} total seconds)\n  Implementation Turns: {}\n  Validation Rounds: {}\n",
-                task_id_str, id, info.agent_name, info.status, info.prompt, start_wall_str,
+                "- Tool Call ID: {}\n  Subagent Tag: {}\n  Address This Worker With: {}\n  Subagent: {}\n  Status: {}\n  Task Prompt: {}\n  Started At: {} (running for {}, {elapsed_secs} total seconds)\n  Implementation Turns: {}\n  Validation Rounds: {}\n",
+                task_id_str, id, id, info.agent_name, info.status, info.prompt, start_wall_str,
                 duration_str, info.implementation_turns, info.validation_rounds
             ));
             // The per-worker prompt read is grammar-validated (see
@@ -2217,9 +2407,14 @@ mod tests {
     /// drain notices, and drop concurrently on real threads. Every teardown must
     /// report back inside the timeout, and every *undrained* notice must still be
     /// queued afterwards.
-    #[tokio::test]
-    async fn test_guard_drop_reclaim_does_not_panic_or_deadlock_under_concurrent_teardown() {
-        let _notice_lock = crate::orchestrator::notice::TEST_NOTICE_MUTEX.lock().await;
+    #[test]
+    fn test_guard_drop_reclaim_does_not_panic_or_deadlock_under_concurrent_teardown() {
+        // 24 registrations and 24 teardowns churn the process-global registry and its
+        // bounded completed ring, so this storm must be serialised against every other
+        // registry test: unsynchronised, its ring evictions erase the completed row a
+        // sibling test is in the middle of reading back. Ordering rule: workers -> notice.
+        let _workers_lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _notice_lock = crate::orchestrator::notice::TEST_NOTICE_MUTEX.blocking_lock();
 
         let (tx, rx) = std::sync::mpsc::channel::<(u8, String)>();
         for i in 0..24u8 {
@@ -3428,6 +3623,204 @@ mod tests {
             "a refused report never invents a registry entry to put a rank on"
         );
         drop(guard);
+        remove_worker_entry_for_test(&key);
+    }
+
+    /// Reply identity and notice addressing must agree **also for a registration made
+    /// without a cancel token**. [`register_active_worker`] gives every entry a fresh
+    /// child of the global token, so [`active_worker_key_for_current_token`] can never
+    /// match the token in scope and the reply used to degrade to the bare role name —
+    /// a key the notice store never files notices under. The rule therefore resolves
+    /// the role against the live registry, and only when it pins exactly one entry.
+    #[test]
+    fn test_reply_identity_resolves_a_tokenless_registration_to_its_effective_key() {
+        // A plain `#[test]` with its own current-thread runtime, the shape already
+        // used by the `worker_prompt_path` probes above: the registry lock is a
+        // std mutex and must be held for the whole probe without ever crossing an
+        // `await` point, so this test stays mutually exclusive with every sibling
+        // test that takes the same lock for as long as its entries are live.
+        let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime to scope the worker token");
+
+        let lone = register_active_worker(
+            Some("t-7701".to_string()),
+            "replykeyless".to_string(),
+            "tokenless registration".to_string(),
+        );
+        let lone_key = lone.0.clone();
+        assert_eq!(
+            lone_key, "replykeyless-t-7701",
+            "the natural key is what the notice store addresses this worker by"
+        );
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let (token_step, role_step, trimmed) = rt.block_on(
+            crate::orchestrator::CURRENT_WORKER_TOKEN.scope(token.clone(), async {
+                (
+                    active_worker_key_for_current_token(),
+                    active_worker_key_for_reply("replykeyless"),
+                    active_worker_key_for_reply("  ReplyKeyLess  "),
+                )
+            }),
+        );
+        assert_eq!(
+            token_step, None,
+            "a token-less registration carries no token that can match the turn"
+        );
+        assert_eq!(
+            role_step.as_deref(),
+            Some(lone_key.as_str()),
+            "the lone live entry for that role name IS the replying worker"
+        );
+        assert_eq!(
+            trimmed.as_deref(),
+            Some(lone_key.as_str()),
+            "and the role name is judged by whole fields, case- and whitespace-insensitively"
+        );
+
+        // No worker turn, no claim on a registry entry: a Manager turn, the bridge or a
+        // unit test keeps the identity the dispatcher reports.
+        assert_eq!(
+            active_worker_key_for_reply("replykeyless"),
+            None,
+            "outside a worker turn the caller keeps its bare role name"
+        );
+
+        // Two live entries for one role name stay ambiguous — guessing one of them would
+        // invent an attribution the registry cannot support.
+        let twin = register_active_worker(
+            Some("t-7702".to_string()),
+            "replykeyless".to_string(),
+            "same-role sibling".to_string(),
+        );
+        let twin_key = twin.0.clone();
+        assert_eq!(
+            rt.block_on(
+                crate::orchestrator::CURRENT_WORKER_TOKEN.scope(token.clone(), async {
+                    active_worker_key_for_reply("replykeyless")
+                }),
+            ),
+            None,
+            "two live entries addressed by one role name are never resolved by guess"
+        );
+
+        // The exact-token step keeps priority: with a tokened and a tokenless entry of
+        // the same role, the reply is keyed to the entry owning the token in scope.
+        let tokened = register_active_worker_with_token(
+            Some("t-7703".to_string()),
+            "replykeyboth".to_string(),
+            "registered with the turn's token".to_string(),
+            Some(token.clone()),
+        );
+        let tokenless = register_active_worker(
+            Some("t-7704".to_string()),
+            "replykeyboth".to_string(),
+            "same role, no such token".to_string(),
+        );
+        let tokened_key = tokened.0.clone();
+        assert_eq!(
+            rt.block_on(
+                crate::orchestrator::CURRENT_WORKER_TOKEN.scope(token.clone(), async {
+                    active_worker_key_for_reply("replykeyboth")
+                }),
+            )
+            .as_deref(),
+            Some(tokened_key.as_str()),
+            "the entry owning the scoped token wins, ambiguously registered or not"
+        );
+
+        // A role name the registry cannot address at all resolves to nothing — judged
+        // under a token no entry owns, so the exact-token step cannot answer first.
+        let stray = tokio_util::sync::CancellationToken::new();
+        assert_eq!(
+            rt.block_on(
+                crate::orchestrator::CURRENT_WORKER_TOKEN.scope(stray.clone(), async {
+                    active_worker_key_for_reply("replykeynobody")
+                }),
+            ),
+            None,
+            "no live entry, no invented key"
+        );
+        assert_eq!(
+            rt.block_on(
+                crate::orchestrator::CURRENT_WORKER_TOKEN
+                    .scope(stray, async { active_worker_key_for_reply("   ") }),
+            ),
+            None,
+            "an empty role name is no identity"
+        );
+
+        // Leave the shared table exactly as this test found it: the entries go outright
+        // (no `COMPLETED_SEQ` draw, no ring eviction) and the guards are forgotten, so
+        // this test never adds to — or evicts from — the bounded completed ring a
+        // sibling test reads back.
+        let keys = [lone_key, twin_key, tokened_key, tokenless.0.clone()];
+        for key in &keys {
+            remove_worker_entry_for_test(key);
+        }
+        std::mem::forget(lone);
+        std::mem::forget(twin);
+        std::mem::forget(tokened);
+        std::mem::forget(tokenless);
+    }
+
+    #[test]
+    fn test_same_token_delegation_and_runner_share_single_registry_slot() {
+        let _lock = TEST_WORKERS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let token = tokio_util::sync::CancellationToken::new();
+
+        // Outer registration (OrchestratorManager::delegate)
+        let outer = register_active_worker_with_token(
+            Some("t-same-tok".to_string()),
+            "sametokcoder".to_string(),
+            "outer manager prompt".to_string(),
+            Some(token.clone()),
+        );
+        // Inner registration (run_specialist_live_inner) with the exact same token
+        let inner = register_active_worker_with_token(
+            Some("t-same-tok".to_string()),
+            "sametokcoder".to_string(),
+            "inner runner brief".to_string(),
+            Some(token.clone()),
+        );
+
+        assert_eq!(
+            outer.0, "sametokcoder-t-same-tok",
+            "outer registration claims the natural key"
+        );
+        assert_eq!(
+            inner.0, outer.0,
+            "inner runner with the same token must reuse the natural key instead of allocating a #N twin"
+        );
+
+        let matching_live: Vec<_> = worker_entries()
+            .into_iter()
+            .filter(|e| e.is_active && e.agent_name == "sametokcoder")
+            .collect();
+        assert_eq!(
+            matching_live.len(),
+            1,
+            "only one active entry may exist for the delegation"
+        );
+        assert_eq!(matching_live[0].prompt, "inner runner brief");
+
+        // Dropping the inner guard leaves the worker active while the outer guard is still held.
+        drop(inner);
+        assert!(
+            WORKERS.get(&outer.0).is_some_and(|e| e.is_active()),
+            "entry must stay active until the outer guard also drops"
+        );
+
+        // Dropping the outer guard transitions the entry to completed.
+        let key = outer.0.clone();
+        drop(outer);
+        assert!(
+            WORKERS.get(&key).is_some_and(|e| !e.is_active()),
+            "entry must transition to completed once both guards have dropped"
+        );
         remove_worker_entry_for_test(&key);
     }
 }

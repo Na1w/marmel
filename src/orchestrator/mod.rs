@@ -73,7 +73,8 @@ pub use steer::{
 };
 pub use workers::{
     ActiveWorkerGuard, ActiveWorkerInfo, CompletedWorkerInfo, WorkerCallClass, WorkerEntry,
-    active_worker_entries, cancel_active_worker, cancel_all_active_workers, format_duration_human,
+    active_worker_entries, active_worker_key_for_current_token, active_worker_key_for_reply,
+    cancel_active_worker, cancel_all_active_workers, format_duration_human,
     get_active_specialist_context_str, get_active_subtasks_str, get_active_worker_tokens,
     has_active_workers, recent_completed_entries, register_active_worker,
     register_active_worker_with_token, set_active_worker_status, update_active_worker_context,

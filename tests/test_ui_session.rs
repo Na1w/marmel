@@ -780,6 +780,20 @@ async fn test_steering_conversation_history_accumulates_worker_reply_to_arbitrat
     let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
     marmennill::orchestrator::set_event_sender(event_tx);
 
+    // **The notice has to land where a live worker drains it.** The arbitrator addresses the
+    // `ForwardNotice` with `agent_name: "coder"` and a `tool_call_id` that is *not* a registry
+    // task id (`call_1`, an OpenAI-style id). The bridge must resolve that to the effective key
+    // of a live worker — filing it under `call_1` would create an inbox nobody drains, leave the
+    // history entry pending for the whole 10-minute TTL and get the worker's correct reply back
+    // as `worker-mismatch`.
+    let worker = marmennill::orchestrator::register_active_worker_with_token(
+        Some("t-ui-1".to_string()),
+        "coder".to_string(),
+        "build PPC JIT".to_string(),
+        Some(tokio_util::sync::CancellationToken::new()),
+    );
+    let worker_key = worker.0.clone();
+
     let mut renderer = ScriptedRenderer::new(vec![]);
     let steering_history = Arc::new(std::sync::RwLock::new(Vec::<(String, String)>::new()));
     marmennill::orchestrator::set_steering_history(Arc::clone(&steering_history));
@@ -823,13 +837,45 @@ async fn test_steering_conversation_history_accumulates_worker_reply_to_arbitrat
         text[start..end].to_string()
     };
 
+    // The recorded entry names the worker that was really addressed, and exactly one
+    // copy of that notice is queued for it.
+    {
+        let hist = steering_history.read().unwrap();
+        assert!(
+            hist[0].1.contains(&worker_key),
+            "the history entry must name the effective key the notice was filed under \
+             ({worker_key}), got: {}",
+            hist[0].1
+        );
+    }
+    let queued = marmennill::orchestrator::notice::peek_worker_inbox(&worker_key);
+    assert_eq!(
+        queued.len(),
+        1,
+        "exactly one notice may be queued for the addressed worker, got {queued:?}"
+    );
+    assert_eq!(queued[0].notice_id, notice_id);
+    assert_eq!(queued[0].target_worker, worker_key);
+    assert!(
+        !marmennill::orchestrator::notice::has_worker_inbox("call_1"),
+        "an unresolved tool-call id must never become an inbox key no worker drains"
+    );
+
     // Specialist worker replies via handle_reply_to_arbitrator_async
     let args = serde_json::json!({
         "notice_id": notice_id,
         "message": "Status: removed the two jit_invalidate_all() calls and ctest passes 7/7."
     });
     let reply_res = marmennill::harness::handle_reply_to_arbitrator_async("coder", &args).await;
-    assert!(reply_res.is_ok());
+    assert!(
+        reply_res.is_ok(),
+        "the addressed worker's reply must be accepted, got {reply_res:?}"
+    );
+    assert!(marmennill::orchestrator::get_pending_notice(&notice_id).is_none());
+    assert!(
+        marmennill::orchestrator::notice::peek_worker_inbox(&worker_key).is_empty(),
+        "the queued copy must be retired once the notice is answered"
+    );
 
     // Verify history was UPDATED with worker reply and synthesized response
     {
@@ -878,6 +924,432 @@ async fn test_steering_conversation_history_accumulates_worker_reply_to_arbitrat
             .contains("The coder removed the jit_invalidate_all() calls and ctest passes 7/7."),
         "Turn 2 request must contain the specialist reply from steering history! Request was: {turn2_req}"
     );
+}
+
+/// Contract guard for the **notice → reply → answer** loop at the bridge edge.
+///
+/// Three assertions the earlier tests only reached indirectly:
+/// 1. **One steer decision, one notice.** A `ForwardNotice` subtask must file exactly one copy,
+///    and only for the addressed worker — no second copy under the subtask's `tool_call_id`, the
+///    bare role name, or a broadcast key.
+/// 2. **The rewrite travels, not the raw user line.** The arbitrator rewrites the instruction
+///    when it forwards it. The queued copy, the pending copy and the arbitrator turn that is
+///    later built from that copy must all carry the rewrite; the raw user line belongs to the
+///    steer request only.
+/// 3. **One worker reply, one answer.** An accepted reply costs exactly one arbitrator turn and
+///    emits exactly one `Event::SteerResponse`. The `already-replied` rejection may appear only
+///    for a genuine duplicate — never for the first reply, and a refused duplicate must not cost
+///    a second turn or a second answer.
+#[tokio::test]
+async fn test_steering_one_notice_per_steer_carries_the_rewrite_and_exactly_one_answer() {
+    let _lock = TEST_MUTEX.lock().await;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Deliberately unlike each other: a copy of the raw user line must never pass as the rewrite.
+    const RAW_USER_LINE: &str = "yo is the parser stuff finished";
+    const ARBITRATOR_REWRITE: &str =
+        "Report the current state of the parser refactor and the suite result.";
+    const WORKER_ANSWER: &str = "Refactor is done, suite green at 214/214.";
+    const ARBITRATOR_REPLY: &str =
+        "The coder finished the parser refactor; the suite passes 214 of 214.";
+
+    // Arbitrator turn of a worker-reply evaluation vs. the steer arbitration request, told apart
+    // by the reply-evaluation prompt (`evaluate_worker_reply` renders "Original User Inquiry:").
+    const STEER_SSE: &str = "data: {\"id\":\"c_steer\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"ForwardToWorker\\\", \\\"subtasks\\\": [{\\\"tool_call_id\\\": \\\"call_ui_c\\\", \\\"action\\\": \\\"ForwardNotice\\\", \\\"agent_name\\\": \\\"coder\\\", \\\"message\\\": \\\"__REWRITE__\\\"}]}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
+    const EVAL_SSE: &str = "data: {\"id\":\"c_eval\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"SynthesizeResponse\\\", \\\"response\\\": \\\"__ANSWER__\\\"}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
+
+    let server = MockServer::start().await;
+    let received_bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let rb = received_bodies.clone();
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&req.body).to_string();
+            rb.lock().unwrap().push(body.clone());
+            if body.contains("Original User Inquiry") {
+                ResponseTemplate::new(200)
+                    .set_body_string(EVAL_SSE.replace("__ANSWER__", ARBITRATOR_REPLY))
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_string(STEER_SSE.replace("__REWRITE__", ARBITRATOR_REWRITE))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let client =
+        marmennill::llm::ChatClient::new(format!("{}/v1", server.uri()), "test".to_string());
+    marmennill::config::set_active(Config {
+        backend_url: format!("{}/v1", server.uri()),
+        ..Default::default()
+    });
+
+    let stats = Arc::new(marmennill::harness::HarnessStats::new());
+    let (arb_tx, mut arb_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    marmennill::orchestrator::set_event_sender(event_tx);
+
+    let worker_token = tokio_util::sync::CancellationToken::new();
+    let worker = marmennill::orchestrator::register_active_worker_with_token(
+        Some("t-ui-7".to_string()),
+        "coder".to_string(),
+        "build PPC JIT".to_string(),
+        Some(worker_token.clone()),
+    );
+    let worker_key = worker.0.clone();
+
+    let steering_history = Arc::new(std::sync::RwLock::new(Vec::<(String, String)>::new()));
+    marmennill::orchestrator::set_steering_history(Arc::clone(&steering_history));
+    let mut renderer = ScriptedRenderer::new(vec![]);
+
+    // ---- Steer decision: ForwardNotice with the arbitrator's rewrite -------------------
+    marmennill::ui::bridge::spawn_steer_arbitration(
+        &client,
+        stats.clone(),
+        "build PPC JIT",
+        &[],
+        RAW_USER_LINE.to_string(),
+        &arb_tx,
+        &mut renderer,
+        Some(Arc::clone(&steering_history)),
+    );
+
+    let forwarded = loop {
+        let event = arb_rx.recv().await.expect("arbitration channel open");
+        if let marmennill::ui::bridge::SteerArbEvent::Finished {
+            forwarded: posted, ..
+        } = event
+        {
+            break posted;
+        }
+    };
+    assert_eq!(
+        forwarded.len(),
+        1,
+        "one ForwardNotice subtask must file exactly one notice, got {forwarded:?}"
+    );
+    assert_eq!(forwarded[0].1, worker_key.to_ascii_lowercase());
+    let notice_id = forwarded[0].0.clone();
+
+    // Exactly one queued copy, and it sits in the addressed worker's inbox only.
+    let mut aliases = vec![
+        worker_key.clone(),
+        "coder".to_string(),
+        "t-ui-7".to_string(),
+        "call_ui_c".to_string(),
+        "worker".to_string(),
+        "*".to_string(),
+    ];
+    aliases.sort();
+    aliases.dedup();
+    let copies: Vec<(String, usize)> = aliases
+        .iter()
+        .map(|key| {
+            (
+                key.clone(),
+                marmennill::orchestrator::notice::worker_inbox_len(key),
+            )
+        })
+        .filter(|(_, queued)| *queued > 0)
+        .collect();
+    assert_eq!(
+        copies,
+        vec![(worker_key.to_ascii_lowercase(), 1)],
+        "a steer decision must file exactly one notice copy, for the addressed worker only"
+    );
+    assert!(
+        !marmennill::orchestrator::notice::has_worker_inbox("call_ui_c"),
+        "the subtask's tool-call id must never become an inbox key"
+    );
+
+    // What the worker is handed is the **rewrite**, and it carries the id to echo back.
+    let queued = marmennill::orchestrator::notice::peek_worker_inbox(&worker_key);
+    assert_eq!(queued.len(), 1);
+    assert_eq!(
+        queued[0].user_inquiry, ARBITRATOR_REWRITE,
+        "the delivered notice must carry the arbitrator's rewrite"
+    );
+    assert_ne!(
+        queued[0].user_inquiry, RAW_USER_LINE,
+        "the raw user line must not be what is forwarded"
+    );
+    assert_eq!(queued[0].notice_id, notice_id);
+    let rendered = marmennill::orchestrator::render_notice_for_worker(&queued[0]);
+    assert!(rendered.contains(ARBITRATOR_REWRITE) && rendered.contains(&notice_id));
+    assert_eq!(
+        marmennill::orchestrator::get_pending_notice(&notice_id)
+            .expect("the forwarded notice must be pending")
+            .user_inquiry,
+        ARBITRATOR_REWRITE
+    );
+
+    // The steer turn itself must not have answered anything yet.
+    let mut turn_one_status: Vec<String> = Vec::new();
+    while let Ok(event) = event_rx.try_recv() {
+        if let Event::SteerResponse(text) = event {
+            turn_one_status.push(text);
+        }
+    }
+    for status in &turn_one_status {
+        assert!(
+            !status.contains(ARBITRATOR_REPLY),
+            "the steer turn must not answer the user with the worker's reply: {status}"
+        );
+    }
+
+    // ---- Worker reply through the real tool surface ------------------------------------
+    let invocation = marmennill::harness::ToolInvocation {
+        name: marmennill::tool_names::TOOL_REPLY_TO_ARBITRATOR.to_string(),
+        arguments: serde_json::json!({
+            "notice_id": notice_id,
+            "message": WORKER_ANSWER,
+        }),
+    };
+    let reply = marmennill::orchestrator::CURRENT_WORKER_TOKEN
+        .scope(
+            worker_token.clone(),
+            marmennill::harness::dispatch_for_async(
+                &invocation,
+                marmennill::harness::ToolCaller::Specialist(marmennill::agents::Agent::Coder),
+            ),
+        )
+        .await;
+    let reply = match reply {
+        Ok(result) => {
+            assert!(
+                !result.is_error,
+                "the first reply must never be refused, and never as already-replied: {}",
+                result.content
+            );
+            result
+        }
+        Err(err) => panic!("the addressed worker's reply must be accepted, got {err}"),
+    };
+    assert!(reply.content.contains("recorded successfully"));
+
+    // One accepted reply = exactly one arbitrator turn, built from the **rewrite**.
+    let eval_bodies: Vec<String> = received_bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|body| body.contains("Original User Inquiry"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        eval_bodies.len(),
+        1,
+        "one accepted reply must cost exactly one arbitrator turn"
+    );
+    assert!(
+        eval_bodies[0].contains(ARBITRATOR_REWRITE),
+        "the arbitrator turn must see the rewritten inquiry it forwarded"
+    );
+    assert!(
+        !eval_bodies[0].contains(RAW_USER_LINE),
+        "the arbitrator turn must not be rebuilt from the raw user line"
+    );
+    assert!(eval_bodies[0].contains(WORKER_ANSWER));
+
+    // …and exactly one user-visible answer.
+    let mut answers: Vec<String> = Vec::new();
+    while let Ok(event) = event_rx.try_recv() {
+        if let Event::SteerResponse(text) = event {
+            answers.push(text);
+        }
+    }
+    assert_eq!(
+        answers.len(),
+        1,
+        "one worker reply must produce exactly one arbitrator answer, got {answers:?}"
+    );
+    assert!(answers[0].contains(ARBITRATOR_REPLY));
+
+    // The notice is resolved once: pending gone, inbox copy retired, reply recorded.
+    assert!(marmennill::orchestrator::get_pending_notice(&notice_id).is_none());
+    assert!(marmennill::orchestrator::notice::peek_worker_inbox(&worker_key).is_empty());
+    let recorded = marmennill::orchestrator::get_worker_reply(&notice_id)
+        .expect("the accepted reply must be recorded");
+    assert_eq!(recorded.reply_message, WORKER_ANSWER);
+    assert_eq!(recorded.worker_tag, worker_key);
+
+    // A genuine duplicate is the only thing allowed to be told `already-replied` — and refusing
+    // it must cost neither a second arbitrator turn nor a second answer.
+    let duplicate = marmennill::orchestrator::CURRENT_WORKER_TOKEN
+        .scope(
+            worker_token.clone(),
+            marmennill::harness::dispatch_for_async(
+                &invocation,
+                marmennill::harness::ToolCaller::Specialist(marmennill::agents::Agent::Coder),
+            ),
+        )
+        .await;
+    let detail = match duplicate {
+        Err(err) => err.to_string(),
+        Ok(ok) => panic!(
+            "a second reply for an already resolved notice must be refused, got ok: {:?}",
+            ok.content
+        ),
+    };
+    assert!(
+        detail.contains("already-replied"),
+        "the duplicate must be refused as already-replied, got {detail}"
+    );
+    assert_eq!(
+        received_bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|body| body.contains("Original User Inquiry"))
+            .count(),
+        1,
+        "a refused duplicate must not start a second arbitrator turn"
+    );
+    let mut extra: Vec<String> = Vec::new();
+    while let Ok(event) = event_rx.try_recv() {
+        if let Event::SteerResponse(text) = event {
+            extra.push(text);
+        }
+    }
+    assert!(
+        extra.is_empty(),
+        "a refused duplicate must emit no answer, got {extra:?}"
+    );
+
+    // One dialogue, one resolved steering-history entry.
+    let history = steering_history.read().unwrap();
+    assert_eq!(history.len(), 1, "one dialogue, one entry: {history:?}");
+    assert_eq!(history[0].0, RAW_USER_LINE);
+    assert!(history[0].1.contains(ARBITRATOR_REPLY));
+    assert!(
+        !history[0].1.contains("awaiting specialist reply"),
+        "the pending placeholder must be resolved by the answer, got {}",
+        history[0].1
+    );
+    drop(history);
+
+    drop(worker);
+}
+
+/// Root cause 2, end-to-end: a `ForwardNotice` the arbitrator addresses at something **no live
+/// worker drains** must be refused **observably** — never filed into a dead inbox.
+///
+/// The old bridge fell back to `agent_name.unwrap_or(tool_call_id)`, so with no `agent_name`
+/// the notice was stored under `call_1`: no worker identity ever drained that key, the
+/// steering history sat "awaiting specialist reply" for the whole 10-minute TTL, and the
+/// instruction was lost. Here the arbitrator addresses a `ForwardNotice` at an OpenAI-style
+/// call id while an unrelated coder worker is live.
+#[tokio::test]
+async fn test_steering_forward_notice_with_an_unroutable_target_is_refused_visibly() {
+    let _lock = TEST_MUTEX.lock().await;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let received_bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let rb = received_bodies.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&req.body).to_string();
+            rb.lock().unwrap().push(body.clone());
+            // No `agent_name`: only `tool_call_id: "call_dead"` names a target.
+            ResponseTemplate::new(200).set_body_string(
+                "data: {\"id\":\"c_unroutable\",\"choices\":[{\"delta\":{\"content\":\"{\\\"decision\\\": \\\"ForwardToWorker\\\", \\\"subtasks\\\": [{\\\"tool_call_id\\\": \\\"call_dead\\\", \\\"action\\\": \\\"ForwardNotice\\\", \\\"message\\\": \\\"switch to postgres\\\"}]}\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+            )
+        })
+        .mount(&server)
+        .await;
+
+    let client =
+        marmennill::llm::ChatClient::new(format!("{}/v1", server.uri()), "test".to_string());
+    let cfg = marmennill::config::Config {
+        backend_url: format!("{}/v1", server.uri()),
+        ..Default::default()
+    };
+    marmennill::config::set_active(cfg);
+
+    let stats = Arc::new(marmennill::harness::HarnessStats::new());
+    let (arb_tx, mut arb_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    marmennill::orchestrator::set_event_sender(event_tx);
+
+    // A live worker exists; it simply is not the one the arbitrator addressed.
+    let worker = marmennill::orchestrator::register_active_worker_with_token(
+        Some("t-ui-2".to_string()),
+        "coder".to_string(),
+        "build PPC JIT".to_string(),
+        Some(tokio_util::sync::CancellationToken::new()),
+    );
+    let worker_key = worker.0.clone();
+
+    let mut renderer = ScriptedRenderer::new(vec![]);
+    let steering_history = Arc::new(std::sync::RwLock::new(Vec::<(String, String)>::new()));
+    marmennill::orchestrator::set_steering_history(Arc::clone(&steering_history));
+
+    marmennill::ui::bridge::spawn_steer_arbitration(
+        &client,
+        stats.clone(),
+        "build PPC JIT",
+        &[],
+        "tell the worker to switch to postgres".to_string(),
+        &arb_tx,
+        &mut renderer,
+        Some(Arc::clone(&steering_history)),
+    );
+
+    let mut deltas: Vec<String> = Vec::new();
+    loop {
+        let Some(event) = arb_rx.recv().await else {
+            break;
+        };
+        if let marmennill::ui::bridge::SteerArbEvent::Delta(text) = &event {
+            deltas.push(text.clone());
+        }
+        if matches!(
+            event,
+            marmennill::ui::bridge::SteerArbEvent::Finished { .. }
+        ) {
+            break;
+        }
+    }
+
+    // **Nothing was filed** — not under the dead token, not onto an unrelated live worker.
+    assert!(
+        !marmennill::orchestrator::notice::has_worker_inbox("call_dead"),
+        "an unroutable token must never become a worker inbox key"
+    );
+    assert!(
+        marmennill::orchestrator::notice::peek_worker_inbox(&worker_key).is_empty(),
+        "an unroutable instruction must not be dumped on an unrelated live worker"
+    );
+
+    // **It is visible**: named in the streamed arbitrator output and in the recorded entry,
+    // and the entry does not pretend a specialist reply is outstanding.
+    assert!(
+        deltas
+            .iter()
+            .any(|d| d.contains("no active specialist is addressed by 'call_dead'")),
+        "the arbitrator output must name the refused target, got {deltas:?}"
+    );
+    {
+        let hist = steering_history.read().unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].0, "tell the worker to switch to postgres");
+        assert!(
+            hist[0].1.contains("not forwarded") && hist[0].1.contains("call_dead"),
+            "the recorded entry must report the refused forwarding, got {}",
+            hist[0].1
+        );
+        assert!(
+            !hist[0].1.contains("awaiting specialist reply"),
+            "a steer that posted no notice must not leave a pending history entry, got {}",
+            hist[0].1
+        );
+    }
+
+    drop(worker);
 }
 
 #[tokio::test]

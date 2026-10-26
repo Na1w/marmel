@@ -34,6 +34,22 @@ pub(crate) const VALIDATION_SKIP_FILE_SUFFIX: &str = "-validation-skip.md";
 pub(crate) const VALIDATION_SKIP_REASON: &str =
     "Plan directive (no-validate): validation not required";
 
+/// Reason stored in the no-validation record of a task that **has no plan line**
+/// (an ad-hoc task delegated by the Steer Arbitrator).
+///
+/// Deliberately a distinct constant from [`VALIDATION_SKIP_REASON`], and never a
+/// rewording of it: that string asserts **plan provenance** ("the plan line said
+/// `(no-validate)`"), which never existed for an ad-hoc task. Naming a plan
+/// directive that no plan ever wrote would misreport the decision's origin on
+/// disk and in the UI, and the plan wording is pinned verbatim by the lib test
+/// `test_pregenerate_records_the_no_validation_decision` and by the
+/// `tests/test_dynamic_prompts.rs` / `tests/test_validation_loop.rs` literals.
+/// The ad-hoc record therefore says out loud what actually authorized it: the
+/// delegation had no plan line at all, so the plan-side write never took a
+/// validation decision for it.
+pub(crate) const VALIDATION_SKIP_REASON_ADHOC: &str =
+    "Ad-hoc delegated task (no plan line): validation not required";
+
 /// The write-side outcome of one plan task line's validation directive.
 ///
 /// Only [`Self::SkipRecord`] may ever create a `<task_id>-validation-skip.md`,
@@ -744,10 +760,24 @@ impl PromptBuilder {
         }
     }
 
-    /// Write the durable "the plan declared this task validation-free" record and
-    /// return its file name, or `None` when the task id is refused by the grammar
-    /// authority (warned about, never repaired into some other name).
-    fn write_validation_skip_record(prompts_dir: &Path, task_id: &str) -> Option<String> {
+    /// Write the durable "this task needs no validation" record and return its
+    /// file name, or `None` when the task id is refused by the grammar authority
+    /// (warned about, never repaired into some other name).
+    ///
+    /// This is the **single** writer of `<task_id>-validation-skip.md`, so the
+    /// grammar gate ([`Self::validation_skip_file_name`]), the one-line file shape
+    /// and the failure log live here once. `reason` names the **provenance** of the
+    /// decision and is the only difference between the two records that can exist:
+    /// [`VALIDATION_SKIP_REASON`] for a plan line carrying `(no-validate)`,
+    /// [`VALIDATION_SKIP_REASON_ADHOC`] for a delegated task with no plan line.
+    /// The read side treats the string as opaque (only a non-blank record counts),
+    /// so it must stay exactly one line + `\n` — a blank record reads as "no
+    /// decision" and would silently drop the exemption.
+    pub(crate) fn write_validation_skip_record(
+        prompts_dir: &Path,
+        task_id: &str,
+        reason: &str,
+    ) -> Option<String> {
         let name = match Self::validation_skip_file_name(task_id) {
             Ok(name) => name,
             Err(err) => {
@@ -759,10 +789,7 @@ impl PromptBuilder {
                 return None;
             }
         };
-        match std::fs::write(
-            prompts_dir.join(&name),
-            format!("{VALIDATION_SKIP_REASON}\n"),
-        ) {
+        match std::fs::write(prompts_dir.join(&name), format!("{reason}\n")) {
             Ok(()) => Some(name),
             Err(err) => {
                 tracing::warn!(
@@ -773,6 +800,108 @@ impl PromptBuilder {
                 None
             }
         }
+    }
+
+    /// Record that an **ad-hoc delegated task** — one with no plan line — needs no
+    /// validation, and return the record's file name (`None` when no record may be
+    /// or was authored).
+    ///
+    /// This is the write-side counterpart of [`Self::validation_write_decision`] for
+    /// tasks the plan never produced. The ad-hoc steering path
+    /// ([`crate::orchestrator::steer::execute_steer_subtask`]) mints a valid task id
+    /// and delegates without ever touching `create_plan`, so no write-side decision
+    /// was ever taken for it and the read side sees a verdict gap
+    /// (`<task_id>-validation.md` missing, no record) and fails the deliverable
+    /// closed. Authoring this record before the run is what turns that default into
+    /// "no validation", and it is the only producer of
+    /// [`VALIDATION_SKIP_REASON_ADHOC`].
+    ///
+    /// Every step below is load-bearing:
+    /// 1. **Grammar gate** — the same check as [`Self::validation_skip_file_name`] /
+    ///    [`AgentBlueprint::save_to_disk`]. An id that cannot be safely addressed
+    ///    gets no record and no repaired name, so it keeps the fail-closed gap.
+    /// 2. **Role opt-out** — `planner` / `validator` deliverables are never
+    ///    validation-eligible on the read side, so a record for them would be inert
+    ///    and would contradict the documented role-level opt-out.
+    /// 3. **Plan-collision guard** — an ad-hoc id that *is* a line of the active
+    ///    plan keeps **plan** semantics: it must not be exempted by an ad-hoc
+    ///    default, and its authored brief must not be destroyed by step 4. This is
+    ///    what stops an unrelated ad-hoc deliverable from checking off (or silently
+    ///    de-validating) a planned task.
+    /// 4. **Stale-brief hygiene** — identical to the plan path's `SkipRecord` arm:
+    ///    a readable brief ranks above a record on the read side, so a surviving
+    ///    brief would make the record a lie. On delete failure **no record is
+    ///    authored** and `None` is returned, which keeps the fail-closed behaviour
+    ///    rather than manufacturing an exemption.
+    /// 5. Write through [`Self::write_validation_skip_record`], the single owner of
+    ///    the record shape. A failed write is reported there and returns `None` —
+    ///    never a silent success.
+    ///
+    /// `pub` (like [`Self::pregenerate_for_plan_offline`]) so the integration tests
+    /// under `tests/` drive the real writer rather than hand-written fixtures.
+    pub fn record_adhoc_no_validation(
+        prompts_dir: &Path,
+        raw_task_id: &str,
+        agent: crate::agents::Agent,
+        plan_markdown: Option<&str>,
+    ) -> Option<String> {
+        // 1. Grammar authority first: never mint an exemption for an id that cannot
+        //    be safely addressed as a single path segment.
+        let normalized = crate::task_id::normalize_task_id_ref(raw_task_id);
+        let id = match crate::task_id::validate_task_id(normalized) {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::warn!(
+                    "Rejected task id {raw_task_id:?} while recording its ad-hoc no-validation default under {}: {err}. \
+                     No `-validation-skip.md` record is written and no substitute name is derived, so this task \
+                     keeps the fail-closed verdict guard.",
+                    prompts_dir.display()
+                );
+                return None;
+            }
+        };
+
+        // 2. Role-level opt-outs are never briefed and never recorded: the read side
+        //    does not probe for these roles at all.
+        if matches!(
+            agent,
+            crate::agents::Agent::Planner | crate::agents::Agent::Validator
+        ) {
+            return None;
+        }
+
+        // 3. An id that belongs to the plan is a **planned** task, whatever the
+        //    steering path called it. Plan semantics stay untouched.
+        if plan_markdown.is_some_and(|md| crate::plan_parse::find_task_line(md, id).is_some()) {
+            tracing::warn!(
+                "Steering asked for an ad-hoc no-validation default for task {id:?}, but that id is a line of the \
+                 active execution plan. No ad-hoc record is written: the plan's own validation decision (brief or \
+                 `(no-validate)` record) stays authoritative."
+            );
+            return None;
+        }
+
+        // 4. Mutual exclusivity with the brief, exactly as the plan path does it.
+        match Self::delete_stale_validation_brief(prompts_dir, id) {
+            Ok(true) => tracing::info!(
+                "Deleted a validation brief left for task {id:?} by an earlier plan before recording its \
+                 ad-hoc no-validation default."
+            ),
+            Ok(false) => {}
+            Err(err) => {
+                tracing::error!(
+                    "Failed to delete the stale validation brief of task {id:?} under {dir}: {err}. \
+                     No `-validation-skip.md` record is written, so this task keeps the fail-closed verdict \
+                     guard against the brief that is still on disk.",
+                    dir = prompts_dir.display()
+                );
+                return None;
+            }
+        }
+
+        // 5. One writer, one line, one reason.
+        let _ = std::fs::create_dir_all(prompts_dir);
+        Self::write_validation_skip_record(prompts_dir, id, VALIDATION_SKIP_REASON_ADHOC)
     }
 
     /// Read the durable no-validation record for `raw_task_id` inside `prompts_dir`.
@@ -894,9 +1023,11 @@ impl PromptBuilder {
                     // side to infer. A task with neither record — e.g. a task id refused
                     // by the grammar authority below — keeps the fail-closed verdict
                     // guard instead of a manufactured exemption.
-                    if let Some(skip_name) =
-                        Self::write_validation_skip_record(prompts_dir, &item.task_id)
-                    {
+                    if let Some(skip_name) = Self::write_validation_skip_record(
+                        prompts_dir,
+                        &item.task_id,
+                        VALIDATION_SKIP_REASON,
+                    ) {
                         generated.push(skip_name);
                     }
                 }
@@ -1905,6 +2036,298 @@ mod tests {
         assert!(
             outside.is_empty(),
             "no plan id may write outside the prompts dir: {outside:?}"
+        );
+    }
+
+    // ---- ad-hoc (Steer Arbitrator) no-validation default ---------------------
+    //
+    // A task delegated by steering has **no plan line**, so the plan-side writer
+    // never took a validation decision for it. `record_adhoc_no_validation` is the
+    // only code that may record the ad-hoc default, and it must never leak into
+    // planned-task semantics.
+
+    /// The ad-hoc record names its **own** provenance and never borrows the plan
+    /// wording: one line, exactly `VALIDATION_SKIP_REASON_ADHOC`, while
+    /// `VALIDATION_SKIP_REASON` keeps asserting plan provenance untouched.
+    #[test]
+    fn test_adhoc_record_carries_adhoc_provenance_not_plan_provenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prompts = tmp.path().join("prompts");
+
+        let name =
+            PromptBuilder::record_adhoc_no_validation(&prompts, "steer-task-9", Agent::Coder, None)
+                .expect(
+                    "a valid ad-hoc id on a validation-eligible role records the ad-hoc default",
+                );
+        assert_eq!(name, "steer-task-9-validation-skip.md");
+        assert_eq!(
+            std::fs::read_to_string(prompts.join(&name))
+                .expect("ad-hoc skip record")
+                .as_str(),
+            format!("{VALIDATION_SKIP_REASON_ADHOC}\n"),
+            "the record is exactly one line carrying the ad-hoc reason"
+        );
+        assert_eq!(
+            PromptBuilder::validation_skip_record(&prompts, "steer-task-9").as_deref(),
+            Some(VALIDATION_SKIP_REASON_ADHOC)
+        );
+        // Provenance honesty, both directions.
+        assert!(
+            !VALIDATION_SKIP_REASON_ADHOC.contains("Plan directive"),
+            "an ad-hoc task has no plan line, so its record must not claim a plan directive"
+        );
+        assert!(
+            VALIDATION_SKIP_REASON.contains("Plan directive"),
+            "the plan-directive reason stays pinned for planned tasks"
+        );
+        // A decorated steer id normalizes to the same record name (grammar parity
+        // with the blueprint writer), never to a mended name.
+        assert_eq!(
+            PromptBuilder::record_adhoc_no_validation(
+                &prompts,
+                "[steer-task-10]",
+                Agent::Researcher,
+                None,
+            )
+            .as_deref(),
+            Some("steer-task-10-validation-skip.md")
+        );
+        // The brief really is absent afterwards — the only state a record explains.
+        assert!(
+            crate::agents::validation::probe_validation_brief(&prompts, "steer-task-9").is_absent()
+        );
+    }
+
+    /// `planner` / `validator` are role-level opt-outs: the read side never probes
+    /// for them, so an ad-hoc record would be inert and would contradict the
+    /// documented "role-level opt-outs are never briefed" rule. Nothing is written.
+    #[test]
+    fn test_adhoc_record_is_not_authored_for_role_exempt_roles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prompts = tmp.path().join("prompts");
+
+        for agent in [Agent::Planner, Agent::Validator] {
+            assert_eq!(
+                PromptBuilder::record_adhoc_no_validation(
+                    &prompts,
+                    &format!("steer-task-{}", agent.as_str()),
+                    agent,
+                    None,
+                ),
+                None,
+                "{agent} is a role-level opt-out and must get no ad-hoc record"
+            );
+            assert_eq!(
+                PromptBuilder::validation_skip_record(
+                    &prompts,
+                    &format!("steer-task-{}", agent.as_str())
+                ),
+                None,
+                "{agent} must have no record on disk"
+            );
+        }
+        let files: Vec<String> = std::fs::read_dir(&prompts)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            files
+                .iter()
+                .all(|name| !name.ends_with("-validation-skip.md")),
+            "role-exempt ad-hoc tasks must create no skip record at all: {files:?}"
+        );
+        // A validation-eligible role in the same directory does get one, so the
+        // absence above is the role rule, not a broken fixture.
+        assert!(
+            PromptBuilder::record_adhoc_no_validation(
+                &prompts,
+                "steer-task-coder",
+                Agent::Coder,
+                None,
+            )
+            .is_some()
+        );
+    }
+
+    /// **The anti-typo / anti-collision guard.** An id that is a line of the active
+    /// plan — pending *or* already checked, in either spelling — is a **planned**
+    /// task: the ad-hoc default must not exempt it, and the plan's own records must
+    /// survive byte-for-byte. An id absent from the plan still gets the record, so
+    /// the guard is keyed on plan membership, not on the plan existing at all.
+    #[test]
+    fn test_adhoc_record_is_not_authored_for_an_id_that_is_a_plan_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prompts = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts).expect("prompts dir");
+
+        let plan = "# Execution Plan\n\n### Phase 1\n\
+                    - [ ] [t-001] Fix the parser (coder)\n\
+                    - [x] [t-002] Audit the code structure (researcher)\n";
+        // A plan-authored brief for the pending line, which must not be destroyed.
+        let brief = prompts.join("t-001-validation.md");
+        std::fs::write(&brief, "audit this deliverable\n").expect("plan brief");
+
+        for id in ["t-001", "t-002"] {
+            assert_eq!(
+                PromptBuilder::record_adhoc_no_validation(&prompts, id, Agent::Coder, Some(plan)),
+                None,
+                "{id} is a plan line, so no ad-hoc exemption may be recorded for it"
+            );
+            assert_eq!(
+                PromptBuilder::validation_skip_record(&prompts, id),
+                None,
+                "{id} must keep plan semantics, not an ad-hoc record"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&brief).expect("plan brief survives"),
+            "audit this deliverable\n",
+            "the collision guard must neither exempt a planned task nor destroy its brief"
+        );
+
+        // The very same id DOES get the record when no plan mentions it, proving the
+        // guard is plan membership rather than the plan's mere existence.
+        assert_eq!(
+            PromptBuilder::record_adhoc_no_validation(
+                &prompts,
+                "t-001",
+                Agent::Coder,
+                Some("# Execution Plan\n\n- [ ] [t-999] Something else (coder)\n"),
+            )
+            .as_deref(),
+            Some("t-001-validation-skip.md")
+        );
+    }
+
+    /// Mutual exclusivity: the ad-hoc record replaces a stale brief from an earlier
+    /// plan, and when that brief cannot be deleted **no record is authored** — the
+    /// read side ranks a present brief above a record, so recording a skip on top of
+    /// one would misreport what the read side does (fail closed, never fail open).
+    #[test]
+    fn test_adhoc_record_replaces_a_stale_brief_and_never_coexists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prompts = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts).expect("prompts dir");
+
+        // Deletable stale brief → gone, record written, brief really absent.
+        std::fs::write(prompts.join("steer-task-11-validation.md"), "stale\n")
+            .expect("stale brief");
+        assert_eq!(
+            PromptBuilder::record_adhoc_no_validation(
+                &prompts,
+                "steer-task-11",
+                Agent::Coder,
+                None
+            )
+            .as_deref(),
+            Some("steer-task-11-validation-skip.md")
+        );
+        assert!(
+            !prompts.join("steer-task-11-validation.md").exists(),
+            "a stale brief must not coexist with the ad-hoc record"
+        );
+        assert!(
+            crate::agents::validation::probe_validation_brief(&prompts, "steer-task-11")
+                .is_absent()
+        );
+
+        // Undeletable brief (the destination is a directory) → no record at all, and
+        // the contradicting pair is never left on disk.
+        std::fs::create_dir(prompts.join("steer-task-12-validation.md")).expect("blocking dir");
+        assert_eq!(
+            PromptBuilder::record_adhoc_no_validation(
+                &prompts,
+                "steer-task-12",
+                Agent::Coder,
+                None
+            ),
+            None,
+            "a brief that cannot be deleted must not be papered over with a record"
+        );
+        assert!(
+            prompts.join("steer-task-12-validation.md").exists(),
+            "the undeletable brief stays where the read side can still see it"
+        );
+        assert!(
+            !prompts.join("steer-task-12-validation-skip.md").exists(),
+            "no ad-hoc record may be authored while a brief survives"
+        );
+        assert_eq!(
+            PromptBuilder::validation_skip_record(&prompts, "steer-task-12"),
+            None,
+            "the task stays fail closed"
+        );
+    }
+
+    /// Self-healing in the other direction (E5): when an id that earlier got an
+    /// ad-hoc record later **is** a plan line, `create_plan`'s writer restores plan
+    /// semantics — the ad-hoc record is dropped and the brief authored.
+    #[test]
+    fn test_adhoc_record_is_dropped_when_the_id_later_becomes_a_plan_line() {
+        let catalog = Catalog::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let prompts = tmp.path().join("prompts");
+
+        assert!(
+            PromptBuilder::record_adhoc_no_validation(&prompts, "t-077", Agent::Coder, None)
+                .is_some()
+        );
+        assert!(prompts.join("t-077-validation-skip.md").exists());
+
+        let generated = PromptBuilder::pregenerate_for_plan_offline(
+            "- [ ] [t-077] Implement the widget factory (coder)\n",
+            &catalog,
+            &prompts,
+        );
+        assert!(generated.contains(&"t-077-validation.md".to_string()));
+        assert!(prompts.join("t-077-validation.md").exists());
+        assert!(
+            !prompts.join("t-077-validation-skip.md").exists(),
+            "a plan-authored task must not inherit the earlier ad-hoc exemption"
+        );
+        assert_eq!(
+            PromptBuilder::validation_skip_record(&prompts, "t-077"),
+            None
+        );
+    }
+
+    /// An id the grammar authority refuses can never be given an exemption: no
+    /// record name is returned, no file is created, and nothing lands outside the
+    /// prompts directory. Same hostile table the blueprint and plan writers use,
+    /// plus the shapes specific to a steer-authored id.
+    #[test]
+    fn test_adhoc_record_refuses_grammar_rejected_ids_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prompts = tmp.path().join("prompts");
+        let long = "t-".to_string() + &"z".repeat(63); // 65 chars > MAX_TASK_ID_LEN
+        assert_eq!(long.chars().count(), crate::task_id::MAX_TASK_ID_LEN + 1);
+
+        for raw in ["../x", "a/b", "..", ".hidden", "", long.as_str()] {
+            assert_eq!(
+                PromptBuilder::record_adhoc_no_validation(&prompts, raw, Agent::Coder, None),
+                None,
+                "{raw:?} must be refused and never gain an ad-hoc exemption"
+            );
+        }
+        let strays: Vec<String> = std::fs::read_dir(&prompts)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            strays.is_empty(),
+            "a refused ad-hoc id must create no file of any kind: {strays:?}"
+        );
+        assert!(
+            files_outside(tmp.path(), &prompts).is_empty(),
+            "a refused ad-hoc id must never write outside the prompts dir"
         );
     }
 }

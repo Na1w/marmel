@@ -530,7 +530,7 @@ const WORKER_KEY_DISAMBIGUATOR: char = '#';
 const WORKER_KEY_SEGMENT: char = '-';
 
 /// Addresses that every worker drains (broadcast steering).
-const BROADCAST_TARGETS: [&str; 2] = ["*", "worker"];
+pub(crate) const BROADCAST_TARGETS: [&str; 2] = ["*", "worker"];
 
 /// The exact routing identity of one worker, resolved from its registry key.
 ///
@@ -1206,31 +1206,23 @@ where
 
     let raw = match reply_res {
         Ok(Ok(r)) => {
-            if !full_accum.trim().is_empty() {
-                full_accum
-            } else {
+            if !r.content.trim().is_empty() {
                 r.content
+            } else {
+                full_accum
             }
         }
         _ => String::new(),
     };
 
-    let raw_trimmed = raw.trim();
-    let json_text = if let Some(stripped) = raw_trimmed.strip_prefix("```json") {
-        stripped.trim_end_matches("```").trim()
-    } else if let Some(stripped) = raw_trimmed.strip_prefix("```") {
-        stripped.trim_end_matches("```").trim()
-    } else if let Some(start) = raw_trimmed.find('{') {
-        if let Some(end) = raw_trimmed.rfind('}') {
-            &raw_trimmed[start..=end]
-        } else {
-            raw_trimmed
-        }
+    let demuxed = crate::llm::thinking::demux_stream(&raw);
+    let raw_trimmed = if !demuxed.content().trim().is_empty() {
+        demuxed.content().trim()
     } else {
-        raw_trimmed
+        demuxed.thinking().trim()
     };
 
-    let parsed: Option<WorkerReplyEvaluation> = serde_json::from_str(json_text).ok();
+    let parsed = parse_worker_reply_evaluation(raw_trimmed);
     if let Some(eval) = parsed {
         stats.record_steer_arbitration();
         if eval.decision.eq_ignore_ascii_case("SynthesizeResponse")
@@ -1241,7 +1233,10 @@ where
         return Ok(eval);
     }
 
-    let fallback_resp = if !raw_trimmed.is_empty() && !raw_trimmed.starts_with('{') {
+    let looks_like_json = raw_trimmed.starts_with('{')
+        || raw_trimmed.starts_with("```")
+        || raw_trimmed.contains("\"decision\"");
+    let fallback_resp = if !raw_trimmed.is_empty() && !looks_like_json {
         raw_trimmed.to_string()
     } else {
         format!("Specialist [{worker_tag}] explains: {worker_reply}")
@@ -1255,4 +1250,78 @@ where
         follow_up_prompt: None,
         user_status: None,
     })
+}
+
+/// Parse a [`WorkerReplyEvaluation`] from the visible content of an LLM reply,
+/// tolerating markdown code fences and any stray `{` characters in leading prose.
+fn parse_worker_reply_evaluation(raw_trimmed: &str) -> Option<WorkerReplyEvaluation> {
+    let fenced = if let Some(stripped) = raw_trimmed.strip_prefix("```json") {
+        Some(stripped.trim_end_matches("```").trim())
+    } else {
+        raw_trimmed
+            .strip_prefix("```")
+            .map(|stripped| stripped.trim_end_matches("```").trim())
+    };
+    if let Some(candidate) = fenced
+        && let Ok(eval) = serde_json::from_str::<WorkerReplyEvaluation>(candidate)
+    {
+        return Some(eval);
+    }
+
+    if let Some(end) = raw_trimmed.rfind('}') {
+        for (start, _) in raw_trimmed[..=end].match_indices('{') {
+            let slice = &raw_trimmed[start..=end];
+            if let Ok(eval) = serde_json::from_str::<WorkerReplyEvaluation>(slice) {
+                return Some(eval);
+            }
+        }
+        for (start, _) in raw_trimmed[..=end].match_indices('{') {
+            let slice = &raw_trimmed[start..=end];
+            if let Ok(serde_json::Value::Object(map)) =
+                serde_json::from_str::<serde_json::Value>(slice)
+            {
+                let response = map
+                    .get("response")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let follow_up_prompt = map
+                    .get("follow_up_prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let user_status = map
+                    .get("user_status")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let decision = map
+                    .get("decision")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        if follow_up_prompt.is_some() && response.is_none() {
+                            "AskFollowUp".to_string()
+                        } else {
+                            "SynthesizeResponse".to_string()
+                        }
+                    });
+                if response.is_some() || follow_up_prompt.is_some() {
+                    return Some(WorkerReplyEvaluation {
+                        decision,
+                        response,
+                        follow_up_prompt,
+                        user_status,
+                    });
+                }
+            }
+        }
+    }
+
+    serde_json::from_str::<WorkerReplyEvaluation>(raw_trimmed).ok()
 }

@@ -81,6 +81,7 @@ fn test_drain_steer_delegation_events_updates_ui_and_queue() {
             sleep_seconds: None,
         }),
         user_msg: "check files".to_string(),
+        forwarded: Vec::new(),
     })
     .unwrap();
 
@@ -157,6 +158,7 @@ fn test_drain_steer_queue_and_continue_with_streamed_response() {
             sleep_seconds: None,
         }),
         user_msg: "add an extra feature later".to_string(),
+        forwarded: Vec::new(),
     })
     .unwrap();
 
@@ -204,6 +206,7 @@ fn test_drain_steer_queue_and_continue_fallback_response_when_none() {
             sleep_seconds: None,
         }),
         user_msg: "fix docs later".to_string(),
+        forwarded: Vec::new(),
     })
     .unwrap();
 
@@ -253,6 +256,7 @@ fn test_drain_steer_respond_directly_does_not_queue() {
                 sleep_seconds: None,
             }),
             user_msg: "how is it going?".to_string(),
+            forwarded: Vec::new(),
         })
         .unwrap();
 
@@ -299,6 +303,7 @@ fn test_drain_steer_synthesized_answer_does_not_queue() {
             sleep_seconds: None,
         }),
         user_msg: "what is the subagent doing?".to_string(),
+        forwarded: Vec::new(),
     })
     .unwrap();
 
@@ -334,6 +339,7 @@ fn test_drain_steer_sleep_does_not_queue() {
             sleep_seconds: Some(5),
         }),
         user_msg: "wait a moment".to_string(),
+        forwarded: Vec::new(),
     })
     .unwrap();
 
@@ -374,6 +380,7 @@ fn test_drain_steer_fallback_with_response_does_not_queue() {
             sleep_seconds: None,
         }),
         user_msg: "status?".to_string(),
+        forwarded: Vec::new(),
     })
     .unwrap();
 
@@ -444,6 +451,7 @@ fn test_drain_steer_cancel_subtask_cancels_worker_and_updates_subagents() {
             sleep_seconds: None,
         }),
         user_msg: "cancel coder".to_string(),
+        forwarded: Vec::new(),
     })
     .unwrap();
 
@@ -565,6 +573,7 @@ fn test_drain_steer_cancel_addresses_one_entry_and_leaves_the_sibling_row_open()
             sleep_seconds: None,
         }),
         user_msg: "cancel only the second coder".to_string(),
+        forwarded: Vec::new(),
     })
     .unwrap();
 
@@ -668,21 +677,136 @@ fn test_bridge_match_rule_resolves_whole_effective_tokens_with_and_semantics() {
     // No address at all addresses nothing.
     assert!(action::addressed_worker_keys(None, None).is_empty());
 
-    // A forwarded notice addressed to one worker is posted under that worker's effective key.
-    let addressed = action::notice_target(&crate::orchestrator::SteerSubtaskDecision {
-        tool_call_id: "t-token-1".to_string(),
-        action: "ForwardNotice".to_string(),
-        message: Some("use postgres".to_string()),
-        agent_name: Some("coder".to_string()),
-        prompt: None,
-        sleep_seconds: None,
-    });
+    // A forwarded notice addressed to one worker is posted under that worker's **effective
+    // registry key** — the exact spelling the runner drains its inbox with, and therefore the
+    // identity its `reply_to_arbitrator` must carry.
+    let addressed = action::notice_targets(&forward_notice("t-token-1", Some("coder")));
     assert_eq!(
-        addressed, key,
+        addressed,
+        action::NoticeTargeting::Addresses(vec![key.clone()]),
         "the notice target must be the effective registry key the pane row is named by"
     );
 
+    // No `agent_name` at all (the prompt only ever spelled it out for `DelegateTask`): the
+    // task token still resolves to the effective key.
+    assert_eq!(
+        action::notice_targets(&forward_notice("t-token-1", None)),
+        action::NoticeTargeting::Addresses(vec![key.clone()]),
+        "a task-shaped token must resolve to the effective key on its own"
+    );
+
+    // A non-registry `tool_call_id` (`call_1` — the OpenAI-style id models really emit) must
+    // never become an inbox key: the agent half resolves the live worker instead. Filing it
+    // under `call_1` is what made the notice undrainable and the correct reply a
+    // `worker-mismatch`.
+    assert_eq!(
+        action::notice_targets(&forward_notice("call_1", Some("coder"))),
+        action::NoticeTargeting::Addresses(vec![key.clone()]),
+        "an unknown tool_call_id must resolve through the agent half, never be filed as an inbox key"
+    );
+
+    // With neither half pointing at a live worker, the target is **refused** rather than
+    // emitted as an unroutable token.
+    assert_eq!(
+        action::notice_targets(&forward_notice("call_1", None)),
+        action::NoticeTargeting::Unroutable {
+            token: "call_1".to_string()
+        },
+        "a token no worker drains must be reported, not filed into a dead inbox"
+    );
+    assert_eq!(
+        action::notice_targets(&forward_notice("", None)),
+        action::NoticeTargeting::Unroutable {
+            token: "the arbitrator named no worker".to_string()
+        },
+        "an omitted/empty tool_call_id with no agent name is refused, not silently broadcast"
+    );
+
+    // A deliberate broadcast token stays a broadcast — but it is resolved to the live keys,
+    // never posted under a token nobody drains while workers are running.
+    let broadcast = action::notice_targets(&forward_notice("worker", None));
+    match broadcast {
+        action::NoticeTargeting::Addresses(keys) => {
+            assert!(
+                keys.contains(&key),
+                "a `worker` broadcast must reach the live worker's key, got {keys:?}"
+            );
+        }
+        other => panic!("a broadcast token must never be refused: {other:?}"),
+    }
+
     drop(guard);
+
+    // With no live worker behind it, the broadcast token itself is the target: the documented
+    // broadcast semantics survive, and it is the only non-registry token this rule emits.
+    assert_eq!(
+        action::notice_targets(&forward_notice("worker", None)),
+        action::NoticeTargeting::Addresses(vec!["worker".to_string()]),
+        "an explicit broadcast with no live worker stays a `worker` broadcast"
+    );
+}
+
+/// A `ForwardNotice` subtask for the targeting assertions.
+fn forward_notice(
+    tool_call_id: &str,
+    agent_name: Option<&str>,
+) -> crate::orchestrator::SteerSubtaskDecision {
+    crate::orchestrator::SteerSubtaskDecision {
+        tool_call_id: tool_call_id.to_string(),
+        action: "ForwardNotice".to_string(),
+        message: Some("use postgres".to_string()),
+        agent_name: agent_name.map(str::to_string),
+        prompt: None,
+        sleep_seconds: None,
+    }
+}
+
+/// Two live workers of the **same role** must be addressed individually: a `ForwardNotice`
+/// that names only the role posts one notice per effective key, so the second worker is never
+/// reached through a de-facto role broadcast under a raw name token.
+#[test]
+fn test_bridge_notice_targeting_addresses_every_same_role_worker_individually() {
+    let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let first = crate::orchestrator::register_active_worker_with_token(
+        Some("t-target-a".to_string()),
+        "coder".to_string(),
+        "first coder".to_string(),
+        Some(tokio_util::sync::CancellationToken::new()),
+    );
+    let second = crate::orchestrator::register_active_worker_with_token(
+        Some("t-target-b".to_string()),
+        "coder".to_string(),
+        "second coder".to_string(),
+        Some(tokio_util::sync::CancellationToken::new()),
+    );
+
+    let targeting = action::notice_targets(&forward_notice("call_ambiguous", Some("coder")));
+    let keys = match targeting {
+        action::NoticeTargeting::Addresses(keys) => keys,
+        other => panic!("two live coders must be addressed, not refused: {other:?}"),
+    };
+    assert!(
+        keys.contains(&first.0) && keys.contains(&second.0),
+        "one notice per live key, got {keys:?} (want {} and {})",
+        first.0,
+        second.0
+    );
+    assert!(
+        !keys.iter().any(|k| k == "coder" || k == "call_ambiguous"),
+        "never post under a raw name token or an unroutable id: {keys:?}"
+    );
+
+    // A precise token still addresses exactly one of them.
+    assert_eq!(
+        action::notice_targets(&forward_notice("t-target-b", Some("coder"))),
+        action::NoticeTargeting::Addresses(vec![second.0.clone()]),
+        "the addressed worker only — the sibling must not receive the notice"
+    );
+
+    drop((first, second));
 }
 
 /// (b) A **stale pane row** can no longer make the arbitrator believe subagents are executing:
@@ -706,21 +830,33 @@ fn test_bridge_stale_pane_row_cannot_report_subagents_executing() {
         stale_rows.iter().any(|s| s.is_active),
         "the fixture must really be a stale, 'active-looking' pane row"
     );
-    assert!(
-        !crate::orchestrator::has_active_workers(),
-        "the registry must report no running worker for this fixture"
+    // The registry is process-global and tests outside this lock set can register a live
+    // worker while this one runs, so the arbitrator's two reads are pinned to **one**
+    // snapshot of it. What must never depend on that snapshot is the pane-row fixture: the
+    // stale row's identity may not reach either read model, and with the registry reporting
+    // no worker — the fixture's own case — the status stays on 'planning/turn'.
+    assert_eq!(
+        arbiter::orchestrator_status_label(false),
+        "Active (planning/turn)",
+        "with no worker in the registry, a stale pane row must not push the arbitrator status \
+         to 'subagents executing'"
     );
 
+    let registry_says_active = crate::orchestrator::has_active_workers();
     assert_eq!(
-        arbiter::orchestrator_status_label(crate::orchestrator::has_active_workers()),
-        "Active (planning/turn)",
-        "a stale pane row must not push the arbitrator status to 'subagents executing'"
+        arbiter::orchestrator_status_label(registry_says_active),
+        if registry_says_active {
+            "Active (subagents executing)"
+        } else {
+            "Active (planning/turn)"
+        },
+        "the arbitrator's status must track the registry alone"
     );
+    let subtask_table = arbiter::active_subtasks_render();
     assert!(
-        !arbiter::active_subtasks_render().contains("Active Background Subagents"),
-        "the arbitrator's subtask table must not list an active worker the registry does not \
-         have, got {:?}",
-        arbiter::active_subtasks_render()
+        !subtask_table.contains("t-stale-row") && !subtask_table.contains("coder-t-stale-row"),
+        "the arbitrator's subtask table must never list a pane row the registry no longer \
+         holds, got {subtask_table:?}"
     );
 
     // And the drain does not resurrect the stale row either: the projection drops rows the
@@ -747,6 +883,7 @@ fn test_bridge_stale_pane_row_cannot_report_subagents_executing() {
             sleep_seconds: None,
         }),
         user_msg: "cancel the stale row".to_string(),
+        forwarded: Vec::new(),
     })
     .unwrap();
     drain_steer_arbitration_events(
@@ -808,6 +945,7 @@ fn test_drain_steer_cancel_without_a_row_buffer_still_uses_registry_truth() {
             sleep_seconds: None,
         }),
         user_msg: "cancel it".to_string(),
+        forwarded: Vec::new(),
     })
     .unwrap();
 
@@ -927,6 +1065,7 @@ fn test_drain_steer_abort_cancels_all_active_workers() {
             sleep_seconds: None,
         }),
         user_msg: "stop all".to_string(),
+        forwarded: Vec::new(),
     })
     .unwrap();
 
@@ -1059,13 +1198,17 @@ fn test_arbiter_sleep_notice_wording_per_host_channel() {
 #[test]
 fn test_arbiter_recorded_response_chain_for_both_hosts() {
     // No decision at all.
-    assert_eq!(arbiter::recorded_response(None, None, &[]), "No decision");
+    assert_eq!(
+        arbiter::recorded_response(None, None, &[], &[]),
+        "No decision"
+    );
 
     // Decision without a direct response falls back to the decision name.
     assert_eq!(
         arbiter::recorded_response(
             Some(&steer_decision("RespondDirectly", None, None)),
             None,
+            &[],
             &[]
         ),
         "Decision: RespondDirectly"
@@ -1080,6 +1223,7 @@ fn test_arbiter_recorded_response_chain_for_both_hosts() {
                 None
             )),
             None,
+            &[],
             &[]
         ),
         "Coder is running the suite."
@@ -1087,18 +1231,38 @@ fn test_arbiter_recorded_response_chain_for_both_hosts() {
 
     // Sleep without a response.
     assert_eq!(
-        arbiter::recorded_response(Some(&steer_decision("Sleep", None, Some(12))), None, &[]),
+        arbiter::recorded_response(
+            Some(&steer_decision("Sleep", None, Some(12))),
+            None,
+            &[],
+            &[]
+        ),
         "Slept for 12s"
     );
 
-    // ForwardToWorker with no posted notice (the sink never posts one here).
+    // ForwardToWorker with **no** posted notice: the entry must not claim an outstanding
+    // specialist reply that no worker can ever answer.
     assert_eq!(
         arbiter::recorded_response(
             Some(&steer_decision("ForwardToWorker", None, None)),
             None,
+            &[],
             &[]
         ),
-        "Forwarded notice to worker (awaiting specialist reply)"
+        "ForwardToWorker decision carried no forwarded notice (nothing is awaiting a \
+         specialist reply)"
+    );
+
+    // ForwardToWorker whose target resolved to no live worker: named, not silent.
+    assert_eq!(
+        arbiter::recorded_response(
+            Some(&steer_decision("ForwardToWorker", None, None)),
+            None,
+            &[],
+            &["call_1".to_string()]
+        ),
+        "notice not forwarded: no active specialist is addressed by 'call_1' (nothing is \
+         awaiting a specialist reply)"
     );
 
     // ForwardToWorker with posted notices (spawned-arbitrator host), in posting order.
@@ -1110,7 +1274,8 @@ fn test_arbiter_recorded_response_chain_for_both_hosts() {
         arbiter::recorded_response(
             Some(&steer_decision("ForwardToWorker", None, None)),
             None,
-            &forwarded
+            &forwarded,
+            &[]
         ),
         "Forwarded notice notice-1 to coder (awaiting specialist reply), \
          Forwarded notice notice-2 to debugger (awaiting specialist reply)"
@@ -1121,7 +1286,8 @@ fn test_arbiter_recorded_response_chain_for_both_hosts() {
         arbiter::recorded_response(
             Some(&steer_decision("DelegateTask", Some("ignored"), None)),
             Some("Synthesized answer"),
-            &forwarded
+            &forwarded,
+            &[]
         ),
         "Synthesized answer"
     );
@@ -1535,6 +1701,7 @@ fn test_bridge_drain_cancel_action_spellings_take_the_same_branch() {
                 sleep_seconds: None,
             }),
             user_msg: format!("cancel the coder ({spelling})"),
+            forwarded: Vec::new(),
         })
         .unwrap();
 
@@ -1613,6 +1780,7 @@ fn test_bridge_deferred_steer_survives_terminal_sleep_instead_of_being_dropped()
             Some(5),
         )),
         user_msg: instruction.to_string(),
+        forwarded: Vec::new(),
     })
     .unwrap();
 
@@ -2170,26 +2338,59 @@ fn test_bridge_sleep_chain_host_sleep_refuses_a_sub_minimum_budget_and_floors_th
     }
 }
 
+/// Serialise against every other holder of the process-global notice store.
+///
+/// Notices are filed per addressed worker, and a `*` / `worker` **broadcast** notice is
+/// drained by *any* worker — so a sibling test's drain can quietly steal the notice this
+/// file's steer tests just posted (and `clear_all_notices()` in `notice_tests` can wipe
+/// it outright). Taking the same `TEST_NOTICE_MUTEX` the notice tests hold removes that
+/// cross-talk. Ordering rule for the crate: **workers → notice**; no test takes them the
+/// other way round, so this cannot deadlock. Taken outside any runtime, because tokio's
+/// `blocking_lock` refuses to park inside one.
+fn notice_store_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    crate::orchestrator::notice::TEST_NOTICE_MUTEX.blocking_lock()
+}
+
 /// (d) A notice dropped by the inbox capacity bound is never lost silently: the bound stays
-/// intact, the drop is counted (delta, not an absolute global) and the bridge surfaces which
+/// intact, the drop is counted (delta, not an absolute global) and the drop text names which
 /// notice id was dropped — while the newest instruction survives.
+///
+/// The same drive also pins the **one notice per steer** rule end-to-end: the arbitration round
+/// posts exactly one notice for one `ForwardNotice` subtask, under the addressed worker's own
+/// effective key, and the drain host renders that result without posting anything of its own
+/// (no phantom second copy, no third delivery as a Manager turn).
 #[test]
 fn test_bridge_notice_capacity_drop_is_observable_and_inbox_stays_bounded() {
     use crate::orchestrator::notice;
 
-    let target = "t035c-capacity-target";
+    let _workers = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let _notices = notice_store_lock();
+
+    // The notice must land where a live worker actually drains it: a registered worker,
+    // addressed by task token, filed under its effective key.
+    let guard = crate::orchestrator::register_active_worker_with_token(
+        Some("t-035c-capacity".to_string()),
+        "coder".to_string(),
+        "capacity-bound steer".to_string(),
+        Some(tokio_util::sync::CancellationToken::new()),
+    );
+    let target = guard.0.clone();
+
     let capacity = notice::INBOX_CAPACITY;
     let before = notice::notice_lifecycle_stats();
 
     for i in 0..capacity {
         notice::post_notice_to_worker(
-            target,
+            &target,
             &format!("filler {i}"),
             Some(&format!("t035c-fill-{i}")),
         );
     }
     assert_eq!(
-        notice::worker_inbox_len(target),
+        notice::worker_inbox_len(&target),
         capacity,
         "the inbox is filled to exactly its documented capacity"
     );
@@ -2199,19 +2400,49 @@ fn test_bridge_notice_capacity_drop_is_observable_and_inbox_stays_bounded() {
     let mut steer_queue = Vec::new();
     let mut steer_abort = false;
 
-    let mut forwarded = subtask_with("t-035c-capacity", "forward notice", Some(target));
+    let mut forwarded = subtask_with("t-035c-capacity", "forward notice", Some("coder"));
     forwarded.message = Some("switch to postgres".to_string());
+    let decision = crate::orchestrator::SteerDecision {
+        decision: "ForwardToWorker".to_string(),
+        response: None,
+        tier: None,
+        model: None,
+        subtasks: vec![forwarded],
+        sleep_seconds: None,
+    };
 
+    // **The arbitration round owns the posting** — one call, one notice per subtask.
+    let outcomes =
+        arbiter::post_forward_notices(Some(&decision), "ask the coder to switch to postgres");
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "one ForwardNotice subtask must yield exactly one outcome"
+    );
+    let posted = match &outcomes[0] {
+        arbiter::ForwardOutcome::Posted(posted) => posted.clone(),
+        other => panic!("the addressed worker must be reachable, got {other:?}"),
+    };
+    assert_eq!(
+        posted.target, target,
+        "the notice must be filed under the addressed worker's effective key"
+    );
+    assert_eq!(
+        posted.dropped_older.len(),
+        1,
+        "the overflow must be reported to the caller, not swallowed"
+    );
+    assert!(
+        arbiter::capacity_drop_text(&target, &posted.dropped_older).contains("t035c-fill-0"),
+        "the drop text must name the dropped id"
+    );
+    let forwarded_ids = arbiter::posted_notices(&outcomes);
+
+    // The host only renders that result.
     tx.send(SteerArbEvent::Finished {
-        decision: Some(crate::orchestrator::SteerDecision {
-            decision: "ForwardToWorker".to_string(),
-            response: None,
-            tier: None,
-            model: None,
-            subtasks: vec![forwarded],
-            sleep_seconds: None,
-        }),
+        decision: Some(decision),
         user_msg: "ask the coder to switch to postgres".to_string(),
+        forwarded: forwarded_ids,
     })
     .unwrap();
 
@@ -2225,13 +2456,52 @@ fn test_bridge_notice_capacity_drop_is_observable_and_inbox_stays_bounded() {
 
     // Backpressure kept: the inbox never exceeds INBOX_CAPACITY.
     assert_eq!(
-        notice::worker_inbox_len(target),
+        notice::worker_inbox_len(&target),
         capacity,
         "the INBOX_CAPACITY bound must stay intact"
     );
 
-    // The drop is counted (delta for this key's overflow, never an absolute process total).
+    // **One notice per steer**: the whole round (posting + drain-host rendering) issued
+    // exactly one notice for this decision — the drain host used to add a second copy under
+    // a `worker` broadcast default. Checked per key so parallel tests cannot perturb it.
+    let queued = notice::peek_worker_inbox(&target);
+    assert_eq!(
+        queued
+            .iter()
+            .filter(|n| n.user_inquiry == "switch to postgres")
+            .count(),
+        1,
+        "exactly one copy of this steer's notice may be queued, got {queued:?}"
+    );
+    assert!(
+        queued
+            .iter()
+            .all(|n| n.user_inquiry != "ask the coder to switch to postgres"),
+        "the raw user text must never be posted as a second (broadcast) notice, got {queued:?}"
+    );
     let after = notice::notice_lifecycle_stats();
+    let drained = notice::drain_worker_notices(&target);
+    assert_eq!(
+        drained
+            .iter()
+            .filter(|n| n.notice_id == posted.notice_id)
+            .count(),
+        1,
+        "the worker drains exactly one copy of this steer's notice"
+    );
+    assert!(
+        drained
+            .iter()
+            .any(|n| n.notice_id == posted.notice_id && n.user_inquiry == "switch to postgres"),
+        "the delivered copy carries the arbitrator's rewritten inquiry"
+    );
+    assert!(
+        drained.len() == capacity,
+        "the drained inbox holds exactly the capacity-bounded set, got {}",
+        drained.len()
+    );
+
+    // The drop is counted (delta for this key's overflow, never an absolute process total).
     let evicted_delta = after.capacity_evicted_total - before.capacity_evicted_total;
     assert!(
         evicted_delta >= 1,
@@ -2243,12 +2513,8 @@ fn test_bridge_notice_capacity_drop_is_observable_and_inbox_stays_bounded() {
         crate::orchestrator::get_pending_notice("t035c-fill-0").is_none(),
         "the oldest notice is the one dropped by the capacity policy"
     );
-    assert!(
-        crate::orchestrator::get_pending_notice("t035c-fill-1").is_some(),
-        "only the oldest notice is dropped, not the whole inbox"
-    );
 
-    // The drop is observable in the UI, naming the dropped id and the bound.
+    // The forwarding is observable in the UI, naming the notice id and its key.
     let statuses: Vec<String> = renderer
         .events
         .iter()
@@ -2260,17 +2526,401 @@ fn test_bridge_notice_capacity_drop_is_observable_and_inbox_stays_bounded() {
     assert!(
         statuses
             .iter()
-            .any(|s| s.contains("capped at") && s.contains("t035c-fill-0")),
-        "the capacity drop must be surfaced to the user, got {statuses:?}"
+            .any(|s| s.contains(&posted.notice_id) && s.contains(&target)),
+        "the forwarded notice must be surfaced with its id and target, got {statuses:?}"
     );
 
-    // And the instruction itself is still queued for the next seam.
+    // And a forwarded steer does **not** also reach the Manager: the notice is the delivery.
     assert!(
-        steer_queue
-            .iter()
-            .any(|s| s == "ask the coder to switch to postgres"),
-        "the steering instruction itself must survive, got {steer_queue:?}"
+        steer_queue.is_empty(),
+        "a forwarded steer must not be pushed into steer_queue as a third delivery, got {steer_queue:?}"
     );
+
+    drop(guard);
+}
+
+/// (a) **One notice per `ForwardNotice` steer.** The arbitration round posts it once
+/// (`arbiter::post_forward_notices`); the drain host only renders what it was handed. Before the
+/// fix the drain host posted a **second** copy of the same decision — under a `worker` broadcast
+/// default with the raw user text — and also pushed the raw text into `steer_queue`, so one steer
+/// was delivered three times, the phantom copy stayed pending for the whole 10-minute TTL, and a
+/// second answer to it came back `already-replied`.
+#[test]
+fn test_bridge_forward_notice_posts_exactly_one_notice_per_steer() {
+    use crate::orchestrator::notice;
+
+    let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let _notices = notice_store_lock();
+
+    let guard = crate::orchestrator::register_active_worker_with_token(
+        Some("t-035c-one".to_string()),
+        "coder".to_string(),
+        "one notice per steer".to_string(),
+        Some(tokio_util::sync::CancellationToken::new()),
+    );
+    let target = guard.0.clone();
+
+    let raw_user_text = "ask the coder about the rebase t035c-once";
+    let decision = crate::orchestrator::SteerDecision {
+        decision: "ForwardToWorker".to_string(),
+        response: Some("Passing that to the coder.".to_string()),
+        tier: None,
+        model: None,
+        subtasks: vec![{
+            let mut st = subtask_with("t-035c-one", "forward notice", Some("coder"));
+            st.message = Some("how is the rebase going?".to_string());
+            st
+        }],
+        sleep_seconds: None,
+    };
+
+    // The posting owner: exactly one notice, under the addressed worker's effective key.
+    let outcomes = arbiter::post_forward_notices(Some(&decision), raw_user_text);
+    assert_eq!(outcomes.len(), 1, "one subtask, one outcome");
+    let posted = match &outcomes[0] {
+        arbiter::ForwardOutcome::Posted(posted) => posted.clone(),
+        other => panic!("the addressed worker is live, got {other:?}"),
+    };
+    assert_eq!(posted.target, target);
+    assert_eq!(
+        notice::worker_inbox_len(&target),
+        1,
+        "the posting owner filed exactly one copy"
+    );
+    // The recorded entry's ids are the ids actually pending — the correlation the reply needs.
+    assert!(
+        crate::orchestrator::get_pending_notice(&posted.notice_id).is_some(),
+        "the forwarded id must be a real pending notice"
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut renderer = TestRenderer::new();
+    let mut steer_queue = Vec::new();
+    let mut steer_abort = false;
+    tx.send(SteerArbEvent::Finished {
+        decision: Some(decision),
+        user_msg: raw_user_text.to_string(),
+        forwarded: arbiter::posted_notices(&outcomes),
+    })
+    .unwrap();
+
+    drain_steer_arbitration_events(
+        &mut rx,
+        &mut renderer,
+        &mut steer_queue,
+        &mut steer_abort,
+        None,
+    );
+
+    // The drain host posted nothing: still exactly one queued copy, carrying the arbitrator's
+    // rewritten inquiry rather than the raw user text.
+    let queued = notice::peek_worker_inbox(&target);
+    assert_eq!(
+        queued.len(),
+        1,
+        "the whole steer must yield exactly one queued notice, got {queued:?}"
+    );
+    assert_eq!(queued[0].notice_id, posted.notice_id);
+    assert_eq!(queued[0].user_inquiry, "how is the rebase going?");
+    assert!(
+        notice::peek_worker_inbox("worker")
+            .iter()
+            .all(|n| n.user_inquiry != raw_user_text),
+        "no broadcast copy of the raw user text may be filed"
+    );
+    assert!(
+        !notice::has_worker_inbox("t-035c-one"),
+        "the raw `tool_call_id` must never become an inbox key"
+    );
+
+    // And the instruction is **not** also handed to the Manager as a third delivery.
+    assert!(
+        steer_queue.is_empty(),
+        "a forwarded steer must not be pushed into steer_queue, got {steer_queue:?}"
+    );
+
+    // The forwarding is surfaced with both the id and the key it was filed under.
+    assert!(renderer.events.iter().any(|e| matches!(
+        e,
+        Event::Status(s) if s.contains(&posted.notice_id) && s.contains(&target)
+    )));
+
+    // One pending notice means one reply resolves the dialogue: the worker drains exactly one
+    // copy, its first answer is accepted, and only a genuine second answer is `already-replied`.
+    let drained = notice::drain_worker_notices(&target);
+    assert_eq!(drained.len(), 1, "the worker drains one copy: {drained:?}");
+    assert_eq!(drained[0].notice_id, posted.notice_id);
+    let first = notice::record_worker_reply_for_notice(&target, &posted.notice_id, "rebased");
+    assert!(
+        first.is_ok(),
+        "the addressed worker's reply must be accepted: {first:?}"
+    );
+    let second = notice::record_worker_reply_for_notice(&target, &posted.notice_id, "again");
+    assert_eq!(
+        second.err().map(|rejection| rejection.kind().to_string()),
+        Some("already-replied".to_string()),
+        "only a duplicate answer may be reported as already-replied"
+    );
+
+    drop(guard);
+}
+
+/// (e) An omitted `tool_call_id` must not silently drop the notice. The field now carries a serde
+/// default, so the decision stays a `ForwardToWorker` and the `agent_name` half still resolves a
+/// live worker — the handle only becomes load-bearing when nothing else can address anyone.
+#[test]
+fn test_bridge_forward_notice_survives_an_omitted_tool_call_id() {
+    use crate::orchestrator::notice;
+
+    let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let _notices = notice_store_lock();
+
+    let guard = crate::orchestrator::register_active_worker_with_token(
+        Some("t-035c-nohandle".to_string()),
+        "coder".to_string(),
+        "decision without a subtask handle".to_string(),
+        Some(tokio_util::sync::CancellationToken::new()),
+    );
+    let target = guard.0.clone();
+
+    // Exactly the shape the arbitrator emits when it leaves out `tool_call_id`.
+    let decision: crate::orchestrator::SteerDecision = serde_json::from_str(
+        r#"{"decision":"ForwardToWorker","subtasks":[{"action":"ForwardNotice","agent_name":"coder","message":"run the suite"}]}"#,
+    )
+    .expect("an omitted tool_call_id must not make the decision unparseable");
+    assert_eq!(decision.subtasks[0].tool_call_id, "");
+
+    let outcomes =
+        arbiter::post_forward_notices(Some(&decision), "tell the coder to run the suite");
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "one subtask must still produce one outcome"
+    );
+    let posted = match &outcomes[0] {
+        arbiter::ForwardOutcome::Posted(posted) => posted.clone(),
+        other => panic!("the agent name alone must still address the live worker: {other:?}"),
+    };
+    assert_eq!(posted.target, target, "filed under the live worker's key");
+    let queued = notice::peek_worker_inbox(&target);
+    assert_eq!(queued.len(), 1, "exactly one notice survived: {queued:?}");
+    assert_eq!(queued[0].user_inquiry, "run the suite");
+
+    notice::drain_worker_notices(&target);
+    drop(guard);
+}
+
+/// (a2) The **paused-stream host** is the other posting site, and it owns exactly one post per
+/// `ForwardNotice` subtask too: no second copy under a `worker` broadcast with the raw user text,
+/// and no third delivery pushed into `steer_queue` as a Manager turn. No test used to run both
+/// posting hosts, which is how the duplicate survived.
+#[test]
+fn test_bridge_sink_host_posts_exactly_one_notice_for_a_forward_notice_decision() {
+    use crate::orchestrator::notice;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // The notice lock is taken **inside** `with_arbitration_test_lock`, which is where
+    // `TEST_WORKERS_MUTEX` is held: the crate's order is workers → notice, and inverting
+    // it here would deadlock against the sibling tests that hold the registry lock and
+    // then wait for the notice store.
+    with_arbitration_test_lock(async {
+        let _notices = crate::orchestrator::notice::TEST_NOTICE_MUTEX.lock().await;
+
+        let task = "t-035c-sink";
+        let raw_user_text = "ask the coder about the rebase t035c-sink";
+        let body = serde_json::json!({
+            "decision": "ForwardToWorker",
+            "response": "Handing that to the coder.",
+            "subtasks": [{
+                "tool_call_id": task,
+                "action": "ForwardNotice",
+                "agent_name": "coder",
+                "message": "how is the rebase going?",
+            }],
+        });
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse_chunk(&body.to_string())))
+            .mount(&server)
+            .await;
+
+        let guard = crate::orchestrator::register_active_worker_with_token(
+            Some(task.to_string()),
+            "coder".to_string(),
+            "paused-stream posting".to_string(),
+            Some(tokio_util::sync::CancellationToken::new()),
+        );
+        let target = guard.0.clone();
+
+        let client = crate::llm::ChatClient::new_with_token(server.uri(), "mock", "tok");
+        let stats = std::sync::Arc::new(crate::harness::HarnessStats::new());
+        let history = std::sync::Arc::new(std::sync::RwLock::new(Vec::<(String, String)>::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut renderer = TestRenderer::new();
+        let mut steer_queue = Vec::new();
+        let mut steer_abort = false;
+        let mut subagents: Vec<SubagentDetail> = Vec::new();
+
+        {
+            let mut sink = super::sink::RendererSink {
+                renderer: &mut renderer,
+                steer_queue: &mut steer_queue,
+                steer_abort_requested: &mut steer_abort,
+                arb_tx: &tx,
+                arb_rx: &mut rx,
+                client: &client,
+                stats: stats.clone(),
+                goal: "keep the suite green",
+                subagents: &mut subagents,
+                plan: None,
+                ctx: None,
+                steering_history: Some(history.clone()),
+            };
+            let action = crate::llm::StreamSink::on_pause(&mut sink, raw_user_text).await;
+            assert_eq!(action, crate::llm::PauseAction::Resume);
+        }
+
+        // One notice, filed under the addressed worker's own key, carrying the arbitrator's
+        // rewritten inquiry.
+        let queued = notice::peek_worker_inbox(&target);
+        assert_eq!(
+            queued.len(),
+            1,
+            "the paused-stream host must post exactly one notice, got {queued:?}"
+        );
+        assert_eq!(queued[0].user_inquiry, "how is the rebase going?");
+        assert_eq!(queued[0].target_worker, target);
+        assert!(
+            notice::peek_worker_inbox("worker")
+                .iter()
+                .all(|n| n.user_inquiry != raw_user_text),
+            "no broadcast copy of the raw user text may be filed"
+        );
+
+        // The instruction is not additionally handed to the Manager.
+        assert!(
+            steer_queue.is_empty(),
+            "a forwarded steer must not be queued as a Manager turn, got {steer_queue:?}"
+        );
+
+        // It is surfaced with id + key, and the recorded entry names the same id.
+        assert!(renderer.events.iter().any(|e| matches!(
+            e,
+            Event::Status(s) if s.contains(&queued[0].notice_id) && s.contains(&target)
+        )));
+        let entries = history.read().unwrap().clone();
+        assert_eq!(entries.len(), 1, "one steer, one entry: {entries:?}");
+        assert!(
+            entries[0].1.contains(&queued[0].notice_id) && entries[0].1.contains(&target),
+            "the recorded entry must name the notice it is waiting on, got {}",
+            entries[0].1
+        );
+
+        // And the worker drains exactly one copy and can answer it once.
+        let drained = notice::drain_worker_notices(&target);
+        assert_eq!(drained.len(), 1, "one delivered copy: {drained:?}");
+        assert!(
+            notice::record_worker_reply_for_notice(&target, &drained[0].notice_id, "rebased")
+                .is_ok(),
+            "the addressed worker's reply must resolve the notice"
+        );
+
+        drop(guard);
+    });
+}
+
+/// A `Cancel` carrying **no** `agent_name` (only a task token) must still address exactly one
+/// registry entry — and report it under that entry's effective key, never under the raw token.
+#[test]
+fn test_drain_steer_cancel_without_an_agent_name_addresses_one_registry_entry() {
+    let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let token_a = tokio_util::sync::CancellationToken::new();
+    let guard_a = crate::orchestrator::register_active_worker_with_token(
+        Some("t-035c-named-a".to_string()),
+        "coder".to_string(),
+        "first build".to_string(),
+        Some(token_a.clone()),
+    );
+    let token_b = tokio_util::sync::CancellationToken::new();
+    let guard_b = crate::orchestrator::register_active_worker_with_token(
+        Some("t-035c-named-b".to_string()),
+        "coder".to_string(),
+        "second build".to_string(),
+        Some(token_b.clone()),
+    );
+    let key_b = guard_b.0.clone();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut renderer = TestRenderer::new();
+    let mut steer_queue = Vec::new();
+    let mut steer_abort = false;
+    tx.send(SteerArbEvent::Finished {
+        decision: Some(crate::orchestrator::SteerDecision {
+            decision: "ForwardToWorker".to_string(),
+            response: None,
+            tier: None,
+            model: None,
+            subtasks: vec![subtask_with("t-035c-named-b", "Cancel", None)],
+            sleep_seconds: None,
+        }),
+        user_msg: "cancel the second build".to_string(),
+        forwarded: Vec::new(),
+    })
+    .unwrap();
+
+    drain_steer_arbitration_events(
+        &mut rx,
+        &mut renderer,
+        &mut steer_queue,
+        &mut steer_abort,
+        None,
+    );
+
+    assert!(
+        token_b.is_cancelled(),
+        "the task token alone must address the second worker"
+    );
+    assert!(
+        !token_a.is_cancelled(),
+        "the sibling sharing only the role must be untouched"
+    );
+    let statuses: Vec<String> = renderer
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Status(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|s| s.contains("Cancelled specialist subagent"))
+            .count(),
+        1,
+        "exactly one cancel is reported, got {statuses:?}"
+    );
+    assert!(
+        statuses
+            .iter()
+            .any(|s| s.contains(&format!("Cancelled specialist subagent '{key_b}'"))),
+        "the report must name the effective key, got {statuses:?}"
+    );
+
+    drop(guard_a);
+    drop(guard_b);
 }
 
 // The paused-stream host (`sink.rs`) resolves a `Sleep` duration through the single

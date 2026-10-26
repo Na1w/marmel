@@ -26,9 +26,22 @@ use std::sync::Arc;
 
 pub const STEER_ARBITRATOR_SYSTEM_PROMPT: &str = include_str!("../../prompts/steer_arbitrator.md");
 
+/// Wall-clock bound on one arbitrator decision call, in seconds. Named because the WARN that
+/// reports a lost round trip must be able to state it (see
+/// [`arbitrate_steer_context_stream`]).
+const STEER_CALL_TIMEOUT_SECS: u64 = 60;
+
 /// A per-subtask decision, matching caesar `SteerSubtaskDecision`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteerSubtaskDecision {
+    /// The arbitrator's handle for the target subagent. **Tolerant by design**: every
+    /// sibling field already carries `#[serde(default)]`, and a missing handle must not
+    /// make the *whole* decision unparseable — that silently degrades the steer to
+    /// `RespondDirectly` and no notice is ever posted. An empty handle is rejected where
+    /// it matters, by target resolution
+    /// ([`crate::ui::bridge::action::notice_targets`]), which refuses to file a notice
+    /// under a token no worker can drain and surfaces that refusal instead.
+    #[serde(default)]
     pub tool_call_id: String,
     /// Raw action string from the arbitrator. Canonicalized through
     /// [`SteerSubtaskAction`] / [`normalize_steer_subtask_action`] — the vocabulary is
@@ -222,6 +235,7 @@ where
         tools: None,
     };
 
+    let mut demux = crate::llm::thinking::ThinkingDemuxer::new();
     let mut extractor = StreamingResponseExtractor::new();
     let mut did_stream_response = false;
     let mut raw_stream_accum = String::new();
@@ -235,17 +249,22 @@ where
     // Nothing is acquired here: `ChatClient::chat_stream` is the single
     // acquisition site, and the scope is discharged when the call returns,
     // times out or is cancelled, so the class never leaks outward.
+    let call_started = std::time::Instant::now();
     let reply = match tokio::time::timeout(
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(STEER_CALL_TIMEOUT_SECS),
         pool::with_call_context(
             steer_arbitrator_call_context(),
             client.chat_stream(&req, |chunk| {
                 raw_stream_accum.push_str(chunk);
-                let (delta, _) = extractor.push_chunk(chunk);
-                if !delta.is_empty() {
-                    did_stream_response = true;
-                    on_delta(&delta);
-                }
+                demux.push_delta(chunk, |kind, piece| {
+                    if kind == crate::llm::thinking::DeltaKind::Content {
+                        let (delta, _) = extractor.push_chunk(piece);
+                        if !delta.is_empty() {
+                            did_stream_response = true;
+                            on_delta(&delta);
+                        }
+                    }
+                });
                 true
             }),
         ),
@@ -253,8 +272,42 @@ where
     .await
     {
         Ok(Ok(r)) => r,
-        _ => return None,
+        // A round that produced nothing used to be silent: `None` makes the arbitration loop
+        // stop exactly as if the arbitrator had answered something else, so a dead backend, a
+        // 404 from an unmatched mock or a hit deadline was indistinguishable from a real
+        // decision — in the logs and in CI triage alike. Same WARN discipline as the
+        // "decision did not parse" fallback below; the returned `None` is unchanged.
+        Ok(Err(err)) => {
+            tracing::warn!(
+                backend = %client.backend_url(),
+                model = %client.model(),
+                elapsed_ms = call_started.elapsed().as_millis() as u64,
+                error = %err,
+                "Steer arbitrator call failed — this arbitration round produced no decision"
+            );
+            return None;
+        }
+        Err(elapsed) => {
+            tracing::warn!(
+                backend = %client.backend_url(),
+                model = %client.model(),
+                elapsed_ms = call_started.elapsed().as_millis() as u64,
+                timeout_secs = STEER_CALL_TIMEOUT_SECS,
+                error = %elapsed,
+                "Steer arbitrator call timed out — this arbitration round produced no decision"
+            );
+            return None;
+        }
     };
+    demux.finish_delta(|kind, piece| {
+        if kind == crate::llm::thinking::DeltaKind::Content {
+            let (delta, _) = extractor.push_chunk(piece);
+            if !delta.is_empty() {
+                did_stream_response = true;
+                on_delta(&delta);
+            }
+        }
+    });
 
     let mut raw = reply.content.trim().to_string();
     if raw.is_empty() && !reply.raw.is_empty() {
@@ -262,6 +315,12 @@ where
     }
     if raw.is_empty() && !raw_stream_accum.is_empty() {
         raw = raw_stream_accum.trim().to_string();
+    }
+    let demuxed_raw = crate::llm::thinking::demux_stream(&raw);
+    if !demuxed_raw.content().trim().is_empty() {
+        raw = demuxed_raw.content().trim().to_string();
+    } else if !demuxed_raw.thinking().trim().is_empty() {
+        raw = demuxed_raw.thinking().trim().to_string();
     }
 
     let json_text = if let Some(stripped) = raw.strip_prefix("```json") {
@@ -278,36 +337,67 @@ where
         &raw
     };
 
-    let parsed_decision = if let Ok(mut decision) = serde_json::from_str::<SteerDecision>(json_text)
-    {
-        if decision.decision.eq_ignore_ascii_case("Sleep") && decision.sleep_seconds.is_none() {
-            // The fallback duration is the owner's constant, not a
-            // steer-local literal re-typed next to the extraction it pairs with.
-            decision.sleep_seconds = Some(crate::tool_args::SLEEP_DEFAULT_SECS);
+    let parsed_candidate = serde_json::from_str::<SteerDecision>(json_text).or_else(|first_err| {
+        if let Some(end) = raw.rfind('}') {
+            for (start, _) in raw[..=end].match_indices('{') {
+                if let Ok(decision) = serde_json::from_str::<SteerDecision>(&raw[start..=end]) {
+                    return Ok(decision);
+                }
+            }
         }
-        Some(decision)
-    } else if let Some(tc) = reply
-        .tool_calls
-        .iter()
-        .find(|tc| crate::tool_names::is_sleep_tool_name(&tc.function.name))
-    {
-        Some(sleep_steer_decision(&tc.function.arguments))
-    } else if did_stream_response || !raw.is_empty() {
-        let resp = if !raw.is_empty() {
-            raw
-        } else {
-            raw_stream_accum
-        };
-        Some(SteerDecision {
-            decision: "RespondDirectly".to_string(),
-            response: Some(resp),
-            tier: None,
-            model: None,
-            subtasks: Vec::new(),
-            sleep_seconds: None,
-        })
-    } else {
-        None
+        Err(first_err)
+    });
+
+    let parsed_decision = match parsed_candidate {
+        Ok(mut decision) => {
+            if decision.decision.eq_ignore_ascii_case("Sleep") && decision.sleep_seconds.is_none() {
+                // The fallback duration is the owner's constant, not a
+                // steer-local literal re-typed next to the extraction it pairs with.
+                decision.sleep_seconds = Some(crate::tool_args::SLEEP_DEFAULT_SECS);
+            }
+            Some(decision)
+        }
+        Err(err) => {
+            // A decision that does not parse used to vanish: the round degraded into
+            // `RespondDirectly` and any `ForwardNotice` subtask inside it was never
+            // posted, with nothing recorded anywhere. The fallback is still the safe
+            // direction (an answer to the user beats a phantom action), but it is now
+            // logged and surfaced, so a lost notice is at least observable.
+            tracing::warn!(
+                error = %err,
+                decision_text = %crate::text_util::truncate_with_ellipsis(json_text, 400),
+                "Steer arbitrator decision did not parse — no subtask action from it can run; \
+                 falling back to a direct answer"
+            );
+            crate::orchestrator::emit_status(
+                "Steer arbitrator returned an unreadable decision — the instruction was NOT \
+                 forwarded to any specialist (see logs)"
+                    .to_string(),
+            );
+            if let Some(tc) = reply
+                .tool_calls
+                .iter()
+                .find(|tc| crate::tool_names::is_sleep_tool_name(&tc.function.name))
+            {
+                Some(sleep_steer_decision(&tc.function.arguments))
+            } else if did_stream_response || !raw.is_empty() {
+                let resp = if !raw.is_empty() {
+                    raw
+                } else {
+                    raw_stream_accum
+                };
+                Some(SteerDecision {
+                    decision: "RespondDirectly".to_string(),
+                    response: Some(resp),
+                    tier: None,
+                    model: None,
+                    subtasks: Vec::new(),
+                    sleep_seconds: None,
+                })
+            } else {
+                None
+            }
+        }
     };
 
     if let Some(decision) = parsed_decision {
@@ -731,6 +821,31 @@ pub async fn execute_steer_subtask(
     prompt: &str,
 ) -> Result<Deliverable, anyhow::Error> {
     let plan = Plan::default();
+    // Provenance: an ad-hoc steering/arbitrator delegation has **no plan line**, so
+    // the write side (`create_plan` → `pregenerate_for_plan_offline`) never took a
+    // validation decision for it. Without a decision on disk the read side sees
+    // neither `<task_id>-validation.md` nor a `-validation-skip.md` record and fails
+    // the deliverable closed (`MISSION COMPLETE` revoked → `FAILED`). Record the
+    // ad-hoc default — **no validation** — durably BEFORE the run, so the read side
+    // reads an exemption instead of a verdict gap.
+    //
+    // `validation_prompts_dir()` is used on purpose, not `plan.dir().join("prompts")`:
+    // `Plan::default()` is the CWD-relative `.marmel`, while the read side resolves
+    // `<workspace root>/.marmel/prompts`. Under a scoped workspace root the two
+    // disagree, and a record written where nobody reads it is the same bug with an
+    // extra file. Best effort by design: a refused id, a role opt-out, a plan-id
+    // collision or a failed write all author no record, which leaves today's
+    // fail-closed behaviour intact — never a fail-open success.
+    if let Some(raw_task_id) = task_id.as_deref() {
+        let prompts_dir = crate::agents::validation::validation_prompts_dir();
+        let plan_markdown = plan.read().ok().flatten();
+        crate::agents::PromptBuilder::record_adhoc_no_validation(
+            &prompts_dir,
+            raw_task_id,
+            agent,
+            plan_markdown.as_deref(),
+        );
+    }
     let mut manager = OrchestratorManager::new(client.clone(), plan, stats);
     manager.cancellation_token = crate::orchestrator::bus::global_cancellation_token();
     let req = DelegationRequest {
@@ -800,6 +915,7 @@ Your task: Formulate a direct, helpful, and concise answer to the user in the EX
         tools: None,
     };
 
+    let mut demux = crate::llm::thinking::ThinkingDemuxer::new();
     let mut full_response = String::new();
     // Same internal-fast-call class as the arbitrator decision itself (see
     // [`steer_arbitrator_call_context`]): this synthesis is part of the steering
@@ -810,8 +926,12 @@ Your task: Formulate a direct, helpful, and concise answer to the user in the EX
         pool::with_call_context(
             steer_arbitrator_call_context(),
             client.chat_stream(&req, |chunk| {
-                full_response.push_str(chunk);
-                on_delta(chunk);
+                demux.push_delta(chunk, |kind, piece| {
+                    if kind == crate::llm::thinking::DeltaKind::Content {
+                        full_response.push_str(piece);
+                        on_delta(piece);
+                    }
+                });
                 true
             }),
         ),
@@ -822,11 +942,20 @@ Your task: Formulate a direct, helpful, and concise answer to the user in the EX
         Ok(Err(e)) => return Err(e),
         Err(e) => return Err(e.into()),
     };
+    demux.finish_delta(|kind, piece| {
+        if kind == crate::llm::thinking::DeltaKind::Content {
+            full_response.push_str(piece);
+            on_delta(piece);
+        }
+    });
 
     let final_text = if !full_response.trim().is_empty() {
         full_response.trim().to_string()
     } else {
-        reply.content.trim().to_string()
+        crate::llm::thinking::demux_stream(&reply.content)
+            .content()
+            .trim()
+            .to_string()
     };
 
     Ok(final_text)

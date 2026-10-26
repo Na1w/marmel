@@ -3,6 +3,7 @@
 //! runs inside an isolated tempdir — never the repo root.
 
 use super::*;
+use crate::harness::fs::normalize_for_compare;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,12 +18,15 @@ use std::path::{Path, PathBuf};
 // the raw platform spelling against those literals is what breaks these tests
 // on Windows.
 //
-// `normalize_for_compare` canonicalises the *spelling* of what is compared —
-// never the assertion strength: the same file set, the same order, the same
-// counts and the same truncation markers are still required. It is applied to
-// **both** sides of a comparison (`normalize_paths` for collected paths,
-// `normalize_expected` for the asserted literals), so neither side carries a
-// platform-spelling advantage.
+// `normalize_for_compare` (imported from `src/harness/fs.rs`, where it is the
+// platform-pinned alias of `normalize_for_compare_in_family` — the single
+// implementation shared with the containment helpers `containment_key` /
+// `path_within` / `lock_shard_for`) canonicalises the *spelling* of what is
+// compared — never the assertion strength: the same file set, the same order,
+// the same counts and the same truncation markers are still required. It is
+// applied to **both** sides of a comparison (`normalize_paths` for collected
+// paths, `normalize_expected` for the asserted literals), so neither side carries
+// a platform-spelling advantage.
 //
 // For `glob` this is defence in depth only: production already canonicalises
 // every collected path (`src/harness/search.rs`: `normalize_glob_path` with
@@ -31,44 +35,8 @@ use std::path::{Path, PathBuf};
 // load-bearing for `grep_search`, whose lines carry the absolute walker path.
 //
 // `dunce` is present in `Cargo.lock` only as a *transitive* dependency (it is
-// not a direct dependency in `Cargo.toml`), so the verbatim prefix is trimmed
-// here instead of adding a dependency for one test helper.
-
-/// Windows verbatim / device-namespace prefixes that `Path::canonicalize()` can
-/// introduce (`\\?\`, `\\.\`, `\\localhost\`, and their `/` spellings). Every
-/// entry is ASCII, so a prefix match always ends on a `char` boundary.
-const WINDOWS_PATH_PREFIXES: &[&str] = &[
-    "\\\\?\\",
-    "\\\\.\\",
-    "\\\\localhost\\",
-    "//?/",
-    "//./",
-    "//localhost/",
-];
-
-/// Canonical spelling of a path-ish string for comparison: drops a Windows
-/// verbatim/device prefix and renders `\` as `/`.
-///
-/// **No-op on Unix**: under `cfg!(unix)` the input is returned untouched, byte
-/// for byte, so a Unix run compares exactly the strings it always compared.
-fn normalize_for_compare(raw: &str) -> String {
-    if cfg!(unix) {
-        return raw.to_owned();
-    }
-    strip_windows_path_prefix(raw).replace('\\', "/")
-}
-
-/// Drop a leading [`WINDOWS_PATH_PREFIXES`] entry, case-insensitively.
-fn strip_windows_path_prefix(raw: &str) -> &str {
-    let bytes = raw.as_bytes();
-    for prefix in WINDOWS_PATH_PREFIXES {
-        let p = prefix.as_bytes();
-        if bytes.len() >= p.len() && bytes[..p.len()].eq_ignore_ascii_case(p) {
-            return &raw[p.len()..];
-        }
-    }
-    raw
-}
+// not a direct dependency in `Cargo.toml`), so the verbatim prefix is trimmed by
+// hand — in production code, not here.
 
 /// `matches`-list flavour of [`normalize_for_compare`]: element-by-element, so
 /// the expected list keeps asserting the exact same set in the exact same order.

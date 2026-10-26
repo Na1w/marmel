@@ -127,6 +127,10 @@ pub(crate) fn load_system_prompt_with_plan_and_warning(
             }
         }
     }
+    let mcp_block = crate::prompts::format_mcp_prompt_block(cfg, &cfg.orchestration.mcp_servers);
+    if !mcp_block.is_empty() {
+        prompt.push_str(&mcp_block);
+    }
     let (plan_section, warning) = plan_prompt_section(plan);
     if let Some(warning) = warning.as_ref() {
         tracing::warn!("{warning}");

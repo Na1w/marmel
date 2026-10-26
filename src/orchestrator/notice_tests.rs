@@ -6,6 +6,59 @@ use crate::orchestrator::SpecialistRegistry;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+// Test isolation for the process-global UI bus.
+//
+// `set_event_sender` / `set_status_sender` (src/orchestrator/bus.rs) are a single
+// process-wide registration, so two tests that install their own sender in parallel steal it
+// from each other, and a test that never installs one still emits into whoever holds the
+// registration (`orchestrator::preemption::tests` emits `SubagentStreamPause`, the bus hammer
+// test emits 1 000 `Event::Message`s). That cross-talk is what made
+// `test_handle_reply_to_arbitrator_ask_followup` flake at default parallelism.
+//
+// Two rules keep the round trips deterministic, on top of the `TEST_NOTICE_MUTEX` /
+// `TEST_WORKERS_MUTEX` pattern this crate already uses:
+//
+// 1. **One owner at a time.** Every test that swaps `EVENT_SENDER` holds `TEST_NOTICE_MUTEX`
+//    (the tokio mutex that also serializes the notice store) for its whole round trip, so
+//    exactly one such test is in flight. `orchestrator::tests`' bus-hammer test — the largest
+//    emitter in the crate — takes that same lock, which is what stops it from stealing or
+//    flooding the registration mid-round.
+// 2. **Foreign traffic is skipped, never asserted away.** Tests that only *emit* (they never
+//    swap the sender, so they are not serialized against the registration) can still put
+//    events into our channel. `steer_responses` below ignores events that are not ours while
+//    still counting duplicate answers — the answer count is the contract under test.
+
+/// Collect the `Event::SteerResponse`s emitted for the round under test.
+///
+/// Waits (bounded) for the first one, skipping events that belong to other tests running in
+/// parallel — the bus is process-global, so unrelated tests may emit into the sender installed
+/// here — then settles briefly so a duplicate answer cannot slip past the "exactly one"
+/// assertions. A genuinely missing answer fails fast instead of hanging.
+async fn steer_responses(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::ui::Event>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(crate::ui::Event::SteerResponse(text))) => {
+                out.push(text);
+                break;
+            }
+            Ok(Some(_other)) => continue,
+            Ok(None) => return out,
+            Err(_elapsed) => return out,
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    while let Ok(event) = rx.try_recv() {
+        if let crate::ui::Event::SteerResponse(text) = event {
+            out.push(text);
+        }
+    }
+    out
+}
+
 #[tokio::test]
 async fn test_notice_id_generation_and_posting() {
     let _lock = TEST_NOTICE_MUTEX.lock().await;
@@ -277,7 +330,16 @@ async fn test_empty_target_is_not_drained_by_every_worker() {
 
 /// Broadcast steering (`*` / `worker`) is unchanged by the exact-match routing.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // reason: see the lock note inside the test body
 async fn test_broadcast_targets_still_route_to_any_worker() {
+    // A broadcast notice (`*` / `worker`) is drainable by **any** worker, so it is
+    // exposed to every test that drains for its own key. The registry teardown storm
+    // (`workers.rs`) posts and drains notices while holding only `TEST_WORKERS_MUTEX`,
+    // so `TEST_NOTICE_MUTEX` alone cannot keep this notice intact. Taking the registry
+    // lock in the crate's order (**workers → notice**) serializes the two drains.
+    let _workers = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let _lock = TEST_NOTICE_MUTEX.lock().await;
     clear_all_notices();
 
@@ -375,6 +437,21 @@ async fn test_record_worker_reply_matches_pending_notice() {
     );
 }
 
+/// Re-arm the **process-global** active config immediately before a reply is evaluated.
+///
+/// [`handle_reply_to_arbitrator`] resolves its backend from `ACTIVE_CONFIG` **at call
+/// time**, and other modules' drivers swap or clear that global while these tests run:
+/// `orchestrator::pool`'s `config_pool_test` installs its own config and then calls
+/// `config::clear_active()`. Those drivers hold locks this file must never take
+/// (`config::sandbox_env_test_lock` has a one-second acquisition watchdog, so it cannot
+/// be held across a model round trip; `workers::TEST_WORKERS_MUTEX` is taken in the
+/// notice→workers order by a workers test, so taking it here would invert and deadlock).
+/// Re-arming with no await between the write and the resolution inside the tool call
+/// shrinks the vulnerable window to the tool call itself.
+fn arm_reply_backend(cfg: &crate::config::Config) {
+    crate::config::set_active(cfg.clone());
+}
+
 #[tokio::test]
 async fn test_handle_reply_to_arbitrator_success_and_validation() {
     let _lock = TEST_NOTICE_MUTEX.lock().await;
@@ -400,7 +477,7 @@ async fn test_handle_reply_to_arbitrator_success_and_validation() {
         backend_url: server.uri(),
         ..Default::default()
     };
-    crate::config::set_active(cfg);
+    crate::config::set_active(cfg.clone());
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     crate::orchestrator::set_event_sender(event_tx);
@@ -442,6 +519,7 @@ async fn test_handle_reply_to_arbitrator_success_and_validation() {
             "message": "Switched to tokio::fs for all file operations."
         }),
     };
+    arm_reply_backend(&cfg);
     let ok_res = dispatch_for_async(&tool_valid, ToolCaller::Specialist(Agent::Coder)).await;
     assert!(ok_res.is_ok());
     let out = ok_res.unwrap();
@@ -452,15 +530,18 @@ async fn test_handle_reply_to_arbitrator_success_and_validation() {
     assert!(get_pending_notice("notice-async-1").is_none());
     assert!(get_worker_reply("notice-async-1").is_some());
 
-    let ev = event_rx
-        .try_recv()
-        .expect("Event::SteerResponse should be emitted");
-    match ev {
-        crate::ui::Event::SteerResponse(text) => {
-            assert!(text.contains("Coder confirms that async I/O has been implemented."));
-        }
-        other => panic!("Expected Event::SteerResponse, got {other:?}"),
-    }
+    // (c) One accepted reply costs exactly one arbitrator answer to the user. Foreign events
+    // from tests running in parallel are skipped by the collector; a duplicate answer is not.
+    let answers: Vec<String> = steer_responses(&mut event_rx)
+        .await
+        .into_iter()
+        .filter(|text| text.contains("Coder confirms that async I/O has been implemented."))
+        .collect();
+    assert_eq!(
+        answers.len(),
+        1,
+        "one worker reply must produce exactly one arbitrator answer, got {answers:?}"
+    );
 
     {
         let hist = steering_history.read().unwrap();
@@ -505,7 +586,7 @@ async fn test_handle_reply_to_arbitrator_ask_followup() {
         backend_url: server.uri(),
         ..Default::default()
     };
-    crate::config::set_active(cfg);
+    crate::config::set_active(cfg.clone());
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     crate::orchestrator::set_event_sender(event_tx);
@@ -532,20 +613,24 @@ async fn test_handle_reply_to_arbitrator_ask_followup() {
         }),
     };
 
+    arm_reply_backend(&cfg);
     let res = dispatch_for_async(&tool_reply, ToolCaller::Specialist(Agent::Coder)).await;
     assert!(res.is_ok());
     let out = res.unwrap();
     assert!(out.content.contains("follow-up question"));
 
-    let ev = event_rx
-        .try_recv()
-        .expect("SteerResponse emitted for user status");
-    match ev {
-        crate::ui::Event::SteerResponse(text) => {
-            assert!(text.contains("Asking a follow-up about backward compatibility"));
-        }
-        other => panic!("Expected SteerResponse, got {other:?}"),
-    }
+    // (c) The follow-up round is announced to the user **exactly once**, and it is not an
+    // answer: the dialogue is still open, so the arbitrator must not have answered it yet.
+    let answers = steer_responses(&mut event_rx).await;
+    let announcements: Vec<&String> = answers
+        .iter()
+        .filter(|text| text.contains("Asking a follow-up about backward compatibility"))
+        .collect();
+    assert_eq!(
+        announcements.len(),
+        1,
+        "the follow-up round must reach the user exactly once, got {answers:?}"
+    );
 
     let drained = drain_worker_notices("coder");
     assert_eq!(drained.len(), 1);
@@ -604,7 +689,7 @@ async fn test_steering_history_multiple_notices_resolved_out_of_order() {
         backend_url: server.uri(),
         ..Default::default()
     };
-    crate::config::set_active(cfg);
+    crate::config::set_active(cfg.clone());
 
     let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
     crate::orchestrator::set_event_sender(event_tx);
@@ -632,6 +717,7 @@ async fn test_steering_history_multiple_notices_resolved_out_of_order() {
             "message": "The memory leak was caused by a missing free in the malloc wrapper."
         }),
     };
+    arm_reply_backend(&cfg);
     let res_dbg = dispatch_for_async(&tool_dbg, ToolCaller::Specialist(Agent::Debugger)).await;
     assert!(res_dbg.is_ok());
 
@@ -656,6 +742,7 @@ async fn test_steering_history_multiple_notices_resolved_out_of_order() {
             "message": "Implemented the JIT instructions for PowerPC 604e."
         }),
     };
+    arm_reply_backend(&cfg);
     let res_coder = dispatch_for_async(&tool_coder, ToolCaller::Specialist(Agent::Coder)).await;
     assert!(res_coder.is_ok());
 
@@ -1727,4 +1814,64 @@ fn test_rendered_notice_surfaces_the_id_the_reply_must_name() {
     assert!(rendered.contains("notice_id: \"notice-render-1\""));
     assert!(rendered.contains(crate::tool_names::TOOL_REPLY_TO_ARBITRATOR));
     assert!(rendered.contains("Which allocator did you pick?"));
+}
+
+#[tokio::test]
+async fn test_evaluate_worker_reply_strips_thinking_with_draft_json_and_extracts_response() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let reasoning = "We need to evaluate the worker reply. Draft JSON:\n{\n  \"decision\": \"SynthesizeResponse\",\n  \"response\": \"DRAFT INSIDE THINK\"\n}\nNow emit final JSON.";
+    let content = "{\n  \"decision\": \"SynthesizeResponse\",\n  \"response\": \"The researcher has finished gathering git evidence and is writing docs/review_scope.md.\",\n  \"follow_up_prompt\": \"\",\n  \"user_status\": \"\"\n}";
+    let sse1 = serde_json::json!({
+        "id": "chatcmpl-eval-1",
+        "choices": [{"delta": {"reasoning_content": reasoning}, "finish_reason": null}]
+    });
+    let sse2 = serde_json::json!({
+        "id": "chatcmpl-eval-1",
+        "choices": [{"delta": {"content": content}, "finish_reason": "stop"}]
+    });
+    let body = format!("data: {sse1}\n\ndata: {sse2}\n\ndata: [DONE]\n\n");
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new_with_token(server.uri(), "mock", "tok");
+    let stats = HarnessStats::new();
+    let notice = SteerNotice {
+        notice_id: "notice-eval-1".to_string(),
+        user_inquiry: "What is t-001 doing?".to_string(),
+        target_worker: "researcher-t-001".to_string(),
+        created_at_ms: 0,
+    };
+
+    let mut deltas = String::new();
+    let eval = evaluate_worker_reply(
+        &client,
+        &stats,
+        &notice,
+        "researcher",
+        "Status: writing docs/review_scope.md",
+        |d| deltas.push_str(d),
+    )
+    .await
+    .expect("evaluation should succeed");
+
+    assert_eq!(eval.decision, "SynthesizeResponse");
+    assert_eq!(
+        eval.response.as_deref(),
+        Some(
+            "The researcher has finished gathering git evidence and is writing docs/review_scope.md."
+        )
+    );
+    assert_eq!(
+        deltas,
+        "The researcher has finished gathering git evidence and is writing docs/review_scope.md."
+    );
+    assert!(!deltas.contains("<think>"));
+    assert!(!deltas.contains("\"decision\""));
 }

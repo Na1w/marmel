@@ -4,6 +4,36 @@ use crate::harness::{ToolError, ToolResult};
 use crate::tool_names::TOOL_DELEGATE_TASK;
 use std::path::Path;
 
+// Test-only guard for the process-global UI bus
+// (`crate::orchestrator::bus`: `EVENT_SENDER` / `STATUS_SENDER`).
+//
+// Both senders are a single swap-style registration for the whole process: two tests that
+// install their own channel steal the registration from each other, and a test that merely
+// *emits* (`emit_event` / `emit_status` read whatever sender is registered right now) lands in
+// whichever channel happens to be installed. So every test that swaps a sender — or that
+// asserts on what its own sender received — holds the same lock, and the bus-hammer test below
+// (the crate's largest emitter, 1 000 events plus 1 000 statuses) holds it for its whole run.
+//
+// The lock is `orchestrator::notice::TEST_NOTICE_MUTEX`, the tokio mutex that already
+// serializes the process-global notice store: reusing it means one lock orders every
+// round-trip test in the crate against the store **and** the bus registration at once, with no
+// second lock to deadlock against.
+
+/// Take the process-global worker-registry lock (the same `TEST_WORKERS_MUTEX` the registry
+/// tests use) for any test that runs a **live delegation**.
+///
+/// `OrchestratorManager::new` derives its cancellation token from
+/// `bus::global_cancellation_token()` (src/orchestrator/mod.rs), and the pool test drivers
+/// (`orchestrator::pool::pool_test`) reset — and in one case cancel — that process-global token
+/// while holding this very lock. A delegation started outside it can therefore inherit or
+/// observe another test's cancellation and come back `Failed` instead of `Complete`: that is the
+/// residual flake this guard removes.
+fn worker_registry_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Build a manager rooted at a fresh temp plan dir for tests.
 fn test_manager(dir: &tempfile::TempDir) -> OrchestratorManager {
     OrchestratorManager::new(
@@ -28,7 +58,13 @@ fn test_format_duration_human_minutes_and_seconds() {
 /// role system prompt, `[1]` = brief) and must not expose any Manager
 /// transcript or the Manager's own conversation history.
 #[tokio::test]
+// The guard owns the process-global cancellation token for the whole scenario, and the
+// scenario is the await: holding it across that await is the point, not a bug.
+#[allow(clippy::await_holding_lock)]
 async fn test_orchestr_context_isolation() {
+    // Owns the global cancellation token against the pool drivers (see `worker_registry_lock`).
+    let _workers = worker_registry_lock();
+
     let tmp = tempfile::tempdir().unwrap();
     let m = test_manager(&tmp);
 
@@ -73,7 +109,13 @@ async fn test_orchestr_context_isolation() {
 /// A `MISSION COMPLETE (task-id)` marker flips the matching plan box to `[x]`;
 /// a FAILED marker leaves it unchecked.
 #[tokio::test]
+// The guard owns the process-global cancellation token for the whole scenario, and the
+// scenario is the await: holding it across that await is the point, not a bug.
+#[allow(clippy::await_holding_lock)]
 async fn test_orchestr_task_checkoff_complete_flips() {
+    // Owns the global cancellation token against the pool drivers (see `worker_registry_lock`).
+    let _workers = worker_registry_lock();
+
     let tmp = tempfile::tempdir().unwrap();
     let m = test_manager(&tmp);
     m.create_plan("- [ ] [t-101] Build the parser.\n- [ ] [t-102] Test the parser.\n")
@@ -242,7 +284,13 @@ async fn test_orchestr_apply_checkoff_rejected_retains_critique_content() {
 /// Fractal delegation: nested delegation beyond max_recursion_depth is
 /// rejected.
 #[tokio::test]
+// The guard owns the process-global cancellation token for the whole scenario, and the
+// scenario is the await: holding it across that await is the point, not a bug.
+#[allow(clippy::await_holding_lock)]
 async fn test_orchestr_fractal_depth_rejected() {
+    // Owns the global cancellation token against the pool drivers (see `worker_registry_lock`).
+    let _workers = worker_registry_lock();
+
     let tmp = tempfile::tempdir().unwrap();
     let mut m = test_manager(&tmp);
     m.orchestration.max_recursion_depth = 3;
@@ -416,7 +464,13 @@ fn test_orchestr_guard_rejects_domain_module() {
 }
 
 #[tokio::test]
+// The guard owns the process-global cancellation token for the whole scenario, and the
+// scenario is the await: holding it across that await is the point, not a bug.
+#[allow(clippy::await_holding_lock)]
 async fn test_orchestr_run_executing_rejects_domain_module() {
+    // Owns the global cancellation token against the pool drivers (see `worker_registry_lock`).
+    let _workers = worker_registry_lock();
+
     let tmp = tempfile::tempdir().unwrap();
     let mut m = test_manager(&tmp);
     m.orchestration.manager_module = "src/agents/researcher.rs".to_string();
@@ -491,7 +545,13 @@ impl tracing::Subscriber for ErrorLogCapture {
 /// the Manager reads as "the Executing phase is done"), and it must never
 /// delegate anything or touch the plan on disk.
 #[tokio::test]
+// The guard owns the process-global cancellation token for the whole scenario, and the
+// scenario is the await: holding it across that await is the point, not a bug.
+#[allow(clippy::await_holding_lock)]
 async fn test_orchestr_run_executing_plan_read_error_is_not_completion() {
+    // Owns the global cancellation token against the pool drivers (see `worker_registry_lock`).
+    let _workers = worker_registry_lock();
+
     let tmp = tempfile::tempdir().unwrap();
     let mut m = test_manager(&tmp);
     std::fs::create_dir_all(m.plan.dir()).unwrap();
@@ -567,7 +627,13 @@ async fn test_orchestr_run_executing_plan_read_error_is_not_completion() {
 /// `Ok(..)`, no delegation, and no error logged. That is what distinguishes
 /// "nothing pending" from "cannot read" at this call site.
 #[tokio::test]
+// The guard owns the process-global cancellation token for the whole scenario, and the
+// scenario is the await: holding it across that await is the point, not a bug.
+#[allow(clippy::await_holding_lock)]
 async fn test_orchestr_run_executing_empty_pending_list_still_completes() {
+    // Owns the global cancellation token against the pool drivers (see `worker_registry_lock`).
+    let _workers = worker_registry_lock();
+
     let capture = ErrorLogCapture::default();
     let guard = tracing::subscriber::set_default(capture.clone());
 
@@ -621,7 +687,13 @@ async fn test_orchestr_run_executing_empty_pending_list_still_completes() {
 /// checked off on completion, and the loop terminates via the empty-pending
 /// completion path.
 #[tokio::test]
+// The guard owns the process-global cancellation token for the whole scenario, and the
+// scenario is the await: holding it across that await is the point, not a bug.
+#[allow(clippy::await_holding_lock)]
 async fn test_orchestr_run_executing_dispatches_pending_tasks_unchanged() {
+    // Owns the global cancellation token against the pool drivers (see `worker_registry_lock`).
+    let _workers = worker_registry_lock();
+
     let tmp = tempfile::tempdir().unwrap();
     let mut m = test_manager(&tmp);
     m.create_plan("- [ ] [t-810] Build the parser\n- [ ] [t-811] Write the tests\n")
@@ -671,7 +743,13 @@ async fn test_orchestr_run_executing_dispatches_pending_tasks_unchanged() {
 }
 
 #[tokio::test]
+// The guard owns the process-global cancellation token for the whole scenario, and the
+// scenario is the await: holding it across that await is the point, not a bug.
+#[allow(clippy::await_holding_lock)]
 async fn test_orchestr_delegation_events_emitted() {
+    // Owns the global cancellation token against the pool drivers (see `worker_registry_lock`).
+    let _workers = worker_registry_lock();
+
     let tmp = tempfile::tempdir().unwrap();
     let m = test_manager(&tmp);
     let req = DelegationRequest {
@@ -765,6 +843,10 @@ fn test_handle_delegate_task_terminal_marker_deduplication() {
 /// message ownership.)
 #[tokio::test]
 async fn test_bus_hammer_concurrent_emitters() {
+    // Owns the process-global sender registration for the whole hammer: without it, a test
+    // running in parallel swaps the sender out from under this run (its own channel would get
+    // nothing) or receives the 1 000 events and 1 000 statuses emitted here.
+    let _bus = crate::orchestrator::notice::TEST_NOTICE_MUTEX.lock().await;
     let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<crate::ui::Event>();
     set_status_sender(status_tx);
@@ -1105,7 +1187,13 @@ fn test_saved_prompt_path_round_trips_a_normal_task_id() {
 /// warning naming the rejected id, and must never read or write outside the
 /// prompts directory.
 #[test]
+// The guard owns the process-global cancellation token for the whole scenario, and the
+// scenario is the await: holding it across that await is the point, not a bug.
+#[allow(clippy::await_holding_lock)]
 fn test_delegate_with_rejected_task_id_falls_back_to_jit_and_warns() {
+    // Owns the global cancellation token against the pool drivers (see `worker_registry_lock`).
+    let _workers = worker_registry_lock();
+
     let tmp = tempfile::tempdir().unwrap();
     let m = test_manager(&tmp);
     let prompts_dir = tmp.path().join("prompts");

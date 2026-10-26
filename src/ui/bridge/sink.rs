@@ -1,6 +1,5 @@
 //! `RendererSink`: the `StreamSink` adapter bridging LLM streaming into the renderer.
 
-use super::action;
 use super::arbiter::{self, ArbitrationChannel, SleepNotice};
 use super::drain::drain_steer_arbitration_events;
 use super::steer::{SharedSteeringHistory, SteerArbEvent};
@@ -223,7 +222,43 @@ impl StreamSink for RendererSink<'_> {
             return PauseAction::Resume;
         }
 
-        let recorded_resp = arbiter::recorded_response(decision.as_ref(), None, &[]);
+        // **One notice per `ForwardNotice` subtask, posted once, here.** This host owns the
+        // posting for the paused-stream path exactly as the spawned host does for its path
+        // (both go through `arbiter::post_forward_notices`), and the decision arms below only
+        // render the result. The old shape posted the arbitrator's text here and then posted
+        // the raw user message again as a `worker` broadcast, so one steer filed two notices
+        // for the same decision and added a third delivery as a Manager turn.
+        let outcomes = arbiter::post_forward_notices(decision.as_ref(), user_msg);
+        for outcome in &outcomes {
+            match outcome {
+                arbiter::ForwardOutcome::Posted(posted) => {
+                    self.renderer.on_event(&Event::Status(format!(
+                        "Notice {} forwarded to {} — resuming stream...",
+                        posted.notice_id, posted.target
+                    )));
+                    if !posted.dropped_older.is_empty() {
+                        // Backpressure is kept (drop-oldest at INBOX_CAPACITY) but never silent.
+                        let drop_text =
+                            arbiter::capacity_drop_text(&posted.target, &posted.dropped_older);
+                        tracing::warn!(target_worker = %posted.target, reason = %drop_text, "Steering notice dropped by inbox capacity");
+                        self.renderer
+                            .on_event(&Event::Status(format!("[Arbitrator] {drop_text}")));
+                    }
+                }
+                arbiter::ForwardOutcome::Unroutable { token } => {
+                    // Never filed into an inbox no worker drains: the refusal is surfaced.
+                    self.renderer.on_event(&Event::Status(format!(
+                        "[Arbitrator] {}",
+                        arbiter::unroutable_target_text(token)
+                    )));
+                }
+            }
+        }
+        let forwarded = arbiter::posted_notices(&outcomes);
+        let unroutable = arbiter::unroutable_targets(&outcomes);
+
+        let recorded_resp =
+            arbiter::recorded_response(decision.as_ref(), None, &forwarded, &unroutable);
         if let Some(ref hist_lock) = self.steering_history
             && let Ok(mut hist) = hist_lock.write()
         {
@@ -387,27 +422,25 @@ impl StreamSink for RendererSink<'_> {
                     PauseAction::Abort
                 }
                 "ForwardToWorker" => {
-                    let target = decision
-                        .as_ref()
-                        .and_then(|d| {
-                            action::first(Some(d), action::ACTION_FORWARD_NOTICE)
-                                .map(action::notice_target)
-                        })
-                        .unwrap_or_else(|| "worker".to_string());
-                    let posted = arbiter::post_notice_observable(&target, user_msg);
-                    let notice = posted.notice;
-                    self.renderer.on_event(&Event::Status(format!(
-                        "Notice {} forwarded to {} — resuming stream...",
-                        notice.notice_id, target
-                    )));
-                    if !posted.dropped_older.is_empty() {
-                        // Backpressure is kept (drop-oldest at INBOX_CAPACITY) but never silent.
-                        let drop_text = arbiter::capacity_drop_text(&target, &posted.dropped_older);
-                        tracing::warn!(target_worker = %target, reason = %drop_text, "Steering notice dropped by inbox capacity");
+                    // The notices for this decision were already posted (once) above, and
+                    // their ids are what the steering history recorded. Re-posting the raw
+                    // user message here is what used to create the phantom second notice, so
+                    // this arm only renders the outcome and decides whether the instruction
+                    // still has to reach the Manager.
+                    if forwarded.is_empty() {
+                        // Nothing was filed (no `ForwardNotice` subtask, or every target was
+                        // refused): the instruction must survive, so it is queued for the next
+                        // seam instead of being dropped with this pause.
+                        self.steer_queue.push(user_msg.to_string());
+                        self.renderer.on_event(&Event::Status(
+                            "No forwarding notice was posted for this steering instruction — \
+                             queued for the next turn instead"
+                                .to_string(),
+                        ));
+                    } else {
                         self.renderer
-                            .on_event(&Event::Status(format!("[Arbitrator] {drop_text}")));
+                            .on_event(&Event::Status(arbiter::forwarded_status(&forwarded, true)));
                     }
-                    self.steer_queue.push(user_msg.to_string());
                     let _ = self.renderer.flush();
                     PauseAction::Resume
                 }

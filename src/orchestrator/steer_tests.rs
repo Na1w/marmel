@@ -273,6 +273,74 @@ async fn test_execute_steer_subtask_runs_specialist() {
     assert!(d.content.contains("Inspect git status"));
 }
 
+/// The steer seam must record the **ad-hoc no-validation default** where the read side
+/// looks for it. Under `cargo test` the live runner short-circuits to a canned deliverable
+/// (`agents::runner::try_run_specialist_live` returns `None` because the test exe lives under
+/// `/deps/`), so `test_execute_steer_subtask_runs_specialist` proves nothing about validation —
+/// this test therefore asserts the durable write that the fix actually adds.
+///
+/// Two things are pinned: the record lands in `<scoped workspace root>/.marmel/prompts` (the
+/// spelling `agents::validation::validation_prompts_dir()` resolves to, i.e. the one the verdict
+/// probe reads) and **not** in the CWD-relative `.marmel` that `Plan::default()` is rooted at.
+/// A record nobody reads is the same bug with an extra file. The id is unique so the repository's
+/// own plan can never collide with it and trigger the plan-collision guard.
+#[tokio::test]
+async fn test_execute_steer_subtask_authors_the_adhoc_record_for_a_unique_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scoped_root = tmp.path().to_path_buf();
+    let prompts = scoped_root.join(".marmel").join("prompts");
+
+    crate::harness::with_workspace_root(scoped_root.clone(), async move {
+        let client = ChatClient::new_with_token("http://127.0.0.1:11434", "mock", "tok");
+        let stats = Arc::new(HarnessStats::new());
+        let res = execute_steer_subtask(
+            &client,
+            stats,
+            Agent::Coder,
+            Some("steer-test-adhoc-1".to_string()),
+            "Inspect git status",
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "the delegated steer subtask still runs: {res:?}"
+        );
+
+        let record = prompts.join("steer-test-adhoc-1-validation-skip.md");
+        assert!(
+            record.exists(),
+            "the steer seam must record the ad-hoc no-validation default under the workspace-root \
+             prompts dir the verdict probe reads, expected at {}",
+            record.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&record).expect("record").trim(),
+            crate::agents::prompt_builder::VALIDATION_SKIP_REASON_ADHOC,
+            "the record must carry the ad-hoc provenance"
+        );
+        assert!(
+            !crate::agents::prompt_builder::VALIDATION_SKIP_REASON_ADHOC.contains("Plan directive"),
+            "an ad-hoc delegation never had a plan directive to cite"
+        );
+        assert!(
+            !prompts.join("steer-test-adhoc-1-validation.md").exists(),
+            "the ad-hoc default authors no auditor brief"
+        );
+
+        // Nothing was written to the CWD-relative plan dir (`Plan::default()`), which is a
+        // different directory from `validation_prompts_dir()` under a scoped root.
+        let cwd_prompts = std::path::Path::new(".marmel").join("prompts");
+        assert!(
+            !cwd_prompts
+                .join("steer-test-adhoc-1-validation-skip.md")
+                .exists(),
+            "the record must not be dropped where the read side never looks: {}",
+            cwd_prompts.display()
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn test_synthesize_steer_subtask_response_streams_answer() {
     use wiremock::matchers::{method, path};
@@ -530,6 +598,161 @@ async fn test_arbitrate_steer_context_stream_plain_text_fallback() {
     );
 }
 
+// RC-5: one omitted field must never silently drop a forwarded notice.
+//
+// `SteerSubtaskDecision.tool_call_id` used to have no serde default while every sibling field
+// had one, so a perfectly actionable `ForwardNotice` subtask without a handle made the **whole**
+// decision unparseable — and an unparseable decision degraded into `RespondDirectly` with no
+// notice posted and nothing recorded anywhere.
+
+/// An omitted `tool_call_id` is tolerated: the decision stays a `ForwardToWorker` with its
+/// subtask intact, so the notice can still be posted (targeting then decides where).
+#[test]
+fn test_steer_decision_tolerates_an_omitted_tool_call_id() {
+    let json = r#"{"decision":"ForwardToWorker","subtasks":[{"action":"ForwardNotice","agent_name":"coder","message":"rebase onto main"}]}"#;
+    let parsed: SteerDecision = serde_json::from_str(json)
+        .expect("a missing tool_call_id must not make the whole decision unparseable");
+
+    assert_eq!(
+        normalize_steer_decision(Some(&parsed.decision)),
+        "ForwardToWorker"
+    );
+    assert_eq!(parsed.subtasks.len(), 1);
+    assert_eq!(parsed.subtasks[0].tool_call_id, "");
+    assert_eq!(
+        normalize_steer_subtask_action(
+            &parsed.subtasks[0].action,
+            &parsed.subtasks[0].tool_call_id
+        ),
+        SteerSubtaskAction::ForwardNotice
+    );
+    assert_eq!(
+        parsed.subtasks[0].message.as_deref(),
+        Some("rebase onto main")
+    );
+}
+
+/// When a decision genuinely cannot be parsed, the fallback stays the **safe** direction (an
+/// answer to the user, never a phantom action) but it is **surfaced**: the user is told no
+/// specialist was forwarded anything, instead of the steer vanishing.
+///
+/// The status channel is a process-global registration (`set_status_sender`), so a parallel
+/// test can replace it between this test's install and the emit. The round is therefore re-run
+/// (bounded) with the sender re-installed each attempt — the assertion itself stays strict.
+#[tokio::test]
+async fn test_arbitrate_steer_context_stream_surfaces_an_unparseable_decision() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    // A `ForwardNotice` subtask with no `action` at all: unparseable, so no action can run.
+    let bad = r#"{"decision":"ForwardToWorker","subtasks":[{"tool_call_id":"call_nope","agent_name":"coder","message":"stop"}]}"#;
+    let chunk = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        serde_json::to_string(&serde_json::json!({
+            "choices": [{ "delta": { "content": bad } }]
+        }))
+        .expect("sse frame")
+    );
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(chunk))
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new_with_token(server.uri(), "mock", "tok");
+    let stats = HarnessStats::new();
+    let ctx = SteerContext {
+        main_goal: "test goal",
+        orchestrator_status: "Active",
+        pending_approval: "None",
+        plan_progress: "None",
+        plan_content: "None",
+        available_agents: "",
+        steering_history: "None",
+        user_message: "tell the coder to stop",
+        active_subtasks: "None",
+    };
+
+    let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut surfaced = false;
+    let mut statuses: Vec<String> = Vec::new();
+
+    for _ in 0..5 {
+        crate::orchestrator::set_status_sender(status_tx.clone());
+
+        let decision = arbitrate_steer_context_stream(&client, &stats, ctx.clone(), |_| {}).await;
+
+        // Safe direction: a direct answer, no phantom forwarding.
+        let d = decision.expect("the raw text still yields a direct answer");
+        assert_eq!(
+            normalize_steer_decision(Some(&d.decision)),
+            "RespondDirectly",
+            "an unparseable decision must degrade to a direct answer"
+        );
+        assert!(
+            d.subtasks.is_empty(),
+            "no action may run from a bad decision"
+        );
+
+        while let Ok(status) = status_rx.try_recv() {
+            statuses.push(status);
+        }
+        if statuses.iter().any(|s| {
+            s.contains("unreadable decision") && s.contains("NOT forwarded to any specialist")
+        }) {
+            surfaced = true;
+            break;
+        }
+    }
+
+    // Observable: the user is told the instruction was not forwarded.
+    assert!(
+        surfaced,
+        "an unreadable decision must be surfaced, got {statuses:?}"
+    );
+}
+
+/// Source guard: the parse-failure arm of the arbitration must keep surfacing the loss — a
+/// `warn!` for the logs **and** a user-visible status naming the fact that nothing was
+/// forwarded. Needles are assembled at runtime (style of the sleep guard below) and comment
+/// lines are excluded, so this test's own text can never satisfy them.
+#[test]
+fn unparseable_steer_decision_arms_log_and_surface_the_lost_notice() {
+    let src = include_str!("steer.rs");
+    let production = src
+        .split(&["#[cfg(", "test)", "]"].concat())
+        .next()
+        .expect("steer.rs always has a first region");
+    let code: String = production
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<&str>>()
+        .join("\n");
+
+    let arm = concat!("serde_json::from_str::", "<SteerDecision>");
+    let region = code
+        .split_once(arm)
+        .map(|(_head, tail)| {
+            tail.split_once("if let Some(decision) = parsed_decision")
+                .map_or(tail, |(head, _)| head)
+        })
+        .expect("the parse of the arbitrator decision must stay a single arm");
+    assert!(
+        region.contains("tracing::warn"),
+        "an unreadable arbitrator decision must be logged, not swallowed"
+    );
+    assert!(
+        region.contains(&["emit_", "status("].concat()),
+        "an unreadable arbitrator decision must reach the user through a status line"
+    );
+    assert!(
+        region.contains(&["unreadable deci", "sion"].concat())
+            && region.contains(&["forwarded to any s", "pecialist"].concat()),
+        "the status must say plainly that no specialist received the instruction"
+    );
+}
+
 // One shared normalizer for the subtask `action` vocabulary
 
 /// Every spelling of a known action must fold onto the same canonical action,
@@ -753,9 +976,24 @@ fn test_unknown_steer_subtask_action_rejection_is_logged() {
         );
 
         let _ = normalize_steer_subtask_action("destroy_everything", "tc-42");
+        // The tracing interest cache is process-global: a test running on another thread can
+        // install a different subscriber and leave this callsite cached as disabled, which
+        // would make the assertion below fail on an otherwise correct implementation. The
+        // rejection is therefore re-attempted (bounded) with the interest cache rebuilt, and
+        // the *first* logged rejection satisfies "exactly one".
+        let mut logged = counter.load(Ordering::Relaxed);
+        for attempt in 0..5 {
+            if logged > 0 {
+                break;
+            }
+            if attempt > 0 {
+                tracing::callsite::rebuild_interest_cache();
+                let _ = normalize_steer_subtask_action("destroy_everything", "tc-42");
+                logged = counter.load(Ordering::Relaxed);
+            }
+        }
         assert_eq!(
-            counter.load(Ordering::Relaxed),
-            1,
+            logged, 1,
             "an unrecognized action must log exactly one explicit rejection"
         );
     });
@@ -1119,6 +1357,62 @@ async fn test_arbitrate_steer_json_sleep_without_duration_uses_the_owner_default
         .expect("a Sleep decision JSON must yield a decision");
     assert_eq!(d.decision, "Sleep");
     assert_eq!(d.sleep_seconds, Some(SLEEP_DEFAULT_SECS));
+}
+
+#[tokio::test]
+async fn test_arbitrate_steer_context_stream_ignores_thinking_draft_json() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let reasoning = "Drafting: {\"decision\": \"RespondDirectly\", \"response\": \"WRONG DRAFT FROM THINKING\"}";
+    let payload = serde_json::json!({
+        "decision": "RespondDirectly",
+        "response": "Clean synthesized response to the user."
+    });
+    let sse1 = serde_json::json!({
+        "id": "chatcmpl-think-1",
+        "choices": [{"delta": {"reasoning_content": reasoning}, "finish_reason": null}]
+    });
+    let sse2 = serde_json::json!({
+        "id": "chatcmpl-think-1",
+        "choices": [{"delta": {"content": payload.to_string()}, "finish_reason": "stop"}]
+    });
+    let body = format!("data: {sse1}\n\ndata: {sse2}\n\ndata: [DONE]\n\n");
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new_with_token(server.uri(), "mock", "tok");
+    let stats = HarnessStats::new();
+    let ctx = SteerContext {
+        main_goal: "test goal",
+        orchestrator_status: "Active",
+        pending_approval: "None",
+        plan_progress: "None",
+        plan_content: "None",
+        available_agents: "",
+        steering_history: "None",
+        user_message: "status?",
+        active_subtasks: "None",
+    };
+
+    let mut streamed = String::new();
+    let d = arbitrate_steer_context_stream(&client, &stats, ctx, |delta| {
+        streamed.push_str(delta);
+    })
+    .await
+    .expect("decision should parse cleanly after thinking block");
+
+    assert_eq!(d.decision, "RespondDirectly");
+    assert_eq!(
+        d.response.as_deref(),
+        Some("Clean synthesized response to the user.")
+    );
+    assert_eq!(streamed, "Clean synthesized response to the user.");
 }
 
 /// Source guard for the collapse: the production region of `steer.rs` must not

@@ -60,9 +60,14 @@
 //! `run_session` is spawned, so no drain can precede it; the repro's panel poll is deliberately
 //! short (2 s) because the mechanism is a *dropped* event — waiting longer cannot make it pass.
 //! Every other wait is a positive wait ordered by an observable event with a deliberately generous
-//! bound (`PANEL_DEADLINE`), so a loaded machine can never turn a real pass into a timeout; the
-//! scenarios that assert *absence* of progress bound themselves with `MANAGER_TURN_DELAY` instead,
-//! which is ~10x wider than the observation made inside it and carries an explicit slip guard.
+//! bound (`PANEL_DEADLINE`), so a loaded machine can never turn a real pass into a timeout. The
+//! scenarios that assert *absence* of progress are delimited by observable events at both ends as
+//! well, never by a sleep: the window opens when the session's own backend reports that it has been
+//! handed the Manager's request (`Scenario::session_requests` — wiremock records a request *before*
+//! it awaits the held response, so this is exact proof that the turn has been dispatched and that
+//! the loop has already passed the last drain boundary in front of it), and it closes when the held
+//! reply reaches the renderer. A slow runner can therefore only make those windows longer, never
+//! shorter or raced.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -107,12 +112,19 @@ const PANEL_DEADLINE: Duration = Duration::from_secs(12);
 /// longer wait only slows the failure down.
 const REPRO_DEADLINE: Duration = Duration::from_secs(2);
 /// The Manager turn of scenarios 3 and 5 is held this long: that is the window in which the session
-/// loop performs no delegation drain at all. It is an order of magnitude wider than the few hundred
-/// milliseconds those scenarios spend observing inside it, so the
-/// `window_opened_at.elapsed() < MANAGER_TURN_DELAY` slip guard cannot be tripped by ordinary
-/// scheduling noise — and it never lengthens a passing run, because `finish` stops the loop instead
-/// of waiting for the held turn to be answered.
+/// loop performs no delegation drain at all. Scenario 3's blind-window watch is delimited at both
+/// ends by observable events — the request landing on the session mock
+/// ([`Scenario::session_requests`]) and the held reply reaching the renderer
+/// ([`Witness::answered_with`]) — so this delay is no longer a timing assumption the assertions
+/// lean on: it only has to outlast the test's own setup (one poll tick plus a pool round-trip), and
+/// 4 s leaves orders of magnitude of slack for a loaded runner.
 const MANAGER_TURN_DELAY: Duration = Duration::from_millis(4000);
+
+/// The body the session backend answers every Manager turn with ([`session_backend`]). Scenario 3
+/// watches for this text to reach the renderer: streamed content is handed to the host from inside
+/// the turn itself, so it is the exact end of the held turn — the loop cannot reach any drain or
+/// projection boundary of its own before that call has returned.
+const SESSION_REPLY: &str = "Continuing the round.";
 
 // ---------------------------------------------------------------------------
 // the panel predicate under test
@@ -130,6 +142,7 @@ fn draws_queued(row: &SubagentDetail) -> bool {
 struct Witness {
     rows: Arc<Mutex<Vec<Vec<SubagentDetail>>>>,
     statuses: Arc<Mutex<Vec<String>>>,
+    messages: Arc<Mutex<Vec<String>>>,
     kill: Arc<AtomicBool>,
     reads: Arc<AtomicUsize>,
 }
@@ -141,6 +154,19 @@ impl Witness {
 
     fn statuses(&self) -> Vec<String> {
         self.statuses.lock().expect("statuses lock").clone()
+    }
+
+    /// Everything the streamed turn handed to the host as assistant text.
+    fn messages(&self) -> Vec<String> {
+        self.messages.lock().expect("messages lock").clone()
+    }
+
+    /// True once the turn's own reply has reached the host. The reply is emitted by the
+    /// `StreamSink` from *inside* `chat_client_turn`, i.e. strictly before the session loop can
+    /// return from its backend call and reach any drain or projection boundary — which is what
+    /// makes it usable as the exact closing edge of a "nothing happened during the turn" watch.
+    fn answered_with(&self, marker: &str) -> bool {
+        self.messages().iter().any(|line| line.contains(marker))
     }
 
     /// Every push in which the row for `name` satisfied [`draws_queued`].
@@ -195,12 +221,22 @@ impl Renderer for Probe {
     }
 
     fn on_event(&mut self, event: &Event) {
-        if let Event::Status(text) = event {
-            self.w
-                .statuses
-                .lock()
-                .expect("statuses lock")
-                .push(text.clone());
+        match event {
+            Event::Status(text) => {
+                self.w
+                    .statuses
+                    .lock()
+                    .expect("statuses lock")
+                    .push(text.clone());
+            }
+            Event::Message(text) => {
+                self.w
+                    .messages
+                    .lock()
+                    .expect("messages lock")
+                    .push(text.clone());
+            }
+            _ => {}
         }
     }
 
@@ -268,7 +304,7 @@ async fn session_backend(reply_delay: Option<Duration>) -> MockServer {
     }
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(template.set_body_string(sse("Continuing the round.")))
+        .respond_with(template.set_body_string(sse(SESSION_REPLY)))
         .mount(&server)
         .await;
     server
@@ -386,6 +422,34 @@ fn is_queued_for(vector: &Arc<Mutex<Vec<DelegationEvent>>>, task: &str) -> bool 
     })
 }
 
+/// The same question with the rank left out: event kind + task id + agent only. Used where the
+/// point is that the gate appended **an** edge for this delegation, so that a rank reported
+/// differently can never masquerade as "nothing was appended" — the ambiguity an exact
+/// `1 of 1` pattern leaves in a failure message.
+fn is_queued_edge_for(vector: &Arc<Mutex<Vec<DelegationEvent>>>, task: &str) -> bool {
+    events_in(vector).iter().any(|event| {
+        matches!(event, DelegationEvent::Queued { agent, task: t, .. }
+            if *agent == Agent::Coder && t.as_deref() == Some(task))
+    })
+}
+
+/// The rank carried by the `Queued` edge for `task`, read out so it can be asserted — and
+/// reported — on its own.
+fn queued_rank_for(vector: &Arc<Mutex<Vec<DelegationEvent>>>, task: &str) -> Option<QueuePosition> {
+    events_in(vector).iter().find_map(|event| match event {
+        DelegationEvent::Queued {
+            agent,
+            task: t,
+            position,
+            of,
+        } if *agent == Agent::Coder && t.as_deref() == Some(task) => Some(QueuePosition {
+            position: *position,
+            of: *of,
+        }),
+        _ => None,
+    })
+}
+
 /// One live scenario: capped config installed, session backend + Manager built, the Manager's event
 /// vector wired as the process-wide delegation sink, and `run_session` running against a [`Probe`].
 /// Worker registration and session start are separate steps so a test can control which came first.
@@ -397,7 +461,10 @@ struct Scenario {
     row_name: String,
     config: Config,
     _plan_dir: tempfile::TempDir,
-    _session_backend: MockServer,
+    /// The Manager's own backend, kept so a test can ask it what it has been **handed** — the
+    /// exact dispatch signal for a held turn (see [`Scenario::session_requests`]) — and so dropping
+    /// it at the end of the scenario still shuts the mock server down.
+    session_backend: MockServer,
 }
 
 impl Scenario {
@@ -432,7 +499,7 @@ impl Scenario {
             worker: None,
             row_name,
             _plan_dir: plan_dir,
-            _session_backend: backend,
+            session_backend: backend,
             config: cfg,
         }
     }
@@ -468,18 +535,84 @@ impl Scenario {
         }));
     }
 
-    /// Stop the loop and unwind every process-global this scenario touched.
+    /// How many requests the Manager's own backend has been **handed**.
+    ///
+    /// `wiremock` pushes an incoming request into its `received_requests` recording before the
+    /// response is produced, and awaits `ResponseTemplate::set_delay` only after the handler has
+    /// returned and released the mock-set lock (`mock_server/bare_server.rs::handle_request`,
+    /// `mock_server/hyper.rs::run_server`). `chat_client_turn` (`src/ui/session.rs:2321`) is the
+    /// session loop's only backend call site, so this count is an exact, machine-independent read
+    /// of where the loop stands:
+    ///
+    /// * `0` — the loop has not issued its turn yet;
+    /// * `1` — the turn is dispatched and its response is still being held: the loop is parked
+    ///   inside the call, i.e. it has already passed **every** drain and projection boundary that
+    ///   precedes the request, including the top-of-turn
+    ///   `project_then_drain_delegation_events` (`src/ui/session.rs:2245`);
+    /// * `2` — the loop has come back from the turn, so the drain-free window is over.
+    async fn session_requests(&self) -> usize {
+        self.session_backend
+            .received_requests()
+            .await
+            .expect("the session backend records the requests it receives")
+            .len()
+    }
+
+    /// Stop the loop and unwind every process-global this scenario touched. A join that times out
+    /// or ends abnormally is reported, never swallowed: a session task that outlives its test keeps
+    /// running and re-registers **its own** event vector as the process-wide delegation sink
+    /// (`drain_delegation_events_with_transcript` re-points the sink at whichever manager it
+    /// drains), so it silently poisons the next scenario in this binary and a green run would hide
+    /// it.
     async fn finish(mut self, call: Option<JoinHandle<Result<StreamedReply, anyhow::Error>>>) {
         self.witness.kill.store(true, Ordering::SeqCst);
+        let mut loose_ends: Vec<String> = Vec::new();
         if let Some(call) = call {
-            let _ = tokio::time::timeout(Duration::from_secs(6), call).await;
+            match tokio::time::timeout(Duration::from_secs(6), call).await {
+                Err(_elapsed) => {
+                    loose_ends.push("the queued call task was still running after 6 s".to_string());
+                }
+                Ok(Err(join)) => {
+                    loose_ends.push(format!("the queued call task ended abnormally: {join}"));
+                }
+                Ok(Ok(Err(error))) => {
+                    loose_ends.push(format!("the queued call task returned an error: {error}"));
+                }
+                Ok(Ok(Ok(_reply))) => {}
+            }
         }
         if let Some(session) = self.session.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(6), session).await;
+            match tokio::time::timeout(Duration::from_secs(6), session).await {
+                Err(_elapsed) => {
+                    loose_ends.push("the session task was still running after 6 s".to_string());
+                }
+                Ok(Err(join)) => {
+                    loose_ends.push(format!("the session task ended abnormally: {join}"));
+                }
+                Ok(Ok(())) => {}
+            }
         }
         self.worker = None;
         clear_delegation_event_sink();
         set_active(Config::default());
+        assert!(
+            loose_ends.is_empty(),
+            "scenario teardown left loose ends: {loose_ends:?}"
+        );
+    }
+}
+
+/// Event-driven replacement for the old "a panel row was pushed" proxy: poll
+/// [`Scenario::session_requests`] until the session backend has been handed `want` Manager-turn
+/// requests, and return how many it had been handed when the poll stopped.
+async fn wait_until_dispatched(scenario: &Scenario, want: usize, deadline: Duration) -> usize {
+    let limit = Instant::now() + deadline;
+    loop {
+        let handed = scenario.session_requests().await;
+        if handed >= want || Instant::now() >= limit {
+            return handed;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -695,11 +828,28 @@ async fn no_delegation_drain_runs_while_the_manager_turn_is_in_flight() {
     scenario.register_worker(task);
     scenario.spawn_session();
 
-    // The loop's first boundary has run once its row is on the panel; the Manager turn now sits
-    // inside its held backend call.
+    // HANDSHAKE — the exact "the Manager turn is in flight" signal, in place of the old inference
+    // from a panel push. A row is opened by the projection at the top of the round/turn
+    // (`src/ui/session.rs:2073` / `:2168`), and the loop then runs **another** drain at `:2245`
+    // before it issues the turn's request at `:2317`: a transition produced off the row push can
+    // land inside that `2073 -> 2245` stretch and be destroyed by it — which is what this scenario
+    // did on a macOS runner, where the loop's straight-line prep wins that race. Waiting for the
+    // session backend to report that it has been handed the request puts the transition firmly
+    // behind that last drain boundary instead, and the held response parks the loop there.
+    let handed = wait_until_dispatched(&scenario, 1, PANEL_DEADLINE).await;
+    assert_eq!(
+        handed, 1,
+        "the Manager's backend call must have been dispatched — with no further turn behind it — \
+         before a queued transition is produced; the session backend was handed {handed} request(s) \
+         while each response is held for {MANAGER_TURN_DELAY:?}"
+    );
+
+    // The row is on the panel by construction now: the projection that opens it is one of the
+    // boundaries the handshake above has already proved the loop passed.
     assert!(
-        wait_until(PANEL_DEADLINE, || witness.latest_row(&row_name).is_some()).await,
-        "the row must be on the panel before the transition is produced; pushes: {}",
+        witness.latest_row(&row_name).is_some(),
+        "the registry projection must have opened a row for {row_name} before the turn's request; \
+         pushes: {}",
         witness.pushes().len()
     );
 
@@ -709,33 +859,95 @@ async fn no_delegation_drain_runs_while_the_manager_turn_is_in_flight() {
         queue_model.to_string(),
         task.to_string(),
     ));
-    wait_until_queued(&backend, queue_model, 1).await;
-    let window_opened_at = Instant::now();
+
+    // The transition below is only ever produced by a call that genuinely reached the pool's wait,
+    // so check that rather than letting a dead or slow call masquerade as a missing event —
+    // `wait_until_queued` is bounded and its return alone proves nothing.
+    let snapshot = wait_until_queued(&backend, queue_model, 1).await;
+    assert!(
+        !call.is_finished(),
+        "the queued specialist call terminated before it was ever in line for a slot; pool: \
+         {snapshot:?}"
+    );
+    assert!(
+        snapshot.waiting >= 1,
+        "the call must be a real waiter on the capped pair before its transition is asserted; \
+         pool: {snapshot:?}"
+    );
+
+    // The queued call must have got in line *while that turn is still parked there*. If the setup
+    // above ever slipped past the held response, the transition would legitimately have been eaten
+    // by the loop's next boundary — say so, rather than letting it read as a missing event.
+    let still_one_turn = scenario.session_requests().await;
+    assert_eq!(
+        still_one_turn, 1,
+        "the Manager turn dispatched for this window must still be in flight now that the queued \
+         call is in line; the session backend has been handed {still_one_turn} request(s), so the \
+         setup above slipped past the {MANAGER_TURN_DELAY:?} held response"
+    );
 
     assert!(
-        wait_until(PANEL_DEADLINE, || is_queued_for(&vector, task)).await,
-        "the gate must have appended the Queued event; events: {:?}",
+        wait_until(PANEL_DEADLINE, || is_queued_edge_for(&vector, task)).await,
+        "the gate must have appended a Queued edge for {task}; events: {:?}",
+        events_in(&vector)
+    );
+    assert_eq!(
+        queued_rank_for(&vector, task),
+        Some(QueuePosition { position: 1, of: 1 }),
+        "with exactly one permit held and exactly one caller in line, the pool's rank for this \
+         delegation is 1 of 1; events: {:?}",
         events_in(&vector)
     );
 
-    // Still inside the held turn: the event is unread and the panel has not moved.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // WATCH THE WHOLE HELD TURN: every sample, for as long as the turn has not answered, the edge
+    // must still be sitting unread in the vector and nothing about the wait may have reached the
+    // panel. Both ends of this watch are events, not clocks — it opens on the dispatch handshake
+    // and closes the moment the turn's own reply reaches the host, which the sink emits from
+    // *inside* `chat_client_turn` (`src/ui/bridge/sink.rs::emit`), i.e. strictly before the loop
+    // can return from the call and reach any drain boundary. So every sample here is provably
+    // taken while the turn is in flight on Linux, macOS and Windows alike: the last pre-request
+    // drain (`session.rs:2245`) is behind us, the next boundary lies behind the reply, and the
+    // pool appends exactly one `Queued` per acquisition (`src/orchestrator/pool.rs:583-589`,
+    // re-reporting only on a rank change at `:643-652`), so a sample can neither arrive too early
+    // to see the edge nor too late to have it drained.
+    let mut samples = 0usize;
+    let mut drained_mid_turn: Option<String> = None;
+    let watch_limit = Instant::now() + PANEL_DEADLINE;
+    while !witness.answered_with(SESSION_REPLY) {
+        let queued_pushes = witness.queued_pushes(&row_name);
+        if !is_queued_edge_for(&vector, task) || !queued_pushes.is_empty() {
+            drained_mid_turn = Some(format!(
+                "events={:?}, queued pushes={}, total pushes={}",
+                events_in(&vector),
+                queued_pushes.len(),
+                witness.pushes().len()
+            ));
+            break;
+        }
+        samples += 1;
+        if Instant::now() >= watch_limit {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let closed_on_reply = witness.answered_with(SESSION_REPLY);
     assert!(
-        window_opened_at.elapsed() < MANAGER_TURN_DELAY,
-        "test window slipped past the held Manager turn (elapsed {:?}); the blind-window assertions \
-         below are not meaningful on this machine",
-        window_opened_at.elapsed()
+        drained_mid_turn.is_none(),
+        "the loop must run no delegation drain while its own backend call is in flight, but after \
+         {samples} samples inside the held turn: {}",
+        drained_mid_turn.unwrap_or_default()
     );
     assert!(
-        is_queued_for(&vector, task),
-        "the Queued event must still be sitting unread in the vector: the loop runs no delegation \
-         drain while its own backend call is in flight; events: {:?}",
-        events_in(&vector)
+        samples > 0,
+        "the watch sampled nothing inside the held turn (samples={samples})"
     );
     assert!(
-        witness.queued_pushes(&row_name).is_empty(),
-        "no queued push may have reached the panel during the drain-free window; pushes: {}",
-        witness.pushes().len()
+        closed_on_reply,
+        "the held Manager turn never answered within {PANEL_DEADLINE:?}, so the drain-free window \
+         has no closing edge; session requests: {}, pushes: {}, statuses: {:?}",
+        scenario.session_requests().await,
+        witness.pushes().len(),
+        witness.statuses()
     );
 
     // The window closes at the next boundary: the drain consumes the event and the fold lands —
@@ -937,10 +1149,26 @@ async fn the_pool_rank_reaches_the_registry_inside_the_drain_free_window() {
     scenario.register_worker(task);
     scenario.spawn_session();
 
-    // The loop's first boundary has run; the Manager turn now sits inside its held call.
+    // The same handshake scenario 3 uses, for the same reason: a row push only proves the loop
+    // reached a *projection*, and it still runs another drain at `src/ui/session.rs:2245` before it
+    // issues the turn's request at `:2317` — a transition produced off the row push can be
+    // destroyed inside that `2073 -> 2245` stretch (this is the flake that bit this scenario, whose
+    // assertion is byte-identical to scenario 3's). Asking the session backend how many requests it
+    // has been handed puts the transition firmly behind that last boundary instead, so the read
+    // below is deterministic on a loaded 3-4 vCPU macOS runner just as it is on Linux and Windows:
+    // the pool appends its one `Queued` per acquisition (`src/orchestrator/pool.rs:583-589`) into a
+    // vector nothing drains until the held response is delivered.
+    let handed = wait_until_dispatched(&scenario, 1, PANEL_DEADLINE).await;
+    assert_eq!(
+        handed, 1,
+        "the Manager turn must have been dispatched — with no further turn behind it — before the \
+         transition is produced; the session backend was handed {handed} request(s) while each \
+         response is held for {MANAGER_TURN_DELAY:?}"
+    );
     assert!(
-        wait_until(PANEL_DEADLINE, || witness.latest_row(&row_name).is_some()).await,
-        "the row must be on the panel before the transition is produced; pushes: {}",
+        witness.latest_row(&row_name).is_some(),
+        "the registry projection must have opened a row for {row_name} before the turn's request; \
+         pushes: {}",
         witness.pushes().len()
     );
 
@@ -950,11 +1178,27 @@ async fn the_pool_rank_reaches_the_registry_inside_the_drain_free_window() {
         queue_model.to_string(),
         task.to_string(),
     ));
-    wait_until_queued(&backend, queue_model, 1).await;
-    let window_opened_at = Instant::now();
+    let snapshot = wait_until_queued(&backend, queue_model, 1).await;
     assert!(
-        wait_until(PANEL_DEADLINE, || is_queued_for(&vector, task)).await,
-        "the gate must have appended the Queued event; events: {:?}",
+        !call.is_finished(),
+        "the queued specialist call terminated before it was ever in line for a slot; pool: \
+         {snapshot:?}"
+    );
+    assert!(
+        snapshot.waiting >= 1,
+        "the call must be a real waiter on the capped pair before its rank is asserted; pool: \
+         {snapshot:?}"
+    );
+    let handed_while_queued = scenario.session_requests().await;
+    assert_eq!(
+        handed_while_queued, 1,
+        "the turn whose window this scenario reads must still be in flight now that the call is in \
+         line; the session backend has been handed {handed_while_queued} request(s), so the setup \
+         above slipped past the {MANAGER_TURN_DELAY:?} held response"
+    );
+    assert!(
+        wait_until(PANEL_DEADLINE, || is_queued_edge_for(&vector, task)).await,
+        "the gate must have appended a Queued edge for {task}; events: {:?}",
         events_in(&vector)
     );
 
@@ -979,16 +1223,25 @@ async fn the_pool_rank_reaches_the_registry_inside_the_drain_free_window() {
         "and readable through the registry's own read model"
     );
 
-    // (b) The loop itself is still parked: the event is unread and the panel has not moved.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        window_opened_at.elapsed() < MANAGER_TURN_DELAY,
-        "test window slipped past the held Manager turn (elapsed {:?}); the assertions below \
-         are not meaningful on this machine",
-        window_opened_at.elapsed()
+    // (b) The loop is provably still parked inside the turn that opened this window: exactly one
+    //     request has been handed to its backend and that turn's reply has not reached the host
+    //     yet, so the loop has not been back to a boundary of its own since the rank was read.
+    //     Both ends are observed facts, not a wall-clock guess, so no slip guard is needed here.
+    let handed_at_read = scenario.session_requests().await;
+    assert_eq!(
+        handed_at_read, 1,
+        "the turn this window belongs to must still be in flight; the session backend has been \
+         handed {handed_at_read} request(s), so the loop came back from it and the assertions below \
+         would no longer be inside a drain-free window"
     );
     assert!(
-        is_queued_for(&vector, task),
+        !witness.answered_with(SESSION_REPLY),
+        "the held reply had already reached the host, so this window had closed before the rank was \
+         read; messages: {:?}",
+        witness.messages()
+    );
+    assert!(
+        is_queued_edge_for(&vector, task),
         "the Queued event must still sit unread in the vector: the loop runs no delegation drain \
          while its own backend call is in flight; events: {:?}",
         events_in(&vector)

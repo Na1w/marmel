@@ -61,17 +61,6 @@ pub(crate) fn any(decision: Option<&SteerDecision>, action: SteerSubtaskAction) 
         .any(|st| route(st) == action)
 }
 
-/// The first subtask of `decision` that routes to `action`.
-pub(crate) fn first(
-    decision: Option<&SteerDecision>,
-    action: SteerSubtaskAction,
-) -> Option<&SteerSubtaskDecision> {
-    decision
-        .into_iter()
-        .flat_map(|d| d.subtasks.iter())
-        .find(|st| route(st) == action)
-}
-
 /// The **one** worker-addressing rule the bridge uses — cancel *and* post-to-worker.
 ///
 /// The pair `(agent, task)` is resolved against the worker registry, never against pane rows
@@ -130,23 +119,76 @@ fn routing_identity(
     identity
 }
 
-/// The worker a forwarded notice is addressed to: the **effective registry key** when the
-/// arbitrator's `(agent, task)` pair addresses exactly one running worker, otherwise the raw
-/// token the arbitrator supplied (agent name, else the subtask's tool-call id).
+/// The worker a forwarded notice is addressed to.
 ///
-/// The fallback is what keeps an explicit broadcast (`worker` / `*`) or an address with no
-/// live worker behind it behaving as before — the notice router applies the same whole-token
-/// rules to it — while a precisely addressed notice is posted under the exact key the pane
-/// row and the registry use.
-pub(crate) fn notice_target(subtask: &SteerSubtaskDecision) -> String {
-    match addressed_worker_keys(subtask.agent_name.as_deref(), Some(&subtask.tool_call_id))
-        .as_slice()
-    {
-        [only] => only.clone(),
-        _ => subtask
-            .agent_name
-            .clone()
-            .unwrap_or_else(|| subtask.tool_call_id.clone()),
+/// The arbitrator supplies free-form tokens (`agent_name`, `tool_call_id`), and posting one
+/// of those tokens verbatim is only safe when a live worker actually drains the inbox it
+/// becomes. `notice_targets` therefore resolves the pair against the worker registry and
+/// refuses, rather than silently filing an orphan inbox:
+///
+/// * the **pair** resolves through [`addressed_worker_keys`] (whole-token AND semantics,
+///   the same rule the registry applies when cancelling and the notice router applies when
+///   delivering);
+/// * exactly one match posts under that **effective registry key** — the exact spelling the
+///   runner drains its inbox with, which is what makes the worker's `reply_to_arbitrator`
+///   pass the strict reply contract instead of being rejected `worker-mismatch`;
+/// * several matches post **one notice per key** (never a de-facto role broadcast under a
+///   raw name token);
+/// * when the pair matches nothing, the agent name alone is tried, then an explicit
+///   broadcast token (`worker` / `*`) is honoured as the deliberate broadcast it is;
+/// * anything else is [`NoticeTargeting::Unroutable`] — the host must surface it, because
+///   filing it under a token no worker drains loses the instruction and poisons the reply
+///   contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NoticeTargeting {
+    /// Post exactly one notice **per key**, in registry order.
+    Addresses(Vec<String>),
+    /// Nothing may be posted. `token` is what the arbitrator addressed, kept for the
+    /// visible rejection.
+    Unroutable { token: String },
+}
+
+/// Resolve the addressing of one `ForwardNotice` subtask (see [`NoticeTargeting`]).
+pub(crate) fn notice_targets(subtask: &SteerSubtaskDecision) -> NoticeTargeting {
+    let agent = subtask.agent_name.as_deref().unwrap_or("").trim();
+    let task = subtask.tool_call_id.trim();
+
+    match addressed_worker_keys(Some(agent), Some(task)).as_slice() {
+        [] => {}
+        keys => return NoticeTargeting::Addresses(keys.to_vec()),
+    }
+
+    // The arbitrator echoed something that is not the registry's task id (an OpenAI-style
+    // `call_…` id is the usual case). The agent half can still address one worker — but
+    // only if the router really accepts that token for a live entry.
+    if !agent.is_empty() {
+        let by_agent = addressed_worker_keys(Some(agent), None);
+        if !by_agent.is_empty() {
+            return NoticeTargeting::Addresses(by_agent);
+        }
+    }
+
+    // A bare broadcast token is the arbitrator deliberately addressing "whatever is
+    // running"; that documented semantics stays, and it is the only non-registry token
+    // this function will ever emit.
+    for token in [task, agent] {
+        if crate::orchestrator::notice::BROADCAST_TARGETS
+            .iter()
+            .any(|b| *b == token.to_ascii_lowercase().as_str())
+        {
+            return NoticeTargeting::Addresses(vec![token.to_string()]);
+        }
+    }
+
+    NoticeTargeting::Unroutable {
+        token: {
+            let token = if agent.is_empty() { task } else { agent };
+            if token.is_empty() {
+                "the arbitrator named no worker".to_string()
+            } else {
+                token.to_string()
+            }
+        },
     }
 }
 

@@ -303,6 +303,129 @@ pub(crate) fn capacity_drop_text(target: &str, dropped: &[SteerNotice]) -> Strin
     )
 }
 
+/// One `ForwardNotice` subtask that was carried out by the arbitration round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ForwardedNotice {
+    pub notice_id: String,
+    pub target: String,
+    /// Notices evicted oldest-first by the inbox capacity bound to make room for this one.
+    pub dropped_older: Vec<SteerNotice>,
+}
+
+/// What one `ForwardNotice` subtask produced: a posted notice per resolved target, or an
+/// explicit refusal to post (see [`super::action::notice_targets`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ForwardOutcome {
+    /// The notice was filed under this inbox key.
+    Posted(ForwardedNotice),
+    /// Nothing was filed: the arbitrator addressed a token no live worker drains. Filing it
+    /// anyway would create an inbox nobody reads and make the worker's later reply
+    /// `worker-mismatch`, so the refusal is what the host must surface.
+    Unroutable { token: String },
+}
+
+/// Post every `ForwardNotice` subtask of a `ForwardToWorker` decision **exactly once**.
+///
+/// This is the single posting owner for both bridge hosts. The old shape posted the
+/// arbitrator-rewritten inquiry here *and* the raw user text again in each host's
+/// `Finished` / `on_pause` arm (the raw copy under a `worker` broadcast default), so one
+/// steer produced two notices for the same decision plus a third delivery as a Manager
+/// turn: the worker answered one id, the phantom copy stayed pending until the TTL, and a
+/// second reply for the same steer came back `already-replied`. A host that receives the
+/// result of this function must render it, never post again.
+pub(crate) fn post_forward_notices(
+    decision: Option<&SteerDecision>,
+    user_msg: &str,
+) -> Vec<ForwardOutcome> {
+    let Some(d) = decision else {
+        return Vec::new();
+    };
+    if normalize_steer_decision(Some(&d.decision)) != "ForwardToWorker" {
+        return Vec::new();
+    }
+
+    let mut outcomes = Vec::new();
+    let mut seen_target_inquiry = std::collections::HashSet::new();
+    for (st, subtask_action) in action::routed(Some(d)) {
+        if subtask_action != action::ACTION_FORWARD_NOTICE {
+            continue;
+        }
+        // The arbitrator's rewritten inquiry is the instruction; the raw user text only as
+        // a fallback when the subtask carries none.
+        let inquiry = st.message.as_deref().unwrap_or(user_msg);
+        match action::notice_targets(st) {
+            action::NoticeTargeting::Addresses(targets) => {
+                for target in targets {
+                    if !seen_target_inquiry.insert((target.clone(), inquiry.to_string())) {
+                        continue;
+                    }
+                    let posted = post_notice_observable(&target, inquiry);
+                    outcomes.push(ForwardOutcome::Posted(ForwardedNotice {
+                        notice_id: posted.notice.notice_id,
+                        target,
+                        dropped_older: posted.dropped_older,
+                    }));
+                }
+            }
+            action::NoticeTargeting::Unroutable { token } => {
+                tracing::warn!(
+                    target_worker = %token,
+                    "Steer arbitrator addressed a ForwardNotice at a token no active worker \
+                     drains — nothing was posted (filing it would orphan the instruction and \
+                     make any later reply worker-mismatch)"
+                );
+                outcomes.push(ForwardOutcome::Unroutable { token });
+            }
+        }
+    }
+    outcomes
+}
+
+/// The ids actually filed, as the steering-history / status consumers need them.
+pub(crate) fn posted_notices(outcomes: &[ForwardOutcome]) -> Vec<(String, String)> {
+    outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            ForwardOutcome::Posted(posted) => {
+                Some((posted.notice_id.clone(), posted.target.clone()))
+            }
+            ForwardOutcome::Unroutable { .. } => None,
+        })
+        .collect()
+}
+
+/// The tokens whose notice was refused.
+pub(crate) fn unroutable_targets(outcomes: &[ForwardOutcome]) -> Vec<String> {
+    outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            ForwardOutcome::Unroutable { token } => Some(token.clone()),
+            ForwardOutcome::Posted { .. } => None,
+        })
+        .collect()
+}
+
+/// One visible line per posted notice, worded identically in both hosts.
+pub(crate) fn forwarded_status(forwarded: &[(String, String)], resuming: bool) -> String {
+    let ids: Vec<String> = forwarded
+        .iter()
+        .map(|(notice_id, target)| format!("{notice_id} → {target}"))
+        .collect();
+    format!(
+        "Notice(s) {} forwarded — waiting for specialist reply{}...",
+        ids.join(", "),
+        if resuming { " — resuming stream" } else { "" }
+    )
+}
+
+/// One visible line per refused target, worded identically in both hosts.
+pub(crate) fn unroutable_target_text(token: &str) -> String {
+    format!(
+        "notice NOT forwarded: no active specialist is addressed by '{token}' — the \
+         instruction was not filed into an inbox no worker drains"
+    )
+}
+
 /// The notice appended to the user instruction on every round after the arbitrator slept.
 ///
 /// Single source of truth for this wording — both bridge hosts build their round > 1 payload
@@ -641,15 +764,26 @@ pub(crate) async fn run_delegated_subtask(
     }
 }
 
+/// Prefixes `text` with the arbitrator's own note when it has one.
+fn with_prefix(note: Option<&str>, text: &str) -> String {
+    match note.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(note) => format!("{note} — {text}"),
+        None => text.to_string(),
+    }
+}
+
 /// The entry recorded in the steering history for a finished arbitration.
 ///
 /// `synthesized` is the synthesized answer of delegated subtasks (only the spawned arbitrator
-/// produces one) and `forwarded` the notices forwarded to workers in posting order (only the
-/// spawned arbitrator forwards them — the sink does that in its own decision handling).
+/// produces one) and `forwarded` the notices posted for this decision in posting order — posted
+/// by the single posting owner ([`post_forward_notices`]) and reported to the drain host through
+/// the `Finished` event, so both hosts record the same thing. `unroutable` names the targets
+/// that could not be resolved to a live worker.
 pub(crate) fn recorded_response(
     decision: Option<&SteerDecision>,
     synthesized: Option<&str>,
     forwarded: &[(String, String)],
+    unroutable: &[String],
 ) -> String {
     if let Some(answer) = synthesized {
         return answer.to_string();
@@ -657,23 +791,51 @@ pub(crate) fn recorded_response(
     let Some(d) = decision else {
         return "No decision".to_string();
     };
-    if let Some(response) = d.response.as_ref() {
-        return response.clone();
-    }
     match normalize_steer_decision(Some(&d.decision)) {
+        // **One notice per `ForwardNotice` subtask, and the entry names those ids.** The
+        // reply correlation in `orchestrator::bus` looks an entry up by the notice id the
+        // specialist echoes back, so an entry that names nothing can never be resolved by a
+        // reply: it would sit "awaiting specialist reply" until the 10-minute TTL while the
+        // worker's real answer got appended as a second entry. The arbitrator's own note to
+        // the user is kept in front of it.
+        "ForwardToWorker" if !forwarded.is_empty() => {
+            let pending = forwarded
+                .iter()
+                .map(|(notice_id, target)| {
+                    format!("Forwarded notice {notice_id} to {target} (awaiting specialist reply)")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            with_prefix(d.response.as_deref(), &pending)
+        }
+        // Nothing was filed. Claiming "awaiting specialist reply" here would leave a history
+        // entry waiting for a reply that can never come, so the recorded text says what
+        // actually happened.
+        "ForwardToWorker" if !unroutable.is_empty() => with_prefix(
+            d.response.as_deref(),
+            &format!(
+                "notice not forwarded: {} (nothing is awaiting a specialist reply)",
+                unroutable
+                    .iter()
+                    .map(|token| format!("no active specialist is addressed by '{token}'"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        ),
+        "ForwardToWorker" => with_prefix(
+            d.response.as_deref(),
+            "ForwardToWorker decision carried no forwarded notice (nothing is awaiting a \
+             specialist reply)",
+        ),
         // The wording must describe the sleep that was actually taken, so it
         // goes through the same floor/ceiling the loop slept with.
-        "Sleep" => format!("Slept for {}s", clamped_sleep_secs(d.sleep_seconds)),
-        // `forwarded` is only ever populated for a `ForwardToWorker` decision.
-        "ForwardToWorker" if !forwarded.is_empty() => forwarded
-            .iter()
-            .map(|(notice_id, target)| {
-                format!("Forwarded notice {notice_id} to {target} (awaiting specialist reply)")
-            })
-            .collect::<Vec<_>>()
-            .join(", "),
-        "ForwardToWorker" => "Forwarded notice to worker (awaiting specialist reply)".to_string(),
-        _ => format!("Decision: {}", d.decision),
+        "Sleep" if d.response.is_none() => {
+            format!("Slept for {}s", clamped_sleep_secs(d.sleep_seconds))
+        }
+        _ => d
+            .response
+            .clone()
+            .unwrap_or_else(|| format!("Decision: {}", d.decision)),
     }
 }
 
@@ -830,31 +992,63 @@ mod tests {
     /// The **steered** path, end to end: a `Sleep` decision carrying
     /// `sleep_seconds: 0` sleeps the floor instead of nothing, both hosts report
     /// the floor, and the history text names the seconds actually slept.
+    ///
+    /// The two-round handshake is pinned so that only a real production failure can fail
+    /// this test:
+    /// * the round-1 mock is mounted **first** and is the one capped by `up_to_n_times(1)`.
+    ///   wiremock answers the first matching mock in mount order
+    ///   (`wiremock-0.6.5/src/mock_set.rs:57-73`), so prompt text the loop pulls out of
+    ///   workspace-global state (`Plan::default().read()` reads the CWD
+    ///   `.marmel/execution_plan.md`) can never let the wake-up mock steal round 1;
+    /// * the round-2 mock requires the wake-up notice, and that needle is read back out of
+    ///   the production builder [`wake_up_notice`] instead of a re-typed literal, so it can
+    ///   never drift from what the loop actually sends;
+    /// * both mocks are `named` + `expect(1)` and verified after the run, so a lost or
+    ///   mis-routed round trip is named at the mock rather than surfacing as `rounds == [1]`.
     #[test]
     fn steered_sleep_with_zero_seconds_sleeps_the_floor_not_nothing() {
         use wiremock::matchers::{body_string_contains, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        // The round-2 discriminator is the notice the loop itself appends from round 2 on,
+        // taken from [`wake_up_notice`]'s own rendering of "<msg> (<notice>)" — a matcher
+        // may only test text this test owns, never something a workspace file contributes.
+        let wake_up_needle = {
+            let probe = "wake-up-needle-probe";
+            let rendered = wake_up_notice(probe);
+            rendered
+                .strip_prefix(&format!("{probe} ("))
+                .and_then(|notice| notice.strip_suffix(')'))
+                .unwrap_or_else(|| {
+                    panic!("wake_up_notice must render \"<msg> (<notice>)\", got {rendered:?}")
+                })
+                .to_string()
+        };
+
         arbitration_test(async {
             let server = MockServer::start().await;
-            // Round 2 (the wake-up round) answers instead of sleeping again.
-            Mock::given(method("POST"))
-                .and(path("/chat/completions"))
-                .and(body_string_contains(
-                    "SYSTEM NOTICE: You already slept as requested",
-                ))
-                .respond_with(ResponseTemplate::new(200).set_body_string(sse_chunk(
-                    r#"{"decision": "RespondDirectly", "response": "woke and answered"}"#,
-                )))
-                .mount(&server)
-                .await;
-            // Round 1: a Sleep that asks for ZERO seconds.
+            // Round 1: a Sleep that asks for ZERO seconds. Mounted first and answered at
+            // most once, so round 1 is answered by this mock whatever else the body carries.
             Mock::given(method("POST"))
                 .and(path("/chat/completions"))
                 .respond_with(ResponseTemplate::new(200).set_body_string(sse_chunk(
                     r#"{"decision": "Sleep", "response": "waiting for the build", "sleep_seconds": 0}"#,
                 )))
                 .up_to_n_times(1)
+                .named("round-1-sleep")
+                .expect(1)
+                .mount(&server)
+                .await;
+            // Round 2 (the wake-up round) answers instead of sleeping again — reachable only
+            // by a body the loop built for round > 1.
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .and(body_string_contains(wake_up_needle.as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_string(sse_chunk(
+                    r#"{"decision": "RespondDirectly", "response": "woke and answered"}"#,
+                )))
+                .named("round-2-wake-up")
+                .expect(1)
                 .mount(&server)
                 .await;
 
@@ -864,7 +1058,6 @@ mod tests {
                 std::sync::Arc::new(std::sync::RwLock::new(Vec::<(String, String)>::new()));
             let mut channel = RecordingChannel::default();
 
-            let started = std::time::Instant::now();
             let outcome = arbitrate_steering(
                 &mut channel,
                 &ArbitrationRequest {
@@ -876,13 +1069,60 @@ mod tests {
                 },
             )
             .await;
-            let waited = started.elapsed();
 
-            assert!(!outcome.sleep_cancelled);
+            // The handshake is itself part of what this test asserts: a round answered by the
+            // wrong mock, or lost to a failed round trip, must be named at the mock — never
+            // reported as a truncated round list.
+            let calls = server.received_requests().await.unwrap_or_default().len();
+            assert_eq!(
+                calls, 2,
+                "two arbitration rounds must make exactly two arbitrator calls, got {calls} — \
+                 a lost or extra round trip is not a sleep-floor failure"
+            );
+            // Both mocks declared `expect(1)`, so this pins that each of them answered exactly
+            // one round and names the one that did not. Which round each mock answered is
+            // proven behaviourally below, by the answer only that mock can produce — never by
+            // what a request body happened to contain, because the loop's prompt embeds
+            // workspace-global text this test does not own.
+            server.verify().await;
+
+            assert!(
+                !outcome.sleep_cancelled,
+                "the floored sleep must run to the end, not be cancelled: decision={:?} \
+                 notices={:?} sleep={:?}",
+                outcome.decision, channel.notices, outcome.sleep,
+            );
+            let decision = outcome.decision.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "the arbitration ended with no decision at all, i.e. an arbitrator round \
+                     trip produced nothing (every failed steer call collapses to `None` in \
+                     src/orchestrator/steer.rs) — that is not a sleep-floor failure: \
+                     decision={:?} notices={:?} sleep={:?}",
+                    outcome.decision, channel.notices, outcome.sleep,
+                )
+            });
             assert_eq!(
                 channel.rounds,
                 vec![1, 2],
-                "a floored sleep must still re-evaluate in a second round"
+                "a floored sleep must still re-evaluate in a second round — decision={:?} \
+                 notices={:?} sleep={:?}",
+                outcome.decision,
+                channel.notices,
+                outcome.sleep,
+            );
+            assert_eq!(
+                normalize_steer_decision(Some(&decision.decision)),
+                "RespondDirectly",
+                "round 2 must have ended the chain with the wake-up mock's answer — \
+                 decision={:?} notices={:?}",
+                outcome.decision,
+                channel.notices,
+            );
+            assert_eq!(
+                decision.response.as_deref(),
+                Some("woke and answered"),
+                "only the round-2 wake-up mock can produce this answer: a different one means \
+                 a round was answered by the wrong mock"
             );
             assert_eq!(
                 channel.notices,
@@ -896,14 +1136,23 @@ mod tests {
                 ],
                 "the requested 0s must be reported as the floored sleep"
             );
-            assert!(
-                waited >= std::time::Duration::from_millis(500),
-                "the loop must actually wait, not spin: slept {waited:?} \
-                 for a {SLEEP_MIN_SECS}s floor"
-            );
+            // Behavioural proof that the loop waited instead of spinning, deliberately free of
+            // any wall-clock threshold (load-sensitive on CI, and `tokio::time::pause()` would
+            // fast-forward the 50 ms SSE poll, the 2 s preempt-ack and the 60 s call timeout
+            // living on this same current-thread runtime). The clock-independent half of the
+            // invariant lives in `floored_sleep_is_allowed_by_the_budget_at_any_clock`, which
+            // drives the injected-clock seam (`SleepBudget::new_at` / `allow_at`).
             assert_eq!(
                 outcome.sleep.slept_secs, SLEEP_MIN_SECS,
                 "the chained budget accounts the floored sleep"
+            );
+            assert_eq!(
+                outcome.sleep.extensions, 1,
+                "the floored sleep is exactly one accounted extension"
+            );
+            assert_eq!(
+                outcome.sleep.stop, None,
+                "no documented cap ended the chain — the re-evaluation round did run"
             );
 
             let hist = history.read().unwrap();
@@ -926,7 +1175,7 @@ mod tests {
             sleep_seconds: Some(0),
         };
         assert_eq!(
-            recorded_response(Some(&no_response), None, &[]),
+            recorded_response(Some(&no_response), None, &[], &[]),
             format!("Slept for {SLEEP_MIN_SECS}s")
         );
         let missing = SteerDecision {
@@ -938,8 +1187,48 @@ mod tests {
             sleep_seconds: None,
         };
         assert_eq!(
-            recorded_response(Some(&missing), None, &[]),
+            recorded_response(Some(&missing), None, &[], &[]),
             format!("Slept for {SLEEP_DEFAULT_SECS}s")
+        );
+    }
+
+    /// Clock-proof half of the same invariant: a **floored** sleep (the `sleep_seconds: 0`
+    /// request of [`steered_sleep_with_zero_seconds_sleeps_the_floor_not_nothing`], taken
+    /// through [`clamped_sleep_secs`]) is granted by a freshly armed chain budget at **any**
+    /// injected `now`, so the second round of that handshake can never depend on how long a
+    /// round trip happened to take. What ends a chain is its own documented cap — never the
+    /// floor. Driven through the injected-clock seam ([`SleepBudget::new_at`] /
+    /// [`SleepBudget::allow_at`]), so no wall clock is involved at all.
+    #[test]
+    fn floored_sleep_is_allowed_by_the_budget_at_any_clock() {
+        let start = Instant::now();
+        let floored = clamped_sleep_secs(Some(0));
+        assert_eq!(
+            floored, SLEEP_MIN_SECS,
+            "0s is floored before the budget sees it"
+        );
+
+        for elapsed_secs in [0u64, 1, 60, MAX_CHAINED_SLEEP_SECONDS - SLEEP_MIN_SECS] {
+            let budget = SleepBudget::new_at(start);
+            assert_eq!(
+                budget.allow_at(floored, start + Duration::from_secs(elapsed_secs)),
+                Ok(SLEEP_MIN_SECS),
+                "a {elapsed_secs}s round trip must not stop the first floored sleep — \
+                 without it there is no re-evaluation round at all"
+            );
+        }
+
+        // The chain keeps re-evaluating while its documented extension cap allows it.
+        let mut budget = SleepBudget::new_at(start);
+        let mut extensions_taken = 0usize;
+        while let Ok(secs) = budget.allow_at(floored, start) {
+            assert_eq!(secs, SLEEP_MIN_SECS);
+            budget.note_slept(secs);
+            extensions_taken += 1;
+        }
+        assert_eq!(
+            extensions_taken, MAX_CHAINED_SLEEP_EXTENSIONS,
+            "the extension cap, not the floor, is what stops the chain"
         );
     }
 

@@ -394,7 +394,7 @@ impl ToolDef {
                     "properties": {
                         "notice_id": {
                             "type": "string",
-                            "description": "The exact ID of the steering notice you are replying to (e.g. 'notice-1' or 'steer-1')."
+                            "description": "The exact id of the steering notice you are answering — the literal value the delivered notice shows on its `ID: <notice-id>` line (e.g. 'notice-1'). No other id form exists: a value no pending notice carries is rejected ('unknown-notice-id'), as is an already-answered one ('already-replied'), a notice addressed to another worker ('worker-mismatch'), or an omitted/empty one ('missing-notice-id'). A rejected reply records nothing."
                         },
                         "message": {
                             "type": "string",
