@@ -346,79 +346,25 @@ impl TuiRenderer {
         let mut chat_area = Rect::default();
         let mut plan_area = Rect::default();
         let mut subagent_area = Rect::default();
+        let mut input_area = Rect::default();
 
+        // The frame body is the rebuilt layout: `layout::compute_layout` replaces
+        // the legacy `[Min(3), Length(1), Length(3)]` root split, the
+        // `Percentage(60)/Percentage(40)` main split and the
+        // `Percentage(50)/Percentage(50)` right-column pair (spec §2.1, §2.3),
+        // and `draw_new_ui` renders every pane component of §3 into those rects.
         terminal.draw(|frame| {
-            let size = frame.area();
-
-            // 3.1 Vertical split: Main (Min 3) + Status (Length 1) + Input (Length 3).
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(3),
-                    Constraint::Length(1),
-                    Constraint::Length(3),
-                ])
-                .split(size);
-            let main_area = chunks[0];
-            let status_area = chunks[1];
-            let input_area = chunks[2];
-
-            // 3.2 Horizontal split: Chat (60%) + right panel (40%).
-            let has_plan = !self.plan_content.trim().is_empty() && self.show_plan_panel;
-            let has_subagents = self.show_subagent_panel && !self.subagents.is_empty();
-
-            let (chat_rect, right_area) = if has_plan || has_subagents {
-                let main_chunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-                    .split(main_area);
-                (main_chunks[0], Some(main_chunks[1]))
-            } else {
-                (main_area, None)
-            };
-
-            // 3.3 Right panel split: Plan (top 50%) + Subagents (bottom 50%).
-            let mut plan_rect = None;
-            let mut subagent_rect = None;
-            if let Some(r_area) = right_area {
-                if has_plan && has_subagents {
-                    let right_chunks = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                        .split(r_area);
-                    plan_rect = Some(right_chunks[0]);
-                    subagent_rect = Some(right_chunks[1]);
-                } else if has_plan {
-                    plan_rect = Some(r_area);
-                } else if has_subagents {
-                    subagent_rect = Some(r_area);
-                }
-            }
-
-            chat_area = chat_rect;
-            if let Some(p) = plan_rect {
-                plan_area = p;
-            }
-            if let Some(s) = subagent_rect {
-                subagent_area = s;
-            }
-
-            self.render_chat(frame, chat_area);
-            if let Some(p) = plan_rect {
-                let plan = self.plan_content.clone();
-                let is_archived = self.plan_is_archived;
-                self.render_plan(frame, p, &plan, is_archived);
-            }
-            if let Some(s) = subagent_rect {
-                self.render_subagents(frame, s);
-            }
-            self.render_status(frame, status_area);
-            self.render_input(frame, input_area);
+            let rects = self.draw_new_ui(frame);
+            chat_area = rects.transcript.unwrap_or_default();
+            plan_area = rects.plan.unwrap_or_default();
+            subagent_area = rects.workers.unwrap_or_default();
+            input_area = rects.input.unwrap_or_default();
         })?;
 
         self.chat_area = chat_area;
         self.plan_area = plan_area;
         self.subagent_area = subagent_area;
+        self.input_area = input_area;
         Ok(())
     }
 

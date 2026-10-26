@@ -4,6 +4,11 @@ mod events;
 pub mod formatting;
 mod render;
 
+mod components;
+mod layout;
+mod state;
+mod theme;
+
 pub use formatting::*;
 
 #[cfg(test)]
@@ -404,6 +409,125 @@ impl TuiRenderer {
         let res = self.draw(&mut terminal);
         self.terminal = Some(terminal);
         res
+    }
+
+    /// One frame of the rebuilt UI: derive the [`state::UiView`] view model,
+    /// compute the pane geometry with [`layout::compute_layout`] (spec §2), then
+    /// render every pane component of [`components`] (spec §3) and return the
+    /// rects so [`Self::draw`] can write the geometry caches back.
+    ///
+    /// The text bodies of the transcript / plan / worker / status / composer
+    /// panes are still produced by the existing `render.rs` panes (which are also
+    /// what keep `formatting::*` — markdown, ANSI, wrapping — in use): they fill
+    /// the **new** rects first, and the component chrome (border, title, `●`
+    /// focus badge, state chips) is drawn over them afterwards. t-007..t-009 move
+    /// that content behind the component `render` functions.
+    pub(crate) fn draw_new_ui(&mut self, frame: &mut ratatui::Frame) -> layout::PaneRects {
+        let view = state::UiView::from_renderer(self);
+        let area = frame.area();
+        let rects = layout::compute_layout(area, &view);
+
+        if let Some(notice) = rects.notice {
+            components::render_notice(frame, notice, area.width, area.height);
+            return rects;
+        }
+
+        // 1. Content pass: the pane bodies.
+        if let Some(rect) = rects.transcript {
+            self.render_chat(frame, rect);
+        }
+        if let Some(rect) = rects.plan {
+            let plan = self.plan_content.clone();
+            let archived = self.plan_is_archived;
+            self.render_plan(frame, rect, &plan, archived);
+        }
+        if let Some(rect) = rects.workers {
+            self.render_subagents(frame, rect);
+        }
+        if let Some(rect) = rects.status {
+            self.render_status(frame, rect);
+        }
+        if let Some(rect) = rects.input {
+            self.render_input(frame, rect);
+        }
+
+        // 2. Chrome pass: header, status chips, pane frames, legend, overlays.
+        let header = components::header::HeaderData {
+            mode: rects.mode,
+            plan: &view.plan,
+            budget: layout::header_budget(area.width),
+            ctx_tokens: self.orchestrator_context_tokens,
+        };
+        if let Some(rect) = rects.header {
+            components::header::render(frame, rect, &header);
+        }
+        let status = components::status_bar::StatusData {
+            workers: &self.subagents,
+            follow: view.follow,
+            show_thought: view.show_thought,
+            plan_visible: view.plan_visible,
+            workers_visible: view.workers_visible,
+            abort_armed: view.abort_armed,
+        };
+        if let Some(rect) = rects.status {
+            components::status_bar::render(frame, rect, &status);
+        }
+        if let Some(rect) = rects.plan {
+            let data = components::plan_pane::PlanData {
+                focus: view.focused(state::FocusPane::Plan),
+                progress: &view.plan,
+                scroll: view.scroll.plan,
+            };
+            components::plan_pane::render(frame, rect, &data);
+        }
+        if let Some(rect) = rects.transcript {
+            let data = components::transcript::TranscriptData {
+                focus: view.focused(state::FocusPane::Transcript),
+                follow: view.follow,
+                scroll: view.scroll.transcript,
+            };
+            components::transcript::render(frame, rect, &data);
+        }
+        if let Some(rect) = rects.workers {
+            let data = components::activity::ActivityData {
+                focus: view.focused(state::FocusPane::Workers),
+                rows: &self.subagents,
+                selected: self.selected_subagent_idx,
+                detail_present: layout::workers_detail_present(area.width),
+                scroll: view.scroll.workers,
+            };
+            components::activity::render(frame, rect, &data);
+        }
+        if let Some(rect) = rects.input {
+            let data = components::input::InputData {
+                focus: view.focused(state::FocusPane::Input),
+                active: view.composer_active(),
+                armed: view.abort_armed,
+                draft_lines: view.input_lines,
+            };
+            components::input::render(frame, rect, &data);
+        }
+        let compact = layout::compact_legend(area.width);
+        if let Some(rect) = rects.footer {
+            let data = components::help::HelpData {
+                kind: components::help::HelpKind::Legend,
+                compact,
+            };
+            components::help::render(frame, rect, &data);
+        }
+        // Overlays draw last (§7.3). The armed-abort surface is drawn as the
+        // status row-2 prompt of §8.5, never as a modal, so only the help
+        // overlay reaches this point until the `?`/`F1` binding lands in t-010.
+        if view.overlay == state::OverlayState::Help
+            && let Some(rect) = rects.body
+        {
+            let data = components::help::HelpData {
+                kind: components::help::HelpKind::Overlay(view.overlay),
+                compact,
+            };
+            components::help::render(frame, rect, &data);
+        }
+        rects
     }
 
     /// Check whether abort is actively armed and within the 3-second confirmation window.

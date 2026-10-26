@@ -6789,3 +6789,361 @@ fn a_lifecycle_line_the_cap_has_already_trimmed_is_re_appended_at_the_tail_by_th
         "the resurrected line costs one drawable line of real traffic"
     );
 }
+
+// ---- new UI scaffold: view model, layout ladder, theme, pane chrome ----------
+
+/// Draw one whole frame of the rebuilt UI and hand back the text of every row.
+fn draw_new_frame(r: &mut TuiRenderer, width: u16, height: u16) -> Vec<String> {
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            r.draw_new_ui(frame);
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect()
+}
+
+/// A renderer in the M4 state: both side panes on, one running worker, one
+/// transcript line, a mixed plan.
+fn m4_renderer() -> TuiRenderer {
+    let mut r = TuiRenderer::new();
+    r.plan_content = "## Tasks\n\n- [x] [t-001] research baseline\n- [ ] [t-004] wireframe\n"
+        .to_string();
+    r.messages = vec!["User: rebuild the TUI".to_string()];
+    r.show_plan_panel = true;
+    r.show_subagent_panel = true;
+    r.subagents = vec![SubagentDetail {
+        name: "coder_specialist-t-004".to_string(),
+        task_id: Some("t-004".to_string()),
+        is_active: true,
+        ..SubagentDetail::default()
+    }];
+    r
+}
+
+#[test]
+fn plan_progress_is_the_checked_box_split_of_the_same_plan_text() {
+    // Acceptance criterion 2: `done/total` equals the `CheckboxState::Checked` /
+    // total split for three fixtures.
+    let empty = state::PlanProgress::from_plan("No active execution plan on disk.", None, &[]);
+    assert_eq!((empty.done, empty.total), (0, 0));
+    assert!(!empty.has_tasks());
+    assert_eq!(empty.progress_label(), "0/0 done");
+
+    let all_checked =
+        state::PlanProgress::from_plan("- [x] [t-001] a\n- [X] [t-002] b\n", None, &[]);
+    assert_eq!((all_checked.done, all_checked.total), (2, 2));
+    assert_eq!(all_checked.pending(), 0);
+
+    let mixed = state::PlanProgress::from_plan(
+        "# Plan\n\n- [x] [t-001] a\n- [ ] [t-004] b\n- [x] t-008 c\n\n```\n- [ ] not a task\n```",
+        None,
+        &[],
+    );
+    assert_eq!((mixed.done, mixed.total), (2, 3));
+    assert_eq!(mixed.pending(), 1);
+    assert_eq!(mixed.progress_label(), "2/3 done");
+}
+
+#[test]
+fn plan_progress_active_task_prefers_the_explicit_task_then_a_running_row() {
+    let explicit =
+        state::PlanProgress::from_plan("- [ ] [t-004] b\n", Some("t-004"), &[]);
+    assert_eq!(explicit.active_task.as_deref(), Some("t-004"));
+
+    let running = vec![SubagentDetail {
+        name: "coder_specialist-t-009".to_string(),
+        task_id: Some("t-009".to_string()),
+        is_active: true,
+        ..SubagentDetail::default()
+    }];
+    let derived = state::PlanProgress::from_plan("- [ ] [t-004] b\n", None, &running);
+    assert_eq!(derived.active_task.as_deref(), Some("t-009"));
+
+    let idle = vec![SubagentDetail {
+        name: "writer-t-011".to_string(),
+        task_id: Some("t-011".to_string()),
+        ..SubagentDetail::default()
+    }];
+    let none = state::PlanProgress::from_plan("- [ ] [t-004] b\n", None, &idle);
+    assert_eq!(none.active_task, None);
+}
+
+#[test]
+fn view_mode_follows_the_two_pane_toggles() {
+    let mut r = TuiRenderer::new();
+    r.show_plan_panel = false;
+    r.show_subagent_panel = false;
+    assert_eq!(state::UiView::from_renderer(&r).mode, state::ViewMode::Transcript);
+
+    r.show_plan_panel = true;
+    assert_eq!(state::UiView::from_renderer(&r).mode, state::ViewMode::Plan);
+
+    r.show_subagent_panel = true;
+    assert_eq!(state::UiView::from_renderer(&r).mode, state::ViewMode::Split);
+
+    r.show_plan_panel = false;
+    assert_eq!(state::UiView::from_renderer(&r).mode, state::ViewMode::Workers);
+}
+
+#[test]
+fn the_view_model_mirrors_focus_follow_scroll_and_the_armed_surface() {
+    let mut r = TuiRenderer::new();
+    r.focused_panel = FocusedPanel::Subagents;
+    r.chat_auto_scroll = false;
+    r.chat_scroll = 7;
+    r.plan_scroll = 3;
+    r.subagent_scroll = 11;
+    let view = state::UiView::from_renderer(&r);
+    assert_eq!(view.focus, state::FocusPane::Workers);
+    assert!(view.focused(state::FocusPane::Workers));
+    assert!(!view.focused(state::FocusPane::Input));
+    assert!(!view.follow);
+    assert!(view.composer_active());
+    assert_eq!(
+        (
+            view.scroll.transcript,
+            view.scroll.plan,
+            view.scroll.workers
+        ),
+        (7, 3, 11)
+    );
+    assert_eq!(view.overlay, state::OverlayState::None);
+
+    // Arming abort opens the confirm surface (drawn on status row 2, §8.5).
+    r.confirm_abort = true;
+    r.abort_armed_at = Some(std::time::Instant::now());
+    let armed = state::UiView::from_renderer(&r);
+    assert!(armed.abort_armed);
+    assert_eq!(armed.overlay, state::OverlayState::Confirm);
+    assert!(armed.overlay.is_open());
+    assert!(!armed.composer_active());
+}
+
+#[test]
+fn no_pane_rect_is_zero_sized_at_any_supported_terminal_size() {
+    // Acceptance criterion 19 (layout half): 100x30, 90x24, 60x16 and 40x10.
+    let r = m4_renderer();
+    let view = state::UiView::from_renderer(&r);
+    for (width, height) in [(100u16, 30u16), (90, 24), (60, 16), (40, 10), (120, 60)] {
+        let rects = layout::compute_layout(Rect::new(0, 0, width, height), &view);
+        for (name, rect) in [
+            ("header", rects.header),
+            ("body", rects.body),
+            ("status", rects.status),
+            ("input", rects.input),
+            ("footer", rects.footer),
+            ("transcript", rects.transcript),
+            ("plan", rects.plan),
+            ("workers", rects.workers),
+        ] {
+            if let Some(rect) = rect {
+                assert!(
+                    rect.width >= 1 && rect.height >= 1,
+                    "{name} at {width}x{height} is {}x{}",
+                    rect.width,
+                    rect.height
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn below_40x10_only_the_too_small_notice_is_drawn() {
+    let r = m4_renderer();
+    let view = state::UiView::from_renderer(&r);
+    let rects = layout::compute_layout(Rect::new(0, 0, 39, 9), &view);
+    assert_eq!(rects.notice, Some(Rect::new(0, 0, 39, 9)));
+    assert_eq!(rects.header, None);
+    assert_eq!(rects.body, None);
+    assert_eq!(rects.status, None);
+    assert_eq!(rects.input, None);
+    assert_eq!(rects.footer, None);
+    assert_eq!(rects.transcript, None);
+    assert_eq!(rects.plan, None);
+    assert_eq!(rects.workers, None);
+
+    let rows = draw_new_frame(&mut TuiRenderer::new(), 39, 9);
+    let joined = rows.concat();
+    assert!(
+        joined.contains("Terminal too small")
+            && joined.contains("40x10")
+            && joined.contains("39x9"),
+        "the notice names the required and the current size: {joined}"
+    );
+    assert!(!joined.contains("Input"));
+    assert!(!joined.contains("LIVE"));
+}
+
+#[test]
+fn below_twenty_rows_the_footer_row_is_dropped_and_the_status_bar_collapses() {
+    let r = m4_renderer();
+    let view = state::UiView::from_renderer(&r);
+    let rects = layout::compute_layout(Rect::new(0, 0, 100, 19), &view);
+    assert_eq!(rects.footer, None, "the footer is absent, not zero-height");
+    assert_eq!(rects.status.expect("status present").height, 1);
+    assert!(rects.input.expect("input present").height <= 3);
+
+    let tall = layout::compute_layout(Rect::new(0, 0, 100, 30), &view);
+    assert_eq!(tall.footer.expect("footer at 30 rows").height, 1);
+    assert_eq!(tall.status.expect("status present").height, 2);
+}
+
+#[test]
+fn the_side_column_stacks_to_one_pane_below_ninety_columns() {
+    // §2.5 `width < 90`: transcript plus only the focused side pane.
+    let mut r = m4_renderer();
+    r.focused_panel = FocusedPanel::Plan;
+    let view = state::UiView::from_renderer(&r);
+    let rects = layout::compute_layout(Rect::new(0, 0, 80, 30), &view);
+    assert!(rects.transcript.is_some());
+    assert!(rects.plan.is_some());
+    assert_eq!(rects.workers, None, "only the focused side pane survives");
+
+    let wide = layout::compute_layout(Rect::new(0, 0, 100, 30), &view);
+    assert!(wide.plan.is_some() && wide.workers.is_some());
+}
+
+#[test]
+fn the_header_chip_budget_drops_val_then_ctx_then_elapsed() {
+    // §7.4 drop order; `val` stays off until plumbing delta D1 (gate (c)).
+    let wide = layout::header_budget(120);
+    assert!(!wide.show_val);
+    assert!(wide.show_ctx && wide.show_elapsed && wide.show_mode && wide.show_task);
+
+    let compact = layout::header_budget(70);
+    assert!(
+        compact.show_elapsed,
+        "elapsed survives at 70; §2.5 drops it only below 70"
+    );
+    let narrow = layout::header_budget(69);
+    assert!(!narrow.show_ctx && !narrow.show_elapsed && !narrow.show_mode);
+    assert!(narrow.show_task, "the active task id outlives the optional chips");
+
+    let tiny = layout::header_budget(40);
+    assert!(tiny.show_task);
+    assert!(layout::compact_legend(69) && !layout::compact_legend(70));
+    assert!(!layout::workers_detail_present(59) && layout::workers_detail_present(60));
+}
+
+#[test]
+fn theme_glyphs_are_the_spec_table_and_the_picker_follows_row_state() {
+    use theme::Glyph;
+    assert_eq!(Glyph::Done.symbol(), '✓');
+    assert_eq!(Glyph::Active.symbol(), '▶');
+    assert_eq!(Glyph::Pending.symbol(), '⧗');
+    assert_eq!(Glyph::Paused.symbol(), '⏸');
+    assert_eq!(Glyph::Failed.symbol(), '✗');
+    assert_eq!(Glyph::Active.label(), "running");
+
+    assert_eq!(theme::task_glyph(true, false), Glyph::Done);
+    assert_eq!(theme::task_glyph(false, true), Glyph::Active);
+    assert_eq!(theme::task_glyph(false, false), Glyph::Pending);
+
+    assert_eq!(theme::worker_glyph(true, false, false), Glyph::Active);
+    assert_eq!(theme::worker_glyph(true, true, false), Glyph::Paused);
+    assert_eq!(theme::worker_glyph(false, false, true), Glyph::Pending);
+    assert_eq!(theme::worker_glyph(false, false, false), Glyph::Done);
+
+    // The palette keeps today's colours (§7.1).
+    assert_eq!(theme::frame_focus().fg, Some(Color::Cyan));
+    assert_eq!(theme::frame_idle().fg, Some(Color::DarkGray));
+    assert_eq!(theme::frame_alert().fg, Some(Color::Red));
+    assert_eq!(theme::frame_confirm().fg, Some(Color::Yellow));
+    assert_eq!(theme::chip_active().fg, Some(Color::Yellow));
+    assert!(theme::chip_active().add_modifier.contains(Modifier::BOLD));
+    assert_eq!(theme::chip().bg, Some(Color::DarkGray));
+    assert_eq!(theme::chip_done().fg, Some(Color::Green));
+    assert_eq!(theme::chip_pending().fg, Some(Color::LightRed));
+    assert_eq!(theme::error().fg, Some(Color::Red));
+    assert_eq!(theme::text_dim().fg, Some(Color::DarkGray));
+    assert_eq!(theme::text_primary(), ratatui::style::Style::default());
+    assert_eq!(theme::FOCUS_BADGE, '●');
+}
+
+#[test]
+fn fit_spans_clips_to_the_rect_and_marks_the_cut() {
+    let wide = components::fit_spans(
+        vec![
+            ratatui::text::Span::raw("abcdef"),
+            ratatui::text::Span::raw("ghijkl"),
+        ],
+        12,
+    );
+    assert_eq!(wide.iter().map(|s| s.content.as_ref()).collect::<String>(), "abcdefghijkl");
+
+    let clipped = components::fit_spans(
+        vec![
+            ratatui::text::Span::raw("abcdef"),
+            ratatui::text::Span::raw("ghijkl"),
+        ],
+        8,
+    );
+    let text = clipped.iter().map(|s| s.content.as_ref()).collect::<String>();
+    assert_eq!(text, "abcdefg…", "the cut is cell-granular, not span-granular");
+
+    let one = components::fit_spans(
+        vec![ratatui::text::Span::raw("abcdef"), ratatui::text::Span::raw("g")],
+        3,
+    );
+    let text = one.iter().map(|s| s.content.as_ref()).collect::<String>();
+    assert_eq!(text, "ab…");
+
+    let zero = components::fit_spans(vec![ratatui::text::Span::raw("abc")], 0);
+    assert!(zero.is_empty(), "a zero-width rect gets no spans at all");
+}
+
+#[test]
+fn the_new_frame_carries_header_plan_progress_pane_titles_and_the_legend() {
+    // Acceptance criterion 1 (layout half): progress is in the frame with the
+    // plan pane open, and the legend is there too (G1/G2).
+    let mut r = m4_renderer();
+    r.input_text = String::new();
+    let rows = draw_new_frame(&mut r, 100, 30);
+    let header = rows[0].trim();
+    assert!(header.starts_with("Marmel"), "header row: {header:?}");
+    assert!(header.contains("M4 Split"), "mode chip: {header:?}");
+    assert!(header.contains("1/2 done"), "plan progress: {header:?}");
+    assert!(header.contains("t-004"), "active task chip: {header:?}");
+
+    let joined = rows.concat();
+    assert!(joined.contains("Transcript"), "transcript title");
+    assert!(joined.contains("Execution Plan"), "plan title");
+    assert!(joined.contains("Workers"), "workers title");
+    assert!(joined.contains("Input"), "composer title");
+    assert!(joined.contains("F1 help"), "footer legend");
+    assert!(joined.contains("LIVE"), "follow chip on status row 2");
+    // The content pass still fills the panes with real text.
+    assert!(joined.contains("User: rebuild the TUI"), "transcript body");
+    assert!(joined.contains("wireframe"), "plan body");
+    assert!(joined.contains("coder_specialist"), "worker roster body");
+}
+
+#[test]
+fn the_focused_pane_badges_its_title_and_every_other_pane_does_not() {
+    let mut r = m4_renderer();
+    r.focused_panel = FocusedPanel::Plan;
+    let rows = draw_new_frame(&mut r, 100, 30);
+    let joined = rows.concat();
+    let badgeed: Vec<&String> = rows
+        .iter()
+        .filter(|row| row.contains(theme::FOCUS_BADGE))
+        .collect();
+    assert!(
+        badgeed.iter().any(|row| row.contains("Execution Plan")),
+        "the focused plan pane carries the badge: {badgeed:?}"
+    );
+    assert!(
+        !joined.contains("Workers ●"),
+        "only the focused pane is badged in its title"
+    );
+}
