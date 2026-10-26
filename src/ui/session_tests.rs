@@ -985,6 +985,28 @@ fn test_is_abort_for_renderer_selects_the_vocabulary_by_gate() {
         !sink.contains("if is_abort_command(&input)"),
         "sink.rs must not call the narrowed predicate directly"
     );
+
+    // And the production gating renderer, so both real renderers are covered by
+    // the same owner: the rebuilt TUI gates and reads only the deliberate slash
+    // spellings (every one of which it has already put behind `y`), the headless
+    // renderer above keeps its bare words.
+    let tui = crate::ui::tui::TuiRenderer::new();
+    assert!(
+        tui.gates_destructive_commands(),
+        "the TUI is the renderer that gates destructive commands"
+    );
+    for word in ["stop", "cancel", "exit", "quit", "abort"] {
+        assert!(
+            !is_abort_for_renderer(&tui, word),
+            "the TUI reads {word:?} as steering text, never as a mid-turn abort"
+        );
+    }
+    for spelling in ["/abort", "/exit", "/quit", "/q", "/stop", "/cancel"] {
+        assert!(
+            is_abort_for_renderer(&tui, spelling),
+            "the confirmed slash spellings still mean abort for the TUI: {spelling:?}"
+        );
+    }
 }
 
 fn multiple_tool_calls_sse(calls: &[(&str, &str, &str)]) -> String {
