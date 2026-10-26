@@ -1080,6 +1080,9 @@ fn boot_payload(workers: Vec<WorkerSection>) -> CapturePayload {
                 last_activity_at: None,
                 turn_thinking: Some("turn thinking".to_string()),
                 is_thinking: Some(true),
+
+                queue: None,
+                paused: false,
             }],
             journal: vec![
                 UiJournalRecord::User {
@@ -2495,6 +2498,9 @@ fn resume_boot_assigns_every_pane_string_verbatim_including_the_plan_pane() {
             last_activity_at: None,
             turn_thinking: Some("turn thinking".to_string()),
             is_thinking: Some(true),
+
+            queue: None,
+            paused: false,
         }],
         journal: vec![
             UiJournalRecord::User {
@@ -3782,6 +3788,8 @@ fn ac_c3_panels() -> Vec<SubagentPanel> {
             last_activity_at: Some(boot_timepoint(2.0)),
             turn_thinking: Some(format!("turn thinking of panel {i}")),
             is_thinking: Some(false),
+            queue: None,
+            paused: false,
         })
         .collect()
 }

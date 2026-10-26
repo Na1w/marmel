@@ -523,6 +523,10 @@ fn panels_four() -> Vec<SubagentPanel> {
             last_activity_at: Some(TimePoint::now()),
             turn_thinking: Some(format!("turn thinking of panel {i}")),
             is_thinking: Some(false),
+            // D2: a panel written before the queue/pause fields existed restores as
+            // "no queue position, not paused", which is what these fixtures describe.
+            queue: None,
+            paused: false,
         })
         .collect()
 }

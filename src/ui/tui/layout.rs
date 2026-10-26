@@ -50,8 +50,11 @@ enum Shape {
 /// `> t-NNN`; `done/total` is never dropped (§7.4, G1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeaderBudget {
-    /// Per-worker validation round — gated on plumbing delta **D1** (§9.3), so
-    /// it is false until that lands (spec §10 gate (c)).
+    /// Per-worker validation round — the field plumbing delta **D1** (§9.3)
+    /// unblocked, so the budget keeps it at every width §2.5 has not already taken
+    /// the optional chips away at. The pane still withholds the chip when the
+    /// registry recorded no round: a budget that says `true` is a licence to print a
+    /// real number, never an instruction to print one.
     pub show_val: bool,
     /// `ctx %`.
     pub show_ctx: bool,
@@ -67,8 +70,10 @@ pub struct HeaderBudget {
 pub const fn header_budget(cols: u16) -> HeaderBudget {
     let compact = cols < COMPACT_COLS;
     HeaderBudget {
-        // Gated on D1 (§9.3): no pane may print a round number yet.
-        show_val: false,
+        // D1 (§9.3) landed, so the budget keeps the validation-round chip in the
+        // same band the other optional chips live in; §7.4 still makes it the first
+        // one the ladder takes back.
+        show_val: !compact,
         // §2.5 `width < 70`: the header drops `val`, then `ctx`, then `elapsed`
         // (drop order §7.4). All optional chips leave together at that band, so
         // what remains is brand + `done/total` (never dropped, G1) + task id,

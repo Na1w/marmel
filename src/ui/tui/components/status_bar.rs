@@ -19,9 +19,13 @@
 //! The one §3 field still absent is the legacy free-text `status_line` prose (with
 //! its 125 ms spinner tier): it is not part of the §2.2 field set and no component
 //! input carries it, so the row prints the counters instead of guessing at prose.
-//! `val N` is never printed: plumbing delta D1 (§9.3) has not landed. An
-//! arbitration round counter is never printed either — it is not data at all
-//! (spec §8.4), so both absences are rules, not truncation.
+//! `val N` prints the **registry's** `validation_rounds` (max over the projected
+//! rows), which is the field plumbing delta D1 (§9.3) unblocked: the renderer folds
+//! `WorkerEntry::validation_rounds` onto the row and hands the maximum over
+//! [`StatusData::workers`] to [`StatusData::val_rounds`]. Zero means no validation
+//! round was recorded and the field is withheld — the bar never prints `val 0`. An
+//! arbitration round counter is never printed either: it is not data at all
+//! (spec §8.4), so that absence stays a rule, not truncation.
 //!
 //! Two rules this component owns:
 //!
@@ -78,6 +82,11 @@ pub struct StatusData<'a> {
     pub ctx_limit: usize,
     /// The renderer's session clock in whole seconds (`session_start`).
     pub elapsed: Option<u64>,
+    /// The highest `validation_rounds` across [`StatusData::workers`] — the §2.2
+    /// `val N` field, on the row since plumbing delta D1 (§9.3). `0` means the
+    /// registry recorded no validation round for any worker and the field is
+    /// withheld rather than printed as `val 0`. Never an arbitration round (§8.4).
+    pub val_rounds: usize,
     // There is deliberately no `follow` / `unseen` pair here any more: the
     // scroll-state chip (`● LIVE` / `↓ N new`) belongs to the transcript pane that
     // owns the viewport, and drawing it here as well put the same chip on screen
@@ -91,14 +100,16 @@ pub struct StatusData<'a> {
 // Row 1 — §7.4 spells the counter part as `queued` → `paused` → active names
 // (counts kept) → `val` → `ctx`; the clock goes first because §2.5 (`width < 70`)
 // makes row 1 keep tokens plus active/paused/queued at every width the ladder
-// reaches. `val` has no rank: it is gated on D1 (§9.3), so it is never on the line
-// to be dropped. The active-name list has no rank either: it is the flexible
+// reaches. `val` carries a rank now that plumbing delta D1 (§9.3) put
+// `validation_rounds` on the row: before D1 it was never on the line to be dropped.
+// The active-name list has no rank either: it is the flexible
 // field (§7.4 "counts kept") and is clipped into the space left for it rather than
 // deleted, so a wide bar never throws the roster away to save a cell.
 const DROP_CLOCK: u8 = 0;
 const DROP_QUEUED: u8 = 1;
 const DROP_PAUSED: u8 = 2;
-const DROP_CTX: u8 = 3;
+const DROP_VAL: u8 = 3;
+const DROP_CTX: u8 = 4;
 
 // Row 2 — the chips echo toggles (G5), but the armed prompt outranks all of them:
 // it is the time-boxed signal, so when row 2 cannot hold both, the least important
@@ -347,6 +358,20 @@ fn metrics(data: &StatusData<'_>, tokens: (usize, usize), elapsed: Option<u64>) 
             spans: vec![
                 Span::styled(" | ", theme::text_dim()),
                 Span::styled(format!("{queued}q"), theme::chip()),
+            ],
+        });
+    }
+    // `val N` — the §2.2 field D1 unblocked: the registry's validation round, max
+    // over the projected rows, straight behind the state counts it belongs to. A zero
+    // is not a round, so the field is withheld rather than printed as `val 0`, and an
+    // arbitration round is never a candidate for this slot (§8.4).
+    if data.val_rounds > 0 {
+        fields.push(Field {
+            drop: Some(DROP_VAL),
+            flex: false,
+            spans: vec![
+                Span::styled(" | ", theme::text_dim()),
+                Span::styled(format!("val {}", data.val_rounds), theme::chip_pending()),
             ],
         });
     }
@@ -631,6 +656,8 @@ mod tests {
             ctx_tokens: 0,
             ctx_limit: 0,
             elapsed: None,
+
+            val_rounds: 0,
         }
     }
 
@@ -1007,20 +1034,107 @@ mod tests {
         }
     }
 
+    /// Spec §8.4 once plumbing delta D1 (§9.3) has landed: the row carries
+    /// `validation_rounds`, so `val N` is printed from that number and withheld when
+    /// the registry recorded no round. What stays forbidden is the *word*: a
+    /// validation round is never spelled as a "round", and an arbitration round is
+    /// still not data at all (DATA gap 9).
     #[test]
-    fn no_validation_or_arbitration_round_number_is_ever_printed() {
-        // Spec §8.4 plus gate (c): `val N` waits for D1 and the arbitration round
-        // is not data, so neither may appear at any width or row count.
+    fn the_validation_round_is_printed_from_the_row_and_never_called_a_round() {
         let workers = [worker("coder_specialist", true, true, true)];
+
+        // D1: the projection carries a round, so the bar prints the registry's number.
+        let reviewed = StatusData {
+            val_rounds: 2,
+            ..data(&workers, false)
+        };
+        let rows = draw(120, 2, &reviewed);
+        assert!(rows[0].contains("val 2"), "{rows:?}");
+
+        // No round is not `val 0`: the slot is simply absent, exactly as it was
+        // before D1 — the difference is only that the number can now arrive.
+        let none = draw(120, 2, &data(&workers, false));
+        assert!(!none.join("\n").contains("val"), "{none:?}");
+
+        // At every width and row count, armed or not, the word `round` is never on
+        // this row: the arbitration counter stays unrendered.
         for (width, height, armed) in [
             (120, 2, false),
             (120, 2, true),
             (70, 1, true),
             (64, 2, true),
         ] {
-            let joined = draw(width, height, &data(&workers, armed)).join("\n");
-            assert!(!joined.contains("val"), "{joined:?}");
-            assert!(!joined.contains("round"), "{joined:?}");
+            for rounds in [0usize, 3] {
+                let d = StatusData {
+                    val_rounds: rounds,
+                    ..data(&workers, armed)
+                };
+                let joined = draw(width, height, &d).join("\n");
+                assert!(
+                    !joined.contains("round"),
+                    "{width}x{height} armed={armed} rounds={rounds}: {joined:?}"
+                );
+                if rounds == 0 {
+                    assert!(
+                        !joined.contains("val"),
+                        "{width}x{height} armed={armed}: a zero round is not printed: {joined:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// §7.4 after D1: `val` joined the row-1 ladder and sits between the paused
+    /// count and `ctx` — it leaves before the context ratio does, and only after the
+    /// clock and the two counts it belongs to have already gone.
+    #[test]
+    fn row_one_drops_val_before_ctx_and_after_the_counts() {
+        let workers = [worker("coder_specialist", true, true, true)];
+        let d = StatusData {
+            val_rounds: 2,
+            ..metered(&workers, (0, 0), (12_300, 30_000))
+        };
+        let line = |width: u16| text(build_metrics_line(&d, (0, 0), Some(723), width, false));
+
+        // Wide enough for the whole ladder: the round is on the row next to the
+        // counts it belongs to.
+        let at_120 = line(120);
+        assert!(
+            at_120.contains("1p") && at_120.contains("1q") && at_120.contains("val 2"),
+            "{at_120:?}"
+        );
+
+        // Read the ladder off the row instead of pinning it to fixed widths: each
+        // field goes at a strictly narrower terminal than the one before it.
+        let mut disappeared: Vec<(&str, u16)> = Vec::new();
+        for width in (20..=120u16).rev() {
+            let row = line(width);
+            for (field, probe) in [
+                ("names", "coder_specialist"),
+                ("clock", "elapsed"),
+                ("queued", "1q"),
+                ("paused", "1p"),
+                ("val", "val 2"),
+                ("ctx", "ctx 41%"),
+            ] {
+                if !row.contains(probe) && !disappeared.iter().any(|(seen, _)| *seen == field) {
+                    disappeared.push((field, width));
+                }
+            }
+        }
+        assert_eq!(
+            disappeared
+                .iter()
+                .map(|(field, _)| *field)
+                .collect::<Vec<_>>(),
+            ["names", "clock", "queued", "paused", "val", "ctx"],
+            "row-1 ladder: {disappeared:?}"
+        );
+        for pair in disappeared.windows(2) {
+            assert!(
+                pair[0].1 > pair[1].1,
+                "one field at a time, never two at once: {disappeared:?}"
+            );
         }
     }
 

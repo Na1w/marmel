@@ -1033,6 +1033,12 @@ impl TuiRenderer {
                     context_tokens: 0,
                     queue: None,
                     paused: false,
+                    // D1 lifecycle fields arrive from the registry projection
+                    // (`set_subagents` mirrors `WorkerEntry`), never from here.
+                    status_label: None,
+                    implementation_turns: 0,
+                    validation_rounds: 0,
+                    latest_validator_feedback: None,
                 });
                 idx
             }

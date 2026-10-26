@@ -544,6 +544,9 @@ mod tests {
                 last_activity_at: None,
                 turn_thinking: None,
                 is_thinking: None,
+
+                queue: None,
+                paused: false,
             }],
             ..Default::default()
         };

@@ -75,9 +75,10 @@ pub(crate) fn drain_steer_arbitration_events_with_transcript(
                     },
                 ));
                 renderer.on_event(&Event::Message(format!(
-                    "\n[Steering Subtask — {} ({}):]\n{}\n",
+                    "\n[Steering Subtask — {} ({})]\n{}\n{}\n",
                     agent.as_str(),
                     task_id,
+                    action::deliverable_verdict_line(&task_id, &deliverable),
                     deliverable.content
                 )));
                 renderer.on_event(&Event::Status(format!(

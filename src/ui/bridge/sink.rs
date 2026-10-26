@@ -308,9 +308,10 @@ impl StreamSink for RendererSink<'_> {
                 ));
                 self.renderer.reset_active_agent();
                 self.renderer.on_event(&Event::Message(format!(
-                    "\n[Steering Subtask — {} ({}):]\n{}\n",
+                    "\n[Steering Subtask — {} ({})]\n{}\n{}\n",
                     agent.as_str(),
                     task_id,
+                    super::action::deliverable_verdict_line(&task_id, &deliverable),
                     deliverable.content
                 )));
                 self.renderer.on_event(&Event::Status(format!(

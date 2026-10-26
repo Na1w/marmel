@@ -13,27 +13,32 @@
 //! token counters, and the `Audit`/`Dup` badge via `helpers::subagent_row_badge`),
 //! exactly as the legacy subagents pane does.
 //!
-//! Deliberately **not** rendered: any validation- or arbitration-round number.
-//! `validation_rounds` is not projected into the UI row until plumbing delta
-//! **D1** (spec §9.3), and `round_started(round)` discards its argument in both
-//! hosts, so no round counter is data (spec §8.4, §2.2). The pane would rather
-//! print nothing than invent a number.
+//! Rendered from the row: `val N` is the row's own `validation_rounds` and `turn N`
+//! its `implementation_turns` — both landed with plumbing delta **D1** (spec §9.3), so
+//! the numbers are the registry's counters and not a guess. What is still never
+//! rendered is an arbitration-round number: `round_started(round)` discards its
+//! argument in both hosts, so that counter is not data (spec §8.4, §2.2).
 //!
-//! ## Needs plumb for t-009b (data that is not in the frozen signature)
+//! ## The row model after D1
 //!
 //! [`ActivityData`] is built by `TuiRenderer::draw_new_ui` and carries `focus` /
 //! `rows` / `selected` / `detail_present` / `scroll` / `list_scroll` /
-//! `show_thought` / `thinking_budget` — the last three landed with t-009b. The gap
-//! still open is a data gap in the row model itself, not a plumbing gap here:
+//! `show_thought` / `thinking_budget`. The rows now carry the four lifecycle fields
+//! D1 added to [`SubagentDetail`] (`status_label`, `implementation_turns`,
+//! `validation_rounds`, `latest_validator_feedback`), mirrored from
+//! [`orchestrator::WorkerEntry`] by `TuiRenderer::set_subagents`.
 //!
-//! * `status_label` on the row (D1, `workers.rs:459`) is what would let an aborted
-//!   or validator-rejected worker read `✗ failed` instead of `✓ done`: with only
-//!   `is_active` / `paused` / `queue` projected, "not running" is all the row can
-//!   honestly say (§7.2, DATA §4.1 gap 1). The pane does not guess the rest.
+//! * `status_label` is what lets an aborted or validator-rejected worker read
+//!   `✗ failed` instead of `✓ done`: with only `is_active` / `paused` / `queue`
+//!   projected, "not running" was all the row could honestly say (§7.2, DATA §4.1
+//!   gap 1). A row with no projected label still falls back to the liveness glyph —
+//!   the pane never guesses a terminal state from prose.
+//! * `latest_validator_feedback` is printed verbatim under `[Validator]` in the
+//!   detail half, so a rejected row states why it was rejected.
 //!
-//! With `show_thought` plumbed, the detail half now prints the buffered reasoning
-//! under the `[Thinking]` header when the toggle is on, and keeps the size-only
-//! line when it is off — so `Ctrl+T` is honoured instead of bypassed.
+//! With `show_thought` plumbed, the detail half prints the buffered reasoning under
+//! the `[Thinking]` header when the toggle is on, and keeps the size-only line when
+//! it is off — so `Ctrl+T` is honoured instead of bypassed.
 
 use super::transcript::verdict_marks;
 use super::{fit_spans, pane_block, spans_width, title_width};
@@ -304,7 +309,11 @@ fn roster_row(
 /// the role and the task id, and only after them the optional metrics (badge,
 /// turns, elapsed, ctx), which are the fields the ladder is allowed to eat.
 fn row_spans(row: &SubagentDetail, entry: Option<&WorkerEntry>) -> Vec<Span<'static>> {
-    let glyph = theme::worker_glyph(row.is_active, row.paused, row.queue.is_some());
+    // The glyph is driven by the row's own projected state; the registry entry is
+    // read only as the fallback for a row the projection has not folded a label onto
+    // yet (a row restored from a bundle, or one opened by stream traffic).
+    let label = row_status_label(row).or_else(|| entry.map(|entry| entry.status_label.as_str()));
+    let glyph = theme::worker_state_glyph(row.is_active, row.paused, row.queue.is_some(), label);
     let mut spans = vec![glyph.tagged()];
     // A queue rank is only meaningful while the row is part of the round.
     if let Some(queue) = row.queue.filter(|_| row.is_active) {
@@ -326,11 +335,24 @@ fn row_spans(row: &SubagentDetail, entry: Option<&WorkerEntry>) -> Vec<Span<'sta
     if let Some(task) = task_id(row, entry) {
         spans.push(Span::styled(format!(" {task}"), theme::text_dim()));
     }
-    if let Some(turns) = entry
-        .map(|entry| entry.implementation_turns)
-        .filter(|turns| *turns > 0)
-    {
+    // `turn N` and `val N` are the registry's own turn/round counters: the row
+    // carries `validation_rounds` and `implementation_turns` since D1 (§9.3), and
+    // the per-frame entry is the fallback for a row the projection has not folded
+    // yet. Both are printed only when a number was actually recorded, and `val` is a
+    // **validation** round — never an arbitration round (§8.4).
+    let turns = if row.implementation_turns > 0 {
+        row.implementation_turns
+    } else {
+        entry.map(|entry| entry.implementation_turns).unwrap_or(0)
+    };
+    if turns > 0 {
         spans.push(Span::styled(format!(" turn {turns}"), theme::text_dim()));
+    }
+    if row.validation_rounds > 0 {
+        spans.push(Span::styled(
+            format!(" val {}", row.validation_rounds),
+            theme::chip_pending(),
+        ));
     }
     let elapsed = elapsed_secs(row, entry);
     if elapsed > 0 {
@@ -443,6 +465,23 @@ fn detail_lines(
     let mut lines = vec![Line::from(fit_spans(row_spans(row, entry), width))];
     let mut sections = Vec::new();
 
+    // The registry's latest validator feedback, printed verbatim (plumbing delta D1,
+    // §9.3). A `Rejected` row is the case this exists for: the glyph says the
+    // deliverable was refused, this says why, and neither is a paraphrase of the
+    // other. Nothing is printed when the registry carries no feedback.
+    if let Some(feedback) = row
+        .latest_validator_feedback
+        .as_deref()
+        .or_else(|| entry.and_then(|entry| entry.latest_validator_feedback.as_deref()))
+        .map(str::trim)
+        .filter(|feedback| !feedback.is_empty())
+    {
+        sections.push(Line::styled("[Validator]".to_string(), theme::error()));
+        for line in feedback.lines() {
+            sections.push(Line::styled(format!(" {line}"), theme::text_primary()));
+        }
+    }
+
     if !row.thinking.is_empty() {
         sections.push(Line::styled("[Thinking]".to_string(), theme::text_dim()));
         if show_thought {
@@ -548,14 +587,17 @@ fn thinking_tokens(thinking: &str) -> usize {
 /// room", and the counts, the position and the detail chip are the part the
 /// operator reads, so those are what survives the narrow pane.
 fn chip_row(data: &ActivityData<'_>, detail: DetailReport, width: u16) -> Vec<Span<'static>> {
-    let (running, paused, queued, idle) = state_counts(data.rows);
-    let counts = |labelled| {
+    let counts = state_counts(data.rows);
+    let counts_spans = |labelled: bool| {
         let mut spans = vec![Span::styled(" ".to_string(), theme::text_primary())];
+        // The four §7.2 states are always spelled; a fifth `✗ failed N` segment joins
+        // only when a row really is in that state, so an aborted worker is never folded
+        // into the `✓ done` count (D1 put the label on the row that says so).
         for (glyph, n) in [
-            (Glyph::Active, running),
-            (Glyph::Paused, paused),
-            (Glyph::Pending, queued),
-            (Glyph::Done, idle),
+            (Glyph::Active, counts.running),
+            (Glyph::Paused, counts.paused),
+            (Glyph::Pending, counts.queued),
+            (Glyph::Done, counts.done),
         ] {
             if labelled {
                 spans.push(glyph.tagged());
@@ -563,6 +605,18 @@ fn chip_row(data: &ActivityData<'_>, detail: DetailReport, width: u16) -> Vec<Sp
             } else {
                 spans.push(Span::styled(
                     format!("{} {n} ", glyph.symbol()),
+                    glyph.style(),
+                ));
+            }
+        }
+        if counts.failed > 0 {
+            let glyph = Glyph::Failed;
+            if labelled {
+                spans.push(glyph.tagged());
+                spans.push(Span::styled(format!(" {} ", counts.failed), glyph.style()));
+            } else {
+                spans.push(Span::styled(
+                    format!("{} {} ", glyph.symbol(), counts.failed),
                     glyph.style(),
                 ));
             }
@@ -591,33 +645,61 @@ fn chip_row(data: &ActivityData<'_>, detail: DetailReport, width: u16) -> Vec<Sp
         detail_chip,
     ];
 
-    let labelled = counts(true);
+    let labelled = counts_spans(true);
     if spans_width(&labelled) + spans_width(&tail) <= usize::from(width) {
         let mut chips = labelled;
         chips.extend(tail);
         return chips;
     }
-    let mut chips = counts(false);
+    let mut chips = counts_spans(false);
     chips.extend(tail);
     chips
 }
 
-/// The four state counts of the roster, derived from the same glyph mapping the
+/// The registry's own status label as projected onto the row (plumbing delta D1,
+/// §9.3). `None` means the projection has not folded one onto this row yet, which
+/// is a real state: the glyph then falls back to plain liveness.
+fn row_status_label(row: &SubagentDetail) -> Option<&str> {
+    match row.status_label.as_deref() {
+        Some(label) if !label.is_empty() => Some(label),
+        _ => None,
+    }
+}
+
+/// The state tally of the roster, keyed by the §7.2 glyph each row actually drew.
+///
+/// `done` counts the rows that finished with no verdict against them; `failed` counts
+/// the rows the registry labelled `Aborted` / `Rejected` / `Failed` / `Replan`, which
+/// used to be folded into the done count because liveness alone could not tell the two
+/// apart (plumbing delta D1, §9.3).
+#[derive(Debug, Default, Clone, Copy)]
+struct StateCounts {
+    running: usize,
+    paused: usize,
+    queued: usize,
+    done: usize,
+    failed: usize,
+}
+
+/// The state counts of the roster, derived from the same glyph mapping the
 /// rows are drawn with (spec §8.3) so the tally can never disagree with the rows.
-fn state_counts(rows: &[SubagentDetail]) -> (usize, usize, usize, usize) {
-    let mut running = 0usize;
-    let mut paused = 0usize;
-    let mut queued = 0usize;
-    let mut idle = 0usize;
+fn state_counts(rows: &[SubagentDetail]) -> StateCounts {
+    let mut counts = StateCounts::default();
     for row in rows {
-        match theme::worker_glyph(row.is_active, row.paused, row.queue.is_some()) {
-            Glyph::Active => running += 1,
-            Glyph::Paused => paused += 1,
-            Glyph::Pending => queued += 1,
-            Glyph::Done | Glyph::Failed => idle += 1,
+        match theme::worker_state_glyph(
+            row.is_active,
+            row.paused,
+            row.queue.is_some(),
+            row_status_label(row),
+        ) {
+            Glyph::Active => counts.running += 1,
+            Glyph::Paused => counts.paused += 1,
+            Glyph::Pending => counts.queued += 1,
+            Glyph::Done => counts.done += 1,
+            Glyph::Failed => counts.failed += 1,
         }
     }
-    (running, paused, queued, idle)
+    counts
 }
 
 /// The specialist role: the registry's own `agent_name` when the row resolves,
@@ -1391,5 +1473,193 @@ mod tests {
             .draw(|frame| seen = render(frame, Rect::new(0, 0, width, height), data))
             .unwrap();
         seen
+    }
+
+    /// The half D1 unblocked (§9.3, DATA §4.1 gap 1): the registry's own `status_label`
+    /// is on the row, so a worker that ended aborted or validator-rejected reads
+    /// `✗ failed`, and only an approved/completed one reads `✓ done`. Liveness alone
+    /// cannot tell those apart, which is exactly the lie this pins down.
+    #[test]
+    fn an_aborted_or_rejected_worker_does_not_read_done() {
+        for label in [
+            "Aborted",
+            "Rejected",
+            "Failed",
+            "Replan Required (too complex)",
+        ] {
+            let mut closed = row("coder-t-900", "t-900", false);
+            closed.status_label = Some(label.to_string());
+            let data = ActivityData {
+                focus: true,
+                rows: &[closed],
+                selected: 0,
+                detail_present: false,
+                scroll: 0,
+                list_scroll: 0,
+                show_thought: false,
+                thinking_budget: None,
+            };
+            // 90 columns, not 70: the tally spells its state counts with word labels
+            // only while the border row has room (§7.2), and the extra `✗ failed N`
+            // segment is exactly what tips a 70-column border row into the compact
+            // `✗ N` spelling. The row itself is labelled at either width.
+            let lines = rows_text(90, 12, &data);
+            let roster = roster_line(&lines, "t-900");
+            assert!(
+                roster.contains("✗ failed"),
+                "{label}: a closed terminal row must read failed, got: {roster}"
+            );
+            assert!(
+                !roster.contains("✓ done"),
+                "{label}: a row that did not deliver must not badge done, got: {roster}"
+            );
+            // The tally agrees with the row: the failed count carries the row and the
+            // done count stays empty.
+            let tally = lines.join("\n");
+            assert!(
+                tally.contains("✗ failed 1"),
+                "the tally must count the row as failed, got:\n{tally}"
+            );
+            assert!(
+                tally.contains("✓ done 0"),
+                "and not fold it into the done count, got:\n{tally}"
+            );
+        }
+
+        // The approved case keeps its `✓ done`, so the change is not "everything is
+        // red": it is the label deciding between the two.
+        let mut approved = row("coder-t-901", "t-901", false);
+        approved.status_label = Some("Approved".to_string());
+        let data = ActivityData {
+            focus: true,
+            rows: &[approved],
+            selected: 0,
+            detail_present: false,
+            scroll: 0,
+            list_scroll: 0,
+            show_thought: false,
+            thinking_budget: None,
+        };
+        let lines = rows_text(70, 12, &data);
+        let roster = roster_line(&lines, "t-901");
+        assert!(roster.contains("✓ done"), "{roster}");
+        assert!(!roster.contains('✗'), "{roster}");
+        assert!(
+            lines.join("\n").contains("✓ done 1"),
+            "{}",
+            lines.join("\n")
+        );
+    }
+
+    /// The roster line that names `task`, so an assertion can talk about one row
+    /// without tripping over the state tally on the border row.
+    fn roster_line(lines: &[String], task: &str) -> String {
+        lines
+            .iter()
+            .find(|line| line.contains(task))
+            .cloned()
+            .unwrap_or_else(|| panic!("no roster line naming {task}: {}", lines.join("\n")))
+            .trim()
+            .to_string()
+    }
+
+    /// A `Revising` worker is mid-review, not idle and not running: §7.2 spells the
+    /// validating state `⧗`, the same glyph the queue state uses.
+    #[test]
+    fn a_revising_worker_reads_the_validating_glyph() {
+        let mut revising = row("coder-t-902", "t-902", true);
+        revising.status_label = Some("Revising".to_string());
+        let data = ActivityData {
+            focus: true,
+            rows: &[revising],
+            selected: 0,
+            detail_present: false,
+            scroll: 0,
+            list_scroll: 0,
+            show_thought: false,
+            thinking_budget: None,
+        };
+        let lines = rows_text(70, 12, &data);
+        let roster = roster_line(&lines, "t-902");
+        assert!(roster.contains("⧗ queued"), "{roster}");
+        assert!(!roster.contains("✓ done"), "{roster}");
+        assert!(!roster.contains("▶ running"), "{roster}");
+    }
+
+    /// `val N` on the roster row: the registry's `validation_rounds` is projected onto
+    /// the row (D1), so the pane prints it — and prints nothing at all when no round
+    /// ran. An arbitration round is never a candidate (§8.4).
+    #[test]
+    fn the_roster_prints_the_validation_round_carried_on_the_row() {
+        let mut reviewed = row("coder-t-903", "t-903", true);
+        reviewed.validation_rounds = 2;
+        reviewed.implementation_turns = 3;
+        let data = ActivityData {
+            focus: true,
+            rows: &[reviewed],
+            selected: 0,
+            detail_present: false,
+            scroll: 0,
+            list_scroll: 0,
+            show_thought: false,
+            thinking_budget: None,
+        };
+        let text = rows_text(90, 12, &data).join("\n");
+        assert!(text.contains("val 2"), "{text}");
+        assert!(text.contains("turn 3"), "{text}");
+
+        let plain = row("coder-t-904", "t-904", true);
+        let data = ActivityData {
+            focus: true,
+            rows: &[plain],
+            selected: 0,
+            detail_present: false,
+            scroll: 0,
+            list_scroll: 0,
+            show_thought: false,
+            thinking_budget: None,
+        };
+        let text = rows_text(90, 12, &data).join("\n");
+        assert!(!text.contains("val"), "{text}");
+        assert!(!text.contains("round"), "{text}");
+    }
+
+    /// A rejected deliverable says why: the registry's `latest_validator_feedback` is
+    /// projected onto the row and the detail half prints it verbatim.
+    #[test]
+    fn the_detail_prints_the_registrys_validator_feedback() {
+        let mut rejected = row("coder-t-905", "t-905", false);
+        rejected.status_label = Some("Rejected".to_string());
+        rejected.latest_validator_feedback =
+            Some("definition not used in a test\nclippy: unused import".to_string());
+        let data = ActivityData {
+            focus: true,
+            rows: &[rejected],
+            selected: 0,
+            detail_present: true,
+            scroll: 0,
+            list_scroll: 0,
+            show_thought: false,
+            thinking_budget: None,
+        };
+        let text = rows_text(80, 20, &data).join("\n");
+        assert!(text.contains("[Validator]"), "{text}");
+        assert!(text.contains("definition not used in a test"), "{text}");
+        assert!(text.contains("clippy: unused import"), "{text}");
+
+        // No feedback recorded: the section is absent, not empty.
+        let clean = row("coder-t-906", "t-906", false);
+        let data = ActivityData {
+            focus: true,
+            rows: &[clean],
+            selected: 0,
+            detail_present: true,
+            scroll: 0,
+            list_scroll: 0,
+            show_thought: false,
+            thinking_budget: None,
+        };
+        let text = rows_text(80, 20, &data).join("\n");
+        assert!(!text.contains("[Validator]"), "{text}");
     }
 }

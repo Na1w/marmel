@@ -107,6 +107,104 @@ pub(crate) const ACTIVITY_STATUS_KEYWORDS: &[&str] = &[
     "Paused",
 ];
 
+/// One error kept in renderer state so the failure outlives the status line that
+/// carried it (spec §8.5).
+///
+/// Two parts, both verbatim copies of reported traffic:
+///
+/// * [`Self::category`] — the categorical cause the session loop reported
+///   (`helpers::classify_llm_error` produces the vocabulary: `http`, `connectivity`,
+///   `timeout`, `stream`, `unknown`; `System Error` is the transport/panic class).
+///   This is the half a one-line status can show.
+/// * [`Self::detail`] — the **whole** reported text, multi-line included. §7.4 keeps
+///   only the first line in `status_line`; the buffer keeps all of it, which is what
+///   makes the recall worth printing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StickyError {
+    /// The categorical cause, e.g. `http` for `LLM error: http (Ready)`.
+    pub(crate) category: String,
+    /// The full error text, verbatim.
+    pub(crate) detail: String,
+}
+
+/// Whether one line is error traffic this renderer should remember.
+///
+/// The spellings are exactly the ones `events.rs::error_line` recognises when `e`
+/// recalls (the `e`/`/error` handler is frozen), plus nothing else: recording a line
+/// the recall path cannot reach would create a second truth the key path never
+/// reads. Every line matched here is a line the session loop pushes into the
+/// transcript, so the remembered error and the recalled error are the same bytes.
+fn is_error_traffic_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("LLM error")
+        || trimmed.starts_with("System Error")
+        || trimmed.starts_with('✗')
+        || trimmed.contains("LLM error:")
+}
+
+/// Project one piece of error traffic onto the §8.5 buffer, or `None` when the text
+/// carries no error traffic at all.
+///
+/// The category is read out of the categorical spelling the loop emits
+/// (`LLM error: <category> …`); when a line carries no category clause the line
+/// itself is the category rather than a guessed one.
+fn sticky_error_from(text: &str) -> Option<StickyError> {
+    let line = text.lines().find(|line| is_error_traffic_line(line))?;
+    let line = line.trim();
+    let category = match line.to_ascii_lowercase().split_once("llm error:") {
+        Some((_, rest)) => rest
+            .trim()
+            .split(['(', ':'])
+            .next()
+            .map(str::trim)
+            .filter(|word| !word.is_empty())
+            .unwrap_or("llm error")
+            .to_string(),
+        None if line.starts_with("System Error") => "System Error".to_string(),
+        None if line.starts_with('✗') => line
+            .trim_start_matches('✗')
+            .split_whitespace()
+            .next()
+            .unwrap_or("error")
+            .to_string(),
+        None => line.to_string(),
+    };
+    Some(StickyError {
+        category,
+        detail: text.to_string(),
+    })
+}
+
+/// Mirror the worker lifecycle the registry already carries onto the pane rows
+/// (plumbing delta D1, design §9.3).
+///
+/// Everything below already exists on [`crate::orchestrator::WorkerEntry`]
+/// (`status_label`, `implementation_turns`, `validation_rounds`,
+/// `latest_validator_feedback`) and used to be dropped at the UI boundary, which is
+/// why a finished row could only ever read `✓ done` and why the `val N` field stayed
+/// switched off (§8.4 gate). One registry snapshot per pass, joined on the
+/// **effective registry key** — the same key the row projection uses — so no label
+/// string is parsed and no counter is invented here.
+///
+/// A row whose key the registry no longer carries keeps its last mirror: the
+/// completed ring is what supplies a terminal label (`Aborted`, `Rejected`), and an
+/// entry leaving the ring must not erase the state that explains why the row closed.
+fn fold_worker_lifecycle(rows: &mut [SubagentDetail]) {
+    if rows.is_empty() {
+        return;
+    }
+    let entries = crate::orchestrator::worker_entries();
+    for row in rows.iter_mut() {
+        let Some(entry) = entries.iter().find(|entry| entry.key == row.name) else {
+            continue;
+        };
+        row.status_label = Some(entry.status_label.clone());
+        row.implementation_turns = entry.implementation_turns;
+        row.validation_rounds = entry.validation_rounds;
+        row.latest_validator_feedback = entry.latest_validator_feedback.clone();
+    }
+}
+
 pub struct TuiRenderer {
     /// Ordered chat/log transcript. Each entry is a single message string
     /// (may contain embedded `\n`).
@@ -225,6 +323,15 @@ pub struct TuiRenderer {
     /// Wrapped transcript lines the body reported on the frame where the viewport
     /// last sat at its bottom — the baseline for the `↓ N new` count (spec G7).
     pub(crate) transcript_baseline_lines: Option<usize>,
+    /// The §8.5 sticky last-error buffer: the categorical cause and the **full**
+    /// error text of the most recent error this renderer saw.
+    ///
+    /// `status_line` keeps only the first line of the traffic that produced it
+    /// (spec §7.4), so without this buffer the cause a failure was reported with is
+    /// overwritten by the next status line and `e` / `/error` have nothing left to
+    /// recall. The buffer stores the text **verbatim** — it never rephrases an error
+    /// and never invents a cause that was not reported.
+    pub(crate) last_error: Option<StickyError>,
     /// Width used for the current line cache. Defaults to `0`.
     pub(crate) cached_chat_width: std::cell::Cell<usize>,
     /// `show_thought` value used for the current line cache.
@@ -352,6 +459,7 @@ impl TuiRenderer {
             subagent_height: std::cell::Cell::new(15),
             max_context_tokens: 0,
             transcript_baseline_lines: None,
+            last_error: None,
             cached_chat_width: std::cell::Cell::new(0),
             cached_show_thought: std::cell::Cell::new(false),
             cached_message_lines: std::cell::RefCell::new(Vec::new()),
@@ -559,6 +667,10 @@ impl TuiRenderer {
 
         let compact = layout::compact_legend(area.width);
         let elapsed = self.elapsed_clock();
+        // `val N` (§2.2): the maximum `validation_rounds` over the projected worker
+        // rows (plumbing delta D1, §9.3). One read per frame, shared by the header and
+        // the status row so the two can never print two different rounds.
+        let val_rounds = self.max_validation_rounds();
 
         // 1. Header: one borderless row of §2.2 chips, §7.4 drop ladder.
         if let Some(rect) = rects.header {
@@ -569,6 +681,7 @@ impl TuiRenderer {
                 ctx_tokens: self.orchestrator_context_tokens,
                 ctx_limit: self.max_context_tokens,
                 elapsed,
+                val_rounds,
             };
             components::header::render(frame, rect, &data);
         }
@@ -703,6 +816,7 @@ impl TuiRenderer {
                 ctx_tokens: self.orchestrator_context_tokens,
                 ctx_limit: self.max_context_tokens,
                 elapsed,
+                val_rounds,
             };
             components::status_bar::render(frame, rect, &data);
         }
@@ -808,6 +922,18 @@ impl TuiRenderer {
         self.total_project_elapsed()
             .map(|elapsed| elapsed.as_secs())
             .or_else(|| Some(self.session_start.elapsed().as_secs()))
+    }
+
+    /// The §2.2 `val N` value: the highest `validation_rounds` across the projected
+    /// worker rows (plumbing delta D1, §9.3). `0` means the registry recorded no
+    /// validation round for any worker, and the panes withhold the field rather than
+    /// print `val 0`. Never derived from an arbitration round (§8.4).
+    pub(crate) fn max_validation_rounds(&self) -> usize {
+        self.subagents
+            .iter()
+            .map(|row| row.validation_rounds)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Check whether abort is actively armed and within the 3-second confirmation window.
@@ -1391,6 +1517,16 @@ impl Renderer for TuiRenderer {
                     for line in text.lines() {
                         self.messages.push(line.to_string());
                     }
+                    // §8.5: keep the cause verbatim. These are exactly the lines the
+                    // transcript now carries, so the remembered error and the one `e`
+                    // recalls cannot drift apart. A report the loop repeats (the same
+                    // failure re-announced on a retry) keeps the first record rather
+                    // than restamping it: the buffer marks the edge, not the traffic.
+                    if let Some(sticky) = sticky_error_from(text)
+                        && self.last_error.as_ref() != Some(&sticky)
+                    {
+                        self.last_error = Some(sticky);
+                    }
                     if self.chat_auto_scroll {
                         let w = self.chat_width.get();
                         let n = self.estimated_chat_lines(w);
@@ -1842,6 +1978,13 @@ impl Renderer for TuiRenderer {
         // Drop entries absent from the authoritative list.
         self.subagents
             .retain(|s| subagents.iter().any(|i| i.name == s.name));
+        // Plumbing delta D1 (design §9.3): the lifecycle the registry already carries
+        // (`status_label`, `implementation_turns`, `validation_rounds`,
+        // `latest_validator_feedback`) is mirrored onto the rows here, at the same
+        // boundary where the loop's queue/pause state is adopted. This is the only
+        // writer of those four fields on the renderer side, and it reads one registry
+        // snapshot rather than re-deriving anything from prose.
+        fold_worker_lifecycle(&mut self.subagents);
         let any_active = self.subagents.iter().any(|s| s.is_active);
         if any_active {
             self.show_subagent_panel = true;
@@ -2304,6 +2447,18 @@ fn subagent_panel_from_detail(detail: &SubagentDetail) -> crate::session::format
         // them from the renderer's maps, keyed by the same `name`.
         turn_thinking: None,
         is_thinking: None,
+        // Plumbing delta D2 (design §9.4): the slot-queue pair and the arbitration
+        // pause ARE persisted now, so a restore puts the row back in the state the
+        // screen was actually showing instead of silently downgrading a
+        // `(Queued 2/3)` or `(Paused)` row to "idle". Both are `#[serde(default)]`
+        // on the way in, so a bundle written before D2 still loads.
+        queue: detail
+            .queue
+            .map(|queue| crate::session::format::QueuePanel {
+                position: queue.position,
+                of: queue.of,
+            }),
+        paused: detail.paused,
     }
 }
 
@@ -2351,19 +2506,34 @@ fn subagent_detail_from_panel(panel: &crate::session::format::SubagentPanel) -> 
         content: panel.content.clone(),
         is_active: panel.is_active,
         context_tokens: panel.context_tokens,
-        // Neither slot state is **persisted**: `queue` belongs to a live delegation's
-        // wait in a pool ledger that exists only inside this process, and `paused` to a
-        // stream the preemption handshake is holding right now. A journaled pane records
-        // a round that was interrupted, never a stream parked behind the arbitrator, so
-        // both start clean. How each is recovered afterwards is the difference fix #3
-        // made: a pause comes back only from a fresh `Event::SubagentStreamPause`, while
-        // a queue label comes back by itself as soon as the pool reports a rank for the
-        // live entry behind the row — the projection mirrors
-        // `orchestrator::WorkerEntry::queue_position` (fix #3), so the persisted format
-        // needs no queue field and a restored row is never left claiming — or hiding — a
-        // position the registry knows about.
-        queue: None,
-        paused: false,
+        // Both slot states come back from the bundle now. Before plumbing delta D2
+        // (design §9.4) neither was persisted at all: `queue` belongs to a live
+        // delegation's wait in a pool ledger that exists only inside this process, and
+        // `paused` to a stream the preemption handshake is holding right now, so a
+        // journaled pane recorded a round that was interrupted and the row came back
+        // downgraded to idle — a `(Queued 2/3)` or `(Paused)` row lost its state for as
+        // long as the pool stayed quiet, and only a fresh `Event::SubagentStreamPause`
+        // or a fresh queue event could put it back (fix #3 made the queue label come
+        // back by itself once the pool reported a rank, because the projection mirrors
+        // `orchestrator::WorkerEntry::queue_position`).
+        //
+        // D2 closes that window: a panel captured while parked or queued restores as
+        // parked or queued. A rank the registry knows about still wins on the next
+        // projection, and a panel written before D2 has no such fields, so it restores
+        // exactly as it did before — never an invented position.
+        queue: panel.queue.map(|queue| crate::ui::QueueState {
+            position: queue.position,
+            of: queue.of,
+        }),
+        paused: panel.paused,
+        // The D1 lifecycle fields are deliberately NOT persisted: the worker
+        // registry is their only source, and a restored row re-derives them from
+        // the live entry behind its key. Restoring prose from a bundle would let a
+        // label outlive the worker that produced it.
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     }
 }
 

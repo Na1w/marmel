@@ -192,6 +192,51 @@ pub(crate) fn notice_targets(subtask: &SteerSubtaskDecision) -> NoticeTargeting 
     }
 }
 
+/// The transcript line a completed subtask's **typed** verdict produces.
+///
+/// `Deliverable::marker` is the verdict the specialist actually returned
+/// ([`crate::markers::MissionMarker`]) — the same value the plan layer checks a task line
+/// off against — and it used to be dropped at this boundary: the bridge printed
+/// `deliverable.content` and left the transcript to decide the badge by scraping that
+/// prose. This projects the marker instead, in the shapes [`crate::markers`] owns
+/// (`MISSION COMPLETE (t-007)`, `FAILED: <reason>`, `REPLAN REQUIRED (t-007): <reason>`),
+/// so `MISSION COMPLETE` / `FAILED` / `REPLAN REQUIRED` badging is driven by data
+/// (DATA §6 gap 10).
+///
+/// The line is deliberately **marker-led**: `transcript::verdict_of` emphasises a line
+/// only when it opens with a marker, which is what keeps a prose mention of a verdict
+/// word unbadged. A `REVOKED` verdict keeps coming from the assembled deliverable,
+/// because revocation is applied to the marker inside that text by the runner — the
+/// content is printed too, so the revocation still reaches the pane as the runner wrote
+/// it.
+pub(crate) fn deliverable_verdict_line(
+    task_id: &str,
+    deliverable: &crate::agents::Deliverable,
+) -> String {
+    use crate::markers::{self, MissionMarker};
+    let task = task_id.trim();
+    match &deliverable.marker {
+        MissionMarker::Complete { .. } => {
+            if task.is_empty() {
+                markers::MARKER_COMPLETE.to_string()
+            } else {
+                markers::decorated(markers::MARKER_COMPLETE, task)
+            }
+        }
+        MissionMarker::Failed { reason } => {
+            format!("{}: {}", markers::MARKER_FAILED, reason.trim())
+        }
+        MissionMarker::Replan { reason } => {
+            let head = if task.is_empty() {
+                markers::MARKER_REPLAN.to_string()
+            } else {
+                markers::decorated(markers::MARKER_REPLAN, task)
+            };
+            format!("{head}: {}", reason.trim())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,5 +356,64 @@ mod tests {
                 "a tool alias that is not a subtask action must stay rejected in the bridge"
             );
         }
+    }
+
+    #[test]
+    fn a_deliverables_verdict_line_is_led_by_the_marker_the_plan_layer_acts_on() {
+        use crate::agents::Deliverable;
+        use crate::markers::{
+            self, MARKER_COMPLETE, MissionMarker, decorated, starts_with_complete,
+        };
+
+        // Completion: the decorated marker the plan layer checks a line off against,
+        // spelled by `markers` and not by this module.
+        let complete = Deliverable {
+            marker: MissionMarker::Complete {
+                task_id: Some("t-012".to_string()),
+            },
+            content: "plumbed the panes\n\nMISSION COMPLETE (t-012)".to_string(),
+            task_id: Some("t-012".to_string()),
+        };
+        let line = deliverable_verdict_line("t-012", &complete);
+        assert_eq!(line, decorated(MARKER_COMPLETE, "t-012"), "{line}");
+        assert!(starts_with_complete(&line), "{line}");
+
+        // Failure: the sanctioned `FAILED: <reason>` shape, so the transcript badges
+        // the line from the marker value rather than by scraping the body prose.
+        let failed = Deliverable {
+            marker: MissionMarker::Failed {
+                reason: "tests did not run".to_string(),
+            },
+            content: "I could not finish".to_string(),
+            task_id: Some("t-012".to_string()),
+        };
+        let line = deliverable_verdict_line("t-012", &failed);
+        assert_eq!(line, "FAILED: tests did not run", "{line}");
+        assert!(markers::has_failure_marker(&line), "{line}");
+
+        // Replan: the strongest statement, decorated with the task it reopens.
+        let replan = Deliverable {
+            marker: MissionMarker::Replan {
+                reason: "the plan misses the migration".to_string(),
+            },
+            content: "this needs a different plan".to_string(),
+            task_id: Some("t-012".to_string()),
+        };
+        let line = deliverable_verdict_line("t-012", &replan);
+        assert_eq!(
+            line, "REPLAN REQUIRED (t-012): the plan misses the migration",
+            "{line}"
+        );
+        // Marker-led on purpose: `transcript::verdict_of` badges a line only when it
+        // opens with a marker, so the projected value is what drives the badge.
+        assert!(line.starts_with(markers::MARKER_REPLAN), "{line}");
+
+        // A deliverable with no task id never renders an empty `()` decoration.
+        let taskless = Deliverable {
+            marker: MissionMarker::Complete { task_id: None },
+            content: "done".to_string(),
+            task_id: None,
+        };
+        assert_eq!(deliverable_verdict_line("", &taskless), MARKER_COMPLETE);
     }
 }

@@ -698,6 +698,69 @@ mod tests {
         assert_eq!(chip.content.as_ref(), " \u{2193} 5 new ");
     }
 
+    /// The honesty half of G7 with a **real** baseline. The distance-below reading
+    /// alone (`max_scroll - scroll`) reports 0 here: the pane grew taller, so the
+    /// offset the renderer handed back is now the bottom of a longer body, and the
+    /// chip would say "you are caught up" about five lines nobody has seen. The
+    /// baseline the renderer records when the viewport last sat at the bottom is what
+    /// makes the count come out right.
+    #[test]
+    fn a_baseline_keeps_the_new_count_truthful_when_the_viewport_is_repinned() {
+        let messages = fixture(0..30);
+        // Frame 1: 12 rows, follow off, the operator is at the tail of the body.
+        let (_, first) = draw_body_rows(50, 12, &body_of(&messages), false, 999);
+        assert_eq!(first.scroll, 20);
+        assert_eq!(first.total_lines, 30);
+        assert_eq!(
+            first.unseen, 0,
+            "at the tail with nothing below: nothing unseen"
+        );
+
+        // Frame 2: five lines arrive and the pane is 19 rows tall, so the very same
+        // offset is now pinned to the bottom of a longer body.
+        let mut grown = messages.clone();
+        grown.extend(fixture(30..35));
+        let repinned = |baseline: Option<usize>| {
+            let backend = TestBackend::new(50, 19);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let mut report = BodyReport {
+                scroll: 0,
+                max_scroll: 0,
+                unseen: 0,
+                total_lines: 0,
+            };
+            terminal
+                .draw(|frame| {
+                    report = draw_body(
+                        frame,
+                        Rect::new(0, 0, 50, 19),
+                        &body_of(&grown),
+                        false,
+                        first.scroll,
+                        baseline,
+                    );
+                })
+                .unwrap();
+            report
+        };
+        let repinned_at_tail = repinned(None);
+        assert_eq!(
+            usize::from(repinned_at_tail.scroll),
+            repinned_at_tail.max_scroll
+        );
+        // Without the baseline the pane would claim the operator is caught up.
+        assert_eq!(repinned_at_tail.unseen, 0, "the lie this exists to fix");
+
+        // With the baseline frame 1 left behind, the five unseen lines are counted
+        // and the chip spells them.
+        let honest = repinned(Some(first.total_lines));
+        assert_eq!(honest.unseen, 5);
+        assert_eq!(
+            scroll_chip(false, honest.unseen).content.as_ref(),
+            " \u{2193} 5 new "
+        );
+    }
+
     #[test]
     fn follow_off_scroll_is_only_ever_lowered_to_stay_legal() {
         let messages = fixture(0..30);

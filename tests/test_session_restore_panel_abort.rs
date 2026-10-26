@@ -504,6 +504,10 @@ impl PanelFixture {
             last_activity_at: self.last_activity_at.clone(),
             turn_thinking: self.turn_thinking.clone(),
             is_thinking: self.is_thinking,
+            // D2 fields: this fixture describes a panel with no queue rank and no
+            // pause, which is exactly what an older session file carries too.
+            queue: None,
+            paused: false,
         }
     }
 }

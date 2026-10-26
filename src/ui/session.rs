@@ -1594,14 +1594,23 @@ fn subagent_detail_from_panel(panel: &SubagentPanel) -> SubagentDetail {
         content: panel.content.clone(),
         is_active: panel.is_active,
         context_tokens: panel.context_tokens,
-        // Neither slot state survives a restore: `queue` belongs to a live
-        // delegation and `paused` to a stream the preemption handshake is holding.
-        // A journaled pane records a round that was interrupted, never a stream
-        // that is parked behind the arbitrator right now, so both start clean and
-        // only a fresh typed transition (`Event::SubagentStreamPause`) or a fresh
-        // queue event can set them again.
-        queue: None,
-        paused: false,
+        // Plumbing delta D2 (design §9.4): both slot states are carried by the
+        // bundle now, so the restored row reads exactly as it was drawn instead of
+        // downgrading a `(Queued n/m)` or `(Paused)` row to idle. A panel written
+        // before D2 has no such fields (`#[serde(default)]`), and then both come
+        // back clean, which is what happened before too.
+        queue: panel.queue.map(|queue| crate::ui::QueueState {
+            position: queue.position,
+            of: queue.of,
+        }),
+        paused: panel.paused,
+        // The D1 lifecycle fields are mirrored from the worker registry, which is
+        // their only source: a restored row re-derives them from the live entry
+        // behind its key rather than reviving a label out of a file.
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     }
 }
 
@@ -4314,6 +4323,8 @@ mod restored_subagent_row_tests {
             last_activity_at: Some(TimePoint::now()),
             turn_thinking: None,
             is_thinking: None,
+            queue: None,
+            paused: false,
         }
     }
 

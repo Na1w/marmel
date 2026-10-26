@@ -152,6 +152,12 @@ pub const fn task_glyph(completed: bool, active: bool) -> Glyph {
 /// Glyph for a specialist roster row, derived from the registry-projected row
 /// state (`is_active` / `paused` / `queue`, spec §8.3). A row with nothing in
 /// flight reads `✓` (idle = finished, never `▶`).
+///
+/// This is the label-free half of the rule: with only liveness projected, "not
+/// running" is all a row can honestly say. [`worker_state_glyph`] is the entry
+/// point a caller uses once the registry's own `status_label` is on the row
+/// (plumbing delta D1, design §9.3), because liveness alone cannot tell an aborted
+/// worker from an approved one.
 pub const fn worker_glyph(is_active: bool, paused: bool, queued: bool) -> Glyph {
     if paused {
         Glyph::Paused
@@ -162,4 +168,61 @@ pub const fn worker_glyph(is_active: bool, paused: bool, queued: bool) -> Glyph 
     } else {
         Glyph::Done
     }
+}
+
+/// Terminal status labels that mean "this worker did not deliver" (§7.2 `✗`).
+/// Matched against the leading word of `WorkerEntry::status_label`, the vocabulary
+/// the runner and the review loop actually write: `Aborted`, `Rejected`, `Failed`,
+/// `Replan Required (…)`.
+const FAILED_STATUS_LABELS: [&str; 4] = ["aborted", "failed", "rejected", "replan"];
+/// Labels that mean "still working, held by the review loop" (§7.2 `⧗`, which the
+/// spec spells "queued **or validating**").
+const PENDING_STATUS_LABELS: [&str; 3] = ["revising", "validating", "queued"];
+/// Labels that mean the worker delivered and was accepted (§7.2 `✓`).
+const DONE_STATUS_LABELS: [&str; 2] = ["approved", "completed"];
+
+/// The §7.2 glyph for a worker whose registry label is projected (D1).
+///
+/// The slot state comes first — a stream parked behind the arbitrator, or a
+/// delegation waiting for a backend slot, is in those states regardless of what
+/// its last label said. Then the label decides a **terminal** state, which is the
+/// whole point of D1: `is_active == false` says the stream closed, and only the
+/// label says whether it closed approved or aborted. An aborted or
+/// validator-rejected worker therefore reads `✗ failed` and never `✓ done`.
+///
+/// A label the vocabulary does not know (`In Progress`, `Running`) decides
+/// nothing, and the caller falls back to [`worker_glyph`]: guessing a terminal state
+/// from prose would be inventing a state the registry never reported.
+pub fn worker_state_glyph(
+    is_active: bool,
+    paused: bool,
+    queued: bool,
+    status_label: Option<&str>,
+) -> Glyph {
+    if paused || queued {
+        return worker_glyph(is_active, paused, queued);
+    }
+    if let Some(label) = status_label
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+    {
+        // Only the leading word decides: `Replan Required (…)` is a replan verdict,
+        // and a label that merely mentions a verdict word later is not one.
+        let head = label
+            .split([' ', '-', '(', ':'])
+            .next()
+            .unwrap_or(label)
+            .trim()
+            .to_ascii_lowercase();
+        if FAILED_STATUS_LABELS.contains(&head.as_str()) {
+            return Glyph::Failed;
+        }
+        if PENDING_STATUS_LABELS.contains(&head.as_str()) {
+            return Glyph::Pending;
+        }
+        if DONE_STATUS_LABELS.contains(&head.as_str()) {
+            return Glyph::Done;
+        }
+    }
+    worker_glyph(is_active, paused, queued)
 }

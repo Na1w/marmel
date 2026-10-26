@@ -6,7 +6,7 @@
 //! `plan_content` string the plan pane draws, so the header and the pane can never
 //! disagree about the state of the plan.
 //!
-//! `HeaderData` reaches this pane with six values. The two §2.2 fields that were
+//! `HeaderData` reaches this pane with seven values. The two §2.2 fields that were
 //! not plumbed when this pane was first written landed in t-009b:
 //!
 //! * **`ctx %`** — `ctx_tokens` (the numerator) and `ctx_limit`
@@ -18,8 +18,11 @@
 //!   ([`HeaderData::elapsed`]); the pane no longer reaches for a process-wide or
 //!   plan-file clock, so it can never print a duration that outlived the session.
 //!
-//! `val N` is absent by rule, not by truncation: plumbing delta D1 (§9.3) has not
-//! landed, and an arbitration round counter is not data at all (spec §8.4).
+//! `val N` is the registry's validation round and appears only once plumbing delta
+//! D1 (§9.3) has landed — the renderer folds `WorkerEntry::validation_rounds` onto
+//! the worker row and hands the maximum over the rows to [`HeaderData::val_rounds`].
+//! With no round recorded (`val_rounds == 0`) the chip is withheld. An arbitration
+//! round counter is never a candidate for it (spec §8.4).
 
 use super::fit_spans;
 use super::status_bar::format_count;
@@ -50,16 +53,24 @@ pub struct HeaderData<'a> {
     /// The renderer-owned session clock in whole seconds (`t-009b`), `None` while
     /// no session clock exists yet.
     pub elapsed: Option<u64>,
+    /// The highest `validation_rounds` across the projected worker rows — the
+    /// `val N` chip plumbing delta D1 (§9.3) unblocked. `0` means the registry
+    /// recorded no validation round, and the chip is withheld instead of printing
+    /// `val 0`. Never an arbitration round (§8.4).
+    pub val_rounds: usize,
 }
 
 /// The §7.4 drop ladder, lowest priority first: `val` → `ctx` → `elapsed` → mode
 /// name → `> t-NNN`.
 ///
-/// `val` has no variant because it is never on the line to be dropped (D1 gate,
-/// §9.3). `done/total` and the app name are never dropped at any width (G1), so
+/// `Val` is on the ladder now that plumbing delta D1 (§9.3) put `validation_rounds`
+/// on the worker row: it is the first chip to go, exactly as §7.4 orders the row.
+/// `done/total` and the app name are never dropped at any width (G1), so
 /// they carry no rank at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Drop {
+    /// `val N` — the registry's validation round (D1).
+    Val,
     /// `ctx …`.
     Ctx,
     /// The project clock.
@@ -153,10 +164,20 @@ fn fields(data: &HeaderData<'_>, elapsed: Option<u64>) -> Vec<Field> {
             ],
         });
     }
-    // `val N` is deliberately not emitted here: per-worker `validation_rounds` is
-    // still not projected into the UI row (plumbing delta D1, §9.3), and
-    // `layout::header_budget` keeps `show_val` false for the same reason. The
-    // arbitration round counter is never a candidate either (§8.4).
+    // `val N` — the registry's validation round, max over the projected rows
+    // (plumbing delta D1, §9.3). Two gates: the §7.4 budget has to keep the chip, and
+    // the registry has to have recorded a round. An arbitration round counter is never
+    // a candidate here (§8.4) — this number comes from `WorkerEntry::validation_rounds`
+    // and nowhere else.
+    if data.budget.show_val && data.val_rounds > 0 {
+        fields.push(Field {
+            drop: Some(Drop::Val),
+            spans: vec![Span::styled(
+                format!(" val {}", data.val_rounds),
+                theme::chip_pending(),
+            )],
+        });
+    }
     if data.budget.show_ctx
         && let Some(chip) = ctx_chip(data)
     {
@@ -273,6 +294,8 @@ mod tests {
             ctx_tokens: 12_400,
             ctx_limit: 0,
             elapsed: None,
+
+            val_rounds: 0,
         };
         let line = text(&header_line(&data, Some(723), 100));
         assert!(line.contains("Marmel"), "{line:?}");
@@ -298,6 +321,8 @@ mod tests {
             ctx_tokens: 12_400,
             ctx_limit: 0,
             elapsed: None,
+
+            val_rounds: 0,
         };
         let line = text(&header_line(&data, Some(723), 90));
         assert!(
@@ -326,6 +351,8 @@ mod tests {
             ctx_tokens: 1_234_567,
             ctx_limit: 0,
             elapsed: None,
+
+            val_rounds: 0,
         };
         assert!(budget.show_ctx && budget.show_elapsed && budget.show_mode);
 
@@ -408,6 +435,8 @@ mod tests {
                 ctx_tokens: 0,
                 ctx_limit: 0,
                 elapsed: None,
+
+                val_rounds: 0,
             };
             let line = text(&header_line(&data, None, 100));
             assert_eq!(plan.done, done);
@@ -430,28 +459,99 @@ mod tests {
             ctx_tokens: 0,
             ctx_limit: 0,
             elapsed: None,
+
+            val_rounds: 0,
         };
         let line = text(&header_line(&data, None, 40));
         assert!(line.contains("0/0 done"), "{line:?}");
         assert!(!line.contains('▶'), "no task id to show: {line:?}");
     }
 
+    /// The §2.2 `val N` chip once plumbing delta D1 (§9.3) landed: the number comes
+    /// from the projection and from nowhere else, and the arbitration round is still
+    /// never a candidate (§8.4, DATA gap 9).
     #[test]
-    fn the_header_never_prints_a_validation_or_arbitration_round() {
-        // Gate (c): `val N` waits for D1, and the arbitration round is not data.
+    fn the_val_chip_prints_the_projected_round_and_never_a_round_word() {
         let plan = progress(MIXED, Some("t-004"));
-        let data = HeaderData {
+        let reviewed = HeaderData {
             mode: ViewMode::Split,
             plan: &plan,
             budget: header_budget(120),
             ctx_tokens: 12_400,
             ctx_limit: 0,
             elapsed: None,
+            val_rounds: 2,
+        };
+        let line = text(&header_line(&reviewed, Some(723), 120));
+        assert!(line.contains("val 2"), "{line:?}");
+
+        // No round recorded: the chip is withheld rather than printed as `val 0`.
+        let unreviewed = HeaderData {
+            val_rounds: 0,
+            ..reviewed
         };
         for width in [40u16, 60, 90, 120] {
-            let line = text(&header_line(&data, Some(723), width));
+            let line = text(&header_line(&unreviewed, Some(723), width));
             assert!(!line.contains("val"), "{width}: {line:?}");
-            assert!(!line.contains("round"), "{width}: {line:?}");
+        }
+
+        // Neither spelling of "round" reaches the header at any width, with a round
+        // on the row or without one.
+        for data in [&reviewed, &unreviewed] {
+            for width in [40u16, 60, 70, 90, 120] {
+                let line = text(&header_line(data, Some(723), width));
+                assert!(!line.contains("round"), "{width}: {line:?}");
+            }
+        }
+    }
+
+    /// §7.4 after D1: `val` is the first chip the narrow header sheds — ahead of
+    /// `ctx`, then the clock — while `done/total` and the brand stay (G1).
+    #[test]
+    fn the_val_chip_is_the_first_to_leave_the_narrow_header() {
+        // A long task id and a 7-figure context count are what push the row past
+        // the width where the ladder has to start dropping.
+        let plan = progress(MIXED, Some("t-004-wireframe-pane-rebuild"));
+        let data = HeaderData {
+            mode: ViewMode::Split,
+            plan: &plan,
+            budget: header_budget(120),
+            ctx_tokens: 1_234_567,
+            ctx_limit: 0,
+            elapsed: None,
+            val_rounds: 2,
+        };
+
+        let at_120 = text(&header_line(&data, Some(723), 120));
+        assert!(
+            at_120.contains("val 2") && at_120.contains("ctx ") && at_120.contains("elapsed"),
+            "{at_120:?}"
+        );
+
+        // Read the ladder off the sweep: the widest terminal at which each chip was
+        // still on the row. A chip dropped first has the *largest* such width.
+        let mut left_at: Vec<(&str, u16)> = Vec::new();
+        for width in (40..=120u16).rev() {
+            let line = text(&header_line(&data, Some(723), width));
+            assert!(line.contains("Marmel"), "{width}: {line:?}");
+            assert!(line.contains("3/7 done"), "{width}: {line:?}");
+            assert!(
+                UnicodeWidthStr::width(line.as_str()) <= usize::from(width),
+                "{width}: header exceeds its rect: {line:?}"
+            );
+            for (chip, probe) in [("val", "val 2"), ("ctx", "ctx "), ("elapsed", "elapsed")] {
+                if !line.contains(probe) && !left_at.iter().any(|(seen, _)| *seen == chip) {
+                    left_at.push((chip, width));
+                }
+            }
+        }
+        assert_eq!(
+            left_at.iter().map(|(chip, _)| *chip).collect::<Vec<_>>(),
+            ["val", "ctx", "elapsed"],
+            "§7.4 header ladder: {left_at:?}"
+        );
+        for pair in left_at.windows(2) {
+            assert!(pair[0].1 > pair[1].1, "one chip at a time: {left_at:?}");
         }
     }
 
@@ -466,6 +566,8 @@ mod tests {
             ctx_tokens: 12_400,
             ctx_limit: 0,
             elapsed: None,
+
+            val_rounds: 0,
         };
         let row = draw(40, &data);
         assert!(row.contains("Marmel"), "{row:?}");
@@ -489,6 +591,8 @@ mod tests {
             ctx_tokens: 12_400,
             ctx_limit: 30_000,
             elapsed: None,
+
+            val_rounds: 0,
         };
         let line = text(&header_line(&data, None, 120));
         assert!(line.contains("ctx 41%"), "{line:?}");
@@ -522,6 +626,8 @@ mod tests {
             ctx_tokens: 0,
             ctx_limit: 0,
             elapsed: Some(723),
+
+            val_rounds: 0,
         };
         let row = draw(120, &data);
         assert!(row.contains("elapsed 12m 3s"), "{row:?}");
@@ -544,6 +650,8 @@ mod tests {
             ctx_tokens: 0,
             ctx_limit: 0,
             elapsed: None,
+
+            val_rounds: 0,
         };
         let backend = ratatui::backend::TestBackend::new(20, 1);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();

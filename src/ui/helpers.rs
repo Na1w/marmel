@@ -798,6 +798,12 @@ pub(crate) fn update_subagent_lifecycle(
             context_tokens: active_tokens,
             queue: None,
             paused: false,
+            // The D1 lifecycle fields are mirrored from the registry by the renderer's
+            // projection (`tui::fold_worker_lifecycle`), never inferred here.
+            status_label: None,
+            implementation_turns: 0,
+            validation_rounds: 0,
+            latest_validator_feedback: None,
         };
         if let Some(entry) = entry.as_ref() {
             apply_registry_entry(&mut row, entry);

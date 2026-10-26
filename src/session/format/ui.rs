@@ -177,6 +177,32 @@ pub struct SubagentPanel {
     /// without it the pane comes back in the wrong state. `None` = no entry.
     #[serde(default)]
     pub is_thinking: Option<bool>,
+
+    // ---- queue / arbitration-pause state (design §9.4 D2) ----
+    //
+    // Both arrive as `#[serde(default)]` with a default that is exactly what
+    // `Default` produces, so an `ui.json` written before these fields existed still
+    // parses and `SCHEMA_VERSION` is unchanged. Nothing else may change here:
+    // `deny_unknown_fields` stays, and no existing field is renamed or retyped.
+    /// Concurrency-slot queue state — the durable twin of
+    /// [`crate::ui::SubagentDetail::queue`]. `None` = the row was not waiting for a
+    /// backend slot at capture instant.
+    #[serde(default)]
+    pub queue: Option<QueuePanel>,
+    /// Whether this worker's stream was held by steering arbitration at capture
+    /// instant — the durable twin of [`crate::ui::SubagentDetail::paused`].
+    #[serde(default)]
+    pub paused: bool,
+}
+
+/// Durable projection of [`crate::ui::QueueState`]: a 1-based FIFO rank and the
+/// queue depth that contains it. Kept as its own struct so the pair can be
+/// `Option`-wrapped (absent = not waiting) instead of encoded as two sentinels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueuePanel {
+    pub position: usize,
+    pub of: usize,
 }
 
 /// Persistence mirror of `ui::transcript::UiRecord` — the same 8 variants, the
@@ -382,5 +408,137 @@ impl UiSection {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One panel with every field carrying something distinguishable.
+    fn panel() -> SubagentPanel {
+        SubagentPanel {
+            name: "coder-t-012".to_string(),
+            task_id: Some("t-012".to_string()),
+            prompt: "plumb the panes".to_string(),
+            logs: vec!["started task t-012".to_string()],
+            thinking: String::new(),
+            content: "done".to_string(),
+            is_active: true,
+            context_tokens: 12,
+            worked_duration_secs: 3.5,
+            started_at: Some(TimePoint::now()),
+            last_activity_at: Some(TimePoint::now()),
+            turn_thinking: None,
+            is_thinking: Some(true),
+            queue: Some(QueuePanel { position: 2, of: 3 }),
+            paused: true,
+        }
+    }
+
+    fn section_with(panel: &SubagentPanel) -> UiSection {
+        UiSection {
+            subagent_panels: vec![panel.clone()],
+            ..UiSection::default()
+        }
+    }
+
+    /// D2 round trip: the queue pair and the arbitration pause survive the durable
+    /// format byte-for-byte, so a restore puts the row back in the state the screen
+    /// was showing instead of downgrading it to a running row.
+    #[test]
+    fn the_queue_pair_and_the_pause_round_trip_through_the_durable_format() {
+        // One fixture value: `TimePoint::now()` re-samples on every call, so building
+        // the expectation twice would compare two different clocks.
+        let fixture = panel();
+        let encoded =
+            serde_json::to_string(&section_with(&fixture)).expect("a section always serialises");
+        let decoded: UiSection = serde_json::from_str(&encoded).expect("our own output re-reads");
+        assert_eq!(decoded.subagent_panels, vec![fixture.clone()]);
+        let restored = &decoded.subagent_panels[0];
+        assert_eq!(
+            restored.queue,
+            Some(QueuePanel { position: 2, of: 3 }),
+            "the rank the pane was showing is still there: {encoded}"
+        );
+        assert!(restored.paused, "the held stream is still marked held");
+    }
+
+    /// Backwards compatibility: a `ui.json` written **before** D2 carries neither
+    /// `queue` nor `paused`. Both arrive as `#[serde(default)]`, so the older bundle
+    /// loads and the row comes back without either state — which is exactly what the
+    /// older binary produced, and never an invented position.
+    #[test]
+    fn a_panel_written_before_the_queue_and_pause_fields_still_loads() {
+        let mut value = serde_json::to_value(section_with(&panel())).expect("serialisable");
+        let panels = value["subagent_panels"]
+            .as_array_mut()
+            .expect("one panel in the fixture");
+        let removed = ["queue", "paused"];
+        for entry in panels.iter_mut() {
+            let object = entry.as_object_mut().expect("a panel object");
+            for field in removed {
+                assert!(
+                    object.remove(field).is_some(),
+                    "the fixture must really carry {field} before it is stripped"
+                );
+            }
+        }
+        let decoded: UiSection =
+            serde_json::from_value(value).expect("a pre-D2 bundle must still load");
+        let restored = &decoded.subagent_panels[0];
+        assert_eq!(
+            restored.queue, None,
+            "no rank was recorded, none is claimed"
+        );
+        assert!(!restored.paused, "no pause was recorded, none is claimed");
+        // Everything the older binary did record still arrives unchanged.
+        assert_eq!(restored.name, "coder-t-012");
+        assert_eq!(restored.context_tokens, 12);
+        assert_eq!(restored.logs, vec!["started task t-012".to_string()]);
+        assert_eq!(restored.worked_duration_secs, 3.5);
+        assert_eq!(restored.is_thinking, Some(true));
+    }
+
+    /// The D2 fields were added without loosening the contract: `deny_unknown_fields`
+    /// still refuses a bundle carrying a field this binary does not know, so a
+    /// newer writer is a version mismatch and never a half-read pane.
+    #[test]
+    fn adding_fields_with_defaults_did_not_open_the_reader_to_unknown_ones() {
+        let mut value = serde_json::to_value(panel()).expect("serialisable");
+        value.as_object_mut().expect("a panel object").insert(
+            "written_by_a_newer_release".to_string(),
+            serde_json::json!(1),
+        );
+        let err = serde_json::from_value::<SubagentPanel>(value)
+            .expect_err("an unknown field must be refused, not ignored");
+        assert!(
+            err.to_string().contains("written_by_a_newer_release"),
+            "the refusal names the offending field: {err}"
+        );
+    }
+
+    /// `SCHEMA_VERSION` stays at 1 and `UiSection::default()` stays a loadable
+    /// bundle: the new fields default to exactly what `Default` produces, so an old
+    /// `ui.json` needs no migration and the default section still passes its own
+    /// structural check.
+    #[test]
+    fn the_default_section_is_still_a_loadable_bundle_with_the_new_fields_present() {
+        let encoded = serde_json::to_string(&UiSection::default()).expect("serialisable");
+        let decoded: UiSection =
+            serde_json::from_str(&encoded).expect("the default section re-reads");
+        assert_eq!(decoded, UiSection::default());
+        assert!(
+            UiSection::default().structural_violations().is_empty(),
+            "the default bundle must stay loadable"
+        );
+        // A queued, paused row adds no structural violation either: the pair is a
+        // display state, and the registry — not the bundle — stays the authority that
+        // moves or retires it from here on.
+        let with_queue = section_with(&panel());
+        assert!(
+            with_queue.structural_violations().is_empty(),
+            "{with_queue:?}"
+        );
     }
 }

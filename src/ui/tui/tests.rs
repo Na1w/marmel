@@ -224,6 +224,11 @@ fn estimated_subagent_lines_counts_sections() {
         context_tokens: 0,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
     // Default (show_thought = false, thinking moved to bottom status bar):
     // 1 (header) + 1 ([Output]) + 1 (out) + 1 ([Logs]) + 1 (- log1) = 5
@@ -468,6 +473,11 @@ fn set_subagents_adopts_authoritative_list() {
         context_tokens: 0,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
 
     // Authoritative list from the loop (no thinking/content, just lifecycle).
@@ -485,6 +495,11 @@ fn set_subagents_adopts_authoritative_list() {
         context_tokens: 0,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     }];
     r.set_subagents(authoritative);
 
@@ -510,6 +525,11 @@ fn set_subagents_adopts_authoritative_list() {
         context_tokens: 0,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
     r.set_subagents(vec![SubagentDetail {
         name: "coder".to_string(),
@@ -525,6 +545,11 @@ fn set_subagents_adopts_authoritative_list() {
         context_tokens: 0,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     }]);
     assert_eq!(r.subagents.len(), 1);
     assert_eq!(r.subagents[0].name, "coder");
@@ -710,6 +735,11 @@ fn set_subagents_adopts_authoritative_queue_state() {
         context_tokens: 0,
         queue: Some(crate::ui::QueueState { position: 5, of: 9 }),
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
 
     // The loop says the slot is held: the stale local position must go.
@@ -727,6 +757,11 @@ fn set_subagents_adopts_authoritative_queue_state() {
         context_tokens: 0,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     }]);
     assert_eq!(r.subagents[0].queue, None);
     assert_eq!(
@@ -749,6 +784,11 @@ fn set_subagents_adopts_authoritative_queue_state() {
         context_tokens: 0,
         queue: Some(crate::ui::QueueState { position: 1, of: 2 }),
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     }]);
     assert_eq!(
         r.subagents[0].queue,
@@ -1210,10 +1250,16 @@ fn queue_position_updates_never_move_the_selection_or_the_list_window() {
     }
 }
 
-/// A restart keeps the panel rows but not the pool: no semaphore survives, so no
-/// position may survive either. The restored row comes back as a running row.
+/// Plumbing delta D2 (design §9.4): the queue pair is part of the durable panel, so
+/// a restore puts the row back in the state the screen was showing — the pane no
+/// longer has to guess "running" for a row that was waiting for a slot. What is
+/// still true after the restore is the safety half: the pool ledger itself did not
+/// survive, so only the registry can move or retire the position from here on, and a
+/// row the registry closed loses it (asserted by
+/// `a_row_that_is_not_running_never_shows_a_queue_position` and
+/// `set_subagents_adopts_authoritative_queue_state`).
 #[test]
-fn a_restored_row_never_shows_a_stale_queue_position() {
+fn a_restored_row_carries_the_queue_position_the_bundle_recorded() {
     let mut live = TuiRenderer::new();
     live.show_subagent_panel = true;
     let mut queued = queue_row(
@@ -1230,8 +1276,10 @@ fn a_restored_row_never_shows_a_stale_queue_position() {
 
     assert_eq!(restored.subagents.len(), 1);
     assert_eq!(
-        restored.subagents[0].queue, None,
-        "the queue ledger does not survive a restart, so the panel may not claim a position"
+        restored.subagents[0].queue,
+        Some(crate::ui::QueueState { position: 7, of: 9 }),
+        "the panel carries the rank the screen was showing, so a queued row does not \
+         come back claiming to hold a slot"
     );
     assert!(
         restored.subagents[0].is_active,
@@ -1241,12 +1289,22 @@ fn a_restored_row_never_shows_a_stale_queue_position() {
     let (rows, _) = draw_subagent_panel(&mut restored, 100, 20);
     let text = rows.join("\n");
     assert!(
-        text.contains("coder-t-1 (Active)"),
-        "a restored row comes back as a running row, got:\n{text}"
+        text.contains("coder-t-1 (Queued 7/9)"),
+        "the restored row reads the way it was drawn, got:\n{text}"
     );
-    assert!(
-        !text.contains("Queued"),
-        "no stale queue position may survive a restore, got:\n{text}"
+
+    // The backwards-compatible half: a bundle written before D2 has no `queue`
+    // field at all, and then the row comes back without one — the same reading the
+    // old binary produced, never an invented rank.
+    let mut legacy_section = section.clone();
+    for panel in &mut legacy_section.subagent_panels {
+        panel.queue = None;
+    }
+    let mut legacy = TuiRenderer::new();
+    legacy.restore_panes(&legacy_section);
+    assert_eq!(
+        legacy.subagents[0].queue, None,
+        "a pre-D2 bundle restores without a queue position"
     );
 }
 
@@ -2160,11 +2218,13 @@ fn the_authoritative_rows_from_the_loop_own_the_pause_label() {
     );
 }
 
-/// A restart drops the arbitration handshake exactly like it drops the queue
-/// ledger: a journaled pane records a round that was interrupted, never a stream
-/// the arbitrator is holding right now.
+/// Plumbing delta D2 (design §9.4): the arbitration pause is part of the durable
+/// panel too, so a row whose stream was held by the arbitrator comes back holding,
+/// instead of silently claiming a slot it did not have. The safety half is unchanged
+/// and is asserted by `the_authoritative_rows_from_the_loop_own_the_pause_label`: only a live stream
+/// can be held, so the loop's teardown of the row takes the flag straight back down.
 #[test]
-fn a_restored_row_never_shows_a_stale_pause() {
+fn a_restored_row_carries_the_pause_the_bundle_recorded() {
     let mut live = TuiRenderer::new();
     live.show_subagent_panel = true;
     let mut held = queue_row("coder-t-1", true, None);
@@ -2178,18 +2238,27 @@ fn a_restored_row_never_shows_a_stale_pause() {
 
     assert_eq!(restored.subagents.len(), 1);
     assert!(
-        !restored.subagents[0].paused,
-        "the preemption handshake does not survive a restart, so the panel may not claim a pause"
+        restored.subagents[0].paused,
+        "the screen was showing a held stream, so the restored row says so"
     );
     let (rows, _) = draw_subagent_panel(&mut restored, 100, 20);
     let text = rows.join("\n");
     assert!(
-        text.contains("coder-t-1 (Active)"),
-        "a restored row comes back as a running row, got:\n{text}"
+        text.contains("coder-t-1 (Paused)"),
+        "the restored row reads the way it was drawn, got:\n{text}"
     );
+
+    // The backwards-compatible half: a pre-D2 bundle records no pause, and the row
+    // then comes back unheld — exactly the reading the old binary produced.
+    let mut legacy_section = section.clone();
+    for panel in &mut legacy_section.subagent_panels {
+        panel.paused = false;
+    }
+    let mut legacy = TuiRenderer::new();
+    legacy.restore_panes(&legacy_section);
     assert!(
-        !text.contains("Paused"),
-        "no stale pause may survive a restore, got:\n{text}"
+        !legacy.subagents[0].paused,
+        "a pre-D2 bundle restores without a pause"
     );
 }
 
@@ -2394,6 +2463,11 @@ fn test_subagent_thinking_visibility_controlled_by_show_thought() {
         context_tokens: 0,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
 
     // The pane's thinking flag is set explicitly here, not inferred from the
@@ -2572,6 +2646,11 @@ fn test_subagent_tool_calls_logged_with_arguments_and_stripped_prefix() {
         worked_duration: Duration::ZERO,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
     r.active_agent = "coder-t-001".to_string();
 
@@ -2938,6 +3017,11 @@ fn test_subagent_scrolling_and_focus() {
         worked_duration: Duration::ZERO,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
 
     r.show_thought = true;
@@ -3005,6 +3089,11 @@ fn test_subagent_switch_scrolls_to_bottom_and_autoscrolls() {
         worked_duration: Duration::ZERO,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
     r.subagents.push(SubagentDetail {
         name: "coder-2".to_string(),
@@ -3025,6 +3114,11 @@ fn test_subagent_switch_scrolls_to_bottom_and_autoscrolls() {
         worked_duration: Duration::ZERO,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
 
     r.subagent_width.set(40);
@@ -3201,6 +3295,11 @@ fn test_subagent_context_tokens_rendering_in_list() {
         worked_duration: Duration::ZERO,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
     r.subagents.push(SubagentDetail {
         name: "researcher-t-2".to_string(),
@@ -3216,6 +3315,11 @@ fn test_subagent_context_tokens_rendering_in_list() {
         worked_duration: Duration::ZERO,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
     r.subagents.push(SubagentDetail {
         name: "validator".to_string(),
@@ -3231,6 +3335,11 @@ fn test_subagent_context_tokens_rendering_in_list() {
         worked_duration: Duration::ZERO,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
 
     let backend = ratatui::backend::TestBackend::new(100, 20);
@@ -3284,6 +3393,11 @@ fn test_subagent_time_counter_rendering_in_list() {
         worked_duration: Duration::ZERO,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
     r.subagents.push(SubagentDetail {
         name: "researcher-t-2".to_string(),
@@ -3299,6 +3413,11 @@ fn test_subagent_time_counter_rendering_in_list() {
         worked_duration: Duration::from_secs(85),
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
 
     let backend = ratatui::backend::TestBackend::new(100, 20);
@@ -4150,6 +4269,11 @@ fn test_tui_renders_subagent_thinking_progress_and_output_during_streaming() {
         context_tokens: 0,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     }]);
 
     // 1. When subagent is active but has not produced tokens yet:
@@ -4317,6 +4441,11 @@ fn test_subagent_thinking_shows_remaining_budget_countdown() {
         context_tokens: 0,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
 
     // 1. Stream 4000 characters in Turn 1: ~1000 tokens. 10000 - 1000 = 9000 remaining (~9.0k remaining).
@@ -4428,6 +4557,11 @@ fn test_manager_output_routes_to_chat_when_specialist_inactive() {
         context_tokens: 0,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
     r.active_agent = "researcher-steer-task-1".to_string();
 
@@ -4486,6 +4620,11 @@ fn test_set_subagents_preserves_manager_active_agent() {
         context_tokens: 0,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     }];
     r.set_subagents(active_list);
 
@@ -4823,6 +4962,13 @@ fn rich_subagent(name: &str) -> SubagentDetail {
         context_tokens: 18_431,
         queue: None,
         paused: false,
+        // The D1 lifecycle fields are NOT part of the durable panel (the worker
+        // registry is their only source), so they stay at their defaults here: a
+        // round-trip through `capture_ui` / `restore_panes` must not claim them.
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     }
 }
 
@@ -7484,9 +7630,11 @@ fn the_side_column_stacks_to_one_pane_below_ninety_columns() {
 
 #[test]
 fn the_header_chip_budget_drops_val_then_ctx_then_elapsed() {
-    // §7.4 drop order; `val` stays off until plumbing delta D1 (gate (c)).
+    // §7.4 drop order. D1 (§9.3) has landed, so the budget keeps `val` in the same
+    // band as the other optional chips and the pane decides whether it has a number
+    // to print there.
     let wide = layout::header_budget(120);
-    assert!(!wide.show_val);
+    assert!(wide.show_val, "D1 landed: the round chip is on the ladder");
     assert!(wide.show_ctx && wide.show_elapsed && wide.show_mode && wide.show_task);
 
     let compact = layout::header_budget(70);
@@ -7495,7 +7643,10 @@ fn the_header_chip_budget_drops_val_then_ctx_then_elapsed() {
         "elapsed survives at 70; §2.5 drops it only below 70"
     );
     let narrow = layout::header_budget(69);
-    assert!(!narrow.show_ctx && !narrow.show_elapsed && !narrow.show_mode);
+    assert!(
+        !narrow.show_ctx && !narrow.show_elapsed && !narrow.show_mode && !narrow.show_val,
+        "the optional chips, `val` first, leave together below 70"
+    );
     assert!(
         narrow.show_task,
         "the active task id outlives the optional chips"
@@ -7526,6 +7677,67 @@ fn theme_glyphs_are_the_spec_table_and_the_picker_follows_row_state() {
     assert_eq!(theme::worker_glyph(false, false, true), Glyph::Pending);
     assert_eq!(theme::worker_glyph(false, false, false), Glyph::Done);
 
+    // The label-aware picker (plumbing delta D1, §9.3). Liveness alone cannot tell an
+    // aborted worker from an approved one, so the registry's own `status_label`
+    // decides the terminal states — and the slot states still outrank the label.
+    for label in [
+        "Aborted",
+        "Rejected",
+        "Failed",
+        "Replan Required (too complex)",
+    ] {
+        assert_eq!(
+            theme::worker_state_glyph(false, false, false, Some(label)),
+            Glyph::Failed,
+            "{label} is a worker that did not deliver (§7.2 `✗`)"
+        );
+    }
+    assert_eq!(
+        theme::worker_state_glyph(false, false, false, Some("Approved")),
+        Glyph::Done,
+        "only an accepted deliverable reads `✓ done`"
+    );
+    assert_eq!(
+        theme::worker_state_glyph(true, false, false, Some("Revising")),
+        Glyph::Pending,
+        "the review loop holds the worker: §7.2 spells validating `⧗`"
+    );
+    assert_eq!(
+        theme::worker_state_glyph(true, false, false, Some("In Progress")),
+        Glyph::Active,
+        "a label outside the terminal vocabulary decides nothing and liveness answers"
+    );
+    assert_eq!(
+        theme::worker_state_glyph(false, false, false, Some("In Progress")),
+        Glyph::Done,
+        "…including when the honest answer is that the stream closed"
+    );
+    assert_eq!(
+        theme::worker_state_glyph(false, true, false, Some("Approved")),
+        Glyph::Paused,
+        "a parked stream is parked whatever its last label said"
+    );
+    assert_eq!(
+        theme::worker_state_glyph(true, false, true, Some("Running")),
+        Glyph::Pending,
+        "a delegation waiting for a slot is queued while its label says it runs"
+    );
+    assert_eq!(
+        theme::worker_state_glyph(false, false, false, None),
+        Glyph::Done,
+        "no projected label: the picker is the label-free rule, nothing more"
+    );
+    assert_eq!(
+        theme::worker_state_glyph(false, false, false, Some("   ")),
+        Glyph::Done,
+        "a blank label is no label"
+    );
+    assert_eq!(
+        theme::worker_state_glyph(false, false, false, Some("Unapproved")),
+        Glyph::Done,
+        "only the leading word decides, so `Unapproved` is not a verdict this knows"
+    );
+
     // The palette keeps today's colours (§7.1).
     assert_eq!(theme::frame_focus().fg, Some(Color::Cyan));
     assert_eq!(theme::frame_idle().fg, Some(Color::DarkGray));
@@ -7540,6 +7752,178 @@ fn theme_glyphs_are_the_spec_table_and_the_picker_follows_row_state() {
     assert_eq!(theme::text_dim().fg, Some(Color::DarkGray));
     assert_eq!(theme::text_primary(), ratatui::style::Style::default());
     assert_eq!(theme::FOCUS_BADGE, '●');
+}
+
+/// Plumbing delta D1 (design §9.3) at the boundary it was asked for: the four worker
+/// lifecycle fields the orchestrator already keeps (`status_label`,
+/// `implementation_turns`, `validation_rounds`, `latest_validator_feedback`) reach the
+/// renderer's own row type instead of dying at the UI edge. Nothing here is derived
+/// from prose — one snapshot of the process-global registry, joined on the effective
+/// registry key.
+#[test]
+fn the_worker_lifecycle_the_registry_keeps_lands_on_the_pane_row() {
+    use crate::orchestrator::workers;
+    let _workers = workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let worker = workers::register_active_worker(
+        Some("t-9512".to_string()),
+        "coder".to_string(),
+        "carry the lifecycle across the UI boundary".to_string(),
+    );
+    let key = worker.0.clone();
+    let _cleanup = EntryCleanup { key: key.clone() };
+
+    // The state a validator rejection leaves in the registry: the review loop's own
+    // turn and round counters, its feedback text, and the terminal label.
+    workers::set_active_worker_status(&key, "Rejected");
+    workers::update_active_worker_progress(&key, 3, 2, Some("clippy: unused import".to_string()));
+
+    // The loop's row carries none of it — that is the gap D1 describes.
+    let mut r = m4_renderer();
+    r.subagents.clear();
+    r.set_subagents(vec![SubagentDetail {
+        name: key.clone(),
+        task_id: Some("t-9512".to_string()),
+        is_active: true,
+        ..SubagentDetail::default()
+    }]);
+    assert_eq!(r.subagents.len(), 1, "{:?}", r.subagents);
+    let row = r.subagents.iter().find(|row| row.name == key).unwrap();
+    assert_eq!(
+        row.status_label.as_deref(),
+        Some("Rejected"),
+        "the registry's own label, not a guess from liveness"
+    );
+    assert_eq!(row.implementation_turns, 3);
+    assert_eq!(row.validation_rounds, 2);
+    assert_eq!(
+        row.latest_validator_feedback.as_deref(),
+        Some("clippy: unused import")
+    );
+
+    // The one number the header and the status row are allowed to print (§8.4): the
+    // max over the rows, from the rows.
+    assert_eq!(r.max_validation_rounds(), 2);
+
+    // And the two fields the missing data kept switched off now reach the frame: the
+    // roster row prints its round, and the validator-rejected row reads `✗ failed`
+    // rather than the `✓ done` a closed stream used to imply.
+    let frame = draw_new_frame(&mut r, 120, 40);
+    let text = frame.join("\n");
+    assert!(text.contains("val 2"), "no round counter in:\n{text}");
+    let roster = frame
+        .iter()
+        // The roster row is the only line that prints a turn counter, so it cannot be
+        // confused with the header's `▶ t-9512` chip.
+        .find(|line| line.contains("t-9512") && line.contains("turn "))
+        .unwrap_or_else(|| panic!("no roster row for the delegation:\n{text}"));
+    assert!(roster.contains("✗ failed"), "{roster}");
+    assert!(!roster.contains("✓ done"), "{roster}");
+    assert!(roster.contains("turn 3"), "{roster}");
+    // The tally agrees with the row. Both spellings §7.2 allows are accepted — the
+    // word labels are only kept while the border row has room — but the `✓` segment
+    // has to stay empty either way.
+    assert!(
+        frame
+            .iter()
+            .any(|line| line.contains("✗ failed 1") || line.contains("✗ 1")),
+        "the tally counts the rejected row as failed:\n{text}"
+    );
+    assert!(
+        frame
+            .iter()
+            .any(|line| line.contains("✓ done 0") || line.contains("✓ 0")),
+        "…and not as done:\n{text}"
+    );
+
+    // The validator's words are the other half of the same fold: a rejected row states
+    // why it was rejected.
+    r.set_view_mode(state::ViewMode::Workers);
+    let detail = draw_new_frame(&mut r, 120, 40).join("\n");
+    assert!(detail.contains("[Validator]"), "{detail}");
+    assert!(detail.contains("clippy: unused import"), "{detail}");
+}
+
+/// §8.5: a failure outlives the status line that carried it. The renderer keeps the
+/// categorical cause and the full text, and the `e` handler — which reads the
+/// transcript and the status line, not a buffer of its own — finds the same bytes back.
+#[test]
+fn a_reported_error_stays_recallable_after_the_status_line_moved_on() {
+    let mut r = TuiRenderer::new();
+
+    // The session loop's error traffic, in the shape `session.rs` reports it.
+    r.on_event(&Event::Status(
+        "LLM error: rate limit exceeded (Ready)\nsecond line of the report".to_string(),
+    ));
+
+    // The transcript is honest about the failure — this is what `e` recalls today.
+    assert!(
+        r.messages
+            .iter()
+            .any(|line| line.contains("LLM error: rate limit exceeded")),
+        "{:?}",
+        r.messages
+    );
+
+    // And the buffer holds the category plus the whole text, which is more than
+    // §7.4 lets the status line keep.
+    let sticky = r.last_error.clone().expect("an error was reported");
+    assert_eq!(sticky.category, "rate limit exceeded", "{sticky:?}");
+    assert_eq!(
+        sticky.detail,
+        "LLM error: rate limit exceeded (Ready)\nsecond line of the report"
+    );
+
+    // The status line moves on: the spinner text is whatever the loop reported next.
+    r.on_event(&Event::Status("Ready".to_string()));
+    assert_eq!(r.status_line, "Ready");
+
+    // `e` with an empty composer is never a silent key (§5, G5).
+    assert!(press(&mut r, KeyCode::Char('e'), KeyModifiers::NONE));
+    let recalled = r.messages.last().cloned().unwrap_or_default();
+    assert!(recalled.starts_with("✗ LLM error:"), "{recalled:?}");
+    assert!(recalled.contains("see .marmel/marmel.log"), "{recalled:?}");
+    assert!(
+        !recalled.contains("No error recorded"),
+        "the pending-plumbing message must not survive the plumbing: {recalled:?}"
+    );
+}
+
+/// A non-error status report never leaves an error behind, and a repeated report of the
+/// same failure does not restamp the buffer: it records the edge, not the traffic.
+#[test]
+fn only_error_traffic_is_remembered_and_repeats_do_not_restamp_it() {
+    let mut r = TuiRenderer::new();
+    r.on_event(&Event::Status("calling backend".to_string()));
+    assert!(
+        r.last_error.is_none(),
+        "ordinary status traffic is not an error: {:?}",
+        r.last_error
+    );
+
+    r.on_event(&Event::Status(
+        "System Error: transport closed the stream".to_string(),
+    ));
+    let first = r.last_error.clone().expect("the error is recorded");
+    assert_eq!(first.category, "System Error", "{first:?}");
+
+    r.on_event(&Event::Status(
+        "System Error: transport closed the stream".to_string(),
+    ));
+    assert_eq!(
+        r.last_error,
+        Some(first.clone()),
+        "the same failure re-announced keeps the first record"
+    );
+
+    // A genuine second failure does replace it: the buffer tracks the last error, not
+    // the first one.
+    r.on_event(&Event::Status("LLM error: http (Ready)".to_string()));
+    let second = r.last_error.clone().expect("the newer error wins");
+    assert_eq!(second.category, "http", "{second:?}");
+    assert_ne!(second, first.clone(), "the buffer tracks the last error");
+    assert_eq!(first.detail, "System Error: transport closed the stream");
 }
 
 #[test]
@@ -8538,6 +8922,59 @@ fn ctrl_f_moves_the_follow_chip_in_the_transcript_pane() {
     let on = draw_new_frame(&mut r, 100, 30).concat();
     assert!(on.contains("LIVE"), "and comes back: {on}");
     assert!(r.follow);
+}
+
+/// G7 at the renderer's own seam (DATA gap 7): the unseen baseline is re-measured
+/// whenever the viewport sits at the bottom of the body, and is **held** while the
+/// operator is scrolled up. That is what lets `↓ N new` count the output that arrived
+/// unseen rather than only the gap under the viewport — and the baseline is a measured
+/// line count, never a guess from `max_scroll - scroll`.
+#[test]
+fn the_unseen_baseline_is_re_measured_at_the_tail_and_held_while_scrolled_up() {
+    let mut r = m4_renderer();
+    r.messages = (0..30)
+        .map(|i| format!("User: line {i:02} of the transcript"))
+        .collect();
+
+    // Following the tail: every line that exists has been on screen, so the body's own
+    // measured line count becomes the baseline.
+    draw_new_frame(&mut r, 100, 30);
+    let tail = r.transcript_baseline_lines.expect("a frame was drawn");
+    assert_eq!(tail, 30, "one rendered line per message at this width");
+
+    // `Ctrl+F` disarms follow with nothing new in flight: the state is stated, and
+    // nothing is claimed as unseen.
+    assert!(press(&mut r, KeyCode::Char('f'), KeyModifiers::CONTROL));
+    let still = draw_new_frame(&mut r, 100, 30);
+    assert!(
+        still.iter().any(|line| line.contains("follow off")),
+        "{still:?}"
+    );
+    assert!(
+        !still.iter().any(|line| line.contains(" new ")),
+        "nothing arrived: {still:?}"
+    );
+
+    // Ten lines arrive while the viewport stands still. The baseline must not move —
+    // the operator has not seen that output — so the pane counts it and says so.
+    r.messages
+        .extend((30..40).map(|i| format!("User: line {i:02} of the transcript")));
+    let behind = draw_new_frame(&mut r, 100, 30);
+    assert_eq!(
+        r.transcript_baseline_lines,
+        Some(tail),
+        "the baseline waits for the operator to come back to the tail"
+    );
+    assert!(
+        behind.iter().any(|line| line.contains("\u{2193} 10 new")),
+        "the ten unseen lines are counted: {behind:?}"
+    );
+
+    // Coming back to the tail retires the count and re-measures the baseline.
+    assert!(press(&mut r, KeyCode::Char('f'), KeyModifiers::CONTROL));
+    let back = draw_new_frame(&mut r, 100, 30);
+    assert!(back.iter().any(|line| line.contains("LIVE")), "{back:?}");
+    assert_eq!(r.transcript_baseline_lines, Some(40));
 }
 
 /// §10 item 15 from the key side: every roster row is reachable with the arrows —

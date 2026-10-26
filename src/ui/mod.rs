@@ -76,6 +76,38 @@ pub struct SubagentDetail {
     pub paused: bool,
     /// The context tokens used by this subagent.
     pub context_tokens: usize,
+
+    // ---- worker lifecycle projection (design §9.3 D1) ----
+    //
+    // These four fields already exist in the orchestrator's public read model
+    // ([`crate::orchestrator::WorkerEntry`]) and were dropped at the UI boundary,
+    // which is why the Workers pane could only ever print a liveness glyph and the
+    // status bar had to keep its `val N` field switched off. They are **mirrored
+    // from the registry**, never derived from a label string and never counted by
+    // the renderer itself.
+    /// The registry's own descriptive status label (`WorkerEntry::status_label`,
+    /// e.g. `Running`, `Approved`, `Rejected`, `Aborted`, `Revising`).
+    ///
+    /// `None` = the registry has no entry for this row (an event arrived before the
+    /// registration, or the row was restored with no worker behind it), which is a
+    /// real distinction the pane renders: with no label the row falls back to the
+    /// `is_active` glyph instead of guessing a state from prose.
+    ///
+    /// This is the field that stops an aborted or validator-rejected worker from
+    /// reading `✓ done`: liveness (`is_active`) says the stream closed, the label
+    /// says **how**.
+    pub status_label: Option<String>,
+    /// Implementation turns recorded by the registry
+    /// (`WorkerEntry::implementation_turns`).
+    pub implementation_turns: usize,
+    /// Validator rounds recorded by the registry (`WorkerEntry::validation_rounds`).
+    /// The `val N` field of the status bar and the Workers row is driven by this
+    /// number — never by an arbitration round counter (design §8.4).
+    pub validation_rounds: usize,
+    /// The latest validator feedback text carried by the registry
+    /// (`WorkerEntry::latest_validator_feedback`), shown in the row detail so a
+    /// rejected worker says why.
+    pub latest_validator_feedback: Option<String>,
 }
 
 /// A single agent event dispatched to the active renderer.
