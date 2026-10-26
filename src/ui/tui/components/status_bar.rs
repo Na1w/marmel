@@ -87,6 +87,12 @@ pub struct StatusData<'a> {
     /// registry recorded no validation round for any worker and the field is
     /// withheld rather than printed as `val 0`. Never an arbitration round (§8.4).
     pub val_rounds: usize,
+    /// How many of the operator's own steering instructions the bridge is still
+    /// **holding** for a later seam (spec §3, §8.3; DATA §6 gap 7). The renderer
+    /// derives this by counting the `Queued` slice of the transitions the bridge
+    /// reported to it — it is never an estimate, never a turn count, and never
+    /// printed at all when nothing is queued.
+    pub queued_steers: usize,
     // There is deliberately no `follow` / `unseen` pair here any more: the
     // scroll-state chip (`● LIVE` / `↓ N new`) belongs to the transcript pane that
     // owns the viewport, and drawing it here as well put the same chip on screen
@@ -118,6 +124,10 @@ const DROP_THOUGHT_CHIP: u8 = 0;
 const DROP_WORKERS_CHIP: u8 = 1;
 const DROP_PLAN_CHIP: u8 = 2;
 const DROP_COUNTS_CHIP: u8 = 3;
+// The queued-steer chip outranks the aggregate worker counts: §8.3's counts describe
+// the specialists, while this one answers the operator's own question — what happened
+// to the instruction I just typed — and it is the only chip on the frame that can.
+const DROP_STEERS_CHIP: u8 = 4;
 
 /// One field of a single-row bar and its place in that row's ladder
 /// (`None` = never dropped).
@@ -444,6 +454,23 @@ fn chips(data: &StatusData<'_>) -> Vec<Field> {
             theme::chip(),
         )],
     });
+    if data.queued_steers > 0 {
+        // What the operator's own instructions are doing. The count is the number of
+        // bridge-reported transitions still sitting in the `Queued` stage, so the chip
+        // appears exactly when something is really being held and disappears when it is
+        // not — an empty queue prints nothing here rather than a reassuring zero.
+        chips.push(Field {
+            drop: Some(DROP_STEERS_CHIP),
+            flex: false,
+            spans: vec![
+                Span::styled(
+                    format!(" {} ", Glyph::Pending.symbol()),
+                    Glyph::Pending.style(),
+                ),
+                Span::styled(format!("{} steers ", data.queued_steers), theme::chip()),
+            ],
+        });
+    }
     if !data.abort_armed {
         let active = data.workers.iter().filter(|row| row.is_active).count();
         let paused = data.workers.iter().filter(|row| row.paused).count();
@@ -658,6 +685,7 @@ mod tests {
             elapsed: None,
 
             val_rounds: 0,
+            queued_steers: 0,
         }
     }
 
@@ -1153,5 +1181,78 @@ mod tests {
         draw(0, 0, &data(&[], true));
         draw(1, 1, &data(&[], true));
         draw(40, 1, &data(&[], false));
+    }
+
+    /// Affordance 1 of the steering surface (spec §3, §8.3; DATA §6 gap 7): the bar
+    /// states how many of the operator's own instructions the bridge is still
+    /// holding. The number arrives from the renderer's ledger of bridge-reported
+    /// transitions, and nothing is printed while nothing is held — no zero, no
+    /// placeholder, no counter with no data source.
+    #[test]
+    fn the_queued_steer_chip_appears_only_while_an_instruction_is_held() {
+        let workers = [worker("coder_specialist", true, false, false)];
+        let held = StatusData {
+            queued_steers: 3,
+            ..data(&workers, false)
+        };
+        let rows = draw(120, 2, &held);
+        assert!(rows[1].contains("3 steers "), "{rows:?}");
+        assert!(
+            rows[1].contains('⧗'),
+            "the pending glyph leads it: {rows:?}"
+        );
+
+        // Nothing held: the slot is absent rather than zero-filled, at every width
+        // and both row counts.
+        for (width, height) in [(120u16, 2u16), (80, 2), (46, 2), (120, 1), (40, 1)] {
+            let joined = draw(width, height, &data(&workers, false)).join("\n");
+            assert!(
+                !joined.contains("steers"),
+                "{width}x{height}: nothing is queued, so nothing is claimed: {joined:?}"
+            );
+        }
+    }
+
+    /// The chip row's ladder ranks the operator's own question above §8.3's
+    /// aggregate worker counts: reading the ladder off the row, the `Na Np Nq` counts
+    /// leave at a strictly wider terminal than the `N steers` chip does — and the
+    /// steer chip is still on the row at the width where the counts already went.
+    #[test]
+    fn the_steer_chip_leaves_the_chip_row_after_the_worker_counts() {
+        let workers = [worker("coder_specialist", true, true, true)];
+        let held = StatusData {
+            queued_steers: 2,
+            ..data(&workers, false)
+        };
+        let at = |width: u16| draw(width, 2, &held)[1].clone();
+
+        // Wide enough for both.
+        let wide = at(120);
+        assert!(
+            wide.contains("2 steers") && wide.contains("1a 1p 1q"),
+            "{wide:?}"
+        );
+
+        let mut counts_gone_at: Option<u16> = None;
+        let mut steers_gone_at: Option<u16> = None;
+        for width in (4..=120u16).rev() {
+            let row = at(width);
+            if counts_gone_at.is_none() && !row.contains("1a 1p 1q") {
+                counts_gone_at = Some(width);
+                assert!(
+                    row.contains("2 steers"),
+                    "the steer chip must still be on the row when the counts go: {row:?}"
+                );
+            }
+            if steers_gone_at.is_none() && !row.contains("2 steers") {
+                steers_gone_at = Some(width);
+            }
+        }
+        let counts = counts_gone_at.expect("the counts leave at some width");
+        let steers = steers_gone_at.expect("the steer chip leaves only when it must");
+        assert!(
+            steers < counts,
+            "one field at a time, counts first: counts gone at {counts}, steers gone at {steers}"
+        );
     }
 }

@@ -38,6 +38,7 @@
 
 use super::{fit_spans, pane_block, title_width};
 use crate::markers;
+use crate::ui::SteerStage;
 use crate::ui::tui::formatting::{
     count_wrapped_rendered_lines, format_terminal_math, parse_ansi_lines, render_markdown_lines,
     render_message_lines, strip_think_tags,
@@ -52,6 +53,69 @@ use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarStat
 
 /// The §8.1 empty state, spelled once so the pane and its tests cannot drift.
 pub const EMPTY_STATE: &str = "No output yet. Type an instruction and press Enter (? for keys).";
+
+/// Label of every line that reports what happened to one of the operator's own
+/// steering instructions — queued, forwarded, refused (spec §3, §8.3; DATA §6 gap 7).
+///
+/// The **renderer** writes these sentences (it is the only side that receives the
+/// bridge's `note_steer` projection); this pane owns how they **look**, and both read
+/// this one constant, so the label the renderer writes and the label the pane styles
+/// cannot drift apart.
+pub const STEER_LINE_PREFIX: &str = "[Steer ";
+
+/// The palette slot of each steering stage, spelled once.
+///
+/// The three stages are the three states the bridge can honestly report, and each gets
+/// its own slot so a glance separates "still waiting" from "reached the specialist"
+/// from "never got there". No slot is invented for a state the bridge cannot report.
+fn steer_style(stage: SteerStage) -> Style {
+    match stage {
+        SteerStage::Queued => theme::chip_pending(),
+        SteerStage::Delivered => theme::chip_done(),
+        SteerStage::Revoked => theme::error(),
+    }
+}
+
+/// Which steering stage a line states, read off the label the renderer wrote.
+fn steer_stage_of(text: &str) -> Option<SteerStage> {
+    let rest = text.strip_prefix(STEER_LINE_PREFIX)?;
+    [
+        SteerStage::Queued,
+        SteerStage::Delivered,
+        SteerStage::Revoked,
+    ]
+    .into_iter()
+    .find(|stage| rest.starts_with(stage.label()))
+}
+
+/// Re-style every steering-lifecycle line with its stage's slot.
+///
+/// Deliberately a *patch* of the existing spans rather than a prepended badge: the
+/// stage is already spelled in the label, and a second glyph would collide with the
+/// verdict badge [`verdict_marks`] puts on a line whose quoted instruction happens to
+/// carry a marker word.
+fn steer_mark(line: Line<'static>) -> Line<'static> {
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    let Some(stage) = steer_stage_of(&text) else {
+        return line;
+    };
+    let style = steer_style(stage);
+    Line::from(
+        line.spans
+            .into_iter()
+            .map(|span| Span::styled(span.content.into_owned(), span.style.patch(style)))
+            .collect::<Vec<Span<'static>>>(),
+    )
+}
+
+/// Emphasise every steering-lifecycle line in a run of body lines.
+pub(crate) fn steer_marks(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    lines.into_iter().map(steer_mark).collect()
+}
 
 /// What the transcript draws this frame: the pane owns the whole body, so every
 /// conversation string it paints arrives here (spec §3, Transcript row).
@@ -261,7 +325,10 @@ fn body_lines(body: &TranscriptBody<'_>) -> Vec<Line<'static>> {
     if !body.steer.is_empty() {
         lines.extend(verdict_marks(steer_lines(body.steer, body.messages)));
     }
-    lines
+    // Steering-lifecycle lines last, so the stage colour wins over any verdict badge
+    // colouring a quoted instruction happens to attract: the line is *about* the
+    // instruction, and the stage is the fact the operator is reading.
+    steer_marks(lines)
 }
 
 /// The streaming reasoning region (§8.2), think-tag free, dimmed and italic.
@@ -1242,5 +1309,88 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    /// The three steering stages each keep their own palette slot, and a line that
+    /// only *mentions* a queue word keeps whatever colour the message carried.
+    /// The pane never prepends a badge: the label the renderer wrote stays intact.
+    #[test]
+    fn a_steering_line_takes_the_palette_slot_of_its_stage() {
+        let painted = steer_marks(vec![
+            Line::raw(format!(
+                "{STEER_LINE_PREFIX}queued → manager] shorten the fixture — held for the next seam"
+            )),
+            Line::raw(format!(
+                "{STEER_LINE_PREFIX}delivered → coder-t-011] shorten the fixture — filed in the \
+                 specialist's inbox (notice id notice-7)"
+            )),
+            Line::raw(format!(
+                "{STEER_LINE_PREFIX}not delivered → ghost-agent] shorten the fixture — addressed \
+                 no live worker"
+            )),
+            Line::raw("User: the queue is empty"),
+        ]);
+        assert_eq!(
+            painted[0].spans[0].style.fg,
+            theme::chip_pending().fg,
+            "a held instruction reads like a pending one"
+        );
+        assert_eq!(
+            painted[1].spans[0].style.fg,
+            theme::chip_done().fg,
+            "an instruction that reached its addressee reads as done"
+        );
+        assert_eq!(
+            painted[2].spans[0].style.fg,
+            theme::error().fg,
+            "an instruction that never got there reads as an error"
+        );
+        let queued = painted[0].spans[0].style.fg;
+        let delivered = painted[1].spans[0].style.fg;
+        let revoked = painted[2].spans[0].style.fg;
+        assert_ne!(queued, delivered);
+        assert_ne!(delivered, revoked);
+        assert_ne!(queued, revoked);
+        // The body line is untouched: no colour is borrowed from the steering slots.
+        assert_eq!(painted[3].spans[0].style, Style::default());
+        let label: String = painted[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            label.starts_with(STEER_LINE_PREFIX) && label.contains("queued → manager"),
+            "the renderer's label survives unchanged: {label}"
+        );
+    }
+
+    /// The stage is read off the label the renderer wrote — nothing else. A line that
+    /// carries a queue word somewhere in its text, or a label naming a stage the
+    /// bridge cannot report, is left exactly as it arrived.
+    #[test]
+    fn only_the_three_stage_labels_are_read_as_steering_stages() {
+        assert_eq!(
+            steer_stage_of(&format!("{STEER_LINE_PREFIX}queued → manager] x")),
+            Some(SteerStage::Queued)
+        );
+        assert_eq!(
+            steer_stage_of(&format!("{STEER_LINE_PREFIX}delivered → coder-t-1] x")),
+            Some(SteerStage::Delivered)
+        );
+        assert_eq!(
+            steer_stage_of(&format!("{STEER_LINE_PREFIX}not delivered → ghost] x")),
+            Some(SteerStage::Revoked)
+        );
+        assert_eq!(
+            steer_stage_of(&format!("{STEER_LINE_PREFIX}round 3 → manager] x")),
+            None,
+            "an arbitration round is not a stage the bridge can report"
+        );
+        assert_eq!(steer_stage_of("User: the queue is empty"), None);
+        assert_eq!(steer_stage_of(STEER_LINE_PREFIX), None);
+        // No badge is added to a line that is not a steering line.
+        let untouched = steer_mark(Line::raw("User: the queue is empty"));
+        assert_eq!(untouched.spans.len(), 1);
+        assert_eq!(untouched.spans[0].style, Style::default());
     }
 }

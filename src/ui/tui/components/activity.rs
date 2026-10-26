@@ -23,10 +23,11 @@
 //!
 //! [`ActivityData`] is built by `TuiRenderer::draw_new_ui` and carries `focus` /
 //! `rows` / `selected` / `detail_present` / `scroll` / `list_scroll` /
-//! `show_thought` / `thinking_budget`. The rows now carry the four lifecycle fields
-//! D1 added to [`SubagentDetail`] (`status_label`, `implementation_turns`,
-//! `validation_rounds`, `latest_validator_feedback`), mirrored from
-//! [`orchestrator::WorkerEntry`] by `TuiRenderer::set_subagents`.
+//! `show_thought` / `thinking_budget` / `steering` (the selected worker's own
+//! steering notices, peeked from the orchestrator inbox). The rows now carry the
+//! four lifecycle fields D1 added to [`SubagentDetail`] (`status_label`,
+//! `implementation_turns`, `validation_rounds`, `latest_validator_feedback`),
+//! mirrored from [`orchestrator::WorkerEntry`] by `TuiRenderer::set_subagents`.
 //!
 //! * `status_label` is what lets an aborted or validator-rejected worker read
 //!   `✗ failed` instead of `✓ done`: with only `is_active` / `paused` / `queue`
@@ -74,6 +75,13 @@ const ROSTER_MIN: u16 = 4;
 /// Detail floor of §2.3.
 const DETAIL_MIN: u16 = 3;
 
+/// How many of a worker's queued steering notices the detail half names before it
+/// collapses the rest into a count. The inbox itself is bounded by the orchestrator;
+/// this only bounds the printed block so a deep inbox cannot eat the detail half.
+const MAX_DETAIL_STEERING_NOTICES: usize = 3;
+/// Cell budget of the quoted instruction inside one `[Steering]` line.
+const MAX_DETAIL_STEERING_CHARS: usize = 120;
+
 /// What the worker pane draws this frame.
 #[derive(Debug, Clone, Copy)]
 pub struct ActivityData<'a> {
@@ -96,6 +104,14 @@ pub struct ActivityData<'a> {
     /// The selected worker's thinking budget, for the `~N tokens of M budget`
     /// header under `[Thinking]`.
     pub thinking_budget: Option<usize>,
+    /// The steering notices **waiting in this worker's inbox** right now, read by the
+    /// renderer from the orchestrator's own bounded inboxes
+    /// ([`crate::orchestrator::notice::peek_worker_inbox`] — a peek, never a drain).
+    ///
+    /// This is the targeting half of the steering affordance (spec §3, §8.3; DATA §6 gap
+    /// 7): which instruction the arbitrator routed to *this* specialist, and how long it
+    /// has been sitting there. The pane invents nothing — an empty slice prints nothing.
+    pub steering: &'a [crate::orchestrator::SteerNotice],
 }
 
 /// Where the two scrollable halves landed this frame. The renderer writes these
@@ -410,6 +426,7 @@ fn draw_detail(
         body.width,
         data.show_thought,
         data.thinking_budget,
+        data.steering,
     );
     let total = count_wrapped_rendered_lines(&lines, usize::from(body.width));
     let scrollbar = total > height && body.width > 1;
@@ -461,9 +478,87 @@ fn detail_lines(
     width: u16,
     show_thought: bool,
     thinking_budget: Option<usize>,
+    steering: &[crate::orchestrator::SteerNotice],
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(fit_spans(row_spans(row, entry), width))];
     let mut sections = Vec::new();
+
+    // Why this row reads `⏸ paused` (spec §7.2, §8.3). The flag is written by exactly one
+    // thing — the typed stream-pause transition the preemption handshake emits when a
+    // steering round takes the worker's model slot — so the pane can state the mechanism
+    // honestly instead of guessing a cause from status prose (which a pause is explicitly
+    // never derived from). The `[Steering]` block below then names what is waiting behind
+    // it in this worker's own inbox.
+    if row.paused {
+        sections.push(Line::from(vec![
+            Glyph::Paused.badge(),
+            Span::styled(
+                "  this stream yielded its model slot to the Steer Arbitrator".to_string(),
+                theme::chip_pending(),
+            ),
+        ]));
+        sections.push(Line::styled(
+            "  why: a steering instruction is being arbitrated, and the preemption \
+             handshake reclaims the slot when that round ends"
+                .to_string(),
+            theme::text_dim(),
+        ));
+        sections.push(Line::styled(
+            format!(
+                "  still running: the worker stays registered and dispatched — pausing a \
+                 stream never closes the row{}",
+                if steering.is_empty() {
+                    "".to_string()
+                } else {
+                    format!(
+                        ", and {} steering notice(s) are already queued in front of it",
+                        steering.len()
+                    )
+                }
+            ),
+            theme::text_dim(),
+        ));
+    }
+
+    // Which steering instructions the arbitrator routed to **this** specialist, from the
+    // inbox the orchestrator itself owns. Ages are the notice clock's, not the pane's.
+    if !steering.is_empty() {
+        sections.push(Line::styled(
+            format!(
+                "[Steering] {} notice(s) waiting for this specialist",
+                steering.len()
+            ),
+            theme::chip_pending(),
+        ));
+        for notice in steering.iter().take(MAX_DETAIL_STEERING_NOTICES) {
+            let age_secs = crate::orchestrator::notice::notice_age_ms(notice) / 1000;
+            let expired = if crate::orchestrator::notice::is_notice_expired(notice) {
+                ", unanswered past its lifetime"
+            } else {
+                ""
+            };
+            sections.push(Line::from(vec![
+                Span::styled(format!(" {} ", notice.notice_id), theme::frame_focus()),
+                Span::styled(
+                    format!(
+                        "\"{}\" (waiting {}s{expired})",
+                        one_line(&notice.user_inquiry, MAX_DETAIL_STEERING_CHARS),
+                        age_secs
+                    ),
+                    theme::text_primary(),
+                ),
+            ]));
+        }
+        if steering.len() > MAX_DETAIL_STEERING_NOTICES {
+            sections.push(Line::styled(
+                format!(
+                    " +{} more in this inbox",
+                    steering.len() - MAX_DETAIL_STEERING_NOTICES
+                ),
+                theme::text_dim(),
+            ));
+        }
+    }
 
     // The registry's latest validator feedback, printed verbatim (plumbing delta D1,
     // §9.3). A `Rejected` row is the case this exists for: the glyph says the
@@ -777,6 +872,22 @@ fn format_elapsed(secs: u64) -> String {
     }
 }
 
+/// Collapse a multi-line instruction into one quoted line, clipped at `max_chars`
+/// characters. The steering notices carry raw operator text, which may be any number
+/// of lines: the `[Steering]` block prints one notice per row, so the whitespace is
+/// folded and the tail is marked with the shared ellipsis. Characters, not bytes, so
+/// the cut can never land inside a multi-byte code point.
+fn one_line(text: &str, max_chars: usize) -> String {
+    let folded = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let chars: Vec<char> = folded.chars().collect();
+    if chars.len() <= max_chars {
+        return folded;
+    }
+    let mut head: String = chars[..max_chars].iter().collect();
+    head.push(theme::ELLIPSIS);
+    head
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -822,6 +933,7 @@ mod tests {
     fn roster_shows_every_worker_beyond_the_three_row_cap() {
         let workers = rows(12);
         let data = ActivityData {
+            steering: &[],
             focus: true,
             rows: &workers,
             selected: 0,
@@ -846,6 +958,7 @@ mod tests {
     fn every_row_stays_reachable_when_the_roster_is_clipped() {
         let workers = rows(12);
         let data = ActivityData {
+            steering: &[],
             focus: true,
             rows: &workers,
             selected: 11,
@@ -874,6 +987,7 @@ mod tests {
         let mut workers = rows(3);
         workers[1].paused = true;
         let data = ActivityData {
+            steering: &[],
             focus: false,
             rows: &workers,
             selected: 1,
@@ -894,6 +1008,7 @@ mod tests {
         let mut workers = rows(1);
         workers[0].queue = Some(crate::ui::QueueState { position: 2, of: 3 });
         let data = ActivityData {
+            steering: &[],
             focus: false,
             rows: &workers,
             selected: 0,
@@ -912,6 +1027,7 @@ mod tests {
     fn empty_roster_shows_the_spec_empty_state() {
         let workers: Vec<SubagentDetail> = Vec::new();
         let data = ActivityData {
+            steering: &[],
             focus: true,
             rows: &workers,
             selected: 0,
@@ -932,6 +1048,7 @@ mod tests {
         workers[0].context_tokens = 12_400;
         workers[0].worked_duration = Duration::from_secs(125);
         let data = ActivityData {
+            steering: &[],
             focus: false,
             rows: &workers,
             selected: 0,
@@ -950,6 +1067,7 @@ mod tests {
     fn no_round_counter_is_invented() {
         let workers = rows(2);
         let data = ActivityData {
+            steering: &[],
             focus: true,
             rows: &workers,
             selected: 0,
@@ -971,6 +1089,7 @@ mod tests {
     fn exactly_one_row_is_marked_selected() {
         let workers = rows(5);
         let data = ActivityData {
+            steering: &[],
             focus: true,
             rows: &workers,
             selected: 2,
@@ -996,6 +1115,7 @@ mod tests {
             "\x1b[32mgreen log line\x1b[0m".to_string(),
         ];
         let data = ActivityData {
+            steering: &[],
             focus: true,
             rows: &workers,
             selected: 0,
@@ -1022,6 +1142,7 @@ mod tests {
         let mut workers = rows(1);
         workers[0].thinking = "private chain of thought".to_string();
         let data = ActivityData {
+            steering: &[],
             focus: true,
             rows: &workers,
             selected: 0,
@@ -1043,6 +1164,7 @@ mod tests {
     fn detail_half_is_absent_in_a_narrow_column() {
         let workers = rows(2);
         let data = ActivityData {
+            steering: &[],
             focus: false,
             rows: &workers,
             selected: 0,
@@ -1078,6 +1200,7 @@ mod tests {
     fn a_pane_too_short_for_both_halves_says_so() {
         let workers = rows(2);
         let data = ActivityData {
+            steering: &[],
             focus: true,
             rows: &workers,
             selected: 0,
@@ -1098,6 +1221,7 @@ mod tests {
     fn selection_index_out_of_range_clamps_instead_of_panicking() {
         let workers = rows(3);
         let data = ActivityData {
+            steering: &[],
             focus: true,
             rows: &workers,
             selected: 99,
@@ -1116,6 +1240,7 @@ mod tests {
     fn degenerate_rects_are_ignored_without_panicking() {
         let workers = rows(2);
         let data = ActivityData {
+            steering: &[],
             focus: false,
             rows: &workers,
             selected: 0,
@@ -1139,6 +1264,7 @@ mod tests {
     fn chip_row_never_spills_the_pane_width() {
         let workers = rows(12);
         let data = ActivityData {
+            steering: &[],
             focus: true,
             rows: &workers,
             selected: 0,
@@ -1163,6 +1289,7 @@ mod tests {
         // prints `▶`/`⧗`/`⏸`/`✓` glyphs that must not be assumed to be one cell.
         let workers = rows(12);
         let data = ActivityData {
+            steering: &[],
             focus: true,
             rows: &workers,
             selected: 3,
@@ -1225,6 +1352,7 @@ mod tests {
         let workers = rows(12);
         for selected in 0..12 {
             let data = ActivityData {
+                steering: &[],
                 focus: true,
                 rows: &workers,
                 selected,
@@ -1250,6 +1378,7 @@ mod tests {
         // And the roster really is clipped at this height: the oldest row is off
         // screen while the newest one is selected.
         let data = ActivityData {
+            steering: &[],
             focus: true,
             rows: &workers,
             selected: 11,
@@ -1271,6 +1400,7 @@ mod tests {
         let workers = rows(3);
         for focus in [true, false] {
             let data = ActivityData {
+                steering: &[],
                 focus,
                 rows: &workers,
                 selected: 1,
@@ -1330,6 +1460,7 @@ mod tests {
             .map(|i| format!("log line {i:02} {}", "y".repeat(40)))
             .collect();
         let data = ActivityData {
+            steering: &[],
             focus: true,
             rows: &workers,
             selected: 0,
@@ -1369,6 +1500,7 @@ mod tests {
         // handed back so the event clamps match the picture.
         let workers = rows(12);
         let scrolled = ActivityData {
+            steering: &[],
             focus: true,
             rows: &workers,
             selected: 5,
@@ -1385,6 +1517,7 @@ mod tests {
 
         // An offset past the end is lowered, never wrapped.
         let past = ActivityData {
+            steering: &[],
             selected: 11,
             list_scroll: 999,
             ..scrolled
@@ -1400,6 +1533,7 @@ mod tests {
         // The minimal reveal survives: an offset that would hide the selection is
         // pulled back only as far as it must be.
         let hidden = ActivityData {
+            steering: &[],
             selected: 11,
             list_scroll: 0,
             ..scrolled
@@ -1417,6 +1551,7 @@ mod tests {
         let mut workers = rows(1);
         workers[0].content = "line\n".repeat(60);
         let data = ActivityData {
+            steering: &[],
             focus: true,
             rows: &workers,
             selected: 0,
@@ -1438,6 +1573,7 @@ mod tests {
         let mut workers = rows(1);
         workers[0].thinking = "first I read the plan\nthen I edit".to_string();
         let shown = ActivityData {
+            steering: &[],
             focus: true,
             rows: &workers,
             selected: 0,
@@ -1456,6 +1592,7 @@ mod tests {
 
         // No budget for this row: still shown, without a fabricated budget figure.
         let unbudged = ActivityData {
+            steering: &[],
             thinking_budget: None,
             ..shown
         };
@@ -1490,6 +1627,7 @@ mod tests {
             let mut closed = row("coder-t-900", "t-900", false);
             closed.status_label = Some(label.to_string());
             let data = ActivityData {
+                steering: &[],
                 focus: true,
                 rows: &[closed],
                 selected: 0,
@@ -1531,6 +1669,7 @@ mod tests {
         let mut approved = row("coder-t-901", "t-901", false);
         approved.status_label = Some("Approved".to_string());
         let data = ActivityData {
+            steering: &[],
             focus: true,
             rows: &[approved],
             selected: 0,
@@ -1570,6 +1709,7 @@ mod tests {
         let mut revising = row("coder-t-902", "t-902", true);
         revising.status_label = Some("Revising".to_string());
         let data = ActivityData {
+            steering: &[],
             focus: true,
             rows: &[revising],
             selected: 0,
@@ -1595,6 +1735,7 @@ mod tests {
         reviewed.validation_rounds = 2;
         reviewed.implementation_turns = 3;
         let data = ActivityData {
+            steering: &[],
             focus: true,
             rows: &[reviewed],
             selected: 0,
@@ -1610,6 +1751,7 @@ mod tests {
 
         let plain = row("coder-t-904", "t-904", true);
         let data = ActivityData {
+            steering: &[],
             focus: true,
             rows: &[plain],
             selected: 0,
@@ -1633,6 +1775,7 @@ mod tests {
         rejected.latest_validator_feedback =
             Some("definition not used in a test\nclippy: unused import".to_string());
         let data = ActivityData {
+            steering: &[],
             focus: true,
             rows: &[rejected],
             selected: 0,
@@ -1650,6 +1793,7 @@ mod tests {
         // No feedback recorded: the section is absent, not empty.
         let clean = row("coder-t-906", "t-906", false);
         let data = ActivityData {
+            steering: &[],
             focus: true,
             rows: &[clean],
             selected: 0,
@@ -1661,5 +1805,227 @@ mod tests {
         };
         let text = rows_text(80, 20, &data).join("\n");
         assert!(!text.contains("[Validator]"), "{text}");
+    }
+
+    /// A notice filed for this specialist is named in its own detail half: the
+    /// instruction, the notice id it has to reply to, and how long it has waited.
+    /// The slice is the renderer's peek of the orchestrator's own inbox, so this is
+    /// targeting data, not a guess from status prose (spec §3, §8.3).
+    #[test]
+    fn the_detail_half_lists_the_notices_waiting_in_this_workers_inbox() {
+        let now_ms = crate::orchestrator::notice::notice_now_ms_for_test();
+        let notices = [crate::orchestrator::SteerNotice {
+            notice_id: "notice-t013b-one".to_string(),
+            user_inquiry: "switch to\nthe shorter fixture".to_string(),
+            target_worker: "coder-t-907".to_string(),
+            created_at_ms: now_ms,
+        }];
+        let running = row("coder-t-907", "t-907", true);
+        let data = ActivityData {
+            steering: &notices,
+            focus: true,
+            rows: &[running],
+            selected: 0,
+            detail_present: true,
+            scroll: 0,
+            list_scroll: 0,
+            show_thought: false,
+            thinking_budget: None,
+        };
+        let text = rows_text(90, 24, &data).join("\n");
+        assert!(
+            text.contains("[Steering] 1 notice(s) waiting for this specialist"),
+            "{text}"
+        );
+        assert!(text.contains("notice-t013b-one"), "{text}");
+        assert!(
+            text.contains("\"switch to the shorter fixture\""),
+            "the instruction is folded onto one line: {text}"
+        );
+        assert!(text.contains("(waiting 0s)"), "{text}");
+    }
+
+    /// An empty inbox prints nothing at all: the pane never announces steering the
+    /// arbitrator did not file, and never prints a reassuring zero.
+    #[test]
+    fn an_empty_inbox_prints_no_steering_block() {
+        let running = row("coder-t-908", "t-908", true);
+        let data = ActivityData {
+            steering: &[],
+            focus: true,
+            rows: &[running],
+            selected: 0,
+            detail_present: true,
+            scroll: 0,
+            list_scroll: 0,
+            show_thought: false,
+            thinking_budget: None,
+        };
+        let text = rows_text(90, 24, &data).join("\n");
+        assert!(!text.contains("[Steering]"), "{text}");
+        assert!(!text.contains("notice"), "{text}");
+    }
+
+    /// A deep inbox is capped and the remainder is named as a count — the numbers are
+    /// the inbox's own length, so the pane cannot over- or under-state it.
+    #[test]
+    fn a_deep_inbox_is_capped_and_the_remainder_is_named_as_a_count() {
+        let now_ms = crate::orchestrator::notice::notice_now_ms_for_test();
+        let notices: Vec<crate::orchestrator::SteerNotice> = (0..5)
+            .map(|i| crate::orchestrator::SteerNotice {
+                notice_id: format!("notice-t013b-{i}"),
+                user_inquiry: format!("instruction {i}"),
+                target_worker: "coder-t-909".to_string(),
+                created_at_ms: now_ms,
+            })
+            .collect();
+        let running = row("coder-t-909", "t-909", true);
+        let data = ActivityData {
+            steering: &notices,
+            focus: true,
+            rows: &[running],
+            selected: 0,
+            detail_present: true,
+            scroll: 0,
+            list_scroll: 0,
+            show_thought: false,
+            thinking_budget: None,
+        };
+        let text = rows_text(90, 40, &data).join("\n");
+        assert!(
+            text.contains("[Steering] 5 notice(s) waiting for this specialist"),
+            "{text}"
+        );
+        for listed in 0..MAX_DETAIL_STEERING_NOTICES {
+            assert!(
+                text.contains(&format!("notice-t013b-{listed}")),
+                "notice {listed} must be named: {text}"
+            );
+        }
+        assert!(
+            !text.contains(&format!("notice-t013b-{}", MAX_DETAIL_STEERING_NOTICES + 1)),
+            "the cap must hold: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "+{} more in this inbox",
+                5 - MAX_DETAIL_STEERING_NOTICES
+            )),
+            "{text}"
+        );
+    }
+
+    /// A paused row says *why*: the flag has exactly one writer — the preemption
+    /// handshake that reclaims the stream's model slot for a steering round — so the
+    /// pane states that mechanism (spec §7.2, §8.3). The cause is never derived from
+    /// status prose, and the row is never closed by the pause.
+    #[test]
+    fn a_paused_row_states_why_it_gave_up_its_model_slot() {
+        let mut held = row("coder-t-910", "t-910", true);
+        held.paused = true;
+        let data = ActivityData {
+            steering: &[],
+            focus: true,
+            rows: &[held],
+            selected: 0,
+            detail_present: true,
+            scroll: 0,
+            list_scroll: 0,
+            show_thought: false,
+            thinking_budget: None,
+        };
+        let text = rows_text(90, 24, &data).join("\n");
+        assert!(
+            text.contains("yielded its model slot to the Steer Arbitrator"),
+            "{text}"
+        );
+        assert!(
+            text.contains("why: a steering instruction is being arbitrated"),
+            "{text}"
+        );
+        assert!(
+            text.contains("still running: the worker stays registered and dispatched"),
+            "a pause must not read as a closed row: {text}"
+        );
+    }
+
+    /// The counter-case of the pause affordance: a row the arbitrator never paused
+    /// prints no pause cause, and no arbitration round number is invented in its
+    /// place (§8.4).
+    #[test]
+    fn a_running_row_never_prints_a_pause_cause() {
+        let running = row("coder-t-911", "t-911", true);
+        let data = ActivityData {
+            steering: &[],
+            focus: true,
+            rows: &[running],
+            selected: 0,
+            detail_present: true,
+            scroll: 0,
+            list_scroll: 0,
+            show_thought: false,
+            thinking_budget: None,
+        };
+        let text = rows_text(90, 24, &data).join("\n");
+        assert!(!text.contains("model slot"), "{text}");
+        assert!(!text.contains("why:"), "{text}");
+        assert!(!text.contains("round"), "{text}");
+    }
+
+    /// The pause cause and the inbox are one sentence when both are true: the row
+    /// states how many notices are already waiting in front of it.
+    #[test]
+    fn a_paused_row_names_the_notices_queued_in_front_of_it() {
+        let now_ms = crate::orchestrator::notice::notice_now_ms_for_test();
+        let notices = [
+            crate::orchestrator::SteerNotice {
+                notice_id: "notice-t013b-a".to_string(),
+                user_inquiry: "first".to_string(),
+                target_worker: "coder-t-912".to_string(),
+                created_at_ms: now_ms,
+            },
+            crate::orchestrator::SteerNotice {
+                notice_id: "notice-t013b-b".to_string(),
+                user_inquiry: "second".to_string(),
+                target_worker: "coder-t-912".to_string(),
+                created_at_ms: now_ms,
+            },
+        ];
+        let mut held = row("coder-t-912", "t-912", true);
+        held.paused = true;
+        let data = ActivityData {
+            steering: &notices,
+            focus: true,
+            rows: &[held],
+            selected: 0,
+            detail_present: true,
+            scroll: 0,
+            list_scroll: 0,
+            show_thought: false,
+            thinking_budget: None,
+        };
+        let text = rows_text(90, 30, &data).join("\n");
+        assert!(
+            text.contains("2 steering notice(s) are already queued in front of it"),
+            "{text}"
+        );
+    }
+
+    /// The quote fold is the pane's only edit of the operator's words: whitespace is
+    /// collapsed, and a long instruction is cut at the character budget with the
+    /// shared ellipsis — never mid-code-point.
+    #[test]
+    fn one_line_folds_whitespace_and_marks_the_cut() {
+        assert_eq!(
+            one_line("  fold\n  these\tlines ", 40),
+            "fold these lines".to_string()
+        );
+        let long = one_line("日本語の instruktion som är lång", 6);
+        assert_eq!(long, "日本語の i…".to_string(), "cut at 6 characters");
+        assert_eq!(
+            one_line("exact budget", 12),
+            "exact budget".to_string(),
+            "a text at the budget is not cut"
+        );
     }
 }

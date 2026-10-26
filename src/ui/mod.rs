@@ -110,6 +110,82 @@ pub struct SubagentDetail {
     pub latest_validator_feedback: Option<String>,
 }
 
+/// Where one operator steering instruction stands between submission and effect.
+///
+/// The three states are exactly what the bridge can know about an instruction it
+/// was handed: it is being **held** for a later seam, it **reached** the addressee
+/// the arbitration chose, or it will **never** be applied. Nothing else is claimed:
+/// the bridge never invents a fourth state, and a state is only ever reported for
+/// an instruction the bridge itself queued, forwarded or refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteerStage {
+    /// Held for a later seam — the Manager's next turn, or a specialist's inbox
+    /// that has not drained it yet.
+    Queued,
+    /// Reached its addressee: filed into a live specialist's inbox (with a notice
+    /// id), delegated to a specialist, or handed to the Manager.
+    Delivered,
+    /// Will never be applied: the arbitrator addressed a token no live worker
+    /// drains, so no notice was filed, or the notice sat past its TTL.
+    Revoked,
+}
+
+impl SteerStage {
+    /// The word the panes print for this stage. Presentation stays in the panes;
+    /// this is only the vocabulary they share with the bridge.
+    pub const fn label(self) -> &'static str {
+        match self {
+            SteerStage::Queued => "queued",
+            SteerStage::Delivered => "delivered",
+            SteerStage::Revoked => "not delivered",
+        }
+    }
+}
+
+/// Addressee label of an instruction the bridge hands to the **Manager** rather
+/// than to a specialist. Spelled once so no pane has to invent a name for it.
+pub const MANAGER_TARGET: &str = "manager";
+
+/// One steering instruction, as the bridge saw it: the text it was handed, who it
+/// ended up addressed to, and what happened to it.
+///
+/// This is a **projection of bridge state**, never a second owner of it: a trace is
+/// built at the exact statement where the bridge touches its own `steer_queue` or
+/// files a notice, from the values that statement already holds. It changes no
+/// arbitration, preemption or routing decision — it is the part of the plumbing
+/// that gets to speak.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SteerTrace {
+    /// What happened to it.
+    pub stage: SteerStage,
+    /// The operator's instruction, verbatim as the bridge received it.
+    pub text: String,
+    /// The effective registry key it is addressed to, or [`MANAGER_TARGET`].
+    pub target: String,
+    /// The notice this instruction became, when it became one.
+    pub notice_id: Option<String>,
+    /// Why this stage, in the bridge's own machine-readable words (the sleep chain
+    /// that ended the round, the unroutable token, the delegated task id…).
+    pub reason: String,
+}
+
+impl SteerTrace {
+    /// A trace for an instruction the bridge is holding for a later seam.
+    pub fn queued(
+        text: impl Into<String>,
+        target: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            stage: SteerStage::Queued,
+            text: text.into(),
+            target: target.into(),
+            notice_id: None,
+            reason: reason.into(),
+        }
+    }
+}
+
 /// A single agent event dispatched to the active renderer.
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -215,6 +291,22 @@ pub trait Renderer: Send {
     fn set_subagents(&mut self, _subagents: Vec<SubagentDetail>) {}
     fn set_thinking_budgets(&mut self, _cfg: &crate::config::Config) {}
     fn reset_active_agent(&mut self) {}
+
+    // ---- steering-instruction lifecycle (spec §3, §8.3; DATA §6 gap 7) ----
+    //
+    // A steering instruction that the bridge queued, forwarded or refused is state
+    // the operator cannot otherwise see: `steer_queue` is a local of the session
+    // loop, and a notice lives in the orchestrator's bounded inboxes. So the bridge
+    // hands a *projection* of each transition to the renderer here, built from the
+    // values at the statement that already touches the queue or files the notice.
+    //
+    // Default body is a no-op: a renderer without the affordance (headless raw mode,
+    // the CLI, every test renderer) behaves byte-for-byte as before, and no
+    // arbitration, preemption or routing decision is influenced by whether anyone
+    // listens.
+
+    /// Report one steering-instruction transition to the renderer.
+    fn note_steer(&mut self, _trace: &SteerTrace) {}
 
     // ---- destructive-command gate (spec §5, §6, G3) ----
     //

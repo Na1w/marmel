@@ -2,10 +2,10 @@
 
 use super::arbiter::{self, ArbitrationChannel, SleepNotice};
 use super::drain::drain_steer_arbitration_events;
-use super::steer::{SharedSteeringHistory, SteerArbEvent};
+use super::steer::{SharedSteeringHistory, SteerArbEvent, queue_steer, queue_steer_as};
 use crate::llm::{ChatClient, PauseAction, StreamControl, StreamEvent, StreamSink};
 use crate::ui::helpers::{is_abort_for_renderer, is_reset_command};
-use crate::ui::{Event, Renderer, SubagentDetail};
+use crate::ui::{Event, MANAGER_TARGET, Renderer, SteerStage, SteerTrace, SubagentDetail};
 use std::sync::Arc;
 
 /// What the paused-stream host asks the sleep chain for, given the `Sleep` decision it renders.
@@ -236,7 +236,15 @@ impl StreamSink for RendererSink<'_> {
             if arbiter::is_terminal_sleep(decision.as_ref()) {
                 let reason = arbiter::durable_steer_reason(&sleep);
                 tracing::warn!(reason = %reason, "Steering instruction survived a cancelled arbitrator sleep — queued for the next seam");
-                self.steer_queue.push(user_msg.to_string());
+                queue_steer(
+                    self.steer_queue,
+                    self.renderer,
+                    &SteerTrace::queued(
+                        user_msg,
+                        MANAGER_TARGET,
+                        format!("the arbitrator's sleep was cancelled before it acted — {reason}"),
+                    ),
+                );
                 self.renderer
                     .on_event(&Event::Status(arbiter::durable_steer_status(&reason)));
                 let _ = self.renderer.flush();
@@ -254,6 +262,20 @@ impl StreamSink for RendererSink<'_> {
         for outcome in &outcomes {
             match outcome {
                 arbiter::ForwardOutcome::Posted(posted) => {
+                    self.renderer.note_steer(&SteerTrace {
+                        stage: SteerStage::Delivered,
+                        text: user_msg.to_string(),
+                        target: posted.target.clone(),
+                        notice_id: Some(posted.notice_id.clone()),
+                        reason: if posted.dropped_older.is_empty() {
+                            "filed in the specialist's inbox; awaiting its reply".to_string()
+                        } else {
+                            format!(
+                                "filed in the specialist's inbox; {} older notice(s) dropped by the inbox cap",
+                                posted.dropped_older.len()
+                            )
+                        },
+                    });
                     self.renderer.on_event(&Event::Status(format!(
                         "Notice {} forwarded to {} — resuming stream...",
                         posted.notice_id, posted.target
@@ -269,6 +291,13 @@ impl StreamSink for RendererSink<'_> {
                 }
                 arbiter::ForwardOutcome::Unroutable { token } => {
                     // Never filed into an inbox no worker drains: the refusal is surfaced.
+                    self.renderer.note_steer(&SteerTrace {
+                        stage: SteerStage::Revoked,
+                        text: user_msg.to_string(),
+                        target: token.clone(),
+                        notice_id: None,
+                        reason: arbiter::unroutable_target_text(token),
+                    });
                     self.renderer.on_event(&Event::Status(format!(
                         "[Arbitrator] {}",
                         arbiter::unroutable_target_text(token)
@@ -342,6 +371,17 @@ impl StreamSink for RendererSink<'_> {
                     agent.as_str()
                 )));
                 let _ = self.renderer.flush();
+
+                // The instruction reached a specialist — this host ran it inline, so this is
+                // where that becomes visible. The deliverable report below still enters the
+                // queue exactly as before; the projection names the instruction itself.
+                self.renderer.note_steer(&SteerTrace {
+                    stage: SteerStage::Delivered,
+                    text: user_msg.to_string(),
+                    target: agent.as_str().to_string(),
+                    notice_id: None,
+                    reason: format!("the arbitrator delegated it as subtask '{task_id}'"),
+                });
 
                 self.steer_queue.push(format!(
                     "(User steering resulted in subtask '{task_id}' executed by specialist '{}'. Deliverable:\n{})",
@@ -417,7 +457,17 @@ impl StreamSink for RendererSink<'_> {
                     // Durable steering: a terminal `Sleep` must not swallow the instruction —
                     // it is queued and delivered at the next seam instead.
                     let reason = arbiter::durable_steer_reason(&sleep);
-                    self.steer_queue.push(user_msg.to_string());
+                    queue_steer(
+                        self.steer_queue,
+                        self.renderer,
+                        &SteerTrace::queued(
+                            user_msg,
+                            MANAGER_TARGET,
+                            format!(
+                                "the arbitrator finished sleeping without acting on it — {reason}"
+                            ),
+                        ),
+                    );
                     self.renderer
                         .on_event(&Event::Status(arbiter::durable_steer_status(&reason)));
                     let _ = self.renderer.flush();
@@ -426,7 +476,15 @@ impl StreamSink for RendererSink<'_> {
                 "AbortImmediately" => {
                     self.renderer.request_abort();
                     *self.steer_abort_requested = true;
-                    self.steer_queue.push(user_msg.to_string());
+                    queue_steer(
+                        self.steer_queue,
+                        self.renderer,
+                        &SteerTrace::queued(
+                            user_msg,
+                            MANAGER_TARGET,
+                            "the arbitrator asked for an immediate abort; the instruction is handed to the Manager",
+                        ),
+                    );
                     self.renderer.on_event(&Event::Status(
                         "Steering requested immediate abort".to_string(),
                     ));
@@ -436,8 +494,17 @@ impl StreamSink for RendererSink<'_> {
                 "RejectPlan" => {
                     self.renderer.request_abort();
                     *self.steer_abort_requested = true;
-                    self.steer_queue
-                        .push(format!("User rejected plan: {user_msg}"));
+                    let queued = format!("User rejected plan: {user_msg}");
+                    queue_steer_as(
+                        self.steer_queue,
+                        self.renderer,
+                        &SteerTrace::queued(
+                            user_msg,
+                            MANAGER_TARGET,
+                            "the arbitrator rejected the plan",
+                        ),
+                        &queued,
+                    );
                     self.renderer.on_event(&Event::Status(
                         "Plan rejected — aborting current turn".to_string(),
                     ));
@@ -454,7 +521,15 @@ impl StreamSink for RendererSink<'_> {
                         // Nothing was filed (no `ForwardNotice` subtask, or every target was
                         // refused): the instruction must survive, so it is queued for the next
                         // seam instead of being dropped with this pause.
-                        self.steer_queue.push(user_msg.to_string());
+                        queue_steer(
+                            self.steer_queue,
+                            self.renderer,
+                            &SteerTrace::queued(
+                                user_msg,
+                                MANAGER_TARGET,
+                                "no forwarding notice was posted for this instruction",
+                            ),
+                        );
                         self.renderer.on_event(&Event::Status(
                             "No forwarding notice was posted for this steering instruction — \
                              queued for the next turn instead"
@@ -468,7 +543,18 @@ impl StreamSink for RendererSink<'_> {
                     PauseAction::Resume
                 }
                 "ApprovePlan" => {
-                    self.steer_queue.push("User approved plan.".to_string());
+                    // The queue receives the wrapper it always received; the pane names the
+                    // instruction the operator actually sent.
+                    queue_steer_as(
+                        self.steer_queue,
+                        self.renderer,
+                        &SteerTrace::queued(
+                            user_msg,
+                            MANAGER_TARGET,
+                            "the arbitrator approved the plan on the operator's behalf",
+                        ),
+                        "User approved plan.",
+                    );
                     self.renderer.on_event(&Event::Status(
                         "Plan approved — resuming stream...".to_string(),
                     ));
@@ -476,7 +562,15 @@ impl StreamSink for RendererSink<'_> {
                     PauseAction::Resume
                 }
                 "QueueAndContinue" => {
-                    self.steer_queue.push(user_msg.to_string());
+                    queue_steer(
+                        self.steer_queue,
+                        self.renderer,
+                        &SteerTrace::queued(
+                            user_msg,
+                            MANAGER_TARGET,
+                            "held while the running specialists continue",
+                        ),
+                    );
                     if decision
                         .as_ref()
                         .and_then(|d| d.response.as_ref())
@@ -499,7 +593,15 @@ impl StreamSink for RendererSink<'_> {
                         .and_then(|d| d.response.as_ref())
                         .is_some();
                     if !has_response {
-                        self.steer_queue.push(user_msg.to_string());
+                        queue_steer(
+                            self.steer_queue,
+                            self.renderer,
+                            &SteerTrace::queued(
+                                user_msg,
+                                MANAGER_TARGET,
+                                "the arbitrator returned no action and no answer for it",
+                            ),
+                        );
                         self.renderer.on_event(&Event::Status(
                             "Instruction queued for next turn — resuming stream...".to_string(),
                         ));

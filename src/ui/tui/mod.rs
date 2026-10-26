@@ -14,7 +14,7 @@ pub use formatting::*;
 #[cfg(test)]
 mod tests;
 
-use super::{Event, Renderer, SubagentDetail};
+use super::{Event, Renderer, SteerStage, SteerTrace, SubagentDetail};
 use crate::config::Config;
 use crate::orchestrator::OrchestratorManager;
 use anyhow::Result;
@@ -307,6 +307,16 @@ pub struct TuiRenderer {
     pub(crate) input_draft: String,
     /// Buffer for streaming steer-mode sentences awaiting completion.
     pub(crate) steer_sentence_buffer: String,
+    /// What happened to the operator's own steering instructions (spec §3, §8.3;
+    /// DATA §6 gap 7).
+    ///
+    /// Every entry was **handed to the renderer by the bridge** at the statement where the
+    /// bridge touches its own steer queue, files a notice, or refuses a target — see
+    /// [`crate::ui::Renderer::note_steer`]. The renderer never invents an entry, never
+    /// re-decides one, and never counts anything that is not in this list: the status-bar
+    /// `N steers` chip is `queued_steers()`, the length of the `Queued` slice of this very
+    /// vector. Bounded by [`MAX_STEER_TRACES`] so a long session cannot grow it without end.
+    pub(crate) steer_traces: Vec<SteerTrace>,
 
     /// Cached chat inner width (area width − 2). Defaults to `80`.
     pub(crate) chat_width: std::cell::Cell<usize>,
@@ -452,6 +462,7 @@ impl TuiRenderer {
             history_index: None,
             input_draft: String::new(),
             steer_sentence_buffer: String::new(),
+            steer_traces: Vec::new(),
 
             chat_width: std::cell::Cell::new(80),
             chat_height: std::cell::Cell::new(15),
@@ -656,6 +667,9 @@ impl TuiRenderer {
         // immediately before the view model is read. One pass per frame, and the
         // mirror makes every fold an edge rather than a re-read.
         self.adopt_legacy_view_writes();
+        // The notice tables are the only owner of what a filed notice did next, so the
+        // ledger is re-read against them once per frame before anything reads it.
+        self.refresh_steer_traces();
         let view = state::UiView::from_renderer(self);
         let area = frame.area();
         let rects = layout::compute_layout(area, &view);
@@ -758,6 +772,15 @@ impl TuiRenderer {
                 .subagents
                 .get(selected)
                 .map(|row| self.get_thinking_budget(row));
+            // The steering notices waiting in front of the selected worker, read from
+            // the orchestrator's own inbox (read-only: peeking never drains it). This is
+            // the targeting half of the affordance — which instruction the arbitrator
+            // routed to *this* specialist, and how long it has been waiting.
+            let steering = self
+                .subagents
+                .get(selected)
+                .map(|row| crate::orchestrator::notice::peek_worker_inbox(&row.name))
+                .unwrap_or_default();
             let geometry = {
                 let data = components::activity::ActivityData {
                     focus: view.focused(state::FocusPane::Workers),
@@ -768,6 +791,7 @@ impl TuiRenderer {
                     list_scroll: self.subagent_list_scroll,
                     show_thought: self.show_thought,
                     thinking_budget,
+                    steering: &steering,
                 };
                 components::activity::render(frame, rect, &data)
             };
@@ -817,6 +841,7 @@ impl TuiRenderer {
                 ctx_limit: self.max_context_tokens,
                 elapsed,
                 val_rounds,
+                queued_steers: self.queued_steers(),
             };
             components::status_bar::render(frame, rect, &data);
         }
@@ -947,6 +972,129 @@ impl TuiRenderer {
             .map(|row| row.validation_rounds)
             .max()
             .unwrap_or(0)
+    }
+
+    // ---- steering-instruction lifecycle (spec §3, §8.3; DATA §6 gap 7) ------
+    //
+    // The queue a steering instruction lands in is a local of the session loop and the
+    // notices it becomes live in the orchestrator's bounded inboxes, so the only thing
+    // the renderer may show is what the bridge *tells* it at the statement that touches
+    // either. `record_steer` is fed exclusively by
+    // [`crate::ui::Renderer::note_steer`]; `refresh_steer_traces` then asks the
+    // orchestrator's own read-only notice tables what became of a notice the bridge
+    // filed, and adopts only an answer those tables actually give.
+
+    /// Fold one bridge-reported transition into the ledger, announcing it in the
+    /// transcript exactly once per stage change.
+    ///
+    /// The identity of an entry is the pair *instruction + addressee*, because one
+    /// instruction can legitimately be filed for several specialists at once and each
+    /// of those is a separate fact for the operator. The one exception is a stage that
+    /// ends the wait: a delivered or refused instruction replaces the entry the bridge
+    /// earlier reported as held for it, even when the addressee is named differently
+    /// there — the wait for *that instruction* is over, and the chip must say so.
+    pub(crate) fn record_steer(&mut self, trace: &SteerTrace) {
+        let known = self
+            .steer_traces
+            .iter()
+            .position(|entry| entry.text == trace.text && entry.target == trace.target)
+            .or_else(|| {
+                if trace.stage == SteerStage::Queued {
+                    return None;
+                }
+                self.steer_traces
+                    .iter()
+                    .position(|entry| entry.stage == SteerStage::Queued && entry.text == trace.text)
+            });
+        match known {
+            Some(index) if self.steer_traces[index].stage == trace.stage => {
+                // Same stage: no new fact for the operator, only a sharper reason. The
+                // transcript gets nothing, so an instruction never scrolls the pane with
+                // restatements of the same state.
+                self.steer_traces[index].reason = trace.reason.clone();
+                if trace.notice_id.is_some() {
+                    self.steer_traces[index].notice_id = trace.notice_id.clone();
+                }
+                self.dirty = true;
+                return;
+            }
+            Some(index) => {
+                self.steer_traces[index] = trace.clone();
+            }
+            None => {
+                self.steer_traces.push(trace.clone());
+                if self.steer_traces.len() > MAX_STEER_TRACES {
+                    let excess = self.steer_traces.len() - MAX_STEER_TRACES;
+                    self.steer_traces.drain(0..excess);
+                }
+            }
+        }
+        self.messages.push(steer_transcript_line(trace));
+        if self.chat_auto_scroll {
+            let w = self.chat_width.get();
+            let n = self.estimated_chat_lines(w);
+            let h = self.chat_height.get();
+            self.chat_scroll = n.saturating_sub(h) as u16;
+        }
+        self.dirty = true;
+    }
+
+    /// What the orchestrator's notice tables now say about the notices the bridge filed,
+    /// folded back into the same ledger (never into a second one).
+    ///
+    /// Three answers exist and only these: the notice is still pending and past its TTL
+    /// (it will never be read → [`SteerStage::Revoked`]), a reply for it was recorded
+    /// ([`SteerStage::Delivered`]), or the tables say nothing new (the entry keeps the
+    /// stage the bridge gave it). A missing notice is never read as a revocation: the
+    /// inboxes are drained by the worker itself, and a drained notice was delivered.
+    pub(crate) fn refresh_steer_traces(&mut self) {
+        let updates: Vec<SteerTrace> = self
+            .steer_traces
+            .iter()
+            .filter_map(|entry| {
+                let notice_id = entry.notice_id.as_deref()?;
+                let pending = crate::orchestrator::get_pending_notice(notice_id);
+                let reply = crate::orchestrator::get_worker_reply(notice_id);
+                if reply.is_some() && entry.stage != SteerStage::Delivered {
+                    return Some(SteerTrace {
+                        stage: SteerStage::Delivered,
+                        text: entry.text.clone(),
+                        target: entry.target.clone(),
+                        notice_id: entry.notice_id.clone(),
+                        reason: "the specialist answered it".to_string(),
+                    });
+                }
+                if let Some(notice) = pending
+                    && crate::orchestrator::notice::is_notice_expired(&notice)
+                    && entry.stage != SteerStage::Revoked
+                {
+                    return Some(SteerTrace {
+                        stage: SteerStage::Revoked,
+                        text: entry.text.clone(),
+                        target: entry.target.clone(),
+                        notice_id: entry.notice_id.clone(),
+                        reason: format!(
+                            "it passed its lifetime in {}'s inbox unanswered",
+                            entry.target
+                        ),
+                    });
+                }
+                None
+            })
+            .collect();
+        for update in updates {
+            self.record_steer(&update);
+        }
+    }
+
+    /// The `N steers` chip: how many of the operator's instructions are **still held**
+    /// (the `Queued` slice of [`Self::steer_traces`]). There is no other source for this
+    /// number and no other number is ever printed for it.
+    pub(crate) fn queued_steers(&self) -> usize {
+        self.steer_traces
+            .iter()
+            .filter(|entry| entry.stage == SteerStage::Queued)
+            .count()
     }
 
     /// Check whether abort is actively armed and within the 3-second confirmation window.
@@ -1187,6 +1335,48 @@ fn estimate_stream_tokens(text: &str) -> usize {
 /// row's list without limit. The newest lines win because the detail pane is read from
 /// its tail: dropping the oldest lines keeps the activity the operator is watching.
 pub(crate) const MAX_SUBAGENT_ROW_LOGS: usize = 200;
+
+/// How many steering instructions the renderer keeps in [`TuiRenderer::steer_traces`].
+///
+/// The ledger is a *witness* of the bridge's recent transitions, not an archive: the
+/// question a pane answers is "what happened to what I just sent", so the newest
+/// transitions are the ones that must survive, and an unbounded vector would grow for
+/// the whole life of a session. The cap drops the **oldest** entries only.
+pub(crate) const MAX_STEER_TRACES: usize = 12;
+
+/// Longest instruction one transcript line quotes before it marks the cut.
+const MAX_STEER_QUOTED_CHARS: usize = 160;
+
+/// The one transcript line naming what happened to one steering instruction.
+///
+/// The label comes from [`components::transcript::STEER_LINE_PREFIX`], which is also what
+/// the transcript pane styles on — the renderer writes the sentence, the pane decides how
+/// it looks, and both read the same constant so the pairing cannot drift.
+fn steer_transcript_line(trace: &SteerTrace) -> String {
+    let collapsed = trace
+        .text
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ");
+    let quoted = if collapsed.chars().count() > MAX_STEER_QUOTED_CHARS {
+        let head: String = collapsed.chars().take(MAX_STEER_QUOTED_CHARS).collect();
+        format!("{head}{}", theme::ELLIPSIS)
+    } else {
+        collapsed
+    };
+    let notice = trace
+        .notice_id
+        .as_deref()
+        .map(|id| format!(" (notice id {id})"))
+        .unwrap_or_default();
+    format!(
+        "{}{} → {}] {quoted} — {}{notice}",
+        components::transcript::STEER_LINE_PREFIX,
+        trace.stage.label(),
+        trace.target,
+        trace.reason,
+    )
+}
 
 /// Merge the renderer's live log lines with the ones an authoritative push carries.
 ///
@@ -2055,6 +2245,16 @@ impl Renderer for TuiRenderer {
 
     fn reset_active_agent(&mut self) {
         self.active_agent = "Manager".to_string();
+    }
+
+    /// The bridge's steering-instruction projection (spec §3, §8.3; DATA §6 gap 7).
+    ///
+    /// This is the only writer of [`TuiRenderer::steer_traces`]: a queued, forwarded or
+    /// refused instruction reaches the panes because the bridge said so at the statement
+    /// that queued, filed or refused it — never because the renderer guessed it from
+    /// status prose or counted something of its own.
+    fn note_steer(&mut self, trace: &SteerTrace) {
+        self.record_steer(trace);
     }
 
     // ---- session-rehydration hooks ----

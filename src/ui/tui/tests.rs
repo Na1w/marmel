@@ -9865,3 +9865,379 @@ fn the_gate_keeps_pasted_blocks_intact_and_the_tui_the_only_gating_renderer() {
         "the TUI gates, which is what lets the loop drop the bare words"
     );
 }
+
+// ---- steering-instruction visibility (spec §3, §8.3; DATA §6 gap 7/9) ----
+
+/// Affordance 1, end to end at the renderer's seam: an instruction the bridge handed
+/// over arrives in the transcript as a labelled line and in the status bar as a chip —
+/// both driven by the bridge's own transition, never by a counter of the pane's.
+#[test]
+fn a_queued_steer_from_the_bridge_lands_in_the_transcript_and_arms_the_chip() {
+    let mut r = m4_renderer();
+    crate::ui::Renderer::note_steer(
+        &mut r,
+        &SteerTrace::queued(
+            "rename the module first",
+            crate::ui::MANAGER_TARGET,
+            "held while the specialists run",
+        ),
+    );
+
+    assert_eq!(r.queued_steers(), 1, "the chip reads this ledger");
+    let line = r
+        .messages
+        .last()
+        .expect("the transcript gained a line")
+        .clone();
+    assert_eq!(
+        line,
+        "[Steer queued → manager] rename the module first — held while the specialists run"
+    );
+
+    let frame = draw_new_frame(&mut r, 100, 30).join("\n");
+    assert!(frame.contains("[Steer queued"), "{frame}");
+    assert!(frame.contains("rename the module first"), "{frame}");
+    assert!(
+        frame.contains("1 steers"),
+        "the chip is on the bar: {frame}"
+    );
+    assert!(!frame.contains("round"), "no arbitration counter: {frame}");
+}
+
+/// The chip counts instructions the bridge is *still* holding. A transition to
+/// delivered takes the number down, and an empty ledger prints no chip at all.
+#[test]
+fn the_steer_chip_counts_only_the_instructions_still_being_held() {
+    let mut r = m4_renderer();
+    for text in ["first instruction", "second instruction"] {
+        crate::ui::Renderer::note_steer(
+            &mut r,
+            &SteerTrace::queued(text, crate::ui::MANAGER_TARGET, "held"),
+        );
+    }
+    assert!(
+        draw_new_frame(&mut r, 100, 30)
+            .join("\n")
+            .contains("2 steers")
+    );
+
+    // The same instruction, now filed with a specialist: the count comes down and the
+    // transcript gains exactly one more line for the stage change.
+    let before = r.messages.len();
+    crate::ui::Renderer::note_steer(
+        &mut r,
+        &SteerTrace {
+            stage: SteerStage::Delivered,
+            text: "first instruction".to_string(),
+            target: "coder_specialist-t-004".to_string(),
+            notice_id: None,
+            reason: "filed".to_string(),
+        },
+    );
+    assert_eq!(r.queued_steers(), 1);
+    assert_eq!(r.messages.len(), before + 1, "one line per stage change");
+    assert!(
+        draw_new_frame(&mut r, 100, 30)
+            .join("\n")
+            .contains("1 steers")
+    );
+
+    crate::ui::Renderer::note_steer(
+        &mut r,
+        &SteerTrace {
+            stage: SteerStage::Delivered,
+            text: "second instruction".to_string(),
+            target: "coder_specialist-t-004".to_string(),
+            notice_id: None,
+            reason: "filed".to_string(),
+        },
+    );
+    assert_eq!(r.queued_steers(), 0);
+    let frame = draw_new_frame(&mut r, 100, 30).join("\n");
+    assert!(
+        !frame.contains("steers"),
+        "nothing held, so nothing is claimed: {frame}"
+    );
+}
+
+/// Affordance 2: a notice the arbitrator filed is named with the specialist it is
+/// sitting in front of and the id that specialist must reply to — and the same notice
+/// is listed in that worker's own detail half, read from the orchestrator's inbox.
+#[test]
+fn a_forwarded_notice_names_the_specialist_and_its_notice_id() {
+    let worker = "steer-target-coder-t-013b";
+    let posted = crate::orchestrator::notice::post_notice_to_worker(
+        worker,
+        "use the shorter fixture",
+        Some("notice-t013b-a"),
+    );
+    assert_eq!(posted.notice_id, "notice-t013b-a");
+
+    let mut r = m4_renderer();
+    r.subagents = vec![SubagentDetail {
+        name: worker.to_string(),
+        task_id: Some("t-013b".to_string()),
+        is_active: true,
+        ..SubagentDetail::default()
+    }];
+    crate::ui::Renderer::note_steer(
+        &mut r,
+        &SteerTrace {
+            stage: SteerStage::Delivered,
+            text: "use the shorter fixture".to_string(),
+            target: worker.to_string(),
+            notice_id: Some(posted.notice_id.clone()),
+            reason: "filed in the inbox".to_string(),
+        },
+    );
+
+    assert_eq!(
+        r.messages.last().map(String::as_str),
+        Some(
+            "[Steer delivered → steer-target-coder-t-013b] use the shorter fixture — filed in \
+             the inbox (notice id notice-t013b-a)"
+        )
+    );
+    // A filed notice is not a held instruction: the chip stays off.
+    assert_eq!(r.queued_steers(), 0);
+
+    let frame = draw_new_frame(&mut r, 100, 44).join("\n");
+    assert!(frame.contains("[Steer delivered"), "{frame}");
+    assert!(frame.contains("notice-t013b-a"), "{frame}");
+    assert!(
+        frame.contains("[Steering] 1 notice"),
+        "the worker's own detail half lists what is waiting for it: {frame}"
+    );
+    assert!(
+        frame.contains("[Steering] 1 notice(s) waiting for")
+            && frame.contains("this specialist")
+            && frame.contains("(waiting 0s)"),
+        "the listed notice carries its own wait: {frame}"
+    );
+}
+
+/// A `ForwardNotice` the round refused because the token addressed no live worker is
+/// reported as never delivered, naming the token — and it is never counted as held.
+#[test]
+fn an_unroutable_target_is_reported_as_never_delivered() {
+    let mut r = m4_renderer();
+    crate::ui::Renderer::note_steer(
+        &mut r,
+        &SteerTrace {
+            stage: SteerStage::Revoked,
+            text: "tell the ghost what to do".to_string(),
+            target: "ghost_worker".to_string(),
+            notice_id: None,
+            reason: "the arbitrator addressed `ghost_worker`, which no live worker answers"
+                .to_string(),
+        },
+    );
+    let line = r.messages.last().cloned().unwrap_or_default();
+    assert!(
+        line.starts_with("[Steer not delivered → ghost_worker]"),
+        "{line}"
+    );
+    assert!(line.contains("no live worker"), "{line}");
+    assert_eq!(
+        r.queued_steers(),
+        0,
+        "an instruction that reached nobody is not counted as held"
+    );
+    let frame = draw_new_frame(&mut r, 100, 30).join("\n");
+    assert!(frame.contains("[Steer not delivered"), "{frame}");
+    assert!(frame.contains("ghost_worker"), "{frame}");
+    assert!(!frame.contains("steers"), "{frame}");
+}
+
+/// The ledger is a bounded witness, and it speaks once per stage: an unbounded session
+/// cannot grow it, and a restatement of the same stage never scrolls the transcript.
+#[test]
+fn steer_traces_stay_bounded_and_announce_each_stage_once() {
+    let mut r = m4_renderer();
+    let total = MAX_STEER_TRACES + 5;
+    for index in 0..total {
+        crate::ui::Renderer::note_steer(
+            &mut r,
+            &SteerTrace::queued(
+                format!("instruction {index}"),
+                crate::ui::MANAGER_TARGET,
+                "held",
+            ),
+        );
+    }
+    assert_eq!(r.steer_traces.len(), MAX_STEER_TRACES);
+    assert_eq!(
+        r.steer_traces.last().map(|entry| entry.text.as_str()),
+        Some("instruction 16"),
+        "the newest transitions are the ones that survive"
+    );
+    assert!(
+        !r.steer_traces
+            .iter()
+            .any(|entry| entry.text == "instruction 0"),
+        "the oldest transition is the one that goes"
+    );
+    assert_eq!(r.queued_steers(), MAX_STEER_TRACES);
+
+    // Same stage again: no new transcript line, only a sharper reason.
+    let before = r.messages.len();
+    crate::ui::Renderer::note_steer(
+        &mut r,
+        &SteerTrace::queued("instruction 16", crate::ui::MANAGER_TARGET, "still held"),
+    );
+    assert_eq!(r.messages.len(), before, "a stage is announced once");
+    assert_eq!(
+        r.steer_traces
+            .iter()
+            .find(|entry| entry.text == "instruction 16")
+            .map(|entry| entry.reason.as_str()),
+        Some("still held")
+    );
+
+    // One instruction, two addressees: the ledger keeps one entry per (text, target),
+    // so a notice filed for a second specialist is a second fact and never a
+    // double-counted duplicate — and the cap still holds.
+    crate::ui::Renderer::note_steer(
+        &mut r,
+        &SteerTrace::queued("instruction 16", "other_worker", "held there too"),
+    );
+    assert_eq!(
+        r.steer_traces.len(),
+        MAX_STEER_TRACES,
+        "the bound holds against a second addressee too"
+    );
+    let for_other = r
+        .steer_traces
+        .iter()
+        .filter(|entry| entry.text == "instruction 16")
+        .map(|entry| entry.target.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        for_other,
+        ["manager", "other_worker"],
+        "one entry per addressee, oldest first"
+    );
+    assert_eq!(
+        r.steer_traces
+            .iter()
+            .filter(|entry| entry.text == "instruction 16" && entry.target == "other_worker")
+            .count(),
+        1,
+        "never two entries for one (instruction, addressee)"
+    );
+}
+
+/// Affordance 2's second half: the notice tables decide what happened next. A reply
+/// the specialist recorded moves the entry to delivered, clears it from the chip, and
+/// says so with the notice id — the renderer never guesses this state.
+#[test]
+fn the_specialists_answer_moves_the_trace_to_delivered_and_clears_the_chip() {
+    let worker = "steer-probe-coder-t-013b";
+    let posted = crate::orchestrator::notice::post_notice_to_worker(
+        worker,
+        "raise the coverage gate",
+        Some("notice-t013b-b"),
+    );
+    let mut r = m4_renderer();
+    crate::ui::Renderer::note_steer(
+        &mut r,
+        &SteerTrace {
+            stage: SteerStage::Queued,
+            text: "raise the coverage gate".to_string(),
+            target: worker.to_string(),
+            notice_id: Some(posted.notice_id.clone()),
+            reason: "filed in the inbox".to_string(),
+        },
+    );
+    assert_eq!(r.queued_steers(), 1, "pending in the inbox, so still held");
+    r.refresh_steer_traces();
+    assert_eq!(r.steer_traces[0].stage, SteerStage::Queued);
+    assert_eq!(r.queued_steers(), 1, "a pending notice is not an answer");
+
+    crate::orchestrator::record_worker_reply_for_notice(worker, "notice-t013b-b", "done")
+        .expect("the reply names the pending notice");
+    let before = r.messages.len();
+    r.refresh_steer_traces();
+
+    assert_eq!(r.steer_traces[0].stage, SteerStage::Delivered);
+    assert_eq!(r.queued_steers(), 0, "answered, so no longer held");
+    assert_eq!(
+        r.messages.len(),
+        before + 1,
+        "the stage change is announced"
+    );
+    assert_eq!(
+        r.messages.last().map(String::as_str),
+        Some(
+            "[Steer delivered → steer-probe-coder-t-013b] raise the coverage gate — the \
+             specialist answered it (notice id notice-t013b-b)"
+        )
+    );
+    // The reply consumed the notice; the inbox is empty again.
+    assert!(
+        crate::orchestrator::notice::peek_worker_inbox(worker).is_empty(),
+        "the reply resolved the queued copy"
+    );
+}
+
+/// The honesty guard: the tables answering "nothing" is not an answer. A notice the
+/// tables do not know about keeps the stage the bridge gave it, so a notice that was
+/// drained, reclaimed or simply never filed can never be dressed up as a revocation.
+#[test]
+fn a_notice_the_tables_say_nothing_about_keeps_the_stage_the_bridge_gave_it() {
+    let mut r = m4_renderer();
+    crate::ui::Renderer::note_steer(
+        &mut r,
+        &SteerTrace {
+            stage: SteerStage::Queued,
+            text: "instruction with an unknown notice id".to_string(),
+            target: "steer-absent-coder-t-013b".to_string(),
+            notice_id: Some("notice-t013b-never-filed".to_string()),
+            reason: "filed in the inbox".to_string(),
+        },
+    );
+    let before = r.messages.len();
+    r.refresh_steer_traces();
+    assert_eq!(
+        r.steer_traces[0].stage,
+        SteerStage::Queued,
+        "the tables said nothing, so nothing changed"
+    );
+    assert_eq!(r.messages.len(), before, "and nothing was announced");
+    assert_eq!(r.queued_steers(), 1);
+    assert!(
+        !r.messages.join("\n").contains("not delivered"),
+        "never a revocation the data does not support"
+    );
+}
+
+/// Affordance 3 in one frame: a stream the preemption handshake paused is marked on
+/// the roster, counted on the bar, and explained in its detail half — while a row the
+/// arbitrator never pauses carries no pause claim at all.
+#[test]
+fn a_paused_row_is_marked_counted_and_explained_in_the_new_frame() {
+    let mut r = m4_renderer();
+    r.subagents[0].paused = true;
+    let paused = draw_new_frame(&mut r, 160, 50).join("\n");
+    assert!(paused.contains('\u{23f8}'), "the roster glyph: {paused}");
+    assert!(paused.contains("paused"), "the roster word label: {paused}");
+    assert!(
+        paused.contains("1p"),
+        "the bar counts the held stream: {paused}"
+    );
+    assert!(
+        paused.contains("yielded its model slot") && paused.contains("Steer Arbitrator"),
+        "the detail half states the mechanism: {paused}"
+    );
+    assert!(
+        paused.contains("why: a steering instruction is being arbitrated"),
+        "and why: {paused}"
+    );
+
+    // Control: the same renderer with the flag cleared prints no pause cause anywhere,
+    // so the explanation cannot be a standing caption.
+    let mut running = m4_renderer();
+    let frame = draw_new_frame(&mut running, 160, 50).join("\n");
+    assert!(!frame.contains("model slot"), "{frame}");
+    assert!(!frame.contains("Steer Arbitrator"), "{frame}");
+}
