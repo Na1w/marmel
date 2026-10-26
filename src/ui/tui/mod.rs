@@ -42,6 +42,33 @@ pub(crate) enum FocusedPanel {
     Subagents,
 }
 
+/// The last value the renderer itself wrote on each legacy view field.
+///
+/// The rebuilt view state (`view_mode` / `focus` / `follow`) is authoritative,
+/// but the key path of `events.rs` still writes the pre-rebuild fields
+/// (`show_plan_panel`, `show_subagent_panel`, `focused_panel`,
+/// `chat_auto_scroll`) directly until t-011 routes those keys through the
+/// transition helpers here. Comparing the live field against this mirror tells
+/// [`TuiRenderer::adopt_legacy_view_writes`] the one thing it needs to know: did
+/// somebody write behind the API? A mirror the API keeps current therefore fires
+/// exactly once per legacy write, and never re-reads a mode, a focus or a follow
+/// flag out of a pane toggle the operator has already moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LegacyViewMirror {
+    /// Last seen `show_plan_panel`.
+    pub(crate) plan_visible: bool,
+    /// Last seen `show_subagent_panel`.
+    pub(crate) workers_visible: bool,
+    /// Last seen `focused_panel`.
+    pub(crate) focus: FocusedPanel,
+    /// Last seen `chat_auto_scroll`.
+    pub(crate) follow: bool,
+    /// Last seen result of [`TuiRenderer::is_abort_armed`]. Arming is edge
+    /// triggered so an expiry (the 3 s window lapsing on its own) closes the
+    /// Confirm overlay exactly once instead of re-opening it every frame.
+    pub(crate) abort_armed: bool,
+}
+
 /// Status-line substrings that mean "a turn is in flight, keep animating".
 ///
 /// One source of truth for the two places that must never drift apart: the
@@ -109,8 +136,46 @@ pub struct TuiRenderer {
     pub(crate) frame_counter: u64,
     /// The status bar text. Defaults to `"Ready"`.
     pub(crate) status_line: String,
-    /// Which panel has focus (drives border color). Defaults to `Chat`.
+    /// Which legacy panel has focus (drives the border colour of the pre-rebuild
+    /// panes and is the persisted mirror of [`Self::focus`]). Defaults to `Chat`.
+    /// Retired with the key path (spec §9.2); t-011 replaces it with
+    /// [`Self::focus`], and `adopt_legacy_view_writes` keeps the two honest while
+    /// `events.rs` still writes this field directly.
     pub(crate) focused_panel: FocusedPanel,
+    /// M1–M4 view mode — **real UI state** (spec §4.1), not a reading of the pane
+    /// toggles. Built once in [`Self::new`] and moved only by
+    /// [`Self::set_view_mode`] (`F2`–`F5` and `/mode` call it in t-011).
+    pub(crate) view_mode: state::ViewMode,
+    /// Which pane holds focus (spec §4.2) — **real UI state**. Built once in
+    /// [`Self::new`] (the composer: printable keys must always reach it, §4.4)
+    /// and moved only by [`Self::set_focus`] / [`Self::cycle_focus_pane`].
+    pub(crate) focus: state::FocusPane,
+    /// Transcript follow: `LIVE` vs `↓ N new` (spec G7) — **real UI state**. The
+    /// legacy `chat_auto_scroll` flag is its mirror for the pre-rebuild scroll
+    /// path; [`Self::set_follow`] writes both.
+    pub(crate) follow: bool,
+    /// The modal surface on screen (spec §3, §8.5) — **real UI state**: `None`,
+    /// the `?`/`F1` legend, or a confirm awaiting `y`/`n`. Moved only by
+    /// [`Self::open_help`], [`Self::show_confirm`] and [`Self::close_overlay`].
+    pub(crate) overlay: state::OverlayState,
+    /// The `?`/`F1` legend toggle (G2). It stays on while a confirm surface is
+    /// drawn over it, so dismissing a confirm returns the legend (§5: `Esc`
+    /// closes one overlay). Replaces the `help_open = false` the view model used
+    /// to hard-code.
+    pub(crate) help_open: bool,
+    /// A destructive action is awaiting `y`/`n` (spec G3, §3 confirm overlay).
+    /// The armed-abort prompt of §8.5 occupies the same surface while its 3 s
+    /// window is live; `close_overlay` dismisses whichever surface is on top.
+    pub(crate) confirm_open: bool,
+    /// What [`Self::adopt_legacy_view_writes`] last saw on the legacy view
+    /// fields, so a write the transition helpers made is never mistaken for a
+    /// write the legacy key path made.
+    pub(crate) legacy_view: LegacyViewMirror,
+    /// Whether teardown has run. Set by [`Self::shutdown`]; while it is set the
+    /// renderer never paints (see [`Self::render_terminal`]), so a post-teardown
+    /// `flush` cannot draw TUI chrome into the user's shell and a second
+    /// `shutdown` — or the `Drop` that follows one — is a no-op paint-wise.
+    pub(crate) terminal_torn_down: bool,
     /// Vertical scroll offset of the chat panel.
     pub(crate) chat_scroll: u16,
     /// Vertical scroll offset of the plan panel.
@@ -235,6 +300,30 @@ impl TuiRenderer {
             tokens_out: 0,
             orchestrator_context_tokens: 0,
             focused_panel: FocusedPanel::Chat,
+            // The view state is built once, here, and only the transition
+            // helpers below move it (spec §4.1, §4.2). The mode is the mode the
+            // boot pane inventory describes (§4.3): both side panes boot closed,
+            // which is M1; `F2`/`F3`/`F4`/`F5`, `/mode`, `Ctrl+P` and `Ctrl+A`
+            // move it, and `set_view_mode(Split)` opens both side panes with it.
+            view_mode: state::ViewMode::for_panes(false, false),
+            // The composer holds focus at boot: printable keys must reach it in
+            // every mode and every focus state (§4.4), so it is where the operator
+            // starts and what `Tab` cycles back to (§4.2).
+            focus: state::FocusPane::Input,
+            // Follow is on at boot: the transcript shows the newest line until the
+            // operator scrolls back, and only then starts counting (§G7).
+            follow: true,
+            overlay: state::OverlayState::None,
+            help_open: false,
+            confirm_open: false,
+            legacy_view: LegacyViewMirror {
+                plan_visible: false,
+                workers_visible: false,
+                focus: FocusedPanel::Chat,
+                follow: true,
+                abort_armed: false,
+            },
+            terminal_torn_down: false,
             chat_scroll: 0,
             plan_scroll: 0,
             show_plan_panel: false,
@@ -402,7 +491,20 @@ impl TuiRenderer {
         })
     }
 
+    /// Paint one frame through the routed draw path (spec §9.1: the new UI is the
+    /// only thing this entry path paints).
+    ///
+    /// After teardown the terminal is gone — raw mode is off, the primary screen is
+    /// back and the operator's shell owns stdout — so this returns without painting
+    /// instead of recreating a `Terminal` and writing escape codes into the shell.
+    /// The session loop still calls `flush()` a few times after `shutdown()` (the
+    /// shutdown is issued from inside the loop and from `Drop`), and every one of
+    /// those calls must be a no-op rather than a repaint on a screen that is no
+    /// longer ours.
     pub(crate) fn render_terminal(&mut self) -> Result<()> {
+        if self.terminal_torn_down {
+            return Ok(());
+        }
         self.last_render = std::time::Instant::now();
         self.frame_counter = self.frame_counter.wrapping_add(1);
         let mut terminal = match self.terminal.take() {
@@ -432,6 +534,13 @@ impl TuiRenderer {
     /// over, and reads the viewport each pass established back out of the report
     /// each `render` returns. The help overlay is drawn last, over the body (§7.3).
     pub(crate) fn draw_new_ui(&mut self, frame: &mut ratatui::Frame) -> layout::PaneRects {
+        // The frame is built from stored view state, so anything a writer outside
+        // the key path changed on the legacy fields (a worker activating opens the
+        // Workers pane through `set_subagents`, a plan event opens the Plan pane,
+        // the scroll keys move `chat_auto_scroll`) is folded into that state here,
+        // immediately before the view model is read. One pass per frame, and the
+        // mirror makes every fold an edge rather than a re-read.
+        self.adopt_legacy_view_writes();
         let view = state::UiView::from_renderer(self);
         let area = frame.area();
         let rects = layout::compute_layout(area, &view);
@@ -707,6 +816,174 @@ impl TuiRenderer {
                 .is_some_and(|t| t.elapsed() < Duration::from_secs(3))
     }
 
+    // ---- view-state transitions (spec §4.1, §4.2, §3, §8.5) -----------------
+    //
+    // `F2`–`F5`, `Tab`, `Ctrl+F`, `?`/`F1` and `Esc` call these in t-011; they
+    // are the only way the view state moves, and every one of them leaves
+    // `dirty` set so the next cadence tick repaints (spec §5: "no silent key
+    // press", G5).
+
+    /// Move to `mode` (spec §4.1: `F2` cycles, `F3`/`F4`/`F5` name one, and
+    /// `/mode <name>` sets it directly).
+    ///
+    /// The two pane toggles follow the mode's pane inventory (§4.3) — they are
+    /// the spelling the status-row chips, the legacy scroll path and the durable
+    /// `ViewState` use, and keeping them in step is what stops one mode change
+    /// from drawing a frame in which three sources disagree. A focus the new
+    /// mode would orphan is repaired by cycling to the next pane that is on
+    /// screen: an absent pane is never drawn and never hit-tested (§2.4.1), so a
+    /// focus badge may never sit on one (G6).
+    pub(crate) fn set_view_mode(&mut self, mode: state::ViewMode) {
+        self.view_mode = mode;
+        self.show_plan_panel = mode.plan_pane();
+        self.show_subagent_panel = mode.workers_pane();
+        self.legacy_view.plan_visible = self.show_plan_panel;
+        self.legacy_view.workers_visible = self.show_subagent_panel;
+        if !mode.presents(self.focus) {
+            self.cycle_focus_pane(true);
+        }
+        self.dirty = true;
+    }
+
+    /// Focus `pane` (spec §4.2). The legacy `focused_panel` mirror moves with it
+    /// so the pre-rebuild panes, the `Esc` re-focus arm of `events.rs` and the
+    /// persisted `ViewState::focused_panel` tag all name the same pane.
+    pub(crate) fn set_focus(&mut self, pane: state::FocusPane) {
+        self.focus = pane;
+        self.focused_panel = pane.legacy();
+        self.legacy_view.focus = self.focused_panel;
+        self.dirty = true;
+    }
+
+    /// Cycle focus around the §4.2 ring, skipping the panes the current mode does
+    /// not present, and return the pane that ended up focused. `Tab` walks it
+    /// forward and `Shift+Tab` backward (t-011).
+    ///
+    /// Skipping is what makes `Tab` never a silent no-op (G5): with a mode that
+    /// has no Plan/Workers pane the cycle is `Input → Transcript → Input`, and a
+    /// focus that was left on a pane the mode removed is pulled back onto a pane
+    /// that is actually on screen.
+    pub(crate) fn cycle_focus_pane(&mut self, forward: bool) -> state::FocusPane {
+        const ORDER: [state::FocusPane; 4] = state::FocusPane::cycle_order();
+        let at = ORDER
+            .iter()
+            .position(|pane| *pane == self.focus)
+            .unwrap_or(0);
+        for step in 1..=ORDER.len() {
+            let index = if forward {
+                (at + step) % ORDER.len()
+            } else {
+                (at + ORDER.len() - step) % ORDER.len()
+            };
+            if self.view_mode.presents(ORDER[index]) {
+                self.set_focus(ORDER[index]);
+                return self.focus;
+            }
+        }
+        // Unreachable: the transcript is present in every mode (§4.3), so the
+        // ring always has at least one landing pane. The fall-through keeps the
+        // focus where it is rather than inventing an absent one.
+        self.focus
+    }
+
+    /// Turn transcript follow on or off (spec G7: `Ctrl+F`, `/follow`, and the
+    /// scroll keys that pull the viewport back off the tail).
+    ///
+    /// The legacy `chat_auto_scroll` flag is the same decision spelled for the
+    /// pre-rebuild scroll and clamp path (`render.rs`, `events.rs`), so it moves
+    /// with the flag: one operator decision, one number in the frame.
+    pub(crate) fn set_follow(&mut self, follow: bool) {
+        self.follow = follow;
+        self.chat_auto_scroll = follow;
+        self.legacy_view.follow = follow;
+        self.dirty = true;
+    }
+
+    /// Open the `?`/`F1` keymap + command legend (spec §3, G2).
+    ///
+    /// The legend is a toggle, so it stays open across a confirm surface drawn
+    /// over it — `close_overlay` returns it. §7.3 draws exactly one overlay per
+    /// frame, and a pending confirm is the one that wins.
+    pub(crate) fn open_help(&mut self) {
+        self.help_open = true;
+        self.overlay = state::OverlayState::for_surface(self.confirm_open, self.help_open);
+        self.dirty = true;
+    }
+
+    /// Open the confirm surface: a destructive action awaiting `y`/`n` (spec G3,
+    /// §3), and the surface the armed-abort prompt of §8.5 also occupies.
+    pub(crate) fn show_confirm(&mut self) {
+        self.confirm_open = true;
+        self.overlay = state::OverlayState::for_surface(self.confirm_open, self.help_open);
+        self.dirty = true;
+    }
+
+    /// Close the surface that is on screen — `Esc` with an overlay open closes it
+    /// and never arms abort (spec §5, §4.4).
+    ///
+    /// A confirm on top is dismissed and the legend returns underneath if it was
+    /// toggled on; with only the legend open, the legend closes. Nothing here
+    /// touches the abort arming itself: dropping an overlay must neither arm nor
+    /// disarm (acceptance criterion 16).
+    pub(crate) fn close_overlay(&mut self) {
+        match self.overlay {
+            state::OverlayState::Confirm => {
+                self.confirm_open = false;
+                if self.help_open {
+                    self.open_help();
+                    return;
+                }
+                self.overlay = state::OverlayState::None;
+            }
+            state::OverlayState::Help => {
+                self.help_open = false;
+                self.overlay = state::OverlayState::None;
+            }
+            state::OverlayState::None => {}
+        }
+        self.dirty = true;
+    }
+
+    /// Fold the writes the legacy key path still makes directly into the real
+    /// view state, and keep the overlay surface honest with the 3 s abort window.
+    ///
+    /// `events.rs` owns `show_plan_panel` / `show_subagent_panel` /
+    /// `focused_panel` / `chat_auto_scroll` / `confirm_abort` until t-011 rewires
+    /// the keys onto the transitions above. Each change is turned into exactly
+    /// ONE transition — the mirror records what this renderer last wrote, so a
+    /// write the transitions made is never re-adopted and the stored
+    /// mode/focus/follow never drift back out of a pane toggle.
+    pub(crate) fn adopt_legacy_view_writes(&mut self) {
+        if self.show_plan_panel != self.legacy_view.plan_visible
+            || self.show_subagent_panel != self.legacy_view.workers_visible
+        {
+            self.set_view_mode(state::ViewMode::for_panes(
+                self.show_plan_panel,
+                self.show_subagent_panel,
+            ));
+        }
+        if self.focused_panel != self.legacy_view.focus {
+            self.set_focus(state::FocusPane::from_legacy(self.focused_panel));
+        }
+        if self.chat_auto_scroll != self.legacy_view.follow {
+            self.set_follow(self.chat_auto_scroll);
+        }
+        // The armed-abort window is a wall-clock surface, not a toggle (§8.5).
+        // Its rising edge puts the Confirm surface on screen and its falling
+        // edge — three seconds later, or a `clear_abort` — takes it back off with
+        // no key press at all. Edge-triggered on purpose: a confirm request t-011
+        // opens itself must never be closed by an unrelated abort window.
+        let armed = self.is_abort_armed();
+        if armed != self.legacy_view.abort_armed {
+            if armed {
+                self.show_confirm();
+            } else {
+                self.close_overlay();
+            }
+            self.legacy_view.abort_armed = armed;
+        }
+    }
+
     /// Drain pending terminal events and apply render-throttling:
     /// - Force a full re-render when terminal events were handled.
     /// - When state is dirty (new events, tokens, status updates), flush up to 40 FPS (25 ms).
@@ -714,6 +991,14 @@ impl TuiRenderer {
     /// - When completely idle and clean, do NOT re-render (0% CPU idle).
     pub(crate) fn drain_and_throttle_flush(&mut self, blocking: bool) {
         let handled = self.handle_events(blocking);
+        // The key path still writes the pre-rebuild view fields directly (t-011
+        // moves those keys onto the transition helpers), so every pass through
+        // the entry path folds those writes into the real view state before a
+        // frame is built. Running it unconditionally, rather than only for a
+        // handled event, is also what closes the armed-abort Confirm surface
+        // when its 3 s window expires with no key press at all (spec §8.5): the
+        // expiry sets `dirty`, so the surface never lingers on screen.
+        self.adopt_legacy_view_writes();
         if handled {
             self.dirty = false;
             let _ = self.force_flush();
@@ -834,7 +1119,11 @@ impl Renderer for TuiRenderer {
             self.show_plan_panel = true;
             self.had_active_plan = true;
         }
-
+        // A plan restored from disk is the one pane decision taken before the
+        // first frame, so the view mode has to adopt it (a boot with a live plan
+        // is M2, spec §4.1) rather than stay on the M1 the constructor chose.
+        self.adopt_legacy_view_writes();
+        self.terminal_torn_down = false;
         self.force_flush()?;
         Ok(())
     }
@@ -1375,6 +1664,9 @@ impl Renderer for TuiRenderer {
             }
         }
         let handled = self.handle_events(false);
+        // Fold whatever the key path wrote behind the API into the real view
+        // state before the frame is built (see `adopt_legacy_view_writes`).
+        self.adopt_legacy_view_writes();
         if handled || matches!(event, Event::Done) {
             let _ = self.force_flush();
         } else {
@@ -1450,7 +1742,28 @@ impl Renderer for TuiRenderer {
         crate::orchestrator::reset_cancellation();
     }
 
+    /// Tear the terminal back down (spec §6.1 entry-path contract).
+    ///
+    /// Idempotent and panic-safe: every emission is error-tolerant (`let _ =`) —
+    /// after a panic hook or a broken pipe there is nobody left to answer an
+    /// escape sequence — and a second call is a no-op rather than a second
+    /// round-trip to a screen we no longer own. `Drop` calls this, so the normal
+    /// path (`shutdown()` at the end of the session loop) and the unwinding path
+    /// (renderer dropped by a panic) can both run without double-teardown.
+    ///
+    /// `DisableMouseCapture` is defensive and asymmetric by history, not by
+    /// design: this renderer never emits `EnableMouseCapture`, and the rebuilt UI
+    /// takes **no** mouse input (spec §6: the keymap is the whole interface, and
+    /// the legacy mouse arms in `events.rs` are retired with the key path). The
+    /// disable is kept because a terminal that inherited mouse mode from
+    /// somewhere else (a wrapper, a leaked previous process) must still be handed
+    /// back to the shell cleanly. Nothing in the UI may assume mouse events
+    /// arrive.
     fn shutdown(&mut self) {
+        if self.terminal_torn_down {
+            return;
+        }
+        self.terminal_torn_down = true;
         let _ = execute!(
             io::stdout(),
             PopKeyboardEnhancementFlags,
@@ -1781,6 +2094,44 @@ impl Renderer for TuiRenderer {
         // renderer invents: keep the current focus in that case.
         self.focused_panel =
             focused_panel_from_tag(&section.view.focused_panel).unwrap_or(self.focused_panel);
+
+        // 3b. The real view state (spec §4.1, §4.2, §10 item 18). The stored
+        // `ViewState` only carries the pre-rebuild spellings — the pane toggles,
+        // a focus tag and the auto-scroll flag — so those are read back through
+        // the same transition helpers the keys use, which keeps the invariants
+        // (`mode` ⇔ pane inventory, `focus` ⇔ the persisted tag, `follow` ⇔ the
+        // scroll flag) true for a restored session exactly as they are for a live
+        // one. Two documented losses inside that mapping: the tag set has no
+        // Composer entry, so a Composer focus comes back as the Transcript
+        // (`FocusPane::from_legacy`), and the persisted pair of toggles cannot
+        // distinguish a mode the operator left with a pane closed on purpose from
+        // one the toggles put there — which is the same ambiguity the pair always
+        // had. Neither is invented here.
+        //
+        // The focus is read out of the tag FIRST because a restore never repairs
+        // one: `set_view_mode` pulls a focus off a pane its new mode removed (an
+        // absent pane is never drawn or hit-tested, §2.4.1), but a bundle may
+        // legitimately persist a tag for a pane its toggles leave closed, and the
+        // loader rule for a focus the file states is to keep it verbatim rather
+        // than invent another one. So the incoming focus is captured, the mode is
+        // applied, and the captured focus is re-asserted last.
+        let restored_focus = state::FocusPane::from_legacy(self.focused_panel);
+        self.set_view_mode(state::ViewMode::for_panes(
+            self.show_plan_panel,
+            self.show_subagent_panel,
+        ));
+        self.set_focus(restored_focus);
+        self.set_follow(self.chat_auto_scroll);
+        // A Confirm surface belongs to the 3 s abort window, and that window is
+        // never re-armed by a restore (step 5 below). If this process was showing
+        // one when the restore was applied, the surface goes away with it — while
+        // a Help legend the operator opened stays on screen. Resetting the abort
+        // mirror in the same breath keeps the adoption bridge from mistaking the
+        // restore for the window's falling edge and closing the legend too.
+        if self.overlay == state::OverlayState::Confirm {
+            self.close_overlay();
+        }
+        self.legacy_view.abort_armed = false;
 
         // 4. Scroll offsets and selection, verbatim; the live clamp re-checks
         // them against the freshly restored content.
@@ -2126,6 +2477,20 @@ impl Drop for TuiRenderer {
 }
 
 /// Leave the alternate screen (best-effort, from the panic hook).
+///
+/// The panic path bypasses [`Renderer::shutdown`]: the hook runs while the
+/// renderer is being unwound, so this is a free function over the global terminal
+/// mode and deliberately touches no renderer state. It mirrors every mode `init()`
+/// switched on — including bracketed paste, so mode 2004 never leaks into the
+/// user's shell — and disables raw mode first so a terminal left in raw mode
+/// cannot eat the rest of the panic output.
+///
+/// Idempotency: the `Drop` of the renderer runs `shutdown()` after this, so the
+/// same five sequences are written twice on the unwinding path. That is harmless
+/// by construction — every one of them is a reset (`Pop…`, `LeaveAlternateScreen`,
+/// `DisableMouseCapture`, `DisableBracketedPaste`, raw mode off), not a toggle —
+/// and it is what makes the teardown safe to run from a hook, from `Drop` and from
+/// the session loop in any order.
 pub fn leave_alt_screen() -> std::io::Result<()> {
     let _ = disable_raw_mode();
     // Mirror every mode init() switched on, including bracketed paste, because the

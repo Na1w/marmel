@@ -6812,14 +6812,15 @@ fn draw_new_frame(r: &mut TuiRenderer, width: u16, height: u16) -> Vec<String> {
 }
 
 /// A renderer in the M4 state: both side panes on, one running worker, one
-/// transcript line, a mixed plan.
+/// transcript line, a mixed plan. The mode is set through the transition helper
+/// because it is stored view state now — writing the pane toggles alone would
+/// leave the stored mode on M1 until the adoption bridge folded them in.
 fn m4_renderer() -> TuiRenderer {
     let mut r = TuiRenderer::new();
     r.plan_content = "## Tasks\n\n- [x] [t-001] research baseline\n- [ ] [t-004] wireframe\n"
         .to_string();
     r.messages = vec!["User: rebuild the TUI".to_string()];
-    r.show_plan_panel = true;
-    r.show_subagent_panel = true;
+    r.set_view_mode(state::ViewMode::Split);
     r.subagents = vec![SubagentDetail {
         name: "coder_specialist-t-004".to_string(),
         task_id: Some("t-004".to_string()),
@@ -6878,27 +6879,117 @@ fn plan_progress_active_task_prefers_the_explicit_task_then_a_running_row() {
 }
 
 #[test]
-fn view_mode_follows_the_two_pane_toggles() {
+fn view_mode_is_stored_state_and_the_pane_toggles_follow_it() {
+    // Spec §4.1: the mode is real UI state. It is set once at boot from the pane
+    // inventory (both side panes closed = M1) and moves only by transition; the
+    // two pane toggles are what the mode's pane inventory (§4.3) spells for the
+    // status chips, the legacy scroll path and the durable `ViewState`.
     let mut r = TuiRenderer::new();
-    r.show_plan_panel = false;
-    r.show_subagent_panel = false;
-    assert_eq!(state::UiView::from_renderer(&r).mode, state::ViewMode::Transcript);
+    assert_eq!(
+        state::UiView::from_renderer(&r).mode,
+        state::ViewMode::Transcript,
+        "boot: both side panes closed is M1"
+    );
+    assert_eq!(r.focus, state::FocusPane::Input, "boot: the composer is focused");
 
-    r.show_plan_panel = true;
-    assert_eq!(state::UiView::from_renderer(&r).mode, state::ViewMode::Plan);
+    for (mode, plan, workers) in [
+        (state::ViewMode::Plan, true, false),
+        (state::ViewMode::Split, true, true),
+        (state::ViewMode::Workers, false, true),
+        (state::ViewMode::Transcript, false, false),
+    ] {
+        r.set_view_mode(mode);
+        let view = state::UiView::from_renderer(&r);
+        assert_eq!(view.mode, mode, "the stored mode is what the frame reads");
+        assert_eq!(
+            (r.show_plan_panel, r.show_subagent_panel),
+            (plan, workers),
+            "{mode:?} spells its pane inventory into the toggles"
+        );
+        // §2.4.1/G6: a focus may never sit on a pane the mode does not present.
+        assert!(
+            mode.presents(r.focus),
+            "{mode:?} keeps {:?} on screen",
+            r.focus
+        );
+        assert!(r.dirty, "no silent mode change (G5)");
+    }
+}
 
-    r.show_subagent_panel = true;
-    assert_eq!(state::UiView::from_renderer(&r).mode, state::ViewMode::Split);
+#[test]
+fn a_legacy_pane_write_is_adopted_as_exactly_one_transition() {
+    // `events.rs` still writes the pre-rebuild fields directly until t-011 routes
+    // its keys through the transitions, so the bridge turns such a write into one
+    // mode change — and never re-adopts a mode the transitions themselves set.
+    let mut r = TuiRenderer::new();
+    r.show_plan_panel = true; // what `Ctrl+P` does today
+    r.adopt_legacy_view_writes();
+    assert_eq!(r.view_mode, state::ViewMode::Plan);
 
-    r.show_plan_panel = false;
-    assert_eq!(state::UiView::from_renderer(&r).mode, state::ViewMode::Workers);
+    r.adopt_legacy_view_writes();
+    assert_eq!(
+        r.view_mode,
+        state::ViewMode::Plan,
+        "adoption is edge-triggered, not a re-read"
+    );
+
+    r.set_view_mode(state::ViewMode::Split);
+    r.adopt_legacy_view_writes();
+    assert_eq!(
+        r.view_mode,
+        state::ViewMode::Split,
+        "a write the API made is never mistaken for a legacy write"
+    );
+
+    // The same bridge folds a focus tag and the auto-scroll flag.
+    r.focused_panel = FocusedPanel::Subagents;
+    r.chat_auto_scroll = false;
+    r.adopt_legacy_view_writes();
+    assert_eq!(r.focus, state::FocusPane::Workers);
+    assert!(!r.follow);
+    assert!(!r.chat_auto_scroll);
+}
+
+#[test]
+fn a_mode_that_removes_a_pane_repairs_the_focus_onto_a_pane_that_is_there() {
+    // §4.2 ring + §2.4.1: an absent pane is never drawn and never hit-tested, so
+    // closing the pane under focus pulls the focus back on screen instead of
+    // stranding the badge. `Tab` skips the absent panes for the same reason.
+    let mut r = m4_renderer();
+    r.set_focus(state::FocusPane::Plan);
+    assert_eq!(r.focused_panel, FocusedPanel::Plan);
+
+    r.set_view_mode(state::ViewMode::Workers);
+    assert!(
+        !state::ViewMode::Workers.presents(state::FocusPane::Plan),
+        "M4 → M3 removes the plan pane"
+    );
+    assert_ne!(r.focus, state::FocusPane::Plan);
+    assert!(state::ViewMode::Workers.presents(r.focus));
+    assert_eq!(r.focused_panel, r.focus.legacy());
+
+    // `Tab` in a mode with no side panes cycles Input ⇄ Transcript only.
+    r.set_view_mode(state::ViewMode::Transcript);
+    r.set_focus(state::FocusPane::Input);
+    assert_eq!(r.cycle_focus_pane(true), state::FocusPane::Transcript);
+    assert_eq!(r.cycle_focus_pane(true), state::FocusPane::Input);
+    assert_eq!(r.cycle_focus_pane(false), state::FocusPane::Transcript);
+
+    // With both side panes on, the ring is the full §4.2 order.
+    r.set_view_mode(state::ViewMode::Split);
+    r.set_focus(state::FocusPane::Input);
+    assert_eq!(r.cycle_focus_pane(true), state::FocusPane::Transcript);
+    assert_eq!(r.cycle_focus_pane(true), state::FocusPane::Plan);
+    assert_eq!(r.cycle_focus_pane(true), state::FocusPane::Workers);
+    assert_eq!(r.cycle_focus_pane(true), state::FocusPane::Input);
+    assert_eq!(r.cycle_focus_pane(false), state::FocusPane::Workers);
 }
 
 #[test]
 fn the_view_model_mirrors_focus_follow_scroll_and_the_armed_surface() {
     let mut r = TuiRenderer::new();
-    r.focused_panel = FocusedPanel::Subagents;
-    r.chat_auto_scroll = false;
+    r.set_focus(state::FocusPane::Workers);
+    r.set_follow(false);
     r.chat_scroll = 7;
     r.plan_scroll = 3;
     r.subagent_scroll = 11;
@@ -6907,6 +6998,8 @@ fn the_view_model_mirrors_focus_follow_scroll_and_the_armed_surface() {
     assert!(view.focused(state::FocusPane::Workers));
     assert!(!view.focused(state::FocusPane::Input));
     assert!(!view.follow);
+    assert!(!r.chat_auto_scroll, "the legacy scroll flag mirrors follow");
+    assert_eq!(r.focused_panel, FocusedPanel::Subagents);
     assert!(view.composer_active());
     assert_eq!(
         (
@@ -6918,14 +7011,328 @@ fn the_view_model_mirrors_focus_follow_scroll_and_the_armed_surface() {
     );
     assert_eq!(view.overlay, state::OverlayState::None);
 
-    // Arming abort opens the confirm surface (drawn on status row 2, §8.5).
+    // Arming abort opens the confirm surface (drawn on status row 2, §8.5). The
+    // surface is stored state, so the 3 s window is folded in by the same pass
+    // the entry path runs every tick — its rising edge puts it on screen.
     r.confirm_abort = true;
     r.abort_armed_at = Some(std::time::Instant::now());
+    r.adopt_legacy_view_writes();
     let armed = state::UiView::from_renderer(&r);
     assert!(armed.abort_armed);
     assert_eq!(armed.overlay, state::OverlayState::Confirm);
     assert!(armed.overlay.is_open());
     assert!(!armed.composer_active());
+
+    // The falling edge — the window expiring with no key press at all — takes the
+    // surface back off, so nothing lingers once the prompt is stale.
+    r.abort_armed_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(4));
+    r.adopt_legacy_view_writes();
+    assert!(!state::UiView::from_renderer(&r).abort_armed);
+    assert_eq!(state::UiView::from_renderer(&r).overlay, state::OverlayState::None);
+    assert!(!r.confirm_open);
+}
+
+#[test]
+fn the_help_overlay_is_state_and_a_confirm_underneath_it_returns_it() {
+    // G2: `?`/`F1` toggles a legend the view model actually carries; §5/§4.4:
+    // `Esc` closes one overlay and never arms abort.
+    let mut r = m4_renderer();
+    assert!(!r.help_open);
+    assert_eq!(state::UiView::from_renderer(&r).overlay, state::OverlayState::None);
+
+    r.open_help();
+    assert!(r.help_open);
+    assert_eq!(
+        state::UiView::from_renderer(&r).overlay,
+        state::OverlayState::Help
+    );
+    let rows = draw_new_frame(&mut r, 100, 30).concat();
+    assert!(
+        rows.contains("Keys") && rows.contains("Esc close"),
+        "the legend is drawn over the body: {rows}"
+    );
+
+    // A confirm drawn over the legend wins the single overlay slot (§7.3) ...
+    r.show_confirm();
+    assert_eq!(state::UiView::from_renderer(&r).overlay, state::OverlayState::Confirm);
+    // ... and closing it returns the legend that was still toggled on.
+    r.close_overlay();
+    assert!(!r.confirm_open);
+    assert!(r.help_open);
+    assert_eq!(state::UiView::from_renderer(&r).overlay, state::OverlayState::Help);
+
+    // Closing the legend closes it; closing with nothing open is a no-op.
+    r.close_overlay();
+    assert!(!r.help_open);
+    assert_eq!(
+        state::UiView::from_renderer(&r).overlay,
+        state::OverlayState::None
+    );
+    r.close_overlay();
+    assert_eq!(
+        state::UiView::from_renderer(&r).overlay,
+        state::OverlayState::None
+    );
+}
+
+#[test]
+fn every_view_mode_changes_the_rects_compute_layout_actually_produces() {
+    // The mode is not a label on the header chip: it is the input the geometry is
+    // built from, and each of M1–M4 produces a different body split (§2.3).
+    let mut r = m4_renderer();
+    let area = Rect::new(0, 0, 100, 30);
+    let mut seen: Vec<(Option<Rect>, Option<Rect>, Option<Rect>)> = Vec::new();
+
+    for mode in [
+        state::ViewMode::Transcript,
+        state::ViewMode::Plan,
+        state::ViewMode::Workers,
+        state::ViewMode::Split,
+    ] {
+        r.set_view_mode(mode);
+        let view = state::UiView::from_renderer(&r);
+        let rects = layout::compute_layout(area, &view);
+        let body = rects.body.expect("100x30 clears every floor");
+        let transcript = rects.transcript.expect("the transcript is present in every mode");
+        assert_eq!(rects.mode, mode, "the frame reports the mode it drew");
+
+        match mode {
+            state::ViewMode::Transcript => {
+                assert_eq!(rects.plan, None, "M1 removes the plan pane");
+                assert_eq!(rects.workers, None, "M1 removes the workers pane");
+                assert_eq!(transcript, body, "M1 gives the transcript the whole body");
+            }
+            state::ViewMode::Plan => {
+                let plan = rects.plan.expect("M2 shows the plan pane");
+                assert_eq!(rects.workers, None, "M2 has no workers pane");
+                assert_eq!(plan.width + transcript.width, body.width);
+                assert!(
+                    plan.width > transcript.width,
+                    "M2 is 55/45 with the plan in the wider column: plan {} transcript {}",
+                    plan.width,
+                    transcript.width
+                );
+            }
+            state::ViewMode::Workers => {
+                let workers = rects.workers.expect("M3 shows the workers pane");
+                assert_eq!(rects.plan, None, "M3 has no plan pane");
+                assert_eq!(workers.width + transcript.width, body.width);
+                assert!(
+                    workers.width > transcript.width,
+                    "M3 is 55/45 with the roster in the wider column: workers {} transcript {}",
+                    workers.width,
+                    transcript.width
+                );
+            }
+            state::ViewMode::Split => {
+                let plan = rects.plan.expect("M4 shows the plan pane");
+                let workers = rects.workers.expect("M4 shows the workers pane");
+                assert_eq!(plan.width + transcript.width, body.width);
+                assert!(
+                    transcript.width > plan.width,
+                    "M4 is 60/40 with the transcript in the wider column: transcript {} side {}",
+                    transcript.width,
+                    plan.width
+                );
+                assert_eq!(plan.width, workers.width, "the side column stacks two panes");
+                assert_eq!(plan.height + workers.height, body.height);
+            }
+        }
+        seen.push((rects.transcript, rects.plan, rects.workers));
+    }
+
+    for (i, left) in seen.iter().enumerate() {
+        for (j, right) in seen.iter().enumerate().skip(i + 1) {
+            assert_ne!(left, right, "modes {} and {} drew the same rects", i, j);
+        }
+    }
+}
+
+#[test]
+fn capture_ui_and_restore_panes_round_trip_mode_focus_and_follow() {
+    // Spec §10 item 18: the UI state a session captured is the UI state a session
+    // boots into. The persisted `ViewState` spells the state in its pre-rebuild
+    // fields, so the round-trip is checked on both spellings.
+    let mut source = m4_renderer();
+    source.messages = (0..40)
+        .map(|i| format!("pane line {i}"))
+        .collect();
+    source.set_focus(state::FocusPane::Workers);
+    source.set_follow(false);
+    source.chat_scroll = 4;
+    let section = source.capture_ui();
+    assert_eq!(section.structural_violations(), Vec::<String>::new());
+    assert_eq!(section.view.focused_panel, "subagents");
+    assert!(
+        section.view.show_plan_panel && section.view.show_subagent_panel,
+        "M4 persists both pane toggles"
+    );
+    assert!(!section.view.chat_auto_scroll, "follow off is persisted");
+
+    let mut target = TuiRenderer::new();
+    assert_eq!(target.view_mode, state::ViewMode::Transcript);
+    target.restore_panes(&section);
+
+    assert_eq!(target.view_mode, state::ViewMode::Split, "M4 comes back as M4");
+    assert_eq!(target.focus, state::FocusPane::Workers);
+    assert!(!target.follow);
+    assert_eq!(
+        (target.show_plan_panel, target.show_subagent_panel),
+        (true, true),
+        "the toggles stay in step with the restored mode"
+    );
+    assert_eq!(target.focused_panel, FocusedPanel::Subagents);
+    assert!(!target.chat_auto_scroll);
+    assert_eq!(target.chat_scroll, 4);
+    assert_eq!(
+        state::UiView::from_renderer(&target).mode,
+        state::ViewMode::Split
+    );
+    assert_eq!(state::UiView::from_renderer(&target).focus, state::FocusPane::Workers);
+    assert!(!state::UiView::from_renderer(&target).follow);
+    // The restored renderer re-captures the identical section: nothing in the
+    // round-trip is invented and nothing is lost a second time.
+    assert_eq!(target.capture_ui(), section);
+
+    // The one documented loss in the mapping: the tag set has no Composer entry,
+    // so a Composer focus comes back as the Transcript. The renderer does not
+    // invent a Composer focus it never stored.
+    let mut composer = m4_renderer();
+    composer.set_focus(state::FocusPane::Input);
+    assert_eq!(composer.capture_ui().view.focused_panel, "chat");
+    let mut target = TuiRenderer::new();
+    target.restore_panes(&composer.capture_ui());
+    assert_eq!(target.focus, state::FocusPane::Transcript);
+    assert_eq!(target.focused_panel, FocusedPanel::Chat);
+}
+
+#[test]
+fn a_help_overlay_the_operator_opened_survives_a_restore() {
+    // The legend is operator state, not session content: a restore replaces the
+    // panes, it does not close a legend that was open, and it never re-arms a
+    // confirm surface the 3 s window it belongs to did not survive.
+    let source = m4_renderer();
+    let section = source.capture_ui();
+
+    let mut target = m4_renderer();
+    target.open_help();
+    target.show_confirm();
+    assert_eq!(target.overlay, state::OverlayState::Confirm);
+    target.restore_panes(&section);
+
+    assert!(target.help_open, "the legend survives the restore");
+    assert!(
+        !target.confirm_open,
+        "a confirm surface is never re-armed by a restore"
+    );
+    assert_eq!(
+        state::UiView::from_renderer(&target).overlay,
+        state::OverlayState::Help
+    );
+    let rows = draw_new_frame(&mut target, 100, 30).concat();
+    assert!(rows.contains("Keys"), "the restored frame still carries the legend");
+
+    // A renderer that had nothing open keeps nothing open — the restore does not
+    // invent an overlay either.
+    let mut clean = m4_renderer();
+    clean.restore_panes(&section);
+    assert_eq!(
+        state::UiView::from_renderer(&clean).overlay,
+        state::OverlayState::None
+    );
+}
+
+#[test]
+fn teardown_is_idempotent_and_paints_nothing_afterwards() {
+    // The entry path tears the terminal down from three places: the session loop
+    // on a normal exit, the abort/EOF exits, and `Drop` on the unwinding path.
+    // Any of them may run after another, and a paint after the terminal is gone
+    // must not resurrect it — that would write escape codes into the shell.
+    let mut r = TuiRenderer::new();
+    r.messages = vec!["User: one".to_string()];
+    assert!(
+        !r.terminal_torn_down,
+        "a fresh renderer has not been torn down"
+    );
+
+    r.shutdown();
+    assert!(r.terminal_torn_down, "teardown is recorded");
+    r.shutdown();
+    r.shutdown();
+
+    assert!(
+        r.render_terminal().is_ok(),
+        "a paint after teardown is a no-op, not an error"
+    );
+    assert!(
+        r.force_flush().is_ok() && r.flush().is_ok(),
+        "the flush paths the loop keeps calling after shutdown are no-ops too"
+    );
+    assert_eq!(r.frame_counter, 0, "no frame was painted after teardown");
+
+    // `Drop` runs the same teardown a second time; nothing panics.
+    drop(r);
+}
+
+#[test]
+fn a_shrunken_pane_clamps_the_scroll_offset_it_can_no_longer_honour() {
+    // Work item 1: the entry path still clamps scroll state on every geometry
+    // change and repaints. The transcript clamps its own offset to the viewport
+    // it just built, so an offset that no longer exists — the classic case being
+    // a restored or held `chat_scroll` after a resize — never leaves the pane
+    // showing nothing but blank rows.
+    let mut r = m4_renderer();
+    r.messages = (0..200)
+        .map(|i| format!("pane line {i} of two hundred"))
+        .collect();
+    r.set_follow(false);
+
+    for (width, height) in [(100u16, 30u16), (60, 20), (40, 10), (120, 40)] {
+        r.chat_scroll = u16::MAX;
+        let rows = draw_new_frame(&mut r, width, height).concat();
+        assert!(
+            r.chat_scroll < u16::MAX,
+            "{width}x{height}: the impossible offset was not clamped"
+        );
+        assert!(
+            r.chat_scroll > 0,
+            "{width}x{height}: a clamped offset still sits at the tail"
+        );
+        assert!(
+            rows.contains("pane line 199"),
+            "{width}x{height}: the clamped pane must show the newest line"
+        );
+    }
+
+    // The same clamp through a mode change rather than a terminal resize: the
+    // frame that draws the new geometry re-clamps (M1 widens the transcript, M4
+    // narrows it, and the §2.5 ladder narrows it further at 60 columns).
+    for mode in [
+        state::ViewMode::Transcript,
+        state::ViewMode::Split,
+        state::ViewMode::Plan,
+        state::ViewMode::Workers,
+    ] {
+        r.chat_scroll = u16::MAX;
+        r.set_view_mode(mode);
+        let rows = draw_new_frame(&mut r, 60, 24).concat();
+        assert!(
+            rows.contains("pane line 199"),
+            "{mode:?} at 60x24 must show the newest line"
+        );
+    }
+
+    // `clamp_scrolls` is what the resize arm of the event loop calls; run after a
+    // draw has published the pane geometry, it must agree with the draw.
+    let drawn = r.chat_scroll;
+    r.chat_scroll = u16::MAX;
+    r.clamp_scrolls();
+    assert!(
+        r.chat_scroll <= drawn,
+        "the resize clamp lands on the same offset the draw did: {} > {drawn}",
+        r.chat_scroll
+    );
+    assert!(r.chat_scroll > 0);
 }
 
 #[test]
@@ -7002,7 +7409,7 @@ fn below_twenty_rows_the_footer_row_is_dropped_and_the_status_bar_collapses() {
 fn the_side_column_stacks_to_one_pane_below_ninety_columns() {
     // §2.5 `width < 90`: transcript plus only the focused side pane.
     let mut r = m4_renderer();
-    r.focused_panel = FocusedPanel::Plan;
+    r.set_focus(state::FocusPane::Plan);
     let view = state::UiView::from_renderer(&r);
     let rects = layout::compute_layout(Rect::new(0, 0, 80, 30), &view);
     assert!(rects.transcript.is_some());
@@ -7131,7 +7538,7 @@ fn the_new_frame_carries_header_plan_progress_pane_titles_and_the_legend() {
 #[test]
 fn the_focused_pane_badges_its_title_and_every_other_pane_does_not() {
     let mut r = m4_renderer();
-    r.focused_panel = FocusedPanel::Plan;
+    r.set_focus(state::FocusPane::Plan);
     let rows = draw_new_frame(&mut r, 100, 30);
     let joined = rows.concat();
     let badgeed: Vec<&String> = rows
@@ -7177,8 +7584,7 @@ fn live_worker_scenario() -> TuiRenderer {
         "",
     ]
     .join("\n");
-    r.show_plan_panel = true;
-    r.show_subagent_panel = true;
+    r.set_view_mode(state::ViewMode::Split);
     r.input_text = "add the focus badge to every pane title".to_string();
     r.tokens_in = 12_400;
     r.tokens_out = 3_200;

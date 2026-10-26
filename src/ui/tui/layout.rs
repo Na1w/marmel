@@ -5,6 +5,13 @@
 //! [`UiView`]: it never touches the terminal and never returns a zero-sized pane
 //! rect. A pane that the mode (or the ladder) removes is `None` — never split,
 //! never drawn, never hit-tested (§2.4.1).
+//!
+//! The mode and the focus it reads are the renderer's **stored** view state
+//! (`TuiRenderer::view_mode` / `focus`, moved only by the transition helpers),
+//! never a reading of what a pane is showing — so a mode change is a geometry
+//! change on the very next frame, and the [`PaneRects::mode`] a frame reports is
+//! the mode the frame was built from, including where the §2.5 ladder overrides
+//! it.
 
 use super::state::{FocusPane, UiView, ViewMode};
 use ratatui::layout::{Constraint, Layout, Rect};

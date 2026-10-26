@@ -393,6 +393,81 @@ mod tests {
         assert!(lines.iter().all(|l| l.starts_with("[status] ")));
     }
 
+    /// Byte-compatibility guard for the headless lane: `marmel --raw` and every
+    /// piped invocation must keep producing labelled records and NOTHING else.
+    /// The rebuilt TUI (pane titles, box-drawing frames, mode/`LIVE`/focus chips,
+    /// the `F1 help` legend, the overlay chrome, and the escape sequences that
+    /// draw them) is TUI-only: none of it may ever reach this stream, because a
+    /// script that greps `[assistant]` lines breaks the moment a border does.
+    #[test]
+    fn test_raw_output_carries_no_tui_chrome() {
+        let mut r = RawRenderer::new();
+        // The labels are exactly the ones `on_event` maps each event onto — taken
+        // from that mapping rather than re-derived here, and pushed straight into
+        // the buffer so nothing is written to the harness stdout.
+        r.push_line("assistant", "I rebuilt the plan pane.");
+        r.push_line("steer", "steered response");
+        r.push_line("thinking", "checking the layout ladder");
+        r.push_line("coder:content", "worker output");
+        r.push_line("coder:thinking", "worker thinking");
+        r.push_line("tool", "read_file(src/ui/tui/mod.rs)");
+        r.push_line("tool-result", "42 lines");
+        r.push_line("status", "Active: coder | 6m12s");
+        r.push_line("delegation", "STARTED → coder on t-004");
+        r.push_line("delegation", "DONE    coder on t-004");
+        r.push_line(
+            "delegation",
+            &delegation_failed_line(Agent::Coder, Some("t-004"), Some("boom")),
+        );
+        // A restore replays stored pane text; it never re-draws the panes.
+        r.restore_panes(&crate::session::format::UiSection {
+            chat_messages: vec![
+                "User: rebuild the TUI".to_string(),
+                "Marmennill: done".to_string(),
+            ],
+            plan_content: "- [x] [t-001] audit\n".to_string(),
+            ..Default::default()
+        });
+        let out = String::from_utf8(r.buffer.clone()).expect("buffer is valid utf-8");
+
+        for chrome in [
+            "\u{1b}",
+            "│",
+            "─",
+            "╭",
+            "╮",
+            "╯",
+            "╰",
+            "●",
+            "M4 Split",
+            "M1 Transcript",
+            "Execution Plan",
+            "F1 help",
+            "Esc close",
+            "LIVE",
+        ] {
+            assert!(
+                !out.contains(chrome),
+                "raw output gained TUI chrome {chrome:?}: {out}"
+            );
+        }
+
+        // One logical unit per line, each one labelled — the shape scripts parse.
+        for line in out.lines() {
+            assert!(
+                line.starts_with('[') && line[1..].contains(']'),
+                "not a labelled record: {line:?}"
+            );
+        }
+        assert!(out.ends_with('\n'), "the stream is line-terminated");
+        assert!(
+            out.contains("[assistant] I rebuilt the plan pane.\n")
+                && out.contains("[delegation] FAILED  coder on t-004: boom\n")
+                && out.contains("[restored] Marmennill: done\n"),
+            "the payload itself stays byte-verbatim: {out}"
+        );
+    }
+
     // ---- rehydration hooks ----
 
     /// Raw mode owns no pane model, so capture must not claim one: it returns the

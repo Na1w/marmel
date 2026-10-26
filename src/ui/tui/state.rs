@@ -2,14 +2,33 @@
 //! focus model).
 //!
 //! This is a *view* model only: `TuiRenderer` remains the single owner of all
-//! state (ARCH §3, spec §0). Every value here is derived per frame from the
-//! renderer by [`UiView::from_renderer`], so the render path never mutates
-//! renderer state and the session loop is untouched.
+//! state (ARCH §3, spec §0). [`UiView::from_renderer`] snapshots the renderer
+//! once per frame, so the render path never mutates renderer state and the
+//! session loop is untouched.
+//!
+//! Which parts of the snapshot are state and which are derived is the whole
+//! point of this module:
+//!
+//! * **Real, mutable UI state** — [`ViewMode`], [`FocusPane`], the follow flag
+//!   and the overlay surface — is stored on the renderer as
+//!   `TuiRenderer::view_mode` / `focus` / `follow` / `overlay` / `help_open` /
+//!   `confirm_open`, built once in `TuiRenderer::new()` and moved only by the
+//!   `pub(crate)` transition helpers in `mod.rs` (`set_view_mode`, `set_focus`,
+//!   `cycle_focus_pane`, `set_follow`, `open_help`, `show_confirm`,
+//!   `close_overlay`). It is never re-guessed from what another widget happens
+//!   to be showing: a mode, a focus, a follow flag or an overlay the operator
+//!   set stays exactly as set (spec §4.1, §4.2, §G7, §8).
+//! * **Derived per frame** — [`PlanProgress`], which is a pure function of the
+//!   plan text the plan pane draws (spec §3, acceptance criterion 2), and the
+//!   armed-abort window, which is a wall-clock property of `confirm_abort`.
 
 use super::{FocusedPanel, SubagentDetail, TuiRenderer};
 use crate::plan_parse::{CheckboxState, parse_tasks};
 
-/// The four view modes of spec §4.1 (M1–M4). Default is [`ViewMode::Split`].
+/// The four view modes of spec §4.1 (M1–M4). It is stored UI state
+/// (`TuiRenderer::view_mode`), not a reading of the pane toggles: the boot value
+/// is the mode the boot pane inventory describes (M1 — both side panes closed),
+/// and only `TuiRenderer::set_view_mode` moves it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
     /// M1 — transcript fills the body; Plan/Workers absent.
@@ -30,6 +49,43 @@ impl ViewMode {
             Self::Plan => "M2 Plan",
             Self::Workers => "M3 Workers",
             Self::Split => "M4 Split",
+        }
+    }
+
+    /// Whether this mode draws the Plan pane (spec §4.3 "Present panes").
+    pub const fn plan_pane(self) -> bool {
+        matches!(self, Self::Plan | Self::Split)
+    }
+
+    /// Whether this mode draws the Workers pane (spec §4.3 "Present panes").
+    pub const fn workers_pane(self) -> bool {
+        matches!(self, Self::Workers | Self::Split)
+    }
+
+    /// The mode whose present panes are exactly this pair. This is the one place
+    /// the mode and the two pane toggles are related, and it is a total function:
+    /// every pair names a mode, so a pane toggle can never be a silent no-op
+    /// (spec §4.1, G5 — the hole at `events.rs:598-609` / `render.rs:368`).
+    pub const fn for_panes(plan_visible: bool, workers_visible: bool) -> Self {
+        match (plan_visible, workers_visible) {
+            (true, true) => Self::Split,
+            (true, false) => Self::Plan,
+            (false, true) => Self::Workers,
+            (false, false) => Self::Transcript,
+        }
+    }
+
+    /// Whether `pane` is on screen in this mode. §2.4.1 makes an absent pane
+    /// "never split, never drawn, never hit-tested", so focus may never sit on
+    /// one: this is what `TuiRenderer::cycle_focus_pane` skips and what a mode
+    /// change uses to repair a focus the new mode would orphan (G6).
+    pub const fn presents(self, pane: FocusPane) -> bool {
+        match pane {
+            // The composer is drawn in every mode (§2.1) and the transcript is
+            // present in all four modes (§4.3).
+            FocusPane::Input | FocusPane::Transcript => true,
+            FocusPane::Plan => self.plan_pane(),
+            FocusPane::Workers => self.workers_pane(),
         }
     }
 }
@@ -58,6 +114,39 @@ impl FocusPane {
             Self::Workers => "Workers",
         }
     }
+
+    /// The `Tab` cycle of spec §4.2: `Input → Transcript → (Plan) → (Workers) →
+    /// Input`. `TuiRenderer::cycle_focus_pane` walks this ring and skips the
+    /// panes the current mode does not present.
+    pub const fn cycle_order() -> [FocusPane; 4] {
+        [Self::Input, Self::Transcript, Self::Plan, Self::Workers]
+    }
+
+    /// The legacy [`FocusedPanel`] this pane projects onto. `Input` and
+    /// `Transcript` share the `Chat` spelling — the legacy enum never had a
+    /// composer focus (spec §4.2) — and that mirror is what the durable
+    /// `ViewState::focused_panel` tag is derived from, so the new focus and the
+    /// stored bundle can never disagree.
+    pub const fn legacy(self) -> FocusedPanel {
+        match self {
+            Self::Input | Self::Transcript => FocusedPanel::Chat,
+            Self::Plan => FocusedPanel::Plan,
+            Self::Workers => FocusedPanel::Subagents,
+        }
+    }
+
+    /// The inverse of [`FocusPane::legacy`]. The `Input` half of the `Chat`
+    /// spelling is not recoverable from the legacy value (or from a stored
+    /// bundle: `session::format::FOCUSED_PANELS` has no `"input"` spelling until
+    /// plumbing delta **D2**, spec §9.4), so the inverse lands on `Transcript`,
+    /// the body pane the old `Chat` focus meant.
+    pub const fn from_legacy(panel: FocusedPanel) -> Self {
+        match panel {
+            FocusedPanel::Chat => Self::Transcript,
+            FocusedPanel::Plan => Self::Plan,
+            FocusedPanel::Subagents => Self::Workers,
+        }
+    }
 }
 
 /// The modal surface currently on screen (spec §3 help/confirm overlays, §4.4,
@@ -73,16 +162,21 @@ pub enum OverlayState {
 }
 
 impl OverlayState {
-    /// Map the surfaces that can currently be open onto the overlay model.
+    /// Map the two open surfaces onto the one surface that is on screen.
     ///
-    /// `confirm_open` is the armed destructive action awaiting a second key
-    /// press; `help_open` is the `?`/`F1` legend. Written as one mapping so the
-    /// key handlers of t-010 only have to feed it, not invent it.
+    /// `confirm_open` is `TuiRenderer::confirm_open` — a destructive action
+    /// awaiting a `y`/`n`, which the armed-abort prompt also occupies while the
+    /// 3 s window is live (§8.5) — and `help_open` is the `?`/`F1` legend
+    /// toggle. A confirm always wins: §5 honours `y`/`n` only inside the confirm
+    /// overlay, and §7.3 draws exactly one overlay per frame. This is the single
+    /// mapping the transition helpers of `mod.rs` (`open_help`, `show_confirm`,
+    /// `close_overlay`) feed, so the surface on screen is always a function of
+    /// the two stored flags and never of what a pane is drawing.
     pub const fn for_surface(confirm_open: bool, help_open: bool) -> Self {
-        if help_open {
-            Self::Help
-        } else if confirm_open {
+        if confirm_open {
             Self::Confirm
+        } else if help_open {
+            Self::Help
         } else {
             Self::None
         }
@@ -201,41 +295,24 @@ impl UiView {
     /// is written here (spec §0 — the render path keeps its existing cadence and
     /// the session loop keeps driving it).
     ///
-    /// The boot state of §4.1/§4.2 (M4 Split, composer focus, follow on, closed
-    /// overlay) is what a fresh renderer reports: `Split` when both side panes
-    /// are toggled on, `FocusPane::Input` as the focus the body panes cycle
-    /// through, and `chat_auto_scroll` as follow.
+    /// The mode, the focused pane, the follow flag and the overlay surface are
+    /// read straight out of the renderer's own state fields — they are the
+    /// operator's, set once at boot and moved by the transition helpers of
+    /// `mod.rs`, and they are never inferred from a pane toggle or another
+    /// widget (spec §4.1, §4.2, §8.6). Only [`PlanProgress`] and the armed-abort
+    /// window are computed here, because both really are functions of other
+    /// state: the plan text and the abort-arm timestamp.
     pub fn from_renderer(renderer: &TuiRenderer) -> Self {
         let plan = PlanProgress::from_plan(
             &renderer.plan_content,
             renderer.active_plan_task.as_deref(),
             &renderer.subagents,
         );
-        // Legacy `FocusedPanel` tracks only the three body panes; the composer is
-        // the typing target in every mode (spec §4.4) and keeps the boot focus of
-        // §4.2 until `Tab` cycling (t-010) moves the focus explicitly.
-        let focus = match renderer.focused_panel {
-            FocusedPanel::Chat => FocusPane::Transcript,
-            FocusedPanel::Plan => FocusPane::Plan,
-            FocusedPanel::Subagents => FocusPane::Workers,
-        };
-        // The renderer owns no `view_mode` field yet (t-010 adds it), so the mode
-        // is derived from the two pane toggles: neither pane is M1, one pane is
-        // M2/M3, both are the M4 default (spec §4.3).
-        let mode = match (renderer.show_plan_panel, renderer.show_subagent_panel) {
-            (true, true) => ViewMode::Split,
-            (true, false) => ViewMode::Plan,
-            (false, true) => ViewMode::Workers,
-            (false, false) => ViewMode::Transcript,
-        };
         Self {
-            mode,
-            focus,
-            follow: renderer.chat_auto_scroll,
-            // The `?`/F1 legend and the `y`/`n` confirm requests are wired by
-            // t-010, so the only surface observable today is the armed abort,
-            // which §8.5 draws as the status row-2 prompt, never as a modal.
-            overlay: OverlayState::for_surface(renderer.is_abort_armed(), false),
+            mode: renderer.view_mode,
+            focus: renderer.focus,
+            follow: renderer.follow,
+            overlay: renderer.overlay,
             abort_armed: renderer.is_abort_armed(),
             input_lines: renderer.textarea.lines().len().max(1),
             scroll: ScrollState {
