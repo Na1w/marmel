@@ -556,8 +556,9 @@ impl TuiRenderer {
                 if self.focus == FocusPane::Input {
                     self.edit_key(key);
                 } else {
+                    // The gesture away from the tail states the follow decision
+                    // itself (`scroll_to_top` → `set_follow(false)`).
                     self.scroll_to_top();
-                    self.set_follow(self.chat_auto_scroll);
                     self.dirty = true;
                 }
                 return true;
@@ -566,8 +567,8 @@ impl TuiRenderer {
                 if self.focus == FocusPane::Input {
                     self.edit_key(key);
                 } else {
+                    // And the jump to the tail is the explicit way back on.
                     self.scroll_to_bottom();
-                    self.set_follow(self.chat_auto_scroll);
                     self.dirty = true;
                 }
                 return true;
@@ -673,16 +674,16 @@ impl TuiRenderer {
         self.set_follow(!self.follow);
     }
 
-    /// Scroll the focused pane and restate follow from what the scroll path decided
-    /// (G7): scrolling back off the tail turns follow **off**, and returning to the
-    /// tail turns it back on, so the chip can never lag the viewport.
+    /// Scroll the focused pane (G7). The transcript arm of the scroll path states
+    /// the follow decision itself — off the tail turns follow **off**, onto the tail
+    /// turns it back on — so the chip can never lag the viewport, and no caller has
+    /// to restate it from the legacy mirror.
     fn scroll_by(&mut self, up: bool, amount: u16) {
         if up {
             self.scroll_up(amount);
         } else {
             self.scroll_down(amount);
         }
-        self.set_follow(self.chat_auto_scroll);
         self.dirty = true;
     }
 
@@ -971,7 +972,8 @@ impl TuiRenderer {
                 self.history_index = None;
                 self.input_draft.clear();
                 self.messages.push(format!("User: {trimmed}"));
-                self.chat_auto_scroll = true;
+                // A confirmed command is still a submission: like every other one,
+                // it never touches the follow state (item 14).
                 let _ = self.tx.send(line);
             }
             Some(ConfirmAction::Quit) | None => {
@@ -1164,8 +1166,9 @@ impl TuiRenderer {
             // makes the three surfaces byte-identical, and the legend used to be
             // a hard-coded string that had already gone stale.
             LocalCommand::Help => {
+                // A notice, so the same rule as `notice()`: it writes a transcript
+                // line and never the follow state (G7, item 14).
                 self.messages.push(format!("[CLI] {}", help::help_text()));
-                self.chat_auto_scroll = true;
                 self.dirty = true;
             }
             LocalCommand::Thinking => {
@@ -1174,7 +1177,6 @@ impl TuiRenderer {
                     "[CLI] Thinking display: {}",
                     if self.show_thought { "ON" } else { "OFF" }
                 ));
-                self.chat_auto_scroll = true;
                 self.dirty = true;
             }
             // `e` already states its outcome in the transcript, sticky §8.5
@@ -1237,7 +1239,6 @@ impl TuiRenderer {
                 "✗ {}\n{}\nsee .marmel/marmel.log",
                 error.category, error.detail
             ));
-            self.chat_auto_scroll = true;
             self.dirty = true;
             return;
         }
@@ -1253,7 +1254,8 @@ impl TuiRenderer {
                     .to_string(),
             ),
         }
-        self.chat_auto_scroll = true;
+        // Recalling an error is a notice, not a scroll gesture: the transcript stays
+        // wherever the operator left it unless follow is already on (item 14).
         self.dirty = true;
     }
 
@@ -1396,10 +1398,17 @@ impl TuiRenderer {
         self.subagent_list_scroll = self.subagent_list_scroll.min(max_list as u16);
     }
 
+    /// Scroll the focused pane. For the transcript pane the gesture also states the
+    /// follow decision it expresses (G7, spec §10 item 14): pulling the viewport off
+    /// the tail turns follow **off**, and landing back on the tail turns it **on**.
+    ///
+    /// The transcript arm never assigns the legacy `chat_auto_scroll` mirror: that
+    /// flag is a projection of `follow` and moves only through
+    /// [`Self::set_follow`].
     pub(crate) fn scroll_up(&mut self, amount: u16) {
         match self.focused_panel {
             FocusedPanel::Chat => {
-                self.chat_auto_scroll = false;
+                self.set_follow(false);
                 self.chat_scroll = self.chat_scroll.saturating_sub(amount);
             }
             FocusedPanel::Plan => {
@@ -1422,7 +1431,9 @@ impl TuiRenderer {
                 let max_scroll = n.saturating_sub(h) as u16;
                 self.chat_scroll = self.chat_scroll.saturating_add(amount).min(max_scroll);
                 if self.chat_scroll >= max_scroll {
-                    self.chat_auto_scroll = true;
+                    // A scroll that lands on the tail is the explicit
+                    // scroll-to-end gesture §10 item 14 allows to re-arm follow.
+                    self.set_follow(true);
                 }
             }
             FocusedPanel::Plan => {
@@ -1447,10 +1458,13 @@ impl TuiRenderer {
         }
     }
 
+    /// Jump one pane's viewport to its top. For the transcript this is an explicit
+    /// gesture away from the tail, so it is stated as the follow decision it is
+    /// (G7, item 14) rather than as a write of the legacy mirror.
     pub(crate) fn scroll_to_top(&mut self) {
         match self.focused_panel {
             FocusedPanel::Chat => {
-                self.chat_auto_scroll = false;
+                self.set_follow(false);
                 self.chat_scroll = 0;
             }
             FocusedPanel::Plan => {
@@ -1464,6 +1478,9 @@ impl TuiRenderer {
         }
     }
 
+    /// Jump one pane's viewport to its bottom — for the transcript the explicit
+    /// "jump to bottom" gesture that §10 item 14 allows to turn follow back on. It
+    /// is stated through [`Self::set_follow`], never by assigning the mirror.
     pub(crate) fn scroll_to_bottom(&mut self) {
         match self.focused_panel {
             FocusedPanel::Chat => {
@@ -1471,7 +1488,7 @@ impl TuiRenderer {
                 let n = self.estimated_chat_lines(w);
                 let h = self.chat_height.get();
                 self.chat_scroll = n.saturating_sub(h) as u16;
-                self.chat_auto_scroll = true;
+                self.set_follow(true);
             }
             FocusedPanel::Plan => {
                 self.plan_scroll = self.plan_max_scroll;
@@ -1688,7 +1705,12 @@ impl TuiRenderer {
         let user_tokens = crate::manager::context::count_text_tokens(&line);
         self.tokens_in = self.tokens_in.saturating_add(user_tokens);
         self.messages.push(format!("User: {trimmed}"));
-        self.chat_auto_scroll = true;
+        // §10 item 14 (D3): submitting is not a follow decision. The old path wrote
+        // `chat_auto_scroll = true` here, which the view-state bridge then adopted
+        // as `follow = true` — the silent re-arm that threw away an operator who had
+        // deliberately scrolled up. While follow is on the transcript pane pins the
+        // new line by itself; while it is off the line is counted by the
+        // `↓ N new` chip instead. Neither may be decided by a submit.
         // §5: the bare words `stop / cancel / exit / quit / q / abort` are ordinary
         // steering text again — a one-word instruction must not end a run (UX
         // friction 6). They are still delivered verbatim, and the hint says which
@@ -1703,7 +1725,6 @@ impl TuiRenderer {
                     .to_string(),
             );
             self.status_line = format!("Steering text: {trimmed} — use /exit for a confirmed quit");
-            self.chat_auto_scroll = true;
         }
         let _ = self.tx.send(line);
     }
@@ -1726,7 +1747,9 @@ impl TuiRenderer {
             let trimmed = chunk.trim_start_matches('\n');
             self.messages.push(format!("{prefix}{trimmed}"));
         }
-        self.chat_auto_scroll = true;
+        // Output arriving is never a follow decision (item 14): while follow is on
+        // the transcript pins the new sentence on its own, and while it is off the
+        // sentence is counted below the viewport instead.
     }
 }
 
@@ -2191,5 +2214,308 @@ mod tests {
             );
             assert!(drain_submissions(&mut renderer).is_empty());
         }
+    }
+
+    // ---- spec §10 item 14 / defect D3: submit never re-arms follow ----------
+
+    /// The state pair the G7 rule is about: `follow` is the operator's decision and
+    /// `chat_auto_scroll` is only ever its mirror, so they may never disagree.
+    fn follow_pair(renderer: &TuiRenderer) -> (bool, bool) {
+        (renderer.follow, renderer.chat_auto_scroll)
+    }
+
+    /// A transcript with scrollback, so a moved viewport would be visible in the
+    /// offset rather than only in a flag.
+    fn transcript_with_scrollback() -> TuiRenderer {
+        let mut renderer = TuiRenderer::new();
+        renderer.messages = (0..40)
+            .map(|i| format!("line {i:02} of a long answer"))
+            .collect();
+        renderer.set_focus(FocusPane::Transcript);
+        renderer
+    }
+
+    /// D3, the exact defect: an operator who scrolled away from the tail and then
+    /// typed an instruction used to find themselves back at the bottom. Submitting
+    /// must leave `follow` exactly as it was, in both directions.
+    #[test]
+    fn submitting_a_line_never_moves_follow_or_its_mirror() {
+        // Follow off: the scroll-off-tail gesture, then a submission.
+        let mut renderer = transcript_with_scrollback();
+        renderer.chat_scroll = 12;
+        assert!(
+            press(&mut renderer, KeyCode::PageUp, KeyModifiers::NONE),
+            "PageUp scrolls the focused transcript"
+        );
+        assert_eq!(
+            follow_pair(&renderer),
+            (false, false),
+            "the scroll gesture left the tail and restated follow"
+        );
+        let offset = renderer.chat_scroll;
+        assert!(offset > 0, "and the viewport is off the tail, got {offset}");
+
+        submit(&mut renderer, "keep going with the audit");
+        assert_eq!(
+            drain_submissions(&mut renderer),
+            vec!["keep going with the audit".to_string()],
+            "the line still reached the session loop"
+        );
+        assert!(
+            renderer
+                .messages
+                .iter()
+                .any(|line| line == "User: keep going with the audit"),
+            "and it was echoed into the transcript"
+        );
+        assert_eq!(
+            follow_pair(&renderer),
+            (false, false),
+            "the submission did not re-arm follow (item 14)"
+        );
+        assert_eq!(
+            renderer.chat_scroll, offset,
+            "and it did not move the viewport it is now counting lines below"
+        );
+
+        // Follow on: the same submission keeps it on, and keeps the mirror with it.
+        let mut renderer = transcript_with_scrollback();
+        assert!(renderer.follow, "follow starts on");
+        submit(&mut renderer, "keep going with the audit");
+        assert_eq!(follow_pair(&renderer), (true, true), "still following");
+    }
+
+    /// Every shape a submission can take — plain text, the bare stop-word hint, a
+    /// command answered locally, and a command that went through the confirm
+    /// surface — has to leave the follow pair alone.
+    #[test]
+    fn every_submission_shape_leaves_the_follow_choice_alone() {
+        for line in [
+            "a plain instruction",
+            "cancel",
+            "/help",
+            "/thought",
+            "/error",
+            "/zz not a command",
+            "/plan extra argument",
+            "/mode",
+        ] {
+            let mut renderer = transcript_with_scrollback();
+            renderer.set_follow(false);
+            renderer.chat_scroll = 3;
+            submit(&mut renderer, line);
+            assert_eq!(
+                follow_pair(&renderer),
+                (false, false),
+                "`{line}` moved the follow state or its mirror: {:?}",
+                renderer.messages.last()
+            );
+            assert_eq!(
+                renderer.chat_scroll, 3,
+                "`{line}` moved the viewport while follow was off"
+            );
+        }
+
+        // A confirmed destructive command is still a submission: `y` runs it and the
+        // follow decision is still nobody's to change.
+        let mut renderer = transcript_with_scrollback();
+        renderer.set_follow(false);
+        renderer.chat_scroll = 3;
+        submit(&mut renderer, "/reset");
+        assert!(
+            renderer.confirm_action.is_some(),
+            "`/reset` waits on the confirm surface"
+        );
+        assert_eq!(
+            follow_pair(&renderer),
+            (false, false),
+            "arming the confirm did not re-arm follow"
+        );
+        assert!(
+            press(&mut renderer, KeyCode::Char('y'), KeyModifiers::NONE),
+            "`y` confirms inside the surface"
+        );
+        assert_eq!(
+            drain_submissions(&mut renderer),
+            vec!["/reset".to_string()],
+            "the confirmed command went to the loop"
+        );
+        assert_eq!(
+            follow_pair(&renderer),
+            (false, false),
+            "and the confirmed submission left follow alone"
+        );
+        assert_eq!(renderer.chat_scroll, 3);
+    }
+
+    /// The G5 rule that a command answers with a notice must not be paid for with
+    /// the operator's scroll position: a notice writes a transcript line, never a
+    /// follow decision.
+    #[test]
+    fn a_command_notice_never_arms_follow_but_the_follow_command_still_does() {
+        for line in [
+            "/help",
+            "/thought",
+            "/thought",
+            "/error",
+            "/mode plan",
+            "/plan on",
+            "/workers on",
+            "/nonsense",
+            "/mode nonsense",
+        ] {
+            let mut renderer = transcript_with_scrollback();
+            renderer.set_follow(false);
+            submit(&mut renderer, line);
+            assert_eq!(
+                follow_pair(&renderer),
+                (false, false),
+                "`{line}` answered by moving the transcript follow state"
+            );
+        }
+
+        // `/follow` and its argument forms remain the explicit way back on, and they
+        // move the mirror with the decision.
+        for (line, expected) in [
+            ("/follow", true),
+            ("/follow off", false),
+            ("/follow on", true),
+        ] {
+            let mut renderer = transcript_with_scrollback();
+            renderer.set_follow(false);
+            submit(&mut renderer, line);
+            assert_eq!(
+                follow_pair(&renderer),
+                (expected, expected),
+                "`{line}` is the explicit spelling of the decision"
+            );
+        }
+    }
+
+    /// Output arriving is the other half of G7: new lines may only move the
+    /// viewport while follow is on, and must never arm it on their own.
+    #[test]
+    fn output_that_arrives_never_arms_follow_and_only_pins_while_following() {
+        // Follow off: steer sentences and a committed turn add lines and leave both
+        // the flag and the offset exactly where the operator put them.
+        let mut renderer = transcript_with_scrollback();
+        renderer.set_follow(false);
+        renderer.chat_scroll = 4;
+        renderer.current_content = "a streamed answer".to_string();
+        renderer.append_steer_sentence("and a steer sentence");
+        renderer.commit_turn_content();
+        assert_eq!(
+            follow_pair(&renderer),
+            (false, false),
+            "arriving output re-armed follow"
+        );
+        assert_eq!(renderer.chat_scroll, 4, "and moved the viewport");
+
+        // Follow on: the same output is pinned to the tail, which is the behaviour
+        // that must not be lost by the fix.
+        let mut renderer = transcript_with_scrollback();
+        renderer.set_follow(true);
+        renderer.chat_scroll = 0;
+        renderer.current_content = "a streamed answer".to_string();
+        renderer.append_steer_sentence("and a steer sentence");
+        assert_eq!(
+            follow_pair(&renderer),
+            (true, true),
+            "follow stayed on with its mirror"
+        );
+        renderer.commit_turn_content();
+        let tail = {
+            let w = renderer.chat_width.get();
+            let n = renderer.estimated_chat_lines(w);
+            let h = renderer.chat_height.get();
+            n.saturating_sub(h) as u16
+        };
+        assert!(tail > 0, "the fixture has scrollback to pin against");
+        assert_eq!(
+            renderer.chat_scroll, tail,
+            "while following, committed output is pinned to the tail"
+        );
+    }
+
+    /// The flip side of item 14: the two explicit ways back onto the tail still
+    /// work, and they re-pin through the same transition.
+    #[test]
+    fn only_the_follow_toggle_and_a_scroll_to_the_tail_re_arm_follow() {
+        // `Ctrl+F` re-arms.
+        let mut renderer = transcript_with_scrollback();
+        assert!(press(
+            &mut renderer,
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL
+        ));
+        assert_eq!(follow_pair(&renderer), (false, false), "off");
+        assert!(press(
+            &mut renderer,
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL
+        ));
+        assert_eq!(follow_pair(&renderer), (true, true), "back on");
+
+        // A scroll that lands on the tail re-arms; one that does not, does not.
+        let mut renderer = transcript_with_scrollback();
+        renderer.set_follow(false);
+        assert!(press(&mut renderer, KeyCode::PageUp, KeyModifiers::NONE));
+        assert!(!renderer.follow, "still away from the tail");
+        for _ in 0..8 {
+            assert!(press(&mut renderer, KeyCode::PageDown, KeyModifiers::NONE));
+        }
+        assert!(
+            renderer.follow,
+            "walking down to the tail is an explicit scroll-to-end gesture"
+        );
+
+        // `End` is the jump-to-bottom spelling, `Home` the opposite.
+        let mut renderer = transcript_with_scrollback();
+        renderer.set_follow(false);
+        assert!(press(&mut renderer, KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(
+            follow_pair(&renderer),
+            (true, true),
+            "`End` jumps to the tail"
+        );
+        assert!(press(&mut renderer, KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(
+            follow_pair(&renderer),
+            (false, false),
+            "`Home` leaves the tail again"
+        );
+    }
+
+    /// The bridge that folds the pre-rebuild fields into view state may never turn
+    /// a mirror write into `follow = true`: that fold *was* the silent re-arm. A
+    /// write going the other way (the legacy scroll path leaving the tail) is still
+    /// adopted, and a divergent mirror is repaired rather than trusted.
+    #[test]
+    fn the_legacy_bridge_repairs_the_mirror_instead_of_re_arming_it() {
+        let mut renderer = transcript_with_scrollback();
+        renderer.set_follow(false);
+
+        // What the old submit path used to do: assign the flag behind `set_follow`.
+        renderer.chat_auto_scroll = true;
+        renderer.adopt_legacy_view_writes();
+        assert!(
+            !renderer.follow,
+            "a stray write of the mirror re-armed follow (D3)"
+        );
+        assert!(
+            !renderer.chat_auto_scroll,
+            "and the mirror was left disagreeing with follow"
+        );
+
+        // An explicit off-write from the legacy scroll path is still a decision.
+        let mut renderer = transcript_with_scrollback();
+        assert!(renderer.follow);
+        renderer.chat_auto_scroll = false;
+        renderer.adopt_legacy_view_writes();
+        assert!(
+            !renderer.follow,
+            "leaving the tail through the legacy path still turns follow off"
+        );
+        assert!(!renderer.chat_auto_scroll);
     }
 }

@@ -48,13 +48,15 @@ pub(crate) enum FocusedPanel {
 ///
 /// The rebuilt view state (`view_mode` / `focus` / `follow`) is authoritative,
 /// but the key path of `events.rs` still writes the pre-rebuild fields
-/// (`show_plan_panel`, `show_subagent_panel`, `focused_panel`,
-/// `chat_auto_scroll`) directly until t-011 routes those keys through the
-/// transition helpers here. Comparing the live field against this mirror tells
-/// [`TuiRenderer::adopt_legacy_view_writes`] the one thing it needs to know: did
-/// somebody write behind the API? A mirror the API keeps current therefore fires
-/// exactly once per legacy write, and never re-reads a mode, a focus or a follow
-/// flag out of a pane toggle the operator has already moved.
+/// (`show_plan_panel`, `show_subagent_panel`, `focused_panel`) directly until
+/// t-011 routes those keys through the transition helpers here. Comparing the live
+/// field against this mirror tells [`TuiRenderer::adopt_legacy_view_writes`] the
+/// one thing it needs to know: did somebody write behind the API? A mirror the API
+/// keeps current therefore fires exactly once per legacy write, and never re-reads
+/// a mode, a focus or a follow flag out of a pane toggle the operator has already
+/// moved. `chat_auto_scroll` is no longer written behind the API at all — it is the
+/// `follow` projection maintained by [`TuiRenderer::project_follow_mirror`] — so
+/// its entry here only ever records what the transitions wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LegacyViewMirror {
     /// Last seen `show_plan_panel`.
@@ -255,7 +257,11 @@ pub struct TuiRenderer {
     pub(crate) focus: state::FocusPane,
     /// Transcript follow: `LIVE` vs `↓ N new` (spec G7) — **real UI state**. The
     /// legacy `chat_auto_scroll` flag is its mirror for the pre-rebuild scroll
-    /// path; [`Self::set_follow`] writes both.
+    /// path; [`Self::set_follow`] moves both, and only
+    /// [`Self::project_follow_mirror`] ever assigns the mirror. Nothing else may
+    /// turn follow on: not a submit, not a command notice, not arriving output —
+    /// only the `Ctrl+F` / `/follow` transition or a scroll that lands on the tail
+    /// (spec §10 item 14).
     pub(crate) follow: bool,
     /// The modal surface on screen (spec §3, §8.5) — **real UI state**: `None`,
     /// the `?`/`F1` legend, or a confirm awaiting `y`/`n`. Moved only by
@@ -368,6 +374,10 @@ pub struct TuiRenderer {
     /// Persistent terminal instance to preserve Ratatui frame diff buffers.
     pub(crate) terminal: Option<Terminal<CrosstermBackend<io::Stdout>>>,
 
+    /// Legacy mirror of [`Self::follow`] for the pre-rebuild scroll and clamp path.
+    /// Not state: written only by [`Self::set_follow`] /
+    /// [`Self::project_follow_mirror`], plus the constructor and a restore, which
+    /// state the decision through `set_follow` immediately afterwards.
     pub(crate) chat_auto_scroll: bool,
     pub(crate) plan_max_scroll: u16,
     pub(crate) plan_auto_scroll: bool,
@@ -668,9 +678,9 @@ impl TuiRenderer {
         // The frame is built from stored view state, so anything a writer outside
         // the key path changed on the legacy fields (a worker activating opens the
         // Workers pane through `set_subagents`, a plan event opens the Plan pane,
-        // the scroll keys move `chat_auto_scroll`) is folded into that state here,
-        // immediately before the view model is read. One pass per frame, and the
-        // mirror makes every fold an edge rather than a re-read.
+        // the scroll keys take the transcript off the tail) is folded into that
+        // state here, immediately before the view model is read. One pass per
+        // frame, and the mirror makes every fold an edge rather than a re-read.
         self.adopt_legacy_view_writes();
         // The notice tables are the only owner of what a filed notice did next, so the
         // ledger is re-read against them once per frame before anything reads it.
@@ -1190,9 +1200,24 @@ impl TuiRenderer {
     /// with the flag: one operator decision, one number in the frame.
     pub(crate) fn set_follow(&mut self, follow: bool) {
         self.follow = follow;
-        self.chat_auto_scroll = follow;
-        self.legacy_view.follow = follow;
+        self.project_follow_mirror();
         self.dirty = true;
+    }
+
+    /// The one named place the legacy `chat_auto_scroll` mirror is assigned.
+    ///
+    /// The flag is not state: it is the same follow decision spelled for the
+    /// pre-rebuild scroll and clamp path (`render.rs`, the streaming pins in
+    /// `on_event`), so it is a pure projection of [`Self::follow`] and may never be
+    /// written on its own. Code that wants the transcript pinned to the tail calls
+    /// [`Self::set_follow(true)`]; code that finds the mirror disagreeing with
+    /// `follow` calls **this** to put it back, which is what makes audit defect D3
+    /// (a submit that silently re-armed follow by assigning the flag) impossible:
+    /// the only writers of the field left are the constructor and a restore, both
+    /// of which state the decision through `set_follow` right afterwards.
+    pub(crate) fn project_follow_mirror(&mut self) {
+        self.chat_auto_scroll = self.follow;
+        self.legacy_view.follow = self.follow;
     }
 
     /// Open the `?`/`F1` keymap + command legend (spec §3, G2).
@@ -1244,11 +1269,18 @@ impl TuiRenderer {
     /// view state, and keep the overlay surface honest with the 3 s abort window.
     ///
     /// `events.rs` owns `show_plan_panel` / `show_subagent_panel` /
-    /// `focused_panel` / `chat_auto_scroll` / `confirm_abort` until t-011 rewires
-    /// the keys onto the transitions above. Each change is turned into exactly
-    /// ONE transition — the mirror records what this renderer last wrote, so a
-    /// write the transitions made is never re-adopted and the stored
-    /// mode/focus/follow never drift back out of a pane toggle.
+    /// `focused_panel` / `confirm_abort` until t-011 rewires the keys onto the
+    /// transitions above. Each change is turned into exactly ONE transition — the
+    /// mirror records what this renderer last wrote, so a write the transitions made
+    /// is never re-adopted and the stored mode/focus/follow never drift back out of
+    /// a pane toggle.
+    ///
+    /// The follow flag is the exception, and deliberately so (D3): `chat_auto_scroll`
+    /// is a projection of `follow` written only through [`Self::set_follow`] and
+    /// [`Self::project_follow_mirror`], so there is no legitimate legacy write that
+    /// could turn follow **on**. A divergence going that way is therefore repaired
+    /// rather than adopted; one going the other way (the legacy scroll path leaving
+    /// the tail) is a real decision and is folded in.
     pub(crate) fn adopt_legacy_view_writes(&mut self) {
         if self.show_plan_panel != self.legacy_view.plan_visible
             || self.show_subagent_panel != self.legacy_view.workers_visible
@@ -1262,7 +1294,19 @@ impl TuiRenderer {
             self.set_focus(state::FocusPane::from_legacy(self.focused_panel));
         }
         if self.chat_auto_scroll != self.legacy_view.follow {
-            self.set_follow(self.chat_auto_scroll);
+            // D3: this is where a divergent mirror used to be **adopted** as
+            // `follow = true`, which is the silent re-arm — a submit (or a command
+            // notice) that assigned the flag put the operator back at the tail on
+            // the next frame. A divergent mirror is now only ever read as the one
+            // decision the legacy scroll path can express on its own, leaving the
+            // tail, and any other divergence is repaired back onto the projection.
+            // Turning follow back on stays reserved to the explicit actions: the
+            // `Ctrl+F` / `/follow` transition, or a scroll that lands on the tail.
+            if !self.chat_auto_scroll {
+                self.set_follow(false);
+            } else {
+                self.project_follow_mirror();
+            }
         }
         // The armed-abort window is a wall-clock surface, not a toggle (§8.5).
         // Its rising edge puts the Confirm surface on screen and its falling

@@ -2004,3 +2004,289 @@ fn fn_body(source: &str, signature: &str) -> String {
     }
     source[start..start + end].to_string()
 }
+
+// ===========================================================================
+// §10 item 14 / audit defect D3 — an instruction never re-arms transcript
+// follow: the operator's scroll-away-from-the-tail survives a submit, while
+// follow **on** keeps pinning new output to the bottom and the `↓ N new` /
+// `● LIVE` chip keeps saying what it says today.
+// ===========================================================================
+
+/// A conversation with real scrollback, M1 with the transcript focused: the
+/// fixture these pins need, where a viewport that jumped is visible in pixels.
+fn scrollback_renderer() -> TuiRenderer {
+    let mut r = TuiRenderer::new();
+    r.messages = (0..40)
+        .map(|i| format!("line {i:02} of a long answer"))
+        .collect();
+    r.set_view_mode(state::ViewMode::Transcript);
+    r.set_focus(state::FocusPane::Transcript);
+    r
+}
+
+/// The body rows of the transcript pane: its two border rows carry the pane title
+/// and the G7 chip row, which these pins compare separately.
+fn transcript_body(rows: &[String], rect: Rect) -> Vec<String> {
+    let start = (usize::from(rect.y) + 1).min(rows.len());
+    let end = (usize::from(rect.y + rect.height) - 1).max(start);
+    rows[start..end].to_vec()
+}
+
+/// The G7 chip row — the transcript pane's own bottom border.
+fn transcript_chip(rows: &[String], rect: Rect) -> String {
+    rows[usize::from(rect.y + rect.height) - 1].clone()
+}
+
+/// Item 14, the defect: scrolled away from the tail and then typed an instruction,
+/// the operator used to land back at the bottom. Follow stays off, the body does
+/// not move, and the chip keeps counting instead of claiming `LIVE`.
+#[test]
+fn a_submit_leaves_follow_off_and_the_body_exactly_where_the_operator_left_it_item14() {
+    let mut r = scrollback_renderer();
+
+    // Two `PageUp`s: the viewport comes off the tail and follow restates to off.
+    assert!(key(&mut r, KeyCode::PageUp));
+    assert!(key(&mut r, KeyCode::PageUp));
+    assert!(
+        !r.follow && !r.chat_auto_scroll,
+        "the scroll gesture took the viewport off the tail"
+    );
+    let offset = r.chat_scroll;
+
+    let (rows, _, rects) = draw_frame(&mut r, 100, 30);
+    let pane = rects.transcript.expect("M1 draws the transcript");
+    let body_before = snapshot(&transcript_body(&rows, pane));
+    let chip_before = transcript_chip(&rows, pane);
+    assert!(
+        on_screen(&body_before).contains("line 00"),
+        "the window sits at the top of the answer:\n{}",
+        on_screen(&body_before)
+    );
+    assert!(
+        chip_before.contains("new") && !chip_before.contains("LIVE"),
+        "the chip counts what is still below it: {chip_before:?}"
+    );
+
+    // Submit: the line reaches the session loop and is echoed into the transcript.
+    type_text(&mut r, "keep going");
+    assert!(key(&mut r, KeyCode::Enter));
+    assert_eq!(
+        drain_submissions(&mut r),
+        vec!["keep going".to_string()],
+        "the instruction still reached the session loop"
+    );
+    assert!(
+        r.messages
+            .last()
+            .is_some_and(|line| line == "User: keep going"),
+        "and the transcript grew: {:?}",
+        r.messages.last()
+    );
+
+    // State: nobody moved the operator's decision, and the mirror is still its
+    // projection rather than a flag of its own.
+    assert!(
+        !r.follow,
+        "submitting re-armed transcript follow (item 14 / D3)"
+    );
+    assert!(
+        !r.chat_auto_scroll,
+        "and its legacy mirror was written behind `set_follow`"
+    );
+    assert_eq!(
+        r.chat_scroll, offset,
+        "the viewport offset did not move under the operator"
+    );
+
+    // Frame: the same body pixels, and a chip that still counts.
+    let (rows_after, _, rects_after) = draw_frame(&mut r, 100, 30);
+    let pane_after = rects_after.transcript.expect("M1 draws the transcript");
+    assert_eq!(pane, pane_after, "the pane itself did not move");
+    assert_eq!(
+        snapshot(&transcript_body(&rows_after, pane_after)),
+        body_before,
+        "the submit moved the transcript window while follow was off"
+    );
+    let chip_after = transcript_chip(&rows_after, pane_after);
+    assert!(
+        chip_after.contains("new") && !chip_after.contains("LIVE"),
+        "the chip must keep counting, never claim LIVE: {chip_after:?}"
+    );
+}
+
+/// Item 14, other half: while follow IS on, an instruction still pins the
+/// transcript to the bottom and the chip stays `● LIVE`.
+#[test]
+fn a_submit_while_following_still_pins_the_transcript_to_the_bottom_item14() {
+    let mut r = scrollback_renderer();
+    assert!(
+        r.follow && r.chat_auto_scroll,
+        "follow is on until the operator says otherwise"
+    );
+
+    let (rows, _, rects) = draw_frame(&mut r, 100, 30);
+    let pane = rects.transcript.expect("M1 draws the transcript");
+    assert!(
+        transcript_chip(&rows, pane).contains("LIVE"),
+        "a followed transcript says LIVE: {:?}",
+        transcript_chip(&rows, pane)
+    );
+    let pinned_at = r.chat_scroll;
+    assert!(
+        pinned_at > 0,
+        "the followed frame drew at the tail, got {pinned_at}"
+    );
+
+    type_text(&mut r, "keep going");
+    assert!(key(&mut r, KeyCode::Enter));
+    assert_eq!(
+        drain_submissions(&mut r),
+        vec!["keep going".to_string()],
+        "the line was sent"
+    );
+    assert!(
+        r.follow && r.chat_auto_scroll,
+        "submitting kept follow on, mirror with it"
+    );
+
+    let (rows_after, _, rects_after) = draw_frame(&mut r, 100, 30);
+    let pane_after = rects_after.transcript.expect("M1 draws the transcript");
+    let body = on_screen(&transcript_body(&rows_after, pane_after));
+    assert!(
+        body.contains("User: keep going"),
+        "the new line is on screen:\n{body}"
+    );
+    assert!(
+        body.contains("line 39 of a long answer"),
+        "and the newest answer line is still at the bottom:\n{body}"
+    );
+    assert!(
+        !body.contains("line 00 "),
+        "while the top of the answer stays above the fold:\n{body}"
+    );
+    assert!(
+        transcript_chip(&rows_after, pane_after).contains("LIVE"),
+        "the chip stayed LIVE: {:?}",
+        transcript_chip(&rows_after, pane_after)
+    );
+    assert!(
+        r.chat_scroll > pinned_at,
+        "the pin moved down with the new line: {pinned_at} -> {}",
+        r.chat_scroll
+    );
+}
+
+/// Item 14, the way back: `Ctrl+F` and `/follow on` are the explicit actions
+/// allowed to re-arm follow, and both re-pin the body to the tail.
+#[test]
+fn the_follow_toggle_and_the_follow_command_re_arm_follow_and_repin_the_body_item14() {
+    let mut r = scrollback_renderer();
+    assert!(key(&mut r, KeyCode::PageUp));
+    assert!(key(&mut r, KeyCode::PageUp));
+    assert!(!r.follow && !r.chat_auto_scroll, "off, away from the tail");
+
+    // `Ctrl+F` re-arms and the frame repins.
+    assert!(press(&mut r, KeyCode::Char('f'), KeyModifiers::CONTROL));
+    assert!(r.follow && r.chat_auto_scroll, "Ctrl+F re-armed follow");
+    let (probe, _, rects) = draw_frame(&mut r, 100, 30);
+    let pane = rects.transcript.expect("M1 draws the transcript");
+    let body = on_screen(&transcript_body(&probe, pane));
+    assert!(
+        body.contains("line 39 of a long answer"),
+        "the toggle re-pinned the body to the tail:\n{body}"
+    );
+    assert!(
+        transcript_chip(&probe, pane).contains("LIVE"),
+        "and the chip says LIVE: {:?}",
+        transcript_chip(&probe, pane)
+    );
+
+    // Scrolling away turns it off again, and `/follow on` is the same decision for
+    // an operator who never touches a chord.
+    assert!(key(&mut r, KeyCode::PageUp));
+    assert!(
+        !r.follow && !r.chat_auto_scroll,
+        "scrolling off the tail turned it off"
+    );
+    type_text(&mut r, "/follow on");
+    assert!(key(&mut r, KeyCode::Enter));
+    assert!(
+        drain_submissions(&mut r).is_empty(),
+        "`/follow on` was answered locally"
+    );
+    assert!(
+        r.follow && r.chat_auto_scroll,
+        "`/follow on` re-armed follow and its mirror"
+    );
+    let (rows, _, rects) = draw_frame(&mut r, 100, 30);
+    let pane = rects.transcript.expect("M1 draws the transcript");
+    let body = on_screen(&transcript_body(&rows, pane));
+    assert!(
+        body.contains("line 39 of a long answer"),
+        "and re-pinned the body:\n{body}"
+    );
+    assert!(
+        transcript_chip(&rows, pane).contains("LIVE"),
+        "with the LIVE chip: {:?}",
+        transcript_chip(&rows, pane)
+    );
+
+    // `/follow off` is the same decision spelled the other way — and the next
+    // instruction does not quietly undo it.
+    type_text(&mut r, "/follow off");
+    assert!(key(&mut r, KeyCode::Enter));
+    drain_submissions(&mut r);
+    assert!(
+        !r.follow && !r.chat_auto_scroll,
+        "`/follow off` turned follow off"
+    );
+    type_text(&mut r, "and now keep going");
+    assert!(key(&mut r, KeyCode::Enter));
+    drain_submissions(&mut r);
+    assert!(
+        !r.follow,
+        "the submit after `/follow off` re-armed it (item 14 / D3)"
+    );
+    let (rows, _, rects) = draw_frame(&mut r, 100, 30);
+    let pane = rects.transcript.expect("M1 draws the transcript");
+    let chip = transcript_chip(&rows, pane);
+    assert!(
+        !chip.contains("LIVE") && chip.contains("new"),
+        "the chip stayed off and kept counting: {chip:?}"
+    );
+}
+
+/// The structural half, asserted as behaviour: even a direct write of the legacy
+/// mirror — exactly what the submit path used to do — cannot repin the frame,
+/// because the bridge repairs the projection instead of adopting it.
+#[test]
+fn a_stray_write_of_the_auto_scroll_mirror_cannot_repin_the_frame_item14() {
+    let mut r = scrollback_renderer();
+    r.set_follow(false);
+    r.chat_scroll = 2;
+    let (rows, _, rects) = draw_frame(&mut r, 100, 30);
+    let pane = rects.transcript.expect("M1 draws the transcript");
+    let body_before = snapshot(&transcript_body(&rows, pane));
+    assert!(!r.follow && !r.chat_auto_scroll);
+
+    // The write the submit path used to make, behind `set_follow`'s back.
+    r.chat_auto_scroll = true;
+    let rows_after = frame_text(&mut r, 100, 30);
+
+    assert!(
+        !r.follow,
+        "the legacy bridge turned a mirror write into follow (D3)"
+    );
+    assert!(
+        !r.chat_auto_scroll,
+        "and left the mirror disagreeing with follow instead of repairing it"
+    );
+    assert_eq!(r.chat_scroll, 2, "the offset stayed where it was put");
+    assert_eq!(
+        snapshot(&transcript_body(&rows_after, pane)),
+        body_before,
+        "the frame was repainted at a different offset"
+    );
+    let chip = transcript_chip(&rows_after, pane);
+    assert!(!chip.contains("LIVE"), "the chip flipped to LIVE: {chip:?}");
+}
