@@ -13,6 +13,7 @@ pub use formatting::*;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)] mod tests_new_ui;
 
 use super::{Event, Renderer, SteerStage, SteerTrace, SubagentDetail};
 use crate::config::Config;
