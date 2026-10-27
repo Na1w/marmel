@@ -19,6 +19,15 @@
 //!   `workers:` and `think:` on status row 2, `● LIVE` / `↓ N new` in the transcript
 //!   pane that owns the viewport. An empty pane toggles **on** and renders its empty
 //!   state (§8.1), so `Ctrl+A` with no workers is never a no-op.
+//! * **The command table is the vocabulary (spec §6).** `command_intent` resolves
+//!   the first line of a submission against `components::input::slash_commands()`
+//!   — the same table the composer autocompletes and `/help` prints — and every
+//!   row of it has an owner here: the commands the renderer answers itself
+//!   (`run_local_command`, each one the same state transition as its key), and the
+//!   destructive family, which stops at the confirm surface
+//!   (`arm_destructive_command`) and is then the session loop's to
+//!   run. A token the table does not carry is answered where it is typed instead
+//!   of being forwarded to the model, so advertised and handled are one set.
 //!
 //! There is deliberately **no mouse handling**: mouse capture is never switched on
 //! anywhere in `src/`, so the pre-rebuild mouse arms were unreachable in practice,
@@ -111,6 +120,181 @@ impl ConfirmAction {
                 }
             }
         }
+    }
+}
+
+/// A §6 command the TUI answers by itself, with its argument already resolved.
+///
+/// Each arm is the **same state transition** as the key the operator can use
+/// instead — `/plan` is `Ctrl+P`, `/workers` is `Ctrl+A`, `/follow` is `Ctrl+F`,
+/// `/mode <name>` is `F3`/`F4`/`F5`, `/error` is `e` — and none of them reaches
+/// the session loop, so a command is never a prompt to the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalCommand {
+    /// `/help`: print the one legend the `F1` overlay and the footer share.
+    Help,
+    /// `/thought`: the `Ctrl+T` thinking chip.
+    Thinking,
+    /// `/error`: the `e` sticky-error recall (spec §8.5).
+    RecallError,
+    /// `/mode [transcript|plan|workers|split]`: `F3`–`F5`. `None` is the bare
+    /// form, which prints the current mode and the arguments the row advertises.
+    Mode(Option<ViewMode>),
+    /// `/plan [on|off]`: the `Ctrl+P` plan-pane toggle; `None` toggles.
+    Plan(Option<bool>),
+    /// `/workers [on|off]`: the `Ctrl+A` workers-pane toggle; `None` toggles.
+    Workers(Option<bool>),
+    /// `/follow [on|off]`: the `Ctrl+F` follow toggle (G7); `None` toggles.
+    Follow(Option<bool>),
+}
+
+/// Who owns the first line of a submission, resolved against the command table
+/// the composer autocompletes and `/help` prints ([`input::slash_commands`]).
+///
+/// One table decides the owner, which is what keeps **advertised and handled the
+/// same set**: every row is either answered here or handed to the confirm
+/// surface, and a token that is not a row is refused with the composer's own
+/// wording instead of being forwarded to the model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CommandIntent {
+    /// Ordinary text, never a command: a multi-line submission (spec §5), a draft
+    /// outside command mode, or prose that merely starts with a slash.
+    Text,
+    /// A command the renderer answers itself.
+    Local(LocalCommand),
+    /// A command the confirm surface and the session loop own: the six `/reset`
+    /// spellings, the quit family (`:q` and `:q!` included) and the `/cancel`
+    /// spellings.
+    Loop,
+    /// A row of the table, given an argument it does not accept.
+    BadArgument {
+        /// The command token, lower-cased the way the table lookup is.
+        name: String,
+        /// The argument as the operator typed it.
+        argument: String,
+    },
+    /// Command mode, but the token names no row of the table.
+    Unknown {
+        /// The token as the operator typed it.
+        token: String,
+    },
+}
+
+/// Whether `token` reads as a command word rather than as prose that happens to
+/// start with a slash: `/plan` and `/reset_plan` do, `/`, `//` and `/tmp/x` do
+/// not. That is what keeps `/tmp/x is the path` an instruction and a bare `/` an
+/// unfinished draft, instead of a refused command.
+fn looks_like_command(token: &str) -> bool {
+    let Some(body) = token.strip_prefix('/') else {
+        return false;
+    };
+    !body.is_empty()
+        && body
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The table rows whose owner is the confirm surface and the session loop. The
+/// vocabulary itself stays in [`crate::ui::helpers`] — the same predicates the
+/// loop's own gate reads — so the two can never disagree about what is
+/// destructive. `/cancel` is already one of the abort spellings there.
+fn is_confirm_command(line: &str) -> bool {
+    let line = line.trim();
+    crate::ui::helpers::is_reset_command(line)
+        || crate::ui::helpers::is_abort_command(line)
+        || line.eq_ignore_ascii_case("/cancel-all")
+}
+
+/// The argument of a row that takes none: an extra word is refused rather than
+/// quietly ignored, so `/help now` can never read as `/help`.
+fn no_argument(argument: &str, command: LocalCommand) -> Result<LocalCommand, ()> {
+    if argument.is_empty() {
+        Ok(command)
+    } else {
+        Err(())
+    }
+}
+
+/// The argument of `/plan`, `/workers` and `/follow`: bare toggles, `on` and
+/// `off` state the target — the same three moves the chip and the chord make.
+fn on_off_argument(argument: &str) -> Result<Option<bool>, ()> {
+    match argument {
+        "" => Ok(None),
+        "on" => Ok(Some(true)),
+        "off" => Ok(Some(false)),
+        _ => Err(()),
+    }
+}
+
+/// The argument of `/mode`: one of the four §4.1 modes spelled by its own
+/// [`ViewMode::tag`], or bare to ask which mode is on screen.
+fn mode_argument(argument: &str) -> Result<Option<ViewMode>, ()> {
+    if argument.is_empty() {
+        return Ok(None);
+    }
+    ViewMode::from_tag(&argument.to_ascii_lowercase())
+        .map(Some)
+        .ok_or(())
+}
+
+/// Resolve the first line of `line` against the command table: which arm of
+/// [`CommandIntent`] answers it, with the argument already parsed.
+fn command_intent(line: &str) -> CommandIntent {
+    // A block is delivered verbatim, whatever its first line spells.
+    if !crate::ui::helpers::submission_is_single_line(line) {
+        return CommandIntent::Text;
+    }
+    let trimmed = line.trim();
+    let token = input::command_token(trimmed);
+    // The confirm-gated family is tested before command mode, because it owns
+    // whole-line spellings that never put the composer into command mode: the vim
+    // spellings `:q` and `:q!`.
+    if is_confirm_command(trimmed) || token.is_some_and(is_confirm_command) {
+        let Some(token) = token else {
+            return CommandIntent::Loop;
+        };
+        // That gate reads the **whole line**, exactly as the session loop does, so
+        // an argument hanging off a row that advertises none is refused here
+        // instead of being forwarded as a prompt. `/cancel <worker key or task id>`
+        // is the one spelling in the family with an argument.
+        let name = token.to_ascii_lowercase();
+        let argument = trimmed.strip_prefix(token).unwrap_or("").trim();
+        if argument.is_empty() || name == "/cancel" {
+            return CommandIntent::Loop;
+        }
+        return CommandIntent::BadArgument {
+            name,
+            argument: argument.to_string(),
+        };
+    }
+    let Some(token) = token else {
+        return CommandIntent::Text;
+    };
+    if !looks_like_command(token) {
+        return CommandIntent::Text;
+    }
+    let name = token.to_ascii_lowercase();
+    let argument = trimmed.strip_prefix(token).unwrap_or("").trim();
+    let parsed = match name.as_str() {
+        "/help" => no_argument(argument, LocalCommand::Help),
+        "/thought" => no_argument(argument, LocalCommand::Thinking),
+        "/error" => no_argument(argument, LocalCommand::RecallError),
+        "/mode" => mode_argument(argument).map(LocalCommand::Mode),
+        "/plan" => on_off_argument(argument).map(LocalCommand::Plan),
+        "/workers" => on_off_argument(argument).map(LocalCommand::Workers),
+        "/follow" => on_off_argument(argument).map(LocalCommand::Follow),
+        _ => {
+            return CommandIntent::Unknown {
+                token: token.to_string(),
+            };
+        }
+    };
+    match parsed {
+        Ok(command) => CommandIntent::Local(command),
+        Err(()) => CommandIntent::BadArgument {
+            name,
+            argument: argument.to_string(),
+        },
     }
 }
 
@@ -445,9 +629,17 @@ impl TuiRenderer {
         self.set_view_mode(next);
     }
 
+    /// The mode whose pane inventory is exactly this pair (§4.3). `Ctrl+P`,
+    /// `Ctrl+A`, `/plan` and `/workers` all land here, which is what makes a pane
+    /// command and its chord the same transition — and a pane toggle never a
+    /// silent no-op (G5).
+    fn set_panes(&mut self, plan: bool, workers: bool) {
+        self.set_view_mode(ViewMode::for_panes(plan, workers));
+    }
+
     /// `Ctrl+P` / `Ctrl+A` (§5): show or hide the Plan / Workers pane. The pane
     /// toggles are the mode's inventory spelled out, so the route is
-    /// [`Self::set_view_mode`]: in M1 the key changes the mode instead of doing
+    /// [`Self::set_panes`]: in M1 the key changes the mode instead of doing
     /// nothing (UX friction 3, G5), and an empty pane turns **on** and draws its
     /// empty state (§8.1). The `plan:` / `workers:` chip on status row 2 is the
     /// persistent echo.
@@ -462,7 +654,7 @@ impl TuiRenderer {
         } else {
             !self.show_subagent_panel
         };
-        self.set_view_mode(ViewMode::for_panes(plan_visible, workers_visible));
+        self.set_panes(plan_visible, workers_visible);
     }
 
     /// `Ctrl+T`: toggle the thinking block. The chip is the echo (§5: "state chip,
@@ -897,6 +1089,137 @@ impl TuiRenderer {
         self.sync_input_from_textarea();
         self.dirty = true;
         true
+    }
+
+    // ---- the §6 commands the TUI answers itself -----------------------------
+
+    /// The argument column the command table advertises for `name`. Reading the
+    /// hint off the table rather than restating it is what keeps the refusal, the
+    /// composer's ghost row and `/help` in agreement.
+    fn advertised_arguments(name: &str) -> &'static str {
+        input::slash_commands()
+            .into_iter()
+            .find(|command| command.name.eq_ignore_ascii_case(name))
+            .map_or("", |command| command.args)
+    }
+
+    /// One notice line for a command: pushed into the transcript and recorded in
+    /// `status_line` (the field `capture_ui` and the pre-rebuild surfaces read;
+    /// §7.4 keeps a single line of that traffic). This is what stops a command
+    /// from ever answering with silence (G5). On screen the persistent echo is the
+    /// state change itself — the `plan:` / `workers:` / `think:` chips on status
+    /// row 2, the mode chip in the header, the transcript's own `● LIVE` /
+    /// `↓ N new` chip — and this line is the immediate one.
+    ///
+    /// It deliberately does **not** touch `chat_auto_scroll`: that flag is the
+    /// mirror of transcript follow and moves only through [`Self::set_follow`] and
+    /// the scroll path (G7), so a notice that forced it on would quietly switch
+    /// follow back on underneath a `/follow off`.
+    fn notice(&mut self, text: &str) {
+        self.messages.push(format!("[CLI] {text}"));
+        self.status_line = text.lines().next().unwrap_or("").to_string();
+        self.dirty = true;
+    }
+
+    /// §6: answer the commands the composer's table carries, and refuse the
+    /// spellings it does not. Returns whether the submission was answered here,
+    /// i.e. that it must never reach the session loop.
+    ///
+    /// The confirm-gated family is already intercepted by
+    /// [`Self::arm_destructive_command`] before this runs, so its rows reach here
+    /// only as [`CommandIntent::Loop`], which is the loop's to answer.
+    fn run_command_line(&mut self, line: &str) -> bool {
+        match command_intent(line) {
+            CommandIntent::Text | CommandIntent::Loop => false,
+            CommandIntent::Local(command) => {
+                self.run_local_command(command);
+                true
+            }
+            CommandIntent::BadArgument { name, argument } => {
+                let accepted = Self::advertised_arguments(&name);
+                let expected = if accepted.is_empty() {
+                    format!("{name} takes no argument")
+                } else {
+                    format!("{name} takes {accepted}")
+                };
+                self.notice(&format!("{expected} — \"{name} {argument}\" was not run."));
+                true
+            }
+            CommandIntent::Unknown { token } => {
+                self.notice(&format!(
+                    "{token} is not a command — /help prints the command table, F1 the key legend."
+                ));
+                true
+            }
+        }
+    }
+
+    /// Run one command the TUI answers itself. Every arm calls the transition the
+    /// mirrored key calls, so the command and the key cannot drift apart.
+    fn run_local_command(&mut self, command: LocalCommand) {
+        match command {
+            // §5 + acceptance criterion 3: `/help`, the `F1` overlay and the
+            // footer print **one** table, built from `legend()` plus the command
+            // table the composer reads. Printing this rather than a copy is what
+            // makes the three surfaces byte-identical, and the legend used to be
+            // a hard-coded string that had already gone stale.
+            LocalCommand::Help => {
+                self.messages.push(format!("[CLI] {}", help::help_text()));
+                self.chat_auto_scroll = true;
+                self.dirty = true;
+            }
+            LocalCommand::Thinking => {
+                self.show_thought = !self.show_thought;
+                self.messages.push(format!(
+                    "[CLI] Thinking display: {}",
+                    if self.show_thought { "ON" } else { "OFF" }
+                ));
+                self.chat_auto_scroll = true;
+                self.dirty = true;
+            }
+            // `e` already states its outcome in the transcript, sticky §8.5
+            // buffer first, so `/error` is that function and nothing else.
+            LocalCommand::RecallError => self.recall_last_error(),
+            // Bare `/mode` is the question, not a no-op: it answers with the mode
+            // on screen and the arguments the table advertises.
+            LocalCommand::Mode(None) => self.notice(&format!(
+                "View mode {} — /mode {}",
+                self.view_mode.label(),
+                Self::advertised_arguments("/mode")
+            )),
+            LocalCommand::Mode(Some(mode)) => {
+                self.set_view_mode(mode);
+                self.notice(&format!("View mode {} ({})", mode.label(), mode.tag()));
+            }
+            LocalCommand::Plan(on) => {
+                let plan = on.unwrap_or(!self.show_plan_panel);
+                self.set_panes(plan, self.show_subagent_panel);
+                self.notice(&format!(
+                    "Plan pane {} (Ctrl+P does the same)",
+                    if self.show_plan_panel { "on" } else { "off" }
+                ));
+            }
+            LocalCommand::Workers(on) => {
+                let workers = on.unwrap_or(!self.show_subagent_panel);
+                self.set_panes(self.show_plan_panel, workers);
+                self.notice(&format!(
+                    "Workers pane {} (Ctrl+A does the same)",
+                    if self.show_subagent_panel {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                ));
+            }
+            LocalCommand::Follow(on) => {
+                let follow = on.unwrap_or(!self.follow);
+                self.set_follow(follow);
+                self.notice(&format!(
+                    "Transcript follow {} (Ctrl+F does the same)",
+                    if self.follow { "on" } else { "off" }
+                ));
+            }
+        }
     }
 
     /// `e` / `/error`: print the sticky last error again (spec §8.5).
@@ -1336,27 +1659,6 @@ impl TuiRenderer {
             let _ = self.tx.send(String::new());
             return;
         }
-        // Handle the `/thought` toggle locally.
-        if line.trim().eq_ignore_ascii_case("/thought") {
-            self.show_thought = !self.show_thought;
-            let state = if self.show_thought { "ON" } else { "OFF" };
-            self.messages
-                .push(format!("[CLI] Thinking display: {state}"));
-            self.chat_auto_scroll = true;
-            return;
-        }
-        // §5 + acceptance criterion 3: `/help`, the `F1` overlay and the footer
-        // print **one** table. The legend used to be a hard-coded string here and had
-        // already gone stale (it advertised mouse bindings the handler never had), so
-        // the text now comes from `components::help::help_text()`, which is built
-        // from `legend()` plus the slash-command table the composer's autocomplete
-        // reads. Printing this rather than a copy is what makes the three surfaces
-        // byte-identical.
-        if line.trim().eq_ignore_ascii_case("/help") {
-            self.messages.push(format!("[CLI] {}", help::help_text()));
-            self.chat_auto_scroll = true;
-            return;
-        }
         // §6 + §10 item 17: every destructive slash command — the quit family,
         // `/cancel <id>`, `/cancel-all` and all six `/reset` spellings — stops here
         // and waits on the confirm surface. Nothing is sent, no plan is cleared and
@@ -1364,6 +1666,15 @@ impl TuiRenderer {
         // renderer-local `/reset` short-circuit that used to answer five of the six
         // spellings by hand: they now all take the loop's full path on `y`.
         if self.arm_destructive_command(&line) {
+            return;
+        }
+        // §6: the commands the TUI answers itself (`/help`, `/thought`, `/error`,
+        // `/mode`, `/plan`, `/workers`, `/follow`), the refusal for a row given an
+        // argument it does not take, and the refusal for a token the table does not
+        // carry. All three are resolved from the one command table the composer
+        // autocompletes and `/help` prints, so an advertised command is a handled
+        // command and a typed command is never quietly handed to the model.
+        if self.run_command_line(&line) {
             return;
         }
         self.commit_turn_content();
@@ -1416,5 +1727,469 @@ impl TuiRenderer {
             self.messages.push(format!("{prefix}{trimmed}"));
         }
         self.chat_auto_scroll = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Press one key through the seam the live loop drives.
+    fn press(renderer: &mut TuiRenderer, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        renderer.apply_terminal_event(&TermEvent::Key(KeyEvent::new(code, modifiers)))
+    }
+
+    /// Everything the composer has handed to the session loop so far.
+    fn drain_submissions(renderer: &mut TuiRenderer) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(line) = renderer.rx.try_recv() {
+            out.push(line);
+        }
+        out
+    }
+
+    /// Type `line` into the composer and press Enter.
+    fn submit(renderer: &mut TuiRenderer, line: &str) {
+        renderer.set_input_content(line);
+        renderer.submit();
+    }
+
+    /// The whole view state the §6 view commands and their chords are allowed to
+    /// move — the mode, the focus a mode change may repair, and the four toggles.
+    /// Comparing this tuple is what proves a command does **exactly** what its key
+    /// does, rather than merely something in the same direction.
+    fn view(renderer: &TuiRenderer) -> (ViewMode, FocusPane, bool, bool, bool, bool) {
+        (
+            renderer.view_mode,
+            renderer.focus,
+            renderer.show_plan_panel,
+            renderer.show_subagent_panel,
+            renderer.follow,
+            renderer.show_thought,
+        )
+    }
+
+    /// §6 + the advertised/handled rule: every row the table carries has an owner.
+    /// A row that resolved to neither would be a command `/help` advertises and no
+    /// key or handler runs — the exact hole this task closes.
+    #[test]
+    fn every_advertised_command_has_an_owner() {
+        for command in input::slash_commands() {
+            let intent = command_intent(command.name);
+            assert!(
+                matches!(intent, CommandIntent::Local(_) | CommandIntent::Loop),
+                "`{}` is advertised but nothing runs it: {intent:?}",
+                command.name
+            );
+        }
+    }
+
+    /// The argument column of the table is the argument the handler accepts, so
+    /// `/help` and the ghost row can never promise a spelling the command refuses.
+    #[test]
+    fn the_advertised_arguments_are_the_arguments_the_handler_takes() {
+        let accepted: [(&str, CommandIntent); 9] = [
+            (
+                "/mode split",
+                CommandIntent::Local(LocalCommand::Mode(Some(ViewMode::Split))),
+            ),
+            (
+                "/mode TRANSCRIPT",
+                CommandIntent::Local(LocalCommand::Mode(Some(ViewMode::Transcript))),
+            ),
+            (
+                "/plan on",
+                CommandIntent::Local(LocalCommand::Plan(Some(true))),
+            ),
+            (
+                "/plan off",
+                CommandIntent::Local(LocalCommand::Plan(Some(false))),
+            ),
+            (
+                "/workers on",
+                CommandIntent::Local(LocalCommand::Workers(Some(true))),
+            ),
+            (
+                "/follow off",
+                CommandIntent::Local(LocalCommand::Follow(Some(false))),
+            ),
+            ("/error", CommandIntent::Local(LocalCommand::RecallError)),
+            ("/help", CommandIntent::Local(LocalCommand::Help)),
+            ("/thought", CommandIntent::Local(LocalCommand::Thinking)),
+        ];
+        for (line, expected) in accepted {
+            assert_eq!(command_intent(line), expected, "`{line}`");
+        }
+    }
+
+    /// Who owns which spelling: the confirm surface owns the destructive family
+    /// including the two vim spellings, and nothing else is a command at all.
+    #[test]
+    fn the_owner_of_each_spelling_is_resolved_from_the_table() {
+        for spelling in [
+            ":q",
+            ":q!",
+            "/quit",
+            "/exit",
+            "/q",
+            "/abort",
+            "/stop",
+            "/cancel",
+            "/cancel t-004",
+            "/cancel-all",
+            "/reset",
+            "/reset_plan",
+            "/reset-plan",
+            "/clear_plan",
+            "/clear-plan",
+            "/reset_execution_plan",
+        ] {
+            assert_eq!(
+                command_intent(spelling),
+                CommandIntent::Loop,
+                "`{spelling}`"
+            );
+        }
+        // Not commands: prose, an unfinished draft, a path, a bare word (spec §5)
+        // and a block, whatever its first line spells.
+        for text in [
+            "keep working on t-004",
+            "/tmp/x is the path",
+            "/",
+            "// note",
+            "stop",
+            "/plan\nand the rest of the block",
+        ] {
+            assert_eq!(command_intent(text), CommandIntent::Text, "`{text}`");
+        }
+        // A token shaped like a command but absent from the table is reported, not
+        // forwarded — `/retry` among them, which the table no longer carries
+        // because there is no retry action to route it to.
+        for token in ["/xyz", "/retry", "/paln"] {
+            assert_eq!(
+                command_intent(token),
+                CommandIntent::Unknown {
+                    token: token.to_string()
+                },
+                "`{token}`"
+            );
+        }
+        // A row given an argument it does not take.
+        assert_eq!(
+            command_intent("/plan maybe"),
+            CommandIntent::BadArgument {
+                name: "/plan".to_string(),
+                argument: "maybe".to_string(),
+            }
+        );
+        // The confirm family reads the whole line, so an argument hanging off a
+        // row that advertises none is refused rather than sent as a prompt.
+        for spelling in ["/quit now", "/cancel-all now", "/reset now"] {
+            assert!(
+                matches!(command_intent(spelling), CommandIntent::BadArgument { .. }),
+                "`{spelling}`: {:?}",
+                command_intent(spelling)
+            );
+        }
+        // `/cancel <worker key or task id>` is the one row of that family with an
+        // argument, and a multi-word one stays the loop's business.
+        assert_eq!(
+            command_intent("/cancel coder_specialist-t-004"),
+            CommandIntent::Loop
+        );
+    }
+
+    /// Each command makes the same transition as the key that mirrors it: `Ctrl+P`
+    /// (plan), `Ctrl+A` (workers), `Ctrl+F` (follow), `Ctrl+T` (thinking).
+    #[test]
+    fn each_toggle_command_makes_its_chords_transition() {
+        for (command, code, modifiers) in [
+            ("/plan", KeyCode::Char('p'), KeyModifiers::CONTROL),
+            ("/workers", KeyCode::Char('a'), KeyModifiers::CONTROL),
+            ("/follow", KeyCode::Char('f'), KeyModifiers::CONTROL),
+            ("/thought", KeyCode::Char('t'), KeyModifiers::CONTROL),
+        ] {
+            let mut by_command = TuiRenderer::new();
+            let mut by_chord = TuiRenderer::new();
+            submit(&mut by_command, command);
+            assert!(
+                press(&mut by_chord, code, modifiers),
+                "`{code:?}` is a binding"
+            );
+            assert_eq!(
+                view(&by_command),
+                view(&by_chord),
+                "`{command}` moved the view state differently from `{code:?}`"
+            );
+            assert!(
+                drain_submissions(&mut by_command).is_empty(),
+                "`{command}` reached the session loop"
+            );
+            assert!(
+                by_command.confirm_action.is_none(),
+                "`{command}` asked for a confirm its key does not ask for"
+            );
+            assert!(by_command.dirty, "`{command}` left nothing to repaint");
+            assert!(
+                by_command
+                    .messages
+                    .iter()
+                    .any(|line| line.starts_with("[CLI]")),
+                "`{command}` gave no notice: {:?}",
+                by_command.messages
+            );
+        }
+    }
+
+    /// `/mode <name>` is `F3`/`F4`/`F5`; the fourth mode has no direct key, and
+    /// bare `/mode` is a question that gets answered.
+    #[test]
+    fn the_mode_command_sets_the_mode_the_function_key_sets() {
+        for (argument, code) in [
+            ("transcript", KeyCode::F(3)),
+            ("plan", KeyCode::F(4)),
+            ("workers", KeyCode::F(5)),
+        ] {
+            let mut by_command = TuiRenderer::new();
+            let mut by_key = TuiRenderer::new();
+            by_command.set_view_mode(ViewMode::Split);
+            by_key.set_view_mode(ViewMode::Split);
+            submit(&mut by_command, &format!("/mode {argument}"));
+            assert!(press(&mut by_key, code, KeyModifiers::NONE));
+            assert_eq!(
+                view(&by_command),
+                view(&by_key),
+                "`/mode {argument}` moved the view state differently from `{code:?}`"
+            );
+            assert_eq!(by_command.view_mode.tag(), argument);
+            assert!(
+                by_command.status_line.contains("View mode"),
+                "`/mode {argument}`: {}",
+                by_command.status_line
+            );
+            assert!(drain_submissions(&mut by_command).is_empty());
+        }
+
+        // `split` is the mode `F2` only cycles through, and the spelling is
+        // case-insensitive like every other command.
+        let mut renderer = TuiRenderer::new();
+        submit(&mut renderer, "/mode SPLIT");
+        assert_eq!(renderer.view_mode, ViewMode::Split);
+        assert!(renderer.show_plan_panel && renderer.show_subagent_panel);
+
+        // Bare `/mode` answers with the mode on screen and the arguments the table
+        // advertises, and changes nothing.
+        let mut renderer = TuiRenderer::new();
+        let before = view(&renderer);
+        submit(&mut renderer, "/mode");
+        assert_eq!(view(&renderer), before, "bare `/mode` changed the mode");
+        assert!(
+            renderer
+                .status_line
+                .contains(&format!("View mode {}", renderer.view_mode.label())),
+            "{}",
+            renderer.status_line
+        );
+        assert!(
+            renderer
+                .status_line
+                .contains("transcript|plan|workers|split"),
+            "bare `/mode` must state the arguments it takes: {}",
+            renderer.status_line
+        );
+        assert!(drain_submissions(&mut renderer).is_empty());
+    }
+
+    /// `on` / `off` state the target instead of flipping it, and stay idempotent.
+    #[test]
+    fn the_argument_forms_state_the_target_rather_than_flipping_it() {
+        let mut renderer = TuiRenderer::new();
+        submit(&mut renderer, "/plan on");
+        assert!(renderer.show_plan_panel);
+        submit(&mut renderer, "/plan on");
+        assert!(renderer.show_plan_panel, "`/plan on` is idempotent");
+        submit(&mut renderer, "/plan off");
+        assert!(!renderer.show_plan_panel);
+
+        // `/workers on` over a plan pane that is already on lands in M4, exactly
+        // where `Ctrl+A` lands from M2.
+        let mut by_command = TuiRenderer::new();
+        let mut by_chord = TuiRenderer::new();
+        submit(&mut by_command, "/plan on");
+        submit(&mut by_command, "/workers on");
+        press(&mut by_chord, KeyCode::Char('p'), KeyModifiers::CONTROL);
+        press(&mut by_chord, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(view(&by_command), view(&by_chord));
+        assert_eq!(by_command.view_mode, ViewMode::Split);
+
+        // Follow is the G7 flag plus its legacy mirror, as `Ctrl+F` leaves them.
+        submit(&mut renderer, "/follow off");
+        assert!(!renderer.follow && !renderer.chat_auto_scroll);
+        submit(&mut renderer, "/follow on");
+        assert!(renderer.follow && renderer.chat_auto_scroll);
+        assert!(drain_submissions(&mut renderer).is_empty());
+    }
+
+    /// `/error` is the `e` mnemonic: the same recall, the same line, no confirm.
+    #[test]
+    fn the_error_command_recalls_what_the_e_key_recalls() {
+        let planted = vec![
+            "User: rebuild the TUI".to_string(),
+            "LLM error: http — 503 upstream".to_string(),
+        ];
+        let mut by_command = TuiRenderer::new();
+        let mut by_key = TuiRenderer::new();
+        by_command.messages = planted.clone();
+        by_key.messages = planted;
+
+        submit(&mut by_command, "/error");
+        assert!(
+            press(&mut by_key, KeyCode::Char('e'), KeyModifiers::NONE),
+            "`e` is a binding with an empty composer"
+        );
+
+        assert_eq!(
+            by_command.messages, by_key.messages,
+            "`/error` and `e` recalled different traffic"
+        );
+        let recalled = by_command.messages.last().cloned().unwrap_or_default();
+        assert!(recalled.starts_with('✗'), "{recalled}");
+        assert!(recalled.contains("marmel.log"), "{recalled}");
+        assert!(drain_submissions(&mut by_command).is_empty());
+    }
+
+    /// The rule this task is named for: an unknown `/xyz` is answered where it is
+    /// typed and never reaches the model.
+    #[test]
+    fn an_unknown_command_is_refused_and_never_reaches_the_model() {
+        for token in ["/xyz", "/retry", "/paln", "/p"] {
+            let mut renderer = TuiRenderer::new();
+            submit(&mut renderer, token);
+            assert!(
+                drain_submissions(&mut renderer).is_empty(),
+                "`{token}` was sent to the session loop"
+            );
+            assert!(renderer.history.is_empty(), "`{token}` was recorded");
+            let notice = renderer.messages.last().cloned().unwrap_or_default();
+            assert!(
+                notice.contains("is not a command"),
+                "`{token}` gave no unknown-command feedback: {notice}"
+            );
+            assert!(
+                renderer.status_line.contains(token),
+                "`{token}`: {}",
+                renderer.status_line
+            );
+            assert!(
+                renderer.confirm_action.is_none(),
+                "`{token}` opened a confirm"
+            );
+        }
+    }
+
+    /// A row given an argument it does not take is refused, unchanged and unsent.
+    /// That covers the confirm family too: `/quit now` must neither open a confirm
+    /// nor reach the model as a prompt.
+    #[test]
+    fn a_bad_argument_is_refused_and_changes_nothing() {
+        for (line, accepted) in [
+            ("/plan maybe", "on|off"),
+            ("/follow yes", "on|off"),
+            ("/workers up", "on|off"),
+            ("/mode frobnicate", "transcript|plan|workers|split"),
+            ("/help now", "no argument"),
+            ("/error now", "no argument"),
+            ("/quit now", "no argument"),
+            ("/cancel-all now", "no argument"),
+        ] {
+            let mut renderer = TuiRenderer::new();
+            let before = view(&renderer);
+            submit(&mut renderer, line);
+            assert_eq!(view(&renderer), before, "`{line}` moved the view state");
+            assert!(
+                renderer.confirm_action.is_none(),
+                "`{line}` opened a confirm for a spelling no gate accepts"
+            );
+            assert!(
+                drain_submissions(&mut renderer).is_empty(),
+                "`{line}` was sent to the session loop"
+            );
+            let notice = renderer.messages.last().cloned().unwrap_or_default();
+            assert!(
+                notice.contains(accepted),
+                "`{line}` did not name what it accepts: {notice}"
+            );
+            assert!(notice.contains("was not run"), "{notice}");
+        }
+    }
+
+    /// The table `/help` prints is the table the dispatch reads, argument column
+    /// included — and the command with no handler behind it is no longer in it.
+    #[test]
+    fn the_printed_command_table_names_the_arguments_and_the_vim_spellings() {
+        let mut renderer = TuiRenderer::new();
+        submit(&mut renderer, "/help");
+        let printed = renderer.messages.last().cloned().unwrap_or_default();
+        for row in [
+            "/plan on|off",
+            "/workers on|off",
+            "/follow on|off",
+            "/mode transcript|plan|workers|split",
+            ":q",
+            ":q!",
+        ] {
+            assert!(
+                printed.contains(row),
+                "the printed table is missing `{row}`:\n{printed}"
+            );
+        }
+        assert!(
+            !printed.contains("/retry"),
+            "`/retry` is still advertised:\n{printed}"
+        );
+    }
+
+    /// The commands the TUI owns are answered locally: nothing to the loop, no
+    /// confirm, one visible notice each — and the destructive family still stops
+    /// at the confirm surface instead of being answered here.
+    #[test]
+    fn the_local_commands_answer_locally_and_the_destructive_ones_stay_gated() {
+        for line in [
+            "/help",
+            "/thought",
+            "/mode",
+            "/mode workers",
+            "/plan",
+            "/plan off",
+            "/workers",
+            "/workers on",
+            "/follow",
+            "/follow on",
+            "/error",
+        ] {
+            let mut renderer = TuiRenderer::new();
+            submit(&mut renderer, line);
+            assert!(
+                drain_submissions(&mut renderer).is_empty(),
+                "`{line}` reached the session loop"
+            );
+            assert!(
+                renderer
+                    .messages
+                    .iter()
+                    .any(|line| line.starts_with("[CLI]")),
+                "`{line}` left no notice in the transcript"
+            );
+            assert!(renderer.dirty, "`{line}` left nothing to repaint");
+        }
+        for line in ["/quit", ":q", "/reset", "/cancel-all"] {
+            let mut renderer = TuiRenderer::new();
+            submit(&mut renderer, line);
+            assert!(
+                renderer.confirm_action.is_some(),
+                "`{line}` skipped the confirm surface"
+            );
+            assert!(drain_submissions(&mut renderer).is_empty());
+        }
     }
 }

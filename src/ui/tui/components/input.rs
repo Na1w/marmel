@@ -84,11 +84,12 @@ pub struct HistoryPos {
     pub len: usize,
 }
 
-/// A slash command of spec §6 — the one table the composer's autocomplete and
-/// the help overlay's command list both read.
+/// A command of spec §6 — the one table the composer's autocomplete, the help
+/// overlay's command list and the TUI's command dispatch all read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlashCommand {
-    /// The spelling, including the leading `/`.
+    /// The spelling exactly as the operator types it: `/`-prefixed, except for
+    /// the two accepted vim spellings of the quit family.
     pub name: &'static str,
     /// Argument hint shown behind the name; `""` when the command takes none.
     pub args: &'static str,
@@ -96,23 +97,41 @@ pub struct SlashCommand {
     pub effect: &'static str,
 }
 
-/// The §6 command table in spec order. Aliases are rows, because every spelling
-/// in that table is something the operator may type. `/h` and `/f` are *not*
-/// rows: they are prefix matches resolved by [`suggest`].
+/// The §6 command table in spec order — and the single source of the command
+/// vocabulary: the composer autocompletes from it, `/help` and the `F1` overlay
+/// print it, and `events::command_intent` resolves every row in it to an owner.
+/// A row that no owner ran would advertise a command that does nothing, so the
+/// advertised set and the handled set are the same set by construction, and the
+/// argument column is the argument that owner really accepts.
+///
+/// Aliases are rows, because every spelling in that table is something the
+/// operator may type. `/h` and `/f` are *not* rows: they are prefix matches
+/// resolved by [`suggest`]. The two vim spellings are rows but are **not**
+/// reachable through the completion, because the composer only switches into
+/// command mode on a leading `/` ([`command_token`]): they are complete
+/// spellings of the quit family that the confirm gate accepts, listed here so
+/// `/help` says so out loud.
 pub fn slash_commands() -> Vec<SlashCommand> {
     [
         ("/help", "", "print the key legend and this command table"),
         ("/thought", "", "toggle the thinking block (state chip)"),
-        ("/follow", "", "toggle transcript follow (LIVE / ↓ N new)"),
-        ("/plan", "", "show the Execution Plan pane"),
-        ("/workers", "", "show the Workers pane"),
+        (
+            "/follow",
+            "on|off",
+            "toggle transcript follow (Ctrl+F, LIVE / ↓ N new)",
+        ),
+        ("/plan", "on|off", "toggle the Execution Plan pane (Ctrl+P)"),
+        ("/workers", "on|off", "toggle the Workers pane (Ctrl+A)"),
         (
             "/mode",
             "transcript|plan|workers|split",
-            "set the view mode",
+            "set the view mode (F3-F5); bare form prints it",
         ),
-        ("/error", "", "print the sticky last error and the log path"),
-        ("/retry", "", "re-submit the most recent history entry"),
+        (
+            "/error",
+            "",
+            "print the sticky last error and the log path (key e)",
+        ),
         (
             "/cancel",
             "<worker key or task id>",
@@ -124,6 +143,8 @@ pub fn slash_commands() -> Vec<SlashCommand> {
         ("/q", "", "quit the session (confirm)"),
         ("/abort", "", "quit the session (confirm)"),
         ("/stop", "", "quit the session (confirm)"),
+        (":q", "", "quit the session (confirm), as /quit does"),
+        (":q!", "", "quit the session (confirm), as /quit does"),
         (
             "/reset",
             "",
@@ -142,6 +163,10 @@ pub fn slash_commands() -> Vec<SlashCommand> {
 
 /// The command token on line 1 of `buffer`, or `None` when the draft is not in
 /// command mode (spec §6: recognised after trimming, on line 1 only).
+///
+/// Command mode is a leading `/`, and nothing else: the two vim spellings the
+/// command gate accepts (`:q`, `:q!`) are complete spellings, so they are listed
+/// by `/help` but never autocompleted and never chip the composer as a command.
 pub fn command_token(buffer: &str) -> Option<&str> {
     let line = buffer.lines().next()?.trim_start();
     if !line.starts_with('/') {
@@ -445,7 +470,12 @@ mod tests {
         assert_eq!(suggest("/h").as_deref(), Some("/help"));
         assert_eq!(suggest("/tho").as_deref(), Some("/thought"));
         assert_eq!(suggest("/mo").as_deref(), Some("/mode"));
+        assert_eq!(suggest("/mod").as_deref(), Some("/mode"));
         assert_eq!(suggest("/fol").as_deref(), Some("/follow"));
+        assert_eq!(suggest("/err").as_deref(), Some("/error"));
+        // The pane and mode commands the TUI now runs are completable too.
+        assert_eq!(suggest("/pl").as_deref(), Some("/plan"));
+        assert_eq!(suggest("/wor").as_deref(), Some("/workers"));
         assert_eq!(suggest("/cancel-al").as_deref(), Some("/cancel-all"));
         // Command mode is decided by line 1, so a multi-line draft still gets
         // its completion (spec §6: single-line submissions only, line 1 wins).
@@ -471,31 +501,52 @@ mod tests {
         assert_eq!(suggest("/zz"), None);
         // A fully typed command has nothing left to add.
         assert_eq!(suggest("/exit"), None);
+        assert_eq!(suggest("/plan"), None);
+        assert_eq!(suggest("/mode"), None);
         assert_eq!(suggest("/cancel <id>").as_deref(), None);
     }
 
     #[test]
     fn suggest_never_guesses_past_the_longest_common_prefix() {
-        // `/` matches the whole table; the common prefix is `/` itself.
+        // `/` matches the whole slash table; the common prefix is `/` itself.
         assert_eq!(suggest("/"), None);
         // /cancel, /cancel-all, /clear_plan, /clear-plan share only `/c`.
         assert_eq!(suggest("/c"), None);
         assert_eq!(suggest("/ca").as_deref(), Some("/cancel"));
         assert_eq!(suggest("/cle").as_deref(), Some("/clear"));
-        // /q and /quit share `/q`; /reset* and /retry share `/re`.
+        // /q and /quit share `/q`, and the colon spellings are out of reach of a
+        // `/` token, so they never widen the candidate set here.
         assert_eq!(suggest("/q"), None);
-        assert_eq!(suggest("/re"), None);
+        // `/re` used to be ambiguous with `/retry`, which the table no longer
+        // carries (no retry action exists to route it to): the four `/reset`
+        // spellings now share `/reset`, which is honest to complete to.
+        assert_eq!(suggest("/re").as_deref(), Some("/reset"));
         assert_eq!(suggest("/reset").as_deref(), None);
     }
 
     #[test]
     fn candidates_come_from_the_command_table() {
-        assert_eq!(candidates("/").len(), slash_commands().len());
+        // Command mode is a leading `/`, so the completion sees the 20 slash rows
+        // and never the two vim spellings.
+        assert_eq!(candidates("/").len(), 20);
+        assert_eq!(
+            candidates("/").len(),
+            slash_commands()
+                .iter()
+                .filter(|command| command.name.starts_with('/'))
+                .count(),
+            "every slash row is autocompletable"
+        );
         assert_eq!(candidates("/c").len(), 4);
-        assert_eq!(candidates("/re").len(), 5);
+        assert_eq!(candidates("/re").len(), 4);
         assert_eq!(candidates("/mode")[0].name, "/mode");
         assert!(candidates("/zz").is_empty());
-        assert_eq!(slash_commands().len(), 21);
+        assert_eq!(slash_commands().len(), 22);
+        // The vim spellings are rows, so `/help` prints them; `candidates` only
+        // reaches them if asked directly, which `command_token` never does.
+        assert_eq!(candidates(":q").len(), 2);
+        assert_eq!(command_token(":q"), None);
+        assert_eq!(command_token(":q!"), None);
     }
 
     #[test]
@@ -508,7 +559,7 @@ mod tests {
 
     #[test]
     fn suggestion_row_reports_the_candidate_count_when_ambiguous() {
-        assert_eq!(suggestion_row("/").as_deref(), Some("21 commands match /"));
+        assert_eq!(suggestion_row("/").as_deref(), Some("20 commands match /"));
         assert_eq!(suggestion_row("/c").as_deref(), Some("4 commands match /c"));
         assert_eq!(
             suggestion_row("/ca").as_deref(),
@@ -518,6 +569,12 @@ mod tests {
             suggestion_row("/mode").as_deref(),
             Some("/mode transcript|plan|workers|split")
         );
+        // The argument column is the argument the command accepts, so the ghost
+        // row and the handler agree.
+        assert_eq!(suggestion_row("/pl").as_deref(), Some("/plan on|off"));
+        assert_eq!(suggestion_row("/fol").as_deref(), Some("/follow on|off"));
+        assert_eq!(suggestion_row("/wor").as_deref(), Some("/workers on|off"));
+        assert_eq!(suggestion_row("/err").as_deref(), Some("/error"));
         assert_eq!(
             suggestion_row("/zz").as_deref(),
             Some("/zz is not a command")
