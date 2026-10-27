@@ -15,15 +15,22 @@
 //!
 //! Two things are never done, because both are process-wide side effects rather
 //! than a UI assertion: `y` is never pressed on a **Quit** or **CancelAll** request
-//! (`request_user_exit` and `cancel_every_worker` cancel work across the whole
-//! process), and a frame is never painted through the *crossterm* backend
-//! (`render_terminal` would write escape codes into the test runner's stdout).
+//! (`request_user_exit` and `cancel_every_worker` cancel work — and the
+//! process-wide cancellation token — across the whole process, including registry
+//! entries owned by suites that take no lock; the executed broadcast is pinned in
+//! `tests/test_session_restore_panel_abort.rs` instead), and a frame is never
+//! painted through the *crossterm* backend (`render_terminal` would write escape
+//! codes into the test runner's stdout). A **single-worker** `y` *is* pressed: it
+//! addresses one registry entry by name, so it is pinned against live entries the
+//! test itself plants (§10 item 17, `CancellationLedger` below).
 
 use super::*;
+use crate::orchestrator::workers;
 use crate::ui::QueueState;
 use crate::ui::Renderer as _;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::style::{Color, Style};
+use tokio_util::sync::CancellationToken;
 
 /// One frame pass: the text of every row, the cell grid, and the rects it used.
 type Frame = (Vec<String>, Grid, layout::PaneRects);
@@ -634,12 +641,180 @@ fn a_confirm_over_the_help_legend_returns_to_the_legend_on_esc_item16() {
 // cancellation is not reachable from it.
 // ===========================================================================
 
+// ---- the cancellation seam --------------------------------------------------
+//
+// A confirm answer does not *return* a cancellation, it causes one: `y` calls
+// `orchestrator::cancel_active_worker` for one row (`events.rs:950`) or
+// `orchestrator::cancel_all` for the broadcast (`events.rs:991`), and the effect
+// of both lands in the process-global worker registry. The registry is therefore
+// the honest place to observe **which action the UI requested and which worker it
+// targeted**, so these tests plant live entries there instead of reading
+// `events.rs` as text and counting call sites:
+//
+// * one `CancellationToken` per planted row — the token that gets fired is the
+//   identity of the worker the UI actually addressed;
+// * the entry's `status` — `"In Progress"` until a cancel path labels it
+//   `"Aborted"` (`workers.rs:1470` for one worker, `:1494` for the broadcast);
+// * the process-wide token, cloned at plant time — the broadcast's own
+//   fingerprint (`bus.rs:38`), which a single-worker answer must never touch.
+//
+// `workers::TEST_WORKERS_MUTEX` is the lock every other suite in this binary
+// takes before it touches the registry or the global token: the arbitration tests
+// reset the token under it (`bridge/tests.rs:1319`) and the worker suite runs the
+// only other broadcast call site under it (`workers.rs:1652`). Holding it for a
+// whole test is what turns "and nothing else was cancelled" into a decidable
+// fact rather than a race against a parallel suite.
+
+/// Three roster rows private to this file. `{agent}-{task}` is the natural
+/// registry key (`workers.rs:816`), so a planted entry's effective key is
+/// byte-identical to the row name the UI puts into `ConfirmAction::CancelWorker`,
+/// and no other suite's key can collide with these.
+const ITEM17_ROWS: [(&str, &str); 3] = [
+    ("item17_alpha_specialist", "t-9317"),
+    ("item17_beta_specialist", "t-9318"),
+    ("item17_gamma_specialist", "t-9319"),
+];
+
+/// The registry key of one fixture row, spelled the way the registry spells it.
+fn item17_key(agent: &str, task: &str) -> String {
+    format!("{agent}-{task}")
+}
+
+/// The roster half of the fixture: the three rows above, live, in row order, so
+/// selection index `n` and planted key `n` name the same worker.
+fn item17_renderer() -> TuiRenderer {
+    let mut r = TuiRenderer::new();
+    r.plan_content = MIXED_PLAN.to_string();
+    r.subagents = ITEM17_ROWS
+        .iter()
+        .map(|(agent, task)| SubagentDetail {
+            name: item17_key(agent, task),
+            task_id: Some((*task).to_string()),
+            is_active: true,
+            ..SubagentDetail::default()
+        })
+        .collect();
+    r.set_view_mode(state::ViewMode::Split);
+    r
+}
+
+/// One planted registry entry, together with the token a cancellation must fire.
+struct PlantedWorker {
+    key: String,
+    token: CancellationToken,
+    _guard: workers::ActiveWorkerGuard,
+}
+
+/// The recording half of the seam: live workers in the process-global registry,
+/// planted under the exact keys the roster rows carry, plus the three
+/// observations that decide item 17.
+struct CancellationLedger {
+    rows: Vec<PlantedWorker>,
+}
+
+impl CancellationLedger {
+    /// Register one live worker per roster row, and pin the fixture's own
+    /// precondition: the effective key IS the row name, so every key the UI can
+    /// emit is an address this ledger can be read back against.
+    fn plant() -> Self {
+        let rows = ITEM17_ROWS
+            .iter()
+            .map(|(agent, task)| {
+                let token = CancellationToken::new();
+                let guard = workers::register_active_worker_with_token(
+                    Some((*task).to_string()),
+                    (*agent).to_string(),
+                    "item 17 cancellation fixture".to_string(),
+                    Some(token.clone()),
+                );
+                let key = item17_key(agent, task);
+                assert_eq!(
+                    guard.0, key,
+                    "the row's key must be the entry's effective registry key"
+                );
+                PlantedWorker {
+                    key,
+                    token,
+                    _guard: guard,
+                }
+            })
+            .collect();
+        Self { rows }
+    }
+
+    /// The rows whose own cancellation token has been fired, in row order.
+    fn cancelled(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .filter(|row| row.token.is_cancelled())
+            .map(|row| row.key.clone())
+            .collect()
+    }
+
+    /// The rows the registry itself labels `Aborted`, in row order — what a
+    /// cancellation leaves behind for every other reader of the roster.
+    fn aborted(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .filter(|row| {
+                workers::worker_state_snapshot(&row.key)
+                    .is_some_and(|state| state.info.status == "Aborted")
+            })
+            .map(|row| row.key.clone())
+            .collect()
+    }
+
+    /// The rows still running: token armed, entry live, not labelled aborted.
+    fn untouched(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .filter(|row| {
+                !row.token.is_cancelled()
+                    && workers::worker_state_snapshot(&row.key)
+                        .is_some_and(|state| state.is_active() && state.info.status != "Aborted")
+            })
+            .map(|row| row.key.clone())
+            .collect()
+    }
+
+    /// The status the registry holds for one row.
+    fn status(&self, key: &str) -> String {
+        workers::worker_state_snapshot(key)
+            .map(|state| state.info.status)
+            .unwrap_or_else(|| panic!("the fixture lost its entry for {key}"))
+    }
+}
+
+impl Drop for CancellationLedger {
+    fn drop(&mut self) {
+        // Leave the shared table exactly as this test found it: no completed
+        // entries, no completed-ring eviction left behind.
+        for row in &self.rows {
+            let _ = workers::remove_worker_entry_for_test(&row.key);
+        }
+    }
+}
+
+/// Take the registry lock for a whole test (see the seam note above).
+fn registry_gate() -> std::sync::MutexGuard<'static, ()> {
+    workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Item 17: `x` on a selected roster row asks about **that** row and nothing else
-/// — the surface names one worker, promises only that one stops, and `n` leaves
-/// every row running.
+/// — the request carries that row's key and task id, the surface names and
+/// promises only that one worker, and `n` leaves all three planted workers
+/// running: no token fired, no entry labelled `Aborted`, broadcast token armed.
 #[test]
 fn x_asks_about_the_selected_row_and_only_that_row_item17() {
-    let mut r = m4_renderer();
+    let _registry = registry_gate();
+    let ledger = CancellationLedger::plant();
+    let broadcast = crate::orchestrator::global_cancellation_token();
+    let (agent, task) = ITEM17_ROWS[1];
+    let selected = item17_key(agent, task);
+
+    let mut r = item17_renderer();
     r.set_focus(state::FocusPane::Workers);
     r.selected_subagent_idx = 1;
     let rows_before = r.subagents.len();
@@ -648,16 +823,21 @@ fn x_asks_about_the_selected_row_and_only_that_row_item17() {
     assert_eq!(
         r.confirm_action,
         Some(events::ConfirmAction::CancelWorker {
-            key: "researcher_specialist-t-009".to_string(),
-            task_id: Some("t-009".to_string()),
+            key: selected.clone(),
+            task_id: Some(task.to_string()),
         }),
         "the identity is captured at request time (§5)"
+    );
+    assert!(
+        ledger.cancelled().is_empty(),
+        "asking cancels nothing: {:?}",
+        ledger.cancelled()
     );
 
     let (rows, _, rects) = draw_frame(&mut r, 100, 30);
     let screen = on_screen(&rows);
     assert!(
-        screen.contains("Cancel worker 'researcher_specialist-t-009'"),
+        screen.contains(&format!("Cancel worker '{selected}'")),
         "the surface names the selected row only:\n{screen}"
     );
     assert!(
@@ -679,31 +859,51 @@ fn x_asks_about_the_selected_row_and_only_that_row_item17() {
     let body = rects.body.expect("body");
     assert!(contains(body, rects.workers.expect("M4 draws Workers")));
 
-    // `n`: every row is left alone, the roster still has all three.
+    // `n`: the refusal is not a cancellation. Every planted worker keeps its
+    // armed token, its live entry and its running label.
     assert!(key(&mut r, KeyCode::Char('n')));
     assert_eq!(
         r.status_line,
-        "Worker 'researcher_specialist-t-009' was left running."
+        format!("Worker '{selected}' was left running.")
     );
     assert_eq!(r.subagents.len(), rows_before);
-    assert!(
-        r.subagents
-            .iter()
-            .any(|row| row.name == "researcher_specialist-t-009")
-    );
+    assert!(r.subagents.iter().any(|row| row.name == selected));
     assert!(!r.user_exit_requested());
     assert!(
         drain_submissions(&mut r).is_empty(),
         "nothing was sent to the loop"
     );
+    assert_eq!(
+        ledger.cancelled(),
+        Vec::<String>::new(),
+        "no row's token was fired"
+    );
+    assert_eq!(
+        ledger.aborted(),
+        Vec::<String>::new(),
+        "no row was labelled aborted"
+    );
+    assert_eq!(ledger.untouched().len(), 3, "every row is still live");
+    assert!(
+        !broadcast.is_cancelled(),
+        "declining never reaches the broadcast"
+    );
 }
 
-/// Item 17: `y` on a single-worker request goes through the one-worker registry
-/// path only. The session keeps running, nothing is armed, and the source of that
-/// path contains no broadcast call.
+/// Item 17: `y` on a single-worker request cancels **exactly that worker** — one
+/// token fired, one registry entry labelled `Aborted`, the other planted rows
+/// untouched and still labelled running — and never touches the process-wide
+/// cancellation token the broadcast owns. The session keeps running, arms
+/// nothing and sends nothing.
 #[test]
 fn confirming_one_worker_never_reaches_the_broadcast_cancellation_item17() {
-    let mut r = m4_renderer();
+    let _registry = registry_gate();
+    let ledger = CancellationLedger::plant();
+    let broadcast = crate::orchestrator::global_cancellation_token();
+    let (agent, task) = ITEM17_ROWS[2];
+    let target = item17_key(agent, task);
+
+    let mut r = item17_renderer();
     r.set_focus(state::FocusPane::Workers);
     r.selected_subagent_idx = 2;
     assert!(key(&mut r, KeyCode::Char('x')));
@@ -711,76 +911,107 @@ fn confirming_one_worker_never_reaches_the_broadcast_cancellation_item17() {
         r.confirm_action,
         Some(events::ConfirmAction::CancelWorker { .. })
     ));
+    assert!(
+        ledger.cancelled().is_empty(),
+        "the request alone cancels nothing"
+    );
 
     assert!(key(&mut r, KeyCode::Char('y')));
-    // The registry is empty in this process, so the honest answer is "not running
-    // any more" — and crucially the session is alive, un-armed and silent.
-    assert!(
-        r.status_line.contains("validator_specialist-t-003"),
-        "the echo names the same row: {:?}",
-        r.status_line
+    // The effect of the answer, read off the registry the answer acts on: one
+    // worker, and it is the row `x` was standing on.
+    assert_eq!(
+        ledger.cancelled(),
+        vec![target.clone()],
+        "exactly one worker was cancelled"
     );
+    assert_eq!(
+        ledger.aborted(),
+        vec![target.clone()],
+        "and exactly one roster entry carries the cancellation"
+    );
+    assert_eq!(ledger.status(&target), "Aborted");
+    for (other_agent, other_task) in [ITEM17_ROWS[0], ITEM17_ROWS[1]] {
+        let other = item17_key(other_agent, other_task);
+        assert_eq!(
+            ledger.status(&other),
+            "In Progress",
+            "{other} was swept by a broadcast"
+        );
+    }
+    assert_eq!(
+        ledger.untouched().len(),
+        2,
+        "the rows the request did not name keep running"
+    );
+    // The broadcast owns the process-wide token (`bus.rs:38`): an armed one is
+    // the proof that a single-worker answer never reached it.
+    assert!(
+        !broadcast.is_cancelled(),
+        "a single cancellation is not a broadcast"
+    );
+
+    assert_eq!(r.status_line, format!("Cancelled worker '{target}'."));
     assert!(
         !r.user_exit_requested(),
         "a single cancel never ends the session"
     );
     assert!(!r.is_abort_armed());
     assert_eq!(r.overlay, state::OverlayState::None);
-    assert!(drain_submissions(&mut r).is_empty());
+    assert!(
+        drain_submissions(&mut r).is_empty(),
+        "and nothing was sent to the loop"
+    );
 
-    // The auditable half: the handler that resolves `x` and the `CancelWorker`
-    // arm of the answer contain no `cancel_all`, and events.rs keeps exactly one
-    // call site for the broadcast — inside `cancel_every_worker`.
-    let source = include_str!("events.rs");
-    let arm = fn_body(
-        source,
-        "fn request_cancel_selected_worker(&mut self) -> bool",
+    // THE one source-text assertion this suite keeps, and why. What is pinned
+    // above is everything a test can observe: which request the keymap emitted,
+    // which worker it addressed, and that the broadcast token stayed armed. What
+    // no test in THIS binary can observe is the effect of the broadcast itself —
+    // pressing `y` on `CancelAll` would run `orchestrator::cancel_all()` for the
+    // whole test process, sweeping registry entries belonging to suites that do
+    // not hold `TEST_WORKERS_MUTEX` (`ui/helpers.rs`, `ui/session.rs`,
+    // `harness/dispatch_integrity_tests.rs`) — so the executed broadcast is
+    // pinned in its own binary instead:
+    // `tests/test_session_restore_panel_abort.rs`, ac-a4. That leaves exactly one
+    // link unpinned from here, the one inside the confirm answer: that the bulk
+    // cancellation is reachable from the `CancelAll` arm and from no other arm.
+    let answer = fn_body(
+        include_str!("events.rs"),
+        "fn confirm_pending(&mut self) -> bool",
     );
-    assert!(arm.contains("ConfirmAction::CancelWorker"), "got: {arm}");
+    let (singles, broadcast_arm) = answer
+        .split_once("Some(ConfirmAction::CancelAll)")
+        .expect("the confirm answer dispatches on CancelAll");
     assert!(
-        !arm.contains("cancel_all"),
-        "single-worker arm calls the broadcast"
-    );
-    let answer = fn_body(source, "fn confirm_pending(&mut self) -> bool");
-    let worker_arm = answer
-        .split("Some(ConfirmAction::CancelAll)")
-        .next()
-        .unwrap_or("")
-        .to_string();
-    assert!(
-        worker_arm.contains("cancel_active_worker"),
-        "the single-worker path goes through the registry: {worker_arm}"
-    );
-    assert!(
-        !worker_arm.contains("cancel_all("),
-        "and never through the broadcast"
-    );
-    let code = uncommented(source);
-    assert_eq!(
-        code.matches("orchestrator::cancel_all(").count(),
-        1,
-        "exactly one broadcast call site in the key handler (code, not prose)"
-    );
-    assert!(
-        fn_body(source, "fn cancel_every_worker(&mut self)").contains("orchestrator::cancel_all()"),
-        "it lives in `/cancel-all`'s own function"
+        !singles.contains("cancel_every_worker")
+            && broadcast_arm.contains("self.cancel_every_worker()"),
+        "the bulk cancellation is reachable from the `CancelAll` arm and from no \
+         other arm of the confirm answer"
     );
 }
 
-/// Item 17, the other spelling: `/cancel <worker key or task id>` resolves to the
-/// same one-worker request, and `/cancel-all` is the only spelling that reaches
-/// the broadcast — where it waits on the same confirm surface.
+/// Item 17, the other spellings: `/cancel <task id>` and `/cancel <whole key>`
+/// each resolve to the one worker they name — and the confirmed one cancels that
+/// row and no other — while `/cancel-all` is a distinct request that neither
+/// `Esc` nor `n` ever runs. End to end: three requests, one cancelled worker.
 #[test]
 fn the_named_and_the_broadcast_spellings_stay_apart_item17() {
-    // `/cancel <key>` → the same `CancelWorker` request `x` would have made.
-    let mut r = m4_renderer();
-    type_text(&mut r, "/cancel t-009");
+    let _registry = registry_gate();
+    let ledger = CancellationLedger::plant();
+    let broadcast = crate::orchestrator::global_cancellation_token();
+    let (alpha_agent, alpha_task) = ITEM17_ROWS[0];
+    let alpha = item17_key(alpha_agent, alpha_task);
+    let (gamma_agent, gamma_task) = ITEM17_ROWS[2];
+    let gamma = item17_key(gamma_agent, gamma_task);
+
+    // `/cancel <task id>` → the named worker, and `y` cancels that one only.
+    let mut r = item17_renderer();
+    type_text(&mut r, &format!("/cancel {gamma_task}"));
     key(&mut r, KeyCode::Enter);
     assert_eq!(
         r.confirm_action,
         Some(events::ConfirmAction::CancelWorker {
-            key: "researcher_specialist-t-009".to_string(),
-            task_id: Some("t-009".to_string()),
+            key: gamma.clone(),
+            task_id: Some(gamma_task.to_string()),
         }),
         "the argument resolves against the roster"
     );
@@ -789,15 +1020,64 @@ fn the_named_and_the_broadcast_spellings_stay_apart_item17() {
         "and nothing was sent while it waits on the surface"
     );
     let rows = on_screen(&frame_text(&mut r, 100, 30));
-    assert!(rows.contains("Cancel worker 'researcher_specialist-t-009'"));
-    assert!(!rows.contains("Cancels every running worker"));
-    assert!(key(&mut r, KeyCode::Char('n')));
+    assert!(rows.contains(&format!("Cancel worker '{gamma}'")), "{rows}");
+    assert!(!rows.contains("Cancels every running worker"), "{rows}");
+    assert!(key(&mut r, KeyCode::Char('y')));
+    assert_eq!(
+        ledger.cancelled(),
+        vec![gamma.clone()],
+        "the named spelling cancels the named row only"
+    );
+    assert_eq!(ledger.aborted(), vec![gamma.clone()]);
+    assert!(!broadcast.is_cancelled(), "and never reaches the broadcast");
+    assert!(
+        drain_submissions(&mut r).is_empty(),
+        "a confirmed worker cancel is never handed to the loop as a command"
+    );
 
-    // `/cancel-all` → the broadcast, confirmed, never sent as a command.
-    let mut r = m4_renderer();
+    // `/cancel <whole key>` names the same single worker. `Esc` drops it, and a
+    // dropped request is not a cancellation.
+    let mut r = item17_renderer();
+    type_text(&mut r, &format!("/cancel {alpha}"));
+    key(&mut r, KeyCode::Enter);
+    assert_eq!(
+        r.confirm_action,
+        Some(events::ConfirmAction::CancelWorker {
+            key: alpha.clone(),
+            task_id: Some(alpha_task.to_string()),
+        }),
+        "the whole-key spelling resolves to the same one row"
+    );
+    assert!(key(&mut r, KeyCode::Esc));
+    assert_eq!(r.confirm_action, None, "Esc drops the request");
+    assert!(!r.is_abort_armed(), "and arms nothing");
+    assert!(
+        r.status_line
+            .contains(&format!("Confirm cancel of worker '{alpha}'")),
+        "the status line states the pending request: {:?}",
+        r.status_line
+    );
+    assert!(drain_submissions(&mut r).is_empty(), "and nothing was sent");
+    assert_eq!(
+        ledger.cancelled(),
+        vec![gamma.clone()],
+        "the dropped request cancelled nothing"
+    );
+
+    // `/cancel-all` is the broadcast request — a different request, not the named
+    // one wearing another label — and it too runs only on `y`.
+    let mut r = item17_renderer();
     type_text(&mut r, "/cancel-all");
     key(&mut r, KeyCode::Enter);
     assert_eq!(r.confirm_action, Some(events::ConfirmAction::CancelAll));
+    assert_ne!(
+        r.confirm_action,
+        Some(events::ConfirmAction::CancelWorker {
+            key: gamma.clone(),
+            task_id: Some(gamma_task.to_string()),
+        }),
+        "the broadcast is not the named request re-labelled"
+    );
     let rows = on_screen(&frame_text(&mut r, 100, 30));
     assert!(rows.contains("Cancel every worker (/cancel-all)"), "{rows}");
     assert!(
@@ -805,7 +1085,7 @@ fn the_named_and_the_broadcast_spellings_stay_apart_item17() {
         "even the broadcast waits for `y`"
     );
     assert!(key(&mut r, KeyCode::Esc));
-    assert_eq!(r.confirm_action, None, "Esc drops the request");
+    assert_eq!(r.confirm_action, None, "Esc drops the broadcast");
     assert!(!r.is_abort_armed(), "and arms nothing");
     assert!(
         r.status_line
@@ -814,14 +1094,32 @@ fn the_named_and_the_broadcast_spellings_stay_apart_item17() {
         r.status_line
     );
     assert!(drain_submissions(&mut r).is_empty(), "and nothing was sent");
+    assert!(
+        !broadcast.is_cancelled(),
+        "Esc on the broadcast cancels nothing"
+    );
 
     // `n` is the explicit refusal, and it says so on the status line.
-    let mut r = m4_renderer();
+    let mut r = item17_renderer();
     type_text(&mut r, "/cancel-all");
     key(&mut r, KeyCode::Enter);
     assert!(key(&mut r, KeyCode::Char('n')));
     assert_eq!(r.status_line, "Every worker was left running.");
     assert!(!r.user_exit_requested());
+
+    // The whole run, end to end: three requests, one confirmed single-worker
+    // cancellation, and the two rows no request named are still running.
+    assert_eq!(ledger.cancelled(), vec![gamma.clone()]);
+    assert_eq!(ledger.aborted(), vec![gamma]);
+    assert_eq!(
+        ledger.untouched().len(),
+        2,
+        "a named cancellation never swept the roster"
+    );
+    assert!(
+        !broadcast.is_cancelled(),
+        "the broadcast was never run from a keystroke"
+    );
 }
 
 // ===========================================================================
