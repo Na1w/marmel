@@ -414,19 +414,24 @@ The complete 26-row table is the on-screen legend: press `?` or `F1`, or run `/h
 
 ### Slash Commands
 
-Type these directly into the chat input (they match case-insensitively, on line 1 only, and they exist only in the TUI — raw mode reads no input at all). Multi-line drafts are never parsed as commands, so a pasted block that starts with `/reset` arrives verbatim. `/help` prints the same table, and the composer autocompletes: `Tab` accepts the ghost completion.
+Type these directly into the chat input (they match case-insensitively, on line 1 only, and they exist only in the TUI — raw mode reads no input at all). Multi-line drafts are never parsed as commands, so a pasted block that starts with `/reset` arrives verbatim. The table below is the one the composer autocompletes from and `/help` prints — **22 spellings**, 20 `/`-prefixed plus the two vim spellings of the quit family (`:q` / `:q!`, accepted but not autocompleted, because command mode is `/`-only) — and every row is either answered by the TUI itself or routed through the confirm overlay: none of them is delivered to the model as a prompt. `/retry` is not a command (no retry action exists in the backend); an unknown spelling (`/xyz`, `/paln`) or a bad argument (`/plan maybe`, `/quit now`) is refused locally, with the accepted argument read off the table.
 
 | Command | Action |
 |---|---|
-| `/help` | Print the key legend and this command table in the transcript. |
-| `/thought` | Toggle display of reasoning and thinking content (the `think:` chip). |
+| `/help` | Print the key legend and this command table in the transcript (the same body `F1` draws). |
+| `/thought` | Toggle display of reasoning and thinking content (the `think:` chip, `Ctrl+T`). |
+| `/follow [on\|off]` | Toggle transcript follow (the `● LIVE` / `↓ N new` chip on the transcript border, `Ctrl+F`). |
+| `/plan [on\|off]` | Show or hide the Plan pane (the `plan:` chip, `Ctrl+P`). |
+| `/workers [on\|off]` | Show or hide the Workers pane (the `workers:` chip, `Ctrl+A`). |
+| `/mode transcript\|plan\|workers\|split` | Set the view mode (`F3`–`F5`); a bare `/mode` prints the current mode and the arguments it takes. |
+| `/error` | Print the sticky last error again (the `e` key). |
 | `/cancel <worker key or task id>` | Cancel one worker (confirm). |
 | `/cancel` | Selected worker when the Workers pane is focused; otherwise a quit spelling (confirm). |
 | `/cancel-all` | Cancel every running worker (confirm). |
 | `/reset` (`/reset_plan`, `/reset-plan`, `/clear_plan`, `/clear-plan`, `/reset_execution_plan`) | Clear the execution plan, session bundle, steering history and transcript, and tell the model (confirm). |
-| `/exit` (`/quit`, `/q`, `/abort`, `/stop`, and the legacy `:q` / `:q!`) | Quit the session, cancel running workers, and stamp a `userAbort` ending on the bundle (confirm). |
+| `/exit` (`/quit`, `/q`, `/abort`, `/stop`, and the vim spellings `:q` / `:q!`) | Quit the session, cancel running workers, and stamp a `userAbort` ending on the bundle (confirm). |
 
-`/plan`, `/workers`, `/follow`, `/mode …`, `/error` and `/retry` appear in the command table and autocomplete, but no handler executes them yet on this branch — use `Ctrl+P`, `Ctrl+A`, `Ctrl+F`, `F2`–`F5` and `e` instead.
+Command semantics, refusal wording and the autocomplete rules: [docs/new_ui.md §6](docs/new_ui.md).
 
 ### Headless Raw Mode
 

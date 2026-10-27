@@ -138,7 +138,7 @@ decision (`scroll_by` → `set_follow`, `src/ui/tui/events.rs:487-495`).
 
 These are all the bindings the rebuilt TUI has; the same table is what `?`/`F1`
 draws and what `/help` prints (`legend()` in
-`src/ui/tui/components/help.rs:87-250`, 26 rows).
+`src/ui/tui/components/help.rs:87-246`, 26 rows).
 
 ### 5.1 Composer
 
@@ -253,25 +253,60 @@ Printed under the help table, so old muscle memory learns the replacement:
 Type them in the composer (line 1 only, case-insensitive, recognised after
 trimming). The table below is the real command table the composer's autocomplete
 and `/help` both read (`slash_commands()` in
-`src/ui/tui/components/input.rs:102-137`): **21 spellings**.
+`src/ui/tui/components/input.rs:114-162`): **22 spellings** — 20 `/`-prefixed
+ones plus the two vim spellings of the quit family. One resolver reads that same
+table for every submission (`command_intent` in
+`src/ui/tui/events.rs:242-299`, dispatched at `:1133` and `:895`), so every row
+is either answered by the TUI itself or handed to the confirm overlay and then
+the session loop. Nothing in the table is forwarded to the model as a prompt,
+and there is no chain of string compares behind it: the table **is** the
+vocabulary.
 
 | Command | Effect | What actually happens |
 |---|---|---|
-| `/help` | Print the key legend and this command table. | Printed into the transcript by the TUI. |
-| `/thought` | Toggle the thinking block. | Done in the TUI; the `think:` chip echoes it. |
+| `/help` | Print the key legend and this command table. | Printed into the transcript by the TUI — the same body the `F1` overlay draws (`help_text()` built from `legend()` plus this table), so the three surfaces cannot disagree. |
+| `/thought` | Toggle the thinking block. | Done in the TUI, the `Ctrl+T` transition; the `think:` chip echoes it. |
+| `/follow [on\|off]` | Toggle transcript follow. | Done in the TUI, the same transition as `Ctrl+F`: the transcript border shows `● LIVE` again or starts counting `↓ N new`. Bare form toggles; `on` / `off` state the target. |
+| `/plan [on\|off]` | Show or hide the Execution Plan pane. | Done in the TUI, the `Ctrl+P` transition; the `plan:` chip on status row 2 is the persistent echo. |
+| `/workers [on\|off]` | Show or hide the Workers pane. | Done in the TUI, the `Ctrl+A` transition; the `workers:` chip on status row 2 is the persistent echo. |
+| `/mode transcript\|plan\|workers\|split` | Set the view mode. | Done in the TUI, the `F3`/`F4`/`F5` transitions: `transcript` → `M1`, `plan` → `M2`, `workers` → `M3`, `split` → `M4`, plus a notice naming the mode and its tag. A bare `/mode` is a question, not a no-op: it prints the mode on screen and the arguments it accepts. |
+| `/error` | Show the last error again. | Done in the TUI — exactly what the `e` key does (`recall_last_error`, `src/ui/tui/events.rs:1236`): the sticky §8.5 error buffer first (category plus the whole text), a transcript scan as fallback, then `see .marmel/marmel.log`. |
 | `/cancel <worker key or task id>` | Cancel **one** worker. | Confirm overlay; `y` cancels that row. The argument matches a roster key or task id case-insensitively; an unknown name is still confirmed and then reports `Worker '…' is not running any more.` rather than cancelling a different row. |
 | `/cancel` (no argument) | Cancel one worker, or quit. | With the **Workers pane focused** and at least one worker, it names the selected row (confirm). Anywhere else the spelling keeps its old meaning — a quit (confirm). |
 | `/cancel-all` | Cancel every worker. | Confirm overlay, then bulk cancel. |
 | `/reset` | Clear plan, session bundle, steering history and transcript (confirm). | Confirm overlay; `y` hands the command to the session loop, which clears the plan + session bundle + journals and tells the model. |
 | `/reset_plan`, `/reset-plan`, `/clear_plan`, `/clear-plan`, `/reset_execution_plan` | Same as `/reset` (all five are real spellings). | Same confirm, same single path. |
-| `/exit`, `/quit`, `/q`, `/abort`, `/stop` | Quit the session. | Confirm overlay; `y` runs the loop's abort branch (cancel workers, stamp a `userAbort` ending). `:q` and `:q!` are also accepted quit spellings, though they are not in the autocomplete table. |
+| `/exit`, `/quit`, `/q`, `/abort`, `/stop` | Quit the session. | Confirm overlay; `y` runs the loop's abort branch (cancel workers, stamp a `userAbort` ending). |
+| `:q`, `:q!` | Quit the session (the two vim spellings). | Rows of the table, so `/help` lists them, and they route through the **same confirm overlay** as `/quit` (`is_abort_command`, `src/ui/helpers.rs:197-211`). They are **not** autocompleted and never chip the composer as a command, because command mode is `/`-only (`command_token`, `src/ui/tui/components/input.rs:170`). |
 
-`/plan`, `/workers`, `/follow`, `/mode transcript|plan|workers|split`, `/error`
-and `/retry` are listed in the command table and in `/help`, and the composer
-will autocomplete them — **but no handler runs them on this branch**: submitting
-one is delivered to the model as ordinary text. Their keyboard equivalents do
-work: `Ctrl+P` (plan), `Ctrl+A` (workers), `Ctrl+F` (follow), `F2`–`F5` (modes),
-`e` (last error). Recorded as drift in §9.
+`/retry` is **not** a command and is not in the table: no retry action exists in
+the backend, so advertising one would advertise a dead key. Typing it is refused
+like any other unknown spelling (see below).
+
+**Command or prose?** A `/`-prefixed token made of ASCII letters, digits, `_` and
+`-` is a command (`/plan`, `/reset_plan`); everything else is ordinary text and
+goes to the model — `/tmp/x is the path`, `// note`, a lone `/`, a bare `stop`,
+and any multi-line draft whatever its first line spells (`looks_like_command`,
+`src/ui/tui/events.rs:187`).
+
+**Unknown command.** A command-shaped token that is not a row of the table —
+`/xyz`, a misspelling such as `/paln`, or `/retry` — is refused in the composer
+and never sent to the model. The transcript and the status line get:
+`/xyz is not a command — /help prints the command table, F1 the key legend.`
+The composer's ghost row says `/xyz is not a command` while you type it.
+
+**Bad argument.** A row given an argument it does not accept is refused the same
+way, and the accepted argument is read off the table itself rather than
+restated (`advertised_arguments`, `src/ui/tui/events.rs:1101`):
+
+```text
+/plan takes on|off — "/plan maybe" was not run.
+/mode takes transcript|plan|workers|split — "/mode frobnicate" was not run.
+/quit takes no argument — "/quit now" was not run.
+```
+
+`/cancel <worker key or task id>` is the one row of that family with an argument
+of its own.
 
 **Autocomplete.** Start a `/` and the composer's frame shows the completion: a
 unique prefix names it (`/tho` → `/thought`), an ambiguous prefix completes only
@@ -368,20 +403,19 @@ this branch's code disagree, **this guide documents the code**. Recorded drift:
    (the plan pane is `src/ui/tui/components/plan_pane.rs`).
 3. **There is no `ClearTranscript` confirm surface.** `events::ConfirmAction` has
    exactly four variants — `Quit`, `CancelWorker`, `CancelAll`, `Command`
-   (`src/ui/tui/events.rs:49-72`). Transcript clearing happens only as part of
+   (`src/ui/tui/events.rs:58-82`). Transcript clearing happens only as part of
    `/reset`, which is the `Command` variant.
 4. **Spec §10.1 and §7.4 contradict each other about the task id at 40 columns.**
    The code always shows it: `header_budget` returns `show_task: true`
    unconditionally (`src/ui/tui/layout.rs:86`), and the 40 × 10 preview frame
    proves it (` Marmel ✓ 3/7 done ▶ t-004`).
-5. **Six commands in the command table have no handler** — `/follow`, `/plan`,
-   `/workers`, `/mode`, `/error`, `/retry` (`src/ui/tui/components/input.rs:102-137`).
-   They are autocompleted and printed by `/help`, but submitting one reaches the
-   model as plain text. Their key equivalents all work.
-6. **`:q` and `:q!` are accepted quit spellings** (`is_abort_command`,
-   `src/ui/helpers.rs:197-211`) and do open the confirm overlay, but they are not
-   rows in the slash-command table, so `/help` and the autocomplete do not mention them.
-7. **Boot mode differs from the spec's worked example.** Spec §2.2 presents
+5. **`:q` and `:q!` are rows of the command table** (`slash_commands()`,
+   `src/ui/tui/components/input.rs:114-162`) and route through the same confirm
+   overlay as `/quit` (`is_abort_command`, `src/ui/helpers.rs:197-211`), but they
+   are the only rows the autocomplete never offers: composer command mode is
+   `/`-only (`command_token`, `src/ui/tui/components/input.rs:170`), so they are
+   neither completed nor shown as a `command …` chip.
+6. **Boot mode differs from the spec's worked example.** Spec §2.2 presents
    `M4 Split` as the default at 100 × 30; the renderer constructs `M1 Transcript`
    (`view_mode: ViewMode::for_panes(false, false)`, `src/ui/tui/mod.rs:432`) and
    only the restored-plan / live-worker paths open side panes.
