@@ -50,7 +50,8 @@ being fixed at 3 (UX friction 13); `Min(6)` keeps the body >= 6 rows while chrom
 
 **Boot frame vs. this worked frame (normative).** The frame below is **M4 Split**, the §4.1 default *mode*; it
 is **not** the boot frame. `TuiRenderer::new` constructs `view_mode: state::ViewMode::for_panes(false, false)`
-(`src/ui/tui/mod.rs`, the `view_mode:` line of the constructor — currently :433), i.e. **M1 Transcript** with
+(`src/ui/tui/mod.rs`, the `view_mode:` line of the `TuiRenderer::new` constructor — :474 at HEAD `0f82198`;
+the construct is the contract, the number drifts with every edit, see the §10.20 amendment note), i.e. **M1 Transcript** with
 both side panes closed and the composer focused (`focus: state::FocusPane::Input`). Contract, stated plainly:
 **the boot state is M1 Transcript** — that is what the `Marmel M1 Transcript …` frame at 100x30 in
 `docs/new_ui_preview.txt` (case a, "idle/empty boot state") and the boot frame tests pin — while **M4 Split is
@@ -60,30 +61,30 @@ chrome, the region budget and the §2.5 ladder are identical in M1 and M4.
 
 ````
 header Length(1): Marmel — M4 Split — 3/7 done — > t-004 — val 1 — ctx 41% — 12:03
-body: left column Transcript (Min(6)), right column Plan (top) + Workers (bottom)
+body: leading column Execution Plan (Min(6)), trailing column Transcript (top) + Workers (bottom)
 status: tokens in/out, ctx %, elapsed, active/paused/queued, validation round
 +--------------------------------------------------------------------------------------------------+
-| Marmel  M4 Split  3/7 done  > t-004  val 1  ctx 41%  12:03                                       |  header
-|+- Transcript ● ─────────────────────────────────────────+ +- Execution Plan ───────────────────+ |
-|| User: rebuild the TUI on feature/new-ui                | | ## Tasks                            | |
-|| [t-007] Specialist coder_specialist started task …     | | - [x] t-006 research baseline       | |
-|| [Arbitrator]: forwarded notice notice-3 to coder       | | - [x] t-008 layout spec             | |  body
-||                                                        | | - [ ] > t-004 wireframe  (▶ coder)  | | 23 rows
-||   (streaming content region, markdown via 1148)        | | - [ ] t-011 keymap                  | |
-||                                           |█|          | | Overall Progress: 3/7 (42%)          | |
-||                                           | |          | +- Workers ─────────────────────────--+ |
-||                                           |▼| 2 new    | | coder_specialist  ▶ (Active)         | |
-|+------------------------------------------+---+         | | validator         ⏸ (Queued 2/3)     | |
-|                                                          | | writer            (Idle)             | |
-|                                                          | +- Details for coder_specialist -----+ |
-|                                                          | | [Output]  ```rust … (ANSI: 1138)   | |
-|                                                          | +- - - - - - - - - - - - - - - - - - -+ |
-|+- Tokens in 12.4k / out 3.1k | ctx 41% | 12:03 | 1a 0p 2q | val 1 - - - - - - - - - - - - - - - - +|  status
-|| ● LIVE  plan:on  workers:on  think:off  follow:on      |                                        |  row 2
-|+- Input (Enter send, Alt/Shift+Enter newline, Ctrl+Z undo)-+                                     |  input
-|| > rebuild the TUI…                                                              |               |  3..9
-|+- - - - - - - - - - - - - - - - - - - - - - - - - - - - -+                                      |
-| F1 help  Tab focus  F2 mode  F3/F4/F5 panes  x cancel-worker  e last error  Esc arm/overlay  Ctrl+A/P/T |  footer
+| Marmel  M4 Split  3/7 done  > t-004  val 1  ctx 41%  12:03                                       |
+|+- Execution Plan ──────────────────────────────────────++- Transcript ● ────────────────────────+|
+||## Tasks                                              ▲||User: rebuild the TUI on feature/new-ui||
+||- [x] t-006 research baseline                         █||[t-007] coder_specialist started t-004 ||
+||- [x] t-008 layout spec                               █||[Arbitrator]: forwarded notice-3       ||  body
+||- [ ] > t-004 wireframe  (▶ coder)                    █||  (streaming content region,           ||  23 rows
+||- [ ] t-011 keymap                                    █||   markdown via 1148)                  ||
+||                                                      █|+- 2 new -------------------------------+|
+||Overall Progress: 3/7 (42%)                           ║|+- Workers ─────────────────────────────+|
+||                                                      █||coder_specialist  ▶ (Active)           ||
+||                                                      █||validator         ⏸ (Queued 2/3)       ||
+||                                                      █||writer            (Idle)               ||
+||                                                      █||Details for coder_specialist           ||
+||                                                      ▼||[Output]  ```rust … (ANSI: 1138)       ||
+|+- ✓ 3 done ⧗ 4 open -----------------------------------++- ▶ 1 ⏸ 1 ⧗ 1 ✓ 0 ---------------------+|
+|+- Tokens in 12.4k / out 3.1k | ctx 41% | 12:03 | 1a 0p 2q | val 1 ──────────────────────────────+|  status
+|| ● LIVE  plan:on  workers:on  think:off  follow:on                                              ||  row 2
+|+- Input (Enter send, Alt/Shift+Enter newline, Ctrl+Z undo) ─────────────────────────────────────+|  input
+|| > rebuild the TUI…                                                                             ||  3..9
+|+------------------------------------------------------------------------------------------------+|
+| F1 help  Tab focus  F2 mode  F3/F4/F5 panes  x cancel-worker  e last error  Esc arm/overlay  Ctr…|  footer
 +--------------------------------------------------------------------------------------------------+
 ````
 
@@ -111,17 +112,43 @@ M1 Transcript (body 23)   M2 Plan (body 23)               M3 Workers (body 23)
 
 ### 2.3 Body constraints per mode
 
+**One global slot rule (t-024b, `0f82198`).** In every shape that draws both the Plan and the Transcript, the
+Execution Plan pane owns the **leading** slot and the Transcript pane the **trailing** one. Leading is the
+leftmost column of a columns split, the topmost row of a stacked split, and the wide column of the
+short-terminal fallback in which the side column cannot stack; trailing is the slot on the far side of the same
+split. The rule assigns slots only: every slot keeps its own width pair (`55/45`, `60/40`), so the Plan never
+jumps sides between modes at the same terminal size. It supersedes the per-shape trade of t-024 (`ac1f46c`),
+which traded each shape's own slots and left M2 reading Transcript-left / Plan-right while M4 read
+Plan-left / Transcript-right. A shape that draws no Plan pane — M1, M3, and the ladder shapes that keep the
+roster so focus is never stranded — is the rule's **vacuous** case, not an exception to it. The executable
+statement of the rule is `assert_plan_leads_the_transcript` in `src/ui/tui/tests_new_ui.rs`, swept over every
+mode, focus and ladder width.
+
 | Mode | Body split | Explicit `Constraint` list |
 |---|---|---|
 | M1 Transcript | Transcript fills the body | `Layout::vertical([Min(6)])` inside body |
-| M2 Plan | Plan left, Transcript right | `Layout::horizontal([Percentage(55), Percentage(45)])`, each side `vertical([Min(6)])` |
-| M3 Workers | Workers left, Transcript right | `Layout::horizontal([Percentage(55), Percentage(45)])`; Workers `vertical([Min(4), Min(3)])` (roster / detail) |
-| M4 Split (default) | Transcript left, side column right | `Layout::horizontal([Percentage(60), Percentage(40)])` (as today, `render.rs:371-378`), side `vertical([Min(6), Min(6)])` (Plan top, Workers bottom, replacing the `Percentage(50)/Percentage(50)` pair at `render.rs:385-395`) |
+| M2 Plan | Plan **leading** (left), Transcript **trailing** (right) | `Layout::horizontal([Percentage(55), Percentage(45)])`, each side `vertical([Min(6)])`; pinned at 100x30 as Plan `(0,1,55,23)` / Transcript `(55,1,45,23)` |
+| M3 Workers | Workers left, Transcript right — M3 draws no Plan pane, so the slot rule is vacuous here and the roster keeps the wide left column | `Layout::horizontal([Percentage(55), Percentage(45)])`; Workers `vertical([Min(4), Min(3)])` (roster / detail) |
+| M4 Split (default) | Plan **leading** (the wide column), Transcript **trailing** at the head of the side column, Workers under it | `Layout::horizontal([Percentage(60), Percentage(40)])` in `layout::compute_layout` (`Shape::Columns`), side `vertical([Min(6), Min(6)])`; pinned at 100x30 as Plan `(0,1,60,23)`, Transcript `(60,1,40,12)`, Workers `(60,13,40,11)` |
 
-Every pane draws its own `Block` + right-side `Scrollbar` when scrollable (pattern kept from
-`render.rs:478-492`, `616-620`, `1013-1028`). Pane minimums inside a pane (Workers roster `Min(4)`,
-detail `Min(3)`) replace the current `Length(list_len)` + `Min(3)` pair at `render.rs:647-653`, whose
-`.clamp(1, 3)` is the 3-row silent cap G8 removes.
+The pairs are width-proportional, so the leading slot stays the wide one at every size the split survives:
+at 120 columns M2 reads 66 / 54 and M4 reads 72 / 48, and at 120x40 the M4 side column stacks 17 rows
+(Transcript) over 16 rows (Workers). The two vertical fallbacks read the same rule top-to-bottom:
+
+- `width < 90` (§2.5): the body stacks — Plan `(0,1,W,12)`, Transcript `(0,13,W,11)`, Workers absent. With
+  focus on Workers the Transcript leads the stack and the roster takes the second row; no Plan is drawn.
+- side column too short to stack (e.g. 100x16): the Plan takes the wide slot `(0,1,60,11)` and the Transcript
+  the side slot `(60,1,40,11)`, Workers absent; with focus on Workers the Transcript takes the wide slot and
+  the roster the side one.
+- `M2` never stacks: the `width < 90` ladder leaves M2 (and M3) in columns, and at `width < 60` the mode draws
+  its single side pane alone through `Shape::Full`, where there is no slot to trade.
+
+Every pane draws its own `Block` + right-side `Scrollbar` when scrollable (the pattern the legacy
+`render.rs` pane blocks used, before that renderer's pane bodies were removed — see
+`docs/legacy_ui_removal.md`). Pane minimums inside a pane (Workers roster `Min(4)`, detail `Min(3)`) replaced
+the legacy `Length(list_len)` + `Min(3)` pair and its 3-row silent cap G8 removes; the only `.clamp(1, 3)` left
+in the UI is the sanctioned `rows < 20` composer height inside `input_height` in `src/ui/tui/layout.rs`
+(the same fact §10.15 records).
 
 ### 2.4 Zero-rect rule
 
@@ -141,10 +168,10 @@ or **present with width >= 1 and height >= 1**. No pane may be rendered into a 0
 
 | Condition | Effect |
 |---|---|
-| `width < 90` | M4 → single-column body: Transcript + **only the focused side pane** (`vertical([Min(6), Min(6)])`); the other side pane is absent. The header already carries plan progress (G1), so nothing important is lost. |
+| `width < 90` | M4 → single-column body: two stacked panes (`vertical([Min(6), Min(6)])`) with **only the focused side pane** standing in for one of the three, read under the §2.3 slot rule — with the Plan on screen it owns the leading (top) row and the Transcript the bottom one; when the survivor is the roster the Transcript leads and no Plan is drawn, so focus is never stranded. The other side pane is absent. `M2`/`M3` keep their two columns at this width. The header already carries plan progress (G1), so nothing important is lost. |
 | `width < 70` | header drops `val`, then `ctx`, then `elapsed` (drop order §7.4); status row 1 keeps tokens + active/paused/queued; footer legend switches to the short form `F1 help  Esc arm  Enter send`. |
 | `rows < 20` | status collapses to 1 row (metrics only; an armed-abort prompt is appended to it), footer is **dropped** (Length(0) at the root level is an explicit rule, not a pane rect), `input_h` becomes `(draft_lines + 2).clamp(1, 3)` with a `+n` overflow marker in the border title. |
-| `width < 60` | Workers detail pane is absent (roster only); M2/M3 revert to M1 with the focused side pane as the single column. |
+| `width < 60` | Workers detail pane is absent (roster only); M2/M3 collapse to a single column holding that mode's side pane through `Shape::Full` (the mode label stands) — with one pane on screen there is no slot to trade. |
 | `width < 40 \|\| rows < 10` | **too-small notice**: exactly one pane, `Block` + centred `Paragraph`: `Terminal too small — Marmel needs at least 40x10 (currently WxH). Resize to continue.` Header/status/input/footer are all absent (never zero-sized). Key handling keeps working (§4.4); nothing else is drawn. |
 
 ## 3. Pane inventory
@@ -200,9 +227,13 @@ so the operator always knows whether they are typing into the composer (UX frict
 | Mode | Emphasis | Present panes |
 |---|---|---|
 | M1 Transcript | transcript full body width, streaming region largest | Transcript (+ header/status/input/footer) |
-| M2 Plan | Plan 55 % left, auto-scroll to active task (render.rs:579-600 pattern kept) | Plan, Transcript |
+| M2 Plan | Plan 55 % in the leading (left) column, auto-scroll to active task (the legacy plan-scroll pattern kept) | Plan, Transcript |
 | M3 Workers | Workers 55 % left, roster never truncated (G8) | Workers, Transcript |
-| M4 Split | default 60/40 as today; Plan top / Workers bottom in the side column | Transcript, Plan, Workers |
+| M4 Split | 60/40: Plan in the leading (wide) column, Transcript at the head of the trailing side column with Workers under it | Plan, Transcript, Workers |
+
+Slot assignment is not mode-dependent: the §2.3 rule holds in every mode and at every size — the Plan leads the
+split, the Transcript trails it. The panes above are listed in that reading order, and `F3`/`F4`/`F5` remain
+**key** order (`Transcript / Plan / Workers`), not screen order.
 
 Header and status bar are identical in all modes — plan progress, live counters and the key legend are never
 mode-conditional (G1, G4, P1.1).
@@ -467,7 +498,7 @@ do not rename or remove any existing field, and keep `UiSection::default()` load
 12. Focus badge test: at every focus state the focused pane's title buffer contains `●` and its border cell carries `frame_focus`; exactly one pane is focused.
 13. Printable-key routing: with focus on Plan and Workers, `Char('x')`, `Backspace` and `Delete` mutate `textarea` content in that order; `x` with an empty composer and Workers focus instead opens the overlay (both cases asserted).
 14. Follow test: with `follow = false`, appending 5 messages does not change `chat_scroll` and the chip reads `↓ 5 new`; `Ctrl+F` re-arms and the chip reads `LIVE`; **nothing that is not an explicit gesture touches follow** — a submit, a command notice and arriving output all leave it alone, and only the `Ctrl+F` / `/follow on|off` transition or a scroll/jump that lands on the tail re-arms it (`chat_auto_scroll` is a pure projection of `follow`, written only by `set_follow`/`project_follow_mirror`; the old events.rs writes and the `adopt_legacy_view_writes` re-adoption that made the silent re-arm are gone).
-15. Roster test: 12 live workers produce 12 reachable rows (scroll offset changes selection). The roster and its detail pane are owned by `src/ui/tui/components/activity.rs` and the plan pane by `src/ui/tui/components/plan_pane.rs` — there is no `components/workers.rs`. No row-count `.clamp(1, 3)` remains in either module; the only `.clamp(1, 3)` left in the UI is the sanctioned `rows < 20` composer height, inside `input_height` in `src/ui/tui/layout.rs` (verified at `layout.rs:289` on 2026-10-27).
+15. Roster test: 12 live workers produce 12 reachable rows (scroll offset changes selection). The roster and its detail pane are owned by `src/ui/tui/components/activity.rs` and the plan pane by `src/ui/tui/components/plan_pane.rs` — there is no `components/workers.rs`. No row-count `.clamp(1, 3)` remains in either module; the only `.clamp(1, 3)` left in the UI is the sanctioned `rows < 20` composer height, inside `input_height` in `src/ui/tui/layout.rs` (construct-anchored: the clamp is the `wanted.clamp(1, 3)` arm of `input_height`, at `layout.rs:350` at HEAD `0f82198` — the number drifts with every edit, and the `289` this item carried was already stale by the next audit).
 16. An overlay open closes on Esc without arming abort; y/n are honoured only inside the confirm overlay.
 17. Cancel-one-worker test: x -> confirm -> exactly one worker path, with orchestrator::cancel_all() not called (assert via the recording renderer in tests/test_session_restore_panel_abort.rs).
 18. Restore test: capture_ui -> restore_panes round-trips view_mode, focus (including input), follow, and D2's queue/paused; token_witness_warnings appears as one transcript line.

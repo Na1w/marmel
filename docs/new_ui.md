@@ -44,22 +44,25 @@ keyboard and no slash commands (`src/main.rs:65`).
 ## 3. Screen anatomy
 
 The 100×30 frame below is a session with a 7-task plan (3 checked), three live
-workers, a non-empty draft, and focus on the transcript.
+workers, a non-empty draft, and focus on the transcript. The Execution Plan
+holds the **leading** (left) column; the Transcript and the Workers stack share
+the **trailing** (right) column. That ordering is not per-mode — the same rule
+puts the plan first in every mode and at every size (§4.1).
 
 ```text
  Marmel M4 Split ✓ 3/7 done ▶ t-004 ctx 45% elapsed 10m 12s
-┌ Transcript ● ────────────────────────────────────────────┐┌ Execution Plan ─────3/7 done ▶ t-004 ┐
-│User: rebuild the TUI so plan, workers and progress stay  ││# Plan                               ▲│
-│legible                                                   ││                                     █│
-│Marmennill: I split the work into seven tasks and started ││- [x] [t-001] research UX baseline   █│
-│with the audit.                                           ││- [x] [t-002] audit TUI architecture █│
-│[Status] delegating validator_specialist (t-003)          ││- [x] [t-003] draft the design spec  █│
-│Tool: read_file(src/ui/tui/mod.rs)                        ││- [ ] [t-004] scaffold state, layout,█│
-│Marmennill: every pane is now drawn by its own component  ││theme                                █│
-│renderer.                                                 ││- [ ] [t-005] pane chrome and chips  █│
-│Streaming: the status bar chips ar                        ││- [ ] [t-006] wire the roster rank   ║│
-│                                                          ││into the status row                  ▼│
-│                                                          │└ ✓ 3 done ⧗ 4 open ▶ in flight ───────┘
+┌ Execution Plan ─────────────────────────3/7 done ▶ t-004 ┐┌ Transcript ● ────────────────────────┐
+│# Plan                                                    ││workers and progress stay legible    ▲│
+│                                                          ││Marmennill: I split the work into    █│
+│- [x] [t-001] research UX baseline                        ││seven tasks and started with the     █│
+│- [x] [t-002] audit TUI architecture                      ││audit.                               █│
+│- [x] [t-003] draft the design spec                       ││[Status] delegating                  █│
+│- [ ] [t-004] scaffold state, layout, theme               ││validator_specialist (t-003)         █│
+│- [ ] [t-005] pane chrome and chips                       ││Tool: read_file(src/ui/tui/mod.rs)   █│
+│- [ ] [t-006] wire the roster rank into the status row    ││Marmennill: every pane is now drawn  █│
+│- [ ] [t-009b] rewire the render pipeline                 ││by its own component renderer.       █│
+│                                                          ││Streaming: the status bar chips ar   ▼│
+│                                                          │└  ● LIVE ─────────────────────────────┘
 │                                                          │┌ Workers ─────────────────────────────┐
 │                                                          ││ > ▶ running coder_specialist t-004 3…│
 │                                                          ││   ⧗ queued 2/3 researcher_specialist…│
@@ -70,7 +73,7 @@ workers, a non-empty draft, and focus on the transcript.
 │                                                          ││▶ running coder_specialist t-004 3m 1…│
 │                                                          ││[Output]                              │
 │                                                          ││wrote layout.rs, 292 lines            │
-└  ● LIVE ─────────────────────────────────────────────────┘└ ▶ 1 ⏸ 1 ⧗ 1 ✓ 0  1/3  detail 0/0 ────┘
+└ ✓ 3 done ⧗ 4 open ▶ in flight ───────────────────────────┘└ ▶ 1 ⏸ 1 ⧗ 1 ✓ 0  1/3  detail 0/0 ────┘
  Tokens 12.4k in / 3.2k out | 3a | ctx 45% | 1p | 1q | coder_specialist-t-004… | elapsed 10m 12s
  plan:on  workers:on  think:off  3a 1p 1q
 ┌ Input (Enter send, Alt/Shift+Enter newline, Ctrl+Z undo) ────────────────────────────────────────┐
@@ -82,8 +85,8 @@ workers, a non-empty draft, and focus on the transcript.
 | Region | What it holds |
 |---|---|
 | **Header** (1 row) | `Marmel`, the mode name (`M4 Split`), `✓ 3/7 done`, `▶ t-004` (the task in flight), `val N` (the highest validation round across the worker rows, printed only when one has been recorded), `ctx 45%`, `elapsed 10m 12s`. `Marmel` and `✓ done/total` are never dropped at any width; `▶ t-004` is printed at every size that draws a header at all (§7). |
-| **Transcript pane** | The conversation: your input (`User: …`), Manager output (`Marmennill: …`), `[Status]` and `Tool:` lines, thinking blocks when `think:on`. Markdown-rendered. Its **bottom border is its own status**: `● LIVE` while follow is on, `↓ 3 new` when you have scrolled back, `↓ follow off` when follow is off and nothing is unseen, plus `scroll 8/8` whenever there is somewhere to scroll. Empty state: `No output yet. Type an instruction and press Enter (? for keys).` |
-| **Execution Plan pane** | The plan body with task checkboxes and state glyphs (`✓` done, `▶` in flight, `⧗` open). Title right side repeats `3/7 done ▶ t-004`; the bottom border counts `✓ 3 done ⧗ 4 open ▶ in flight`. A scrollbar appears once the body overflows, and the pane auto-scrolls to the task in flight. |
+| **Execution Plan pane** (leading) | The plan body with task checkboxes and state glyphs (`✓` done, `▶` in flight, `⧗` open). Title right side repeats `3/7 done ▶ t-004`; the bottom border counts `✓ 3 done ⧗ 4 open ▶ in flight`. A scrollbar appears once the body overflows, and the pane auto-scrolls to the task in flight. Wherever the plan and the transcript share the frame, this pane takes the leading slot (§4.1). |
+| **Transcript pane** (trailing) | The conversation: your input (`User: …`), Manager output (`Marmennill: …`), `[Status]` and `Tool:` lines, thinking blocks when `think:on`. Markdown-rendered. Its **bottom border is its own status**: `● LIVE` while follow is on, `↓ 3 new` when you have scrolled back, `↓ follow off` when follow is off and nothing is unseen, plus `scroll 8/8` whenever there is somewhere to scroll. Empty state: `No output yet. Type an instruction and press Enter (? for keys).` |
 | **Workers pane** | Top half: the roster, one row per live worker — ` > ` selection marker, state glyph and label (`▶ running`, `⧗ queued 2/3`, `⏸ paused`), the worker key, its task id. Bottom half (only at ≥ 60 columns): the selected worker's detail — `[Output]`, thinking, queued steering, logs. Bottom border: the tally `▶ 1 ⏸ 1 ⧗ 1 ✓ 0  1/3  detail 0/0`. Empty state: `No specialist launched yet.` |
 | **Status bar** (2 rows at ≥ 20 rows) | Row 1: `Tokens 12.4k in / 3.2k out \| 3a \| ctx 45% \| 1p \| 1q \| <worker names> \| elapsed 10m 12s`. Row 2: the state chips `plan:on  workers:on  think:off  3a 1p 1q`, where `3a 1p 1q` are the active / paused / queued worker counts (the same counts row 1 spells as `3a`, `1p`, `1q`). A chip reads `narrow` when a toggle is on but the narrow-terminal ladder hid that pane (§7), so no chip ever advertises a pane you cannot see. |
 | **Composer** | The draft. Title: `Input (Enter send, Alt/Shift+Enter newline, Ctrl+Z undo)`, plus chips when relevant: `command /reset` (the draft is in command mode), `history 3/12` (you are browsing history), `lines 2 · chars 140` (a long draft), and a **ghost completion** row while you type a slash command. |
@@ -92,8 +95,10 @@ workers, a non-empty draft, and focus on the transcript.
 The panes open themselves as the session gets live: booting with a non-empty
 `.marmel/execution_plan.md` opens the plan pane, a worker starting a task opens
 the plan pane, and any active worker opens the workers pane
-(`src/ui/tui/mod.rs:1451`, `:1820`, `:2204`). With nothing live you start in
-`M1 Transcript`.
+(`TuiRenderer::init` for the boot case, `TuiRenderer::on_event` for a worker
+starting a task, and `TuiRenderer::set_subagents` for any active worker, all in
+`src/ui/tui/mod.rs` — construct-anchored, since bare line numbers there rot with
+every edit). With nothing live you start in `M1 Transcript`.
 
 ## 4. View modes, focus, and follow
 
@@ -102,9 +107,22 @@ the plan pane, and any active worker opens the workers pane
 | Mode | What is on screen | Go straight there | Notes |
 |---|---|---|---|
 | `M1 Transcript` | Transcript only | `F3` | Boot mode when no pane is open. |
-| `M2 Plan` | Plan left (55 %) + Transcript right (45 %) | `F4` | |
-| `M3 Workers` | Workers left (55 %) + Transcript right (45 %) | `F5` | |
-| `M4 Split` | Transcript left (60 %) + Plan over Workers in the side column (40 %) | `F2` cycles `M4 → M1 → M2 → M3 → M4` | The narrow-terminal ladder restacks it (§7). |
+| `M2 Plan` | Plan leading (left, 55 %) + Transcript trailing (right, 45 %) | `F4` | |
+| `M3 Workers` | Workers left (55 %) + Transcript right (45 %) | `F5` | `M3` draws no plan pane, so there is no slot to trade. |
+| `M4 Split` | Plan leading (the wide 60 % column) + Transcript over Workers in the trailing side column (40 %) | `F2` cycles `M4 → M1 → M2 → M3 → M4` | The narrow-terminal ladder restacks it (§7). |
+
+**One rule, every shape.** Wherever both the plan and the transcript are on
+screen, the Execution Plan pane owns the **leading** slot and the Transcript the
+**trailing** one: leading is the left column of a side-by-side split, the top row
+of a stacked one, and the wide column when the side column cannot stack. At
+100 × 30 that pins to plan `(0,1,60,23)`, transcript `(60,1,40,12)`, workers
+`(60,13,40,11)` in `M4`, and `(0,1,55,23)` / `(55,1,45,23)` in `M2`; at 120 × 40
+the same pairs resolve to 72 / 48 columns (`M4`) and 66 / 54 (`M2`), the side
+column stacking 17 transcript rows over 16 worker rows. The plan never crosses
+to the far side of a split when you change mode or resize. Nothing about the
+keys moves with it: `F2` still walks `M4 → M1 → M2 → M3`, `F3`/`F4`/`F5` still
+jump to Transcript / Plan / Workers, and the `F3/F4/F5 panes` legend row is
+**key** order, not screen order.
 
 `Ctrl+P` shows or hides the Plan pane and `Ctrl+A` shows or hides the Workers
 pane. Each toggle moves the mode to whatever the resulting pair of panes means,
@@ -316,16 +334,19 @@ to the common prefix and counts the rest (`/rese` → `/reset  (3 more)  Tab`),
 
 ## 7. Small terminals: what degrades to what
 
-Geometry comes from `compute_layout` and its thresholds in
-`src/ui/tui/layout.rs:20-35`. The ladder is applied in order, first match wins.
+Geometry comes from `compute_layout` and its threshold constants in
+`src/ui/tui/layout.rs` (`MIN_COLS`, `MIN_ROWS`, `BODY_MIN`, `COLUMN_MIN`,
+`NARROW_COLS`, `COMPACT_COLS`, `DETAIL_COLS`, `SHORT_ROWS`) — named rather than
+numbered, because the lines those constants sat on have already moved twice.
+The ladder is applied in order, first match wins.
 
 | Terminal | What you get |
 |---|---|
-| **≥ 100 × 30** | Full layout: header 1 row, body (absorbs all slack, floor 6 rows), status 2 rows, composer `(draft lines + 2)` clamped to 3…9, footer legend 1 row. `M4 Split` is two columns, 60 / 40. |
-| **< 90 columns** | `M4 Split` stacks: transcript on top, **one** side pane below (the focused one, or Plan when both are on). The hidden side's chip reads `narrow` instead of `on`. `M2`/`M3` keep their two columns. |
+| **≥ 100 × 30** | Full layout: header 1 row, body (absorbs all slack, floor 6 rows), status 2 rows, composer `(draft lines + 2)` clamped to 3…9, footer legend 1 row. `M4 Split` is two columns, 60 / 40, with the Execution Plan in the wide leading column and the Transcript at the head of the trailing side column, Workers under it. |
+| **< 90 columns** | `M4 Split` stacks two panes and keeps **one** side pane (the focused one, or Plan when both are on). The stack follows the §4.1 rule: with the Plan on screen it sits **on top** with the Transcript below it; when the survivor is the roster the Transcript is on top with the Workers below, and no plan pane is drawn. The hidden side's chip reads `narrow` instead of `on`. `M2`/`M3` keep their two columns. |
 | **< 70 columns** | Header drops `val N`, then `ctx %`, then `elapsed`, then the mode name; `Marmel`, `✓ done/total` and `▶ t-004` stay. The footer legend shortens to ` F1 help  Esc arm  Enter send`. |
-| **< 60 columns** | The worker **detail** half is not drawn at all (roster only). `M2`/`M3` collapse to a single column holding that pane. |
-| **< 20 rows** | Status bar collapses to **1 row** — the chip row (`plan:on …`) and the footer legend disappear. The composer clamps to 1…3 rows with a `+n` overflow marker. The body floor stays 6 rows. |
+| **< 60 columns** | The worker **detail** half is not drawn at all (roster only). `M2`/`M3` collapse to a single column holding that pane — with one pane on screen there is nothing to order. |
+| **< 20 rows** | Status bar collapses to **1 row** — the chip row (`plan:on …`) and the footer legend disappear. The composer clamps to 1…3 rows with a `+n` overflow marker. The body floor stays 6 rows. When the body is too short to stack the side column (100 × 16 is the case the tests pin), `M4 Split` still leads with the plan: plan in the wide column `(0,1,60,11)`, transcript in the side column `(60,1,40,11)`, Workers not drawn; with focus on Workers the transcript takes the wide column and the roster the side one. |
 | **40 × 10** | The floor. Still: header (with `✓ 3/7 done ▶ t-004`), transcript with `● LIVE  scroll 8/8`, one status row with tokens and the active count, and the composer. Fields are shed one at a time, never in a block. |
 | **< 40 columns or < 10 rows** | Nothing but the notice: `Terminal too small — Marmel needs at least 40x10 (currently 39x9). Resize to continue.` No pane, chip or metric is drawn, so nothing lies about a pane that does not exist. |
 
@@ -383,8 +404,11 @@ legend, side panes taken away by the ladder:
 ## 8. The mouse is no longer used
 
 Mouse capture is never enabled, and the UI is **keyboard only**: mouse reports
-are ignored rather than guessed at (the only remaining `DisableMouseCapture`
-calls are defensive teardown cleanup, `src/ui/tui/mod.rs:2123` and `:2898`).
+are ignored rather than guessed at (the only remaining `DisableMouseCapture` is
+the one executed reset burst `write_terminal_resets()` in `src/ui/tui/mod.rs`,
+reached from the `shutdown()` and `leave_alt_screen()` teardowns — defensive
+cleanup, never a capture; the symbol names are the anchor, since the line
+numbers there move with every edit).
 Scrolling is `PageUp` / `PageDown` / `Up` / `Down` / `Home` / `End`, selection is
 `Left` / `Right` in the Workers pane, and focus is `Tab` / `Shift+Tab`. This also
 means terminal-native text selection and copy-on-select work again.
@@ -395,9 +419,15 @@ The contract for intent is `docs/ui_design_spec.md` §2 (layout), §4 (modes +
 focus), §5 (keymap), §6 (commands), §7 (palette), §8 (states). Where the spec and
 this branch's code disagree, **this guide documents the code**. Recorded drift:
 
-1. **Spec §10 item 20 cites stale line numbers** for the mouse teardown. The real
-   `DisableMouseCapture` sites are `src/ui/tui/mod.rs:2123` and `src/ui/tui/mod.rs:2898`
-   (the import is at `src/ui/tui/mod.rs:23`); there is no `EnableMouseCapture` anywhere.
+1. **Spec §10 item 20 cited stale line numbers for the mouse teardown — that
+   drift is closed by the spec's own D6 amendment (`fda0a8b`).** The spec now
+   anchors the item on constructs: the `crossterm::event` import plus exactly one
+   executed `DisableMouseCapture` — the shared `write_terminal_resets()` burst,
+   reached from the `shutdown()` and `leave_alt_screen()` teardowns in
+   `src/ui/tui/mod.rs`. There is no `EnableMouseCapture` anywhere. (The
+   `:2123` / `:2898` / `:23` numbers this row used to carry predate that
+   amendment and are superseded by it — they are the same line-number rot the
+   amendment was about, on this side of the fence.)
 2. **Spec §10.15 names a file that does not exist** — `components/workers.rs`.
    The worker roster/detail component is `src/ui/tui/components/activity.rs`
    (the plan pane is `src/ui/tui/components/plan_pane.rs`).
@@ -405,9 +435,11 @@ this branch's code disagree, **this guide documents the code**. Recorded drift:
    exactly four variants — `Quit`, `CancelWorker`, `CancelAll`, `Command`
    (`src/ui/tui/events.rs:58-82`). Transcript clearing happens only as part of
    `/reset`, which is the `Command` variant.
-4. **Spec §10.1 and §7.4 contradict each other about the task id at 40 columns.**
-   The code always shows it: `header_budget` returns `show_task: true`
-   unconditionally (`src/ui/tui/layout.rs:86`), and the 40 × 10 preview frame
+4. **Spec §10.1 and §7.4 once contradicted each other about the task id at
+   40 columns; both rows now carry the same resolution, and this row records how
+   the code reads.** The code always shows it: `header_budget` returns
+   `show_task: true` unconditionally (the `show_task` arm of that function in
+   `src/ui/tui/layout.rs` — :108 at HEAD `0f82198`), and the 40 × 10 preview frame
    proves it (` Marmel ✓ 3/7 done ▶ t-004`).
 5. **`:q` and `:q!` are rows of the command table** (`slash_commands()`,
    `src/ui/tui/components/input.rs:114-162`) and route through the same confirm
@@ -415,9 +447,11 @@ this branch's code disagree, **this guide documents the code**. Recorded drift:
    are the only rows the autocomplete never offers: composer command mode is
    `/`-only (`command_token`, `src/ui/tui/components/input.rs:170`), so they are
    neither completed nor shown as a `command …` chip.
-6. **Boot mode differs from the spec's worked example.** Spec §2.2 presents
-   `M4 Split` as the default at 100 × 30; the renderer constructs `M1 Transcript`
-   (`view_mode: ViewMode::for_panes(false, false)`, `src/ui/tui/mod.rs:432`) and
+6. **Boot mode differs from the spec's worked frame.** Spec §2.2 draws `M4 Split`
+   as the worked 100 × 30 frame, and states normatively alongside it that the boot
+   state is `M1 Transcript`; the renderer builds exactly that
+   (`view_mode: state::ViewMode::for_panes(false, false)` in the
+   `TuiRenderer::new` constructor — `src/ui/tui/mod.rs:474` at HEAD `0f82198`) and
    only the restored-plan / live-worker paths open side panes.
 
 Not verified in the sandbox:
