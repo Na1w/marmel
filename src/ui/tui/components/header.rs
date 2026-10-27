@@ -60,13 +60,19 @@ pub struct HeaderData<'a> {
     pub val_rounds: usize,
 }
 
-/// The §7.4 drop ladder, lowest priority first: `val` → `ctx` → `elapsed` → mode
-/// name → `> t-NNN`.
+/// The field the post-budget width-fit pass drops next, lowest priority first:
+/// `val` → `ctx` → `elapsed` → mode name → `> t-NNN`.
 ///
 /// `Val` is on the ladder now that plumbing delta D1 (§9.3) put `validation_rounds`
 /// on the worker row: it is the first chip to go, exactly as §7.4 orders the row.
 /// `done/total` and the app name are never dropped at any width (G1), so
 /// they carry no rank at all.
+///
+/// **The budget ladder stops at the mode name.** `layout::header_budget` keeps
+/// `show_task: true` at every width down to the 40-column floor (§7.4 tail, §10.1), so
+/// `Drop::Task` only ever fires here, in [`drop_to_fit`], and only for an id that
+/// cannot share the row with the never-dropped chips: an ordinary `t-NNN` id is on the
+/// header line at 40 columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Drop {
     /// `val N` — the registry's validation round (D1).
@@ -221,6 +227,11 @@ fn ctx_chip(data: &HeaderData<'_>) -> Option<String> {
 
 /// Drop fields in ladder order until the line fits `budget`, so a narrow header
 /// loses one chip at a time instead of collapsing into an ellipsis (§7.4, §2.5).
+///
+/// This is the post-budget pass: `layout::header_budget` has already had its say, and
+/// at every supported width it kept the task id. The ladder here therefore ends with
+/// [`Drop::Task`], and reaches it only when the assembled row still overruns the rect
+/// after `val`, `ctx`, `elapsed` and the mode name have all gone.
 fn drop_to_fit(fields: &mut Vec<Field>, budget: usize) {
     while fields_width(fields) > budget {
         let Some(worst) = fields.iter().filter_map(|field| field.drop).min() else {
@@ -336,13 +347,23 @@ mod tests {
         assert!(line.contains("elapsed 12m 3s"), "{line:?}");
     }
 
+    /// §7.4 (as corrected in `c6794a6`) and §10.1: the ladder is **exactly**
+    /// `val` → `ctx` → `elapsed` → mode name, and it stops there. `done/total` and the
+    /// active task id are never ladder casualties; the only thing that can still take
+    /// the id away is the width-*fit* pass, for an id too long to sit beside the
+    /// never-dropped chips — pinned by
+    /// [`an_over_long_task_id_is_the_only_fit_pass_casualty`].
     #[test]
-    fn seventy_columns_degrade_one_chip_at_a_time_in_ladder_order() {
-        // §2.5 (`width < 90` collapses the body) plus §7.4: the header sheds `ctx`,
-        // then the clock, then the mode name, then the task id — and never the
-        // progress counter. A long task id and a 7-figure ctx count are what push
-        // the line past 70 columns.
-        let plan = progress(MIXED, Some("t-004-wireframe-pane-rebuild"));
+    fn the_header_ladder_sheds_val_then_ctx_then_elapsed_then_the_mode_name() {
+        // The fit pass re-runs the §7.4 order *after* the budget, so the row is built
+        // with the 70-column budget (every chip licensed) and then fitted to narrower
+        // rects — that is the only way the ladder's order is observable at all, since
+        // the budget itself takes the whole optional band away below 70 columns at
+        // once. An id long enough that the mode name has to pay for it at 40 columns,
+        // a 7-figure ctx count and a recorded validation round put every droppable
+        // chip on the row.
+        let id = "t-017d-header-pane";
+        let plan = progress(MIXED, Some(id));
         let budget = header_budget(70);
         let data = HeaderData {
             mode: ViewMode::Split,
@@ -352,69 +373,89 @@ mod tests {
             ctx_limit: 0,
             elapsed: None,
 
-            val_rounds: 0,
+            val_rounds: 2,
         };
-        assert!(budget.show_ctx && budget.show_elapsed && budget.show_mode);
-
-        let at_70 = text(&header_line(&data, Some(723), 70));
-        assert!(!at_70.contains("ctx "), "ctx is first out: {at_70:?}");
-        assert!(!at_70.contains("elapsed"), "then the clock: {at_70:?}");
         assert!(
-            at_70.contains("M4 Split"),
-            "the mode name outlives both: {at_70:?}"
+            budget.show_val && budget.show_ctx && budget.show_elapsed && budget.show_mode,
+            "the fit pass, not the budget, is under test: {budget:?}",
         );
         assert!(
-            at_70.contains("t-004"),
-            "the task id outlives the mode name: {at_70:?}"
-        );
-        assert!(
-            UnicodeWidthStr::width(at_70.as_str()) <= 70,
-            "70 columns: {at_70:?}"
+            budget.show_task,
+            "§7.4: `show_task` is true at every width down to the 40-column floor",
         );
 
-        let at_56 = text(&header_line(&data, Some(723), 56));
-        assert!(
-            !at_56.contains("M4 Split"),
-            "the mode name goes next: {at_56:?}"
-        );
-        assert!(at_56.contains("t-004"), "{at_56:?}");
-
-        let at_40 = text(&header_line(&data, Some(723), 40));
-        assert!(
-            !at_40.contains("t-004"),
-            "the task id is last out: {at_40:?}"
-        );
-        assert!(
-            at_40.contains("3/7 done"),
-            "done/total is never dropped: {at_40:?}"
-        );
-
-        // Ladder invariant while narrowing: a chip that has left never comes back.
-        let mut previous: Option<String> = None;
-        for width in [70u16, 64, 56, 48, 40] {
+        // Read the ladder off the sweep: the widest terminal at which each chip was
+        // still on the row. The chip dropped first has the *largest* such width.
+        let ladder = [
+            ("val", "val 2"),
+            ("ctx", "ctx "),
+            ("elapsed", "elapsed"),
+            ("mode", "M4 Split"),
+        ];
+        let mut left_at: Vec<(&str, u16)> = Vec::new();
+        let mut gone: Vec<&str> = Vec::new();
+        for width in (40..=80u16).rev() {
             let line = text(&header_line(&data, Some(723), width));
             assert!(line.contains("Marmel"), "{width}: {line:?}");
             assert!(
                 line.contains("3/7 done"),
-                "{width}: done/total is never dropped (G1): {line:?}"
+                "{width}: done/total is never dropped (G1): {line:?}",
+            );
+            assert!(
+                line.contains('▶') && line.contains(id),
+                "{width}: the active task id is never a ladder casualty (§7.4, §10.1): {line:?}",
             );
             assert!(
                 UnicodeWidthStr::width(line.as_str()) <= usize::from(width),
-                "{width}: header exceeds its rect: {line:?}"
+                "{width}: header exceeds its rect: {line:?}",
             );
-            if let Some(older) = &previous {
-                for chip in ["ctx ", "elapsed", "M4 Split", "t-004"] {
-                    if older.contains(chip) {
-                        continue;
-                    }
+            // Ladder invariant while narrowing: a chip that has left never comes back.
+            for (chip, probe) in ladder {
+                if line.contains(probe) {
                     assert!(
-                        !line.contains(chip),
-                        "{chip} came back at {width} columns: {older:?} -> {line:?}"
+                        !gone.contains(&chip),
+                        "{chip} came back at {width} columns: {line:?}",
                     );
+                } else if !gone.contains(&chip) {
+                    gone.push(chip);
+                    left_at.push((chip, width));
                 }
             }
-            previous = Some(line);
         }
+        assert_eq!(
+            left_at.iter().map(|(chip, _)| *chip).collect::<Vec<_>>(),
+            ["val", "ctx", "elapsed", "mode"],
+            "§7.4 drop order, exactly, with the width each chip left at: {left_at:?}",
+        );
+        for pair in left_at.windows(2) {
+            assert!(
+                pair[0].1 > pair[1].1,
+                "one chip at a time, in ladder order: {left_at:?}",
+            );
+        }
+
+        // The named widths, spelled out.
+        let at_60 = text(&header_line(&data, Some(723), 60));
+        assert!(
+            !at_60.contains("val") && !at_60.contains("ctx ") && !at_60.contains("elapsed"),
+            "the round, the context and the clock are out by 60: {at_60:?}",
+        );
+        assert!(
+            at_60.contains("M4 Split") && at_60.contains(id),
+            "the mode name and the task id outlive all three: {at_60:?}",
+        );
+
+        // The 40-column floor: the mode name is the ladder's last casualty, and the
+        // counter plus the task id are what is left.
+        let at_40 = text(&header_line(&data, Some(723), 40));
+        assert!(
+            !at_40.contains("M4 Split"),
+            "the mode name is the last thing the ladder takes: {at_40:?}",
+        );
+        assert!(
+            at_40.contains("Marmel") && at_40.contains("3/7 done") && at_40.contains("▶ t-017d"),
+            "brand, counter and task id carry the 40-column header (§10.1): {at_40:?}",
+        );
     }
 
     #[test]
@@ -539,7 +580,12 @@ mod tests {
                 UnicodeWidthStr::width(line.as_str()) <= usize::from(width),
                 "{width}: header exceeds its rect: {line:?}"
             );
-            for (chip, probe) in [("val", "val 2"), ("ctx", "ctx "), ("elapsed", "elapsed")] {
+            for (chip, probe) in [
+                ("val", "val 2"),
+                ("ctx", "ctx "),
+                ("elapsed", "elapsed"),
+                ("mode", "M4 Split"),
+            ] {
                 if !line.contains(probe) && !left_at.iter().any(|(seen, _)| *seen == chip) {
                     left_at.push((chip, width));
                 }
@@ -547,22 +593,37 @@ mod tests {
         }
         assert_eq!(
             left_at.iter().map(|(chip, _)| *chip).collect::<Vec<_>>(),
-            ["val", "ctx", "elapsed"],
+            ["val", "ctx", "elapsed", "mode"],
             "§7.4 header ladder: {left_at:?}"
         );
         for pair in left_at.windows(2) {
             assert!(pair[0].1 > pair[1].1, "one chip at a time: {left_at:?}");
         }
+        // §7.4's tail: the mode name is the last chip the ladder touches. The id here
+        // is 28 characters long, so the width-*fit* pass — never the budget — takes it
+        // below 49 columns; see `an_over_long_task_id_is_the_only_fit_pass_casualty`.
+        let at_50 = text(&header_line(&data, Some(723), 50));
+        assert!(
+            !at_50.contains("M4 Split") && at_50.contains("t-004-wireframe-pane-rebuild"),
+            "the mode name pays for the row before the id does: {at_50:?}"
+        );
     }
 
     #[test]
     fn done_total_and_the_active_task_survive_into_a_40x1_frame() {
-        // G1, asserted through the actual widget rather than the span builder.
+        // G1 plus §10.1 as corrected in `c6794a6`, asserted through the actual widget
+        // rather than the span builder: at the 40-column floor the header carries the
+        // counter **and** the active task id, and only the optional band is gone.
         let plan = progress(MIXED, Some("t-004"));
+        let budget = header_budget(40);
+        assert!(
+            budget.show_task,
+            "§7.4: `header_budget` never drops the task id, not even at the 40-col floor"
+        );
         let data = HeaderData {
             mode: ViewMode::Split,
             plan: &plan,
-            budget: header_budget(40),
+            budget,
             ctx_tokens: 12_400,
             ctx_limit: 0,
             elapsed: None,
@@ -573,8 +634,146 @@ mod tests {
         assert!(row.contains("Marmel"), "{row:?}");
         assert!(row.contains("3/7 done"), "{row:?}");
         assert!(
+            row.contains('▶') && row.contains("t-004"),
+            "the active task id is on the 40-column header line (§10.1): {row:?}"
+        );
+        assert!(
             !row.contains("ctx "),
             "40 cols is below the ctx band: {row:?}"
+        );
+    }
+
+    /// §7.4/§10.1 as corrected in `c6794a6`, read through the **real** per-width
+    /// budget: at every supported width down to the 40-column floor the header carries
+    /// both `done/total` and the active task id, and what the budget gives up is the
+    /// optional band (`val`, `ctx`, `elapsed`, mode name) — never the id.
+    #[test]
+    fn the_task_id_is_on_the_header_line_at_every_supported_width() {
+        let plan = progress(MIXED, Some("t-004"));
+        for width in [40u16, 48, 60, 69, 70, 90, 100, 120] {
+            let budget = header_budget(width);
+            assert!(
+                budget.show_task,
+                "{width}: `header_budget` keeps the task id (§7.4)",
+            );
+            let data = HeaderData {
+                mode: ViewMode::Split,
+                plan: &plan,
+                budget,
+                ctx_tokens: 12_400,
+                ctx_limit: 30_000,
+                elapsed: None,
+
+                val_rounds: 2,
+            };
+            let line = text(&header_line(&data, Some(723), width));
+            assert!(
+                line.contains('▶') && line.contains("t-004"),
+                "{width} cols: the active task id is never a budget casualty (§10.1): {line:?}",
+            );
+            assert!(
+                line.contains("Marmel") && line.contains("3/7 done"),
+                "{width} cols: brand and counter are never dropped (G1): {line:?}",
+            );
+            assert!(
+                UnicodeWidthStr::width(line.as_str()) <= usize::from(width),
+                "{width}: header exceeds its rect: {line:?}",
+            );
+            // The chips the budget may give up appear exactly when it licenses them,
+            // so the ladder never silently outruns `header_budget`.
+            for (chip, probe, allowed) in [
+                ("val", "val 2", budget.show_val),
+                ("ctx", "ctx 41%", budget.show_ctx),
+                ("elapsed", "elapsed", budget.show_elapsed),
+                ("mode", "M4 Split", budget.show_mode),
+            ] {
+                assert_eq!(
+                    line.contains(probe),
+                    allowed,
+                    "{width} cols: {chip} is not the budget's to drop: {line:?}",
+                );
+            }
+        }
+    }
+
+    /// §7.4's tail, stated the way `c6794a6` settled it: the *budget* never drops the
+    /// task id, so its absence at a narrow width can only come from the post-budget
+    /// width-fit pass, and only for an id too long to sit beside the never-dropped
+    /// chips. The `header_budget` field set is asserted pre-fit to prove the budget
+    /// is not the culprit.
+    #[test]
+    fn an_over_long_task_id_is_the_only_fit_pass_casualty() {
+        let long_id = "t-004-wireframe-pane-rebuild";
+        let plan = progress(MIXED, Some(long_id));
+        let data = HeaderData {
+            mode: ViewMode::Split,
+            plan: &plan,
+            budget: header_budget(40),
+            ctx_tokens: 12_400,
+            ctx_limit: 0,
+            elapsed: None,
+
+            val_rounds: 2,
+        };
+
+        // Pre-fit, at the 40-column budget: the whole optional band is already gone and
+        // the id is still on the row. Nothing dropped the task id but the fit pass.
+        let pre_fit = fields(&data, Some(723));
+        assert_eq!(
+            pre_fit.iter().map(|field| field.drop).collect::<Vec<_>>(),
+            vec![None, None, Some(Drop::Task)],
+            "brand and counter carry no rank; the id keeps the last one",
+        );
+        let needed = u16::try_from(fields_width(&pre_fit)).expect("a header row within u16");
+        assert!(
+            needed > 40,
+            "the fixture has to overrun the floor for this test to mean anything: {needed}",
+        );
+
+        // The fit pass is a pure width decision: one cell enough and the id stays.
+        let exactly_enough = text(&header_line(&data, Some(723), needed));
+        assert!(
+            exactly_enough.contains("▶ ") && exactly_enough.contains(long_id),
+            "{needed} cols is enough for this id: {exactly_enough:?}",
+        );
+        let one_cell_short = text(&header_line(&data, Some(723), needed - 1));
+        assert!(
+            one_cell_short.contains("Marmel") && one_cell_short.contains("3/7 done"),
+            "the never-dropped chips stay regardless: {one_cell_short:?}",
+        );
+        assert!(
+            !one_cell_short.contains(long_id),
+            "an id that cannot share the row is the one casualty of the fit pass: {one_cell_short:?}",
+        );
+
+        // And the fit pass still reaches the id last: with the optional band licensed,
+        // the mode name is taken before the id is, at a width this id does fit at.
+        let licensed = HeaderData {
+            budget: header_budget(70),
+            ..data
+        };
+        let at_50 = text(&header_line(&licensed, Some(723), 50));
+        assert!(
+            !at_50.contains("M4 Split") && at_50.contains(long_id),
+            "the mode name pays before the id: {at_50:?}",
+        );
+
+        // An ordinary `t-NNN` id at the very same 40-column budget: present, and not
+        // even clipped. This is the case §10.1 and the 40x10 frame of
+        // `docs/new_ui_preview.txt` describe.
+        let ordinary = progress(MIXED, Some("t-004"));
+        let short = HeaderData {
+            plan: &ordinary,
+            ..data
+        };
+        let at_40 = text(&header_line(&short, Some(723), 40));
+        assert!(
+            at_40.contains("▶ t-004") && at_40.contains("3/7 done") && at_40.contains("Marmel"),
+            "an ordinary task id survives the 40-column floor: {at_40:?}",
+        );
+        assert!(
+            !at_40.contains(theme::ELLIPSIS),
+            "nothing had to be clipped: {at_40:?}",
         );
     }
 
