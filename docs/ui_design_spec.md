@@ -449,6 +449,8 @@ Because the structs use `#[serde(deny_unknown_fields)]`, only *added* fields wit
 do not rename or remove any existing field, and keep `UiSection::default()` loadable (the `Default` impl at
 :268-280 must gain the new fields with the same values the renderer boots with).
 
+**Implemented (t-017b), one correction to the field types:** `view_mode` is `#[serde(default)] Option<String>` and `follow` is `#[serde(default)] Option<bool>`, because `None` is the honest spelling of "this bundle predates the field" — an old `ui.json` then restores through the fields it does have (mode from the two pane toggles via `ViewMode::for_panes`, follow from `chat_auto_scroll`) instead of being refused or silently defaulted to an off flag; `FOCUSED_PANELS` is now `["chat", "input", "plan", "subagents"]` (`"chat"` keeps naming the transcript pane, `"input"` is the composer) with the new `VIEW_MODES = ["transcript", "plan", "workers", "split"]` checked by `structural_violations` only when a mode is stated, and the loss-free pane table is `FocusPane::tag`/`FocusPane::from_tag` while `legacy()`/`from_legacy()` survive for the pre-rebuild `events.rs` fields only.
+
 ## 10. Acceptance criteria
 
 1. Header renders `done/total` and the active task id in every frame at 40x10 with the Plan pane closed (unit test over `PlanProgress` + `render_header` against `TestBackend`). **resolved with §7.4:** the task id is never a budget casualty — `header_budget.show_task` is `true` at 40 cols, so an ordinary `t-NNN` id sits on the header line at the 40x10 floor. Only the width-fit pass, which runs after the budget and in the same order, can take the id back, and only for an id too long to fit beside the mandatory chips.

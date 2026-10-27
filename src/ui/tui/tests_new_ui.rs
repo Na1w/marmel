@@ -829,27 +829,71 @@ fn the_named_and_the_broadcast_spellings_stay_apart_item17() {
 // queue/paused pair, and states a witness disagreement in the transcript.
 // ===========================================================================
 
-/// Item 18: the durable round trip, read back off a redrawn frame — the mode, the
-/// focus, the follow state and D2's queue/paused pair come back as pane state, and
-/// the documented loss (a composer focus has no durable spelling) is asserted as
-/// the documented loss rather than invented.
+/// Item 18: the durable round trip, read back off a redrawn frame. The mode, the
+/// focused pane — the composer, which is the one pane the pre-rebuild spellings
+/// had no name for — and the follow state come back as pane state, D2's
+/// queue/paused pair comes back as row state, and the focus marker is on the
+/// composer in the repaint, not on the body pane the legacy `Chat` tag named.
 #[test]
 fn capture_and_restore_repaints_mode_focus_follow_and_the_d2_pair_item18() {
     use crate::ui::Renderer;
 
+    // The view the operator left: M4, composer focused, follow off.
     let mut source = m4_renderer();
-    source.set_focus(state::FocusPane::Workers);
+    source.set_view_mode(state::ViewMode::Split);
+    source.set_focus(state::FocusPane::Input);
     source.set_follow(false);
     let section = source.capture_ui();
+    assert_eq!(
+        section.structural_violations(),
+        Vec::<String>::new(),
+        "a captured view state must be a loadable one"
+    );
+    // D2 (spec §9.4): the bundle states the view directly — the mode token, the
+    // composer token and an explicit off — so there is nothing left to fold.
+    assert_eq!(
+        section.view.view_mode.as_deref(),
+        Some("split"),
+        "the mode is stored as a mode"
+    );
+    assert_eq!(
+        section.view.focused_panel, "input",
+        "the composer has its own token"
+    );
+    assert_eq!(
+        section.view.follow,
+        Some(false),
+        "follow off is recorded, never defaulted"
+    );
 
     let mut restored = TuiRenderer::new();
     restored.restore_panes(&section);
 
-    // The view state, read back through the same invariants the keys use.
+    // The view state, read back as stated rather than re-derived from a pane
+    // toggle, and moved through the same transition helpers the keys use.
     assert_eq!(restored.view_mode, state::ViewMode::Split);
-    assert_eq!(restored.focus, state::FocusPane::Workers);
+    assert_eq!(
+        restored.focus,
+        state::FocusPane::Input,
+        "the composer focus survives the round trip"
+    );
     assert!(!restored.follow, "follow off survives the round trip");
-    assert!(!restored.chat_auto_scroll);
+    assert!(
+        !restored.chat_auto_scroll,
+        "the pre-rebuild scroll mirror moves with the flag"
+    );
+    assert_eq!(
+        restored.focused_panel,
+        FocusedPanel::Chat,
+        "the legacy mirror keeps its own three-variant spelling"
+    );
+    let view = state::UiView::from_renderer(&restored);
+    assert_eq!(view.mode, state::ViewMode::Split);
+    assert_eq!(view.focus, state::FocusPane::Input);
+    assert!(!view.follow);
+    // And nothing is lost a second time: the restored renderer re-captures the
+    // very section it was handed.
+    assert_eq!(restored.capture_ui(), section);
 
     // D2: the queue rank and the arbitration pause are durable row state.
     let queued = restored
@@ -869,38 +913,154 @@ fn capture_and_restore_repaints_mode_focus_follow_and_the_d2_pair_item18() {
         .expect("the paused row is back");
     assert!(paused.paused, "the held stream is still marked held");
 
-    // And it is all on the redrawn frame: mode chip, roster rank, pause glyph and
-    // the transcript's follow-off chip.
-    let rows = on_screen(&frame_text(&mut restored, 100, 30));
-    assert!(rows.contains("M4 Split"), "mode chip: {rows}");
+    // And it is all on the redrawn frame: mode chip, roster rank, pause glyph,
+    // the transcript's follow-off chip, and the focus badge over the composer.
+    let (text, styles, rects) = draw_styled(&mut restored, 100, 30);
+    let screen = on_screen(&text);
+    assert!(screen.contains("M4 Split"), "mode chip: {screen}");
     assert!(
-        rows.contains("plan:on") && rows.contains("workers:on"),
-        "chips: {rows}"
+        screen.contains("plan:on") && screen.contains("workers:on"),
+        "chips: {screen}"
     );
     assert!(
-        rows.contains("queued 2/3 researcher_specialist"),
-        "the restored queue rank is drawn on the row: {rows}"
+        screen.contains("queued 2/3 researcher_specialist"),
+        "the restored queue rank is drawn on the row: {screen}"
     );
     assert!(
-        rows.contains("⏸ paused validator_specialist"),
-        "the restored pause is drawn on the row: {rows}"
+        screen.contains("⏸ paused validator_specialist"),
+        "the restored pause is drawn on the row: {screen}"
     );
     assert!(
-        rows.contains("↓ follow off"),
-        "the follow state reads back on the transcript border: {rows}"
+        screen.contains("↓ follow off"),
+        "the follow state reads back on the transcript border: {screen}"
     );
 
-    // The documented loss (§4.2, `FocusPane::from_legacy`): the durable tag set
-    // has no composer spelling, so a composer focus comes back as the transcript.
-    let mut composer_focus = m4_renderer();
-    composer_focus.set_focus(state::FocusPane::Input);
-    let section = composer_focus.capture_ui();
+    // The focus marker, which is the half D2 fixed (spec §4.2, item 12 and item
+    // 18): exactly one pane is badgeable — follow is off, so the transcript's
+    // `● LIVE` chip is not on the frame — and it is the composer. Its title
+    // carries its own hint text, so its badge rides the end of that title row
+    // rather than sitting after a pane label.
+    assert_eq!(
+        screen.matches(theme::FOCUS_BADGE).count(),
+        1,
+        "exactly one pane carries the focus badge:\n{screen}"
+    );
+    assert!(
+        text.iter()
+            .any(|row| row.contains("Input (") && row.contains(theme::FOCUS_BADGE)),
+        "the restored focus badge sits in the composer's own title: {screen}"
+    );
+    let composer = rects.input.expect("the composer is drawn in every mode");
+    assert_eq!(
+        corner_colour(&styles, composer),
+        Some(theme::frame_focus().fg.unwrap()),
+        "the restore repaints the composer's frame in `frame_focus`"
+    );
+    for (label, pane) in [
+        ("transcript", rects.transcript),
+        ("plan", rects.plan),
+        ("workers", rects.workers),
+    ] {
+        let rect = pane.expect("M4 draws every body pane at 100x30");
+        assert_eq!(
+            corner_colour(&styles, rect),
+            Some(theme::frame_idle().fg.unwrap()),
+            "{label} is not the restored focus, so its frame stays `frame_idle`"
+        );
+    }
+}
+
+/// Item 18, the backwards-compatibility half: a `ui.json` written before D2 holds
+/// no `view_mode`, no `follow`, and no composer token. It must still load — the
+/// loader refuses, it never repairs, and a field the writer never had is not a
+/// violation — and it must restore to a sane view derived from the fields it
+/// **does** carry: the mode from the pane toggles, the focus from the body-pane
+/// token, follow from its auto-scroll mirror.
+#[test]
+fn a_pre_d2_view_state_restores_from_the_fields_it_actually_has_item18() {
+    use crate::ui::Renderer;
+
+    // A bundle exactly as a pre-D2 release wrote it: take a real capture and take
+    // back out the three things D2 added.
+    let mut source = m4_renderer();
+    source.set_focus(state::FocusPane::Plan);
+    source.set_follow(false);
+    let mut value = serde_json::to_value(source.capture_ui()).expect("a capture serialises");
+    {
+        let view = value["view"].as_object_mut().expect("a view object");
+        for field in ["view_mode", "follow"] {
+            assert!(
+                view.remove(field).is_some(),
+                "the capture must really carry {field} before it is stripped"
+            );
+        }
+        // The composer token is D2's too: an older bundle can only name the body
+        // pane, and that older spelling has to stay legal.
+        view.insert("focused_panel".to_string(), serde_json::json!("chat"));
+    }
+    let older: crate::session::format::UiSection =
+        serde_json::from_value(value).expect("a pre-D2 bundle must still load");
+    assert_eq!(
+        older.view.view_mode, None,
+        "no mode was recorded, none is claimed"
+    );
+    assert_eq!(
+        older.view.follow, None,
+        "no follow flag was recorded, none is claimed"
+    );
+    assert_eq!(
+        older.structural_violations(),
+        Vec::<String>::new(),
+        "an older bundle must not become a refusal because it predates a field"
+    );
+
     let mut restored = TuiRenderer::new();
-    restored.restore_panes(&section);
+    restored.restore_panes(&older);
+
+    // Sane defaults, each derived from a field the older bundle has, never
+    // invented: M4 from its toggles, the body pane from the `chat` token, and the
+    // follow flag from the auto-scroll mirror.
+    assert_eq!(
+        restored.view_mode,
+        state::ViewMode::Split,
+        "the toggles still name the mode an older bundle had"
+    );
     assert_eq!(
         restored.focus,
         state::FocusPane::Transcript,
-        "the `Chat` tag is read as the body pane it always named"
+        "`chat` is read as the body pane it always named"
+    );
+    assert!(
+        !restored.follow,
+        "the auto-scroll mirror is the older spelling of follow off"
+    );
+    assert_eq!(restored.focused_panel, FocusedPanel::Chat);
+    assert!(!restored.chat_auto_scroll);
+
+    // And the frame says the same thing: the mode chip, the follow-off chip and
+    // one focus badge, on the transcript, where the old `Chat` focus sat.
+    let (text, styles, rects) = draw_styled(&mut restored, 100, 30);
+    let screen = on_screen(&text);
+    assert!(screen.contains("M4 Split"), "mode chip: {screen}");
+    assert!(screen.contains("↓ follow off"), "follow chip: {screen}");
+    assert_eq!(
+        screen.matches(theme::FOCUS_BADGE).count(),
+        1,
+        "one focus badge, and it is the restored one:\n{screen}"
+    );
+    assert!(
+        screen.contains(&format!(
+            "{} {}",
+            state::FocusPane::Transcript.label(),
+            theme::FOCUS_BADGE
+        )),
+        "the transcript carries the badge the `chat` token restores: {screen}"
+    );
+    let transcript = rects.transcript.expect("M4 draws the transcript at 100x30");
+    assert_eq!(
+        corner_colour(&styles, transcript),
+        Some(theme::frame_focus().fg.unwrap()),
+        "and its frame is repainted in `frame_focus`"
     );
 }
 

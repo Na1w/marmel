@@ -2770,6 +2770,12 @@ fn resume_boot_assigns_every_pane_string_verbatim_including_the_plan_pane() {
             chat_auto_scroll: false,
             subagent_autoscroll: true,
             plan_auto_scroll: true,
+            // D2 (spec §9.4): the mode, the focused pane and the follow flag are
+            // spelled directly. This fixture spells them the way the toggles and
+            // the auto-scroll mirror already describe, so the section is a
+            // bundle this binary would itself have written.
+            view_mode: Some("split".to_string()),
+            follow: Some(false),
         },
         budgets: BudgetWitness {
             thinking_budgets: budgets,
@@ -4061,6 +4067,12 @@ fn ac_c3_view_offsets_and_toggles_come_back_verbatim_when_the_clamp_has_room() {
             chat_auto_scroll: false,
             subagent_autoscroll: true,
             plan_auto_scroll: false,
+            // D2 (spec §9.4): the mode and the follow flag are stated, not
+            // re-derived from the toggles, and both are restored verbatim — so
+            // the `live.view == stored.view` comparison below is a real
+            // round-trip through the two new fields.
+            view_mode: Some("split".to_string()),
+            follow: Some(false),
         },
         plan_content: "step 1 done\nstep 2 in flight\nstep 3 pending".to_string(),
         ..UiSection::default()

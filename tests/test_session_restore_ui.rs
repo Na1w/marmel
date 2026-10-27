@@ -1181,6 +1181,11 @@ fn ac_c3_view_offsets_selection_and_toggles_match_the_committed_view() {
         chat_auto_scroll: false,
         subagent_autoscroll: true,
         plan_auto_scroll: false,
+        // D2 (spec §9.4): the mode and the follow flag are stated in the bundle
+        // and restored verbatim, so the whole-`ViewState` comparison below is a
+        // round trip through them too, not only through the pre-rebuild fields.
+        view_mode: Some("split".to_string()),
+        follow: Some(false),
     };
     assert_eq!(
         section.structural_violations(),
@@ -1316,6 +1321,11 @@ fn ac_c3_scroll_offsets_that_the_live_clamp_moved_are_reported_as_warnings() {
         chat_auto_scroll: false,
         subagent_autoscroll: false,
         plan_auto_scroll: false,
+        // D2 (spec §9.4): stated, not re-derived — this fixture is about the
+        // clamp, and the two new fields are here so the literal stays a bundle
+        // this binary would itself have written.
+        view_mode: Some("split".to_string()),
+        follow: Some(false),
     };
     assert_eq!(
         section.structural_violations(),

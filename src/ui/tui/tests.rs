@@ -2632,7 +2632,9 @@ fn capture_and_restore_round_trip_scrolls_with_the_live_clamp() {
     assert_eq!(section.view.plan_scroll, 4);
     assert_eq!(section.view.subagent_scroll, 2);
     assert_eq!(section.view.subagent_list_scroll, 1);
-    assert_eq!(section.view.focused_panel, "chat");
+    // The boot renderer holds the composer focused (spec §4.2), and D2 gives that
+    // pane its own token, so the focus is stored as it was held.
+    assert_eq!(section.view.focused_panel, "input");
 
     let mut target = TuiRenderer::new();
     // Same derived geometry as the source, otherwise the live clamp
@@ -3964,15 +3966,16 @@ fn capture_ui_and_restore_panes_round_trip_mode_focus_and_follow() {
     // round-trip is invented and nothing is lost a second time.
     assert_eq!(target.capture_ui(), section);
 
-    // The one documented loss in the mapping: the tag set has no Composer entry,
-    // so a Composer focus comes back as the Transcript. The renderer does not
-    // invent a Composer focus it never stored.
+    // D2 (spec §9.4): the composer has its own token, so a Composer focus comes
+    // back as the composer and not as the body pane the legacy `Chat` spelling
+    // named. The legacy mirror still projects `Chat`, because the pre-rebuild
+    // enum has no composer variant.
     let mut composer = m4_renderer();
     composer.set_focus(state::FocusPane::Input);
-    assert_eq!(composer.capture_ui().view.focused_panel, "chat");
+    assert_eq!(composer.capture_ui().view.focused_panel, "input");
     let mut target = TuiRenderer::new();
     target.restore_panes(&composer.capture_ui());
-    assert_eq!(target.focus, state::FocusPane::Transcript);
+    assert_eq!(target.focus, state::FocusPane::Input);
     assert_eq!(target.focused_panel, FocusedPanel::Chat);
 }
 

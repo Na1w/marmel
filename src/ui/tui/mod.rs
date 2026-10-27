@@ -237,10 +237,13 @@ pub struct TuiRenderer {
     /// The status bar text. Defaults to `"Ready"`.
     pub(crate) status_line: String,
     /// Which legacy panel has focus (drives the border colour of the pre-rebuild
-    /// panes and is the persisted mirror of [`Self::focus`]). Defaults to `Chat`.
-    /// Retired with the key path (spec §9.2); t-011 replaces it with
-    /// [`Self::focus`], and `adopt_legacy_view_writes` keeps the two honest while
-    /// `events.rs` still writes this field directly.
+    /// panes and is the legacy projection of [`Self::focus`],
+    /// [`state::FocusPane::legacy`]). Defaults to `Chat`. Retired with the key
+    /// path (spec §9.2); it survives only while `events.rs` writes this field
+    /// directly, and `adopt_legacy_view_writes` keeps the two honest. Since
+    /// plumbing delta D2 (spec §9.4) the *persisted* spelling is
+    /// [`state::FocusPane::tag`] read off [`Self::focus`], so no bundle value
+    /// ever goes through the lossy `Input`/`Transcript` fold again.
     pub(crate) focused_panel: FocusedPanel,
     /// M1–M4 view mode — **real UI state** (spec §4.1), not a reading of the pane
     /// toggles. Built once in [`Self::new`] and moved only by
@@ -1137,8 +1140,10 @@ impl TuiRenderer {
     }
 
     /// Focus `pane` (spec §4.2). The legacy `focused_panel` mirror moves with it
-    /// so the pre-rebuild panes, the `Esc` re-focus arm of `events.rs` and the
-    /// persisted `ViewState::focused_panel` tag all name the same pane.
+    /// so the pre-rebuild panes and the `Esc` re-focus arm of `events.rs` name the
+    /// same pane as the real focus; the persisted `ViewState::focused_panel` token
+    /// is spelled off [`state::FocusPane::tag`], so it names it exactly too,
+    /// composer included (spec §9.4 D2).
     pub(crate) fn set_focus(&mut self, pane: state::FocusPane) {
         self.focus = pane;
         self.focused_panel = pane.legacy();
@@ -2263,13 +2268,43 @@ impl Renderer for TuiRenderer {
 
     /// CAPTURE the pane model verbatim. This is a pure field read: no event is
     /// replayed, nothing is re-rendered, and no line is regenerated. `&self`
-    /// because a capture never mutates the UI.
+    /// because a capture never mutates the UI. The view state is read through the
+    /// same precedence the adoption bridge uses (see the locals below), so a
+    /// pre-rebuild field that the key path wrote behind the transition helpers is
+    /// captured as the state it names.
     fn capture_ui(&self) -> crate::session::format::UiSection {
         let budgets = self
             .thinking_budgets
             .iter()
             .map(|(role, budget)| (role.clone(), *budget))
             .collect();
+        // The view state has two spellings: the real one (`view_mode`, `focus`)
+        // and the pre-rebuild one (the two pane toggles, `focused_panel`). While
+        // the transition helpers are in use they never disagree — `set_view_mode`
+        // and `set_focus` write both. A direct write to a pre-rebuild field by the
+        // key path of `events.rs` is the fresher of the pair, and
+        // `adopt_legacy_view_writes` folds it into the real state on the next
+        // entry pass, so a capture of a still-unfolded renderer records the pane
+        // the key path named rather than a mode or a focus no key press asked
+        // for. That is the one case where the composer half stays unrecoverable
+        // (`FocusPane::from_legacy`), and it is exactly what pre-D2 bundles held.
+        let stated_panes =
+            state::ViewMode::for_panes(self.show_plan_panel, self.show_subagent_panel);
+        let stated_mode = if self.view_mode == stated_panes {
+            self.view_mode
+        } else {
+            stated_panes
+        };
+        let stated_focus = if self.focused_panel == self.focus.legacy() {
+            self.focus
+        } else {
+            state::FocusPane::from_legacy(self.focused_panel)
+        };
+        let stated_follow = if self.follow == self.chat_auto_scroll {
+            self.follow
+        } else {
+            self.chat_auto_scroll
+        };
         crate::session::format::UiSection {
             // The pane vector is copied element-for-element, in order,
             // including embedded newlines and empty or duplicate entries.
@@ -2310,13 +2345,25 @@ impl Renderer for TuiRenderer {
                 subagent_scroll: self.subagent_scroll,
                 subagent_list_scroll: self.subagent_list_scroll,
                 selected_subagent_idx: self.selected_subagent_idx,
-                focused_panel: focused_panel_tag(self.focused_panel).to_string(),
+                // The focus is captured from the real view state, so the pane the
+                // operator was in — composer included — keeps its own token
+                // instead of being folded into the legacy `Chat` spelling
+                // (spec §9.4 D2, §10 item 18).
+                focused_panel: stated_focus.tag().to_string(),
                 show_thought: self.show_thought,
                 show_subagent_panel: self.show_subagent_panel,
                 show_plan_panel: self.show_plan_panel,
                 chat_auto_scroll: self.chat_auto_scroll,
                 subagent_autoscroll: self.subagent_autoscroll,
                 plan_auto_scroll: self.plan_auto_scroll,
+                // The mode and the follow flag are stored as the renderer states
+                // them, not reconstructed on the way in from the two pane toggles
+                // and the auto-scroll mirror: those are the pre-rebuild spellings
+                // a pre-D2 bundle had to make do with, and they are what a bundle
+                // restores from when the mode token is absent. `Some` always,
+                // because `None` means "a bundle predates this field".
+                view_mode: Some(stated_mode.tag().to_string()),
+                follow: Some(stated_follow),
             },
             // Witness only: `Config` stays the authority; capture states the
             // numbers it holds, and restore never adopts them.
@@ -2460,38 +2507,44 @@ impl Renderer for TuiRenderer {
             self.had_active_plan = section.had_active_plan;
             self.active_plan_task = section.active_plan_task.clone();
         }
-        // An out-of-set spelling is a loader refusal, not something the
-        // renderer invents: keep the current focus in that case.
-        self.focused_panel =
-            focused_panel_from_tag(&section.view.focused_panel).unwrap_or(self.focused_panel);
-
-        // 3b. The real view state (spec §4.1, §4.2, §10 item 18). The stored
-        // `ViewState` only carries the pre-rebuild spellings — the pane toggles,
-        // a focus tag and the auto-scroll flag — so those are read back through
-        // the same transition helpers the keys use, which keeps the invariants
-        // (`mode` ⇔ pane inventory, `focus` ⇔ the persisted tag, `follow` ⇔ the
-        // scroll flag) true for a restored session exactly as they are for a live
-        // one. Two documented losses inside that mapping: the tag set has no
-        // Composer entry, so a Composer focus comes back as the Transcript
-        // (`FocusPane::from_legacy`), and the persisted pair of toggles cannot
-        // distinguish a mode the operator left with a pane closed on purpose from
-        // one the toggles put there — which is the same ambiguity the pair always
-        // had. Neither is invented here.
+        // 3b. The real view state (spec §4.1, §4.2, §9.4 D2, §10 item 18). Since
+        // D2 the bundle states the mode, the focused pane (composer included) and
+        // the follow flag, so they are read back through the same transition
+        // helpers the keys use — which keeps the invariants (`mode` ⇔ pane
+        // inventory, `focus` ⇔ the legacy `focused_panel` mirror, `follow` ⇔ the
+        // scroll mirror) true for a restored session exactly as they are for a
+        // live one, and restores the composer focus the pre-rebuild spellings
+        // could not name. The legacy fields are what follow from the view state
+        // here, never the other way round.
         //
-        // The focus is read out of the tag FIRST because a restore never repairs
+        // Only a field the bundle predates falls back to the older derivation,
+        // and it derives from what that bundle DID carry rather than from a
+        // default invented here: the mode from the two pane toggles, the follow
+        // flag from its `chat_auto_scroll` mirror. That is what such a bundle
+        // restored to before, so an old `ui.json` still lands in the same view.
+        //
+        // The focus is applied AFTER the mode because a restore never repairs
         // one: `set_view_mode` pulls a focus off a pane its new mode removed (an
         // absent pane is never drawn or hit-tested, §2.4.1), but a bundle may
-        // legitimately persist a tag for a pane its toggles leave closed, and the
-        // loader rule for a focus the file states is to keep it verbatim rather
-        // than invent another one. So the incoming focus is captured, the mode is
-        // applied, and the captured focus is re-asserted last.
-        let restored_focus = state::FocusPane::from_legacy(self.focused_panel);
-        self.set_view_mode(state::ViewMode::for_panes(
-            self.show_plan_panel,
-            self.show_subagent_panel,
-        ));
-        self.set_focus(restored_focus);
-        self.set_follow(self.chat_auto_scroll);
+        // legitimately persist a token for a pane its toggles leave closed, and
+        // the loader rule for a focus the file states is to keep it verbatim
+        // rather than invent another one. An out-of-set token is a loader
+        // refusal (U-chk); if one reaches the renderer anyway it changes nothing,
+        // because a focus the file does not state is not a focus to set.
+        let restored_focus = state::FocusPane::from_tag(&section.view.focused_panel);
+        let restored_mode = section
+            .view
+            .view_mode
+            .as_deref()
+            .and_then(state::ViewMode::from_tag)
+            .unwrap_or_else(|| {
+                state::ViewMode::for_panes(self.show_plan_panel, self.show_subagent_panel)
+            });
+        self.set_view_mode(restored_mode);
+        if let Some(pane) = restored_focus {
+            self.set_focus(pane);
+        }
+        self.set_follow(section.view.follow.unwrap_or(self.chat_auto_scroll));
         // A Confirm surface belongs to the 3 s abort window, and that window is
         // never re-armed by a restore (step 5 below). If this process was showing
         // one when the restore was applied, the surface goes away with it — while
@@ -2626,27 +2679,6 @@ impl Renderer for TuiRenderer {
             warnings = report.warnings.len(),
             "session restore: repair report surfaced to the UI"
         );
-    }
-}
-
-/// The persisted spelling of [`FocusedPanel`] (`"chat" | "plan" |
-/// "subagents"`, the same set as `session::format::FOCUSED_PANELS`).
-fn focused_panel_tag(panel: FocusedPanel) -> &'static str {
-    match panel {
-        FocusedPanel::Chat => "chat",
-        FocusedPanel::Plan => "plan",
-        FocusedPanel::Subagents => "subagents",
-    }
-}
-
-/// Inverse of [`focused_panel_tag`]; `None` for an out-of-set spelling, which
-/// the loader refuses rather than repairs.
-fn focused_panel_from_tag(tag: &str) -> Option<FocusedPanel> {
-    match tag {
-        "chat" => Some(FocusedPanel::Chat),
-        "plan" => Some(FocusedPanel::Plan),
-        "subagents" => Some(FocusedPanel::Subagents),
-        _ => None,
     }
 }
 

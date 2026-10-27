@@ -88,6 +88,33 @@ impl ViewMode {
             FocusPane::Workers => self.workers_pane(),
         }
     }
+
+    /// The persisted token for this mode: the one member of
+    /// `session::format::VIEW_MODES` that names it, spelled from the mode itself
+    /// rather than re-derived from the two pane toggles (spec §9.4 D2, §10 item
+    /// 18). The toggles are still written alongside it, and they are what a
+    /// pre-D2 bundle — which has no mode token at all — restores from.
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Transcript => "transcript",
+            Self::Plan => "plan",
+            Self::Workers => "workers",
+            Self::Split => "split",
+        }
+    }
+
+    /// The inverse of [`ViewMode::tag`], total over `VIEW_MODES`. `None` is a
+    /// token outside the set, which the loader refuses (U-chk) rather than
+    /// resolves to the boot mode.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "transcript" => Some(Self::Transcript),
+            "plan" => Some(Self::Plan),
+            "workers" => Some(Self::Workers),
+            "split" => Some(Self::Split),
+            _ => None,
+        }
+    }
 }
 
 /// Pane focus (spec §4.2), replacing the legacy `FocusedPanel`. Focus is drawn
@@ -124,9 +151,11 @@ impl FocusPane {
 
     /// The legacy [`FocusedPanel`] this pane projects onto. `Input` and
     /// `Transcript` share the `Chat` spelling — the legacy enum never had a
-    /// composer focus (spec §4.2) — and that mirror is what the durable
-    /// `ViewState::focused_panel` tag is derived from, so the new focus and the
-    /// stored bundle can never disagree.
+    /// composer focus (spec §4.2) — and this mirror is what the pre-rebuild key
+    /// path of `events.rs` still reads and writes. It is **not** the persistence
+    /// route any more: since plumbing delta D2 (spec §9.4) the durable bundle
+    /// spells the pane through [`FocusPane::tag`], so nothing stored ever goes
+    /// through this fold.
     pub const fn legacy(self) -> FocusedPanel {
         match self {
             Self::Input | Self::Transcript => FocusedPanel::Chat,
@@ -135,16 +164,45 @@ impl FocusPane {
         }
     }
 
-    /// The inverse of [`FocusPane::legacy`]. The `Input` half of the `Chat`
-    /// spelling is not recoverable from the legacy value (or from a stored
-    /// bundle: `session::format::FOCUSED_PANELS` has no `"input"` spelling until
-    /// plumbing delta **D2**, spec §9.4), so the inverse lands on `Transcript`,
-    /// the body pane the old `Chat` focus meant.
+    /// The inverse of [`FocusPane::legacy`], for the pre-rebuild field only. It
+    /// cannot recover which of `Input`/`Transcript` the `Chat` spelling came from
+    /// — that is exactly why it is no longer on the persistence path — and it
+    /// lands on `Transcript`, the body pane the old `Chat` focus named.
     pub const fn from_legacy(panel: FocusedPanel) -> Self {
         match panel {
             FocusedPanel::Chat => Self::Transcript,
             FocusedPanel::Plan => Self::Plan,
             FocusedPanel::Subagents => Self::Workers,
+        }
+    }
+
+    /// The persisted token for this pane: the one member of
+    /// `session::format::FOCUSED_PANELS` that names it, and the value
+    /// `ViewState::focused_panel` carries (spec §9.4 D2, §10 item 18). One token
+    /// per pane, so a capture → restore cycle loses no focus and the composer is
+    /// no longer folded into the transcript. `"chat"` is kept as the transcript's
+    /// token because every bundle written before D2 holds that spelling and it
+    /// must keep meaning the same pane.
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Transcript => "chat",
+            Self::Plan => "plan",
+            Self::Workers => "subagents",
+        }
+    }
+
+    /// The inverse of [`FocusPane::tag`], total over `FOCUSED_PANELS`: each token
+    /// names exactly one pane, including `"input"`. `None` is a token outside the
+    /// set, which the loader refuses (U-chk) rather than repairs — and
+    /// [`TuiRenderer::restore_panes`] keeps the focus it already holds for one.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "input" => Some(Self::Input),
+            "chat" => Some(Self::Transcript),
+            "plan" => Some(Self::Plan),
+            "subagents" => Some(Self::Workers),
+            _ => None,
         }
     }
 }
