@@ -374,42 +374,59 @@ Model, backend URL, and auth token are configuration keys and environment variab
 
 ### Interactive TUI
 
-The interactive TUI contains three main panels:
-1. **Chat:** Conversation stream showing Manager actions, user inputs, thinking blocks, and tool executions.
-2. **Plan:** The active execution plan (`.marmel/execution_plan.md`) with task checkboxes.
-3. **Subagents:** Real-time log and deliverables from delegated specialists. A specialist waiting for a concurrency slot is labelled `(Queued n/m)` — its queue position out of the sessions queued for that backend URL + model pair (see [Session Concurrency](#session-concurrency-orchestrationconcurrency)).
+The rebuilt TUI (branch `feature/new-ui`) is a titled-pane layout: a **header** row, the **Transcript**, **Execution Plan** and **Workers** panes, a two-row **status bar**, the **composer**, and a one-row **key legend** in the footer. The full user guide — screen anatomy, view modes, focus, every binding, the small-terminal ladder, and rendered frames — is in [docs/new_ui.md](docs/new_ui.md).
 
-The Plan panel opens by itself at startup when `.marmel/execution_plan.md` is non-empty; `Tab` cycles only panels that are visible.
+- **Four view modes**, chosen with `F2`–`F5` or the pane toggles: `M1 Transcript`, `M2 Plan` (plan left 55 %, transcript right 45 %), `M3 Workers` (same split), `M4 Split` (transcript left 60 %, plan over workers right 40 %). `Ctrl+P` shows or hides the Plan pane, `Ctrl+A` the Workers pane. Booting with a non-empty `.marmel/execution_plan.md` opens the plan pane, and the first active worker opens the workers pane.
+- **Progress is always on screen.** `✓ 3/7 done` and the task id in flight (`▶ t-004`) are drawn in the header at every size down to the 40×10 floor, and each pane counts its own contents on its bottom border (`✓ 3 done ⧗ 4 open ▶ in flight`, `▶ 1 ⏸ 1 ⧗ 1 ✓ 0`). A worker waiting for a concurrency slot reads `⧗ queued 2/3` — its queue position out of the sessions queued for that backend URL + model pair (see [Session Concurrency](#session-concurrency-orchestrationconcurrency)).
+- **Focus is visible**: a `●` badge in the focused pane's title plus the focus border colour. `Tab` / `Shift+Tab` cycle Input → Transcript → Plan → Workers, skipping panes that are not drawn.
+- **Nothing destructive runs on one keystroke**: `/reset`, `/exit`, `/cancel-all`, `x` and `Ctrl+D` stop at a confirm overlay that names the action and its consequence, answered by `y` / `n` / `Esc`.
+- **Keyboard only.** Mouse capture is not enabled, so terminal-native selection and copy keep working; scroll with `PageUp` / `PageDown` / `Up` / `Down` / `Home` / `End`.
+- **Degrades cleanly**: below 90 columns the split restacks, below 70 the header sheds optional chips, below 20 rows the status bar drops to one row and the footer legend goes, and below 40×10 a single "Terminal too small" notice is drawn.
 
 ### Keyboard Shortcuts
+
+The complete 26-row table is the on-screen legend: press `?` or `F1`, or run `/help`. Core bindings:
 
 | Shortcut | Action |
 |---|---|
 | `Enter` | Send message. |
 | `Shift+Enter` / `Alt+Enter` / `Ctrl+Enter` / `Ctrl+J` | Insert newline in multi-line prompt. |
 | `Ctrl+Z` / `Ctrl+Y` | Undo / redo text in input box. |
-| `Tab` | Cycle focus between Chat, Plan, and Subagents panels. |
-| `Ctrl+P` | Toggle visibility of the Plan panel. |
-| `Ctrl+A` | Toggle visibility of the Subagents panel. |
-| `Ctrl+T` | Toggle visibility of reasoning / thinking blocks. |
-| `Esc` / `Ctrl+C` | Arm abort (press twice within 3 seconds to exit). |
-| Any printable key | Disarm a pending abort after `Esc` or `Ctrl+C`. |
-| `Ctrl+D` | Immediate exit. |
 | `Ctrl+Up` / `Ctrl+Down` | Browse input history. |
-| `←` / `→` | With the Subagents panel focused: previous / next subagent. |
-| `PageUp` / `PageDown` | Scroll focused panel up / down by 10 lines. |
-| `Home` / `End` | Jump to start / end of line (Chat) or top / bottom of panel. |
+| `Tab` | Accept a slash-command completion, else cycle focus forward. `Shift+Tab` cycles backward. |
+| `F2` | Cycle view mode (`M4 → M1 → M2 → M3 → M4`). |
+| `F3` / `F4` / `F5` | Transcript / Plan / Workers view mode. |
+| `Ctrl+P` / `Ctrl+A` | Show or hide the Plan / Workers pane. |
+| `Ctrl+T` | Toggle thinking blocks (echoed by the `think:on` chip). |
+| `Ctrl+F` | Toggle transcript follow (the `● LIVE` / `↓ 3 new` chip on the transcript border). |
+| `?` / `F1` | Keymap and command overlay (`?` only with an empty composer). |
+| `PageUp` / `PageDown` | Scroll the focused pane by 10 lines (the transcript when the composer holds focus). |
+| `Up` / `Down` | History when the draft is empty, else scroll the focused pane by 1. |
+| `←` / `→` | With Workers focused: previous / next worker. Otherwise: caret. |
+| `Home` / `End` | Line start / end in the composer, else pane top / bottom. |
+| `x` | Cancel the selected worker (opens the confirm overlay; Workers pane focused). |
+| `e` | Print the last error again. |
+| `y` / `n` | Confirm / dismiss the pending action — honoured only inside the confirm overlay. |
+| `Ctrl+D` | Quit confirm overlay (never exits un-armed). |
+| `Esc` / `Ctrl+C` | Close an overlay; else arm abort (`Abort armed. Press ESC again to abort.`); a second press within 3 s exits. Any printable key disarms the arm. |
+
+`Ctrl+D` as an immediate exit, mouse scrolling/clicking, and the bare words `stop` / `cancel` / `exit` / `quit` / `q` / `abort` as commands are all gone: a bare word is ordinary steering text, and `?` prints what replaced each removed binding.
 
 ### Slash Commands
 
-Type these directly into the chat input (they match case-insensitively, and they exist only in the TUI — raw mode reads no input at all):
+Type these directly into the chat input (they match case-insensitively, on line 1 only, and they exist only in the TUI — raw mode reads no input at all). Multi-line drafts are never parsed as commands, so a pasted block that starts with `/reset` arrives verbatim. `/help` prints the same table, and the composer autocompletes: `Tab` accepts the ghost completion.
 
 | Command | Action |
 |---|---|
-| `/help` | Print keybinding and command reference in the chat pane. |
-| `/thought` | Toggle display of reasoning and thinking content. |
-| `/reset` (`/reset_plan`, `/reset-plan`, `/clear_plan`, `/clear-plan`, `/reset_execution_plan`) | Clear the execution plan, delete the session bundle and the legacy journals, and revert to conversational mode. |
-| `/abort` (`abort`, `/exit`, `exit`, `/quit`, `quit`, `/q`, `:q`, `:q!`, `/stop`, `stop`, `/cancel`, `cancel`) | Exit the session, cancel running workers, and stamp a `userAbort` ending on the bundle. |
+| `/help` | Print the key legend and this command table in the transcript. |
+| `/thought` | Toggle display of reasoning and thinking content (the `think:` chip). |
+| `/cancel <worker key or task id>` | Cancel one worker (confirm). |
+| `/cancel` | Selected worker when the Workers pane is focused; otherwise a quit spelling (confirm). |
+| `/cancel-all` | Cancel every running worker (confirm). |
+| `/reset` (`/reset_plan`, `/reset-plan`, `/clear_plan`, `/clear-plan`, `/reset_execution_plan`) | Clear the execution plan, session bundle, steering history and transcript, and tell the model (confirm). |
+| `/exit` (`/quit`, `/q`, `/abort`, `/stop`, and the legacy `:q` / `:q!`) | Quit the session, cancel running workers, and stamp a `userAbort` ending on the bundle (confirm). |
+
+`/plan`, `/workers`, `/follow`, `/mode …`, `/error` and `/retry` appear in the command table and autocomplete, but no handler executes them yet on this branch — use `Ctrl+P`, `Ctrl+A`, `Ctrl+F`, `F2`–`F5` and `e` instead.
 
 ### Headless Raw Mode
 
