@@ -12,7 +12,7 @@ Implementation contract for the TUI rebuild. Claims about **existing** code are 
 - Event source unchanged: synchronous crossterm::event::poll/read (src/ui/tui/events.rs:19-27), one event per blocking call (:302-304). No EventStream (feature enabled, never used — ARCH §1), no input thread, no new channel.
 - Cadence constants unchanged: 30 ms input poll (events.rs:19), 25 ms dirty floor (mod.rs:434,1097), 125 ms spinner tier (mod.rs:438), 3 s abort-arm window (mod.rs:410-415), 250 ms plan-mtime cache (render.rs:272), 125 ms spinner phase (render.rs:1109), 200-line log cap (mod.rs:470, merge_logs :496-512).
 - Test seams preserved: per-pane render_*(&mut Frame, Rect) against TestBackend (src/ui/tui/tests.rs:803-828,831-843), the mpsc pair as input boundary (mod.rs:165-166; drain_submissions tests.rs:4524-4530), on_event(&Event) as state boundary, Renderer as loop boundary (src/ui/session_tests.rs:3832, tests/test_session_restore_panel_abort.rs, tests/test_panel_paused_indicator.rs:588, tests/test_session_abort_flush.rs:218), capture_ui/restore_panes as persistence boundary (mod.rs:1291,1400).
-- Terminal setup/teardown unchanged: init (mod.rs:515-547), shutdown (:1160-1169), Drop (:1829-1833), leave_alt_screen (:1836-1847). DisableMouseCapture stays in both teardown paths as defensive idempotent cleanup even though capture is never enabled (mod.rs:1165,1844).
+- Terminal setup/teardown unchanged: init (mod.rs:515-547), shutdown (:1160-1169), Drop (:1829-1833), leave_alt_screen (:1836-1847). DisableMouseCapture stays in both teardown paths as defensive idempotent cleanup even though capture is never enabled — the `shutdown()` teardown and the `leave_alt_screen()` teardown in `src/ui/tui/mod.rs` (the import plus exactly those two call sites; see §10.20).
 
 ## 1. Design goals (measurable)
 
@@ -47,6 +47,16 @@ Layout::vertical([
 being fixed at 3 (UX friction 13); `Min(6)` keeps the body >= 6 rows while chrome is at its default size.
 
 ### 2.2 DEFAULT 100x30 — mode M4 Split, focus Transcript (body = 23 rows)
+
+**Boot frame vs. this worked frame (normative).** The frame below is **M4 Split**, the §4.1 default *mode*; it
+is **not** the boot frame. `TuiRenderer::new` constructs `view_mode: state::ViewMode::for_panes(false, false)`
+(`src/ui/tui/mod.rs`, the `view_mode:` line of the constructor — currently :433), i.e. **M1 Transcript** with
+both side panes closed and the composer focused (`focus: state::FocusPane::Input`). Contract, stated plainly:
+**the boot state is M1 Transcript** — that is what the `Marmel M1 Transcript …` frame at 100x30 in
+`docs/new_ui_preview.txt` (case a, "idle/empty boot state") and the boot frame tests pin — while **M4 Split is
+the contract for the 100x30 layout budget drawn below**, the mode the operator reaches with `F2`/`F5`,
+`/mode split`, or by switching a side pane on with `Ctrl+P`/`Ctrl+A`. Nothing in §2 is mode-conditional: the
+chrome, the region budget and the §2.5 ladder are identical in M1 and M4.
 
 ````
 header Length(1): Marmel — M4 Split — 3/7 done — > t-004 — val 1 — ctx 41% — 12:03
@@ -153,16 +163,25 @@ becomes a thin call into the component with a borrowed `FrameContext`.
 | Worker activity feed | `components/workers.rs` | `subagents: Vec<SubagentDetail>` (mod.rs:121) plus the per-frame `orchestrator::worker_entries()` snapshot (render.rs:659) and badge from `helpers::subagent_row_badge` (helpers.rs:627) | roster (state glyph, ctx, elapsed), selection highlight, roster `n/total`, detail `[Thinking]/[Output]/[Logs]` (logs merged + capped at 200, mod.rs:496-512) | `Tab` focus, `←/→` select worker, `↑/↓` scroll, `x` cancel selected |
 | Input / composer | `components/composer.rs` | `textarea: ratatui_textarea::TextArea` (mod.rs:89), `input_text`/`cursor` (:91,:93), `history`/`history_index`/`input_draft` (:129-133) | draft with real height 3..9, caret, `+n` overflow marker, slash-command hint in the border title | typing (always), `Enter`, history, undo/redo, paste (events.rs:288-291,319-338) |
 | Help / keymap overlay | `components/help_overlay.rs` + `components/keymap.rs` | `keymap::legend()` — generated from the same table the key handler matches on (replaces the hard-coded legend, events.rs:789-813) | full key table + slash-command table with argument hints | `?` (empty composer) / `F1` open; `Esc` close (no arming) |
-| Confirm overlay | `components/confirm_overlay.rs` | `pending_confirm: Option<ConfirmRequest>` — `Quit \| ResetPlan \| CancelWorker{key,task_id} \| CancelAll \| ClearTranscript` | what will happen, what it touches, `y`/`n` prompt | `y` yes, `n` no, `Esc` dismiss; all other keys ignored |
+| Confirm overlay | `components/confirm_overlay.rs` | `confirm_action: Option<ConfirmAction>` (`src/ui/tui/events.rs`) — exactly `ConfirmAction::{Quit, CancelWorker{key,task_id}, CancelAll, Command{line}}`; the overlay text is built by `help::ConfirmRequest` | what will happen, what it touches, `y`/`n` prompt | `y` yes, `n` no, `Esc` dismiss; all other keys ignored |
 | (support) layout | `components/layout.rs` | pure function over `Size` + pane visibility | `Panes { header, body, status, input, footer, per-pane Option<Rect> }` | — |
 | (support) palette | `components/palette.rs` | `Color`/`Style` constants + `Glyph` enum | §7 | — |
+
+**Confirm-action inventory (normative; matches `enum ConfirmAction` in `src/ui/tui/events.rs`).** There are
+exactly four confirm surfaces: `Quit`, `CancelWorker { key, task_id }`, `CancelAll`, `Command { line }`. There
+is no `ResetPlan` variant and no `ClearTranscript` confirm surface — the renderer never clears the transcript
+itself, so nothing can confirm such an action. Transcript clearing happens **only** through `/reset` (all six
+spellings, `is_reset_command` in `src/ui/helpers.rs`): the confirm arms a `Command { line }`, and on `y` the
+verbatim line goes to the session loop, whose reset path clears the plan, the bundle, the steering history and
+the transcript (§6, G3).
 
 ## 4. View modes & focus model
 
 ### 4.1 Modes
 
 `enum ViewMode { Transcript, Plan, Workers, Split }` — stored on the renderer (`view_mode`), persisted
-(§9.4). Default `Split` (M4). Keys: `F2` cycles M4→M1→M2→M3→M4; `F3` M1; `F4` M2; `F5` M3. `Ctrl+P` /
+(§9.4). Default `Split` (M4) — the default *mode*, not the boot frame: a fresh renderer boots in M1 Transcript
+with both side panes closed (see §2.2). Keys: `F2` cycles M4→M1→M2→M3→M4; `F3` M1; `F4` M2; `F5` M3. `Ctrl+P` /
 `Ctrl+A` keep toggling the Plan / Workers pane (events.rs:176-184, 185-194): in M1 they switch the mode so
 the toggle is never a silent no-op (G5, UX friction 3), and an empty pane toggles **on** and renders its
 empty state (§8.1).
@@ -235,7 +254,8 @@ table into the footer, the `F1` overlay and `/help` — one source, so the legen
 
 - **All mouse arms (events.rs:226-287) deleted.** `EnableMouseCapture` is executed nowhere in `src/`, so the
   block is unreachable in practice (UX §1 "Unreachable bindings", defect 2); the `/help` legend advertised it
-  (events.rs:806). `DisableMouseCapture` remains in both teardown paths only (mod.rs:1165,1844) per §0.
+  (events.rs:806). `DisableMouseCapture` remains in both teardown paths only (the `shutdown()` and
+  `leave_alt_screen()` teardowns in `src/ui/tui/mod.rs`) per §0 and §10.20.
 - **`Ctrl+D` as immediate quit (events.rs:173-175) removed.** A single un-armed keystroke ended the session
   with no arming and no confirm; G3 requires an arming or confirm step on every exit path.
 - **Bare words `stop`, `cancel`, `exit`, `quit`, `q`, `abort` no longer terminate the session.** They are
@@ -321,9 +341,18 @@ children (render.rs:1030). The abort-armed state no longer replaces the metrics 
   measured with `unicode-width`; a clipped line ends in `…`. No `Line` may exceed its rect (test §10.19 reuses
   `formatting::rect_contains`, formatting.rs:1131).
 - Wrapped-line counts keep using `formatting::count_wrapped_rendered_lines` (:847) / `wrapped_lines` (:872).
-- Header drop order when narrow: `val` → `ctx` → `elapsed` → mode name → `> t-NNN`. `done/total` is
-  **never** dropped (G1). Status row 1 drop order: `queued` → `paused` → `active` names (counts kept) →
-  `val` → `ctx`.
+- Header drop order when narrow: `val` → `ctx` → `elapsed` → mode name. `done/total` **and** the active task
+  id `> t-NNN` are **never** dropped by the width budget (G1, §10.1): `header_budget` keeps `show_task: true`
+  at every width down to the 40-column too-small floor (the `show_task` arm of `header_budget`,
+  `src/ui/tui/layout.rs`), and the 40x10 frame of `docs/new_ui_preview.txt` carries `▶ t-004`. The only
+  thing that can still take the task id away is the width-*fit* pass in `header::drop_to_fit`, which sits
+  **after** the budget and re-runs the same order (`val` → `ctx` → `elapsed` → mode name → task id) only when
+  the assembled line is wider than the rect; it therefore reaches the task id last, and only for an id long
+  enough not to fit next to the mandatory chips. Whatever survives both passes is clipped with `…` by
+  `header::fit_spans` if it still overruns the rect.
+  **resolved:** §10.1 and §7.4 agree — the task id is not a budget casualty: at the narrowest supported width
+  (40 cols) an ordinary `t-NNN` id stays on the header line, and the budget ladder stops at the mode name.
+  Status row 1 drop order: `queued` → `paused` → `active` names (counts kept) → `val` → `ctx`.
 - `status_line` keeps only its first line, as today (mod.rs:776-782), but the sticky-error buffer (§8.5) keeps
   the full text.
 
@@ -422,7 +451,7 @@ do not rename or remove any existing field, and keep `UiSection::default()` load
 
 ## 10. Acceptance criteria
 
-1. Header renders `done/total` and the active task id in every frame at 40x10 with the Plan pane closed (unit test over `PlanProgress` + `render_header` against `TestBackend`).
+1. Header renders `done/total` and the active task id in every frame at 40x10 with the Plan pane closed (unit test over `PlanProgress` + `render_header` against `TestBackend`). **resolved with §7.4:** the task id is never a budget casualty — `header_budget.show_task` is `true` at 40 cols, so an ordinary `t-NNN` id sits on the header line at the 40x10 floor. Only the width-fit pass, which runs after the budget and in the same order, can take the id back, and only for an id too long to fit beside the mandatory chips.
 2. Header `done/total` equals the `CheckboxState::Checked` / total split of the same `plan_content` string for 3 fixtures (empty, all-checked, mixed).
 3. `keymap::legend()`, the footer text and the `/help` transcript output are byte-identical, and the legend names no key that `handle_events` does not bind (assert the legend rows against the table).
 4. `F1` and `?`-on-empty-composer open the same overlay; `?` with a non-empty composer inserts `?`.
@@ -436,12 +465,12 @@ do not rename or remove any existing field, and keep `UiSection::default()` load
 12. Focus badge test: at every focus state the focused pane's title buffer contains `●` and its border cell carries `frame_focus`; exactly one pane is focused.
 13. Printable-key routing: with focus on Plan and Workers, `Char('x')`, `Backspace` and `Delete` mutate `textarea` content in that order; `x` with an empty composer and Workers focus instead opens the overlay (both cases asserted).
 14. Follow test: with `follow = false`, appending 5 messages does not change `chat_scroll` and the chip reads `↓ 5 new`; `Ctrl+F` re-arms and the chip reads `LIVE`; submit no longer re-arms silently (replaces events.rs:784,846, render.rs:464-469).
-15. Roster test: 12 live workers produce 12 reachable rows (scroll offset changes selection), no `.clamp(1, 3)` remains in `components/workers.rs`.
+15. Roster test: 12 live workers produce 12 reachable rows (scroll offset changes selection). The roster and its detail pane are owned by `src/ui/tui/components/activity.rs` and the plan pane by `src/ui/tui/components/plan_pane.rs` — there is no `components/workers.rs`. No row-count `.clamp(1, 3)` remains in either module; the only `.clamp(1, 3)` left in the UI is the sanctioned `rows < 20` composer height, inside `input_height` in `src/ui/tui/layout.rs` (verified at `layout.rs:289` on 2026-10-27).
 16. An overlay open closes on Esc without arming abort; y/n are honoured only inside the confirm overlay.
 17. Cancel-one-worker test: x -> confirm -> exactly one worker path, with orchestrator::cancel_all() not called (assert via the recording renderer in tests/test_session_restore_panel_abort.rs).
 18. Restore test: capture_ui -> restore_panes round-trips view_mode, focus (including input), follow, and D2's queue/paused; token_witness_warnings appears as one transcript line.
 19. Layout test: at 100x30, 90x24, 60x16 and 40x10 no pane rect has width or height 0; at 39x9 the too-small notice appears; no rendered line exceeds its rect (rect_contains, formatting.rs:1131 may be reused).
-20. Source hygiene: grep over src/ finds no MouseEvent arm and no EnableMouseCapture; DisableMouseCapture remains only at mod.rs:1165,1844.
+20. Source hygiene: grep over src/ finds no `MouseEvent` arm and no executed `EnableMouseCapture` anywhere in `src/` (the token survives only in prose comments recording that it is never executed); `DisableMouseCapture` survives as the `crossterm::event` import plus **exactly two** teardown sites in `src/ui/tui/mod.rs` — one in `shutdown()`, one in `leave_alt_screen()` — and nowhere else (three code occurrences in total, the count pinned by a test). No line numbers are quoted here on purpose: they move with every edit. Verified 2026-10-27 at `mod.rs:24` (import), `mod.rs:2124` (`shutdown()`) and `mod.rs:2899` (`leave_alt_screen()`); the numbers this item used to cite (`1165,1844`) were stale.
 21. Cadence invariants unchanged (30 ms / 25 ms / 125 ms / 3 s / 250 ms constants of §0), and an idle renderer performs no terminal.draw (ARCH §2).
 
 Additional gates: (a) `cargo clippy --all-targets -- -D warnings` and `cargo build` pass with **zero**

@@ -6842,7 +6842,11 @@ fn drawn_logs(rows: &[String]) -> Vec<String> {
                 None => row.clone(),
             };
             let trimmed = inner.trim_end_matches(|c: char| {
-                c.is_whitespace() || matches!(c, '\u{2502}' | '\u{2551}' | '\u{2503}' | '\u{25bc}' | '\u{25b2}')
+                c.is_whitespace()
+                    || matches!(
+                        c,
+                        '\u{2502}' | '\u{2551}' | '\u{2503}' | '\u{25bc}' | '\u{25b2}'
+                    )
             });
             trimmed
                 .strip_prefix("- ")
@@ -7066,7 +7070,12 @@ fn a_longer_incoming_list_sharing_a_prefix_is_adopted_without_duplicating_that_p
     r.set_subagents(vec![auth_row(ROW, &[P1, P2, P3])]);
     assert_eq!(
         r.subagents[0].logs,
-        vec![P1.to_string(), P2.to_string(), P3.to_string(), TAIL.to_string()],
+        vec![
+            P1.to_string(),
+            P2.to_string(),
+            P3.to_string(),
+            TAIL.to_string()
+        ],
         "the shared prefix must not be duplicated by the adopted list, got {:?}",
         r.subagents[0].logs
     );
@@ -7143,7 +7152,12 @@ fn dedup_is_content_sensitive_and_order_stable_across_a_legitimately_repeating_l
     r.set_subagents(vec![auth_row(ROW, &[S1, R1, R3])]);
     assert_eq!(
         r.subagents[0].logs,
-        vec![S1.to_string(), R1.to_string(), R3.to_string(), M1.to_string()],
+        vec![
+            S1.to_string(),
+            R1.to_string(),
+            R3.to_string(),
+            M1.to_string()
+        ],
         "the loop's list leads, the renderer's missing line follows in its own order, and no \
          second copy of a text the base already holds is appended, got {:?}",
         r.subagents[0].logs
@@ -7396,12 +7410,19 @@ fn an_empty_log_push_after_the_cap_neither_shrinks_nor_clears_the_capped_list() 
         .expect("the capped row has a newest line");
     r.set_subagents(vec![auth_row(ROW, &[newest.as_str()])]);
     assert_eq!(r.subagents[0].logs.len(), MAX, "still exactly at the cap");
-    assert_eq!(r.subagents[0].logs, capped, "and unchanged in content and order");
+    assert_eq!(
+        r.subagents[0].logs, capped,
+        "and unchanged in content and order"
+    );
 
     // The retained window is still drawn, from its oldest retained line.
     let (rows, _) = draw_workers_pane(&r.subagents, 0, 0, false, 100, 40);
     let shown = drawn_logs(&rows);
-    assert_eq!(shown, capped[..shown.len()], "the capped head of the list is drawn");
+    assert_eq!(
+        shown,
+        capped[..shown.len()],
+        "the capped head of the list is drawn"
+    );
     assert!(
         !shown.iter().any(|line| line == "line 0"),
         "the line the cap dropped is not drawn, got {shown:?}"
@@ -7479,7 +7500,11 @@ fn a_lifecycle_line_the_cap_has_already_trimmed_is_re_appended_at_the_tail_by_th
         .iter()
         .position(|line| line == LIFECYCLE)
         .expect("the re-appended lifecycle line is still on the row");
-    assert_eq!(at, MAX - 2, "it now sits inside the stream, not at either end");
+    assert_eq!(
+        at,
+        MAX - 2,
+        "it now sits inside the stream, not at either end"
+    );
 
     let (rows, _) = draw_workers_pane(&r.subagents, 0, 0, false, 100, 40);
     assert_eq!(
@@ -7640,7 +7665,8 @@ fn queue_position_updates_never_move_the_selection_or_the_list_window() {
     // which is exactly the state a reselect would silently destroy.
     r.selected_subagent_idx = 6;
 
-    let (before, geometry) = draw_workers_pane(&r.subagents, r.selected_subagent_idx, 0, false, 90, 12);
+    let (before, geometry) =
+        draw_workers_pane(&r.subagents, r.selected_subagent_idx, 0, false, 90, 12);
     assert_eq!(
         geometry.roster_scroll, 2,
         "the selected row is scrolled into view once, with the top rows out of the window"
@@ -7677,9 +7703,18 @@ fn queue_position_updates_never_move_the_selection_or_the_list_window() {
         }
         r.set_subagents(authoritative);
 
-        assert_eq!(r.selected_subagent_idx, 6, "a slot transition never reselects");
-        let (after, geometry) =
-            draw_workers_pane(&r.subagents, r.selected_subagent_idx, geometry.roster_scroll, false, 90, 12);
+        assert_eq!(
+            r.selected_subagent_idx, 6,
+            "a slot transition never reselects"
+        );
+        let (after, geometry) = draw_workers_pane(
+            &r.subagents,
+            r.selected_subagent_idx,
+            geometry.roster_scroll,
+            false,
+            90,
+            12,
+        );
         assert_eq!(
             geometry.roster_scroll, 2,
             "a slot transition never scrolls the list window"
@@ -7752,14 +7787,23 @@ fn a_re_queued_row_follows_every_rank_edge_in_its_label_and_its_bar() {
     let rows = vec![row(Some(crate::ui::QueueState { position: 3, of: 3 }))];
     let (drawn, _) = draw_workers_pane(&rows, 0, 0, true, 90, 24);
     let roster = roster_row_of(&drawn, "coder");
-    assert!(roster.contains("3/3"), "the last rank is drawn too: {roster:?}");
+    assert!(
+        roster.contains("3/3"),
+        "the last rank is drawn too: {roster:?}"
+    );
 
     // The same edges through the other writer: the delegation-event fold.
     let mut r = TuiRenderer::new();
-    r.set_subagents(vec![row(Some(crate::ui::QueueState { position: 1, of: 2 }))]);
+    r.set_subagents(vec![row(Some(crate::ui::QueueState {
+        position: 1,
+        of: 2,
+    }))]);
     let (drawn, _) = draw_workers_pane(&r.subagents, 0, 0, true, 90, 24);
     let roster = roster_row_of(&drawn, "coder");
-    assert!(roster.contains("1/2"), "the pushed rank is on the row: {roster:?}");
+    assert!(
+        roster.contains("1/2"),
+        "the pushed rank is on the row: {roster:?}"
+    );
 
     r.on_event(&Event::Delegation(
         crate::orchestrator::DelegationEvent::Running {
@@ -7841,14 +7885,8 @@ fn a_held_stream_is_labelled_paused_and_keeps_its_live_shape() {
         frame.contains("2a") || frame.contains("1a"),
         "the held stream is still counted in the round: {frame}"
     );
-    assert!(
-        frame.contains("1p"),
-        "and counted as held: {frame}"
-    );
-    assert!(
-        frame.contains("coder-t-9706"),
-        "and named: {frame}"
-    );
+    assert!(frame.contains("1p"), "and counted as held: {frame}");
+    assert!(frame.contains("coder-t-9706"), "and named: {frame}");
 }
 
 /// Who owns the pause label, re-established: the session loop's rows do. A renderer
@@ -7964,11 +8002,12 @@ fn the_status_row_names_held_and_queued_streams_and_keeps_every_count() {
         line.contains("1q"),
         "the queued stream gets its own segment: {line:?}"
     );
-    for name in ["coder-t-9710", "validator-t-9711", "coder_specialist-t-9712"] {
-        assert!(
-            line.contains(name),
-            "the name list names {name}: {line:?}"
-        );
+    for name in [
+        "coder-t-9710",
+        "validator-t-9711",
+        "coder_specialist-t-9712",
+    ] {
+        assert!(line.contains(name), "the name list names {name}: {line:?}");
     }
 
     // Control: one running row adds no pause and no queue segment, so those counts
@@ -7977,7 +8016,10 @@ fn the_status_row_names_held_and_queued_streams_and_keeps_every_count() {
     plain.set_view_mode(state::ViewMode::Split);
     plain.subagents = vec![status_row_worker("coder-t-9713", "t-9713")];
     let line = metrics_row(&draw_new_frame(&mut plain, 150, 40));
-    assert!(line.contains("1a"), "the round still counts the row: {line:?}");
+    assert!(
+        line.contains("1a"),
+        "the round still counts the row: {line:?}"
+    );
     assert!(!line.contains("1p"), "no pause segment: {line:?}");
     assert!(!line.contains("1q"), "no queue segment: {line:?}");
 }
@@ -8065,14 +8107,22 @@ fn the_project_clock_is_the_last_field_of_the_row_and_the_first_the_ladder_takes
     );
     let at = line.find("elapsed ").expect("the clock is on the row");
     let tokens = line.find(" Tokens ").expect("the token pair is on the row");
-    assert!(tokens < at, "the clock is the last field of the row: {line:?}");
+    assert!(
+        tokens < at,
+        "the clock is the last field of the row: {line:?}"
+    );
 
     // The narrow rung of the ladder: the clock leaves, the counters do not.
     let mut narrow = live_worker_scenario();
     let line = metrics_row(&draw_new_frame(&mut narrow, 60, 16));
-    assert!(!line.contains("elapsed"), "the clock is the first to go: {line:?}");
     assert!(
-        line.starts_with(" Tokens ") && line.contains("3a") && line.contains("1p")
+        !line.contains("elapsed"),
+        "the clock is the first to go: {line:?}"
+    );
+    assert!(
+        line.starts_with(" Tokens ")
+            && line.contains("3a")
+            && line.contains("1p")
             && line.contains("1q"),
         "the counters the ladder must keep stay: {line:?}"
     );
@@ -8084,7 +8134,10 @@ fn the_project_clock_is_the_last_field_of_the_row_and_the_first_the_ladder_takes
 #[test]
 fn the_slot_wait_and_parked_stream_sentences_arm_the_backend_wait_clock() {
     let mut r = TuiRenderer::new();
-    assert!(r.waiting_for_token_since.is_none(), "control: nothing waiting");
+    assert!(
+        r.waiting_for_token_since.is_none(),
+        "control: nothing waiting"
+    );
 
     r.on_event(&Event::Status(
         "queued for a backend slot (2 of 4) — Manager".to_string(),
@@ -8109,7 +8162,9 @@ fn the_slot_wait_and_parked_stream_sentences_arm_the_backend_wait_clock() {
         "a parked stream is the same kind of deliberate silence"
     );
 
-    r.on_event(&Event::Status("calling backend (gpt-6-x) for t-9720".to_string()));
+    r.on_event(&Event::Status(
+        "calling backend (gpt-6-x) for t-9720".to_string(),
+    ));
     assert!(
         r.waiting_for_token_since.is_some(),
         "and so is the model call itself"
@@ -8152,7 +8207,10 @@ fn the_thinking_half_is_gated_by_the_toggle_and_reports_its_budget() {
         "the reasoning text must not leak without the toggle, got:\n{text}"
     );
     let roster = roster_row_of(&hidden, "coder");
-    assert!(roster.contains("2/4"), "hiding the thought costs no rank: {roster:?}");
+    assert!(
+        roster.contains("2/4"),
+        "hiding the thought costs no rank: {roster:?}"
+    );
 
     // Toggle on, through the renderer seam (it is what hands the pane the budget the
     // worker was launched with): the text and the countdown ride the same header line.
@@ -8164,9 +8222,15 @@ fn the_thinking_half_is_gated_by_the_toggle_and_reports_its_budget() {
         text.contains("~1.0k tokens of 10.0k budget (9.0k remaining)"),
         "the budget countdown is the header of the thinking half, got:\n{text}"
     );
-    assert!(text.contains("aaaa"), "the reasoning is printed, got:\n{text}");
+    assert!(
+        text.contains("aaaa"),
+        "the reasoning is printed, got:\n{text}"
+    );
     let roster = only_row(&frame, "coder", (120, 40));
-    assert!(roster.contains("2/4"), "and the rank is still there: {roster:?}");
+    assert!(
+        roster.contains("2/4"),
+        "and the rank is still there: {roster:?}"
+    );
 }
 
 // ---- t-015: the restore seam and the registry identity rules --------------------
@@ -8305,8 +8369,12 @@ fn a_collided_row_is_badged_and_measured_from_the_entry_that_owns_its_key() {
     );
     let (plain, collided, audit_key) = (first.0.clone(), second.0.clone(), audit.0.clone());
     let _plain_guard = EntryCleanup { key: plain.clone() };
-    let _collided_guard = EntryCleanup { key: collided.clone() };
-    let _audit_guard = EntryCleanup { key: audit_key.clone() };
+    let _collided_guard = EntryCleanup {
+        key: collided.clone(),
+    };
+    let _audit_guard = EntryCleanup {
+        key: audit_key.clone(),
+    };
     workers::update_active_worker_context(&collided, 4_321);
     assert_ne!(plain, collided, "the second worker took a collision key");
 
@@ -8396,7 +8464,10 @@ fn the_runners_second_registration_opens_no_roster_row_and_never_steals_the_sele
     let ui = r.capture_ui();
     assert_eq!(ui.subagent_panels.len(), 1, "one delegated task, one row");
     assert_eq!(ui.subagent_panels[0].name, plain);
-    assert_eq!(ui.view.selected_subagent_idx, 0, "the pane follows the live row");
+    assert_eq!(
+        ui.view.selected_subagent_idx, 0,
+        "the pane follows the live row"
+    );
     assert_eq!(ui.subagent_panels[0].logs, lines);
 
     // Refresh edge #2 — the runner re-registers the same identity while the Manager
@@ -8408,7 +8479,10 @@ fn the_runners_second_registration_opens_no_roster_row_and_never_steals_the_sele
     );
     let twin = runner.0.clone();
     let _twin_guard = EntryCleanup { key: twin.clone() };
-    assert!(twin.contains('#'), "the second registration took a collision key: {twin}");
+    assert!(
+        twin.contains('#'),
+        "the second registration took a collision key: {twin}"
+    );
 
     let _ = crate::ui::helpers::project_subagent_rows(&mut loop_rows);
     loop_rows.retain(|row| row.name == plain || row.name == twin);
@@ -8428,7 +8502,12 @@ fn the_runners_second_registration_opens_no_roster_row_and_never_steals_the_sele
     let selected = ui
         .subagent_panels
         .get(ui.view.selected_subagent_idx)
-        .unwrap_or_else(|| panic!("selection {} names no row: {names:?}", ui.view.selected_subagent_idx));
+        .unwrap_or_else(|| {
+            panic!(
+                "selection {} names no row: {names:?}",
+                ui.view.selected_subagent_idx
+            )
+        });
     assert_eq!(
         selected.name, plain,
         "the selection still follows the row that has the history"
@@ -8437,7 +8516,8 @@ fn the_runners_second_registration_opens_no_roster_row_and_never_steals_the_sele
 
     // And the drawn roster agrees with the state: one row, no collision key on
     // screen, and the history still scrollable to its last line.
-    let (drawn, geometry) = draw_workers_pane(&r.subagents, r.selected_subagent_idx, 0, false, 120, 24);
+    let (drawn, geometry) =
+        draw_workers_pane(&r.subagents, r.selected_subagent_idx, 0, false, 120, 24);
     let text = drawn.join("\n");
     assert!(
         !text.contains(&twin),
@@ -8494,7 +8574,10 @@ fn a_closed_row_still_recalls_its_thinking_and_its_logs() {
         "a closed row reads done: {roster:?}"
     );
     for section in ["[Thinking]", "[Output]", "[Logs]"] {
-        assert!(text.contains(section), "{section} is still recallable:\n{text}");
+        assert!(
+            text.contains(section),
+            "{section} is still recallable:\n{text}"
+        );
     }
     assert!(
         text.contains("half a thought, still on screen")
@@ -8513,9 +8596,11 @@ fn draw_new_frame_styled(
 ) -> (Vec<String>, Vec<Vec<ratatui::style::Style>>) {
     let backend = ratatui::backend::TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| {
-        r.draw_new_ui(frame);
-    }).unwrap();
+    terminal
+        .draw(|frame| {
+            r.draw_new_ui(frame);
+        })
+        .unwrap();
     let buffer = terminal.backend().buffer();
     let text = (0..height)
         .map(|y| {
@@ -8782,7 +8867,11 @@ fn draw_plan_pane(
                 auto_scroll,
                 target_task,
             };
-            components::plan_pane::render(frame, ratatui::layout::Rect::new(0, 0, width, height), &data);
+            components::plan_pane::render(
+                frame,
+                ratatui::layout::Rect::new(0, 0, width, height),
+                &data,
+            );
         })
         .unwrap();
     let buffer = terminal.backend().buffer();
@@ -8809,11 +8898,14 @@ fn the_plan_pane_falls_back_to_its_first_open_task_and_then_to_its_tail() {
     let rows = draw_plan_pane(&plan, 0, &[], true, None, 60, 20);
     let drawn = rows.join("\n");
     assert!(
-        rows.iter().any(|row| row.contains("[t-031] the first open task")),
+        rows.iter()
+            .any(|row| row.contains("[t-031] the first open task")),
         "the first open task is the scroll target:\n{drawn}"
     );
     assert!(
-        !rows.iter().any(|row| row.contains("[t-001] a finished step 1")),
+        !rows
+            .iter()
+            .any(|row| row.contains("[t-001] a finished step 1")),
         "and the finished head is off screen:\n{drawn}"
     );
 
