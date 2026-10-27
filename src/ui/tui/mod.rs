@@ -727,6 +727,12 @@ impl TuiRenderer {
     /// worker rows, the composer buffer, the session counters and its own clocks
     /// over, and reads the viewport each pass established back out of the report
     /// each `render` returns. The help overlay is drawn last, over the body (§7.3).
+    ///
+    /// The numbered passes below are the **paint order**, not the on-screen order:
+    /// which pane sits in which slot is decided solely by
+    /// [`layout::compute_layout`], and since the t-024 trade the Plan holds the
+    /// leading slot of M4 while the Transcript is painted ahead of it but into the
+    /// side column. Nothing here may restate that geometry.
     pub(crate) fn draw_new_ui(&mut self, frame: &mut ratatui::Frame) -> layout::PaneRects {
         // The frame is built from stored view state, so anything a writer outside
         // the key path changed on the legacy fields (a worker activating opens the

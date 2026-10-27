@@ -31,13 +31,17 @@ use crate::plan_parse::{CheckboxState, parse_tasks};
 /// and only `TuiRenderer::set_view_mode` moves it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
-    /// M1 — transcript fills the body; Plan/Workers absent.
+    /// M1 — Transcript fills the body; Plan/Workers absent.
     Transcript,
-    /// M2 — Plan left (55 %), Transcript right (45 %).
+    /// M2 — Transcript left (55 %), Plan right (45 %). The pair is the §2.3 pair
+    /// traded by t-024, which moved the Plan pane into the Transcript's slot.
     Plan,
-    /// M3 — Workers left (55 %), Transcript right (45 %).
+    /// M3 — Workers left (55 %), Transcript right (45 %). No Plan pane, so the
+    /// t-024 trade does not touch this mode.
     Workers,
-    /// M4 — Transcript left (60 %), Plan over Workers in the side column (40 %).
+    /// M4 — Plan left (60 %), Transcript over Workers in the side column (40 %).
+    /// Before t-024 the wide column was the Transcript's and the Plan sat at the
+    /// head of the side column.
     Split,
 }
 
@@ -145,6 +149,13 @@ impl FocusPane {
     /// The `Tab` cycle of spec §4.2: `Input → Transcript → (Plan) → (Workers) →
     /// Input`. `TuiRenderer::cycle_focus_pane` walks this ring and skips the
     /// panes the current mode does not present.
+    ///
+    /// The ring is the §4.2 **inventory** order, not a left-to-right walk of the
+    /// panes, and t-024 deliberately leaves it alone: the order is what `Shift+Tab`
+    /// reverses and what the persisted focus tags were spelled against, and it was
+    /// never positional — in M3 the ring already stepped Transcript → Workers while
+    /// the roster sat in the left column. Which pane sits where is geometry, and
+    /// [`super::layout`] is the only owner of that.
     pub const fn cycle_order() -> [FocusPane; 4] {
         [Self::Input, Self::Transcript, Self::Plan, Self::Workers]
     }

@@ -620,6 +620,14 @@ impl TuiRenderer {
     /// `F2`: walk M4 → M1 → M2 → M3 → M4 (§4.1). The mode carries its pane
     /// inventory, so the key is never a silent no-op: the toggles move with it and a
     /// focus the new mode would orphan is pulled back onto a pane that is on screen.
+    ///
+    /// The walk direction reads forward against the t-024 geometry, which is why the
+    /// order itself does not move with the pane swap: the pane that holds the
+    /// **leading** slot (the left column, or the whole body in M1) walks Plan (M4) →
+    /// Transcript (M1) → Transcript (M2) → Workers (M3), and Plan → Transcript →
+    /// Workers is exactly the left-to-right order of the panes M4 itself draws. Under
+    /// the pre-t-024 geometry the same walk stepped Transcript → Plan → Workers, the
+    /// then-left-to-right order of M4 — the trade moved the panes, not the direction.
     fn cycle_view_mode(&mut self) {
         let next = match self.view_mode {
             ViewMode::Split => ViewMode::Transcript,

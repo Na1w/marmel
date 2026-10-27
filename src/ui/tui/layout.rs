@@ -12,6 +12,17 @@
 //! change on the very next frame, and the [`PaneRects::mode`] a frame reports is
 //! the mode the frame was built from, including where the §2.5 ladder overrides
 //! it.
+//!
+//! **Slot assignment (t-024).** In every shape that draws both the Plan and the
+//! Transcript, the two panes hold each other's §2.3 slot: M2 draws the Transcript
+//! in the wide left column and the Plan in the right one, and M4 draws the Plan in
+//! the wide column with the Transcript at the head of the side column over the
+//! roster. The trade is positional — a slot keeps its own width, so a pane that
+//! moves to the other side of a split takes the other side's width with it — and
+//! it applies to the stacked and single-side fallbacks of the §2.5 ladder the same
+//! way. M3 draws no Plan pane, so nothing trades there, and the shapes the ladder
+//! reduces to a single pane (`width < 60`, and `width < 90` with no side pane on
+//! screen) have nothing to trade.
 
 use super::state::{FocusPane, UiView, ViewMode};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -41,7 +52,10 @@ enum Shape {
     Full,
     /// Side-by-side columns (`Percentage` pair of §2.3).
     Columns,
-    /// Transcript above, the focused side pane below (`vertical([Min(6), Min(6)])`).
+    /// Two panes stacked (`vertical([Min(6), Min(6)])`). With the Plan on screen it
+    /// holds the top slot and the Transcript the bottom one — the trade of t-024,
+    /// which is the other way round from §2.3. When the §2.5 ladder keeps the roster
+    /// instead of the Plan there is nothing to trade and the Transcript stays on top.
     Stacked,
 }
 
@@ -182,46 +196,82 @@ pub fn compute_layout(area: Rect, view: &UiView) -> PaneRects {
         (ViewMode::Plan, Shape::Full) => rects.plan = Some(body),
         (ViewMode::Workers, Shape::Full) => rects.workers = Some(body),
         (ViewMode::Plan, _) => {
+            // M2, t-024: the Transcript holds the wide left column and the Plan the
+            // right one. The `55/45` pair is the §2.3 pair unchanged — what traded
+            // is which pane sits in which slot (the pair used to read Plan left /
+            // Transcript right).
             let cols = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
                 .split(body);
-            rects.plan = Some(cols[0]);
-            rects.transcript = Some(cols[1]);
+            rects.transcript = Some(cols[0]);
+            rects.plan = Some(cols[1]);
         }
         (ViewMode::Workers, _) => {
+            // M3 has no Plan pane, so the t-024 trade cannot touch it: the roster
+            // keeps the wide left column and the Transcript the right one.
             let cols = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
                 .split(body);
             rects.workers = Some(cols[0]);
             rects.transcript = Some(cols[1]);
         }
         (ViewMode::Split, Shape::Stacked) => {
+            // §2.5 `width < 90`: the body stacks two panes, and the focused side
+            // pane stands in for one of the three. Where the survivor is the Plan the
+            // t-024 trade applies as it does in the columns below — the Plan takes the
+            // top slot (the Transcript's former one) and the Transcript the bottom
+            // (the Plan's former one). Where the roster survives there is no Plan on
+            // screen to trade, and the Transcript keeps the top slot.
             let stack = Layout::vertical([Constraint::Min(BODY_MIN), Constraint::Min(BODY_MIN)])
                 .split(body);
-            rects.transcript = Some(stack[0]);
             match side_pane(view) {
-                Some(FocusPane::Plan) => rects.plan = Some(stack[1]),
-                Some(FocusPane::Workers) => rects.workers = Some(stack[1]),
+                Some(FocusPane::Plan) => {
+                    rects.plan = Some(stack[0]);
+                    rects.transcript = Some(stack[1]);
+                }
+                Some(FocusPane::Workers) => {
+                    rects.transcript = Some(stack[0]);
+                    rects.workers = Some(stack[1]);
+                }
                 _ => rects.transcript = Some(body),
             }
         }
         (ViewMode::Split, _) => {
+            // M4, t-024: the Plan holds the wide column and the Transcript the top
+            // of the side column, over the roster. Before the trade the wide column
+            // was the Transcript's and the side column's top slot was the Plan's.
             let cols = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
                 .split(body);
-            rects.transcript = Some(cols[0]);
-            let side = cols[1];
+            let (wide, side) = (cols[0], cols[1]);
             match (view.plan_visible, view.workers_visible) {
                 (true, true) if side.height >= 2 * BODY_MIN => {
                     let stack =
                         Layout::vertical([Constraint::Min(BODY_MIN), Constraint::Min(BODY_MIN)])
                             .split(side);
-                    rects.plan = Some(stack[0]);
+                    rects.plan = Some(wide);
+                    rects.transcript = Some(stack[0]);
                     rects.workers = Some(stack[1]);
                 }
+                // The side column cannot stack two panes: only one of the two side
+                // panes is drawn, and [`side_pane`] picks the one that keeps the
+                // focus on screen. Where that is the Plan, the Plan/Transcript trade
+                // applies exactly as it does in the stackable arm above.
                 (true, true) => match side_pane(view) {
-                    Some(FocusPane::Workers) => rects.workers = Some(side),
-                    _ => rects.plan = Some(side),
+                    Some(FocusPane::Workers) => {
+                        rects.transcript = Some(wide);
+                        rects.workers = Some(side);
+                    }
+                    _ => {
+                        rects.plan = Some(wide);
+                        rects.transcript = Some(side);
+                    }
                 },
-                (true, false) => rects.plan = Some(side),
-                (false, true) => rects.workers = Some(side),
+                (true, false) => {
+                    rects.plan = Some(wide);
+                    rects.transcript = Some(side);
+                }
+                (false, true) => {
+                    rects.transcript = Some(wide);
+                    rects.workers = Some(side);
+                }
                 (false, false) => rects.transcript = Some(body),
             }
         }
@@ -242,8 +292,9 @@ fn resolve_body(body: Rect, view: &UiView) -> (ViewMode, Shape) {
         return (view.mode, Shape::Full);
     }
     if body.width < NARROW_COLS {
-        // §2.5 `width < 90`: M4 stacks the transcript over only the focused side
-        // pane; a mode that already isolates one pane needs no second column.
+        // §2.5 `width < 90`: M4 stacks two panes — the Plan over the Transcript, the
+        // trade of t-024 — holding only the focused side pane in place of the other
+        // one; a mode that already isolates one pane needs no second column.
         return match view.mode {
             ViewMode::Split if side_pane(view).is_some() && body.height >= 2 * BODY_MIN => {
                 (ViewMode::Split, Shape::Stacked)

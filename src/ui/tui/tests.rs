@@ -3558,6 +3558,39 @@ fn draw_new_frame(r: &mut TuiRenderer, width: u16, height: u16) -> Vec<String> {
         .collect()
 }
 
+/// The cells strictly inside one pane rect — its body, border excluded — with the
+/// scrollbar glyphs a pane draws on its inner right edge stripped off.
+fn pane_body(rows: &[String], pane: Rect) -> Vec<String> {
+    let x = usize::from(pane.x) + 1;
+    let width = usize::from(pane.width).saturating_sub(2);
+    let y = usize::from(pane.y) + 1;
+    let height = usize::from(pane.height).saturating_sub(2);
+    rows[y..y + height]
+        .iter()
+        .map(|row| {
+            row.chars()
+                .skip(x)
+                .take(width)
+                .collect::<String>()
+                .trim_end()
+                .trim_end_matches(['│', '║', '▲', '▼', '█'])
+                .to_string()
+        })
+        .collect()
+}
+
+/// What one pane says, with its body rows folded back into a single line. A pane
+/// wraps at its own width, so after the t-024 trade moved the transcript into the
+/// side column a sentence can straddle two rows: folding keeps an assertion about
+/// the pane's message independent of the width it happens to be drawn at.
+fn pane_says(rows: &[String], pane: Rect) -> String {
+    pane_body(rows, pane)
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ")
+}
+
 /// A renderer in the M4 state: both side panes on, one running worker, one
 /// transcript line, a mixed plan. The mode is set through the transition helper
 /// because it is stored view state now — writing the pane toggles alone would
@@ -3871,10 +3904,16 @@ fn every_view_mode_changes_the_rects_compute_layout_actually_produces() {
                 assert_eq!(rects.workers, None, "M2 has no workers pane");
                 assert_eq!(plan.width + transcript.width, body.width);
                 assert!(
-                    plan.width > transcript.width,
-                    "M2 is 55/45 with the plan in the wider column: plan {} transcript {}",
-                    plan.width,
-                    transcript.width
+                    transcript.width > plan.width,
+                    "M2 is the 55/45 pair with the transcript in the wider column \
+                     since the t-024 trade: transcript {} plan {}",
+                    transcript.width,
+                    plan.width
+                );
+                assert!(
+                    transcript.x < plan.x,
+                    "M2 puts the transcript in the left column and the plan in the \
+                     right one: transcript {transcript:?} plan {plan:?}"
                 );
             }
             state::ViewMode::Workers => {
@@ -3893,16 +3932,28 @@ fn every_view_mode_changes_the_rects_compute_layout_actually_produces() {
                 let workers = rects.workers.expect("M4 shows the workers pane");
                 assert_eq!(plan.width + transcript.width, body.width);
                 assert!(
-                    transcript.width > plan.width,
-                    "M4 is 60/40 with the transcript in the wider column: transcript {} side {}",
-                    transcript.width,
-                    plan.width
+                    plan.width > transcript.width,
+                    "M4 is the 60/40 pair with the plan in the wide column since the \
+                     t-024 trade: plan {} side {}",
+                    plan.width,
+                    transcript.width
                 );
+                assert_eq!(plan.height, body.height, "the plan owns a whole column");
                 assert_eq!(
-                    plan.width, workers.width,
+                    transcript.width, workers.width,
                     "the side column stacks two panes"
                 );
-                assert_eq!(plan.height + workers.height, body.height);
+                assert_eq!(transcript.height + workers.height, body.height);
+                assert!(
+                    plan.x < transcript.x && plan.x < workers.x,
+                    "the plan column comes first, the stacked side column after it: \
+                     plan {plan:?} transcript {transcript:?} workers {workers:?}"
+                );
+                assert!(
+                    transcript.y < workers.y && transcript.x == workers.x,
+                    "the transcript heads the side column and the roster stacks under \
+                     it: transcript {transcript:?} workers {workers:?}"
+                );
             }
         }
         seen.push((rects.transcript, rects.plan, rects.workers));
@@ -6548,9 +6599,22 @@ fn a_queued_steer_from_the_bridge_lands_in_the_transcript_and_arms_the_chip() {
         "[Steer queued → manager] rename the module first — held while the specialists run"
     );
 
-    let frame = draw_new_frame(&mut r, 100, 30).join("\n");
-    assert!(frame.contains("[Steer queued"), "{frame}");
-    assert!(frame.contains("rename the module first"), "{frame}");
+    let rows = draw_new_frame(&mut r, 100, 30);
+    let frame = rows.join("\n");
+    // The line lands in the **transcript pane** itself. Since the t-024 trade that
+    // pane is the side column of M4, narrow enough to wrap the sentence across two
+    // rows, so the pane's own body rows are folded back into one line before the
+    // phrase is looked for.
+    let view = state::UiView::from_renderer(&r);
+    let rects = layout::compute_layout(Rect::new(0, 0, 100, 30), &view);
+    let transcript = rects.transcript.expect("M4 draws the transcript");
+    assert!(
+        transcript.x > rects.body.expect("a 100x30 body").x,
+        "t-024: the transcript is the side column, the plan holds the left: {rects:?}"
+    );
+    let said = pane_says(&rows, transcript);
+    assert!(said.contains("[Steer queued"), "{said}\n{frame}");
+    assert!(said.contains("rename the module first"), "{said}\n{frame}");
     assert!(
         frame.contains("1 steers"),
         "the chip is on the bar: {frame}"
@@ -8704,9 +8768,12 @@ fn draw_new_frame_styled(
     (text, styles)
 }
 
-/// The style a drawn row was painted with, read at the first non-blank cell after
-/// the pane border. Every span of a plan body line shares one style, so any glyph
-/// of the line answers for the whole line.
+/// The style a drawn row was painted with, read at the cell where `needle` itself
+/// starts. Every span of a plan body line shares one style, so any glyph of the
+/// line answers for the whole line. The column is taken from the needle rather
+/// than from the first content cell of the row: since the t-024 pane trade a row
+/// can carry the text of two panes at once, and the left-hand one is no longer
+/// guaranteed to be the pane the needle belongs to.
 fn row_style(
     styles: &[Vec<ratatui::style::Style>],
     rows: &[String],
@@ -8717,9 +8784,9 @@ fn row_style(
         .position(|row| row.contains(needle))
         .unwrap_or_else(|| panic!("no drawn row carries {needle:?}:\n{}", rows.join("\n")));
     let cell = rows[y]
-        .chars()
-        .position(|c| c != ' ' && c != '\u{2502}')
-        .unwrap_or(0);
+        .find(needle)
+        .map(|byte| rows[y][..byte].chars().count())
+        .expect("the row that matched carries the needle");
     styles[y][cell.min(styles[y].len().saturating_sub(1))]
 }
 

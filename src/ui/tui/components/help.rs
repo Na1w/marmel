@@ -166,7 +166,7 @@ pub fn legend() -> Vec<LegendRow> {
         },
         LegendRow {
             keys: "F2",
-            action: "cycle the view mode",
+            action: "cycle mode M4 (Plan left) → M1 → M2 → M3",
             scope: "global",
             footer: "F2 mode",
         },

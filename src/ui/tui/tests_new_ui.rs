@@ -288,6 +288,57 @@ fn on_screen(rows: &[String]) -> String {
     rows.join("\n")
 }
 
+/// The cells strictly inside one pane rect — its body, border excluded — with the
+/// scrollbar glyphs a pane draws on its inner right edge stripped off.
+fn pane_body(rows: &[String], pane: Rect) -> Vec<String> {
+    let x = usize::from(pane.x) + 1;
+    let width = usize::from(pane.width).saturating_sub(2);
+    let y = usize::from(pane.y) + 1;
+    let height = usize::from(pane.height).saturating_sub(2);
+    rows[y..y + height]
+        .iter()
+        .map(|row| {
+            row.chars()
+                .skip(x)
+                .take(width)
+                .collect::<String>()
+                .trim_end()
+                .trim_end_matches(['│', '║', '▲', '▼', '█'])
+                .to_string()
+        })
+        .collect()
+}
+
+/// What one pane says, its body rows folded back into a single line. A pane wraps
+/// at its own width, so after the t-024 trade moved the transcript into the side
+/// column a sentence can straddle two rows: folding keeps an assertion about the
+/// pane's message independent of the width it happens to be drawn at.
+fn pane_says(rows: &[String], pane: Rect) -> String {
+    pane_body(rows, pane)
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ")
+}
+
+/// The horizontal reading order of the three body panes of one frame: leftmost
+/// first, and within one column the higher pane first. This is the order an
+/// operator's eye walks, and it is what t-024 changed.
+fn reading_order(rects: &layout::PaneRects) -> Vec<&'static str> {
+    let mut panes: Vec<(&'static str, Rect)> = Vec::new();
+    for (label, rect) in [
+        ("transcript", rects.transcript),
+        ("plan", rects.plan),
+        ("workers", rects.workers),
+    ] {
+        if let Some(rect) = rect {
+            panes.push((label, rect));
+        }
+    }
+    panes.sort_by_key(|(_, rect)| (rect.x, rect.y));
+    panes.iter().map(|(label, _)| *label).collect()
+}
+
 // ===========================================================================
 // §10 item 16 — an overlay closes on Esc without arming abort; y/n are honoured
 // only inside the confirm overlay.
@@ -532,9 +583,18 @@ fn every_confirm_action_draws_its_surface_last_over_the_body_item16() {
             "{label}: the box starts over the pane underneath it, so it is drawn last"
         );
         // The covered panes keep their own borders on that row: `Clear` plus the box
-        // only reach the body's middle, never a pane's outer frame.
+        // only reach the body's middle, never a pane's outer frame. Since the t-024
+        // trade the pane whose left border sits on the body's left edge is the Plan
+        // — the Transcript now heads the side column, which the box does reach.
+        let left_column = rects
+            .plan
+            .expect("M4 draws the plan in the wide left column");
         assert_eq!(
-            grid[title_row][usize::from(transcript.x)].as_str(),
+            left_column.x, body.x,
+            "{label}: the plan pane holds the body's left edge after t-024"
+        );
+        assert_eq!(
+            grid[title_row][usize::from(left_column.x)].as_str(),
             "│",
             "{label}: the covered pane keeps its left border"
         );
@@ -1404,11 +1464,16 @@ fn a_disagreeing_token_witness_arrives_as_one_transcript_line_item18() {
         "the live counter is kept, never adopted"
     );
 
-    // And it is on screen, not just in the vector.
-    let rows = on_screen(&frame_text(&mut restored, 100, 30));
+    // And it is on screen, not just in the vector: the transcript pane says it.
+    // Since the t-024 trade that pane is M4's side column, whose width wraps the
+    // sentence, so the pane's own body rows are folded back into one line.
+    let (rows, _, rects) = draw_frame(&mut restored, 100, 30);
+    let transcript = rects.transcript.expect("M4 draws the transcript at 100x30");
+    let said = pane_says(&rows, transcript);
     assert!(
-        rows.contains("[CLI] Restore warning: tokens_in witness 900"),
-        "the transcript states the disagreement:\n{rows}"
+        said.contains("[CLI] Restore warning: tokens_in witness 900"),
+        "the transcript states the disagreement:\n{}",
+        on_screen(&rows)
     );
 }
 
@@ -1544,7 +1609,8 @@ fn below_the_floor_only_the_too_small_notice_is_drawn_item19() {
 /// then the second status row and the footer, then the too-small notice.
 #[test]
 fn the_degradation_ladder_drops_panes_in_spec_order_item19() {
-    // 100 wide: M4 is three panes — transcript plus plan over workers.
+    // 100 wide: M4 is three panes — the plan in the wide column, the transcript
+    // over the roster in the side column (the t-024 order).
     let mut r = m4_renderer();
     let (_, _, wide) = draw_frame(&mut r, 100, 30);
     assert!(
@@ -1567,7 +1633,7 @@ fn the_degradation_ladder_drops_panes_in_spec_order_item19() {
     let (rows_89, _, at_89) = draw_frame(&mut r, 89, 30);
     assert!(
         at_89.transcript.is_some() && at_89.plan.is_some() && at_89.workers.is_none(),
-        "width < 90 stacks the transcript over the focused side pane alone: {at_89:?}"
+        "width < 90 stacks the focused side pane and the transcript alone: {at_89:?}"
     );
     let screen = on_screen(&rows_89);
     assert!(
@@ -1673,6 +1739,221 @@ fn the_degradation_ladder_drops_panes_in_spec_order_item19() {
     );
 }
 
+/// t-024: the Execution Plan pane and the Transcript pane hold **each other's**
+/// slots. The pre-trade geometry is spelled out as literals so the swap is pinned
+/// in both directions — the plan drawn exactly where the transcript used to be, the
+/// transcript exactly where the plan used to be — and cannot drift back silently.
+/// Every shape in which both panes are visible is pinned: the M4 column pair, the
+/// M2 column pair, the `width < 90` stacked fallback and the short-terminal
+/// fallback in which the side column cannot stack. The roster is pinned as **not**
+/// traded, because no plan pane is on screen for it to trade with.
+#[test]
+fn the_plan_and_the_transcript_hold_each_others_slot_t024() {
+    // ---- M4 Split, columns: the 60 % column and the head of the 40 % side column.
+    // Pre-trade: transcript (0,1,60,23), plan (60,1,40,12), workers (60,13,40,11).
+    let mut r = m4_renderer();
+    let (rows, _, rects) = draw_frame(&mut r, 100, 30);
+    let body = rects.body.expect("100x30 clears every floor");
+    assert_eq!(body, Rect::new(0, 1, 100, 23), "the body of these frames");
+    assert_eq!(
+        rects.plan,
+        Some(Rect::new(0, 1, 60, 23)),
+        "the plan holds the wide column the transcript used to hold: {rects:?}"
+    );
+    assert_eq!(
+        rects.transcript,
+        Some(Rect::new(60, 1, 40, 12)),
+        "the transcript holds the head of the side column the plan used to hold: {rects:?}"
+    );
+    assert_eq!(
+        rects.workers,
+        Some(Rect::new(60, 13, 40, 11)),
+        "the roster keeps the slot it never traded: {rects:?}"
+    );
+    assert_eq!(
+        reading_order(&rects),
+        vec!["plan", "transcript", "workers"],
+        "the eye walks Plan, Transcript, Workers: {rects:?}"
+    );
+
+    // The pixels agree with the geometry: the body's first row carries the plan's
+    // title at the body's left edge and the transcript's title at the side column.
+    let cells: Vec<char> = rows[usize::from(body.y)].chars().collect();
+    let left: String = cells[..usize::from(body.width) / 2].iter().collect();
+    let side: String = cells[usize::from(body.width) * 3 / 5..].iter().collect();
+    assert!(
+        left.starts_with("┌ Execution Plan"),
+        "the plan pane titles the left column: {left:?}"
+    );
+    assert!(
+        side.starts_with("┌ Transcript"),
+        "the transcript pane titles the side column: {side:?}"
+    );
+    assert!(
+        !left.contains("Transcript"),
+        "and the old order is gone from the left column: {left:?}"
+    );
+
+    // ---- M2 Plan, columns: pre-trade plan (0,1,55,23) / transcript (55,1,45,23).
+    let mut r = m4_renderer();
+    r.set_view_mode(state::ViewMode::Plan);
+    let (_, _, rects) = draw_frame(&mut r, 100, 30);
+    assert_eq!(
+        rects.transcript,
+        Some(Rect::new(0, 1, 55, 23)),
+        "M2: the transcript moved into the wide left column: {rects:?}"
+    );
+    assert_eq!(
+        rects.plan,
+        Some(Rect::new(55, 1, 45, 23)),
+        "M2: the plan moved into the right column: {rects:?}"
+    );
+    assert_eq!(
+        reading_order(&rects),
+        vec!["transcript", "plan"],
+        "M2 reads Transcript, Plan: {rects:?}"
+    );
+
+    // ---- M3 Workers draws no plan pane, so nothing trades there.
+    let mut r = m4_renderer();
+    r.set_view_mode(state::ViewMode::Workers);
+    let (_, _, rects) = draw_frame(&mut r, 100, 30);
+    assert_eq!(
+        rects.workers,
+        Some(Rect::new(0, 1, 55, 23)),
+        "M3 keeps the roster in the wide left column: {rects:?}"
+    );
+    assert_eq!(
+        rects.transcript,
+        Some(Rect::new(55, 1, 45, 23)),
+        "and the transcript in the right one: {rects:?}"
+    );
+
+    // ---- The `width < 90` stacked fallback: pre-trade the transcript held the top
+    // slot and the focused side pane the bottom one.
+    let mut r = m4_renderer();
+    r.set_focus(state::FocusPane::Plan);
+    let (_, _, rects) = draw_frame(&mut r, 89, 30);
+    let body = rects.body.expect("89x30 clears the floors");
+    let plan = rects
+        .plan
+        .expect("the focused plan pane survives the ladder");
+    let transcript = rects
+        .transcript
+        .expect("the transcript survives in every mode");
+    assert_eq!(rects.workers, None, "only the focused side pane is stacked");
+    assert_eq!(
+        (plan.x, plan.y),
+        (body.x, body.y),
+        "the plan heads the stack"
+    );
+    assert_eq!((plan.width, transcript.width), (body.width, body.width));
+    assert_eq!(
+        transcript.y,
+        plan.y + plan.height,
+        "the transcript takes the slot under it, the plan's former one: {rects:?}"
+    );
+    assert_eq!(
+        plan.height + transcript.height,
+        body.height,
+        "and the two fill the body: {rects:?}"
+    );
+
+    // With the roster focused the ladder keeps the roster instead of the plan, and
+    // there is no plan pane on screen to trade — the transcript stays on top.
+    let mut r = m4_renderer();
+    r.set_focus(state::FocusPane::Workers);
+    let (_, _, rects) = draw_frame(&mut r, 89, 30);
+    let body = rects.body.expect("89x30 clears the floors");
+    let transcript = rects.transcript.expect("the transcript survives");
+    let workers = rects.workers.expect("the focused roster survives");
+    assert_eq!(
+        rects.plan, None,
+        "the ladder removes the unfocused side pane"
+    );
+    assert_eq!((transcript.x, transcript.y), (body.x, body.y));
+    assert_eq!(workers.y, transcript.y + transcript.height);
+
+    // ---- The short-terminal fallback: the side column cannot stack two panes, so
+    // one side pane is dropped — and where the survivor is the plan, the trade still
+    // applies (pre-trade: transcript (0,10,60,11) / plan (60,10,40,11) at 100x16).
+    let mut r = m4_renderer();
+    let (_, _, rects) = draw_frame(&mut r, 100, 16);
+    let body = rects.body.expect("100x16 clears the floors");
+    assert!(
+        body.height < 12,
+        "this frame is the one the side column cannot stack: {body:?}"
+    );
+    assert_eq!(
+        rects.plan,
+        Some(Rect::new(0, body.y, 60, body.height)),
+        "the plan takes the wide column here too: {rects:?}"
+    );
+    assert_eq!(
+        rects.transcript,
+        Some(Rect::new(60, body.y, 40, body.height)),
+        "and the transcript the side column: {rects:?}"
+    );
+    assert_eq!(rects.workers, None, "and the roster drops out, as before");
+}
+
+/// t-024 moved panes, not the `F2` walk: the walk stays forward because the pane
+/// occupying the **leading** slot (the left column, or the whole body in M1) moves
+/// around the same ring as M4 lays its panes out left to right.
+#[test]
+fn the_f2_mode_walk_still_steps_forward_after_the_t024_trade() {
+    let mut r = m4_renderer();
+    let split_order = {
+        let (_, _, rects) = draw_frame(&mut r, 100, 30);
+        assert_eq!(rects.mode, state::ViewMode::Split);
+        reading_order(&rects)
+    };
+
+    let mut modes: Vec<state::ViewMode> = Vec::new();
+    let mut leading: Vec<&'static str> = Vec::new();
+    for _ in 0..4 {
+        assert!(key(&mut r, KeyCode::F(2)));
+        let (_, _, rects) = draw_frame(&mut r, 100, 30);
+        modes.push(rects.mode);
+        leading.push(reading_order(&rects)[0]);
+    }
+    assert_eq!(
+        modes,
+        vec![
+            state::ViewMode::Transcript,
+            state::ViewMode::Plan,
+            state::ViewMode::Workers,
+            state::ViewMode::Split,
+        ],
+        "`F2` still walks M1 → M2 → M3 → M4 from M4"
+    );
+    assert_eq!(
+        leading,
+        vec!["transcript", "transcript", "workers", "plan"],
+        "the leading slot walks Transcript → Transcript → Workers → Plan: {leading:?}"
+    );
+
+    // The ring the walk describes is the order M4 draws its panes, so no press
+    // steps the operator's eye back across the frame.
+    let mut ring = leading.clone();
+    ring.dedup();
+    let at = ring
+        .iter()
+        .position(|pane| *pane == split_order[0])
+        .unwrap_or_else(|| {
+            panic!(
+                "the walk never leads with {:?}: {leading:?}",
+                split_order[0]
+            )
+        });
+    ring.rotate_left(at);
+    assert_eq!(
+        ring, split_order,
+        "F2 walks the leading slot in M4's own left-to-right order {split_order:?}, \
+         got {ring:?} (walk {leading:?})"
+    );
+}
+
 /// Item 19 (§2.4.1): a pane the mode or the ladder removes is not drawn at all —
 /// never a zero-sized rect, never a title, never a chip that lies about it.
 #[test]
@@ -1734,7 +2015,8 @@ fn every_view_mode_shows_its_own_pane_inventory() {
         "the header names the mode: {rows:?}"
     );
 
-    // `F4` adds the plan pane at 55 %, transcript right.
+    // `F4` adds the plan pane: the transcript keeps the wide 55 % column and the
+    // plan takes the right 45 % one (the t-024 order).
     assert!(key(&mut r, KeyCode::F(4)));
     assert_eq!(r.view_mode, state::ViewMode::Plan);
     let (rows, _, rects) = draw_frame(&mut r, 100, 30);
@@ -1742,6 +2024,11 @@ fn every_view_mode_shows_its_own_pane_inventory() {
     assert!(screen.contains("M2 Plan"));
     assert!(rects.plan.is_some() && rects.transcript.is_some() && rects.workers.is_none());
     assert!(screen.contains("Execution Plan") && screen.contains("Transcript"));
+    assert!(
+        rects.transcript.expect("M2 draws the transcript").x
+            < rects.plan.expect("M2 draws the plan").x,
+        "the transcript sits left of the plan in M2: {rects:?}"
+    );
 
     // `F5` swaps in the Workers pane.
     assert!(key(&mut r, KeyCode::F(5)));
