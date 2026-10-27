@@ -1,4 +1,13 @@
-# Verification report — `feature/new-ui` (plan task t-012b)
+# Verification report — `feature/new-ui`
+
+> **This file has two parts.** §1–§8 below are the t-012b audit at HEAD `4fca031`, kept as the historical
+> record. **PART B at the end of this file is the current audit** (t-020) at HEAD `9726d26`: its gate table,
+> §10 acceptance matrix and D1–D11 ledger supersede the corresponding tables in §1–§8. Companion artefact:
+> `docs/change_surface_report.md`.
+
+---
+
+## PART A — verification report (plan task t-012b)
 
 Auditor: validator_specialist. Date: 2026-10-27 (CET). Branch audited: `feature/new-ui` @ `4fca031`.
 Mode: **read-only audit**. No tracked source file was created, modified, deleted or reformatted. Nothing was
@@ -249,3 +258,253 @@ or the implementation line.
 | `cargo build` (forced, uncached, `git archive HEAD` copy) | — | 0 warnings | 0 |
 | `cargo clippy --all-targets` (forced, uncached, same copy) | — | 0 diagnostics | 0 |
 | `cargo fmt --all -- --check` | — | 30 hunks / 2 files | 1 |
+
+---
+---
+
+# PART B — final branch audit at HEAD `9726d26` (plan task t-020)
+
+Auditor: validator_specialist. Date: 2026-10-27 (CET). Branch: `feature/new-ui` @
+`9726d26b4740417a923de09ab9fb86252e10ebd7` (parent `d8cb75d`).
+Mode: **read-only on `src/`**. Part A (§1–§8 above) is the t-012b audit at HEAD `4fca031` and is left
+untouched as a historical record; **Part B supersedes its gate numbers, its §10 matrix and its defect
+ledger**, because five fix commits and three test/doc commits landed after Part A was written.
+Companion artefact: `docs/change_surface_report.md` (t-020) — commit chain, diff surface, file inventory,
+out-of-surface touch list, test-count evolution.
+
+Read-only proof for this audit: before writing, `git status --porcelain` showed only untracked
+`.marmel.old*/`, `docs.old/`; after writing, the only tracked/untracked additions are
+`docs/change_surface_report.md` and this append. Nothing under `src/` was created, modified, deleted or
+reformatted; `README.md`, `docs/new_ui.md`, `docs/runtime_smoke_report.md`, `.marmel*` and `docs.old/`
+were not touched. Cargo runs wrote to `target/` only (gitignored).
+
+---
+
+## B.1 Commit chain — reconciled (full evidence in `docs/change_surface_report.md` §1)
+
+* **24 commits**, strictly linear, from `ae8d4d6` (parent `b66f669`) to `9726d26`.
+  `git rev-list --count --ancestry-path b66f669..HEAD` = 24; `git log --merges` over the range = 0.
+* **`12d8f59` and `2445408` are ordinary reachable commits on the chain**, not amended, not superseded, not
+  dangling, not unrelated: `git cat-file -t` → `commit` for both; `12d8f5958a44d9acd79e2853bb84c832db0ca957`
+  parent `e41d9bf`, `2445408e15883b96d22b606a1654411d2124eaa1` parent `12d8f59`;
+  `git merge-base --is-ancestor <sha> HEAD` → YES for both; `git branch --all --contains` →
+  `feature/new-ui` only; both appear in `git log --oneline` and `git log --all --oneline`; the reflog shows
+  them as plain `commit:` entries (`2026-10-26 23:10:24` and `23:27:42`) with no amend/rebase attached.
+  **The premise that they were "absent from the recorded chain" is an artefact of a truncated 22-sha chain
+  list — the real chain has 24 entries and contains both.**
+* The **one** genuinely unreachable commit in the branch window is `3290cdf324af4031a2678aa749562b13d7c88b1f`,
+  the pre-amend version of the D3 fix (`reflog`: `commit:` at 07:12:57 → `commit (amend):` producing
+  `684de35` at 07:13:09). `--is-ancestor` → NO, `branch --contains` → empty,
+  `git fsck --unreachable --no-reflogs` lists it. Every other unreachable object dated inside the window is
+  stash bookkeeping (`WIP on feature/new-ui: …`, `index on …`, `untracked files on …`). No orphan child of
+  any branch-chain commit exists beyond `3290cdf` and those stashes.
+* **Clean descendant of the base branch, nothing rewritten:** `git merge-base main HEAD` =
+  `b66f669` = `main` tip = `origin/main` tip (`git rev-parse main origin/main` identical);
+  `git rev-list --count HEAD..main` = 0; the branch root's parent is `b66f669` itself;
+  `reflog show main` is all `pull -r: Fast-forward`, no `reset`/`rebase`/force entry in the window. No
+  `master` ref exists.
+
+---
+
+## B.2 Gates re-run at HEAD `9726d26` — actual numbers (2026-10-27, this sandbox)
+
+Every number below was produced by a command run in this audit. Cached-vs-forced is disclosed.
+
+| # | Gate | Exit | Actual result |
+|---|---|---|---|
+| 1 | `cargo fmt --all -- --check` | **0** | clean, **0 output bytes** (Part A's 30 hunks are gone; D1 stays fixed) |
+| 2 | `cargo build` | **0** | `Finished dev profile … in 0.22s` (warm). **Forced uncached** against the HEAD tree (`git archive HEAD` → `/tmp/lintcopy`, shared target dir): `Compiling marmennill v1.0.0 (/tmp/lintcopy)` in **23.28 s**, **0 warnings** |
+| 3 | `cargo clippy --all-targets -- -D warnings` | **0** | warm run 0.27 s, 0 diagnostics. **Forced uncached** on the same scratch copy: `Checking marmennill v1.0.0 (/tmp/lintcopy)` in **26.05 s**, **0 diagnostics**, `-D warnings` satisfied |
+| 4 | `cargo test --lib ui::` | **0** | `test result: ok. **560 passed; 0 failed**; 0 ignored; 0 measured; 952 filtered out; finished in 16.54s` |
+| 5 | `cargo test --lib --no-fail-fast` | 101 | `test result: FAILED. **1508 passed; 4 failed**; 0 ignored; finished in 17.92s` — the 4 are exactly `harness::pty::tests::{test_harness_pty_process_group_kill, test_interactive_pty_manager_lifecycle, test_run_command_parses_timeout_seconds_argument, test_run_command_pty_cancelled_by_worker_token}` |
+| 6 | `cargo test --test '*' --no-fail-fast` | 101 | **38 test binaries: 362 passed / 1 failed / 2 ignored.** Sole failure `test_prompt_based_tool_gating` (`tests/test_role_gating.rs:310:5`, `Validator with run_command in prompt must be permitted to execute run_command`). The 2 ignores are in `test_subpane_logs_repro` |
+| 7 | Escape-byte check on captured `cargo test --lib` stdout | **PASS** | captured file 136 176 bytes → **0 `ESC` (0x1b) bytes, 0 `CR` (0x0d) bytes** (byte-level scan, `grep -c $'\x1b'` agrees: 0). D11 has **not** regressed |
+| 8 | `#[allow]` delta | **PASS** | `src/` `#[allow(`: **20 at HEAD, 26 at `b66f669`**; diff shows **0 added, 6 removed** (`#[allow(dead_code)]` on the five composer helpers `src/ui/tui/events.rs:398,415,431,446,459` deleted by `7ce7b99`, one field in `src/ui/tui/mod.rs:187` deleted by `9165143`). All 20 survivors are outside `src/ui/tui/**` (9 `orchestrator/tests.rs`, 2 `orchestrator/workers.rs`, 2 `agents/runner/fix_loop.rs`, 1 each `orchestrator/notice_tests.rs`, `agents/mod.rs`, `llm/stream.rs`, `llm/client.rs`, `ui/session_tests.rs`, `ui/bridge/steer.rs`, `ui/bridge/tests.rs`) — the three `src/ui` ones exist at `b66f669` too |
+| 9 | Known-flaky-under-load set | **PASS** | none of `test_notice_reply_round_trip…`, `test_broadcast_targets_still_route_to_any_worker`, `legitimate_mcp_tool_still_dispatches…`, `the_armed_abort_prompt_occupies_the_same_surface_and_holds_no_request`, `throttled_triggers_coalesce…` was red in run #5/#6 |
+| 10 | Working tree | **PASS** | `git status --porcelain` (pre-write): 21 untracked entries only (`.marmel.old*/`, `docs.old/`); nothing staged, none of them ever committed |
+
+### B.2.1 The four red lib tests are environmental (re-confirmed at this HEAD)
+
+Verbatim panic sites/first lines from run #5:
+`src/harness/pty_tests.rs:16:47` → `spawn sandbox: Execution(failed to openpty: Os { code: 13,
+kind: PermissionDenied … })`; `:120:10` → `spawn session: Execution(Failed to create PTY: failed to
+openpty: …)`; `:102:34` → `executes with custom timeout: Execution(failed to openpty: …)`; `:179:5` →
+`assertion failed: res.is_ok()` (the same denial surfacing through an `is_ok()` assert).
+`src/harness/**` has **zero commits** on this branch, so these four are not branch-authored.
+
+### B.2.2 The one red integration test is environmental / pre-existing
+
+`test_prompt_based_tool_gating` asserts a role may `run_command`; that tool path allocates a PTY
+(`src/harness/pty.rs` → `portable_pty` `openpty`), which this sandbox denies (§1.1 of
+`docs/runtime_smoke_report.md`, `python3 -c "import pty; pty.openpty()"` → `OSError: out of pty devices`).
+`src/tool_names.rs`, `src/harness/**` and `tests/test_role_gating.rs` all have **zero commits** on this
+branch, so it cannot be a UI regression.
+
+---
+
+## B.3 §10 acceptance matrix — verdict per item, at HEAD `9726d26`
+
+All cited in-crate tests ran green inside gate #4 (560/0); the integration one ran green inside gate #6.
+Line numbers are live at this HEAD.
+
+| §10 item | Verdict | Evidence (test / file:line, verified at this HEAD) |
+|---|---|---|
+| 1 header `done/total` + active task id at 40x10, plan closed | **MET** (fixed by `dc7712f`) | `components/header.rs:613 done_total_and_the_active_task_survive_into_a_40x1_frame`; `:651 the_task_id_is_on_the_header_line_at_every_supported_width` (loops 80→40); `:705 an_over_long_task_id_is_the_only_fit_pass_casualty`; `layout.rs:86 show_task: true` at every width; header line at 40 asserted to carry `Marmel`, `3/7 done`, `▶ t-017d` (`header.rs:456`) |
+| 2 `done/total` = checkbox split of the same plan string, 3 fixtures | **MET** | `header.rs:462 progress_counter_matches_the_checkbox_split_of_the_plan_text` — fixtures `("",0,0)`, all-checked `(2,2)`, `MIXED (3,7)`; `:493 an_empty_plan_still_carries_the_counter_and_no_task_chip` |
+| 3 legend / footer / `/help` byte-identical; legend names only bound keys | **MET** | `components/help.rs:545 legend_is_non_empty_with_unique_keys`, `:575 legend_names_every_current_binding`, `:616 legend_advertises_no_removed_binding`, `:655 footer_legend_comes_from_the_table`, `:868 legend_rows_are_the_only_source_of_the_footer_and_the_help_body`; `tests.rs:4966 every_legend_row_is_a_real_handler_path` presses every legend row for real (`:4994-5215`) |
+| 4 `F1` and `?`-on-empty open the same overlay; `?` with a draft types | **MET** | `tests.rs:5098-5106` (inside `every_legend_row_is_a_real_handler_path`): `F1` then `?` yield the same overlay; `tests.rs:5360-5364` `set_input_content("what")` → `input_text == "what?"`, `!help_open`; `tests_new_ui.rs:304/328` |
+| 5 `stop/cancel/exit/quit/q/abort` = steering text, never exit | **MET** | `tests.rs:6450 a_bare_abort_word_is_steering_text_and_never_ends_the_session` (word table at `:6452`, incl. `STOP`, `Stop`) via `drain_submissions` + `!user_exit_requested()`; `helpers.rs:1296 test_is_abort_command_recognizes_the_slash_spellings_only`, `:1327 test_bare_abort_words_and_the_legacy_vocabulary_are_both_named`; sink gate `session_tests.rs:854/881/922/964`; landed `12d8f59`, `2445408`, `78297f8` |
+| 6 `/exit` → `Quit`; `n` alive, `y` exits; `Esc` alive **and not armed** | **MET** | `tests.rs:5302 ctrl_d_opens_the_quit_confirm_and_never_exits_un_armed`, `:5388 y_and_n_are_honoured_only_inside_the_confirm_overlay`, `:5423 both_quit_requests_route_through_the_renderers_existing_exit`, `:6019 the_quit_confirm_is_painted_modally_over_the_body_with_the_metrics_live`, `tests_new_ui.rs:339 …_item16` |
+| 7 `/reset` + all aliases → one confirm request; on `y` the verbatim string goes over `tx`; no renderer-side plan clear | **MET** | `ConfirmAction::Command { line }` (`events.rs`) carries the command verbatim; `tests.rs:6256 every_destructive_slash_command_stops_at_the_confirm_surface`, `:6327 a_confirmed_command_is_handed_to_the_session_loop_verbatim`, `:5531` asserts the submit path contains no `Plan::default()`/`plan.clear()`; alias table `helpers.rs:276-287` (`/reset`, `/reset_plan`, `/reset-plan`, `/clear_plan`, `/clear-plan`, `/reset_execution_plan`) pinned by `session_tests.rs:649 test_is_reset_command_matches_aliases`; the plan clear happens on the **session-loop** side (`session.rs:936 handle_reset_command_and_commit` → `helpers.rs:289 handle_reset_command`) |
+| 8 `Ctrl+D` opens `Quit`, no `user_exit`; a second `Ctrl+D` still needs `y` | **MET** | `tests.rs:5302-5312`: `!user_exit_requested()` after one press and after a second (`"a second Ctrl+D still needs y"`); key-table row `Ctrl+D` at `tests.rs:5187-5191` |
+| 9 `x` → `CancelWorker{key,task_id}`; `/cancel <id>` resolves the same | **MET** | `tests.rs:6114 the_cancel_worker_confirm_names_the_row_it_will_stop`, `:6393 cancel_with_an_argument_confirms_one_named_worker`, key-table row `x` (`tests.rs:5096-5106`, exact `CancelWorker { key: "coder_specialist-t-004", task_id: Some("t-004") }`), `tests_new_ui.rs:813 x_asks_about_the_selected_row_and_only_that_row_item17` |
+| 10 `Ctrl+T/F/A/P` each leave a distinct persistent chip on status row 2 | **MET** | `tests.rs:5621 every_toggle_leaves_a_chip_and_an_empty_pane_says_so` (toggle off→on pairs, chip text asserted) |
+| 11 `Ctrl+A`/`F5` with zero workers renders `No specialist launched yet.`; chip still flips | **MET** | `components/activity.rs:63 pub const EMPTY_STATE: &str = "No specialist launched yet.";`, `:1027 empty_roster_shows_the_spec_empty_state` (asserts the string at `:1041`); chip flip asserted in `tests.rs:5621` (and `:5667` quotes the same string) |
+| 12 focus badge: `●` in the focused pane's title, `frame_focus` border, exactly one focused | **MET** | `tests.rs:4708 the_focused_pane_badges_its_title_and_every_other_pane_does_not`; `components/transcript.rs:1243 the_focus_badge_and_border_only_ever_track_focus`; `components/input.rs:675 title_carries_the_composer_keys_and_focus_badge`, `:648 border_colour_marks_typing_target_and_armed_abort`; ring `tests_new_ui.rs:1789 the_tab_focus_ring_walks_wraps_and_marks_the_focused_pane`, `:1859 shift_tab_walks_backwards_and_the_ring_skips_panes_the_mode_removed`; `tests.rs:5850 the_boot_frame_badges_the_composer_not_the_transcript` |
+| 13 printable routing: `Char('x')`, `Backspace`, `Delete` mutate `textarea` under Plan/Workers focus; empty-composer `x` opens the overlay | **MET** | `tests.rs:5339 printables_and_editing_keys_reach_the_composer_from_every_focus` (draft `"ab"` survives in every pane focus), plus the `x` overlay case in the same table (`tests.rs:5096-5106`) and `tests_new_ui.rs:813` |
+| 14 follow: only an explicit gesture re-arms; submit/notice/output never touch it | **MET** (fixed by `684de35`) | `tests_new_ui.rs:2399 a_submit_leaves_follow_off_and_the_body_exactly_where_the_operator_left_it_item14`, `:2475 a_submit_while_following_still_pins_the_transcript_to_the_bottom_item14`, `:2537 the_follow_toggle_and_the_follow_command_re_arm_follow_and_repin_the_body_item14`, `:2618 a_stray_write_of_the_auto_scroll_mirror_cannot_repin_the_frame_item14`; `tests.rs:5673 ctrl_f_moves_the_follow_chip_in_the_transcript_pane`; structural: the only writer of the legacy mirror is `mod.rs:1280 project_follow_mirror` (named at `:1269`), `events.rs` has **no** `chat_auto_scroll` assignment outside its own tests, and the §10.14 wording in the spec was amended in the same commit |
+| 15 roster 12 live workers → 12 reachable rows; ownership `activity.rs`/`plan_pane.rs`; only the sanctioned `.clamp(1, 3)` | **MET** | `tests.rs:5748 every_worker_row_is_reachable_with_the_arrow_keys`; `activity.rs:933 roster_shows_every_worker_beyond_the_three_row_cap`, `:958 every_row_stays_reachable_when_the_roster_is_clipped`; `grep -rn "clamp(1, 3)" src/ui/` → only `layout.rs:289` inside `input_height` (`rows < 20` branch, verified by reading `layout.rs:285-293`); no `components/workers.rs` exists, and the spec text now names the real owners (`c6794a6`) |
+| 16 overlay closes on Esc without arming abort; y/n honoured only inside the confirm overlay | **MET** | `tests_new_ui.rs:299 an_open_help_overlay_closes_on_esc_without_arming_abort_item16`, `:339 y_and_n_are_honoured_only_inside_the_confirm_overlay_item16`, `:403 every_confirm_action_draws_its_surface_last_over_the_body_item16`, `:612 a_confirm_over_the_help_legend_returns_to_the_legend_on_esc_item16`; `tests.rs:5262 esc_closes_an_open_overlay_without_arming_then_arms_abort` |
+| 17 cancel one worker → exactly one worker path, `orchestrator::cancel_all()` not called | **MET** (fixed by `5d30439`) | The prescribed vehicle now exists: `tests/test_session_restore_panel_abort.rs:2799 ac_a4_a_named_cancellation_reaches_one_worker_while_the_broadcast_reaches_every_one` — ran **ok** in gate #6 (that binary: 11 tests, all green). It witnesses fired/unfired per-worker `CancellationToken`s and registry `Aborted` vs `In Progress`, i.e. behaviour, not source text. The request half (`x`, `/cancel <id>` → `CancelWorker{key,task_id}`; `/cancel-all` → `CancelAll`) is pinned in-crate at `tests_new_ui.rs:813/902/1000`, necessarily so because `ConfirmAction` and `apply_terminal_event` are `pub(crate)`; the reason is documented at `tests/test_session_restore_panel_abort.rs:2770-2798` |
+| 18 restore round-trips `view_mode`, focus incl. input, follow, D2 queue/paused; witness warning = one transcript line | **MET** (fixed by `4d71e32`) | `tests_new_ui.rs:1139 capture_and_restore_repaints_mode_focus_follow_and_the_d2_pair_item18`, `:1281 a_pre_d2_view_state_restores_from_the_fields_it_actually_has_item18`, `:1372 a_disagreeing_token_witness_arrives_as_one_transcript_line_item18`; `tests.rs:3919 capture_ui_and_restore_panes_round_trip_mode_focus_and_follow`; format layer `src/session/format/ui.rs:305 view_mode`, `:306 follow`, `:362 FOCUSED_PANELS = ["chat","input","plan","subagents"]`, `:404` `VIEW_MODES` validation, tests at `:604` and `:638`; `FocusPane::legacy`/`from_legacy` now carry an `Input` spelling |
+| 19 no zero-sized pane at 100x30/90x24/60x16/40x10; 39x9 too-small notice; nothing drawn outside its rect | **MET** | `tests_new_ui.rs:1424 no_pane_is_zero_sized_overlapping_or_outside_its_rect_item19` (the five sizes, pairwise `!overlaps`, `contains`, no cells outside every pane), `:1489 below_the_floor_only_the_too_small_notice_is_drawn_item19`, `:1546 the_degradation_ladder_drops_panes_in_spec_order_item19`; `tests.rs:4198 no_pane_rect_is_zero_sized_at_any_supported_terminal_size`, `:4227 below_40x10_only_the_too_small_notice_is_drawn` |
+| 20 source hygiene: no `MouseEvent` arm, no executed `EnableMouseCapture`; mouse-disable count pinned | **MET in code and by its pin; the item's own prose has drifted again (D6)** | `tests_new_ui.rs:2099 no_mouse_arm_and_no_mouse_binding_survive_in_the_ui_sources_item20` asserts `events.rs` mentions none of `MouseEvent`/`EnableMouseCapture`/`Mouse` and that `mod.rs` code carries **exactly 2** `DisableMouseCapture` tokens (import + the one shared burst); `:2203 a_mouse_report_changes_nothing_on_screen_item20`; `tests.rs:5813 a_mouse_report_is_ignored_and_moves_nothing`. Actual sites at this HEAD: import `mod.rs:24`, single burst inside `write_terminal_resets` `mod.rs:3053`, reached from `shutdown()` `mod.rs:2231` and `leave_alt_screen()` `mod.rs:3073`. §10.20's sentence "three code occurrences in total … `mod.rs:2124` … `mod.rs:2899`" is **stale** (the 3→2 change came with `097a4a1`) — see D6 below |
+| 21 cadence constants unchanged; idle renderer performs no `terminal.draw` | **MET** | `tests_new_ui.rs:2242 the_cadence_constants_are_the_unchanged_spec_ones_item21`, `:2279 an_idle_clean_renderer_performs_no_terminal_draw_item21`; constants live: `events.rs:310 event::poll(Duration::from_millis(30))`, `mod.rs:1414/2141` 25 ms dirty floor, `mod.rs:1418` 125 ms spinner tier, `mod.rs:1182` 3 s arm window |
+| (a) clippy/build clean with **zero** new `#[allow]` | **MET** | Gate #3 (uncached, 0 diagnostics) + gate #8 (0 added, 6 removed) |
+| (b) "the four moved plan-parsing helpers compile from their new home and `plan_parse` tests still pass" | **PARTIALLY MET — recorded deviation** | `plan_parse`'s tests pass (gate #5, all `plan_parse` tests green), but the helpers never moved: `visual_line_offset_of_first_pending` / `extract_plan_line_task_id` / `line_matches_task_id` / `visual_line_offset_of_task` are still `src/ui/tui/formatting.rs:998,1028,1034,1040` and `src/plan_parse.rs:2746,2762,2767,2775` calls **into** `crate::ui::tui::formatting::*`; `clamp_warning_sentences` is still `src/ui/tui/mod.rs:2921` called from `src/ui/session.rs:1547`, and `src/ui/notes.rs` does not exist. The one collision the item cared about **is** resolved: a single surviving grammar owner `crate::plan_parse::line_matches_task_id` (`src/plan_parse.rs:593`) with `formatting.rs:1034` a thin delegate, boundary documented at `src/plan_parse.rs:573` and `docs/legacy_ui_removal.md:37-52`. Net: dependency direction is inverted vs §9.1, harmless at build time, but the item as written is not met |
+| (c) `val N` absent while D1 is undone | **MET (clause moot, invariant intact)** | D1 landed: `src/ui/mod.rs:106 validation_rounds`, filled at `src/ui/tui/mod.rs:207`, projected by `max_validation_rounds` `mod.rs:1046` into the header/status at `mod.rs:752`. Pin: `header.rs:515 the_val_chip_prints_the_projected_round_and_never_a_round_word` and `:552 the_val_chip_is_the_first_to_leave_the_narrow_header`; no "round" word ever renders |
+
+**Matrix roll-up: 21/21 acceptance items MET; additional gate (a) MET, (c) MET, (b) PARTIALLY MET
+(documented ownership deviation, no build or test cost).** No acceptance item is red at this HEAD.
+
+Runtime-smoke verdict folded in (`docs/runtime_smoke_report.md`, captured at `d8cb75d`, one commit before
+this HEAD and with the same test counts — ui:: 560/0, lib 1508/4, integration 362/1/2 — re-confirmed here
+at `9726d26`): the frame matrix (§3) is **PASS on every row except row 13, the sticky error line, which is
+PARTIAL** (behaviour pinned, no `TestBackend` frame pin — see §9 risk 4); the §2.5 degradation ladder verdict
+is **PASS**; §6 confirms `--help`, `--config`, the session-flag validator and the raw/headless path still
+work; §7 states the live interactive launch is **UNTESTED** here; §8 records an out-of-band 80x24 repaint of
+the rebuilt UI on a real stream. `tests/test_new_ui_runtime_smoke.rs` contributes 8 public-seam tests inside
+the 362.
+
+---
+
+## B.4 Defect ledger D1–D11 — closure status at HEAD `9726d26`
+
+| Defect | Status at HEAD | Fixing commit (message verified to exist and match) | Independent verification at this HEAD |
+|---|---|---|---|
+| **D1** fmt gate red, branch-authored | **FIXED** | `c6794a6` — `chore(ui,docs): clear the fmt gate, correct the stale spots in the spec (t-017a)` | `cargo fmt --all -- --check` exit 0, 0 bytes output (gate #1) |
+| **D2** persistence delta §9.4 half-implemented; item 18 "focus incl. input" fails | **FIXED** | `4d71e32` — `fix(session,ui): persist mode, pane focus and follow through a restore (D2, t-017b)` | `FOCUSED_PANELS` gained `"input"` (`session/format/ui.rs:362`); `ViewState.view_mode/follow` at `:305/:306` with pre-D2 compatibility (`:321`); the old test that *asserted the loss* is gone; item-18 pins green (`tests_new_ui.rs:1139/1281`) |
+| **D3** submit silently re-armed follow | **FIXED** | `684de35` — `fix(ui): submitting never re-arms transcript follow (D3, spec §10 item 14)` (amend of the unreachable `3290cdf`) | No `chat_auto_scroll` write left in `events.rs` outside its own tests; single mirror writer `mod.rs:1280`; four new pins `tests_new_ui.rs:2399/2475/2537/2618` |
+| **D4** 40-column header contradiction + coverage hole | **FIXED** | `dc7712f` — `test(ui): pin the active task id at the 40-column header floor (D4)` | `header.rs:651` asserts the task id at every width 80→40; `:613` the 40x1 frame; `:705` the over-long-id fit pass is the only casualty; spec §10.1 amended with the §7.4 resolution |
+| **D5** frame-time global token read made frame tests process-global | **FIXED** | `d8cb75d` — `fix(ui): inject the frame's token snapshot instead of reading the global (D5)` | exactly one reader remains, `mod.rs:680` inside `refresh_global_token_snapshot` (`mod.rs:679`), sampled once per frame into `global_tokens_in/out` (`mod.rs:426/429`); frame assembly merges renderer state only |
+| **D6** stale line numbers in the binding contract | **PARTIALLY FIXED — re-drifted, still open (Low, docs)** | `c6794a6` amended §10.20 to be line-number-independent and pinned the count by test | The amended item now says "**exactly two** teardown sites … three code occurrences in total … Verified … `mod.rs:2124` … `mod.rs:2899`", but since `097a4a1` the burst is a **single shared** `write_terminal_resets` (`mod.rs:3049-3057`) → the pin asserts **2** code occurrences (`tests_new_ui.rs:2099`), and the quoted lines are not the sites (`shutdown` `mod.rs:2231`, `leave_alt_screen` `mod.rs:3073`). Behaviour and its test pin are right; the contract sentence is stale again. Recommendation: re-amend §10.20 once, dropping the numbers it already declares it will not depend on |
+| **D7** §10.15 named a non-existent file | **FIXED** | `c6794a6` | §10.15 now names `components/activity.rs` + `components/plan_pane.rs` and states there is no `components/workers.rs` (true: no such file); the sanctioned clamp is at `layout.rs:289`, exactly as the item says |
+| **D8** item 17 verified by grepping `events.rs`, not by the prescribed integration vehicle | **FIXED** | `5d30439` — `test(ui): pin acceptance item 17 by behaviour, not by grepping events.rs (D8, t-017e)` | `tests/test_session_restore_panel_abort.rs:2799 ac_a4_…` drives a real `TuiRenderer` through the public exit/cancel seam and asserts per-worker token fired/not-fired and registry status; green in gate #6. The in-crate half no longer rests on `fn_body` string analysis |
+| **D9** §3 confirm-request inventory drifted from the code | **FIXED** | `9165143` — `ui: fix chip clipping, status-bar field ladder and roster rank; add preview evidence` (`git log -S ClearTranscript -- docs/ui_design_spec.md` → this commit) | Spec §3 now lists exactly `Quit | CancelWorker{key,task_id} | CancelAll | Command{line}` and says outright there is no `ResetPlan` and no `ClearTranscript` surface (`docs/ui_design_spec.md:166,171-172`); the code enum matches those four and only those four |
+| **D10** unknown long options swallowed as the prompt | **NOT FIXED — pre-existing, declared out of scope** (see B.5) | n/a (`src/main.rs` has **zero** commits on this branch) | Repro recorded in `docs/runtime_smoke_report.md` §6.1 and re-derivable from the code at `src/main.rs:324-330` |
+| **D11** unit tests wrote terminal-reset sequences to the ambient stdout | **FIXED** | `097a4a1` — `fix(ui): stop test-dropped renderers resetting the ambient terminal (D11)` | `terminal_owned` guard + `take_terminal_resets()` + one shared `write_terminal_resets()`; pins `tests_new_ui.rs:2158 no_unit_test_reaches_the_ambient_terminal_teardown_item_d11`, `tests.rs:4058 teardown_writes_exactly_the_reset_burst_to_the_writer_it_is_given`, `tests.rs:4088 a_renderer_that_never_took_the_screen_over_writes_no_resets_on_teardown`; **measured here: 0 ESC and 0 CR bytes in the 136 176-byte captured lib-test stdout** (Part A measured 2 776 ESC bytes; the fix commit itself quotes 3 448 pre-fix) |
+
+Roll-up: **9 fixed (D1, D2, D3, D4, D5, D7, D8, D9, D11), 1 open at documentation severity (D6 prose
+re-drift), 1 pre-existing and out of scope (D10).** No functional defect from Part A remains unfixed.
+
+---
+
+## B.5 D10 disposition (explicit)
+
+**Disposition: pre-existing defect in `src/main.rs`, out of scope for the UI rebuild, recorded and
+deliberately not fixed on this branch.**
+
+* Site: the catch-all arm of `parse_args()` at **`src/main.rs:324-330`** —
+  `other => { if args.prompt.is_none() { args.prompt = Some(other.to_string()) } else { eprintln!("ignoring extra argument: {other}") } }`.
+  There is no `--version` arm.
+* Out-of-scope proof, not assertion: `git log --oneline b66f669..HEAD -- src/main.rs` is **empty**; the file
+  is byte-identical to the merge base, so the UI branch cannot have caused or worsened it.
+* Reproduction evidence already recorded in `docs/runtime_smoke_report.md` §6.1: without a readable user
+  config, `./target/debug/marmel --version` exits 1 with
+  `Error: reading /home/fredrik/.marmel/marmel.toml / Permission denied (os error 13)`; with a readable
+  `--config`, the same command **starts a session** — `[status] Running (…)`, an assistant turn, an LLM
+  transport error, `[done]`, exit 0. Nothing prints a version, nothing reports an unknown option. The same
+  shape applies to any unrecognised long option.
+* Effect on this branch's deliverable: none on the UI surface — the headless/raw path and the frame path are
+  unaffected, and the CLI probes in the smoke report §6 show `--help`, `--config`, `--raw` and the
+  session-flag validator behaving as designed.
+* **Recommendation for a future ticket (one line):** add an explicit `--version` (and a
+  `--version/-V` constant from `CARGO_PKG_VERSION`) arm to `parse_args()` and make the catch-all reject any
+  unrecognised `--`-prefixed token with exit 2 instead of promoting it to the session prompt.
+
+---
+
+## B.6 Residual risks for a human to eyeball on a real terminal
+
+Stated plainly first: **no live interactive launch of `marmel` was possible in this sandbox.**
+`openpty` is denied (`python3 -c "import pty; pty.openpty()"` → `OSError: out of pty devices`;
+`script -qec "true" /dev/null` → `failed to create pseudo-terminal: Permission denied`), which is also why
+exactly four `harness::pty` lib tests and `test_prompt_based_tool_gating` are red here. **No interactive
+success is claimed anywhere in this report.** Everything asserted about the running UI rests on
+`TestBackend` cell-level frames, in-crate state pins, one public-seam integration file, and an out-of-band
+80x24 repaint that belonged to another session (§8 of the smoke report).
+
+What a human should look at on a real device:
+
+1. **Live PTY / raw mode / alternate screen.** `init()` (`enable_raw_mode`, `EnterAlternateScreen`,
+   `PushKeyboardEnhancementFlags`, `EnableBracketedPaste`) and `shutdown()`/`leave_alt_screen()` never ran
+   against a device here. Confirm the shell is sane after quitting with `y` — no leftover alt screen, mouse
+   or bracketed-paste modes, cursor visible, no `reset` needed. This is the D11 guarantee, and it is pinned
+   only by in-crate source/behaviour tests, never by a real teardown.
+2. **Key decoding.** `Tab`/`Shift+Tab` under keyboard-enhancement flags, `Alt+Enter`/`Shift+Enter` newline,
+   `Ctrl+T/F/A/P/D/C`, `F1`/`F2`/`F3`/`F4`/`F5`, `?` on an empty composer vs. typed, `Esc` arm/dismiss —
+   every one is pinned by *synthesised* `KeyEvent`s, not by bytes arriving from a terminal. Whether the
+   disambiguated forms actually arrive (and whether a terminal's own `Esc`-timing beats the 3 s arm window)
+   is unverified.
+3. **Resize / SIGWINCH.** The §2.5 ladder is pinned by calling `compute_layout`/`apply_terminal_event` with
+   fabricated sizes at 100x30 / 90x24 / 89x30 / 70x30 / 69x30 / 60x16 / 60x30 / 59x30 / 100x19 / 40x10 /
+   39x9. Live drag-resizing (rapid intermediate sizes, a resize during a streaming paint, the too-small
+   notice appearing and clearing without leftover chrome) has never been exercised.
+4. **The disclosed pinning gaps.** (a) **The §8.5 sticky-error line** (`✗ <cause>` +
+   `see .marmel/marmel.log`) and the armed-abort prompt at the tiniest sizes are pinned **behaviourally
+   only** — no `TestBackend` frame asserts the drawn lines, because they are reached through `pub(crate)`
+   keys (smoke report §3 row 13, §9 risk 4). (b) **Overlay and focus variants are pinned only at 100x30**:
+   29 of the 36 `tests_new_ui` frame pins draw 100x30; 80x24/60x16 carry ~5 pins each (geometry, scroll
+   clamp, scroll-chip-once, status-row clipping, queued rank). Eyeball each confirm overlay, the help
+   overlay and every focus state at 60x16 and 40x10.
+5. **`draw_new_ui` / `apply_terminal_event` are `pub(crate)`.** Frame evidence therefore lives only in-crate;
+   no `tests/` file (and no third-party consumer) can paint a frame or press a key. That encapsulation is
+   deliberate, but it means "smoke-test the frames" can never be reproduced from outside the crate, and the
+   8 public-seam tests in `tests/test_new_ui_runtime_smoke.rs` cover the pane model and text pipeline only —
+   not pixels. Consider a feature-gated `pub` draw entry point if out-of-crate frame evidence is ever needed.
+6. **Fenced content is routed to markdown before the ANSI bridge.** `components/transcript.rs::stream_lines`
+   sends anything containing ` ``` ` through `render_markdown_lines` first, so **raw SGR bytes can survive
+   into `Line` spans** (the smoke test records it: `SMOKE text[ansi]: markdown carries 1 line(s) with raw
+   SGR bytes`). `TestBackend` renders them as ordinary cells; a real terminal may *interpret* them — coloured
+   worker output inside a fenced block is the case to look at, along with the related cosmetic effects
+   (escape bytes counting toward wrap arithmetic; whitespace-only payloads still consuming rows).
+7. **Truncation legibility.** §7.4 deliberately cuts names and chips mid-token with `…`
+   (`coder_specialist-…`, `Es…`, `3a 1p 1q`). The verified property is "marked and never outside the rect",
+   not "readable" — judge 60x16 and 40x10 by eye, plus a font without box-drawing glyphs for the
+   `● ⧗ ▶ ⏸ ✓ ✗ ↓` set and the `─ │ ┌ ┐ └ ┘` chrome.
+8. **Colour.** Styles are asserted only through `TestBackend` cell attributes; true-colour vs. 16-colour
+   fallback and contrast in a real palette are unproven.
+9. **Cadence under load.** The 30 ms poll / 25 ms dirty floor / 125 ms spinner / 3 s arm / 250 ms plan-mtime
+   constants are pinned as constants and as "no draw while idle", never against a real draw loop's latency.
+10. **The four PTY tests and the role-gating test are unproven, not proven green.** Re-run
+    `cargo test --lib harness::pty` and `cargo test --test test_role_gating` on a host with PTY access
+    before calling the suite "all green"; both sit in code this branch never edited.
+
+---
+
+## B.7 Verdict
+
+`feature/new-ui` @ `9726d26` is **certified deliverable** on the evidence above: the fmt gate is green, the
+build and clippy gates are green uncached, the UI suite is 560/0, the lib suite is 1508/4 with all four
+failures environmental and pre-branch, the integration suite is 362/1/2 with the one failure environmental
+and pre-branch, no `#[allow]` was introduced, no dependency changed, 21/21 §10 acceptance items are met, and
+the Part A defect ledger is closed except D6 (documentation prose drift) and D10 (pre-existing, out of
+scope, disposition recorded in B.5).
+
+The single non-conformance with a binding instruction is §9.1's helper-ownership move (additional gate (b)),
+which was answered with an in-place ownership consolidation instead of a file move and is documented in
+`docs/legacy_ui_removal.md` and at `src/plan_parse.rs:573`; it should be either accepted as an amendment to
+§9.1 or scheduled, not left silent.
+
+Nothing in this audit certifies live terminal behaviour: the sandbox denies PTY allocation, so the interactive
+surface is unverified by construction and is handed to the human checklist in B.6.
