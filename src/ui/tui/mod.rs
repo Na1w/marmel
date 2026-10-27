@@ -31,7 +31,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
-use std::io;
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
@@ -291,6 +291,16 @@ pub struct TuiRenderer {
     /// `flush` cannot draw TUI chrome into the user's shell and a second
     /// `shutdown` — or the `Drop` that follows one — is a no-op paint-wise.
     pub(crate) terminal_torn_down: bool,
+    /// Whether this renderer ever took the ambient terminal over, i.e. whether
+    /// [`Renderer::init`] ran. Set by `init()`, cleared by [`Self::shutdown`].
+    ///
+    /// This is what the teardown writes its reset burst to *decide on*: a renderer
+    /// that never entered the alternate screen switched no terminal mode on, so it
+    /// has nothing to hand back, and writing `LeaveAlternateScreen`, the mouse
+    /// disables and `DisableBracketedPaste` anyway addresses a terminal this
+    /// process never owned — the shell, a pager, a library caller, or the process
+    /// holding the unit-test stdout (audit D11).
+    pub(crate) terminal_owned: bool,
     /// Vertical scroll offset of the chat panel.
     pub(crate) chat_scroll: u16,
     /// Vertical scroll offset of the plan panel.
@@ -463,6 +473,7 @@ impl TuiRenderer {
                 abort_armed: false,
             },
             terminal_torn_down: false,
+            terminal_owned: false,
             chat_scroll: 0,
             plan_scroll: 0,
             show_plan_panel: false,
@@ -1474,6 +1485,11 @@ pub(crate) fn merge_logs(existing: &[String], incoming: &[String]) -> Vec<String
 impl Renderer for TuiRenderer {
     fn init(&mut self) -> Result<()> {
         enable_raw_mode()?;
+        // From the next line on this renderer owns the screen, so the reset burst
+        // in [`Self::shutdown`] is its to write. Set before the modes are switched
+        // on, so an `init()` that fails halfway still gets the full teardown from
+        // the `Drop` of the renderer.
+        self.terminal_owned = true;
         execute!(
             io::stdout(),
             EnterAlternateScreen,
@@ -2162,17 +2178,11 @@ impl Renderer for TuiRenderer {
     /// back to the shell cleanly. Nothing in the UI may assume mouse events
     /// arrive.
     fn shutdown(&mut self) {
-        if self.terminal_torn_down {
+        if !self.take_terminal_resets() {
             return;
         }
-        self.terminal_torn_down = true;
-        let _ = execute!(
-            io::stdout(),
-            PopKeyboardEnhancementFlags,
-            LeaveAlternateScreen,
-            DisableMouseCapture,
-            DisableBracketedPaste
-        );
+        let mut stdout = io::stdout();
+        let _ = write_terminal_resets(&mut stdout);
         let _ = disable_raw_mode();
     }
 
@@ -2941,12 +2951,57 @@ impl TuiRenderer {
         self.cached_show_thought.set(!self.show_thought);
         self.cached_rendered_show_thought.set(!self.show_thought);
     }
+
+    /// Decide whether [`Renderer::shutdown`] owes the terminal a reset burst, and
+    /// record the answer. It returns `true` exactly once per [`Renderer::init`] —
+    /// the only writer of `terminal_owned` — and that single caller is the one
+    /// allowed to hand [`write_terminal_resets`] an `io::stdout()`.
+    ///
+    /// A renderer nobody initialized — every one a unit test builds and then drops,
+    /// and one whose `init()` failed at `enable_raw_mode` — switched no terminal
+    /// mode on, so it has nothing to hand back. Writing the burst anyway addresses
+    /// a terminal this process never owned: the shell, a pager, a library caller,
+    /// or the process holding the unit-test stdout, which is exactly what several
+    /// hundred test-dropped renderers used to do on every `cargo test --lib` run
+    /// (audit D11). The decision is its own method so a test can exercise both
+    /// answers without ever writing to the real terminal.
+    ///
+    /// `terminal_torn_down` is set on every call, so the paint suppression keyed on
+    /// it (`render_terminal`, `flush`, `force_flush`) is unchanged for a silent
+    /// teardown.
+    fn take_terminal_resets(&mut self) -> bool {
+        if self.terminal_torn_down {
+            return false;
+        }
+        self.terminal_torn_down = true;
+        std::mem::take(&mut self.terminal_owned)
+    }
 }
 
 impl Drop for TuiRenderer {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// The whole reset burst that hands the terminal back, in one definition: pop the
+/// keyboard-enhancement flags, leave the alternate screen, disable mouse capture,
+/// disable bracketed paste.
+///
+/// Both teardown paths write it — [`Renderer::shutdown`] on a normal exit and
+/// [`leave_alt_screen`] on the panic path — so the two can no longer drift apart,
+/// and so the burst has a writer a unit test can hand a buffer to instead of the
+/// ambient stdout (audit D11). The commands and their order are exactly what the
+/// two call sites used to spell out inline; the payload is pinned by
+/// `teardown_writes_exactly_the_reset_burst_to_the_writer_it_is_given`.
+fn write_terminal_resets<W: Write>(w: &mut W) -> std::io::Result<()> {
+    execute!(
+        w,
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )
 }
 
 /// Leave the alternate screen (best-effort, from the panic hook).
@@ -2968,13 +3023,8 @@ pub fn leave_alt_screen() -> std::io::Result<()> {
     let _ = disable_raw_mode();
     // Mirror every mode init() switched on, including bracketed paste, because the
     // panic path bypasses shutdown() and must not leak mode 2004 into the user's shell.
-    execute!(
-        io::stdout(),
-        PopKeyboardEnhancementFlags,
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-        DisableBracketedPaste
-    )
+    let mut stdout = io::stdout();
+    write_terminal_resets(&mut stdout)
 }
 
 /// Run the interactive TUI session using the CLI's optional initial prompt.

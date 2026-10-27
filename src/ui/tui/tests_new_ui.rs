@@ -2115,8 +2115,9 @@ fn no_mouse_arm_and_no_mouse_binding_survive_in_the_ui_sources_item20() {
     );
     assert_eq!(
         code.matches("DisableMouseCapture").count(),
-        3,
-        "the crossterm import plus the two teardown sites, and nowhere else"
+        2,
+        "the crossterm import plus the one reset burst the two teardown paths share, \
+         and nowhere else"
     );
     for file in ["render.rs", "state.rs", "layout.rs"] {
         let source = match file {
@@ -2138,6 +2139,59 @@ fn uncommented(source: &str) -> String {
         .filter(|line| !line.trim_start().starts_with("//"))
         .collect::<Vec<&str>>()
         .join("\n")
+}
+
+/// D11: the tests run headless, so nothing they reach may write the terminal state
+/// of the process running them. Two invariants keep that true, and both are pinned
+/// here rather than trusted:
+///
+/// * the reset burst has exactly one definition in `mod.rs`, reached from
+///   `io::stdout()` by exactly two call sites — `shutdown()` (behind its
+///   `terminal_owned` guard, so a renderer that never called `init()` writes
+///   nothing) and the panic-hook free function;
+/// * no test source reaches the terminal-taking entry points at all, so every
+///   `TuiRenderer` a test builds is dropped with the guard closed.
+#[test]
+fn no_unit_test_reaches_the_ambient_terminal_teardown_item_d11() {
+    let module = uncommented(include_str!("mod.rs"));
+    assert_eq!(
+        module.matches("write_terminal_resets").count(),
+        3,
+        "one burst definition and exactly two call sites: shutdown() and the panic hook"
+    );
+    assert!(
+        module.contains("if !self.take_terminal_resets() {"),
+        "shutdown() must ask before it writes, or every test-dropped renderer paints \
+         resets into the ambient stdout"
+    );
+    assert!(
+        module.contains("std::mem::take(&mut self.terminal_owned)"),
+        "the answer is exactly whether this renderer took the screen over, and it is \
+         consumed so a second teardown writes nothing"
+    );
+    assert!(
+        module.contains("self.terminal_owned = true;"),
+        "init() is what arms the burst, before any mode is switched on"
+    );
+
+    // The forbidden spellings are assembled from parts so this test's own text
+    // cannot be mistaken for a call site.
+    let take_over = [".", "init()"].concat();
+    let panic_hook = ["leave_alt_", "screen"].concat();
+    let raw_mode = ["enable_", "raw_mode"].concat();
+    for (file, source) in [
+        ("tests.rs", include_str!("tests.rs")),
+        ("tests_new_ui.rs", include_str!("tests_new_ui.rs")),
+    ] {
+        let code = uncommented(source);
+        for forbidden in [&take_over, &panic_hook, &raw_mode] {
+            assert!(
+                !code.contains(forbidden.as_str()),
+                "{file} must never reach {forbidden}: the terminal of the process \
+                 running the tests is not the renderer's to switch or reset"
+            );
+        }
+    }
 }
 
 /// Item 20, frame level: a mouse report is not a binding. It changes no state, is

@@ -4050,6 +4050,89 @@ fn teardown_is_idempotent_and_paints_nothing_afterwards() {
     drop(r);
 }
 
+/// D11: the reset burst is one definition, and it is written to whatever writer it
+/// is handed — a unit test hands it a buffer, so the burst is pinned without ever
+/// touching the terminal of the process running the tests. The exact bytes are
+/// pinned so a production teardown can neither silently gain nor lose a reset.
+#[test]
+fn teardown_writes_exactly_the_reset_burst_to_the_writer_it_is_given() {
+    let mut buf: Vec<u8> = Vec::new();
+    write_terminal_resets(&mut buf).expect("a Vec<u8> sink cannot fail");
+    let burst = String::from_utf8(buf).expect("the reset burst is ASCII");
+
+    assert_eq!(
+        burst,
+        "\u{1b}[<1u\u{1b}[?1049l\u{1b}[?1006l\u{1b}[?1015l\u{1b}[?1003l\u{1b}[?1002l\u{1b}[?1000l\u{1b}[?2004l",
+        "pop the keyboard flags, leave the alternate screen, the five mouse disables, \
+         then bracketed paste off — in that order, and nothing else"
+    );
+    assert_eq!(
+        burst.matches('\u{1b}').count(),
+        8,
+        "eight sequences — the same eight the two teardown paths write"
+    );
+    for enter in ["?1049h", "?2004h", "?1000h", "[>"] {
+        assert!(
+            !burst.contains(enter),
+            "the burst carries resets only, never an {enter} enable: {burst:?}"
+        );
+    }
+}
+
+/// D11: a renderer that never took the ambient terminal over (`init()` never ran)
+/// has no terminal mode to hand back, so its teardown — including the `Drop` every
+/// unit test triggers — must write nothing at all. Before the `terminal_owned`
+/// guard, one `cargo test --lib` run dropped 431 such renderers and wrote 431
+/// reset bursts (3 448 ESC bytes) into the captured stdout of the test run.
+#[test]
+fn a_renderer_that_never_took_the_screen_over_writes_no_resets_on_teardown() {
+    let mut fresh = TuiRenderer::new();
+    assert!(
+        !fresh.terminal_owned,
+        "a renderer built by `new()` has entered no screen mode"
+    );
+    assert!(
+        !fresh.take_terminal_resets(),
+        "a renderer that took over no screen is owed no reset burst"
+    );
+    assert!(
+        fresh.terminal_torn_down,
+        "the silent teardown still records itself, so post-teardown paints stay suppressed"
+    );
+    assert!(
+        !fresh.take_terminal_resets(),
+        "a second teardown is a no-op, not a second answer"
+    );
+
+    // The exact call `Drop` makes for every renderer a test builds: guarded, so it
+    // writes nothing to the terminal of the process running the tests.
+    let mut dropped = TuiRenderer::new();
+    dropped.shutdown();
+    assert!(
+        !dropped.terminal_owned && dropped.terminal_torn_down,
+        "the Drop path stays silent and still suppresses painting"
+    );
+
+    // The armed path: `init()` is what sets the flag, and it is consumed exactly
+    // once, which is what lets the real TUI hand the screen back — once, and never
+    // twice.
+    let mut armed = TuiRenderer::new();
+    armed.terminal_owned = true;
+    assert!(
+        armed.take_terminal_resets(),
+        "an initialized renderer is owed exactly one reset burst"
+    );
+    assert!(
+        !armed.terminal_owned,
+        "the burst is consumed, so a later teardown cannot write it again"
+    );
+    assert!(
+        !armed.take_terminal_resets(),
+        "the panic-hook path followed by `Drop` re-runs the same resets only outside \
+         the renderer, never as a second guarded burst"
+    );
+}
+
 #[test]
 fn a_shrunken_pane_clamps_the_scroll_offset_it_can_no_longer_honour() {
     // Work item 1: the entry path still clamps scroll state on every geometry
