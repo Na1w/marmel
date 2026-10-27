@@ -13,16 +13,24 @@
 //! the mode the frame was built from, including where the §2.5 ladder overrides
 //! it.
 //!
-//! **Slot assignment (t-024).** In every shape that draws both the Plan and the
-//! Transcript, the two panes hold each other's §2.3 slot: M2 draws the Transcript
-//! in the wide left column and the Plan in the right one, and M4 draws the Plan in
-//! the wide column with the Transcript at the head of the side column over the
-//! roster. The trade is positional — a slot keeps its own width, so a pane that
-//! moves to the other side of a split takes the other side's width with it — and
-//! it applies to the stacked and single-side fallbacks of the §2.5 ladder the same
-//! way. M3 draws no Plan pane, so nothing trades there, and the shapes the ladder
-//! reduces to a single pane (`width < 60`, and `width < 90` with no side pane on
-//! screen) have nothing to trade.
+//! **Slot assignment — one global rule (t-024b).** In every shape that draws both
+//! the Plan and the Transcript, the Execution Plan pane owns the **leading** slot
+//! and the Transcript pane the **trailing** one. Leading is the leftmost column of
+//! a columns split, the topmost row of a stacked split, and the wide column of the
+//! short-terminal fallback in which the side column cannot stack; trailing is the
+//! slot on the far side of the same split. So M2 draws the Plan in the wide left
+//! column and the Transcript in the right one, M4 draws the Plan in the wide column
+//! with the Transcript at the head of the side column over the roster, and the
+//! `width < 90` stack puts the Plan on top. The rule is about slots only: a slot
+//! keeps its own §2.3 width (`55/45`, `60/40`), and the Plan never jumps sides
+//! between modes — one geometry, read the same way in every shape.
+//!
+//! Where a shape draws no Plan pane the rule has nothing to place and the older
+//! arrangement stands: M3 keeps the roster in the wide left column over the
+//! Transcript, a stacked or side-column fallback that keeps the roster instead of
+//! the Plan heads with the Transcript, and the shapes the §2.5 ladder reduces to a
+//! single pane (`width < 60`, and `width < 90` with no side pane on screen) place
+//! nothing at all.
 
 use super::state::{FocusPane, UiView, ViewMode};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -53,9 +61,9 @@ enum Shape {
     /// Side-by-side columns (`Percentage` pair of §2.3).
     Columns,
     /// Two panes stacked (`vertical([Min(6), Min(6)])`). With the Plan on screen it
-    /// holds the top slot and the Transcript the bottom one — the trade of t-024,
-    /// which is the other way round from §2.3. When the §2.5 ladder keeps the roster
-    /// instead of the Plan there is nothing to trade and the Transcript stays on top.
+    /// holds the leading (top) slot and the Transcript the trailing (bottom) one —
+    /// the global rule read vertically. When the §2.5 ladder keeps the roster
+    /// instead of the Plan there is no Plan to place and the Transcript stays on top.
     Stacked,
 }
 
@@ -196,18 +204,19 @@ pub fn compute_layout(area: Rect, view: &UiView) -> PaneRects {
         (ViewMode::Plan, Shape::Full) => rects.plan = Some(body),
         (ViewMode::Workers, Shape::Full) => rects.workers = Some(body),
         (ViewMode::Plan, _) => {
-            // M2, t-024: the Transcript holds the wide left column and the Plan the
-            // right one. The `55/45` pair is the §2.3 pair unchanged — what traded
-            // is which pane sits in which slot (the pair used to read Plan left /
-            // Transcript right).
+            // M2 under the global rule: the Plan owns the leading (left) column and
+            // the Transcript the trailing (right) one — the same reading order M4
+            // gives its columns, so the Plan never moves to the far side of a split.
+            // The `55/45` pair is the §2.3 pair unchanged; the rule fixes which pane
+            // owns which slot, never a width.
             let cols = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
                 .split(body);
-            rects.transcript = Some(cols[0]);
-            rects.plan = Some(cols[1]);
+            rects.plan = Some(cols[0]);
+            rects.transcript = Some(cols[1]);
         }
         (ViewMode::Workers, _) => {
-            // M3 has no Plan pane, so the t-024 trade cannot touch it: the roster
-            // keeps the wide left column and the Transcript the right one.
+            // M3 has no Plan pane, so the global rule has nothing to place here: the
+            // roster keeps the wide left column and the Transcript the right one.
             let cols = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
                 .split(body);
             rects.workers = Some(cols[0]);
@@ -216,10 +225,10 @@ pub fn compute_layout(area: Rect, view: &UiView) -> PaneRects {
         (ViewMode::Split, Shape::Stacked) => {
             // §2.5 `width < 90`: the body stacks two panes, and the focused side
             // pane stands in for one of the three. Where the survivor is the Plan the
-            // t-024 trade applies as it does in the columns below — the Plan takes the
-            // top slot (the Transcript's former one) and the Transcript the bottom
-            // (the Plan's former one). Where the roster survives there is no Plan on
-            // screen to trade, and the Transcript keeps the top slot.
+            // global rule places it exactly as it does in the columns below — the Plan
+            // leads the stack (top row) and the Transcript takes the row under it.
+            // Where the roster survives there is no Plan on screen to place, and the
+            // Transcript keeps the leading row.
             let stack = Layout::vertical([Constraint::Min(BODY_MIN), Constraint::Min(BODY_MIN)])
                 .split(body);
             match side_pane(view) {
@@ -235,9 +244,9 @@ pub fn compute_layout(area: Rect, view: &UiView) -> PaneRects {
             }
         }
         (ViewMode::Split, _) => {
-            // M4, t-024: the Plan holds the wide column and the Transcript the top
-            // of the side column, over the roster. Before the trade the wide column
-            // was the Transcript's and the side column's top slot was the Plan's.
+            // M4 under the global rule: the Plan owns the leading (wide) column and
+            // the Transcript the head of the side column, over the roster. The
+            // `60/40` pair is the §2.3 pair unchanged.
             let cols = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
                 .split(body);
             let (wide, side) = (cols[0], cols[1]);
@@ -252,8 +261,8 @@ pub fn compute_layout(area: Rect, view: &UiView) -> PaneRects {
                 }
                 // The side column cannot stack two panes: only one of the two side
                 // panes is drawn, and [`side_pane`] picks the one that keeps the
-                // focus on screen. Where that is the Plan, the Plan/Transcript trade
-                // applies exactly as it does in the stackable arm above.
+                // focus on screen. Where that is the Plan, the global rule puts it in
+                // the leading (wide) column with the Transcript in the side one.
                 (true, true) => match side_pane(view) {
                     Some(FocusPane::Workers) => {
                         rects.transcript = Some(wide);
@@ -292,9 +301,10 @@ fn resolve_body(body: Rect, view: &UiView) -> (ViewMode, Shape) {
         return (view.mode, Shape::Full);
     }
     if body.width < NARROW_COLS {
-        // §2.5 `width < 90`: M4 stacks two panes — the Plan over the Transcript, the
-        // trade of t-024 — holding only the focused side pane in place of the other
-        // one; a mode that already isolates one pane needs no second column.
+        // §2.5 `width < 90`: M4 stacks two panes — under the global rule the Plan in
+        // the leading (top) row over the Transcript — holding only the focused side
+        // pane in place of the other one; a mode that already isolates one pane
+        // needs no second column.
         return match view.mode {
             ViewMode::Split if side_pane(view).is_some() && body.height >= 2 * BODY_MIN => {
                 (ViewMode::Split, Shape::Stacked)

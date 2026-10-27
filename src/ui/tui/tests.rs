@@ -3580,9 +3580,9 @@ fn pane_body(rows: &[String], pane: Rect) -> Vec<String> {
 }
 
 /// What one pane says, with its body rows folded back into a single line. A pane
-/// wraps at its own width, so after the t-024 trade moved the transcript into the
-/// side column a sentence can straddle two rows: folding keeps an assertion about
-/// the pane's message independent of the width it happens to be drawn at.
+/// wraps at its own width, and in M4 the transcript is the narrow side column, so a
+/// sentence can straddle two rows: folding keeps an assertion about the pane's
+/// message independent of the width it happens to be drawn at.
 fn pane_says(rows: &[String], pane: Rect) -> String {
     pane_body(rows, pane)
         .join(" ")
@@ -3904,16 +3904,20 @@ fn every_view_mode_changes_the_rects_compute_layout_actually_produces() {
                 assert_eq!(rects.workers, None, "M2 has no workers pane");
                 assert_eq!(plan.width + transcript.width, body.width);
                 assert!(
-                    transcript.width > plan.width,
-                    "M2 is the 55/45 pair with the transcript in the wider column \
-                     since the t-024 trade: transcript {} plan {}",
-                    transcript.width,
-                    plan.width
+                    plan.width > transcript.width,
+                    "M2 is the 55/45 pair with the plan in the wider — leading — \
+                     column: plan {} transcript {}",
+                    plan.width,
+                    transcript.width
+                );
+                assert_eq!(
+                    plan.x, body.x,
+                    "M2 puts the plan in the leading (left) column: plan {plan:?}"
                 );
                 assert!(
-                    transcript.x < plan.x,
-                    "M2 puts the transcript in the left column and the plan in the \
-                     right one: transcript {transcript:?} plan {plan:?}"
+                    plan.x < transcript.x,
+                    "M2 leads with the plan and trails with the transcript, exactly \
+                     the way M4 orders its columns: plan {plan:?} transcript {transcript:?}"
                 );
             }
             state::ViewMode::Workers => {
@@ -3933,8 +3937,8 @@ fn every_view_mode_changes_the_rects_compute_layout_actually_produces() {
                 assert_eq!(plan.width + transcript.width, body.width);
                 assert!(
                     plan.width > transcript.width,
-                    "M4 is the 60/40 pair with the plan in the wide column since the \
-                     t-024 trade: plan {} side {}",
+                    "M4 is the 60/40 pair with the plan in the wide — leading — \
+                     column: plan {} side {}",
                     plan.width,
                     transcript.width
                 );
@@ -3962,6 +3966,83 @@ fn every_view_mode_changes_the_rects_compute_layout_actually_produces() {
     for (i, left) in seen.iter().enumerate() {
         for (j, right) in seen.iter().enumerate().skip(i + 1) {
             assert_ne!(left, right, "modes {} and {} drew the same rects", i, j);
+        }
+    }
+}
+
+/// The single global slot rule (t-024b) read across the whole §2.5 ladder instead of
+/// one shape at a time: wherever a frame draws both the Execution Plan and the
+/// Transcript, the plan owns the **leading** slot — the leftmost column of a columns
+/// split, the topmost row of the `width < 90` stack, the wide column of a
+/// short-terminal frame — and the transcript owns the trailing one. Widths straddle
+/// every ladder step (120, 100, the 90 boundary, the `width < 90` stack, the
+/// `width < 70` band, the `width < 60` detail floor and the band below it) and heights
+/// straddle the footer band, the un-stackable side column and the too-small floor.
+/// A frame with no plan pane — M1, M3, a single-column fallback, the roster-only
+/// fallback or the too-small notice — is the rule's vacuous case and is skipped, which
+/// is why the assertion is stated over the pair and not over the mode.
+#[test]
+fn the_plan_holds_the_leading_slot_in_every_shape_at_every_ladder_width() {
+    for area in [
+        Rect::new(0, 0, 120, 40),
+        Rect::new(0, 0, 100, 30),
+        Rect::new(0, 0, 95, 30),
+        Rect::new(0, 0, 90, 30),
+        Rect::new(0, 0, 89, 30),
+        Rect::new(0, 0, 80, 30),
+        Rect::new(0, 0, 70, 30),
+        Rect::new(0, 0, 60, 30),
+        Rect::new(0, 0, 59, 30),
+        Rect::new(0, 0, 45, 30),
+        Rect::new(0, 0, 39, 30),
+        Rect::new(0, 0, 100, 20),
+        Rect::new(0, 0, 100, 16),
+        Rect::new(0, 0, 100, 12),
+        Rect::new(0, 0, 100, 10),
+        Rect::new(0, 0, 100, 9),
+    ] {
+        for mode in [
+            state::ViewMode::Transcript,
+            state::ViewMode::Plan,
+            state::ViewMode::Workers,
+            state::ViewMode::Split,
+        ] {
+            for focus in [
+                state::FocusPane::Input,
+                state::FocusPane::Transcript,
+                state::FocusPane::Plan,
+                state::FocusPane::Workers,
+            ] {
+                let mut r = m4_renderer();
+                r.set_view_mode(mode);
+                r.set_focus(focus);
+                let view = state::UiView::from_renderer(&r);
+                let rects = layout::compute_layout(area, &view);
+                let label = format!("{area:?} {mode:?} focus {focus:?}");
+                let (Some(plan), Some(transcript)) = (rects.plan, rects.transcript) else {
+                    continue;
+                };
+                let body = rects.body.expect("a frame that draws two panes has a body");
+                assert_eq!(
+                    plan.x, body.x,
+                    "{label}: the plan owns the body's leading edge: {rects:?}"
+                );
+                if plan.x == transcript.x {
+                    assert!(
+                        plan.y < transcript.y,
+                        "{label}: one column, so the plan holds the top row: {rects:?}"
+                    );
+                } else {
+                    assert!(
+                        plan.x < transcript.x,
+                        "{label}: the plan holds the leading column: {rects:?}"
+                    );
+                }
+                assert!(
+                    plan.width >= transcript.width,
+                    "{label}: the leading slot is never the narrower one: {rects:?}"
+                );
+            }
         }
     }
 }
@@ -6601,8 +6682,8 @@ fn a_queued_steer_from_the_bridge_lands_in_the_transcript_and_arms_the_chip() {
 
     let rows = draw_new_frame(&mut r, 100, 30);
     let frame = rows.join("\n");
-    // The line lands in the **transcript pane** itself. Since the t-024 trade that
-    // pane is the side column of M4, narrow enough to wrap the sentence across two
+    // The line lands in the **transcript pane** itself. In M4 that pane is the side
+    // column, narrow enough to wrap the sentence across two
     // rows, so the pane's own body rows are folded back into one line before the
     // phrase is looked for.
     let view = state::UiView::from_renderer(&r);
@@ -6610,7 +6691,7 @@ fn a_queued_steer_from_the_bridge_lands_in_the_transcript_and_arms_the_chip() {
     let transcript = rects.transcript.expect("M4 draws the transcript");
     assert!(
         transcript.x > rects.body.expect("a 100x30 body").x,
-        "t-024: the transcript is the side column, the plan holds the left: {rects:?}"
+        "the transcript is the trailing side column, the plan leads on the left: {rects:?}"
     );
     let said = pane_says(&rows, transcript);
     assert!(said.contains("[Steer queued"), "{said}\n{frame}");
@@ -8771,9 +8852,10 @@ fn draw_new_frame_styled(
 /// The style a drawn row was painted with, read at the cell where `needle` itself
 /// starts. Every span of a plan body line shares one style, so any glyph of the
 /// line answers for the whole line. The column is taken from the needle rather
-/// than from the first content cell of the row: since the t-024 pane trade a row
-/// can carry the text of two panes at once, and the left-hand one is no longer
-/// guaranteed to be the pane the needle belongs to.
+/// than from the first content cell of the row: a drawn row can
+/// carry the text of two panes at once (the wide leading pane and the trailing side
+/// column), and the left-hand one is not guaranteed to be the pane the needle belongs
+/// to.
 fn row_style(
     styles: &[Vec<ratatui::style::Style>],
     rows: &[String],

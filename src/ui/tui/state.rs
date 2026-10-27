@@ -33,15 +33,15 @@ use crate::plan_parse::{CheckboxState, parse_tasks};
 pub enum ViewMode {
     /// M1 — Transcript fills the body; Plan/Workers absent.
     Transcript,
-    /// M2 — Transcript left (55 %), Plan right (45 %). The pair is the §2.3 pair
-    /// traded by t-024, which moved the Plan pane into the Transcript's slot.
+    /// M2 — Plan left (55 %), Transcript right (45 %): the leading/trailing pair of
+    /// the single slot rule, on the §2.3 `55/45` pair.
     Plan,
-    /// M3 — Workers left (55 %), Transcript right (45 %). No Plan pane, so the
-    /// t-024 trade does not touch this mode.
+    /// M3 — Workers left (55 %), Transcript right (45 %). No Plan pane, so the slot
+    /// rule has nothing to place in this mode.
     Workers,
-    /// M4 — Plan left (60 %), Transcript over Workers in the side column (40 %).
-    /// Before t-024 the wide column was the Transcript's and the Plan sat at the
-    /// head of the side column.
+    /// M4 — Plan left in the wide column (60 %), Transcript over Workers in the side
+    /// column (40 %). The Plan holds the leading slot here exactly as it does in M2,
+    /// so it never changes side between the two modes.
     Split,
 }
 
@@ -151,7 +151,7 @@ impl FocusPane {
     /// panes the current mode does not present.
     ///
     /// The ring is the §4.2 **inventory** order, not a left-to-right walk of the
-    /// panes, and t-024 deliberately leaves it alone: the order is what `Shift+Tab`
+    /// panes, and t-024b deliberately leaves it alone: the order is what `Shift+Tab`
     /// reverses and what the persisted focus tags were spelled against, and it was
     /// never positional — in M3 the ring already stepped Transcript → Workers while
     /// the roster sat in the left column. Which pane sits where is geometry, and

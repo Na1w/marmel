@@ -730,9 +730,10 @@ impl TuiRenderer {
     ///
     /// The numbered passes below are the **paint order**, not the on-screen order:
     /// which pane sits in which slot is decided solely by
-    /// [`layout::compute_layout`], and since the t-024 trade the Plan holds the
-    /// leading slot of M4 while the Transcript is painted ahead of it but into the
-    /// side column. Nothing here may restate that geometry.
+    /// [`layout::compute_layout`], whose single rule puts the Plan in the leading
+    /// slot and the Transcript in the trailing one of every shape that draws both —
+    /// so in M4 the Plan is painted second but sits left of the Transcript. Nothing
+    /// here may restate that geometry.
     pub(crate) fn draw_new_ui(&mut self, frame: &mut ratatui::Frame) -> layout::PaneRects {
         // The frame is built from stored view state, so anything a writer outside
         // the key path changed on the legacy fields (a worker activating opens the

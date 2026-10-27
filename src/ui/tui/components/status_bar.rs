@@ -902,9 +902,9 @@ mod tests {
     #[test]
     fn a_pane_the_ladder_took_away_is_not_announced_as_on() {
         // The presence chips read `layout::PaneRects`, not the mode or the toggle:
-        // at 80 columns the §2.5 ladder stacks one side pane with the transcript,
-        // so the other toggle is still on while its pane has no rect. A chip that
-        // said `workers:on` for a pane nobody can see is a chip that lies (G5).
+        // at 80 columns the §2.5 ladder stacks the plan in the leading row over the
+        // transcript, so the roster toggle is still on while its pane has no rect. A
+        // chip that said `workers:on` for a pane nobody can see is a lie (G5).
         let workers = [worker("coder_specialist", true, false, false)];
         let squeezed = StatusData {
             plan_present: true,
