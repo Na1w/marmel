@@ -411,6 +411,22 @@ pub struct TuiRenderer {
     pub tokens_in: usize,
     /// Estimated total output (completion) tokens across the session.
     pub tokens_out: usize,
+    /// Injected snapshot of the process-wide llm prompt-token counter, taken once
+    /// per painted frame by [`Self::refresh_global_token_snapshot`] — never read
+    /// out of the global while a frame is being built (audit D5).
+    ///
+    /// The frame is a pure function of renderer state. Pulling
+    /// `crate::llm::get_global_token_counts()` into the frame made every whole-frame
+    /// assertion in the process depend on what every other test in that process had
+    /// streamed: two renders of one fixture could print different status rows, and
+    /// a pass/fail result moved with test scheduling order. Production keeps the
+    /// live figure — the session's own `tokens_in` merged with the process counter
+    /// under the same `max` — because the entry path that paints writes this field
+    /// first.
+    pub(crate) global_tokens_in: usize,
+    /// Injected snapshot of the process-wide llm completion-token counter; see
+    /// [`Self::global_tokens_in`].
+    pub(crate) global_tokens_out: usize,
     /// Context window size (tokens) of the orchestrator/main turn.
     pub orchestrator_context_tokens: usize,
     /// Map of specialist role -> max_thinking_tokens.
@@ -446,6 +462,8 @@ impl TuiRenderer {
             status_line: "Ready".to_string(),
             tokens_in: 0,
             tokens_out: 0,
+            global_tokens_in: 0,
+            global_tokens_out: 0,
             orchestrator_context_tokens: 0,
             focused_panel: FocusedPanel::Chat,
             // The view state is built once, here, and only the transition
@@ -643,6 +661,27 @@ impl TuiRenderer {
         })
     }
 
+    /// Take the one snapshot of the process-wide llm token counters that this
+    /// frame is allowed to see, and store it as renderer state (audit D5).
+    ///
+    /// This is the **only** place in the paint path that touches
+    /// [`crate::llm::get_global_token_counts`], and it is the only thing that
+    /// connects the process-wide counter to what the status row prints. It runs at
+    /// the top of [`Self::render_terminal`] — the single entry path that paints a
+    /// frame in production — so the live TUI still shows the live usage, while
+    /// [`Self::draw_new_ui`] becomes a pure function of renderer state and a
+    /// `TestBackend` frame can no longer be moved by what an unrelated test in the
+    /// same process streamed.
+    ///
+    /// The pair is stored as read, not merged: the merge with this renderer's own
+    /// counters stays in the frame, and the counters it merges are monotonic
+    /// (`fetch_add`), so a snapshot can never make a displayed total go backwards.
+    pub(crate) fn refresh_global_token_snapshot(&mut self) {
+        let (global_in, global_out) = crate::llm::get_global_token_counts();
+        self.global_tokens_in = global_in;
+        self.global_tokens_out = global_out;
+    }
+
     /// Paint one frame through the routed draw path (spec §9.1: the new UI is the
     /// only thing this entry path paints).
     ///
@@ -657,6 +696,9 @@ impl TuiRenderer {
         if self.terminal_torn_down {
             return Ok(());
         }
+        // Audit D5: the process-wide counters are read exactly once per painted
+        // frame, right here, and the frame below reads only the snapshot.
+        self.refresh_global_token_snapshot();
         self.last_render = std::time::Instant::now();
         self.frame_counter = self.frame_counter.wrapping_add(1);
         let mut terminal = match self.terminal.take() {
@@ -852,7 +894,16 @@ impl TuiRenderer {
         // owns and the pane rects this frame actually produced — a pane the §2.5
         // ladder took away must not still be announced as `on` (§2.5, G5).
         if let Some(rect) = rects.status {
-            let (global_in, global_out) = crate::llm::get_global_token_counts();
+            // The token pair is merged from renderer state only: `tokens_in` /
+            // `tokens_out` are this renderer's own running totals and
+            // `global_tokens_*` is the snapshot the paint path injected before the
+            // frame was built (audit D5). `max` keeps the displayed total from ever
+            // going backwards — a session counter can lead the process counter (the
+            // renderer estimates streamed text itself) and the process counter can
+            // lead it (turns taken outside this renderer's event stream) — and the
+            // snapshot, taken from a `fetch_add` counter, is monotonic too. The
+            // frame reads no process-global anywhere, so two draws of one fixture
+            // are byte-identical regardless of what else the process is doing.
             let data = components::status_bar::StatusData {
                 workers: &self.subagents,
                 show_thought: view.show_thought,
@@ -861,8 +912,8 @@ impl TuiRenderer {
                 plan_present: rects.plan.is_some(),
                 workers_present: rects.workers.is_some(),
                 abort_armed: view.abort_armed,
-                tokens_in: self.tokens_in.max(global_in),
-                tokens_out: self.tokens_out.max(global_out),
+                tokens_in: self.tokens_in.max(self.global_tokens_in),
+                tokens_out: self.tokens_out.max(self.global_tokens_out),
                 ctx_tokens: self.orchestrator_context_tokens,
                 ctx_limit: self.max_context_tokens,
                 elapsed,

@@ -5951,11 +5951,13 @@ fn rows_outside(rows: &[String], skip: &[ratatui::layout::Rect]) -> Vec<String> 
 /// Mask every digit run in a drawn row to `#`.
 ///
 /// Two draws of the *same* renderer may legitimately print different numbers, and
-/// that is not a regression: status row 1 shows `tokens_in.max(global_in)` /
-/// `tokens_out.max(global_out)` against the process-wide
-/// `crate::llm::get_global_token_counts()` witness (`tui/mod.rs:805-815`), and the
-/// header carries the renderer's own session clock. Inside a parallel test process
-/// other tests move those witnesses between two frames, and the clock ticks with
+/// that is not a regression: status row 1 carries the header's session clock, and
+/// the token pair is the **max** of this renderer's own session counters and the
+/// snapshot of the process-wide llm totals that [`TuiRenderer::render_terminal`]
+/// injects once per painted frame (audit D5 — `draw_new_ui` itself reads no
+/// process-global, so a `TestBackend` frame no longer moves with what the rest of
+/// the test process streamed). A frame that has been fed token events of its own
+/// still sees its own totals move between two draws, and the clock ticks with
 /// machine speed. G4 and §7.3 are about the chrome and the metric **fields**
 /// staying on screen and in place under an overlay — not about the counter values —
 /// so the frame comparisons mask the digits and compare the field set.
@@ -5983,8 +5985,9 @@ fn steady_rows(rows: &[String]) -> Vec<String> {
 
 /// The §2.2 metrics of status row 1, with the wall-clock field dropped and the
 /// remaining values masked by [`steady`]. Keeping the raw figures in a whole-row
-/// comparison would make the test depend on what the rest of the test process is
-/// doing to the global token witness and on how fast the machine is.
+/// comparison would make the test depend on how fast the machine is and on the
+/// token totals this renderer has been fed, which is what a whole-row pin is not
+/// about.
 fn metrics_of(rows: &[String], status: &ratatui::layout::Rect) -> String {
     let row = rows[usize::from(status.y)].as_str();
     let without_clock = row

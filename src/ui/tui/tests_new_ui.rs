@@ -259,12 +259,15 @@ fn rows_within(rows: &[String], rect: Rect) -> Vec<String> {
     rows[start..end].to_vec()
 }
 
-/// A frame with the two fields a second pass of the *same* renderer may
+/// A frame with the two live fields a second pass of the *same* renderer may
 /// legitimately differ on taken out: the session clock (`elapsed …`) and the token
-/// counters, which the status row reads as `self.tokens_in.max(global_in)`
-/// (`mod.rs:839`) from a process-global counter the rest of the suite is free to
-/// move between the two draws. A frame pin must not be a stopwatch, and it must not
-/// be a race against a shared counter either.
+/// counters. The clock is this renderer's own wall clock, so a frame pin must not be
+/// a stopwatch. The counters are per-renderer state: the process-wide llm totals
+/// reach the status row only as the snapshot the paint path stores once per frame
+/// (audit D5), which a `TestBackend` pin never injects — but a pin that fed this
+/// renderer an `Event::TokensIn` / `TokensOut` still sees its own totals move
+/// between two draws, so the field stays stripped here as well. The D5 pins at the
+/// end of this file assert the injected form directly.
 fn snapshot(rows: &[String]) -> Vec<String> {
     rows.iter()
         .map(|row| {
@@ -2641,4 +2644,148 @@ fn a_stray_write_of_the_auto_scroll_mirror_cannot_repin_the_frame_item14() {
     );
     let chip = transcript_chip(&rows_after, pane);
     assert!(!chip.contains("LIVE"), "the chip flipped to LIVE: {chip:?}");
+}
+
+// ===========================================================================
+// Audit D5 — a frame must be a pure function of renderer state.
+//
+// The status row's token pair used to be pulled out of the process-wide llm
+// counters *while the frame was being built*, so any test in the same process
+// that streamed a turn changed the frame an unrelated frame pin was comparing,
+// and a pass could flip on scheduling order alone. The value is now an injected
+// input: the production paint path (`TuiRenderer::render_terminal`) stores one
+// snapshot per frame and `draw_new_ui` reads only that, so a `TestBackend` frame
+// has no ambient dependency left. The pins below are the regression guard.
+// ===========================================================================
+
+/// The rows with only the session clock removed. `elapsed …` ends the row it is on,
+/// so cutting there leaves every other field — the token counters included — raw.
+fn clockless(rows: &[String]) -> Vec<String> {
+    rows.iter()
+        .map(|row| match row.find("elapsed") {
+            Some(at) => row[..at].to_string(),
+            None => row.clone(),
+        })
+        .collect()
+}
+
+/// The status row's token pair as drawn, i.e. the ` Tokens N in / N out ` field of
+/// status row 1 (§2.2).
+fn drawn_tokens(rows: &[String], status: Rect) -> String {
+    let row = &rows[usize::from(status.y)];
+    let at = row
+        .find(" Tokens ")
+        .expect("status row 1 always carries the token pair (§2.5)");
+    let rest = &row[at..];
+    let end = rest.find(" out ").expect("the pair spells `N in / N out`") + " out ".len();
+    rest[..end].trim().to_string()
+}
+
+/// D5: two renderers built from one fixture draw one identical frame each, even
+/// though the process-global counters moved between the two draws. This is the
+/// reproduction of the defect: before the injection the two frames differed only
+/// in the status row (`0 in / 0 out` against the counters another test had
+/// reached), which is what made whole-frame assertions race with the rest of the
+/// suite.
+#[test]
+fn a_frame_does_not_move_when_another_test_bumps_the_llm_token_globals_d5() {
+    let mut first = m4_renderer();
+    let before = clockless(&frame_text(&mut first, 100, 30));
+
+    // Stands in for every other test in this process that streams a turn.
+    crate::llm::record_tokens_in(4_812);
+    crate::llm::record_tokens_out(9_217);
+
+    let mut second = m4_renderer();
+    let after = clockless(&frame_text(&mut second, 100, 30));
+    assert_eq!(
+        before, after,
+        "the frame changed because the process-global counters did (D5)"
+    );
+
+    // Same fixture, same renderer, redrawn after the bump: still the same frame.
+    let redrawn = clockless(&frame_text(&mut first, 100, 30));
+    assert_eq!(
+        before, redrawn,
+        "a redraw of one renderer moved with the globals (D5)"
+    );
+}
+
+/// D5, second half: the live figure is not lost, it is injected. The production
+/// snapshot call — the one the paint path makes per frame — still carries the
+/// process-wide counters into the frame, whatever value they happen to have reached
+/// by the time this test runs.
+#[test]
+fn the_injected_snapshot_still_puts_the_live_global_counters_on_screen_d5() {
+    let mut r = m4_renderer();
+    crate::llm::record_tokens_in(311);
+    crate::llm::record_tokens_out(723);
+    r.refresh_global_token_snapshot();
+    let (global_in, global_out) = (r.global_tokens_in, r.global_tokens_out);
+
+    let (rows, _, rects) = draw_frame(&mut r, 100, 30);
+    let status = rects.status.expect("a 100x30 frame draws the status row");
+    assert_eq!(
+        drawn_tokens(&rows, status),
+        format!(
+            "Tokens {} in / {} out",
+            components::status_bar::format_count(global_in),
+            components::status_bar::format_count(global_out)
+        ),
+        "the status row stopped showing the snapshot the paint path injected"
+    );
+    assert!(
+        global_in >= 311 && global_out >= 723,
+        "the snapshot stopped tracking the process counters: {global_in}/{global_out}"
+    );
+}
+
+/// D5 kept the merge semantics: the displayed pair is the **max** of this
+/// renderer's own totals and the injected snapshot, in either direction, so the
+/// counters on screen never run backwards.
+#[test]
+fn the_token_pair_stays_the_maximum_of_the_two_counters_either_way_d5() {
+    let own_ahead = {
+        let mut r = m4_renderer();
+        r.tokens_in = 9_400;
+        r.tokens_out = 2_300;
+        r.global_tokens_in = 4_812;
+        r.global_tokens_out = 9_217;
+        let (rows, _, rects) = draw_frame(&mut r, 100, 30);
+        drawn_tokens(&rows, rects.status.expect("status row"))
+    };
+    assert_eq!(
+        own_ahead, "Tokens 9.4k in / 9.2k out",
+        "the session counter stopped leading the snapshot"
+    );
+
+    let snapshot_ahead = {
+        let mut r = m4_renderer();
+        r.tokens_in = 12;
+        r.tokens_out = 7;
+        r.global_tokens_in = 1_200_000;
+        r.global_tokens_out = 5_500;
+        let (rows, _, rects) = draw_frame(&mut r, 100, 30);
+        drawn_tokens(&rows, rects.status.expect("status row"))
+    };
+    assert_eq!(
+        snapshot_ahead, "Tokens 1.2M in / 5.5k out",
+        "the snapshot stopped leading the session counter"
+    );
+}
+
+/// D5, the whole point: with no snapshot injected — which is the state every
+/// frame pin in this file is built in — the frame shows this renderer's own
+/// counters no matter what the rest of the process has streamed.
+#[test]
+fn an_uninjected_frame_shows_this_renderers_own_counters_only_d5() {
+    crate::llm::record_tokens_in(64_000);
+    crate::llm::record_tokens_out(32_000);
+    let mut r = m4_renderer();
+    let (rows, _, rects) = draw_frame(&mut r, 100, 30);
+    assert_eq!(
+        drawn_tokens(&rows, rects.status.expect("status row")),
+        "Tokens 0 in / 0 out",
+        "the frame read ambient process state again (D5)"
+    );
 }
