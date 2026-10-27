@@ -71,11 +71,11 @@ pub(crate) struct LegacyViewMirror {
 
 /// Status-line substrings that mean "a turn is in flight, keep animating".
 ///
-/// One source of truth for the two places that must never drift apart: the
-/// render-loop throttle tier in [`TuiRenderer::drain_and_throttle_flush`] (a
-/// spinner-only repaint every 125 ms while nothing else is dirty) and the
-/// activity indicator in [`TuiRenderer::render_status`]. If they disagree, a
-/// frame can be animating in one panel and frozen in the other.
+/// One source of truth for the animation gate: the render-loop throttle tier in
+/// [`TuiRenderer::drain_and_throttle_flush`] (a spinner-only repaint every 125 ms
+/// while nothing else is dirty) reads this list, and the pane labels spell the
+/// same words. If the two drifted apart, a frame could be animating in one panel
+/// and frozen in the other.
 ///
 /// Both spellings of the concurrency-slot keyword are listed deliberately: the
 /// gate reports a slot wait as lowercase status traffic

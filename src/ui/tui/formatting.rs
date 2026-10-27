@@ -1,7 +1,6 @@
 //! Formatting, text parsing, terminal math, and word wrapping utilities for TUI.
 
 use ansi_to_tui::IntoText;
-use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
@@ -1126,10 +1125,6 @@ pub fn extract_complete_sentences(buffer: &mut String) -> Vec<String> {
         }
     }
     sentences
-}
-
-pub fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
-    x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)
 }
 
 /// Parse a string that may contain ANSI escape sequences into Ratatui `Line`s.
