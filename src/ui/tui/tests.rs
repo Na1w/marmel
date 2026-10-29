@@ -65,32 +65,44 @@ fn extract_sentences_handles_tab_whitespace() {
 
 #[test]
 fn message_style_matches_reference_prefixes() {
+    // The transcript role table lives in `theme.rs` (§B.1/§D2): this test pins
+    // both the slot a prefix resolves to *and* that slot's value, so a hue can
+    // only move together with the role it names.
     let (s, special) = message_style("User: hello");
     assert!(special);
-    assert_eq!(s.fg, Some(Color::Cyan));
+    assert_eq!(s, theme::role_user());
+    assert_eq!(s.fg, Some(Color::LightCyan));
     assert!(s.add_modifier.contains(Modifier::BOLD));
 
     let (s, special) = message_style("Marmennill: reply");
     assert!(special);
+    assert_eq!(s, theme::role_manager());
     assert_eq!(s.fg, Some(Color::LightYellow));
     assert!(s.add_modifier.contains(Modifier::BOLD));
 
     let (s, special) = message_style("[Status] running");
     assert!(special);
+    assert_eq!(s, theme::role_status());
     assert_eq!(s.fg, Some(Color::Yellow));
 
     let (s, special) = message_style("System Error: boom");
     assert!(special);
+    assert_eq!(s, theme::state_failed());
     assert_eq!(s.fg, Some(Color::Red));
     assert!(s.add_modifier.contains(Modifier::BOLD));
 
     let (s, special) = message_style("--- Turn 1");
     assert!(special);
-    assert_eq!(s.fg, Some(Color::Green));
+    assert_eq!(s, theme::role_turn());
+    assert_eq!(s.fg, Some(Color::DarkGray));
     assert!(s.add_modifier.contains(Modifier::BOLD));
 
-    let (_, special) = message_style("plain line");
+    // Body text carries no forced foreground (§F2): a forced `White` is
+    // white-on-white on a light profile, so the default branch stays fg-less.
+    let (s, special) = message_style("plain line");
     assert!(!special);
+    assert_eq!(s, theme::text_primary());
+    assert_eq!(s.fg, None);
 }
 
 #[test]
@@ -1176,13 +1188,18 @@ fn the_arbitration_pause_keyword_is_shared_by_both_animation_tiers() {
 }
 
 #[test]
-fn test_orchestrator_content_is_white_and_steer_is_yellow() {
-    let (white_style, special_white) = message_style("Orchestrator answer");
-    assert!(!special_white);
-    assert_eq!(white_style.fg, Some(Color::White));
+fn test_orchestrator_content_is_fg_less_and_steer_is_manager_yellow() {
+    // Body text used to be forced to `Color::White` (white-on-white on a light
+    // profile, research §F2); it now inherits the terminal profile.
+    let (body_style, special_body) = message_style("Orchestrator answer");
+    assert!(!special_body);
+    assert_eq!(body_style, theme::text_primary());
+    assert_eq!(body_style.fg, None);
+    assert_eq!(body_style.bg, None);
 
     let (yellow_style, special_yellow) = message_style("Marmennill: Direct answer from arbitrator");
     assert!(special_yellow);
+    assert_eq!(yellow_style, theme::role_manager());
     assert_eq!(yellow_style.fg, Some(Color::LightYellow));
     assert!(yellow_style.add_modifier.contains(Modifier::BOLD));
 
@@ -1254,7 +1271,9 @@ fn test_subagent_tool_calls_logged_with_arguments_and_stripped_prefix() {
 #[test]
 fn test_plan_scrolling_with_wrapped_lines() {
     let mut r = TuiRenderer::new();
-    r.focused_panel = FocusedPanel::Plan;
+    // The scroll path resolves its target from the real focus, so the fixture
+    // focuses the plan pane rather than only writing the legacy mirror.
+    r.set_focus(state::FocusPane::Plan);
     let plan_text = "# Header\nThis is a long plan line that will wrap onto multiple visual lines when rendered in a narrow panel.\n- [ ] Task 1\n- [x] Task 2\n";
     r.plan_content = plan_text.to_string();
 
@@ -1359,7 +1378,9 @@ fn test_line_matches_task_id_exact_and_boundary() {
 #[test]
 fn test_subagent_scrolling_and_focus() {
     let mut r = TuiRenderer::new();
-    r.focused_panel = FocusedPanel::Subagents;
+    // The scroll path resolves its target from the real focus, so the fixture
+    // focuses the workers pane rather than only writing the legacy mirror.
+    r.set_focus(state::FocusPane::Workers);
     r.subagents.push(SubagentDetail {
         name: "coder".to_string(),
         task_id: None,
@@ -1486,7 +1507,9 @@ fn test_subagent_switch_scrolls_to_bottom_and_autoscrolls() {
     r.subagent_width.set(40);
     r.subagent_height.set(4);
 
-    r.focused_panel = FocusedPanel::Subagents;
+    // The scroll path resolves its target from the real focus, so the fixture
+    // focuses the workers pane rather than only writing the legacy mirror.
+    r.set_focus(state::FocusPane::Workers);
     r.scroll_up(5);
     assert!(!r.subagent_autoscroll);
 
@@ -1825,8 +1848,8 @@ fn test_delegation_completed_emits_task_id_completed_in_chat() {
 
     let (style, special) = message_style("[t-007] completed.");
     assert!(special);
+    assert_eq!(style, theme::state_done());
     assert_eq!(style.fg, Some(ratatui::style::Color::Green));
-    assert!(style.add_modifier.contains(ratatui::style::Modifier::BOLD));
 }
 
 #[test]
@@ -4521,18 +4544,22 @@ fn theme_glyphs_are_the_spec_table_and_the_picker_follows_row_state() {
         "only the leading word decides, so `Unapproved` is not a verdict this knows"
     );
 
-    // The palette keeps today's colours (§7.1).
+    // The palette keeps today's colours (§7.1), now pinned on the role slot that
+    // owns each value: the frozen aliases (`chip`, `chip_active`, `chip_done`,
+    // `chip_pending`, `error`, `text_dim`, `frame_alert`) are deleted, and the
+    // slots they delegated to carry the identical values.
     assert_eq!(theme::frame_focus().fg, Some(Color::Cyan));
     assert_eq!(theme::frame_idle().fg, Some(Color::DarkGray));
-    assert_eq!(theme::frame_alert().fg, Some(Color::Red));
-    assert_eq!(theme::frame_confirm().fg, Some(Color::Yellow));
-    assert_eq!(theme::chip_active().fg, Some(Color::Yellow));
-    assert!(theme::chip_active().add_modifier.contains(Modifier::BOLD));
-    assert_eq!(theme::chip().bg, Some(Color::DarkGray));
-    assert_eq!(theme::chip_done().fg, Some(Color::Green));
-    assert_eq!(theme::chip_pending().fg, Some(Color::LightRed));
-    assert_eq!(theme::error().fg, Some(Color::Red));
-    assert_eq!(theme::text_dim().fg, Some(Color::DarkGray));
+    assert_eq!(theme::frame_danger().fg, Some(Color::Red));
+    assert_eq!(theme::frame_caution().fg, Some(Color::Yellow));
+    assert_eq!(theme::state_running().fg, Some(Color::Yellow));
+    assert!(theme::state_running().add_modifier.contains(Modifier::BOLD));
+    assert_eq!(theme::chip_neutral().bg, Some(Color::DarkGray));
+    assert_eq!(theme::state_done().fg, Some(Color::Green));
+    assert_eq!(theme::state_replan().fg, Some(Color::LightRed));
+    assert_eq!(theme::state_failed().fg, Some(Color::Red));
+    assert!(theme::state_failed().add_modifier.contains(Modifier::BOLD));
+    assert_eq!(theme::text_muted().fg, Some(Color::DarkGray));
     assert_eq!(theme::text_primary(), ratatui::style::Style::default());
     assert_eq!(theme::FOCUS_BADGE, '●');
 }
@@ -4629,9 +4656,10 @@ fn the_worker_lifecycle_the_registry_keeps_lands_on_the_pane_row() {
 }
 
 /// §8.5: a failure outlives the status line that carried it. The renderer keeps the
-/// categorical cause and the full text, and `e` reads **that buffer** — the transcript
-/// and status-line scan is only the fallback — so the recalled line carries the
-/// category and every line of the report, not the one line §7.4 lets the status keep.
+/// categorical cause and the full text, and `/error` reads **that buffer** — the
+/// transcript and status-line scan is only the fallback — so the recalled line
+/// carries the category and every line of the report, not the one line §7.4 lets the
+/// status keep.
 #[test]
 fn a_reported_error_stays_recallable_after_the_status_line_moved_on() {
     let mut r = TuiRenderer::new();
@@ -4663,8 +4691,12 @@ fn a_reported_error_stays_recallable_after_the_status_line_moved_on() {
     r.on_event(&Event::Status("Ready".to_string()));
     assert_eq!(r.status_line, "Ready");
 
-    // `e` with an empty composer is never a silent key (§5, G5).
-    assert!(press(&mut r, KeyCode::Char('e'), KeyModifiers::NONE));
+    // `/error` is the whole route to the recall now that the bare-`e` mnemonic is
+    // gone: it is one submitted line, and it recalls the same traffic from every
+    // focus, so it can never swallow a letter out of a draft (§5, G5).
+    r.set_focus(state::FocusPane::Transcript);
+    r.set_input_content("/error");
+    r.submit();
     let recalled = r.messages.last().cloned().unwrap_or_default();
     // The recalled line is the buffer: `✗ <category>`, then the report verbatim.
     assert!(
@@ -4682,9 +4714,12 @@ fn a_reported_error_stays_recallable_after_the_status_line_moved_on() {
     );
 }
 
-/// §8.5 + work item 3: the buffer, not the transcript, is what `e` reads. A
+/// §8.5 + work item 3: the buffer, not the transcript, is what `/error` reads. A
 /// transcript clear — what `/reset` and a restore can do — must not cost the
 /// operator the cause of the failure that ended the last turn.
+///
+/// The name keeps the `e` spelling it was written under; the bare-letter mnemonic it
+/// used to drive is gone, and the recall is now submitted as a command.
 #[test]
 fn an_error_recalled_with_e_survives_a_transcript_clear() {
     let mut r = TuiRenderer::new();
@@ -4698,7 +4733,11 @@ fn an_error_recalled_with_e_survives_a_transcript_clear() {
     r.status_line = "Ready".to_string();
     assert!(r.messages.is_empty(), "the transcript was cleared");
 
-    assert!(press(&mut r, KeyCode::Char('e'), KeyModifiers::NONE));
+    // `/error` carries no focus requirement — unlike the bare `e` it replaces, which
+    // only armed over a pane focus and swallowed the letter everywhere else (§4.4).
+    r.set_focus(state::FocusPane::Transcript);
+    r.set_input_content("/error");
+    r.submit();
     let recalled = r.messages.last().cloned().unwrap_or_default();
     assert_eq!(
         recalled,
@@ -4707,9 +4746,11 @@ fn an_error_recalled_with_e_survives_a_transcript_clear() {
         "the whole report is recalled from the buffer"
     );
 
-    // With no buffer and no transcript either, `e` still says so (G5).
+    // With no buffer and no transcript either, the command still says so (G5).
     let mut clean = TuiRenderer::new();
-    assert!(press(&mut clean, KeyCode::Char('e'), KeyModifiers::NONE));
+    clean.set_focus(state::FocusPane::Transcript);
+    clean.set_input_content("/error");
+    clean.submit();
     assert!(
         clean
             .messages
@@ -4725,7 +4766,9 @@ fn an_error_recalled_with_e_survives_a_transcript_clear() {
     legacy
         .messages
         .push("LLM error: timeout (Ready) — stream cut".to_string());
-    assert!(press(&mut legacy, KeyCode::Char('e'), KeyModifiers::NONE));
+    legacy.set_focus(state::FocusPane::Transcript);
+    legacy.set_input_content("/error");
+    legacy.submit();
     let fallback = legacy.messages.last().cloned().unwrap_or_default();
     assert!(fallback.starts_with("✗ LLM error: timeout"), "{fallback:?}");
 }
@@ -5016,6 +5059,74 @@ fn the_status_row_keeps_every_count_and_clips_names_into_the_free_columns() {
                 "{width}x{height}: the name list is cut inside a name, not deleted: {row:?}"
             );
         }
+
+        // §F1 on the painted frame, at every width the ladder reaches: the metrics
+        // row is one DarkGray band, so **no** cell of it may carry the band colour
+        // as ink. Before the band routing the separators, the `ctx` field and the
+        // whole worker-name list were DarkGray on DarkGray, and the `…` marking a
+        // clipped name list was invisible too.
+        let (banded, styles) = draw_new_frame_styled(&mut r, width, height);
+        let band = theme::band_surface().bg;
+        let (metrics, line) = banded
+            .iter()
+            .enumerate()
+            .find(|(_, drawn_row)| drawn_row.trim_start().starts_with("Tokens"))
+            .expect("the metrics row is drawn at every width");
+        for (cell, style) in styles[metrics].iter().enumerate() {
+            assert_eq!(
+                style.bg, band,
+                "{width}x{height}: cell {cell} of the metrics row is off the band: {line:?}"
+            );
+            if let Some(fg) = style.fg {
+                assert_ne!(
+                    Some(fg),
+                    band,
+                    "{width}x{height}: cell {cell} paints {fg:?} on the band: {line:?}"
+                );
+            }
+        }
+        // The band's own rungs, element by element: chrome labels neutral, the
+        // muted secondary rung muted-but-visible, the number worth reading bold.
+        let painted = |needle: &str| {
+            let cell = line
+                .find(needle)
+                .map(|byte| line[..byte].chars().count())
+                .unwrap_or_else(|| panic!("{needle:?} is not on the drawn metrics row: {line:?}"));
+            styles[metrics][cell]
+        };
+        assert_eq!(
+            painted(" | ").fg,
+            theme::chip_muted().fg,
+            "{width}x{height}: the separator is the band's muted rung: {line:?}"
+        );
+        assert_eq!(
+            painted(" Tokens ").fg,
+            theme::chip_neutral().fg,
+            "{width}x{height}: the token label is the neutral band chip: {line:?}"
+        );
+        assert_eq!(
+            painted(" in / ").fg,
+            theme::chip_value().fg,
+            "{width}x{height}: the token pair is the band's number rung: {line:?}"
+        );
+        assert!(
+            painted(" in / ")
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD),
+            "{width}x{height}: and it keeps its weight: {line:?}"
+        );
+        if width >= 80 {
+            assert_eq!(
+                painted("coder").fg,
+                theme::chip_muted().fg,
+                "{width}x{height}: the worker names are visible on the band: {line:?}"
+            );
+            assert_eq!(
+                painted("ctx 45%").fg,
+                theme::chip_muted().fg,
+                "{width}x{height}: the ctx ratio is the band's muted rung: {line:?}"
+            );
+        }
     }
 }
 
@@ -5147,14 +5258,26 @@ fn every_legend_row_is_a_real_handler_path() {
             undo && redo
         }),
         ("Ctrl+Up / Ctrl+Down", |r| {
+            // The row says "in any focus": the chord is the input-history route
+            // from the composer **and** from a pane focus, and it is the only one
+            // there — the plain arrows belong to the pane.
             r.history = vec!["earlier note".to_string()];
             let back =
                 press(r, KeyCode::Up, KeyModifiers::CONTROL) && r.input_text == "earlier note";
             let fwd = press(r, KeyCode::Down, KeyModifiers::CONTROL) && r.input_text.is_empty();
-            back && fwd
+            r.set_focus(state::FocusPane::Transcript);
+            let at_a_pane = press(r, KeyCode::Up, KeyModifiers::CONTROL)
+                && r.input_text == "earlier note"
+                && r.history_index == Some(0);
+            // The plain arrows over that same pane leave the walk exactly where the
+            // chord left it: they are the pane's keys, not the composer's.
+            let plain_is_the_pane = press(r, KeyCode::Up, KeyModifiers::NONE)
+                && r.input_text == "earlier note"
+                && r.history_index == Some(0);
+            back && fwd && at_a_pane && plain_is_the_pane
         }),
         ("Up / Down", |r| {
-            // With a draft the keys scroll the focused pane by one ...
+            // A pane focus owns the plain arrows whatever the draft says ...
             r.messages = (0..120).map(|i| format!("User: filler {i}")).collect();
             r.chat_width.set(100);
             r.chat_height.set(10);
@@ -5168,10 +5291,35 @@ fn every_legend_row_is_a_real_handler_path() {
             if !press(r, KeyCode::Up, KeyModifiers::NONE) || r.chat_scroll >= bottom {
                 return false;
             }
-            // ... and with an empty composer they walk the history (§5).
+            // ... and an empty draft is still a pane step, never a swallowed
+            // history no-op: the draft and the walk bookkeeping stay the
+            // composer's, and `Ctrl+Up` remains the only way to reach them (§5).
             r.set_input_content("");
             r.history = vec!["earlier note".to_string()];
-            press(r, KeyCode::Up, KeyModifiers::NONE) && r.input_text == "earlier note"
+            let above = r.chat_scroll;
+            let still_the_pane = press(r, KeyCode::Up, KeyModifiers::NONE)
+                && r.input_text.is_empty()
+                && r.history_index.is_none()
+                && r.chat_scroll < above;
+            // With the composer focused the same two keys never reach a viewport,
+            // and they never reach the history either: the row promises caret and
+            // scroll, nothing else, so a press with nowhere for the caret to go is
+            // not claimed at all — no recall, no repaint, no follow decision.
+            r.set_focus(state::FocusPane::Input);
+            let parked = r.chat_scroll;
+            let follow = (r.follow, r.chat_auto_scroll);
+            let no_recall = !press(r, KeyCode::Up, KeyModifiers::NONE)
+                && !press(r, KeyCode::Down, KeyModifiers::NONE)
+                && r.input_text.is_empty()
+                && r.history_index.is_none()
+                && r.chat_scroll == parked
+                && (r.follow, r.chat_auto_scroll) == follow;
+            // The chord is the row above's, and it works from the composer too.
+            let chord = press(r, KeyCode::Up, KeyModifiers::CONTROL)
+                && r.input_text == "earlier note"
+                && r.history_index == Some(0)
+                && r.chat_scroll == parked;
+            still_the_pane && no_recall && chord
         }),
         ("Left / Right", |r| {
             // Workers focus: the roster selection moves ...
@@ -5183,23 +5331,40 @@ fn every_legend_row_is_a_real_handler_path() {
             r.set_focus(state::FocusPane::Workers);
             let next = press(r, KeyCode::Right, KeyModifiers::NONE) && r.selected_subagent_idx == 1;
             let prev = press(r, KeyCode::Left, KeyModifiers::NONE) && r.selected_subagent_idx == 0;
-            // ... everywhere else it is the caret.
+            // ... and at the end of the roster the key falls back to the caret
+            // instead of being swallowed.
+            r.set_input_content("hello");
+            let at_the_end = press(r, KeyCode::Left, KeyModifiers::NONE)
+                && r.selected_subagent_idx == 0
+                && r.cursor == "hell".len();
+            // ... everywhere else it is the caret, rows present or not.
             r.set_focus(state::FocusPane::Input);
             r.set_input_content("hello");
             let caret = press(r, KeyCode::Left, KeyModifiers::NONE)
                 && r.cursor == "hell".len()
                 && r.input_text == "hello";
-            next && prev && caret
+            next && prev && at_the_end && caret
         }),
         ("Home / End", |r| {
             r.set_input_content("hello");
             let home = press(r, KeyCode::Home, KeyModifiers::NONE) && r.cursor == 0;
             let end = press(r, KeyCode::End, KeyModifiers::NONE) && r.cursor == "hello".len();
+            // A pane focus turns the same pair into a jump, and the jump leaves
+            // the composer caret where the operator left it.
             r.set_focus(state::FocusPane::Plan);
             r.plan_max_scroll = 30;
             let pane_end = press(r, KeyCode::End, KeyModifiers::NONE) && r.plan_scroll == 30;
             let pane_home = press(r, KeyCode::Home, KeyModifiers::NONE) && r.plan_scroll == 0;
-            home && end && pane_end && pane_home
+            let caret_intact = r.cursor == "hello".len() && r.input_text == "hello";
+            // With the composer focused the jump keys never reach a viewport: the
+            // plan keeps the offset the operator parked.
+            r.plan_scroll = 12;
+            r.set_focus(state::FocusPane::Input);
+            let parked = r.plan_scroll;
+            let no_jump = press(r, KeyCode::End, KeyModifiers::NONE)
+                && press(r, KeyCode::Home, KeyModifiers::NONE)
+                && r.plan_scroll == parked;
+            home && end && pane_end && pane_home && caret_intact && no_jump
         }),
         ("PageUp / PageDown", |r| {
             r.messages = (0..120).map(|i| format!("User: filler {i}")).collect();
@@ -5212,12 +5377,21 @@ fn every_legend_row_is_a_real_handler_path() {
             if bottom == 0 {
                 return false;
             }
-            if !press(r, KeyCode::PageUp, KeyModifiers::NONE)
-                || r.chat_scroll != bottom.saturating_sub(10)
-            {
-                return false;
-            }
-            press(r, KeyCode::PageDown, KeyModifiers::NONE) && r.chat_scroll == bottom
+            let pages = press(r, KeyCode::PageUp, KeyModifiers::NONE)
+                && r.chat_scroll == bottom.saturating_sub(10)
+                && press(r, KeyCode::PageDown, KeyModifiers::NONE)
+                && r.chat_scroll == bottom;
+            // The row says "never the composer": with `Input` focused the page
+            // keys have no owner at all, so they are not key presses and they
+            // state no movement.
+            r.set_focus(state::FocusPane::Input);
+            let parked = r.chat_scroll;
+            let follow = (r.follow, r.chat_auto_scroll);
+            let at_the_composer = !press(r, KeyCode::PageUp, KeyModifiers::NONE)
+                && !press(r, KeyCode::PageDown, KeyModifiers::NONE)
+                && r.chat_scroll == parked
+                && (r.follow, r.chat_auto_scroll) == follow;
+            pages && at_the_composer
         }),
         ("Tab / Shift+Tab", |r| {
             let fwd = press(r, KeyCode::Tab, KeyModifiers::NONE)
@@ -5284,9 +5458,12 @@ fn every_legend_row_is_a_real_handler_path() {
                 && r.chat_auto_scroll;
             off && on
         }),
-        ("x", |r| {
+        ("Ctrl+X", |r| {
+            // The collision-free spelling of the removed bare-`x` mnemonic: the
+            // chord needs the Workers focus its binding has always needed, and it
+            // cannot be mistaken for a draft, because a Ctrl chord never types.
             r.set_focus(state::FocusPane::Workers);
-            press(r, KeyCode::Char('x'), KeyModifiers::NONE)
+            press(r, KeyCode::Char('x'), KeyModifiers::CONTROL)
                 && r.overlay == state::OverlayState::Confirm
                 && r.confirm_action
                     == Some(events::ConfirmAction::CancelWorker {
@@ -5294,14 +5471,6 @@ fn every_legend_row_is_a_real_handler_path() {
                         task_id: Some("t-004".to_string()),
                     })
                 && r.input_text.is_empty()
-        }),
-        ("e", |r| {
-            r.messages
-                .push("LLM error: rate limit exceeded".to_string());
-            press(r, KeyCode::Char('e'), KeyModifiers::NONE)
-                && r.messages
-                    .last()
-                    .is_some_and(|m| m.starts_with("✗ LLM error: rate limit exceeded"))
         }),
         ("Esc", |r| {
             r.open_help();
@@ -5352,6 +5521,19 @@ fn every_legend_row_is_a_real_handler_path() {
     let documented: Vec<&str> = rows.iter().map(|row| row.keys).collect();
     let driven: Vec<&str> = drivers.iter().map(|(keys, _)| *keys).collect();
 
+    // §10.3 counts: the table is the vocabulary, and this test is pinned to its
+    // size so a row added or dropped without a driver (or a driver without a row)
+    // cannot slip through as a length-only mismatch.
+    assert_eq!(
+        rows.len(),
+        25,
+        "the §5 legend row count moved: {documented:?}"
+    );
+    assert_eq!(
+        drivers.len(),
+        25,
+        "one driver per legend row, and the count moved: {driven:?}"
+    );
     for keys in &driven {
         assert!(
             documented.contains(keys),
@@ -5466,7 +5648,8 @@ fn ctrl_d_opens_the_quit_confirm_and_never_exits_un_armed() {
 }
 
 /// §10 item 13: printables and editing keys mutate the composer whatever pane is
-/// focused, and `x` is only a mnemonic while the composer is empty.
+/// focused, and `x` is a letter wherever it is typed — the cancel request is the
+/// `Ctrl+X` chord, which the composer can never mistake for a draft.
 #[test]
 fn printables_and_editing_keys_reach_the_composer_from_every_focus() {
     let mut r = m4_renderer();
@@ -5495,10 +5678,19 @@ fn printables_and_editing_keys_reach_the_composer_from_every_focus() {
     assert_eq!(r.input_text, "what?");
     assert!(!r.help_open, "a typed `?` is not the overlay key");
 
-    // `x` with an empty composer in the Workers pane is the cancel mnemonic (§5).
+    // Bare `x` is a letter in every focus, Workers included: the mnemonic that used
+    // to arm here swallowed the first character of any draft starting with `x`. The
+    // cancel request is the `Ctrl+X` chord, which cannot be mistaken for a draft (§5).
     r.set_focus(state::FocusPane::Workers);
     r.set_input_content("");
     assert!(press(&mut r, KeyCode::Char('x'), KeyModifiers::NONE));
+    assert_eq!(r.input_text, "x", "the letter reached the draft");
+    assert_eq!(
+        r.overlay,
+        state::OverlayState::None,
+        "and a bare letter armed no confirm surface"
+    );
+    assert!(press(&mut r, KeyCode::Char('x'), KeyModifiers::CONTROL));
     assert_eq!(r.overlay, state::OverlayState::Confirm);
     assert_eq!(
         r.confirm_action,
@@ -5507,7 +5699,10 @@ fn printables_and_editing_keys_reach_the_composer_from_every_focus() {
             task_id: Some("t-004".to_string()),
         })
     );
-    assert_eq!(r.input_text, "", "the mnemonic consumed the character");
+    assert_eq!(
+        r.input_text, "x",
+        "the chord consumed nothing: the draft it interrupted is intact"
+    );
     assert_eq!(
         r.status_line,
         "Confirm cancel of worker 'coder_specialist-t-004' — y to cancel it, n or Esc to leave it running."
@@ -5672,8 +5867,9 @@ fn both_quit_requests_route_through_the_renderers_existing_exit() {
     );
 }
 
-/// §5 `x` + §10 items 9/17: the confirm carries the selected row's identity, and
-/// `y` cancels that one worker without ever touching the exit path.
+/// §5 `Ctrl+X` + §10 items 9/17: the confirm carries the selected row's identity,
+/// and `y` cancels that one worker without ever touching the exit path. The chord
+/// carries the old `x` binding's scope and semantics; the bare letter types.
 #[test]
 fn x_then_y_cancels_the_selected_worker_by_name() {
     let mut r = m4_renderer();
@@ -5686,7 +5882,7 @@ fn x_then_y_cancels_the_selected_worker_by_name() {
     r.set_focus(state::FocusPane::Workers);
     r.selected_subagent_idx = 1;
 
-    assert!(press(&mut r, KeyCode::Char('x'), KeyModifiers::NONE));
+    assert!(press(&mut r, KeyCode::Char('x'), KeyModifiers::CONTROL));
     assert_eq!(
         r.confirm_action,
         Some(events::ConfirmAction::CancelWorker {
@@ -5911,12 +6107,18 @@ fn every_worker_row_is_reachable_with_the_arrow_keys() {
     assert_eq!(r.selected_subagent_idx, 0);
 }
 
-/// §5: `e` is never silent. It replays the last error traffic, and when nothing is
-/// recorded it says the sticky buffer still needs the t-012 plumbing.
+/// §5: `/error` is never silent. It replays the last error traffic, and when nothing
+/// is recorded it says the sticky buffer still needs the t-012 plumbing. The bare
+/// `e` that used to carry it is gone — it armed over a pane focus and swallowed the
+/// letter on an empty draft — so the recall is a submitted command here, and it needs
+/// no particular focus to work (the composer-focus case is pinned in
+/// `error_recalls_the_sticky_error_in_every_focus_…` of `tests_new_ui.rs`).
 #[test]
 fn e_recalls_the_last_error_or_reports_what_is_missing() {
     let mut r = TuiRenderer::new();
-    assert!(press(&mut r, KeyCode::Char('e'), KeyModifiers::NONE));
+    r.set_focus(state::FocusPane::Transcript);
+    r.set_input_content("/error");
+    r.submit();
     let nothing = r.messages.last().cloned().unwrap_or_default();
     assert!(
         nothing.contains("No error recorded"),
@@ -5929,7 +6131,8 @@ fn e_recalls_the_last_error_or_reports_what_is_missing() {
 
     r.messages
         .push("LLM error: rate limit exceeded after 3 retries".to_string());
-    assert!(press(&mut r, KeyCode::Char('e'), KeyModifiers::NONE));
+    r.set_input_content("/error");
+    r.submit();
     let recalled = r.messages.last().cloned().unwrap_or_default();
     assert!(
         recalled.starts_with("✗ LLM error: rate limit exceeded after 3 retries"),
@@ -6240,7 +6443,7 @@ fn the_quit_confirm_is_painted_modally_over_the_body_with_the_metrics_live() {
     assert!(!after.join("\n").contains("y / n"), "the surface is gone");
 }
 
-/// §7.3 + §10 item 17: `x` names the **selected** worker on the surface, so the
+/// §7.3 + §10 item 17: `Ctrl+X` names the **selected** worker on the surface, so the
 /// operator sees which row `y` will stop before stopping it.
 #[test]
 fn the_cancel_worker_confirm_names_the_row_it_will_stop() {
@@ -6252,7 +6455,7 @@ fn the_cancel_worker_confirm_names_the_row_it_will_stop() {
     let status = rects.status.expect("the status rect exists at 100x30");
     let plain = draw_new_frame(&mut r, 100, 30);
 
-    assert!(press(&mut r, KeyCode::Char('x'), KeyModifiers::NONE));
+    assert!(press(&mut r, KeyCode::Char('x'), KeyModifiers::CONTROL));
     assert_eq!(
         r.confirm_action,
         Some(events::ConfirmAction::CancelWorker {
@@ -7125,6 +7328,7 @@ fn draw_workers_pane(
                 selected,
                 detail_present: true,
                 scroll: detail_scroll,
+                autoscroll: false,
                 list_scroll: 0,
                 show_thought,
                 thinking_budget: None,
@@ -8244,6 +8448,83 @@ fn the_status_row_names_held_and_queued_streams_and_keeps_every_count() {
         assert!(line.contains(name), "the name list names {name}: {line:?}");
     }
 
+    // §F1 (research): the metrics row is **one** DarkGray band, so every element on
+    // it has to name its own `fg`. The defect was `text_dim` (DarkGray, no `bg`)
+    // painted inside that band — the separators, the `ctx` field and the whole
+    // worker-name list were DarkGray-on-DarkGray and therefore invisible. The row is
+    // now routed through the band tokens (`band_surface` for the fill, `chip_neutral`
+    // / `chip_muted` / `chip_value` for the contents), and this pins the invariant on
+    // the painted frame: no cell of the band ever carries the band colour as ink.
+    let (drawn, styles) = draw_new_frame_styled(&mut r, 150, 40);
+    let band = theme::band_surface().bg;
+    assert_eq!(
+        theme::band_surface().fg,
+        None,
+        "the band surface owns no ink of its own"
+    );
+    let (row, metrics) = drawn
+        .iter()
+        .enumerate()
+        .find(|(_, row)| row.trim_start().starts_with("Tokens"))
+        .expect("the metrics row is drawn");
+    for (cell, style) in styles[row].iter().enumerate() {
+        assert_eq!(
+            style.bg, band,
+            "cell {cell} of the metrics row is not the band: {metrics:?}"
+        );
+        if let Some(fg) = style.fg {
+            assert_ne!(
+                Some(fg),
+                band,
+                "cell {cell} paints {fg:?} on the band: {metrics:?}"
+            );
+        }
+    }
+    // Element by element: the separators and the name list are the band's own muted
+    // rung, the counts are the neutral band chip, and the token pair is the band's
+    // readable-number rung.
+    let painted = |needle: &str| {
+        let cell = metrics
+            .find(needle)
+            .map(|byte| metrics[..byte].chars().count())
+            .unwrap_or_else(|| panic!("{needle:?} is not on the drawn metrics row: {metrics:?}"));
+        styles[row][cell]
+    };
+    for needle in [
+        " | ",
+        "coder-t-9710",
+        "validator-t-9711",
+        "coder_specialist-t-9712",
+    ] {
+        assert_eq!(
+            painted(needle).fg,
+            theme::chip_muted().fg,
+            "{needle:?} is the band's muted rung, not the chrome rung: {metrics:?}"
+        );
+        assert_eq!(
+            painted(needle).bg,
+            band,
+            "{needle:?} carries the band: {metrics:?}"
+        );
+    }
+    for needle in ["3a", "1p", "1q"] {
+        assert_eq!(
+            painted(needle).fg,
+            theme::chip_neutral().fg,
+            "the {needle} count is the neutral band chip: {metrics:?}"
+        );
+    }
+    assert_eq!(
+        painted(" Tokens ").fg,
+        theme::chip_neutral().fg,
+        "the token label is the neutral band chip: {metrics:?}"
+    );
+    assert_eq!(
+        painted("in /").fg,
+        theme::chip_value().fg,
+        "the token pair is the band's number rung, not the fg-less body slot: {metrics:?}"
+    );
+
     // Control: one running row adds no pause and no queue segment, so those counts
     // cannot be a standing caption.
     let mut plain = TuiRenderer::new();
@@ -8448,8 +8729,16 @@ fn the_thinking_half_is_gated_by_the_toggle_and_reports_its_budget() {
 
     // Toggle on, through the renderer seam (it is what hands the pane the budget the
     // worker was launched with): the text and the countdown ride the same header line.
+    // The header sits at the head of the thinking half, so the fixture holds the detail
+    // there instead of letting the follow flag answer itself: with
+    // `subagent_autoscroll` on — the boot default — the pane now pins a body longer than
+    // the viewport to its tail, which is exactly what the retired `render.rs` pass used
+    // to do to `subagent_scroll` off-file, and a 4000-char reasoning body scrolls the
+    // header away (pinned separately below by
+    // `the_detail_follow_flag_pins_the_pane_to_the_tail_it_measured`).
     r.set_view_mode(state::ViewMode::Workers);
     r.show_thought = true;
+    r.subagent_autoscroll = false;
     let frame = draw_new_frame(&mut r, 120, 40);
     let text = frame.join("\n");
     assert!(
@@ -8464,6 +8753,229 @@ fn the_thinking_half_is_gated_by_the_toggle_and_reports_its_budget() {
     assert!(
         roster.contains("2/4"),
         "and the rank is still there: {roster:?}"
+    );
+}
+
+/// The key path and the draw path on one geometry (audit defect 11): the transcript's
+/// `↑` steps against the maximum the **last frame drew** — `BodyReport::max_scroll`
+/// published by the write-back in `draw_new_ui` — and not against a line-count estimate
+/// measured off-file. Before the repair the key clamped against
+/// `estimated_chat_lines(...)` while the pane clamped and pinned the body against the
+/// lines it had actually drawn at its own width, one column narrower once its scrollbar
+/// was needed, so a step taken before a frame wrote back could land anywhere.
+#[test]
+fn a_transcript_step_measures_the_geometry_the_last_frame_drew() {
+    let mut r = TuiRenderer::new();
+    r.set_view_mode(state::ViewMode::Transcript);
+    r.messages = (1..=80)
+        .map(|n| format!("message {n:02} — one line each, long enough to be counted"))
+        .collect();
+    draw_new_frame(&mut r, 120, 40);
+    let measured = r
+        .transcript_measured_max
+        .get()
+        .expect("the pane reported its measure");
+    assert!(
+        measured > 10,
+        "the fixture needs a body to scroll: {measured}"
+    );
+    assert!(r.follow, "follow is the boot default");
+    assert_eq!(
+        usize::from(r.chat_scroll),
+        measured,
+        "the frame pinned the body at the tail it measured"
+    );
+
+    // One press, one row — the step is measured against that published maximum.
+    r.set_focus(state::FocusPane::Transcript);
+    r.scroll_up(1);
+    assert_eq!(
+        usize::from(r.chat_scroll),
+        measured - 1,
+        "one press stepped one row off the geometry the frame drew"
+    );
+    assert!(!r.follow, "stepping off the tail takes follow off");
+
+    // The chip row states the same numbers the keys stepped from, so the follow chip
+    // and the viewport are one decision and not two measurements.
+    let frame = draw_new_frame(&mut r, 120, 40);
+    assert_eq!(
+        usize::from(r.chat_scroll),
+        measured - 1,
+        "the frame kept the offset the operator parked"
+    );
+    let text = frame.join("\n");
+    assert!(
+        text.contains(&format!(" scroll {}/{} ", measured - 1, measured)),
+        "the readout names the drawn maximum the key path used, got:\n{text}"
+    );
+    assert!(
+        text.contains(" ↓ 1 new "),
+        "and the unseen count is stated against it: {text}"
+    );
+    assert!(
+        !text.contains("● LIVE"),
+        "the follow chip agrees with a viewport that is off the tail: {text}"
+    );
+}
+
+/// The follow flag answers itself inside the pane (defect 12, defect 15): with
+/// `subagent_autoscroll` on, a detail body longer than the viewport is pinned to the tail
+/// the pane *measured*, not to a line-count estimate written from outside it. The pin is
+/// checked at the frame seam because that is where the flag is handed over, and the
+/// reported maximum is what the scroll keys in `events.rs` clamp against on the next
+/// press — the chip row, the viewport and the key path all read one decision.
+#[test]
+fn the_detail_follow_flag_pins_the_pane_to_the_tail_it_measured() {
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.set_focus(state::FocusPane::Workers);
+    r.subagents.push(SubagentDetail {
+        name: "coder-t-9731".to_string(),
+        task_id: Some("t-9731".to_string()),
+        is_active: true,
+        logs: (1..=60).map(|n| format!("log line {n}")).collect(),
+        ..SubagentDetail::default()
+    });
+    // The operator has scrolled up: the offset is theirs, and the flag is what asks for
+    // the tail back.
+    r.subagent_scroll = 4;
+    assert!(r.subagent_autoscroll, "follow is the boot default");
+
+    let frame = draw_new_frame(&mut r, 120, 40);
+    let measured = r
+        .detail_measured_max
+        .get()
+        .expect("the pane reported its measure");
+    assert!(
+        measured > 0,
+        "60 log lines do not fit the detail half, so there is a tail to pin"
+    );
+    assert_eq!(
+        usize::from(r.subagent_scroll),
+        measured,
+        "the frame parks the offset at the tail this pass measured"
+    );
+    let text = frame.join("\n");
+    assert!(
+        text.contains("log line 60"),
+        "the newest line is on screen while following, got:\n{text}"
+    );
+    assert!(
+        !text.contains("log line 1 "),
+        "and the head of the body is off screen: {text}"
+    );
+
+    // The same frame is the one the key path steps from: holding the flag off and
+    // pressing `↑` moves exactly one row off the measured tail, never a jump.
+    r.subagent_autoscroll = false;
+    r.scroll_up(1);
+    assert_eq!(
+        usize::from(r.subagent_scroll),
+        measured - 1,
+        "one press steps one row off the geometry the frame drew"
+    );
+}
+
+/// Audit defect 13, asserted at the seam that opened it: a started delegation records
+/// which task is in flight and says **nothing** about the plan viewport. The plan the
+/// operator parked off-centre is not handed back to the in-flight task by new task
+/// traffic — centring is armed only by a plan document this process has never seen
+/// (`arm_plan_centring`, on the `had_active_plan` edge in `render.rs::refresh_plan_cache`)
+/// and released by a plan scroll key (`events.rs::scroll_plan_to`).
+///
+/// The fixture states `had_active_plan` up front because that is the defect-13 case: the
+/// plan on screen is one this process has already seen, so there is no centring edge to
+/// fire. The drawn-window half of the pin is asserted **before** the delegation on
+/// purpose: `on_event` ends in a throttled `force_flush`/`flush` → `render_terminal` →
+/// `draw`, and that legacy paint path re-reads `.marmel/execution_plan.md` from disk on
+/// its own 250 ms cadence, so a test renderer reached through `on_event` can end up
+/// drawing whatever plan file the machine happens to hold. What the delegation must not
+/// do — arm centring — is a state fact, and is asserted after the seam.
+#[test]
+fn a_started_delegation_never_hands_the_plan_viewport_back_to_the_in_flight_task() {
+    let mut r = TuiRenderer::new();
+    r.set_view_mode(state::ViewMode::Split);
+    r.plan_content = (1..=60)
+        .map(|n| format!("- [ ] [t-99{n:02}] plan step {n:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    r.had_active_plan = true;
+    draw_new_frame(&mut r, 120, 40);
+    let tail = usize::from(r.plan_max_scroll);
+    assert!(
+        tail > 10,
+        "the fixture needs a plan taller than its pane, got {tail}"
+    );
+
+    // An operator gesture, twice over: down to the tail, then three rows back up. The
+    // gesture owns the offset and the release of centring.
+    r.set_focus(state::FocusPane::Plan);
+    assert!(r.scroll_to_bottom(), "the plan had a tail to reach");
+    assert_eq!(
+        usize::from(r.plan_scroll),
+        tail,
+        "the key stepped to the maximum the pane measured"
+    );
+    assert!(r.scroll_up(3), "and stepped back off it");
+    let held = usize::from(r.plan_scroll);
+    assert!(
+        !r.plan_auto_scroll,
+        "a plan gesture releases centring on the in-flight task"
+    );
+
+    // The frame under a released centring draws the operator's window and nothing else:
+    // three rows short of the tail (`plan step 57` is the last line of the 60-line body
+    // at that offset), neither nailed to the tail nor centred on the task in flight.
+    let parked = draw_new_frame(&mut r, 120, 40);
+    assert_eq!(
+        usize::from(r.plan_scroll),
+        held,
+        "the frame moved a plan offset the operator parked"
+    );
+    let rects = layout::compute_layout(Rect::new(0, 0, 120, 40), &state::UiView::from_renderer(&r));
+    let plan = rects.plan.expect("the plan pane is on");
+    let shown = pane_says(&parked, plan);
+    assert!(
+        shown.contains("plan step 57"),
+        "the parked window — three rows above the tail — is what is drawn: {shown}"
+    );
+    assert!(
+        !shown.contains("plan step 60"),
+        "the frame did not nail the plan back to its tail: {shown}"
+    );
+    assert!(
+        !shown.contains("plan step 01"),
+        "the frame did not centre the plan on the task in flight: {shown}"
+    );
+
+    // Task traffic, three times over: a started task, that task completing, another
+    // started task. None of the three may arm centring.
+    let traffic = [
+        Event::Delegation(crate::orchestrator::DelegationEvent::Started {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-9901".to_string()),
+        }),
+        Event::Delegation(crate::orchestrator::DelegationEvent::Completed {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-9901".to_string()),
+        }),
+        Event::Delegation(crate::orchestrator::DelegationEvent::Started {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-9902".to_string()),
+        }),
+    ];
+    for (index, event) in traffic.iter().enumerate() {
+        r.on_event(event);
+        assert!(
+            !r.plan_auto_scroll,
+            "delegation traffic {index} re-armed plan centring"
+        );
+    }
+    assert_eq!(
+        r.active_plan_task.as_deref(),
+        Some("t-9902"),
+        "the task in flight is still recorded — only its power to re-centre is gone"
     );
 }
 
@@ -8970,8 +9482,8 @@ fn every_task_in_flight_is_marked_and_a_prefixed_sibling_is_not() {
         let style = row_style(&styles, &drawn, line);
         assert_eq!(
             style.fg,
-            Some(Color::Yellow),
-            "an in-flight line is the active chip colour: {line}"
+            theme::state_running().fg,
+            "an in-flight line wears the in-flight slot: {line}"
         );
         assert!(
             style.add_modifier.contains(Modifier::BOLD),
@@ -8981,11 +9493,33 @@ fn every_task_in_flight_is_marked_and_a_prefixed_sibling_is_not() {
     let sibling = row_style(&styles, &drawn, "[t-90] a prefixed sibling");
     assert_eq!(
         sibling.fg,
-        Some(Color::LightRed),
-        "t-90 is not t-9: it stays an open line"
+        theme::state_queued().fg,
+        "t-90 is not t-9: it stays an open line, so it wears the waiting slot"
+    );
+    // §F4: an open task is waiting, not wrong. The warm hues are reserved for
+    // problems (`state_failed`, `state_replan`) and for work in flight
+    // (`state_running`), so an open line may never sit one lightness step from an
+    // error — it has to be cool or neutral.
+    for warm in [
+        theme::state_failed().fg,
+        theme::state_replan().fg,
+        theme::state_running().fg,
+    ] {
+        assert_ne!(
+            sibling.fg, warm,
+            "an open plan line never wears a warm hue (§F4)"
+        );
+    }
+    assert!(
+        matches!(
+            sibling.fg,
+            Some(Color::Blue | Color::LightBlue | Color::Gray | Color::White)
+        ),
+        "the open-state hue is cool or neutral (§F4), got {:?}",
+        sibling.fg
     );
     let done = row_style(&styles, &drawn, "[t-5] already finished");
-    assert_eq!(done.fg, Some(Color::Green), "a checked line reads done");
+    assert_eq!(done.fg, theme::state_done().fg, "a checked line reads done");
 }
 
 /// The streaming half of the transcript, re-established: the content buffer is

@@ -186,13 +186,13 @@ becomes a thin call into the component with a borrowed `FrameContext`.
 | Header | `components/header.rs` | `PlanProgress` computed in-spec from `TuiRenderer::plan_content` (mod.rs:87) using `plan_parse::CheckboxState` (plan_parse.rs:50-55) + `SubagentDetail::task_id` / `active_plan_task` (mod.rs:171-173, ui/mod.rs:40) | `3/7 done`, `> t-004`, `ctx %`, `elapsed`, mode id, `val N` (only after D1) | none (read-only); `F1` for legend |
 | Status bar | `components/status_bar.rs` | `tokens_in`/`tokens_out`/`orchestrator_context_tokens` (mod.rs:191-195), `session_start` (mod.rs:187), `status_line` (mod.rs:106), `ACTIVITY_STATUS_KEYWORDS` spinner tier (mod.rs:56), counts over `subagents: Vec<SubagentDetail>` (`is_active`/`paused`/`queue`, ui/mod.rs:55,60,76) | tokens in/out, ctx %, elapsed, active/paused/queued counts, max validation round (post-D1); row 2 = state chips + abort-arm prompt | none; chips are state echoes (G5) |
 | Plan / task overview | `components/plan.rs` | `plan_content` (mod.rs:87) polled from `.marmel/execution_plan.md` with the 250 ms mtime cache (render.rs:266-322); active-task set as today (render.rs:512-538) | plan markdown, checkbox colouring, `done/total` line, active-task highlight, `No active execution plan.` empty state | `PageUp/Down`, `Home/End`, `Ctrl+P` toggle, `Tab` focus |
-| Transcript | `components/transcript.rs` | `messages: Vec<String>` (mod.rs:81) via `formatting::render_markdown_lines` (1148) / `parse_ansi_lines` (1138); `current_thought`/`current_content` (mod.rs:83,85), `steer_sentence_buffer` (:135) | scrollback + streaming region + `↓ N new`/`LIVE` chip + scrollbar | `PageUp/Down`, `Home/End`, `Ctrl+F` follow toggle, `e` last error |
-| Worker activity feed | `components/workers.rs` | `subagents: Vec<SubagentDetail>` (mod.rs:121) plus the per-frame `orchestrator::worker_entries()` snapshot (render.rs:659) and badge from `helpers::subagent_row_badge` (helpers.rs:627) | roster (state glyph, ctx, elapsed), selection highlight, roster `n/total`, detail `[Thinking]/[Output]/[Logs]` (logs merged + capped at 200, mod.rs:496-512) | `Tab` focus, `←/→` select worker, `↑/↓` scroll, `x` cancel selected |
+| Transcript | `components/transcript.rs` | `messages: Vec<String>` (mod.rs:81) via `formatting::render_markdown_lines` (1148) / `parse_ansi_lines` (1138); `current_thought`/`current_content` (mod.rs:83,85), `steer_sentence_buffer` (:135) | scrollback + streaming region + `↓ N new`/`LIVE` chip + scrollbar | `PageUp/Down`, `Home/End`, `Ctrl+F` follow toggle; the last-error recall is the `/error` command — the `e` key is removed (§5) |
+| Worker activity feed | `components/workers.rs` | `subagents: Vec<SubagentDetail>` (mod.rs:121) plus the per-frame `orchestrator::worker_entries()` snapshot (render.rs:659) and badge from `helpers::subagent_row_badge` (helpers.rs:627) | roster (state glyph, ctx, elapsed), selection highlight, roster `n/total`, detail `[Thinking]/[Output]/[Logs]` (logs merged + capped at 200, mod.rs:496-512) | `Tab` focus, `←/→` select worker, `↑/↓` walk the roster window (`PageUp/Down`, `Home/End` the detail log), `Ctrl+X` cancel selected (the bare `x` is removed, §5) |
 | Input / composer | `components/composer.rs` | `textarea: ratatui_textarea::TextArea` (mod.rs:89), `input_text`/`cursor` (:91,:93), `history`/`history_index`/`input_draft` (:129-133) | draft with real height 3..9, caret, `+n` overflow marker, slash-command hint in the border title | typing (always), `Enter`, history, undo/redo, paste (events.rs:288-291,319-338) |
 | Help / keymap overlay | `components/help_overlay.rs` + `components/keymap.rs` | `keymap::legend()` — generated from the same table the key handler matches on (replaces the hard-coded legend, events.rs:789-813) | full key table + slash-command table with argument hints | `?` (empty composer) / `F1` open; `Esc` close (no arming) |
 | Confirm overlay | `components/confirm_overlay.rs` | `confirm_action: Option<ConfirmAction>` (`src/ui/tui/events.rs`) — exactly `ConfirmAction::{Quit, CancelWorker{key,task_id}, CancelAll, Command{line}}`; the overlay text is built by `help::ConfirmRequest` | what will happen, what it touches, `y`/`n` prompt | `y` yes, `n` no, `Esc` dismiss; all other keys ignored |
 | (support) layout | `components/layout.rs` | pure function over `Size` + pane visibility | `Panes { header, body, status, input, footer, per-pane Option<Rect> }` | — |
-| (support) palette | `components/palette.rs` | `Color`/`Style` constants + `Glyph` enum | §7 | — |
+| (support) palette | `src/ui/tui/theme.rs` (`mod theme;`, private to `ui::tui`) | semantic role tokens returning `Style` (no `Theme` struct, no runtime switch) + `Glyph` enum + glyph pickers | §7.1–§7.2 | — |
 
 **Confirm-action inventory (normative; matches `enum ConfirmAction` in `src/ui/tui/events.rs`).** There are
 exactly four confirm surfaces: `Quit`, `CancelWorker { key, task_id }`, `CancelAll`, `Command { line }`. There
@@ -245,8 +245,10 @@ mode-conditional (G1, G4, P1.1).
 regardless of `focus` — this closes the dead-key hole at events.rs:141-154,214-220. Only non-printable
 navigation/shortcut keys are interpreted as commands when a non-input pane is focused
 (`↑↓←→`, `Home/End`, `PageUp/PageDown`, `Tab`, `F1–F5`, `Ctrl+A/P/T/F/Z/Y`, `Esc`, `Ctrl+C`, `Ctrl+D`).
-Single-letter shortcuts (`x`, `e`, `?`) are honoured **only when the composer is empty**; if the draft is
-non-empty they insert literally, because that rule protects typing (G6) which outranks mnemonics.
+`?` is the **only** single-letter shortcut the handler still honours, and only when the composer is empty;
+the two that used to share that rule (`x`, `e`) are **removed** (§5, *Deprecated / deleted*), so every other
+printable — `x` and `e` included — inserts literally whatever the draft says, which is the G6 rule: protecting
+typing outranks mnemonics.
 
 ## 5. Keymap
 
@@ -261,8 +263,8 @@ table into the footer, the `F1` overlay and `/help` — one source, so the legen
 | printable / `Char` / paste | insert in composer — **always**, any focus (fixes events.rs:214-220; paste events.rs:288-291,319-338) | composer |
 | `Backspace`, `Delete`, `Char(0x08)`, `Char(0x7f)` | edit composer — **always**, any focus (fixes events.rs:141-154) | composer |
 | `Ctrl+Z` / `Ctrl+Y` | undo / redo (events.rs:202-209) | composer |
-| `Ctrl+Up` / `Ctrl+Down` | input history prev / next (events.rs:65-66,78-79) | composer |
-| `Up` / `Down` | composer empty & caret on first line: history; otherwise scroll focused pane ±1 (events.rs:67-74,80-87) | composer / pane |
+| `Ctrl+Up` / `Ctrl+Down` | input history prev / next — the **only** history route, and it works in **every** focus (`history_prev` / `history_next` behind the `ctrl` arm of `on_key_event`) | composer |
+| `Up` / `Down` | scroll the focused pane ±1 when a **pane** holds focus (Workers: the roster window); with **composer** focus the caret moves inside a multi-line draft only, and a press with nowhere for the caret to go is not claimed at all — the old "composer empty: history" half of this row is **removed** (moved to the `Ctrl+Up` / `Ctrl+Down` row above; `scroll_or_history` in `src/ui/tui/events.rs`; see *Deprecated / deleted*) | pane / composer |
 | `Left` / `Right` | Workers focused: prev/next worker; else move caret (events.rs:90-122) | pane / composer |
 | `Home` / `End` | composer: line start/end; pane: top/bottom (events.rs:123-140) | pane / composer |
 | `PageUp` / `PageDown` | scroll focused pane ±10 (events.rs:62-63) | pane |
@@ -272,8 +274,9 @@ table into the footer, the `F1` overlay and `/help` — one source, so the legen
 | `Ctrl+P` / `Ctrl+A` | show Plan pane / show Workers pane (events.rs:176-184,185-194) | global |
 | `Ctrl+T` | toggle thinking display (events.rs:195-201); state chip, not a chat line (G5) | global |
 | `Ctrl+F` | toggle transcript follow (LIVE / ↓ N new) (G7) | global |
-| `x` (empty composer, Workers focused) | cancel **selected** worker → confirm overlay → `orchestrator::cancel_active_worker(key, task_id)` (workers.rs:1455); **never** `cancel_all()` (bus.rs:38) | pane |
-| `e` (empty composer) | show last sticky error in the transcript | global |
+| **removed** `x` (empty composer, Workers focused) | the bare-letter cancel is gone: it armed on an empty draft in the Workers pane and swallowed the letter (see *Deprecated / deleted*). `x` now reaches the composer like any printable; the binding below replaced it | — |
+| `Ctrl+X` (Workers focused) | cancel **selected** worker → confirm overlay → `orchestrator::cancel_active_worker(key, task_id)`; **never** `cancel_all()` — same scope, same captured identity and same confirm as the removed `x`, plus a status-line notice when the guard is not met; `/cancel <worker key or task id>` (§6) is the named-row spelling | pane |
+| **removed** `e` (empty composer) | the sticky-error recall is no longer a key at all: it armed on an empty draft over a pane focus and swallowed the letter (see *Deprecated / deleted*). `/error` (§6) prints the last sticky error in the transcript from **any** focus | — |
 | `Esc` | overlay open → close; else arm abort (3 s window, mod.rs:410-415); armed again → `request_user_exit` (events.rs:44-59) — never re-focuses | global |
 | `Ctrl+C` | same as `Esc` (events.rs:156-172) | global |
 | `Ctrl+D` | open the `Quit` confirm overlay — never exits un-armed | global |
@@ -297,6 +300,20 @@ table into the footer, the `F1` overlay and `/help` — one source, so the legen
   (helpers.rs:183-186) so a pasted multi-line block is still delivered verbatim.
 - **`Esc`'s side effect of silently re-focusing Chat (events.rs:51-53) removed** (UX friction 8).
 - **The 3-row roster clamp (render.rs:647-653) removed** (G8).
+- **Bare `x` (empty composer, Workers focused) removed** — it armed on an empty draft in the Workers pane and
+  swallowed the letter, which is exactly the moment a letter is the first character of what the operator is
+  typing. The capability moved to spellings that cannot collide with a draft: `Ctrl+X` (pane scope, confirm
+  overlay, same selected row and same captured identity) and `/cancel <worker key or task id>` (§6).
+- **Bare `e` (empty composer) removed** — same failure mode over a pane focus: it armed on an empty draft and
+  swallowed the letter. `/error` (§6) prints the sticky last error and, being a slash command, is
+  focus-independent.
+- **Plain `Up` / `Down` history recall removed** — one keystroke was both a pane gesture and a composer
+  gesture, so an arrow spent while scrolling a pane replaced the draft. `Ctrl+Up` / `Ctrl+Down` walks the
+  input history in every focus; the plain arrows are assigned by focus alone (§4.2, §5).
+
+The three rows above are the same entries `?` / `F1` and `/help` print under the keymap table: `removed()` in
+`src/ui/tui/components/help.rs` is their single owner, and they are deliberately **not** rows of
+`legend()` — the legend may only name keys the handler binds (§10.3).
 
 ## 6. Slash commands
 
@@ -311,7 +328,7 @@ being typed; `/` alone lists all commands in the transcript and the hint line sh
 | `/follow` | — | toggle transcript follow; chip `LIVE` / `↓ N new` (G7) | `/f` |
 | `/plan`, `/workers` | — | show Plan / Workers pane (= `Ctrl+P` / `Ctrl+A`) | |
 | `/mode` | `transcript\|plan\|workers\|split` | set view mode | `/mode <tab>` lists the four names |
-| `/error` | — | print the sticky last error + the log path (`.marmel/marmel.log`) | pairs with `e` |
+| `/error` | — | print the sticky last error + the log path (`.marmel/marmel.log`) | the **only** recall route — the bare `e` binding was removed (§5); focus-independent |
 | `/retry` | — | re-submit the most recent history entry verbatim (history at mod.rs:129-133) | confirm only if the composer is non-empty |
 | `/cancel` | `<worker key or task id>` | cancel **one** worker → confirm overlay → `cancel_active_worker` (workers.rs:1455) | no arg + Workers focus ⇒ uses the selected row; **`cancel_all()` not called** |
 | `/cancel-all` | — | cancel every worker → confirm overlay → `orchestrator::cancel_all()` (bus.rs:38) | distinct from `/cancel` |
@@ -331,39 +348,179 @@ Ambiguity is resolved by longest-common-prefix, never by guessing a command the 
 
 ## 7. Visual language
 
-### 7.1 Palette slots (`components/palette.rs`, concrete values)
+### 7.1 Palette: semantic role tokens (`src/ui/tui/theme.rs`)
 
-| Slot | Value | Used by |
-|---|---|---|
-| `frame_focus` | `Style::default().fg(Color::Cyan)` | focused pane border (keeps today's Cyan, render.rs:426-430) |
-| `frame_idle` | `Style::default().fg(Color::DarkGray)` | unfocused border (keeps DarkGray) |
-| `frame_alert` | `Style::default().fg(Color::Red)` | abort-armed input border (render.rs:1183-1187), `✗` |
-| `frame_confirm` | `Style::default().fg(Color::Yellow)` | confirm overlay border |
-| `chip` | `Style::default().fg(Color::White).bg(Color::DarkGray)` | status row-2 state chips |
-| `chip_active` | `Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)` | `▶` running, active plan task (render.rs:548-569 pattern) |
-| `chip_done` | `Style::default().fg(Color::Green)` | `✓`, `[x]`, plan headers |
-| `chip_pending` | `Style::default().fg(Color::LightRed)` | `[ ]`, pending task (render.rs:548-569) |
-| `text_primary` | `Style::default()` | body text |
-| `text_dim` | `Style::default().fg(Color::DarkGray)` | secondary header/status fields |
-| `error` | `Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)` | sticky error line, `LLM error:` |
+The palette lives in **`src/ui/tui/theme.rs`** (`mod theme;`, private to `ui::tui`). Earlier drafts of
+this spec called it `components/palette.rs`; that file does not exist. There is no `Theme` struct and no
+runtime switch — a slot is a free function returning a `ratatui::style::Style`, and a component asks for
+a **role** (`state_running`, `role_tool`, `scroll_unseen`), never a hue. `theme.rs` is the only module
+allowed to name a `Color`.
+
+Normative rules (the same contract is a doc-comment table at the top of `theme.rs`, and each rule below
+is pinned by a unit test in that file):
+
+1. **A token names a UI role, never a hue.** Call sites stay readable when a hue moves, and a hue may be
+   re-used in a different screen region without lying about what it marks.
+2. **Named ANSI-16 colours only.** `theme.rs` detects whether to paint at all (§F9, the capability
+   paragraph below) but negotiates no wider ramp: `COLORTERM` is ignored and no `Color::Rgb` /
+   `Color::Indexed` value exists in `src/`, so a truecolor value would still be a guess about the
+   operator's profile. `palette_stays_on_the_named_ansi_16_ramp` fails if a slot leaves the named ramp.
+3. **Colour never carries meaning alone.** Every state also ships a glyph and a word (§7.2), focus also
+   ships the `●` badge (§7.3), verdicts and sections ship words.
+4. **Warm is for problems.** `Red` = failed / irreversible; `LightRed` = "needs attention, nothing broke".
+   Waiting, live, unseen-new, queued and selection slots are cool (`Blue`/`LightBlue`) or neutral
+   (`Gray`/`White`), so a benign chip is never one lightness step from an error.
+5. **Band-aware.** The status row is painted over a DarkGray band, so a style with no `bg` inherits it —
+   `text_muted` (DarkGray) inside the band is invisible text. Anything drawn inside the band must use a
+   band slot that pairs its `fg` with `bg(DarkGray)`.
+
+**Capability layer (research §F9).** `theme.rs` resolves the terminal's colour capability **once per
+process** — a `OnceLock` read of `NO_COLOR` and `TERM` in the style of `sandbox::kernel_has_landlock`, never
+a per-frame `getenv` — and applies it inside the slot constructors, so no call site and no routing pass ever
+learns it exists: `NO_COLOR` set to any non-empty value (the [no-color.org](https://no-color.org) rule, value
+never parsed; an empty `NO_COLOR=` leaves colour on), or `TERM=dumb` / absent / empty, degrades every style to
+**no `fg` and no `bg`** while keeping the informational modifiers (`BOLD`, `ITALIC`) and every glyph, word
+label and `●` badge identical — rule 3 is what makes that survivable — and the band drops its `bg(DarkGray)`
+fill rather than depending on one (`band_surface`, `caret_line`, the band chips). `COLORFGBG` light-background
+detection and a `COLORTERM` upgrade are deliberately **not** implemented: `COLORFGBG` is absent on most
+emulators with no reliable default, and the palette has no light-background fork to switch to, so acting on
+that guess could only re-arrange rule 4's warm/cool contract while changing no glyph, label or redundancy;
+`COLORTERM` can only license a ramp rule 2 refuses to use. In `cfg(test)` builds the palette is pinned rather
+than read from the runner's environment, and tests force a tier through a thread-local guard
+(`Forced::monochrome()`), never `std::env::set_var` (`docs/fix_notice_reply_flakiness.md` §7). Values below
+are shorthand for `Style::default().fg(…)` / `.add_modifier(…)`; "on DarkGray" means
+`.fg(…).bg(Color::DarkGray)`. `Reach: live` means production code calls the slot today; `Reach: bridge`
+means the slot is declared but no call site routes it yet — it carries a scoped `#[allow(dead_code)]`
+plus a `route at <file:line>` note, which the call-site pass deletes when it adds the call (the crate
+denies `dead_code`/`unused`, and `theme` is a private module, so an unrouted slot cannot simply be left
+unattributed).
+
+**Pane frames**
+
+| Slot | Value | Role — and what it must never do | Reach |
+|---|---|---|---|
+| `frame_focus` | Cyan | focused pane frame + title; never a content accent, never a modal frame | live |
+| `frame_idle` | DarkGray | unfocused pane frame + title | live |
+| `frame_danger` | Red | armed abort, too-small notice; never a benign warning | live (via `frame_alert`) |
+| `frame_caution` | Yellow | confirm gate frame; never pane focus | live (via `frame_confirm`) |
+| `frame_notice` | LightBlue | help/keymap modal frame — "a modal is up" is not "focus moved" | bridge |
+
+**Text hierarchy**
+
+| Slot | Value | Role — and what it must never do | Reach |
+|---|---|---|---|
+| `text_primary` | *(no fg, no bg)* | all body prose, composer draft, overlay body; must stay fg-less so it follows the terminal profile — forcing `White` is unreadable on a light profile | live |
+| `text_secondary` | Gray | values, ids, empty states, first-run guidance; never inside the band | bridge |
+| `text_muted` | DarkGray | chrome labels, separators, gutters, scroll readouts — **outside** the band only; never an empty state | live (via `text_dim`) |
+| `text_thought` | DarkGray + ITALIC | the reasoning stream; always introduced by a label, because a terminal without italics collapses it onto `text_muted` | bridge |
+
+**Structural emphasis (no state hue)**
+
+| Slot | Value | Role — and what it must never do | Reach |
+|---|---|---|---|
+| `section_header` | Gray + BOLD | `[Thinking]` / `[Validator]` / `[Output]` / `[Logs]`; carries no state, so a section is never red just because it is named Validator | bridge |
+| `selection` | White + BOLD | the pointer on the selected roster row; must not borrow the in-flight hue | bridge |
+
+**The band (one surface, three chip `fg`s)**
+
+| Slot | Value | Role — and what it must never do | Reach |
+|---|---|---|---|
+| `band_surface` | bg DarkGray | the status row surface itself; its text colour always comes from a band chip | bridge |
+| `chip_neutral` | White on DarkGray | neutral state-echo chips on the band; never a verdict slot | live (via `chip`) |
+| `chip_muted` | Gray on DarkGray | the muted rung *inside* the band — the band-safe twin of `text_muted` | bridge |
+| `chip_value` | White on DarkGray + BOLD | numbers worth reading on the band; `text_primary` has no `bg` and must not be used there | bridge |
+
+**Lifecycle states (plan tasks and worker rows; also drive `Glyph::style`, §7.2)**
+
+| Slot | Value | Role — and what it must never do | Reach |
+|---|---|---|---|
+| `state_running` | Yellow + BOLD | in flight: `▶`, active task id, live worker; do not re-add `BOLD` at the call site; never a selection marker | live (via `chip_active`, `Glyph::Active`) |
+| `state_queued` | Blue | waiting: `⧗`, open plan line `[ ]`, queue rank, queued steers, validating | live (`Glyph::Pending`) |
+| `state_paused` | Gray | parked stream `⏸`; must stay distinct from queued and from the neutral chip | live (`Glyph::Paused`) |
+| `state_done` | Green | delivered/approved/checked `✓`; never the wordmark, never "live/following" | live (via `chip_done`, `Glyph::Done`) |
+| `state_failed` | Red + BOLD | failed/aborted/rejected `✗`, sticky error line; never a section header, never a warning | live (via `error`, `Glyph::Failed`) |
+| `state_replan` | LightRed | needs attention without having failed: `REPLAN`, `val N`; never an open task, queue rank, scroll state or overflow marker | live (via `chip_pending`) |
+
+**Verdicts (four slots, never colliding — `✗` is shared by two of them)**
+
+| Slot | Value | Role | Reach |
+|---|---|---|---|
+| `verdict_ok` | Green | `MISSION COMPLETE` | bridge |
+| `verdict_reject` | Gray + BOLD | `REVOKED` — withdrawn, not failed; must never equal `verdict_fail`, and may not reuse the chrome chip | bridge |
+| `verdict_fail` | Red + BOLD | `FAILED` | bridge |
+| `verdict_replan` | LightRed | `REPLAN REQUIRED` | bridge |
+
+**Transcript voice / line type**
+
+| Slot | Value | Role | Reach |
+|---|---|---|---|
+| `role_user` | LightCyan + BOLD | `User:` / `User (Steer):` — off Cyan so a user line cannot read as pane focus | bridge |
+| `role_manager` | LightYellow + BOLD | the manager's voice: `Marmennill:`, `[Steer Arbitrator]`, streamed steer sentences (one slot where there are today three spellings) | bridge |
+| `role_status` | Yellow | `[Status]` / `[CLI]` lines | bridge |
+| `role_tool` | Magenta | `[Tool Call]` / `[Tool Result]` lines | bridge |
+| `role_turn` | DarkGray + BOLD | `--- Turn …` separators; chrome, so the success hue does not run across the transcript | bridge |
+
+**Scroll / follow state and scrollbars**
+
+| Slot | Value | Role | Reach |
+|---|---|---|---|
+| `scroll_live` | LightBlue | `● LIVE` (following the live edge) — not the success hue | bridge |
+| `scroll_unseen` | Blue | `↓ N new` below the fold | bridge |
+| `scroll_stale` | Gray | `↓ follow off` — the operator's own choice, so neutral | bridge |
+| `scrollbar_thumb` | Gray | `Scrollbar::thumb_style` | bridge |
+| `scrollbar_track` | DarkGray | `Scrollbar::track_style` | bridge |
+
+**Accents that are not states**
+
+| Slot | Value | Role | Reach |
+|---|---|---|---|
+| `brand` | Cyan + BOLD | the `" Marmel"` wordmark — kept out of the success hue, or green stops meaning done | bridge |
+| `notice_ref` | LightYellow | a steering/arbitration notice id — must not borrow `frame_focus` | bridge |
+| `notice_expired` | LightRed | a notice past its lifetime (attention, not failure) | bridge |
+| `caret_line` | bg DarkGray | the composer line holding the caret (a light profile can otherwise lose the caret) | bridge |
+
+**Frozen aliases (the compatibility bridge).** The ten slot names the panes call today keep their exact
+old values and simply delegate to the slot that now owns the value, so a call-site migration can proceed
+one site at a time without changing a rendered frame or breaking a value-pinned test:
+
+`frame_alert` → `frame_danger`, `frame_confirm` → `frame_caution`, `chip` → `chip_neutral`,
+`chip_active` → `state_running`, `chip_done` → `state_done`, `chip_pending` → `state_replan`,
+`text_dim` → `text_muted`, `error` → `state_failed`; `frame_focus`, `frame_idle` and `text_primary`
+already named a role and are unchanged. No alias may gain a new call site. `legacy_slots_keep_their_frozen_values`
+in `theme.rs` pins the delegation and the values; the §7.1 contract test in `src/ui/tui/tests.rs`
+(`theme_glyphs_are_the_spec_table_and_the_picker_follows_row_state`) and the composer border tests in
+`components/input.rs` pin the same values from outside.
+
+The one intentional visual change in this pass: the `⧗` (waiting) and `⏸` (paused) badges move off
+`LightRed` and off the neutral chip slot onto `state_queued` / `state_paused`, because those two badges
+were wearing the failure-adjacent hue and the chrome chip respectively.
 
 ### 7.2 State glyphs (`enum Glyph`)
 
 `✓` done/completed · `▶` running/active · `⧗` queued-or-validating · `⏸` paused · `✗` failed/aborted.
-They replace the prose-only `(Active | Paused | Queued n/m | Idle)` labels (render.rs:717-739) but the word
-label is kept beside the glyph whenever the rect has room, so the pane stays readable on terminals without
-the glyphs. Glyphs must be measured with `unicode-width` (`UnicodeWidthChar::width`, already imported at
-render.rs:15) and never assumed to be 1 cell; grapheme boundaries come from `unicode-segmentation`
-(both crates already in `Cargo.toml:41-42`).
+They replace the prose-only `(Active | Paused | Queued n/m | Idle)` label the legacy status row built inline;
+that label was deleted with the legacy UI, and today's `src/ui/tui/render.rs` (≈400 lines) holds only cache
+maintenance plus `draw()` delegating to `TuiRenderer::draw_new_ui`, so there is no successor line to cite —
+the current owners are `theme::Glyph::{symbol,label,style,badge,tagged}` with `theme::task_glyph`,
+`theme::worker_glyph` and `theme::worker_state_glyph` deciding which glyph a row gets, while
+`components::status_bar::chips` / `chip_line` and `components::activity::chip_row` / `state_counts` keep the
+counts in words. The word label is kept beside the glyph whenever the rect has room, so the pane stays
+readable on terminals without the glyphs. Glyphs must be measured with `unicode-width`
+(`UnicodeWidthChar::width`, used by `components::mod::fit_spans`) and never assumed to be 1 cell; grapheme
+boundaries come from `unicode-segmentation` (both crates already in `Cargo.toml:41-42`).
 
 ### 7.3 Borders & focus
 
 `Block::bordered()` (single-line) for every pane; focused pane = `frame_focus` + `●` badge in the title
 (G6 — visible without colour). Titles: ` Transcript ● `, ` Execution Plan `, ` Workers `, ` Input (…hint) `.
 Overlays are drawn **last**, centred, `Clear` + a bordered `Paragraph` sized to their content clamped to
-`Percentage(80)` of the frame — the pattern the Subagents block already uses by rendering itself after its
-children (render.rs:1030). The abort-armed state no longer replaces the metrics row
-(replaces render.rs:1117-1125, UX friction 11): the prompt lives on status row 2 and row 1 keeps counting.
+`Percentage(80)` of the frame — step 8 of `TuiRenderer::draw_new_ui` (`src/ui/tui/mod.rs`), which paints
+`components::help::render` (kind `HelpKind::Overlay`) after every pane, over the rect `components::help::overlay_rect`
+gives it; the same children-first order `components::activity::render` uses when it draws `draw_body` before
+its own `pane_block` and `chip_row` title. The abort-armed state no longer replaces the metrics row (the
+legacy bar that overwrote the counters is gone with the legacy UI, UX friction 11): `components::status_bar::render`
+splits the band with `status_rows`, `armed_prompt` rides on row 2 inside `chip_line`, and where the §2.5
+ladder leaves one row `metrics_line(…, prompt_first)` shares that row instead of hiding the counting.
 
 ### 7.4 Truncation, wrapping, chip drop order
 
@@ -410,9 +567,9 @@ children (render.rs:1030). The abort-armed state no longer replaces the metrics 
 5. **Error / abort.** A failure produces one sticky transcript line `✗ <cause>` plus `see .marmel/marmel.log`
    (the categorical `LLM error: {category}` text is the only source today, session.rs:2345-2356,
    helpers.rs:247-261 — the spec keeps that text but stores it verbatim in `last_error` and keeps it
-   recallable with `e` or `/error`). Abort arming shows the prompt on status row 2 with the metrics still
+   recallable with `/error`, the bare `e` binding having been removed (§5). Abort arming shows the prompt on status row 2 with the metrics still
    live; the second `Esc`/`Ctrl+C` runs `request_user_exit` (mod.rs:1141-1149). Cancel-one-worker
-   (`x`, `/cancel <id>`) must not call `cancel_all()` (bus.rs:38).
+   (`Ctrl+X`, `/cancel <id>`) must not call `cancel_all()` (bus.rs:38).
 6. **Session restore.** After `restore_panes` (mod.rs:1400) the panes come back with their `view_mode`,
    `focus`, `follow`, scroll offsets, pane toggles, plan text and worker rows; `announce_restore`
    (mod.rs:1560) emits the report and `token_witness_warnings` (mod.rs:1792-1814) appears as exactly **one**
@@ -512,6 +669,8 @@ new home and `plan_parse` tests still pass; (c) `val N` and any arbitration-roun
 is implemented — a test asserts the status bar renders no round number while D1 is undone.
 
 **Amendment history — 2026-10-27, D6 (docs-only):** item 20 re-verified at HEAD `1b518eb` and de-rotted after the D11 consolidation (`097a4a1`): occurrence count corrected from three to **two** code occurrences (import + the one shared `write_terminal_resets()` burst), line refs re-anchored to the named constructs (`write_terminal_resets()` / `shutdown()` / `leave_alt_screen()`), and §0's mirrored "import plus exactly those two call sites" clause corrected to match; no acceptance criterion changed. Committed as `docs(spec): de-rot §10.20 teardown occurrence count and line refs (D6)`.
+
+**Amendment history — 2026-10-28 (docs-only, keymap sync):** §3, §4.4, §5, §6 and §8 re-verified against `src/ui/tui/events.rs` (`on_key_event`, `scroll_or_history`, `request_cancel_selected_worker_by_chord`, `arm_destructive_command`, `recall_last_error`), `state.rs` (`composer_has_focus`) and `components/help.rs` (`legend()`, `removed()`, `footer_legend()`) at HEAD `1fb7779` + working tree: the bare `x` and `e` rows are marked **removed** with their replacements (`Ctrl+X` / `/cancel <worker key or task id>`, `/error`), the `Up` / `Down` row no longer describes a history recall (`Ctrl+Up` / `Ctrl+Down` is the only history binding, in every focus), and the reasons are recorded under §5 *Deprecated / deleted* as the same entries `?` / `F1` / `/help` print. The §2.2 worked frame is kept as drawn (its footer predates these deletions); the live footer is generated by `footer_legend()` from the table and now reads ` F1 help  Tab focus  F2 mode  F3/F4/F5 panes  Ctrl+X cancel-worker  Esc arm  Ctrl+A/P panes`. **Recorded, not amended:** acceptance items 9, 13 and 17 still spell the removed `x` press — item 13's "`x` with an empty composer and Workers focus instead opens the overlay" is the half that now reads against the code, where `Char('x')` always mutates `textarea` and only `Ctrl+X` opens `CancelWorker`; the in-crate gates for what replaced those presses are `printables_and_editing_keys_reach_the_composer_from_every_focus` (item 13: bare `x` types in every focus, `Ctrl+X` opens the confirm) and `ctrl_x_asks_about_the_selected_row_and_only_that_row_item17` (item 17: one row only, never the broadcast cancellation). No acceptance criterion was changed here.
 
 ---
 

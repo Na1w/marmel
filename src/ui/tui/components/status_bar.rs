@@ -190,19 +190,66 @@ pub fn render(frame: &mut Frame, rect: Rect, data: &StatusData<'_>) {
 /// The legacy bar writes this row as a full-width paragraph, so an armed banner
 /// longer than the counters would otherwise leave its tail standing behind the
 /// shorter metrics line — the same defect §7.3 removes. The bar keeps its
-/// DarkGray band (`theme::chip()`, §7.1) on whatever row this component repaints,
-/// armed or not, and the armed signal is carried by the prompt's own `error()`
-/// style plus the `✗` glyph rather than by a red row that hides the counters.
+/// DarkGray band (`theme::band_surface()`, §7.1 research §F1) on whatever row this
+/// component repaints, armed or not, and the armed signal is carried by the
+/// prompt's own `state_failed()` style plus the `✗` glyph rather than by a red row
+/// that hides the counters.
+///
+/// The surface deliberately owns **no** text colour: a band fill that also carries
+/// an `fg` is what made the §F1 defect possible, because every span inside the row
+/// then had to beat that `fg` to stay readable. Each span names its own `fg`
+/// through a band slot (`chip_neutral` / `chip_muted` / `chip_value`) or a state
+/// role, so no cell ever paints the band colour on itself.
 fn paint_row(frame: &mut Frame, row: Rect, spans: Vec<Span<'static>>) {
-    let spans = pad_to_width(spans, row.width);
-    frame.render_widget(Paragraph::new(Line::from(spans)).style(theme::chip()), row);
+    let spans = pad_to_width(band_safe_clip_markers(spans), row.width);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(theme::band_surface()),
+        row,
+    );
 }
 
-/// Pad a fitted span run with spaces up to `width` cells (§7.4).
+/// Move the row's clip markers off the band colour.
+///
+/// The clip marker is added by [`super::fit_spans`], a helper the panes share, and
+/// it paints `…` with the chrome rung (`text_muted`: a `DarkGray` with no `bg`)
+/// because those panes sit on the terminal's default background. This row is not a
+/// default background: it is the band, and there that `fg` **is** the band colour,
+/// i.e. a cut nobody can see — the §F1 defect wearing a mask.
+///
+/// The bar therefore repairs its own markers on the way to the widget: a marker that
+/// arrives with the band as its only ink and no fill of its own is repainted with the
+/// band's muted rung. Text, glyph and ladder are untouched (the marker is still `…`,
+/// still one cell wide, still in the same place); only the rung moves. Doing it here
+/// rather than in the shared helper keeps that helper's contract — the band decides
+/// what is legible on the band, and no colour is named in this component, so the
+/// monochrome degrade (`NO_COLOR`, `TERM=dumb`) still strips everything.
+fn band_safe_clip_markers(spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    let marker = theme::ELLIPSIS.to_string();
+    let band = theme::band_surface().bg;
+    spans
+        .into_iter()
+        .map(|span| {
+            // Only a marker that would be invisible here is touched: a span this
+            // component painted itself already chose a band rung, and in monochrome
+            // the band has no colour to collide with.
+            let invisible_on_the_band = span.content.as_ref() == marker.as_str()
+                && span.style.bg.is_none()
+                && band.is_some_and(|colour| span.style.fg == Some(colour));
+            if invisible_on_the_band {
+                Span::styled(span.content, theme::chip_muted())
+            } else {
+                span
+            }
+        })
+        .collect()
+}
+
+/// Pad a fitted span run with spaces up to `width` cells (§7.4). The pad is pure
+/// surface, so it takes the fill token and nothing else.
 fn pad_to_width(mut spans: Vec<Span<'static>>, width: u16) -> Vec<Span<'static>> {
     let free = usize::from(width).saturating_sub(spans_width(&spans));
     if free > 0 {
-        spans.push(Span::styled(" ".repeat(free), theme::chip()));
+        spans.push(Span::styled(" ".repeat(free), theme::band_surface()));
     }
     spans
 }
@@ -312,14 +359,14 @@ fn metrics(data: &StatusData<'_>, tokens: (usize, usize), elapsed: Option<u64>) 
             drop: None,
             flex: false,
             spans: vec![
-                Span::styled(" Tokens ", theme::chip()),
+                Span::styled(" Tokens ", theme::chip_neutral()),
                 Span::styled(
                     format!(
                         "{} in / {} out",
                         format_count(tokens.0),
                         format_count(tokens.1)
                     ),
-                    theme::text_primary(),
+                    theme::chip_value(),
                 ),
             ],
         },
@@ -329,8 +376,8 @@ fn metrics(data: &StatusData<'_>, tokens: (usize, usize), elapsed: Option<u64>) 
             drop: None,
             flex: false,
             spans: vec![
-                Span::styled(" | ", theme::text_dim()),
-                Span::styled(format!("{active}a"), theme::chip()),
+                Span::styled(" | ", theme::chip_muted()),
+                Span::styled(format!("{active}a"), theme::chip_neutral()),
             ],
         },
     ];
@@ -346,8 +393,8 @@ fn metrics(data: &StatusData<'_>, tokens: (usize, usize), elapsed: Option<u64>) 
             drop: Some(DROP_CTX),
             flex: false,
             spans: vec![
-                Span::styled(" | ", theme::text_dim()),
-                Span::styled(format!("ctx {pct}%"), theme::text_dim()),
+                Span::styled(" | ", theme::chip_muted()),
+                Span::styled(format!("ctx {pct}%"), theme::chip_muted()),
             ],
         });
     }
@@ -356,8 +403,8 @@ fn metrics(data: &StatusData<'_>, tokens: (usize, usize), elapsed: Option<u64>) 
             drop: Some(DROP_PAUSED),
             flex: false,
             spans: vec![
-                Span::styled(" | ", theme::text_dim()),
-                Span::styled(format!("{paused}p"), theme::chip()),
+                Span::styled(" | ", theme::chip_muted()),
+                Span::styled(format!("{paused}p"), theme::chip_neutral()),
             ],
         });
     }
@@ -366,8 +413,8 @@ fn metrics(data: &StatusData<'_>, tokens: (usize, usize), elapsed: Option<u64>) 
             drop: Some(DROP_QUEUED),
             flex: false,
             spans: vec![
-                Span::styled(" | ", theme::text_dim()),
-                Span::styled(format!("{queued}q"), theme::chip()),
+                Span::styled(" | ", theme::chip_muted()),
+                Span::styled(format!("{queued}q"), theme::chip_neutral()),
             ],
         });
     }
@@ -380,18 +427,20 @@ fn metrics(data: &StatusData<'_>, tokens: (usize, usize), elapsed: Option<u64>) 
             drop: Some(DROP_VAL),
             flex: false,
             spans: vec![
-                Span::styled(" | ", theme::text_dim()),
-                Span::styled(format!("val {}", data.val_rounds), theme::chip_pending()),
+                Span::styled(" | ", theme::chip_muted()),
+                // `val N` is the attention role, not a verdict: the frozen alias
+                // carried this value, and `state_replan` is the token that owns it.
+                Span::styled(format!("val {}", data.val_rounds), theme::state_replan()),
             ],
         });
     }
     if !active_names.is_empty() {
         // One span per name, so a narrow bar cuts the *list* — whole names in, the
         // rest behind an ellipsis — rather than the whole field or a name's tail.
-        let mut spans = vec![Span::styled(" | ", theme::text_dim())];
+        let mut spans = vec![Span::styled(" | ", theme::chip_muted())];
         for (index, name) in active_names.iter().enumerate() {
             let lead = if index == 0 { "" } else { ", " };
-            spans.push(Span::styled(format!("{lead}{name}"), theme::text_dim()));
+            spans.push(Span::styled(format!("{lead}{name}"), theme::chip_muted()));
         }
         fields.push(Field {
             drop: None,
@@ -404,13 +453,13 @@ fn metrics(data: &StatusData<'_>, tokens: (usize, usize), elapsed: Option<u64>) 
             drop: Some(DROP_CLOCK),
             flex: false,
             spans: vec![
-                Span::styled(" | ", theme::text_dim()),
+                Span::styled(" | ", theme::chip_muted()),
                 Span::styled(
                     format!(
                         "elapsed {}",
                         crate::orchestrator::workers::format_duration_human(secs)
                     ),
-                    theme::text_dim(),
+                    theme::chip_muted(),
                 ),
             ],
         });
@@ -432,7 +481,7 @@ fn chips(data: &StatusData<'_>) -> Vec<Field> {
         flex: false,
         spans: vec![Span::styled(
             format!(" plan:{} ", presence(data.plan_visible, data.plan_present)),
-            theme::chip(),
+            theme::chip_neutral(),
         )],
     }];
     chips.push(Field {
@@ -443,7 +492,7 @@ fn chips(data: &StatusData<'_>) -> Vec<Field> {
                 " workers:{} ",
                 presence(data.workers_visible, data.workers_present)
             ),
-            theme::chip(),
+            theme::chip_neutral(),
         )],
     });
     chips.push(Field {
@@ -451,7 +500,7 @@ fn chips(data: &StatusData<'_>) -> Vec<Field> {
         flex: false,
         spans: vec![Span::styled(
             format!(" think:{} ", on_off(data.show_thought)),
-            theme::chip(),
+            theme::chip_neutral(),
         )],
     });
     if data.queued_steers > 0 {
@@ -467,7 +516,10 @@ fn chips(data: &StatusData<'_>) -> Vec<Field> {
                     format!(" {} ", Glyph::Pending.symbol()),
                     Glyph::Pending.style(),
                 ),
-                Span::styled(format!("{} steers ", data.queued_steers), theme::chip()),
+                Span::styled(
+                    format!("{} steers ", data.queued_steers),
+                    theme::chip_neutral(),
+                ),
             ],
         });
     }
@@ -484,7 +536,7 @@ fn chips(data: &StatusData<'_>) -> Vec<Field> {
             flex: false,
             spans: vec![Span::styled(
                 format!(" {active}a {paused}p {queued}q "),
-                theme::chip(),
+                theme::chip_neutral(),
             )],
         });
     }
@@ -595,7 +647,7 @@ fn clip_names(spans: Vec<Span<'static>>, budget: usize) -> Vec<Span<'static>> {
     if kept.len() < 2 {
         return fit_spans(spans, u16::try_from(budget).unwrap_or(u16::MAX));
     }
-    kept.push(Span::styled(ellipsis, theme::text_dim()));
+    kept.push(Span::styled(ellipsis, theme::chip_muted()));
     kept
 }
 
@@ -610,7 +662,10 @@ fn fields_width<'a>(fields: impl Iterator<Item = &'a Field>) -> usize {
 fn armed_prompt() -> Vec<Span<'static>> {
     vec![
         Glyph::Failed.badge(),
-        Span::styled(" abort armed — Esc again ".to_string(), theme::error()),
+        Span::styled(
+            " abort armed — Esc again ".to_string(),
+            theme::state_failed(),
+        ),
     ]
 }
 
@@ -1254,5 +1309,404 @@ mod tests {
             steers < counts,
             "one field at a time, counts first: counts gone at {counts}, steers gone at {steers}"
         );
+    }
+
+    // ---- band routing (research §F1) ------------------------------------------
+
+    /// Draw the bar and hand back the text of every row **and** the style of every
+    /// cell, so the band invariant can be asserted on the painted frame rather than
+    /// on the span list alone.
+    fn draw_styled(
+        width: u16,
+        height: u16,
+        data: &StatusData<'_>,
+    ) -> (Vec<String>, Vec<Vec<ratatui::style::Style>>) {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, Rect::new(0, 0, width, height), data))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        let styles = (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].style()).collect())
+            .collect();
+        (text, styles)
+    }
+
+    /// The column a drawn element starts at, so its cell style can be read there.
+    fn column(row: &str, needle: &str) -> usize {
+        row.find(needle)
+            .map(|byte| row[..byte].chars().count())
+            .unwrap_or_else(|| panic!("{needle:?} is not on the drawn row {row:?}"))
+    }
+
+    /// The band colour, read off the surface token instead of named here: this
+    /// component owns no colour literal, and neither may its tests.
+    fn band() -> Option<ratatui::style::Color> {
+        theme::band_surface().bg
+    }
+
+    /// A bar carrying every field the row can print, wide enough that nothing is
+    /// clipped: each element then exists to be inspected.
+    fn full_bar(workers: &[SubagentDetail], armed: bool) -> StatusData<'_> {
+        StatusData {
+            tokens_in: 12_400,
+            tokens_out: 3_200,
+            ctx_tokens: 4_500,
+            ctx_limit: 10_000,
+            elapsed: Some(723),
+            val_rounds: 3,
+            queued_steers: 2,
+            ..data(workers, armed)
+        }
+    }
+
+    /// §F1, pinned on the row that caused it: the bar is **one** surface, and every
+    /// element inside it names its own `fg` through a band token, so no cell of
+    /// either row ever paints the band colour on the band colour. The defect was
+    /// `text_dim` (DarkGray, no `bg`) sitting inside the DarkGray band: the
+    /// separators and the worker-name list were invisible.
+    #[test]
+    fn nothing_in_the_band_paints_the_band_colour_on_itself() {
+        let workers = [
+            worker("coder", true, false, false),
+            worker("writer", true, true, false),
+            worker("researcher", false, false, true),
+        ];
+        let (rows, styles) = draw_styled(150, 2, &full_bar(&workers, true));
+        assert_eq!(rows.len(), 2, "both rows are painted: {rows:?}");
+
+        // The surface: one fill, and it owns no text colour of its own — a band
+        // that also carries an `fg` is what let a dark `fg` vanish into it.
+        assert_eq!(theme::band_surface().fg, None, "the surface owns no ink");
+
+        for (y, row) in rows.iter().enumerate() {
+            for (x, style) in styles[y].iter().enumerate() {
+                assert_eq!(
+                    style.bg,
+                    band(),
+                    "row {y} cell {x} is not the band: {:?}",
+                    row.chars().nth(x).unwrap_or(' ')
+                );
+                if let Some(fg) = style.fg {
+                    assert_ne!(
+                        fg,
+                        band().expect("the band is painted in a colour build"),
+                        "row {y} cell {x} paints {fg:?} on the band: {:?}",
+                        row.chars().nth(x).unwrap_or(' ')
+                    );
+                }
+            }
+        }
+
+        // Element by element: what each element is painted with now.
+        let metrics = &rows[0];
+        let chips = &rows[1];
+        let painted =
+            |row_index: usize, row: &str, needle: &str| styles[row_index][column(row, needle)];
+
+        // The separators — the invisible ones.
+        for (row_index, row, needle) in [
+            (0, metrics.as_str(), " | "),
+            (0, metrics.as_str(), "coder"),
+            (0, metrics.as_str(), "ctx 45%"),
+            (0, metrics.as_str(), "elapsed"),
+        ] {
+            let style = painted(row_index, row, needle);
+            assert_eq!(
+                style.fg,
+                theme::chip_muted().fg,
+                "{needle:?} on the band is the band's muted rung: {row:?}"
+            );
+            assert_eq!(
+                style.bg,
+                band(),
+                "{needle:?} carries the band under it: {row:?}"
+            );
+            assert_ne!(
+                style.fg,
+                band(),
+                "{needle:?} would be invisible on the band: {row:?}"
+            );
+        }
+        // The counts and the labels.
+        for (needle, row) in [
+            ("2a", metrics.as_str()),
+            ("1p", metrics.as_str()),
+            ("1q", metrics.as_str()),
+        ] {
+            let style = painted(0, row, needle);
+            assert_eq!(style.fg, theme::chip_neutral().fg, "{needle:?}: {row:?}");
+            assert_eq!(style.bg, band(), "{needle:?}: {row:?}");
+        }
+        // The token pair: label neutral, value the band's readable-number rung.
+        assert_eq!(
+            painted(0, metrics, " Tokens ").fg,
+            theme::chip_neutral().fg,
+            "the token label is a neutral band chip: {metrics:?}"
+        );
+        let value = painted(0, metrics, "12.4k");
+        assert_eq!(
+            value.fg,
+            theme::chip_value().fg,
+            "the token pair is a band value: {metrics:?}"
+        );
+        assert_eq!(value.bg, band(), "and it carries its own band: {metrics:?}");
+        assert!(
+            value.add_modifier.contains(ratatui::style::Modifier::BOLD),
+            "the number worth reading keeps its weight: {metrics:?}"
+        );
+        // `val N` is the attention role, and the armed prompt is the failure role.
+        let val = painted(0, metrics, "val 3");
+        assert_eq!(
+            val.fg,
+            theme::state_replan().fg,
+            "`val N` is `state_replan`: {metrics:?}"
+        );
+        assert_eq!(val.bg, band(), "and it sits on the band: {metrics:?}");
+        let prompt = painted(1, chips, " abort armed");
+        assert_eq!(
+            prompt.fg,
+            theme::state_failed().fg,
+            "the armed prompt is `state_failed`: {chips:?}"
+        );
+        assert!(
+            prompt.add_modifier.contains(ratatui::style::Modifier::BOLD),
+            "and keeps its weight: {chips:?}"
+        );
+        let steers = painted(1, chips, "2 steers");
+        assert_eq!(
+            steers.fg,
+            theme::chip_neutral().fg,
+            "the steer count: {chips:?}"
+        );
+        assert_eq!(steers.bg, band(), "the steer count: {chips:?}");
+    }
+
+    /// Every span this component builds is painted with a band token or a state
+    /// role — nothing reaches for a chrome rung that carries no `bg`, which is the
+    /// other half of §F1 (a `fg`-only DarkGray on the band is invisible text).
+    #[test]
+    fn every_band_element_is_painted_with_a_band_token_or_a_state_role() {
+        let workers = [
+            worker("coder", true, false, false),
+            worker("writer", true, true, false),
+            worker("researcher", false, false, true),
+        ];
+        let allowed = [
+            theme::band_surface(),
+            theme::chip_neutral(),
+            theme::chip_muted(),
+            theme::chip_value(),
+            theme::state_replan(),
+            theme::state_failed(),
+            theme::state_queued(),
+        ];
+        for armed in [false, true] {
+            let bar = full_bar(&workers, armed);
+            let mut lines = vec![
+                pad_to_width(metrics_line(&bar, 200, false), 200),
+                pad_to_width(metrics_line(&bar, 200, true), 200),
+                pad_to_width(chip_line(&bar, 200), 200),
+            ];
+            lines.push(pad_to_width(
+                clip_names(
+                    metrics(&bar, (12_400, 3_200), Some(723))
+                        .into_iter()
+                        .find(|field| field.flex)
+                        .expect("the name list is the flexible field")
+                        .spans,
+                    22,
+                ),
+                200,
+            ));
+            for line in lines {
+                for span in line {
+                    assert!(
+                        allowed.contains(&span.style),
+                        "{:?} is painted with {:?}, which is no band token",
+                        span.content,
+                        span.style
+                    );
+                    if let (Some(fg), Some(bg)) = (span.style.fg, band()) {
+                        assert_ne!(fg, bg, "{:?} would be invisible on the band", span.content);
+                    }
+                }
+            }
+        }
+        // The queued-steer glyph keeps its state role (`⧗` = waiting, cool), which
+        // is a state rather than a band rung — and it is still never the band colour.
+        let chips = pad_to_width(chip_line(&full_bar(&workers, false), 200), 200);
+        let glyph = chips
+            .iter()
+            .find(|span| span.content.as_ref().contains(Glyph::Pending.symbol()))
+            .expect("the steer chip carries its state glyph");
+        assert_eq!(
+            glyph.style,
+            Glyph::Pending.style(),
+            "the {} glyph keeps the state role `theme` gives it",
+            Glyph::Pending.symbol()
+        );
+        assert_ne!(glyph.style.fg, band(), "and it is never the band colour");
+    }
+
+    /// The `…` this component adds when it clips the name list is part of the band,
+    /// so it must be the band's muted rung too — a clip marker nobody can see marks
+    /// nothing.
+    #[test]
+    fn the_name_list_clip_marker_is_band_safe() {
+        let workers = [
+            worker("coder_specialist", true, false, false),
+            worker("writer", true, false, false),
+            worker("researcher_long_name", true, false, false),
+        ];
+        let bar = full_bar(&workers, false);
+        let names = metrics(&bar, (12_400, 3_200), Some(723))
+            .into_iter()
+            .find(|field| field.flex)
+            .expect("the name list is the flexible field")
+            .spans;
+        let clipped = clip_names(names, 22);
+        let last = clipped.last().expect("a clipped run keeps a marker");
+        assert_eq!(last.content.as_ref(), theme::ELLIPSIS.to_string());
+        assert_eq!(
+            last.style,
+            theme::chip_muted(),
+            "the clip marker is the band's muted rung, not the chrome rung"
+        );
+        assert_ne!(last.style.fg, band(), "and it is visible on the band");
+    }
+
+    /// The other clip marker on this row comes from the shared row fitter, which
+    /// paints the `…` with the chrome rung because the panes it also serves sit on
+    /// the terminal's default background. On the band that rung **is** the band
+    /// colour, so the bar moves its own markers onto `chip_muted` on the way to the
+    /// widget. Every width that clips is checked, because a cut nobody can see marks
+    /// nothing.
+    #[test]
+    fn every_clip_marker_on_the_band_survives_every_width() {
+        let workers = [
+            worker("coder_specialist", true, false, false),
+            worker("writer_specialist", true, false, false),
+            worker("very_long_worker_name", true, true, true),
+        ];
+        let bar = full_bar(&workers, true);
+        let mut markers = 0usize;
+        for width in (18..=150u16).step_by(2) {
+            let (rows, styles) = draw_styled(width, 2, &bar);
+            for (y, row) in rows.iter().enumerate() {
+                for (cell, ch) in row.chars().enumerate() {
+                    if ch != theme::ELLIPSIS {
+                        continue;
+                    }
+                    markers += 1;
+                    let style = styles[y][cell];
+                    assert_eq!(
+                        style.fg,
+                        theme::chip_muted().fg,
+                        "the clip marker at cell {cell} of row {y} on a {width}-cell bar is not the band's muted rung: {row:?}"
+                    );
+                    assert_eq!(
+                        style.bg,
+                        band(),
+                        "the clip marker at cell {cell} of row {y} on a {width}-cell bar loses the band: {row:?}"
+                    );
+                    if let Some(fg) = style.fg {
+                        assert_ne!(
+                            fg,
+                            band().expect("a colour build paints the band"),
+                            "the clip marker at cell {cell} of row {y} on a {width}-cell bar would be invisible: {row:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            markers > 0,
+            "a narrow bar must clip, or this test checks nothing"
+        );
+    }
+
+    /// The repair itself, as a pure function: a marker that arrives with the band
+    /// colour as its only ink and no fill moves to the band's muted rung, and
+    /// anything already legible on the band is handed through untouched.
+    #[test]
+    fn the_band_repairs_a_marker_painted_in_the_band_colour() {
+        let marker = theme::ELLIPSIS.to_string();
+        let band = band().expect("a colour build paints the band");
+        let repaired = band_safe_clip_markers(vec![
+            Span::styled("3a", theme::chip_neutral()),
+            // exactly what the shared row fitter hands over: DarkGray ink, no fill
+            Span::styled(marker.clone(), ratatui::style::Style::default().fg(band)),
+        ]);
+        assert_eq!(repaired.len(), 2, "the run keeps its shape");
+        assert_eq!(
+            repaired[0].style,
+            theme::chip_neutral(),
+            "a span this component painted itself is left alone"
+        );
+        assert_eq!(
+            repaired[1].style,
+            theme::chip_muted(),
+            "the marker moves onto the band's muted rung"
+        );
+        assert_eq!(
+            repaired[1].content.as_ref(),
+            marker.as_str(),
+            "and the marker's text is untouched"
+        );
+
+        let kept = band_safe_clip_markers(vec![Span::styled(marker.clone(), theme::chip_muted())]);
+        assert_eq!(
+            kept[0].style,
+            theme::chip_muted(),
+            "a marker already band-safe is not re-painted"
+        );
+    }
+
+    /// The degrade contract (`NO_COLOR`, `TERM=dumb`) only holds for this component
+    /// because it never names a colour: every value comes from `theme`, which drops
+    /// both colour channels there. A raw `bg`/`fg` here would survive the degrade
+    /// and re-open §F1, and a frozen alias would undo the routing pass.
+    #[test]
+    fn the_component_names_no_colour_and_calls_no_frozen_alias() {
+        let source = include_str!("status_bar.rs");
+        // Patterns are assembled at runtime so this test's own text cannot match
+        // them.
+        let raw_colour = ["Col", "or::"].concat();
+        let theme_prefix = "theme::".to_string();
+        let forbidden_calls: Vec<String> = [
+            "chip",
+            "chip_active",
+            "chip_done",
+            "chip_pending",
+            "error",
+            "text_dim",
+            "text_muted",
+            "text_primary",
+        ]
+        .iter()
+        .map(|name| format!("{theme_prefix}{name}()"))
+        .collect();
+
+        assert!(
+            !source.contains(&raw_colour),
+            "the status bar must not name a colour; it asks `theme` for a role"
+        );
+        for call in &forbidden_calls {
+            assert!(
+                !source.contains(call),
+                "`{call}` is a frozen alias or a band-unsafe rung and has no call site here"
+            );
+        }
     }
 }

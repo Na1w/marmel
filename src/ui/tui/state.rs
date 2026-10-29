@@ -160,13 +160,37 @@ impl FocusPane {
         [Self::Input, Self::Transcript, Self::Plan, Self::Workers]
     }
 
+    /// The **one** predicate that answers the question every scroll and every
+    /// composer key asks: does the composer hold focus, or does a body pane?
+    ///
+    /// It is stated here, off the real focus, so the key router in `events.rs` has
+    /// exactly one way to answer it. The legacy [`FocusPane::legacy`] fold cannot
+    /// do that: it spells `Input` and `Transcript` with the same `Chat` token, so
+    /// it cannot tell a composer key from a transcript key, which is what made the
+    /// composer's history walk and the panes' scrolling fight over `Up`/`Down`.
+    /// The rule the predicate carries (spec §4.2, §4.4):
+    ///
+    /// * the composer owns a key **iff** `Input` holds focus;
+    /// * a pane viewport owns a key **iff** some other pane holds focus.
+    ///
+    /// Printables, paste, `Backspace`/`Delete` and the `Ctrl+Z/Y/J` chords are the
+    /// deliberate exception to that rule — they reach the composer in every focus
+    /// so typing is never starved (§4.4) — and they are the reason the predicate is
+    /// named for *focus* rather than for *typing*.
+    pub const fn composer_has_focus(self) -> bool {
+        matches!(self, Self::Input)
+    }
+
     /// The legacy [`FocusedPanel`] this pane projects onto. `Input` and
     /// `Transcript` share the `Chat` spelling — the legacy enum never had a
-    /// composer focus (spec §4.2) — and this mirror is what the pre-rebuild key
-    /// path of `events.rs` still reads and writes. It is **not** the persistence
+    /// composer focus (spec §4.2) — and this mirror is what the pre-rebuild fields
+    /// of `mod.rs` (the `legacy_view` snapshot and the bridge that adopts it) still
+    /// carry. It is **not** the persistence
     /// route any more: since plumbing delta D2 (spec §9.4) the durable bundle
     /// spells the pane through [`FocusPane::tag`], so nothing stored ever goes
-    /// through this fold.
+    /// through this fold. Key routing does **not** read it either: it asks
+    /// [`FocusPane::composer_has_focus`] and then scrolls the pane itself, because
+    /// this fold cannot tell the composer from the transcript.
     pub const fn legacy(self) -> FocusedPanel {
         match self {
             Self::Input | Self::Transcript => FocusedPanel::Chat,
@@ -319,13 +343,24 @@ impl PlanProgress {
 }
 
 /// Scroll offsets of the scrollable panes, re-clamped on resize (spec §2.4.4).
+///
+/// Every entry is a plain offset — the position the pane last drew, or the one the
+/// scroll keys left. **No follow decision is encoded in an offset here.** Each pane
+/// is handed its own follow request as a flag next to the offset
+/// (`TranscriptData::follow`, `PlanData::auto_scroll`,
+/// `ActivityData::autoscroll`), because "stay on the newest line" is only ever
+/// answerable by the pass that counts the body: a tail resolved in the state layer
+/// would be an estimate of the tail, and an estimate is precisely the second geometry
+/// that let a scroll key and a frame disagree about one viewport (audit defects
+/// 11/12/15).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScrollState {
     /// Transcript pane offset (renderer's `chat_scroll`).
     pub transcript: u16,
     /// Plan pane offset (renderer's `plan_scroll`).
     pub plan: u16,
-    /// Worker detail offset (renderer's `subagent_scroll`).
+    /// Worker detail offset (renderer's `subagent_scroll`). Whether that offset is
+    /// even used is the pane's call, made from `subagent_autoscroll`.
     pub workers: u16,
 }
 
@@ -385,6 +420,14 @@ impl UiView {
             scroll: ScrollState {
                 transcript: renderer.chat_scroll,
                 plan: renderer.plan_scroll,
+                // A verbatim mirror, in every pane. The follow flags are carried to
+                // the panes beside these offsets — `TranscriptData::follow`,
+                // `PlanData::auto_scroll`, `ActivityData::autoscroll` — and each pane
+                // resolves "the newest line" against the body it counts, so the view
+                // model never rewrites an offset into a tail it cannot measure
+                // (audit defect 15, where `subagent_autoscroll` was answered only by
+                // a pass outside the pane, and defects 11/12, where that pass and the
+                // pane then drew two different geometries).
                 workers: renderer.subagent_scroll,
             },
             plan_visible: renderer.show_plan_panel,
@@ -405,5 +448,112 @@ impl UiView {
         // Only a modal overlay takes the keyboard away; `Esc` closes it without
         // arming abort (§4.4).
         !self.overlay.is_open()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One roster row whose detail body is long enough that "the tail" is a place
+    /// the pane has to scroll to reach.
+    fn row_with_a_long_log() -> SubagentDetail {
+        SubagentDetail {
+            name: "coder_specialist-t-004".to_string(),
+            logs: (0..40)
+                .map(|index| format!("- log line {index:02}"))
+                .collect(),
+            is_active: true,
+            ..SubagentDetail::default()
+        }
+    }
+
+    /// Defects 11/12/15, the state half: the view model mirrors offsets and carries
+    /// follow decisions **beside** them, never inside them. `ScrollState` never
+    /// substitutes a tail for a stored offset, because the tail of a pane is only
+    /// ever known by the pass that counts that pane's body — an offset the state
+    /// layer invented would be a second, rival geometry, which is exactly what let a
+    /// scroll key and a frame disagree about one viewport. Each pane is handed its
+    /// follow request as a flag next to the offset:
+    /// `TranscriptData::follow`, `PlanData::auto_scroll`,
+    /// `ActivityData::autoscroll`.
+    #[test]
+    fn the_scroll_state_mirrors_offsets_and_encodes_no_follow_decision_in_them() {
+        let mut renderer = TuiRenderer::new();
+        renderer.subagents.push(row_with_a_long_log());
+        renderer.chat_scroll = 7;
+        renderer.plan_scroll = 2;
+        renderer.subagent_scroll = 3;
+        renderer.set_follow(true);
+        renderer.subagent_autoscroll = true;
+        renderer.plan_auto_scroll = true;
+
+        let view = UiView::from_renderer(&renderer);
+        assert_eq!(view.scroll.transcript, 7, "the transcript's own offset");
+        assert_eq!(view.scroll.plan, 2, "the plan's own offset");
+        assert_eq!(
+            view.scroll.workers, 3,
+            "the detail offset the scroll keys left, verbatim, however long the log is"
+        );
+        assert!(
+            view.follow,
+            "transcript follow crosses to the pane as the flag it is"
+        );
+        assert_eq!(
+            usize::from(renderer.subagent_scroll),
+            3,
+            "and no stored offset was rewritten on the way in"
+        );
+    }
+
+    /// The same mirror with every follow flag off: the view model is a reading, not a
+    /// decision, so an operator's parked offset is handed to the pane untouched and
+    /// the pane cannot be handed a tail it was never asked for.
+    #[test]
+    fn a_detail_scrolled_off_its_tail_is_handed_over_as_that_offset() {
+        let mut renderer = TuiRenderer::new();
+        renderer.subagents.push(row_with_a_long_log());
+        renderer.subagent_autoscroll = false;
+        renderer.set_follow(false);
+        renderer.subagent_scroll = 3;
+
+        let view = UiView::from_renderer(&renderer);
+        assert_eq!(view.scroll.workers, 3, "the operator's offset, verbatim");
+        assert!(
+            usize::from(view.scroll.workers) < usize::from(renderer.worker_detail_tail()),
+            "and it is still short of the tail the key path measures"
+        );
+    }
+
+    /// Nothing in the state layer follows on its own: a follow flag standing over an
+    /// offset that is not the tail moves no viewport, and the follow is realised only
+    /// by the frame that measures the pane.
+    #[test]
+    fn a_follow_flag_over_an_offset_that_is_not_the_measured_tail_moves_nothing() {
+        let mut renderer = TuiRenderer::new();
+        renderer.subagents.push(row_with_a_long_log());
+        let tail = usize::from(renderer.worker_detail_tail());
+        assert!(tail > 1, "the fixture has a tail to be short of");
+        renderer.subagent_scroll = (tail - 1) as u16;
+        assert!(renderer.subagent_autoscroll);
+
+        let view = UiView::from_renderer(&renderer);
+        assert_eq!(
+            usize::from(view.scroll.workers),
+            tail - 1,
+            "one line short of the measured tail, and it stays there"
+        );
+    }
+
+    /// With no row on the roster there is no detail half to follow, so the entry is
+    /// simply the stored field — which is what the view model has always been for a
+    /// pane that is not on screen.
+    #[test]
+    fn an_empty_roster_mirrors_the_detail_offset_instead_of_inventing_one() {
+        let mut renderer = TuiRenderer::new();
+        renderer.subagent_scroll = 11;
+        assert!(renderer.subagent_autoscroll);
+        assert!(renderer.subagents.is_empty(), "no row, so no detail half");
+        assert_eq!(UiView::from_renderer(&renderer).scroll.workers, 11);
     }
 }

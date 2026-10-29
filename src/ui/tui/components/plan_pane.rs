@@ -143,7 +143,9 @@ fn draw_body(frame: &mut Frame, rect: Rect, data: &PlanData<'_>) -> PlanGeometry
             let mut state =
                 ScrollbarState::new(usize::from(max_scroll)).position(usize::from(scroll));
             frame.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight),
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .thumb_style(theme::scrollbar_thumb())
+                    .track_style(theme::scrollbar_track()),
                 inner,
                 &mut state,
             );
@@ -173,29 +175,33 @@ fn auto_scroll_offset(data: &PlanData<'_>, width: usize) -> u16 {
 
 /// The plan body as styled lines.
 ///
-/// The colour rules are the legacy ones (`render.rs:499-514`), expressed through
-/// [`theme`] slots rather than raw colours (§7.1): a heading is the done chip
-/// colour in bold, the in-flight task line is the active chip colour in bold, a
-/// checked line is done, an open line pending. Task ids are matched with
-/// [`line_matches_task_id`] so `[t-004]` and `t-004` name the same line.
+/// Every colour is a [`theme`] role token rather than a raw colour (§7.1): a
+/// heading is an in-pane section label, so it takes [`theme::section_header`]
+/// and no longer borrows the success hue; the in-flight task line is
+/// [`theme::state_running`] (which already carries its own `BOLD`, so the call
+/// site adds no weight); a checked line is [`theme::state_done`]; an open line
+/// is [`theme::state_queued`], because waiting is cool and the warm
+/// [`theme::state_replan`] hue is reserved for "needs attention" (§F4). Task ids
+/// are matched with [`line_matches_task_id`] so `[t-004]` and `t-004` name the
+/// same line.
 fn body_lines(data: &PlanData<'_>) -> Vec<Line<'static>> {
     data.text
         .lines()
         .map(|raw| {
             let line = raw.replace('\t', "    ");
             let style = if line.starts_with("# ") || line.starts_with("## ") {
-                theme::chip_done().add_modifier(ratatui::style::Modifier::BOLD)
+                theme::section_header()
             } else if data
                 .active_tasks
                 .iter()
                 .any(|task| line_matches_task_id(&line, task))
                 && (line.contains("[ ]") || line.contains("( )"))
             {
-                theme::chip_active().add_modifier(ratatui::style::Modifier::BOLD)
+                theme::state_running()
             } else if line.contains("[x]") || line.contains("[X]") {
-                theme::chip_done()
+                theme::state_done()
             } else if line.contains("[ ]") {
-                theme::chip_pending()
+                theme::state_queued()
             } else {
                 theme::text_primary()
             };
@@ -219,11 +225,11 @@ fn counter_spans(progress: &PlanProgress) -> Vec<Span<'static>> {
     }
     spans.push(Span::styled(
         format!("{} ", progress.progress_label()),
-        theme::chip_done(),
+        theme::state_done(),
     ));
     if let Some(task) = task {
         spans.push(Glyph::Active.badge());
-        spans.push(Span::styled(format!(" {task} "), theme::chip_active()));
+        spans.push(Span::styled(format!(" {task} "), theme::state_running()));
     }
     spans
 }
@@ -239,33 +245,35 @@ fn state_spans(data: &PlanData<'_>, geometry: PlanGeometry) -> Vec<Span<'static>
         spans.push(Glyph::Done.badge());
         spans.push(Span::styled(
             format!(" {} done ", progress.done),
-            theme::chip_done(),
+            theme::state_done(),
         ));
         spans.push(Glyph::Pending.badge());
         spans.push(Span::styled(
             format!(" {} open ", progress.pending()),
-            theme::chip_pending(),
+            theme::state_queued(),
         ));
         if progress.active_task.is_some() {
             spans.push(Glyph::Active.badge());
             spans.push(Span::styled(
                 " in flight ".to_string(),
-                theme::chip_active(),
+                theme::state_running(),
             ));
         }
     } else {
         // §8.1: an empty plan is stated, never left blank. The body carries the
         // cached sentinel text ("No active execution plan."); this line says the
-        // same thing about the counter the header shows.
+        // same thing about the counter the header shows. An empty state is
+        // guidance, not chrome, so it reads one rung above the gutter tier (§F3)
+        // and never in the warm attention hue, which belongs to `REPLAN` (§F4).
         spans.push(Span::styled(
             " no tasks in plan ".to_string(),
-            theme::chip_pending(),
+            theme::text_secondary(),
         ));
     }
     if geometry.scroll > 0 {
         spans.push(Span::styled(
             format!(" scroll {} ", geometry.scroll),
-            theme::text_dim(),
+            theme::text_muted(),
         ));
     }
     spans
@@ -608,6 +616,11 @@ mod tests {
             styled("# Tasks").add_modifier.contains(Modifier::BOLD),
             "heading is bold"
         );
+        assert_eq!(
+            styled("# Tasks").fg,
+            theme::section_header().fg,
+            "a plan heading is a section label, not a verdict: it borrows no state hue"
+        );
         assert!(
             styled("[t-004] wireframe")
                 .add_modifier
@@ -616,17 +629,22 @@ mod tests {
         );
         assert_eq!(
             styled("[t-004] wireframe").fg,
-            theme::chip_active().fg,
-            "and uses the active slot, not a raw colour"
+            theme::state_running().fg,
+            "and uses the in-flight slot, not a raw colour"
         );
         assert_eq!(
             styled("[t-001] research baseline").fg,
-            theme::chip_done().fg
+            theme::state_done().fg
         );
         assert_eq!(
             styled("[t-005] header pane").fg,
-            theme::chip_pending().fg,
+            theme::state_queued().fg,
             "an open task that is not in flight"
+        );
+        assert_ne!(
+            styled("[t-005] header pane").fg,
+            theme::state_replan().fg,
+            "an open task never wears the warm attention hue (§F4)"
         );
     }
 

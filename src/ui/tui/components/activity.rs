@@ -48,6 +48,7 @@ use crate::ui::SubagentDetail;
 use crate::ui::helpers::subagent_row_badge;
 use crate::ui::tui::formatting::{
     count_wrapped_rendered_lines, format_terminal_math, parse_ansi_lines, render_markdown_lines,
+    thought_style,
 };
 use crate::ui::tui::state::FocusPane;
 use crate::ui::tui::theme::{self, Glyph};
@@ -93,10 +94,25 @@ pub struct ActivityData<'a> {
     pub selected: usize,
     /// Whether the detail half may be drawn at all (§2.5, `width < 60`).
     pub detail_present: bool,
-    /// Scroll offset of the detail half.
+    /// The detail half's own scroll **offset** (renderer state `subagent_scroll`:
+    /// what the last frame drew, or what `PageUp`/`PageDown`/`Home`/`End` left behind).
+    /// It is honoured as asked and only ever pulled back into range — never raised
+    /// toward the tail — unless [`ActivityData::autoscroll`] says the tail is what is
+    /// wanted. See [`draw_detail`].
     pub scroll: u16,
-    /// The roster's own scroll offset (`subagent_list_scroll`), so `↑`/`↓` can
-    /// scroll past the selection instead of the selection re-deriving the view.
+    /// The detail half's follow flag (renderer state `subagent_autoscroll`), handed
+    /// over as the request it is: "pin to the newest line of the body this pass
+    /// draws". Only this pass can say where that line is, because only this pass
+    /// counts the body — an offset resolved anywhere else is an estimate of the tail,
+    /// and an estimate is what made the frame disagree with a scroll key (audit
+    /// defects 11/12/15).
+    pub autoscroll: bool,
+    /// The roster window's own scroll offset (`subagent_list_scroll`), which the
+    /// key path owns: with the Workers pane focused, `↑`/`↓` walk this window
+    /// (`events.rs::scroll_worker_roster_by`) while `PageUp`/`PageDown`/`Home`/`End`
+    /// scroll the detail half and `←`/`→` move the selection. This pass only pulls
+    /// the request into the range the pane can draw — see [`roster_bounds`], which
+    /// the key path clamps against as well.
     pub list_scroll: u16,
     /// The `Ctrl+T` / `/thought` toggle (§8.2): whether buffered reasoning may be
     /// printed at all.
@@ -116,8 +132,9 @@ pub struct ActivityData<'a> {
 
 /// Where the two scrollable halves landed this frame. The renderer writes these
 /// back into `subagent_list_scroll` / `subagent_scroll` / `subagent_width` /
-/// `subagent_height` so its `↑`/`↓`/`PgUp` clamps (`events.rs`) and its autoscroll
-/// estimate match what was drawn.
+/// `subagent_height` so the key path's clamps — `↑`/`↓` against [`roster_window`]
+/// for the roster, `PageUp`/`PageDown`/`Home`/`End` against the reported detail
+/// height for the log — measure from what was drawn, not from an estimate of it.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerGeometry {
     /// Offset the roster was drawn at.
@@ -207,8 +224,10 @@ fn draw_body(
     frame.render_widget(Clear, inner);
 
     if data.rows.is_empty() {
-        let paragraph =
-            Paragraph::new(Line::styled(EMPTY_STATE, theme::text_dim())).wrap(Wrap { trim: true });
+        // §8.1 + §F3: an empty state is the message a new operator has to read, so
+        // it never sits in the gutter tier.
+        let paragraph = Paragraph::new(Line::styled(EMPTY_STATE, theme::text_secondary()))
+            .wrap(Wrap { trim: true });
         frame.render_widget(paragraph, inner);
         return (
             DetailReport {
@@ -227,7 +246,7 @@ fn draw_body(
 
     let row = &data.rows[selected];
     let entry = entries.iter().find(|candidate| candidate.key == row.name);
-    let report = draw_detail(frame, detail, row, entry, data.scroll, data);
+    let report = draw_detail(frame, detail, row, entry, data);
     let roster_scroll = draw_roster(frame, roster, data, entries, selected);
     (report, roster_scroll)
 }
@@ -248,6 +267,10 @@ fn split_inner(inner: Rect, detail_present: bool) -> (Rect, Rect) {
 /// silence; here the roster gets its own chunk, its own scrollbar, and a scroll
 /// offset that starts from the renderer's `subagent_list_scroll` and is only moved
 /// far enough to keep the selected row on screen.
+///
+/// The window is not this pass's to invent: [`roster_bounds`] is the one rule, and
+/// the key path clamps `↑`/`↓` against exactly the same bounds, so a press and a
+/// frame can never disagree about where the window may go.
 fn draw_roster(
     frame: &mut Frame,
     roster: Rect,
@@ -259,18 +282,13 @@ fn draw_roster(
         return 0;
     }
     let height = usize::from(roster.height);
+    let (lower, upper) = roster_bounds(data.rows.len(), selected, height);
+    // The renderer owns the offset (`↑`/`↓` walk this window in `events.rs`); this
+    // pass only pulls the request into the drawable range, which is the same
+    // minimal reveal the legacy pane used at `render.rs:619-625` — selecting never
+    // jumps the view further than it must, and scrolling never loses the marker.
+    let scroll = usize::from(data.list_scroll).clamp(lower, upper);
     let max_scroll = data.rows.len().saturating_sub(height);
-    // The renderer owns the offset (`↑`/`↓` scroll the list past the selection);
-    // this pass only pulls it back into range and, as a last resort, reveals the
-    // selected row — the same minimal reveal the legacy pane used at
-    // `render.rs:619-625`, so selecting never jumps the view more than it must.
-    let mut scroll = usize::from(data.list_scroll).min(max_scroll);
-    if selected < scroll {
-        scroll = selected;
-    } else if selected >= scroll + height {
-        scroll = selected + 1 - height;
-    }
-    let scroll = scroll.min(max_scroll);
     // The scrollbar takes the last column, so rows are clipped to what is left.
     let text_width = roster.width.saturating_sub(u16::from(max_scroll > 0));
 
@@ -288,12 +306,55 @@ fn draw_roster(
     if max_scroll > 0 {
         let mut state = ScrollbarState::new(max_scroll).position(scroll);
         frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .thumb_style(theme::scrollbar_thumb())
+                .track_style(theme::scrollbar_track()),
             roster,
             &mut state,
         );
     }
     scroll as u16
+}
+
+/// The drawable range of the roster window: `(lowest, highest)` scroll offsets a
+/// `height`-row roster holding `rows` rows can be drawn at while the `selected`
+/// row keeps its marker on screen.
+///
+/// Both ends come from one rule rather than from two owners. The upper end is the
+/// ordinary `rows - height` tail clamp, pulled back to the selection because the
+/// window never scrolls the marker off the top; the lower end is how far the
+/// window can retreat before the marker falls off the bottom. Everything in
+/// between is the operator's, which is what `↑`/`↓` walk.
+fn roster_bounds(rows: usize, selected: usize, height: usize) -> (usize, usize) {
+    if height == 0 {
+        return (0, 0);
+    }
+    let tail = rows.saturating_sub(height);
+    let selected = selected.min(rows.saturating_sub(1));
+    (selected.saturating_sub(height - 1), tail.min(selected))
+}
+
+/// The same bounds, addressed by the **outer** rect of the Workers pane rather than
+/// by a height, so the key path can clamp a press against the geometry the pane is
+/// actually going to draw instead of estimating it. `pane` is the bordered rect
+/// (`PaneRects::workers`), exactly as `render` receives it, and `detail_present` is
+/// the §2.5 narrow-column rule the frame applies.
+///
+/// An empty roster, a pane with no rows, or one whose split leaves the roster no
+/// rows at all yields `(0, 0)`: there is no window to move, and a key press against
+/// it is a no-op rather than a claim.
+pub fn roster_window(
+    pane: Rect,
+    detail_present: bool,
+    rows: usize,
+    selected: usize,
+) -> (usize, usize) {
+    if rows == 0 || pane.width == 0 {
+        return (0, 0);
+    }
+    let inner = pane.inner(Margin::new(1, 1));
+    let roster = split_inner(inner, detail_present).0;
+    roster_bounds(rows, selected, usize::from(roster.height))
 }
 
 /// One roster row, clipped to a single line (§7.4: roster lines are single-row and
@@ -305,9 +366,11 @@ fn roster_row(
     width: u16,
 ) -> Line<'static> {
     let marker = if selected {
-        Span::styled(SELECTION_MARKER.to_string(), theme::chip_active())
+        // The pointer marking the selected row owns a neutral slot: it must not
+        // borrow the in-flight hue (a state) or the focus border (a focus signal).
+        Span::styled(SELECTION_MARKER.to_string(), theme::selection())
     } else {
-        Span::styled(SELECTION_GUTTER.to_string(), theme::text_dim())
+        Span::styled(SELECTION_GUTTER.to_string(), theme::text_muted())
     };
     let mut spans = vec![marker];
     spans.extend(row_spans(row, entry));
@@ -331,25 +394,30 @@ fn row_spans(row: &SubagentDetail, entry: Option<&WorkerEntry>) -> Vec<Span<'sta
     let label = row_status_label(row).or_else(|| entry.map(|entry| entry.status_label.as_str()));
     let glyph = theme::worker_state_glyph(row.is_active, row.paused, row.queue.is_some(), label);
     let mut spans = vec![glyph.tagged()];
-    // A queue rank is only meaningful while the row is part of the round.
+    // A queue rank is only meaningful while the row is part of the round. It is a
+    // *waiting* count, so it rides the queued slot and never the warm attention
+    // hue, which belongs to `REPLAN` and expired notices (§F4).
     if let Some(queue) = row.queue.filter(|_| row.is_active) {
         spans.push(Span::styled(
             format!(" {}/{}", queue.position, queue.of),
-            theme::chip_pending(),
+            theme::state_queued(),
         ));
     }
     let name_style = if row.is_active {
         theme::text_primary()
     } else {
-        theme::text_dim()
+        theme::text_muted()
     };
     let role = role_label(row, entry);
     spans.push(Span::styled(format!(" {role}"), name_style));
     if let Some(badge) = subagent_row_badge(entry, &row.name) {
-        spans.push(Span::styled(format!(" {badge}"), theme::chip()));
+        // `Audit` / `Dup #N` classify the row rather than state it: an id-like
+        // label, so the readable middle rung, and not a band chip on a row that
+        // is not on the band.
+        spans.push(Span::styled(format!(" {badge}"), theme::text_secondary()));
     }
     if let Some(task) = task_id(row, entry) {
-        spans.push(Span::styled(format!(" {task}"), theme::text_dim()));
+        spans.push(Span::styled(format!(" {task}"), theme::text_muted()));
     }
     // `turn N` and `val N` are the registry's own turn/round counters: the row
     // carries `validation_rounds` and `implementation_turns` since D1 (§9.3), and
@@ -362,23 +430,25 @@ fn row_spans(row: &SubagentDetail, entry: Option<&WorkerEntry>) -> Vec<Span<'sta
         entry.map(|entry| entry.implementation_turns).unwrap_or(0)
     };
     if turns > 0 {
-        spans.push(Span::styled(format!(" turn {turns}"), theme::text_dim()));
+        spans.push(Span::styled(format!(" turn {turns}"), theme::text_muted()));
     }
     if row.validation_rounds > 0 {
+        // `val N` is the one warm counter in the palette: a validation round is
+        // "needs attention", which is exactly the family `state_replan` owns.
         spans.push(Span::styled(
             format!(" val {}", row.validation_rounds),
-            theme::chip_pending(),
+            theme::state_replan(),
         ));
     }
     let elapsed = elapsed_secs(row, entry);
     if elapsed > 0 {
-        spans.push(Span::styled(format_elapsed(elapsed), theme::text_dim()));
+        spans.push(Span::styled(format_elapsed(elapsed), theme::text_muted()));
     }
     let tokens = token_count(row, entry);
     if tokens > 0 {
         spans.push(Span::styled(
             format!(" {} ctx", format_count(tokens)),
-            theme::text_dim(),
+            theme::text_muted(),
         ));
     }
     spans
@@ -391,7 +461,6 @@ fn draw_detail(
     area: Rect,
     row: &SubagentDetail,
     entry: Option<&WorkerEntry>,
-    scroll: u16,
     data: &ActivityData<'_>,
 ) -> DetailReport {
     if area.width == 0 || area.height < 2 {
@@ -441,9 +510,22 @@ fn draw_detail(
     };
     let total = count_wrapped_rendered_lines(&lines, usize::from(text_width));
     let max = total.saturating_sub(height);
-    // The offset is renderer state (`subagent_scroll`, already autoscroll-clamped
-    // there); it is never raised from here.
-    let offset = usize::from(scroll).min(max);
+    // Two spellings of what this half is asked to show, and both are decided here
+    // rather than anywhere that has to guess how long this body is:
+    //
+    // * `autoscroll` is the detail's follow flag (`subagent_autoscroll`) carried in as
+    //   the request it is — the newest line, whatever the body measures this frame.
+    //   The legacy pass used to answer that flag by rewriting `subagent_scroll` from a
+    //   line-count estimate (`render.rs`, retired); this pass answers it against the
+    //   body it actually counted, so the tail is the tail even when an estimate lags
+    //   behind it.
+    // * otherwise the offset is the operator's own: honoured exactly as asked, and
+    //   only ever pulled back into range, never raised from here.
+    let offset = if data.autoscroll {
+        max
+    } else {
+        usize::from(data.scroll).min(max)
+    };
     let text = Rect {
         width: text_width,
         ..body
@@ -457,7 +539,9 @@ fn draw_detail(
     if scrollbar {
         let mut state = ScrollbarState::new(max).position(offset);
         frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .thumb_style(theme::scrollbar_thumb())
+                .track_style(theme::scrollbar_track()),
             body,
             &mut state,
         );
@@ -492,16 +576,18 @@ fn detail_lines(
     if row.paused {
         sections.push(Line::from(vec![
             Glyph::Paused.badge(),
+            // The explanation of a parked stream wears the parked slot: nothing
+            // here is warm, because nothing broke (§F4).
             Span::styled(
                 "  this stream yielded its model slot to the Steer Arbitrator".to_string(),
-                theme::chip_pending(),
+                theme::state_paused(),
             ),
         ]));
         sections.push(Line::styled(
             "  why: a steering instruction is being arbitrated, and the preemption \
              handshake reclaims the slot when that round ends"
                 .to_string(),
-            theme::text_dim(),
+            theme::text_muted(),
         ));
         sections.push(Line::styled(
             format!(
@@ -516,36 +602,47 @@ fn detail_lines(
                     )
                 }
             ),
-            theme::text_dim(),
+            theme::text_muted(),
         ));
     }
 
     // Which steering instructions the arbitrator routed to **this** specialist, from the
     // inbox the orchestrator itself owns. Ages are the notice clock's, not the pane's.
     if !steering.is_empty() {
+        // `[Steering]` is a section label like the other four below: neutral
+        // weight, no state hue (§F6).
         sections.push(Line::styled(
             format!(
                 "[Steering] {} notice(s) waiting for this specialist",
                 steering.len()
             ),
-            theme::chip_pending(),
+            theme::section_header(),
         ));
         for notice in steering.iter().take(MAX_DETAIL_STEERING_NOTICES) {
             let age_secs = crate::orchestrator::notice::notice_age_ms(notice) / 1000;
-            let expired = if crate::orchestrator::notice::is_notice_expired(notice) {
+            let expired = crate::orchestrator::notice::is_notice_expired(notice);
+            let expired_words = if expired {
                 ", unanswered past its lifetime"
             } else {
                 ""
             };
             sections.push(Line::from(vec![
-                Span::styled(format!(" {} ", notice.notice_id), theme::frame_focus()),
+                // The notice id keeps its own accent: borrowing the focus Cyan made
+                // "a notice is listed" look like "this pane has focus".
+                Span::styled(format!(" {} ", notice.notice_id), theme::notice_ref()),
+                // A notice that ran past its lifetime is finally *seen* to be
+                // outstanding: the attention family, never the failure hue.
                 Span::styled(
                     format!(
-                        "\"{}\" (waiting {}s{expired})",
+                        "\"{}\" (waiting {}s{expired_words})",
                         one_line(&notice.user_inquiry, MAX_DETAIL_STEERING_CHARS),
                         age_secs
                     ),
-                    theme::text_primary(),
+                    if expired {
+                        theme::notice_expired()
+                    } else {
+                        theme::text_primary()
+                    },
                 ),
             ]));
         }
@@ -555,7 +652,7 @@ fn detail_lines(
                     " +{} more in this inbox",
                     steering.len() - MAX_DETAIL_STEERING_NOTICES
                 ),
-                theme::text_dim(),
+                theme::text_muted(),
             ));
         }
     }
@@ -571,14 +668,20 @@ fn detail_lines(
         .map(str::trim)
         .filter(|feedback| !feedback.is_empty())
     {
-        sections.push(Line::styled("[Validator]".to_string(), theme::error()));
+        sections.push(Line::styled(
+            "[Validator]".to_string(),
+            theme::section_header(),
+        ));
         for line in feedback.lines() {
             sections.push(Line::styled(format!(" {line}"), theme::text_primary()));
         }
     }
 
     if !row.thinking.is_empty() {
-        sections.push(Line::styled("[Thinking]".to_string(), theme::text_dim()));
+        sections.push(Line::styled(
+            "[Thinking]".to_string(),
+            theme::section_header(),
+        ));
         if show_thought {
             // §8.2: the reasoning stream is printed while the toggle is on. The
             // budget the worker was launched with rides the header line, from
@@ -595,8 +698,12 @@ fn detail_lines(
                 }
                 _ => " shown (Ctrl+T to hide):".to_string(),
             };
-            sections.push(Line::styled(header, theme::text_dim()));
-            let style = theme::text_dim().add_modifier(ratatui::style::Modifier::ITALIC);
+            sections.push(Line::styled(header, theme::text_muted()));
+            // The reasoning tier is the shared one (`formatting::thought_style`), so
+            // a thought reads identically in the transcript, the streaming buffer
+            // and here — a fourth hand-written copy of `text_dim + ITALIC` is what
+            // let the tier drift (§F7).
+            let style = thought_style();
             for line in row.thinking.lines() {
                 sections.push(Line::styled(
                     format!(" {}", crate::ui::tui::formatting::strip_think_tags(line)),
@@ -609,13 +716,16 @@ fn detail_lines(
             // cannot leak through this pane (§8.2).
             sections.push(Line::styled(
                 format!(" {} chars — hidden (Ctrl+T)", row.thinking.chars().count()),
-                theme::text_dim(),
+                theme::text_muted(),
             ));
         }
     }
 
     if !row.content.is_empty() {
-        sections.push(Line::styled("[Output]".to_string(), theme::frame_focus()));
+        sections.push(Line::styled(
+            "[Output]".to_string(),
+            theme::section_header(),
+        ));
         if row.content.contains("```") {
             sections.extend(render_markdown_lines(&row.content));
         } else {
@@ -633,7 +743,7 @@ fn detail_lines(
     }
 
     if !row.logs.is_empty() {
-        sections.push(Line::styled("[Logs]".to_string(), theme::chip_done()));
+        sections.push(Line::styled("[Logs]".to_string(), theme::section_header()));
         for log in &row.logs {
             if log.contains('\x1b') {
                 for parsed in parse_ansi_lines(log) {
@@ -642,16 +752,17 @@ fn detail_lines(
                     sections.push(Line::from(spans));
                 }
             } else {
-                sections.push(Line::styled(format!("- {log}"), theme::text_dim()));
+                sections.push(Line::styled(format!("- {log}"), theme::text_muted()));
             }
         }
     }
 
     if sections.is_empty() {
         let role = role_label(row, entry);
+        // An empty state is guidance, not gutter chrome (§F3).
         sections.push(Line::styled(
             format!("Nothing streamed yet for {role}."),
-            theme::text_dim(),
+            theme::text_secondary(),
         ));
     }
 
@@ -728,15 +839,15 @@ fn chip_row(data: &ActivityData<'_>, detail: DetailReport, width: u16) -> Vec<Sp
     let detail_chip = if detail.present {
         Span::styled(
             format!(" detail {}/{} ", detail.scroll, detail.max),
-            theme::text_dim(),
+            theme::text_muted(),
         )
     } else if data.detail_present {
-        Span::styled(" detail too short ".to_string(), theme::text_dim())
+        Span::styled(" detail too short ".to_string(), theme::text_muted())
     } else {
-        Span::styled(" detail hidden ".to_string(), theme::text_dim())
+        Span::styled(" detail hidden ".to_string(), theme::text_muted())
     };
     let tail = vec![
-        Span::styled(format!(" {position}/{total} "), theme::text_dim()),
+        Span::styled(format!(" {position}/{total} "), theme::text_muted()),
         detail_chip,
     ];
 
@@ -894,6 +1005,8 @@ mod tests {
     use std::time::Duration;
     use unicode_width::UnicodeWidthStr;
 
+    use ratatui::style::Style;
+
     /// A roster row with the minimum the pane needs to name it.
     fn row(name: &str, task: &str, is_active: bool) -> SubagentDetail {
         SubagentDetail {
@@ -929,6 +1042,24 @@ mod tests {
             .collect()
     }
 
+    /// The same draw as [`rows_text`], but handing back the **style** of every
+    /// cell, so a colour contract can be asserted off a real frame instead of off
+    /// the function that produced it.
+    fn rows_styles(width: u16, height: u16, data: &ActivityData<'_>) -> Vec<Vec<Style>> {
+        let backend =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        let mut terminal = backend;
+        terminal
+            .draw(|frame| {
+                render(frame, Rect::new(0, 0, width, height), data);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].style()).collect())
+            .collect()
+    }
+
     #[test]
     fn roster_shows_every_worker_beyond_the_three_row_cap() {
         let workers = rows(12);
@@ -939,6 +1070,7 @@ mod tests {
             selected: 0,
             detail_present: true,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -964,6 +1096,7 @@ mod tests {
             selected: 11,
             detail_present: true,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -993,6 +1126,7 @@ mod tests {
             selected: 1,
             detail_present: false,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1014,6 +1148,7 @@ mod tests {
             selected: 0,
             detail_present: false,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1033,6 +1168,7 @@ mod tests {
             selected: 0,
             detail_present: true,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1054,6 +1190,7 @@ mod tests {
             selected: 0,
             detail_present: false,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1073,6 +1210,7 @@ mod tests {
             selected: 0,
             detail_present: true,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1095,6 +1233,7 @@ mod tests {
             selected: 2,
             detail_present: false,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1104,6 +1243,87 @@ mod tests {
             .filter(|line| line.contains("> "))
             .count();
         assert_eq!(marked, 1, "one selection marker expected");
+    }
+
+    #[test]
+    fn every_detail_section_header_shares_one_neutral_slot() {
+        // §F6/§C.2: the in-pane section labels used to be painted with four
+        // unrelated hues (`error`, `text_dim`, `frame_focus`, `chip_done`), so a
+        // `[Validator]` heading could read as a failure and `[Logs]` as a
+        // verdict. They now take [`theme::section_header`], which names no state.
+        let mut worker = row("coder-t-042", "t-042", true);
+        worker.content = "the streamed output".to_string();
+        worker.logs = vec!["a recorded log line".to_string()];
+        worker.thinking = "a recorded thought".to_string();
+        worker.latest_validator_feedback = Some("a recorded verdict reason".to_string());
+        let data = ActivityData {
+            steering: &[],
+            focus: true,
+            rows: &[worker],
+            selected: 0,
+            detail_present: true,
+            scroll: 0,
+            autoscroll: false,
+            list_scroll: 0,
+            show_thought: true,
+            thinking_budget: None,
+        };
+        let text = rows_text(80, 24, &data);
+        let styles = rows_styles(80, 24, &data);
+        for label in ["[Validator]", "[Thinking]", "[Output]", "[Logs]"] {
+            let y = text
+                .iter()
+                .position(|line| line.contains(label))
+                .unwrap_or_else(|| panic!("{label} header expected: {text:?}"));
+            let x = text[y]
+                .find(label)
+                .expect("the header starts in its own row");
+            let style = styles[y][x];
+            assert_eq!(
+                style.fg,
+                theme::section_header().fg,
+                "`{label}` wears the one section slot"
+            );
+            assert!(
+                style.add_modifier.contains(ratatui::style::Modifier::BOLD),
+                "`{label}` keeps the section slot's weight"
+            );
+            for borrowed in [
+                theme::state_failed(),
+                theme::state_done(),
+                theme::state_running(),
+                theme::frame_focus(),
+            ] {
+                assert_ne!(
+                    style.fg, borrowed.fg,
+                    "`{label}` borrows no state or focus hue"
+                );
+            }
+        }
+
+        // The thought tier is the shared one: identical to the helper the
+        // transcript and the streaming buffer use, and distinct from the header
+        // above it and from gutter chrome.
+        let y = text
+            .iter()
+            .position(|line| line.contains("a recorded thought"))
+            .expect("the thought body is drawn while Ctrl+T is on");
+        let x = text[y].find("a recorded thought").expect("thought text");
+        let thought = crate::ui::tui::formatting::thought_style();
+        let cell = styles[y][x];
+        assert_eq!(
+            cell.fg, thought.fg,
+            "the workers pane prints the same reasoning tier as every other pane"
+        );
+        assert_eq!(
+            cell.add_modifier, thought.add_modifier,
+            "and the same weight/italic pair (§F7)"
+        );
+        assert_ne!(
+            (cell.fg, cell.add_modifier),
+            (theme::text_muted().fg, theme::text_muted().add_modifier),
+            "reasoning is not gutter chrome (§F7)"
+        );
     }
 
     #[test]
@@ -1121,6 +1341,7 @@ mod tests {
             selected: 0,
             detail_present: true,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1148,6 +1369,7 @@ mod tests {
             selected: 0,
             detail_present: true,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1170,6 +1392,7 @@ mod tests {
             selected: 0,
             detail_present: false,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1206,6 +1429,7 @@ mod tests {
             selected: 0,
             detail_present: true,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1227,6 +1451,7 @@ mod tests {
             selected: 99,
             detail_present: true,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1246,6 +1471,7 @@ mod tests {
             selected: 0,
             detail_present: true,
             scroll: 7,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1270,6 +1496,7 @@ mod tests {
             selected: 0,
             detail_present: true,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1295,6 +1522,7 @@ mod tests {
             selected: 3,
             detail_present: true,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1358,6 +1586,7 @@ mod tests {
                 selected,
                 detail_present: false,
                 scroll: 0,
+                autoscroll: false,
                 list_scroll: 0,
                 show_thought: false,
                 thinking_budget: None,
@@ -1384,6 +1613,7 @@ mod tests {
             selected: 11,
             detail_present: false,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1396,7 +1626,9 @@ mod tests {
     fn the_selection_marker_never_borrows_the_focus_signal() {
         // §7.3: focus is the border colour plus the `●` title badge. The `>`
         // roster marker keeps its own slot in both states, so a selected row in
-        // an unfocused pane cannot be read as focus (G6).
+        // an unfocused pane cannot be read as focus (G6). The slot is the
+        // selection slot — neutral weight, so it also never impersonates the
+        // in-flight state of the row it points at.
         let workers = rows(3);
         for focus in [true, false] {
             let data = ActivityData {
@@ -1406,6 +1638,7 @@ mod tests {
                 selected: 1,
                 detail_present: false,
                 scroll: 0,
+                autoscroll: false,
                 list_scroll: 0,
                 show_thought: false,
                 thinking_budget: None,
@@ -1426,8 +1659,18 @@ mod tests {
                         markers += 1;
                         assert_eq!(
                             buffer[(x, y)].style().fg,
-                            theme::chip_active().fg,
+                            theme::selection().fg,
                             "selection marker style drifted at ({x},{y})"
+                        );
+                        assert_ne!(
+                            buffer[(x, y)].style().fg,
+                            theme::frame_focus().fg,
+                            "the marker never wears the focus hue at ({x},{y})"
+                        );
+                        assert_ne!(
+                            buffer[(x, y)].style().fg,
+                            theme::state_running().fg,
+                            "the marker never borrows the in-flight hue at ({x},{y})"
                         );
                     }
                 }
@@ -1466,6 +1709,7 @@ mod tests {
             selected: 0,
             detail_present: true,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1506,6 +1750,7 @@ mod tests {
             selected: 5,
             detail_present: true,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 5,
             show_thought: false,
             thinking_budget: None,
@@ -1519,6 +1764,7 @@ mod tests {
         let past = ActivityData {
             steering: &[],
             selected: 11,
+            autoscroll: false,
             list_scroll: 999,
             ..scrolled
         };
@@ -1535,6 +1781,7 @@ mod tests {
         let hidden = ActivityData {
             steering: &[],
             selected: 11,
+            autoscroll: false,
             list_scroll: 0,
             ..scrolled
         };
@@ -1557,6 +1804,7 @@ mod tests {
             selected: 0,
             detail_present: true,
             scroll: 999,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1564,6 +1812,189 @@ mod tests {
         let seen = geometry(70, 24, &data);
         assert!(seen.detail_max > 0, "the body must overflow: {seen:?}");
         assert_eq!(seen.detail_scroll, seen.detail_max as u16, "{seen:?}");
+    }
+
+    /// Defect 15, the component half. The detail's follow request has two spellings,
+    /// and both are resolved *here*, against the body this pass counted:
+    ///
+    /// * `autoscroll: true` — what `subagent_autoscroll` asks for, carried straight
+    ///   from the renderer state — pins the view to the newest line whatever the body
+    ///   measures, so a body that grew since the last frame is followed instead of
+    ///   lagged;
+    /// * `autoscroll: false` hands the pane the operator's `scroll` offset, which is
+    ///   honoured as asked: pulled back into range, never raised toward the tail.
+    ///
+    /// This is the flag the pane used to ignore: only the legacy pre-frame pin
+    /// (`render.rs`, retired here) answered it, from a line-count estimate, while this
+    /// pass drew whatever offset it happened to be handed.
+    #[test]
+    fn a_tail_request_pins_the_detail_to_the_newest_line_it_measured() {
+        let mut workers = rows(1);
+        workers[0].logs = (0..60)
+            .map(|index| format!("log line {index:02}"))
+            .collect();
+        let following = ActivityData {
+            steering: &[],
+            focus: true,
+            rows: &workers,
+            selected: 0,
+            detail_present: true,
+            scroll: 0,
+            autoscroll: true,
+            list_scroll: 0,
+            show_thought: false,
+            thinking_budget: None,
+        };
+        let seen = geometry(70, 24, &following);
+        assert!(seen.detail_max > 0, "the body must overflow: {seen:?}");
+        assert_eq!(
+            seen.detail_scroll, seen.detail_max as u16,
+            "the tail request was not pinned to the measured tail: {seen:?}"
+        );
+        let text = rows_text(70, 24, &following).join("\n");
+        assert!(
+            text.contains("log line 59"),
+            "the newest line is not on screen: {text}"
+        );
+        assert!(
+            !text.contains("log line 00"),
+            "the head should have scrolled out: {text}"
+        );
+
+        // The other spelling, with the same body: the operator's offset stays exactly
+        // where the scroll keys left it, however long the log is. The flag is off, so
+        // nothing is asked of the tail.
+        let parked = ActivityData {
+            scroll: 3,
+            autoscroll: false,
+            ..following
+        };
+        let seen = geometry(70, 24, &parked);
+        assert_eq!(
+            seen.detail_scroll, 3,
+            "the plain offset was not honoured: {seen:?}"
+        );
+        let text = rows_text(70, 24, &parked).join("\n");
+        assert!(
+            !text.contains("log line 59"),
+            "a parked detail was dragged to the tail: {text}"
+        );
+
+        // An offset beyond the end is still only pulled back into range — the clamp
+        // that was always there, and still not a follow the pane invented.
+        let past = ActivityData {
+            scroll: 999,
+            autoscroll: false,
+            ..following
+        };
+        let seen = geometry(70, 24, &past);
+        assert_eq!(
+            seen.detail_scroll, seen.detail_max as u16,
+            "an out-of-range offset was not clamped: {seen:?}"
+        );
+    }
+
+    /// Defect 14, the geometry half: the range the key path clamps `↑`/`↓` against
+    /// ([`roster_window`]) is the range this pass actually draws at. Every offset
+    /// inside it is drawn exactly, an offset outside it lands on the end of it, and a
+    /// roster with no window to walk reports `(0, 0)` and draws at the head — which is
+    /// what makes a press there a no-op rather than a claim.
+    #[test]
+    fn the_roster_window_the_key_path_walks_is_the_window_this_pass_draws() {
+        let workers = rows(12);
+        let selected = 5;
+        let pane = Rect::new(0, 0, 70, 24);
+        let (lower, upper) = roster_window(pane, true, workers.len(), selected);
+        assert!(lower <= upper, "a range always exists: {lower}..{upper}");
+        assert!(
+            upper > lower,
+            "12 rows in this half can travel: {lower}..{upper}"
+        );
+
+        let base = ActivityData {
+            steering: &[],
+            focus: true,
+            rows: &workers,
+            selected,
+            detail_present: true,
+            scroll: 0,
+            autoscroll: false,
+            list_scroll: 0,
+            show_thought: false,
+            thinking_budget: None,
+        };
+        for offset in [lower, (lower + upper) / 2, upper] {
+            let data = ActivityData {
+                autoscroll: false,
+                list_scroll: offset as u16,
+                ..base
+            };
+            assert_eq!(
+                usize::from(geometry(70, 24, &data).roster_scroll),
+                offset,
+                "the window was not drawn where the key path parked it"
+            );
+        }
+
+        // Outside the range, in both directions, the drawn offset is the end of it —
+        // the same place a press would have left it.
+        let above = ActivityData {
+            autoscroll: false,
+            list_scroll: 999,
+            ..base
+        };
+        assert_eq!(
+            usize::from(geometry(70, 24, &above).roster_scroll),
+            upper,
+            "an offset above the window was not landed on its end"
+        );
+        let (low_edge, up_edge) = roster_window(pane, true, workers.len(), 11);
+        let below = ActivityData {
+            autoscroll: false,
+            list_scroll: 0,
+            selected: 11,
+            ..base
+        };
+        assert!(low_edge > 0, "row 11 cannot stay visible at the head");
+        assert_eq!(
+            usize::from(geometry(70, 24, &below).roster_scroll),
+            low_edge,
+            "the reveal did not land where the bounds say: {low_edge}..{up_edge}"
+        );
+
+        // A roster that fits its half has no window: `(0, 0)`, and a request is
+        // answered at the head without moving anything.
+        let two = rows(2);
+        assert_eq!(
+            roster_window(pane, true, two.len(), 1),
+            (0, 0),
+            "two rows fit: nothing to walk"
+        );
+        let fits = ActivityData {
+            rows: &two,
+            selected: 1,
+            autoscroll: false,
+            list_scroll: 3,
+            ..base
+        };
+        assert_eq!(
+            usize::from(geometry(70, 24, &fits).roster_scroll),
+            0,
+            "a request against a roster with nothing to scroll moved the window"
+        );
+
+        // The degenerate inputs are answered without a panic and without a window.
+        assert_eq!(roster_window(pane, true, 0, 0), (0, 0), "no rows");
+        assert_eq!(
+            roster_window(Rect::new(0, 0, 0, 0), true, 12, 5),
+            (0, 0),
+            "no published rect"
+        );
+        assert_eq!(
+            roster_window(pane, true, 12, 99),
+            roster_window(pane, true, 12, 11),
+            "a selection past the end is clamped, not panicked on"
+        );
     }
 
     #[test]
@@ -1579,6 +2010,7 @@ mod tests {
             selected: 0,
             detail_present: true,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: true,
             thinking_budget: Some(4000),
@@ -1633,6 +2065,7 @@ mod tests {
                 selected: 0,
                 detail_present: false,
                 scroll: 0,
+                autoscroll: false,
                 list_scroll: 0,
                 show_thought: false,
                 thinking_budget: None,
@@ -1675,6 +2108,7 @@ mod tests {
             selected: 0,
             detail_present: false,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1715,6 +2149,7 @@ mod tests {
             selected: 0,
             detail_present: false,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1741,6 +2176,7 @@ mod tests {
             selected: 0,
             detail_present: false,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1757,6 +2193,7 @@ mod tests {
             selected: 0,
             detail_present: false,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1781,6 +2218,7 @@ mod tests {
             selected: 0,
             detail_present: true,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1799,6 +2237,7 @@ mod tests {
             selected: 0,
             detail_present: true,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1828,6 +2267,7 @@ mod tests {
             selected: 0,
             detail_present: true,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1845,6 +2285,96 @@ mod tests {
         assert!(text.contains("(waiting 0s)"), "{text}");
     }
 
+    /// Colour pass §C.2: a notice id owns [`theme::notice_ref`] and must not
+    /// borrow the focus Cyan, and a notice that ran past its lifetime is finally
+    /// *seen* to be outstanding — the attention hue, never the failure hue.
+    #[test]
+    fn an_expired_notice_is_marked_without_borrowing_focus_or_failure() {
+        let now_ms = crate::orchestrator::notice::notice_now_ms_for_test();
+        let ttl = crate::orchestrator::notice::NOTICE_TTL_MS;
+        let notices = [
+            crate::orchestrator::SteerNotice {
+                notice_id: "notice-alive-one".to_string(),
+                user_inquiry: "still inside its lifetime".to_string(),
+                target_worker: "coder-t-912".to_string(),
+                created_at_ms: now_ms,
+            },
+            crate::orchestrator::SteerNotice {
+                notice_id: "notice-stale-one".to_string(),
+                user_inquiry: "past its lifetime".to_string(),
+                target_worker: "coder-t-912".to_string(),
+                created_at_ms: now_ms - ttl,
+            },
+        ];
+        let running = row("coder-t-912", "t-912", true);
+        let data = ActivityData {
+            steering: &notices,
+            focus: true,
+            rows: &[running],
+            selected: 0,
+            detail_present: true,
+            scroll: 0,
+            autoscroll: false,
+            list_scroll: 0,
+            show_thought: false,
+            thinking_budget: None,
+        };
+        let text = rows_text(90, 24, &data);
+        let styles = rows_styles(90, 24, &data);
+        let cell = |needle: &str| -> Style {
+            let y = text
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} drawn: {text:?}"));
+            let x = text[y]
+                .find(needle)
+                .expect("the needle starts inside its row");
+            styles[y][x]
+        };
+
+        for id in ["notice-alive-one", "notice-stale-one"] {
+            let id_cell = cell(id);
+            assert_eq!(
+                id_cell.fg,
+                theme::notice_ref().fg,
+                "`{id}` wears the notice-reference accent"
+            );
+            assert_ne!(
+                id_cell.fg,
+                theme::frame_focus().fg,
+                "`{id}` never borrows the focus hue"
+            );
+        }
+
+        let stale = cell("past its lifetime");
+        assert_eq!(
+            stale.fg,
+            theme::notice_expired().fg,
+            "an unanswered notice past its lifetime is marked"
+        );
+        assert_ne!(
+            stale.fg,
+            theme::state_failed().fg,
+            "and reads as attention, never as a failure"
+        );
+        assert!(
+            text.iter().any(|line| line.contains("past its lifetime")
+                && line.contains("unanswered past its lifetime")),
+            "the words still say it: {text:?}"
+        );
+        let live = cell("still inside its lifetime");
+        assert_ne!(
+            live.fg,
+            theme::notice_expired().fg,
+            "a notice inside its lifetime stays body text"
+        );
+        assert_ne!(
+            live.fg,
+            theme::notice_ref().fg,
+            "only the reference id takes the notice accent"
+        );
+    }
+
     /// An empty inbox prints nothing at all: the pane never announces steering the
     /// arbitrator did not file, and never prints a reassuring zero.
     #[test]
@@ -1857,6 +2387,7 @@ mod tests {
             selected: 0,
             detail_present: true,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1887,6 +2418,7 @@ mod tests {
             selected: 0,
             detail_present: true,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1930,6 +2462,7 @@ mod tests {
             selected: 0,
             detail_present: true,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -1962,6 +2495,7 @@ mod tests {
             selected: 0,
             detail_present: true,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,
@@ -2000,6 +2534,7 @@ mod tests {
             selected: 0,
             detail_present: true,
             scroll: 0,
+            autoscroll: false,
             list_scroll: 0,
             show_thought: false,
             thinking_budget: None,

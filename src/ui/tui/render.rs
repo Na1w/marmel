@@ -2,11 +2,11 @@
 
 use super::TuiRenderer;
 use super::formatting::*;
+use super::theme;
 use anyhow::Result;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::io;
 
@@ -113,9 +113,7 @@ impl TuiRenderer {
     /// Render streaming thought lines.
     pub(crate) fn render_streaming_thought(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        let think_style = Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::ITALIC);
+        let think_style = thought_style();
         for line in self.current_thought.lines() {
             let line = line.replace('\t', "    ");
             let trimmed = line.trim();
@@ -160,10 +158,7 @@ impl TuiRenderer {
                 if cleaned.trim().is_empty() && !line.trim().is_empty() {
                     continue;
                 }
-                lines.push(Line::from(Span::styled(
-                    cleaned,
-                    Style::default().fg(Color::White),
-                )));
+                lines.push(Line::from(Span::styled(cleaned, theme::text_primary())));
             }
         }
         lines
@@ -182,9 +177,7 @@ impl TuiRenderer {
             "Marmennill: "
         };
         let formatted = format!("{prefix}{}", self.steer_sentence_buffer);
-        let steer_style = Style::default()
-            .fg(Color::LightYellow)
-            .add_modifier(Modifier::BOLD);
+        let steer_style = theme::role_manager();
         for line in formatted.lines() {
             let line = line.replace('\t', "    ");
             lines.push(Line::from(Span::styled(line, steer_style)));
@@ -255,90 +248,139 @@ impl TuiRenderer {
         }
     }
 
-    pub(crate) fn draw(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    ) -> Result<()> {
-        // Refresh the plan content from disk (live check-off updates), cached to avoid synchronous disk I/O on every frame.
+    /// The transcript's largest legal offset — its **tail** — as the pass that
+    /// draws the pane measured it.
+    ///
+    /// This is the one answer to "how far down may the transcript go", and it is
+    /// the same number the pane drew and published (audit defects 11/12). The
+    /// transcript counts its own wrapped lines at the width it draws them at —
+    /// one column narrower once its scrollbar is needed — and reports
+    /// `BodyReport::max_scroll`, which [`Self::draw_new_ui`] publishes into
+    /// `transcript_measured_max` with the offset it drew. A scroll key, a resize
+    /// clamp and the pane's own pin therefore all step from one geometry, and a
+    /// press can no longer measure its step against an estimate the next frame
+    /// disagrees with.
+    ///
+    /// The renderer's cached line estimate answers only for a transcript this
+    /// process has never painted — a restore, a resize before the first frame, or
+    /// a key press ahead of any draw — where there is no drawn geometry to agree
+    /// with yet. It is a bootstrap, not a second owner: the moment a frame draws
+    /// the pane, the measured number takes over and keeps the estimate out of the
+    /// argument.
+    pub(crate) fn transcript_tail(&self) -> u16 {
+        match self.transcript_measured_max.get() {
+            Some(measured) => measured.min(usize::from(u16::MAX)) as u16,
+            None => self
+                .estimated_chat_lines(self.chat_width.get())
+                .saturating_sub(self.chat_height.get())
+                .min(usize::from(u16::MAX)) as u16,
+        }
+    }
+
+    /// The worker-detail tail, stated the same way as [`Self::transcript_tail`]:
+    /// the maximum the Workers pane measured and published
+    /// (`WorkerGeometry::detail_max`), and the wrapped-line estimate only while
+    /// that pane has never been drawn.
+    pub(crate) fn worker_detail_tail(&self) -> u16 {
+        match self.detail_measured_max.get() {
+            Some(measured) => measured.min(usize::from(u16::MAX)) as u16,
+            None => self
+                .estimated_subagent_lines(self.subagent_width.get())
+                .saturating_sub(self.subagent_height.get())
+                .min(usize::from(u16::MAX)) as u16,
+        }
+    }
+
+    /// One frame's plan-box refresh: re-read the disk-backed plan text (cached to
+    /// avoid synchronous I/O on every frame) and state the ONE scroll decision the
+    /// plan box is allowed to make on its own — the first plan document this
+    /// process has ever seen gets centred on the task in flight.
+    ///
+    /// Nothing else in the frame touches plan scroll state. Task traffic is not a
+    /// centring event (`mod.rs::on_event` used to arm it on every
+    /// `DelegationEvent::Started`, which silently undid an operator's scroll-up —
+    /// audit defect 13), and a scroll gesture releases centring through
+    /// [`Self::scroll_plan_to`] and is never handed back by a frame.
+    fn refresh_plan_cache(&mut self) {
         let plan_path = std::path::Path::new(crate::manager::phase::MARMEL_DIR)
             .join(crate::manager::phase::PLAN_FILE);
         let archive_path = std::path::Path::new(crate::manager::phase::MARMEL_DIR)
             .join("execution_plan_archive.md");
 
-        if self.last_plan_check.elapsed() >= std::time::Duration::from_millis(250)
-            || self.plan_content.is_empty()
+        if !(self.last_plan_check.elapsed() >= std::time::Duration::from_millis(250)
+            || self.plan_content.is_empty())
         {
-            self.last_plan_check = std::time::Instant::now();
-            let current_plan_mtime = std::fs::metadata(&plan_path)
-                .ok()
-                .and_then(|m| m.modified().ok());
-            let current_archive_mtime = std::fs::metadata(&archive_path)
-                .ok()
-                .and_then(|m| m.modified().ok());
-
-            if current_plan_mtime != self.plan_mtime
-                || current_archive_mtime != self.archive_mtime
-                || self.plan_content.is_empty()
-            {
-                self.plan_mtime = current_plan_mtime;
-                self.archive_mtime = current_archive_mtime;
-
-                let (plan, is_archived, has_active_plan) = if current_plan_mtime.is_some() {
-                    let content = std::fs::read_to_string(&plan_path)
-                        .unwrap_or_else(|_| "Error reading execution plan.".to_string());
-                    let active = !content.trim().is_empty();
-                    (content, false, active)
-                } else if current_archive_mtime.is_some() {
-                    (
-                        format!(
-                            "[Plan completed & archived to .marmel/archive/]\n\n{}",
-                            std::fs::read_to_string(&archive_path).unwrap_or_default()
-                        ),
-                        true,
-                        false,
-                    )
-                } else {
-                    (
-                        "No active execution plan on disk.".to_string(),
-                        false,
-                        false,
-                    )
-                };
-                self.plan_content = plan;
-                self.plan_is_archived = is_archived;
-
-                // Auto-open plan panel when a plan appears; keep it visible so user can always see plan progress.
-                if (has_active_plan || is_archived) && !self.had_active_plan {
-                    self.show_plan_panel = true;
-                    self.plan_scroll = 0;
-                    self.plan_auto_scroll = true;
-                }
-                self.had_active_plan = has_active_plan || is_archived;
-            }
+            return;
         }
 
-        if self.chat_auto_scroll {
-            let w = self.chat_width.get();
-            let n = self.estimated_chat_lines(w);
-            let h = self.chat_height.get();
-            self.chat_scroll = n.saturating_sub(h) as u16;
+        self.last_plan_check = std::time::Instant::now();
+        let current_plan_mtime = std::fs::metadata(&plan_path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        let current_archive_mtime = std::fs::metadata(&archive_path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+
+        if current_plan_mtime == self.plan_mtime
+            && current_archive_mtime == self.archive_mtime
+            && !self.plan_content.is_empty()
+        {
+            return;
         }
 
-        if self.subagent_autoscroll {
-            let w = self.subagent_width.get();
-            let n = self.estimated_subagent_lines(w);
-            let h = self.subagent_height.get();
-            self.subagent_scroll = n.saturating_sub(h) as u16;
+        self.plan_mtime = current_plan_mtime;
+        self.archive_mtime = current_archive_mtime;
+
+        let (plan, is_archived, has_active_plan) = if current_plan_mtime.is_some() {
+            let content = std::fs::read_to_string(&plan_path)
+                .unwrap_or_else(|_| "Error reading execution plan.".to_string());
+            let active = !content.trim().is_empty();
+            (content, false, active)
+        } else if current_archive_mtime.is_some() {
+            (
+                format!(
+                    "[Plan completed & archived to .marmel/archive/]\n\n{}",
+                    std::fs::read_to_string(&archive_path).unwrap_or_default()
+                ),
+                true,
+                false,
+            )
         } else {
-            let w = self.subagent_width.get();
-            let n = self.estimated_subagent_lines(w);
-            let h = self.subagent_height.get();
-            let max_scroll = n.saturating_sub(h) as u16;
-            if self.subagent_scroll > max_scroll {
-                self.subagent_scroll = max_scroll;
-            }
-        }
+            (
+                "No active execution plan on disk.".to_string(),
+                false,
+                false,
+            )
+        };
+        self.plan_content = plan;
+        self.plan_is_archived = is_archived;
 
+        // A plan this process has not seen before opens its pane and gets centred;
+        // the transition is the only writer of the centring flag outside a scroll
+        // gesture and a restore, and it is an edge — `had_active_plan` is true from
+        // here on, so no later task traffic re-arms it.
+        if (has_active_plan || is_archived) && !self.had_active_plan {
+            self.arm_plan_centring();
+        }
+        self.had_active_plan = has_active_plan || is_archived;
+    }
+
+    pub(crate) fn draw(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ) -> Result<()> {
+        self.refresh_plan_cache();
+
+        // No scroll state is written before the frame is drawn. Every pane clamps,
+        // pins and reports its own geometry while it paints (audit defects 11/12:
+        // this pass used to re-pin `chat_scroll` from the follow mirror and
+        // re-measure the detail half from a line-count estimate, in parallel with
+        // the components, which erased any scroll that did not also flip a flag and
+        // let a key step and a frame disagree about the geometry). The single frame
+        // write-back in `draw_new_ui` publishes what each pane drew, and the follow
+        // flags are carried to the panes as the requests they are
+        // (`TranscriptData::follow`, `PlanData::auto_scroll`,
+        // `ActivityData::autoscroll`) rather than being resolved into offsets here.
         let mut chat_area = Rect::default();
         let mut plan_area = Rect::default();
         let mut subagent_area = Rect::default();
@@ -362,5 +404,39 @@ impl TuiRenderer {
         self.subagent_area = subagent_area;
         self.input_area = input_area;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The streaming buffers used to carry their own hard-coded copies of the
+    /// "thought", "body" and "steer" styles (§B.3), which competed with the
+    /// palette. They now ask the palette for the same role tokens the panes use,
+    /// and the body tier keeps **no** explicit foreground (§F2: a forced `White`
+    /// is white-on-white on a light profile).
+    #[test]
+    fn the_streaming_buffers_are_styled_by_the_palette_slots() {
+        let mut r = TuiRenderer::new();
+        r.current_thought = "weigh the seam".to_string();
+        r.current_content = "chunk of orchestrator".to_string();
+        r.steer_sentence_buffer = "hold the fixture".to_string();
+
+        let thought = r.render_streaming_thought();
+        assert_eq!(thought.len(), 1, "got: {thought:?}");
+        assert_eq!(thought[0].spans[0].style, thought_style());
+
+        let content = r.render_streaming_content();
+        assert_eq!(content.len(), 1, "got: {content:?}");
+        assert_eq!(content[0].spans[0].style, theme::text_primary());
+        assert_eq!(
+            content[0].spans[0].style.fg, None,
+            "body text inherits the operator's terminal profile"
+        );
+
+        let steer = r.render_streaming_steer();
+        assert_eq!(steer.len(), 1, "got: {steer:?}");
+        assert_eq!(steer[0].spans[0].style, theme::role_manager());
     }
 }

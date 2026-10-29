@@ -5,12 +5,39 @@
 //! (and is the seam the §10.3 legend-parity test feeds synthetic events through), and
 //! [`TuiRenderer::on_key_event`] holds the keymap in precedence order.
 //!
-//! Three rules shape the file:
+//! Four rules shape the file:
 //!
 //! * **The composer is never starved (§4.4).** Printables, paste, `Backspace`,
 //!   `Delete`, `Ctrl+Z/Y/J` and the caret keys reach `textarea.input(key)` in every
 //!   mode and every focus state. The pre-rebuild gating — editing keys and printables
-//!   were dead unless Chat held focus — is gone (UX friction 14, G6).
+//!   were dead unless Chat held focus — is gone (UX friction 14, G6). The one
+//!   printable that can be spent elsewhere is `?`, which opens the legend on an empty
+//!   composer. **Every other printable reaches the draft in every focus**: the bare
+//!   letter mnemonics (`x` for cancel-worker, `e` for last-error) are gone, because
+//!   they armed on an empty composer — exactly the moment a letter is the first
+//!   character of what the operator is typing. What carries those two capabilities
+//!   now cannot collide with a draft at all: the `/error` and
+//!   `/cancel <worker key or task id>` rows of the §6 command table, and the `Ctrl+X`
+//!   chord (a Ctrl chord never inserts a character).
+//! * **One key, one owner: focus decides it.** The keys that could belong either to
+//!   the composer or to a pane viewport — `Up`, `Down`, `PageUp`, `PageDown`, `Home`,
+//!   `End` — are settled by one predicate, `composer_has_focus`, which
+//!   reads the real [`state::FocusPane`] and never the shape of the draft or the
+//!   legacy `focused_panel` fold. The composer owns them iff it holds focus; a pane
+//!   owns them otherwise, and then the composer's text, caret and history walk are
+//!   left alone. Composer history is reachable through the `Ctrl+Up` / `Ctrl+Down`
+//!   chord **alone**, in every focus: the plain arrows are never a history recall at
+//!   all. With the composer focused they move the caret inside a multi-line draft,
+//!   and where the caret has nowhere to go the press is an explicit no-op — not
+//!   claimed, not repaint-worthy, and never a pane scroll either. This is what keeps
+//!   "scroll the views" and "walk the input history" from being the same keystroke:
+//!   an arrow that only ever *walked* a single-line draft was still reaching into the
+//!   composer while the operator was reaching for the transcript (operator request,
+//!   the reported Up/Down-versus-scroll conflict).
+//!   A pane with two viewports splits them the same way: in the Workers pane
+//!   `Up`/`Down` own the **roster** window and `PageUp`/`PageDown`/`Home`/`End` own
+//!   the selected worker's **detail** log, so no key answers to both halves and every
+//!   half has exactly one owner (`Self::scroll_worker_detail_to` holds the table).
 //! * **View state moves only through the transitions** of `mod.rs` (`set_view_mode`,
 //!   `set_focus`, `cycle_focus_pane`, `set_follow`, `open_help`, `show_confirm`,
 //!   `close_overlay`). No key arm writes `view_mode` / `focus` / `follow` / `overlay`
@@ -35,9 +62,9 @@
 //! teardown paths only (§0), as defensive cleanup for a terminal that inherited
 //! mouse mode elsewhere.
 
-use super::components::{help, input};
+use super::components::{activity, help, input};
 use super::state::{self, FocusPane, ViewMode};
-use super::{FocusedPanel, TuiRenderer, is_abort};
+use super::{TuiRenderer, is_abort};
 use crate::ui::{Renderer, SubagentDetail};
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::time::{Duration, Instant};
@@ -127,15 +154,17 @@ impl ConfirmAction {
 ///
 /// Each arm is the **same state transition** as the key the operator can use
 /// instead — `/plan` is `Ctrl+P`, `/workers` is `Ctrl+A`, `/follow` is `Ctrl+F`,
-/// `/mode <name>` is `F3`/`F4`/`F5`, `/error` is `e` — and none of them reaches
-/// the session loop, so a command is never a prompt to the model.
+/// `/mode <name>` is `F3`/`F4`/`F5`, `/cancel <worker key or task id>` is
+/// `Ctrl+X` — and none of them reaches the session loop, so a command is never a
+/// prompt to the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocalCommand {
     /// `/help`: print the one legend the `F1` overlay and the footer share.
     Help,
     /// `/thought`: the `Ctrl+T` thinking chip.
     Thinking,
-    /// `/error`: the `e` sticky-error recall (spec §8.5).
+    /// `/error`: the sticky-error recall (spec §8.5), now the only route to it and
+    /// therefore focus-independent.
     RecallError,
     /// `/mode [transcript|plan|workers|split]`: `F3`–`F5`. `None` is the bare
     /// form, which prints the current mode and the arguments the row advertises.
@@ -369,9 +398,18 @@ impl TuiRenderer {
     ///    request is pending there (§5). Outside it they are ordinary characters, so
     ///    typing `no` still types.
     /// 2. Global view keys, then Ctrl chords.
-    /// 3. Single-letter mnemonics (`?`, `x`, `e`) only with an **empty composer**;
-    ///    with a draft they insert literally — protecting typing outranks mnemonics
-    ///    (§4.4).
+    /// 3. `?` is the only printable that can be spent anywhere but the draft, and it
+    ///    takes the key only on an **empty** composer; every other printable inserts,
+    ///    in every focus and mode, whatever the draft says (§4.4). The bare-letter
+    ///    mnemonics that used to sit in this arm — `x` (cancel the selected worker,
+    ///    Workers pane only) and `e` (recall the last error, pane focus only) — are
+    ///    removed on the operator's request: their precondition was an empty
+    ///    composer, which is precisely when a letter is the first character of a word.
+    ///    The two capabilities moved to spellings that cannot collide with typing: the
+    ///    `/error` and `/cancel <worker key or task id>` rows of the §6 table, and the
+    ///    `Ctrl+X` chord. `?` keeps its (unchanged) empty-draft precondition: on an
+    ///    empty draft it opens the legend instead of inserting, which is the one
+    ///    remaining keystroke in this class.
     /// 4. Navigation and editing keys, then the printable insert, which happens in
     ///    every mode and every focus state.
     ///
@@ -487,19 +525,33 @@ impl TuiRenderer {
                     self.toggle_follow();
                     return true;
                 }
+                // The collision-free spelling of the removed bare-`x` mnemonic: a
+                // Ctrl chord never reaches the textarea, so it cannot intercept a
+                // letter, and it carries the old scope and the old semantics exactly
+                // — the selected Workers roster row, the confirm surface, nothing
+                // else (§5, operator request).
+                'x' => {
+                    self.disarm_abort();
+                    self.request_cancel_selected_worker_by_chord();
+                    return true;
+                }
                 'z' => {
                     self.disarm_abort();
                     self.ensure_textarea_in_sync();
+                    let before = self.input_text.clone();
                     self.textarea.undo();
                     self.sync_input_from_textarea();
+                    self.end_history_walk_if_edited(&before);
                     self.dirty = true;
                     return true;
                 }
                 'y' => {
                     self.disarm_abort();
                     self.ensure_textarea_in_sync();
+                    let before = self.input_text.clone();
                     self.textarea.redo();
                     self.sync_input_from_textarea();
+                    self.end_history_walk_if_edited(&before);
                     self.dirty = true;
                     return true;
                 }
@@ -527,14 +579,29 @@ impl TuiRenderer {
             return true;
         }
 
-        // 5. Navigation and composer editing.
+        // 5. Navigation and composer editing. Every arm here settles the
+        //    composer-versus-pane question with one predicate,
+        //    [`Self::composer_has_focus`] — the real `FocusPane`, never the draft
+        //    shape, the caret, or the legacy `focused_panel` fold that spells
+        //    `Input` and `Transcript` with the same `Chat` token.
         match key.code {
             KeyCode::Up | KeyCode::Down => return self.scroll_or_history(key, ctrl),
             KeyCode::PageUp => {
+                // A viewport gesture is a pane key: the composer has no viewport of
+                // its own, so with the composer focused the key has no owner and is
+                // reported as not a key press at all instead of claiming the event
+                // and leaving the follow/scroll state describing a movement that
+                // never happened.
+                if self.composer_has_focus() {
+                    return false;
+                }
                 self.scroll_by(true, 10);
                 return true;
             }
             KeyCode::PageDown => {
+                if self.composer_has_focus() {
+                    return false;
+                }
                 self.scroll_by(false, 10);
                 return true;
             }
@@ -553,22 +620,23 @@ impl TuiRenderer {
                 return true;
             }
             KeyCode::Home => {
-                if self.focus == FocusPane::Input {
+                if self.composer_has_focus() {
                     self.edit_key(key);
-                } else {
+                } else if self.scroll_to_top() {
                     // The gesture away from the tail states the follow decision
-                    // itself (`scroll_to_top` → `set_follow(false)`).
-                    self.scroll_to_top();
+                    // itself (`scroll_to_top` → `set_follow(false)`) — and a pane
+                    // already at its top has nothing to state and nothing to
+                    // repaint, while still owning the key.
                     self.dirty = true;
                 }
                 return true;
             }
             KeyCode::End => {
-                if self.focus == FocusPane::Input {
+                if self.composer_has_focus() {
                     self.edit_key(key);
-                } else {
-                    // And the jump to the tail is the explicit way back on.
-                    self.scroll_to_bottom();
+                } else if self.scroll_to_bottom() {
+                    // And the jump that actually reaches the tail is the explicit
+                    // way back on.
                     self.dirty = true;
                 }
                 return true;
@@ -585,23 +653,15 @@ impl TuiRenderer {
             _ => {}
         }
 
-        // 6. Printables. With an empty composer a mnemonic wins; otherwise — and for
-        //    every other printable — the character is typed, in any mode and any
-        //    focus (§4.4).
+        // 6. Printables. The character is typed in any mode and any focus (§4.4).
+        //    Only `?` can be spent elsewhere, and only on an empty draft: every other
+        //    printable — `x` and `e` included, at the start of a draft or mid-word —
+        //    reaches the textarea. The bare-letter mnemonics that used to be here are
+        //    `/error`, `/cancel <worker key or task id>` and `Ctrl+X` now.
         if let KeyCode::Char(c) = key.code {
-            if !ctrl && !alt && self.composer_is_empty() {
-                match c {
-                    '?' => {
-                        self.open_help();
-                        return true;
-                    }
-                    'x' if self.request_cancel_selected_worker() => return true,
-                    'e' => {
-                        self.recall_last_error();
-                        return true;
-                    }
-                    _ => {}
-                }
+            if !ctrl && !alt && c == '?' && self.composer_is_empty() {
+                self.open_help();
+                return true;
             }
             // §5: a printable press cancels a pending abort arm before it inserts.
             if self.is_abort_armed() {
@@ -683,56 +743,119 @@ impl TuiRenderer {
     }
 
     /// Scroll the focused pane (G7). The transcript arm of the scroll path states
-    /// the follow decision itself — off the tail turns follow **off**, onto the tail
-    /// turns it back on — so the chip can never lag the viewport, and no caller has
-    /// to restate it from the legacy mirror.
+    /// the follow decision itself — off the tail turns follow **off**, an arrival on
+    /// the tail turns it back on — so the chip can never lag the viewport, and no
+    /// caller has to restate it from the legacy mirror.
+    ///
+    /// The frame is only marked dirty when a viewport actually moved: a press at an
+    /// extreme, or on a pane that has nothing to scroll, has nothing to repaint, and
+    /// leaving `dirty` set there is what used to make the chip look like it had
+    /// toggled (defect 9).
     fn scroll_by(&mut self, up: bool, amount: u16) {
-        if up {
-            self.scroll_up(amount);
+        let moved = if up {
+            self.scroll_up(amount)
         } else {
-            self.scroll_down(amount);
+            self.scroll_down(amount)
+        };
+        if moved {
+            self.dirty = true;
         }
-        self.dirty = true;
     }
 
-    /// `Up` / `Down` (§5): `Ctrl+Up`/`Ctrl+Down` are history; inside a multi-line
-    /// draft the caret keeps moving; with an empty draft the key walks the history;
-    /// otherwise it scrolls the focused pane by one, which is what the pre-rebuild
-    /// handler did and what keeps `Down` useful with a one-line draft.
+    /// `Up` / `Down` (§5). One predicate owns the decision: the composer holds the
+    /// key **iff** it holds focus, and a pane holds it otherwise. That is the whole
+    /// fix for the reported overlap — the same key used to be a composer key and a
+    /// pane key at once, decided by the shape of the draft, so `Up` behind the
+    /// composer could scroll the transcript and `Up` on the transcript could
+    /// rewrite the composer's draft.
+    ///
+    /// * `Ctrl+Up` / `Ctrl+Down` is the **only** history binding, in every focus. It
+    ///   is a chord, so it is unambiguous, it is how a multi-line entry is walked,
+    ///   and no caret guard can get in front of it. It is also the only way to reach
+    ///   the walk at all: the operator who wants the previous submission asks for it
+    ///   by name instead of arrowing into it.
+    /// * With the **composer** focused: the caret moves inside a multi-line draft
+    ///   whenever it can. Everywhere else the plain keys belong to nothing — they are
+    ///   not a history recall (that was the reported conflict: an arrow spent on
+    ///   scrolling replaced the draft), they are not a pane step (the composer owns
+    ///   the key), and they are not claimed, so no repaint, `follow` decision or
+    ///   scroll offset is left describing a movement that never happened.
+    /// * With a **pane** focused: one step of that pane's viewport, and never a
+    ///   touch on the composer — not its draft, not its caret, not its history
+    ///   bookkeeping. The Workers pane is the one pane with two viewports, so its
+    ///   arrows belong to the roster window
+    ///   ([`Self::scroll_worker_roster_by`]) while the selected worker's detail log
+    ///   keeps the page and jump keys — the two-viewport rule is spelled out at
+    ///   [`Self::scroll_worker_detail_to`].
+    ///
+    /// Returns whether the key did something. A composer press with nowhere for the
+    /// caret to go is not claimed: it neither repaints nor leaves `follow` and a
+    /// scroll offset stating a movement that never happened.
     fn scroll_or_history(&mut self, key: KeyEvent, ctrl: bool) -> bool {
+        let up = key.code == KeyCode::Up;
         if ctrl {
-            if key.code == KeyCode::Up {
-                self.history_prev();
+            let walked = if up {
+                self.history_prev()
             } else {
-                self.history_next();
+                self.history_next()
+            };
+            if walked {
+                self.dirty = true;
             }
-            self.dirty = true;
+            return walked;
+        }
+        if !self.composer_has_focus() {
+            if self.focus == FocusPane::Workers {
+                // Defect 14: the roster window (`subagent_list_scroll`) had no key
+                // owner at all — only a resize clamp — while the pane itself
+                // advertised `↑`/`↓` as the keys that scroll it. They are, and they
+                // are its only owner. The detail half one level in keeps
+                // `PageUp`/`PageDown`/`Home`/`End`, so the pane's two viewports
+                // still answer to two different keys.
+                if self.scroll_worker_roster_by(up, 1) {
+                    self.dirty = true;
+                }
+            } else {
+                self.scroll_by(up, 1);
+            }
             return true;
         }
         self.ensure_textarea_in_sync();
         let last_line = self.textarea.lines().len().saturating_sub(1);
         let line = self.textarea.cursor().0;
-        let up = key.code == KeyCode::Up;
         let caret_moves = (up && line > 0) || (!up && line < last_line);
         if caret_moves {
             self.edit_key(key);
             return true;
         }
-        if self.composer_is_empty() {
-            if up {
-                self.history_prev();
-            } else {
-                self.history_next();
-            }
-            self.dirty = true;
-            return true;
-        }
-        self.scroll_by(up, 1);
-        true
+        // The composer holds the key, and there is nothing inside the composer for
+        // it to do: the caret is against the edge of the draft. The history walk is
+        // **not** the fallback any more — a plain arrow here belongs to no one, and
+        // is reported as not a key press. Claiming it (or walking the history
+        // through it) is exactly what made the operator's scroll attempt rewrite the
+        // draft, and it is what the `Ctrl+Up` / `Ctrl+Down` chord of §5 is there to
+        // make unnecessary.
+        false
     }
 
-    /// `Left` / `Right` in the Workers pane: move the roster selection, keeping the
-    /// selected row's detail in view exactly as the pre-rebuild Subagents handler did.
+    /// `Left` / `Right` in the Workers pane: move the roster selection, and ask the
+    /// pane to show the selected row's newest line.
+    ///
+    /// This is the **selection reveal**, not a viewport gesture: it is the one place
+    /// on the key path allowed to arm `subagent_autoscroll`, because it is choosing
+    /// which detail the pane shows rather than scrolling one. The scroll keys state
+    /// the same flag through the movement-guarded arms instead (defect 15), and the
+    /// roster window itself belongs to `Up` / `Down`
+    /// ([`Self::scroll_worker_roster_by`], defect 14) — the selection keys never
+    /// write `subagent_list_scroll` by hand; the pane reveals the row it is given,
+    /// against the same bounds the arrows clamp to.
+    ///
+    /// The reveal states the request and stops there. "Show me the newest line" is
+    /// answered by the pass that counts the detail body
+    /// (`components::activity::draw_detail`), which is the only place that knows
+    /// where this row's tail is; the offset the keys left stands until that frame
+    /// resolves it, so no estimate of the tail is ever parked into
+    /// `subagent_scroll` from here.
     fn select_worker(&mut self, forward: bool) -> bool {
         if self.subagents.is_empty() {
             return false;
@@ -750,10 +873,6 @@ impl TuiRenderer {
             self.selected_subagent_idx -= 1;
         }
         self.subagent_autoscroll = true;
-        let w = self.subagent_width.get();
-        let n = self.estimated_subagent_lines(w);
-        let h = self.subagent_height.get();
-        self.subagent_scroll = n.saturating_sub(h) as u16;
         self.dirty = true;
         true
     }
@@ -800,12 +919,15 @@ impl TuiRenderer {
         self.show_request(ConfirmAction::Quit);
     }
 
-    /// `x` (§5): ask to cancel the **selected** worker of the Workers pane.
+    /// `Ctrl+X` (§5): ask to cancel the **selected** worker of the Workers pane — the
+    /// collision-free replacement for the bare `x` the operator stopped wanting.
     ///
-    /// The precondition is part of the binding, not an implementation detail: the key
-    /// is scoped to the pane, and when it is not met the character falls through and
-    /// is typed, which is what keeps `x` usable as a letter (acceptance criterion
-    /// 13). The cancel itself waits for `y`.
+    /// The precondition is part of the binding and is unchanged from the old key: the
+    /// request is scoped to the pane, so a row can never be cancelled from a focus
+    /// that is not showing the roster. What a chord can do and a letter could not is
+    /// never be silent (G5): a letter whose guard failed fell through and typed
+    /// itself, while the chord says in the status line why it did nothing. The cancel
+    /// itself still waits for `y`.
     fn request_cancel_selected_worker(&mut self) -> bool {
         if self.focus != FocusPane::Workers || self.subagents.is_empty() {
             return false;
@@ -819,9 +941,25 @@ impl TuiRenderer {
         self.show_request(ConfirmAction::CancelWorker { key, task_id })
     }
 
+    /// The `Ctrl+X` arm of the keymap: [`Self::request_cancel_selected_worker`] plus
+    /// the notice for the case where that guard is not met. It adds no capability and
+    /// changes no semantics — same selected row, same captured identity, same confirm
+    /// surface — it only replaces the letter that used to carry them.
+    fn request_cancel_selected_worker_by_chord(&mut self) {
+        if self.request_cancel_selected_worker() {
+            return;
+        }
+        self.notice(if self.subagents.is_empty() {
+            "Ctrl+X asks to cancel the selected roster row — no worker is on the roster."
+        } else {
+            "Ctrl+X asks to cancel the selected roster row of the Workers pane — press \
+             Ctrl+A or F5 to focus it, or type /cancel <worker key or task id>."
+        });
+    }
+
     /// Put one destructive request on the confirm surface and state it in the
     /// status line. This is the single place the surface is armed, so every entry
-    /// point — `Ctrl+D`, `x`, a slash command — ends on the same surface with the
+    /// point — `Ctrl+D`, `Ctrl+X`, a slash command — ends on the same surface with the
     /// same `y` / `n` affordance, and none of them arms abort on the way.
     fn show_request(&mut self, action: ConfirmAction) -> bool {
         let status = Self::confirm_status_line(&action);
@@ -1042,25 +1180,63 @@ impl TuiRenderer {
 
     // ---- composer helpers (spec §4.4, §6) ------------------------------------
 
+    /// The **one** predicate answering "does the composer own this key, or does a
+    /// pane?" — the real [`FocusPane`], projected through
+    /// [`state::FocusPane::composer_has_focus`].
+    ///
+    /// Every arm of [`Self::on_key_event`] that has to choose between the composer
+    /// and a pane viewport asks this and nothing else. It used to ask two different
+    /// questions in two adjacent arms — `Home`/`End` tested the stored focus while
+    /// `Up`/`Down`/`PageUp`/`PageDown` tested the shape of the draft (or nothing at
+    /// all) — and the legacy three-valued `focused_panel` fold then resolved both
+    /// onto the same `Chat` spelling, which collapsed the composer and the
+    /// transcript into one owner. Inside the composer the draft now decides only
+    /// whether the caret has somewhere to go; the history walk belongs to the
+    /// `Ctrl+Up`/`Ctrl+Down` chord alone. Either way the draft never decides *who*
+    /// gets the key.
+    fn composer_has_focus(&self) -> bool {
+        self.focus.composer_has_focus()
+    }
+
     /// Route one key to the composer widget. This is the single place the §4.4 rule
     /// lives, and it contains no focus test anywhere.
     fn edit_key(&mut self, key: KeyEvent) {
         self.ensure_textarea_in_sync();
+        let before = self.input_text.clone();
         self.textarea.input(key);
         self.sync_input_from_textarea();
+        self.end_history_walk_if_edited(&before);
         self.dirty = true;
     }
 
     /// Insert a newline at the caret (§5: modified Enter and `Ctrl+J`).
     fn newline(&mut self) {
         self.ensure_textarea_in_sync();
+        let before = self.input_text.clone();
         self.textarea.insert_newline();
         self.sync_input_from_textarea();
+        self.end_history_walk_if_edited(&before);
         self.dirty = true;
     }
 
-    /// Whether the draft is empty — the precondition that turns `?`, `x` and `e` from
-    /// typed characters into mnemonics (§4.4).
+    /// End a history browse the moment the operator changes the draft.
+    ///
+    /// `history_index` is the renderer's claim that what stands in the composer is
+    /// *entry n of the history*, and the `history n/m` chip draws it. Left set
+    /// after a hand edit, the next `Ctrl+Up`/`Ctrl+Down` walks on from the stale
+    /// position and overwrites what was just typed. A key that only moves the caret
+    /// leaves the browse alone — walking the caret through a recalled entry is not
+    /// an edit of it.
+    fn end_history_walk_if_edited(&mut self, before: &str) {
+        if self.history_index.is_some() && self.input_text != before {
+            self.history_index = None;
+        }
+    }
+
+    /// Whether the draft is empty — the precondition that turns `?` from a typed
+    /// character into the legend key (§4.4). It is the only remaining use of this
+    /// gate in the printable arm: the bare-letter mnemonics that also used it are
+    /// gone, so no letter ever depends on what the draft does or does not say.
     fn composer_is_empty(&self) -> bool {
         self.input_text.is_empty() && self.textarea.lines().iter().all(|line| line.is_empty())
     }
@@ -1097,6 +1273,7 @@ impl TuiRenderer {
             .move_cursor(ratatui_textarea::CursorMove::Jump(0, column));
         self.textarea.insert_str(tail);
         self.sync_input_from_textarea();
+        self.end_history_walk_if_edited(&buffer);
         self.dirty = true;
         true
     }
@@ -1187,8 +1364,8 @@ impl TuiRenderer {
                 ));
                 self.dirty = true;
             }
-            // `e` already states its outcome in the transcript, sticky §8.5
-            // buffer first, so `/error` is that function and nothing else.
+            // `/error` already states its outcome in the transcript, sticky §8.5
+            // buffer first, so the command is that function and nothing else.
             LocalCommand::RecallError => self.recall_last_error(),
             // Bare `/mode` is the question, not a no-op: it answers with the mode
             // on screen and the arguments the table advertises.
@@ -1232,7 +1409,11 @@ impl TuiRenderer {
         }
     }
 
-    /// `e` / `/error`: print the sticky last error again (spec §8.5).
+    /// `/error`: print the sticky last error again (spec §8.5). This is now the only
+    /// route to the recall, and a slash command is focus-independent: the draft, the
+    /// pane and the caret are the same wherever the `/error` line is submitted from
+    /// (§4.4), which is exactly why the bare `e` mnemonic was removed instead of
+    /// re-scoped.
     ///
     /// The §8.5 buffer comes first, because it is the report as it was made: the
     /// categorical cause plus the **whole** text, multi-line included. `status_line`
@@ -1240,7 +1421,7 @@ impl TuiRenderer {
     /// cleared (`/reset`, a restore, a pruning), so a transcript-only scan loses the
     /// cause exactly when the operator needs it — which is why the scan below is the
     /// fallback, not the source. Saying so out loud when the buffer is empty is what
-    /// keeps `e` from ever being a silent key (G5).
+    /// keeps `/error` from ever being a silent command (G5).
     fn recall_last_error(&mut self) {
         if let Some(error) = self.last_error.clone() {
             self.messages.push(format!(
@@ -1323,10 +1504,12 @@ impl TuiRenderer {
             return;
         }
         self.ensure_textarea_in_sync();
+        let before = self.input_text.clone();
         // A single insert_str splices the block in one edit: one undo record and one
         // line rewrite, so a very large paste cannot trigger a per-char re-render storm.
         self.textarea.insert_str(body);
         self.sync_input_from_textarea();
+        self.end_history_walk_if_edited(&before);
         self.dirty = true;
     }
 
@@ -1363,6 +1546,33 @@ impl TuiRenderer {
         self.cursor = text.len();
     }
 
+    /// Install a **recalled history entry** in the composer.
+    ///
+    /// This is [`Self::set_input_content`] with the caret parked at the end of the
+    /// recalled entry's *first* line instead of at `CursorMove::End`. For the
+    /// single-line case the two are the same position, so a recalled command still
+    /// lands ready to re-submit. It matters for a multi-line entry: the caret is kept
+    /// off the entry's last line, so an arrow spent inside the recalled text answers
+    /// for the entry's first line rather than for a line the operator never typed.
+    /// The walk itself is unaffected either way — `Ctrl+Up`/`Ctrl+Down` short-circuit
+    /// ahead of any caret question (§5), so a recalled entry can never be
+    /// half-walked by an arrow, which is what the plain-key history fallback used to
+    /// make possible.
+    fn recall_input_content(&mut self, text: &str) {
+        self.set_input_content(text);
+        let Some(first_line) = self.textarea.lines().first() else {
+            return;
+        };
+        if self.textarea.lines().len() < 2 {
+            return;
+        }
+        let first_line = first_line.clone();
+        let column = first_line.chars().count();
+        self.textarea
+            .move_cursor(ratatui_textarea::CursorMove::Jump(0, column as u16));
+        self.cursor = first_line.len();
+    }
+
     pub(crate) fn ensure_textarea_in_sync(&mut self) {
         if self.textarea.lines().join("\n") != self.input_text {
             let lines: Vec<String> = if self.input_text.is_empty() {
@@ -1387,127 +1597,333 @@ impl TuiRenderer {
         }
     }
 
-    /// Clamp all scroll offsets to their recomputed maxima.
+    /// Clamp every scroll offset into the range its pane can draw.
+    ///
+    /// The three ranges are the ones the panes published, not measurements taken
+    /// here: the transcript and the worker detail go through
+    /// [`Self::transcript_tail`] / [`Self::worker_detail_tail`], which read the
+    /// geometry those panes measured and wrote back on the frame
+    /// (`draw_new_ui`), and the plan reads `plan_max_scroll`, which the plan pane
+    /// publishes the same way. So a resize clamp, a scroll key and a draw can never
+    /// land on three different offsets (audit defects 11/12; the pin pass in
+    /// `render.rs` used to run the same arithmetic a third time, from an estimate).
     pub(crate) fn clamp_scrolls(&mut self) {
-        let w = self.chat_width.get();
-        let n = self.estimated_chat_lines(w);
-        let h = self.chat_height.get();
-        self.chat_scroll = self.chat_scroll.min(n.saturating_sub(h) as u16);
+        self.chat_scroll = self.chat_scroll.min(self.transcript_tail());
 
         self.plan_scroll = self.plan_scroll.min(self.plan_max_scroll);
 
-        let w = self.subagent_width.get();
-        let n = self.estimated_subagent_lines(w);
-        let h = self.subagent_height.get();
-        self.subagent_scroll = self.subagent_scroll.min(n.saturating_sub(h) as u16);
+        self.subagent_scroll = self.subagent_scroll.min(self.worker_detail_tail());
 
+        // The roster's clamp is deliberately the coarse one it has always had: this
+        // pass only knows the pane rect, not the split the pane is going to choose.
+        // The authoritative range is the pane's (`components::activity::roster_window`),
+        // applied when the window is drawn and reconciled against on the next `↑`/`↓`
+        // (`events.rs::scroll_worker_roster_by`, defect 14) — so a resize can leave a
+        // stale offset stored for one frame, never one drawn or walked.
         let list_height = self.subagent_area.height.saturating_sub(3).max(1) as usize;
         let max_list = self.subagents.len().saturating_sub(list_height);
         self.subagent_list_scroll = self.subagent_list_scroll.min(max_list as u16);
     }
 
-    /// Scroll the focused pane. For the transcript pane the gesture also states the
-    /// follow decision it expresses (G7, spec §10 item 14): pulling the viewport off
-    /// the tail turns follow **off**, and landing back on the tail turns it **on**.
+    /// Move the transcript viewport to `target` and state **only** the follow
+    /// decision the move actually expresses (defect 9).
+    ///
+    /// `toward_tail` says which way the gesture was pulling. The rule, which is the
+    /// whole of G7 as spec §10 item 14 states it:
+    ///
+    /// * an **away** gesture that moved the viewport turns follow off;
+    /// * a **toward** gesture turns it back on only when it *arrived* on the tail
+    ///   (and the pane has a tail to arrive on, i.e. `tail > 0`);
+    /// * a press that lands where the viewport already stands states nothing at all:
+    ///   `follow`, its legacy mirror, the `● LIVE` / `↓ N new` chip and the dirty
+    ///   flag are all left exactly as they were. That is what stops a transcript
+    ///   that fits its pane — `max_scroll == 0`, the case with no tail to leave —
+    ///   from toggling its own chip on every single arrow press.
     ///
     /// The transcript arm never assigns the legacy `chat_auto_scroll` mirror: that
     /// flag is a projection of `follow` and moves only through
     /// [`Self::set_follow`].
-    pub(crate) fn scroll_up(&mut self, amount: u16) {
-        match self.focused_panel {
-            FocusedPanel::Chat => {
-                self.set_follow(false);
-                self.chat_scroll = self.chat_scroll.saturating_sub(amount);
+    ///
+    /// Returns whether the viewport moved, which is what tells the caller whether
+    /// there is anything at all to repaint.
+    fn scroll_transcript_to(&mut self, target: u16, toward_tail: bool) -> bool {
+        let tail = self.transcript_tail();
+        let stored = self.chat_scroll;
+        // Where the viewport genuinely stands, which is not always what the field
+        // says: with follow on the transcript pane pins itself to the tail it measured
+        // (`components/transcript.rs`), so the tail is what a press compares against
+        // even when no frame has written `chat_scroll` back yet.
+        let current = if self.follow { tail } else { stored };
+        if target == current {
+            // The viewport is already where the press asked for, so there is no
+            // movement and no decision: `follow`, its mirror, the chip and the
+            // dirty flag all stay as they are. The one piece of bookkeeping still
+            // worth doing is a stale offset — while the pane is pinned the field can
+            // lag behind what is drawn. Reconciling it changes no pixel (the pin
+            // ignores it), states nothing, and is what lets the next press measure
+            // its step from the position the operator is really looking at.
+            if target != stored {
+                self.chat_scroll = target;
             }
-            FocusedPanel::Plan => {
+            return false;
+        }
+        self.chat_scroll = target;
+        if toward_tail {
+            if tail > 0 && target >= tail {
+                // Only an arrival re-arms: this is the explicit scroll-to-end
+                // gesture §10 item 14 allows. A press that moved the viewport
+                // without getting it there states no decision.
+                self.set_follow(true);
+            }
+        } else {
+            self.set_follow(false);
+        }
+        true
+    }
+
+    /// Put the plan viewport where the operator asked for it.
+    ///
+    /// `plan_auto_scroll` does **not** mean "the viewport sits at the tail". It
+    /// means "centre the pane on the task in flight": `components/plan_pane.rs`
+    /// answers it with an offset computed from the active task, never from what the
+    /// operator asked for. So no scroll gesture ever writes it **on** (defect 13):
+    /// an operator who pages or jumps to the tail asked for the tail, and handing
+    /// the viewport back to the in-flight task on the next frame is exactly the
+    /// follow-then-jump flap this closes.
+    ///
+    /// What a gesture does write is the opposite intent, and only once it has
+    /// actually taken the viewport over: `false`, meaning "this offset is the
+    /// operator's, stop centring". The release is still stated when the offset
+    /// itself did not change but centring was live and the pane is scrollable —
+    /// releasing it visibly moves the body back to the operator's offset. With
+    /// nothing to scroll (`plan_max_scroll == 0`) a press has nowhere to go and
+    /// changes neither the offset nor the intent.
+    ///
+    /// Returns whether anything the operator can see changed.
+    fn scroll_plan_to(&mut self, target: u16) -> bool {
+        if target == self.plan_scroll {
+            if self.plan_auto_scroll && self.plan_max_scroll > 0 {
                 self.plan_auto_scroll = false;
-                self.plan_scroll = self.plan_scroll.saturating_sub(amount);
+                return true;
             }
-            FocusedPanel::Subagents => {
-                self.subagent_autoscroll = false;
-                self.subagent_scroll = self.subagent_scroll.saturating_sub(amount);
+            return false;
+        }
+        self.plan_scroll = target;
+        self.plan_auto_scroll = false;
+        true
+    }
+
+    /// Move the worker-detail viewport and state the `subagent_autoscroll`
+    /// decision the move expresses, under the same no-movement-no-decision rule as
+    /// the transcript (defects 9 and 15): the flag is turned off by a gesture that
+    /// moved the detail off its tail and back on only by one that arrived on it, so
+    /// it can never flap on a press with nowhere to go.
+    ///
+    /// # The Workers pane: two viewports, two owners
+    ///
+    /// The pane shows a roster of workers **and** the selected worker's detail log,
+    /// so its two offsets are addressed by two disjoint sets of keys, and no key
+    /// answers to both:
+    ///
+    /// | key | viewport it owns | offset it writes |
+    /// |---|---|---|
+    /// | `Up` / `Down` | the roster window | `subagent_list_scroll` |
+    /// | `PageUp` / `PageDown` | the selected worker's detail log | `subagent_scroll` |
+    /// | `Home` / `End` | the detail log, top / tail | `subagent_scroll` |
+    /// | `Left` / `Right` | the roster selection (the window reveals the new row) | `selected_subagent_idx` |
+    ///
+    /// So the detail functions here never touch the roster offset, and
+    /// [`Self::scroll_worker_roster_by`] never touches the detail offset or this
+    /// flag. (Defect 14 was exactly this hole: the roster offset had no key owner at
+    /// all, only a resize clamp, while the pane advertised `↑`/`↓` as its scroll
+    /// keys.)
+    fn scroll_worker_detail_to(&mut self, target: u16, toward_tail: bool) -> bool {
+        let tail = self.worker_detail_tail();
+        let stored = self.subagent_scroll;
+        let current = if self.subagent_autoscroll {
+            tail
+        } else {
+            stored
+        };
+        if target == current {
+            // Same no-movement-no-decision rule, with the same stale-offset
+            // reconciliation as the transcript arm: while the flag is on the pane
+            // pins this offset to the tail it measured, so the stored field can lag
+            // behind what was drawn.
+            if target != stored {
+                self.subagent_scroll = target;
+            }
+            return false;
+        }
+        self.subagent_scroll = target;
+        if toward_tail {
+            if tail > 0 && target >= tail {
+                self.subagent_autoscroll = true;
+            }
+        } else {
+            self.subagent_autoscroll = false;
+        }
+        true
+    }
+
+    /// The roster window's drawable bounds, asked of the pass that draws it.
+    ///
+    /// The key path deliberately does not estimate the roster's height: the pane
+    /// owns that geometry (`components::activity::roster_window`), so the press is
+    /// clamped against the rect the last frame actually published
+    /// (`subagent_area`) with the same §2.5 detail rule the frame applies. A press
+    /// can therefore never claim a window position the pane is going to refuse, and
+    /// the two ends of the range are the two ends the pane's own scrollbar draws.
+    ///
+    /// `(0, 0)` — no rows, or a Workers rect no frame has published yet — means
+    /// there is no window to move.
+    fn worker_roster_bounds(&self) -> (usize, usize) {
+        let pane = self.subagent_area;
+        let selected = self
+            .selected_subagent_idx
+            .min(self.subagents.len().saturating_sub(1));
+        activity::roster_window(
+            pane,
+            super::layout::workers_detail_present(pane.width),
+            self.subagents.len(),
+            selected,
+        )
+    }
+
+    /// `Up` / `Down` with the Workers pane focused: walk the **roster window** by
+    /// `amount` rows, and nothing else (defect 14).
+    ///
+    /// The window is the outer viewport of the Workers pane — the list of workers —
+    /// and this is its only key owner. It is a window, not a log: the selection
+    /// stays where it is (`←`/`→` move that, and reveal the row), the detail half
+    /// keeps its own offset, and **no follow-ish flag is written at all**, because
+    /// moving a list window says nothing about following the tail of a log. That is
+    /// the roster half of the no-movement-no-decision rule: at either end of the
+    /// window — including a roster that fits its half, where the bounds collapse to
+    /// a single position — the offset does not move, nothing is stated, and no frame
+    /// is asked for.
+    ///
+    /// Direction follows the other two viewports, which all count rows hidden from
+    /// the top: `up` reveals the **earlier** rows (offset toward `lower`), `down` the
+    /// later ones. A roster, unlike a log, has both ends worth walking.
+    ///
+    /// Returns whether the window moved.
+    fn scroll_worker_roster_by(&mut self, up: bool, amount: u16) -> bool {
+        let (lower, upper) = self.worker_roster_bounds();
+        let current = usize::from(self.subagent_list_scroll).clamp(lower, upper);
+        let target = if up {
+            current.saturating_sub(usize::from(amount)).max(lower)
+        } else {
+            current.saturating_add(usize::from(amount)).min(upper)
+        };
+        if target == current {
+            // Already at the end the press asked for. The only bookkeeping still
+            // worth doing is a stale offset — the pane's own clamp can land the
+            // drawn window somewhere the stored value does not say — so it is
+            // reconciled here and nothing else is touched, exactly as the transcript
+            // and detail arms reconcile theirs.
+            if usize::from(self.subagent_list_scroll) != current {
+                self.subagent_list_scroll = current as u16;
+            }
+            return false;
+        }
+        self.subagent_list_scroll = target as u16;
+        true
+    }
+
+    /// Scroll the focused pane one step up (G7). For the transcript and the worker
+    /// detail the gesture also states the follow decision it expresses (spec §10
+    /// item 14): a press that pulled the viewport off the tail turns the follow-ish
+    /// flag **off**, and a press with nowhere to go states nothing.
+    ///
+    /// The target is the real [`FocusPane`], never the legacy `focused_panel` fold.
+    /// The fold spells `Input` and `Transcript` with one `Chat` token, so resolving
+    /// the target from it moved the transcript viewport while the composer held
+    /// focus — a scroll of a pane the operator was not looking at. The composer owns
+    /// no viewport, so it names no scroll target and returns `false`.
+    ///
+    /// For the Workers pane the target is the **detail** half. Plain `Up` / `Down` no
+    /// longer reach this function there — they own the roster window
+    /// ([`Self::scroll_worker_roster_by`]) — so what arrives here is the
+    /// `PageUp` / `PageDown` page gesture.
+    pub(crate) fn scroll_up(&mut self, amount: u16) -> bool {
+        match self.focus {
+            FocusPane::Input => false,
+            FocusPane::Transcript => {
+                let target = self.chat_scroll.saturating_sub(amount);
+                self.scroll_transcript_to(target, false)
+            }
+            FocusPane::Plan => {
+                let target = self.plan_scroll.saturating_sub(amount);
+                self.scroll_plan_to(target)
+            }
+            FocusPane::Workers => {
+                let target = self.subagent_scroll.saturating_sub(amount);
+                self.scroll_worker_detail_to(target, false)
             }
         }
     }
 
-    pub(crate) fn scroll_down(&mut self, amount: u16) {
-        match self.focused_panel {
-            FocusedPanel::Chat => {
-                let w = self.chat_width.get();
-                let n = self.estimated_chat_lines(w);
-                let h = self.chat_height.get();
-                let max_scroll = n.saturating_sub(h) as u16;
-                self.chat_scroll = self.chat_scroll.saturating_add(amount).min(max_scroll);
-                if self.chat_scroll >= max_scroll {
-                    // A scroll that lands on the tail is the explicit
-                    // scroll-to-end gesture §10 item 14 allows to re-arm follow.
-                    self.set_follow(true);
-                }
+    /// Scroll the focused pane one step down. Re-arming follow is reserved for the
+    /// press that actually **arrived** on the tail; a partial press toward it moves
+    /// the viewport and states no decision, and a press already sitting on the tail
+    /// moves nothing and states nothing. The plan arm never re-arms centring at all
+    /// (defect 13, [`Self::scroll_plan_to`]).
+    pub(crate) fn scroll_down(&mut self, amount: u16) -> bool {
+        match self.focus {
+            FocusPane::Input => false,
+            FocusPane::Transcript => {
+                let tail = self.transcript_tail();
+                let target = self.chat_scroll.saturating_add(amount).min(tail);
+                self.scroll_transcript_to(target, true)
             }
-            FocusedPanel::Plan => {
-                self.plan_scroll = self
+            FocusPane::Plan => {
+                let target = self
                     .plan_scroll
                     .saturating_add(amount)
                     .min(self.plan_max_scroll);
-                if self.plan_scroll >= self.plan_max_scroll {
-                    self.plan_auto_scroll = true;
-                }
+                self.scroll_plan_to(target)
             }
-            FocusedPanel::Subagents => {
-                let w = self.subagent_width.get();
-                let n = self.estimated_subagent_lines(w);
-                let h = self.subagent_height.get();
-                let max_scroll = n.saturating_sub(h) as u16;
-                self.subagent_scroll = self.subagent_scroll.saturating_add(amount).min(max_scroll);
-                if self.subagent_scroll >= max_scroll {
-                    self.subagent_autoscroll = true;
-                }
+            FocusPane::Workers => {
+                let tail = self.worker_detail_tail();
+                let target = self.subagent_scroll.saturating_add(amount).min(tail);
+                self.scroll_worker_detail_to(target, true)
             }
         }
     }
 
     /// Jump one pane's viewport to its top. For the transcript this is an explicit
     /// gesture away from the tail, so it is stated as the follow decision it is
-    /// (G7, item 14) rather than as a write of the legacy mirror.
-    pub(crate) fn scroll_to_top(&mut self) {
-        match self.focused_panel {
-            FocusedPanel::Chat => {
-                self.set_follow(false);
-                self.chat_scroll = 0;
-            }
-            FocusedPanel::Plan => {
-                self.plan_auto_scroll = false;
-                self.plan_scroll = 0;
-            }
-            FocusedPanel::Subagents => {
-                self.subagent_autoscroll = false;
-                self.subagent_scroll = 0;
-            }
+    /// (G7, item 14) rather than as a write of the legacy mirror — but only when
+    /// the viewport was anywhere other than the top to begin with.
+    pub(crate) fn scroll_to_top(&mut self) -> bool {
+        match self.focus {
+            FocusPane::Input => false,
+            FocusPane::Transcript => self.scroll_transcript_to(0, false),
+            FocusPane::Plan => self.scroll_plan_to(0),
+            FocusPane::Workers => self.scroll_worker_detail_to(0, false),
         }
     }
 
     /// Jump one pane's viewport to its bottom — for the transcript the explicit
-    /// "jump to bottom" gesture that §10 item 14 allows to turn follow back on. It
-    /// is stated through [`Self::set_follow`], never by assigning the mirror.
-    pub(crate) fn scroll_to_bottom(&mut self) {
-        match self.focused_panel {
-            FocusedPanel::Chat => {
-                let w = self.chat_width.get();
-                let n = self.estimated_chat_lines(w);
-                let h = self.chat_height.get();
-                self.chat_scroll = n.saturating_sub(h) as u16;
-                self.set_follow(true);
+    /// "jump to bottom" gesture that §10 item 14 allows to turn follow back on,
+    /// stated through [`Self::set_follow`] and never by assigning the mirror. For
+    /// the plan it is the tail **as an offset**: the jump does not hand the pane
+    /// back to the in-flight task (defect 13).
+    pub(crate) fn scroll_to_bottom(&mut self) -> bool {
+        match self.focus {
+            FocusPane::Input => false,
+            FocusPane::Transcript => {
+                let tail = self.transcript_tail();
+                self.scroll_transcript_to(tail, true)
             }
-            FocusedPanel::Plan => {
-                self.plan_scroll = self.plan_max_scroll;
-                self.plan_auto_scroll = true;
+            FocusPane::Plan => {
+                let target = self.plan_max_scroll;
+                self.scroll_plan_to(target)
             }
-            FocusedPanel::Subagents => {
-                let w = self.subagent_width.get();
-                let n = self.estimated_subagent_lines(w);
-                let h = self.subagent_height.get();
-                self.subagent_scroll = n.saturating_sub(h) as u16;
-                self.subagent_autoscroll = true;
+            FocusPane::Workers => {
+                let tail = self.worker_detail_tail();
+                self.scroll_worker_detail_to(tail, true)
             }
         }
     }
@@ -1604,38 +2020,58 @@ impl TuiRenderer {
         }
     }
 
-    /// Walk backward through input history (Ctrl+Up).
-    pub(crate) fn history_prev(&mut self) {
-        if self.history.is_empty() {
-            return;
-        }
+    /// Walk backward through the input history — the binding is the `Ctrl+Up` chord
+    /// and nothing else, in every focus (the plain arrows never reach this: see
+    /// [`Self::scroll_or_history`]). Returns whether the draft actually changed,
+    /// which is what lets the caller treat an empty history as an unclaimed chord
+    /// instead of a swallowed one.
+    ///
+    /// The walk is bookkeeping of the **composer**: `history_index` and
+    /// `input_draft` only ever describe what stands in the composer, and only the
+    /// composer's keys may move them.
+    pub(crate) fn history_prev(&mut self) -> bool {
+        let last = match self.history.len() {
+            0 => return false,
+            len => len - 1,
+        };
+        let step = match self.history_index {
+            None => Some(last),
+            Some(index) if index > 0 => Some(index - 1),
+            // Already at the oldest entry. Restating the same entry used to rebuild
+            // the textarea — resetting a caret the operator had moved — and to look
+            // like the walk was still going.
+            Some(_) => None,
+        };
+        let Some(index) = step else {
+            return false;
+        };
         if self.history_index.is_none() {
             self.input_draft = self.input_text.clone();
-            self.history_index = Some(self.history.len() - 1);
-        } else if let Some(idx) = self.history_index
-            && idx > 0
-        {
-            self.history_index = Some(idx - 1);
         }
-        if let Some(idx) = self.history_index {
-            let text = self.history[idx].clone();
-            self.set_input_content(&text);
-        }
+        self.history_index = Some(index);
+        let text = self.history[index].clone();
+        self.recall_input_content(&text);
+        true
     }
 
-    /// Walk forward through input history (Ctrl+Down).
-    pub(crate) fn history_next(&mut self) {
-        if let Some(idx) = self.history_index {
-            if idx + 1 < self.history.len() {
-                self.history_index = Some(idx + 1);
-                let text = self.history[idx + 1].clone();
-                self.set_input_content(&text);
-            } else {
-                self.history_index = None;
-                let text = self.input_draft.clone();
-                self.set_input_content(&text);
-            }
+    /// Walk forward through the input history — the `Ctrl+Down` chord and nothing
+    /// else, in every focus. Returns whether the draft changed: with no walk in
+    /// progress there is nothing to walk forward to, and the chord is then not a key
+    /// press at all rather than a claimed no-op.
+    pub(crate) fn history_next(&mut self) -> bool {
+        let Some(index) = self.history_index else {
+            return false;
+        };
+        if index + 1 < self.history.len() {
+            self.history_index = Some(index + 1);
+            let text = self.history[index + 1].clone();
+            self.recall_input_content(&text);
+        } else {
+            self.history_index = None;
+            let text = self.input_draft.clone();
+            self.recall_input_content(&text);
         }
+        true
     }
 
     /// Consolidate streaming thought/content and steer sentence buffer into messages.
@@ -1660,12 +2096,11 @@ impl TuiRenderer {
         }
         if !msg_accum.trim().is_empty() {
             self.messages.push(msg_accum);
-            if self.chat_auto_scroll {
-                let w = self.chat_width.get();
-                let n = self.estimated_chat_lines(w);
-                let h = self.chat_height.get();
-                self.chat_scroll = n.saturating_sub(h) as u16;
-            }
+            // No pin here. This arm's job is to fold the streaming buffers into the
+            // transcript; keeping the viewport on the newest line while `follow` is
+            // on is the transcript pane's decision, taken once per frame against the
+            // body it counted itself. Estimating the tail from a key path is what let
+            // a frame disagree with a scroll key about the geometry (audit defect 11).
         }
     }
 
@@ -2061,32 +2496,51 @@ mod tests {
         assert!(drain_submissions(&mut renderer).is_empty());
     }
 
-    /// `/error` is the `e` mnemonic: the same recall, the same line, no confirm.
+    /// `/error` is the **whole** route to the recall now that the bare `e` mnemonic is
+    /// gone: the same line, the same notice, from the composer focus and from a pane
+    /// focus, with no confirm and nothing sent. The letter itself only ever types.
     #[test]
-    fn the_error_command_recalls_what_the_e_key_recalls() {
+    fn the_error_command_recalls_the_sticky_error_in_every_focus() {
         let planted = vec![
             "User: rebuild the TUI".to_string(),
             "LLM error: http — 503 upstream".to_string(),
         ];
-        let mut by_command = TuiRenderer::new();
-        let mut by_key = TuiRenderer::new();
-        by_command.messages = planted.clone();
-        by_key.messages = planted;
+        let mut from_composer = TuiRenderer::new();
+        let mut from_pane = TuiRenderer::new();
+        from_composer.messages = planted.clone();
+        from_pane.messages = planted.clone();
+        from_composer.set_focus(state::FocusPane::Input);
+        from_pane.set_focus(state::FocusPane::Transcript);
 
-        submit(&mut by_command, "/error");
-        assert!(
-            press(&mut by_key, KeyCode::Char('e'), KeyModifiers::NONE),
-            "`e` is a binding with an empty composer"
-        );
+        submit(&mut from_composer, "/error");
+        submit(&mut from_pane, "/error");
 
         assert_eq!(
-            by_command.messages, by_key.messages,
-            "`/error` and `e` recalled different traffic"
+            from_composer.messages, from_pane.messages,
+            "`/error` recalled different traffic per focus"
         );
-        let recalled = by_command.messages.last().cloned().unwrap_or_default();
+        let recalled = from_composer.messages.last().cloned().unwrap_or_default();
         assert!(recalled.starts_with('✗'), "{recalled}");
         assert!(recalled.contains("marmel.log"), "{recalled}");
-        assert!(drain_submissions(&mut by_command).is_empty());
+        assert!(
+            from_composer.confirm_action.is_none(),
+            "the recall is a notice, never a confirm"
+        );
+        assert!(drain_submissions(&mut from_composer).is_empty());
+
+        // The letter that used to carry the recall is a letter everywhere — over a
+        // pane focus included, which is where it used to be spent (§4.4).
+        let mut typed = TuiRenderer::new();
+        typed.messages = planted;
+        typed.set_focus(state::FocusPane::Transcript);
+        assert!(press(&mut typed, KeyCode::Char('e'), KeyModifiers::NONE));
+        assert_eq!(typed.input_text, "e", "the bare letter reaches the draft");
+        assert_eq!(
+            typed.messages.len(),
+            2,
+            "and recalled nothing: {:?}",
+            typed.messages
+        );
     }
 
     /// The rule this task is named for: an unknown `/xyz` is answered where it is
@@ -2402,8 +2856,20 @@ mod tests {
 
     /// Output arriving is the other half of G7: new lines may only move the
     /// viewport while follow is on, and must never arm it on their own.
+    ///
+    /// The second half of the rule changed owner with the scroll-geometry
+    /// unification (audit defects 11/12): while follow is on, arriving output does
+    /// NOT get pinned to a tail estimated here. The key path states the decision and
+    /// leaves the offset alone; the frame that draws the transcript pins the body to
+    /// the tail it counted, and that is what the pins
+    /// [`crate::ui::tui::tests::a_followed_transcript_shows_the_last_lines_of_a_long_answer`]
+    /// and
+    /// `tests_new_ui::a_submit_while_following_still_pins_the_transcript_to_the_bottom_item14`
+    /// hold at the seam where the pin actually happens. What is pinned here is the
+    /// half this file owns: the decision, and the fact that no key path writes the
+    /// viewport out from under the pane.
     #[test]
-    fn output_that_arrives_never_arms_follow_and_only_pins_while_following() {
+    fn output_that_arrives_never_arms_follow_and_never_moves_the_viewport_itself() {
         // Follow off: steer sentences and a committed turn add lines and leave both
         // the flag and the offset exactly where the operator put them.
         let mut renderer = transcript_with_scrollback();
@@ -2419,8 +2885,11 @@ mod tests {
         );
         assert_eq!(renderer.chat_scroll, 4, "and moved the viewport");
 
-        // Follow on: the same output is pinned to the tail, which is the behaviour
-        // that must not be lost by the fix.
+        // Follow on: the same output keeps the decision on and its mirror with it,
+        // and still moves nothing from here. The transcript pane is handed
+        // `follow` and pins itself against its own measurement; an estimate written
+        // from the event path is exactly the second geometry that used to disagree
+        // with the frame below it.
         let mut renderer = transcript_with_scrollback();
         renderer.set_follow(true);
         renderer.chat_scroll = 0;
@@ -2432,17 +2901,19 @@ mod tests {
             "follow stayed on with its mirror"
         );
         renderer.commit_turn_content();
-        let tail = {
-            let w = renderer.chat_width.get();
-            let n = renderer.estimated_chat_lines(w);
-            let h = renderer.chat_height.get();
-            n.saturating_sub(h) as u16
-        };
-        assert!(tail > 0, "the fixture has scrollback to pin against");
         assert_eq!(
-            renderer.chat_scroll, tail,
-            "while following, committed output is pinned to the tail"
+            follow_pair(&renderer),
+            (true, true),
+            "the committed turn restated the follow decision"
         );
+        assert_eq!(
+            renderer.chat_scroll, 0,
+            "and the event path wrote no offset"
+        );
+        let view = state::UiView::from_renderer(&renderer);
+        assert!(view.follow, "the frame is handed the follow request");
+        let tail = renderer.transcript_tail();
+        assert!(tail > 0, "the fixture has scrollback to pin against");
     }
 
     /// The flip side of item 14: the two explicit ways back onto the tail still
@@ -2525,5 +2996,954 @@ mod tests {
             "leaving the tail through the legacy path still turns follow off"
         );
         assert!(!renderer.chat_auto_scroll);
+    }
+
+    // ---- the key x focus x draft ownership rule -----------------------------
+    //
+    // The reported defect is that scrolling the panes and walking the composer's
+    // input history were the same key, decided by the shape of the draft. The rule
+    // these guards hold: the composer owns `Up`/`Down`/`PageUp`/`PageDown`/`Home`/
+    // `End` **iff** `FocusPane::Input` holds focus (one predicate,
+    // [`FocusPane::composer_has_focus`]), and a pane owns them otherwise. Every one
+    // of them drives the public seam the live loop calls.
+
+    /// Defects 1, 2, 5 and 7 plus the reported scroll conflict: the composer's keys
+    /// never move a pane viewport or state a follow decision, a pane's keys never
+    /// touch the composer — not its draft, not its caret, not its history
+    /// bookkeeping — and a plain arrow is never a history recall in either focus.
+    #[test]
+    fn up_and_down_follow_the_focus_and_never_cross_the_line() {
+        // Composer focused with a scrollback transcript waiting and a history to
+        // walk: `Up` recalls **nothing**. The composer owns the key, there is no
+        // caret movement to make, and the walk is reachable by the chord alone, so
+        // the press is an explicit no-op — no recall, no scroll, no repaint.
+        let mut renderer = transcript_with_scrollback();
+        renderer.set_focus(FocusPane::Input);
+        renderer.chat_width.set(80);
+        renderer.chat_height.set(10);
+        renderer.history = vec!["earlier note".to_string()];
+        renderer.set_input_content("");
+        // Park the transcript's viewport somewhere in the middle of its scrollback so
+        // "no pane viewport moved" is an offset claim, not a tautology.
+        renderer.chat_scroll = 12;
+        let offset = renderer.chat_scroll;
+        let follow = follow_pair(&renderer);
+        renderer.dirty = false;
+        assert!(
+            !press(&mut renderer, KeyCode::Up, KeyModifiers::NONE),
+            "a plain `Up` behind the composer is not claimed once the history \
+             fallback is gone"
+        );
+        assert!(
+            renderer.input_text.is_empty(),
+            "the draft was not replaced by a history entry: {:?}",
+            renderer.input_text
+        );
+        assert_eq!(
+            renderer.history_index, None,
+            "and no walk was started behind the operator's back"
+        );
+        assert!(!renderer.dirty, "an unclaimed press asked for no repaint");
+        assert_eq!(renderer.chat_scroll, offset, "no pane viewport moved");
+        assert_eq!(
+            follow_pair(&renderer),
+            follow,
+            "and no follow decision was stated for a gesture the operator never made"
+        );
+        // The same arrow one focus over *does* own the key and steps the pane — which
+        // is the whole point of the operator's report.
+        renderer.set_focus(FocusPane::Transcript);
+        assert!(
+            press(&mut renderer, KeyCode::Up, KeyModifiers::NONE),
+            "the transcript took the same key"
+        );
+        assert!(renderer.chat_scroll < offset, "and it scrolled");
+        assert!(
+            renderer.input_text.is_empty() && renderer.history_index.is_none(),
+            "while the composer kept its empty draft and its unbegun walk"
+        );
+        // The chord reaches the walk from either focus.
+        assert!(
+            press(&mut renderer, KeyCode::Up, KeyModifiers::CONTROL),
+            "`Ctrl+Up` is the history binding over a pane focus too"
+        );
+        assert_eq!(renderer.input_text, "earlier note");
+        assert_eq!(renderer.history_index, Some(0));
+
+        // Transcript focused over a multi-line draft: the draft keeps its text, its
+        // caret and its walk bookkeeping, whatever `Up` does to the viewport.
+        let mut renderer = transcript_with_scrollback();
+        renderer.chat_width.set(80);
+        renderer.chat_height.set(10);
+        renderer.set_input_content("line one\nline two");
+        let draft = renderer.input_text.clone();
+        let caret = renderer.textarea.cursor();
+        let index = renderer.history_index;
+        assert!(
+            press(&mut renderer, KeyCode::Up, KeyModifiers::NONE),
+            "the pane took the key"
+        );
+        assert_eq!(
+            renderer.input_text, draft,
+            "the unfocused draft was not edited"
+        );
+        assert_eq!(
+            renderer.textarea.cursor(),
+            caret,
+            "and the unfocused caret did not move"
+        );
+        assert_eq!(renderer.history_index, index, "nor did the history walk");
+        assert!(renderer.history_index.is_none());
+    }
+
+    /// Defect 3: `Down` used to be swallowed by the history bookkeeping whenever
+    /// the draft was empty, so the transcript could not be scrolled down at all in
+    /// the default state. The focused pane scrolls instead.
+    #[test]
+    fn down_with_a_pane_in_focus_and_an_empty_draft_scrolls_the_pane() {
+        let mut renderer = transcript_with_scrollback();
+        renderer.chat_width.set(80);
+        renderer.chat_height.set(10);
+        assert!(
+            press(&mut renderer, KeyCode::End, KeyModifiers::NONE),
+            "`End` jumps a pane focus to the tail"
+        );
+        let tail = renderer.chat_scroll;
+        assert!(tail > 0, "the fixture has scrollback to move in");
+        assert!(press(&mut renderer, KeyCode::Up, KeyModifiers::NONE));
+        let above = renderer.chat_scroll;
+        assert!(above < tail, "`Up` pulled the viewport off the tail");
+
+        renderer.set_input_content("");
+        assert!(
+            press(&mut renderer, KeyCode::Down, KeyModifiers::NONE),
+            "`Down` with an empty draft is a pane scroll, not a swallowed no-op"
+        );
+        assert_eq!(renderer.chat_scroll, above + 1, "and it moved the viewport");
+    }
+
+    /// Defect 4, in its new and stronger form: with the composer focused and nothing
+    /// inside the composer for the arrow to do, the press is an explicit no-op **even
+    /// when a history is waiting to be walked**. It does not claim the event, so
+    /// nothing repaints and no `follow` / scroll state is left describing a movement
+    /// that never happened.
+    #[test]
+    fn a_composer_press_with_nothing_to_walk_is_not_claimed() {
+        let mut renderer = transcript_with_scrollback();
+        renderer.set_focus(FocusPane::Input);
+        renderer.history.clear();
+        renderer.set_input_content("");
+        let follow = follow_pair(&renderer);
+
+        assert!(
+            !press(&mut renderer, KeyCode::Up, KeyModifiers::NONE),
+            "an empty history is not a key press"
+        );
+        assert!(renderer.input_text.is_empty(), "and it restated nothing");
+        assert_eq!(follow_pair(&renderer), follow, "and it stated no decision");
+
+        assert!(
+            !press(&mut renderer, KeyCode::Down, KeyModifiers::NONE),
+            "nor is `Down` with no walk in progress"
+        );
+        assert!(renderer.history_index.is_none());
+
+        // The walk is no longer what rescues the key: a **full** history behind an
+        // empty single-line draft still leaves the plain arrows unclaimed. This is
+        // the reported conflict — the operator's arrow was recalling history while
+        // they were trying to scroll.
+        let mut renderer = transcript_with_scrollback();
+        renderer.set_focus(FocusPane::Input);
+        renderer.chat_scroll = 12;
+        renderer.history = vec!["older entry".to_string(), "newest entry".to_string()];
+        renderer.set_input_content("");
+        let before = (
+            renderer.input_text.clone(),
+            renderer.history_index,
+            renderer.chat_scroll,
+            follow_pair(&renderer),
+        );
+        renderer.dirty = false;
+        assert!(
+            !press(&mut renderer, KeyCode::Up, KeyModifiers::NONE),
+            "a waiting history does not make a plain composer `Up` a key press"
+        );
+        assert!(
+            !press(&mut renderer, KeyCode::Down, KeyModifiers::NONE),
+            "nor does it make a plain composer `Down` one"
+        );
+        assert_eq!(
+            renderer.input_text, before.0,
+            "the draft stayed the operator's"
+        );
+        assert_eq!(
+            renderer.history_index, before.1,
+            "and the walk never started"
+        );
+        assert_eq!(renderer.chat_scroll, before.2, "and no viewport moved");
+        assert_eq!(
+            follow_pair(&renderer),
+            before.3,
+            "and no decision was stated"
+        );
+        assert!(!renderer.dirty, "and nothing was scheduled for repaint");
+
+        // A multi-line draft with the caret against its edge has nowhere to go
+        // either, and no draft shape turns a plain arrow into a walk.
+        let mut renderer = transcript_with_scrollback();
+        renderer.set_focus(FocusPane::Input);
+        renderer.history = vec!["first\nsecond".to_string()];
+        renderer.set_input_content("keep\nthis");
+        let before = (renderer.input_text.clone(), renderer.history_index);
+        assert!(
+            !press(&mut renderer, KeyCode::Up, KeyModifiers::NONE),
+            "the caret is already on the first line"
+        );
+        assert_eq!(renderer.input_text, before.0, "and the draft stayed put");
+        assert_eq!(renderer.history_index, before.1);
+    }
+
+    /// Defects 6 and 8: the walk is driven by the explicit `Ctrl+Up`/`Ctrl+Down`
+    /// binding, so a recalled multi-line entry cannot abort it with a caret, and a
+    /// hand edit ends the browse so a stale walk can never overwrite the edit.
+    #[test]
+    fn a_history_walk_survives_a_multiline_entry_and_an_edit_ends_it() {
+        let mut renderer = transcript_with_scrollback();
+        renderer.set_focus(FocusPane::Input);
+        renderer.history = vec!["first entry".to_string(), "line one\nline two".to_string()];
+
+        assert!(
+            press(&mut renderer, KeyCode::Up, KeyModifiers::CONTROL),
+            "`Ctrl+Up` is the explicit history binding"
+        );
+        assert_eq!(renderer.input_text, "line one\nline two");
+        assert_eq!(renderer.history_index, Some(1));
+        assert_eq!(
+            renderer.textarea.cursor(),
+            (0, "line one".chars().count()),
+            "a multi-line recall parks the caret on its first line, where the next \
+             `Up` cannot turn it into a caret move"
+        );
+
+        assert!(press(&mut renderer, KeyCode::Up, KeyModifiers::CONTROL));
+        assert_eq!(
+            renderer.input_text, "first entry",
+            "and the walk kept walking through the multi-line entry"
+        );
+        assert_eq!(renderer.history_index, Some(0));
+
+        // At the oldest entry the walk is over: pressing again restates nothing and
+        // leaves the caret alone.
+        let caret = renderer.textarea.cursor();
+        assert!(
+            !press(&mut renderer, KeyCode::Up, KeyModifiers::CONTROL),
+            "walking past the oldest entry is not a key press"
+        );
+        assert_eq!(renderer.textarea.cursor(), caret, "and it reset no caret");
+
+        // A hand edit ends the browse.
+        assert!(press(&mut renderer, KeyCode::Char('!'), KeyModifiers::NONE));
+        assert_eq!(renderer.input_text, "first entry!");
+        assert_eq!(
+            renderer.history_index, None,
+            "editing a recalled entry ends the walk"
+        );
+        assert!(
+            !press(&mut renderer, KeyCode::Down, KeyModifiers::CONTROL),
+            "and there is no stale walk left to walk forward on"
+        );
+        assert_eq!(
+            renderer.input_text, "first entry!",
+            "so the edit is never overwritten by an old entry"
+        );
+    }
+
+    /// Defect 10 (consistency): `PageUp`/`PageDown` answer the same focus question
+    /// as `Home`/`End`. The composer has no viewport, so with the composer focused
+    /// they are an unclaimed no-op; with a pane focused they page that pane.
+    #[test]
+    fn page_keys_are_pane_keys() {
+        let mut renderer = transcript_with_scrollback();
+        renderer.set_focus(FocusPane::Input);
+        renderer.chat_width.set(80);
+        renderer.chat_height.set(10);
+        renderer.set_input_content("a draft");
+        let offset = renderer.chat_scroll;
+        let follow = follow_pair(&renderer);
+        for code in [KeyCode::PageUp, KeyCode::PageDown] {
+            assert!(
+                !press(&mut renderer, code, KeyModifiers::NONE),
+                "the composer holds focus, so {code:?} has no viewport to page"
+            );
+            assert_eq!(renderer.chat_scroll, offset, "{code:?} moved a viewport");
+            assert_eq!(follow_pair(&renderer), follow, "{code:?} stated a decision");
+        }
+
+        renderer.set_focus(FocusPane::Transcript);
+        assert!(press(&mut renderer, KeyCode::End, KeyModifiers::NONE));
+        let tail = renderer.chat_scroll;
+        assert!(tail > 0, "the fixture has scrollback to page");
+        assert!(press(&mut renderer, KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(
+            renderer.chat_scroll,
+            tail.saturating_sub(10),
+            "the focused transcript pages by ten"
+        );
+        assert!(press(&mut renderer, KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(renderer.chat_scroll, tail, "and back to the tail");
+    }
+
+    // ---- the follow / auto-scroll contract: a decision only for a movement ----
+    //
+    // The other half of the reported overlap: every `Up`/`Down`/`PageUp`/`PageDown`/
+    // `Home`/`End` press used to restate the follow flags whether or not the
+    // viewport could move, so a pane with nothing to scroll flipped `● LIVE` into
+    // `↓ follow off` and back on every press (defect 9), and a plan scrolled to its
+    // tail was handed back to the in-flight task (defect 13). The contract these
+    // guards pin:
+    //
+    // | press                              | viewport | follow-ish flag |
+    // |------------------------------------|----------|-----------------|
+    // | moved away from the tail           | moves    | off             |
+    // | moved and arrived on the tail      | moves    | on              |
+    // | moved, still short of the tail     | moves    | unchanged       |
+    // | nothing to scroll / already there  | still    | unchanged       |
+
+    /// The tail the key path measures, spelled out so a fixture says what it means.
+    /// It is the pane's own published maximum once a frame has drawn the transcript,
+    /// and the renderer's line estimate before then — [`TuiRenderer::transcript_tail`]
+    /// is the one place that chooses between the two.
+    fn transcript_tail_of(renderer: &TuiRenderer) -> u16 {
+        renderer.transcript_tail()
+    }
+
+    /// Defect 9, the visible half: over a transcript that fits its pane there is no
+    /// tail to leave, so no scroll key may state a follow decision at all. The chip
+    /// keeps saying `● LIVE`, the mirror keeps agreeing, and the frame is not even
+    /// marked dirty because there is nothing to repaint.
+    #[test]
+    fn a_pane_with_nothing_to_scroll_states_no_follow_decision() {
+        let mut renderer = transcript_with_scrollback();
+        // Wide and tall: every line of the fixture is on screen, `max_scroll == 0`.
+        renderer.chat_width.set(400);
+        renderer.chat_height.set(400);
+        assert_eq!(
+            transcript_tail_of(&renderer),
+            0,
+            "the fixture must have nothing to scroll"
+        );
+
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            renderer.dirty = false;
+            assert!(
+                press(&mut renderer, code, KeyModifiers::NONE),
+                "the transcript holds focus, so {code:?} is its key"
+            );
+            assert_eq!(
+                renderer.chat_scroll, 0,
+                "{code:?} moved an immovable offset"
+            );
+            assert_eq!(
+                follow_pair(&renderer),
+                (true, true),
+                "{code:?} broke follow on a pane with nothing to scroll"
+            );
+            assert!(
+                !renderer.dirty,
+                "{code:?} asked for a repaint of a viewport that did not move"
+            );
+        }
+    }
+
+    /// Defect 9, the other half: with a pane that *can* scroll, a press whose
+    /// offset already sits at the requested extreme moves nothing and therefore
+    /// states nothing. Re-arming follow stays reserved for `Ctrl+F`, `/follow on`,
+    /// and the press that actually travels onto the tail.
+    #[test]
+    fn a_press_already_at_the_requested_extreme_states_nothing() {
+        let mut renderer = transcript_with_scrollback();
+        renderer.chat_width.set(80);
+        renderer.chat_height.set(10);
+        let tail = transcript_tail_of(&renderer);
+        assert!(tail > 10, "the fixture needs room to be scrolled: {tail}");
+
+        // Sitting on the top with follow off: the away gestures have nowhere to go.
+        renderer.set_follow(false);
+        renderer.chat_scroll = 0;
+        for code in [KeyCode::Up, KeyCode::PageUp, KeyCode::Home] {
+            renderer.dirty = false;
+            assert!(press(&mut renderer, code, KeyModifiers::NONE));
+            assert_eq!(renderer.chat_scroll, 0, "{code:?} moved the offset");
+            assert_eq!(
+                follow_pair(&renderer),
+                (false, false),
+                "{code:?} restated a follow decision for no movement"
+            );
+            assert!(!renderer.dirty, "{code:?} repainted a still viewport");
+        }
+
+        // Sitting on the tail with follow off: the toward gestures move nothing, so
+        // they do not arm follow either.
+        renderer.chat_scroll = tail;
+        for code in [KeyCode::Down, KeyCode::PageDown, KeyCode::End] {
+            renderer.dirty = false;
+            assert!(press(&mut renderer, code, KeyModifiers::NONE));
+            assert_eq!(renderer.chat_scroll, tail, "{code:?} moved the offset");
+            assert_eq!(
+                follow_pair(&renderer),
+                (false, false),
+                "{code:?} armed follow without moving the viewport"
+            );
+            assert!(!renderer.dirty, "{code:?} repainted a still viewport");
+        }
+
+        // The press that does move states its decision, in both directions.
+        assert!(press(&mut renderer, KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(renderer.chat_scroll, tail - 1, "`Up` moved one line");
+        assert!(
+            !renderer.follow,
+            "and an away press states the decision it is"
+        );
+    }
+
+    /// The arrival rule: a press that travels toward the tail without getting there
+    /// moves the viewport and states no decision; the one that lands on the tail is
+    /// what re-arms follow, and only when there is a tail to land on.
+    #[test]
+    fn only_the_press_that_arrives_at_the_tail_re_arms_follow() {
+        let mut renderer = transcript_with_scrollback();
+        renderer.chat_width.set(80);
+        renderer.chat_height.set(10);
+        let tail = transcript_tail_of(&renderer);
+        assert!(tail > 10, "the fixture needs room to be scrolled: {tail}");
+
+        renderer.set_follow(false);
+        renderer.chat_scroll = 0;
+
+        // Half-way down: a real move, no decision.
+        assert!(press(&mut renderer, KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(renderer.chat_scroll, 10, "the page moved the viewport");
+        assert_eq!(
+            follow_pair(&renderer),
+            (false, false),
+            "a press short of the tail armed follow"
+        );
+
+        // One line short, then the step that arrives.
+        renderer.chat_scroll = tail - 1;
+        assert!(press(&mut renderer, KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            renderer.chat_scroll, tail,
+            "the viewport arrived on the tail"
+        );
+        assert_eq!(
+            follow_pair(&renderer),
+            (true, true),
+            "the arrival re-armed follow and its mirror"
+        );
+
+        // And the away press from the tail breaks it again.
+        assert!(press(&mut renderer, KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(renderer.chat_scroll, tail.saturating_sub(10));
+        assert_eq!(
+            follow_pair(&renderer),
+            (false, false),
+            "leaving the tail broke follow"
+        );
+    }
+
+    /// Defect 13: `plan_auto_scroll` means "centre the pane on the task in flight",
+    /// so a manual gesture to the plan tail must never write it. The tail is an
+    /// offset the operator asked for, and the next frame must not trade it for the
+    /// in-flight task.
+    #[test]
+    fn a_manual_plan_gesture_never_hands_the_viewport_back_to_the_active_task() {
+        let mut renderer = TuiRenderer::new();
+        renderer.set_focus(FocusPane::Plan);
+        renderer.plan_max_scroll = 40;
+        renderer.plan_scroll = 12;
+        // What launching a task leaves behind (`on_event` arms the centring).
+        renderer.plan_auto_scroll = true;
+
+        // `End` is the explicit jump to the tail: the offset becomes the operator's
+        // and the centring intent is released, never re-armed.
+        assert!(press(&mut renderer, KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(renderer.plan_scroll, 40, "`End` went to the tail");
+        assert!(
+            !renderer.plan_auto_scroll,
+            "a manual jump to the tail re-armed active-task centring"
+        );
+
+        // From the tail one `Up` is one line, not a jump back to the in-flight task.
+        assert!(press(&mut renderer, KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(renderer.plan_scroll, 39, "`Up` moved one line");
+        assert!(!renderer.plan_auto_scroll);
+
+        // Paging back down onto the tail does not hand it back either.
+        assert!(press(&mut renderer, KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(renderer.plan_scroll, 40, "`PageDown` went to the tail");
+        assert!(
+            !renderer.plan_auto_scroll,
+            "the tail is an offset, not a request to centre on the active task"
+        );
+
+        // With nothing to scroll, a plan press changes neither the offset nor the
+        // intent, and asks for no repaint.
+        let mut renderer = TuiRenderer::new();
+        renderer.set_focus(FocusPane::Plan);
+        renderer.plan_max_scroll = 0;
+        renderer.plan_auto_scroll = true;
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            renderer.dirty = false;
+            assert!(press(&mut renderer, code, KeyModifiers::NONE));
+            assert_eq!(
+                renderer.plan_scroll, 0,
+                "{code:?} moved an immovable offset"
+            );
+            assert!(
+                renderer.plan_auto_scroll,
+                "{code:?} on an unscrollable plan released its centring intent"
+            );
+            assert!(!renderer.dirty, "{code:?} repainted a still viewport");
+        }
+    }
+
+    /// The worker-detail tail as the key path measures it, spelled out so the
+    /// fixture says what it means. Like the transcript's, it is the pane's own
+    /// published maximum once a frame has drawn the Workers pane, and the renderer's
+    /// line estimate before then — [`TuiRenderer::worker_detail_tail`] is the one
+    /// place that chooses between the two.
+    fn worker_detail_tail_of(renderer: &TuiRenderer) -> u16 {
+        renderer.worker_detail_tail()
+    }
+
+    /// A Workers fixture holding one row whose detail is long enough to scroll.
+    fn worker_detail_with_log() -> TuiRenderer {
+        let mut renderer = TuiRenderer::new();
+        renderer.subagents.push(SubagentDetail {
+            name: "coder_specialist-t-004".to_string(),
+            logs: (0..40).map(|i| format!("- log line {i:02}")).collect(),
+            is_active: true,
+            ..SubagentDetail::default()
+        });
+        renderer.set_focus(FocusPane::Workers);
+        renderer
+    }
+
+    /// Defects 9 and 15 in the third pane. The worker detail carries its own
+    /// auto-scroll flag, and it obeys exactly the transcript's rule: a press that
+    /// moves nothing states no decision at all, and the flag comes back on only for
+    /// the press that **arrives** on the detail tail. The one other key path allowed
+    /// to arm it is the `Left`/`Right` selection reveal (`select_worker`), which
+    /// chooses a different detail rather than scrolling this one.
+    ///
+    /// The keys under test are the detail half's own — `PageUp`/`PageDown`/`Home`/
+    /// `End`. Plain `Up`/`Down` are deliberately absent: with the Workers pane
+    /// focused they own the **roster window** (defect 14,
+    /// [`Self::scroll_worker_roster_by`]), which is what
+    /// [`the_workers_arrows_walk_the_roster_window_and_leave_the_log_alone`] is for.
+    #[test]
+    fn a_worker_detail_press_with_nothing_to_scroll_states_no_autoscroll_decision() {
+        let mut renderer = worker_detail_with_log();
+        assert_eq!(renderer.subagent_scroll, 0);
+        assert!(
+            renderer.subagent_autoscroll,
+            "a fresh renderer follows the running worker's detail"
+        );
+
+        // (a) A pane tall enough for the whole detail: there is no tail to leave, so
+        // no scroll key may state a decision — the jump keys included.
+        renderer.subagent_width.set(400);
+        renderer.subagent_height.set(400);
+        assert_eq!(
+            worker_detail_tail_of(&renderer),
+            0,
+            "the fixture must have nothing to scroll"
+        );
+        for code in [
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            renderer.dirty = false;
+            assert!(
+                press(&mut renderer, code, KeyModifiers::NONE),
+                "the workers pane holds focus, so {code:?} is its key"
+            );
+            assert_eq!(
+                renderer.subagent_scroll, 0,
+                "{code:?} moved an immovable offset"
+            );
+            assert!(
+                renderer.subagent_autoscroll,
+                "{code:?} turned worker-detail autoscroll off for no movement"
+            );
+            assert!(!renderer.dirty, "{code:?} repainted a still viewport");
+        }
+
+        // (b) With room to scroll, a press already sitting at the requested extreme
+        // still states nothing — in both directions, and with the flag off.
+        renderer.subagent_width.set(40);
+        renderer.subagent_height.set(4);
+        renderer.subagent_autoscroll = false;
+        let tail = worker_detail_tail_of(&renderer);
+        assert!(tail > 10, "the fixture needs room to be scrolled: {tail}");
+
+        for code in [KeyCode::PageUp, KeyCode::Home] {
+            renderer.subagent_scroll = 0;
+            renderer.dirty = false;
+            assert!(press(&mut renderer, code, KeyModifiers::NONE));
+            assert_eq!(renderer.subagent_scroll, 0, "{code:?} moved the offset");
+            assert!(
+                !renderer.subagent_autoscroll,
+                "{code:?} restated an autoscroll decision for no movement"
+            );
+            assert!(!renderer.dirty, "{code:?} repainted a still viewport");
+        }
+
+        for code in [KeyCode::PageDown, KeyCode::End] {
+            renderer.subagent_scroll = tail;
+            renderer.dirty = false;
+            assert!(press(&mut renderer, code, KeyModifiers::NONE));
+            assert_eq!(
+                renderer.subagent_scroll, tail,
+                "{code:?} moved an offset already at its tail"
+            );
+            assert!(
+                !renderer.subagent_autoscroll,
+                "{code:?} armed autoscroll without moving the viewport"
+            );
+            assert!(!renderer.dirty, "{code:?} repainted a still viewport");
+        }
+
+        // (c) A real move states its decision: short of the tail it stays off, the
+        // arrival turns it on, and pulling back off the tail turns it off again.
+        renderer.subagent_scroll = 0;
+        assert!(press(&mut renderer, KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(renderer.subagent_scroll, 10, "the page moved the detail");
+        assert!(
+            !renderer.subagent_autoscroll,
+            "a press short of the tail armed it"
+        );
+
+        renderer.subagent_scroll = tail - 10;
+        assert!(press(&mut renderer, KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(
+            renderer.subagent_scroll, tail,
+            "the viewport arrived on the detail tail"
+        );
+        assert!(
+            renderer.subagent_autoscroll,
+            "the arrival re-armed the flag"
+        );
+        assert!(renderer.dirty, "and a moved viewport asks for a repaint");
+
+        assert!(press(&mut renderer, KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(renderer.subagent_scroll, tail - 10);
+        assert!(
+            !renderer.subagent_autoscroll,
+            "leaving the tail turned the flag off"
+        );
+    }
+
+    /// A Workers fixture the frame has already laid out: `count` roster rows, the
+    /// selection parked mid-list so the window has room to travel in both directions,
+    /// and a **published** `subagent_area` — the rect the key path clamps `↑`/`↓`
+    /// against instead of estimating its own.
+    fn workers_pane_with_roster(count: usize) -> TuiRenderer {
+        let mut renderer = TuiRenderer::new();
+        renderer.subagents = (0..count)
+            .map(|index| SubagentDetail {
+                name: format!("coder_specialist-t-{index:04}"),
+                logs: (0..40)
+                    .map(|line| format!("- log line {line:02}"))
+                    .collect(),
+                is_active: true,
+                ..SubagentDetail::default()
+            })
+            .collect();
+        renderer.selected_subagent_idx = count.saturating_sub(1) / 2;
+        renderer.subagent_area = ratatui::layout::Rect::new(0, 0, 80, 16);
+        renderer.set_focus(FocusPane::Workers);
+        renderer
+    }
+
+    /// The roster window's bounds as the **pane** states them for this fixture — the
+    /// same call the key path makes, spelled out here so a failing assertion says
+    /// which of the two ends disagrees.
+    fn roster_bounds_of(renderer: &TuiRenderer) -> (usize, usize) {
+        let pane = renderer.subagent_area;
+        activity::roster_window(
+            pane,
+            crate::ui::tui::layout::workers_detail_present(pane.width),
+            renderer.subagents.len(),
+            renderer.selected_subagent_idx,
+        )
+    }
+
+    /// Defect 14: the Workers pane has two viewports, and `↑`/`↓` own the **outer**
+    /// one — the roster window. The presses walk it one row at a time against the
+    /// bounds the pane publishes, stop at both ends instead of running past them, and
+    /// touch nothing else: not the selection (`←`/`→`), not the detail offset
+    /// (`PageUp`/`PageDown`/`Home`/`End`), not one follow-ish flag.
+    #[test]
+    fn the_workers_arrows_walk_the_roster_window_and_leave_the_log_alone() {
+        let mut renderer = workers_pane_with_roster(12);
+        let (lower, upper) = roster_bounds_of(&renderer);
+        assert!(
+            upper > lower,
+            "the fixture needs a window with room to travel: {lower}..{upper}"
+        );
+
+        // Down walks toward the later rows, one step per press, and stops on the end.
+        for step in lower..upper {
+            renderer.subagent_list_scroll = step as u16;
+            renderer.dirty = false;
+            assert!(press(&mut renderer, KeyCode::Down, KeyModifiers::NONE));
+            assert_eq!(
+                usize::from(renderer.subagent_list_scroll),
+                step + 1,
+                "Down walked the window by one row"
+            );
+            assert!(renderer.dirty, "a moved window asks for a repaint");
+        }
+        renderer.dirty = false;
+        assert!(press(&mut renderer, KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            usize::from(renderer.subagent_list_scroll),
+            upper,
+            "Down past the end of the window did not run off it"
+        );
+        assert!(!renderer.dirty, "a press at the end repainted nothing");
+
+        // Up walks back toward the earlier rows and stops at its own end.
+        for step in (lower + 1..=upper).rev() {
+            renderer.subagent_list_scroll = step as u16;
+            renderer.dirty = false;
+            assert!(press(&mut renderer, KeyCode::Up, KeyModifiers::NONE));
+            assert_eq!(
+                usize::from(renderer.subagent_list_scroll),
+                step - 1,
+                "Up walked the window by one row"
+            );
+        }
+        renderer.subagent_list_scroll = lower as u16;
+        renderer.dirty = false;
+        assert!(press(&mut renderer, KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            usize::from(renderer.subagent_list_scroll),
+            lower,
+            "Up past the head of the window did not run off it"
+        );
+        assert!(!renderer.dirty, "a press at the head repainted nothing");
+
+        // A stale offset — a stored position the pane would refuse — is reconciled
+        // into the window rather than drawn or argued about. Held above the end, it is
+        // pulled down to `upper` and the press that would have walked off the end does
+        // nothing else (no movement, no repaint).
+        renderer.subagent_list_scroll = u16::MAX;
+        renderer.dirty = false;
+        assert!(press(&mut renderer, KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            usize::from(renderer.subagent_list_scroll),
+            upper,
+            "an out-of-range offset was not pulled into the window"
+        );
+        assert!(
+            !renderer.dirty,
+            "reconciling a stale offset painted nothing"
+        );
+        // The very next press walks from that reconciled position.
+        renderer.dirty = false;
+        assert!(press(&mut renderer, KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            usize::from(renderer.subagent_list_scroll),
+            upper - 1,
+            "the walk did not continue from the reconciled position"
+        );
+        assert!(renderer.dirty, "a moved window asks for a repaint");
+
+        // And everything the arrows do not own stayed exactly where it was, in both
+        // states of the detail's follow flag.
+        for autoscroll in [true, false] {
+            renderer.subagent_list_scroll = lower as u16;
+            renderer.subagent_scroll = 5;
+            renderer.subagent_autoscroll = autoscroll;
+            renderer.set_follow(true);
+            let selected = renderer.selected_subagent_idx;
+            let chat_scroll = renderer.chat_scroll;
+            let plan_scroll = renderer.plan_scroll;
+            for code in [KeyCode::Up, KeyCode::Down] {
+                renderer.dirty = false;
+                assert!(press(&mut renderer, code, KeyModifiers::NONE));
+                assert_eq!(
+                    renderer.selected_subagent_idx, selected,
+                    "{code:?} moved the roster selection"
+                );
+                assert_eq!(renderer.subagent_scroll, 5, "{code:?} moved the detail log");
+                assert_eq!(
+                    renderer.subagent_autoscroll, autoscroll,
+                    "{code:?} restated the detail's follow flag"
+                );
+                assert!(renderer.follow, "{code:?} flipped transcript follow");
+                assert_eq!(
+                    renderer.chat_scroll, chat_scroll,
+                    "{code:?} scrolled the transcript"
+                );
+                assert_eq!(
+                    renderer.plan_scroll, plan_scroll,
+                    "{code:?} scrolled the plan"
+                );
+            }
+            assert_eq!(
+                usize::from(renderer.subagent_list_scroll),
+                lower + 1,
+                "the pair walked the window by exactly one row (Up at the head moved nothing)"
+            );
+        }
+    }
+
+    /// The roster half of the no-movement-no-decision rule: a roster that fits its
+    /// half has no window to move, so an arrow is still the pane's key (it is claimed)
+    /// but moves no offset, states no flag and asks for no repaint (defect 14).
+    #[test]
+    fn a_roster_with_nothing_to_scroll_states_nothing_when_the_arrows_are_pressed() {
+        let mut renderer = workers_pane_with_roster(2);
+        let (lower, upper) = roster_bounds_of(&renderer);
+        assert_eq!((lower, upper), (0, 0), "two rows fit their half");
+
+        renderer.subagent_scroll = 7;
+        renderer.subagent_autoscroll = false;
+        renderer.set_follow(true);
+        for code in [KeyCode::Up, KeyCode::Down] {
+            renderer.dirty = false;
+            assert!(
+                press(&mut renderer, code, KeyModifiers::NONE),
+                "{code:?} is still the roster's key"
+            );
+            assert_eq!(
+                renderer.subagent_list_scroll, 0,
+                "{code:?} moved an immovable window"
+            );
+            assert_eq!(renderer.subagent_scroll, 7, "{code:?} moved the log");
+            assert!(
+                !renderer.subagent_autoscroll,
+                "{code:?} flipped the detail's follow flag"
+            );
+            assert!(renderer.follow, "{code:?} flipped transcript follow");
+            assert!(!renderer.dirty, "{code:?} repainted a still window");
+        }
+    }
+
+    /// The other half of one-key-one-owner: the detail's own page and jump keys move
+    /// the log — and state its follow decision — while the roster window stands
+    /// exactly where the arrows left it.
+    #[test]
+    fn the_detail_page_and_jump_keys_leave_the_roster_window_where_it_stands() {
+        let mut renderer = workers_pane_with_roster(12);
+        let (lower, upper) = roster_bounds_of(&renderer);
+        assert!(upper > lower, "the roster needs room to be parked in");
+        let parked = lower + 1;
+        renderer.subagent_list_scroll = parked as u16;
+        renderer.subagent_scroll = 0;
+        renderer.subagent_autoscroll = false;
+        let selected = renderer.selected_subagent_idx;
+
+        for code in [
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            assert!(
+                press(&mut renderer, code, KeyModifiers::NONE),
+                "{code:?} is the detail's key"
+            );
+            assert_eq!(
+                usize::from(renderer.subagent_list_scroll),
+                parked,
+                "{code:?} walked the roster window"
+            );
+            assert_eq!(
+                renderer.selected_subagent_idx, selected,
+                "{code:?} moved the roster selection"
+            );
+        }
+
+        let tail = worker_detail_tail_of(&renderer);
+        assert!(tail > 10, "the log needs room to scroll: {tail}");
+        assert_eq!(
+            renderer.subagent_scroll, tail,
+            "the page and jump keys did not walk the log"
+        );
+        assert!(
+            renderer.subagent_autoscroll,
+            "arriving on the log tail did not re-arm its flag"
+        );
+    }
+
+    /// Defect 15, on the key path: the flag is the request, and the key path only
+    /// ever states the flag and the offset it moved. The pane resolves "the newest
+    /// line" against a body it counted itself — `ActivityData::autoscroll` is this
+    /// very flag, carried across untouched — so no tail estimated here can be parked
+    /// into `subagent_scroll` as an offset. The resolving half is held where it
+    /// happens, by `a_tail_request_pins_the_detail_to_the_newest_line_it_measured` in
+    /// `components::activity`.
+    #[test]
+    fn the_follow_flag_is_the_tail_request_and_the_offset_stays_the_operators() {
+        let mut renderer = worker_detail_with_log();
+        renderer.subagent_width.set(40);
+        renderer.subagent_height.set(4);
+        let tail = worker_detail_tail_of(&renderer);
+        assert!(tail > 10, "the log needs room to scroll: {tail}");
+
+        renderer.subagent_scroll = tail;
+        assert!(renderer.subagent_autoscroll, "a fresh renderer follows");
+        assert_eq!(
+            state::UiView::from_renderer(&renderer).scroll.workers,
+            renderer.subagent_scroll,
+            "the view model mirrors the offset and carries the flag beside it"
+        );
+
+        assert!(press(&mut renderer, KeyCode::PageUp, KeyModifiers::NONE));
+        assert!(
+            !renderer.subagent_autoscroll,
+            "leaving the tail did not turn the flag off"
+        );
+        assert!(
+            renderer.subagent_scroll < tail,
+            "the gesture did not move the offset it owns"
+        );
+        assert_eq!(
+            state::UiView::from_renderer(&renderer).scroll.workers,
+            renderer.subagent_scroll,
+            "the pane was handed the offset the key left, with follow off"
+        );
+
+        assert!(press(&mut renderer, KeyCode::End, KeyModifiers::NONE));
+        assert!(
+            renderer.subagent_autoscroll,
+            "arriving on the tail did not re-arm the flag"
+        );
+        assert_eq!(
+            state::UiView::from_renderer(&renderer).scroll.workers,
+            renderer.subagent_scroll,
+            "the flag came back and the offset is still the mirror"
+        );
     }
 }

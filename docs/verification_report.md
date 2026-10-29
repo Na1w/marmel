@@ -5,6 +5,20 @@
 > §10 acceptance matrix and D1–D11 ledger supersede the corresponding tables in §1–§8. Companion artefact:
 > `docs/change_surface_report.md`.
 
+> **Post-change annotation (added 2026-10-28; nothing below was rewritten).** The PTY-dependent failures
+> this report classes as environmental — `4 × harness::pty::tests::*` plus `test_prompt_based_tool_gating`
+> — **no longer run red on this host**. They now self-gate on a runtime PTY capability probe,
+> `pty_allocation_blocker()` (`src/harness/pty.rs:870`), and announce `SKIP <name>: <reason>` instead of
+> executing (`/dev/pts/ptmx` is `c---------`, mode `000`, so `openpty()` answers `EACCES`). Read every
+> "EXPECTED RED (environmental)" row in §2 (gates 6 and 7), and §3.1/§3.2, §7 item 1 and §B.6, as the
+> **historical** pre-change state. Post-change measurements: `cargo test --all-targets --all-features
+> --no-fail-fast` → **1908–1909 passed / 0 failed / 2 ignored, exit 0** over three consecutive runs;
+> `bash scripts/cross_platform_check.sh --only-host` → **PASS, 4/4 legs**, `host:test` =
+> **`1907 passed; 0 failed; 2 ignored; 1 filtered out`**. The local gate's `--skip` set is no longer the
+> 6-name list of PTY names — `scripts/cross_platform_check.sh` now skips **1** name (a repo-state
+> sensitivity) and the 5 PTY tests self-skip. Measured write-up: `docs/fix_pty_gating.md`
+> (§1.1 host hole, §2.2–§2.4 change + fail-closed proofs, §3–§4 counts, §5 caveats).
+
 ---
 
 ## PART A — verification report (plan task t-012b)
@@ -57,6 +71,10 @@ from that scratch copy. Both recompiled the crate (`Checking marmennill v1.0.0 (
 
 ### 3.1 `cargo test --lib` — 4 failures, all PTY-dependent (environmental)
 
+*(Historical — pre-change state. These 4 tests now self-gate on `pty_allocation_blocker()` and print
+`SKIP ` on this host, so `cargo test --lib` is no longer red because of them; see the post-change
+annotation at the top of this file and `docs/fix_pty_gating.md` §2.2–§2.4.)*
+
 | Test | Panic site | First panic line |
 |---|---|---|
 | `harness::pty::tests::test_harness_pty_process_group_kill` | `src/harness/pty_tests.rs:16:47` | `spawn sandbox: Execution(failed to openpty: Os { code: 13, kind: PermissionDenied, message: "Permission denied" })` |
@@ -71,6 +89,9 @@ exit 101 → **environmental, not a regression**. The same four appear in the pr
 `src/session/format/{mod.rs,ui.rs}`).
 
 ### 3.2 `cargo test --test '*'` — 1 failure
+
+*(Historical — same annotation: `test_prompt_based_tool_gating` now self-gates its execution leg and prints
+`SKIP ` on this host.)*
 
 `test_prompt_based_tool_gating`, panic at **`tests/test_role_gating.rs:310:5`**:
 `Validator with run_command in prompt must be permitted to execute run_command`.
@@ -231,7 +252,11 @@ or the implementation line.
 1. **The four `harness::pty::tests` and `tests/test_role_gating.rs::test_prompt_based_tool_gating` are unproven,
    not proven green.** Both groups are gated on `openpty`; they must be re-run on a host with PTY access before
    the branch can be called "all green". The role-gating one is recorded red in the pre-branch baseline as well,
-   so it is at minimum not a new regression.
+   so it is at minimum not a new regression. *(Updated 2026-10-28: the substance still holds — on this host the
+   assertions are not executed — but they now declare it themselves: each test calls the runtime probe
+   `pty_allocation_blocker()` (`src/harness/pty.rs:870`) and prints `SKIP <name>: <reason>`, so the "unproven"
+   verdict is recorded in the test output rather than inferred from a `--skip` list. On a PTY-capable host the
+   probe stays silent and every assertion runs, i.e. CI still proves them. `docs/fix_pty_gating.md` §2.3–§2.4.)*
 2. **No live TUI was ever launched** (no TTY, no PTY, no readable `~/.marmel/marmel.toml`). Everything about the
    rebuild's device behaviour is inferred from `TestBackend` frames: raw-mode entry/teardown ordering
    (`mod.rs:1430` kitty push, `mod.rs:2114` shutdown, `mod.rs:2891` `leave_alt_screen`), kitty `Shift+Tab` /

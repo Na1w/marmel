@@ -20,7 +20,7 @@ focus badge, every key press leaves a visible echo (a `plan:on` chip, a
 `● LIVE` / `↓ 3 new` chip on the transcript's own border), the footer legend and
 the `?` overlay tell you the keymap instead of assuming you memorised it, and
 nothing destructive happens on a single keystroke: `/reset`, `/exit`,
-`/cancel-all`, `x` and `Ctrl+D` all stop at a confirm overlay that names the
+`/cancel-all`, `Ctrl+X` and `Ctrl+D` all stop at a confirm overlay that names the
 action and what it costs.
 
 ## 2. Starting it
@@ -79,7 +79,7 @@ puts the plan first in every mode and at every size (§4.1).
 ┌ Input (Enter send, Alt/Shift+Enter newline, Ctrl+Z undo) ────────────────────────────────────────┐
 │add the focus badge to every pane title                                                           │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
- F1 help  Tab focus  F2 mode  F3/F4/F5 panes  x cancel-worker  e last error  Esc arm  Ctrl+A/P panes
+ F1 help  Tab focus  F2 mode  F3/F4/F5 panes  Ctrl+X cancel-worker  Esc arm  Ctrl+A/P panes
 ```
 
 | Region | What it holds |
@@ -87,10 +87,10 @@ puts the plan first in every mode and at every size (§4.1).
 | **Header** (1 row) | `Marmel`, the mode name (`M4 Split`), `✓ 3/7 done`, `▶ t-004` (the task in flight), `val N` (the highest validation round across the worker rows, printed only when one has been recorded), `ctx 45%`, `elapsed 10m 12s`. `Marmel` and `✓ done/total` are never dropped at any width; `▶ t-004` is printed at every size that draws a header at all (§7). |
 | **Execution Plan pane** (leading) | The plan body with task checkboxes and state glyphs (`✓` done, `▶` in flight, `⧗` open). Title right side repeats `3/7 done ▶ t-004`; the bottom border counts `✓ 3 done ⧗ 4 open ▶ in flight`. A scrollbar appears once the body overflows, and the pane auto-scrolls to the task in flight. Wherever the plan and the transcript share the frame, this pane takes the leading slot (§4.1). |
 | **Transcript pane** (trailing) | The conversation: your input (`User: …`), Manager output (`Marmennill: …`), `[Status]` and `Tool:` lines, thinking blocks when `think:on`. Markdown-rendered. Its **bottom border is its own status**: `● LIVE` while follow is on, `↓ 3 new` when you have scrolled back, `↓ follow off` when follow is off and nothing is unseen, plus `scroll 8/8` whenever there is somewhere to scroll. Empty state: `No output yet. Type an instruction and press Enter (? for keys).` |
-| **Workers pane** | Top half: the roster, one row per live worker — ` > ` selection marker, state glyph and label (`▶ running`, `⧗ queued 2/3`, `⏸ paused`), the worker key, its task id. Bottom half (only at ≥ 60 columns): the selected worker's detail — `[Output]`, thinking, queued steering, logs. Bottom border: the tally `▶ 1 ⏸ 1 ⧗ 1 ✓ 0  1/3  detail 0/0`. Empty state: `No specialist launched yet.` |
+| **Workers pane** | Top half: the roster, one row per live worker — ` > ` selection marker, state glyph and label (`▶ running`, `⧗ queued 2/3`, `⏸ paused`), the worker key, its task id. Bottom half (only at ≥ 60 columns): the selected worker's detail — `[Output]`, thinking, queued steering, logs. The two halves have separate keys: `Up` / `Down` walk the roster window, `PageUp` / `PageDown` / `Home` / `End` scroll the detail log, `Left` / `Right` move the selection (§5.2). Bottom border: the tally `▶ 1 ⏸ 1 ⧗ 1 ✓ 0  1/3  detail 0/0` — the counts, the selected row over the roster size, and the detail offset over its maximum (` detail hidden ` / ` detail too short ` when the ladder drops that half). Empty state: `No specialist launched yet.` |
 | **Status bar** (2 rows at ≥ 20 rows) | Row 1: `Tokens 12.4k in / 3.2k out \| 3a \| ctx 45% \| 1p \| 1q \| <worker names> \| elapsed 10m 12s`. Row 2: the state chips `plan:on  workers:on  think:off  3a 1p 1q`, where `3a 1p 1q` are the active / paused / queued worker counts (the same counts row 1 spells as `3a`, `1p`, `1q`). A chip reads `narrow` when a toggle is on but the narrow-terminal ladder hid that pane (§7), so no chip ever advertises a pane you cannot see. |
 | **Composer** | The draft. Title: `Input (Enter send, Alt/Shift+Enter newline, Ctrl+Z undo)`, plus chips when relevant: `command /reset` (the draft is in command mode), `history 3/12` (you are browsing history), `lines 2 · chars 140` (a long draft), and a **ghost completion** row while you type a slash command. |
-| **Footer legend** (1 row at ≥ 20 rows) | ` F1 help  Tab focus  F2 mode  F3/F4/F5 panes  x cancel-worker  e last error  Esc arm  Ctrl+A/P panes`. Below 70 columns it shortens to ` F1 help  Esc arm  Enter send`, and at 100 columns a long line is clipped with `…`. |
+| **Footer legend** (1 row at ≥ 20 rows) | ` F1 help  Tab focus  F2 mode  F3/F4/F5 panes  Ctrl+X cancel-worker  Esc arm  Ctrl+A/P panes`. Below 70 columns it shortens to ` F1 help  Esc arm  Enter send`, and at 100 columns a long line is clipped with `…`. |
 
 The panes open themselves as the session gets live: booting with a non-empty
 `.marmel/execution_plan.md` opens the plan pane, a worker starting a task opens
@@ -142,21 +142,74 @@ The focus marker is a `●` badge in the focused pane's **title** (e.g.
 carries it. Focus can never sit on a pane that is not on screen: changing mode
 pulls a stranded focus back onto a visible pane.
 
+Focus is also what decides **who owns a key**. One predicate —
+`FocusPane::composer_has_focus` in `src/ui/tui/state.rs`, read by every key arm
+through `composer_has_focus` in `src/ui/tui/events.rs` — answers "composer or
+pane?" for each key that could mean either (`Up`, `Down`, `PageUp`, `PageDown`,
+`Home`, `End`): the composer owns it **iff** `Input` holds focus, a pane viewport
+owns it otherwise. The shape of the draft never decides *who* gets the key;
+inside the composer it only decides where the caret can go — the history walk
+belongs to the `Ctrl+Up` / `Ctrl+Down` chord and to nothing else (§5.1). The
+deliberate exception is §4.4: printables, paste, `Backspace` /
+`Delete`, `Ctrl+Z` / `Ctrl+Y` and `Ctrl+J` reach the composer in **every** focus,
+so typing is never starved.
+
 ### 4.3 Follow / auto-scroll
 
-Follow is on at boot: the transcript shows the newest line. Scrolling it back
-(`PageUp`, or `Up` when that key scrolls rather than walking history) turns
-follow **off** and the transcript border starts counting `↓ 3 new` — and `↓ follow
-off` once nothing is unseen. Returning to the tail turns follow back on
-(`● LIVE`). `Ctrl+F` toggles follow explicitly. The rule is symmetric, so
-the chip never lags the viewport: the scroll path and the chip are the same
-decision (`scroll_by` → `set_follow`, `src/ui/tui/events.rs:487-495`).
+Follow is on at boot, so the transcript sits on the newest line and its bottom
+border reads `● LIVE`. Every scroll gesture states that flag from what the
+viewport **actually did** — the same rule in `scroll_transcript_to` (transcript)
+and `scroll_worker_detail_to` (the worker detail half) in
+`src/ui/tui/events.rs`:
+
+* a gesture that **moved** the viewport away from the tail turns follow **off**.
+  The border starts counting `↓ 3 new` — lines below the viewport the operator
+  has not seen — and reads `↓ follow off` once follow is off and nothing is
+  unseen;
+* a gesture that **arrived** on the tail turns it back on (`● LIVE`). A press
+  that moved the viewport part of the way towards the tail moves the viewport and
+  states nothing, so nothing re-arms quietly;
+* a press with nowhere to go states **nothing** — not the flag, not the chip, not
+  a repaint. That covers a press already at the top, a press already at the tail,
+  and a pane whose body fits its rect: with `max_scroll == 0` there is no tail to
+  leave, and the `scroll 8/8` readout beside the chip is printed only when there
+  is somewhere to scroll. This is what stops a transcript that fits its pane from
+  flipping its own chip on every arrow press;
+* nothing else re-arms it. Submitting a message, a command notice or task traffic
+  never touches `follow`. The ways back on are `Ctrl+F`, `/follow on`, and a
+  scroll or `End` that **lands** on the tail.
+
+The `↓ N new` count is honest in both directions: with follow off the pane takes
+the larger of "lines still below the viewport" and "lines added since the
+viewport last sat at its bottom" (the baseline the renderer keeps as
+`transcript_baseline_lines`), so an offset re-pinned by a resize clamp can never
+turn `↓ 3 new` into a silent "you are caught up". The chip is drawn by the
+transcript pane itself — the only surface that can honestly report its own
+viewport — and never on the status bar.
+
+The other two viewports carry the same shape with their own flag:
+
+* **Execution Plan** — its flag means "centre the pane on the task in flight",
+  not "sit at the tail". It is armed once, when the first plan document this
+  process reads appears (`arm_plan_centring` in `src/ui/tui/mod.rs`). A scroll
+  gesture releases it (`scroll_plan_to`) and **no gesture re-arms it**, not even
+  `End`: paging to the end of the plan and then having task traffic hand the
+  viewport back to the in-flight task is exactly the flap this closes.
+* **Worker detail** — `subagent_autoscroll` is off/on under the transcript rule
+  above. `Left` / `Right` move the roster **selection**, and choosing a row is
+  itself a request to see that row's newest detail line (`select_worker`), which
+  the pane resolves against the body it measured; the chip row then reads
+  ` detail <offset>/<max> ` (` detail hidden ` / ` detail too short ` when the
+  §2.5 ladder took the half away). The roster window has no follow flag at all:
+  `scroll_worker_roster_by` moves a list window, which says nothing about
+  following the tail of a log.
 
 ## 5. Keyboard
 
-These are all the bindings the rebuilt TUI has; the same table is what `?`/`F1`
-draws and what `/help` prints (`legend()` in
-`src/ui/tui/components/help.rs:87-246`, 26 rows).
+These are all the bindings the rebuilt TUI has; they are the same 26 bindings
+`?`/`F1` draws and `/help` prints — the single keymap table `legend()` in
+`src/ui/tui/components/help.rs` (26 rows; anchored on the function name rather
+than a line range, because that range has already rotted once).
 
 ### 5.1 Composer
 
@@ -167,8 +220,8 @@ draws and what `/help` prints (`legend()` in
 | Printable key / paste | Insert in the composer, **in any mode and any focus**. A paste always goes to the composer. |
 | `Backspace` / `Delete` | Edit the composer, in any focus. |
 | `Ctrl+Z` / `Ctrl+Y` | Undo / redo the draft. |
-| `Ctrl+Up` / `Ctrl+Down` | Previous / next input history entry (the composer shows `history 3/12`). |
-| `Up` / `Down` | Move the caret inside a multi-line draft; with an empty draft, walk history; otherwise scroll the focused pane by 1. |
+| `Ctrl+Up` / `Ctrl+Down` | Previous / next input history entry — **in every focus**, a pane focused included, the only route to the walk, and the only way to walk a multi-line entry (the composer shows `history 3/12`). |
+| `Up` / `Down` | **With composer focus only:** move the caret inside a multi-line draft. These keys never recall history — that is `Ctrl+Up` / `Ctrl+Down` and nothing else — and they never scroll a pane while the composer holds focus. A press with nowhere for the caret to go (a single-line draft, or the caret already against the top / bottom edge) is not claimed at all: no repaint, no scroll, no follow change. With a **pane** focused the same keys belong to that pane (§5.2). |
 | `Ctrl+P` / `Ctrl+A` | Show / hide the Plan / Workers pane. |
 | `Ctrl+T` | Toggle thinking blocks (echo: the `think:on` chip). |
 
@@ -180,11 +233,29 @@ draws and what `/help` prints (`legend()` in
 | `Shift+Tab` | Cycle focus backward. |
 | `F2` | Cycle the view mode (`M4 → M1 → M2 → M3 → M4`). |
 | `F3` / `F4` / `F5` | Go to Transcript / Plan / Workers. |
-| `Left` / `Right` | With the Workers pane focused: previous / next worker in the roster. Otherwise: caret. |
-| `PageUp` / `PageDown` | Scroll the focused pane by 10 lines — the transcript when the composer holds focus (turns follow off/on accordingly). |
-| `Home` / `End` | With the composer focused: line start / end. Otherwise: pane top / bottom (jumping to the bottom re-arms follow). |
+| `Left` / `Right` | With the Workers pane focused: previous / next worker in the roster, and choosing a row asks the pane to show that row's newest detail line. Already at the first / last row, or with no worker on the roster, the key falls through to the caret. Anywhere else: caret. |
+| `Up` / `Down` | With a **pane** focused: one step of that pane's viewport — the transcript body, the plan body, or in the Workers pane the **roster window** (never the detail log). While a pane holds focus these keys never touch the composer: not its draft, not its caret, not its history (§5.1 owns the composer case). |
+| `PageUp` / `PageDown` | With a **pane** focused: ten steps of that viewport — the transcript body, the plan body, or in the Workers pane the selected worker's **detail log** (the roster window is walked by `Up` / `Down`). With the **composer** focused the key has no owner at all — the composer has no viewport — so it does nothing: no scroll, no follow change. |
+| `Home` / `End` | With the composer focused: caret to line start / end. With a pane focused: that viewport's top / bottom — in the Workers pane the **detail log**, never the roster. `End` re-arms transcript follow only when it lands on the tail, and on the plan it never re-arms the centring (§4.3). |
 | `Ctrl+F` | Toggle transcript follow. |
 | Resize | Clamp scroll offsets to the new size and redraw immediately. |
+
+**The Workers pane has two viewports, and no key answers to both.** The pane
+shows a roster of workers *and* the selected worker's detail log, so its two
+offsets are addressed by two disjoint sets of keys:
+
+| Key | Viewport it owns |
+|---|---|
+| `Up` / `Down` | the roster **window** (`scroll_worker_roster_by`) — one row per press, both ends walkable, selection untouched |
+| `PageUp` / `PageDown` | the selected worker's **detail log** (`scroll_worker_detail_to`) |
+| `Home` / `End` | the detail log, top / tail |
+| `Left` / `Right` | the roster **selection** (`select_worker`); the window reveals the row |
+
+So `Up` / `Down` in that pane never scroll a log, `PageUp` / `PageDown` / `Home` /
+`End` never scroll the roster, and moving the roster window states no follow flag
+at all (§4.3). The function names above are the anchors in
+`src/ui/tui/events.rs`; the pane publishes its own drawable range, so a press can
+never claim a window position the frame is going to refuse.
 
 ### 5.3 Help
 
@@ -203,7 +274,7 @@ the identical table into the transcript.
 | Key | Action |
 |---|---|
 | `Ctrl+D` | Open the **Quit confirm**. It never exits un-armed; a second `Ctrl+D` just refreshes the same overlay. |
-| `x` | Cancel the **selected** worker in the Workers pane (opens a confirm). Only works with the Workers pane focused, at least one worker, and an empty composer; otherwise `x` types the letter. |
+| `Ctrl+X` | Cancel the **selected** worker while the **Workers pane is focused** (opens a confirm). Same scope and same semantics as the bare `x` it replaced — Workers focus plus at least one roster row — but a Ctrl chord is never a letter, so it cannot swallow a draft: when the guard is not met the status line says why (`Ctrl+X asks to cancel the selected roster row — no worker is on the roster.` / `… press Ctrl+A or F5 to focus it, or type /cancel <worker key or task id>.`) instead of typing the character. |
 | `y` | Run the pending action — honoured **only** inside the confirm overlay. |
 | `n` | Dismiss the pending action. |
 | `Esc` | Dismiss the pending action (same as `n` here). |
@@ -240,18 +311,20 @@ workers, and a destructive slash command. There is no "clear transcript" surface
 
 | Key | Action |
 |---|---|
-| `e` | Print the sticky last error again (with `see .marmel/marmel.log`). Only while the composer is empty; with a draft, `e` types. |
+| *(no key)* | There is no last-error binding any more: the recall is the `/error` row of §6, which is focus-independent and prints the sticky §8.5 error with `see .marmel/marmel.log` — or says `No error recorded to recall: …` when there is nothing to recall (G5). The bare `e` is removed (§5.7), so `e` types the letter in every focus. |
 
 ### 5.6 Precedence, in one paragraph
 
 `y` / `n` belong to the confirm overlay and are ordinary letters outside it (typing
 `no` still types). Then global view keys (`F1`–`F5`, `Esc`, `Tab`), then `Ctrl`
-chords, then `Enter`, then navigation and editing, then printables — and among
-printables a single-letter mnemonic (`?`, `x`, `e`) wins **only with an empty
-composer**. Any printable first disarms a pending abort, and so do the `Ctrl+P`,
-`Ctrl+A`, `Ctrl+T`, `Ctrl+F`, `Ctrl+Z`, `Ctrl+Y` and `Ctrl+J` chords. A multi-line
-draft is never interpreted as a command, so a pasted block whose first line is
-`/reset` arrives verbatim.
+chords, then `Enter`, then navigation and editing, then printables — and `?` is
+the **only** printable that can be spent anywhere but the draft, and then only on
+an **empty** composer. The other two single-letter mnemonics that used to sit
+here (`x`, `e`) are removed (§5.7), so those letters always type, in every focus
+and mode. Any printable first disarms a pending abort, and so do the `Ctrl+P`,
+`Ctrl+A`, `Ctrl+T`, `Ctrl+F`, `Ctrl+X`, `Ctrl+Z`, `Ctrl+Y` and `Ctrl+J` chords. A
+multi-line draft is never interpreted as a command, so a pasted block whose first
+line is `/reset` arrives verbatim.
 
 ### 5.7 Bindings that no longer exist
 
@@ -265,6 +338,18 @@ Printed under the help table, so old muscle memory learns the replacement:
 - **`Esc` re-focusing Chat** — `Esc` closes an overlay or arms abort; it never
   changes focus.
 - **The 3-row worker roster clamp** — every live worker is reachable.
+- **Bare `x`** — removed: it armed on an empty draft in the Workers pane and
+  swallowed the letter; `Ctrl+X`, or `/cancel <worker key or task id>`, now asks
+  to cancel the selected worker (confirm).
+- **Bare `e`** — removed: it armed on an empty draft over a pane focus and
+  swallowed the letter; `/error` prints the sticky last error from any focus.
+- **Plain `Up` / `Down` history recall** — removed: it fired while the operator
+  was scrolling a pane and replaced the draft; `Ctrl+Up` / `Ctrl+Down` walks the
+  input history in every focus.
+
+That list **is** the list `?` / `F1` and `/help` print under the keymap table
+(`removed()` in `src/ui/tui/components/help.rs`) — it is deliberately not part of
+the legend, because the legend may only name keys the handler binds.
 
 ## 6. Slash commands
 
@@ -288,7 +373,7 @@ vocabulary.
 | `/plan [on\|off]` | Show or hide the Execution Plan pane. | Done in the TUI, the `Ctrl+P` transition; the `plan:` chip on status row 2 is the persistent echo. |
 | `/workers [on\|off]` | Show or hide the Workers pane. | Done in the TUI, the `Ctrl+A` transition; the `workers:` chip on status row 2 is the persistent echo. |
 | `/mode transcript\|plan\|workers\|split` | Set the view mode. | Done in the TUI, the `F3`/`F4`/`F5` transitions: `transcript` → `M1`, `plan` → `M2`, `workers` → `M3`, `split` → `M4`, plus a notice naming the mode and its tag. A bare `/mode` is a question, not a no-op: it prints the mode on screen and the arguments it accepts. |
-| `/error` | Show the last error again. | Done in the TUI — exactly what the `e` key does (`recall_last_error`, `src/ui/tui/events.rs:1236`): the sticky §8.5 error buffer first (category plus the whole text), a transcript scan as fallback, then `see .marmel/marmel.log`. |
+| `/error` | Show the last error again. | Done in the TUI (`recall_last_error` in `src/ui/tui/events.rs`), and since the bare `e` binding was removed it is the **only** route to the recall — as a slash command it is focus-independent (§4.4): the sticky §8.5 error buffer first (category plus the whole text), a transcript scan as fallback, then `see .marmel/marmel.log`. |
 | `/cancel <worker key or task id>` | Cancel **one** worker. | Confirm overlay; `y` cancels that row. The argument matches a roster key or task id case-insensitively; an unknown name is still confirmed and then reports `Worker '…' is not running any more.` rather than cancelling a different row. |
 | `/cancel` (no argument) | Cancel one worker, or quit. | With the **Workers pane focused** and at least one worker, it names the selected row (confirm). Anywhere else the spelling keeps its old meaning — a quit (confirm). |
 | `/cancel-all` | Cancel every worker. | Confirm overlay, then bulk cancel. |
@@ -409,8 +494,14 @@ the one executed reset burst `write_terminal_resets()` in `src/ui/tui/mod.rs`,
 reached from the `shutdown()` and `leave_alt_screen()` teardowns — defensive
 cleanup, never a capture; the symbol names are the anchor, since the line
 numbers there move with every edit).
-Scrolling is `PageUp` / `PageDown` / `Up` / `Down` / `Home` / `End`, selection is
-`Left` / `Right` in the Workers pane, and focus is `Tab` / `Shift+Tab`. This also
+
+Scrolling is keyboard-only, and it is split **per viewport** (§5.2): the
+transcript body and the plan body take `Up` / `Down` (one line) and `PageUp` /
+`PageDown` (ten lines) with `Home` / `End` for the ends; in the Workers pane
+`Up` / `Down` walk the **roster window** while `PageUp` / `PageDown` / `Home` /
+`End` scroll the selected worker's **detail log**, and `Left` / `Right` move the
+roster selection there (the caret elsewhere). Input history is `Ctrl+Up` /
+`Ctrl+Down` from any focus, and focus itself is `Tab` / `Shift+Tab`. This also
 means terminal-native text selection and copy-on-select work again.
 
 ## 9. Known drift (spec vs. code) and what was not verified

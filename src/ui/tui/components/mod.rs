@@ -38,7 +38,7 @@ pub fn pane_block(title: &str, focused: bool, border: Style) -> Block<'static> {
             theme::frame_focus(),
         )
     } else {
-        (format!(" {title} "), theme::text_dim())
+        (format!(" {title} "), theme::text_muted())
     };
     Block::bordered()
         .border_style(border)
@@ -111,7 +111,7 @@ pub fn fit_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Span<'static>> {
         kept.push(Span::styled(piece, style));
     }
     kept.retain(|span| !span.content.is_empty());
-    kept.push(Span::styled(ellipsis, theme::text_dim()));
+    kept.push(Span::styled(ellipsis, theme::text_muted()));
     kept
 }
 
@@ -123,7 +123,7 @@ pub fn render_notice(frame: &mut Frame, rect: Rect, cols: u16, rows: u16) {
         "Terminal too small — Marmel needs at least {MIN_COLS}x{MIN_ROWS} (currently {cols}x{rows}). Resize to continue."
     );
     let paragraph = Paragraph::new(text)
-        .block(pane_block("Marmel", false, theme::frame_alert()))
+        .block(pane_block("Marmel", false, theme::frame_danger()))
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true });
     frame.render_widget(paragraph, rect);

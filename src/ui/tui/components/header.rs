@@ -136,14 +136,16 @@ pub(crate) fn header_line(
 fn fields(data: &HeaderData<'_>, elapsed: Option<u64>) -> Vec<Field> {
     let mut fields = vec![Field {
         drop: None,
-        spans: vec![Span::styled(" Marmel".to_string(), theme::chip_done())],
+        // The wordmark owns its own slot: painting it with the success hue made a
+        // green corner mean "done" and "the logo" at the same time (§F5).
+        spans: vec![Span::styled(" Marmel".to_string(), theme::brand())],
     }];
     if data.budget.show_mode {
         fields.push(Field {
             drop: Some(Drop::Mode),
             spans: vec![Span::styled(
                 format!(" {}", data.mode.label()),
-                theme::text_dim(),
+                theme::text_muted(),
             )],
         });
     }
@@ -155,7 +157,7 @@ fn fields(data: &HeaderData<'_>, elapsed: Option<u64>) -> Vec<Field> {
             Glyph::Done.badge(),
             Span::styled(
                 format!(" {} ", data.plan.progress_label()),
-                theme::chip_done(),
+                theme::state_done(),
             ),
         ],
     });
@@ -166,7 +168,7 @@ fn fields(data: &HeaderData<'_>, elapsed: Option<u64>) -> Vec<Field> {
             drop: Some(Drop::Task),
             spans: vec![
                 Glyph::Active.badge(),
-                Span::styled(format!(" {task}"), theme::chip_active()),
+                Span::styled(format!(" {task}"), theme::state_running()),
             ],
         });
     }
@@ -180,7 +182,7 @@ fn fields(data: &HeaderData<'_>, elapsed: Option<u64>) -> Vec<Field> {
             drop: Some(Drop::Val),
             spans: vec![Span::styled(
                 format!(" val {}", data.val_rounds),
-                theme::chip_pending(),
+                theme::state_replan(),
             )],
         });
     }
@@ -189,7 +191,7 @@ fn fields(data: &HeaderData<'_>, elapsed: Option<u64>) -> Vec<Field> {
     {
         fields.push(Field {
             drop: Some(Drop::Ctx),
-            spans: vec![Span::styled(format!(" {chip}"), theme::text_dim())],
+            spans: vec![Span::styled(format!(" {chip}"), theme::text_muted())],
         });
     }
     if data.budget.show_elapsed
@@ -202,7 +204,7 @@ fn fields(data: &HeaderData<'_>, elapsed: Option<u64>) -> Vec<Field> {
                     " elapsed {}",
                     crate::orchestrator::workers::format_duration_human(secs)
                 ),
-                theme::text_dim(),
+                theme::text_muted(),
             )],
         });
     }

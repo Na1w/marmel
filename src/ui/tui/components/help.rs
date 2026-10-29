@@ -48,14 +48,16 @@ const CLOSE_HINT: &str = " Esc close ";
 /// The hint that the clipped remainder of the table is one `/help` away.
 const MORE_HINT: &str = " /help prints the full table ";
 
-/// The keys the wide footer legend prints, in the order §2.2 prints them.
-const FOOTER_KEYS: [&str; 8] = [
+/// The keys the wide footer legend prints, in the order §2.2 prints them. The
+/// bare-letter rows are gone with the bindings (operator request), so the footer
+/// carries the chord that replaced them and no longer advertises the recall —
+/// which lives in the `/error` row of the command table instead.
+const FOOTER_KEYS: [&str; 7] = [
     "F1 / ?",
     "Tab / Shift+Tab",
     "F2",
     "F3 / F4 / F5",
-    "x",
-    "e",
+    "Ctrl+X",
     "Esc",
     "Ctrl+P / Ctrl+A",
 ];
@@ -122,33 +124,39 @@ pub fn legend() -> Vec<LegendRow> {
             scope: "composer",
             footer: "",
         },
+        // The scroll-conflict repair (audit defects 1, 2, 3, 7, 10, 14) plus the
+        // reported follow-up: one predicate decides the owner of these keys —
+        // `FocusPane::Input` holds focus, or it does not — so the legend states the
+        // owner first and the gesture second. Inside the composer the draft only ever
+        // chooses where the caret goes; the history walk belongs to the chord row
+        // above and to nothing else, so no arrow row can advertise it.
         LegendRow {
             keys: "Ctrl+Up / Ctrl+Down",
-            action: "input history previous / next",
+            action: "walk input history, in any focus",
             scope: "composer",
             footer: "",
         },
         LegendRow {
             keys: "Up / Down",
-            action: "history, else scroll the pane by 1",
+            action: "caret in a multi-line draft · pane scroll by 1",
             scope: "composer / pane",
             footer: "",
         },
         LegendRow {
             keys: "Left / Right",
-            action: "previous / next worker, else caret",
+            action: "Workers roster selection · else caret",
             scope: "composer / pane",
             footer: "",
         },
         LegendRow {
             keys: "Home / End",
-            action: "line start / end, or pane top / end",
+            action: "composer caret start/end · pane top/tail",
             scope: "composer / pane",
             footer: "",
         },
         LegendRow {
             keys: "PageUp / PageDown",
-            action: "scroll the focused pane by 10",
+            action: "page the focused pane by 10, never the composer",
             scope: "pane",
             footer: "",
         },
@@ -195,16 +203,10 @@ pub fn legend() -> Vec<LegendRow> {
             footer: "",
         },
         LegendRow {
-            keys: "x",
+            keys: "Ctrl+X",
             action: "cancel the selected worker (confirm)",
             scope: "pane",
-            footer: "x cancel-worker",
-        },
-        LegendRow {
-            keys: "e",
-            action: "show the last error again",
-            scope: "global",
-            footer: "e last error",
+            footer: "Ctrl+X cancel-worker",
         },
         LegendRow {
             keys: "Esc",
@@ -256,6 +258,9 @@ pub fn removed() -> Vec<&'static str> {
         "bare stop / cancel / exit / quit / q / abort — removed: ordinary steering text; the slash forms open a confirm overlay",
         "Esc re-focusing Chat — removed: Esc closes an overlay or arms abort, it never changes focus",
         "3-row worker roster clamp — removed: every live worker is reachable",
+        "bare x — removed: it armed on an empty draft in the Workers pane and swallowed the letter; Ctrl+X, or /cancel <worker key or task id>, now asks to cancel the selected worker (confirm)",
+        "bare e — removed: it armed on an empty draft over a pane focus and swallowed the letter; /error prints the sticky last error from any focus",
+        "plain Up / Down history recall — removed: it fired while the operator was scrolling a pane and replaced the draft; Ctrl+Up / Ctrl+Down walks the input history in every focus",
     ]
 }
 
@@ -328,7 +333,7 @@ pub fn help_text() -> String {
 /// describe an action other than the one `y` will run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfirmRequest {
-    /// What the request is, e.g. `Cancel worker 'coder_specialist-t-004' (x)`.
+    /// What the request is, e.g. `Cancel worker 'coder_specialist-t-004' (Ctrl+X)`.
     pub action: String,
     /// What running it does, e.g. `Stops that one worker; the rest keep running.`
     pub consequence: String,
@@ -439,8 +444,13 @@ pub fn footer_legend(compact: bool) -> String {
 pub fn render(frame: &mut Frame, rect: Rect, data: &HelpData) {
     match data.kind {
         HelpKind::Legend => {
+            // §F3: the footer legend is the guidance a first-run operator reads, so
+            // it never sits in the gutter tier.
             let spans = fit_spans(
-                vec![Span::styled(footer_legend(data.compact), theme::text_dim())],
+                vec![Span::styled(
+                    footer_legend(data.compact),
+                    theme::text_secondary(),
+                )],
                 rect.width,
             );
             frame.render_widget(Paragraph::new(Line::from(spans)), rect);
@@ -452,7 +462,9 @@ pub fn render(frame: &mut Frame, rect: Rect, data: &HelpData) {
                 return;
             }
             let (title, border, body) = match overlay {
-                OverlayState::Help => ("Keys", theme::frame_focus(), help_text()),
+                // A modal being open is not a focus change, so the keymap overlay
+                // takes the notice frame rather than the Cyan the focused pane owns.
+                OverlayState::Help => ("Keys", theme::frame_notice(), help_text()),
                 OverlayState::Confirm => (
                     "Confirm",
                     theme::frame_confirm(),
@@ -487,7 +499,7 @@ pub fn render(frame: &mut Frame, rect: Rect, data: &HelpData) {
             let block = pane_block(title, false, border)
                 .title_bottom(Line::from(CLOSE_HINT))
                 .title_bottom(
-                    Line::from(Span::styled(MORE_HINT, theme::text_dim()))
+                    Line::from(Span::styled(MORE_HINT, theme::text_secondary()))
                         .alignment(Alignment::Right),
                 );
             frame.render_widget(Paragraph::new(text).block(block), area);
@@ -554,7 +566,17 @@ mod tests {
             assert!(!row.action.is_empty(), "{} has no action", row.keys);
             assert!(!row.scope.is_empty(), "{} has no scope", row.keys);
         }
-        assert_eq!(rows.len(), 26);
+        assert_eq!(rows.len(), 25);
+        // §4.4 + the operator's keymap request: no binding is a bare printable
+        // character except `?`, which is a row of the "F1 / ?" pair and never a
+        // single-character key string of its own.
+        for row in &rows {
+            assert!(
+                row.keys.chars().count() > 1,
+                "the legend binds the bare character {:?} again",
+                row.keys
+            );
+        }
     }
 
     #[test]
@@ -594,8 +616,7 @@ mod tests {
             "Ctrl+P / Ctrl+A",
             "Ctrl+T",
             "Ctrl+F",
-            "x",
-            "e",
+            "Ctrl+X",
             "Esc",
             "Ctrl+C",
             "Ctrl+D",
@@ -628,6 +649,14 @@ mod tests {
         assert!(removed.contains("Ctrl+D"));
         assert!(removed.contains("bare stop / cancel / exit / quit / q / abort"));
         assert!(removed.contains("Esc re-focusing Chat"));
+        // The two bare-letter mnemonics the operator asked to lose are not rows of
+        // the table either: they are listed here, naming what replaced them.
+        assert!(removed.contains("bare x — removed"), "{removed}");
+        assert!(removed.contains("bare e — removed"), "{removed}");
+        for row in legend() {
+            assert_ne!(row.keys, "x", "the bare x mnemonic came back");
+            assert_ne!(row.keys, "e", "the bare e mnemonic came back");
+        }
     }
 
     #[test]
@@ -664,8 +693,7 @@ mod tests {
                 "Tab focus",
                 "F2 mode",
                 "F3/F4/F5 panes",
-                "x cancel-worker",
-                "e last error",
+                "Ctrl+X cancel-worker",
                 "Esc arm",
                 "Ctrl+A/P panes"
             ]

@@ -127,11 +127,7 @@ pub fn slash_commands() -> Vec<SlashCommand> {
             "transcript|plan|workers|split",
             "set the view mode (F3-F5); bare form prints it",
         ),
-        (
-            "/error",
-            "",
-            "print the sticky last error and the log path (key e)",
-        ),
+        ("/error", "", "print the sticky last error and the log path"),
         (
             "/cancel",
             "<worker key or task id>",
@@ -314,12 +310,12 @@ pub fn draft_indicator(lines: usize, chars: Option<usize>) -> Option<String> {
     })
 }
 
-/// Composer border colour (§7.3): armed is `frame_alert`, and the frame reads
-/// as focused when it holds focus *or* when it is the typing target, because
+/// Composer border colour (§7.3): armed is [`theme::frame_danger`], and the frame
+/// reads as focused when it holds focus *or* when it is the typing target, because
 /// §4.4 makes it the typing target in every mode and focus state.
 fn border_style(data: &InputData<'_>) -> Style {
     if data.armed {
-        theme::frame_alert()
+        theme::frame_danger()
     } else if data.focus || data.active {
         theme::frame_focus()
     } else {
@@ -344,26 +340,31 @@ fn composer_frame(data: &InputData<'_>, state: &ComposerState<'_>, rect: Rect) -
     let mut frame = pane_block(&title, data.focus, border_style(data));
     if let Some(row) = state.buffer.and_then(suggestion_row) {
         frame = frame.title(
-            Line::from(Span::styled(format!(" {row} "), theme::chip())).alignment(Alignment::Right),
+            Line::from(Span::styled(format!(" {row} "), theme::chip_neutral()))
+                .alignment(Alignment::Right),
         );
     }
     let mut chips: Vec<Span<'static>> = Vec::new();
     let buffer = state.buffer.unwrap_or("");
     if let Some(chip) = command_chip(buffer) {
-        chips.push(Span::styled(format!(" {chip} "), theme::chip_active()));
+        chips.push(Span::styled(format!(" {chip} "), theme::state_running()));
     }
     if let Some(chip) = history_chip(state.history) {
-        chips.push(Span::styled(format!(" {chip} "), theme::chip()));
+        chips.push(Span::styled(format!(" {chip} "), theme::chip_neutral()));
     }
     let chars = state.buffer.map(|buffer| buffer.chars().count());
     if let Some(chip) = draft_indicator(data.draft_lines, chars) {
-        chips.push(Span::styled(format!(" {chip} "), theme::text_dim()));
+        chips.push(Span::styled(format!(" {chip} "), theme::text_muted()));
     }
     let hidden = data
         .draft_lines
         .saturating_sub(visible_draft_lines(rect.height));
     if hidden > 0 {
-        chips.push(Span::styled(format!(" +{hidden} "), theme::chip_pending()));
+        // `+N` counts draft rows the frame cannot show — output below the fold,
+        // the same job the transcript's `↓ N new` chip does. The warm attention
+        // hue is reserved for `REPLAN`/expired notices, and a long draft is not
+        // a problem (§F4).
+        chips.push(Span::styled(format!(" +{hidden} "), theme::scroll_unseen()));
     }
     if !chips.is_empty() {
         // The chips ride the bottom border row, which is 2 cells narrower than the
@@ -413,7 +414,6 @@ fn draw_body(frame: &mut Frame, rect: Rect, data: &InputData<'_>) {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
-    use ratatui::style::Color;
 
     /// Draw `block` into a `width x height` test terminal and hand back the
     /// text of every row plus the style of every cell.
@@ -639,8 +639,16 @@ mod tests {
                 Rect::new(0, 0, 40, 4),
             ),
         );
-        assert_eq!(focused.1[1][0].fg, Some(Color::Cyan));
-        assert_eq!(unfocused.1[1][0].fg, Some(Color::DarkGray));
+        assert_eq!(
+            focused.1[1][0].fg,
+            theme::frame_focus().fg,
+            "the focused composer keeps the focus frame"
+        );
+        assert_eq!(
+            unfocused.1[1][0].fg,
+            theme::frame_idle().fg,
+            "an unfocused composer recedes to the idle frame"
+        );
         assert_ne!(focused.1[1][0], unfocused.1[1][0]);
     }
 
@@ -657,7 +665,11 @@ mod tests {
                 Rect::new(0, 0, 40, 4),
             ),
         );
-        assert_eq!(typing.1[1][0].fg, Some(Color::Cyan));
+        assert_eq!(
+            typing.1[1][0].fg,
+            theme::frame_focus().fg,
+            "the typing target wears the focus frame"
+        );
         // Armed abort outranks both (§7.3, replaces render.rs:1183-1187).
         let armed = draw_block(
             40,
@@ -668,7 +680,11 @@ mod tests {
                 Rect::new(0, 0, 40, 4),
             ),
         );
-        assert_eq!(armed.1[1][0].fg, Some(Color::Red));
+        assert_eq!(
+            armed.1[1][0].fg,
+            theme::frame_danger().fg,
+            "an armed abort wears the danger frame, never a benign hue"
+        );
     }
 
     #[test]
@@ -717,7 +733,7 @@ mod tests {
     #[test]
     fn overflow_marker_marks_the_hidden_draft_lines() {
         // A 4-row frame shows 2 draft lines; a 6-line draft hides 4.
-        let (rows, _) = draw_block(
+        let (rows, styles) = draw_block(
             60,
             4,
             composer_frame(
@@ -728,6 +744,19 @@ mod tests {
         );
         assert!(rows[3].contains("+4"), "bottom row: {}", rows[3]);
         assert!(rows[3].contains("lines 6"), "bottom row: {}", rows[3]);
+        let marker = rows[3]
+            .find('+')
+            .expect("the overflow marker is drawn on the bottom row");
+        assert_eq!(
+            styles[3][marker].fg,
+            theme::scroll_unseen().fg,
+            "a draft below the fold is unseen output, not a problem (§F4)"
+        );
+        assert_ne!(
+            styles[3][marker].fg,
+            theme::state_replan().fg,
+            "the overflow marker never borrows the warm attention hue"
+        );
         // A draft that fits gets no marker and no indicator.
         let (rows, _) = draw_block(
             60,
@@ -811,7 +840,11 @@ mod tests {
             .unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(0, 0)].symbol(), "┌");
-        assert_eq!(buffer[(0, 1)].style().fg, Some(Color::Cyan));
+        assert_eq!(
+            buffer[(0, 1)].style().fg,
+            theme::frame_focus().fg,
+            "the `render()` entry point draws the focused frame"
+        );
         let row: String = (0..60)
             .map(|x| buffer[(x, 0)].symbol().to_string())
             .collect();

@@ -852,6 +852,38 @@ impl Drop for PtySession {
     }
 }
 
+/// Capability probe: can this host allocate a PTY at all?
+///
+/// Returns `None` when a PTY opens normally, or `Some(reason)` naming the failure
+/// when the host cannot provide one. This is a **host capability**, not a product
+/// behaviour: `openpty()` needs a usable `/dev/pts/ptmx` on Linux (a devpts mount
+/// with `ptmxmode=000`, or an equivalent device hole, makes every allocation return
+/// `EACCES`), and the same applies to the platform equivalent elsewhere.
+///
+/// The verdict is probed once and cached, mirroring `kernel_has_landlock()` in
+/// `src/harness/sandbox.rs`: it cannot change within a process, and every caller
+/// must see the same answer. Callers in tests announce a visible `SKIP ` rather
+/// than reaching for `#[ignore]`, for the reason spelled out at
+/// `src/harness/sandbox.rs:1765-1770` — "an invisible skip is the failure mode
+/// these tests exist to avoid". A PTY-capable host (every CI runner) keeps running
+/// the full assertions, so green never means "not checked".
+pub fn pty_allocation_blocker() -> Option<&'static str> {
+    static CACHED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            match native_pty_system().openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            }) {
+                Ok(_pair) => None,
+                Err(err) => Some(format!("{err}")),
+            }
+        })
+        .as_deref()
+}
+
 /// Execute a shell command via `run_command`. Parses `{ command, timeout_seconds? }`.
 ///
 /// If `timeout_seconds` (or `timeout`) is provided it is the per-call override;

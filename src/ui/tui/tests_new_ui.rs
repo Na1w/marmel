@@ -525,15 +525,15 @@ fn every_confirm_action_draws_its_surface_last_over_the_body_item16() {
             consequence: "Ends the session and cancels every running worker.",
         },
         ConfirmCase {
-            label: "CancelWorker (x)",
-            // `x` only arms from the roster, so the *before* frame already has the
-            // roster focused: the compare below is then about the overlay alone,
+            label: "CancelWorker (Ctrl+X)",
+            // `Ctrl+X` only arms from the roster, so the *before* frame already has
+            // the roster focused: the compare below is then about the overlay alone,
             // never about the focus ring.
             setup: |r| {
                 r.set_focus(state::FocusPane::Workers);
             },
             request: |r| {
-                key(r, KeyCode::Char('x'));
+                press(r, KeyCode::Char('x'), KeyModifiers::CONTROL);
             },
             action: "Cancel worker 'coder_specialist-t-004'",
             consequence: "Stops that one worker; every other worker keeps running.",
@@ -916,12 +916,12 @@ fn registry_gate() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Item 17: `x` on a selected roster row asks about **that** row and nothing else
-/// — the request carries that row's key and task id, the surface names and
+/// Item 17: `Ctrl+X` on a selected roster row asks about **that** row and nothing
+/// else — the request carries that row's key and task id, the surface names and
 /// promises only that one worker, and `n` leaves all three planted workers
 /// running: no token fired, no entry labelled `Aborted`, broadcast token armed.
 #[test]
-fn x_asks_about_the_selected_row_and_only_that_row_item17() {
+fn ctrl_x_asks_about_the_selected_row_and_only_that_row_item17() {
     let _registry = registry_gate();
     let ledger = CancellationLedger::plant();
     let broadcast = crate::orchestrator::global_cancellation_token();
@@ -933,7 +933,7 @@ fn x_asks_about_the_selected_row_and_only_that_row_item17() {
     r.selected_subagent_idx = 1;
     let rows_before = r.subagents.len();
 
-    assert!(key(&mut r, KeyCode::Char('x')));
+    assert!(press(&mut r, KeyCode::Char('x'), KeyModifiers::CONTROL));
     assert_eq!(
         r.confirm_action,
         Some(events::ConfirmAction::CancelWorker {
@@ -1020,7 +1020,7 @@ fn confirming_one_worker_never_reaches_the_broadcast_cancellation_item17() {
     let mut r = item17_renderer();
     r.set_focus(state::FocusPane::Workers);
     r.selected_subagent_idx = 2;
-    assert!(key(&mut r, KeyCode::Char('x')));
+    assert!(press(&mut r, KeyCode::Char('x'), KeyModifiers::CONTROL));
     assert!(matches!(
         r.confirm_action,
         Some(events::ConfirmAction::CancelWorker { .. })
@@ -1032,7 +1032,7 @@ fn confirming_one_worker_never_reaches_the_broadcast_cancellation_item17() {
 
     assert!(key(&mut r, KeyCode::Char('y')));
     // The effect of the answer, read off the registry the answer acts on: one
-    // worker, and it is the row `x` was standing on.
+    // worker, and it is the row `Ctrl+X` was standing on.
     assert_eq!(
         ledger.cancelled(),
         vec![target.clone()],
@@ -3292,4 +3292,1846 @@ fn an_uninjected_frame_shows_this_renderers_own_counters_only_d5() {
         "Tokens 0 in / 0 out",
         "the frame read ambient process state again (D5)"
     );
+}
+
+// ===========================================================================
+// The scroll-conflict contract, drawn — who owns `Up` / `Down` / `PageUp` /
+// `PageDown` / `Home` / `End` (audit defects 1-5, 7, 10: one predicate,
+// `FocusPane::composer_has_focus`, and never the shape of the draft or the
+// legacy `focused_panel` fold), and what the G7 chip may claim about the
+// viewport the same frame painted (defect 9's visible half).
+//
+// The state-level half of each rule is already pinned inside `events.rs`
+// (`up_and_down_follow_the_focus_and_never_cross_the_line`,
+// `down_with_a_pane_in_focus_and_an_empty_draft_scrolls_the_pane`,
+// `page_keys_are_pane_keys`, the `scroll_*_to` follow guards and
+// `the_workers_arrows_walk_the_roster_window_and_leave_the_log_alone`), so every
+// pin below is about the **frame**: the pixels of the pane that did or did not
+// move, the pixels of the composer that did or did not change, and the chip row
+// read back out of the drawn border instead of off the fields behind it.
+// ===========================================================================
+
+/// What one drawn transcript chip row states about the viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowChip {
+    /// `● LIVE`
+    Live,
+    /// `↓ N new`
+    New(usize),
+    /// `↓ follow off`
+    FollowOff,
+}
+
+/// Read the follow chip and the `scroll a/b` readout **out of the drawn border
+/// row**. Parsing the pixels rather than the fields is the point: a chip that
+/// agrees with `follow` but not with the window it is drawn under is exactly the
+/// defect these pins exist for.
+fn read_chip_row(row: &str) -> (FollowChip, Option<(u16, u16)>) {
+    let chip = if row.contains("LIVE") {
+        FollowChip::Live
+    } else if let Some(at) = row.find("\u{2193} ") {
+        let rest = &row[at + "\u{2193} ".len()..];
+        let run: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        match run.parse::<usize>() {
+            Ok(unseen) => FollowChip::New(unseen),
+            Err(_) => FollowChip::FollowOff,
+        }
+    } else {
+        FollowChip::FollowOff
+    };
+    let position = row.find(" scroll ").and_then(|at| {
+        let rest = &row[at + " scroll ".len()..];
+        let (offset, maximum) = rest.split_once('/')?;
+        let number = |part: &str| -> Option<u16> {
+            let run: String = part.chars().take_while(char::is_ascii_digit).collect();
+            run.parse::<u16>().ok()
+        };
+        Some((number(offset)?, number(maximum)?))
+    });
+    (chip, position)
+}
+
+/// Assert that one drawn frame tells **one** story about the transcript viewport:
+/// the `scroll a/b` readout names the window the pane actually painted (the
+/// first body row of that frame is body row `a`), the follow chip agrees with
+/// that position, and the offset the renderer kept is the one it drew. Returns
+/// the drawn offset and the drawn chip so a caller can also assert the gesture's
+/// step.
+///
+/// `max` is the measure the first frame published: the fixtures here never grow
+/// the conversation, so every later frame must publish the same one.
+fn assert_frame_agrees_with_its_chip(
+    label: &str,
+    rows: &[String],
+    pane: Rect,
+    max: usize,
+    r: &TuiRenderer,
+) -> (usize, FollowChip) {
+    let chip_row = transcript_chip(rows, pane);
+    let (chip, position) = read_chip_row(&chip_row);
+    let (at, measured) = position.unwrap_or_else(|| {
+        panic!("{label}: the pane drew no `scroll a/b` readout in {chip_row:?}")
+    });
+    assert_eq!(
+        usize::from(measured),
+        max,
+        "{label}: the readout's maximum is not the measure the pane published: {chip_row:?}"
+    );
+    assert_eq!(
+        usize::from(r.chat_scroll),
+        usize::from(at),
+        "{label}: the offset the renderer kept ({}) is not the one it drew ({at})",
+        r.chat_scroll
+    );
+
+    let body = transcript_body(rows, pane);
+    let first = body.first().cloned().unwrap_or_default();
+    assert!(
+        first.contains(&format!("line {at:02}")),
+        "{label}: the drawn window does not start at the row its own readout names \
+         ({at}):\n{}",
+        on_screen(&body)
+    );
+    let last = body.last().cloned().unwrap_or_default();
+    let at_tail = usize::from(at) == usize::from(measured);
+    match chip {
+        FollowChip::Live => {
+            assert!(
+                r.follow && r.chat_auto_scroll,
+                "{label}: `● LIVE` was drawn with follow off (mirror {})",
+                r.chat_auto_scroll
+            );
+            assert!(
+                at_tail,
+                "{label}: `● LIVE` while the drawn window is short of its tail: {chip_row:?}"
+            );
+            assert!(
+                last.contains("line 39"),
+                "{label}: `● LIVE` but the newest line of the fixture is off screen: {last:?}"
+            );
+        }
+        FollowChip::New(unseen) => {
+            assert!(
+                !r.follow && !r.chat_auto_scroll,
+                "{label}: `↓ {unseen} new` was drawn while follow was on"
+            );
+            assert!(
+                !at_tail,
+                "{label}: `↓ {unseen} new` on a window already at its tail: {chip_row:?}"
+            );
+            assert_eq!(
+                unseen,
+                usize::from(measured) - usize::from(at),
+                "{label}: the unseen count disagrees with the distance the frame drew: {chip_row:?}"
+            );
+            assert!(
+                !last.contains("line 39"),
+                "{label}: `↓ {unseen} new` but the newest line is on screen: {last:?}"
+            );
+        }
+        FollowChip::FollowOff => {
+            assert!(
+                !r.follow && !r.chat_auto_scroll,
+                "{label}: `↓ follow off` was drawn while follow was on"
+            );
+            assert!(
+                at_tail,
+                "{label}: `↓ follow off` while the drawn window is off its tail: {chip_row:?}"
+            );
+        }
+    }
+    (usize::from(at), chip)
+}
+
+/// Contract row (a): with the **composer** focused, `Up` / `Down` are the composer's
+/// caret keys inside a multi-line draft, and belong to nothing at all when the caret
+/// has nowhere to go — they never recall history (the reported conflict: the operator
+/// was scrolling and the draft got replaced), they never move a drawn pane and they
+/// never restate its follow chip. The multi-line case is pinned too, because it used
+/// to be the draft shape, not the focus, that decided who got the key (defects 1, 2
+/// and 5).
+#[test]
+fn arrows_behind_the_composer_leave_every_drawn_pane_where_it_stands() {
+    let mut r = scrollback_renderer();
+    r.set_focus(state::FocusPane::Input);
+    r.history = vec!["first note".to_string(), "second note".to_string()];
+
+    let (rows, _, rects) = draw_frame(&mut r, 100, 30);
+    let pane = rects.transcript.expect("M1 draws the transcript");
+    let body = snapshot(&transcript_body(&rows, pane));
+    let chip = transcript_chip(&rows, pane);
+    let offset = r.chat_scroll;
+    let follow = (r.follow, r.chat_auto_scroll);
+    assert!(
+        chip.contains("LIVE"),
+        "the boot frame follows the tail: {chip:?}"
+    );
+
+    // One plain `Up`, with a two-entry history waiting behind an empty draft: the
+    // press is refused. Nothing is recalled, nothing is scrolled, nothing is marked
+    // for repaint — the history is reachable by the `Ctrl+Up` chord alone.
+    r.dirty = false;
+    assert!(
+        !key(&mut r, KeyCode::Up),
+        "a plain `Up` behind the composer is not claimed once it is no longer the \
+         history fallback"
+    );
+    assert!(r.input_text.is_empty(), "the draft stayed the operator's");
+    assert_eq!(
+        r.history_index, None,
+        "and no history walk was started behind their back"
+    );
+    assert!(!r.dirty, "an unclaimed press asked for no repaint");
+    let (rows, _, _) = draw_frame(&mut r, 100, 30);
+    assert_eq!(
+        snapshot(&transcript_body(&rows, pane)),
+        body,
+        "a composer arrow scrolled the transcript"
+    );
+    assert_eq!(
+        transcript_chip(&rows, pane),
+        chip,
+        "a composer arrow restated the follow chip"
+    );
+    assert_eq!(r.chat_scroll, offset, "and no viewport offset moved");
+    assert_eq!(
+        (r.follow, r.chat_auto_scroll),
+        follow,
+        "and no follow decision was stated for a gesture inside the composer"
+    );
+
+    // `Down` is refused on the same grounds: there is no walk to walk back.
+    r.dirty = false;
+    assert!(!key(&mut r, KeyCode::Down), "and so is `Down`");
+    assert!(r.input_text.is_empty());
+    assert!(r.history_index.is_none());
+    assert!(!r.dirty, "again no repaint was requested");
+    let (rows, _, _) = draw_frame(&mut r, 100, 30);
+    assert_eq!(
+        snapshot(&transcript_body(&rows, pane)),
+        body,
+        "a composer arrow scrolled the transcript"
+    );
+    assert_eq!(transcript_chip(&rows, pane), chip);
+    assert_eq!(r.chat_scroll, offset);
+
+    // The chord, from the very same focus, does walk — and still leaves every drawn
+    // pane where it stands.
+    r.dirty = false;
+    assert!(
+        press(&mut r, KeyCode::Up, KeyModifiers::CONTROL),
+        "`Ctrl+Up` is the way into the history from the composer"
+    );
+    assert_eq!(r.input_text, "second note");
+    assert_eq!(r.history_index, Some(1), "the walk is the composer's");
+    assert!(
+        r.dirty,
+        "a press that changed the draft does ask for a repaint"
+    );
+    let (rows, _, _) = draw_frame(&mut r, 100, 30);
+    assert_eq!(
+        r.chat_scroll, offset,
+        "and the chord moved no viewport offset"
+    );
+    assert_eq!(
+        (r.follow, r.chat_auto_scroll),
+        follow,
+        "and stated no follow decision"
+    );
+    assert!(
+        on_screen(&rows).contains("history 2/2"),
+        "the composer names the browse it is in:\n{}",
+        on_screen(&rows)
+    );
+    assert!(press(&mut r, KeyCode::Down, KeyModifiers::CONTROL));
+    assert!(r.input_text.is_empty(), "and walks back out to the draft");
+    assert!(r.history_index.is_none());
+
+    // A multi-line draft: the arrows move the caret inside the draft, and the pane
+    // viewport still does not move. A taller draft legitimately costs the body a
+    // row (§2.1 `input_h`), so the baseline is re-taken for this part: the pin is
+    // that the **arrows** change nothing in it.
+    type_text(&mut r, "one");
+    assert!(press(&mut r, KeyCode::Char('j'), KeyModifiers::CONTROL));
+    type_text(&mut r, "two");
+    assert_eq!(draft(&mut r), "one\ntwo");
+    let (rows, _, _) = draw_frame(&mut r, 100, 30);
+    let body = snapshot(&transcript_body(&rows, pane));
+    let chip = transcript_chip(&rows, pane);
+    let offset = r.chat_scroll;
+    assert!(
+        key(&mut r, KeyCode::Up),
+        "the caret steps up inside the draft"
+    );
+    assert_eq!(r.textarea.cursor().0, 0, "and it is the caret that moved");
+    let (rows, _, _) = draw_frame(&mut r, 100, 30);
+    assert_eq!(
+        snapshot(&transcript_body(&rows, pane)),
+        body,
+        "the caret case scrolled a pane"
+    );
+    assert_eq!(transcript_chip(&rows, pane), chip);
+    assert_eq!(r.chat_scroll, offset, "and the caret case moved an offset");
+    assert!(
+        !key(&mut r, KeyCode::Up),
+        "with the caret against the top edge of a multi-line draft the press is not \
+         claimed, so no follow state is left describing a movement that never happened \
+         and no history entry is swapped in"
+    );
+    assert_eq!(draft(&mut r), "one\ntwo", "and the draft stayed put");
+    assert!(r.history_index.is_none(), "and the walk never began");
+    let (rows, _, _) = draw_frame(&mut r, 100, 30);
+    assert_eq!(snapshot(&transcript_body(&rows, pane)), body);
+    assert_eq!(transcript_chip(&rows, pane), chip);
+    assert_eq!(r.chat_scroll, offset);
+}
+
+/// The visible half of the reported conflict: the operator was trying to **scroll**
+/// with `Up` while the composer held focus. The press must not recall a history
+/// entry, must not move any region the frame draws, and must not schedule a repaint —
+/// in a frame that draws the plan, the transcript and the roster at once.
+#[test]
+fn a_plain_arrow_behind_the_composer_recalls_nothing_and_repaints_nothing() {
+    let mut r = m4_renderer();
+    r.history = vec![
+        "an old submission".to_string(),
+        "a newer submission".to_string(),
+    ];
+    r.set_focus(state::FocusPane::Input);
+
+    let (rows, _, rects) = draw_frame(&mut r, 120, 30);
+    let panes = leaf_rects(&rects);
+    for label in ["transcript", "plan", "workers", "input"] {
+        assert!(
+            panes.iter().any(|(name, _)| *name == label),
+            "the M4 frame must draw {label} to prove it stayed put: {panes:?}"
+        );
+    }
+    let before: Vec<(&'static str, Vec<String>)> = panes
+        .iter()
+        .map(|(label, rect)| (*label, snapshot(&rows_within(&rows, *rect))))
+        .collect();
+    let offsets = (r.chat_scroll, r.plan_scroll, r.subagent_list_scroll);
+    let follow = (r.follow, r.chat_auto_scroll);
+
+    for code in [KeyCode::Up, KeyCode::Down] {
+        r.dirty = false;
+        assert!(
+            !key(&mut r, code),
+            "a plain {code:?} behind the composer with a history waiting is not a \
+             key press any more"
+        );
+        assert!(r.input_text.is_empty(), "the draft was not recalled over");
+        assert_eq!(
+            r.history_index, None,
+            "and no history walk began behind the operator"
+        );
+        assert!(!r.dirty, "and the press asked for no repaint");
+    }
+    assert_eq!(
+        (r.chat_scroll, r.plan_scroll, r.subagent_list_scroll),
+        offsets,
+        "a composer arrow moved a viewport offset"
+    );
+    assert_eq!(
+        (r.follow, r.chat_auto_scroll),
+        follow,
+        "and a composer arrow stated a follow decision"
+    );
+
+    let (rows, _, after) = draw_frame(&mut r, 120, 30);
+    for (label, rect) in leaf_rects(&after) {
+        let earlier = before
+            .iter()
+            .find(|(name, _)| *name == label)
+            .map(|(_, cells)| cells.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            snapshot(&rows_within(&rows, rect)),
+            earlier,
+            "the refused composer arrow redrew {label}"
+        );
+    }
+    // And the same frame says nothing about a browse the operator never started.
+    assert!(
+        !on_screen(&rows).contains("history "),
+        "an unclaimed arrow drew a history readout:\n{}",
+        on_screen(&rows)
+    );
+}
+
+/// Contract row (b): with a **pane** focused, `Up` / `Down` are that pane's and
+/// never reach the composer — not its draft, not its caret, and not a history
+/// walk that is in progress. The drawn composer keeps its pixels and its
+/// `history n/m` chip while the pane under it walks (defects 5 and 7). The run is
+/// pinned press by press now that a plain arrow can never be a history route at all:
+/// one row of window per press, and nothing at all on the composer's side.
+#[test]
+fn arrows_on_a_pane_leave_the_drawn_composer_and_its_history_walk_alone() {
+    let mut r = scrollback_renderer();
+    r.history = vec!["first note".to_string(), "line one\nline two".to_string()];
+
+    // Start the walk from the composer, then hand the focus to the pane.
+    r.set_focus(state::FocusPane::Input);
+    assert!(press(&mut r, KeyCode::Up, KeyModifiers::CONTROL));
+    assert_eq!(r.input_text, "line one\nline two");
+    r.set_focus(state::FocusPane::Transcript);
+
+    let (rows, _, rects) = draw_frame(&mut r, 100, 30);
+    let pane = rects.transcript.expect("M1 draws the transcript");
+    let composer = rects.input.expect("M1 draws the composer");
+    let composer_before = snapshot(&rows_within(&rows, composer));
+    let body_before = snapshot(&transcript_body(&rows, pane));
+    let draft_text = r.input_text.clone();
+    let caret = r.textarea.cursor();
+    let walk = r.history_index;
+    assert_eq!(
+        caret,
+        (0, "line one".len()),
+        "the recall parked the caret at the end of \
+         its first line, where it cannot be turned into a scroll"
+    );
+    assert!(
+        on_screen(&rows).contains("history 2/2"),
+        "the browse is on screen while a pane holds the focus:\n{}",
+        on_screen(&rows)
+    );
+
+    // A run of `Up` presses. After **every** press the pane has stepped one row and
+    // the composer is pixel-identical, with its draft, its caret and its walk
+    // bookkeeping untouched — the pane's arrows never reach across into the composer.
+    let mut at = r.chat_scroll;
+    for step in 1..=3 {
+        assert!(
+            key(&mut r, KeyCode::Up),
+            "the pane refused the `Up` it owns at step {step}"
+        );
+        assert_eq!(
+            r.chat_scroll,
+            at.saturating_sub(1),
+            "step {step} was not one row of the pane's own window"
+        );
+        at = r.chat_scroll;
+        assert_eq!(r.input_text, draft_text, "step {step} edited the draft");
+        assert_eq!(r.textarea.cursor(), caret, "step {step} moved the caret");
+        assert_eq!(
+            r.history_index, walk,
+            "step {step} touched the walk bookkeeping"
+        );
+        let (rows, _, _) = draw_frame(&mut r, 100, 30);
+        assert_eq!(
+            snapshot(&rows_within(&rows, composer)),
+            composer_before,
+            "step {step} redrew the composer"
+        );
+        assert_ne!(
+            snapshot(&transcript_body(&rows, pane)),
+            body_before,
+            "step {step} did not move the pane they own"
+        );
+        assert!(
+            on_screen(&rows).contains("history 2/2"),
+            "step {step} dropped the browse chip:\n{}",
+            on_screen(&rows)
+        );
+    }
+    let (rows, _, _) = draw_frame(&mut r, 100, 30);
+    let window_before_downs = snapshot(&transcript_body(&rows, pane));
+
+    // A run of `Down` presses over the same pane steps the same window back down —
+    // they used to be the history's, and to be swallowed when no walk was running
+    // (defect 3).
+    for step in 1..=2 {
+        assert!(
+            key(&mut r, KeyCode::Down),
+            "`Down` was swallowed at step {step} instead of stepping the pane"
+        );
+        assert_eq!(
+            r.chat_scroll,
+            at + 1,
+            "step {step} of `Down` was not one row"
+        );
+        at = r.chat_scroll;
+        assert_eq!(r.input_text, draft_text, "step {step} edited the draft");
+        assert_eq!(r.textarea.cursor(), caret, "step {step} moved the caret");
+        assert_eq!(r.history_index, walk, "step {step} touched the walk");
+        let (rows, _, _) = draw_frame(&mut r, 100, 30);
+        assert_eq!(
+            snapshot(&rows_within(&rows, composer)),
+            composer_before,
+            "step {step} of `Down` redrew the composer"
+        );
+        assert!(
+            on_screen(&rows).contains("history 2/2"),
+            "step {step} of `Down` dropped the browse chip:\n{}",
+            on_screen(&rows)
+        );
+    }
+    let (rows, _, _) = draw_frame(&mut r, 100, 30);
+    assert_ne!(
+        snapshot(&transcript_body(&rows, pane)),
+        window_before_downs,
+        "the run of `Down` presses did not move the pane they own"
+    );
+
+    // The walk the operator started is still intact for the composer: the chord
+    // picks it up and restores their own draft.
+    r.set_focus(state::FocusPane::Input);
+    assert!(press(&mut r, KeyCode::Down, KeyModifiers::CONTROL));
+    assert!(
+        r.input_text.is_empty(),
+        "the draft the walk started from came back"
+    );
+    assert!(r.history_index.is_none());
+}
+
+/// Contract row (c), the plan half: with the **Plan** pane focused, a run of plain
+/// `Up` / `Down` presses walks only the drawn plan window. The composer keeps its
+/// pixels, its draft, its caret and its history bookkeeping press for press — the
+/// plan's arrows are never a history recall, however many of them are pressed.
+#[test]
+fn plan_focus_arrows_walk_the_drawn_plan_window_and_leave_the_composer_alone() {
+    let mut r = m4_renderer();
+    r.plan_content = (1..=30)
+        .map(|index| format!("- [ ] [t-{index:03}] plan row {index}"))
+        .collect::<Vec<String>>()
+        .join("\n");
+    r.history = vec![
+        "an old submission".to_string(),
+        "a newer submission".to_string(),
+    ];
+    r.set_input_content("a draft with words");
+    r.set_focus(state::FocusPane::Plan);
+
+    let (rows, _, rects) = draw_frame(&mut r, 120, 30);
+    let pane = rects.plan.expect("M4 Split draws the Plan pane");
+    let composer = rects.input.expect("every mode draws the composer");
+    let composer_before = snapshot(&rows_within(&rows, composer));
+    let draft_text = draft(&mut r);
+    let caret = r.textarea.cursor();
+    let walk = r.history_index;
+    assert_eq!(draft_text, "a draft with words", "the fixture draft");
+
+    // Park the plan at its tail so there is a window to walk back up.
+    assert!(
+        key(&mut r, KeyCode::End),
+        "`End` is a pane jump for the plan"
+    );
+    let tail = r.plan_scroll;
+    assert!(tail > 3, "the plan fixture needs a window to walk: {tail}");
+    let (rows, _, _) = draw_frame(&mut r, 120, 30);
+    let window_before = snapshot(&pane_body(&rows, pane));
+
+    let mut at = tail;
+    for step in 1..=3 {
+        assert!(
+            key(&mut r, KeyCode::Up),
+            "the plan refused the `Up` it owns at step {step}"
+        );
+        assert_eq!(r.plan_scroll, at - 1, "step {step} was not one plan row");
+        at = r.plan_scroll;
+        assert_eq!(r.input_text, draft_text, "step {step} edited the draft");
+        assert_eq!(r.textarea.cursor(), caret, "step {step} moved the caret");
+        assert_eq!(
+            r.history_index, walk,
+            "step {step} started or moved a history walk"
+        );
+        assert!(
+            r.input_text.contains('a'),
+            "step {step} reached the draft's content"
+        );
+        let (rows, _, _) = draw_frame(&mut r, 120, 30);
+        assert_eq!(
+            snapshot(&rows_within(&rows, composer)),
+            composer_before,
+            "step {step} redrew the composer"
+        );
+        assert_ne!(
+            snapshot(&pane_body(&rows, pane)),
+            window_before,
+            "step {step} did not move the plan window it owns"
+        );
+    }
+    let (rows, _, _) = draw_frame(&mut r, 120, 30);
+    let window_after_ups = snapshot(&pane_body(&rows, pane));
+
+    for step in 1..=2 {
+        assert!(
+            key(&mut r, KeyCode::Down),
+            "the plan swallowed its `Down` at step {step}"
+        );
+        assert_eq!(r.plan_scroll, at + 1, "step {step} was not one plan row");
+        at = r.plan_scroll;
+        assert_eq!(r.input_text, draft_text, "step {step} edited the draft");
+        assert_eq!(r.textarea.cursor(), caret, "step {step} moved the caret");
+        assert_eq!(r.history_index, walk, "step {step} touched the walk");
+    }
+    let (rows, _, _) = draw_frame(&mut r, 120, 30);
+    assert_ne!(
+        snapshot(&pane_body(&rows, pane)),
+        window_after_ups,
+        "the run of `Down` presses did not move the plan window"
+    );
+    assert_eq!(
+        snapshot(&rows_within(&rows, composer)),
+        composer_before,
+        "the plan's arrows redrew the composer"
+    );
+    assert!(
+        on_screen(&rows).contains("a draft with words"),
+        "the draft the pane arrows interrupted is not on screen:\n{}",
+        on_screen(&rows)
+    );
+}
+
+/// Contract row (c), the roster half: with the **Workers** pane focused, a run of
+/// plain `Up` / `Down` presses walks only the drawn roster window. The composer keeps
+/// its pixels, its draft, its caret and its history bookkeeping press for press, and
+/// the detail log — the pane's other viewport — stays where its own keys left it.
+#[test]
+fn workers_focus_arrows_walk_the_drawn_roster_window_and_leave_the_composer_alone() {
+    const ROWS: usize = 12;
+    let mut r = roster_fixture(ROWS);
+    r.history = vec![
+        "an old submission".to_string(),
+        "a newer submission".to_string(),
+    ];
+    r.set_input_content("a draft with words");
+    assert_eq!(r.focus, state::FocusPane::Workers, "the fixture focus");
+
+    let (rows, _, rects) = draw_frame(&mut r, 140, 24);
+    let pane = rects.workers.expect("M3 draws the Workers pane");
+    let composer = rects.input.expect("every mode draws the composer");
+    // The rect the key path clamps the roster window against is the one the last
+    // frame published (`render.rs::draw` stores it).
+    r.subagent_area = pane;
+    let composer_before = snapshot(&rows_within(&rows, composer));
+    let draft_text = draft(&mut r);
+    let caret = r.textarea.cursor();
+    let walk = r.history_index;
+    let selected = r.selected_subagent_idx;
+    let window_before = drawn_roster_rows(&rows, pane, ROWS);
+    assert!(
+        window_before.len() >= 3,
+        "the fixture needs a roster window with room to travel: {window_before:?}"
+    );
+
+    let mut at = usize::from(r.subagent_list_scroll);
+    for step in 1..=3 {
+        assert!(
+            key(&mut r, KeyCode::Down),
+            "the roster refused the `Down` it owns at step {step}"
+        );
+        assert_eq!(
+            usize::from(r.subagent_list_scroll),
+            at + 1,
+            "step {step} was not one roster row"
+        );
+        at = usize::from(r.subagent_list_scroll);
+        assert_eq!(r.input_text, draft_text, "step {step} edited the draft");
+        assert_eq!(r.textarea.cursor(), caret, "step {step} moved the caret");
+        assert_eq!(
+            r.history_index, walk,
+            "step {step} started or moved a history walk"
+        );
+        assert_eq!(
+            r.selected_subagent_idx, selected,
+            "step {step} moved the roster selection instead of its window"
+        );
+        let (rows, _, _) = draw_frame(&mut r, 140, 24);
+        let pane = rects.workers.expect("M3 draws the Workers pane");
+        assert_eq!(
+            snapshot(&rows_within(&rows, composer)),
+            composer_before,
+            "step {step} redrew the composer"
+        );
+        assert_eq!(
+            drawn_roster_rows(&rows, pane, ROWS),
+            (at..at + window_before.len()).collect::<Vec<usize>>(),
+            "step {step} did not reveal exactly the next roster row"
+        );
+    }
+
+    for step in 1..=2 {
+        assert!(
+            key(&mut r, KeyCode::Up),
+            "the roster swallowed its `Up` at step {step}"
+        );
+        assert_eq!(
+            usize::from(r.subagent_list_scroll),
+            at - 1,
+            "step {step} was not one roster row"
+        );
+        at = usize::from(r.subagent_list_scroll);
+        assert_eq!(r.input_text, draft_text, "step {step} edited the draft");
+        assert_eq!(r.textarea.cursor(), caret, "step {step} moved the caret");
+        assert_eq!(r.history_index, walk, "step {step} touched the walk");
+    }
+    let (rows, _, _) = draw_frame(&mut r, 140, 24);
+    let pane = rects.workers.expect("M3 draws the Workers pane");
+    assert_eq!(
+        drawn_roster_rows(&rows, pane, ROWS),
+        (at..at + window_before.len()).collect::<Vec<usize>>(),
+        "the run of `Up` presses did not walk the roster window back"
+    );
+    assert_eq!(
+        snapshot(&rows_within(&rows, composer)),
+        composer_before,
+        "the roster's arrows redrew the composer"
+    );
+    assert!(
+        on_screen(&rows).contains("a draft with words"),
+        "the draft the roster arrows interrupted is not on screen:\n{}",
+        on_screen(&rows)
+    );
+}
+
+/// Contract row (c): `Down` on an **empty draft** with a pane focused is a
+/// viewport step, never a swallowed no-op — the next frame shows the window one
+/// row lower, one line fewer counted below it, and a partial press toward the
+/// tail states no follow decision at all (defects 3 and 9).
+#[test]
+fn down_on_an_empty_draft_over_a_scrollback_pane_steps_the_drawn_window() {
+    let mut r = scrollback_renderer();
+    assert!(
+        r.input_text.is_empty(),
+        "the default state is an empty draft, which is the state the defect swallowed"
+    );
+
+    let (rows, _, rects) = draw_frame(&mut r, 100, 30);
+    let pane = rects.transcript.expect("M1 draws the transcript");
+    let max = r
+        .transcript_measured_max
+        .get()
+        .expect("the pane published its measure");
+    assert!(max >= 4, "the fixture needs room to walk: {max}");
+    assert_eq!(
+        assert_frame_agrees_with_its_chip("boot frame", &rows, pane, max, &r),
+        (max, FollowChip::Live),
+        "the boot frame sits at the tail it measured, and says LIVE"
+    );
+    for _ in 0..3 {
+        assert!(key(&mut r, KeyCode::Up));
+    }
+    let (rows, _, _) = draw_frame(&mut r, 100, 30);
+    let (at, chip) = assert_frame_agrees_with_its_chip("three rows up", &rows, pane, max, &r);
+    assert_eq!(at, max - 3);
+    assert_eq!(chip, FollowChip::New(3));
+    let body_before = snapshot(&transcript_body(&rows, pane));
+
+    // The press that used to be swallowed: empty draft, pane focused, no walk in
+    // progress. It owns the key and moves the window exactly one row.
+    assert!(
+        key(&mut r, KeyCode::Down),
+        "`Down` with an empty draft was swallowed instead of scrolling the pane"
+    );
+    assert!(
+        r.history_index.is_none(),
+        "and it invented no history walk on the way"
+    );
+    let (rows, _, _) = draw_frame(&mut r, 100, 30);
+    let (at, chip) = assert_frame_agrees_with_its_chip("one row back down", &rows, pane, max, &r);
+    assert_eq!(at, max - 2, "the step was not one row");
+    assert_eq!(chip, FollowChip::New(2));
+    let body_after = snapshot(&transcript_body(&rows, pane));
+    assert_ne!(body_after, body_before, "the drawn window did not move");
+    assert!(
+        body_after[0].contains(&format!("line {:02}", max - 2)),
+        "the window is not showing the row the press asked for:\n{}",
+        on_screen(&body_after)
+    );
+    assert!(
+        !r.follow,
+        "a press that moved the viewport without reaching the tail stated a follow \
+         decision it did not express"
+    );
+
+    // One more step is still short of the tail and still states no decision; the
+    // press that **arrives** is the one allowed back on (spec §10 item 14).
+    assert!(key(&mut r, KeyCode::Down));
+    let (rows, _, _) = draw_frame(&mut r, 100, 30);
+    let (at, chip) =
+        assert_frame_agrees_with_its_chip("one step short of the tail", &rows, pane, max, &r);
+    assert_eq!(at, max - 1);
+    assert_eq!(chip, FollowChip::New(1));
+    assert!(!r.follow, "a step short of the tail re-armed follow");
+    assert!(key(&mut r, KeyCode::Down));
+    let (rows, _, _) = draw_frame(&mut r, 100, 30);
+    let (at, chip) = assert_frame_agrees_with_its_chip("arrival at the tail", &rows, pane, max, &r);
+    assert_eq!(at, max);
+    assert_eq!(chip, FollowChip::Live);
+}
+
+/// Contract row (d): after every scroll gesture the **same frame** states one
+/// position — the `scroll a/b` readout, the follow chip and the window the pane
+/// painted all agree with each other, with the offset the renderer keeps, and with
+/// the follow flag its chip is supposed to echo. This is the visible half of
+/// defect 9 and of the chip lag the reported overlap produced.
+#[test]
+fn the_follow_chip_and_the_drawn_window_agree_after_every_scroll_key() {
+    let mut r = scrollback_renderer();
+    let (rows, _, rects) = draw_frame(&mut r, 100, 30);
+    let pane = rects.transcript.expect("M1 draws the transcript");
+    let max = r
+        .transcript_measured_max
+        .get()
+        .expect("the pane published its measure");
+    assert!(max >= 12, "the walk needs a body with room: {max}");
+    assert_eq!(
+        assert_frame_agrees_with_its_chip("boot frame", &rows, pane, max, &r),
+        (max, FollowChip::Live),
+        "the boot frame follows its tail"
+    );
+
+    // One gesture per step, then exactly one frame, then the agreement check. The
+    // expected offset and chip are what the contract says the gesture means.
+    let gestures: Vec<(&str, (KeyCode, KeyModifiers), usize, FollowChip)> = vec![
+        (
+            "Up off the tail",
+            (KeyCode::Up, KeyModifiers::NONE),
+            max - 1,
+            FollowChip::New(1),
+        ),
+        (
+            "Up again",
+            (KeyCode::Up, KeyModifiers::NONE),
+            max - 2,
+            FollowChip::New(2),
+        ),
+        (
+            "Down, short of the tail",
+            (KeyCode::Down, KeyModifiers::NONE),
+            max - 1,
+            FollowChip::New(1),
+        ),
+        (
+            "Down, arriving at the tail",
+            (KeyCode::Down, KeyModifiers::NONE),
+            max,
+            FollowChip::Live,
+        ),
+        (
+            "PageUp off the tail",
+            (KeyCode::PageUp, KeyModifiers::NONE),
+            max - 10,
+            FollowChip::New(10),
+        ),
+        (
+            "Home to the top",
+            (KeyCode::Home, KeyModifiers::NONE),
+            0,
+            FollowChip::New(max),
+        ),
+        (
+            "End back to the tail",
+            (KeyCode::End, KeyModifiers::NONE),
+            max,
+            FollowChip::Live,
+        ),
+        (
+            "Ctrl+F off, at the tail",
+            (KeyCode::Char('f'), KeyModifiers::CONTROL),
+            max,
+            FollowChip::FollowOff,
+        ),
+        (
+            "Up off the tail again",
+            (KeyCode::Up, KeyModifiers::NONE),
+            max - 1,
+            FollowChip::New(1),
+        ),
+        (
+            "PageDown arriving",
+            (KeyCode::PageDown, KeyModifiers::NONE),
+            max,
+            FollowChip::Live,
+        ),
+    ];
+    for (label, (code, modifiers), expected_at, expected_chip) in gestures {
+        press(&mut r, code, modifiers);
+        let (rows, _, rects) = draw_frame(&mut r, 100, 30);
+        let pane = rects.transcript.expect("M1 draws the transcript");
+        let drawn = assert_frame_agrees_with_its_chip(label, &rows, pane, max, &r);
+        assert_eq!(
+            drawn,
+            (expected_at, expected_chip),
+            "{label}: the frame states a different position from the one the \
+             contract gives it (chip row {:?})",
+            transcript_chip(&rows, pane)
+        );
+    }
+}
+
+/// Contract row (e): `Ctrl+Up` / `Ctrl+Down` stay the history chord **in every
+/// focus** — with a pane focused the recalled entry is drawn in the composer, the
+/// `history n/m` chip follows the walk and leaves with it, and the pane under it
+/// never moves (defects 6 and 7).
+#[test]
+fn the_history_chord_still_walks_while_a_pane_holds_the_focus() {
+    let mut r = scrollback_renderer();
+    r.history = vec![
+        "entry one\nentry two".to_string(),
+        "line one\nline two".to_string(),
+    ];
+    // A two-line draft on purpose: the composer's height (§2.1 `input_h`) is what
+    // gives the body its rows, so holding the draft at two lines keeps the pane's
+    // geometry fixed and makes "the chord never moved the pane" a pixel claim
+    // rather than an offset claim.
+    r.set_input_content("keep\nthis");
+
+    let (rows, _, rects) = draw_frame(&mut r, 100, 30);
+    let pane = rects.transcript.expect("M1 draws the transcript");
+    let body_before = snapshot(&transcript_body(&rows, pane));
+    assert_eq!(
+        r.focus,
+        state::FocusPane::Transcript,
+        "the fixture holds a pane focus, so every press here is a pane-focus press"
+    );
+
+    assert!(
+        press(&mut r, KeyCode::Up, KeyModifiers::CONTROL),
+        "`Ctrl+Up` is a key press in a pane focus too"
+    );
+    assert_eq!(r.input_text, "line one\nline two");
+    assert_eq!(r.history_index, Some(1));
+    let (rows, _, rects) = draw_frame(&mut r, 100, 30);
+    let composer = rects.input.expect("M1 draws the composer");
+    let drawn_composer = on_screen(&pane_body(&rows, composer));
+    assert!(
+        drawn_composer.contains("line one") && drawn_composer.contains("line two"),
+        "the recalled entry is not drawn in the composer: {drawn_composer:?}"
+    );
+    assert!(
+        on_screen(&rows).contains("history 2/2"),
+        "the chip names the walk the chord started:\n{}",
+        on_screen(&rows)
+    );
+    assert_eq!(
+        snapshot(&transcript_body(
+            &rows,
+            rects.transcript.expect("transcript")
+        )),
+        body_before,
+        "the chord moved the pane that was focused"
+    );
+
+    // A multi-line entry cannot stop the walk: the recalled caret sits at the end
+    // of the entry's first line, so the next `Ctrl+Up` is the next entry and not a
+    // caret move (defect 6).
+    assert!(press(&mut r, KeyCode::Up, KeyModifiers::CONTROL));
+    assert_eq!(r.input_text, "entry one\nentry two");
+    assert_eq!(r.history_index, Some(0));
+
+    // `Ctrl+Down` walks forward, then back out to the operator's own draft, and
+    // the chip leaves with the walk.
+    assert!(press(&mut r, KeyCode::Down, KeyModifiers::CONTROL));
+    assert_eq!(r.input_text, "line one\nline two");
+    assert_eq!(r.history_index, Some(1));
+    assert!(press(&mut r, KeyCode::Down, KeyModifiers::CONTROL));
+    assert_eq!(
+        r.input_text, "keep\nthis",
+        "the draft from before the walk came back"
+    );
+    assert!(r.history_index.is_none());
+    let (rows, _, rects) = draw_frame(&mut r, 100, 30);
+    let drawn_composer = on_screen(&pane_body(&rows, rects.input.expect("composer")));
+    assert!(
+        drawn_composer.contains("keep"),
+        "the composer is not showing the operator's own draft: {drawn_composer:?}"
+    );
+    assert!(
+        !drawn_composer.contains("line one"),
+        "the composer is still showing the recalled entry: {drawn_composer:?}"
+    );
+    let screen = on_screen(&rows);
+    assert!(
+        !screen.contains("history 2/2") && !screen.contains("history 1/2"),
+        "a finished walk still advertises itself:\n{screen}"
+    );
+    assert_eq!(
+        snapshot(&transcript_body(
+            &rows,
+            rects.transcript.expect("transcript")
+        )),
+        body_before,
+        "the history chord moved the pane"
+    );
+}
+
+/// The chord is now the **only** door to the input history, so it has to answer in
+/// every focus: `Ctrl+Up` recalls from the composer and from each of the three pane
+/// focuses, the `history n/m` readout follows it in all four, the walk keeps walking
+/// from the focus it started in, and no focus hands that recall to the plain arrows.
+#[test]
+fn the_history_chord_recalls_from_the_composer_and_from_every_pane_focus() {
+    for focus in [
+        state::FocusPane::Input,
+        state::FocusPane::Transcript,
+        state::FocusPane::Plan,
+        state::FocusPane::Workers,
+    ] {
+        let mut r = m4_renderer();
+        r.history = vec![
+            "the oldest entry".to_string(),
+            "the middle entry".to_string(),
+            "the newest entry".to_string(),
+        ];
+        r.set_focus(focus);
+
+        // One frame first: the panes publish the geometry the key path clamps
+        // against. The pixel baseline is taken after the plain arrow below, so that
+        // claim compares the frame the chord is pressed into.
+        let (_, _, rects) = draw_frame(&mut r, 120, 30);
+        r.subagent_area = rects.workers.expect("M4 Split draws the Workers pane");
+
+        // The plain arrows come first, so the baseline below is taken with their
+        // effect (a pane step, never a recall) already spent.
+        let claimed = key(&mut r, KeyCode::Up);
+        match focus {
+            state::FocusPane::Input => assert!(
+                !claimed,
+                "{focus:?}: a plain `Up` with a history waiting behind an empty draft \
+                 is still not a key press"
+            ),
+            pane => assert!(
+                claimed,
+                "{pane:?}: the pane owns the plain arrow, and refused to say so"
+            ),
+        }
+        assert!(
+            r.input_text.is_empty(),
+            "{focus:?}: a plain `Up` recalled a draft out from under the operator"
+        );
+        assert_eq!(
+            r.history_index, None,
+            "{focus:?}: a plain `Up` started a history walk"
+        );
+
+        // Now the chord.
+        let (rows, _, rects) = draw_frame(&mut r, 120, 30);
+        let before: Vec<(&'static str, Vec<String>)> = leaf_rects(&rects)
+            .iter()
+            .filter(|(label, _)| *label != "input")
+            .map(|(label, rect)| (*label, snapshot(&rows_within(&rows, *rect))))
+            .collect();
+        assert!(
+            press(&mut r, KeyCode::Up, KeyModifiers::CONTROL),
+            "{focus:?}: `Ctrl+Up` must recall from here"
+        );
+        assert_eq!(
+            r.input_text, "the newest entry",
+            "{focus:?}: the chord recalled the wrong entry"
+        );
+        assert_eq!(
+            r.history_index,
+            Some(2),
+            "{focus:?}: the chord left the walk bookkeeping elsewhere"
+        );
+
+        let (rows, _, _) = draw_frame(&mut r, 120, 30);
+        let composer = rects.input.expect("every mode draws the composer");
+        let drawn_composer = on_screen(&pane_body(&rows, composer));
+        assert!(
+            drawn_composer.contains("the newest entry"),
+            "{focus:?}: the recalled entry is not in the drawn composer: {drawn_composer:?}"
+        );
+        assert!(
+            on_screen(&rows).contains("history 3/3"),
+            "{focus:?}: the readout does not follow the chord:\n{}",
+            on_screen(&rows)
+        );
+        for (label, rect) in leaf_rects(&rects) {
+            if label == "input" {
+                continue;
+            }
+            let earlier = before
+                .iter()
+                .find(|(name, _)| *name == label)
+                .map(|(_, cells)| cells.clone())
+                .expect("the baseline covers every drawn region");
+            assert_eq!(
+                snapshot(&rows_within(&rows, rect)),
+                earlier,
+                "{focus:?}: the history chord redrew {label}"
+            );
+        }
+
+        // And the walk is not a one-press trick from a non-composer focus: it keeps
+        // walking, then walks back out to the operator's own draft.
+        assert!(
+            press(&mut r, KeyCode::Up, KeyModifiers::CONTROL),
+            "{focus:?}: the second `Ctrl+Up` did not walk"
+        );
+        assert_eq!(r.input_text, "the middle entry", "{focus:?}: wrong entry");
+        assert_eq!(r.history_index, Some(1));
+        assert!(press(&mut r, KeyCode::Down, KeyModifiers::CONTROL));
+        assert_eq!(
+            r.input_text, "the newest entry",
+            "{focus:?}: `Ctrl+Down` walked past an entry"
+        );
+        assert_eq!(r.history_index, Some(2));
+        assert!(press(&mut r, KeyCode::Down, KeyModifiers::CONTROL));
+        assert!(
+            r.input_text.is_empty(),
+            "{focus:?}: the walk did not end back at the operator's draft"
+        );
+        assert!(r.history_index.is_none());
+        let (rows, _, _) = draw_frame(&mut r, 120, 30);
+        assert!(
+            !on_screen(&rows).contains("history "),
+            "{focus:?}: a finished walk still advertises itself:\n{}",
+            on_screen(&rows)
+        );
+    }
+}
+
+/// Twelve roster rows for the Workers pane, named and logged so every row and every
+/// log line is individually addressable in the drawn frame. The role the pane prints
+/// comes from the part of the name before `-t-` (`activity.rs::role_label`), and the
+/// task id is printed right behind it, so `roster07` and `t-9207` both identify one
+/// row on screen. The names are unique to this file so no other suite's registry key
+/// can be mistaken for one of them.
+fn roster_fixture(count: usize) -> TuiRenderer {
+    let mut r = TuiRenderer::new();
+    r.subagents = (0..count)
+        .map(|index| SubagentDetail {
+            name: format!("roster{index:02}-t-92{index:02}"),
+            task_id: Some(format!("t-92{index:02}")),
+            logs: (0..40)
+                .map(|line| format!("- log line {index:02}/{line:02}"))
+                .collect(),
+            is_active: true,
+            ..SubagentDetail::default()
+        })
+        .collect();
+    r.selected_subagent_idx = count / 2;
+    r.set_view_mode(state::ViewMode::Workers);
+    r.set_focus(state::FocusPane::Workers);
+    r
+}
+
+/// Which roster rows the frame actually painted, as row indices in order: the drawn
+/// window read off the pixels rather than off `subagent_list_scroll`.
+fn drawn_roster_rows(rows: &[String], pane: Rect, count: usize) -> Vec<usize> {
+    let screen = on_screen(&rows_within(rows, pane));
+    (0..count)
+        .filter(|index| screen.contains(&format!("roster{index:02}")))
+        .collect()
+}
+
+/// The detail log the frame actually painted, in order. Each row's log lines are
+/// distinct, so this compares the selection **and** the log offset at once.
+fn drawn_log(rows: &[String], pane: Rect) -> Vec<String> {
+    pane_body(rows, pane)
+        .into_iter()
+        .filter(|row| row.contains("log line"))
+        .collect()
+}
+
+/// Contract row (b), the second pane: the Workers pane has **two** viewports and the
+/// keys never cross them. `Up`/`Down` walk the drawn roster window one row per press
+/// and leave the drawn detail log pixel-identical; `PageUp`/`PageDown`/`Home`/`End`
+/// walk the log and leave the drawn roster window pixel-identical; a press at the end
+/// of the roster window moves nothing and asks for no repaint. The state-level half is
+/// pinned in `events.rs`
+/// (`the_workers_arrows_walk_the_roster_window_and_leave_the_log_alone`,
+/// `the_detail_page_and_jump_keys_leave_the_roster_window_where_it_stands`); what was
+/// never pinned is the frame — which names and which log lines are on screen after
+/// each press (audit defect 14).
+#[test]
+fn the_workers_arrows_walk_the_drawn_roster_window_while_the_page_keys_walk_the_drawn_log() {
+    const ROWS: usize = 12;
+    let mut r = roster_fixture(ROWS);
+    // The log has to be off its tail or "the page key moved the log" is not
+    // observable, and nothing here may restate a follow flag.
+    r.subagent_autoscroll = false;
+    r.set_follow(false);
+
+    let (rows, _, rects) = draw_frame(&mut r, 140, 24);
+    let pane = rects.workers.expect("M3 draws the Workers pane");
+    // The rect the frame reported, published the way the real pass publishes it
+    // (`render.rs::draw` takes `draw_new_ui`'s `PaneRects` and stores
+    // `rects.workers` into `subagent_area` after the draw). The key path clamps the
+    // roster window against the rect the last frame published rather than estimating
+    // it, so a frame-level pin of the walk has to hold that same rect.
+    r.subagent_area = pane;
+    let detail_present = layout::workers_detail_present(pane.width);
+    let (lower, upper) = components::activity::roster_window(
+        pane,
+        detail_present,
+        r.subagents.len(),
+        r.selected_subagent_idx,
+    );
+    assert!(
+        upper > lower + 1,
+        "the fixture needs a roster window with room to travel: {lower}..{upper} \
+         (pane={pane:?}, detail_present={detail_present}, inner={:?})",
+        pane.inner(ratatui::layout::Margin::new(1, 1))
+    );
+
+    let drawn = drawn_roster_rows(&rows, pane, ROWS);
+    let log = drawn_log(&rows, pane);
+    assert!(
+        !drawn.is_empty() && !log.is_empty(),
+        "the pane drew neither roster nor log: {drawn:?}\n{}",
+        on_screen(&rows)
+    );
+    assert_eq!(
+        drawn.first().copied(),
+        Some(usize::from(r.subagent_list_scroll)),
+        "the drawn window does not start at the offset the renderer kept"
+    );
+    let selected = r.selected_subagent_idx;
+    assert!(
+        drawn.contains(&selected),
+        "the window does not show its own selection: {drawn:?}"
+    );
+
+    // `Down` walks the window one row per press, and the log is untouched pixel for
+    // pixel at every step.
+    let mut step = usize::from(r.subagent_list_scroll);
+    while step < upper {
+        assert!(key(&mut r, KeyCode::Down), "Down was swallowed");
+        let (rows, _, rects) = draw_frame(&mut r, 140, 24);
+        let pane = rects.workers.expect("M3 draws the Workers pane");
+        step += 1;
+        assert_eq!(
+            usize::from(r.subagent_list_scroll),
+            step,
+            "Down at {step} did not walk the window"
+        );
+        let length = drawn.len();
+        assert_eq!(
+            drawn_roster_rows(&rows, pane, ROWS),
+            (step..step + length).collect::<Vec<_>>(),
+            "Down did not reveal exactly the next roster row"
+        );
+        assert_eq!(
+            drawn_log(&rows, pane),
+            log,
+            "the roster arrow moved the detail log"
+        );
+        assert_eq!(r.selected_subagent_idx, selected, "Down moved the row");
+    }
+
+    // Where the window stands at the end of its travel, read out of a fresh frame:
+    // the baseline every later gesture here is compared against.
+    let (rows, _, rects) = draw_frame(&mut r, 140, 24);
+    let pane = rects.workers.expect("M3 draws the Workers pane");
+    let at_end = drawn_roster_rows(&rows, pane, ROWS);
+
+    // The press past the end of the window: claimed by the pane, but it moves
+    // nothing and asks for no repaint.
+    r.dirty = false;
+    assert!(key(&mut r, KeyCode::Down), "Down is still a pane key");
+    assert_eq!(
+        usize::from(r.subagent_list_scroll),
+        upper,
+        "Down ran off the end of the window"
+    );
+    assert!(!r.dirty, "a press with nothing to move asked for a repaint");
+    let (rows, _, rects) = draw_frame(&mut r, 140, 24);
+    let pane = rects.workers.expect("M3 draws the Workers pane");
+    assert_eq!(
+        drawn_roster_rows(&rows, pane, ROWS),
+        at_end,
+        "a press at the end of the window moved the drawn roster"
+    );
+    assert_eq!(
+        drawn_log(&rows, pane),
+        log,
+        "a press at the end of the window moved the detail log"
+    );
+
+    // `PageUp` / `PageDown` belong to the other viewport: the log moves, the drawn
+    // window does not.
+    assert!(key(&mut r, KeyCode::PageDown), "PageDown is a pane key");
+    let (rows, _, rects) = draw_frame(&mut r, 140, 24);
+    let pane = rects.workers.expect("M3 draws the Workers pane");
+    assert_ne!(
+        drawn_log(&rows, pane),
+        log,
+        "PageDown left the drawn log exactly where it was"
+    );
+    assert_eq!(
+        drawn_roster_rows(&rows, pane, ROWS),
+        at_end,
+        "PageDown moved the drawn roster window"
+    );
+    assert!(key(&mut r, KeyCode::PageUp));
+    let (rows, _, rects) = draw_frame(&mut r, 140, 24);
+    let pane = rects.workers.expect("M3 draws the Workers pane");
+    assert_eq!(
+        drawn_log(&rows, pane),
+        log,
+        "PageUp did not walk the drawn log back to where it started"
+    );
+    assert_eq!(
+        drawn_roster_rows(&rows, pane, ROWS),
+        at_end,
+        "PageUp moved the drawn roster window"
+    );
+
+    // `Home` / `End` jump the log and leave the window alone.
+    assert!(key(&mut r, KeyCode::End));
+    let (rows, _, rects) = draw_frame(&mut r, 140, 24);
+    let pane = rects.workers.expect("M3 draws the Workers pane");
+    assert_ne!(
+        drawn_log(&rows, pane),
+        log,
+        "End did not take the drawn log to its tail"
+    );
+    assert_eq!(
+        drawn_roster_rows(&rows, pane, ROWS),
+        at_end,
+        "End moved the drawn roster window"
+    );
+    assert!(key(&mut r, KeyCode::Home));
+    let (rows, _, rects) = draw_frame(&mut r, 140, 24);
+    let pane = rects.workers.expect("M3 draws the Workers pane");
+    assert_eq!(
+        drawn_log(&rows, pane),
+        log,
+        "Home did not bring the drawn log back"
+    );
+    assert_eq!(
+        drawn_roster_rows(&rows, pane, ROWS),
+        at_end,
+        "Home moved the drawn roster window"
+    );
+
+    // And none of it reached the composer or the transcript's follow pair.
+    assert!(
+        r.input_text.is_empty() && r.history_index.is_none(),
+        "a Workers-pane gesture reached the composer: {:#?}",
+        r.input_text
+    );
+    assert!(
+        !r.follow && !r.chat_auto_scroll,
+        "a Workers key restated transcript follow"
+    );
+    assert_eq!(
+        r.selected_subagent_idx, selected,
+        "a viewport key moved the row"
+    );
+}
+
+// ---- composer typing is never starved (§4.4) --------------------------------
+//
+// The reported regression: normal text could not be written in the composer, "at
+// least not if one starts typing `e`". `e` was a **draft-scoped** mnemonic — it
+// fired whenever the draft was empty, whichever pane held the focus — so the first
+// keystroke of every draft that begins with `e` was spent recalling the sticky
+// error instead of reaching the draft. The mnemonic is now **focus-scoped**: with
+// the composer focused `e` is a printable (the `x` mnemonic already required the
+// Workers pane, in its own guard), and the recall stays reachable from every body
+// pane and from `/error`. `?` keeps its documented empty-composer binding (spec §5,
+// §10.4 item 4), which is why the pins below walk letters, not punctuation.
+
+/// Every letter of the alphabet reaches the composer as the **first** character of a
+/// draft, `e` and `x` included (the fixture carries worker rows, so `x` has to prove
+/// it needs the Workers pane and not merely an empty draft). No transcript traffic
+/// and no overlay on the way: the press only types.
+#[test]
+fn every_letter_types_into_the_focused_composer_including_a_leading_e() {
+    for c in 'a'..='z' {
+        let mut r = m4_renderer();
+        assert!(
+            r.focus.composer_has_focus(),
+            "boot focuses the composer, so this is the keystroke the operator types"
+        );
+        let messages_before = r.messages.clone();
+        assert!(
+            press(&mut r, KeyCode::Char(c), KeyModifiers::NONE),
+            "`{c}` was not a key press at all"
+        );
+        assert_eq!(
+            draft(&mut r),
+            c.to_string(),
+            "`{c}` never reached the draft"
+        );
+        assert_eq!(
+            r.messages, messages_before,
+            "`{c}` answered with transcript traffic instead of typing"
+        );
+        assert_eq!(
+            r.overlay,
+            state::OverlayState::None,
+            "`{c}` opened an overlay instead of typing"
+        );
+    }
+}
+
+/// The user-visible shape of the regression: `e` on its own, and the reported
+/// `test e`. Both land whole in the draft, and the draft still submits and still
+/// walks its history, so nothing about the composer contract moved with the fix.
+#[test]
+fn a_draft_that_starts_with_e_types_submits_and_keeps_the_history_chord() {
+    let mut r = m4_renderer();
+    r.set_focus(state::FocusPane::Input);
+    let messages_before = r.messages.clone();
+
+    type_text(&mut r, "e");
+    assert_eq!(draft(&mut r), "e", "a draft may start with `e`");
+    assert_eq!(
+        r.messages, messages_before,
+        "the leading `e` typed, it did not report"
+    );
+
+    type_text(&mut r, "rror: the e2e test failed");
+    assert_eq!(
+        draft(&mut r),
+        "error: the e2e test failed",
+        "every `e` of the draft reaches it, not just the first"
+    );
+    assert_eq!(
+        r.messages, messages_before,
+        "typing into the composer pushed transcript traffic"
+    );
+    assert!(
+        r.history_index.is_none(),
+        "typing must not start a history walk: {:?}",
+        r.history_index
+    );
+
+    // `Ctrl+Up` still walks the history from the composer (§5), with a draft standing
+    // in it, and the draft comes back whole.
+    r.history = vec!["earlier note".to_string()];
+    assert!(press(&mut r, KeyCode::Up, KeyModifiers::CONTROL));
+    assert_eq!(draft(&mut r), "earlier note");
+    assert_eq!(r.history_index, Some(0));
+    assert!(press(&mut r, KeyCode::Down, KeyModifiers::CONTROL));
+    assert_eq!(draft(&mut r), "error: the e2e test failed");
+
+    // And Enter submits the whole line, which is all the operator ever wanted.
+    assert!(key(&mut r, KeyCode::Enter));
+    let mut sent = Vec::new();
+    while let Ok(line) = r.rx.try_recv() {
+        sent.push(line);
+    }
+    assert_eq!(
+        sent,
+        vec!["error: the e2e test failed".to_string()],
+        "the typed draft was not submitted verbatim"
+    );
+    assert!(draft(&mut r).is_empty(), "and submitting cleared it");
+}
+
+/// The recall keeps its substance and loses its keystroke: `/error` replays the
+/// sticky error from a **pane** focus and from the **composer** focus alike (so it is
+/// never a silent command, G5), it types nothing and scrolls nothing (item 14), and
+/// the bare letter that used to carry it inserts wherever the draft is.
+#[test]
+fn error_recalls_the_sticky_error_in_every_focus_and_the_bare_letter_types() {
+    let mut r = scrollback_renderer();
+    assert_eq!(
+        r.focus,
+        state::FocusPane::Transcript,
+        "the fixture starts over a pane"
+    );
+    r.on_event(&Event::Status(
+        "LLM error: http (Ready)\nthe backend refused the request".to_string(),
+    ));
+    let before = r.messages.len();
+
+    // Over the pane: the recall is one submitted line, and it is the sticky buffer.
+    type_text(&mut r, "/error");
+    assert!(key(&mut r, KeyCode::Enter));
+    assert_eq!(r.messages.len(), before + 1, "the recall is one new line");
+    assert!(
+        r.messages
+            .last()
+            .is_some_and(|m| m.starts_with("✗ http\nLLM error: http (Ready)")),
+        "the sticky buffer is what got recalled: {:?}",
+        r.messages.last()
+    );
+    assert!(draft(&mut r).is_empty(), "the recall does not type");
+    assert!(
+        drain_submissions(&mut r).is_empty(),
+        "a command must never reach the session loop"
+    );
+
+    // The recall stated a notice, it did not scroll: the drawn window is still where
+    // the arrow left it (item 14).
+    draw_frame(&mut r, 100, 30);
+    assert!(
+        key(&mut r, KeyCode::Up),
+        "the pane owns `Up` and steps one line"
+    );
+    let offset = r.chat_scroll;
+    assert!(offset > 0, "the fixture has a window to step: {offset}");
+
+    // From the composer focus the very same command recalls the very same line, and
+    // the pane viewport under it does not move.
+    r.set_focus(state::FocusPane::Input);
+    let recalled_once = r.messages.len();
+    type_text(&mut r, "/error");
+    assert!(key(&mut r, KeyCode::Enter));
+    assert_eq!(r.messages.len(), recalled_once + 1);
+    assert!(
+        r.messages
+            .last()
+            .is_some_and(|m| m.starts_with("✗ http\nLLM error: http (Ready)")),
+        "the recall is the same from the composer: {:?}",
+        r.messages.last()
+    );
+    assert_eq!(
+        r.chat_scroll, offset,
+        "recalling from the composer scrolled a pane"
+    );
+
+    // And the bare letter is a letter in both focuses — that is the whole point of
+    // moving the capability into a slash command.
+    for focus in [state::FocusPane::Input, state::FocusPane::Transcript] {
+        r.set_focus(focus);
+        assert!(key(&mut r, KeyCode::Char('e')), "{focus:?}: `e` is typing");
+        assert_eq!(
+            draft(&mut r),
+            "e",
+            "{focus:?}: the letter reached the draft"
+        );
+        assert!(
+            r.messages.last().is_some_and(|m| m.starts_with('✗')),
+            "{focus:?}: the typed letter recalled a second time"
+        );
+        r.set_input_content("");
+        assert!(draft(&mut r).is_empty());
+    }
+}
+
+// ---- the keymap rule the operator asked for: no bare letter is a mnemonic ----
+
+/// The fixture the two removed bindings would have been **armed** for: three live
+/// roster rows with a selection (so the old `x` had a subject the moment the Workers
+/// pane held focus) and a sticky error in the §8.5 buffer (so the old `e` had
+/// something to recall over any body pane). A letter typed into this renderer must
+/// still be only a letter.
+fn mnemonic_armed_renderer() -> TuiRenderer {
+    let mut r = m4_renderer();
+    r.on_event(&Event::Status(
+        "LLM error: rate limit (Ready)\nthe backend said no".to_string(),
+    ));
+    r.selected_subagent_idx = 1;
+    r
+}
+
+/// The rule, pinned letter by letter: a printable is the first character of a word
+/// far more often than it is a command, so **every** letter a–z types into the
+/// composer in every focus — over the roster included, where `x` used to open a
+/// confirm, and over a body pane holding a recorded error, where `e` used to recall
+/// it. Nothing else may happen on the way: no overlay, no transcript traffic, no
+/// roster move, nothing sent to the loop.
+#[test]
+fn every_printable_letter_is_a_character_in_every_focus() {
+    for focus in [
+        state::FocusPane::Input,
+        state::FocusPane::Transcript,
+        state::FocusPane::Plan,
+        state::FocusPane::Workers,
+    ] {
+        for letter in 'a'..='z' {
+            let mut r = mnemonic_armed_renderer();
+            r.set_focus(focus);
+            let messages = r.messages.len();
+            let selected = r.selected_subagent_idx;
+
+            assert!(
+                key(&mut r, KeyCode::Char(letter)),
+                "{focus:?}: {letter} was dropped instead of typed"
+            );
+            assert_eq!(
+                draft(&mut r),
+                letter.to_string(),
+                "{focus:?}: {letter} never became the first character of the draft"
+            );
+            assert_eq!(
+                r.input_text,
+                letter.to_string(),
+                "{focus:?}: {letter} never reached the draft mirror"
+            );
+            assert_eq!(
+                r.overlay,
+                state::OverlayState::None,
+                "{focus:?}: {letter} opened an overlay"
+            );
+            assert!(
+                r.confirm_action.is_none(),
+                "{focus:?}: {letter} armed a destructive request"
+            );
+            assert!(!r.help_open, "{focus:?}: {letter} opened the legend");
+            assert_eq!(
+                r.messages.len(),
+                messages,
+                "{focus:?}: {letter} pushed transcript traffic"
+            );
+            assert_eq!(
+                r.selected_subagent_idx, selected,
+                "{focus:?}: {letter} moved the roster selection"
+            );
+            assert!(
+                drain_submissions(&mut r).is_empty(),
+                "{focus:?}: {letter} reached the session loop"
+            );
+        }
+    }
+}
+
+/// A real draft built out of the letters that used to be bindings — `x` as the very
+/// first character, `x` and `e` mid-word — types whole and submits whole, including
+/// in the focus where `x` used to open a confirm and over a pane holding an error the
+/// `e` used to recall.
+#[test]
+fn a_draft_full_of_x_and_e_types_and_submits_verbatim() {
+    const DRAFT: &str = "exit the x route, e.g. now";
+    for focus in [
+        state::FocusPane::Workers,
+        state::FocusPane::Transcript,
+        state::FocusPane::Input,
+    ] {
+        let mut r = mnemonic_armed_renderer();
+        r.set_focus(focus);
+        let messages = r.messages.len();
+
+        type_text(&mut r, DRAFT);
+        assert_eq!(
+            draft(&mut r),
+            DRAFT,
+            "{focus:?}: a letter of the draft was intercepted"
+        );
+        assert_eq!(
+            r.overlay,
+            state::OverlayState::None,
+            "{focus:?}: an overlay opened in the middle of a word"
+        );
+        assert!(
+            r.confirm_action.is_none(),
+            "{focus:?}: a request was armed mid-word"
+        );
+        assert_eq!(
+            r.messages.len(),
+            messages,
+            "{focus:?}: typing pushed transcript traffic"
+        );
+
+        assert!(key(&mut r, KeyCode::Enter));
+        assert_eq!(
+            drain_submissions(&mut r),
+            vec![DRAFT.to_string()],
+            "{focus:?}: the draft was not submitted verbatim"
+        );
+        assert!(draft(&mut r).is_empty(), "{focus:?}: the draft lived on");
+    }
+}
+
+/// A slash command is only a command when the draft **is** the command: the same
+/// spellings mid-sentence stay ordinary steering text, so the two replacement routes
+/// can never fire by accident while an operator writes about them.
+#[test]
+fn the_replacement_commands_run_only_when_the_draft_is_the_command() {
+    const TEXT: &str = "the /error and /cancel lines in the log";
+    let mut r = mnemonic_armed_renderer();
+    r.set_focus(state::FocusPane::Workers);
+    let messages = r.messages.len();
+
+    type_text(&mut r, TEXT);
+    assert_eq!(
+        draft(&mut r),
+        TEXT,
+        "a command spelling mid-text typed itself"
+    );
+    assert!(key(&mut r, KeyCode::Enter));
+
+    assert_eq!(
+        drain_submissions(&mut r),
+        vec![TEXT.to_string()],
+        "the sentence was not delivered as text"
+    );
+    assert_eq!(
+        r.overlay,
+        state::OverlayState::None,
+        "a mid-text /cancel opened a confirm"
+    );
+    assert!(
+        r.confirm_action.is_none(),
+        "a mid-text /cancel armed a request"
+    );
+    assert_eq!(
+        r.messages.last().map(String::as_str),
+        Some("User: the /error and /cancel lines in the log"),
+        "no recall and no notice: the whole submission is one text line"
+    );
+    assert_eq!(r.messages.len(), messages + 1, "{:?}", r.messages);
+}
+
+/// The command that replaced the bare `x`: `/cancel` with no argument, typed while
+/// the Workers pane holds the focus, reaches the confirm surface for the **selected**
+/// roster row — same captured identity, same surface, same `y` — and `y` cancels
+/// exactly that worker and no other.
+#[test]
+fn cancel_command_asks_about_the_selected_row_and_cancels_it_item17() {
+    let _registry = registry_gate();
+    let ledger = CancellationLedger::plant();
+    let broadcast = crate::orchestrator::global_cancellation_token();
+    let (agent, task) = ITEM17_ROWS[1];
+    let selected = item17_key(agent, task);
+
+    let mut r = item17_renderer();
+    r.set_focus(state::FocusPane::Workers);
+    r.selected_subagent_idx = 1;
+
+    // Typed one printable at a time, exactly as the operator types it.
+    type_text(&mut r, "/cancel");
+    assert_eq!(
+        draft(&mut r),
+        "/cancel",
+        "the command is a draft until Enter runs it"
+    );
+    assert!(key(&mut r, KeyCode::Enter));
+
+    assert_eq!(r.overlay, state::OverlayState::Confirm);
+    assert_eq!(
+        r.confirm_action,
+        Some(events::ConfirmAction::CancelWorker {
+            key: selected.clone(),
+            task_id: Some(task.to_string()),
+        }),
+        "the request names the selected row, the same identity the chord captured"
+    );
+    assert!(
+        r.status_line.contains(&selected),
+        "the status line names the row: {}",
+        r.status_line
+    );
+    assert!(draft(&mut r).is_empty(), "submitting cleared the command");
+    assert!(
+        drain_submissions(&mut r).is_empty(),
+        "a confirmed-command request never reaches the loop on its own"
+    );
+    assert!(
+        ledger.cancelled().is_empty(),
+        "asking cancels nothing: {:?}",
+        ledger.cancelled()
+    );
+
+    // `y` runs it for that one row and no other.
+    assert!(key(&mut r, KeyCode::Char('y')));
+    assert_eq!(r.overlay, state::OverlayState::None);
+    assert_eq!(
+        ledger.cancelled(),
+        vec![selected.clone()],
+        "exactly the selected roster row was cancelled"
+    );
+    assert_eq!(
+        ledger.aborted(),
+        vec![selected.clone()],
+        "and the registry labels that row and only that row"
+    );
+    assert_eq!(ledger.untouched().len(), 2, "the other rows keep running");
+    assert!(
+        !broadcast.is_cancelled(),
+        "a one-worker cancel never reaches the broadcast token"
+    );
+    assert!(
+        r.status_line.contains(&selected),
+        "the outcome is stated: {}",
+        r.status_line
+    );
+    assert!(drain_submissions(&mut r).is_empty());
+}
+
+/// The chord that replaced the bare `x` cannot collide with typing, so it also never
+/// falls through silently: when its guard is not met it says what it would need, and
+/// still puts no character in the draft and arms no request.
+#[test]
+fn ctrl_x_off_the_roster_states_why_and_never_types() {
+    // Rows present, roster not focused.
+    let mut r = m4_renderer();
+    r.set_focus(state::FocusPane::Input);
+    assert!(press(&mut r, KeyCode::Char('x'), KeyModifiers::CONTROL));
+    assert!(draft(&mut r).is_empty(), "a Ctrl chord never types");
+    assert_eq!(r.overlay, state::OverlayState::None, "and arms nothing");
+    assert!(
+        r.messages
+            .last()
+            .is_some_and(|m| m.contains("Ctrl+X") && m.contains("Workers pane")),
+        "the chord said what it needs: {:?}",
+        r.messages.last()
+    );
+    assert!(
+        r.status_line.contains("Ctrl+X"),
+        "and echoed it: {}",
+        r.status_line
+    );
+
+    // Roster focused, empty roster: the other reason, stated instead of silence.
+    let mut empty = TuiRenderer::new();
+    empty.set_focus(state::FocusPane::Workers);
+    assert!(press(&mut empty, KeyCode::Char('x'), KeyModifiers::CONTROL));
+    assert!(empty.input_text.is_empty(), "and here too it typed nothing");
+    assert!(
+        empty
+            .messages
+            .last()
+            .is_some_and(|m| m.contains("no worker is on the roster")),
+        "{:?}",
+        empty.messages
+    );
+    assert!(empty.confirm_action.is_none());
+}
+
+/// Audit pin — this records what `?` does today, it does not bless it. `?` is the one
+/// printable the keymap still spends elsewhere: on an **empty** draft, in every focus,
+/// it opens the legend and the character never reaches the draft, so a draft whose
+/// first character would be `?` (a question typed as written) cannot be typed
+/// directly. Any draft with one character in it types `?` normally. The collision-free
+/// routes to the same overlay already exist and need no keystroke that can be typed:
+/// `F1` and `/help`.
+#[test]
+fn a_leading_question_mark_opens_the_legend_in_every_focus_and_types_after_one_character() {
+    for focus in [
+        state::FocusPane::Input,
+        state::FocusPane::Transcript,
+        state::FocusPane::Plan,
+        state::FocusPane::Workers,
+    ] {
+        let mut r = mnemonic_armed_renderer();
+        r.set_focus(focus);
+
+        assert!(key(&mut r, KeyCode::Char('?')));
+        assert_eq!(
+            r.overlay,
+            state::OverlayState::Help,
+            "{focus:?}: the empty-draft `?` did not open the legend"
+        );
+        assert!(
+            r.help_open,
+            "{focus:?}: the overlay state and the flag disagree"
+        );
+        assert!(
+            draft(&mut r).is_empty(),
+            "{focus:?}: the swallowed `?` reached the draft anyway"
+        );
+        // The character is gone, not queued: a second press re-opens the same
+        // overlay and still types nothing.
+        assert!(key(&mut r, KeyCode::Char('?')));
+        assert!(
+            draft(&mut r).is_empty(),
+            "{focus:?}: the second `?` typed while the legend was open"
+        );
+
+        // One character down and the same key is only a character again.
+        r.close_overlay();
+        assert!(key(&mut r, KeyCode::Char('w')));
+        assert!(key(&mut r, KeyCode::Char('?')));
+        assert_eq!(
+            draft(&mut r),
+            "w?",
+            "{focus:?}: `?` mid-draft was swallowed"
+        );
+        assert_eq!(
+            r.overlay,
+            state::OverlayState::None,
+            "{focus:?}: a mid-draft `?` opened the legend"
+        );
+    }
 }

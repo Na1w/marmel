@@ -137,6 +137,8 @@ no evidence obtainable here.
 | 18 | No line overruns its rect / clipping is marked | 100x30 … 40x10 | PASS (rect rule) / **PARTIAL** (word-break is a taste call) | the `cells_outside_every_pane` rule above; the recorded frames show clipping is always ellipsis-marked, never silent: `workers/…`, `coder_specialist-t-004 3…`, `coder_specialist-… | elapsed 10m 12s`, legend `Es…`. Mid-token cuts do exist **by design** for chips/names (§7.4), so a blanket "never mid-word" claim would be false — graded PARTIAL and put in §9 risk 2 |
 | 19 | Live repaint actually reaches a terminal stream | 80x24 (host session, piped stdout) | PASS (out-of-band) | §8 quotes the decoded cursor-addressed rows of a real 80x24 frame emitted by the rebuilt UI in this sandbox |
 
+**Naming note (kept deliberately — nothing was renamed):** the sticky-error tests in `src/ui/tui/tests.rs` — `e_recalls_the_last_error_or_reports_what_is_missing` (`:6117`), quoted in row 13, and its sibling `an_error_recalled_with_e_survives_a_transcript_clear` (`:4724`) — still spell the removed bare-`e` mnemonic in their **names**, while the presses they drive now submit `/error` (the bare `e` binding is gone; see `docs/new_ui.md` §5.7).
+
 ---
 
 ## 4. Degradation ladder (`docs/ui_design_spec.md` §2.5) at 60x16, 40x10, 39x9

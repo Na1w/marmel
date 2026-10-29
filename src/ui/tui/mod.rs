@@ -347,6 +347,21 @@ pub struct TuiRenderer {
     pub(crate) subagent_width: std::cell::Cell<usize>,
     /// Cached subagent details height. Defaults to `15`.
     pub(crate) subagent_height: std::cell::Cell<usize>,
+    /// The transcript's largest legal offset **as the transcript pane measured it**,
+    /// published by the frame write-back (`draw_new_ui`, from
+    /// `components::transcript::BodyReport::max_scroll`). `None` until that pane has
+    /// been drawn once.
+    ///
+    /// This is the scroll geometry the key path steps against, so the offset a
+    /// scroll key asked for and the viewport the pane drew are measured from the
+    /// same body at the same width (audit defect 11). Nothing else may write it:
+    /// [`Self::transcript_tail`] is the only reader, and the estimate it falls back
+    /// on before the first frame is a bootstrap, not a rival measurement.
+    pub(crate) transcript_measured_max: std::cell::Cell<Option<usize>>,
+    /// The worker detail's largest legal offset as the Workers pane measured it
+    /// (`components::activity::WorkerGeometry::detail_max`), published by the same
+    /// write-back. `None` until that pane has been drawn once.
+    pub(crate) detail_measured_max: std::cell::Cell<Option<usize>>,
     /// `config.max_context_tokens`: the denominator of the `ctx %` chip (spec
     /// §2.2). `0` means no config was ever handed over, and the panes then print
     /// the raw token count instead of a percentage of an unknown budget.
@@ -375,7 +390,15 @@ pub struct TuiRenderer {
     pub(crate) cached_rendered_messages: std::cell::RefCell<Vec<Vec<ratatui::text::Line<'static>>>>,
     /// `show_thought` value that the rendered-message cache was built with.
     pub(crate) cached_rendered_show_thought: std::cell::Cell<bool>,
-    /// Whether subagent details auto-scroll. Defaults to `false`.
+    /// Whether the worker detail follows the newest line of the selected row's log
+    /// (spec G7's Workers spelling of follow). Defaults to `true`: a row nobody has
+    /// scrolled away from shows its newest line.
+    ///
+    /// It is a **request**, carried to the pane as
+    /// [`components::activity::ActivityData::autoscroll`] and answered there against
+    /// the body that pass counted — never resolved into an offset outside it. Only
+    /// the scroll keys (movement-guarded, `events.rs`), the selection reveal, a
+    /// restore and the constructor write it.
     pub(crate) subagent_autoscroll: bool,
 
     /// Completed input lines forwarded to the session loop.
@@ -389,7 +412,17 @@ pub struct TuiRenderer {
     /// [`Self::project_follow_mirror`], plus the constructor and a restore, which
     /// state the decision through `set_follow` immediately afterwards.
     pub(crate) chat_auto_scroll: bool,
+    /// The plan's largest legal offset, published by the plan pane's own frame
+    /// write-back (`components::plan_pane::PlanGeometry::max_scroll`). `0` until the
+    /// pane has been drawn, which is why a bundle restored into an undrawn renderer
+    /// keeps no `plan_scroll` the live clamp cannot vouch for.
     pub(crate) plan_max_scroll: u16,
+    /// Whether the plan pane still centres itself on the task in flight, or whether
+    /// the operator has taken the plan viewport (`false`, spec §7.3, audit defect
+    /// 13). It is NOT "the offset sits at the tail" and no scroll gesture ever turns
+    /// it back on: only [`Self::arm_plan_centring`] (a plan document this process has
+    /// not seen before) and a restore write it, and
+    /// [`Self::scroll_plan_to`] is the only other writer.
     pub(crate) plan_auto_scroll: bool,
     pub(crate) active_plan_task: Option<String>,
 
@@ -512,6 +545,8 @@ impl TuiRenderer {
             chat_height: std::cell::Cell::new(15),
             subagent_width: std::cell::Cell::new(40),
             subagent_height: std::cell::Cell::new(15),
+            transcript_measured_max: std::cell::Cell::new(None),
+            detail_measured_max: std::cell::Cell::new(None),
             max_context_tokens: 0,
             transcript_baseline_lines: None,
             last_error: None,
@@ -776,12 +811,18 @@ impl TuiRenderer {
         }
 
         // 2. Transcript. The pane is handed the conversation and the renderer's own
-        // rendered-line cache, and reports back where the viewport landed; the
-        // write-back keeps `chat_scroll` / `chat_width` / `chat_height` — which the
-        // autoscroll preparation above and the scroll keys in `events.rs` read —
-        // pointing at what was actually drawn. The unseen-line count stays inside
-        // the pane: it is the transcript's own scroll state, and the status row that
-        // used to echo it put a second `● LIVE` on the frame.
+        // rendered-line cache, and reports back the geometry this pass established:
+        // where the viewport landed and how far down the body may go. Both are
+        // written back here — the single frame-level scroll write-back, and the only
+        // writer of the geometry the scroll keys in `events.rs` and the resize clamp
+        // step against (audit defect 11: the key path used to clamp against
+        // `estimated_chat_lines` while this pane clamped and pinned against the lines
+        // it had actually drawn, so a step measured off-file could be rewritten, or
+        // turned into a jump, by the frame below it). The `Ctrl+F` follow flag is
+        // handed over as the request it is (`TranscriptData::follow`), which is what
+        // pins the body to the tail — the `● LIVE` chip on the pane's bottom border
+        // is built from the very same report, so the chip and the viewport can never
+        // state two different positions. The unseen-line count stays inside the pane.
         if let Some(rect) = rects.transcript {
             self.ensure_rendered_message_cache();
             let report = {
@@ -807,6 +848,7 @@ impl TuiRenderer {
             self.chat_height
                 .set(usize::from(rect.height.saturating_sub(2)));
             self.chat_scroll = report.scroll;
+            self.transcript_measured_max.set(Some(report.max_scroll));
             // The `↓ N new` baseline (G7): whenever the viewport sits at the bottom
             // of the body, every line that exists has been on screen, so the body's
             // own line count becomes the baseline the next frame measures growth
@@ -816,8 +858,11 @@ impl TuiRenderer {
             }
         }
 
-        // 3. Execution Plan: body, chrome, and the scroll geometry that
-        // `plan_auto_scroll` and the `↑`/`↓` clamps share.
+        // 3. Execution Plan: body, chrome, and the scroll geometry that the `↑`/`↓`
+        // clamps and the pane's own centring share. The write-back of
+        // `plan_scroll`/`plan_max_scroll` is the plan's whole frame-level scroll
+        // state: the centring request travels in as `PlanData::auto_scroll` and is
+        // answered by the pane, and nothing above this pass may restate it.
         if let Some(rect) = rects.plan {
             let active_tasks = self.active_plan_tasks();
             let target_task = self.plan_target_task();
@@ -837,8 +882,14 @@ impl TuiRenderer {
             self.plan_max_scroll = geometry.max_scroll;
         }
 
-        // 4. Workers: roster + detail half, with both offsets and the detail
-        // measure written back for the autoscroll estimate and the key clamps.
+        // 4. Workers: roster + detail half. The pane reports both offsets and the
+        // measure its detail body was counted at, and this write-back is what lets
+        // the key path clamp `↑`/`↓` against the roster window and
+        // `PageUp`/`PageDown`/`Home`/`End` against the log — always the geometry the
+        // last frame drew, never an estimate of it. The detail follow flag crosses as
+        // the request it is (`ActivityData::autoscroll`), so the pane resolves
+        // "newest line" against the body it counted itself instead of a pass outside
+        // it guessing at the tail from a line estimate.
         if let Some(rect) = rects.workers {
             let selected = self
                 .selected_subagent_idx
@@ -863,6 +914,7 @@ impl TuiRenderer {
                     selected: self.selected_subagent_idx,
                     detail_present: layout::workers_detail_present(area.width),
                     scroll: view.scroll.workers,
+                    autoscroll: self.subagent_autoscroll,
                     list_scroll: self.subagent_list_scroll,
                     show_thought: self.show_thought,
                     thinking_budget,
@@ -875,6 +927,7 @@ impl TuiRenderer {
             if geometry.detail_present {
                 self.subagent_width.set(geometry.detail_width);
                 self.subagent_height.set(geometry.detail_height);
+                self.detail_measured_max.set(Some(geometry.detail_max));
             }
         }
 
@@ -1023,15 +1076,15 @@ impl TuiRenderer {
     }
 
     /// Get the composer's `TextArea` ready for a component-owned body pass: the
-    /// widget is synchronised with `input_text`, its cursor line carries no style
-    /// of its own, and its block is cleared — the composer component draws the one
-    /// border, title and chip row, so a block on the widget would paint a second
-    /// frame over it.
+    /// widget is synchronised with `input_text`, its cursor line takes the
+    /// palette's [`theme::caret_line`] slot (a fill, so a light profile does not
+    /// swallow the caret), and its block is cleared — the composer component draws
+    /// the one border, title and chip row, so a block on the widget would paint a
+    /// second frame over it.
     pub(crate) fn prepare_textarea(&mut self) {
         self.ensure_textarea_in_sync();
         self.textarea.set_block(ratatui::widgets::Block::default());
-        self.textarea
-            .set_cursor_line_style(ratatui::style::Style::default());
+        self.textarea.set_cursor_line_style(theme::caret_line());
     }
 
     /// The elapsed clock both chrome panes print, as whole seconds.
@@ -1114,12 +1167,6 @@ impl TuiRenderer {
             }
         }
         self.messages.push(steer_transcript_line(trace));
-        if self.chat_auto_scroll {
-            let w = self.chat_width.get();
-            let n = self.estimated_chat_lines(w);
-            let h = self.chat_height.get();
-            self.chat_scroll = n.saturating_sub(h) as u16;
-        }
         self.dirty = true;
     }
 
@@ -1264,9 +1311,14 @@ impl TuiRenderer {
     /// Turn transcript follow on or off (spec G7: `Ctrl+F`, `/follow`, and the
     /// scroll keys that pull the viewport back off the tail).
     ///
-    /// The legacy `chat_auto_scroll` flag is the same decision spelled for the
-    /// pre-rebuild scroll and clamp path (`render.rs`, `events.rs`), so it moves
-    /// with the flag: one operator decision, one number in the frame.
+    /// This is the one decision that pins the transcript to its tail. Nothing else
+    /// pins it: the nine `if chat_auto_scroll { chat_scroll = estimate - height }`
+    /// blocks the streaming arms of `on_event` used to run never own a viewport, and
+    /// the pane pins itself to the tail it measured on every frame it draws
+    /// (`components::transcript::draw_body`) from this very flag. The legacy
+    /// `chat_auto_scroll` flag is the same decision spelled for the pre-rebuild
+    /// scroll path, so it moves with the flag: one operator decision, one number in
+    /// the frame.
     pub(crate) fn set_follow(&mut self, follow: bool) {
         self.follow = follow;
         self.project_follow_mirror();
@@ -1276,17 +1328,37 @@ impl TuiRenderer {
     /// The one named place the legacy `chat_auto_scroll` mirror is assigned.
     ///
     /// The flag is not state: it is the same follow decision spelled for the
-    /// pre-rebuild scroll and clamp path (`render.rs`, the streaming pins in
-    /// `on_event`), so it is a pure projection of [`Self::follow`] and may never be
-    /// written on its own. Code that wants the transcript pinned to the tail calls
-    /// [`Self::set_follow(true)`]; code that finds the mirror disagreeing with
-    /// `follow` calls **this** to put it back, which is what makes audit defect D3
-    /// (a submit that silently re-armed follow by assigning the flag) impossible:
-    /// the only writers of the field left are the constructor and a restore, both
-    /// of which state the decision through `set_follow` right afterwards.
+    /// pre-rebuild scroll path, so it is a pure projection of [`Self::follow`] and
+    /// may never be written on its own. Code that wants the transcript pinned to the
+    /// tail calls [`Self::set_follow(true)`]; code that finds the mirror disagreeing
+    /// with `follow` calls **this** to put it back, which is what makes audit defect
+    /// D3 (a submit that silently re-armed follow by assigning the flag) impossible:
+    /// the only writers of the field left are the constructor and a restore, both of
+    /// which state the decision through `set_follow` right afterwards. What reads it
+    /// is persistence and the adoption bridge — the live pin lives in the transcript
+    /// pane, which is handed [`state::UiView::follow`].
     pub(crate) fn project_follow_mirror(&mut self) {
         self.chat_auto_scroll = self.follow;
         self.legacy_view.follow = self.follow;
+    }
+
+    /// Arm the plan pane's centring on the task in flight: opened plan pane, plan
+    /// offset cleared, centring on.
+    ///
+    /// This is the **only** writer of [`Self::plan_auto_scroll`] other than a scroll
+    /// gesture and a restore, and its caller calls it on one edge only — the first
+    /// plan document this process has seen (`render.rs::refresh_plan_cache`, guarded
+    /// by `had_active_plan`). Audit defect 13 was the opposite: `on_event` armed the
+    /// flag on every `DelegationEvent::Started`, so an operator who had scrolled to
+    /// the tail of the plan was handed back to the in-flight task by the next task's
+    /// traffic. Task traffic is not an operator gesture, so it no longer states
+    /// anything about the plan viewport; a fresh plan document genuinely is a fresh
+    /// plan, and the offset this renderer holds refers to a document that is gone.
+    pub(crate) fn arm_plan_centring(&mut self) {
+        self.show_plan_panel = true;
+        self.plan_scroll = 0;
+        self.plan_auto_scroll = true;
+        self.dirty = true;
     }
 
     /// Open the `?`/`F1` keymap + command legend (spec §3, G2).
@@ -1617,12 +1689,6 @@ impl Renderer for TuiRenderer {
                         self.active_agent = "Manager".to_string();
                     }
                     self.current_content.push_str(text);
-                    if self.chat_auto_scroll {
-                        let w = self.chat_width.get();
-                        let n = self.estimated_chat_lines(w);
-                        let h = self.chat_height.get();
-                        self.chat_scroll = n.saturating_sub(h) as u16;
-                    }
                 }
             }
             Event::SteerResponse(text) => {
@@ -1634,12 +1700,6 @@ impl Renderer for TuiRenderer {
                 let sentences = extract_complete_sentences(&mut self.steer_sentence_buffer);
                 for s in sentences {
                     self.append_steer_sentence(&s);
-                }
-                if self.chat_auto_scroll {
-                    let w = self.chat_width.get();
-                    let n = self.estimated_chat_lines(w);
-                    let h = self.chat_height.get();
-                    self.chat_scroll = n.saturating_sub(h) as u16;
                 }
             }
             Event::Thinking(text) => {
@@ -1665,12 +1725,6 @@ impl Renderer for TuiRenderer {
                         self.active_agent = "Manager".to_string();
                     }
                     self.current_thought.push_str(text);
-                    if self.chat_auto_scroll {
-                        let w = self.chat_width.get();
-                        let n = self.estimated_chat_lines(w);
-                        let h = self.chat_height.get();
-                        self.chat_scroll = n.saturating_sub(h) as u16;
-                    }
                 }
             }
             Event::SubagentMessage { agent_tag, text } => {
@@ -1770,12 +1824,6 @@ impl Renderer for TuiRenderer {
                         self.active_agent = "Manager".to_string();
                     }
                     self.messages.push(format!("[Tool Call] {text}"));
-                    if self.chat_auto_scroll {
-                        let w = self.chat_width.get();
-                        let n = self.estimated_chat_lines(w);
-                        let h = self.chat_height.get();
-                        self.chat_scroll = n.saturating_sub(h) as u16;
-                    }
                 }
             }
             Event::ToolResult(text) => {
@@ -1803,12 +1851,6 @@ impl Renderer for TuiRenderer {
                         self.active_agent = "Manager".to_string();
                     }
                     self.messages.push(format!("[Tool Result] {text}"));
-                    if self.chat_auto_scroll {
-                        let w = self.chat_width.get();
-                        let n = self.estimated_chat_lines(w);
-                        let h = self.chat_height.get();
-                        self.chat_scroll = n.saturating_sub(h) as u16;
-                    }
                 }
             }
             Event::Status(text) => {
@@ -1854,12 +1896,6 @@ impl Renderer for TuiRenderer {
                         && self.last_error.as_ref() != Some(&sticky)
                     {
                         self.last_error = Some(sticky);
-                    }
-                    if self.chat_auto_scroll {
-                        let w = self.chat_width.get();
-                        let n = self.estimated_chat_lines(w);
-                        let h = self.chat_height.get();
-                        self.chat_scroll = n.saturating_sub(h) as u16;
                     }
                 }
                 // Live-track logs for subagents: match by agent name prefix (e.g. "coder-<id>: ...")
@@ -1939,8 +1975,15 @@ impl Renderer for TuiRenderer {
                         self.active_agent = name.clone();
                         let t = clean_task.unwrap_or("(no task id)");
                         if let Some(tid) = clean_task {
+                            // Which task is in flight is data the plan pane reads and
+                            // centres itself on while centring is live. What a started
+                            // task must NOT do is arm centring: an operator who had
+                            // scrolled the plan to its tail was handed back to the
+                            // in-flight task by the next delegation (audit defect 13).
+                            // Centring is armed by a plan document this process has not
+                            // seen before (`arm_plan_centring`) and released by a plan
+                            // scroll key — never by task traffic.
                             self.active_plan_task = Some(tid.to_string());
-                            self.plan_auto_scroll = true;
                             self.show_plan_panel = true;
                         }
                         // Fold into the local subagent list so the panel stays
@@ -1978,12 +2021,6 @@ impl Renderer for TuiRenderer {
                             None => format!("[{agent}] completed."),
                         };
                         self.messages.push(completed_msg);
-                        if self.chat_auto_scroll {
-                            let w = self.chat_width.get();
-                            let n = self.estimated_chat_lines(w);
-                            let h = self.chat_height.get();
-                            self.chat_scroll = n.saturating_sub(h) as u16;
-                        }
                         if self.active_plan_task.as_deref() == clean_task {
                             self.active_plan_task = self
                                 .subagents
@@ -2090,12 +2127,6 @@ impl Renderer for TuiRenderer {
                                 (None, None) => format!("[{agent}] failed."),
                             };
                         self.messages.push(failed_msg);
-                        if self.chat_auto_scroll {
-                            let w = self.chat_width.get();
-                            let n = self.estimated_chat_lines(w);
-                            let h = self.chat_height.get();
-                            self.chat_scroll = n.saturating_sub(h) as u16;
-                        }
                         if self.active_plan_task.as_deref() == clean_task {
                             self.active_plan_task = self
                                 .subagents
@@ -2452,6 +2483,16 @@ impl Renderer for TuiRenderer {
                 history_index: self.history_index,
             },
             view: crate::session::format::ViewState {
+                // Scroll state that is durable: the four offsets and the three
+                // follow/centring flags, verbatim. What is deliberately NOT stored is the
+                // geometry each pane measured while drawing it
+                // (`transcript_measured_max`, `detail_measured_max`, `plan_max_scroll`): a
+                // maximum is a property of the frame that drew it, and a restored
+                // conversation is not that conversation. Restore re-clamps the restored
+                // offsets against the line-count bootstrap that
+                // `transcript_tail`/`worker_detail_tail` fall back to once
+                // `invalidate_pane_caches` has cleared the published maxima, and the first
+                // frame after the restore republishes a measured number.
                 chat_scroll: self.chat_scroll,
                 plan_scroll: self.plan_scroll,
                 subagent_scroll: self.subagent_scroll,
@@ -3001,6 +3042,13 @@ impl TuiRenderer {
     /// Drop every derived chat cache so the next frame is rebuilt from the
     /// restored bytes: derived caches are never stored, and a frame must never
     /// draw a line that was not stored.
+    ///
+    /// The two measured scroll maxima belong here too (audit defects 11/12): they
+    /// are what the pane last *drew*, not durable state, so a restored
+    /// conversation must not be clamped against the geometry of the conversation
+    /// it replaced. Clearing them hands the answer back to the line-count
+    /// bootstrap in [`TuiRenderer::transcript_tail`] until the first frame after the
+    /// restore republishes a measured number.
     fn invalidate_pane_caches(&self) {
         self.cached_rendered_messages.borrow_mut().clear();
         self.cached_message_lines.borrow_mut().clear();
@@ -3008,6 +3056,8 @@ impl TuiRenderer {
         self.cached_total_message_lines.set(0);
         self.cached_show_thought.set(!self.show_thought);
         self.cached_rendered_show_thought.set(!self.show_thought);
+        self.transcript_measured_max.set(None);
+        self.detail_measured_max.set(None);
     }
 
     /// Decide whether [`Renderer::shutdown`] owes the terminal a reset burst, and

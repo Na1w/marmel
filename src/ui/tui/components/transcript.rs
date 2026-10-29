@@ -41,7 +41,7 @@ use crate::markers;
 use crate::ui::SteerStage;
 use crate::ui::tui::formatting::{
     count_wrapped_rendered_lines, format_terminal_math, parse_ansi_lines, render_markdown_lines,
-    render_message_lines, strip_think_tags,
+    render_message_lines, strip_think_tags, thought_style,
 };
 use crate::ui::tui::state::FocusPane;
 use crate::ui::tui::theme::{self, Glyph};
@@ -70,9 +70,13 @@ pub const STEER_LINE_PREFIX: &str = "[Steer ";
 /// from "never got there". No slot is invented for a state the bridge cannot report.
 fn steer_style(stage: SteerStage) -> Style {
     match stage {
-        SteerStage::Queued => theme::chip_pending(),
-        SteerStage::Delivered => theme::chip_done(),
-        SteerStage::Revoked => theme::error(),
+        // Waiting is cool and never warm (§F4): the queue rank wears the same
+        // slot as an open plan line.
+        SteerStage::Queued => theme::state_queued(),
+        SteerStage::Delivered => theme::state_done(),
+        // A withdrawn steer is a decision taken back, not a failure: it takes the
+        // verdict slot for exactly that, so it cannot be read as `FAILED`.
+        SteerStage::Revoked => theme::verdict_reject(),
     }
 }
 
@@ -261,7 +265,7 @@ pub(crate) fn draw_body(
             // A pane that is handed no conversation at all leaves the frame to its
             // owner rather than painting over it.
             if !occupied(frame, inner) {
-                let paragraph = Paragraph::new(Line::styled(EMPTY_STATE, theme::text_dim()))
+                let paragraph = Paragraph::new(Line::styled(EMPTY_STATE, theme::text_secondary()))
                     .wrap(Wrap { trim: true });
                 frame.render_widget(paragraph, inner);
             }
@@ -277,7 +281,9 @@ pub(crate) fn draw_body(
             if scrollbar {
                 let mut state = ScrollbarState::new(max_scroll).position(offset);
                 frame.render_stateful_widget(
-                    Scrollbar::new(ScrollbarOrientation::VerticalRight),
+                    Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                        .thumb_style(theme::scrollbar_thumb())
+                        .track_style(theme::scrollbar_track()),
                     inner,
                     &mut state,
                 );
@@ -332,8 +338,11 @@ fn body_lines(body: &TranscriptBody<'_>) -> Vec<Line<'static>> {
 }
 
 /// The streaming reasoning region (§8.2), think-tag free, dimmed and italic.
+/// The style is the shared thought tier ([`theme::text_thought`] + a weight
+/// step), so this region, the message-line tier and the streaming buffer in
+/// `render.rs` are one slot and cannot drift apart (§F7).
 fn thought_lines(thought: &str) -> Vec<Line<'static>> {
-    let style = theme::text_dim().add_modifier(ratatui::style::Modifier::ITALIC);
+    let style = thought_style();
     let mut lines = Vec::new();
     for raw in thought.lines() {
         let line = raw.replace('\t', "    ");
@@ -386,7 +395,7 @@ fn steer_lines(steer: &str, messages: &[String]) -> Vec<Line<'static>> {
         .map(|line| {
             Line::from(Span::styled(
                 line.replace('\t', "    "),
-                theme::chip_active(),
+                theme::role_manager(),
             ))
         })
         .collect()
@@ -441,13 +450,14 @@ impl Verdict {
     }
 
     /// The palette slot this verdict is painted in — four verdicts, four slots,
-    /// so `REVOKED` can never be mistaken for the worker's own `FAILED`.
+    /// so `REVOKED` can never be mistaken for the worker's own `FAILED`, and so a
+    /// withdrawn instruction never wears the failure hue or the chrome chip.
     fn style(self) -> Style {
         match self {
-            Self::Complete => theme::chip_done(),
-            Self::Revoked => theme::chip(),
-            Self::Failed => theme::error(),
-            Self::Replan => theme::chip_pending(),
+            Self::Complete => theme::verdict_ok(),
+            Self::Revoked => theme::verdict_reject(),
+            Self::Failed => theme::verdict_fail(),
+            Self::Replan => theme::verdict_replan(),
         }
     }
 
@@ -472,7 +482,7 @@ fn verdict_mark(line: Line<'static>) -> Line<'static> {
 
     let mut spans = Vec::with_capacity(line.spans.len() + 2);
     spans.push(verdict.badge());
-    spans.push(Span::styled(" ".to_string(), theme::text_dim()));
+    spans.push(Span::styled(" ".to_string(), theme::text_muted()));
     for span in line.spans {
         spans.push(Span::styled(
             span.content.into_owned(),
@@ -549,21 +559,31 @@ fn chip_row(follow: bool, report: BodyReport) -> Vec<Span<'static>> {
 /// The G7 chip: `● LIVE` while following, otherwise how many lines sit below the
 /// viewport. With follow off and nothing unseen the chip still names the state,
 /// so no key press is ever silent (G5).
+///
+/// None of the three states borrows the success hue (§F5): a green corner used to
+/// mean "done" and "following" at once. Following is the cool live slot, unseen
+/// output is its own count slot, and follow-off is neutral because it is the
+/// operator's own choice, not a problem (§F4).
 fn scroll_chip(follow: bool, unseen: usize) -> Span<'static> {
     if follow {
-        Span::styled(format!(" {} LIVE ", theme::FOCUS_BADGE), theme::chip_done())
+        Span::styled(
+            format!(" {} LIVE ", theme::FOCUS_BADGE),
+            theme::scroll_live(),
+        )
     } else if unseen > 0 {
-        Span::styled(format!(" \u{2193} {unseen} new "), theme::chip_pending())
+        Span::styled(format!(" \u{2193} {unseen} new "), theme::scroll_unseen())
     } else {
-        Span::styled(" \u{2193} follow off ".to_string(), theme::chip_pending())
+        Span::styled(" \u{2193} follow off ".to_string(), theme::scroll_stale())
     }
 }
 
-/// The scroll readout that makes the scrollbar's meaning legible in text.
+/// The scroll readout that makes the scrollbar's meaning legible in text. It is
+/// chrome on the pane's own border row (not the status band), so it takes the
+/// gutter rung rather than a band chip.
 fn position_chip(report: BodyReport) -> Span<'static> {
     let offset = report.scroll;
     let max = report.max_scroll;
-    Span::styled(format!(" scroll {offset}/{max} "), theme::chip())
+    Span::styled(format!(" scroll {offset}/{max} "), theme::text_muted())
 }
 
 /// Whether `rect` already carries pixels drawn by an earlier pass of this frame.
@@ -937,12 +957,16 @@ mod tests {
         let replan = buffer[(1, 4)].style();
         let plain = buffer[(1, 5)].style();
         // Each verdict keeps its own palette slot, and none of them is body text.
-        assert_eq!(complete.fg, theme::chip_done().fg);
-        assert_eq!(revoked.fg, theme::chip().fg);
-        assert_eq!(revoked.bg, theme::chip().bg);
-        assert_eq!(failed.fg, theme::error().fg);
+        assert_eq!(complete.fg, theme::verdict_ok().fg);
+        assert_eq!(revoked.fg, theme::verdict_reject().fg);
+        assert_ne!(
+            revoked,
+            theme::chip_neutral(),
+            "a revoked verdict never borrows the neutral chrome chip"
+        );
+        assert_eq!(failed.fg, theme::verdict_fail().fg);
         assert!(failed.add_modifier.contains(ratatui::style::Modifier::BOLD));
-        assert_eq!(replan.fg, theme::chip_pending().fg);
+        assert_eq!(replan.fg, theme::verdict_replan().fg);
         // Body text keeps whatever colour the message carried, which is none of
         // the four verdict slots.
         assert_ne!(plain.fg, complete.fg);
@@ -1332,18 +1356,18 @@ mod tests {
         ]);
         assert_eq!(
             painted[0].spans[0].style.fg,
-            theme::chip_pending().fg,
-            "a held instruction reads like a pending one"
+            theme::state_queued().fg,
+            "a held instruction is waiting, and waiting is cool (§F4)"
         );
         assert_eq!(
             painted[1].spans[0].style.fg,
-            theme::chip_done().fg,
+            theme::state_done().fg,
             "an instruction that reached its addressee reads as done"
         );
         assert_eq!(
             painted[2].spans[0].style.fg,
-            theme::error().fg,
-            "an instruction that never got there reads as an error"
+            theme::verdict_reject().fg,
+            "an instruction withdrawn before it got there is not a failure"
         );
         let queued = painted[0].spans[0].style.fg;
         let delivered = painted[1].spans[0].style.fg;
@@ -1392,5 +1416,35 @@ mod tests {
         let untouched = steer_mark(Line::raw("User: the queue is empty"));
         assert_eq!(untouched.spans.len(), 1);
         assert_eq!(untouched.spans[0].style, Style::default());
+    }
+
+    /// The streaming regions are palette slots, never local styles: the
+    /// reasoning region takes the shared thought tier — `ITALIC` **plus** a
+    /// weight step, so the tier still reads apart from gutter chrome on a
+    /// terminal that drops italics (§F7) — and the manager's streamed sentence
+    /// takes the very slot a `Marmennill:` message line resolves to.
+    #[test]
+    fn the_streaming_regions_take_the_same_slots_as_the_message_lines() {
+        let thought = thought_lines("weigh the seam");
+        assert_eq!(thought.len(), 1, "got: {thought:?}");
+        let tier = thought_style();
+        assert_eq!(thought[0].spans[0].style, tier);
+        assert!(
+            tier.add_modifier.contains(ratatui::style::Modifier::ITALIC),
+            "the tier keeps its italics"
+        );
+        assert!(
+            tier.add_modifier.contains(ratatui::style::Modifier::DIM),
+            "and a weight step for terminals without italics"
+        );
+        assert_ne!(tier, theme::text_muted(), "reasoning is not gutter chrome");
+
+        let steer = steer_lines("hold the fixture", &[]);
+        assert_eq!(steer[0].spans[0].style, theme::role_manager());
+        assert_eq!(
+            steer[0].spans[0].style,
+            crate::ui::tui::formatting::message_style("Marmennill: hold the fixture").0,
+            "one slot for the manager's voice, streamed or committed"
+        );
     }
 }

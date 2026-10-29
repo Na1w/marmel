@@ -37,6 +37,8 @@ static WORKSPACE_ROOT: std::sync::RwLock<Option<std::path::PathBuf>> = std::sync
 
 tokio::task_local! {
     static SCOPED_WORKSPACE_ROOT: std::path::PathBuf;
+    /// Per-task override of the MCP dispatch gate (see [`with_mcp_gate`]).
+    static SCOPED_MCP_GATE: Arc<McpDispatchGate>;
 }
 
 /// Run an async future scoped to a specific workspace root (ideal for isolated tests & sub-workspaces).
@@ -213,14 +215,11 @@ impl McpDispatchGate {
     }
 }
 
-/// Register the global MCP manager for tool dispatch.
-///
-/// Registration is the primary defence: every discovered tool is checked against
-/// the MCP name policy and against the built-in tool namespace. Refusals are
-/// reported with `tracing::warn!` and are never dispatchable — such a tool is
-/// rejected outright, never silently renamed.
-pub fn set_mcp_manager(manager: Arc<crate::mcp::McpManager>) {
-    let gate = Arc::new(McpDispatchGate::build(&manager));
+/// Build the policy-filtered dispatch view of `manager` — the same gate
+/// [`set_mcp_manager`] installs globally, without touching the process global.
+/// Refusals are reported the same way (`tracing::warn!`), never renamed.
+pub fn build_mcp_gate(manager: &Arc<crate::mcp::McpManager>) -> Arc<McpDispatchGate> {
+    let gate = Arc::new(McpDispatchGate::build(manager));
     for rejection in gate.rejected() {
         tracing::warn!(
             "Refusing MCP tool '{}': {}",
@@ -228,17 +227,63 @@ pub fn set_mcp_manager(manager: Arc<crate::mcp::McpManager>) {
             rejection.reason
         );
     }
+    gate
+}
+
+/// Register the global MCP manager for tool dispatch.
+///
+/// Registration is the primary defence: every discovered tool is checked against
+/// the MCP name policy and against the built-in tool namespace. Refusals are
+/// reported with `tracing::warn!` and are never dispatchable — such a tool is
+/// rejected outright, never silently renamed.
+pub fn set_mcp_manager(manager: Arc<crate::mcp::McpManager>) {
+    let gate = build_mcp_gate(&manager);
     if let Ok(mut lock) = MCP_GATE.write() {
         *lock = Some(gate);
     }
 }
 
+/// Run `f` with `gate` as the **calling task's** MCP dispatch gate.
+///
+/// [`set_mcp_manager`] writes a process-global slot, so every dispatcher in the
+/// process resolves the same registry: a second writer re-points the first writer's
+/// calls, and a tool that was dispatchable a moment ago answers
+/// [`ToolError::Forbidden`] ("tool `…` is forbidden for caller `Manager` by
+/// orchestration policy") or `UnknownTool`. In production there is exactly one
+/// writer (`src/main.rs`, at startup), so this changes no product behaviour; it adds
+/// the scoping seam the crate already ships for the sibling process global
+/// ([`with_workspace_root`] / [`SCOPED_WORKSPACE_ROOT`]), so a caller — notably a
+/// test in a parallel test binary, where several modules install their own registry
+/// (`src/llm/client_tests.rs`) — can own the gate it dispatches against for the
+/// duration of its own round trip. See `docs/fix_notice_reply_flakiness.md` §7.
+///
+/// Reads inside `f` see `gate`; on exit the previous state (scoped or global) is
+/// restored by the task-local scope itself.
+pub async fn with_mcp_gate<F, R>(gate: Arc<McpDispatchGate>, f: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    SCOPED_MCP_GATE.scope(gate, f).await
+}
+
+/// The gate that governs the current call site: this task's scoped gate when one is
+/// installed, otherwise the process-global registry.
+fn current_mcp_gate() -> Option<Arc<McpDispatchGate>> {
+    SCOPED_MCP_GATE
+        .try_with(Arc::clone)
+        .ok()
+        .or_else(get_mcp_gate)
+}
+
 /// Retrieve the active global MCP manager if available.
 pub fn get_mcp_manager() -> Option<Arc<crate::mcp::McpManager>> {
-    get_mcp_gate().map(|gate| Arc::clone(&gate.manager))
+    current_mcp_gate().map(|gate| Arc::clone(&gate.manager))
 }
 
 /// Retrieve the policy-filtered MCP registry — the dispatch view of the manager.
+///
+/// This is the **process-global** slot; a task running under [`with_mcp_gate`]
+/// dispatches through its scoped gate instead (see [`current_mcp_gate`]).
 pub fn get_mcp_gate() -> Option<Arc<McpDispatchGate>> {
     MCP_GATE.read().ok().and_then(|lock| lock.clone())
 }
@@ -249,7 +294,7 @@ pub fn get_mcp_gate() -> Option<Arc<McpDispatchGate>> {
 /// `McpManager::tools_for_servers`, so a name the policy refused is never even
 /// offered to a model, let alone dispatched.
 pub fn allowed_mcp_tools(servers: &[String]) -> Vec<crate::mcp::McpTool> {
-    let Some(gate) = get_mcp_gate() else {
+    let Some(gate) = current_mcp_gate() else {
         return Vec::new();
     };
     gate.manager
@@ -261,7 +306,7 @@ pub fn allowed_mcp_tools(servers: &[String]) -> Vec<crate::mcp::McpTool> {
 
 /// Resolve the manager that is allowed to serve `name` (see [`McpDispatchGate::route`]).
 fn mcp_route(name: &str) -> Option<Arc<crate::mcp::McpManager>> {
-    get_mcp_gate().and_then(|gate| gate.route(name).map(Arc::clone))
+    current_mcp_gate().and_then(|gate| gate.route(name).map(Arc::clone))
 }
 
 /// Execute an MCP tool call, or `None` when no MCP tool is routed for the invocation.
@@ -1226,8 +1271,35 @@ mod tests {
         assert!(!result3.is_error);
     }
 
+    /// Take the process-global worker/cancellation serialisation lock — the same
+    /// `workers::TEST_WORKERS_MUTEX` convention this crate already uses
+    /// (`orchestrator::tests.rs:22`, `orchestrator::pool.rs:1029`,
+    /// `ui::bridge::tests.rs:1316`).
+    ///
+    /// A `delegate_task` round trip resolves its cancellation state out of two process
+    /// globals: `handle_delegate_task` short-circuits on
+    /// `orchestrator::is_globally_cancelled()` (`orchestrator/delegate.rs:145`), and the
+    /// Manager it builds draws `global_cancellation_token().child_token()`
+    /// (`orchestrator/mod.rs:147`), so a token that is already cancelled hands the
+    /// delegation an immediately-cancelled child. Either way the deliverable comes back
+    /// as `MissionMarker::Failed` — "Task aborted by user instruction.\n\nFAILED
+    /// (aborted)" — and this test's `!res.is_error` is charged **another test's**
+    /// abort. Instrumenting `cancel_all()` (logging the calling thread over a full lib
+    /// run) found exactly two runtime writers of that token: the two `ui::bridge`
+    /// arbitration drivers, and both run inside `with_arbitration_test_lock`
+    /// (`ui::bridge::tests.rs:1315-1327`), which holds this lock and restores the token
+    /// on both sides. Holding it across the round trip therefore excludes them;
+    /// `test_harness_cancellation_writers_share_the_worker_serialisation_lock` pins that
+    /// they keep doing so. See `docs/fix_notice_reply_flakiness.md` §7.
+    fn worker_registry_serial() -> std::sync::MutexGuard<'static, ()> {
+        crate::orchestrator::workers::TEST_WORKERS_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn test_harness_delegate_task_manager_routes_and_returns_deliverable() {
+        let _serial = worker_registry_serial();
         let invocation = ToolInvocation {
             name: TOOL_DELEGATE_TASK.to_string(),
             arguments: serde_json::json!({
@@ -1236,9 +1308,49 @@ mod tests {
                 "task_id": "t-del-999"
             }),
         };
-        let res = dispatch_for(&invocation, ToolCaller::Manager).unwrap();
-        assert!(!res.is_error);
-        assert!(res.content.contains("MISSION COMPLETE"));
+        let res = dispatch_for(&invocation, ToolCaller::Manager)
+            .unwrap_or_else(|e| panic!("delegate_task must not hard-error: {e}"));
+        assert!(
+            !res.is_error,
+            "delegate_task must return the deliverable (an aborted deliverable here \
+             means a foreign process-global cancel landed inside this round trip): {}",
+            res.content
+        );
+        assert!(
+            res.content.contains("MISSION COMPLETE"),
+            "the deliverable must carry the completion marker: {}",
+            res.content
+        );
+    }
+
+    /// Pins the invariant `test_harness_delegate_task_manager_routes_and_returns_deliverable`
+    /// depends on (§7): the serialisation lock it holds is the one every
+    /// cancellation-writing test in this binary already holds. If a future cancellation
+    /// driver aborts outside that lock, this guard goes red instead of the delegate
+    /// test flaking under load.
+    #[test]
+    fn test_harness_cancellation_writers_share_the_worker_serialisation_lock() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/ui/bridge/tests.rs"
+        ))
+        .expect("the arbitration test drivers are part of this crate");
+        let start = source
+            .find("fn with_arbitration_test_lock")
+            .expect("the arbitration test driver must exist");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}").unwrap_or(body.len())];
+        assert!(
+            body.contains("workers::TEST_WORKERS_MUTEX"),
+            "the arbitration drivers cancel the process globally (`cancel_all`) and must \
+             stay serialised behind `workers::TEST_WORKERS_MUTEX`, which the delegate_task \
+             round trip also takes: {body}"
+        );
+        assert!(
+            body.contains("reset_cancellation()"),
+            "the arbitration drivers must restore the global cancellation token on both \
+             sides of their round trip: {body}"
+        );
     }
 
     #[test]
