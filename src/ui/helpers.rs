@@ -180,11 +180,18 @@ pub fn chunk_utf8(s: &str, max: usize) -> Vec<&str> {
 /// pasted command line is only padding, so `"/reset\n"` keeps working: the test
 /// looks at what is left after trimming, which is exactly the "content on more than
 /// one line" case.
-fn submission_is_single_line(line: &str) -> bool {
+pub(crate) fn submission_is_single_line(line: &str) -> bool {
     let t = line.trim();
     !t.contains('\n') && !t.contains('\r')
 }
 
+/// The **slash** spellings of the destructive commands, plus the two vim
+/// spellings that were already explicit. Spec §5 deletes the bare words: a
+/// one-word instruction such as `stop` killed the run (UX friction 6), so the
+/// command vocabulary is now the forms the operator deliberately typed — and in
+/// the interactive TUI every one of them opens the confirm overlay before it
+/// reaches this test (spec §6, G3).
+///
 /// Whole-string command test — see [`submission_is_single_line`] for why a
 /// multi-line submission is never a command.
 pub(crate) fn is_abort_command(line: &str) -> bool {
@@ -193,18 +200,75 @@ pub(crate) fn is_abort_command(line: &str) -> bool {
     }
     let t = line.trim();
     t.eq_ignore_ascii_case("/abort")
-        || t.eq_ignore_ascii_case("abort")
         || t.eq_ignore_ascii_case("/exit")
-        || t.eq_ignore_ascii_case("exit")
         || t.eq_ignore_ascii_case("/quit")
-        || t.eq_ignore_ascii_case("quit")
         || t.eq_ignore_ascii_case("/q")
         || t.eq_ignore_ascii_case(":q")
         || t.eq_ignore_ascii_case(":q!")
         || t.eq_ignore_ascii_case("/stop")
-        || t.eq_ignore_ascii_case("stop")
         || t.eq_ignore_ascii_case("/cancel")
-        || t.eq_ignore_ascii_case("cancel")
+}
+
+/// The bare words spec §5 removes from the command vocabulary — the six the
+/// design names. They are **ordinary steering text** for a renderer that gates
+/// destructive commands (the rebuilt TUI); the hint the TUI prints points at the
+/// slash spelling that does open a confirm.
+pub(crate) fn is_bare_abort_word(line: &str) -> bool {
+    if !submission_is_single_line(line) {
+        return false;
+    }
+    const BARE: [&str; 6] = ["stop", "cancel", "exit", "quit", "q", "abort"];
+    let t = line.trim();
+    BARE.iter().any(|word| t.eq_ignore_ascii_case(word))
+}
+
+/// The **pre-rebuild** vocabulary: slash spellings plus the bare words that were
+/// abort commands before spec §5 removed them. This is exactly what
+/// [`is_abort_command`] used to be, and it is what a renderer that does **not**
+/// gate destructive commands (headless `RawRenderer`, the test renderers, the
+/// CLI) must keep seeing, so their behaviour stays byte-unchanged while the TUI
+/// routes every destructive action through its confirm surface.
+///
+/// Note the deliberate asymmetry with [`is_bare_abort_word`]: bare `q` was never
+/// a command before §5 either, so it stays out of the legacy set.
+///
+/// Whole-string command test — see [`submission_is_single_line`].
+pub(crate) fn is_legacy_abort_command(line: &str) -> bool {
+    if !submission_is_single_line(line) {
+        return false;
+    }
+    const LEGACY_BARE: [&str; 5] = ["stop", "cancel", "exit", "quit", "abort"];
+    if is_abort_command(line) {
+        return true;
+    }
+    let t = line.trim();
+    LEGACY_BARE.iter().any(|word| t.eq_ignore_ascii_case(word))
+}
+
+/// The whole-string abort test with the **renderer's destructive-command gate**
+/// applied (spec §5, §6, G3) — the single owner of that decision.
+///
+/// Every consumer of renderer input shares this one function, because the input
+/// paths are shared by all renderers: the session loop's own reads
+/// (`session.rs`, `read_input` and the mid-flight `poll_input` polls) and the
+/// stream sink's mid-turn poll (`bridge::sink::RendererSink::poll_control`). A
+/// renderer that confirms every destructive action itself (the rebuilt TUI) has
+/// already put `y` behind the slash spellings, so a bare word such as `stop` —
+/// which it deliberately hands over as ordinary steering text — must not end the
+/// run underneath it. Every other renderer (headless `RawRenderer`, the CLI, the
+/// test renderers) keeps the pre-rebuild vocabulary verbatim, because
+/// [`is_legacy_abort_command`] is exactly what [`is_abort_command`] was before
+/// spec §5 shrank it.
+///
+/// Reading the gate rather than one predicate is what keeps the brief's promise
+/// that non-TUI behaviour stays byte-unchanged: an un-gated consumer of the
+/// narrowed predicate would silently turn a legacy bare word into steering text.
+pub(crate) fn is_abort_for_renderer(renderer: &dyn Renderer, line: &str) -> bool {
+    if renderer.gates_destructive_commands() {
+        is_abort_command(line)
+    } else {
+        is_legacy_abort_command(line)
+    }
 }
 
 /// Whole-string command test — see [`submission_is_single_line`] for why a
@@ -798,6 +862,12 @@ pub(crate) fn update_subagent_lifecycle(
             context_tokens: active_tokens,
             queue: None,
             paused: false,
+            // The D1 lifecycle fields are mirrored from the registry by the renderer's
+            // projection (`tui::fold_worker_lifecycle`), never inferred here.
+            status_label: None,
+            implementation_turns: 0,
+            validation_rounds: 0,
+            latest_validator_feedback: None,
         };
         if let Some(entry) = entry.as_ref() {
             apply_registry_entry(&mut row, entry);
@@ -1219,24 +1289,79 @@ fn truncate_reason(s: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
 
+    /// Spec §5 shrinks the command vocabulary to the **slash** spellings: the bare
+    /// words are ordinary steering text for the gating TUI, so a one-word
+    /// instruction ("stop") can no longer end a run (UX friction 6).
     #[test]
-    fn test_is_abort_command_recognizes_variants() {
-        assert!(is_abort_command("/abort"));
-        assert!(is_abort_command("abort"));
-        assert!(is_abort_command("ABORT"));
-        assert!(is_abort_command("/exit"));
-        assert!(is_abort_command("exit"));
-        assert!(is_abort_command("/quit"));
-        assert!(is_abort_command("quit"));
-        assert!(is_abort_command("/q"));
-        assert!(is_abort_command(":q"));
-        assert!(is_abort_command(":q!"));
-        assert!(is_abort_command("/stop"));
-        assert!(is_abort_command("stop"));
-        assert!(is_abort_command("/cancel"));
-        assert!(is_abort_command("cancel"));
+    fn test_is_abort_command_recognizes_the_slash_spellings_only() {
+        for command in [
+            "/abort", "/exit", "/quit", "/q", "/stop", "/cancel", ":q", ":q!",
+        ] {
+            assert!(is_abort_command(command), "{command} is a command");
+            assert!(
+                is_abort_command(&format!("  {command}  ")),
+                "{command} survives padding"
+            );
+            assert!(
+                is_abort_command(&format!("{}\n", command.to_uppercase())),
+                "{command} is matched case-insensitively"
+            );
+        }
+        // The bare words §5 removed: steering text, not commands.
+        for word in ["abort", "exit", "quit", "stop", "cancel", "q"] {
+            assert!(!is_abort_command(word), "{word} is no longer a command");
+            assert!(
+                is_abort_command(&format!("/{word}")),
+                "the slash form of {word} is"
+            );
+        }
         assert!(!is_abort_command("continue"));
         assert!(!is_abort_command("status"));
+    }
+
+    /// The bare words §5 removes are named as a set of their own, because the TUI
+    /// has to recognise them to explain what replaced them, and the pre-rebuild
+    /// vocabulary (`is_legacy_abort_command`) is what a renderer that gates
+    /// nothing — headless `RawRenderer`, the CLI, the test renderers — still sees.
+    #[test]
+    fn test_bare_abort_words_and_the_legacy_vocabulary_are_both_named() {
+        for word in ["stop", "cancel", "exit", "quit", "q", "abort"] {
+            assert!(is_bare_abort_word(word), "{word} is a bare abort word");
+            assert!(
+                is_bare_abort_word(&format!("  {word}  ")),
+                "{word} survives padding"
+            );
+            assert!(
+                !is_bare_abort_word(&format!("/{word}")),
+                "the slash form is not a bare word"
+            );
+        }
+        assert!(!is_bare_abort_word("stop the plan"));
+        assert!(!is_bare_abort_word("please stop"));
+
+        // The legacy union reproduces the pre-§5 predicate exactly: every bare
+        // word that used to end a session still does for a non-gating renderer,
+        // and the slash spellings keep matching.
+        for line in [
+            "/abort", "abort", "ABORT", "/exit", "exit", "/quit", "quit", "/q", ":q", ":q!",
+            "/stop", "stop", "/cancel", "cancel", "  STOP  ", "/abort\n",
+        ] {
+            assert!(
+                is_legacy_abort_command(line),
+                "{line} was, and stays, abort"
+            );
+        }
+        // §5's removals are exactly the delta: bare words are commands for the
+        // legacy vocabulary and steering text for the gated one.
+        for word in ["abort", "exit", "quit", "stop", "cancel"] {
+            assert!(is_legacy_abort_command(word));
+            assert!(!is_abort_command(word));
+        }
+        // Bare `q` was never a command, so it stays out of the legacy set too.
+        assert!(!is_legacy_abort_command("q"));
+        assert!(is_legacy_abort_command("/q"));
+        assert!(!is_legacy_abort_command("continue"));
+        assert!(!is_legacy_abort_command("please stop\nnow"));
     }
 
     /// Command interpretation is restricted to **single-line** submissions: a
@@ -1246,7 +1371,7 @@ mod tests {
     #[test]
     fn test_is_abort_command_rejects_multi_line_submissions() {
         // Single-line variants keep working, padding included.
-        assert!(is_abort_command("  STOP  "));
+        assert!(is_abort_command("  /STOP  "));
         assert!(is_abort_command("/abort\n"));
         // Multi-line submissions are ordinary text, never an abort.
         assert!(!is_abort_command("stop\nplease stop"));
@@ -1254,6 +1379,11 @@ mod tests {
         assert!(!is_abort_command("please stop\nnow"));
         assert!(!is_abort_command("stop\r\nnow"));
         assert!(!is_abort_command("/abort\n\n/abort"));
+        // The same gate holds for both new predicates.
+        assert!(is_bare_abort_word("  STOP  \n"));
+        assert!(!is_bare_abort_word("stop\nnow"));
+        assert!(is_legacy_abort_command("  STOP  \n"));
+        assert!(!is_legacy_abort_command("stop\nnow"));
     }
 
     /// Same single-line gate for the reset aliases: the first line of a pasted

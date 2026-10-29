@@ -307,9 +307,47 @@ async fn test_prompt_based_tool_gating() {
             "leave_verdict".to_string(),
         ],
     };
+    // `dispatch_for` gates first and executes second: a policy refusal returns
+    // `ToolError::Forbidden` from `dispatch_specialist*` *before* any handler runs
+    // (`src/harness/mod.rs:648`), while a handler that fails returns
+    // `ToolError::Execution`. So the two verdicts are distinguishable, and only one
+    // of them is a product claim.
+    //
+    // The product claim pinned here is the **gate**: this caller must not be refused.
+    // The second half of the original assertion — that the tool also *executes* —
+    // additionally needs a real pty, because the `run_command` handler goes through
+    // `pty::run_command` -> `PtySession::spawn` -> `openpty()`. A host with no usable
+    // `/dev/pts/ptmx` (mode `000`, so `openpty` answers `EACCES`) cannot exercise
+    // that half at all, on a pristine tree, with correct product code.
+    //
+    // Hence: a `Forbidden` verdict fails on every host, an `Ok` verdict satisfies
+    // both halves, and an `Execution` verdict is only tolerated when the probe says
+    // this host cannot allocate a pty — announced as a `SKIP `, in the spelling used
+    // by `integration_host` (`src/harness/sandbox.rs:1637`), never silently and
+    // never via `#[ignore]`. On a pty-capable host (every CI runner) the probe
+    // passes and the full `is_ok()` assertion runs, so nothing is quietly dropped.
+    let run_verdict = dispatch_for(&tool_run, validator_caller_with_run);
+    match &run_verdict {
+        Ok(_) => {}
+        Err(ToolError::Forbidden { tool, caller }) => panic!(
+            "Validator with run_command in prompt must be permitted to execute run_command, \
+             but the gate refused it: tool={tool:?} caller={caller:?}"
+        ),
+        Err(err) => match marmennill::harness::pty::pty_allocation_blocker() {
+            Some(reason) => eprintln!(
+                "SKIP test_prompt_based_tool_gating (leg 1, execution only): this host cannot \
+                 allocate a PTY ({reason}), so run_command cannot execute; the gate verdict is \
+                 still pinned below — the refusal path is `{err}`"
+            ),
+            None => panic!(
+                "Validator with run_command in prompt must be permitted to execute run_command \
+                 (a pty is allocatable here, so this is a real failure): {err:?}"
+            ),
+        },
+    }
     assert!(
-        dispatch_for(&tool_run, validator_caller_with_run).is_ok(),
-        "Validator with run_command in prompt must be permitted to execute run_command"
+        !matches!(run_verdict, Err(ToolError::Forbidden { .. })),
+        "Validator with run_command in prompt must not be gated"
     );
 
     // 2. A Coder whose prompt omits `write_file` is forbidden from `write_file`.
@@ -363,9 +401,12 @@ async fn test_prompt_based_tool_gating() {
 //    dispatches the call, so no verdict state and no verdict file is touched.
 //
 // `test_prompt_based_tool_gating` covers the *advisory* prompt-blueprint layer
-// (a tool named in the prompt is expected to be executable); it is a sanctioned
-// known failure, untouched here. The identity rule asserted below is orthogonal
-// and stronger: no prompt blueprint, allowlist or wildcard namespace widens it.
+// (a tool named in the prompt is expected to be executable). It is not a known
+// product failure: the gate itself is asserted unconditionally there, and only the
+// *execution* leg of that one call is host-gated, because `run_command` needs a
+// real pty that some hosts cannot provide (see the note inside that test). The
+// identity rule asserted below is orthogonal and stronger: no prompt blueprint,
+// allowlist or wildcard namespace widens it.
 
 fn verdict_tool(verdict: &str, comments: &str) -> ToolInvocation {
     ToolInvocation {

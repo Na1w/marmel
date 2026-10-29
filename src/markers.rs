@@ -43,6 +43,7 @@
 //! |---|---|
 //! | [`has_complete_marker`] / [`has_replan_marker`] / [`has_failure_marker`] | `upper.contains("<literal>")` |
 //! | [`has_terminal_marker`] | the three-way "is this a verdict?" triad |
+//! | [`has_revocation_marker`] | the `content.contains(REVOCATION_TOKEN)` a display site would otherwise write |
 //! | [`starts_with_complete`] | `first_line.starts_with("<literal>")` |
 //! | [`decorated`] / [`failed_trailer`] | the ad-hoc `format!` decorations |
 //! | [`revoke_completion`] | the case-sensitive `replace("MISSION COMPLETE", …)` |
@@ -354,6 +355,48 @@ pub fn has_terminal_marker(text: &str) -> bool {
 pub fn starts_with_complete(text: &str) -> bool {
     text.get(..COMPLETE_UPPER.len())
         .is_some_and(|head| head.eq_ignore_ascii_case(COMPLETE_UPPER))
+}
+
+/// `true` when `text` carries a **revocation-shaped** [`REVOCATION_TOKEN`], i.e.
+/// the token [`revoke_completion`] wrote over a completion marker.
+///
+/// Three conditions, and every one of them is load-bearing:
+///
+/// * the token ends at a word boundary, so an identifier or word that merely
+///   starts with it never counts (the same rule the marker-literal scan applies);
+/// * the token is the first non-blank content of its line — the placement it
+///   inherits from the completion marker it replaced, which is where a verdict
+///   is written. A prose "revoked" in the middle of a sentence is not a verdict;
+/// * no completion marker survived anywhere in the text, because revocation
+///   rewrites **every** occurrence in every casing. Text that still spells a
+///   completion next to the word "revoked" only *describes* a revocation.
+///
+/// This is the predicate that lets a display site tell a **revoked** deliverable
+/// apart from a completed or a failed one without re-spelling the token: the
+/// grammar of "was this verdict revoked" stays owned here, and the token itself
+/// never leaks into a call-site format string.
+#[must_use]
+pub fn has_revocation_marker(text: &str) -> bool {
+    let upper = text.to_ascii_uppercase();
+    if upper.contains(COMPLETE_UPPER) {
+        return false;
+    }
+    let map = line_map(&upper);
+    find_all(&upper, REVOCATION_TOKEN)
+        .into_iter()
+        .any(|(start, end)| {
+            placement_of(start, &map, &upper) == Placement::LineStart
+                && whole_marker_token(&upper, end)
+        })
+}
+
+/// `true` when the token ending at `end` is not glued to a longer word or
+/// identifier run (`REVOKED (t-1)` counts, `REVOKED_BY` does not).
+fn whole_marker_token(sanitized: &str, end: usize) -> bool {
+    !sanitized[end..]
+        .chars()
+        .next()
+        .is_some_and(|next| next.is_alphanumeric() || next == '_')
 }
 
 // Failure-verdict vocabulary
@@ -1175,6 +1218,45 @@ mod tests {
         assert!(revoked.contains("FAILED stays"));
         assert_eq!(revoke_completion("no marker at all"), "no marker at all");
         assert_eq!(revoke_completion(""), "");
+    }
+
+    /// The revocation predicate is **shape-aware**, not a substring scan: only the
+    /// token `revoke_completion` wrote over a completion marker counts.
+    #[test]
+    fn has_revocation_marker_reads_the_token_a_revocation_wrote() {
+        // The canonical shape: every casing, the decorated pair, and the whole
+        // rejected-deliverable body the assembler produces.
+        for text in [
+            "REVOKED (t-023)",
+            "revoked (t-023)",
+            "ReVoKeD",
+            "report\n\nREVOKED (t-023)",
+            "report\n\n   REVOKED (t-023)\n\nFAILED (Validator rejected deliverable)",
+        ] {
+            assert!(has_revocation_marker(text), "{text}");
+        }
+        let rejected = revoke_completion(&format!(
+            "VALIDATOR REJECTION: no evidence\n---------------\nreport\n\n{MARKER_COMPLETE} (t-023)"
+        ));
+        assert!(
+            has_revocation_marker(&rejected),
+            "the rejected body is a revoked deliverable: {rejected}"
+        );
+        assert!(!has_complete_marker(&rejected));
+
+        // Prose, glue and a surviving completion are not revocations.
+        for text in [
+            "the arbitrator revoked that instruction earlier in the run",
+            "REVOKED_BY the operator: nothing was revoked here",
+            "REVOKED (t-1)\n\nMISSION COMPLETE (t-1)",
+            "",
+            "no verdict at all",
+        ] {
+            assert!(
+                !has_revocation_marker(text),
+                "not a revocation shape: {text:?}"
+            );
+        }
     }
 
     // ---- failure-verdict vocabulary ----------------------------------------

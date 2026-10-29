@@ -3627,3 +3627,258 @@ async fn test_sink_panel_pump_moves_the_pane_while_its_own_await_is_in_flight() 
 
     drop(guard);
 }
+
+/// Emission-level guard for the **drain** host: the transcript message a completed
+/// steering subtask produces must carry the marker-led verdict line the typed marker
+/// projects, in every verdict shape.
+///
+/// `action::deliverable_verdict_line` is unit-tested on its own, which pins the
+/// projector but not this call site: an edit to the format string here (or dropping
+/// the placeholder) would keep that test green while the pane silently stops showing
+/// `MISSION COMPLETE` / `FAILED:` / `REPLAN REQUIRED` at all. So this drives the real
+/// drain and reads the message back the way the pane does.
+#[test]
+fn test_drain_steer_emits_a_marker_led_verdict_line_for_every_deliverable() {
+    use crate::markers::{self, decorated};
+
+    let task = "t-012emit-drain";
+    let cases: Vec<(MissionMarker, String, String)> = vec![
+        (
+            MissionMarker::Complete {
+                task_id: Some(task.to_string()),
+            },
+            "inspected the panes".to_string(),
+            decorated(markers::MARKER_COMPLETE, task),
+        ),
+        (
+            MissionMarker::Failed {
+                reason: "tests did not run".to_string(),
+            },
+            "I could not finish".to_string(),
+            format!("{}: tests did not run", markers::MARKER_FAILED),
+        ),
+        (
+            MissionMarker::Replan {
+                reason: "the plan misses the migration".to_string(),
+            },
+            "this needs a different plan".to_string(),
+            format!(
+                "{}: the plan misses the migration",
+                decorated(markers::MARKER_REPLAN, task)
+            ),
+        ),
+    ];
+
+    for (marker, content, expected_line) in cases {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut renderer = TestRenderer::new();
+        let mut steer_queue = Vec::new();
+        let mut steer_abort = false;
+
+        tx.send(SteerArbEvent::DelegationCompleted {
+            agent: Agent::Coder,
+            task_id: task.to_string(),
+            deliverable: Deliverable {
+                marker,
+                content: content.clone(),
+                task_id: Some(task.to_string()),
+            },
+        })
+        .expect("the channel is open");
+
+        drain_steer_arbitration_events(
+            &mut rx,
+            &mut renderer,
+            &mut steer_queue,
+            &mut steer_abort,
+            None,
+        );
+
+        let messages: Vec<&String> = renderer
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Message(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            messages.len(),
+            1,
+            "exactly one transcript message per completed subtask, got {:?}",
+            renderer.events
+        );
+        let message = messages[0];
+        let lines: Vec<&str> = message.lines().collect();
+
+        // `["", "[Steering Subtask — coder (t-…)]", "<verdict>", "<body>", ""]`:
+        // the verdict is its own line, and it leads that line.
+        assert_eq!(
+            lines.get(1).copied(),
+            Some(format!("[Steering Subtask — coder ({task})]").as_str()),
+            "the header must stay the second line: {message:?}"
+        );
+        assert_eq!(
+            lines.get(2).copied(),
+            Some(expected_line.as_str()),
+            "the emitted message must carry the marker-led verdict line: {message:?}"
+        );
+        assert!(
+            message.contains(&format!("\n{content}\n")),
+            "the deliverable body must still follow the verdict: {message:?}"
+        );
+    }
+}
+
+/// Emission-level guard for the **paused-stream sink** host: the same message is built
+/// by a second, independent format string (`sink.rs`), and this drives it end to end —
+/// arbitrator decision, delegated subtask, transcript message.
+///
+/// The three verdict shapes are produced the way the live runner produces them: the
+/// subtask body carries the verdict the specialist emitted, and `MissionMarker::parse`
+/// decides the marker the sink projects (a `FAILED` / `REPLAN REQUIRED` in the brief
+/// outranks the canned body's trailing completion, exactly as the FAIL-first rule says).
+/// The completion case is asserted byte-for-byte; the two failure-family cases are
+/// asserted marker-led, because their reason clause is the whole body.
+#[test]
+fn test_bridge_sink_host_emits_a_marker_led_verdict_line_for_its_delegated_subtask() {
+    use crate::markers::{self, MARKER_COMPLETE, MARKER_FAILED, MARKER_REPLAN, decorated};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    with_arbitration_test_lock(async {
+        for (task, prompt, kind) in [
+            (
+                "t-012emit-a",
+                "check the restored pane plumbing",
+                "complete",
+            ),
+            (
+                "t-012emit-b",
+                "report the outcome, then on its own line: FAILED: the fixture refused the brief",
+                "failed",
+            ),
+            (
+                "t-012emit-c",
+                "report the outcome, then on its own line: REPLAN REQUIRED: the plan misses the migration",
+                "replan",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            let decision = serde_json::json!({
+                "decision": "DelegateTask",
+                "response": "Handing that to the coder.",
+                "subtasks": [{
+                    "tool_call_id": task,
+                    "action": "DelegateTask",
+                    "agent_name": "coder",
+                    "prompt": prompt,
+                }],
+            });
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string(sse_chunk(&decision.to_string())),
+                )
+                .mount(&server)
+                .await;
+
+            let client = crate::llm::ChatClient::new_with_token(server.uri(), "mock", "tok");
+            let stats = std::sync::Arc::new(crate::harness::HarnessStats::new());
+            let history =
+                std::sync::Arc::new(std::sync::RwLock::new(Vec::<(String, String)>::new()));
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut renderer = TestRenderer::new();
+            let mut steer_queue = Vec::new();
+            let mut steer_abort = false;
+            let mut subagents: Vec<SubagentDetail> = Vec::new();
+
+            {
+                let mut sink = super::sink::RendererSink {
+                    renderer: &mut renderer,
+                    steer_queue: &mut steer_queue,
+                    steer_abort_requested: &mut steer_abort,
+                    arb_tx: &tx,
+                    arb_rx: &mut rx,
+                    client: &client,
+                    stats: stats.clone(),
+                    goal: "keep the suite green",
+                    subagents: &mut subagents,
+                    plan: None,
+                    ctx: None,
+                    steering_history: Some(history),
+                };
+                let action = crate::llm::StreamSink::on_pause(&mut sink, "steer: check it").await;
+                assert_eq!(action, crate::llm::PauseAction::Resume, "task {task}");
+            }
+
+            let messages: Vec<&String> = renderer
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Message(text) if text.contains("[Steering Subtask") => Some(text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                messages.len(),
+                1,
+                "the sink must emit exactly one steering-subtask message for {task}, got {:?}",
+                renderer.events
+            );
+            let message = messages[0];
+            let lines: Vec<&str> = message.lines().collect();
+            assert_eq!(
+                lines.get(1).copied(),
+                Some(format!("[Steering Subtask — coder ({task})]").as_str()),
+                "the header must stay the second line: {message:?}"
+            );
+            let verdict = lines.get(2).copied().unwrap_or_default();
+            match kind {
+                "complete" => assert_eq!(
+                    verdict,
+                    decorated(MARKER_COMPLETE, task),
+                    "a completed subtask must be completion-led: {message:?}"
+                ),
+                "failed" => {
+                    assert!(
+                        verdict.starts_with(&format!("{MARKER_FAILED}: ")),
+                        "a failed subtask must be failure-led: {message:?}"
+                    );
+                    assert!(
+                        markers::has_failure_marker(verdict),
+                        "the verdict line must carry the failure marker: {message:?}"
+                    );
+                }
+                _ => {
+                    assert!(
+                        verdict.starts_with(&format!("{MARKER_REPLAN} ({task}): ")),
+                        "a replan must be replan-led and decorated with its task: {message:?}"
+                    );
+                    assert!(
+                        markers::has_replan_marker(verdict),
+                        "the verdict line must carry the replan marker: {message:?}"
+                    );
+                }
+            }
+            assert!(
+                message.contains(prompt),
+                "the deliverable body must still be printed after the verdict: {message:?}"
+            );
+
+            // Hygiene: the delegated subtask registers its own worker under this task
+            // id; nothing of this scenario may leak into the process-global registry.
+            for entry in crate::orchestrator::worker_entries() {
+                if entry.key.contains(task) {
+                    crate::orchestrator::workers::remove_worker_entry_for_test(&entry.key);
+                }
+            }
+            assert!(
+                crate::orchestrator::worker_entries()
+                    .iter()
+                    .all(|entry| !entry.key.contains(task)),
+                "the scenario must leave no registry row behind: {task}"
+            );
+        }
+    });
+}

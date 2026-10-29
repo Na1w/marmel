@@ -1,10 +1,41 @@
 use super::*;
 
+/// Host-capability gate for the PTY-dependent tests in this file.
+///
+/// A PTY is a **host capability**, not a product behaviour. Where the OS cannot
+/// hand out a pty — on Linux a `devpts` mount with `ptmxmode=000` leaves
+/// `/dev/pts/ptmx` at mode `000` and `openpty()` answers `EACCES` — every test in
+/// this file that drives a real pty is un-runnable *on that host*, on a pristine
+/// tree, with correct product code. Failing them there reports a defect that does
+/// not exist; `#[ignore]` hides them everywhere, including the CI runners that do
+/// have `/dev/pts` and where the assertions are meaningful.
+///
+/// So the gate is the runtime probe in [`pty_allocation_blocker`], and a skip is
+/// always announced, in the `SKIP ` spelling already pinned by
+/// `test_sandbox_tests_never_rebuild_the_binary_path_from_a_name` and used by
+/// `integration_host` in `src/harness/sandbox.rs:1637`. On a PTY-capable host
+/// (every CI runner in `.github/workflows/ci.yml`) the probe passes and every
+/// assertion below runs unconditionally.
+fn pty_or_skip(test: &str) -> bool {
+    match pty_allocation_blocker() {
+        None => true,
+        Some(reason) => {
+            eprintln!(
+                "SKIP {test}: this host cannot allocate a PTY ({reason}), so real-pty behaviour cannot be exercised here"
+            );
+            false
+        }
+    }
+}
+
 /// Spawning a background sleep loop and tearing down the PTY leaves zero orphan
 /// processes — the backgrounded child dies with the group.
 #[test]
 #[cfg(unix)]
 fn test_harness_pty_process_group_kill() {
+    if !pty_or_skip("harness::pty::tests::test_harness_pty_process_group_kill") {
+        return;
+    }
     let temp = tempfile::tempdir().unwrap();
     let dir = temp.path();
     let pidfile = dir.join("bg.pid");
@@ -90,6 +121,9 @@ fn test_sanitize_terminal_output_strips_bell_and_osc() {
 
 #[test]
 fn test_run_command_parses_timeout_seconds_argument() {
+    if !pty_or_skip("harness::pty::tests::test_run_command_parses_timeout_seconds_argument") {
+        return;
+    }
     #[cfg(unix)]
     let cmd = "sleep 10";
     #[cfg(windows)]
@@ -105,6 +139,9 @@ fn test_run_command_parses_timeout_seconds_argument() {
 
 #[tokio::test]
 async fn test_interactive_pty_manager_lifecycle() {
+    if !pty_or_skip("harness::pty::tests::test_interactive_pty_manager_lifecycle") {
+        return;
+    }
     let mgr = PtyManager::new();
     let cwd = std::env::current_dir().unwrap();
     let session_id = "test-session-1";
@@ -162,6 +199,9 @@ async fn test_interactive_pty_manager_lifecycle() {
 
 #[tokio::test]
 async fn test_run_command_pty_cancelled_by_worker_token() {
+    if !pty_or_skip("harness::pty::tests::test_run_command_pty_cancelled_by_worker_token") {
+        return;
+    }
     let token = tokio_util::sync::CancellationToken::new();
     let token_clone = token.clone();
 

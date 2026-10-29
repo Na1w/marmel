@@ -177,6 +177,32 @@ pub struct SubagentPanel {
     /// without it the pane comes back in the wrong state. `None` = no entry.
     #[serde(default)]
     pub is_thinking: Option<bool>,
+
+    // ---- queue / arbitration-pause state (design §9.4 D2) ----
+    //
+    // Both arrive as `#[serde(default)]` with a default that is exactly what
+    // `Default` produces, so an `ui.json` written before these fields existed still
+    // parses and `SCHEMA_VERSION` is unchanged. Nothing else may change here:
+    // `deny_unknown_fields` stays, and no existing field is renamed or retyped.
+    /// Concurrency-slot queue state — the durable twin of
+    /// [`crate::ui::SubagentDetail::queue`]. `None` = the row was not waiting for a
+    /// backend slot at capture instant.
+    #[serde(default)]
+    pub queue: Option<QueuePanel>,
+    /// Whether this worker's stream was held by steering arbitration at capture
+    /// instant — the durable twin of [`crate::ui::SubagentDetail::paused`].
+    #[serde(default)]
+    pub paused: bool,
+}
+
+/// Durable projection of [`crate::ui::QueueState`]: a 1-based FIFO rank and the
+/// queue depth that contains it. Kept as its own struct so the pair can be
+/// `Option`-wrapped (absent = not waiting) instead of encoded as two sentinels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueuePanel {
+    pub position: usize,
+    pub of: usize,
 }
 
 /// Persistence mirror of `ui::transcript::UiRecord` — the same 8 variants, the
@@ -244,8 +270,13 @@ pub struct ViewState {
     pub subagent_scroll: u16,
     pub subagent_list_scroll: u16,
     pub selected_subagent_idx: usize,
-    /// `"chat" | "plan" | "subagents"` — mirrors `FocusedPanel`; a value outside
-    /// that set is a refusal (U-chk).
+    /// `"chat" | "input" | "plan" | "subagents"` — the pane that held focus; a
+    /// value outside [`FOCUSED_PANELS`] is a refusal (U-chk). `"chat"` is the
+    /// transcript pane in the spelling every pre-D2 bundle already holds, and it
+    /// keeps that meaning; `"input"` is the composer (design §9.4 D2), the pane
+    /// the legacy `FocusedPanel` enum had no variant for and therefore could not
+    /// spell. One token per pane, in both directions, so a capture → restore
+    /// cycle loses no focus (spec §10 item 18).
     pub focused_panel: String,
     pub show_thought: bool,
     pub show_subagent_panel: bool,
@@ -257,14 +288,38 @@ pub struct ViewState {
     pub chat_auto_scroll: bool,
     pub subagent_autoscroll: bool,
     pub plan_auto_scroll: bool,
+    // ---- the rebuilt view state (design §9.4 D2, spec §10 item 18) ----
+    //
+    // Both arrive as `#[serde(default)]` with a default that is exactly what
+    // `Default` produces, so a `ui.json` written before they existed still parses
+    // and `SCHEMA_VERSION` is unchanged. `None` is load-bearing rather than a
+    // sentinel: it means "this bundle predates the field", and the loader then
+    // derives the value from the pre-rebuild field the older binary *did* write
+    // (the mode from the two pane toggles, follow from `chat_auto_scroll`), which
+    // is what such a bundle restored before D2. Inventing a mode or an off-flag
+    // for a bundle that never stated one is not on the table.
+    /// `"transcript" | "plan" | "workers" | "split"` — the mode the frame was
+    /// drawing (spec §4.1), spelled by the same table the view model uses; a
+    /// `Some` value outside [`VIEW_MODES`] is a refusal (U-chk).
+    #[serde(default)]
+    pub view_mode: Option<String>,
+    /// Transcript follow (spec G7: `LIVE` vs `↓ N new`). It is the operator's own
+    /// decision and not a reading of `chat_auto_scroll`, even though the two are
+    /// kept in step while a session is live.
+    #[serde(default)]
+    pub follow: Option<bool>,
 }
 
 /// Hand-written rather than derived on purpose: `#[derive(Default)]` would give
-/// `focused_panel: ""`, which U-chk refuses. The default here mirrors
-/// the renderer's own initial state — `focused_panel: FocusedPanel::Chat`,
-/// `show_thought`/`show_subagent_panel`/`show_plan_panel` all false — so a
-/// hand-built `UiSection::default()` is a *loadable* bundle. Every field added
-/// later keeps that property: its serde default is the same value written here.
+/// `focused_panel: ""`, which U-chk refuses, and then `UiSection::default()`
+/// would not be a loadable bundle. What is written here **is** that bundle: the
+/// body pane named, every pane toggle off. It is not a captured frame — a
+/// rebuilt renderer boots with the composer focused, and since D2 a capture
+/// spells that `"input"` (design §9.4). Every field added later keeps the
+/// loadable property: its serde default is the same value written here, which
+/// for the two D2 fields is `None`: the default bundle says nothing about the
+/// mode or the follow flag, exactly like a pre-D2 bundle, and the loader derives
+/// both from the fields this struct has always carried.
 impl Default for ViewState {
     fn default() -> Self {
         ViewState {
@@ -280,6 +335,8 @@ impl Default for ViewState {
             chat_auto_scroll: false,
             subagent_autoscroll: false,
             plan_auto_scroll: false,
+            view_mode: None,
+            follow: None,
         }
     }
 }
@@ -294,8 +351,20 @@ pub struct BudgetWitness {
     pub default_thinking_budget: usize,
 }
 
-/// The legal `ViewState::focused_panel` spellings.
-pub const FOCUSED_PANELS: &[&str] = &["chat", "plan", "subagents"];
+/// The legal `ViewState::focused_panel` spellings — one token per focusable pane,
+/// and the set the loader refuses everything else against.
+///
+/// `"chat"` is the transcript pane in the spelling every pre-D2 bundle carries,
+/// and it keeps meaning that pane; `"input"` is D2's addition for the composer
+/// (spec §4.2, §10 item 18), the one pane the legacy `FocusedPanel` enum had no
+/// variant for, which is why a composer focus used to be unrecoverable. Do not
+/// rename `"chat"`: the point of D2 is that an old bundle still restores.
+pub const FOCUSED_PANELS: &[&str] = &["chat", "input", "plan", "subagents"];
+
+/// The legal `ViewState::view_mode` spellings (spec §4.1, M1–M4). An **absent**
+/// `view_mode` is legal too — that is what a pre-D2 bundle holds — but a present
+/// one outside this set is a refusal (U-chk), never a silent M1.
+pub const VIEW_MODES: &[&str] = &["transcript", "plan", "workers", "split"];
 
 impl UiSection {
     /// U-chk: the structural state `ui.json` must be in before any assignment.
@@ -327,6 +396,16 @@ impl UiSection {
             out.push(format!(
                 "view.focused_panel {:?} is not one of {FOCUSED_PANELS:?}",
                 self.view.focused_panel
+            ));
+        }
+        // An absent mode is a pre-D2 bundle and is not a violation; a stated one
+        // has to be a mode this binary can draw. Refusing it is what keeps a
+        // typo (`"M4"` instead of `"split"`) from quietly becoming M1.
+        if let Some(mode) = &self.view.view_mode
+            && !VIEW_MODES.contains(&mode.as_str())
+        {
+            out.push(format!(
+                "view.view_mode {mode:?} is not one of {VIEW_MODES:?}"
             ));
         }
         if let Some(idx) = self.composer.history_index
@@ -382,5 +461,230 @@ impl UiSection {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One panel with every field carrying something distinguishable.
+    fn panel() -> SubagentPanel {
+        SubagentPanel {
+            name: "coder-t-012".to_string(),
+            task_id: Some("t-012".to_string()),
+            prompt: "plumb the panes".to_string(),
+            logs: vec!["started task t-012".to_string()],
+            thinking: String::new(),
+            content: "done".to_string(),
+            is_active: true,
+            context_tokens: 12,
+            worked_duration_secs: 3.5,
+            started_at: Some(TimePoint::now()),
+            last_activity_at: Some(TimePoint::now()),
+            turn_thinking: None,
+            is_thinking: Some(true),
+            queue: Some(QueuePanel { position: 2, of: 3 }),
+            paused: true,
+        }
+    }
+
+    fn section_with(panel: &SubagentPanel) -> UiSection {
+        UiSection {
+            subagent_panels: vec![panel.clone()],
+            ..UiSection::default()
+        }
+    }
+
+    /// D2 round trip: the queue pair and the arbitration pause survive the durable
+    /// format byte-for-byte, so a restore puts the row back in the state the screen
+    /// was showing instead of downgrading it to a running row.
+    #[test]
+    fn the_queue_pair_and_the_pause_round_trip_through_the_durable_format() {
+        // One fixture value: `TimePoint::now()` re-samples on every call, so building
+        // the expectation twice would compare two different clocks.
+        let fixture = panel();
+        let encoded =
+            serde_json::to_string(&section_with(&fixture)).expect("a section always serialises");
+        let decoded: UiSection = serde_json::from_str(&encoded).expect("our own output re-reads");
+        assert_eq!(decoded.subagent_panels, vec![fixture.clone()]);
+        let restored = &decoded.subagent_panels[0];
+        assert_eq!(
+            restored.queue,
+            Some(QueuePanel { position: 2, of: 3 }),
+            "the rank the pane was showing is still there: {encoded}"
+        );
+        assert!(restored.paused, "the held stream is still marked held");
+    }
+
+    /// Backwards compatibility: a `ui.json` written **before** D2 carries neither
+    /// `queue` nor `paused`. Both arrive as `#[serde(default)]`, so the older bundle
+    /// loads and the row comes back without either state — which is exactly what the
+    /// older binary produced, and never an invented position.
+    #[test]
+    fn a_panel_written_before_the_queue_and_pause_fields_still_loads() {
+        let mut value = serde_json::to_value(section_with(&panel())).expect("serialisable");
+        let panels = value["subagent_panels"]
+            .as_array_mut()
+            .expect("one panel in the fixture");
+        let removed = ["queue", "paused"];
+        for entry in panels.iter_mut() {
+            let object = entry.as_object_mut().expect("a panel object");
+            for field in removed {
+                assert!(
+                    object.remove(field).is_some(),
+                    "the fixture must really carry {field} before it is stripped"
+                );
+            }
+        }
+        let decoded: UiSection =
+            serde_json::from_value(value).expect("a pre-D2 bundle must still load");
+        let restored = &decoded.subagent_panels[0];
+        assert_eq!(
+            restored.queue, None,
+            "no rank was recorded, none is claimed"
+        );
+        assert!(!restored.paused, "no pause was recorded, none is claimed");
+        // Everything the older binary did record still arrives unchanged.
+        assert_eq!(restored.name, "coder-t-012");
+        assert_eq!(restored.context_tokens, 12);
+        assert_eq!(restored.logs, vec!["started task t-012".to_string()]);
+        assert_eq!(restored.worked_duration_secs, 3.5);
+        assert_eq!(restored.is_thinking, Some(true));
+    }
+
+    /// The D2 fields were added without loosening the contract: `deny_unknown_fields`
+    /// still refuses a bundle carrying a field this binary does not know, so a
+    /// newer writer is a version mismatch and never a half-read pane.
+    #[test]
+    fn adding_fields_with_defaults_did_not_open_the_reader_to_unknown_ones() {
+        let mut value = serde_json::to_value(panel()).expect("serialisable");
+        value.as_object_mut().expect("a panel object").insert(
+            "written_by_a_newer_release".to_string(),
+            serde_json::json!(1),
+        );
+        let err = serde_json::from_value::<SubagentPanel>(value)
+            .expect_err("an unknown field must be refused, not ignored");
+        assert!(
+            err.to_string().contains("written_by_a_newer_release"),
+            "the refusal names the offending field: {err}"
+        );
+    }
+
+    /// `SCHEMA_VERSION` stays at 1 and `UiSection::default()` stays a loadable
+    /// bundle: the new fields default to exactly what `Default` produces, so an old
+    /// `ui.json` needs no migration and the default section still passes its own
+    /// structural check.
+    #[test]
+    fn the_default_section_is_still_a_loadable_bundle_with_the_new_fields_present() {
+        let encoded = serde_json::to_string(&UiSection::default()).expect("serialisable");
+        let decoded: UiSection =
+            serde_json::from_str(&encoded).expect("the default section re-reads");
+        assert_eq!(decoded, UiSection::default());
+        assert!(
+            UiSection::default().structural_violations().is_empty(),
+            "the default bundle must stay loadable"
+        );
+        // A queued, paused row adds no structural violation either: the pair is a
+        // display state, and the registry — not the bundle — stays the authority that
+        // moves or retires it from here on.
+        let with_queue = section_with(&panel());
+        assert!(
+            with_queue.structural_violations().is_empty(),
+            "{with_queue:?}"
+        );
+    }
+
+    /// D2's view half: the mode, the focused pane — including the composer, which
+    /// the legacy `FocusedPanel` enum had no variant for and therefore could not
+    /// spell — and the follow flag are durable, so a restore repaints the screen
+    /// the capture took instead of the closest thing the pre-rebuild fields could
+    /// describe (spec §9.4, §10 item 18).
+    #[test]
+    fn the_mode_the_focus_and_the_follow_flag_round_trip_through_the_durable_format() {
+        let mut section = UiSection::default();
+        section.view.focused_panel = "input".to_string();
+        section.view.view_mode = Some("split".to_string());
+        section.view.follow = Some(false);
+        section.view.chat_auto_scroll = false;
+        assert!(
+            section.structural_violations().is_empty(),
+            "a composer focus and a stated mode must be loadable: {:?}",
+            section.structural_violations()
+        );
+
+        let encoded = serde_json::to_string(&section).expect("a section always serialises");
+        let decoded: UiSection = serde_json::from_str(&encoded).expect("our own output re-reads");
+        assert_eq!(decoded, section);
+        assert_eq!(
+            decoded.view.focused_panel, "input",
+            "the composer keeps its own token: {encoded}"
+        );
+        assert_eq!(decoded.view.view_mode.as_deref(), Some("split"));
+        assert_eq!(
+            decoded.view.follow,
+            Some(false),
+            "follow off is recorded, never defaulted to on"
+        );
+    }
+
+    /// Backwards compatibility: an `ui.json` written **before** D2 carries neither
+    /// `view_mode` nor `follow`, and its `focused_panel` is one of the three
+    /// pre-D2 spellings. `deny_unknown_fields` only refuses fields the reader does
+    /// not know, so the older bundle still loads — and it comes back with the two
+    /// new fields *unclaimed*, which is the loader's cue to derive them from the
+    /// toggles and the auto-scroll mirror the older binary did write.
+    #[test]
+    fn a_view_written_before_the_mode_and_follow_fields_still_loads_unclaimed() {
+        let mut value = serde_json::to_value(UiSection::default()).expect("serialisable");
+        let view = value["view"].as_object_mut().expect("a view object");
+        for field in ["view_mode", "follow"] {
+            assert!(
+                view.remove(field).is_some(),
+                "the fixture must really carry {field} before it is stripped"
+            );
+        }
+        let decoded: UiSection =
+            serde_json::from_value(value).expect("a pre-D2 view must still load");
+        assert_eq!(
+            decoded.view.view_mode, None,
+            "no mode was recorded, none is claimed"
+        );
+        assert_eq!(
+            decoded.view.follow, None,
+            "no follow flag was recorded, none is claimed"
+        );
+        assert_eq!(
+            decoded.view.focused_panel, "chat",
+            "the pre-D2 focus token is still in the legal set"
+        );
+        assert!(
+            decoded.structural_violations().is_empty(),
+            "an older bundle must not become a refusal because it predates a field: {:?}",
+            decoded.structural_violations()
+        );
+        // The pre-D2 spellings all survive a rename-free extension.
+        for token in ["chat", "plan", "subagents"] {
+            let mut older = decoded.clone();
+            older.view.focused_panel = token.to_string();
+            assert!(
+                older.structural_violations().is_empty(),
+                "{token} must stay legal"
+            );
+        }
+    }
+
+    /// The new mode check is a check, not a repair: a mode the bundle *states*
+    /// outside the set is refused by name, never quietly taken as M1.
+    #[test]
+    fn a_stated_mode_outside_the_set_is_a_violation_and_never_a_default() {
+        let mut section = UiSection::default();
+        section.view.view_mode = Some("M4".to_string());
+        let violations = section.structural_violations();
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("view.view_mode") && violations[0].contains("\"M4\""),
+            "the refusal names the field and the value at fault: {violations:?}"
+        );
     }
 }

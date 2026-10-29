@@ -20,7 +20,14 @@
 //!   `PendingNotice` — with `Restored` as the outcome and the worker keys as
 //!   subjects; the restored cancellation token provably is **not** the old one,
 //!   the worker is reported as non-cancellable until re-armed, and nothing in the
-//!   restore path re-launches it.
+//!   restore path re-launches it;
+//! * the **cancellation** (spec §10 item 17): a named cancellation fires exactly
+//!   one live worker's token and labels exactly one entry `Aborted`, while the
+//!   broadcast the confirm surface's `CancelAll` arm runs fires every live
+//!   worker's token, labels every entry `Aborted` and is the only thing that
+//!   touches the process-wide cancellation token — the two are recorded, not
+//!   inferred, and the request half that decides which of them runs is pinned in
+//!   `src/ui/tui/tests_new_ui.rs` (§10 item 17).
 //!
 //! ## How each authority is observed
 //!
@@ -35,7 +42,12 @@
 //!   only public mirror of the crate's private pane fields;
 //! * the **live worker** is read through the same registry production uses
 //!   (`orchestrator::workers::worker_state_snapshot`, `session::registry_get`,
-//!   `orchestrator::notice::worker_inbox_len`).
+//!   `orchestrator::notice::worker_inbox_len`);
+//! * the **cancellation** is read through two more of production's own seams: the
+//!   live registry (one `CancellationToken` per fixture worker, plus the entry's
+//!   `status` label) and `orchestrator::set_status_sender` — the status sender
+//!   `run_session` installs — which records the cancellation sentence each path
+//!   emitted, per worker.
 //!
 //! ## Honest limits, stated instead of hidden
 //!
@@ -504,6 +516,10 @@ impl PanelFixture {
             last_activity_at: self.last_activity_at.clone(),
             turn_thinking: self.turn_thinking.clone(),
             is_thinking: self.is_thinking,
+            // D2 fields: this fixture describes a panel with no queue rank and no
+            // pause, which is exactly what an older session file carries too.
+            queue: None,
+            paused: false,
         }
     }
 }
@@ -2702,4 +2718,216 @@ fn ac_a3_the_restored_token_is_not_the_old_one_and_nothing_in_the_restore_re_lau
     assert_bundle_bytes_unchanged(&bundle, &before);
 
     cleanup(&bundle);
+}
+
+// ---------------------------------------------------------------------------
+// §10 item 17 — the cancellation the UI emits, and the one it never emits
+// ---------------------------------------------------------------------------
+
+/// The status label the process-global registry holds for one live worker.
+fn registry_status(key: &str) -> String {
+    workers::worker_state_snapshot(key)
+        .map(|state| state.info.status)
+        .unwrap_or_else(|| panic!("the fixture lost its entry for {key}"))
+}
+
+/// Drain what the recording seam has captured so far.
+fn drain_status(receiver: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Ok(line) = receiver.try_recv() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// Keep the recorded sentences that address this fixture's own workers, sorted.
+/// Other fixtures in this file leave live entries in the shared registry (a
+/// restored worker is inserted live and stays live), and a broadcast addresses
+/// every live entry there is — so the witness states what happened to **these**
+/// workers instead of pretending the table holds nothing else.
+fn about_mine(lines: Vec<String>, keys: &[String]) -> Vec<String> {
+    let mut kept: Vec<String> = lines
+        .into_iter()
+        .filter(|line| keys.iter().any(|key| line.contains(key.as_str())))
+        .collect();
+    kept.sort();
+    kept
+}
+
+/// Re-arm the process-wide cancellation token when the test leaves — **including
+/// when it leaves by panic**. The broadcast fires that token, and a later test in
+/// this binary attaches a fresh child of it to a restored worker (`ac-a3`), so a
+/// witness that cancels it must never hand a cancelled one onwards.
+struct GlobalTokenGuard;
+
+impl Drop for GlobalTokenGuard {
+    fn drop(&mut self) {
+        marmennill::orchestrator::reset_cancellation();
+    }
+}
+
+/// Item 17 at the integration layer: a cancellation is a **registry fact**, and
+/// the named spelling and the broadcast produce two different facts.
+///
+/// The request half of item 17 — `x` and `/cancel <id>` emitting
+/// `ConfirmAction::CancelWorker { key, task_id }` while `/cancel-all` emits
+/// `ConfirmAction::CancelAll` — is pinned in the lib suite, because both
+/// `ConfirmAction` and the keymap's one-event seam (`TuiRenderer::apply_terminal_event`)
+/// are `pub(crate)`: an integration test cannot put a request on the confirm
+/// surface at all. What only THIS layer can pin honestly is the **executed**
+/// cancellation, because the broadcast the `CancelAll` arm runs is one call to
+/// `orchestrator::cancel_all()` (`src/ui/tui/events.rs:991`) — the identical call
+/// the TUI's public user-exit seam runs (`src/ui/tui/mod.rs:2125`), which is the
+/// seam this harness can drive on a real `TuiRenderer`. Sweeping the registry is
+/// safe here and only here: this file owns the whole binary, every test in it is
+/// serialized by `registry_lock`, and the process-wide token the same call fires
+/// is re-armed by `GlobalTokenGuard` — a restored worker in `ac-a3` takes a fresh
+/// child of it, so a witness that cancelled it must hand a re-armed one onwards.
+///
+/// The witnesses are the facts a cancellation leaves behind, never prose:
+///
+/// * every live worker's own `CancellationToken` — fired or still armed;
+/// * the entry's registry `status` — `"In Progress"` vs `"Aborted"`
+///   (`src/orchestrator/workers.rs:1470` names one worker, `:1494` the broadcast);
+/// * the process-wide token, which only the broadcast owns (`bus.rs:38`);
+/// * production's own status channel (`orchestrator::set_status_sender` — the very
+///   sender `run_session` installs), which **records** the sentence each cancel
+///   path emitted, per worker: `"[Steering] Cancelled active specialist worker
+///   '…'"` for the named path, `"[Steering] Aborted active specialist worker
+///   '…'"` for the broadcast.
+#[test]
+fn ac_a4_a_named_cancellation_reaches_one_worker_while_the_broadcast_reaches_every_one() {
+    let _guard = registry_lock();
+
+    // Start from a known process-wide token, and keep a handle on it: the
+    // broadcast fires the token that is installed at the moment it runs.
+    marmennill::orchestrator::reset_cancellation();
+    let _token = GlobalTokenGuard;
+    let global = marmennill::orchestrator::global_cancellation_token();
+    assert!(
+        !global.is_cancelled(),
+        "AC-A4 fixture: the process-wide token must start armed"
+    );
+
+    // Three live workers, each with a token of its own — the shape a running
+    // round leaves in the registry.
+    let planted: Vec<(String, CancellationToken, workers::ActiveWorkerGuard)> = (0..3)
+        .map(|index| {
+            let token = CancellationToken::new();
+            let guard = workers::register_active_worker_with_token(
+                Some(format!("t-9017{index}")),
+                Agent::Coder.as_str().to_string(),
+                format!("t017e cancellation witness {index}"),
+                Some(token.clone()),
+            );
+            (guard.0.clone(), token, guard)
+        })
+        .collect();
+    let keys: Vec<String> = planted.iter().map(|(key, ..)| key.clone()).collect();
+    for key in &keys {
+        assert_eq!(
+            registry_status(key),
+            "In Progress",
+            "AC-A4 fixture: {key} must be live and unlabelled"
+        );
+    }
+
+    // The recording seam: the status channel production itself installs, so what
+    // is recorded is the sentence the cancel path actually emitted.
+    let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    marmennill::orchestrator::set_status_sender(status_tx);
+
+    // 1. The named path — exactly what a confirmed `CancelWorker { key, task_id }`
+    //    hands the registry (`src/ui/tui/events.rs:950`): the row's key and its
+    //    task id, nothing else.
+    let named = keys[1].clone();
+    assert!(
+        marmennill::orchestrator::cancel_active_worker(Some(&named), Some("t-90171")),
+        "AC-A4: the named cancellation must find the live worker it names"
+    );
+    assert_eq!(
+        about_mine(drain_status(&mut status_rx), &keys),
+        vec![format!(
+            "[Steering] Cancelled active specialist worker '{named}'"
+        )],
+        "AC-A4: the named path emits exactly one cancellation, for the worker it names"
+    );
+    assert!(
+        planted[1].1.is_cancelled(),
+        "AC-A4: the named worker's own token did not fire"
+    );
+    for index in [0usize, 2] {
+        assert!(
+            !planted[index].1.is_cancelled(),
+            "AC-A4: the named cancellation swept {} it did not name",
+            keys[index]
+        );
+        assert_eq!(
+            registry_status(&keys[index]),
+            "In Progress",
+            "AC-A4: the named cancellation relabelled {} it did not name",
+            keys[index]
+        );
+    }
+    assert_eq!(
+        registry_status(&named),
+        "Aborted",
+        "AC-A4: the cancelled row is not labelled aborted"
+    );
+    assert!(
+        !global.is_cancelled(),
+        "AC-A4: a named cancellation reached the process-wide token, i.e. it was \
+         a broadcast"
+    );
+
+    // 2. The broadcast — the `cancel_all()` the `CancelAll` arm runs, reached
+    //    through the renderer's own public exit seam.
+    let mut renderer = TuiRenderer::new();
+    renderer.request_user_exit();
+    assert!(
+        marmennill::ui::Renderer::user_exit_requested(&renderer),
+        "AC-A4: the renderer did not record the exit it just requested"
+    );
+
+    let emitted = about_mine(drain_status(&mut status_rx), &keys);
+    // One sentence per **live** entry — and all three are still live entries,
+    // because a cancellation labels an entry `Aborted` without closing it
+    // (`completed_seq` stays `None`). That is the observable difference between
+    // the two paths: the named one touched one worker, the broadcast touched
+    // every one, including the worker the named path had already cancelled.
+    let mut expected: Vec<String> = keys
+        .iter()
+        .map(|key| format!("[Steering] Aborted active specialist worker '{key}'"))
+        .collect();
+    expected.sort();
+    assert_eq!(
+        emitted, expected,
+        "AC-A4: the broadcast must emit one sentence per live worker"
+    );
+    for (index, (_, token, _)) in planted.iter().enumerate() {
+        assert!(
+            token.is_cancelled(),
+            "AC-A4: the broadcast left {} armed",
+            keys[index]
+        );
+    }
+    for key in &keys {
+        assert_eq!(
+            registry_status(key),
+            "Aborted",
+            "AC-A4: the broadcast left {key} unlabelled"
+        );
+    }
+    assert!(
+        global.is_cancelled(),
+        "AC-A4: the broadcast did not fire the process-wide token"
+    );
+
+    // 3. The teardown the session loop performs afterwards, so the witness leaves
+    //    the process as it found it rather than cancelled for every later test.
+    renderer.clear_abort();
+    assert!(
+        !marmennill::orchestrator::global_cancellation_token().is_cancelled(),
+        "AC-A4: `clear_abort` did not re-arm the process-wide token"
+    );
 }

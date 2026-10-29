@@ -4,12 +4,19 @@ mod events;
 pub mod formatting;
 mod render;
 
+mod components;
+mod layout;
+mod state;
+mod theme;
+
 pub use formatting::*;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_new_ui;
 
-use super::{Event, Renderer, SubagentDetail};
+use super::{Event, Renderer, SteerStage, SteerTrace, SubagentDetail};
 use crate::config::Config;
 use crate::orchestrator::OrchestratorManager;
 use anyhow::Result;
@@ -24,7 +31,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
-use std::io;
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
@@ -37,13 +44,42 @@ pub(crate) enum FocusedPanel {
     Subagents,
 }
 
+/// The last value the renderer itself wrote on each legacy view field.
+///
+/// The rebuilt view state (`view_mode` / `focus` / `follow`) is authoritative,
+/// but the key path of `events.rs` still writes the pre-rebuild fields
+/// (`show_plan_panel`, `show_subagent_panel`, `focused_panel`) directly until
+/// t-011 routes those keys through the transition helpers here. Comparing the live
+/// field against this mirror tells [`TuiRenderer::adopt_legacy_view_writes`] the
+/// one thing it needs to know: did somebody write behind the API? A mirror the API
+/// keeps current therefore fires exactly once per legacy write, and never re-reads
+/// a mode, a focus or a follow flag out of a pane toggle the operator has already
+/// moved. `chat_auto_scroll` is no longer written behind the API at all — it is the
+/// `follow` projection maintained by [`TuiRenderer::project_follow_mirror`] — so
+/// its entry here only ever records what the transitions wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LegacyViewMirror {
+    /// Last seen `show_plan_panel`.
+    pub(crate) plan_visible: bool,
+    /// Last seen `show_subagent_panel`.
+    pub(crate) workers_visible: bool,
+    /// Last seen `focused_panel`.
+    pub(crate) focus: FocusedPanel,
+    /// Last seen `chat_auto_scroll`.
+    pub(crate) follow: bool,
+    /// Last seen result of [`TuiRenderer::is_abort_armed`]. Arming is edge
+    /// triggered so an expiry (the 3 s window lapsing on its own) closes the
+    /// Confirm overlay exactly once instead of re-opening it every frame.
+    pub(crate) abort_armed: bool,
+}
+
 /// Status-line substrings that mean "a turn is in flight, keep animating".
 ///
-/// One source of truth for the two places that must never drift apart: the
-/// render-loop throttle tier in [`TuiRenderer::drain_and_throttle_flush`] (a
-/// spinner-only repaint every 125 ms while nothing else is dirty) and the
-/// activity indicator in [`TuiRenderer::render_status`]. If they disagree, a
-/// frame can be animating in one panel and frozen in the other.
+/// One source of truth for the animation gate: the render-loop throttle tier in
+/// [`TuiRenderer::drain_and_throttle_flush`] (a spinner-only repaint every 125 ms
+/// while nothing else is dirty) reads this list, and the pane labels spell the
+/// same words. If the two drifted apart, a frame could be animating in one panel
+/// and frozen in the other.
 ///
 /// Both spellings of the concurrency-slot keyword are listed deliberately: the
 /// gate reports a slot wait as lowercase status traffic
@@ -75,6 +111,104 @@ pub(crate) const ACTIVITY_STATUS_KEYWORDS: &[&str] = &[
     "Paused",
 ];
 
+/// One error kept in renderer state so the failure outlives the status line that
+/// carried it (spec §8.5).
+///
+/// Two parts, both verbatim copies of reported traffic:
+///
+/// * [`Self::category`] — the categorical cause the session loop reported
+///   (`helpers::classify_llm_error` produces the vocabulary: `http`, `connectivity`,
+///   `timeout`, `stream`, `unknown`; `System Error` is the transport/panic class).
+///   This is the half a one-line status can show.
+/// * [`Self::detail`] — the **whole** reported text, multi-line included. §7.4 keeps
+///   only the first line in `status_line`; the buffer keeps all of it, which is what
+///   makes the recall worth printing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StickyError {
+    /// The categorical cause, e.g. `http` for `LLM error: http (Ready)`.
+    pub(crate) category: String,
+    /// The full error text, verbatim.
+    pub(crate) detail: String,
+}
+
+/// Whether one line is error traffic this renderer should remember.
+///
+/// The spellings are exactly the ones `events.rs::error_line` recognises when `e`
+/// recalls (the `e`/`/error` handler is frozen), plus nothing else: recording a line
+/// the recall path cannot reach would create a second truth the key path never
+/// reads. Every line matched here is a line the session loop pushes into the
+/// transcript, so the remembered error and the recalled error are the same bytes.
+fn is_error_traffic_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("LLM error")
+        || trimmed.starts_with("System Error")
+        || trimmed.starts_with('✗')
+        || trimmed.contains("LLM error:")
+}
+
+/// Project one piece of error traffic onto the §8.5 buffer, or `None` when the text
+/// carries no error traffic at all.
+///
+/// The category is read out of the categorical spelling the loop emits
+/// (`LLM error: <category> …`); when a line carries no category clause the line
+/// itself is the category rather than a guessed one.
+fn sticky_error_from(text: &str) -> Option<StickyError> {
+    let line = text.lines().find(|line| is_error_traffic_line(line))?;
+    let line = line.trim();
+    let category = match line.to_ascii_lowercase().split_once("llm error:") {
+        Some((_, rest)) => rest
+            .trim()
+            .split(['(', ':'])
+            .next()
+            .map(str::trim)
+            .filter(|word| !word.is_empty())
+            .unwrap_or("llm error")
+            .to_string(),
+        None if line.starts_with("System Error") => "System Error".to_string(),
+        None if line.starts_with('✗') => line
+            .trim_start_matches('✗')
+            .split_whitespace()
+            .next()
+            .unwrap_or("error")
+            .to_string(),
+        None => line.to_string(),
+    };
+    Some(StickyError {
+        category,
+        detail: text.to_string(),
+    })
+}
+
+/// Mirror the worker lifecycle the registry already carries onto the pane rows
+/// (plumbing delta D1, design §9.3).
+///
+/// Everything below already exists on [`crate::orchestrator::WorkerEntry`]
+/// (`status_label`, `implementation_turns`, `validation_rounds`,
+/// `latest_validator_feedback`) and used to be dropped at the UI boundary, which is
+/// why a finished row could only ever read `✓ done` and why the `val N` field stayed
+/// switched off (§8.4 gate). One registry snapshot per pass, joined on the
+/// **effective registry key** — the same key the row projection uses — so no label
+/// string is parsed and no counter is invented here.
+///
+/// A row whose key the registry no longer carries keeps its last mirror: the
+/// completed ring is what supplies a terminal label (`Aborted`, `Rejected`), and an
+/// entry leaving the ring must not erase the state that explains why the row closed.
+fn fold_worker_lifecycle(rows: &mut [SubagentDetail]) {
+    if rows.is_empty() {
+        return;
+    }
+    let entries = crate::orchestrator::worker_entries();
+    for row in rows.iter_mut() {
+        let Some(entry) = entries.iter().find(|entry| entry.key == row.name) else {
+            continue;
+        };
+        row.status_label = Some(entry.status_label.clone());
+        row.implementation_turns = entry.implementation_turns;
+        row.validation_rounds = entry.validation_rounds;
+        row.latest_validator_feedback = entry.latest_validator_feedback.clone();
+    }
+}
+
 pub struct TuiRenderer {
     /// Ordered chat/log transcript. Each entry is a single message string
     /// (may contain embedded `\n`).
@@ -104,8 +238,69 @@ pub struct TuiRenderer {
     pub(crate) frame_counter: u64,
     /// The status bar text. Defaults to `"Ready"`.
     pub(crate) status_line: String,
-    /// Which panel has focus (drives border color). Defaults to `Chat`.
+    /// Which legacy panel has focus (drives the border colour of the pre-rebuild
+    /// panes and is the legacy projection of [`Self::focus`],
+    /// [`state::FocusPane::legacy`]). Defaults to `Chat`. Retired with the key
+    /// path (spec §9.2); it survives only while `events.rs` writes this field
+    /// directly, and `adopt_legacy_view_writes` keeps the two honest. Since
+    /// plumbing delta D2 (spec §9.4) the *persisted* spelling is
+    /// [`state::FocusPane::tag`] read off [`Self::focus`], so no bundle value
+    /// ever goes through the lossy `Input`/`Transcript` fold again.
     pub(crate) focused_panel: FocusedPanel,
+    /// M1–M4 view mode — **real UI state** (spec §4.1), not a reading of the pane
+    /// toggles. Built once in [`Self::new`] and moved only by
+    /// [`Self::set_view_mode`] (`F2`–`F5` and `/mode` call it in t-011).
+    pub(crate) view_mode: state::ViewMode,
+    /// Which pane holds focus (spec §4.2) — **real UI state**. Built once in
+    /// [`Self::new`] (the composer: printable keys must always reach it, §4.4)
+    /// and moved only by [`Self::set_focus`] / [`Self::cycle_focus_pane`].
+    pub(crate) focus: state::FocusPane,
+    /// Transcript follow: `LIVE` vs `↓ N new` (spec G7) — **real UI state**. The
+    /// legacy `chat_auto_scroll` flag is its mirror for the pre-rebuild scroll
+    /// path; [`Self::set_follow`] moves both, and only
+    /// [`Self::project_follow_mirror`] ever assigns the mirror. Nothing else may
+    /// turn follow on: not a submit, not a command notice, not arriving output —
+    /// only the `Ctrl+F` / `/follow` transition or a scroll that lands on the tail
+    /// (spec §10 item 14).
+    pub(crate) follow: bool,
+    /// The modal surface on screen (spec §3, §8.5) — **real UI state**: `None`,
+    /// the `?`/`F1` legend, or a confirm awaiting `y`/`n`. Moved only by
+    /// [`Self::open_help`], [`Self::show_confirm`] and [`Self::close_overlay`].
+    pub(crate) overlay: state::OverlayState,
+    /// The `?`/`F1` legend toggle (G2). It stays on while a confirm surface is
+    /// drawn over it, so dismissing a confirm returns the legend (§5: `Esc`
+    /// closes one overlay). Replaces the `help_open = false` the view model used
+    /// to hard-code.
+    pub(crate) help_open: bool,
+    /// A destructive action is awaiting `y`/`n` (spec G3, §3 confirm overlay).
+    /// The armed-abort prompt of §8.5 occupies the same surface while its 3 s
+    /// window is live; `close_overlay` dismisses whichever surface is on top.
+    pub(crate) confirm_open: bool,
+    /// Which request the confirm surface is holding (spec §3, G3): the tag the key
+    /// path needs so `y` runs exactly what `x` or `Ctrl+D` asked for instead of
+    /// re-guessing it from whatever pane happens to be focused. `None` means the
+    /// surface on screen is the armed-abort prompt, which honours no `y`/`n` at all
+    /// (§5 disarms on printables).
+    pub(crate) confirm_action: Option<events::ConfirmAction>,
+    /// What [`Self::adopt_legacy_view_writes`] last saw on the legacy view
+    /// fields, so a write the transition helpers made is never mistaken for a
+    /// write the legacy key path made.
+    pub(crate) legacy_view: LegacyViewMirror,
+    /// Whether teardown has run. Set by [`Self::shutdown`]; while it is set the
+    /// renderer never paints (see [`Self::render_terminal`]), so a post-teardown
+    /// `flush` cannot draw TUI chrome into the user's shell and a second
+    /// `shutdown` — or the `Drop` that follows one — is a no-op paint-wise.
+    pub(crate) terminal_torn_down: bool,
+    /// Whether this renderer ever took the ambient terminal over, i.e. whether
+    /// [`Renderer::init`] ran. Set by `init()`, cleared by [`Self::shutdown`].
+    ///
+    /// This is what the teardown writes its reset burst to *decide on*: a renderer
+    /// that never entered the alternate screen switched no terminal mode on, so it
+    /// has nothing to hand back, and writing `LeaveAlternateScreen`, the mouse
+    /// disables and `DisableBracketedPaste` anyway addresses a terminal this
+    /// process never owned — the shell, a pager, a library caller, or the process
+    /// holding the unit-test stdout (audit D11).
+    pub(crate) terminal_owned: bool,
     /// Vertical scroll offset of the chat panel.
     pub(crate) chat_scroll: u16,
     /// Vertical scroll offset of the plan panel.
@@ -133,6 +328,16 @@ pub struct TuiRenderer {
     pub(crate) input_draft: String,
     /// Buffer for streaming steer-mode sentences awaiting completion.
     pub(crate) steer_sentence_buffer: String,
+    /// What happened to the operator's own steering instructions (spec §3, §8.3;
+    /// DATA §6 gap 7).
+    ///
+    /// Every entry was **handed to the renderer by the bridge** at the statement where the
+    /// bridge touches its own steer queue, files a notice, or refuses a target — see
+    /// [`crate::ui::Renderer::note_steer`]. The renderer never invents an entry, never
+    /// re-decides one, and never counts anything that is not in this list: the status-bar
+    /// `N steers` chip is `queued_steers()`, the length of the `Queued` slice of this very
+    /// vector. Bounded by [`MAX_STEER_TRACES`] so a long session cannot grow it without end.
+    pub(crate) steer_traces: Vec<SteerTrace>,
 
     /// Cached chat inner width (area width − 2). Defaults to `80`.
     pub(crate) chat_width: std::cell::Cell<usize>,
@@ -142,10 +347,37 @@ pub struct TuiRenderer {
     pub(crate) subagent_width: std::cell::Cell<usize>,
     /// Cached subagent details height. Defaults to `15`.
     pub(crate) subagent_height: std::cell::Cell<usize>,
-    /// Cached plan panel width. Defaults to `40`.
-    pub(crate) plan_width: std::cell::Cell<usize>,
-    /// Cached plan panel height. Defaults to `15`.
-    pub(crate) plan_height: std::cell::Cell<usize>,
+    /// The transcript's largest legal offset **as the transcript pane measured it**,
+    /// published by the frame write-back (`draw_new_ui`, from
+    /// `components::transcript::BodyReport::max_scroll`). `None` until that pane has
+    /// been drawn once.
+    ///
+    /// This is the scroll geometry the key path steps against, so the offset a
+    /// scroll key asked for and the viewport the pane drew are measured from the
+    /// same body at the same width (audit defect 11). Nothing else may write it:
+    /// [`Self::transcript_tail`] is the only reader, and the estimate it falls back
+    /// on before the first frame is a bootstrap, not a rival measurement.
+    pub(crate) transcript_measured_max: std::cell::Cell<Option<usize>>,
+    /// The worker detail's largest legal offset as the Workers pane measured it
+    /// (`components::activity::WorkerGeometry::detail_max`), published by the same
+    /// write-back. `None` until that pane has been drawn once.
+    pub(crate) detail_measured_max: std::cell::Cell<Option<usize>>,
+    /// `config.max_context_tokens`: the denominator of the `ctx %` chip (spec
+    /// §2.2). `0` means no config was ever handed over, and the panes then print
+    /// the raw token count instead of a percentage of an unknown budget.
+    pub(crate) max_context_tokens: usize,
+    /// Wrapped transcript lines the body reported on the frame where the viewport
+    /// last sat at its bottom — the baseline for the `↓ N new` count (spec G7).
+    pub(crate) transcript_baseline_lines: Option<usize>,
+    /// The §8.5 sticky last-error buffer: the categorical cause and the **full**
+    /// error text of the most recent error this renderer saw.
+    ///
+    /// `status_line` keeps only the first line of the traffic that produced it
+    /// (spec §7.4), so without this buffer the cause a failure was reported with is
+    /// overwritten by the next status line and `e` / `/error` have nothing left to
+    /// recall. The buffer stores the text **verbatim** — it never rephrases an error
+    /// and never invents a cause that was not reported.
+    pub(crate) last_error: Option<StickyError>,
     /// Width used for the current line cache. Defaults to `0`.
     pub(crate) cached_chat_width: std::cell::Cell<usize>,
     /// `show_thought` value used for the current line cache.
@@ -158,7 +390,15 @@ pub struct TuiRenderer {
     pub(crate) cached_rendered_messages: std::cell::RefCell<Vec<Vec<ratatui::text::Line<'static>>>>,
     /// `show_thought` value that the rendered-message cache was built with.
     pub(crate) cached_rendered_show_thought: std::cell::Cell<bool>,
-    /// Whether subagent details auto-scroll. Defaults to `false`.
+    /// Whether the worker detail follows the newest line of the selected row's log
+    /// (spec G7's Workers spelling of follow). Defaults to `true`: a row nobody has
+    /// scrolled away from shows its newest line.
+    ///
+    /// It is a **request**, carried to the pane as
+    /// [`components::activity::ActivityData::autoscroll`] and answered there against
+    /// the body that pass counted — never resolved into an offset outside it. Only
+    /// the scroll keys (movement-guarded, `events.rs`), the selection reveal, a
+    /// restore and the constructor write it.
     pub(crate) subagent_autoscroll: bool,
 
     /// Completed input lines forwarded to the session loop.
@@ -167,8 +407,22 @@ pub struct TuiRenderer {
     /// Persistent terminal instance to preserve Ratatui frame diff buffers.
     pub(crate) terminal: Option<Terminal<CrosstermBackend<io::Stdout>>>,
 
+    /// Legacy mirror of [`Self::follow`] for the pre-rebuild scroll and clamp path.
+    /// Not state: written only by [`Self::set_follow`] /
+    /// [`Self::project_follow_mirror`], plus the constructor and a restore, which
+    /// state the decision through `set_follow` immediately afterwards.
     pub(crate) chat_auto_scroll: bool,
+    /// The plan's largest legal offset, published by the plan pane's own frame
+    /// write-back (`components::plan_pane::PlanGeometry::max_scroll`). `0` until the
+    /// pane has been drawn, which is why a bundle restored into an undrawn renderer
+    /// keeps no `plan_scroll` the live clamp cannot vouch for.
     pub(crate) plan_max_scroll: u16,
+    /// Whether the plan pane still centres itself on the task in flight, or whether
+    /// the operator has taken the plan viewport (`false`, spec §7.3, audit defect
+    /// 13). It is NOT "the offset sits at the tail" and no scroll gesture ever turns
+    /// it back on: only [`Self::arm_plan_centring`] (a plan document this process has
+    /// not seen before) and a restore write it, and
+    /// [`Self::scroll_plan_to`] is the only other writer.
     pub(crate) plan_auto_scroll: bool,
     pub(crate) active_plan_task: Option<String>,
 
@@ -184,13 +438,28 @@ pub struct TuiRenderer {
     pub(crate) plan_mtime: Option<std::time::SystemTime>,
     pub(crate) archive_mtime: Option<std::time::SystemTime>,
     pub(crate) plan_is_archived: bool,
-    #[allow(dead_code)]
     pub(crate) session_start: std::time::Instant,
 
     /// Estimated total input (prompt) tokens across the session.
     pub tokens_in: usize,
     /// Estimated total output (completion) tokens across the session.
     pub tokens_out: usize,
+    /// Injected snapshot of the process-wide llm prompt-token counter, taken once
+    /// per painted frame by [`Self::refresh_global_token_snapshot`] — never read
+    /// out of the global while a frame is being built (audit D5).
+    ///
+    /// The frame is a pure function of renderer state. Pulling
+    /// `crate::llm::get_global_token_counts()` into the frame made every whole-frame
+    /// assertion in the process depend on what every other test in that process had
+    /// streamed: two renders of one fixture could print different status rows, and
+    /// a pass/fail result moved with test scheduling order. Production keeps the
+    /// live figure — the session's own `tokens_in` merged with the process counter
+    /// under the same `max` — because the entry path that paints writes this field
+    /// first.
+    pub(crate) global_tokens_in: usize,
+    /// Injected snapshot of the process-wide llm completion-token counter; see
+    /// [`Self::global_tokens_in`].
+    pub(crate) global_tokens_out: usize,
     /// Context window size (tokens) of the orchestrator/main turn.
     pub orchestrator_context_tokens: usize,
     /// Map of specialist role -> max_thinking_tokens.
@@ -226,8 +495,36 @@ impl TuiRenderer {
             status_line: "Ready".to_string(),
             tokens_in: 0,
             tokens_out: 0,
+            global_tokens_in: 0,
+            global_tokens_out: 0,
             orchestrator_context_tokens: 0,
             focused_panel: FocusedPanel::Chat,
+            // The view state is built once, here, and only the transition
+            // helpers below move it (spec §4.1, §4.2). The mode is the mode the
+            // boot pane inventory describes (§4.3): both side panes boot closed,
+            // which is M1; `F2`/`F3`/`F4`/`F5`, `/mode`, `Ctrl+P` and `Ctrl+A`
+            // move it, and `set_view_mode(Split)` opens both side panes with it.
+            view_mode: state::ViewMode::for_panes(false, false),
+            // The composer holds focus at boot: printable keys must reach it in
+            // every mode and every focus state (§4.4), so it is where the operator
+            // starts and what `Tab` cycles back to (§4.2).
+            focus: state::FocusPane::Input,
+            // Follow is on at boot: the transcript shows the newest line until the
+            // operator scrolls back, and only then starts counting (§G7).
+            follow: true,
+            overlay: state::OverlayState::None,
+            help_open: false,
+            confirm_open: false,
+            confirm_action: None,
+            legacy_view: LegacyViewMirror {
+                plan_visible: false,
+                workers_visible: false,
+                focus: FocusedPanel::Chat,
+                follow: true,
+                abort_armed: false,
+            },
+            terminal_torn_down: false,
+            terminal_owned: false,
             chat_scroll: 0,
             plan_scroll: 0,
             show_plan_panel: false,
@@ -242,13 +539,17 @@ impl TuiRenderer {
             history_index: None,
             input_draft: String::new(),
             steer_sentence_buffer: String::new(),
+            steer_traces: Vec::new(),
 
             chat_width: std::cell::Cell::new(80),
             chat_height: std::cell::Cell::new(15),
             subagent_width: std::cell::Cell::new(40),
             subagent_height: std::cell::Cell::new(15),
-            plan_width: std::cell::Cell::new(40),
-            plan_height: std::cell::Cell::new(15),
+            transcript_measured_max: std::cell::Cell::new(None),
+            detail_measured_max: std::cell::Cell::new(None),
+            max_context_tokens: 0,
+            transcript_baseline_lines: None,
+            last_error: None,
             cached_chat_width: std::cell::Cell::new(0),
             cached_show_thought: std::cell::Cell::new(false),
             cached_message_lines: std::cell::RefCell::new(Vec::new()),
@@ -291,6 +592,10 @@ impl TuiRenderer {
     }
 
     /// Populate thinking budget limits per specialist and globally from config.
+    ///
+    /// The context budget (`max_context_tokens`) rides the same hand-over: it is
+    /// the denominator of the `ctx %` chip both the header and the status bar print
+    /// (spec §2.2), and this is the only place a `Config` reaches the renderer.
     pub fn set_thinking_budgets(&mut self, cfg: &Config) {
         let global_budget = if cfg.max_thinking_tokens != crate::config::DEFAULT_MAX_THINKING_TOKENS
         {
@@ -302,6 +607,7 @@ impl TuiRenderer {
                 .unwrap_or(cfg.max_thinking_tokens)
         };
         self.default_thinking_budget = global_budget;
+        self.max_context_tokens = cfg.max_context_tokens;
         self.thinking_budgets.clear();
         for (role, spec) in &cfg.orchestration.specialists {
             if let Some(b) = spec.max_thinking_tokens {
@@ -390,7 +696,44 @@ impl TuiRenderer {
         })
     }
 
+    /// Take the one snapshot of the process-wide llm token counters that this
+    /// frame is allowed to see, and store it as renderer state (audit D5).
+    ///
+    /// This is the **only** place in the paint path that touches
+    /// [`crate::llm::get_global_token_counts`], and it is the only thing that
+    /// connects the process-wide counter to what the status row prints. It runs at
+    /// the top of [`Self::render_terminal`] — the single entry path that paints a
+    /// frame in production — so the live TUI still shows the live usage, while
+    /// [`Self::draw_new_ui`] becomes a pure function of renderer state and a
+    /// `TestBackend` frame can no longer be moved by what an unrelated test in the
+    /// same process streamed.
+    ///
+    /// The pair is stored as read, not merged: the merge with this renderer's own
+    /// counters stays in the frame, and the counters it merges are monotonic
+    /// (`fetch_add`), so a snapshot can never make a displayed total go backwards.
+    pub(crate) fn refresh_global_token_snapshot(&mut self) {
+        let (global_in, global_out) = crate::llm::get_global_token_counts();
+        self.global_tokens_in = global_in;
+        self.global_tokens_out = global_out;
+    }
+
+    /// Paint one frame through the routed draw path (spec §9.1: the new UI is the
+    /// only thing this entry path paints).
+    ///
+    /// After teardown the terminal is gone — raw mode is off, the primary screen is
+    /// back and the operator's shell owns stdout — so this returns without painting
+    /// instead of recreating a `Terminal` and writing escape codes into the shell.
+    /// The session loop still calls `flush()` a few times after `shutdown()` (the
+    /// shutdown is issued from inside the loop and from `Drop`), and every one of
+    /// those calls must be a no-op rather than a repaint on a screen that is no
+    /// longer ours.
     pub(crate) fn render_terminal(&mut self) -> Result<()> {
+        if self.terminal_torn_down {
+            return Ok(());
+        }
+        // Audit D5: the process-wide counters are read exactly once per painted
+        // frame, right here, and the frame below reads only the snapshot.
+        self.refresh_global_token_snapshot();
         self.last_render = std::time::Instant::now();
         self.frame_counter = self.frame_counter.wrapping_add(1);
         let mut terminal = match self.terminal.take() {
@@ -406,12 +749,720 @@ impl TuiRenderer {
         res
     }
 
+    /// One frame of the rebuilt UI: derive the [`state::UiView`] view model,
+    /// compute the pane geometry with [`layout::compute_layout`] (spec §2), then
+    /// render every pane component of [`components`] (spec §3) and return the
+    /// rects so [`Self::draw`] can write the geometry caches back.
+    ///
+    /// Each pane is drawn **exactly once, by its own component**: the component
+    /// `render` functions own body and chrome together (body first, then the block
+    /// that frames it), so there is no legacy content pass filling the new rects
+    /// underneath a chrome pass any more. Every value a pane needs arrives in its
+    /// `*Data` struct — the renderer hands the conversation, the plan text, the
+    /// worker rows, the composer buffer, the session counters and its own clocks
+    /// over, and reads the viewport each pass established back out of the report
+    /// each `render` returns. The help overlay is drawn last, over the body (§7.3).
+    ///
+    /// The numbered passes below are the **paint order**, not the on-screen order:
+    /// which pane sits in which slot is decided solely by
+    /// [`layout::compute_layout`], whose single rule puts the Plan in the leading
+    /// slot and the Transcript in the trailing one of every shape that draws both —
+    /// so in M4 the Plan is painted second but sits left of the Transcript. Nothing
+    /// here may restate that geometry.
+    pub(crate) fn draw_new_ui(&mut self, frame: &mut ratatui::Frame) -> layout::PaneRects {
+        // The frame is built from stored view state, so anything a writer outside
+        // the key path changed on the legacy fields (a worker activating opens the
+        // Workers pane through `set_subagents`, a plan event opens the Plan pane,
+        // the scroll keys take the transcript off the tail) is folded into that
+        // state here, immediately before the view model is read. One pass per
+        // frame, and the mirror makes every fold an edge rather than a re-read.
+        self.adopt_legacy_view_writes();
+        // The notice tables are the only owner of what a filed notice did next, so the
+        // ledger is re-read against them once per frame before anything reads it.
+        self.refresh_steer_traces();
+        let view = state::UiView::from_renderer(self);
+        let area = frame.area();
+        let rects = layout::compute_layout(area, &view);
+
+        if let Some(notice) = rects.notice {
+            components::render_notice(frame, notice, area.width, area.height);
+            return rects;
+        }
+
+        let compact = layout::compact_legend(area.width);
+        let elapsed = self.elapsed_clock();
+        // `val N` (§2.2): the maximum `validation_rounds` over the projected worker
+        // rows (plumbing delta D1, §9.3). One read per frame, shared by the header and
+        // the status row so the two can never print two different rounds.
+        let val_rounds = self.max_validation_rounds();
+
+        // 1. Header: one borderless row of §2.2 chips, §7.4 drop ladder.
+        if let Some(rect) = rects.header {
+            let data = components::header::HeaderData {
+                mode: rects.mode,
+                plan: &view.plan,
+                budget: layout::header_budget(area.width),
+                ctx_tokens: self.orchestrator_context_tokens,
+                ctx_limit: self.max_context_tokens,
+                elapsed,
+                val_rounds,
+            };
+            components::header::render(frame, rect, &data);
+        }
+
+        // 2. Transcript. The pane is handed the conversation and the renderer's own
+        // rendered-line cache, and reports back the geometry this pass established:
+        // where the viewport landed and how far down the body may go. Both are
+        // written back here — the single frame-level scroll write-back, and the only
+        // writer of the geometry the scroll keys in `events.rs` and the resize clamp
+        // step against (audit defect 11: the key path used to clamp against
+        // `estimated_chat_lines` while this pane clamped and pinned against the lines
+        // it had actually drawn, so a step measured off-file could be rewritten, or
+        // turned into a jump, by the frame below it). The `Ctrl+F` follow flag is
+        // handed over as the request it is (`TranscriptData::follow`), which is what
+        // pins the body to the tail — the `● LIVE` chip on the pane's bottom border
+        // is built from the very same report, so the chip and the viewport can never
+        // state two different positions. The unseen-line count stays inside the pane.
+        if let Some(rect) = rects.transcript {
+            self.ensure_rendered_message_cache();
+            let report = {
+                let body = components::transcript::TranscriptBody {
+                    messages: &self.messages,
+                    rendered: Some(&self.cached_rendered_messages.borrow()),
+                    thought: &self.current_thought,
+                    content: &self.current_content,
+                    steer: &self.steer_sentence_buffer,
+                    show_thought: self.show_thought,
+                };
+                let data = components::transcript::TranscriptData {
+                    focus: view.focused(state::FocusPane::Transcript),
+                    follow: view.follow,
+                    scroll: view.scroll.transcript,
+                    body,
+                    unseen_baseline: self.transcript_baseline_lines,
+                };
+                components::transcript::render(frame, rect, &data)
+            };
+            self.chat_width
+                .set(usize::from(rect.width.saturating_sub(2)));
+            self.chat_height
+                .set(usize::from(rect.height.saturating_sub(2)));
+            self.chat_scroll = report.scroll;
+            self.transcript_measured_max.set(Some(report.max_scroll));
+            // The `↓ N new` baseline (G7): whenever the viewport sits at the bottom
+            // of the body, every line that exists has been on screen, so the body's
+            // own line count becomes the baseline the next frame measures growth
+            // against.
+            if view.follow || usize::from(report.scroll) >= report.max_scroll {
+                self.transcript_baseline_lines = Some(report.total_lines);
+            }
+        }
+
+        // 3. Execution Plan: body, chrome, and the scroll geometry that the `↑`/`↓`
+        // clamps and the pane's own centring share. The write-back of
+        // `plan_scroll`/`plan_max_scroll` is the plan's whole frame-level scroll
+        // state: the centring request travels in as `PlanData::auto_scroll` and is
+        // answered by the pane, and nothing above this pass may restate it.
+        if let Some(rect) = rects.plan {
+            let active_tasks = self.active_plan_tasks();
+            let target_task = self.plan_target_task();
+            let geometry = {
+                let data = components::plan_pane::PlanData {
+                    focus: view.focused(state::FocusPane::Plan),
+                    progress: &view.plan,
+                    scroll: view.scroll.plan,
+                    text: &self.plan_content,
+                    active_tasks: &active_tasks,
+                    auto_scroll: self.plan_auto_scroll,
+                    target_task: target_task.as_deref(),
+                };
+                components::plan_pane::render(frame, rect, &data)
+            };
+            self.plan_scroll = geometry.scroll;
+            self.plan_max_scroll = geometry.max_scroll;
+        }
+
+        // 4. Workers: roster + detail half. The pane reports both offsets and the
+        // measure its detail body was counted at, and this write-back is what lets
+        // the key path clamp `↑`/`↓` against the roster window and
+        // `PageUp`/`PageDown`/`Home`/`End` against the log — always the geometry the
+        // last frame drew, never an estimate of it. The detail follow flag crosses as
+        // the request it is (`ActivityData::autoscroll`), so the pane resolves
+        // "newest line" against the body it counted itself instead of a pass outside
+        // it guessing at the tail from a line estimate.
+        if let Some(rect) = rects.workers {
+            let selected = self
+                .selected_subagent_idx
+                .min(self.subagents.len().saturating_sub(1));
+            let thinking_budget = self
+                .subagents
+                .get(selected)
+                .map(|row| self.get_thinking_budget(row));
+            // The steering notices waiting in front of the selected worker, read from
+            // the orchestrator's own inbox (read-only: peeking never drains it). This is
+            // the targeting half of the affordance — which instruction the arbitrator
+            // routed to *this* specialist, and how long it has been waiting.
+            let steering = self
+                .subagents
+                .get(selected)
+                .map(|row| crate::orchestrator::notice::peek_worker_inbox(&row.name))
+                .unwrap_or_default();
+            let geometry = {
+                let data = components::activity::ActivityData {
+                    focus: view.focused(state::FocusPane::Workers),
+                    rows: &self.subagents,
+                    selected: self.selected_subagent_idx,
+                    detail_present: layout::workers_detail_present(area.width),
+                    scroll: view.scroll.workers,
+                    autoscroll: self.subagent_autoscroll,
+                    list_scroll: self.subagent_list_scroll,
+                    show_thought: self.show_thought,
+                    thinking_budget,
+                    steering: &steering,
+                };
+                components::activity::render(frame, rect, &data)
+            };
+            self.subagent_list_scroll = geometry.roster_scroll;
+            self.subagent_scroll = geometry.detail_scroll;
+            if geometry.detail_present {
+                self.subagent_width.set(geometry.detail_width);
+                self.subagent_height.set(geometry.detail_height);
+                self.detail_measured_max.set(Some(geometry.detail_max));
+            }
+        }
+
+        // 5. Composer: the `TextArea` body first, then the frame that owns every
+        // border row. `prepare_textarea` synchronises the widget and strips the
+        // block off it, which is what lets a single border be drawn.
+        if let Some(rect) = rects.input {
+            self.prepare_textarea();
+            let buffer = self.textarea.lines().join("\n");
+            let history = self.history_position();
+            let data = components::input::InputData {
+                focus: view.focused(state::FocusPane::Input),
+                active: view.composer_active(),
+                armed: view.abort_armed,
+                draft_lines: view.input_lines,
+                buffer: Some(&buffer),
+                history,
+                textarea: Some(&self.textarea),
+            };
+            components::input::render(frame, rect, &data);
+        }
+
+        // 6. Status: metrics row + chip row, from the session counters the renderer
+        // owns and the pane rects this frame actually produced — a pane the §2.5
+        // ladder took away must not still be announced as `on` (§2.5, G5).
+        if let Some(rect) = rects.status {
+            // The token pair is merged from renderer state only: `tokens_in` /
+            // `tokens_out` are this renderer's own running totals and
+            // `global_tokens_*` is the snapshot the paint path injected before the
+            // frame was built (audit D5). `max` keeps the displayed total from ever
+            // going backwards — a session counter can lead the process counter (the
+            // renderer estimates streamed text itself) and the process counter can
+            // lead it (turns taken outside this renderer's event stream) — and the
+            // snapshot, taken from a `fetch_add` counter, is monotonic too. The
+            // frame reads no process-global anywhere, so two draws of one fixture
+            // are byte-identical regardless of what else the process is doing.
+            let data = components::status_bar::StatusData {
+                workers: &self.subagents,
+                show_thought: view.show_thought,
+                plan_visible: view.plan_visible,
+                workers_visible: view.workers_visible,
+                plan_present: rects.plan.is_some(),
+                workers_present: rects.workers.is_some(),
+                abort_armed: view.abort_armed,
+                tokens_in: self.tokens_in.max(self.global_tokens_in),
+                tokens_out: self.tokens_out.max(self.global_tokens_out),
+                ctx_tokens: self.orchestrator_context_tokens,
+                ctx_limit: self.max_context_tokens,
+                elapsed,
+                val_rounds,
+                queued_steers: self.queued_steers(),
+            };
+            components::status_bar::render(frame, rect, &data);
+        }
+
+        // 7. Footer legend: `components::help::footer_legend` is the single source
+        // for this row, the same table the help overlay reads (§6, §7.3).
+        if let Some(rect) = rects.footer {
+            let data = components::help::HelpData {
+                kind: components::help::HelpKind::Legend,
+                compact,
+                confirm: None,
+            };
+            components::help::render(frame, rect, &data);
+        }
+        // 8. Overlays draw last, centred over the body (§7.3): `Clear` plus a
+        // content-sized bordered `Paragraph` clamped to 80 % of this rect. Only the
+        // body is covered — the header, the two status rows, the composer and the
+        // footer legend are already painted and stay readable underneath, which is
+        // what keeps the live metrics counting while a confirm is on screen (§7.3,
+        // G4) and leaves the armed prompt on status row 2. A pending request names
+        // itself on the surface (its action and its consequence, plus the `y` / `n`
+        // affordance); with no request the surface is the armed-abort prompt of
+        // §8.5, which honours no `y`/`n` (§5).
+        if view.overlay != state::OverlayState::None
+            && let Some(rect) = rects.body
+        {
+            let request = self
+                .confirm_action
+                .as_ref()
+                .filter(|_| view.overlay == state::OverlayState::Confirm)
+                .map(|action| action.describe());
+            let data = components::help::HelpData {
+                kind: components::help::HelpKind::Overlay(view.overlay),
+                compact,
+                confirm: request,
+            };
+            components::help::render(frame, rect, &data);
+        }
+        rects
+    }
+
+    /// Task ids the plan pane must highlight: every active worker's task plus the
+    /// task the plan itself names in flight, cleaned and deduplicated. The set the
+    /// legacy plan pane built inline (`render.rs:458-485`) — moved here so the pane
+    /// receives it as data.
+    pub(crate) fn active_plan_tasks(&self) -> Vec<String> {
+        let mut active: Vec<String> = Vec::new();
+        for sa in &self.subagents {
+            if !sa.is_active {
+                continue;
+            }
+            let tid = sa
+                .task_id
+                .as_deref()
+                .or_else(|| sa.name.find("-t-").map(|pos| &sa.name[pos + 1..]));
+            if let Some(tid) = tid {
+                let clean = crate::ui::tui::formatting::clean_task_id(tid);
+                if !clean.is_empty() && !active.iter().any(|t| t.eq_ignore_ascii_case(clean)) {
+                    active.push(clean.to_string());
+                }
+            }
+        }
+        if let Some(tid) = &self.active_plan_task {
+            let clean = crate::ui::tui::formatting::clean_task_id(tid);
+            if !clean.is_empty() && !active.iter().any(|t| t.eq_ignore_ascii_case(clean)) {
+                active.push(clean.to_string());
+            }
+        }
+        active
+    }
+
+    /// The task the plan auto-scroll centres on: the plan's own active task, else
+    /// the task of the first active worker.
+    pub(crate) fn plan_target_task(&self) -> Option<String> {
+        self.active_plan_task.clone().or_else(|| {
+            self.subagents
+                .iter()
+                .find(|sa| sa.is_active && sa.task_id.is_some())
+                .and_then(|sa| sa.task_id.clone())
+        })
+    }
+
+    /// Where the composer is standing in the input history, for the `history n/m`
+    /// chip (spec §5). `None` while the operator is editing their own draft.
+    pub(crate) fn history_position(&self) -> Option<components::input::HistoryPos> {
+        let index = self.history_index?;
+        let len = self.history.len();
+        if len == 0 || index >= len {
+            return None;
+        }
+        Some(components::input::HistoryPos {
+            entry: index + 1,
+            len,
+        })
+    }
+
+    /// Get the composer's `TextArea` ready for a component-owned body pass: the
+    /// widget is synchronised with `input_text`, its cursor line takes the
+    /// palette's [`theme::caret_line`] slot (a fill, so a light profile does not
+    /// swallow the caret), and its block is cleared — the composer component draws
+    /// the one border, title and chip row, so a block on the widget would paint a
+    /// second frame over it.
+    pub(crate) fn prepare_textarea(&mut self) {
+        self.ensure_textarea_in_sync();
+        self.textarea.set_block(ratatui::widgets::Block::default());
+        self.textarea.set_cursor_line_style(theme::caret_line());
+    }
+
+    /// The elapsed clock both chrome panes print, as whole seconds.
+    ///
+    /// The execution-plan project clock while one owns the run — the value the
+    /// legacy status bar right-aligned, freezing at plan completion — and the
+    /// session clock (`session_start`, spec §3) otherwise, so a session that has
+    /// not reached a plan yet still counts up instead of printing nothing.
+    pub(crate) fn elapsed_clock(&self) -> Option<u64> {
+        self.total_project_elapsed()
+            .map(|elapsed| elapsed.as_secs())
+            .or_else(|| Some(self.session_start.elapsed().as_secs()))
+    }
+
+    /// The §2.2 `val N` value: the highest `validation_rounds` across the projected
+    /// worker rows (plumbing delta D1, §9.3). `0` means the registry recorded no
+    /// validation round for any worker, and the panes withhold the field rather than
+    /// print `val 0`. Never derived from an arbitration round (§8.4).
+    pub(crate) fn max_validation_rounds(&self) -> usize {
+        self.subagents
+            .iter()
+            .map(|row| row.validation_rounds)
+            .max()
+            .unwrap_or(0)
+    }
+
+    // ---- steering-instruction lifecycle (spec §3, §8.3; DATA §6 gap 7) ------
+    //
+    // The queue a steering instruction lands in is a local of the session loop and the
+    // notices it becomes live in the orchestrator's bounded inboxes, so the only thing
+    // the renderer may show is what the bridge *tells* it at the statement that touches
+    // either. `record_steer` is fed exclusively by
+    // [`crate::ui::Renderer::note_steer`]; `refresh_steer_traces` then asks the
+    // orchestrator's own read-only notice tables what became of a notice the bridge
+    // filed, and adopts only an answer those tables actually give.
+
+    /// Fold one bridge-reported transition into the ledger, announcing it in the
+    /// transcript exactly once per stage change.
+    ///
+    /// The identity of an entry is the pair *instruction + addressee*, because one
+    /// instruction can legitimately be filed for several specialists at once and each
+    /// of those is a separate fact for the operator. The one exception is a stage that
+    /// ends the wait: a delivered or refused instruction replaces the entry the bridge
+    /// earlier reported as held for it, even when the addressee is named differently
+    /// there — the wait for *that instruction* is over, and the chip must say so.
+    pub(crate) fn record_steer(&mut self, trace: &SteerTrace) {
+        let known = self
+            .steer_traces
+            .iter()
+            .position(|entry| entry.text == trace.text && entry.target == trace.target)
+            .or_else(|| {
+                if trace.stage == SteerStage::Queued {
+                    return None;
+                }
+                self.steer_traces
+                    .iter()
+                    .position(|entry| entry.stage == SteerStage::Queued && entry.text == trace.text)
+            });
+        match known {
+            Some(index) if self.steer_traces[index].stage == trace.stage => {
+                // Same stage: no new fact for the operator, only a sharper reason. The
+                // transcript gets nothing, so an instruction never scrolls the pane with
+                // restatements of the same state.
+                self.steer_traces[index].reason = trace.reason.clone();
+                if trace.notice_id.is_some() {
+                    self.steer_traces[index].notice_id = trace.notice_id.clone();
+                }
+                self.dirty = true;
+                return;
+            }
+            Some(index) => {
+                self.steer_traces[index] = trace.clone();
+            }
+            None => {
+                self.steer_traces.push(trace.clone());
+                if self.steer_traces.len() > MAX_STEER_TRACES {
+                    let excess = self.steer_traces.len() - MAX_STEER_TRACES;
+                    self.steer_traces.drain(0..excess);
+                }
+            }
+        }
+        self.messages.push(steer_transcript_line(trace));
+        self.dirty = true;
+    }
+
+    /// What the orchestrator's notice tables now say about the notices the bridge filed,
+    /// folded back into the same ledger (never into a second one).
+    ///
+    /// Three answers exist and only these: the notice is still pending and past its TTL
+    /// (it will never be read → [`SteerStage::Revoked`]), a reply for it was recorded
+    /// ([`SteerStage::Delivered`]), or the tables say nothing new (the entry keeps the
+    /// stage the bridge gave it). A missing notice is never read as a revocation: the
+    /// inboxes are drained by the worker itself, and a drained notice was delivered.
+    pub(crate) fn refresh_steer_traces(&mut self) {
+        let updates: Vec<SteerTrace> = self
+            .steer_traces
+            .iter()
+            .filter_map(|entry| {
+                let notice_id = entry.notice_id.as_deref()?;
+                let pending = crate::orchestrator::get_pending_notice(notice_id);
+                let reply = crate::orchestrator::get_worker_reply(notice_id);
+                if reply.is_some() && entry.stage != SteerStage::Delivered {
+                    return Some(SteerTrace {
+                        stage: SteerStage::Delivered,
+                        text: entry.text.clone(),
+                        target: entry.target.clone(),
+                        notice_id: entry.notice_id.clone(),
+                        reason: "the specialist answered it".to_string(),
+                    });
+                }
+                if let Some(notice) = pending
+                    && crate::orchestrator::notice::is_notice_expired(&notice)
+                    && entry.stage != SteerStage::Revoked
+                {
+                    return Some(SteerTrace {
+                        stage: SteerStage::Revoked,
+                        text: entry.text.clone(),
+                        target: entry.target.clone(),
+                        notice_id: entry.notice_id.clone(),
+                        reason: format!(
+                            "it passed its lifetime in {}'s inbox unanswered",
+                            entry.target
+                        ),
+                    });
+                }
+                None
+            })
+            .collect();
+        for update in updates {
+            self.record_steer(&update);
+        }
+    }
+
+    /// The `N steers` chip: how many of the operator's instructions are **still held**
+    /// (the `Queued` slice of [`Self::steer_traces`]). There is no other source for this
+    /// number and no other number is ever printed for it.
+    pub(crate) fn queued_steers(&self) -> usize {
+        self.steer_traces
+            .iter()
+            .filter(|entry| entry.stage == SteerStage::Queued)
+            .count()
+    }
+
     /// Check whether abort is actively armed and within the 3-second confirmation window.
     pub(crate) fn is_abort_armed(&self) -> bool {
         self.confirm_abort
             && self
                 .abort_armed_at
                 .is_some_and(|t| t.elapsed() < Duration::from_secs(3))
+    }
+
+    // ---- view-state transitions (spec §4.1, §4.2, §3, §8.5) -----------------
+    //
+    // `F2`–`F5`, `Tab`, `Ctrl+F`, `?`/`F1` and `Esc` call these in t-011; they
+    // are the only way the view state moves, and every one of them leaves
+    // `dirty` set so the next cadence tick repaints (spec §5: "no silent key
+    // press", G5).
+
+    /// Move to `mode` (spec §4.1: `F2` cycles, `F3`/`F4`/`F5` name one, and
+    /// `/mode <name>` sets it directly).
+    ///
+    /// The two pane toggles follow the mode's pane inventory (§4.3) — they are
+    /// the spelling the status-row chips, the legacy scroll path and the durable
+    /// `ViewState` use, and keeping them in step is what stops one mode change
+    /// from drawing a frame in which three sources disagree. A focus the new
+    /// mode would orphan is repaired by cycling to the next pane that is on
+    /// screen: an absent pane is never drawn and never hit-tested (§2.4.1), so a
+    /// focus badge may never sit on one (G6).
+    pub(crate) fn set_view_mode(&mut self, mode: state::ViewMode) {
+        self.view_mode = mode;
+        self.show_plan_panel = mode.plan_pane();
+        self.show_subagent_panel = mode.workers_pane();
+        self.legacy_view.plan_visible = self.show_plan_panel;
+        self.legacy_view.workers_visible = self.show_subagent_panel;
+        if !mode.presents(self.focus) {
+            self.cycle_focus_pane(true);
+        }
+        self.dirty = true;
+    }
+
+    /// Focus `pane` (spec §4.2). The legacy `focused_panel` mirror moves with it
+    /// so the pre-rebuild panes and the `Esc` re-focus arm of `events.rs` name the
+    /// same pane as the real focus; the persisted `ViewState::focused_panel` token
+    /// is spelled off [`state::FocusPane::tag`], so it names it exactly too,
+    /// composer included (spec §9.4 D2).
+    pub(crate) fn set_focus(&mut self, pane: state::FocusPane) {
+        self.focus = pane;
+        self.focused_panel = pane.legacy();
+        self.legacy_view.focus = self.focused_panel;
+        self.dirty = true;
+    }
+
+    /// Cycle focus around the §4.2 ring, skipping the panes the current mode does
+    /// not present, and return the pane that ended up focused. `Tab` walks it
+    /// forward and `Shift+Tab` backward (t-011).
+    ///
+    /// Skipping is what makes `Tab` never a silent no-op (G5): with a mode that
+    /// has no Plan/Workers pane the cycle is `Input → Transcript → Input`, and a
+    /// focus that was left on a pane the mode removed is pulled back onto a pane
+    /// that is actually on screen.
+    pub(crate) fn cycle_focus_pane(&mut self, forward: bool) -> state::FocusPane {
+        const ORDER: [state::FocusPane; 4] = state::FocusPane::cycle_order();
+        let at = ORDER
+            .iter()
+            .position(|pane| *pane == self.focus)
+            .unwrap_or(0);
+        for step in 1..=ORDER.len() {
+            let index = if forward {
+                (at + step) % ORDER.len()
+            } else {
+                (at + ORDER.len() - step) % ORDER.len()
+            };
+            if self.view_mode.presents(ORDER[index]) {
+                self.set_focus(ORDER[index]);
+                return self.focus;
+            }
+        }
+        // Unreachable: the transcript is present in every mode (§4.3), so the
+        // ring always has at least one landing pane. The fall-through keeps the
+        // focus where it is rather than inventing an absent one.
+        self.focus
+    }
+
+    /// Turn transcript follow on or off (spec G7: `Ctrl+F`, `/follow`, and the
+    /// scroll keys that pull the viewport back off the tail).
+    ///
+    /// This is the one decision that pins the transcript to its tail. Nothing else
+    /// pins it: the nine `if chat_auto_scroll { chat_scroll = estimate - height }`
+    /// blocks the streaming arms of `on_event` used to run never own a viewport, and
+    /// the pane pins itself to the tail it measured on every frame it draws
+    /// (`components::transcript::draw_body`) from this very flag. The legacy
+    /// `chat_auto_scroll` flag is the same decision spelled for the pre-rebuild
+    /// scroll path, so it moves with the flag: one operator decision, one number in
+    /// the frame.
+    pub(crate) fn set_follow(&mut self, follow: bool) {
+        self.follow = follow;
+        self.project_follow_mirror();
+        self.dirty = true;
+    }
+
+    /// The one named place the legacy `chat_auto_scroll` mirror is assigned.
+    ///
+    /// The flag is not state: it is the same follow decision spelled for the
+    /// pre-rebuild scroll path, so it is a pure projection of [`Self::follow`] and
+    /// may never be written on its own. Code that wants the transcript pinned to the
+    /// tail calls [`Self::set_follow(true)`]; code that finds the mirror disagreeing
+    /// with `follow` calls **this** to put it back, which is what makes audit defect
+    /// D3 (a submit that silently re-armed follow by assigning the flag) impossible:
+    /// the only writers of the field left are the constructor and a restore, both of
+    /// which state the decision through `set_follow` right afterwards. What reads it
+    /// is persistence and the adoption bridge — the live pin lives in the transcript
+    /// pane, which is handed [`state::UiView::follow`].
+    pub(crate) fn project_follow_mirror(&mut self) {
+        self.chat_auto_scroll = self.follow;
+        self.legacy_view.follow = self.follow;
+    }
+
+    /// Arm the plan pane's centring on the task in flight: opened plan pane, plan
+    /// offset cleared, centring on.
+    ///
+    /// This is the **only** writer of [`Self::plan_auto_scroll`] other than a scroll
+    /// gesture and a restore, and its caller calls it on one edge only — the first
+    /// plan document this process has seen (`render.rs::refresh_plan_cache`, guarded
+    /// by `had_active_plan`). Audit defect 13 was the opposite: `on_event` armed the
+    /// flag on every `DelegationEvent::Started`, so an operator who had scrolled to
+    /// the tail of the plan was handed back to the in-flight task by the next task's
+    /// traffic. Task traffic is not an operator gesture, so it no longer states
+    /// anything about the plan viewport; a fresh plan document genuinely is a fresh
+    /// plan, and the offset this renderer holds refers to a document that is gone.
+    pub(crate) fn arm_plan_centring(&mut self) {
+        self.show_plan_panel = true;
+        self.plan_scroll = 0;
+        self.plan_auto_scroll = true;
+        self.dirty = true;
+    }
+
+    /// Open the `?`/`F1` keymap + command legend (spec §3, G2).
+    ///
+    /// The legend is a toggle, so it stays open across a confirm surface drawn
+    /// over it — `close_overlay` returns it. §7.3 draws exactly one overlay per
+    /// frame, and a pending confirm is the one that wins.
+    pub(crate) fn open_help(&mut self) {
+        self.help_open = true;
+        self.overlay = state::OverlayState::for_surface(self.confirm_open, self.help_open);
+        self.dirty = true;
+    }
+
+    /// Open the confirm surface: a destructive action awaiting `y`/`n` (spec G3,
+    /// §3), and the surface the armed-abort prompt of §8.5 also occupies.
+    pub(crate) fn show_confirm(&mut self) {
+        self.confirm_open = true;
+        self.overlay = state::OverlayState::for_surface(self.confirm_open, self.help_open);
+        self.dirty = true;
+    }
+
+    /// Close the surface that is on screen — `Esc` with an overlay open closes it
+    /// and never arms abort (spec §5, §4.4).
+    ///
+    /// A confirm on top is dismissed and the legend returns underneath if it was
+    /// toggled on; with only the legend open, the legend closes. Nothing here
+    /// touches the abort arming itself: dropping an overlay must neither arm nor
+    /// disarm (acceptance criterion 16).
+    pub(crate) fn close_overlay(&mut self) {
+        match self.overlay {
+            state::OverlayState::Confirm => {
+                self.confirm_open = false;
+                if self.help_open {
+                    self.open_help();
+                    return;
+                }
+                self.overlay = state::OverlayState::None;
+            }
+            state::OverlayState::Help => {
+                self.help_open = false;
+                self.overlay = state::OverlayState::None;
+            }
+            state::OverlayState::None => {}
+        }
+        self.dirty = true;
+    }
+
+    /// Fold the writes the legacy key path still makes directly into the real
+    /// view state, and keep the overlay surface honest with the 3 s abort window.
+    ///
+    /// `events.rs` owns `show_plan_panel` / `show_subagent_panel` /
+    /// `focused_panel` / `confirm_abort` until t-011 rewires the keys onto the
+    /// transitions above. Each change is turned into exactly ONE transition — the
+    /// mirror records what this renderer last wrote, so a write the transitions made
+    /// is never re-adopted and the stored mode/focus/follow never drift back out of
+    /// a pane toggle.
+    ///
+    /// The follow flag is the exception, and deliberately so (D3): `chat_auto_scroll`
+    /// is a projection of `follow` written only through [`Self::set_follow`] and
+    /// [`Self::project_follow_mirror`], so there is no legitimate legacy write that
+    /// could turn follow **on**. A divergence going that way is therefore repaired
+    /// rather than adopted; one going the other way (the legacy scroll path leaving
+    /// the tail) is a real decision and is folded in.
+    pub(crate) fn adopt_legacy_view_writes(&mut self) {
+        if self.show_plan_panel != self.legacy_view.plan_visible
+            || self.show_subagent_panel != self.legacy_view.workers_visible
+        {
+            self.set_view_mode(state::ViewMode::for_panes(
+                self.show_plan_panel,
+                self.show_subagent_panel,
+            ));
+        }
+        if self.focused_panel != self.legacy_view.focus {
+            self.set_focus(state::FocusPane::from_legacy(self.focused_panel));
+        }
+        if self.chat_auto_scroll != self.legacy_view.follow {
+            // D3: this is where a divergent mirror used to be **adopted** as
+            // `follow = true`, which is the silent re-arm — a submit (or a command
+            // notice) that assigned the flag put the operator back at the tail on
+            // the next frame. A divergent mirror is now only ever read as the one
+            // decision the legacy scroll path can express on its own, leaving the
+            // tail, and any other divergence is repaired back onto the projection.
+            // Turning follow back on stays reserved to the explicit actions: the
+            // `Ctrl+F` / `/follow` transition, or a scroll that lands on the tail.
+            if !self.chat_auto_scroll {
+                self.set_follow(false);
+            } else {
+                self.project_follow_mirror();
+            }
+        }
+        // The armed-abort window is a wall-clock surface, not a toggle (§8.5).
+        // Its rising edge puts the Confirm surface on screen and its falling
+        // edge — three seconds later, or a `clear_abort` — takes it back off with
+        // no key press at all. Edge-triggered on purpose: a confirm request t-011
+        // opens itself must never be closed by an unrelated abort window.
+        let armed = self.is_abort_armed();
+        if armed != self.legacy_view.abort_armed {
+            if armed {
+                self.show_confirm();
+            } else {
+                self.close_overlay();
+            }
+            self.legacy_view.abort_armed = armed;
+        }
     }
 
     /// Drain pending terminal events and apply render-throttling:
@@ -421,6 +1472,14 @@ impl TuiRenderer {
     /// - When completely idle and clean, do NOT re-render (0% CPU idle).
     pub(crate) fn drain_and_throttle_flush(&mut self, blocking: bool) {
         let handled = self.handle_events(blocking);
+        // The key path still writes the pre-rebuild view fields directly (t-011
+        // moves those keys onto the transition helpers), so every pass through
+        // the entry path folds those writes into the real view state before a
+        // frame is built. Running it unconditionally, rather than only for a
+        // handled event, is also what closes the armed-abort Confirm surface
+        // when its 3 s window expires with no key press at all (spec §8.5): the
+        // expiry sets `dirty`, so the surface never lingers on screen.
+        self.adopt_legacy_view_writes();
         if handled {
             self.dirty = false;
             let _ = self.force_flush();
@@ -469,6 +1528,48 @@ fn estimate_stream_tokens(text: &str) -> usize {
 /// its tail: dropping the oldest lines keeps the activity the operator is watching.
 pub(crate) const MAX_SUBAGENT_ROW_LOGS: usize = 200;
 
+/// How many steering instructions the renderer keeps in [`TuiRenderer::steer_traces`].
+///
+/// The ledger is a *witness* of the bridge's recent transitions, not an archive: the
+/// question a pane answers is "what happened to what I just sent", so the newest
+/// transitions are the ones that must survive, and an unbounded vector would grow for
+/// the whole life of a session. The cap drops the **oldest** entries only.
+pub(crate) const MAX_STEER_TRACES: usize = 12;
+
+/// Longest instruction one transcript line quotes before it marks the cut.
+const MAX_STEER_QUOTED_CHARS: usize = 160;
+
+/// The one transcript line naming what happened to one steering instruction.
+///
+/// The label comes from [`components::transcript::STEER_LINE_PREFIX`], which is also what
+/// the transcript pane styles on — the renderer writes the sentence, the pane decides how
+/// it looks, and both read the same constant so the pairing cannot drift.
+fn steer_transcript_line(trace: &SteerTrace) -> String {
+    let collapsed = trace
+        .text
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ");
+    let quoted = if collapsed.chars().count() > MAX_STEER_QUOTED_CHARS {
+        let head: String = collapsed.chars().take(MAX_STEER_QUOTED_CHARS).collect();
+        format!("{head}{}", theme::ELLIPSIS)
+    } else {
+        collapsed
+    };
+    let notice = trace
+        .notice_id
+        .as_deref()
+        .map(|id| format!(" (notice id {id})"))
+        .unwrap_or_default();
+    format!(
+        "{}{} → {}] {quoted} — {}{notice}",
+        components::transcript::STEER_LINE_PREFIX,
+        trace.stage.label(),
+        trace.target,
+        trace.reason,
+    )
+}
+
 /// Merge the renderer's live log lines with the ones an authoritative push carries.
 ///
 /// `logs` needs the same kind of merge guard `thinking` and `content` already have in
@@ -514,6 +1615,11 @@ pub(crate) fn merge_logs(existing: &[String], incoming: &[String]) -> Vec<String
 impl Renderer for TuiRenderer {
     fn init(&mut self) -> Result<()> {
         enable_raw_mode()?;
+        // From the next line on this renderer owns the screen, so the reset burst
+        // in [`Self::shutdown`] is its to write. Set before the modes are switched
+        // on, so an `init()` that fails halfway still gets the full teardown from
+        // the `Drop` of the renderer.
+        self.terminal_owned = true;
         execute!(
             io::stdout(),
             EnterAlternateScreen,
@@ -541,7 +1647,11 @@ impl Renderer for TuiRenderer {
             self.show_plan_panel = true;
             self.had_active_plan = true;
         }
-
+        // A plan restored from disk is the one pane decision taken before the
+        // first frame, so the view mode has to adopt it (a boot with a live plan
+        // is M2, spec §4.1) rather than stay on the M1 the constructor chose.
+        self.adopt_legacy_view_writes();
+        self.terminal_torn_down = false;
         self.force_flush()?;
         Ok(())
     }
@@ -579,12 +1689,6 @@ impl Renderer for TuiRenderer {
                         self.active_agent = "Manager".to_string();
                     }
                     self.current_content.push_str(text);
-                    if self.chat_auto_scroll {
-                        let w = self.chat_width.get();
-                        let n = self.estimated_chat_lines(w);
-                        let h = self.chat_height.get();
-                        self.chat_scroll = n.saturating_sub(h) as u16;
-                    }
                 }
             }
             Event::SteerResponse(text) => {
@@ -596,12 +1700,6 @@ impl Renderer for TuiRenderer {
                 let sentences = extract_complete_sentences(&mut self.steer_sentence_buffer);
                 for s in sentences {
                     self.append_steer_sentence(&s);
-                }
-                if self.chat_auto_scroll {
-                    let w = self.chat_width.get();
-                    let n = self.estimated_chat_lines(w);
-                    let h = self.chat_height.get();
-                    self.chat_scroll = n.saturating_sub(h) as u16;
                 }
             }
             Event::Thinking(text) => {
@@ -627,12 +1725,6 @@ impl Renderer for TuiRenderer {
                         self.active_agent = "Manager".to_string();
                     }
                     self.current_thought.push_str(text);
-                    if self.chat_auto_scroll {
-                        let w = self.chat_width.get();
-                        let n = self.estimated_chat_lines(w);
-                        let h = self.chat_height.get();
-                        self.chat_scroll = n.saturating_sub(h) as u16;
-                    }
                 }
             }
             Event::SubagentMessage { agent_tag, text } => {
@@ -732,12 +1824,6 @@ impl Renderer for TuiRenderer {
                         self.active_agent = "Manager".to_string();
                     }
                     self.messages.push(format!("[Tool Call] {text}"));
-                    if self.chat_auto_scroll {
-                        let w = self.chat_width.get();
-                        let n = self.estimated_chat_lines(w);
-                        let h = self.chat_height.get();
-                        self.chat_scroll = n.saturating_sub(h) as u16;
-                    }
                 }
             }
             Event::ToolResult(text) => {
@@ -765,12 +1851,6 @@ impl Renderer for TuiRenderer {
                         self.active_agent = "Manager".to_string();
                     }
                     self.messages.push(format!("[Tool Result] {text}"));
-                    if self.chat_auto_scroll {
-                        let w = self.chat_width.get();
-                        let n = self.estimated_chat_lines(w);
-                        let h = self.chat_height.get();
-                        self.chat_scroll = n.saturating_sub(h) as u16;
-                    }
                 }
             }
             Event::Status(text) => {
@@ -807,11 +1887,15 @@ impl Renderer for TuiRenderer {
                     for line in text.lines() {
                         self.messages.push(line.to_string());
                     }
-                    if self.chat_auto_scroll {
-                        let w = self.chat_width.get();
-                        let n = self.estimated_chat_lines(w);
-                        let h = self.chat_height.get();
-                        self.chat_scroll = n.saturating_sub(h) as u16;
+                    // §8.5: keep the cause verbatim. These are exactly the lines the
+                    // transcript now carries, so the remembered error and the one `e`
+                    // recalls cannot drift apart. A report the loop repeats (the same
+                    // failure re-announced on a retry) keeps the first record rather
+                    // than restamping it: the buffer marks the edge, not the traffic.
+                    if let Some(sticky) = sticky_error_from(text)
+                        && self.last_error.as_ref() != Some(&sticky)
+                    {
+                        self.last_error = Some(sticky);
                     }
                 }
                 // Live-track logs for subagents: match by agent name prefix (e.g. "coder-<id>: ...")
@@ -891,8 +1975,15 @@ impl Renderer for TuiRenderer {
                         self.active_agent = name.clone();
                         let t = clean_task.unwrap_or("(no task id)");
                         if let Some(tid) = clean_task {
+                            // Which task is in flight is data the plan pane reads and
+                            // centres itself on while centring is live. What a started
+                            // task must NOT do is arm centring: an operator who had
+                            // scrolled the plan to its tail was handed back to the
+                            // in-flight task by the next delegation (audit defect 13).
+                            // Centring is armed by a plan document this process has not
+                            // seen before (`arm_plan_centring`) and released by a plan
+                            // scroll key — never by task traffic.
                             self.active_plan_task = Some(tid.to_string());
-                            self.plan_auto_scroll = true;
                             self.show_plan_panel = true;
                         }
                         // Fold into the local subagent list so the panel stays
@@ -930,12 +2021,6 @@ impl Renderer for TuiRenderer {
                             None => format!("[{agent}] completed."),
                         };
                         self.messages.push(completed_msg);
-                        if self.chat_auto_scroll {
-                            let w = self.chat_width.get();
-                            let n = self.estimated_chat_lines(w);
-                            let h = self.chat_height.get();
-                            self.chat_scroll = n.saturating_sub(h) as u16;
-                        }
                         if self.active_plan_task.as_deref() == clean_task {
                             self.active_plan_task = self
                                 .subagents
@@ -1042,12 +2127,6 @@ impl Renderer for TuiRenderer {
                                 (None, None) => format!("[{agent}] failed."),
                             };
                         self.messages.push(failed_msg);
-                        if self.chat_auto_scroll {
-                            let w = self.chat_width.get();
-                            let n = self.estimated_chat_lines(w);
-                            let h = self.chat_height.get();
-                            self.chat_scroll = n.saturating_sub(h) as u16;
-                        }
                         if self.active_plan_task.as_deref() == clean_task {
                             self.active_plan_task = self
                                 .subagents
@@ -1082,6 +2161,9 @@ impl Renderer for TuiRenderer {
             }
         }
         let handled = self.handle_events(false);
+        // Fold whatever the key path wrote behind the API into the real view
+        // state before the frame is built (see `adopt_legacy_view_writes`).
+        self.adopt_legacy_view_writes();
         if handled || matches!(event, Event::Done) {
             let _ = self.force_flush();
         } else {
@@ -1157,14 +2239,39 @@ impl Renderer for TuiRenderer {
         crate::orchestrator::reset_cancellation();
     }
 
+    /// The TUI is the renderer that gates destructive commands (spec §5, §6, G3):
+    /// `events.rs::arm_destructive_command` puts every destructive slash spelling on
+    /// the confirm surface before anything is sent, and the bare words §5 removes are
+    /// handed over as ordinary steering text. The session loop therefore reads only
+    /// the slash spellings here (`helpers::is_abort_command`); the headless
+    /// `RawRenderer` and the test renderers keep the pre-rebuild vocabulary.
+    fn gates_destructive_commands(&self) -> bool {
+        true
+    }
+
+    /// Tear the terminal back down (spec §6.1 entry-path contract).
+    ///
+    /// Idempotent and panic-safe: every emission is error-tolerant (`let _ =`) —
+    /// after a panic hook or a broken pipe there is nobody left to answer an
+    /// escape sequence — and a second call is a no-op rather than a second
+    /// round-trip to a screen we no longer own. `Drop` calls this, so the normal
+    /// path (`shutdown()` at the end of the session loop) and the unwinding path
+    /// (renderer dropped by a panic) can both run without double-teardown.
+    ///
+    /// `DisableMouseCapture` is defensive and asymmetric by history, not by
+    /// design: this renderer never emits `EnableMouseCapture`, and the rebuilt UI
+    /// takes **no** mouse input (spec §6: the keymap is the whole interface, and
+    /// the legacy mouse arms in `events.rs` are retired with the key path). The
+    /// disable is kept because a terminal that inherited mouse mode from
+    /// somewhere else (a wrapper, a leaked previous process) must still be handed
+    /// back to the shell cleanly. Nothing in the UI may assume mouse events
+    /// arrive.
     fn shutdown(&mut self) {
-        let _ = execute!(
-            io::stdout(),
-            PopKeyboardEnhancementFlags,
-            LeaveAlternateScreen,
-            DisableMouseCapture,
-            DisableBracketedPaste
-        );
+        if !self.take_terminal_resets() {
+            return;
+        }
+        let mut stdout = io::stdout();
+        let _ = write_terminal_resets(&mut stdout);
         let _ = disable_raw_mode();
     }
 
@@ -1234,6 +2341,13 @@ impl Renderer for TuiRenderer {
         // Drop entries absent from the authoritative list.
         self.subagents
             .retain(|s| subagents.iter().any(|i| i.name == s.name));
+        // Plumbing delta D1 (design §9.3): the lifecycle the registry already carries
+        // (`status_label`, `implementation_turns`, `validation_rounds`,
+        // `latest_validator_feedback`) is mirrored onto the rows here, at the same
+        // boundary where the loop's queue/pause state is adopted. This is the only
+        // writer of those four fields on the renderer side, and it reads one registry
+        // snapshot rather than re-deriving anything from prose.
+        fold_worker_lifecycle(&mut self.subagents);
         let any_active = self.subagents.iter().any(|s| s.is_active);
         if any_active {
             self.show_subagent_panel = true;
@@ -1283,17 +2397,57 @@ impl Renderer for TuiRenderer {
         self.active_agent = "Manager".to_string();
     }
 
+    /// The bridge's steering-instruction projection (spec §3, §8.3; DATA §6 gap 7).
+    ///
+    /// This is the only writer of [`TuiRenderer::steer_traces`]: a queued, forwarded or
+    /// refused instruction reaches the panes because the bridge said so at the statement
+    /// that queued, filed or refused it — never because the renderer guessed it from
+    /// status prose or counted something of its own.
+    fn note_steer(&mut self, trace: &SteerTrace) {
+        self.record_steer(trace);
+    }
+
     // ---- session-rehydration hooks ----
 
     /// CAPTURE the pane model verbatim. This is a pure field read: no event is
     /// replayed, nothing is re-rendered, and no line is regenerated. `&self`
-    /// because a capture never mutates the UI.
+    /// because a capture never mutates the UI. The view state is read through the
+    /// same precedence the adoption bridge uses (see the locals below), so a
+    /// pre-rebuild field that the key path wrote behind the transition helpers is
+    /// captured as the state it names.
     fn capture_ui(&self) -> crate::session::format::UiSection {
         let budgets = self
             .thinking_budgets
             .iter()
             .map(|(role, budget)| (role.clone(), *budget))
             .collect();
+        // The view state has two spellings: the real one (`view_mode`, `focus`)
+        // and the pre-rebuild one (the two pane toggles, `focused_panel`). While
+        // the transition helpers are in use they never disagree — `set_view_mode`
+        // and `set_focus` write both. A direct write to a pre-rebuild field by the
+        // key path of `events.rs` is the fresher of the pair, and
+        // `adopt_legacy_view_writes` folds it into the real state on the next
+        // entry pass, so a capture of a still-unfolded renderer records the pane
+        // the key path named rather than a mode or a focus no key press asked
+        // for. That is the one case where the composer half stays unrecoverable
+        // (`FocusPane::from_legacy`), and it is exactly what pre-D2 bundles held.
+        let stated_panes =
+            state::ViewMode::for_panes(self.show_plan_panel, self.show_subagent_panel);
+        let stated_mode = if self.view_mode == stated_panes {
+            self.view_mode
+        } else {
+            stated_panes
+        };
+        let stated_focus = if self.focused_panel == self.focus.legacy() {
+            self.focus
+        } else {
+            state::FocusPane::from_legacy(self.focused_panel)
+        };
+        let stated_follow = if self.follow == self.chat_auto_scroll {
+            self.follow
+        } else {
+            self.chat_auto_scroll
+        };
         crate::session::format::UiSection {
             // The pane vector is copied element-for-element, in order,
             // including embedded newlines and empty or duplicate entries.
@@ -1329,18 +2483,40 @@ impl Renderer for TuiRenderer {
                 history_index: self.history_index,
             },
             view: crate::session::format::ViewState {
+                // Scroll state that is durable: the four offsets and the three
+                // follow/centring flags, verbatim. What is deliberately NOT stored is the
+                // geometry each pane measured while drawing it
+                // (`transcript_measured_max`, `detail_measured_max`, `plan_max_scroll`): a
+                // maximum is a property of the frame that drew it, and a restored
+                // conversation is not that conversation. Restore re-clamps the restored
+                // offsets against the line-count bootstrap that
+                // `transcript_tail`/`worker_detail_tail` fall back to once
+                // `invalidate_pane_caches` has cleared the published maxima, and the first
+                // frame after the restore republishes a measured number.
                 chat_scroll: self.chat_scroll,
                 plan_scroll: self.plan_scroll,
                 subagent_scroll: self.subagent_scroll,
                 subagent_list_scroll: self.subagent_list_scroll,
                 selected_subagent_idx: self.selected_subagent_idx,
-                focused_panel: focused_panel_tag(self.focused_panel).to_string(),
+                // The focus is captured from the real view state, so the pane the
+                // operator was in — composer included — keeps its own token
+                // instead of being folded into the legacy `Chat` spelling
+                // (spec §9.4 D2, §10 item 18).
+                focused_panel: stated_focus.tag().to_string(),
                 show_thought: self.show_thought,
                 show_subagent_panel: self.show_subagent_panel,
                 show_plan_panel: self.show_plan_panel,
                 chat_auto_scroll: self.chat_auto_scroll,
                 subagent_autoscroll: self.subagent_autoscroll,
                 plan_auto_scroll: self.plan_auto_scroll,
+                // The mode and the follow flag are stored as the renderer states
+                // them, not reconstructed on the way in from the two pane toggles
+                // and the auto-scroll mirror: those are the pre-rebuild spellings
+                // a pre-D2 bundle had to make do with, and they are what a bundle
+                // restores from when the mode token is absent. `Some` always,
+                // because `None` means "a bundle predates this field".
+                view_mode: Some(stated_mode.tag().to_string()),
+                follow: Some(stated_follow),
             },
             // Witness only: `Config` stays the authority; capture states the
             // numbers it holds, and restore never adopts them.
@@ -1484,10 +2660,54 @@ impl Renderer for TuiRenderer {
             self.had_active_plan = section.had_active_plan;
             self.active_plan_task = section.active_plan_task.clone();
         }
-        // An out-of-set spelling is a loader refusal, not something the
-        // renderer invents: keep the current focus in that case.
-        self.focused_panel =
-            focused_panel_from_tag(&section.view.focused_panel).unwrap_or(self.focused_panel);
+        // 3b. The real view state (spec §4.1, §4.2, §9.4 D2, §10 item 18). Since
+        // D2 the bundle states the mode, the focused pane (composer included) and
+        // the follow flag, so they are read back through the same transition
+        // helpers the keys use — which keeps the invariants (`mode` ⇔ pane
+        // inventory, `focus` ⇔ the legacy `focused_panel` mirror, `follow` ⇔ the
+        // scroll mirror) true for a restored session exactly as they are for a
+        // live one, and restores the composer focus the pre-rebuild spellings
+        // could not name. The legacy fields are what follow from the view state
+        // here, never the other way round.
+        //
+        // Only a field the bundle predates falls back to the older derivation,
+        // and it derives from what that bundle DID carry rather than from a
+        // default invented here: the mode from the two pane toggles, the follow
+        // flag from its `chat_auto_scroll` mirror. That is what such a bundle
+        // restored to before, so an old `ui.json` still lands in the same view.
+        //
+        // The focus is applied AFTER the mode because a restore never repairs
+        // one: `set_view_mode` pulls a focus off a pane its new mode removed (an
+        // absent pane is never drawn or hit-tested, §2.4.1), but a bundle may
+        // legitimately persist a token for a pane its toggles leave closed, and
+        // the loader rule for a focus the file states is to keep it verbatim
+        // rather than invent another one. An out-of-set token is a loader
+        // refusal (U-chk); if one reaches the renderer anyway it changes nothing,
+        // because a focus the file does not state is not a focus to set.
+        let restored_focus = state::FocusPane::from_tag(&section.view.focused_panel);
+        let restored_mode = section
+            .view
+            .view_mode
+            .as_deref()
+            .and_then(state::ViewMode::from_tag)
+            .unwrap_or_else(|| {
+                state::ViewMode::for_panes(self.show_plan_panel, self.show_subagent_panel)
+            });
+        self.set_view_mode(restored_mode);
+        if let Some(pane) = restored_focus {
+            self.set_focus(pane);
+        }
+        self.set_follow(section.view.follow.unwrap_or(self.chat_auto_scroll));
+        // A Confirm surface belongs to the 3 s abort window, and that window is
+        // never re-armed by a restore (step 5 below). If this process was showing
+        // one when the restore was applied, the surface goes away with it — while
+        // a Help legend the operator opened stays on screen. Resetting the abort
+        // mirror in the same breath keeps the adoption bridge from mistaking the
+        // restore for the window's falling edge and closing the legend too.
+        if self.overlay == state::OverlayState::Confirm {
+            self.close_overlay();
+        }
+        self.legacy_view.abort_armed = false;
 
         // 4. Scroll offsets and selection, verbatim; the live clamp re-checks
         // them against the freshly restored content.
@@ -1615,27 +2835,6 @@ impl Renderer for TuiRenderer {
     }
 }
 
-/// The persisted spelling of [`FocusedPanel`] (`"chat" | "plan" |
-/// "subagents"`, the same set as `session::format::FOCUSED_PANELS`).
-fn focused_panel_tag(panel: FocusedPanel) -> &'static str {
-    match panel {
-        FocusedPanel::Chat => "chat",
-        FocusedPanel::Plan => "plan",
-        FocusedPanel::Subagents => "subagents",
-    }
-}
-
-/// Inverse of [`focused_panel_tag`]; `None` for an out-of-set spelling, which
-/// the loader refuses rather than repairs.
-fn focused_panel_from_tag(tag: &str) -> Option<FocusedPanel> {
-    match tag {
-        "chat" => Some(FocusedPanel::Chat),
-        "plan" => Some(FocusedPanel::Plan),
-        "subagents" => Some(FocusedPanel::Subagents),
-        _ => None,
-    }
-}
-
 /// Project one live [`SubagentDetail`] onto its durable mirror.
 /// `worked_duration_secs` is carried as an explicit number, never re-derived
 /// from the two re-anchored instants.
@@ -1658,6 +2857,18 @@ fn subagent_panel_from_detail(detail: &SubagentDetail) -> crate::session::format
         // them from the renderer's maps, keyed by the same `name`.
         turn_thinking: None,
         is_thinking: None,
+        // Plumbing delta D2 (design §9.4): the slot-queue pair and the arbitration
+        // pause ARE persisted now, so a restore puts the row back in the state the
+        // screen was actually showing instead of silently downgrading a
+        // `(Queued 2/3)` or `(Paused)` row to "idle". Both are `#[serde(default)]`
+        // on the way in, so a bundle written before D2 still loads.
+        queue: detail
+            .queue
+            .map(|queue| crate::session::format::QueuePanel {
+                position: queue.position,
+                of: queue.of,
+            }),
+        paused: detail.paused,
     }
 }
 
@@ -1705,19 +2916,34 @@ fn subagent_detail_from_panel(panel: &crate::session::format::SubagentPanel) -> 
         content: panel.content.clone(),
         is_active: panel.is_active,
         context_tokens: panel.context_tokens,
-        // Neither slot state is **persisted**: `queue` belongs to a live delegation's
-        // wait in a pool ledger that exists only inside this process, and `paused` to a
-        // stream the preemption handshake is holding right now. A journaled pane records
-        // a round that was interrupted, never a stream parked behind the arbitrator, so
-        // both start clean. How each is recovered afterwards is the difference fix #3
-        // made: a pause comes back only from a fresh `Event::SubagentStreamPause`, while
-        // a queue label comes back by itself as soon as the pool reports a rank for the
-        // live entry behind the row — the projection mirrors
-        // `orchestrator::WorkerEntry::queue_position` (fix #3), so the persisted format
-        // needs no queue field and a restored row is never left claiming — or hiding — a
-        // position the registry knows about.
-        queue: None,
-        paused: false,
+        // Both slot states come back from the bundle now. Before plumbing delta D2
+        // (design §9.4) neither was persisted at all: `queue` belongs to a live
+        // delegation's wait in a pool ledger that exists only inside this process, and
+        // `paused` to a stream the preemption handshake is holding right now, so a
+        // journaled pane recorded a round that was interrupted and the row came back
+        // downgraded to idle — a `(Queued 2/3)` or `(Paused)` row lost its state for as
+        // long as the pool stayed quiet, and only a fresh `Event::SubagentStreamPause`
+        // or a fresh queue event could put it back (fix #3 made the queue label come
+        // back by itself once the pool reported a rank, because the projection mirrors
+        // `orchestrator::WorkerEntry::queue_position`).
+        //
+        // D2 closes that window: a panel captured while parked or queued restores as
+        // parked or queued. A rank the registry knows about still wins on the next
+        // projection, and a panel written before D2 has no such fields, so it restores
+        // exactly as it did before — never an invented position.
+        queue: panel.queue.map(|queue| crate::ui::QueueState {
+            position: queue.position,
+            of: queue.of,
+        }),
+        paused: panel.paused,
+        // The D1 lifecycle fields are deliberately NOT persisted: the worker
+        // registry is their only source, and a restored row re-derives them from
+        // the live entry behind its key. Restoring prose from a bundle would let a
+        // label outlive the worker that produced it.
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     }
 }
 
@@ -1816,6 +3042,13 @@ impl TuiRenderer {
     /// Drop every derived chat cache so the next frame is rebuilt from the
     /// restored bytes: derived caches are never stored, and a frame must never
     /// draw a line that was not stored.
+    ///
+    /// The two measured scroll maxima belong here too (audit defects 11/12): they
+    /// are what the pane last *drew*, not durable state, so a restored
+    /// conversation must not be clamped against the geometry of the conversation
+    /// it replaced. Clearing them hands the answer back to the line-count
+    /// bootstrap in [`TuiRenderer::transcript_tail`] until the first frame after the
+    /// restore republishes a measured number.
     fn invalidate_pane_caches(&self) {
         self.cached_rendered_messages.borrow_mut().clear();
         self.cached_message_lines.borrow_mut().clear();
@@ -1823,6 +3056,33 @@ impl TuiRenderer {
         self.cached_total_message_lines.set(0);
         self.cached_show_thought.set(!self.show_thought);
         self.cached_rendered_show_thought.set(!self.show_thought);
+        self.transcript_measured_max.set(None);
+        self.detail_measured_max.set(None);
+    }
+
+    /// Decide whether [`Renderer::shutdown`] owes the terminal a reset burst, and
+    /// record the answer. It returns `true` exactly once per [`Renderer::init`] —
+    /// the only writer of `terminal_owned` — and that single caller is the one
+    /// allowed to hand [`write_terminal_resets`] an `io::stdout()`.
+    ///
+    /// A renderer nobody initialized — every one a unit test builds and then drops,
+    /// and one whose `init()` failed at `enable_raw_mode` — switched no terminal
+    /// mode on, so it has nothing to hand back. Writing the burst anyway addresses
+    /// a terminal this process never owned: the shell, a pager, a library caller,
+    /// or the process holding the unit-test stdout, which is exactly what several
+    /// hundred test-dropped renderers used to do on every `cargo test --lib` run
+    /// (audit D11). The decision is its own method so a test can exercise both
+    /// answers without ever writing to the real terminal.
+    ///
+    /// `terminal_torn_down` is set on every call, so the paint suppression keyed on
+    /// it (`render_terminal`, `flush`, `force_flush`) is unchanged for a silent
+    /// teardown.
+    fn take_terminal_resets(&mut self) -> bool {
+        if self.terminal_torn_down {
+            return false;
+        }
+        self.terminal_torn_down = true;
+        std::mem::take(&mut self.terminal_owned)
     }
 }
 
@@ -1832,18 +3092,47 @@ impl Drop for TuiRenderer {
     }
 }
 
-/// Leave the alternate screen (best-effort, from the panic hook).
-pub fn leave_alt_screen() -> std::io::Result<()> {
-    let _ = disable_raw_mode();
-    // Mirror every mode init() switched on, including bracketed paste, because the
-    // panic path bypasses shutdown() and must not leak mode 2004 into the user's shell.
+/// The whole reset burst that hands the terminal back, in one definition: pop the
+/// keyboard-enhancement flags, leave the alternate screen, disable mouse capture,
+/// disable bracketed paste.
+///
+/// Both teardown paths write it — [`Renderer::shutdown`] on a normal exit and
+/// [`leave_alt_screen`] on the panic path — so the two can no longer drift apart,
+/// and so the burst has a writer a unit test can hand a buffer to instead of the
+/// ambient stdout (audit D11). The commands and their order are exactly what the
+/// two call sites used to spell out inline; the payload is pinned by
+/// `teardown_writes_exactly_the_reset_burst_to_the_writer_it_is_given`.
+fn write_terminal_resets<W: Write>(w: &mut W) -> std::io::Result<()> {
     execute!(
-        io::stdout(),
+        w,
         PopKeyboardEnhancementFlags,
         LeaveAlternateScreen,
         DisableMouseCapture,
         DisableBracketedPaste
     )
+}
+
+/// Leave the alternate screen (best-effort, from the panic hook).
+///
+/// The panic path bypasses [`Renderer::shutdown`]: the hook runs while the
+/// renderer is being unwound, so this is a free function over the global terminal
+/// mode and deliberately touches no renderer state. It mirrors every mode `init()`
+/// switched on — including bracketed paste, so mode 2004 never leaks into the
+/// user's shell — and disables raw mode first so a terminal left in raw mode
+/// cannot eat the rest of the panic output.
+///
+/// Idempotency: the `Drop` of the renderer runs `shutdown()` after this, so the
+/// same five sequences are written twice on the unwinding path. That is harmless
+/// by construction — every one of them is a reset (`Pop…`, `LeaveAlternateScreen`,
+/// `DisableMouseCapture`, `DisableBracketedPaste`, raw mode off), not a toggle —
+/// and it is what makes the teardown safe to run from a hook, from `Drop` and from
+/// the session loop in any order.
+pub fn leave_alt_screen() -> std::io::Result<()> {
+    let _ = disable_raw_mode();
+    // Mirror every mode init() switched on, including bracketed paste, because the
+    // panic path bypasses shutdown() and must not leak mode 2004 into the user's shell.
+    let mut stdout = io::stdout();
+    write_terminal_resets(&mut stdout)
 }
 
 /// Run the interactive TUI session using the CLI's optional initial prompt.

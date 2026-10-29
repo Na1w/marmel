@@ -1,7 +1,19 @@
 use super::*;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::style::{Color, Modifier};
 use std::time::Duration;
+
+/// Feed one synthetic key press through the same seam the live event loop calls
+/// ([`TuiRenderer::apply_terminal_event`]), and report whether the key meant
+/// something. The §10.3 legend-parity test and every keymap test below drive real
+/// events rather than calling private helpers, so a legend row cannot name a key
+/// the handler does not actually bind.
+fn press(r: &mut TuiRenderer, code: KeyCode, modifiers: KeyModifiers) -> bool {
+    r.apply_terminal_event(&crossterm::event::Event::Key(KeyEvent::new(
+        code, modifiers,
+    )))
+}
 
 #[test]
 fn extract_sentences_splits_on_newline() {
@@ -53,32 +65,44 @@ fn extract_sentences_handles_tab_whitespace() {
 
 #[test]
 fn message_style_matches_reference_prefixes() {
+    // The transcript role table lives in `theme.rs` (§B.1/§D2): this test pins
+    // both the slot a prefix resolves to *and* that slot's value, so a hue can
+    // only move together with the role it names.
     let (s, special) = message_style("User: hello");
     assert!(special);
-    assert_eq!(s.fg, Some(Color::Cyan));
+    assert_eq!(s, theme::role_user());
+    assert_eq!(s.fg, Some(Color::LightCyan));
     assert!(s.add_modifier.contains(Modifier::BOLD));
 
     let (s, special) = message_style("Marmennill: reply");
     assert!(special);
+    assert_eq!(s, theme::role_manager());
     assert_eq!(s.fg, Some(Color::LightYellow));
     assert!(s.add_modifier.contains(Modifier::BOLD));
 
     let (s, special) = message_style("[Status] running");
     assert!(special);
+    assert_eq!(s, theme::role_status());
     assert_eq!(s.fg, Some(Color::Yellow));
 
     let (s, special) = message_style("System Error: boom");
     assert!(special);
+    assert_eq!(s, theme::state_failed());
     assert_eq!(s.fg, Some(Color::Red));
     assert!(s.add_modifier.contains(Modifier::BOLD));
 
     let (s, special) = message_style("--- Turn 1");
     assert!(special);
-    assert_eq!(s.fg, Some(Color::Green));
+    assert_eq!(s, theme::role_turn());
+    assert_eq!(s.fg, Some(Color::DarkGray));
     assert!(s.add_modifier.contains(Modifier::BOLD));
 
-    let (_, special) = message_style("plain line");
+    // Body text carries no forced foreground (§F2): a forced `White` is
+    // white-on-white on a light profile, so the default branch stays fg-less.
+    let (s, special) = message_style("plain line");
     assert!(!special);
+    assert_eq!(s, theme::text_primary());
+    assert_eq!(s.fg, None);
 }
 
 #[test]
@@ -212,6 +236,11 @@ fn estimated_subagent_lines_counts_sections() {
         context_tokens: 0,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
     // Default (show_thought = false, thinking moved to bottom status bar):
     // 1 (header) + 1 ([Output]) + 1 (out) + 1 ([Logs]) + 1 (- log1) = 5
@@ -297,35 +326,42 @@ fn history_navigation_recalls_and_restores_draft() {
     assert_eq!(r.history_index, None);
 }
 
+/// `Tab` / `Shift+Tab` walk the §4.2 focus ring through the key handler, skipping
+/// the panes the current mode does not present, and the legacy `focused_panel`
+/// mirror moves with the stored focus.
 #[test]
 fn cycle_focus_obeys_panel_visibility() {
-    let mut r = TuiRenderer::new();
-    r.show_plan_panel = true;
-    r.plan_content = "plan".to_string();
-    r.show_subagent_panel = true;
-    r.subagents.push(SubagentDetail {
-        name: "coder".to_string(),
-        task_id: None,
-        prompt: String::new(),
-        started_at: None,
-        worked_duration: std::time::Duration::ZERO,
-        last_activity_at: None,
-        logs: vec![],
-        thinking: String::new(),
-        content: String::new(),
-        is_active: true,
-        context_tokens: 0,
-        queue: None,
-        paused: false,
-    });
+    let mut r = m4_renderer();
 
-    r.focused_panel = FocusedPanel::Chat;
-    r.cycle_focus();
-    assert_eq!(r.focused_panel, FocusedPanel::Plan);
-    r.cycle_focus();
-    assert_eq!(r.focused_panel, FocusedPanel::Subagents);
-    r.cycle_focus();
+    // M4 presents all four panes: Input -> Transcript -> Plan -> Workers -> Input.
+    assert_eq!(r.focus, state::FocusPane::Input);
+    press(&mut r, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(r.focus, state::FocusPane::Transcript);
     assert_eq!(r.focused_panel, FocusedPanel::Chat);
+    press(&mut r, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(r.focus, state::FocusPane::Plan);
+    assert_eq!(r.focused_panel, FocusedPanel::Plan);
+    press(&mut r, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(r.focus, state::FocusPane::Workers);
+    assert_eq!(r.focused_panel, FocusedPanel::Subagents);
+    press(&mut r, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(r.focus, state::FocusPane::Input);
+
+    // `Shift+Tab` walks it backwards, spelled both ways terminals deliver it.
+    press(&mut r, KeyCode::BackTab, KeyModifiers::NONE);
+    assert_eq!(r.focus, state::FocusPane::Workers);
+    press(&mut r, KeyCode::Tab, KeyModifiers::SHIFT);
+    assert_eq!(r.focus, state::FocusPane::Plan);
+
+    // An absent pane is never a landing pane (G6): M1 has no Plan or Workers, and
+    // switching to a mode that removes the focused pane pulls focus back onto a
+    // pane that is actually on screen.
+    r.set_view_mode(state::ViewMode::Transcript);
+    assert_eq!(r.focus, state::FocusPane::Input);
+    press(&mut r, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(r.focus, state::FocusPane::Transcript);
+    press(&mut r, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(r.focus, state::FocusPane::Input);
 }
 
 /// A `Delegation(Started)` event creates an active subagent entry and routes
@@ -449,6 +485,11 @@ fn set_subagents_adopts_authoritative_list() {
         context_tokens: 0,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
 
     // Authoritative list from the loop (no thinking/content, just lifecycle).
@@ -466,6 +507,11 @@ fn set_subagents_adopts_authoritative_list() {
         context_tokens: 0,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     }];
     r.set_subagents(authoritative);
 
@@ -491,6 +537,11 @@ fn set_subagents_adopts_authoritative_list() {
         context_tokens: 0,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
     r.set_subagents(vec![SubagentDetail {
         name: "coder".to_string(),
@@ -506,6 +557,11 @@ fn set_subagents_adopts_authoritative_list() {
         context_tokens: 0,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     }]);
     assert_eq!(r.subagents.len(), 1);
     assert_eq!(r.subagents[0].name, "coder");
@@ -691,6 +747,11 @@ fn set_subagents_adopts_authoritative_queue_state() {
         context_tokens: 0,
         queue: Some(crate::ui::QueueState { position: 5, of: 9 }),
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
 
     // The loop says the slot is held: the stale local position must go.
@@ -708,6 +769,11 @@ fn set_subagents_adopts_authoritative_queue_state() {
         context_tokens: 0,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     }]);
     assert_eq!(r.subagents[0].queue, None);
     assert_eq!(
@@ -730,6 +796,11 @@ fn set_subagents_adopts_authoritative_queue_state() {
         context_tokens: 0,
         queue: Some(crate::ui::QueueState { position: 1, of: 2 }),
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     }]);
     assert_eq!(
         r.subagents[0].queue,
@@ -798,281 +869,6 @@ fn queue_row(name: &str, is_active: bool, queue: Option<crate::ui::QueueState>) 
     }
 }
 
-/// Draw the Subagents panel into a `width x height` test terminal and hand back
-/// both the text of every terminal row and the style of every cell.
-fn draw_subagent_panel(
-    r: &mut TuiRenderer,
-    width: u16,
-    height: u16,
-) -> (Vec<String>, Vec<Vec<ratatui::style::Style>>) {
-    let backend = ratatui::backend::TestBackend::new(width, height);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, width, height);
-            r.render_subagents(frame, area);
-        })
-        .unwrap();
-    let buffer = terminal.backend().buffer();
-    let rows = (0..height)
-        .map(|y| {
-            (0..width)
-                .map(|x| buffer[(x, y)].symbol().to_string())
-                .collect::<String>()
-        })
-        .collect();
-    let styles = (0..height)
-        .map(|y| (0..width).map(|x| buffer[(x, y)].style()).collect())
-        .collect();
-    (rows, styles)
-}
-
-/// Draw one status line into a 100-column test terminal.
-fn draw_status_line(r: &mut TuiRenderer, width: u16) -> String {
-    let backend = ratatui::backend::TestBackend::new(width, 1);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| {
-            r.render_status(frame, ratatui::layout::Rect::new(0, 0, width, 1));
-        })
-        .unwrap();
-    let buffer = terminal.backend().buffer();
-    (0..width)
-        .map(|x| buffer[(x, 0)].symbol().to_string())
-        .collect()
-}
-
-/// The frame set both spinners cycle through.
-const SPINNER_FRAMES: [char; 4] = ['-', '\\', '|', '/'];
-
-/// A queued row is labelled with its FIFO position and nothing about the row is
-/// otherwise reinterpreted: the ctx count and the work clock keep their place in
-/// the label, a row holding its slot still reads `(Active)`, and a finished row
-/// still reads `(Idle)`.
-#[test]
-fn queued_rows_are_labelled_with_their_position_in_the_list() {
-    let mut r = TuiRenderer::new();
-    r.show_subagent_panel = true;
-    let now = std::time::Instant::now();
-
-    let mut queued = queue_row(
-        "coder-t-1",
-        true,
-        Some(crate::ui::QueueState { position: 2, of: 4 }),
-    );
-    queued.task_id = Some("t-1".to_string());
-    queued.context_tokens = 3500;
-    queued.started_at = Some(now - Duration::from_secs(5));
-    let mut running = queue_row("coder-t-2", true, None);
-    running.task_id = Some("t-2".to_string());
-    running.context_tokens = 1200;
-    let mut idle = queue_row("researcher-t-3", false, None);
-    idle.task_id = Some("t-3".to_string());
-    idle.context_tokens = 400;
-    r.subagents.extend([queued, running, idle]);
-
-    let (rows, _) = draw_subagent_panel(&mut r, 100, 20);
-    let text = rows.join("\n");
-    assert!(
-        text.contains("coder-t-1 (Queued 2/4, 3.5k ctx, 5s)"),
-        "expected 'coder-t-1 (Queued 2/4, 3.5k ctx, 5s)' in the subagents panel, got:\n{text}"
-    );
-    assert!(
-        text.contains("coder-t-2 (Active, 1.2k ctx)"),
-        "a row that holds its slot must still read (Active), got:\n{text}"
-    );
-    assert!(
-        text.contains("researcher-t-3 (Idle, 400 ctx)"),
-        "a finished row must still read (Idle), got:\n{text}"
-    );
-
-    let queued_row = rows
-        .iter()
-        .find(|line| line.contains("coder-t-1"))
-        .expect("the queued row is drawn");
-    assert!(
-        !queued_row.contains("(Active"),
-        "a queued row must not claim it holds a slot, got: {queued_row:?}"
-    );
-    assert!(
-        !queued_row.contains("(Idle"),
-        "a queued row is still part of the round, got: {queued_row:?}"
-    );
-}
-
-/// The queued row stays green/bold — it belongs to the current round, so making
-/// it grey would drop it out of the panel's whole notion of liveness — while the
-/// slot label carries its own colour so the position is impossible to miss.
-#[test]
-fn a_queued_row_stays_visibly_active_and_colours_only_its_slot_label() {
-    let mut r = TuiRenderer::new();
-    r.show_subagent_panel = true;
-    r.subagents.push(queue_row(
-        "coder-t-1",
-        true,
-        Some(crate::ui::QueueState { position: 2, of: 4 }),
-    ));
-    r.subagents.push(queue_row("coder-t-2", true, None));
-
-    let (rows, styles) = draw_subagent_panel(&mut r, 100, 20);
-    // Row 0 of the list is the first line inside the bordered block (y = 1).
-    let row_y = rows
-        .iter()
-        .position(|line| line.contains("coder-t-1"))
-        .expect("the queued row is drawn");
-    let name_x = rows[row_y].find("coder-t-1").unwrap();
-    let label_x = rows[row_y].find("(Queued").unwrap();
-
-    let name = styles[row_y][name_x];
-    assert_eq!(
-        name.fg,
-        Some(Color::Green),
-        "the name of a queued row stays green, so the row still reads as live"
-    );
-    assert!(
-        name.add_modifier.contains(Modifier::BOLD),
-        "the name of a queued row stays bold"
-    );
-
-    let label = styles[row_y][label_x];
-    assert_eq!(
-        label.fg,
-        Some(Color::LightYellow),
-        "the slot label gets its own colour, got: {:?}",
-        rows[row_y]
-    );
-
-    // The row holding its slot keeps the plain green label: the queued colour is
-    // never applied to a neighbour just because a queue exists.
-    let running_y = rows
-        .iter()
-        .position(|line| line.contains("coder-t-2"))
-        .expect("the running row is drawn");
-    let running_x = rows[running_y].find("(Active").unwrap();
-    assert_eq!(styles[running_y][running_x].fg, Some(Color::LightGreen));
-}
-
-/// The detail pane says what the selected row is waiting on, with the same
-/// position, instead of the generic "waiting for model response" line — and the
-/// spinner keeps turning through the wait.
-#[test]
-fn the_detail_pane_spells_out_the_slot_wait() {
-    let mut r = TuiRenderer::new();
-    r.show_subagent_panel = true;
-    r.subagents.push(queue_row(
-        "coder-t-1",
-        true,
-        Some(crate::ui::QueueState { position: 3, of: 5 }),
-    ));
-
-    let (rows, _) = draw_subagent_panel(&mut r, 100, 20);
-    let text = rows.join("\n");
-    const WAIT: &str = "[Status: Queued 3/5 - waiting for a backend slot...]";
-    assert!(
-        text.contains(WAIT),
-        "expected {WAIT:?} in the subagent status bar, got:\n{text}"
-    );
-    assert!(
-        !text.contains("waiting for model response"),
-        "a row waiting for a slot must not claim it is waiting on the model:\n{text}"
-    );
-
-    let bar = rows
-        .iter()
-        .find(|line| line.contains(WAIT))
-        .expect("the status bar row");
-    let spinner = bar[bar.find(WAIT).unwrap() + WAIT.len()..]
-        .trim_start()
-        .chars()
-        .next()
-        .unwrap_or(' ');
-    assert!(
-        SPINNER_FRAMES.contains(&spinner),
-        "a queued row keeps a live spinner, got {spinner:?} in {bar:?}"
-    );
-}
-
-/// A row that is not running never advertises a slot position: the queue belongs
-/// to a live delegation only.
-#[test]
-fn a_row_that_is_not_running_never_shows_a_queue_position() {
-    let mut r = TuiRenderer::new();
-    r.show_subagent_panel = true;
-    r.subagents.push(queue_row(
-        "coder-t-1",
-        false,
-        Some(crate::ui::QueueState { position: 3, of: 5 }),
-    ));
-
-    let (rows, _) = draw_subagent_panel(&mut r, 100, 20);
-    let text = rows.join("\n");
-    assert!(
-        text.contains("coder-t-1 (Idle)"),
-        "the row reads Idle whatever it once held, got:\n{text}"
-    );
-    assert!(
-        !text.contains("Queued"),
-        "no queue label for a row that is not running, got:\n{text}"
-    );
-}
-
-/// A queued delegation is still dispatched, so it still counts in the
-/// "[N active: …]" activity group — the clocks and the activity count keyed on
-/// `is_active` must not move when a row waits for a slot.
-#[test]
-fn a_queued_row_still_counts_as_active_in_the_main_status_line() {
-    let mut r = TuiRenderer::new();
-    r.subagents.push(queue_row(
-        "coder-t-1",
-        true,
-        Some(crate::ui::QueueState { position: 1, of: 3 }),
-    ));
-    r.subagents.push(queue_row("coder-t-2", true, None));
-    r.status_line = "Delegating to specialist coder-t-1 for t-1".to_string();
-
-    let content = draw_status_line(&mut r, 160);
-    assert!(
-        content.contains("[2 active: coder-t-1, coder-t-2]"),
-        "the queued row must stay in the active group, got: {content:?}"
-    );
-}
-
-/// A round in which every session is waiting for a backend slot has to animate
-/// exactly like a streaming round: the gate reports the wait as status traffic,
-/// and that traffic is what holds the spinner up.
-#[test]
-fn a_queued_only_round_keeps_the_status_line_animating() {
-    let mut r = TuiRenderer::new();
-    // The exact sentence the concurrency gate emits for a slot wait.
-    r.on_event(&Event::Status(
-        "queued for a backend slot (2 of 4) — Manager".to_string(),
-    ));
-    assert!(
-        r.waiting_for_token_since.is_some(),
-        "waiting for a slot counts as waiting on the backend"
-    );
-
-    let content = draw_status_line(&mut r, 160);
-    assert!(
-        content.contains("queued for a backend slot (2 of 4)"),
-        "the slot wait is surfaced in the status line, got: {content:?}"
-    );
-    let tail = content.trim_end();
-    assert!(
-        tail.ends_with(SPINNER_FRAMES),
-        "the activity spinner must keep turning for a queued-only round, got: {tail:?}"
-    );
-
-    // Control: the spinner is not simply always on.
-    let mut idle = TuiRenderer::new();
-    idle.on_event(&Event::Status("Ready".to_string()));
-    let idle_tail = draw_status_line(&mut idle, 80).trim_end().to_string();
-    assert!(
-        !idle_tail.ends_with(SPINNER_FRAMES),
-        "an idle status line must not animate, got: {idle_tail:?}"
-    );
-}
-
 /// The animation keyword set is shared by the render-loop throttle tier and the
 /// status-line indicator, so the two cannot disagree about a queued round.
 #[test]
@@ -1091,146 +887,6 @@ fn the_slot_wait_keyword_is_shared_by_both_animation_tiers() {
     );
 }
 
-/// Queue positions are re-reported every time the line ahead moves, so the label
-/// changes several times a second. Nothing else may move with it: not the
-/// selected row, not the scrolled list window, not the other rows.
-#[test]
-fn queue_position_updates_never_move_the_selection_or_the_list_window() {
-    let mut r = TuiRenderer::new();
-    r.show_subagent_panel = true;
-    for n in 1..=5 {
-        r.subagents
-            .push(queue_row(&format!("coder-t-{n}"), true, None));
-    }
-    // Five rows in a three-line window: the selection has to be scrolled into
-    // view, which is exactly the state a reselect would silently destroy.
-    r.selected_subagent_idx = 4;
-
-    let (before, _) = draw_subagent_panel(&mut r, 100, 20);
-    assert_eq!(
-        r.subagent_list_scroll, 2,
-        "the selected row is scrolled into view once"
-    );
-    let selected_line = before
-        .iter()
-        .position(|line| line.contains("> coder-t-5"))
-        .expect("the selected row is visible");
-    assert!(
-        !before.iter().any(|line| line.contains("coder-t-1")),
-        "the first rows are scrolled out of the window"
-    );
-
-    // The list window, in draw order: exactly the rows carrying a slot or
-    // lifecycle label (the detail header and the detail status bar never do).
-    // Panel borders are trimmed off both ends so the expectation is the row text.
-    let window = |lines: &[String]| -> Vec<String> {
-        lines
-            .iter()
-            .filter(|line| {
-                line.contains("(Queued ") || line.contains("(Active)") || line.contains("(Idle")
-            })
-            .map(|line| line.trim_matches('│').trim_end().to_string())
-            .collect()
-    };
-    assert_eq!(
-        window(&before),
-        [
-            "  coder-t-3 (Active)",
-            "  coder-t-4 (Active)",
-            "> coder-t-5 (Active)",
-        ],
-        "the window holds the tail of the list, selected on its last row"
-    );
-
-    for (position, of) in [(4usize, 6usize), (2, 6), (1, 3)] {
-        // Half of the round queues: once through the renderer's own delegation
-        // arm, once through the session loop's authoritative push.
-        for task in ["t-3", "t-5"] {
-            r.on_event(&Event::Delegation(
-                crate::orchestrator::DelegationEvent::Queued {
-                    agent: crate::agents::Agent::Coder,
-                    task: Some(task.to_string()),
-                    position,
-                    of,
-                },
-            ));
-        }
-        let mut authoritative = r.subagents.clone();
-        for detail in &mut authoritative {
-            detail.queue = match detail.name.as_str() {
-                "coder-t-3" | "coder-t-5" => Some(crate::ui::QueueState { position, of }),
-                _ => None,
-            };
-        }
-        r.set_subagents(authoritative);
-
-        assert_eq!(
-            r.selected_subagent_idx, 4,
-            "a slot transition never reselects a row"
-        );
-        assert_eq!(
-            r.subagent_list_scroll, 2,
-            "a slot transition never scrolls the list window"
-        );
-
-        let (after, _) = draw_subagent_panel(&mut r, 100, 20);
-        assert_eq!(
-            window(&after),
-            vec![
-                format!("  coder-t-3 (Queued {position}/{of})"),
-                "  coder-t-4 (Active)".to_string(),
-                format!("> coder-t-5 (Queued {position}/{of})"),
-            ],
-            "only the two queued labels change, and only their digits"
-        );
-        assert_eq!(
-            after.iter().position(|line| line.contains("> coder-t-5")),
-            Some(selected_line),
-            "the selected row stays on the same terminal line"
-        );
-    }
-}
-
-/// A restart keeps the panel rows but not the pool: no semaphore survives, so no
-/// position may survive either. The restored row comes back as a running row.
-#[test]
-fn a_restored_row_never_shows_a_stale_queue_position() {
-    let mut live = TuiRenderer::new();
-    live.show_subagent_panel = true;
-    let mut queued = queue_row(
-        "coder-t-1",
-        true,
-        Some(crate::ui::QueueState { position: 7, of: 9 }),
-    );
-    queued.task_id = Some("t-1".to_string());
-    live.subagents.push(queued);
-
-    let section = live.capture_ui();
-    let mut restored = TuiRenderer::new();
-    restored.restore_panes(&section);
-
-    assert_eq!(restored.subagents.len(), 1);
-    assert_eq!(
-        restored.subagents[0].queue, None,
-        "the queue ledger does not survive a restart, so the panel may not claim a position"
-    );
-    assert!(
-        restored.subagents[0].is_active,
-        "the delegation was still dispatched when the session was captured"
-    );
-
-    let (rows, _) = draw_subagent_panel(&mut restored, 100, 20);
-    let text = rows.join("\n");
-    assert!(
-        text.contains("coder-t-1 (Active)"),
-        "a restored row comes back as a running row, got:\n{text}"
-    );
-    assert!(
-        !text.contains("Queued"),
-        "no stale queue position may survive a restore, got:\n{text}"
-    );
-}
-
 /// Removes one registry entry when the guard goes out of scope, so a panicking assertion in a
 /// registry-touching test can never leave a live worker behind for the rest of the test binary
 /// (the table is process-global, and a leaked row shows up in every other suite's projection).
@@ -1242,269 +898,6 @@ impl Drop for EntryCleanup {
     fn drop(&mut self) {
         crate::orchestrator::workers::remove_worker_entry_for_test(&self.key);
     }
-}
-
-/// Regression guard for fix #3 + fix #2 (`docs/diagnose_subpane_stale_refresh.md` §3):
-/// a queued row rebuilt **purely from the worker registry** — the pool's rank sits on the
-/// registry entry, and no `Queued` delegation event reaches the panel at all — must carry
-/// the whole pane, not just a row.
-///
-/// Three separate things used to go wrong here, and all three are asserted:
-/// * the projection wrote no `queue` field at all (`apply_registry_entry` ignored
-///   `WorkerEntry::queue_position`), so the row read `coder-… (Active)` while the pool kept
-///   the same delegation in line;
-/// * the pane's change detector ignored `queue`, so even a projection that *did* write it
-///   reported "no change" and the host was never handed the new row set;
-/// * the detail pane (thinking / output / logs) plus the slot-wait bar were never checked
-///   for a queued row at all — the queued detail-pane test asserted only the bottom bar.
-#[test]
-fn a_queued_rows_whole_pane_is_rebuilt_from_the_registry_alone() {
-    use crate::orchestrator::workers;
-    // Registration touches the process-global table other suites assert over.
-    let _workers = workers::TEST_WORKERS_MUTEX
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let worker = workers::register_active_worker(
-        Some("t-9511".to_string()),
-        "coder".to_string(),
-        "hold the line and wait for a backend slot".to_string(),
-    );
-    let key = worker.0.clone();
-    let _cleanup = EntryCleanup { key: key.clone() };
-
-    // The pool's rank, recorded where fix #3 records it: on the live registry entry.
-    assert!(
-        workers::set_active_worker_queue_position(
-            &key,
-            Some(crate::orchestrator::pool::QueuePosition { position: 2, of: 3 }),
-        ),
-        "a live entry must accept a pool rank"
-    );
-    assert_eq!(
-        workers::active_worker_queue_position(&key),
-        Some(crate::orchestrator::pool::QueuePosition { position: 2, of: 3 }),
-        "the rank the pool reported is readable on the entry a projection rebuilds from"
-    );
-
-    // The session loop's authoritative row buffer: the row was opened by an earlier
-    // projection and a lifecycle fold already put a log line on it. It carries **no queue
-    // state** — that is the state a dropped `Queued` event leaves behind.
-    let mut loop_rows = vec![SubagentDetail {
-        name: key.clone(),
-        task_id: Some("t-9511".to_string()),
-        logs: vec!["started task t-9511".to_string()],
-        is_active: true,
-        ..Default::default()
-    }];
-
-    // The pane itself already holds streamed text for that row.
-    let mut r = TuiRenderer::new();
-    r.show_subagent_panel = true;
-    r.show_thought = true;
-    r.subagents.push(SubagentDetail {
-        name: key.clone(),
-        task_id: Some("t-9511".to_string()),
-        thinking: "waiting for the permit, then patching the projection".to_string(),
-        content: "inspected three files".to_string(),
-        is_active: true,
-        ..Default::default()
-    });
-
-    // The loop's refresh edge, in the fixed order (fix #1: project, then drain). Only the
-    // projection runs here: no delegation event exists for this transition at all.
-    assert!(
-        crate::ui::helpers::project_subagent_rows(&mut loop_rows),
-        "a rank the registry newly reports is a change the host must be handed (fix #2 put \
-         `queue` in the row signature); the row set before the rebuild was {loop_rows:?}"
-    );
-    // The registry is process-global, so the projection legitimately sees other suites'
-    // entries; keep this delegation's row and address it by key.
-    loop_rows.retain(|row| row.name == key);
-    assert_eq!(
-        loop_rows
-            .iter()
-            .find(|row| row.name == key)
-            .expect("the live entry has a row after the rebuild")
-            .queue,
-        Some(crate::ui::QueueState { position: 2, of: 3 }),
-        "the projection re-derives the label from the entry (fix #3)"
-    );
-    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
-    let before = rows.join("\n");
-    assert!(
-        before.contains(&format!("{key} (Active)")),
-        "the pane still reads the pre-projection row as a running row, got:\n{before}"
-    );
-
-    r.set_subagents(loop_rows.clone());
-    assert_eq!(
-        r.subagents.len(),
-        1,
-        "the panel holds exactly this delegation's row, got {:?}",
-        r.subagents
-            .iter()
-            .map(|row| row.name.clone())
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        r.subagents[0].queue,
-        Some(crate::ui::QueueState { position: 2, of: 3 }),
-        "the host's push must land on the row the panel is drawing"
-    );
-    assert_eq!(
-        r.subagents[0].logs,
-        vec!["started task t-9511".to_string()],
-        "the loop owns the log lines and hands them over with the row"
-    );
-
-    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
-    let text = rows.join("\n");
-
-    // 1. the row label
-    assert!(
-        text.contains(&format!("{key} (Queued 2/3")),
-        "the row must read `(Queued 2/3 …)`, got:\n{text}"
-    );
-    assert!(
-        !text.contains(&format!("{key} (Active")),
-        "a queued delegation must not be drawn as holding its slot, got:\n{text}"
-    );
-
-    // 2. the detail pane is neither empty nor stale while the row is queued
-    assert!(
-        text.contains("[Thinking]") && text.contains("waiting for the permit"),
-        "the thinking half of the detail pane must survive the queued push, got:\n{text}"
-    );
-    assert!(
-        text.contains("[Output]") && text.contains("inspected three files"),
-        "the output half of the detail pane must survive the queued push, got:\n{text}"
-    );
-    assert!(
-        text.contains("[Logs]") && text.contains("started task t-9511"),
-        "the log half of the detail pane must survive the queued push, got:\n{text}"
-    );
-
-    // 3. the slot wait, spelled out on the row's own bar
-    const WAIT: &str = "[Status: Queued 2/3 - waiting for a backend slot...]";
-    assert!(
-        text.contains(WAIT),
-        "expected {WAIT:?} in the subagent status bar, got:\n{text}"
-    );
-    assert!(
-        !text.contains("waiting for model response") && !text.contains("[Thinking:"),
-        "a row waiting for a slot must not claim it is waiting on the model or streaming, \
-         got:\n{text}"
-    );
-
-    // The guard dropping is what closes the entry in production; `_cleanup` takes the entry
-    // out of the table for good, on this path and on a panicking one.
-    drop(worker);
-}
-
-/// Regression guard for the coverage gap the repro left open: a queued row is not a frozen
-/// row. Text keeps streaming into it between slot waits (the previous turn's tokens, a nested
-/// tool round), and the pane must show **both** the slot state and the new text — the label
-/// must never be traded for the content, and the content must never be traded for the label.
-#[test]
-fn a_queued_row_keeps_its_label_while_thinking_and_output_stream_into_it() {
-    let mut r = TuiRenderer::new();
-    r.show_subagent_panel = true;
-    r.show_thought = true;
-    r.subagents.push(queue_row(
-        "coder-t-1",
-        true,
-        Some(crate::ui::QueueState { position: 2, of: 4 }),
-    ));
-
-    // The lifecycle fold sets the row's active agent and its first log line, and must not
-    // disturb the queue state it says nothing about.
-    r.on_event(&Event::Delegation(
-        crate::orchestrator::DelegationEvent::Started {
-            agent: crate::agents::Agent::Coder,
-            task: Some("t-1".to_string()),
-        },
-    ));
-    assert_eq!(
-        r.subagents[0].queue,
-        Some(crate::ui::QueueState { position: 2, of: 4 }),
-        "a lifecycle fold never retracts a slot position"
-    );
-
-    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
-    let text = rows.join("\n");
-    assert!(
-        text.contains("coder-t-1 (Queued 2/4"),
-        "the queued label is on screen before any stream traffic, got:\n{text}"
-    );
-    assert!(
-        text.contains("[Logs]") && text.contains("started task t-1"),
-        "the lifecycle log line is on screen, got:\n{text}"
-    );
-    assert!(
-        !text.contains("[Thinking]"),
-        "nothing has streamed yet, got:\n{text}"
-    );
-
-    // Stream traffic for the very same row: reasoning, a tool call (log line), then output.
-    r.on_event(&Event::SubagentThinking {
-        agent_tag: "coder-t-1".to_string(),
-        text: "the permit is still behind two callers".to_string(),
-    });
-    r.on_event(&Event::ToolCall("read(src/ui/helpers.rs)".to_string()));
-    r.on_event(&Event::SubagentMessage {
-        agent_tag: "coder-t-1".to_string(),
-        text: "patched the signature".to_string(),
-    });
-
-    assert_eq!(
-        r.subagents[0].queue,
-        Some(crate::ui::QueueState { position: 2, of: 4 }),
-        "streamed text never clears the slot state"
-    );
-
-    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
-    let text = rows.join("\n");
-    assert!(
-        text.contains("coder-t-1 (Queued 2/4"),
-        "the queued label must survive streamed traffic, got:\n{text}"
-    );
-    assert!(
-        text.contains("[Thinking]") && text.contains("the permit is still behind two callers"),
-        "the newly streamed reasoning must be in the detail pane, got:\n{text}"
-    );
-    assert!(
-        text.contains("[Output]") && text.contains("patched the signature"),
-        "the newly streamed output must be in the detail pane, got:\n{text}"
-    );
-    assert!(
-        text.contains("[Logs]") && text.contains("read(src/ui/helpers.rs)"),
-        "the tool-call log line must be in the detail pane, got:\n{text}"
-    );
-    const WAIT: &str = "[Status: Queued 2/4 - waiting for a backend slot...]";
-    assert!(
-        text.contains(WAIT),
-        "the slot wait keeps the bottom bar while text streams into the row, got:\n{text}"
-    );
-    assert!(
-        !text.contains("[Thinking:"),
-        "a row waiting for a slot is not streaming thinking tokens, got:\n{text}"
-    );
-
-    // An authoritative push that carries no text (the loop folds lifecycle events only)
-    // must not wipe what the stream already put on the row.
-    r.set_subagents(vec![queue_row(
-        "coder-t-1",
-        true,
-        Some(crate::ui::QueueState { position: 2, of: 4 }),
-    )]);
-    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
-    let text = rows.join("\n");
-    assert!(
-        text.contains("the permit is still behind two callers")
-            && text.contains("patched the signature")
-            && text.contains("coder-t-1 (Queued 2/4"),
-        "a text-free push keeps both the pane text and the queued label, got:\n{text}"
-    );
 }
 
 // ---- the merge contract for `logs` (gap G10, closed with R1) ----
@@ -1564,58 +957,10 @@ fn repeated_authoritative_pushes_never_duplicate_or_drop_a_log_line() {
     }
 }
 
-/// G1/G2/G4: the push the report actually complained about, asserted at both tiers. A
-/// projection-shaped row carries **no** log channel at all (`helpers::apply_registry_entry`
-/// never writes `logs`; a fresh projected row is `logs: vec![]`), so a text-free re-push must
-/// leave the drawable log list alone — and must not trade the slot label for the content.
-#[test]
-fn a_push_carrying_no_log_lines_never_empties_a_row_that_has_them() {
-    let mut r = TuiRenderer::new();
-    r.show_subagent_panel = true;
-    r.show_thought = true;
-    r.subagents.push(SubagentDetail {
-        name: "coder-t-9401".to_string(),
-        is_active: true,
-        queue: Some(crate::ui::QueueState { position: 1, of: 2 }),
-        logs: vec![
-            "started task t-9401".to_string(),
-            "calling backend (gpt-6-x) for t-9401".to_string(),
-        ],
-        ..Default::default()
-    });
-
-    r.set_subagents(vec![queue_row(
-        "coder-t-9401",
-        true,
-        Some(crate::ui::QueueState { position: 1, of: 2 }),
-    )]);
-    assert_eq!(
-        r.subagents[0].logs,
-        vec![
-            "started task t-9401".to_string(),
-            "calling backend (gpt-6-x) for t-9401".to_string(),
-        ],
-        "a log-free push leaves the row's drawable log list alone"
-    );
-
-    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
-    let text = rows.join("\n");
-    assert!(
-        text.contains("[Logs]")
-            && text.contains("started task t-9401")
-            && text.contains("calling backend (gpt-6-x) for t-9401"),
-        "the log half of the detail pane is still drawn after the log-free push, got:\n{text}"
-    );
-    assert!(
-        text.contains("coder-t-9401 (Queued 1/2"),
-        "keeping the content never costs the queued label, got:\n{text}"
-    );
-}
-
 /// The merge rule in both directions, pinned at the seam itself: the loop stays authoritative
-/// when it genuinely knows more (this is what
-/// `a_queued_rows_whole_pane_is_rebuilt_from_the_registry_alone` depends on — a "renderer always
-/// wins" guard would break it), and a shorter lifecycle list can never take back streamed text.
+/// when it genuinely knows more (a "renderer always wins" guard would break the authoritative
+/// row rebuild the pane relies on), and a shorter lifecycle list can never take back streamed
+/// text.
 #[test]
 fn the_logs_merge_adopts_a_longer_loop_list_and_keeps_the_renderers_tail() {
     // Loop knows more: its list is the base, in its own order, and the renderer's line is
@@ -1736,270 +1081,7 @@ fn the_per_row_log_cap_keeps_the_newest_lines() {
     );
 }
 
-/// Regression guard for fix #2: the label follows **every** queue edge. `Queued -> Running`
-/// (slot acquired) must take the label down, and a **re-queue** with a different rank must
-/// put it back with the new digits and no residue of the old ones — through both writers of
-/// that field: the loop's authoritative push and the delegation-event fold.
-#[test]
-fn a_re_queued_row_follows_every_rank_edge_in_its_label_and_its_bar() {
-    let mut r = TuiRenderer::new();
-    r.show_subagent_panel = true;
-    r.show_thought = true;
-
-    // Edge 1: queued 2/3, pushed authoritatively by the session loop.
-    r.set_subagents(vec![SubagentDetail {
-        name: "coder-t-1".to_string(),
-        is_active: true,
-        queue: Some(crate::ui::QueueState { position: 2, of: 3 }),
-        content: "first round of the delegation".to_string(),
-        logs: vec!["started task t-1".to_string()],
-        ..Default::default()
-    }]);
-    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
-    let text = rows.join("\n");
-    assert!(
-        text.contains("coder-t-1 (Queued 2/3")
-            && text.contains("[Status: Queued 2/3 - waiting for a backend slot...]"),
-        "a queued row is labelled and barred with its rank, got:\n{text}"
-    );
-
-    // Edge 2: slot acquired (`Some -> None`). A stale label would tell the operator the
-    // round is still stuck behind the cap.
-    r.set_subagents(vec![SubagentDetail {
-        name: "coder-t-1".to_string(),
-        is_active: true,
-        queue: None,
-        logs: vec!["started task t-1".to_string()],
-        ..Default::default()
-    }]);
-    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
-    let text = rows.join("\n");
-    assert!(
-        text.contains("coder-t-1 (Active"),
-        "the slot is held, so the row reads `(Active)` again, got:\n{text}"
-    );
-    assert!(
-        !text.contains("Queued"),
-        "no stale queue label may outlive the slot, got:\n{text}"
-    );
-    assert!(
-        text.contains("first round of the delegation"),
-        "the text-free re-push keeps the pane's content, got:\n{text}"
-    );
-
-    // Edge 3: re-queued at a new rank. The digits change and nothing else about the row does.
-    r.set_subagents(vec![SubagentDetail {
-        name: "coder-t-1".to_string(),
-        is_active: true,
-        queue: Some(crate::ui::QueueState { position: 1, of: 2 }),
-        logs: vec!["started task t-1".to_string()],
-        ..Default::default()
-    }]);
-    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
-    let text = rows.join("\n");
-    assert!(
-        text.contains("coder-t-1 (Queued 1/2")
-            && text.contains("[Status: Queued 1/2 - waiting for a backend slot...]"),
-        "a re-queued row shows its new rank, got:\n{text}"
-    );
-    assert!(
-        !text.contains("2/3"),
-        "no residue of the previous rank, got:\n{text}"
-    );
-
-    // The same three edges through the other writer: the delegation-event fold.
-    r.on_event(&Event::Delegation(
-        crate::orchestrator::DelegationEvent::Running {
-            agent: crate::agents::Agent::Coder,
-            task: Some("t-1".to_string()),
-        },
-    ));
-    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
-    let text = rows.join("\n");
-    assert!(
-        !text.contains("Queued") && text.contains("coder-t-1 (Active"),
-        "the `Running` fold takes the label down, got:\n{text}"
-    );
-
-    r.on_event(&Event::Delegation(
-        crate::orchestrator::DelegationEvent::Queued {
-            agent: crate::agents::Agent::Coder,
-            task: Some("t-1".to_string()),
-            position: 3,
-            of: 5,
-        },
-    ));
-    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
-    let text = rows.join("\n");
-    assert!(
-        text.contains("coder-t-1 (Queued 3/5")
-            && text.contains("[Status: Queued 3/5 - waiting for a backend slot...]"),
-        "the `Queued` fold restores the label with the new rank, got:\n{text}"
-    );
-    assert!(
-        text.contains("first round of the delegation") && text.contains("[Logs]"),
-        "a queue edge never empties the detail pane, got:\n{text}"
-    );
-}
-
 // ---- steering arbitration pause in the Subagents panel ----
-
-/// A row whose stream yielded its model slot is labelled `Paused` and is
-/// otherwise untouched: the name keeps the live green/bold spelling, the ctx
-/// count and the work clock keep their place in the label, and a neighbour is
-/// never relabelled because one row is held. A stale flag on a closed row still
-/// reads `(Idle)` — the label word is gated on liveness, never on the flag alone.
-#[test]
-fn a_held_stream_is_labelled_paused_and_keeps_its_live_shape() {
-    let mut r = TuiRenderer::new();
-    r.show_subagent_panel = true;
-    let now = std::time::Instant::now();
-
-    let mut held = queue_row("coder-t-1", true, None);
-    held.paused = true;
-    held.task_id = Some("t-1".to_string());
-    held.context_tokens = 3500;
-    held.started_at = Some(now - Duration::from_secs(5));
-    let mut running = queue_row("coder-t-2", true, None);
-    running.task_id = Some("t-2".to_string());
-    let mut closed = queue_row("researcher-t-3", false, None);
-    closed.task_id = Some("t-3".to_string());
-    closed.paused = true;
-    r.subagents.extend([held, running, closed]);
-
-    let (rows, styles) = draw_subagent_panel(&mut r, 100, 20);
-    let text = rows.join("\n");
-    assert!(
-        text.contains("coder-t-1 (Paused, 3.5k ctx, 5s)"),
-        "expected 'coder-t-1 (Paused, 3.5k ctx, 5s)' in the subagents panel, got:\n{text}"
-    );
-    assert!(
-        text.contains("coder-t-2 (Active)"),
-        "the row that kept its slot still reads (Active), got:\n{text}"
-    );
-
-    let held_line = rows
-        .iter()
-        .find(|line| line.contains("coder-t-1"))
-        .expect("the held row is drawn");
-    assert!(
-        !held_line.contains("(Active"),
-        "a row parked inside the arbitration handshake must not claim it is streaming, got: {held_line:?}"
-    );
-    assert!(
-        !held_line.contains("(Queued"),
-        "a yielded model slot is not a wait behind the concurrency cap, got: {held_line:?}"
-    );
-    assert!(
-        !held_line.contains("(Idle"),
-        "a paused stream is still part of the round, got: {held_line:?}"
-    );
-
-    // A flag that outlived its stream must never produce the label word.
-    let closed_line = rows
-        .iter()
-        .find(|line| line.contains("researcher-t-3"))
-        .expect("the closed row is drawn");
-    assert!(
-        closed_line.contains("(Idle)"),
-        "a finished row reads Idle whatever flag it still carries, got: {closed_line:?}"
-    );
-    assert!(
-        !closed_line.contains("Paused"),
-        "the pause label is gated on liveness, got: {closed_line:?}"
-    );
-
-    // The name stays green/bold — the worker is still live — and only the state
-    // word changes colour, so the pause cannot be mistaken for a dead row.
-    let held_y = rows
-        .iter()
-        .position(|line| line.contains("coder-t-1"))
-        .expect("the held row is drawn");
-    let name_x = rows[held_y].find("coder-t-1").unwrap();
-    let label_x = rows[held_y].find("(Paused").unwrap();
-    let name = styles[held_y][name_x];
-    assert_eq!(
-        name.fg,
-        Some(Color::Green),
-        "a held row keeps its live name colour"
-    );
-    assert!(
-        name.add_modifier.contains(Modifier::BOLD),
-        "a held row keeps its bold name"
-    );
-    assert_eq!(
-        styles[held_y][label_x].fg,
-        Some(Color::LightBlue),
-        "the pause state word gets its own colour"
-    );
-
-    let running_y = rows
-        .iter()
-        .position(|line| line.contains("coder-t-2"))
-        .expect("the running row is drawn");
-    let running_x = rows[running_y].find("(Active").unwrap();
-    assert_eq!(
-        styles[running_y][running_x].fg,
-        Some(Color::LightGreen),
-        "the pause colour is never applied to a neighbour"
-    );
-}
-
-/// The detail pane says which slot the row handed up instead of the generic
-/// "waiting for model response" line — and it wins over both the queue position
-/// and the previous turn's thinking bar, which are both stale once the stream is
-/// parked. The spinner keeps turning because the worker is still live.
-#[test]
-fn the_detail_pane_spells_out_the_held_model_slot() {
-    let mut r = TuiRenderer::new();
-    r.show_subagent_panel = true;
-    let mut held = queue_row(
-        "coder-t-1",
-        true,
-        Some(crate::ui::QueueState { position: 1, of: 2 }),
-    );
-    held.paused = true;
-    r.subagents.push(held);
-    r.subagent_is_thinking.insert("coder-t-1".to_string(), true);
-    r.subagent_turn_thinking.insert(
-        "coder-t-1".to_string(),
-        "reasoning from before the yield".to_string(),
-    );
-
-    let (rows, _) = draw_subagent_panel(&mut r, 100, 20);
-    let text = rows.join("\n");
-    const HELD: &str = "[Status: Paused - model slot yielded to the steering arbitrator...]";
-    assert!(
-        text.contains(HELD),
-        "expected {HELD:?} in the subagent status bar, got:\n{text}"
-    );
-    assert!(
-        !text.contains("waiting for model response"),
-        "a row whose slot is on loan to the arbitrator is not waiting on the model:\n{text}"
-    );
-    assert!(
-        !text.contains("[Status: Queued"),
-        "the handshake wins the bar over a stale queue position:\n{text}"
-    );
-    assert!(
-        !text.contains("[Thinking:"),
-        "thinking text from before the yield is stale, so the thinking bar must go:\n{text}"
-    );
-
-    let bar = rows
-        .iter()
-        .find(|line| line.contains(HELD))
-        .expect("the status bar row");
-    let spinner = bar[bar.find(HELD).unwrap() + HELD.len()..]
-        .trim_start()
-        .chars()
-        .next()
-        .unwrap_or(' ');
-    assert!(
-        SPINNER_FRAMES.contains(&spinner),
-        "a held stream keeps a live spinner, got {spinner:?} in {bar:?}"
-    );
-}
 
 /// The typed transition carries the stream's own tag, so it lands on the row that
 /// tag resolves to — including the registry spellings a tag can never produce —
@@ -2090,126 +1172,6 @@ fn the_panel_pause_is_never_sniffed_out_of_the_status_line() {
     );
 }
 
-/// The session loop holds the authoritative row set, so its view of the pause
-/// wins in both directions — including the teardown it performs when the registry
-/// closes the row, which is what stops a `Paused` from lingering.
-#[test]
-fn the_authoritative_rows_from_the_loop_own_the_pause_label() {
-    let mut r = TuiRenderer::new();
-    r.show_subagent_panel = true;
-    r.subagents.push(queue_row("coder-t-1", true, None));
-
-    // A renderer-local pause ...
-    r.on_event(&Event::SubagentStreamPause {
-        agent_tag: "coder-t-1".to_string(),
-        paused: true,
-    });
-    assert!(r.subagents[0].paused);
-    // ... cannot outlive a loop push that says otherwise.
-    let mut authoritative = r.subagents.clone();
-    authoritative[0].paused = false;
-    r.set_subagents(authoritative);
-    assert!(
-        !r.subagents[0].paused,
-        "the loop folds the typed transition, so its resume edge wins"
-    );
-
-    let mut authoritative = r.subagents.clone();
-    authoritative[0].paused = true;
-    r.set_subagents(authoritative);
-    assert!(
-        r.subagents[0].paused,
-        "and adopting a pause works the same way"
-    );
-
-    // The loop's teardown of a finished worker takes the flag down with it, and a
-    // renderer that missed the closing edge still loses its stale `Paused`.
-    let mut authoritative = r.subagents.clone();
-    authoritative[0].is_active = false;
-    authoritative[0].paused = false;
-    r.set_subagents(authoritative);
-    assert!(!r.subagents[0].is_active);
-    let (rows, _) = draw_subagent_panel(&mut r, 100, 20);
-    let text = rows.join("\n");
-    assert!(
-        text.contains("coder-t-1 (Idle)"),
-        "the closed row reads Idle, got:\n{text}"
-    );
-    assert!(
-        !text.contains("Paused"),
-        "no stale pause survives the loop's teardown, got:\n{text}"
-    );
-}
-
-/// A restart drops the arbitration handshake exactly like it drops the queue
-/// ledger: a journaled pane records a round that was interrupted, never a stream
-/// the arbitrator is holding right now.
-#[test]
-fn a_restored_row_never_shows_a_stale_pause() {
-    let mut live = TuiRenderer::new();
-    live.show_subagent_panel = true;
-    let mut held = queue_row("coder-t-1", true, None);
-    held.paused = true;
-    held.task_id = Some("t-1".to_string());
-    live.subagents.push(held);
-
-    let section = live.capture_ui();
-    let mut restored = TuiRenderer::new();
-    restored.restore_panes(&section);
-
-    assert_eq!(restored.subagents.len(), 1);
-    assert!(
-        !restored.subagents[0].paused,
-        "the preemption handshake does not survive a restart, so the panel may not claim a pause"
-    );
-    let (rows, _) = draw_subagent_panel(&mut restored, 100, 20);
-    let text = rows.join("\n");
-    assert!(
-        text.contains("coder-t-1 (Active)"),
-        "a restored row comes back as a running row, got:\n{text}"
-    );
-    assert!(
-        !text.contains("Paused"),
-        "no stale pause may survive a restore, got:\n{text}"
-    );
-}
-
-/// A held stream stays in the `[N active: …]` group — it really is part of the
-/// running round — and is additionally named in its own segment, derived from the
-/// same rows the panel label reads.
-#[test]
-fn the_main_status_line_names_held_streams_without_dropping_them_from_the_round() {
-    let mut r = TuiRenderer::new();
-    let mut held = queue_row("coder-t-1", true, None);
-    held.paused = true;
-    r.subagents
-        .extend([held, queue_row("coder-t-2", true, None)]);
-    r.status_line = "Delegating to specialist coder-t-1 for t-1".to_string();
-
-    let content = draw_status_line(&mut r, 160);
-    assert!(
-        content.contains("[2 active: coder-t-1, coder-t-2]"),
-        "a parked stream is still part of the round, got: {content:?}"
-    );
-    assert!(
-        content.contains("[1 paused: coder-t-1]"),
-        "the held stream is named in its own segment, got: {content:?}"
-    );
-
-    let mut plain = TuiRenderer::new();
-    plain.subagents.push(queue_row("coder-t-2", true, None));
-    plain.status_line = "Delegating to specialist coder-t-2 for t-2".to_string();
-    let plain_line = draw_status_line(&mut plain, 160);
-    assert!(
-        plain_line.contains("[1 active: coder-t-2]"),
-        "the control group is unchanged, got: {plain_line:?}"
-    );
-    assert!(
-        !plain_line.contains("paused"),
-        "a round with nothing parked shows no pause segment, got: {plain_line:?}"
-    );
-}
-
 /// The animation keyword set is shared by the render-loop throttle tier and the
 /// status-line indicator, so a round whose streams are parked behind the
 /// arbitrator keeps animating in both — exactly like a queued round.
@@ -2225,40 +1187,19 @@ fn the_arbitration_pause_keyword_is_shared_by_both_animation_tiers() {
     );
 }
 
-/// The exact sentence the preemption handshake puts on the status channel has to
-/// hold the spinner up: a stream parked inside the handshake produces no tokens,
-/// and that deliberate silence must not read as a stalled turn.
 #[test]
-fn a_round_with_a_parked_stream_keeps_the_status_line_animating() {
-    let mut r = TuiRenderer::new();
-    r.on_event(&Event::Status(
-        "[coder] Yielded model slot (gpt-x) to Steer Arbitrator — stream paused".to_string(),
-    ));
-    assert!(
-        r.waiting_for_token_since.is_some(),
-        "a stream held by the arbitrator counts as waiting on the backend"
-    );
-
-    let content = draw_status_line(&mut r, 160);
-    assert!(
-        content.contains("stream paused"),
-        "the yielded slot is surfaced in the status line, got: {content:?}"
-    );
-    let tail = content.trim_end();
-    assert!(
-        tail.ends_with(SPINNER_FRAMES),
-        "the activity spinner must keep turning while a stream is parked, got: {tail:?}"
-    );
-}
-
-#[test]
-fn test_orchestrator_content_is_white_and_steer_is_yellow() {
-    let (white_style, special_white) = message_style("Orchestrator answer");
-    assert!(!special_white);
-    assert_eq!(white_style.fg, Some(Color::White));
+fn test_orchestrator_content_is_fg_less_and_steer_is_manager_yellow() {
+    // Body text used to be forced to `Color::White` (white-on-white on a light
+    // profile, research §F2); it now inherits the terminal profile.
+    let (body_style, special_body) = message_style("Orchestrator answer");
+    assert!(!special_body);
+    assert_eq!(body_style, theme::text_primary());
+    assert_eq!(body_style.fg, None);
+    assert_eq!(body_style.bg, None);
 
     let (yellow_style, special_yellow) = message_style("Marmennill: Direct answer from arbitrator");
     assert!(special_yellow);
+    assert_eq!(yellow_style, theme::role_manager());
     assert_eq!(yellow_style.fg, Some(Color::LightYellow));
     assert!(yellow_style.add_modifier.contains(Modifier::BOLD));
 
@@ -2280,263 +1221,6 @@ fn test_orchestrator_content_is_white_and_steer_is_yellow() {
 }
 
 #[test]
-fn test_chat_renders_white_content_and_gates_thought() {
-    let mut r = TuiRenderer::new();
-    assert!(!r.show_thought); // Default is false (OFF)
-
-    r.messages
-        .push("<think>\nsecret thoughts\n</think>\nVisible answer to user".to_string());
-    r.current_thought = "streaming thoughts".to_string();
-    r.current_content = "streaming visible answer".to_string();
-
-    let backend = ratatui::backend::TestBackend::new(80, 10);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-
-    // 1. When show_thought is false: thoughts must NOT appear in chat
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, 80, 10);
-            r.render_chat(frame, area);
-        })
-        .unwrap();
-
-    let buffer = terminal.backend().buffer();
-    let mut lines = Vec::new();
-    for y in 0..10 {
-        let line: String = (0..80)
-            .map(|x| buffer[(x, y)].symbol().to_string())
-            .collect();
-        lines.push(line);
-    }
-    let text_off = lines.join("\n");
-    assert!(
-        !text_off.contains("secret thoughts"),
-        "secret thoughts should be hidden when show_thought=false"
-    );
-    assert!(
-        !text_off.contains("streaming thoughts"),
-        "streaming thoughts should be hidden when show_thought=false"
-    );
-    assert!(text_off.contains("Visible answer to user"));
-    assert!(text_off.contains("streaming visible answer"));
-
-    // 2. Toggle thought ON via /thought
-    r.input_text = "/thought".to_string();
-    r.submit();
-    assert!(r.show_thought);
-
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, 80, 10);
-            r.render_chat(frame, area);
-        })
-        .unwrap();
-
-    let buffer2 = terminal.backend().buffer();
-    let mut lines2 = Vec::new();
-    for y in 0..10 {
-        let line: String = (0..80)
-            .map(|x| buffer2[(x, y)].symbol().to_string())
-            .collect();
-        lines2.push(line);
-    }
-    let text_on = lines2.join("\n");
-    assert!(
-        text_on.contains("secret thoughts"),
-        "thoughts should be shown when show_thought=true"
-    );
-    assert!(
-        text_on.contains("streaming thoughts"),
-        "streaming thoughts should be shown when show_thought=true"
-    );
-    assert!(!text_off.contains("<think>"));
-    assert!(!text_off.contains("</think>"));
-    assert!(!text_on.contains("<think>"));
-    assert!(!text_on.contains("</think>"));
-}
-
-#[test]
-fn test_subagent_thinking_visibility_controlled_by_show_thought() {
-    let backend = ratatui::backend::TestBackend::new(80, 20);
-    let mut terminal = Terminal::new(backend).unwrap();
-
-    let mut r = TuiRenderer::new();
-    r.subagents.push(SubagentDetail {
-        name: "coder".to_string(),
-        task_id: Some("t-001".to_string()),
-        prompt: "task brief".to_string(),
-        started_at: None,
-        worked_duration: std::time::Duration::ZERO,
-        last_activity_at: None,
-        logs: vec!["log step".to_string()],
-        thinking: "secret subagent thoughts".to_string(),
-        content: "deliverable code".to_string(),
-        is_active: true,
-        context_tokens: 0,
-        queue: None,
-        paused: false,
-    });
-
-    // The pane's thinking flag is set explicitly here, not inferred from the
-    // `thinking` buffer: inferring liveness from leftover pane text is the defect
-    // removed, so the collapsed bar now needs the flag the stream sets
-    // (`Event::SubagentThinking`) or a live registry entry. Everything this
-    // test pins — the `show_thought` gate — is unchanged.
-    r.subagent_is_thinking.insert("coder".to_string(), true);
-
-    // 1. By default, show_thought is false -> [Thinking] must not appear
-    assert!(!r.show_thought);
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, 80, 20);
-            r.render_subagents(frame, area);
-        })
-        .unwrap();
-
-    let buffer1 = terminal.backend().buffer();
-    let mut lines1 = Vec::new();
-    for y in 0..20 {
-        let line: String = (0..80)
-            .map(|x| buffer1[(x, y)].symbol().to_string())
-            .collect();
-        lines1.push(line);
-    }
-    let text_off = lines1.join("\n");
-    assert!(
-        !text_off.contains("[Thinking]"),
-        "subagent full [Thinking] block should be hidden when show_thought=false"
-    );
-    assert!(
-        !text_off.contains("secret subagent thoughts"),
-        "subagent raw thoughts should be hidden when show_thought=false"
-    );
-    assert!(
-        text_off.contains("[Thinking:"),
-        "subagent collapsed [Thinking: ~...] indicator should be shown when show_thought=false"
-    );
-    assert!(
-        text_off.contains("[Output]"),
-        "subagent [Output] header should be visible when show_thought=false"
-    );
-    assert!(
-        text_off.contains("deliverable code"),
-        "subagent output content should be visible when show_thought=false"
-    );
-    assert!(text_off.contains("[Logs]"));
-    assert!(text_off.contains("log step"));
-
-    // 2. Toggle thought ON via /thought
-    r.input_text = "/thought".to_string();
-    r.submit();
-    assert!(r.show_thought);
-
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, 80, 20);
-            r.render_subagents(frame, area);
-        })
-        .unwrap();
-
-    let buffer2 = terminal.backend().buffer();
-    let mut lines2 = Vec::new();
-    for y in 0..20 {
-        let line: String = (0..80)
-            .map(|x| buffer2[(x, y)].symbol().to_string())
-            .collect();
-        lines2.push(line);
-    }
-    let text_on = lines2.join("\n");
-    assert!(
-        text_on.contains("[Thinking]"),
-        "subagent [Thinking] should be shown when show_thought=true"
-    );
-    assert!(
-        text_on.contains("secret subagent thoughts"),
-        "subagent thoughts should be shown when show_thought=true"
-    );
-    assert!(
-        text_on.contains("[Output]"),
-        "subagent [Output] should be shown when show_thought=true"
-    );
-    assert!(
-        text_on.contains("deliverable code"),
-        "subagent output content should be shown when show_thought=true"
-    );
-}
-
-/// Regression guard: the collapsed `[Thinking: …]` bar and its spinner are a claim about
-/// the **worker**, so the inferred form requires the registry entry behind the row to be
-/// live. A cancel, a preemption or a guard drop emits no stream event at all, so the pane
-/// would otherwise keep a stale spinner over a worker the Manager and the arbitrator no
-/// longer consider running.
-#[test]
-fn a_finished_worker_with_leftover_thinking_stops_claiming_to_be_thinking() {
-    use crate::orchestrator::workers;
-    // Registration touches the process-global table other suites assert over.
-    let _workers = workers::TEST_WORKERS_MUTEX
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let worker = workers::register_active_worker(
-        Some("t-9503".to_string()),
-        "coder".to_string(),
-        "brief".to_string(),
-    );
-    let key = worker.0.clone();
-
-    let mut r = TuiRenderer::new();
-    r.show_subagent_panel = true;
-    r.subagents.push(SubagentDetail {
-        name: key.clone(),
-        task_id: Some("t-9503".to_string()),
-        thinking: "half a thought, still on screen".to_string(),
-        is_active: true,
-        ..Default::default()
-    });
-
-    let backend = ratatui::backend::TestBackend::new(100, 20);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    let draw = |terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
-                r: &mut TuiRenderer| {
-        terminal
-            .draw(|frame| {
-                let area = ratatui::layout::Rect::new(0, 0, 100, 20);
-                r.render_subagents(frame, area);
-            })
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        (0..20)
-            .map(|y| {
-                (0..100)
-                    .map(|x| buffer[(x, y)].symbol().to_string())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    let while_running = draw(&mut terminal, &mut r);
-    assert!(
-        while_running.contains("[Thinking:"),
-        "a live worker with streamed thinking shows the thinking bar, got:\n{while_running}"
-    );
-
-    // The guard drops: the registry closes the entry. Nothing else in the pane changed —
-    // the row still claims `is_active` and still holds its text — and that is the defect.
-    drop(worker);
-    let after_done = draw(&mut terminal, &mut r);
-    assert!(
-        !after_done.contains("[Thinking:"),
-        "a completed registry entry must never be drawn as still thinking, got:\n{after_done}"
-    );
-    assert!(
-        after_done.contains(&key),
-        "the row itself stays visible: the completed ring still holds the entry"
-    );
-
-    workers::remove_worker_entry_for_test(&key);
-}
-
-#[test]
 fn test_subagent_tool_calls_logged_with_arguments_and_stripped_prefix() {
     let mut r = TuiRenderer::new();
     r.subagents.push(SubagentDetail {
@@ -2553,6 +1237,11 @@ fn test_subagent_tool_calls_logged_with_arguments_and_stripped_prefix() {
         worked_duration: Duration::ZERO,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
     r.active_agent = "coder-t-001".to_string();
 
@@ -2580,74 +1269,11 @@ fn test_subagent_tool_calls_logged_with_arguments_and_stripped_prefix() {
 }
 
 #[test]
-fn test_chat_scrolling_renders_windowed_view() {
-    let mut r = TuiRenderer::new();
-    r.focused_panel = FocusedPanel::Chat;
-    for i in 0..50 {
-        r.messages.push(format!("Message line {i}"));
-    }
-
-    r.chat_width.set(80);
-    r.chat_height.set(8); // inner area height of 80x10 bordered box
-
-    let total_lines = r.estimated_chat_lines(80);
-    assert_eq!(total_lines, 50);
-
-    r.scroll_to_bottom();
-    assert_eq!(r.chat_scroll, 42); // 50 - 8
-
-    let backend = ratatui::backend::TestBackend::new(80, 10);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, 80, 10);
-            r.render_chat(frame, area);
-        })
-        .unwrap();
-
-    let buffer = terminal.backend().buffer();
-    let mut bottom_text = String::new();
-    for y in 0..10 {
-        let line: String = (0..80)
-            .map(|x| buffer[(x, y)].symbol().to_string())
-            .collect();
-        bottom_text.push_str(&line);
-        bottom_text.push('\n');
-    }
-    assert!(bottom_text.contains("Message line 49"));
-    assert!(!bottom_text.contains("Message line 0"));
-
-    r.scroll_to_top();
-    assert_eq!(r.chat_scroll, 0);
-
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, 80, 10);
-            r.render_chat(frame, area);
-        })
-        .unwrap();
-
-    let buffer2 = terminal.backend().buffer();
-    let mut top_text = String::new();
-    for y in 0..10 {
-        let line: String = (0..80)
-            .map(|x| buffer2[(x, y)].symbol().to_string())
-            .collect();
-        top_text.push_str(&line);
-        top_text.push('\n');
-    }
-    assert!(top_text.contains("Message line 0"));
-    assert!(!top_text.contains("Message line 49"));
-
-    r.scroll_down(5);
-    assert_eq!(r.chat_scroll, 5);
-}
-
-#[test]
 fn test_plan_scrolling_with_wrapped_lines() {
     let mut r = TuiRenderer::new();
-    r.focused_panel = FocusedPanel::Plan;
+    // The scroll path resolves its target from the real focus, so the fixture
+    // focuses the plan pane rather than only writing the legacy mirror.
+    r.set_focus(state::FocusPane::Plan);
     let plan_text = "# Header\nThis is a long plan line that will wrap onto multiple visual lines when rendered in a narrow panel.\n- [ ] Task 1\n- [x] Task 2\n";
     r.plan_content = plan_text.to_string();
 
@@ -2684,26 +1310,6 @@ fn test_visual_line_offset_of_first_pending() {
 }
 
 #[test]
-fn test_plan_auto_scrolls_to_first_pending_task() {
-    let mut r = TuiRenderer::new();
-    let plan_text = "# Plan\n## Phase 1\n- [x] Task 1\n- [x] Task 2\n- [x] Task 3\n- [x] Task 4\n- [x] Task 5\n- [x] Task 6\n- [x] Task 7\n- [x] Task 8\n## Phase 2\n- [ ] Task 9\n- [ ] Task 10\n";
-    r.plan_content = plan_text.to_string();
-    r.show_plan_panel = true;
-    r.plan_auto_scroll = true;
-
-    let backend = ratatui::backend::TestBackend::new(80, 8);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, 80, 8);
-            r.render_plan(frame, area, plan_text, false);
-        })
-        .unwrap();
-
-    assert_eq!(r.plan_scroll, 7);
-}
-
-#[test]
 fn test_visual_line_offset_of_task() {
     let plan = "# Plan\n## Phase 1\n- [x] [t-001] First\n- [x] [t-002] Second\n- [ ] [t-003] Third\n- [ ] [t-004] Fourth\n";
     assert_eq!(visual_line_offset_of_task(plan, "t-001", 80), Some(2));
@@ -2711,37 +1317,6 @@ fn test_visual_line_offset_of_task() {
     assert_eq!(visual_line_offset_of_task(plan, "t-003", 80), Some(4));
     assert_eq!(visual_line_offset_of_task(plan, "t-004", 80), Some(5));
     assert_eq!(visual_line_offset_of_task(plan, "t-999", 80), None);
-}
-
-#[test]
-fn test_plan_auto_scrolls_to_started_task() {
-    let mut r = TuiRenderer::new();
-    let plan_text = "# Plan\n## Phase 1\n- [x] [t-001] Task 1\n- [x] [t-002] Task 2\n- [x] [t-003] Task 3\n- [ ] [t-004] Task 4\n- [ ] [t-005] Task 5\n- [ ] [t-006] Task 6\n- [ ] [t-007] Task 7\n- [ ] [t-008] Task 8\n- [ ] [t-009] Task 9\n- [ ] [t-010] Task 10\n";
-    r.plan_content = plan_text.to_string();
-
-    r.on_event(&crate::ui::Event::Delegation(
-        crate::orchestrator::DelegationEvent::Started {
-            agent: crate::agents::Agent::Coder,
-            task: Some("t-008".to_string()),
-        },
-    ));
-
-    assert_eq!(r.active_plan_task.as_deref(), Some("t-008"));
-    assert!(r.plan_auto_scroll);
-    assert!(r.show_plan_panel);
-
-    let backend = ratatui::backend::TestBackend::new(80, 6);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, 80, 6);
-            r.render_plan(frame, area, plan_text, false);
-        })
-        .unwrap();
-
-    // The focused task's plan line sits at line offset 9, leaving 1 line of
-    // context above it -> desired scroll is 8
-    assert_eq!(r.plan_scroll, 8);
 }
 
 #[test]
@@ -2801,105 +1376,11 @@ fn test_line_matches_task_id_exact_and_boundary() {
 }
 
 #[test]
-fn test_render_plan_highlights_all_concurrent_active_tasks_and_avoids_substring_collision() {
-    let mut r = TuiRenderer::new();
-    let plan_text = "\
-# Plan
-- [ ] [t-100] Task 100
-- [ ] [t-100a1] Task 100a1
-- [ ] [t-100b] Task 100b
-- [ ] [t-200] Task 200
-- [x] [t-050] Task 50 completed
-";
-    r.plan_content = plan_text.to_string();
-
-    // Two agents active in parallel: the coder on the first task, the
-    // researcher on the second
-    r.subagents = vec![
-        SubagentDetail {
-            name: "coder-t-100".to_string(),
-            task_id: Some("t-100".to_string()),
-            prompt: "Task 100".to_string(),
-            is_active: true,
-            ..Default::default()
-        },
-        SubagentDetail {
-            name: "researcher-t-200".to_string(),
-            task_id: Some("t-200".to_string()),
-            prompt: "Task 200".to_string(),
-            is_active: true,
-            ..Default::default()
-        },
-    ];
-    // active_plan_task records the latest started task
-    r.active_plan_task = Some("t-200".to_string());
-
-    let backend = ratatui::backend::TestBackend::new(80, 10);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, 80, 10);
-            r.render_plan(frame, area, plan_text, false);
-        })
-        .unwrap();
-
-    let buffer = terminal.backend().buffer();
-
-    // Helper to find a rendered line in the buffer and get the color of its first non-space cell
-    let find_line_fg = |needle: &str| -> Option<Color> {
-        for y in 0..10 {
-            let row_str: String = (0..80)
-                .map(|x| buffer[(x, y)].symbol().to_string())
-                .collect();
-            if row_str.contains(needle) {
-                // Find first cell belonging to the task text
-                for x in 1..79 {
-                    if buffer[(x, y)].symbol() == "[" {
-                        return buffer[(x, y)].style().fg;
-                    }
-                }
-            }
-        }
-        None
-    };
-
-    // Both active tasks MUST be highlighted in Yellow
-    assert_eq!(
-        find_line_fg("[t-100]"),
-        Some(Color::Yellow),
-        "Active task t-100 must be highlighted in Yellow"
-    );
-    assert_eq!(
-        find_line_fg("[t-200]"),
-        Some(Color::Yellow),
-        "Active task t-200 must be highlighted in Yellow"
-    );
-
-    // Inactive tasks sharing a substring with an active one MUST NOT be Yellow
-    // (must be LightRed)
-    assert_eq!(
-        find_line_fg("[t-100a1]"),
-        Some(Color::LightRed),
-        "Inactive task t-100a1 must be LightRed, not Yellow"
-    );
-    assert_eq!(
-        find_line_fg("[t-100b]"),
-        Some(Color::LightRed),
-        "Inactive task t-100b must be LightRed, not Yellow"
-    );
-
-    // The completed task must be Green
-    assert_eq!(
-        find_line_fg("[t-050]"),
-        Some(Color::Green),
-        "Completed task t-050 must be Green"
-    );
-}
-
-#[test]
 fn test_subagent_scrolling_and_focus() {
     let mut r = TuiRenderer::new();
-    r.focused_panel = FocusedPanel::Subagents;
+    // The scroll path resolves its target from the real focus, so the fixture
+    // focuses the workers pane rather than only writing the legacy mirror.
+    r.set_focus(state::FocusPane::Workers);
     r.subagents.push(SubagentDetail {
         name: "coder".to_string(),
         task_id: None,
@@ -2919,6 +1400,11 @@ fn test_subagent_scrolling_and_focus() {
         worked_duration: Duration::ZERO,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
 
     r.show_thought = true;
@@ -2986,6 +1472,11 @@ fn test_subagent_switch_scrolls_to_bottom_and_autoscrolls() {
         worked_duration: Duration::ZERO,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
     r.subagents.push(SubagentDetail {
         name: "coder-2".to_string(),
@@ -3006,12 +1497,19 @@ fn test_subagent_switch_scrolls_to_bottom_and_autoscrolls() {
         worked_duration: Duration::ZERO,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
 
     r.subagent_width.set(40);
     r.subagent_height.set(4);
 
-    r.focused_panel = FocusedPanel::Subagents;
+    // The scroll path resolves its target from the real focus, so the fixture
+    // focuses the workers pane rather than only writing the legacy mirror.
+    r.set_focus(state::FocusPane::Workers);
     r.scroll_up(5);
     assert!(!r.subagent_autoscroll);
 
@@ -3044,657 +1542,35 @@ fn test_subagents_auto_focuses_latest_activated_agent() {
     assert_eq!(r.selected_subagent_idx, 2);
 }
 
+/// Caret stepping, insertion and deletion are key handler behaviour now (§5): the
+/// same keys the operator presses drive them, and they work whatever pane is
+/// focused.
 #[test]
 fn test_input_cursor_stepping_left_and_right() {
     let mut r = TuiRenderer::new();
-    r.focused_panel = FocusedPanel::Chat;
+    r.set_focus(state::FocusPane::Transcript);
     r.input_text = "hello world".to_string();
     r.cursor = "hello world".len();
+    r.ensure_textarea_in_sync();
 
     for _ in 0..5 {
-        r.cursor_left();
+        press(&mut r, KeyCode::Left, KeyModifiers::NONE);
     }
     assert_eq!(r.cursor, "hello ".len());
 
-    r.insert_char('X');
+    press(&mut r, KeyCode::Char('X'), KeyModifiers::NONE);
     assert_eq!(r.input_text, "hello Xworld");
     assert_eq!(r.cursor, "hello X".len());
 
-    r.cursor_right();
-    r.cursor_right();
+    press(&mut r, KeyCode::Right, KeyModifiers::NONE);
+    press(&mut r, KeyCode::Right, KeyModifiers::NONE);
     assert_eq!(r.cursor, "hello Xwo".len());
 
-    r.delete_backward();
+    press(&mut r, KeyCode::Backspace, KeyModifiers::NONE);
     assert_eq!(r.input_text, "hello Xwrld");
-}
 
-#[test]
-fn test_token_counting_and_formatting_in_status_bar() {
-    assert_eq!(
-        TuiRenderer::format_token_counts(0, 0),
-        "0 in / 0 out (0 total)"
-    );
-    assert_eq!(
-        TuiRenderer::format_token_counts(450, 120),
-        "450 in / 120 out (570 total)"
-    );
-    assert_eq!(
-        TuiRenderer::format_token_counts(1500, 320),
-        "1.5k in / 320 out (1.8k total)"
-    );
-    assert_eq!(
-        TuiRenderer::format_token_counts(25400, 1200),
-        "25.4k in / 1.2k out (26.6k total)"
-    );
-    assert_eq!(
-        TuiRenderer::format_token_counts(1_200_000, 350_000),
-        "1.2M in / 350.0k out (1.6M total)"
-    );
-
-    let mut r = TuiRenderer::new();
-    r.on_event(&Event::TokensIn(1000));
-    r.on_event(&Event::Message("Hello world response".to_string()));
-    assert_eq!(r.tokens_in, 1000);
-    assert_eq!(r.orchestrator_context_tokens, 1000);
-    assert!(r.tokens_out > 0);
-}
-
-#[test]
-fn test_orchestrator_context_tokens_in_status_bar() {
-    let mut r = TuiRenderer::new();
-    r.on_event(&Event::TokensIn(14500));
-    assert_eq!(r.orchestrator_context_tokens, 14500);
-
-    let backend = ratatui::backend::TestBackend::new(100, 10);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 9, 100, 1);
-            r.render_status(frame, area);
-        })
-        .unwrap();
-
-    let buffer = terminal.backend().buffer();
-    let content: String = (0..100)
-        .map(|x| buffer[(x, 9)].symbol().to_string())
-        .collect();
-    assert!(
-        content.contains("Ctx: 14.5k"),
-        "expected 'Ctx: 14.5k' in status bar, got: {content}"
-    );
-}
-
-#[test]
-fn test_waiting_for_token_elapsed_time_in_status_bar() {
-    let mut r = TuiRenderer::new();
-    r.on_event(&Event::Status("Running (test-model)".to_string()));
-    assert!(r.waiting_for_token_since.is_some());
-
-    let backend = ratatui::backend::TestBackend::new(100, 10);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 9, 100, 1);
-            r.render_status(frame, area);
-        })
-        .unwrap();
-
-    let buffer = terminal.backend().buffer();
-    let content: String = (0..100)
-        .map(|x| buffer[(x, 9)].symbol().to_string())
-        .collect();
-    assert!(
-        content.contains("Running (test-model)"),
-        "expected 'Running (test-model)' in status bar, got: {content}"
-    );
-    assert!(
-        content.contains("s)"),
-        "expected elapsed seconds counter '(X.Xs)' in status bar, got: {content}"
-    );
-
-    // First token arrives -> timer clears
-    r.on_event(&Event::Message("token 1".to_string()));
-    assert!(r.waiting_for_token_since.is_none());
-}
-
-#[test]
-fn test_subagent_context_tokens_rendering_in_list() {
-    let mut r = TuiRenderer::new();
-    r.show_subagent_panel = true;
-    r.subagents.push(SubagentDetail {
-        name: "coder-t-1".to_string(),
-        task_id: Some("t-1".to_string()),
-        prompt: String::new(),
-        started_at: None,
-        last_activity_at: None,
-        logs: vec![],
-        thinking: String::new(),
-        content: String::new(),
-        is_active: true,
-        context_tokens: 3500,
-        worked_duration: Duration::ZERO,
-        queue: None,
-        paused: false,
-    });
-    r.subagents.push(SubagentDetail {
-        name: "researcher-t-2".to_string(),
-        task_id: Some("t-2".to_string()),
-        prompt: String::new(),
-        started_at: None,
-        last_activity_at: None,
-        logs: vec![],
-        thinking: String::new(),
-        content: String::new(),
-        is_active: false,
-        context_tokens: 1200,
-        worked_duration: Duration::ZERO,
-        queue: None,
-        paused: false,
-    });
-    r.subagents.push(SubagentDetail {
-        name: "validator".to_string(),
-        task_id: None,
-        prompt: String::new(),
-        started_at: None,
-        last_activity_at: None,
-        logs: vec![],
-        thinking: String::new(),
-        content: String::new(),
-        is_active: true,
-        context_tokens: 0,
-        worked_duration: Duration::ZERO,
-        queue: None,
-        paused: false,
-    });
-
-    let backend = ratatui::backend::TestBackend::new(100, 20);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, 100, 20);
-            r.render_subagents(frame, area);
-        })
-        .unwrap();
-
-    let buffer = terminal.backend().buffer();
-    let mut lines = Vec::new();
-    for y in 0..20 {
-        let line: String = (0..100)
-            .map(|x| buffer[(x, y)].symbol().to_string())
-            .collect();
-        lines.push(line);
-    }
-    let full_text = lines.join("\n");
-    assert!(
-        full_text.contains("coder-t-1 (Active, 3.5k ctx)"),
-        "expected 'coder-t-1 (Active, 3.5k ctx)' in subagents panel, got:\n{full_text}"
-    );
-    assert!(
-        full_text.contains("researcher-t-2 (Idle, 1.2k ctx)"),
-        "expected 'researcher-t-2 (Idle, 1.2k ctx)' in subagents panel, got:\n{full_text}"
-    );
-    assert!(
-        full_text.contains("validator (Active)"),
-        "expected 'validator (Active)' with no ctx string when 0, got:\n{full_text}"
-    );
-}
-
-#[test]
-fn test_subagent_time_counter_rendering_in_list() {
-    let mut r = TuiRenderer::new();
-    r.show_subagent_panel = true;
-    let now = std::time::Instant::now();
-    r.subagents.push(SubagentDetail {
-        name: "coder-t-1".to_string(),
-        task_id: Some("t-1".to_string()),
-        prompt: String::new(),
-        started_at: Some(now - Duration::from_secs(5)),
-        last_activity_at: Some(now - Duration::from_secs(5)),
-        logs: vec![],
-        thinking: String::new(),
-        content: String::new(),
-        is_active: true,
-        context_tokens: 3500,
-        worked_duration: Duration::ZERO,
-        queue: None,
-        paused: false,
-    });
-    r.subagents.push(SubagentDetail {
-        name: "researcher-t-2".to_string(),
-        task_id: Some("t-2".to_string()),
-        prompt: String::new(),
-        started_at: None,
-        last_activity_at: Some(now - Duration::from_secs(85)),
-        logs: vec![],
-        thinking: String::new(),
-        content: String::new(),
-        is_active: false,
-        context_tokens: 1200,
-        worked_duration: Duration::from_secs(85),
-        queue: None,
-        paused: false,
-    });
-
-    let backend = ratatui::backend::TestBackend::new(100, 20);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, 100, 20);
-            r.render_subagents(frame, area);
-        })
-        .unwrap();
-
-    let buffer = terminal.backend().buffer();
-    let mut lines = Vec::new();
-    for y in 0..20 {
-        let line: String = (0..100)
-            .map(|x| buffer[(x, y)].symbol().to_string())
-            .collect();
-        lines.push(line);
-    }
-    let full_text = lines.join("\n");
-    assert!(
-        full_text.contains("coder-t-1 (Active, 3.5k ctx, 5s)"),
-        "expected 'coder-t-1 (Active, 3.5k ctx, 5s)' in subagents panel, got:\n{full_text}"
-    );
-    assert!(
-        full_text.contains("researcher-t-2 (Idle, 1.2k ctx, 1m 25s)"),
-        "expected 'researcher-t-2 (Idle, 1.2k ctx, 1m 25s)' in subagents panel, got:\n{full_text}"
-    );
-}
-
-/// Regression guard: every fact on a list line is resolved through the row's
-/// **effective registry key**, and the two registry facts a viewer needs to tell rows
-/// apart are spelled in the label.
-///
-/// The collided `{base}#N` row is built with `context_tokens: 0`, so its ctx can only
-/// come from the registry entry behind that key — which is exactly the lookup the old
-/// name-based read (`get_active_worker_tokens(&sa.name)`) missed.
-#[test]
-fn a_collided_row_renders_from_its_registry_entry_and_the_label_says_what_it_is() {
-    use crate::orchestrator::workers;
-    // Registration touches the process-global table other suites assert over.
-    let _workers = workers::TEST_WORKERS_MUTEX
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    // Private task ids keep these keys out of every other test's way.
-    let first = workers::register_active_worker(
-        Some("t-9501".to_string()),
-        "coder".to_string(),
-        "brief one".to_string(),
-    );
-    let second = workers::register_active_worker(
-        Some("t-9501".to_string()),
-        "coder".to_string(),
-        "brief two".to_string(),
-    );
-    let audit = workers::register_active_worker(
-        Some("t-9502".to_string()),
-        "validator-coder".to_string(),
-        "audit brief".to_string(),
-    );
-    let (plain, collided, audit_key) = (first.0.clone(), second.0.clone(), audit.0.clone());
-    workers::update_active_worker_context(&collided, 4321);
-    assert_ne!(plain, collided, "the second worker took a collision key");
-
-    let mut r = TuiRenderer::new();
-    r.show_subagent_panel = true;
-    for key in [&plain, &collided, &audit_key] {
-        r.subagents.push(SubagentDetail {
-            name: key.clone(),
-            is_active: true,
-            ..Default::default()
-        });
-    }
-
-    let backend = ratatui::backend::TestBackend::new(120, 20);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, 120, 20);
-            r.render_subagents(frame, area);
-        })
-        .unwrap();
-    let buffer = terminal.backend().buffer();
-    let full_text = (0..20)
-        .map(|y| {
-            (0..120)
-                .map(|x| buffer[(x, y)].symbol().to_string())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    assert!(
-        full_text.contains(&format!("{collided} (Active, 4.3k ctx)")),
-        "the ctx of a `{collided}` row comes from the entry holding that exact key, got:\n{full_text}"
-    );
-    let handle = collided.split_once('#').expect("collision key").1;
-    assert!(
-        full_text.contains(&format!("Dup #{handle}")),
-        "a duplicate-key row labels its collision handle, got:\n{full_text}"
-    );
-    assert!(
-        full_text.contains(&format!("{audit_key} (Active) Audit")),
-        "a validator-family row reads as an audit run, got:\n{full_text}"
-    );
-    assert!(
-        full_text.contains(&format!("{plain} (Active)")),
-        "a plain key carries no badge and no invented ctx, got:\n{full_text}"
-    );
-
-    drop(first);
-    drop(second);
-    drop(audit);
-    for key in [&plain, &collided, &audit_key] {
-        workers::remove_worker_entry_for_test(key);
-    }
-}
-
-/// Panel-tier regression guard for the `Dup #N` suppression
-/// (`docs/investigation/dup_rows_root_cause.md` §7, gates 1/2/3): the **real**
-/// projection (`ui::helpers::project_subagent_rows`) and the **real** renderer are run
-/// end to end, so the user-visible half of the claim is pinned rather than inferred from
-/// the row vector.
-///
-/// The shape is the measured one: the Manager registers the delegation at dispatch
-/// (`src/orchestrator/mod.rs:302-307`) and the pane already follows that row; the runner
-/// then registers the **same identity** mid-flight
-/// (`src/agents/runner/execution.rs:302-307`) while the Manager guard is alive, so
-/// `claim_worker_slot` hands it `{base}#N`. That second edge used to open a permanent
-/// row with **0 log lines** and yank `selected_subagent_idx` onto it. Pinned here:
-/// * the re-registration opens **no** panel row (gate 1);
-/// * the selection stays on the row that has lines to draw (gate 3);
-/// * the panel's total log line count does not move, measured against the **unsuppressed
-///   baseline the same code produces** for the same panel (gate 2).
-#[test]
-fn the_runners_second_registration_opens_no_panel_row_and_never_steals_the_selection() {
-    use crate::orchestrator::workers;
-    // The projection enumerates the process-global registry, so it is serialized with the
-    // other suites that assert over that table.
-    let _workers = workers::TEST_WORKERS_MUTEX
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let manager = workers::register_active_worker(
-        Some("t-9530".to_string()),
-        "coder".to_string(),
-        "brief one".to_string(),
-    );
-    let plain = manager.0.clone();
-    let _cleanup_plain = EntryCleanup { key: plain.clone() };
-
-    // The loop's authoritative buffer as the shipped panel leaves it: all of the
-    // delegation's status traffic lands on the plain key (nothing on the status path
-    // spells a tag carrying a collision handle), so 16 lines live on one row.
-    let lines: Vec<String> = (0..16)
-        .map(|i| format!("thinking / calling model {i}"))
-        .collect();
-    let mut loop_rows = vec![SubagentDetail {
-        name: plain.clone(),
-        is_active: true,
-        logs: lines.clone(),
-        ..Default::default()
-    }];
-
-    let mut r = TuiRenderer::new();
-    r.show_subagent_panel = true;
-
-    // Refresh edge #1 — project, then push, the order
-    // `project_then_drain_delegation_events` uses. One delegated task, one row, and the
-    // pane is following a row that has content.
-    let _ = crate::ui::helpers::project_subagent_rows(&mut loop_rows);
-    loop_rows.retain(|row| row.name == plain);
-    r.set_subagents(loop_rows.clone());
-    {
-        let ui = r.capture_ui();
-        assert_eq!(
-            ui.subagent_panels.len(),
-            1,
-            "one delegated task, one panel row"
-        );
-        assert_eq!(ui.subagent_panels[0].name, plain);
-        assert_eq!(
-            ui.view.selected_subagent_idx, 0,
-            "the pane follows the live row"
-        );
-        assert_eq!(
-            ui.subagent_panels[0].logs, lines,
-            "and that row carries its lines"
-        );
-    }
-    let lines_before = r
-        .capture_ui()
-        .subagent_panels
-        .iter()
-        .map(|p| p.logs.len())
-        .sum::<usize>();
-
-    // Refresh edge #2 — the runner re-registers the same identity while the Manager guard
-    // is still held, so the registry now also holds the `{base}#N` twin.
-    let runner = workers::register_active_worker(
-        Some("t-9530".to_string()),
-        "coder".to_string(),
-        "brief two".to_string(),
-    );
-    let twin = runner.0.clone();
-    let _cleanup_twin = EntryCleanup { key: twin.clone() };
-    assert!(
-        twin.contains('#'),
-        "the second registration took a collision key: {twin}"
-    );
-
-    let _ = crate::ui::helpers::project_subagent_rows(&mut loop_rows);
-    loop_rows.retain(|row| row.name == plain || row.name == twin);
-    r.set_subagents(loop_rows.clone());
-
-    let ui = r.capture_ui();
-    let names: Vec<&str> = ui.subagent_panels.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(
-        ui.subagent_panels.len(),
-        1,
-        "gate 1: one delegated task keeps exactly one panel row across the re-registration, \
-         got {names:?}"
-    );
-    assert!(
-        names.iter().all(|name| !name.contains('#')),
-        "no `{twin}` row ever reaches the panel, got {names:?}"
-    );
-    // Gate 3 — the selection steal: whatever the pane has selected must be a row with lines.
-    let selected = ui
-        .subagent_panels
-        .get(ui.view.selected_subagent_idx)
-        .unwrap_or_else(|| {
-            panic!(
-                "selection index {} names no drawn row: {names:?}",
-                ui.view.selected_subagent_idx
-            )
-        });
-    assert_eq!(
-        selected.name, plain,
-        "the selection still follows the delegated task's row"
-    );
-    assert!(
-        !selected.logs.is_empty(),
-        "and it lands on a row the panel has lines to draw for"
-    );
-    let lines_after = ui
-        .subagent_panels
-        .iter()
-        .map(|p| p.logs.len())
-        .sum::<usize>();
-    assert_eq!(
-        lines_after, lines_before,
-        "gate 2: the re-registration moved no log line ({lines_before} before, {lines_after} after)"
-    );
-
-    // What the operator sees: the live row is the marked list entry, and the drawn
-    // `[Logs]` block belongs to it.
-    let (rows, _) = draw_subagent_panel(&mut r, 120, 30);
-    let text = rows.join("\n");
-    assert!(
-        text.contains(&format!("> {plain}")),
-        "the delegated task's row is the selected list entry, got:\n{text}"
-    );
-    assert!(
-        text.contains("[Logs]") && text.contains("thinking / calling model 15"),
-        "the drawn detail pane shows the selected row's newest line, got:\n{text}"
-    );
-    assert!(
-        !text.contains(&twin),
-        "the phantom key {twin} is nowhere in the drawn panel, got:\n{text}"
-    );
-
-    // Gate 2 measured against the **unsuppressed baseline of this same panel**, produced
-    // by the production code rather than assumed: drop the plain half and the redundancy
-    // rule is inert, so the very same projection hands the panel BOTH rows — the shipped
-    // shape. The panel's total line count must be identical on both sides of the
-    // suppression edge, and the extra row must be the empty one.
-    drop(manager);
-    let _ = crate::ui::helpers::project_subagent_rows(&mut loop_rows);
-    loop_rows.retain(|row| row.name == plain || row.name == twin);
-    r.set_subagents(loop_rows.clone());
-    let ui = r.capture_ui();
-    let names: Vec<&str> = ui.subagent_panels.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(
-        ui.subagent_panels.len(),
-        2,
-        "control: without a live plain sibling the same projection does yield the phantom \
-         row too, got {names:?}"
-    );
-    assert_eq!(
-        ui.subagent_panels
-            .iter()
-            .map(|p| p.logs.len())
-            .sum::<usize>(),
-        lines_before,
-        "gate 2 measured against the unsuppressed baseline: suppressing the row is \
-         line-neutral, got {names:?}"
-    );
-    let phantom = ui
-        .subagent_panels
-        .iter()
-        .find(|p| p.name == twin)
-        .expect("the unsuppressed shape shows the twin");
-    assert!(
-        phantom.logs.is_empty() && phantom.is_active,
-        "witness: that unsuppressed row is a **live row with no lines at all** — the row the \
-         suppression removes"
-    );
-    assert_eq!(
-        ui.subagent_panels
-            .get(ui.view.selected_subagent_idx)
-            .map(|p| p.name.as_str()),
-        Some(twin.as_str()),
-        "witness: with no suppression the pane's selection really does jump onto that empty \
-         row — the reported symptom, pinned so a regression cannot quietly re-open it"
-    );
-
-    drop(runner);
-}
-
-/// The session-restore half of the accepted rule at the panel tier (gate 4): a lone
-/// `{base}#N` record — the truthful half of a restored pair, while its plain sibling came
-/// back as an `Interrupted by restart` shell
-/// (`docs/investigation/dup_rows_root_cause.md` §5) — must still be projected, must still
-/// be **drawn** with its journal history and its `Dup #N` badge, and the pane's selection
-/// must sit on that row. This is the control that keeps the suppression from degrading
-/// into "always prefer the plain key".
-#[test]
-fn a_restored_collision_row_is_still_drawn_with_its_history_and_its_badge() {
-    use crate::orchestrator::workers;
-    let _workers = workers::TEST_WORKERS_MUTEX
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    // The restore seam verbatim: the record is installed under its stored key and never
-    // re-draws an id, and no plain half is registered for this task at all.
-    let restored_key = "coder-t-9531#88".to_string();
-    let started = std::time::Instant::now();
-    assert!(workers::install_restored_worker(
-        restored_key.clone(),
-        workers::WorkerState {
-            info: workers::ActiveWorkerInfo {
-                task_id: Some("t-9531".to_string()),
-                agent_name: "coder".to_string(),
-                prompt: "restored brief".to_string(),
-                started_at: started,
-                started_wall: chrono::Local::now(),
-                context_tokens: 2345,
-                implementation_turns: 4,
-                validation_rounds: 1,
-                latest_validator_feedback: None,
-                status: "Approved".to_string(),
-                cancel_token: None,
-            },
-            last_tokens: 2345,
-            completed_seq: Some(9531),
-            completed_at: Some(started),
-            completed_wall: Some(chrono::Local::now()),
-            worker_id_seq_value: 88,
-            queue_position: None,
-        }
-    ));
-    let _cleanup = EntryCleanup {
-        key: restored_key.clone(),
-    };
-
-    // The journaled pane the restore hands the loop: the history the plain half lost.
-    let history: Vec<String> = (1..=12).map(|i| format!("history line {i}")).collect();
-    let mut loop_rows = vec![SubagentDetail {
-        name: restored_key.clone(),
-        is_active: false,
-        logs: history.clone(),
-        ..Default::default()
-    }];
-
-    let _ = crate::ui::helpers::project_subagent_rows(&mut loop_rows);
-    loop_rows.retain(|row| row.name == restored_key);
-    assert_eq!(
-        loop_rows.len(),
-        1,
-        "a lone `{restored_key}` record keeps its row — the suppression is per-live-sibling, \
-         never \"always prefer the plain key\""
-    );
-    assert_eq!(
-        loop_rows[0].logs, history,
-        "with its full journaled history"
-    );
-
-    let mut r = TuiRenderer::new();
-    r.show_subagent_panel = true;
-    r.set_subagents(loop_rows.clone());
-    let ui = r.capture_ui();
-    let selected = ui
-        .subagent_panels
-        .get(ui.view.selected_subagent_idx)
-        .unwrap_or_else(|| {
-            panic!(
-                "selection index {} names no drawn row",
-                ui.view.selected_subagent_idx
-            )
-        });
-    assert_eq!(
-        selected.name, restored_key,
-        "the restored record is the selected row"
-    );
-    assert_eq!(
-        selected.logs, history,
-        "and the panel holds every history line"
-    );
-
-    let (rows, _) = draw_subagent_panel(&mut r, 120, 40);
-    let text = rows.join("\n");
-    assert!(
-        text.contains(&format!("> {restored_key}")),
-        "the restored collision row is drawn as the selected list entry, got:\n{text}"
-    );
-    assert!(
-        text.contains("Dup #88"),
-        "and its label still spells what it is, got:\n{text}"
-    );
-    assert!(
-        text.contains("[Logs]") && text.contains("history line 12"),
-        "with its history drawn for that row, got:\n{text}"
-    );
+    press(&mut r, KeyCode::Delete, KeyModifiers::NONE);
+    assert_eq!(r.input_text, "hello Xwld");
 }
 
 #[test]
@@ -3918,43 +1794,6 @@ fn test_plan_caching_and_throttling() {
 }
 
 #[test]
-fn test_status_bar_displays_right_aligned_elapsed_time() {
-    let mut r = TuiRenderer::new();
-    let start = std::time::Instant::now()
-        .checked_sub(std::time::Duration::from_secs(135))
-        .unwrap();
-    r.plan_start_time = Some(start);
-    r.plan_completed_time = Some(start + std::time::Duration::from_secs(135));
-
-    let backend = ratatui::backend::TestBackend::new(100, 5);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 4, 100, 1);
-            r.render_status(frame, area);
-        })
-        .unwrap();
-
-    let buffer = terminal.backend().buffer();
-    let content: String = (0..100)
-        .map(|x| buffer[(x, 4)].symbol().to_string())
-        .collect();
-
-    assert!(
-        content.contains("Tokens:"),
-        "expected 'Tokens:' on the left, got: {content}"
-    );
-    assert!(
-        content.contains("Elapsed: 2m 15s"),
-        "expected 'Elapsed: 2m 15s' in status bar, got: {content}"
-    );
-    assert!(
-        content.ends_with("Elapsed: 2m 15s "),
-        "expected elapsed time to be right-aligned at the edge of the status bar, got: '{content}'"
-    );
-}
-
-#[test]
 fn test_status_bar_prefers_plan_start_time() {
     let mut r = TuiRenderer::new();
 
@@ -4009,39 +1848,8 @@ fn test_delegation_completed_emits_task_id_completed_in_chat() {
 
     let (style, special) = message_style("[t-007] completed.");
     assert!(special);
+    assert_eq!(style, theme::state_done());
     assert_eq!(style.fg, Some(ratatui::style::Color::Green));
-    assert!(style.add_modifier.contains(ratatui::style::Modifier::BOLD));
-}
-
-#[test]
-fn test_chat_auto_scroll_shows_final_lines_of_multiline_markdown_response() {
-    let mut r = TuiRenderer::new();
-    let text = "## Summary\n\nParagraph 1.\n\nParagraph 2.\n\n### Section 1\nLine 1\nLine 2\n\n### Section 2\n- Item 1\n- Item 2\n\n### Section 3\n- Item 3\n- Item 4\n\n### Final Section\nBottom line 1\nBottom line 2\n";
-    r.on_event(&Event::Message(text.to_string()));
-
-    let backend = ratatui::backend::TestBackend::new(80, 10);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, 80, 10);
-            r.render_chat(frame, area);
-        })
-        .unwrap();
-
-    let buffer = terminal.backend().buffer();
-    let mut rendered = String::new();
-    for y in 0..10 {
-        let line: String = (0..80)
-            .map(|x| buffer[(x, y)].symbol().to_string())
-            .collect();
-        rendered.push_str(&line);
-        rendered.push('\n');
-    }
-
-    assert!(
-        rendered.contains("Bottom line 2"),
-        "expected bottom line to be visible in chat viewport, got:\n{rendered}"
-    );
 }
 
 #[test]
@@ -4104,154 +1912,9 @@ fn test_parallel_specialist_streaming_routes_to_correct_subagents() {
     assert_eq!(r.current_content, "");
 }
 
-#[test]
-fn test_tui_renders_subagent_thinking_progress_and_output_during_streaming() {
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut terminal = Terminal::new(backend).unwrap();
-
-    let mut r = TuiRenderer::new();
-    r.set_subagents(vec![SubagentDetail {
-        name: "researcher-t-001".to_string(),
-        task_id: Some("t-001".to_string()),
-        prompt: "Research NES CPU".to_string(),
-        started_at: None,
-        worked_duration: std::time::Duration::ZERO,
-        last_activity_at: None,
-        logs: vec![],
-        thinking: String::new(),
-        content: String::new(),
-        is_active: true,
-        context_tokens: 0,
-        queue: None,
-        paused: false,
-    }]);
-
-    // 1. When subagent is active but has not produced tokens yet:
-    // It must render an active waiting indicator (never blank).
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, 100, 30);
-            r.render_subagents(frame, area);
-        })
-        .unwrap();
-
-    let mut screen1 = String::new();
-    let buf1 = terminal.backend().buffer();
-    for y in 0..30 {
-        let line: String = (0..100)
-            .map(|x| buf1[(x, y)].symbol().to_string())
-            .collect();
-        screen1.push_str(&line);
-        screen1.push('\n');
-    }
-    assert!(
-        screen1.contains("researcher-t-001"),
-        "subagent header should be visible"
-    );
-    assert!(
-        screen1.contains("[Status: Active - waiting for model response...]"),
-        "active waiting indicator must be shown when subagent is active with 0 tokens, got:\n{screen1}"
-    );
-
-    // 2. Stream tokens of reasoning/thinking:
-    r.on_event(&Event::SubagentThinking {
-        agent_tag: "researcher-t-001".to_string(),
-        text: "Analyzing 6502 addressing modes and cycle timings in detail.".to_string(),
-    });
-
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, 100, 30);
-            r.render_subagents(frame, area);
-        })
-        .unwrap();
-
-    let mut screen2 = String::new();
-    let buf2 = terminal.backend().buffer();
-    for y in 0..30 {
-        let line: String = (0..100)
-            .map(|x| buf2[(x, y)].symbol().to_string())
-            .collect();
-        screen2.push_str(&line);
-        screen2.push('\n');
-    }
-    // With show_thought = false, the collapsed thinking indicator is rendered:
-    assert!(
-        screen2.contains("[Thinking: ~"),
-        "collapsed thinking indicator must be visible when thinking is non-empty, got:\n{screen2}"
-    );
-    assert!(
-        !screen2.contains("Analyzing 6502 addressing modes"),
-        "raw thinking text should be collapsed when show_thought=false"
-    );
-
-    // 3. Stream assistant output content:
-    r.on_event(&Event::SubagentMessage {
-        agent_tag: "researcher-t-001".to_string(),
-        text: "# NES Architecture Research Deliverable\n".to_string(),
-    });
-
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, 100, 30);
-            r.render_subagents(frame, area);
-        })
-        .unwrap();
-
-    let mut screen3 = String::new();
-    let buf3 = terminal.backend().buffer();
-    for y in 0..30 {
-        let line: String = (0..100)
-            .map(|x| buf3[(x, y)].symbol().to_string())
-            .collect();
-        screen3.push_str(&line);
-        screen3.push('\n');
-    }
-    // Output MUST be unconditionally visible regardless of show_thought:
-    assert!(
-        screen3.contains("[Output]"),
-        "[Output] header must be visible even when show_thought=false, got:\n{screen3}"
-    );
-    assert!(
-        screen3.contains("# NES Architecture Research Deliverable"),
-        "subagent content must be visible even when show_thought=false, got:\n{screen3}"
-    );
-
-    // 4. Toggle thought display ON via /thought:
-    r.input_text = "/thought".to_string();
-    r.submit();
-    assert!(r.show_thought);
-
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, 100, 30);
-            r.render_subagents(frame, area);
-        })
-        .unwrap();
-
-    let mut screen4 = String::new();
-    let buf4 = terminal.backend().buffer();
-    for y in 0..30 {
-        let line: String = (0..100)
-            .map(|x| buf4[(x, y)].symbol().to_string())
-            .collect();
-        screen4.push_str(&line);
-        screen4.push('\n');
-    }
-    assert!(
-        screen4.contains("[Thinking]"),
-        "full [Thinking] block must be visible when show_thought=true, got:\n{screen4}"
-    );
-    assert!(
-        screen4.contains("Analyzing 6502 addressing modes and cycle timings in detail."),
-        "raw thinking text must be visible when show_thought=true, got:\n{screen4}"
-    );
-    assert!(
-        screen4.contains("# NES Architecture Research Deliverable"),
-        "output content remains visible when show_thought=true, got:\n{screen4}"
-    );
-}
-
+/// `/help` prints the one shared legend (§10 item 3): the same text the `F1`
+/// overlay and the footer legend are built from, so the three surfaces cannot
+/// drift apart.
 #[test]
 fn test_tui_help_command_includes_ctrl_t() {
     let mut r = TuiRenderer::new();
@@ -4262,119 +1925,12 @@ fn test_tui_help_command_includes_ctrl_t() {
         .messages
         .last()
         .expect("should have emitted /help message");
-    assert!(help_msg.contains("Ctrl+T - toggle the thinking block display"));
-}
-
-#[test]
-fn test_subagent_thinking_shows_remaining_budget_countdown() {
-    let mut r = TuiRenderer::new();
-    r.default_thinking_budget = 10_000;
-    r.subagents.push(SubagentDetail {
-        name: "coder-t-001".to_string(),
-        task_id: Some("t-001".to_string()),
-        prompt: String::new(),
-        started_at: None,
-        worked_duration: std::time::Duration::ZERO,
-        last_activity_at: None,
-        logs: vec![],
-        thinking: String::new(),
-        content: String::new(),
-        is_active: true,
-        context_tokens: 0,
-        queue: None,
-        paused: false,
-    });
-
-    // 1. Stream 4000 characters in Turn 1: ~1000 tokens. 10000 - 1000 = 9000 remaining (~9.0k remaining).
-    r.on_event(&Event::SubagentThinking {
-        agent_tag: "coder-t-001".to_string(),
-        text: "a".repeat(4000),
-    });
-
-    let backend = ratatui::backend::TestBackend::new(100, 20);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, 100, 20);
-            r.render_subagents(frame, area);
-        })
-        .unwrap();
-
-    let mut screen = String::new();
-    let buf = terminal.backend().buffer();
-    for y in 0..20 {
-        let line: String = (0..100).map(|x| buf[(x, y)].symbol().to_string()).collect();
-        screen.push_str(&line);
-        screen.push('\n');
-    }
-
-    assert!(
-        screen.contains("9.0k remaining"),
-        "expected countdown '9.0k remaining' in subagent status bar, got:\n{screen}"
-    );
-    assert!(
-        screen.contains("[Thinking: ~1.0k tokens (9.0k remaining) / 4.0k chars]"),
-        "expected full thinking countdown banner, got:\n{screen}"
-    );
-
-    // 2. Stream message content in Turn 1 — thinking countdown must be cleared from status bar
-    r.on_event(&Event::SubagentMessage {
-        agent_tag: "coder-t-001".to_string(),
-        text: "Deliverable work".to_string(),
-    });
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, 100, 20);
-            r.render_subagents(frame, area);
-        })
-        .unwrap();
-    let mut screen2 = String::new();
-    let buf2 = terminal.backend().buffer();
-    for y in 0..20 {
-        let line: String = (0..100)
-            .map(|x| buf2[(x, y)].symbol().to_string())
-            .collect();
-        screen2.push_str(&line);
-        screen2.push('\n');
-    }
-    assert!(
-        screen2.contains("[Status: Active - streaming output...]"),
-        "expected status to switch to streaming output when content arrives, got:\n{screen2}"
-    );
-    assert!(
-        !screen2.contains("[Thinking: ~"),
-        "thinking banner should not be displayed in status bar when output is streaming"
-    );
-
-    // 3. Turn 2 starts: streams 2000 chars of thinking.
-    // Must count PER-TURN (2000 chars -> 500 tokens, 9.5k remaining), NOT accumulated (6000 chars).
-    r.on_event(&Event::SubagentThinking {
-        agent_tag: "coder-t-001".to_string(),
-        text: "b".repeat(2000),
-    });
-    terminal
-        .draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, 100, 20);
-            r.render_subagents(frame, area);
-        })
-        .unwrap();
-    let mut screen3 = String::new();
-    let buf3 = terminal.backend().buffer();
-    for y in 0..20 {
-        let line: String = (0..100)
-            .map(|x| buf3[(x, y)].symbol().to_string())
-            .collect();
-        screen3.push_str(&line);
-        screen3.push('\n');
-    }
-    assert!(
-        screen3.contains("9.5k remaining"),
-        "expected Turn 2 countdown '9.5k remaining' (per-turn reset), got:\n{screen3}"
-    );
-    assert!(
-        screen3.contains("[Thinking: ~500 tokens (9.5k remaining) / 2.0k chars]"),
-        "expected Turn 2 per-turn thinking countdown banner, got:\n{screen3}"
-    );
+    let body = help_msg
+        .strip_prefix("[CLI] ")
+        .expect("/help prints the CLI-prefixed legend");
+    assert_eq!(body, components::help::help_text().as_str());
+    assert!(help_msg.contains("Ctrl+T"));
+    assert!(help_msg.contains("toggle the thinking chip"));
 }
 
 #[test]
@@ -4394,6 +1950,11 @@ fn test_manager_output_routes_to_chat_when_specialist_inactive() {
         context_tokens: 0,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     });
     r.active_agent = "researcher-steer-task-1".to_string();
 
@@ -4452,6 +2013,11 @@ fn test_set_subagents_preserves_manager_active_agent() {
         context_tokens: 0,
         queue: None,
         paused: false,
+
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     }];
     r.set_subagents(active_list);
 
@@ -4789,6 +2355,13 @@ fn rich_subagent(name: &str) -> SubagentDetail {
         context_tokens: 18_431,
         queue: None,
         paused: false,
+        // The D1 lifecycle fields are NOT part of the durable panel (the worker
+        // registry is their only source), so they stay at their defaults here: a
+        // round-trip through `capture_ui` / `restore_panes` must not claim them.
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     }
 }
 
@@ -5082,7 +2655,9 @@ fn capture_and_restore_round_trip_scrolls_with_the_live_clamp() {
     assert_eq!(section.view.plan_scroll, 4);
     assert_eq!(section.view.subagent_scroll, 2);
     assert_eq!(section.view.subagent_list_scroll, 1);
-    assert_eq!(section.view.focused_panel, "chat");
+    // The boot renderer holds the composer focused (spec §4.2), and D2 gives that
+    // pane its own token, so the focus is stored as it was held.
+    assert_eq!(section.view.focused_panel, "input");
 
     let mut target = TuiRenderer::new();
     // Same derived geometry as the source, otherwise the live clamp
@@ -5985,46 +3560,3802 @@ fn the_hooks_are_object_safe_and_need_no_sync() {
     );
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Dedup / interleaved-push regression coverage driven through the REAL push path
-// (`Renderer::set_subagents` -> `merge_logs`), the way the session loop actually
-// hands rows over. The two unit tests above (`the_logs_merge_adopts_a_longer_loop
-// _list_and_keeps_the_renderers_tail`, `the_per_row_log_cap_keeps_the_newest_lines`)
-// pin the pure function; these pin the same contract as observed on a live
-// renderer across a push sequence, including the renderer's own appended lines.
-// ──────────────────────────────────────────────────────────────────────────────
+// ---- new UI scaffold: view model, layout ladder, theme, pane chrome ----------
 
-/// One authoritative row exactly as the session loop projects it: identity, liveness and
-/// the log lines the row carries — and nothing else (`helpers::apply_registry_entry` never
-/// writes `thinking`/`content`, and a projection-only push carries `logs: vec![]`).
+/// Draw one whole frame of the rebuilt UI and hand back the text of every row.
+fn draw_new_frame(r: &mut TuiRenderer, width: u16, height: u16) -> Vec<String> {
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            r.draw_new_ui(frame);
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect()
+}
+
+/// The cells strictly inside one pane rect — its body, border excluded — with the
+/// scrollbar glyphs a pane draws on its inner right edge stripped off.
+fn pane_body(rows: &[String], pane: Rect) -> Vec<String> {
+    let x = usize::from(pane.x) + 1;
+    let width = usize::from(pane.width).saturating_sub(2);
+    let y = usize::from(pane.y) + 1;
+    let height = usize::from(pane.height).saturating_sub(2);
+    rows[y..y + height]
+        .iter()
+        .map(|row| {
+            row.chars()
+                .skip(x)
+                .take(width)
+                .collect::<String>()
+                .trim_end()
+                .trim_end_matches(['│', '║', '▲', '▼', '█'])
+                .to_string()
+        })
+        .collect()
+}
+
+/// What one pane says, with its body rows folded back into a single line. A pane
+/// wraps at its own width, and in M4 the transcript is the narrow side column, so a
+/// sentence can straddle two rows: folding keeps an assertion about the pane's
+/// message independent of the width it happens to be drawn at.
+fn pane_says(rows: &[String], pane: Rect) -> String {
+    pane_body(rows, pane)
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ")
+}
+
+/// A renderer in the M4 state: both side panes on, one running worker, one
+/// transcript line, a mixed plan. The mode is set through the transition helper
+/// because it is stored view state now — writing the pane toggles alone would
+/// leave the stored mode on M1 until the adoption bridge folded them in.
+fn m4_renderer() -> TuiRenderer {
+    let mut r = TuiRenderer::new();
+    r.plan_content =
+        "## Tasks\n\n- [x] [t-001] research baseline\n- [ ] [t-004] wireframe\n".to_string();
+    r.messages = vec!["User: rebuild the TUI".to_string()];
+    r.set_view_mode(state::ViewMode::Split);
+    r.subagents = vec![SubagentDetail {
+        name: "coder_specialist-t-004".to_string(),
+        task_id: Some("t-004".to_string()),
+        is_active: true,
+        ..SubagentDetail::default()
+    }];
+    r
+}
+
+#[test]
+fn plan_progress_is_the_checked_box_split_of_the_same_plan_text() {
+    // Acceptance criterion 2: `done/total` equals the `CheckboxState::Checked` /
+    // total split for three fixtures.
+    let empty = state::PlanProgress::from_plan("No active execution plan on disk.", None, &[]);
+    assert_eq!((empty.done, empty.total), (0, 0));
+    assert!(!empty.has_tasks());
+    assert_eq!(empty.progress_label(), "0/0 done");
+
+    let all_checked =
+        state::PlanProgress::from_plan("- [x] [t-001] a\n- [X] [t-002] b\n", None, &[]);
+    assert_eq!((all_checked.done, all_checked.total), (2, 2));
+    assert_eq!(all_checked.pending(), 0);
+
+    let mixed = state::PlanProgress::from_plan(
+        "# Plan\n\n- [x] [t-001] a\n- [ ] [t-004] b\n- [x] t-008 c\n\n```\n- [ ] not a task\n```",
+        None,
+        &[],
+    );
+    assert_eq!((mixed.done, mixed.total), (2, 3));
+    assert_eq!(mixed.pending(), 1);
+    assert_eq!(mixed.progress_label(), "2/3 done");
+}
+
+#[test]
+fn plan_progress_active_task_prefers_the_explicit_task_then_a_running_row() {
+    let explicit = state::PlanProgress::from_plan("- [ ] [t-004] b\n", Some("t-004"), &[]);
+    assert_eq!(explicit.active_task.as_deref(), Some("t-004"));
+
+    let running = vec![SubagentDetail {
+        name: "coder_specialist-t-009".to_string(),
+        task_id: Some("t-009".to_string()),
+        is_active: true,
+        ..SubagentDetail::default()
+    }];
+    let derived = state::PlanProgress::from_plan("- [ ] [t-004] b\n", None, &running);
+    assert_eq!(derived.active_task.as_deref(), Some("t-009"));
+
+    let idle = vec![SubagentDetail {
+        name: "writer-t-011".to_string(),
+        task_id: Some("t-011".to_string()),
+        ..SubagentDetail::default()
+    }];
+    let none = state::PlanProgress::from_plan("- [ ] [t-004] b\n", None, &idle);
+    assert_eq!(none.active_task, None);
+}
+
+#[test]
+fn view_mode_is_stored_state_and_the_pane_toggles_follow_it() {
+    // Spec §4.1: the mode is real UI state. It is set once at boot from the pane
+    // inventory (both side panes closed = M1) and moves only by transition; the
+    // two pane toggles are what the mode's pane inventory (§4.3) spells for the
+    // status chips, the legacy scroll path and the durable `ViewState`.
+    let mut r = TuiRenderer::new();
+    assert_eq!(
+        state::UiView::from_renderer(&r).mode,
+        state::ViewMode::Transcript,
+        "boot: both side panes closed is M1"
+    );
+    assert_eq!(
+        r.focus,
+        state::FocusPane::Input,
+        "boot: the composer is focused"
+    );
+
+    for (mode, plan, workers) in [
+        (state::ViewMode::Plan, true, false),
+        (state::ViewMode::Split, true, true),
+        (state::ViewMode::Workers, false, true),
+        (state::ViewMode::Transcript, false, false),
+    ] {
+        r.set_view_mode(mode);
+        let view = state::UiView::from_renderer(&r);
+        assert_eq!(view.mode, mode, "the stored mode is what the frame reads");
+        assert_eq!(
+            (r.show_plan_panel, r.show_subagent_panel),
+            (plan, workers),
+            "{mode:?} spells its pane inventory into the toggles"
+        );
+        // §2.4.1/G6: a focus may never sit on a pane the mode does not present.
+        assert!(
+            mode.presents(r.focus),
+            "{mode:?} keeps {:?} on screen",
+            r.focus
+        );
+        assert!(r.dirty, "no silent mode change (G5)");
+    }
+}
+
+#[test]
+fn a_legacy_pane_write_is_adopted_as_exactly_one_transition() {
+    // `events.rs` still writes the pre-rebuild fields directly until t-011 routes
+    // its keys through the transitions, so the bridge turns such a write into one
+    // mode change — and never re-adopts a mode the transitions themselves set.
+    let mut r = TuiRenderer::new();
+    r.show_plan_panel = true; // what `Ctrl+P` does today
+    r.adopt_legacy_view_writes();
+    assert_eq!(r.view_mode, state::ViewMode::Plan);
+
+    r.adopt_legacy_view_writes();
+    assert_eq!(
+        r.view_mode,
+        state::ViewMode::Plan,
+        "adoption is edge-triggered, not a re-read"
+    );
+
+    r.set_view_mode(state::ViewMode::Split);
+    r.adopt_legacy_view_writes();
+    assert_eq!(
+        r.view_mode,
+        state::ViewMode::Split,
+        "a write the API made is never mistaken for a legacy write"
+    );
+
+    // The same bridge folds a focus tag and the auto-scroll flag.
+    r.focused_panel = FocusedPanel::Subagents;
+    r.chat_auto_scroll = false;
+    r.adopt_legacy_view_writes();
+    assert_eq!(r.focus, state::FocusPane::Workers);
+    assert!(!r.follow);
+    assert!(!r.chat_auto_scroll);
+}
+
+#[test]
+fn a_mode_that_removes_a_pane_repairs_the_focus_onto_a_pane_that_is_there() {
+    // §4.2 ring + §2.4.1: an absent pane is never drawn and never hit-tested, so
+    // closing the pane under focus pulls the focus back on screen instead of
+    // stranding the badge. `Tab` skips the absent panes for the same reason.
+    let mut r = m4_renderer();
+    r.set_focus(state::FocusPane::Plan);
+    assert_eq!(r.focused_panel, FocusedPanel::Plan);
+
+    r.set_view_mode(state::ViewMode::Workers);
+    assert!(
+        !state::ViewMode::Workers.presents(state::FocusPane::Plan),
+        "M4 → M3 removes the plan pane"
+    );
+    assert_ne!(r.focus, state::FocusPane::Plan);
+    assert!(state::ViewMode::Workers.presents(r.focus));
+    assert_eq!(r.focused_panel, r.focus.legacy());
+
+    // `Tab` in a mode with no side panes cycles Input ⇄ Transcript only.
+    r.set_view_mode(state::ViewMode::Transcript);
+    r.set_focus(state::FocusPane::Input);
+    assert_eq!(r.cycle_focus_pane(true), state::FocusPane::Transcript);
+    assert_eq!(r.cycle_focus_pane(true), state::FocusPane::Input);
+    assert_eq!(r.cycle_focus_pane(false), state::FocusPane::Transcript);
+
+    // With both side panes on, the ring is the full §4.2 order.
+    r.set_view_mode(state::ViewMode::Split);
+    r.set_focus(state::FocusPane::Input);
+    assert_eq!(r.cycle_focus_pane(true), state::FocusPane::Transcript);
+    assert_eq!(r.cycle_focus_pane(true), state::FocusPane::Plan);
+    assert_eq!(r.cycle_focus_pane(true), state::FocusPane::Workers);
+    assert_eq!(r.cycle_focus_pane(true), state::FocusPane::Input);
+    assert_eq!(r.cycle_focus_pane(false), state::FocusPane::Workers);
+}
+
+#[test]
+fn the_view_model_mirrors_focus_follow_scroll_and_the_armed_surface() {
+    let mut r = TuiRenderer::new();
+    r.set_focus(state::FocusPane::Workers);
+    r.set_follow(false);
+    r.chat_scroll = 7;
+    r.plan_scroll = 3;
+    r.subagent_scroll = 11;
+    let view = state::UiView::from_renderer(&r);
+    assert_eq!(view.focus, state::FocusPane::Workers);
+    assert!(view.focused(state::FocusPane::Workers));
+    assert!(!view.focused(state::FocusPane::Input));
+    assert!(!view.follow);
+    assert!(!r.chat_auto_scroll, "the legacy scroll flag mirrors follow");
+    assert_eq!(r.focused_panel, FocusedPanel::Subagents);
+    assert!(view.composer_active());
+    assert_eq!(
+        (
+            view.scroll.transcript,
+            view.scroll.plan,
+            view.scroll.workers
+        ),
+        (7, 3, 11)
+    );
+    assert_eq!(view.overlay, state::OverlayState::None);
+
+    // Arming abort opens the confirm surface (drawn on status row 2, §8.5). The
+    // surface is stored state, so the 3 s window is folded in by the same pass
+    // the entry path runs every tick — its rising edge puts it on screen.
+    r.confirm_abort = true;
+    r.abort_armed_at = Some(std::time::Instant::now());
+    r.adopt_legacy_view_writes();
+    let armed = state::UiView::from_renderer(&r);
+    assert!(armed.abort_armed);
+    assert_eq!(armed.overlay, state::OverlayState::Confirm);
+    assert!(armed.overlay.is_open());
+    assert!(!armed.composer_active());
+
+    // The falling edge — the window expiring with no key press at all — takes the
+    // surface back off, so nothing lingers once the prompt is stale.
+    r.abort_armed_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(4));
+    r.adopt_legacy_view_writes();
+    assert!(!state::UiView::from_renderer(&r).abort_armed);
+    assert_eq!(
+        state::UiView::from_renderer(&r).overlay,
+        state::OverlayState::None
+    );
+    assert!(!r.confirm_open);
+}
+
+#[test]
+fn the_help_overlay_is_state_and_a_confirm_underneath_it_returns_it() {
+    // G2: `?`/`F1` toggles a legend the view model actually carries; §5/§4.4:
+    // `Esc` closes one overlay and never arms abort.
+    let mut r = m4_renderer();
+    assert!(!r.help_open);
+    assert_eq!(
+        state::UiView::from_renderer(&r).overlay,
+        state::OverlayState::None
+    );
+
+    r.open_help();
+    assert!(r.help_open);
+    assert_eq!(
+        state::UiView::from_renderer(&r).overlay,
+        state::OverlayState::Help
+    );
+    let rows = draw_new_frame(&mut r, 100, 30).concat();
+    assert!(
+        rows.contains("Keys") && rows.contains("Esc close"),
+        "the legend is drawn over the body: {rows}"
+    );
+
+    // A confirm drawn over the legend wins the single overlay slot (§7.3) ...
+    r.show_confirm();
+    assert_eq!(
+        state::UiView::from_renderer(&r).overlay,
+        state::OverlayState::Confirm
+    );
+    // ... and closing it returns the legend that was still toggled on.
+    r.close_overlay();
+    assert!(!r.confirm_open);
+    assert!(r.help_open);
+    assert_eq!(
+        state::UiView::from_renderer(&r).overlay,
+        state::OverlayState::Help
+    );
+
+    // Closing the legend closes it; closing with nothing open is a no-op.
+    r.close_overlay();
+    assert!(!r.help_open);
+    assert_eq!(
+        state::UiView::from_renderer(&r).overlay,
+        state::OverlayState::None
+    );
+    r.close_overlay();
+    assert_eq!(
+        state::UiView::from_renderer(&r).overlay,
+        state::OverlayState::None
+    );
+}
+
+#[test]
+fn every_view_mode_changes_the_rects_compute_layout_actually_produces() {
+    // The mode is not a label on the header chip: it is the input the geometry is
+    // built from, and each of M1–M4 produces a different body split (§2.3).
+    let mut r = m4_renderer();
+    let area = Rect::new(0, 0, 100, 30);
+    let mut seen: Vec<(Option<Rect>, Option<Rect>, Option<Rect>)> = Vec::new();
+
+    for mode in [
+        state::ViewMode::Transcript,
+        state::ViewMode::Plan,
+        state::ViewMode::Workers,
+        state::ViewMode::Split,
+    ] {
+        r.set_view_mode(mode);
+        let view = state::UiView::from_renderer(&r);
+        let rects = layout::compute_layout(area, &view);
+        let body = rects.body.expect("100x30 clears every floor");
+        let transcript = rects
+            .transcript
+            .expect("the transcript is present in every mode");
+        assert_eq!(rects.mode, mode, "the frame reports the mode it drew");
+
+        match mode {
+            state::ViewMode::Transcript => {
+                assert_eq!(rects.plan, None, "M1 removes the plan pane");
+                assert_eq!(rects.workers, None, "M1 removes the workers pane");
+                assert_eq!(transcript, body, "M1 gives the transcript the whole body");
+            }
+            state::ViewMode::Plan => {
+                let plan = rects.plan.expect("M2 shows the plan pane");
+                assert_eq!(rects.workers, None, "M2 has no workers pane");
+                assert_eq!(plan.width + transcript.width, body.width);
+                assert!(
+                    plan.width > transcript.width,
+                    "M2 is the 55/45 pair with the plan in the wider — leading — \
+                     column: plan {} transcript {}",
+                    plan.width,
+                    transcript.width
+                );
+                assert_eq!(
+                    plan.x, body.x,
+                    "M2 puts the plan in the leading (left) column: plan {plan:?}"
+                );
+                assert!(
+                    plan.x < transcript.x,
+                    "M2 leads with the plan and trails with the transcript, exactly \
+                     the way M4 orders its columns: plan {plan:?} transcript {transcript:?}"
+                );
+            }
+            state::ViewMode::Workers => {
+                let workers = rects.workers.expect("M3 shows the workers pane");
+                assert_eq!(rects.plan, None, "M3 has no plan pane");
+                assert_eq!(workers.width + transcript.width, body.width);
+                assert!(
+                    workers.width > transcript.width,
+                    "M3 is 55/45 with the roster in the wider column: workers {} transcript {}",
+                    workers.width,
+                    transcript.width
+                );
+            }
+            state::ViewMode::Split => {
+                let plan = rects.plan.expect("M4 shows the plan pane");
+                let workers = rects.workers.expect("M4 shows the workers pane");
+                assert_eq!(plan.width + transcript.width, body.width);
+                assert!(
+                    plan.width > transcript.width,
+                    "M4 is the 60/40 pair with the plan in the wide — leading — \
+                     column: plan {} side {}",
+                    plan.width,
+                    transcript.width
+                );
+                assert_eq!(plan.height, body.height, "the plan owns a whole column");
+                assert_eq!(
+                    transcript.width, workers.width,
+                    "the side column stacks two panes"
+                );
+                assert_eq!(transcript.height + workers.height, body.height);
+                assert!(
+                    plan.x < transcript.x && plan.x < workers.x,
+                    "the plan column comes first, the stacked side column after it: \
+                     plan {plan:?} transcript {transcript:?} workers {workers:?}"
+                );
+                assert!(
+                    transcript.y < workers.y && transcript.x == workers.x,
+                    "the transcript heads the side column and the roster stacks under \
+                     it: transcript {transcript:?} workers {workers:?}"
+                );
+            }
+        }
+        seen.push((rects.transcript, rects.plan, rects.workers));
+    }
+
+    for (i, left) in seen.iter().enumerate() {
+        for (j, right) in seen.iter().enumerate().skip(i + 1) {
+            assert_ne!(left, right, "modes {} and {} drew the same rects", i, j);
+        }
+    }
+}
+
+/// The single global slot rule (t-024b) read across the whole §2.5 ladder instead of
+/// one shape at a time: wherever a frame draws both the Execution Plan and the
+/// Transcript, the plan owns the **leading** slot — the leftmost column of a columns
+/// split, the topmost row of the `width < 90` stack, the wide column of a
+/// short-terminal frame — and the transcript owns the trailing one. Widths straddle
+/// every ladder step (120, 100, the 90 boundary, the `width < 90` stack, the
+/// `width < 70` band, the `width < 60` detail floor and the band below it) and heights
+/// straddle the footer band, the un-stackable side column and the too-small floor.
+/// A frame with no plan pane — M1, M3, a single-column fallback, the roster-only
+/// fallback or the too-small notice — is the rule's vacuous case and is skipped, which
+/// is why the assertion is stated over the pair and not over the mode.
+#[test]
+fn the_plan_holds_the_leading_slot_in_every_shape_at_every_ladder_width() {
+    for area in [
+        Rect::new(0, 0, 120, 40),
+        Rect::new(0, 0, 100, 30),
+        Rect::new(0, 0, 95, 30),
+        Rect::new(0, 0, 90, 30),
+        Rect::new(0, 0, 89, 30),
+        Rect::new(0, 0, 80, 30),
+        Rect::new(0, 0, 70, 30),
+        Rect::new(0, 0, 60, 30),
+        Rect::new(0, 0, 59, 30),
+        Rect::new(0, 0, 45, 30),
+        Rect::new(0, 0, 39, 30),
+        Rect::new(0, 0, 100, 20),
+        Rect::new(0, 0, 100, 16),
+        Rect::new(0, 0, 100, 12),
+        Rect::new(0, 0, 100, 10),
+        Rect::new(0, 0, 100, 9),
+    ] {
+        for mode in [
+            state::ViewMode::Transcript,
+            state::ViewMode::Plan,
+            state::ViewMode::Workers,
+            state::ViewMode::Split,
+        ] {
+            for focus in [
+                state::FocusPane::Input,
+                state::FocusPane::Transcript,
+                state::FocusPane::Plan,
+                state::FocusPane::Workers,
+            ] {
+                let mut r = m4_renderer();
+                r.set_view_mode(mode);
+                r.set_focus(focus);
+                let view = state::UiView::from_renderer(&r);
+                let rects = layout::compute_layout(area, &view);
+                let label = format!("{area:?} {mode:?} focus {focus:?}");
+                let (Some(plan), Some(transcript)) = (rects.plan, rects.transcript) else {
+                    continue;
+                };
+                let body = rects.body.expect("a frame that draws two panes has a body");
+                assert_eq!(
+                    plan.x, body.x,
+                    "{label}: the plan owns the body's leading edge: {rects:?}"
+                );
+                if plan.x == transcript.x {
+                    assert!(
+                        plan.y < transcript.y,
+                        "{label}: one column, so the plan holds the top row: {rects:?}"
+                    );
+                } else {
+                    assert!(
+                        plan.x < transcript.x,
+                        "{label}: the plan holds the leading column: {rects:?}"
+                    );
+                }
+                assert!(
+                    plan.width >= transcript.width,
+                    "{label}: the leading slot is never the narrower one: {rects:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn capture_ui_and_restore_panes_round_trip_mode_focus_and_follow() {
+    // Spec §10 item 18: the UI state a session captured is the UI state a session
+    // boots into. The persisted `ViewState` spells the state in its pre-rebuild
+    // fields, so the round-trip is checked on both spellings.
+    let mut source = m4_renderer();
+    source.messages = (0..40).map(|i| format!("pane line {i}")).collect();
+    source.set_focus(state::FocusPane::Workers);
+    source.set_follow(false);
+    source.chat_scroll = 4;
+    let section = source.capture_ui();
+    assert_eq!(section.structural_violations(), Vec::<String>::new());
+    assert_eq!(section.view.focused_panel, "subagents");
+    assert!(
+        section.view.show_plan_panel && section.view.show_subagent_panel,
+        "M4 persists both pane toggles"
+    );
+    assert!(!section.view.chat_auto_scroll, "follow off is persisted");
+
+    let mut target = TuiRenderer::new();
+    assert_eq!(target.view_mode, state::ViewMode::Transcript);
+    target.restore_panes(&section);
+
+    assert_eq!(
+        target.view_mode,
+        state::ViewMode::Split,
+        "M4 comes back as M4"
+    );
+    assert_eq!(target.focus, state::FocusPane::Workers);
+    assert!(!target.follow);
+    assert_eq!(
+        (target.show_plan_panel, target.show_subagent_panel),
+        (true, true),
+        "the toggles stay in step with the restored mode"
+    );
+    assert_eq!(target.focused_panel, FocusedPanel::Subagents);
+    assert!(!target.chat_auto_scroll);
+    assert_eq!(target.chat_scroll, 4);
+    assert_eq!(
+        state::UiView::from_renderer(&target).mode,
+        state::ViewMode::Split
+    );
+    assert_eq!(
+        state::UiView::from_renderer(&target).focus,
+        state::FocusPane::Workers
+    );
+    assert!(!state::UiView::from_renderer(&target).follow);
+    // The restored renderer re-captures the identical section: nothing in the
+    // round-trip is invented and nothing is lost a second time.
+    assert_eq!(target.capture_ui(), section);
+
+    // D2 (spec §9.4): the composer has its own token, so a Composer focus comes
+    // back as the composer and not as the body pane the legacy `Chat` spelling
+    // named. The legacy mirror still projects `Chat`, because the pre-rebuild
+    // enum has no composer variant.
+    let mut composer = m4_renderer();
+    composer.set_focus(state::FocusPane::Input);
+    assert_eq!(composer.capture_ui().view.focused_panel, "input");
+    let mut target = TuiRenderer::new();
+    target.restore_panes(&composer.capture_ui());
+    assert_eq!(target.focus, state::FocusPane::Input);
+    assert_eq!(target.focused_panel, FocusedPanel::Chat);
+}
+
+#[test]
+fn a_help_overlay_the_operator_opened_survives_a_restore() {
+    // The legend is operator state, not session content: a restore replaces the
+    // panes, it does not close a legend that was open, and it never re-arms a
+    // confirm surface the 3 s window it belongs to did not survive.
+    let source = m4_renderer();
+    let section = source.capture_ui();
+
+    let mut target = m4_renderer();
+    target.open_help();
+    target.show_confirm();
+    assert_eq!(target.overlay, state::OverlayState::Confirm);
+    target.restore_panes(&section);
+
+    assert!(target.help_open, "the legend survives the restore");
+    assert!(
+        !target.confirm_open,
+        "a confirm surface is never re-armed by a restore"
+    );
+    assert_eq!(
+        state::UiView::from_renderer(&target).overlay,
+        state::OverlayState::Help
+    );
+    let rows = draw_new_frame(&mut target, 100, 30).concat();
+    assert!(
+        rows.contains("Keys"),
+        "the restored frame still carries the legend"
+    );
+
+    // A renderer that had nothing open keeps nothing open — the restore does not
+    // invent an overlay either.
+    let mut clean = m4_renderer();
+    clean.restore_panes(&section);
+    assert_eq!(
+        state::UiView::from_renderer(&clean).overlay,
+        state::OverlayState::None
+    );
+}
+
+#[test]
+fn teardown_is_idempotent_and_paints_nothing_afterwards() {
+    // The entry path tears the terminal down from three places: the session loop
+    // on a normal exit, the abort/EOF exits, and `Drop` on the unwinding path.
+    // Any of them may run after another, and a paint after the terminal is gone
+    // must not resurrect it — that would write escape codes into the shell.
+    let mut r = TuiRenderer::new();
+    r.messages = vec!["User: one".to_string()];
+    assert!(
+        !r.terminal_torn_down,
+        "a fresh renderer has not been torn down"
+    );
+
+    r.shutdown();
+    assert!(r.terminal_torn_down, "teardown is recorded");
+    r.shutdown();
+    r.shutdown();
+
+    assert!(
+        r.render_terminal().is_ok(),
+        "a paint after teardown is a no-op, not an error"
+    );
+    assert!(
+        r.force_flush().is_ok() && r.flush().is_ok(),
+        "the flush paths the loop keeps calling after shutdown are no-ops too"
+    );
+    assert_eq!(r.frame_counter, 0, "no frame was painted after teardown");
+
+    // `Drop` runs the same teardown a second time; nothing panics.
+    drop(r);
+}
+
+/// D11: the reset burst is one definition, and it is written to whatever writer it
+/// is handed — a unit test hands it a buffer, so the burst is pinned without ever
+/// touching the terminal of the process running the tests. The exact bytes are
+/// pinned so a production teardown can neither silently gain nor lose a reset.
+#[test]
+fn teardown_writes_exactly_the_reset_burst_to_the_writer_it_is_given() {
+    let mut buf: Vec<u8> = Vec::new();
+    write_terminal_resets(&mut buf).expect("a Vec<u8> sink cannot fail");
+    let burst = String::from_utf8(buf).expect("the reset burst is ASCII");
+
+    assert_eq!(
+        burst,
+        "\u{1b}[<1u\u{1b}[?1049l\u{1b}[?1006l\u{1b}[?1015l\u{1b}[?1003l\u{1b}[?1002l\u{1b}[?1000l\u{1b}[?2004l",
+        "pop the keyboard flags, leave the alternate screen, the five mouse disables, \
+         then bracketed paste off — in that order, and nothing else"
+    );
+    assert_eq!(
+        burst.matches('\u{1b}').count(),
+        8,
+        "eight sequences — the same eight the two teardown paths write"
+    );
+    for enter in ["?1049h", "?2004h", "?1000h", "[>"] {
+        assert!(
+            !burst.contains(enter),
+            "the burst carries resets only, never an {enter} enable: {burst:?}"
+        );
+    }
+}
+
+/// D11: a renderer that never took the ambient terminal over (`init()` never ran)
+/// has no terminal mode to hand back, so its teardown — including the `Drop` every
+/// unit test triggers — must write nothing at all. Before the `terminal_owned`
+/// guard, one `cargo test --lib` run dropped 431 such renderers and wrote 431
+/// reset bursts (3 448 ESC bytes) into the captured stdout of the test run.
+#[test]
+fn a_renderer_that_never_took_the_screen_over_writes_no_resets_on_teardown() {
+    let mut fresh = TuiRenderer::new();
+    assert!(
+        !fresh.terminal_owned,
+        "a renderer built by `new()` has entered no screen mode"
+    );
+    assert!(
+        !fresh.take_terminal_resets(),
+        "a renderer that took over no screen is owed no reset burst"
+    );
+    assert!(
+        fresh.terminal_torn_down,
+        "the silent teardown still records itself, so post-teardown paints stay suppressed"
+    );
+    assert!(
+        !fresh.take_terminal_resets(),
+        "a second teardown is a no-op, not a second answer"
+    );
+
+    // The exact call `Drop` makes for every renderer a test builds: guarded, so it
+    // writes nothing to the terminal of the process running the tests.
+    let mut dropped = TuiRenderer::new();
+    dropped.shutdown();
+    assert!(
+        !dropped.terminal_owned && dropped.terminal_torn_down,
+        "the Drop path stays silent and still suppresses painting"
+    );
+
+    // The armed path: `init()` is what sets the flag, and it is consumed exactly
+    // once, which is what lets the real TUI hand the screen back — once, and never
+    // twice.
+    let mut armed = TuiRenderer::new();
+    armed.terminal_owned = true;
+    assert!(
+        armed.take_terminal_resets(),
+        "an initialized renderer is owed exactly one reset burst"
+    );
+    assert!(
+        !armed.terminal_owned,
+        "the burst is consumed, so a later teardown cannot write it again"
+    );
+    assert!(
+        !armed.take_terminal_resets(),
+        "the panic-hook path followed by `Drop` re-runs the same resets only outside \
+         the renderer, never as a second guarded burst"
+    );
+}
+
+#[test]
+fn a_shrunken_pane_clamps_the_scroll_offset_it_can_no_longer_honour() {
+    // Work item 1: the entry path still clamps scroll state on every geometry
+    // change and repaints. The transcript clamps its own offset to the viewport
+    // it just built, so an offset that no longer exists — the classic case being
+    // a restored or held `chat_scroll` after a resize — never leaves the pane
+    // showing nothing but blank rows.
+    let mut r = m4_renderer();
+    r.messages = (0..200)
+        .map(|i| format!("pane line {i} of two hundred"))
+        .collect();
+    r.set_follow(false);
+
+    for (width, height) in [(100u16, 30u16), (60, 20), (40, 10), (120, 40)] {
+        r.chat_scroll = u16::MAX;
+        let rows = draw_new_frame(&mut r, width, height).concat();
+        assert!(
+            r.chat_scroll < u16::MAX,
+            "{width}x{height}: the impossible offset was not clamped"
+        );
+        assert!(
+            r.chat_scroll > 0,
+            "{width}x{height}: a clamped offset still sits at the tail"
+        );
+        assert!(
+            rows.contains("pane line 199"),
+            "{width}x{height}: the clamped pane must show the newest line"
+        );
+    }
+
+    // The same clamp through a mode change rather than a terminal resize: the
+    // frame that draws the new geometry re-clamps (M1 widens the transcript, M4
+    // narrows it, and the §2.5 ladder narrows it further at 60 columns).
+    for mode in [
+        state::ViewMode::Transcript,
+        state::ViewMode::Split,
+        state::ViewMode::Plan,
+        state::ViewMode::Workers,
+    ] {
+        r.chat_scroll = u16::MAX;
+        r.set_view_mode(mode);
+        let rows = draw_new_frame(&mut r, 60, 24).concat();
+        assert!(
+            rows.contains("pane line 199"),
+            "{mode:?} at 60x24 must show the newest line"
+        );
+    }
+
+    // `clamp_scrolls` is what the resize arm of the event loop calls; run after a
+    // draw has published the pane geometry, it must agree with the draw.
+    let drawn = r.chat_scroll;
+    r.chat_scroll = u16::MAX;
+    r.clamp_scrolls();
+    assert!(
+        r.chat_scroll <= drawn,
+        "the resize clamp lands on the same offset the draw did: {} > {drawn}",
+        r.chat_scroll
+    );
+    assert!(r.chat_scroll > 0);
+}
+
+#[test]
+fn no_pane_rect_is_zero_sized_at_any_supported_terminal_size() {
+    // Acceptance criterion 19 (layout half): 100x30, 90x24, 60x16 and 40x10.
+    let r = m4_renderer();
+    let view = state::UiView::from_renderer(&r);
+    for (width, height) in [(100u16, 30u16), (90, 24), (60, 16), (40, 10), (120, 60)] {
+        let rects = layout::compute_layout(Rect::new(0, 0, width, height), &view);
+        for (name, rect) in [
+            ("header", rects.header),
+            ("body", rects.body),
+            ("status", rects.status),
+            ("input", rects.input),
+            ("footer", rects.footer),
+            ("transcript", rects.transcript),
+            ("plan", rects.plan),
+            ("workers", rects.workers),
+        ] {
+            if let Some(rect) = rect {
+                assert!(
+                    rect.width >= 1 && rect.height >= 1,
+                    "{name} at {width}x{height} is {}x{}",
+                    rect.width,
+                    rect.height
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn below_40x10_only_the_too_small_notice_is_drawn() {
+    let r = m4_renderer();
+    let view = state::UiView::from_renderer(&r);
+    let rects = layout::compute_layout(Rect::new(0, 0, 39, 9), &view);
+    assert_eq!(rects.notice, Some(Rect::new(0, 0, 39, 9)));
+    assert_eq!(rects.header, None);
+    assert_eq!(rects.body, None);
+    assert_eq!(rects.status, None);
+    assert_eq!(rects.input, None);
+    assert_eq!(rects.footer, None);
+    assert_eq!(rects.transcript, None);
+    assert_eq!(rects.plan, None);
+    assert_eq!(rects.workers, None);
+
+    let rows = draw_new_frame(&mut TuiRenderer::new(), 39, 9);
+    let joined = rows.concat();
+    assert!(
+        joined.contains("Terminal too small")
+            && joined.contains("40x10")
+            && joined.contains("39x9"),
+        "the notice names the required and the current size: {joined}"
+    );
+    assert!(!joined.contains("Input"));
+    assert!(!joined.contains("LIVE"));
+}
+
+#[test]
+fn below_twenty_rows_the_footer_row_is_dropped_and_the_status_bar_collapses() {
+    let r = m4_renderer();
+    let view = state::UiView::from_renderer(&r);
+    let rects = layout::compute_layout(Rect::new(0, 0, 100, 19), &view);
+    assert_eq!(rects.footer, None, "the footer is absent, not zero-height");
+    assert_eq!(rects.status.expect("status present").height, 1);
+    assert!(rects.input.expect("input present").height <= 3);
+
+    let tall = layout::compute_layout(Rect::new(0, 0, 100, 30), &view);
+    assert_eq!(tall.footer.expect("footer at 30 rows").height, 1);
+    assert_eq!(tall.status.expect("status present").height, 2);
+}
+
+#[test]
+fn the_side_column_stacks_to_one_pane_below_ninety_columns() {
+    // §2.5 `width < 90`: transcript plus only the focused side pane.
+    let mut r = m4_renderer();
+    r.set_focus(state::FocusPane::Plan);
+    let view = state::UiView::from_renderer(&r);
+    let rects = layout::compute_layout(Rect::new(0, 0, 80, 30), &view);
+    assert!(rects.transcript.is_some());
+    assert!(rects.plan.is_some());
+    assert_eq!(rects.workers, None, "only the focused side pane survives");
+
+    let wide = layout::compute_layout(Rect::new(0, 0, 100, 30), &view);
+    assert!(wide.plan.is_some() && wide.workers.is_some());
+}
+
+#[test]
+fn the_header_chip_budget_drops_val_then_ctx_then_elapsed() {
+    // §7.4 drop order. D1 (§9.3) has landed, so the budget keeps `val` in the same
+    // band as the other optional chips and the pane decides whether it has a number
+    // to print there.
+    let wide = layout::header_budget(120);
+    assert!(wide.show_val, "D1 landed: the round chip is on the ladder");
+    assert!(wide.show_ctx && wide.show_elapsed && wide.show_mode && wide.show_task);
+
+    let compact = layout::header_budget(70);
+    assert!(
+        compact.show_elapsed,
+        "elapsed survives at 70; §2.5 drops it only below 70"
+    );
+    let narrow = layout::header_budget(69);
+    assert!(
+        !narrow.show_ctx && !narrow.show_elapsed && !narrow.show_mode && !narrow.show_val,
+        "the optional chips, `val` first, leave together below 70"
+    );
+    assert!(
+        narrow.show_task,
+        "the active task id outlives the optional chips"
+    );
+
+    let tiny = layout::header_budget(40);
+    assert!(tiny.show_task);
+    assert!(layout::compact_legend(69) && !layout::compact_legend(70));
+    assert!(!layout::workers_detail_present(59) && layout::workers_detail_present(60));
+}
+
+#[test]
+fn theme_glyphs_are_the_spec_table_and_the_picker_follows_row_state() {
+    use theme::Glyph;
+    assert_eq!(Glyph::Done.symbol(), '✓');
+    assert_eq!(Glyph::Active.symbol(), '▶');
+    assert_eq!(Glyph::Pending.symbol(), '⧗');
+    assert_eq!(Glyph::Paused.symbol(), '⏸');
+    assert_eq!(Glyph::Failed.symbol(), '✗');
+    assert_eq!(Glyph::Active.label(), "running");
+
+    assert_eq!(theme::task_glyph(true, false), Glyph::Done);
+    assert_eq!(theme::task_glyph(false, true), Glyph::Active);
+    assert_eq!(theme::task_glyph(false, false), Glyph::Pending);
+
+    assert_eq!(theme::worker_glyph(true, false, false), Glyph::Active);
+    assert_eq!(theme::worker_glyph(true, true, false), Glyph::Paused);
+    assert_eq!(theme::worker_glyph(false, false, true), Glyph::Pending);
+    assert_eq!(theme::worker_glyph(false, false, false), Glyph::Done);
+
+    // The label-aware picker (plumbing delta D1, §9.3). Liveness alone cannot tell an
+    // aborted worker from an approved one, so the registry's own `status_label`
+    // decides the terminal states — and the slot states still outrank the label.
+    for label in [
+        "Aborted",
+        "Rejected",
+        "Failed",
+        "Replan Required (too complex)",
+    ] {
+        assert_eq!(
+            theme::worker_state_glyph(false, false, false, Some(label)),
+            Glyph::Failed,
+            "{label} is a worker that did not deliver (§7.2 `✗`)"
+        );
+    }
+    assert_eq!(
+        theme::worker_state_glyph(false, false, false, Some("Approved")),
+        Glyph::Done,
+        "only an accepted deliverable reads `✓ done`"
+    );
+    assert_eq!(
+        theme::worker_state_glyph(true, false, false, Some("Revising")),
+        Glyph::Pending,
+        "the review loop holds the worker: §7.2 spells validating `⧗`"
+    );
+    assert_eq!(
+        theme::worker_state_glyph(true, false, false, Some("In Progress")),
+        Glyph::Active,
+        "a label outside the terminal vocabulary decides nothing and liveness answers"
+    );
+    assert_eq!(
+        theme::worker_state_glyph(false, false, false, Some("In Progress")),
+        Glyph::Done,
+        "…including when the honest answer is that the stream closed"
+    );
+    assert_eq!(
+        theme::worker_state_glyph(false, true, false, Some("Approved")),
+        Glyph::Paused,
+        "a parked stream is parked whatever its last label said"
+    );
+    assert_eq!(
+        theme::worker_state_glyph(true, false, true, Some("Running")),
+        Glyph::Pending,
+        "a delegation waiting for a slot is queued while its label says it runs"
+    );
+    assert_eq!(
+        theme::worker_state_glyph(false, false, false, None),
+        Glyph::Done,
+        "no projected label: the picker is the label-free rule, nothing more"
+    );
+    assert_eq!(
+        theme::worker_state_glyph(false, false, false, Some("   ")),
+        Glyph::Done,
+        "a blank label is no label"
+    );
+    assert_eq!(
+        theme::worker_state_glyph(false, false, false, Some("Unapproved")),
+        Glyph::Done,
+        "only the leading word decides, so `Unapproved` is not a verdict this knows"
+    );
+
+    // The palette keeps today's colours (§7.1), now pinned on the role slot that
+    // owns each value: the frozen aliases (`chip`, `chip_active`, `chip_done`,
+    // `chip_pending`, `error`, `text_dim`, `frame_alert`) are deleted, and the
+    // slots they delegated to carry the identical values.
+    assert_eq!(theme::frame_focus().fg, Some(Color::Cyan));
+    assert_eq!(theme::frame_idle().fg, Some(Color::DarkGray));
+    assert_eq!(theme::frame_danger().fg, Some(Color::Red));
+    assert_eq!(theme::frame_caution().fg, Some(Color::Yellow));
+    assert_eq!(theme::state_running().fg, Some(Color::Yellow));
+    assert!(theme::state_running().add_modifier.contains(Modifier::BOLD));
+    assert_eq!(theme::chip_neutral().bg, Some(Color::DarkGray));
+    assert_eq!(theme::state_done().fg, Some(Color::Green));
+    assert_eq!(theme::state_replan().fg, Some(Color::LightRed));
+    assert_eq!(theme::state_failed().fg, Some(Color::Red));
+    assert!(theme::state_failed().add_modifier.contains(Modifier::BOLD));
+    assert_eq!(theme::text_muted().fg, Some(Color::DarkGray));
+    assert_eq!(theme::text_primary(), ratatui::style::Style::default());
+    assert_eq!(theme::FOCUS_BADGE, '●');
+}
+
+/// Plumbing delta D1 (design §9.3) at the boundary it was asked for: the four worker
+/// lifecycle fields the orchestrator already keeps (`status_label`,
+/// `implementation_turns`, `validation_rounds`, `latest_validator_feedback`) reach the
+/// renderer's own row type instead of dying at the UI edge. Nothing here is derived
+/// from prose — one snapshot of the process-global registry, joined on the effective
+/// registry key.
+#[test]
+fn the_worker_lifecycle_the_registry_keeps_lands_on_the_pane_row() {
+    use crate::orchestrator::workers;
+    let _workers = workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let worker = workers::register_active_worker(
+        Some("t-9512".to_string()),
+        "coder".to_string(),
+        "carry the lifecycle across the UI boundary".to_string(),
+    );
+    let key = worker.0.clone();
+    let _cleanup = EntryCleanup { key: key.clone() };
+
+    // The state a validator rejection leaves in the registry: the review loop's own
+    // turn and round counters, its feedback text, and the terminal label.
+    workers::set_active_worker_status(&key, "Rejected");
+    workers::update_active_worker_progress(&key, 3, 2, Some("clippy: unused import".to_string()));
+
+    // The loop's row carries none of it — that is the gap D1 describes.
+    let mut r = m4_renderer();
+    r.subagents.clear();
+    r.set_subagents(vec![SubagentDetail {
+        name: key.clone(),
+        task_id: Some("t-9512".to_string()),
+        is_active: true,
+        ..SubagentDetail::default()
+    }]);
+    assert_eq!(r.subagents.len(), 1, "{:?}", r.subagents);
+    let row = r.subagents.iter().find(|row| row.name == key).unwrap();
+    assert_eq!(
+        row.status_label.as_deref(),
+        Some("Rejected"),
+        "the registry's own label, not a guess from liveness"
+    );
+    assert_eq!(row.implementation_turns, 3);
+    assert_eq!(row.validation_rounds, 2);
+    assert_eq!(
+        row.latest_validator_feedback.as_deref(),
+        Some("clippy: unused import")
+    );
+
+    // The one number the header and the status row are allowed to print (§8.4): the
+    // max over the rows, from the rows.
+    assert_eq!(r.max_validation_rounds(), 2);
+
+    // And the two fields the missing data kept switched off now reach the frame: the
+    // roster row prints its round, and the validator-rejected row reads `✗ failed`
+    // rather than the `✓ done` a closed stream used to imply.
+    let frame = draw_new_frame(&mut r, 120, 40);
+    let text = frame.join("\n");
+    assert!(text.contains("val 2"), "no round counter in:\n{text}");
+    let roster = frame
+        .iter()
+        // The roster row is the only line that prints a turn counter, so it cannot be
+        // confused with the header's `▶ t-9512` chip.
+        .find(|line| line.contains("t-9512") && line.contains("turn "))
+        .unwrap_or_else(|| panic!("no roster row for the delegation:\n{text}"));
+    assert!(roster.contains("✗ failed"), "{roster}");
+    assert!(!roster.contains("✓ done"), "{roster}");
+    assert!(roster.contains("turn 3"), "{roster}");
+    // The tally agrees with the row. Both spellings §7.2 allows are accepted — the
+    // word labels are only kept while the border row has room — but the `✓` segment
+    // has to stay empty either way.
+    assert!(
+        frame
+            .iter()
+            .any(|line| line.contains("✗ failed 1") || line.contains("✗ 1")),
+        "the tally counts the rejected row as failed:\n{text}"
+    );
+    assert!(
+        frame
+            .iter()
+            .any(|line| line.contains("✓ done 0") || line.contains("✓ 0")),
+        "…and not as done:\n{text}"
+    );
+
+    // The validator's words are the other half of the same fold: a rejected row states
+    // why it was rejected.
+    r.set_view_mode(state::ViewMode::Workers);
+    let detail = draw_new_frame(&mut r, 120, 40).join("\n");
+    assert!(detail.contains("[Validator]"), "{detail}");
+    assert!(detail.contains("clippy: unused import"), "{detail}");
+}
+
+/// §8.5: a failure outlives the status line that carried it. The renderer keeps the
+/// categorical cause and the full text, and `/error` reads **that buffer** — the
+/// transcript and status-line scan is only the fallback — so the recalled line
+/// carries the category and every line of the report, not the one line §7.4 lets the
+/// status keep.
+#[test]
+fn a_reported_error_stays_recallable_after_the_status_line_moved_on() {
+    let mut r = TuiRenderer::new();
+
+    // The session loop's error traffic, in the shape `session.rs` reports it.
+    r.on_event(&Event::Status(
+        "LLM error: rate limit exceeded (Ready)\nsecond line of the report".to_string(),
+    ));
+
+    // The transcript is honest about the failure — the fallback path's source.
+    assert!(
+        r.messages
+            .iter()
+            .any(|line| line.contains("LLM error: rate limit exceeded")),
+        "{:?}",
+        r.messages
+    );
+
+    // And the buffer holds the category plus the whole text, which is more than
+    // §7.4 lets the status line keep.
+    let sticky = r.last_error.clone().expect("an error was reported");
+    assert_eq!(sticky.category, "rate limit exceeded", "{sticky:?}");
+    assert_eq!(
+        sticky.detail,
+        "LLM error: rate limit exceeded (Ready)\nsecond line of the report"
+    );
+
+    // The status line moves on: the spinner text is whatever the loop reported next.
+    r.on_event(&Event::Status("Ready".to_string()));
+    assert_eq!(r.status_line, "Ready");
+
+    // `/error` is the whole route to the recall now that the bare-`e` mnemonic is
+    // gone: it is one submitted line, and it recalls the same traffic from every
+    // focus, so it can never swallow a letter out of a draft (§5, G5).
+    r.set_focus(state::FocusPane::Transcript);
+    r.set_input_content("/error");
+    r.submit();
+    let recalled = r.messages.last().cloned().unwrap_or_default();
+    // The recalled line is the buffer: `✗ <category>`, then the report verbatim.
+    assert!(
+        recalled.starts_with("✗ rate limit exceeded\nLLM error:"),
+        "{recalled:?}"
+    );
+    assert!(
+        recalled.contains("second line of the report"),
+        "the multi-line detail must survive the recall: {recalled:?}"
+    );
+    assert!(recalled.contains("see .marmel/marmel.log"), "{recalled:?}");
+    assert!(
+        !recalled.contains("No error recorded"),
+        "the pending-plumbing message must not survive the plumbing: {recalled:?}"
+    );
+}
+
+/// §8.5 + work item 3: the buffer, not the transcript, is what `/error` reads. A
+/// transcript clear — what `/reset` and a restore can do — must not cost the
+/// operator the cause of the failure that ended the last turn.
+///
+/// The name keeps the `e` spelling it was written under; the bare-letter mnemonic it
+/// used to drive is gone, and the recall is now submitted as a command.
+#[test]
+fn an_error_recalled_with_e_survives_a_transcript_clear() {
+    let mut r = TuiRenderer::new();
+    r.on_event(&Event::Status(
+        "LLM error: http (Ready)\nrequest to the backend was refused".to_string(),
+    ));
+    assert!(r.last_error.is_some(), "the report was remembered");
+
+    // Everything the transcript scan could have read is gone.
+    r.messages.clear();
+    r.status_line = "Ready".to_string();
+    assert!(r.messages.is_empty(), "the transcript was cleared");
+
+    // `/error` carries no focus requirement — unlike the bare `e` it replaces, which
+    // only armed over a pane focus and swallowed the letter everywhere else (§4.4).
+    r.set_focus(state::FocusPane::Transcript);
+    r.set_input_content("/error");
+    r.submit();
+    let recalled = r.messages.last().cloned().unwrap_or_default();
+    assert_eq!(
+        recalled,
+        "✗ http\nLLM error: http (Ready)\nrequest to the backend was refused\n\
+         see .marmel/marmel.log",
+        "the whole report is recalled from the buffer"
+    );
+
+    // With no buffer and no transcript either, the command still says so (G5).
+    let mut clean = TuiRenderer::new();
+    clean.set_focus(state::FocusPane::Transcript);
+    clean.set_input_content("/error");
+    clean.submit();
+    assert!(
+        clean
+            .messages
+            .last()
+            .is_some_and(|m| m.contains("No error recorded")),
+        "{:?}",
+        clean.messages
+    );
+
+    // The transcript scan stays the fallback: traffic pushed straight into the
+    // transcript is recalled verbatim when no buffer was ever filled.
+    let mut legacy = TuiRenderer::new();
+    legacy
+        .messages
+        .push("LLM error: timeout (Ready) — stream cut".to_string());
+    legacy.set_focus(state::FocusPane::Transcript);
+    legacy.set_input_content("/error");
+    legacy.submit();
+    let fallback = legacy.messages.last().cloned().unwrap_or_default();
+    assert!(fallback.starts_with("✗ LLM error: timeout"), "{fallback:?}");
+}
+
+/// A non-error status report never leaves an error behind, and a repeated report of the
+/// same failure does not restamp the buffer: it records the edge, not the traffic.
+#[test]
+fn only_error_traffic_is_remembered_and_repeats_do_not_restamp_it() {
+    let mut r = TuiRenderer::new();
+    r.on_event(&Event::Status("calling backend".to_string()));
+    assert!(
+        r.last_error.is_none(),
+        "ordinary status traffic is not an error: {:?}",
+        r.last_error
+    );
+
+    r.on_event(&Event::Status(
+        "System Error: transport closed the stream".to_string(),
+    ));
+    let first = r.last_error.clone().expect("the error is recorded");
+    assert_eq!(first.category, "System Error", "{first:?}");
+
+    r.on_event(&Event::Status(
+        "System Error: transport closed the stream".to_string(),
+    ));
+    assert_eq!(
+        r.last_error,
+        Some(first.clone()),
+        "the same failure re-announced keeps the first record"
+    );
+
+    // A genuine second failure does replace it: the buffer tracks the last error, not
+    // the first one.
+    r.on_event(&Event::Status("LLM error: http (Ready)".to_string()));
+    let second = r.last_error.clone().expect("the newer error wins");
+    assert_eq!(second.category, "http", "{second:?}");
+    assert_ne!(second, first.clone(), "the buffer tracks the last error");
+    assert_eq!(first.detail, "System Error: transport closed the stream");
+}
+
+#[test]
+fn fit_spans_clips_to_the_rect_and_marks_the_cut() {
+    let wide = components::fit_spans(
+        vec![
+            ratatui::text::Span::raw("abcdef"),
+            ratatui::text::Span::raw("ghijkl"),
+        ],
+        12,
+    );
+    assert_eq!(
+        wide.iter().map(|s| s.content.as_ref()).collect::<String>(),
+        "abcdefghijkl"
+    );
+
+    let clipped = components::fit_spans(
+        vec![
+            ratatui::text::Span::raw("abcdef"),
+            ratatui::text::Span::raw("ghijkl"),
+        ],
+        8,
+    );
+    let text = clipped
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+    assert_eq!(
+        text, "abcdefg…",
+        "the cut is cell-granular, not span-granular"
+    );
+
+    let one = components::fit_spans(
+        vec![
+            ratatui::text::Span::raw("abcdef"),
+            ratatui::text::Span::raw("g"),
+        ],
+        3,
+    );
+    let text = one.iter().map(|s| s.content.as_ref()).collect::<String>();
+    assert_eq!(text, "ab…");
+
+    let zero = components::fit_spans(vec![ratatui::text::Span::raw("abc")], 0);
+    assert!(zero.is_empty(), "a zero-width rect gets no spans at all");
+}
+
+#[test]
+fn the_new_frame_carries_header_plan_progress_pane_titles_and_the_legend() {
+    // Acceptance criterion 1 (layout half): progress is in the frame with the
+    // plan pane open, and the legend is there too (G1/G2).
+    let mut r = m4_renderer();
+    r.input_text = String::new();
+    let rows = draw_new_frame(&mut r, 100, 30);
+    let header = rows[0].trim();
+    assert!(header.starts_with("Marmel"), "header row: {header:?}");
+    assert!(header.contains("M4 Split"), "mode chip: {header:?}");
+    assert!(header.contains("1/2 done"), "plan progress: {header:?}");
+    assert!(header.contains("t-004"), "active task chip: {header:?}");
+
+    let joined = rows.concat();
+    assert!(joined.contains("Transcript"), "transcript title");
+    assert!(joined.contains("Execution Plan"), "plan title");
+    assert!(joined.contains("Workers"), "workers title");
+    assert!(joined.contains("Input"), "composer title");
+    assert!(joined.contains("F1 help"), "footer legend");
+    assert!(joined.contains("LIVE"), "follow chip on status row 2");
+    // The content pass still fills the panes with real text.
+    assert!(joined.contains("User: rebuild the TUI"), "transcript body");
+    assert!(joined.contains("wireframe"), "plan body");
+    assert!(joined.contains("coder_specialist"), "worker roster body");
+}
+
+#[test]
+fn the_focused_pane_badges_its_title_and_every_other_pane_does_not() {
+    let mut r = m4_renderer();
+    r.set_focus(state::FocusPane::Plan);
+    let rows = draw_new_frame(&mut r, 100, 30);
+    let joined = rows.concat();
+    let badgeed: Vec<&String> = rows
+        .iter()
+        .filter(|row| row.contains(theme::FOCUS_BADGE))
+        .collect();
+    assert!(
+        badgeed.iter().any(|row| row.contains("Execution Plan")),
+        "the focused plan pane carries the badge: {badgeed:?}"
+    );
+    assert!(
+        !joined.contains("Workers ●"),
+        "only the focused pane is badged in its title"
+    );
+}
+
+// ---- t-009d regression frames: chip clipping, status ladder, roster rank ------
+
+/// The running scenario of `docs/new_ui_preview.txt` case b: a 7-task plan with 3
+/// checked and three live worker rows — running, queued at rank `2/3`, paused —
+/// under real session counters. The frames the t-009d defect fixes are asserted
+/// against this fixture, so a fix can never be proved only at component level.
+fn live_worker_scenario() -> TuiRenderer {
+    let mut r = TuiRenderer::new();
+    r.messages = vec![
+        "User: rebuild the TUI so plan, workers and progress stay legible".to_string(),
+        "Marmennill: I split the work into seven tasks and started with the audit.".to_string(),
+        "[Status] delegating validator_specialist (t-003)".to_string(),
+        "Tool: read_file(src/ui/tui/mod.rs)".to_string(),
+        "Marmennill: every pane is now drawn by its own component renderer.".to_string(),
+        "Streaming: the status bar chips ar".to_string(),
+    ];
+    r.plan_content = [
+        "# Plan",
+        "",
+        "- [x] [t-001] research UX baseline",
+        "- [x] [t-002] audit TUI architecture",
+        "- [x] [t-003] draft the design spec",
+        "- [ ] [t-004] scaffold state, layout, theme",
+        "- [ ] [t-005] pane chrome and chips",
+        "- [ ] [t-006] wire the roster rank into the status row",
+        "- [ ] [t-009b] rewire the render pipeline",
+        "",
+    ]
+    .join("\n");
+    r.set_view_mode(state::ViewMode::Split);
+    r.input_text = "add the focus badge to every pane title".to_string();
+    r.tokens_in = 12_400;
+    r.tokens_out = 3_200;
+    r.orchestrator_context_tokens = 13_500;
+    r.max_context_tokens = 30_000;
+    r.plan_start_time = Some(std::time::Instant::now() - Duration::from_secs(612));
+    r.subagents = vec![
+        SubagentDetail {
+            name: "coder_specialist-t-004".to_string(),
+            task_id: Some("t-004".to_string()),
+            is_active: true,
+            worked_duration: Duration::from_secs(192),
+            content: "wrote layout.rs, 292 lines".to_string(),
+            ..SubagentDetail::default()
+        },
+        SubagentDetail {
+            name: "researcher_specialist-t-005".to_string(),
+            task_id: Some("t-005".to_string()),
+            is_active: true,
+            worked_duration: Duration::from_secs(30),
+            queue: Some(crate::ui::QueueState { position: 2, of: 3 }),
+            ..SubagentDetail::default()
+        },
+        SubagentDetail {
+            name: "validator_specialist-t-003".to_string(),
+            task_id: Some("t-003".to_string()),
+            is_active: true,
+            paused: true,
+            worked_duration: Duration::from_secs(12),
+            ..SubagentDetail::default()
+        },
+    ];
+    r
+}
+
+/// The one frame row that carries `needle`, or the whole frame in the message.
+fn only_row(rows: &[String], needle: &str, size: (u16, u16)) -> String {
+    rows.iter()
+        .find(|row| row.contains(needle))
+        .cloned()
+        .unwrap_or_else(|| panic!("no {size:?} row carries {needle:?}:\n{}", rows.join("\n")))
+}
+
+#[test]
+fn the_workers_tally_keeps_the_done_count_the_position_and_the_detail_chip() {
+    // Defect 1 (§7.1/§7.4): the bottom tally was measured and fitted against
+    // `rect.width` although a border row is `rect.width - 2` cells, so ratatui cut
+    // the last 2 cells silently — the `✓` count, the `1/3` position and the detail
+    // chip were all gone and nothing marked the cut.
+    let mut r = live_worker_scenario();
+    let rows = draw_new_frame(&mut r, 100, 30);
+    let tally = only_row(&rows, "detail", (100, 30));
+    for glyph in ['▶', '⏸', '⧗', '✓'] {
+        assert!(
+            tally.contains(glyph),
+            "the tally keeps the {glyph} count: {tally:?}"
+        );
+    }
+    assert!(
+        tally.contains("1/3") && tally.contains("detail"),
+        "the roster position and the detail chip survive to the corner: {tally:?}"
+    );
+    assert!(
+        tally.trim_end().ends_with('┘'),
+        "the row stops at the pane's right corner instead of running past it: {tally:?}"
+    );
+}
+
+#[test]
+fn a_queued_worker_keeps_its_rank_where_the_ladder_cannot_cut_it() {
+    // Defect 3 (§2.2/§2.5): the rank was the last field of the roster row, so in a
+    // clipped row `(2/3)` was never readable — the queue depth the §2.5 ladder is
+    // supposed to make legible. It now rides the state fields, before the name.
+    let mut r = live_worker_scenario();
+    let rows = draw_new_frame(&mut r, 100, 30);
+    let roster = only_row(&rows, "researcher_specialist", (100, 30));
+    let rank = roster
+        .find("2/3")
+        .unwrap_or_else(|| panic!("the queue rank is readable at all: {roster:?}"));
+    let name = roster
+        .find("researcher_specialist")
+        .expect("the row still names the worker");
+    assert!(
+        rank < name,
+        "the rank is placed before the fields the ladder clips: {roster:?}"
+    );
+    assert!(
+        roster.contains(theme::ELLIPSIS),
+        "the cut is marked, never silent: {roster:?}"
+    );
+}
+
+#[test]
+fn the_status_row_keeps_every_count_and_clips_names_into_the_free_columns() {
+    // Defect 2 (§2.5/§7.4): `fit_fields` deleted whole fields rather than clipping
+    // one, so a 100-column row read `Tokens 12.4k in / 3.2k out | 3a | ctx 45%`
+    // with ~58 columns free — `1p`, `1q` and every active name were lost.
+    for (width, height) in [(100u16, 30u16), (80, 24), (60, 16)] {
+        let mut r = live_worker_scenario();
+        let rows = draw_new_frame(&mut r, width, height);
+        let row = rows
+            .iter()
+            .map(|row| row.trim_end())
+            .find(|row| row.trim_start().starts_with("Tokens"))
+            .unwrap_or_else(|| panic!("no metrics row at {width}x{height}:\n{}", rows.join("\n")))
+            .to_string();
+        for count in ["3a", "1p", "1q"] {
+            assert!(
+                row.contains(count),
+                "{width}x{height}: the {count} count survives the ladder: {row:?}"
+            );
+        }
+        assert!(
+            row.starts_with(" Tokens ") && row.contains(" in / ") && row.contains(" out"),
+            "{width}x{height}: the mandatory token field stays: {row:?}"
+        );
+        if width >= 80 {
+            assert!(
+                row.contains("ctx 45%"),
+                "{width}x{height}: the ctx ratio is on the row: {row:?}"
+            );
+            assert!(
+                row.contains(theme::ELLIPSIS),
+                "{width}x{height}: the name list is clipped with a mark instead of dropped: {row:?}"
+            );
+            assert!(
+                row.contains("coder"),
+                "{width}x{height}: the name list is cut inside a name, not deleted: {row:?}"
+            );
+        }
+
+        // §F1 on the painted frame, at every width the ladder reaches: the metrics
+        // row is one DarkGray band, so **no** cell of it may carry the band colour
+        // as ink. Before the band routing the separators, the `ctx` field and the
+        // whole worker-name list were DarkGray on DarkGray, and the `…` marking a
+        // clipped name list was invisible too.
+        let (banded, styles) = draw_new_frame_styled(&mut r, width, height);
+        let band = theme::band_surface().bg;
+        let (metrics, line) = banded
+            .iter()
+            .enumerate()
+            .find(|(_, drawn_row)| drawn_row.trim_start().starts_with("Tokens"))
+            .expect("the metrics row is drawn at every width");
+        for (cell, style) in styles[metrics].iter().enumerate() {
+            assert_eq!(
+                style.bg, band,
+                "{width}x{height}: cell {cell} of the metrics row is off the band: {line:?}"
+            );
+            if let Some(fg) = style.fg {
+                assert_ne!(
+                    Some(fg),
+                    band,
+                    "{width}x{height}: cell {cell} paints {fg:?} on the band: {line:?}"
+                );
+            }
+        }
+        // The band's own rungs, element by element: chrome labels neutral, the
+        // muted secondary rung muted-but-visible, the number worth reading bold.
+        let painted = |needle: &str| {
+            let cell = line
+                .find(needle)
+                .map(|byte| line[..byte].chars().count())
+                .unwrap_or_else(|| panic!("{needle:?} is not on the drawn metrics row: {line:?}"));
+            styles[metrics][cell]
+        };
+        assert_eq!(
+            painted(" | ").fg,
+            theme::chip_muted().fg,
+            "{width}x{height}: the separator is the band's muted rung: {line:?}"
+        );
+        assert_eq!(
+            painted(" Tokens ").fg,
+            theme::chip_neutral().fg,
+            "{width}x{height}: the token label is the neutral band chip: {line:?}"
+        );
+        assert_eq!(
+            painted(" in / ").fg,
+            theme::chip_value().fg,
+            "{width}x{height}: the token pair is the band's number rung: {line:?}"
+        );
+        assert!(
+            painted(" in / ")
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD),
+            "{width}x{height}: and it keeps its weight: {line:?}"
+        );
+        if width >= 80 {
+            assert_eq!(
+                painted("coder").fg,
+                theme::chip_muted().fg,
+                "{width}x{height}: the worker names are visible on the band: {line:?}"
+            );
+            assert_eq!(
+                painted("ctx 45%").fg,
+                theme::chip_muted().fg,
+                "{width}x{height}: the ctx ratio is the band's muted rung: {line:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_status_row_uses_the_columns_it_is_given() {
+    // The audit's measurement: 41 used cells of a 100-cell row, ~58 free. The
+    // repaired row fills the width it owns before it drops anything.
+    let mut r = live_worker_scenario();
+    let rows = draw_new_frame(&mut r, 100, 30);
+    let row = only_row(&rows, "Tokens", (100, 30)).trim_end().to_string();
+    // The audit measured 41 used cells of a 100-cell row. The repaired row must
+    // use the width it is given, so it is comfortably more than twice that.
+    assert!(
+        row.chars().count() > 41 * 2,
+        "the 100-column row is used, not left mostly empty: {} cells: {row:?}",
+        row.chars().count()
+    );
+    assert!(row.contains("elapsed"), "the clock came back: {row:?}");
+}
+
+#[test]
+fn a_pane_the_ladder_removed_is_reported_narrow_and_never_on() {
+    // Defect 5 (§8): the pane chips came from the mode alone, so an 80-column frame
+    // announced `workers:on` while the Workers pane had been ladder-absent.
+    let wide = draw_new_frame(&mut live_worker_scenario(), 100, 30).concat();
+    assert!(
+        wide.contains("plan:on") && wide.contains("workers:on"),
+        "both panes are drawn at 100 columns, and both say so"
+    );
+    assert!(
+        !wide.contains("narrow") && !wide.contains("plan:off") && !wide.contains("workers:off"),
+        "nothing is announced as absent that is on screen"
+    );
+
+    let narrow = draw_new_frame(&mut live_worker_scenario(), 80, 24).concat();
+    assert!(
+        narrow.contains("workers:narrow"),
+        "the pane the §2.5 width ladder took away says why: {narrow}"
+    );
+    assert!(
+        !narrow.contains("workers:on"),
+        "a pane that is not drawn is never announced as on"
+    );
+    assert!(
+        narrow.contains("plan:on"),
+        "the side pane that did survive is still reported on"
+    );
+}
+
+#[test]
+fn the_scroll_state_chip_is_drawn_once_in_the_transcript_pane() {
+    // Defect 4 (§7.3, §8): `● LIVE` was printed twice per frame — on the transcript
+    // border row and on the status chip row — so two rows claimed the scroll state.
+    for (width, height) in [(100u16, 30u16), (80, 24), (60, 16), (40, 10)] {
+        let rows = draw_new_frame(&mut live_worker_scenario(), width, height);
+        let live: Vec<&String> = rows.iter().filter(|row| row.contains("LIVE")).collect();
+        assert_eq!(
+            live.len(),
+            1,
+            "{width}x{height} draws exactly one scroll-state chip:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            live[0].contains('└') || live[0].contains('┌'),
+            "{width}x{height}: the one chip belongs to the transcript border: {:?}",
+            live[0]
+        );
+    }
+}
+
+// ==== t-011: the §5 keymap, focus navigation and the shared help legend =====
+
+/// §10 item 3: the legend must name no key the handler does not bind, and every
+/// binding must appear in the legend. Each row of `components::help::legend()` is
+/// paired here with a driver that feeds the synthetic event the row names through
+/// [`TuiRenderer::apply_terminal_event`] — the same seam the live loop calls — and
+/// asserts the state change the row promises. A stale legend row therefore fails the
+/// test, and so does a handler that quietly gains an undocumented binding.
+#[test]
+fn every_legend_row_is_a_real_handler_path() {
+    type Driver = fn(&mut TuiRenderer) -> bool;
+
+    let drivers: Vec<(&'static str, Driver)> = vec![
+        ("Enter", |r| {
+            r.set_input_content("ship it");
+            press(r, KeyCode::Enter, KeyModifiers::NONE)
+                && r.messages.last().map(String::as_str) == Some("User: ship it")
+        }),
+        ("Shift+Enter / Alt+Enter", |r| {
+            r.set_input_content("line one");
+            press(r, KeyCode::Enter, KeyModifiers::SHIFT)
+                && press(r, KeyCode::Enter, KeyModifiers::ALT)
+                && r.input_text == "line one\n\n"
+        }),
+        ("Ctrl+Enter / Ctrl+J", |r| {
+            r.set_input_content("a");
+            if !press(r, KeyCode::Enter, KeyModifiers::CONTROL) || r.input_text != "a\n" {
+                return false;
+            }
+            if !press(r, KeyCode::Char('j'), KeyModifiers::CONTROL) || r.input_text != "a\n\n" {
+                return false;
+            }
+            // The raw `Char('\n')` some terminals produce is the same binding.
+            press(r, KeyCode::Char('\n'), KeyModifiers::NONE) && r.input_text == "a\n\n\n"
+        }),
+        ("Printable / paste", |r| {
+            r.set_focus(state::FocusPane::Workers);
+            let typed = press(r, KeyCode::Char('q'), KeyModifiers::NONE) && r.input_text == "q";
+            let pasted = r
+                .apply_terminal_event(&crossterm::event::Event::Paste("pasted block".to_string()))
+                && r.input_text == "qpasted block";
+            typed && pasted
+        }),
+        ("Backspace / Delete", |r| {
+            r.set_focus(state::FocusPane::Plan);
+            r.set_input_content("abc");
+            if !press(r, KeyCode::Backspace, KeyModifiers::NONE) || r.input_text != "ab" {
+                return false;
+            }
+            press(r, KeyCode::Left, KeyModifiers::NONE);
+            press(r, KeyCode::Delete, KeyModifiers::NONE) && r.input_text == "a"
+        }),
+        ("Ctrl+Z / Ctrl+Y", |r| {
+            r.set_input_content("");
+            press(r, KeyCode::Char('x'), KeyModifiers::NONE);
+            let undo =
+                press(r, KeyCode::Char('z'), KeyModifiers::CONTROL) && r.input_text.is_empty();
+            let redo = press(r, KeyCode::Char('y'), KeyModifiers::CONTROL) && r.input_text == "x";
+            undo && redo
+        }),
+        ("Ctrl+Up / Ctrl+Down", |r| {
+            // The row says "in any focus": the chord is the input-history route
+            // from the composer **and** from a pane focus, and it is the only one
+            // there — the plain arrows belong to the pane.
+            r.history = vec!["earlier note".to_string()];
+            let back =
+                press(r, KeyCode::Up, KeyModifiers::CONTROL) && r.input_text == "earlier note";
+            let fwd = press(r, KeyCode::Down, KeyModifiers::CONTROL) && r.input_text.is_empty();
+            r.set_focus(state::FocusPane::Transcript);
+            let at_a_pane = press(r, KeyCode::Up, KeyModifiers::CONTROL)
+                && r.input_text == "earlier note"
+                && r.history_index == Some(0);
+            // The plain arrows over that same pane leave the walk exactly where the
+            // chord left it: they are the pane's keys, not the composer's.
+            let plain_is_the_pane = press(r, KeyCode::Up, KeyModifiers::NONE)
+                && r.input_text == "earlier note"
+                && r.history_index == Some(0);
+            back && fwd && at_a_pane && plain_is_the_pane
+        }),
+        ("Up / Down", |r| {
+            // A pane focus owns the plain arrows whatever the draft says ...
+            r.messages = (0..120).map(|i| format!("User: filler {i}")).collect();
+            r.chat_width.set(100);
+            r.chat_height.set(10);
+            r.set_focus(state::FocusPane::Transcript);
+            r.set_input_content("a draft");
+            press(r, KeyCode::End, KeyModifiers::NONE);
+            let bottom = r.chat_scroll;
+            if bottom == 0 {
+                return false;
+            }
+            if !press(r, KeyCode::Up, KeyModifiers::NONE) || r.chat_scroll >= bottom {
+                return false;
+            }
+            // ... and an empty draft is still a pane step, never a swallowed
+            // history no-op: the draft and the walk bookkeeping stay the
+            // composer's, and `Ctrl+Up` remains the only way to reach them (§5).
+            r.set_input_content("");
+            r.history = vec!["earlier note".to_string()];
+            let above = r.chat_scroll;
+            let still_the_pane = press(r, KeyCode::Up, KeyModifiers::NONE)
+                && r.input_text.is_empty()
+                && r.history_index.is_none()
+                && r.chat_scroll < above;
+            // With the composer focused the same two keys never reach a viewport,
+            // and they never reach the history either: the row promises caret and
+            // scroll, nothing else, so a press with nowhere for the caret to go is
+            // not claimed at all — no recall, no repaint, no follow decision.
+            r.set_focus(state::FocusPane::Input);
+            let parked = r.chat_scroll;
+            let follow = (r.follow, r.chat_auto_scroll);
+            let no_recall = !press(r, KeyCode::Up, KeyModifiers::NONE)
+                && !press(r, KeyCode::Down, KeyModifiers::NONE)
+                && r.input_text.is_empty()
+                && r.history_index.is_none()
+                && r.chat_scroll == parked
+                && (r.follow, r.chat_auto_scroll) == follow;
+            // The chord is the row above's, and it works from the composer too.
+            let chord = press(r, KeyCode::Up, KeyModifiers::CONTROL)
+                && r.input_text == "earlier note"
+                && r.history_index == Some(0)
+                && r.chat_scroll == parked;
+            still_the_pane && no_recall && chord
+        }),
+        ("Left / Right", |r| {
+            // Workers focus: the roster selection moves ...
+            r.subagents.push(SubagentDetail {
+                name: "coder-t-009".to_string(),
+                task_id: Some("t-009".to_string()),
+                ..SubagentDetail::default()
+            });
+            r.set_focus(state::FocusPane::Workers);
+            let next = press(r, KeyCode::Right, KeyModifiers::NONE) && r.selected_subagent_idx == 1;
+            let prev = press(r, KeyCode::Left, KeyModifiers::NONE) && r.selected_subagent_idx == 0;
+            // ... and at the end of the roster the key falls back to the caret
+            // instead of being swallowed.
+            r.set_input_content("hello");
+            let at_the_end = press(r, KeyCode::Left, KeyModifiers::NONE)
+                && r.selected_subagent_idx == 0
+                && r.cursor == "hell".len();
+            // ... everywhere else it is the caret, rows present or not.
+            r.set_focus(state::FocusPane::Input);
+            r.set_input_content("hello");
+            let caret = press(r, KeyCode::Left, KeyModifiers::NONE)
+                && r.cursor == "hell".len()
+                && r.input_text == "hello";
+            next && prev && at_the_end && caret
+        }),
+        ("Home / End", |r| {
+            r.set_input_content("hello");
+            let home = press(r, KeyCode::Home, KeyModifiers::NONE) && r.cursor == 0;
+            let end = press(r, KeyCode::End, KeyModifiers::NONE) && r.cursor == "hello".len();
+            // A pane focus turns the same pair into a jump, and the jump leaves
+            // the composer caret where the operator left it.
+            r.set_focus(state::FocusPane::Plan);
+            r.plan_max_scroll = 30;
+            let pane_end = press(r, KeyCode::End, KeyModifiers::NONE) && r.plan_scroll == 30;
+            let pane_home = press(r, KeyCode::Home, KeyModifiers::NONE) && r.plan_scroll == 0;
+            let caret_intact = r.cursor == "hello".len() && r.input_text == "hello";
+            // With the composer focused the jump keys never reach a viewport: the
+            // plan keeps the offset the operator parked.
+            r.plan_scroll = 12;
+            r.set_focus(state::FocusPane::Input);
+            let parked = r.plan_scroll;
+            let no_jump = press(r, KeyCode::End, KeyModifiers::NONE)
+                && press(r, KeyCode::Home, KeyModifiers::NONE)
+                && r.plan_scroll == parked;
+            home && end && pane_end && pane_home && caret_intact && no_jump
+        }),
+        ("PageUp / PageDown", |r| {
+            r.messages = (0..120).map(|i| format!("User: filler {i}")).collect();
+            r.chat_width.set(100);
+            r.chat_height.set(10);
+            r.set_focus(state::FocusPane::Transcript);
+            r.set_input_content("a draft");
+            press(r, KeyCode::End, KeyModifiers::NONE);
+            let bottom = r.chat_scroll;
+            if bottom == 0 {
+                return false;
+            }
+            let pages = press(r, KeyCode::PageUp, KeyModifiers::NONE)
+                && r.chat_scroll == bottom.saturating_sub(10)
+                && press(r, KeyCode::PageDown, KeyModifiers::NONE)
+                && r.chat_scroll == bottom;
+            // The row says "never the composer": with `Input` focused the page
+            // keys have no owner at all, so they are not key presses and they
+            // state no movement.
+            r.set_focus(state::FocusPane::Input);
+            let parked = r.chat_scroll;
+            let follow = (r.follow, r.chat_auto_scroll);
+            let at_the_composer = !press(r, KeyCode::PageUp, KeyModifiers::NONE)
+                && !press(r, KeyCode::PageDown, KeyModifiers::NONE)
+                && r.chat_scroll == parked
+                && (r.follow, r.chat_auto_scroll) == follow;
+            pages && at_the_composer
+        }),
+        ("Tab / Shift+Tab", |r| {
+            let fwd = press(r, KeyCode::Tab, KeyModifiers::NONE)
+                && r.focus == state::FocusPane::Transcript;
+            let back = press(r, KeyCode::BackTab, KeyModifiers::NONE)
+                && r.focus == state::FocusPane::Input;
+            fwd && back
+        }),
+        ("F1 / ?", |r| {
+            let f1 = press(r, KeyCode::F(1), KeyModifiers::NONE)
+                && r.help_open
+                && r.overlay == state::OverlayState::Help;
+            r.close_overlay();
+            let question = press(r, KeyCode::Char('?'), KeyModifiers::NONE)
+                && r.help_open
+                && r.input_text.is_empty();
+            f1 && question
+        }),
+        ("F2", |r| {
+            let before = r.view_mode;
+            press(r, KeyCode::F(2), KeyModifiers::NONE)
+                && r.view_mode == state::ViewMode::Transcript
+                && r.view_mode != before
+        }),
+        ("F3 / F4 / F5", |r| {
+            if !press(r, KeyCode::F(3), KeyModifiers::NONE)
+                || r.view_mode != state::ViewMode::Transcript
+            {
+                return false;
+            }
+            if !press(r, KeyCode::F(4), KeyModifiers::NONE)
+                || !r.show_plan_panel
+                || r.show_subagent_panel
+            {
+                return false;
+            }
+            press(r, KeyCode::F(5), KeyModifiers::NONE)
+                && r.view_mode == state::ViewMode::Workers
+                && r.show_subagent_panel
+                && !r.show_plan_panel
+        }),
+        ("Ctrl+P / Ctrl+A", |r| {
+            r.set_view_mode(state::ViewMode::Transcript);
+            let plan = press(r, KeyCode::Char('p'), KeyModifiers::CONTROL)
+                && r.show_plan_panel
+                && r.view_mode == state::ViewMode::Plan;
+            let workers = press(r, KeyCode::Char('a'), KeyModifiers::CONTROL)
+                && r.show_subagent_panel
+                && r.view_mode == state::ViewMode::Split;
+            plan && workers
+        }),
+        ("Ctrl+T", |r| {
+            // §5: the echo is a chip, never a chat line (G5).
+            press(r, KeyCode::Char('t'), KeyModifiers::CONTROL)
+                && r.show_thought
+                && r.messages.iter().all(|m| !m.contains("Thinking display"))
+        }),
+        ("Ctrl+F", |r| {
+            let off = press(r, KeyCode::Char('f'), KeyModifiers::CONTROL)
+                && !r.follow
+                && !r.chat_auto_scroll;
+            let on = press(r, KeyCode::Char('f'), KeyModifiers::CONTROL)
+                && r.follow
+                && r.chat_auto_scroll;
+            off && on
+        }),
+        ("Ctrl+X", |r| {
+            // The collision-free spelling of the removed bare-`x` mnemonic: the
+            // chord needs the Workers focus its binding has always needed, and it
+            // cannot be mistaken for a draft, because a Ctrl chord never types.
+            r.set_focus(state::FocusPane::Workers);
+            press(r, KeyCode::Char('x'), KeyModifiers::CONTROL)
+                && r.overlay == state::OverlayState::Confirm
+                && r.confirm_action
+                    == Some(events::ConfirmAction::CancelWorker {
+                        key: "coder_specialist-t-004".to_string(),
+                        task_id: Some("t-004".to_string()),
+                    })
+                && r.input_text.is_empty()
+        }),
+        ("Esc", |r| {
+            r.open_help();
+            press(r, KeyCode::Esc, KeyModifiers::NONE)
+                && r.overlay == state::OverlayState::None
+                && !r.is_abort_armed()
+        }),
+        ("Ctrl+C", |r| {
+            press(r, KeyCode::Char('c'), KeyModifiers::CONTROL)
+                && r.is_abort_armed()
+                && r.overlay == state::OverlayState::Confirm
+                && r.status_line.contains("Abort armed")
+        }),
+        ("Ctrl+D", |r| {
+            press(r, KeyCode::Char('d'), KeyModifiers::CONTROL)
+                && r.confirm_action == Some(events::ConfirmAction::Quit)
+                && r.overlay == state::OverlayState::Confirm
+                && !r.user_exit_requested()
+        }),
+        ("Printable while armed", |r| {
+            press(r, KeyCode::Esc, KeyModifiers::NONE);
+            let armed = r.is_abort_armed();
+            press(r, KeyCode::Char('k'), KeyModifiers::NONE)
+                && armed
+                && !r.is_abort_armed()
+                && r.input_text == "k"
+                && r.status_line == "Abort cancelled."
+                && r.overlay == state::OverlayState::None
+        }),
+        ("y / n", |r| {
+            press(r, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            press(r, KeyCode::Char('n'), KeyModifiers::NONE)
+                && r.overlay == state::OverlayState::None
+                && r.confirm_action.is_none()
+                && r.status_line == "Quit cancelled."
+                && !r.user_exit_requested()
+        }),
+        ("Resize", |r| {
+            r.messages = (0..50).map(|i| format!("User: filler {i}")).collect();
+            r.chat_width.set(100);
+            r.chat_height.set(10);
+            r.chat_scroll = 999;
+            r.apply_terminal_event(&crossterm::event::Event::Resize(100, 24)) && r.chat_scroll < 999
+        }),
+    ];
+
+    let rows = components::help::legend();
+    let documented: Vec<&str> = rows.iter().map(|row| row.keys).collect();
+    let driven: Vec<&str> = drivers.iter().map(|(keys, _)| *keys).collect();
+
+    // §10.3 counts: the table is the vocabulary, and this test is pinned to its
+    // size so a row added or dropped without a driver (or a driver without a row)
+    // cannot slip through as a length-only mismatch.
+    assert_eq!(
+        rows.len(),
+        25,
+        "the §5 legend row count moved: {documented:?}"
+    );
+    assert_eq!(
+        drivers.len(),
+        25,
+        "one driver per legend row, and the count moved: {driven:?}"
+    );
+    for keys in &driven {
+        assert!(
+            documented.contains(keys),
+            "a driver drives {keys:?}, which the legend does not document: {documented:?}"
+        );
+    }
+    for row in &rows {
+        assert!(
+            driven.contains(&row.keys),
+            "the legend documents {:?} with no handler behind it: {driven:?}",
+            row.keys
+        );
+    }
+    assert_eq!(
+        rows.len(),
+        drivers.len(),
+        "exactly one driver per legend row"
+    );
+
+    for (keys, drive) in &drivers {
+        let mut renderer = m4_renderer();
+        assert!(
+            drive(&mut renderer),
+            "the {keys:?} legend row promises a state change the handler does not produce"
+        );
+    }
+}
+
+/// §5 + §10 item 16: `Esc` spends itself on an open overlay and never arms; with
+/// nothing open it arms the 3 s window, and the window is *not* an exit.
+///
+/// The third press — the one that takes the exit path — is pinned by
+/// [`both_quit_requests_route_through_the_renderers_existing_exit`] rather than
+/// pressed here: [`Renderer::request_user_exit`] calls `orchestrator::cancel_all()`,
+/// a process-wide cancellation that races with the wall-clock arbitration sleeps of
+/// the `ui::bridge` tests in the same test binary (it flips their
+/// `sleep_cancelled`). The end-to-end exit is asserted by the session integration
+/// harness instead.
+#[test]
+fn esc_closes_an_open_overlay_without_arming_then_arms_abort() {
+    let mut r = m4_renderer();
+
+    r.open_help();
+    assert!(press(&mut r, KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(r.overlay, state::OverlayState::None);
+    assert!(!r.help_open, "the legend closed");
+    assert!(!r.confirm_abort, "closing an overlay never arms abort");
+    assert!(!r.is_abort_armed());
+    assert_eq!(
+        r.focus,
+        state::FocusPane::Input,
+        "Esc no longer re-focuses Chat as a side effect (UX friction 8)"
+    );
+
+    assert!(press(&mut r, KeyCode::Esc, KeyModifiers::NONE));
+    assert!(
+        r.is_abort_armed(),
+        "nothing was open, so the key armed abort"
+    );
+    assert!(r.status_line.contains("Abort armed"));
+    assert!(
+        !r.user_exit_requested() && !r.input_state.aborted,
+        "arming is not an exit"
+    );
+    assert_eq!(
+        r.overlay,
+        state::OverlayState::Confirm,
+        "the armed prompt occupies the confirm surface (§8.5)"
+    );
+    assert!(
+        r.confirm_action.is_none(),
+        "the armed prompt holds no y/n request: a printable is typing, not consent"
+    );
+}
+
+/// §5 + §10 item 8: `Ctrl+D` never exits un-armed. It opens the Quit confirm, a
+/// second press is the same request, `n`/`Esc` leave the session alive and un-armed,
+/// and only `y` takes the existing quit path.
+#[test]
+fn ctrl_d_opens_the_quit_confirm_and_never_exits_un_armed() {
+    let mut r = TuiRenderer::new();
+
+    assert!(press(&mut r, KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert_eq!(r.confirm_action, Some(events::ConfirmAction::Quit));
+    assert_eq!(r.overlay, state::OverlayState::Confirm);
+    assert!(!r.user_exit_requested(), "one keystroke never ends it");
+    assert!(!r.is_abort_armed(), "Ctrl+D arms nothing");
+
+    press(&mut r, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    assert!(!r.user_exit_requested(), "a second Ctrl+D still needs y");
+
+    assert!(press(&mut r, KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(r.overlay, state::OverlayState::None);
+    assert!(
+        !r.is_abort_armed(),
+        "Esc out of the confirm leaves it un-armed"
+    );
+    assert!(!r.user_exit_requested());
+
+    press(&mut r, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    assert!(press(&mut r, KeyCode::Char('n'), KeyModifiers::NONE));
+    assert!(r.confirm_action.is_none());
+    assert_eq!(r.status_line, "Quit cancelled.");
+    assert!(
+        !r.user_exit_requested() && !r.input_state.aborted,
+        "`n` leaves the session alive"
+    );
+    assert!(
+        !r.is_abort_armed(),
+        "and `n` arms nothing either (§10 item 6)"
+    );
+}
+
+/// §10 item 13: printables and editing keys mutate the composer whatever pane is
+/// focused, and `x` is a letter wherever it is typed — the cancel request is the
+/// `Ctrl+X` chord, which the composer can never mistake for a draft.
+#[test]
+fn printables_and_editing_keys_reach_the_composer_from_every_focus() {
+    let mut r = m4_renderer();
+
+    for pane in [
+        state::FocusPane::Input,
+        state::FocusPane::Transcript,
+        state::FocusPane::Plan,
+        state::FocusPane::Workers,
+    ] {
+        r.set_focus(pane);
+        r.set_input_content("abc");
+        assert!(press(&mut r, KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(press(&mut r, KeyCode::Left, KeyModifiers::NONE));
+        assert!(press(&mut r, KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(press(&mut r, KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(
+            r.input_text, "ab",
+            "{pane:?} must not swallow printable or editing keys"
+        );
+    }
+
+    // `?` types while there is a draft, and only opens the legend when empty (§4).
+    r.set_input_content("what");
+    assert!(press(&mut r, KeyCode::Char('?'), KeyModifiers::NONE));
+    assert_eq!(r.input_text, "what?");
+    assert!(!r.help_open, "a typed `?` is not the overlay key");
+
+    // Bare `x` is a letter in every focus, Workers included: the mnemonic that used
+    // to arm here swallowed the first character of any draft starting with `x`. The
+    // cancel request is the `Ctrl+X` chord, which cannot be mistaken for a draft (§5).
+    r.set_focus(state::FocusPane::Workers);
+    r.set_input_content("");
+    assert!(press(&mut r, KeyCode::Char('x'), KeyModifiers::NONE));
+    assert_eq!(r.input_text, "x", "the letter reached the draft");
+    assert_eq!(
+        r.overlay,
+        state::OverlayState::None,
+        "and a bare letter armed no confirm surface"
+    );
+    assert!(press(&mut r, KeyCode::Char('x'), KeyModifiers::CONTROL));
+    assert_eq!(r.overlay, state::OverlayState::Confirm);
+    assert_eq!(
+        r.confirm_action,
+        Some(events::ConfirmAction::CancelWorker {
+            key: "coder_specialist-t-004".to_string(),
+            task_id: Some("t-004".to_string()),
+        })
+    );
+    assert_eq!(
+        r.input_text, "x",
+        "the chord consumed nothing: the draft it interrupted is intact"
+    );
+    assert_eq!(
+        r.status_line,
+        "Confirm cancel of worker 'coder_specialist-t-004' — y to cancel it, n or Esc to leave it running."
+    );
+}
+
+/// §10 item 16: `y` / `n` are honoured only inside a confirm surface that holds a
+/// request; everywhere else they are ordinary characters.
+#[test]
+fn y_and_n_are_honoured_only_inside_the_confirm_overlay() {
+    let mut r = TuiRenderer::new();
+
+    // Outside any confirm they type: typing `no` still types.
+    assert!(press(&mut r, KeyCode::Char('y'), KeyModifiers::NONE));
+    assert!(press(&mut r, KeyCode::Char('n'), KeyModifiers::NONE));
+    assert_eq!(r.input_text, "yn", "typing `no` still types");
+    assert_eq!(r.overlay, state::OverlayState::None);
+
+    // The armed-abort prompt occupies the same surface but holds no request (§8.5),
+    // so a `y` there types and disarms rather than consenting (§5).
+    press(&mut r, KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(r.overlay, state::OverlayState::Confirm);
+    assert!(r.is_abort_armed());
+    assert!(press(&mut r, KeyCode::Char('y'), KeyModifiers::NONE));
+    assert_eq!(r.input_text, "yny", "`y` did not confirm the armed prompt");
+    assert!(!r.is_abort_armed(), "and the printable disarmed it instead");
+    assert!(!r.user_exit_requested());
+
+    // Inside a confirm that does hold a request, `n` is the dismissal binding.
+    press(&mut r, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    assert_eq!(r.confirm_action, Some(events::ConfirmAction::Quit));
+    assert!(press(&mut r, KeyCode::Char('n'), KeyModifiers::NONE));
+    assert_eq!(r.input_text, "yny", "the pending request ate the `n`");
+    assert!(r.confirm_action.is_none());
+    assert_eq!(r.overlay, state::OverlayState::None);
+}
+
+/// The two exit requests are pinned by wiring, because firing them would cancel the
+/// whole process (`orchestrator::cancel_all()` in `Renderer::request_user_exit`,
+/// mod.rs:1726) and thereby flip the `sleep_cancelled` of the wall-clock arbitration
+/// tests in `ui::bridge` that share this test binary. Both routes must land on the
+/// renderer's **existing** quit path — the one the armed-abort flow already used —
+/// and no key may exit un-armed.
+#[test]
+fn both_quit_requests_route_through_the_renderers_existing_exit() {
+    fn body(source: &str, signature: &str) -> String {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("events.rs no longer has `{signature}`"));
+        let rest = &source[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .map(|at| at + 1)
+            .unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    let source = include_str!("events.rs");
+
+    let escape = body(source, "fn escape_pressed(&mut self, chord: &str)");
+    assert!(
+        escape.contains("if self.is_abort_armed()"),
+        "the armed window is checked first, so the second press exits"
+    );
+    assert!(
+        escape.contains("self.close_overlay()"),
+        "an open overlay is closed before anything is armed"
+    );
+    assert!(
+        escape.contains("Renderer::request_user_exit(self)"),
+        "the exit press reuses the renderer's existing quit path"
+    );
+    assert!(
+        !escape.contains("set_focus(") && !escape.contains("focused_panel ="),
+        "Esc never re-focuses a pane (UX friction 8)"
+    );
+
+    let confirm = body(source, "fn confirm_pending(&mut self)");
+    assert!(
+        confirm.contains("ConfirmAction::Quit"),
+        "the Quit request is one of the two the surface can hold"
+    );
+    assert!(
+        confirm.contains("Renderer::request_user_exit(self)"),
+        "`y` on the Quit confirm takes the same existing quit path"
+    );
+    assert!(
+        confirm.contains("cancel_active_worker"),
+        "`y` on a cancel request addresses one worker by key"
+    );
+    assert!(
+        !confirm.contains("cancel_all"),
+        "and never the broadcast cancellation (spec §5, bus.rs:38)"
+    );
+
+    let request_quit = body(source, "fn request_quit(&mut self)");
+    assert!(
+        request_quit.contains("show_request(ConfirmAction::Quit)"),
+        "Ctrl+D routes onto the confirm surface through the one arming helper"
+    );
+    assert!(
+        !request_quit.contains("request_user_exit")
+            && !request_quit.contains("confirm_abort = true"),
+        "Ctrl+D neither exits nor arms on its own"
+    );
+    let show_request = body(source, "fn show_request(&mut self, action: ConfirmAction)");
+    assert!(
+        show_request.contains("self.show_confirm()")
+            && show_request.contains("self.confirm_action = Some(action)"),
+        "the surface is opened with the request it will run, from one place"
+    );
+    assert!(
+        !show_request.contains("request_user_exit")
+            && !show_request.contains("cancel_active_worker"),
+        "opening the surface runs nothing (G3)"
+    );
+
+    // t-013: the two bulk-cancellation spellings are woken only by their own arm,
+    // so a single-worker request can never reach the broadcast (§10 item 17).
+    let cancel_all_body = body(source, "fn cancel_every_worker(&mut self)");
+    assert!(
+        cancel_all_body.contains("crate::orchestrator::cancel_all()"),
+        "`/cancel-all` runs the cancellation §6 names, in a function of its own"
+    );
+    assert!(
+        !body(source, "fn request_cancel_selected_worker").contains("cancel_all")
+            && !body(source, "fn request_cancel_worker_by_argument").contains("cancel_all"),
+        "a one-worker request never names the broadcast cancellation"
+    );
+    let handoff = body(source, "fn confirm_pending(&mut self)");
+    assert!(
+        handoff.contains("self.tx.send(line)"),
+        "a confirmed slash command is handed to the session loop rather than \
+         re-implemented in the renderer (unified `/reset`, spec §6)"
+    );
+    let arm = body(source, "fn arm_destructive_command(&mut self, line: &str)");
+    for spelling in [
+        "/cancel-all",
+        "/cancel",
+        "is_reset_command",
+        "is_abort(&token)",
+    ] {
+        assert!(arm.contains(spelling), "arm gate missing {spelling}");
+    }
+    assert!(
+        !arm.contains("Plan::default")
+            && !arm.contains("request_user_exit")
+            && !arm.contains("self.tx.send"),
+        "the gate arms the surface only: no plan clear, no exit, no send"
+    );
+    let submit = body(source, "pub(crate) fn submit(&mut self)");
+    assert!(
+        !submit.contains("Plan::default()") && !submit.contains("plan.clear()"),
+        "the renderer-local `/reset` short-circuit is gone: all six spellings take \
+         the loop's full path (spec §6)"
+    );
+    assert!(
+        submit.contains("arm_destructive_command")
+            && submit.contains("is_bare_abort_word")
+            && !submit.contains("Renderer::request_user_exit"),
+        "`submit` hands destructive spellings to the surface and never exits by itself"
+    );
+}
+
+/// §5 `Ctrl+X` + §10 items 9/17: the confirm carries the selected row's identity,
+/// and `y` cancels that one worker without ever touching the exit path. The chord
+/// carries the old `x` binding's scope and semantics; the bare letter types.
+#[test]
+fn x_then_y_cancels_the_selected_worker_by_name() {
+    let mut r = m4_renderer();
+    r.subagents.push(SubagentDetail {
+        name: "researcher-t-009".to_string(),
+        task_id: Some("t-009".to_string()),
+        is_active: true,
+        ..SubagentDetail::default()
+    });
+    r.set_focus(state::FocusPane::Workers);
+    r.selected_subagent_idx = 1;
+
+    assert!(press(&mut r, KeyCode::Char('x'), KeyModifiers::CONTROL));
+    assert_eq!(
+        r.confirm_action,
+        Some(events::ConfirmAction::CancelWorker {
+            key: "researcher-t-009".to_string(),
+            task_id: Some("t-009".to_string()),
+        }),
+        "the request names the row that was selected when the key was pressed"
+    );
+    assert!(r.status_line.contains("researcher-t-009"));
+
+    assert!(press(&mut r, KeyCode::Char('y'), KeyModifiers::NONE));
+    assert!(r.confirm_action.is_none());
+    assert_eq!(r.overlay, state::OverlayState::None);
+    assert!(
+        r.status_line.contains("researcher-t-009"),
+        "the outcome of the cancel is stated: {}",
+        r.status_line
+    );
+    assert!(
+        !r.user_exit_requested(),
+        "cancelling one worker never exits the session"
+    );
+    assert!(!r.is_abort_armed());
+}
+
+/// §6: `Tab` accepts the composer's ghost completion — the longest common prefix,
+/// never a guessed command — and only falls through to focus cycling when there is
+/// nothing to accept.
+#[test]
+fn tab_accepts_the_ghost_completion_of_a_slash_command() {
+    let mut r = TuiRenderer::new();
+    assert_eq!(r.focus, state::FocusPane::Input, "boot focus");
+
+    r.set_input_content("/tho");
+    assert!(press(&mut r, KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(r.input_text, "/thought");
+    assert_eq!(
+        r.focus,
+        state::FocusPane::Input,
+        "completing does not move focus"
+    );
+
+    // Several candidates: only the shared prefix is inserted (§6).
+    r.set_input_content("/rese");
+    assert!(press(&mut r, KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(r.input_text, "/reset");
+
+    // A bare `/` names nothing, so `Tab` is the focus key again.
+    r.set_input_content("/");
+    assert!(press(&mut r, KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(r.input_text, "/");
+    assert_eq!(r.focus, state::FocusPane::Transcript);
+
+    // An unknown command completes nothing.
+    r.set_input_content("/notacommand");
+    assert!(press(&mut r, KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(r.input_text, "/notacommand");
+    assert_eq!(r.focus, state::FocusPane::Input);
+}
+
+/// §10 items 10 and 11: every toggle leaves a chip on status row 2, and an empty
+/// pane turns on and says so instead of doing nothing.
+#[test]
+fn every_toggle_leaves_a_chip_and_an_empty_pane_says_so() {
+    let mut r = TuiRenderer::new();
+
+    let boot = draw_new_frame(&mut r, 100, 30).concat();
+    assert!(
+        boot.contains("plan:off") && boot.contains("workers:off") && boot.contains("think:off"),
+        "the boot chips name every toggle: {boot}"
+    );
+
+    assert!(press(&mut r, KeyCode::Char('t'), KeyModifiers::CONTROL));
+    let thought = draw_new_frame(&mut r, 100, 30);
+    assert!(
+        thought
+            .iter()
+            .any(|row| row.contains("think:on") && row.contains("plan:off")),
+        "Ctrl+T leaves a chip: {thought:?}"
+    );
+
+    assert!(press(&mut r, KeyCode::Char('p'), KeyModifiers::CONTROL));
+    assert!(press(&mut r, KeyCode::Char('a'), KeyModifiers::CONTROL));
+    let panes = draw_new_frame(&mut r, 100, 30);
+    let chips = panes
+        .iter()
+        .find(|row| row.contains("plan:"))
+        .expect("a plan chip row");
+    assert!(
+        chips.contains("plan:on") && chips.contains("workers:on") && chips.contains("think:on"),
+        "Ctrl+P / Ctrl+A / Ctrl+T each leave a distinct chip: {chips:?}"
+    );
+
+    // Ctrl+A with zero workers: the chip flips and the pane draws its empty state.
+    let mut empty = TuiRenderer::new();
+    assert!(press(&mut empty, KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert!(
+        empty.show_subagent_panel,
+        "the pane turned on, no silent no-op"
+    );
+    let rows = draw_new_frame(&mut empty, 100, 30);
+    let joined = rows.concat();
+    assert!(joined.contains("workers:on"), "the chip flipped: {joined}");
+    assert!(
+        rows.iter().any(|row| row.contains("No specialist")),
+        "the empty Workers pane states why it is empty: {joined}"
+    );
+    assert_eq!(
+        components::activity::EMPTY_STATE,
+        "No specialist launched yet."
+    );
+}
+
+/// G7: `Ctrl+F` moves the follow chip in the transcript pane — one chip, one place.
+#[test]
+fn ctrl_f_moves_the_follow_chip_in_the_transcript_pane() {
+    let mut r = m4_renderer();
+    let live = draw_new_frame(&mut r, 100, 30).concat();
+    assert!(live.contains("LIVE"), "boot follows the tail: {live}");
+
+    assert!(press(&mut r, KeyCode::Char('f'), KeyModifiers::CONTROL));
+    let off = draw_new_frame(&mut r, 100, 30).concat();
+    assert!(
+        off.contains("follow off"),
+        "the chip restates the state: {off}"
+    );
+    assert!(!r.follow);
+
+    assert!(press(&mut r, KeyCode::Char('f'), KeyModifiers::CONTROL));
+    let on = draw_new_frame(&mut r, 100, 30).concat();
+    assert!(on.contains("LIVE"), "and comes back: {on}");
+    assert!(r.follow);
+}
+
+/// G7 at the renderer's own seam (DATA gap 7): the unseen baseline is re-measured
+/// whenever the viewport sits at the bottom of the body, and is **held** while the
+/// operator is scrolled up. That is what lets `↓ N new` count the output that arrived
+/// unseen rather than only the gap under the viewport — and the baseline is a measured
+/// line count, never a guess from `max_scroll - scroll`.
+#[test]
+fn the_unseen_baseline_is_re_measured_at_the_tail_and_held_while_scrolled_up() {
+    let mut r = m4_renderer();
+    r.messages = (0..30)
+        .map(|i| format!("User: line {i:02} of the transcript"))
+        .collect();
+
+    // Following the tail: every line that exists has been on screen, so the body's own
+    // measured line count becomes the baseline.
+    draw_new_frame(&mut r, 100, 30);
+    let tail = r.transcript_baseline_lines.expect("a frame was drawn");
+    assert_eq!(tail, 30, "one rendered line per message at this width");
+
+    // `Ctrl+F` disarms follow with nothing new in flight: the state is stated, and
+    // nothing is claimed as unseen.
+    assert!(press(&mut r, KeyCode::Char('f'), KeyModifiers::CONTROL));
+    let still = draw_new_frame(&mut r, 100, 30);
+    assert!(
+        still.iter().any(|line| line.contains("follow off")),
+        "{still:?}"
+    );
+    assert!(
+        !still.iter().any(|line| line.contains(" new ")),
+        "nothing arrived: {still:?}"
+    );
+
+    // Ten lines arrive while the viewport stands still. The baseline must not move —
+    // the operator has not seen that output — so the pane counts it and says so.
+    r.messages
+        .extend((30..40).map(|i| format!("User: line {i:02} of the transcript")));
+    let behind = draw_new_frame(&mut r, 100, 30);
+    assert_eq!(
+        r.transcript_baseline_lines,
+        Some(tail),
+        "the baseline waits for the operator to come back to the tail"
+    );
+    assert!(
+        behind.iter().any(|line| line.contains("\u{2193} 10 new")),
+        "the ten unseen lines are counted: {behind:?}"
+    );
+
+    // Coming back to the tail retires the count and re-measures the baseline.
+    assert!(press(&mut r, KeyCode::Char('f'), KeyModifiers::CONTROL));
+    let back = draw_new_frame(&mut r, 100, 30);
+    assert!(back.iter().any(|line| line.contains("LIVE")), "{back:?}");
+    assert_eq!(r.transcript_baseline_lines, Some(40));
+}
+
+/// §10 item 15 from the key side: every roster row is reachable with the arrows —
+/// no 3-row clamp survives the keymap.
+#[test]
+fn every_worker_row_is_reachable_with_the_arrow_keys() {
+    let mut r = TuiRenderer::new();
+    r.set_view_mode(state::ViewMode::Workers);
+    r.set_focus(state::FocusPane::Workers);
+    r.subagents = (0..12)
+        .map(|i| SubagentDetail {
+            name: format!("coder-t-{i:03}"),
+            task_id: Some(format!("t-{i:03}")),
+            is_active: true,
+            ..SubagentDetail::default()
+        })
+        .collect();
+
+    for step in 1..12 {
+        assert!(
+            press(&mut r, KeyCode::Right, KeyModifiers::NONE),
+            "row {step} is reachable"
+        );
+        assert_eq!(r.selected_subagent_idx, step, "row {step} is selected");
+    }
+    press(&mut r, KeyCode::Right, KeyModifiers::NONE);
+    assert_eq!(
+        r.selected_subagent_idx, 11,
+        "the selection stops on the last row, it never wraps into a lie"
+    );
+
+    for step in (0..11).rev() {
+        assert!(press(&mut r, KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(r.selected_subagent_idx, step);
+    }
+    press(&mut r, KeyCode::Left, KeyModifiers::NONE);
+    assert_eq!(r.selected_subagent_idx, 0);
+}
+
+/// §5: `/error` is never silent. It replays the last error traffic, and when nothing
+/// is recorded it says the sticky buffer still needs the t-012 plumbing. The bare
+/// `e` that used to carry it is gone — it armed over a pane focus and swallowed the
+/// letter on an empty draft — so the recall is a submitted command here, and it needs
+/// no particular focus to work (the composer-focus case is pinned in
+/// `error_recalls_the_sticky_error_in_every_focus_…` of `tests_new_ui.rs`).
+#[test]
+fn e_recalls_the_last_error_or_reports_what_is_missing() {
+    let mut r = TuiRenderer::new();
+    r.set_focus(state::FocusPane::Transcript);
+    r.set_input_content("/error");
+    r.submit();
+    let nothing = r.messages.last().cloned().unwrap_or_default();
+    assert!(
+        nothing.contains("No error recorded"),
+        "an unrecorded error is reported, not ignored: {nothing}"
+    );
+    assert!(
+        nothing.contains("§8.5"),
+        "and named as pending plumbing: {nothing}"
+    );
+
+    r.messages
+        .push("LLM error: rate limit exceeded after 3 retries".to_string());
+    r.set_input_content("/error");
+    r.submit();
+    let recalled = r.messages.last().cloned().unwrap_or_default();
+    assert!(
+        recalled.starts_with("✗ LLM error: rate limit exceeded after 3 retries"),
+        "the recorded line is replayed verbatim: {recalled}"
+    );
+    assert!(recalled.contains("marmel.log"), "and points at the log");
+}
+
+/// §10 item 20: mouse reports are ignored outright. Mouse capture is never enabled
+/// anywhere in `src/`, so the deleted arms were unreachable; a report must move
+/// nothing, and must not even count as a handled event.
+#[test]
+fn a_mouse_report_is_ignored_and_moves_nothing() {
+    let mut r = m4_renderer();
+    r.set_input_content("untouched");
+    r.set_focus(state::FocusPane::Plan);
+    let focus = r.focus;
+    let mode = r.view_mode;
+    let scroll = r.plan_scroll;
+
+    for kind in [
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        crossterm::event::MouseEventKind::ScrollDown,
+        crossterm::event::MouseEventKind::ScrollUp,
+        crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+    ] {
+        let report = crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column: 12,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            !r.apply_terminal_event(&report),
+            "a mouse report is not a binding: {kind:?}"
+        );
+    }
+
+    assert_eq!(r.focus, focus);
+    assert_eq!(r.view_mode, mode);
+    assert_eq!(r.plan_scroll, scroll);
+    assert_eq!(r.input_text, "untouched");
+    assert_eq!(r.overlay, state::OverlayState::None);
+}
+
+/// Work item 5: the composer is the typing target at boot, so the boot frame must
+/// badge the composer and never claim the transcript is the focus target.
+#[test]
+fn the_boot_frame_badges_the_composer_not_the_transcript() {
+    let r_new = TuiRenderer::new();
+    assert_eq!(r_new.focus, state::FocusPane::Input);
+    assert_eq!(r_new.focused_panel, FocusedPanel::Chat);
+    assert_eq!(r_new.view_mode, state::ViewMode::Transcript);
+    assert!(r_new.follow);
+    assert_eq!(r_new.overlay, state::OverlayState::None);
+
+    let mut r = TuiRenderer::new();
+    let rows = draw_new_frame(&mut r, 100, 30);
+    let joined = rows.concat();
+
+    // Exactly one pane carries the §7.3 focus badge, and it is the composer: the
+    // boot defect was the frame claiming the Transcript was the typing target.
+    let badgeed: Vec<&String> = rows
+        .iter()
+        .filter(|row| row.contains(theme::FOCUS_BADGE))
+        .collect();
+    let focus_badged: Vec<&String> = badgeed
+        .iter()
+        .filter(|row| !row.contains("LIVE"))
+        .copied()
+        .collect();
+    assert_eq!(
+        focus_badged.len(),
+        1,
+        "exactly one pane is badged at boot (the `● LIVE` follow chip is the only other badge glyph):\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        focus_badged[0].contains("Input"),
+        "the composer is the boot focus target: {:?}",
+        focus_badged[0]
+    );
+    assert!(
+        !joined.contains(&format!("Transcript {}", theme::FOCUS_BADGE)),
+        "the transcript is never badged as the focus target at boot:\n{}",
+        rows.join("\n")
+    );
+    // M1 draws no side panes at all (§4.3), so it can never badge one either.
+    for pane in [
+        state::FocusPane::Plan.label(),
+        state::FocusPane::Workers.label(),
+    ] {
+        assert!(
+            !joined.contains(pane),
+            "{pane} is not on screen at boot, so it is not badged either"
+        );
+    }
+}
+
+/// A key release is not a binding: acting on it would double every press on
+/// terminals that report releases.
+#[test]
+fn a_key_release_is_not_a_second_press() {
+    let mut r = TuiRenderer::new();
+    let key = crossterm::event::KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
+    assert!(
+        !r.apply_terminal_event(&crossterm::event::Event::Key(crossterm::event::KeyEvent {
+            kind: crossterm::event::KeyEventKind::Release,
+            ..key
+        })),
+        "a release does nothing"
+    );
+    assert_eq!(r.input_text, "");
+
+    assert!(
+        r.apply_terminal_event(&crossterm::event::Event::Key(crossterm::event::KeyEvent {
+            kind: crossterm::event::KeyEventKind::Repeat,
+            ..key
+        }))
+    );
+    assert_eq!(r.input_text, "k", "a repeat inserts, like the press does");
+}
+// ============================================================================
+// t-013: the confirm overlay is the only route a destructive action takes.
+//
+// Three things are pinned here that the key path alone cannot show:
+//   * the surface is **drawn** — centred over the body, naming the pending
+//     action, its consequence and the `y` / `n` affordance — while the live
+//     metrics outside the body keep counting (spec §7.3, G4);
+//   * every destructive slash command stops at that surface, and `n` leaves the
+//     session alive with nothing sent to the loop (spec §6, G3);
+//   * the bare words §5 removes are ordinary steering text (UX friction 6).
+// ============================================================================
+
+/// Every row of the frame outside the given rects — the chrome an overlay is not
+/// allowed to move.
+fn rows_outside(rows: &[String], skip: &[ratatui::layout::Rect]) -> Vec<String> {
+    rows.iter()
+        .enumerate()
+        .filter(|(y, _)| {
+            let y = *y as u16;
+            !skip
+                .iter()
+                .any(|rect| y >= rect.y && y < rect.y + rect.height)
+        })
+        .map(|(_, row)| row.clone())
+        .collect()
+}
+
+/// Mask every digit run in a drawn row to `#`.
+///
+/// Two draws of the *same* renderer may legitimately print different numbers, and
+/// that is not a regression: status row 1 carries the header's session clock, and
+/// the token pair is the **max** of this renderer's own session counters and the
+/// snapshot of the process-wide llm totals that [`TuiRenderer::render_terminal`]
+/// injects once per painted frame (audit D5 — `draw_new_ui` itself reads no
+/// process-global, so a `TestBackend` frame no longer moves with what the rest of
+/// the test process streamed). A frame that has been fed token events of its own
+/// still sees its own totals move between two draws, and the clock ticks with
+/// machine speed. G4 and §7.3 are about the chrome and the metric **fields**
+/// staying on screen and in place under an overlay — not about the counter values —
+/// so the frame comparisons mask the digits and compare the field set.
+fn steady(row: &str) -> String {
+    let mut out = String::with_capacity(row.len());
+    let mut in_digits = false;
+    for ch in row.chars() {
+        if ch.is_ascii_digit() {
+            if !in_digits {
+                out.push('#');
+                in_digits = true;
+            }
+        } else {
+            out.push(ch);
+            in_digits = false;
+        }
+    }
+    out
+}
+
+/// [`steady`] applied to a row set, for whole-region frame comparisons.
+fn steady_rows(rows: &[String]) -> Vec<String> {
+    rows.iter().map(|row| steady(row)).collect()
+}
+
+/// The §2.2 metrics of status row 1, with the wall-clock field dropped and the
+/// remaining values masked by [`steady`]. Keeping the raw figures in a whole-row
+/// comparison would make the test depend on how fast the machine is and on the
+/// token totals this renderer has been fed, which is what a whole-row pin is not
+/// about.
+fn metrics_of(rows: &[String], status: &ratatui::layout::Rect) -> String {
+    let row = rows[usize::from(status.y)].as_str();
+    let without_clock = row
+        .split(" elapsed ")
+        .next()
+        .unwrap_or(row)
+        .trim()
+        .to_string();
+    steady(&without_clock)
+}
+
+/// Split a drawn frame at the body rect (§2.1): the rows the overlay may cover,
+/// and the rows it may not — header, status bar, composer and footer legend.
+fn body_and_chest(rows: &[String], body: &ratatui::layout::Rect) -> (Vec<String>, Vec<String>) {
+    let top = body.y as usize;
+    let bottom = (body.y + body.height) as usize;
+    let inside = rows[top..bottom].to_vec();
+    let mut outside = rows[..top].to_vec();
+    outside.extend_from_slice(&rows[bottom..]);
+    (inside, outside)
+}
+
+/// §7.3 + G4 + §10 item 16: `Ctrl+D` paints the Quit confirm **modally** — a
+/// `Clear`ed, bordered, centred paragraph over the body — carrying the action's
+/// name, its consequence and the `y` / `n` affordance. The rows outside the body
+/// are pixel-identical to the frame without the overlay, so the metrics stay
+/// live under it. `n` takes it off and leaves the session running.
+#[test]
+fn the_quit_confirm_is_painted_modally_over_the_body_with_the_metrics_live() {
+    let mut r = m4_renderer();
+    r.tokens_in = 1234;
+    r.tokens_out = 567;
+    let view = state::UiView::from_renderer(&r);
+    let rects = layout::compute_layout(ratatui::layout::Rect::new(0, 0, 100, 30), &view);
+    let body = rects.body.expect("the body rect exists at 100x30");
+    let status = rects.status.expect("the status rect exists at 100x30");
+
+    let plain = draw_new_frame(&mut r, 100, 30);
+    assert!(
+        plain.iter().any(|row| row.contains("in /")),
+        "the metrics row counts before the overlay: {}",
+        plain.join("\n")
+    );
+
+    assert!(press(&mut r, KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert_eq!(r.overlay, state::OverlayState::Confirm);
+    let rows = draw_new_frame(&mut r, 100, 30);
+    let frame = rows.join("\n");
+
+    // The surface names the request it holds (§3, §7.3).
+    assert!(frame.contains("Confirm"), "overlay title missing:\n{frame}");
+    assert!(
+        frame.contains("Quit the session"),
+        "the pending action is not named:\n{frame}"
+    );
+    assert!(
+        frame.contains("cancels every running worker"),
+        "the consequence is missing:\n{frame}"
+    );
+    assert!(
+        frame.contains("y / n"),
+        "the y/n affordance is missing:\n{frame}"
+    );
+    assert!(
+        frame.contains("Esc close"),
+        "the close hint is missing:\n{frame}"
+    );
+
+    // It is a modal drawn over the body, not a line smuggled into the chrome: the
+    // body rows changed, the chrome around it did not, and the §2.2 metrics row
+    // still carries its counters underneath (§7.3, G4).
+    let (plain_body, _) = body_and_chest(&plain, &body);
+    let (shown_body, _) = body_and_chest(&rows, &body);
+    assert_ne!(
+        plain_body, shown_body,
+        "the overlay did not paint over the body:\n{frame}"
+    );
+    assert_eq!(
+        steady_rows(&rows_outside(&plain, &[body, status])),
+        steady_rows(&rows_outside(&rows, &[body, status])),
+        "the header, status bar, composer and footer legend must be untouched \
+         under a confirm overlay"
+    );
+    let shown_metrics = metrics_of(&rows, &status);
+    assert_eq!(
+        metrics_of(&plain, &status),
+        shown_metrics,
+        "the metrics keep counting underneath the overlay (G4)"
+    );
+    assert!(
+        shown_metrics.contains("in /") && shown_metrics.contains("#a"),
+        "the row underneath is the live metrics row: {shown_metrics}"
+    );
+    // Centred, not flush left (§7.3): the overlay's top border row starts well
+    // inside the body rather than at its first column.
+    let title_row = shown_body
+        .iter()
+        .find(|row| row.contains("Confirm"))
+        .expect("the title row inside the body");
+    let box_start = title_row
+        .find('┌')
+        .expect("the overlay draws its own bordered box");
+    assert!(
+        box_start > 10 && box_start < 45,
+        "the box is centred inside a 100-cell body, not flush left: {title_row:?}"
+    );
+
+    // `n` closes it and nothing has run (§10 item 6).
+    assert!(press(&mut r, KeyCode::Char('n'), KeyModifiers::NONE));
+    assert_eq!(r.overlay, state::OverlayState::None);
+    assert!(!r.user_exit_requested() && !r.input_state.aborted);
+    let after = draw_new_frame(&mut r, 100, 30);
+    assert_eq!(
+        body_and_chest(&after, &body).0,
+        plain_body,
+        "`n` puts the body back exactly as it was"
+    );
+    assert!(!after.join("\n").contains("y / n"), "the surface is gone");
+}
+
+/// §7.3 + §10 item 17: `Ctrl+X` names the **selected** worker on the surface, so the
+/// operator sees which row `y` will stop before stopping it.
+#[test]
+fn the_cancel_worker_confirm_names_the_row_it_will_stop() {
+    let mut r = m4_renderer();
+    r.set_focus(state::FocusPane::Workers);
+    let view = state::UiView::from_renderer(&r);
+    let rects = layout::compute_layout(ratatui::layout::Rect::new(0, 0, 100, 30), &view);
+    let body = rects.body.expect("the body rect exists at 100x30");
+    let status = rects.status.expect("the status rect exists at 100x30");
+    let plain = draw_new_frame(&mut r, 100, 30);
+
+    assert!(press(&mut r, KeyCode::Char('x'), KeyModifiers::CONTROL));
+    assert_eq!(
+        r.confirm_action,
+        Some(events::ConfirmAction::CancelWorker {
+            key: "coder_specialist-t-004".to_string(),
+            task_id: Some("t-004".to_string()),
+        })
+    );
+    let rows = draw_new_frame(&mut r, 100, 30);
+    let frame = rows.join("\n");
+    assert!(
+        frame.contains("Cancel worker 'coder_specialist-t-004'"),
+        "the action names the selected row:\n{frame}"
+    );
+    assert!(
+        frame.contains("every other worker keeps running"),
+        "the consequence of a one-worker cancel is stated:\n{frame}"
+    );
+    assert!(
+        frame.contains("y / n"),
+        "the y/n affordance is missing:\n{frame}"
+    );
+    let (plain_body, _) = body_and_chest(&plain, &body);
+    let (shown_body, _) = body_and_chest(&rows, &body);
+    assert_ne!(plain_body, shown_body, "drawn over the body:\n{frame}");
+    assert_eq!(
+        steady_rows(&rows_outside(&plain, &[body, status])),
+        steady_rows(&rows_outside(&rows, &[body, status])),
+        "the chrome around the body is untouched"
+    );
+    assert_eq!(
+        metrics_of(&plain, &status),
+        metrics_of(&rows, &status),
+        "the metrics row stays live under the confirm (G4)"
+    );
+
+    // `n` leaves the worker running: no cancel request survives the dismissal.
+    assert!(press(&mut r, KeyCode::Char('n'), KeyModifiers::NONE));
+    assert!(r.confirm_action.is_none());
+    assert!(
+        r.status_line.contains("was left running"),
+        "{}",
+        r.status_line
+    );
+    assert!(!after_cancelled(&r));
+}
+
+/// The tell that no cancellation was fired from the renderer: the session was
+/// never asked to exit and the roster row is untouched.
+fn after_cancelled(r: &TuiRenderer) -> bool {
+    r.user_exit_requested() || r.status_line.starts_with("Cancelled worker")
+}
+
+/// The armed-abort prompt shares the surface (§8.5) but holds no request: it is
+/// drawn as the same modal over the body, says it is an arm rather than a pending
+/// request, and moves the **prompt** onto status row 2 while status row 1 keeps
+/// counting (§7.3, UX friction 11).
+#[test]
+fn the_armed_abort_prompt_occupies_the_same_surface_and_holds_no_request() {
+    let mut r = m4_renderer();
+    let view = state::UiView::from_renderer(&r);
+    let rects = layout::compute_layout(ratatui::layout::Rect::new(0, 0, 100, 30), &view);
+    let body = rects.body.expect("the body rect exists at 100x30");
+    let status = rects.status.expect("the status rect exists at 100x30");
+    let plain = draw_new_frame(&mut r, 100, 30);
+
+    assert!(press(&mut r, KeyCode::Esc, KeyModifiers::NONE));
+    assert!(r.is_abort_armed());
+    assert!(
+        r.confirm_action.is_none(),
+        "the arm holds no y/n request (§5)"
+    );
+    let rows = draw_new_frame(&mut r, 100, 30);
+    let frame = rows.join("\n");
+    assert!(
+        frame.contains("Confirm"),
+        "the surface is on screen:\n{frame}"
+    );
+    assert!(
+        frame.contains("Abort armed"),
+        "the armed wording is on the surface:\n{frame}"
+    );
+    assert!(
+        !frame.contains("Quit the session"),
+        "an arm is not a pending request:\n{frame}"
+    );
+
+    // The body carries the modal …
+    let (plain_body, _) = body_and_chest(&plain, &body);
+    let (shown_body, _) = body_and_chest(&rows, &body);
+    assert_ne!(plain_body, shown_body, "drawn over the body:\n{frame}");
+
+    // … and the prompt itself lives on status row 2 (§8.5), which is the one row
+    // the arming is allowed to change: row 1 keeps the counters, and the header,
+    // composer and footer legend are untouched.
+    let prompt_row = usize::from(status.y) + 1;
+    assert_eq!(
+        metrics_of(&plain, &status),
+        metrics_of(&rows, &status),
+        "status row 1 keeps counting under an armed prompt"
+    );
+    assert!(
+        metrics_of(&rows, &status).contains("in /"),
+        "{}",
+        metrics_of(&rows, &status)
+    );
+    assert!(
+        rows[prompt_row].contains("abort armed"),
+        "the prompt lives on status row 2: {:?}",
+        rows[prompt_row]
+    );
+    let excluded = [
+        body,
+        ratatui::layout::Rect {
+            x: status.x,
+            y: status.y + 1,
+            width: status.width,
+            height: 1,
+        },
+    ];
+    assert_eq!(
+        steady_rows(&rows_outside(&plain, &excluded)),
+        steady_rows(&rows_outside(&rows, &excluded)),
+        "only the body and status row 2 move while an abort is armed"
+    );
+    assert!(r.status_line.contains("Abort armed"), "{}", r.status_line);
+}
+
+/// §6 + G3: every destructive slash command — the quit family, `/cancel`,
+/// `/cancel <id>`, `/cancel-all` and all six `/reset` spellings — stops at the
+/// confirm surface. Nothing is sent to the loop, nothing is cancelled, no exit
+/// is requested, and `n` leaves the session alive with the transcript untouched.
+#[test]
+fn every_destructive_slash_command_stops_at_the_confirm_surface() {
+    let commands = [
+        "/exit",
+        "/quit",
+        "/q",
+        "/abort",
+        "/stop",
+        ":q",
+        ":q!",
+        "/cancel",
+        "/cancel t-004",
+        "/cancel-all",
+        "/reset",
+        "/reset_plan",
+        "/reset-plan",
+        "/clear_plan",
+        "/clear-plan",
+        "/reset_execution_plan",
+    ];
+    for command in commands {
+        let mut r = m4_renderer();
+        r.set_input_content(command);
+        r.submit();
+        assert!(
+            r.confirm_action.is_some(),
+            "`{command}` must open the confirm surface"
+        );
+        assert_eq!(r.overlay, state::OverlayState::Confirm, "`{command}`");
+        assert!(
+            drain_submissions(&mut r).is_empty(),
+            "`{command}` reached the session loop un-confirmed"
+        );
+        assert!(
+            !r.user_exit_requested() && !r.input_state.aborted,
+            "`{command}` ended the session by itself"
+        );
+        assert!(
+            r.plan_content.contains("t-004"),
+            "`{command}` cleared the plan before `y`"
+        );
+
+        assert!(
+            press(&mut r, KeyCode::Char('n'), KeyModifiers::NONE),
+            "`{command}`: `n` is a binding"
+        );
+        assert!(
+            r.confirm_action.is_none(),
+            "`{command}`: `n` dropped the request"
+        );
+        assert_eq!(r.overlay, state::OverlayState::None, "`{command}`");
+        assert!(
+            drain_submissions(&mut r).is_empty(),
+            "`{command}` reached the loop after `n`"
+        );
+        assert!(
+            !r.user_exit_requested() && !r.input_state.aborted,
+            "`{command}` ended the session despite `n`"
+        );
+        assert!(!r.is_abort_armed(), "`{command}` + `n` armed nothing");
+        assert!(
+            r.plan_content.contains("t-004"),
+            "`{command}` + `n` left the plan alone"
+        );
+    }
+}
+
+/// §6 (unified `/reset`) + the quit spellings: `y` hands the **exact** command
+/// back to the session loop, which owns the destructive path. The renderer no
+/// longer clears the plan behind the loop, and no `/reset` spelling is answered
+/// locally any more.
+#[test]
+fn a_confirmed_command_is_handed_to_the_session_loop_verbatim() {
+    let spellings = [
+        "/reset",
+        "/reset_plan",
+        "/reset-plan",
+        "/clear_plan",
+        "/clear-plan",
+        "/reset_execution_plan",
+        "/exit",
+        "/quit",
+        "/q",
+        "/abort",
+        "/stop",
+        ":q",
+        ":q!",
+    ];
+    for spelling in spellings {
+        let mut r = m4_renderer();
+        r.set_input_content(spelling);
+        r.submit();
+        assert_eq!(
+            r.confirm_action,
+            Some(events::ConfirmAction::Command {
+                line: spelling.to_string()
+            }),
+            "`{spelling}` is confirmed as a command hand-off"
+        );
+        // Every spelling takes the one path, and the surface describes it.
+        let request = r
+            .confirm_action
+            .as_ref()
+            .map(|action| action.describe())
+            .expect("a request is pending");
+        assert!(
+            request.action.contains(spelling),
+            "the surface names the spelling it will run: {request:?}"
+        );
+
+        assert!(press(&mut r, KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(
+            drain_submissions(&mut r),
+            vec![spelling.to_string()],
+            "`{spelling}` reaches the loop exactly as typed"
+        );
+        assert_eq!(r.overlay, state::OverlayState::None);
+        assert!(
+            r.plan_content.contains("t-004"),
+            "`{spelling}`: the renderer no longer clears the plan itself — the \
+             loop's reset path does"
+        );
+        assert!(
+            !r.user_exit_requested(),
+            "`{spelling}`: the loop owns the exit, the renderer does not"
+        );
+        assert_eq!(
+            r.history.last().map(String::as_str),
+            Some(spelling),
+            "a confirmed command is remembered in the composer history"
+        );
+    }
+}
+
+/// §6: `/cancel <worker key or task id>` resolves its argument against the
+/// roster and confirms **one** worker; `y` addresses that identity through the
+/// registry's exact-identity matching and never exits the session.
+#[test]
+fn cancel_with_an_argument_confirms_one_named_worker() {
+    for argument in ["coder_specialist-t-004", "t-004", "CODER_SPECIALIST-t-004"] {
+        let mut r = m4_renderer();
+        r.set_input_content(&format!("/cancel {argument}"));
+        r.submit();
+        assert_eq!(
+            r.confirm_action,
+            Some(events::ConfirmAction::CancelWorker {
+                key: "coder_specialist-t-004".to_string(),
+                task_id: Some("t-004".to_string()),
+            }),
+            "`/cancel {argument}` resolves to the roster row"
+        );
+        assert!(press(&mut r, KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(
+            r.status_line.contains("coder_specialist-t-004"),
+            "the outcome names the worker: {}",
+            r.status_line
+        );
+        assert!(
+            !r.user_exit_requested(),
+            "cancelling one worker never exits the session (§10 item 17)"
+        );
+        assert!(drain_submissions(&mut r).is_empty(), "nothing was sent");
+    }
+
+    // An unknown argument is confirmed as typed, never retargeted onto another row.
+    let mut r = m4_renderer();
+    r.set_input_content("/cancel t-999");
+    r.submit();
+    assert_eq!(
+        r.confirm_action,
+        Some(events::ConfirmAction::CancelWorker {
+            key: "t-999".to_string(),
+            task_id: None,
+        }),
+        "the string the operator typed is the identity `y` addresses"
+    );
+
+    // `/cancel-all` is the one request that carries the broadcast cancellation,
+    // and it is held behind the same surface. `y` is not fired here for the same
+    // reason the quit `y` is pinned by wiring above: `cancel_all()` is
+    // process-wide and would race the `ui::bridge` wall-clock tests.
+    let mut r = m4_renderer();
+    r.set_input_content("/cancel-all");
+    r.submit();
+    assert_eq!(r.confirm_action, Some(events::ConfirmAction::CancelAll));
+    assert!(r.status_line.contains("every worker"), "{}", r.status_line);
+    assert!(press(&mut r, KeyCode::Char('n'), KeyModifiers::NONE));
+    assert_eq!(r.status_line, "Every worker was left running.");
+    assert!(!r.user_exit_requested());
+}
+
+/// §5: the bare words `stop / cancel / exit / quit / q / abort` are ordinary
+/// steering text in the TUI. They reach the loop as text, arm nothing, and the
+/// renderer says which spelling does open a confirm (UX friction 6).
+#[test]
+fn a_bare_abort_word_is_steering_text_and_never_ends_the_session() {
+    for word in [
+        "stop", "cancel", "exit", "quit", "q", "abort", "STOP", "Stop",
+    ] {
+        let mut r = m4_renderer();
+        r.set_input_content(word);
+        r.submit();
+        let sent = drain_submissions(&mut r);
+        assert_eq!(
+            sent.iter().map(|line| line.trim()).collect::<Vec<_>>(),
+            vec![word],
+            "`{word}` is delivered as one steering message"
+        );
+        assert!(
+            !r.user_exit_requested() && !r.input_state.aborted,
+            "the bare word `{word}` ended the session"
+        );
+        assert!(
+            r.confirm_action.is_none(),
+            "steering text arms no confirm: `{word}`"
+        );
+        assert!(
+            r.messages.iter().any(|message| {
+                message.contains("steering text")
+                    && message.contains("/exit")
+                    && message.contains("Esc twice")
+            }),
+            "`{word}`: the hint names the confirmed spelling: {:?}",
+            r.messages
+        );
+        assert!(
+            r.status_line.contains("Steering text"),
+            "`{word}`: {}",
+            r.status_line
+        );
+        // The word still lands in history, like any other instruction.
+        assert_eq!(r.history.last().map(String::as_str), Some(word));
+    }
+}
+
+/// The gate is the TUI's, not the command vocabulary's: a multi-line submission
+/// whose first line is a destructive command is still delivered verbatim, and a
+/// renderer that gates nothing keeps the pre-rebuild bare-word behaviour.
+#[test]
+fn the_gate_keeps_pasted_blocks_intact_and_the_tui_the_only_gating_renderer() {
+    let block = "/reset\nnästa rad";
+    let mut r = m4_renderer();
+    r.paste_text(block);
+    r.submit();
+    assert!(
+        r.confirm_action.is_none(),
+        "a pasted block is not a command"
+    );
+    assert_eq!(drain_submissions(&mut r), vec![block.to_string()]);
+    assert!(
+        r.plan_content.contains("t-004"),
+        "the plan survived the paste"
+    );
+
+    // The headless renderer keeps the pre-rebuild vocabulary (its behaviour is
+    // byte-unchanged); the TUI is the only one that gates.
+    let raw = crate::ui::raw::RawRenderer::new();
+    assert!(
+        !crate::ui::Renderer::gates_destructive_commands(&raw),
+        "the headless renderer must not change its abort vocabulary"
+    );
+    let tui = TuiRenderer::new();
+    assert!(
+        crate::ui::Renderer::gates_destructive_commands(&tui),
+        "the TUI gates, which is what lets the loop drop the bare words"
+    );
+}
+
+// ---- steering-instruction visibility (spec §3, §8.3; DATA §6 gap 7/9) ----
+
+/// Affordance 1, end to end at the renderer's seam: an instruction the bridge handed
+/// over arrives in the transcript as a labelled line and in the status bar as a chip —
+/// both driven by the bridge's own transition, never by a counter of the pane's.
+#[test]
+fn a_queued_steer_from_the_bridge_lands_in_the_transcript_and_arms_the_chip() {
+    let mut r = m4_renderer();
+    crate::ui::Renderer::note_steer(
+        &mut r,
+        &SteerTrace::queued(
+            "rename the module first",
+            crate::ui::MANAGER_TARGET,
+            "held while the specialists run",
+        ),
+    );
+
+    assert_eq!(r.queued_steers(), 1, "the chip reads this ledger");
+    let line = r
+        .messages
+        .last()
+        .expect("the transcript gained a line")
+        .clone();
+    assert_eq!(
+        line,
+        "[Steer queued → manager] rename the module first — held while the specialists run"
+    );
+
+    let rows = draw_new_frame(&mut r, 100, 30);
+    let frame = rows.join("\n");
+    // The line lands in the **transcript pane** itself. In M4 that pane is the side
+    // column, narrow enough to wrap the sentence across two
+    // rows, so the pane's own body rows are folded back into one line before the
+    // phrase is looked for.
+    let view = state::UiView::from_renderer(&r);
+    let rects = layout::compute_layout(Rect::new(0, 0, 100, 30), &view);
+    let transcript = rects.transcript.expect("M4 draws the transcript");
+    assert!(
+        transcript.x > rects.body.expect("a 100x30 body").x,
+        "the transcript is the trailing side column, the plan leads on the left: {rects:?}"
+    );
+    let said = pane_says(&rows, transcript);
+    assert!(said.contains("[Steer queued"), "{said}\n{frame}");
+    assert!(said.contains("rename the module first"), "{said}\n{frame}");
+    assert!(
+        frame.contains("1 steers"),
+        "the chip is on the bar: {frame}"
+    );
+    assert!(!frame.contains("round"), "no arbitration counter: {frame}");
+}
+
+/// The chip counts instructions the bridge is *still* holding. A transition to
+/// delivered takes the number down, and an empty ledger prints no chip at all.
+#[test]
+fn the_steer_chip_counts_only_the_instructions_still_being_held() {
+    let mut r = m4_renderer();
+    for text in ["first instruction", "second instruction"] {
+        crate::ui::Renderer::note_steer(
+            &mut r,
+            &SteerTrace::queued(text, crate::ui::MANAGER_TARGET, "held"),
+        );
+    }
+    assert!(
+        draw_new_frame(&mut r, 100, 30)
+            .join("\n")
+            .contains("2 steers")
+    );
+
+    // The same instruction, now filed with a specialist: the count comes down and the
+    // transcript gains exactly one more line for the stage change.
+    let before = r.messages.len();
+    crate::ui::Renderer::note_steer(
+        &mut r,
+        &SteerTrace {
+            stage: SteerStage::Delivered,
+            text: "first instruction".to_string(),
+            target: "coder_specialist-t-004".to_string(),
+            notice_id: None,
+            reason: "filed".to_string(),
+        },
+    );
+    assert_eq!(r.queued_steers(), 1);
+    assert_eq!(r.messages.len(), before + 1, "one line per stage change");
+    assert!(
+        draw_new_frame(&mut r, 100, 30)
+            .join("\n")
+            .contains("1 steers")
+    );
+
+    crate::ui::Renderer::note_steer(
+        &mut r,
+        &SteerTrace {
+            stage: SteerStage::Delivered,
+            text: "second instruction".to_string(),
+            target: "coder_specialist-t-004".to_string(),
+            notice_id: None,
+            reason: "filed".to_string(),
+        },
+    );
+    assert_eq!(r.queued_steers(), 0);
+    let frame = draw_new_frame(&mut r, 100, 30).join("\n");
+    assert!(
+        !frame.contains("steers"),
+        "nothing held, so nothing is claimed: {frame}"
+    );
+}
+
+/// Affordance 2: a notice the arbitrator filed is named with the specialist it is
+/// sitting in front of and the id that specialist must reply to — and the same notice
+/// is listed in that worker's own detail half, read from the orchestrator's inbox.
+#[test]
+fn a_forwarded_notice_names_the_specialist_and_its_notice_id() {
+    let worker = "steer-target-coder-t-013b";
+    let posted = crate::orchestrator::notice::post_notice_to_worker(
+        worker,
+        "use the shorter fixture",
+        Some("notice-t013b-a"),
+    );
+    assert_eq!(posted.notice_id, "notice-t013b-a");
+
+    let mut r = m4_renderer();
+    r.subagents = vec![SubagentDetail {
+        name: worker.to_string(),
+        task_id: Some("t-013b".to_string()),
+        is_active: true,
+        ..SubagentDetail::default()
+    }];
+    crate::ui::Renderer::note_steer(
+        &mut r,
+        &SteerTrace {
+            stage: SteerStage::Delivered,
+            text: "use the shorter fixture".to_string(),
+            target: worker.to_string(),
+            notice_id: Some(posted.notice_id.clone()),
+            reason: "filed in the inbox".to_string(),
+        },
+    );
+
+    assert_eq!(
+        r.messages.last().map(String::as_str),
+        Some(
+            "[Steer delivered → steer-target-coder-t-013b] use the shorter fixture — filed in \
+             the inbox (notice id notice-t013b-a)"
+        )
+    );
+    // A filed notice is not a held instruction: the chip stays off.
+    assert_eq!(r.queued_steers(), 0);
+
+    let frame = draw_new_frame(&mut r, 100, 44).join("\n");
+    assert!(frame.contains("[Steer delivered"), "{frame}");
+    assert!(frame.contains("notice-t013b-a"), "{frame}");
+    assert!(
+        frame.contains("[Steering] 1 notice"),
+        "the worker's own detail half lists what is waiting for it: {frame}"
+    );
+    assert!(
+        frame.contains("[Steering] 1 notice(s) waiting for")
+            && frame.contains("this specialist")
+            && frame.contains("(waiting 0s)"),
+        "the listed notice carries its own wait: {frame}"
+    );
+}
+
+/// A `ForwardNotice` the round refused because the token addressed no live worker is
+/// reported as never delivered, naming the token — and it is never counted as held.
+#[test]
+fn an_unroutable_target_is_reported_as_never_delivered() {
+    let mut r = m4_renderer();
+    crate::ui::Renderer::note_steer(
+        &mut r,
+        &SteerTrace {
+            stage: SteerStage::Revoked,
+            text: "tell the ghost what to do".to_string(),
+            target: "ghost_worker".to_string(),
+            notice_id: None,
+            reason: "the arbitrator addressed `ghost_worker`, which no live worker answers"
+                .to_string(),
+        },
+    );
+    let line = r.messages.last().cloned().unwrap_or_default();
+    assert!(
+        line.starts_with("[Steer not delivered → ghost_worker]"),
+        "{line}"
+    );
+    assert!(line.contains("no live worker"), "{line}");
+    assert_eq!(
+        r.queued_steers(),
+        0,
+        "an instruction that reached nobody is not counted as held"
+    );
+    let frame = draw_new_frame(&mut r, 100, 30).join("\n");
+    assert!(frame.contains("[Steer not delivered"), "{frame}");
+    assert!(frame.contains("ghost_worker"), "{frame}");
+    assert!(!frame.contains("steers"), "{frame}");
+}
+
+/// The ledger is a bounded witness, and it speaks once per stage: an unbounded session
+/// cannot grow it, and a restatement of the same stage never scrolls the transcript.
+#[test]
+fn steer_traces_stay_bounded_and_announce_each_stage_once() {
+    let mut r = m4_renderer();
+    let total = MAX_STEER_TRACES + 5;
+    for index in 0..total {
+        crate::ui::Renderer::note_steer(
+            &mut r,
+            &SteerTrace::queued(
+                format!("instruction {index}"),
+                crate::ui::MANAGER_TARGET,
+                "held",
+            ),
+        );
+    }
+    assert_eq!(r.steer_traces.len(), MAX_STEER_TRACES);
+    assert_eq!(
+        r.steer_traces.last().map(|entry| entry.text.as_str()),
+        Some("instruction 16"),
+        "the newest transitions are the ones that survive"
+    );
+    assert!(
+        !r.steer_traces
+            .iter()
+            .any(|entry| entry.text == "instruction 0"),
+        "the oldest transition is the one that goes"
+    );
+    assert_eq!(r.queued_steers(), MAX_STEER_TRACES);
+
+    // Same stage again: no new transcript line, only a sharper reason.
+    let before = r.messages.len();
+    crate::ui::Renderer::note_steer(
+        &mut r,
+        &SteerTrace::queued("instruction 16", crate::ui::MANAGER_TARGET, "still held"),
+    );
+    assert_eq!(r.messages.len(), before, "a stage is announced once");
+    assert_eq!(
+        r.steer_traces
+            .iter()
+            .find(|entry| entry.text == "instruction 16")
+            .map(|entry| entry.reason.as_str()),
+        Some("still held")
+    );
+
+    // One instruction, two addressees: the ledger keeps one entry per (text, target),
+    // so a notice filed for a second specialist is a second fact and never a
+    // double-counted duplicate — and the cap still holds.
+    crate::ui::Renderer::note_steer(
+        &mut r,
+        &SteerTrace::queued("instruction 16", "other_worker", "held there too"),
+    );
+    assert_eq!(
+        r.steer_traces.len(),
+        MAX_STEER_TRACES,
+        "the bound holds against a second addressee too"
+    );
+    let for_other = r
+        .steer_traces
+        .iter()
+        .filter(|entry| entry.text == "instruction 16")
+        .map(|entry| entry.target.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        for_other,
+        ["manager", "other_worker"],
+        "one entry per addressee, oldest first"
+    );
+    assert_eq!(
+        r.steer_traces
+            .iter()
+            .filter(|entry| entry.text == "instruction 16" && entry.target == "other_worker")
+            .count(),
+        1,
+        "never two entries for one (instruction, addressee)"
+    );
+}
+
+/// Affordance 2's second half: the notice tables decide what happened next. A reply
+/// the specialist recorded moves the entry to delivered, clears it from the chip, and
+/// says so with the notice id — the renderer never guesses this state.
+#[test]
+fn the_specialists_answer_moves_the_trace_to_delivered_and_clears_the_chip() {
+    let worker = "steer-probe-coder-t-013b";
+    let posted = crate::orchestrator::notice::post_notice_to_worker(
+        worker,
+        "raise the coverage gate",
+        Some("notice-t013b-b"),
+    );
+    let mut r = m4_renderer();
+    crate::ui::Renderer::note_steer(
+        &mut r,
+        &SteerTrace {
+            stage: SteerStage::Queued,
+            text: "raise the coverage gate".to_string(),
+            target: worker.to_string(),
+            notice_id: Some(posted.notice_id.clone()),
+            reason: "filed in the inbox".to_string(),
+        },
+    );
+    assert_eq!(r.queued_steers(), 1, "pending in the inbox, so still held");
+    r.refresh_steer_traces();
+    assert_eq!(r.steer_traces[0].stage, SteerStage::Queued);
+    assert_eq!(r.queued_steers(), 1, "a pending notice is not an answer");
+
+    crate::orchestrator::record_worker_reply_for_notice(worker, "notice-t013b-b", "done")
+        .expect("the reply names the pending notice");
+    let before = r.messages.len();
+    r.refresh_steer_traces();
+
+    assert_eq!(r.steer_traces[0].stage, SteerStage::Delivered);
+    assert_eq!(r.queued_steers(), 0, "answered, so no longer held");
+    assert_eq!(
+        r.messages.len(),
+        before + 1,
+        "the stage change is announced"
+    );
+    assert_eq!(
+        r.messages.last().map(String::as_str),
+        Some(
+            "[Steer delivered → steer-probe-coder-t-013b] raise the coverage gate — the \
+             specialist answered it (notice id notice-t013b-b)"
+        )
+    );
+    // The reply consumed the notice; the inbox is empty again.
+    assert!(
+        crate::orchestrator::notice::peek_worker_inbox(worker).is_empty(),
+        "the reply resolved the queued copy"
+    );
+}
+
+/// The honesty guard: the tables answering "nothing" is not an answer. A notice the
+/// tables do not know about keeps the stage the bridge gave it, so a notice that was
+/// drained, reclaimed or simply never filed can never be dressed up as a revocation.
+#[test]
+fn a_notice_the_tables_say_nothing_about_keeps_the_stage_the_bridge_gave_it() {
+    let mut r = m4_renderer();
+    crate::ui::Renderer::note_steer(
+        &mut r,
+        &SteerTrace {
+            stage: SteerStage::Queued,
+            text: "instruction with an unknown notice id".to_string(),
+            target: "steer-absent-coder-t-013b".to_string(),
+            notice_id: Some("notice-t013b-never-filed".to_string()),
+            reason: "filed in the inbox".to_string(),
+        },
+    );
+    let before = r.messages.len();
+    r.refresh_steer_traces();
+    assert_eq!(
+        r.steer_traces[0].stage,
+        SteerStage::Queued,
+        "the tables said nothing, so nothing changed"
+    );
+    assert_eq!(r.messages.len(), before, "and nothing was announced");
+    assert_eq!(r.queued_steers(), 1);
+    assert!(
+        !r.messages.join("\n").contains("not delivered"),
+        "never a revocation the data does not support"
+    );
+}
+
+/// Affordance 3 in one frame: a stream the preemption handshake paused is marked on
+/// the roster, counted on the bar, and explained in its detail half — while a row the
+/// arbitrator never pauses carries no pause claim at all.
+#[test]
+fn a_paused_row_is_marked_counted_and_explained_in_the_new_frame() {
+    let mut r = m4_renderer();
+    r.subagents[0].paused = true;
+    let paused = draw_new_frame(&mut r, 160, 50).join("\n");
+    assert!(paused.contains('\u{23f8}'), "the roster glyph: {paused}");
+    assert!(paused.contains("paused"), "the roster word label: {paused}");
+    assert!(
+        paused.contains("1p"),
+        "the bar counts the held stream: {paused}"
+    );
+    assert!(
+        paused.contains("yielded its model slot") && paused.contains("Steer Arbitrator"),
+        "the detail half states the mechanism: {paused}"
+    );
+    assert!(
+        paused.contains("why: a steering instruction is being arbitrated"),
+        "and why: {paused}"
+    );
+
+    // Control: the same renderer with the flag cleared prints no pause cause anywhere,
+    // so the explanation cannot be a standing caption.
+    let mut running = m4_renderer();
+    let frame = draw_new_frame(&mut running, 160, 50).join("\n");
+    assert!(!frame.contains("model slot"), "{frame}");
+    assert!(!frame.contains("Steer Arbitrator"), "{frame}");
+}
+
+// ---- t-015: the log-merge and per-row-cap contract, re-established --------------
+//
+// The 46 tests retired with the legacy panes (commit `1b9f24d`) are mapped in
+// `docs/legacy_ui_removal.md` §"Re-established in t-015". This section re-establishes
+// the ones that guarded real logic rather than old frame chrome: the single `logs`
+// merge policy, the per-row cap, the queue/pause labelling, the status-row segments,
+// the restore seam, the registry identity rules, plan auto-scroll and the transcript
+// streaming gate. The assertions run on renderer state plus the surviving draw path
+// (`draw_new_ui` / the component render functions) instead of the deleted
+// `render_*` fns.
+
+/// Fixture for the merge tests: one authoritative row exactly as the session loop
+/// builds it — the effective registry key, live, carrying the lifecycle lines.
 fn auth_row(name: &str, logs: &[&str]) -> SubagentDetail {
     SubagentDetail {
         name: name.to_string(),
         is_active: true,
         logs: logs.iter().map(|line| line.to_string()).collect(),
-        ..Default::default()
+        ..SubagentDetail::default()
     }
 }
 
-/// The detail pane draws every log line of the selected row as its own `- <line>` terminal
-/// row (render.rs, the `[Logs]` block), so counting the terminal rows that carry that
-/// prefix counts **drawable** occurrences — a duplicate merge product would show up here.
+/// The log lines the Workers pane drew for the selected row, in drawn order, with the
+/// `- ` marker the pane writes stripped off. Matching is whole-line, so `line 5` can
+/// never be counted inside `line 50`.
+fn drawn_logs(rows: &[String]) -> Vec<String> {
+    rows.iter()
+        .filter_map(|row| {
+            // The pane draws a border column, so the log text starts after the first
+            // `│` and stops at the closing one; anything outside those is chrome.
+            let inner = match row.split_once('│') {
+                Some((_, rest)) => rest.to_string(),
+                None => row.clone(),
+            };
+            let trimmed = inner.trim_end_matches(|c: char| {
+                c.is_whitespace()
+                    || matches!(
+                        c,
+                        '\u{2502}' | '\u{2551}' | '\u{2503}' | '\u{25bc}' | '\u{25b2}'
+                    )
+            });
+            trimmed
+                .strip_prefix("- ")
+                .map(|rest| rest.trim_end().to_string())
+        })
+        .collect()
+}
+
+/// How many drawn log rows carry exactly `line`.
 fn drawn_occurrences(rows: &[String], line: &str) -> usize {
-    let needle = format!("- {line}");
-    rows.iter().filter(|row| row.contains(&needle)).count()
+    drawn_logs(rows)
+        .iter()
+        .filter(|drawn| drawn.as_str() == line)
+        .count()
 }
 
-/// The terminal row on which that log line is drawn, `None` when it is not drawn at all.
+/// The row index (in drawn-log order) of the first drawn log row equal to `line`.
 fn drawn_row_of(rows: &[String], line: &str) -> Option<usize> {
-    let needle = format!("- {line}");
-    rows.iter().position(|row| row.contains(&needle))
+    drawn_logs(rows).iter().position(|drawn| drawn == line)
 }
 
-/// The shape the report actually described: the loop pushes log lines, a projection lands
-/// in the middle of the round carrying none, the renderer streams another line onto the row
-/// in between, and the loop then re-pushes its original lines. Through the real push path
-/// the row must end up with exactly the ordered union — no duplicate of the re-pushed
-/// prefix, no reorder, nothing dropped — and that must be what is drawn.
+/// Draw only the Workers pane, at a caller-chosen size and detail offset, and report
+/// both the text of every row and the geometry the pane measured. The capped-log
+/// tests need a pane with room for a long detail body, and they need the geometry to
+/// know how far that body can scroll.
+fn draw_workers_pane(
+    rows: &[SubagentDetail],
+    selected: usize,
+    detail_scroll: u16,
+    show_thought: bool,
+    width: u16,
+    height: u16,
+) -> (Vec<String>, components::activity::WorkerGeometry) {
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut geometry = components::activity::WorkerGeometry::default();
+    terminal
+        .draw(|frame| {
+            let data = components::activity::ActivityData {
+                focus: true,
+                rows,
+                selected,
+                detail_present: true,
+                scroll: detail_scroll,
+                autoscroll: false,
+                list_scroll: 0,
+                show_thought,
+                thinking_budget: None,
+                steering: &[],
+            };
+            geometry = components::activity::render(
+                frame,
+                ratatui::layout::Rect::new(0, 0, width, height),
+                &data,
+            );
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let text = (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect();
+    (text, geometry)
+}
+
+/// G10/G1, re-established: `logs` has ONE documented merge policy — monotone adoption,
+/// no duplication, cap — and the interleaving the shipped cadence produces (delegation
+/// drains plus the in-sink pump plus the renderer's own streamed traffic) must end on
+/// exactly the ordered union of what each writer saw.
 #[test]
 fn an_interleaved_push_sequence_leaves_exactly_the_ordered_union_of_log_lines() {
     const ROW: &str = "coder-t-9520";
@@ -6043,8 +7374,8 @@ fn an_interleaved_push_sequence_leaves_exactly_the_ordered_union_of_log_lines() 
         "control: the first push for a row the renderer never opened adopts the loop's list"
     );
 
-    // Push B — the projection-only push. `helpers::apply_registry_entry` never writes the
-    // log field, so the row arrives with `logs: []`.
+    // Push B — the projection-only push. `helpers::apply_registry_entry` never writes
+    // the log field, so the row arrives with `logs: []`.
     r.set_subagents(vec![auth_row(ROW, &[])]);
     assert_eq!(
         r.subagents[0].logs,
@@ -6069,8 +7400,8 @@ fn an_interleaved_push_sequence_leaves_exactly_the_ordered_union_of_log_lines() 
         r.subagents[0].logs
     );
 
-    // Draw tier: each line is on screen once, and in that order.
-    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    // Draw tier, on the surviving surface: each line is on screen once, in that order.
+    let (rows, _) = draw_workers_pane(&r.subagents, 0, 0, false, 100, 30);
     let text = rows.join("\n");
     assert!(
         text.contains("[Logs]"),
@@ -6092,9 +7423,8 @@ fn an_interleaved_push_sequence_leaves_exactly_the_ordered_union_of_log_lines() 
     );
 }
 
-/// The 250 ms in-sink pump re-pushes the *same* row vector over and over. Beyond "no
-/// duplicates" this pins idempotence of the whole merge: after the first push the log list
-/// is byte-identical, push after push, and the pane keeps drawing each line once.
+/// Idempotence of the merge, re-established: pushing the identical row five times —
+/// the ordinary cadence — must leave the log list byte-identical after the first push.
 #[test]
 fn the_same_authoritative_row_pushed_five_times_leaves_the_log_list_byte_identical() {
     const ROW: &str = "coder-t-9530";
@@ -6110,8 +7440,8 @@ fn the_same_authoritative_row_pushed_five_times_leaves_the_log_list_byte_identic
         logs: vec![L1.to_string()],
         ..Default::default()
     });
-    // Live traffic the loop has never seen, so every push below is a merge against a row
-    // strictly longer than the loop's list.
+    // Live traffic the loop has never seen, so every push below is a merge against a
+    // row strictly longer than the loop's list.
     r.on_event(&Event::Status(format!("{ROW}: {L2}")));
     r.on_event(&Event::Status(format!("{ROW}: {L3}")));
 
@@ -6138,23 +7468,22 @@ fn the_same_authoritative_row_pushed_five_times_leaves_the_log_list_byte_identic
             vec![L1.to_string(), L2.to_string(), L3.to_string()],
             "push #{round} must not duplicate, drop or reorder a line"
         );
+    }
 
-        let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
-        let text = rows.join("\n");
-        for line in [L1, L2, L3] {
-            assert_eq!(
-                drawn_occurrences(&rows, line),
-                1,
-                "push #{round}: `{line}` must still be drawable exactly once, got:\n{text}"
-            );
-        }
+    let (rows, _) = draw_workers_pane(&r.subagents, 0, 0, false, 100, 30);
+    let text = rows.join("\n");
+    for line in [L1, L2, L3] {
+        assert_eq!(
+            drawn_occurrences(&rows, line),
+            1,
+            "`{line}` must still be drawable exactly once, got:\n{text}"
+        );
     }
 }
 
-/// The merge contract the `set_subagents_adopts_authoritative_list` comment states (a push
-/// merges instead of replacing) seen from the other side: when the loop genuinely knows
-/// more, its longer list is adopted as the base **without duplicating the prefix the row
-/// already carries**, and the renderer's own tail lines stay behind it.
+/// Prefix adoption, re-established: an incoming list that shares a prefix with the
+/// renderer's own list is adopted, the shared prefix stays counted once, and the
+/// renderer's streamed tail keeps the last position.
 #[test]
 fn a_longer_incoming_list_sharing_a_prefix_is_adopted_without_duplicating_that_prefix() {
     const ROW: &str = "coder-t-9540";
@@ -6168,8 +7497,6 @@ fn a_longer_incoming_list_sharing_a_prefix_is_adopted_without_duplicating_that_p
     let mut r = TuiRenderer::new();
     r.show_subagent_panel = true;
 
-    // The row as it stands mid-round: the loop's two lifecycle lines plus the renderer's
-    // own streamed tail.
     r.set_subagents(vec![auth_row(ROW, &[P1, P2])]);
     r.on_event(&Event::Status(format!("{ROW}: {TAIL}")));
     assert_eq!(
@@ -6178,7 +7505,6 @@ fn a_longer_incoming_list_sharing_a_prefix_is_adopted_without_duplicating_that_p
         "control: prefix + renderer tail before the longer push"
     );
 
-    // A longer list sharing the [P1, P2] prefix: adopted, prefix counted once each, tail kept.
     r.set_subagents(vec![auth_row(ROW, &[P1, P2, P3])]);
     assert_eq!(
         r.subagents[0].logs,
@@ -6186,13 +7512,12 @@ fn a_longer_incoming_list_sharing_a_prefix_is_adopted_without_duplicating_that_p
             P1.to_string(),
             P2.to_string(),
             P3.to_string(),
-            TAIL.to_string(),
+            TAIL.to_string()
         ],
         "the shared prefix must not be duplicated by the adopted list, got {:?}",
         r.subagents[0].logs
     );
 
-    // And again with a still longer list: the whole prefix collapses, the tail survives.
     r.set_subagents(vec![auth_row(ROW, &[P1, P2, P3, P4, P5])]);
     assert_eq!(
         r.subagents[0].logs,
@@ -6208,7 +7533,7 @@ fn a_longer_incoming_list_sharing_a_prefix_is_adopted_without_duplicating_that_p
         r.subagents[0].logs
     );
 
-    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let (rows, _) = draw_workers_pane(&r.subagents, 0, 0, false, 100, 30);
     let text = rows.join("\n");
     for line in [P1, P2, P3, P4, P5, TAIL] {
         assert_eq!(
@@ -6217,33 +7542,11 @@ fn a_longer_incoming_list_sharing_a_prefix_is_adopted_without_duplicating_that_p
             "`{line}` must be drawable exactly once after prefix adoption, got:\n{text}"
         );
     }
-    let positions: Vec<usize> = [P1, P2, P3, P4, P5, TAIL]
-        .iter()
-        .map(|line| drawn_row_of(&rows, line).expect("the line is drawable"))
-        .collect();
-    assert_eq!(
-        positions,
-        {
-            let mut sorted = positions.clone();
-            sorted.sort();
-            sorted
-        },
-        "adopted prefix lines and the surviving tail must reach the pane in merge order, got {positions:?}"
-    );
 }
 
-/// Dedup is content-sensitive and order-stable. Pinned against the actual body of
-/// `merge_logs` (`src/ui/tui/mod.rs:496`), whose test is `merged.contains(line)` over the
-/// whole merged list — not a "previous line" test. Two consequences, in both directions:
-/// 1. A repeat that already sits **inside the winning base** is copied verbatim: two
-///    legitimate occurrences of the same text at different positions in the stream stay
-///    two separate lines. That is the shape the renderer itself creates, because its own
-///    append path only skips an *immediate* repeat (`logs.last()` guard on the
-///    `Event::Status` / `ToolCall` / `ToolResult` arms), so a tool call that legitimately
-///    recurs later in the stream is on the row twice.
-/// 2. A repeat carried by the **losing** side never manufactures a second copy: it
-///    collapses into the copy the base already holds. Lines the base lacks are appended in
-///    the losing list's own order, so nothing ever reorders.
+/// Dedup honesty, re-established: the merge dedupes by content, not by count — a line
+/// the renderer legitimately streamed twice stays twice while the merge is running, and
+/// a repeat on the losing side collapses into the winning base's single copy.
 #[test]
 fn dedup_is_content_sensitive_and_order_stable_across_a_legitimately_repeating_line() {
     const ROW: &str = "researcher-t-9550";
@@ -6265,15 +7568,14 @@ fn dedup_is_content_sensitive_and_order_stable_across_a_legitimately_repeating_l
     );
 
     // A projection-only push: the renderer's list is the base, so both occurrences of R1
-    // survive verbatim — content dedup never collapses a repeat that is already inside the
-    // winning base.
+    // survive verbatim — content dedup never collapses a repeat already inside the base.
     r.set_subagents(vec![auth_row(ROW, &[])]);
     assert_eq!(
         r.subagents[0].logs,
         vec![R1.to_string(), M1.to_string(), R1.to_string()],
         "a log-free push must not fold the two legitimate occurrences into one"
     );
-    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let (rows, _) = draw_workers_pane(&r.subagents, 0, 0, false, 100, 30);
     let text = rows.join("\n");
     assert_eq!(
         drawn_occurrences(&rows, R1),
@@ -6282,9 +7584,9 @@ fn dedup_is_content_sensitive_and_order_stable_across_a_legitimately_repeating_l
     );
     assert_eq!(drawn_occurrences(&rows, M1), 1, "got:\n{text}");
 
-    // Now the loop wins (its list is at least as long) and carries R1 once: its list is the
-    // base, the renderer's missing line is appended in its own order, and the renderer's
-    // second R1 collapses into the base's single copy instead of being appended again.
+    // Now the loop wins (its list is at least as long) and carries R1 once: its list is
+    // the base, the renderer's missing line follows in its own order, and the renderer's
+    // second R1 collapses into the base's copy instead of being appended again.
     r.set_subagents(vec![auth_row(ROW, &[S1, R1, R3])]);
     assert_eq!(
         r.subagents[0].logs,
@@ -6298,7 +7600,7 @@ fn dedup_is_content_sensitive_and_order_stable_across_a_legitimately_repeating_l
          second copy of a text the base already holds is appended, got {:?}",
         r.subagents[0].logs
     );
-    let (rows, _) = draw_subagent_panel(&mut r, 100, 30);
+    let (rows, _) = draw_workers_pane(&r.subagents, 0, 0, false, 100, 30);
     let text = rows.join("\n");
     assert_eq!(
         drawn_occurrences(&rows, R1),
@@ -6313,157 +7615,60 @@ fn dedup_is_content_sensitive_and_order_stable_across_a_legitimately_repeating_l
         at.windows(2).all(|pair| pair[0] < pair[1]),
         "the merge is order-stable in the pane ({at:?}), got:\n{text}"
     );
+}
 
-    // Idempotence of that content dedup: re-pushing the shorter list again changes nothing.
-    r.set_subagents(vec![auth_row(ROW, &[S1, R1, R3])]);
+/// The log-free push, re-established: a projection-only push must never empty a row
+/// that has lines, and keeping the content must not cost the row its queue rank.
+#[test]
+fn a_push_carrying_no_log_lines_never_empties_a_row_that_has_them() {
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.subagents.push(SubagentDetail {
+        name: "coder-t-9401".to_string(),
+        is_active: true,
+        queue: Some(crate::ui::QueueState { position: 1, of: 2 }),
+        logs: vec![
+            "started task t-9401".to_string(),
+            "calling backend (gpt-6-x) for t-9401".to_string(),
+        ],
+        ..Default::default()
+    });
+
+    r.set_subagents(vec![queue_row(
+        "coder-t-9401",
+        true,
+        Some(crate::ui::QueueState { position: 1, of: 2 }),
+    )]);
     assert_eq!(
         r.subagents[0].logs,
         vec![
-            S1.to_string(),
-            R1.to_string(),
-            R3.to_string(),
-            M1.to_string()
+            "started task t-9401".to_string(),
+            "calling backend (gpt-6-x) for t-9401".to_string(),
         ],
-        "re-pushing a list whose lines the row already carries is a no-op, got {:?}",
-        r.subagents[0].logs
+        "a log-free push leaves the row's drawable log list alone"
     );
-}
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Per-row LOG-CAP coverage driven through the REAL push path: the session loop's pump
-// hands over the same authoritative row vector again and again
-// (`Renderer::set_subagents` -> `merge_logs`, src/ui/tui/mod.rs:1186 / :496) while the
-// renderer's own `Event::Status` routing streams a long-running worker's traffic onto
-// that row (src/ui/tui/mod.rs:776+). `the_per_row_log_cap_keeps_the_newest_lines`
-// above pins the cap inside the pure function only; the tests below pin what a worker
-// running for hours does on a live renderer: bounded at EVERY pump rather than only at
-// the end, newest lines kept in stream order, the cap binding per row, and the capped
-// list surviving an authoritative push whose log list is empty.
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// A test terminal tall enough that the detail pane draws **every** retained log line
-/// of the selected row (cap + `=== Details … ===` + `[Logs]` = 202 lines), so the
-/// count of drawn log rows is the drawable log count rather than a scrolled window.
-const CAP_TALL: u16 = 240;
-
-/// The log lines the detail pane draws for the selected row, in draw order, as their
-/// position in the stream. Every line streamed by the tests below is spelled
-/// `<prefix><n>`, and the detail pane draws each retained log line as its own
-/// `- <line>` terminal row (render.rs, the `[Logs]` block) — so this counts drawable
-/// occurrences on the terminal, not model entries.
-fn drawn_line_numbers(rows: &[String], prefix: &str) -> Vec<usize> {
-    let needle = format!("- {prefix}");
-    rows.iter()
-        .filter_map(|row| {
-            let at = row.find(&needle)?;
-            let digits: String = row[at + needle.len()..]
-                .chars()
-                .take_while(char::is_ascii_digit)
-                .collect();
-            digits.parse::<usize>().ok()
-        })
-        .collect()
-}
-
-/// A worker that never stops streaming: the pump re-pushes the same authoritative row
-/// vector (log-free, the shape `helpers::apply_registry_entry` produces) after every
-/// chunk of status traffic, and the renderer routes each line onto the row. Past the cap
-/// the row must sit exactly AT it after every single pump — not merely at the end of the
-/// run — both in the model and on the terminal, and what it retains must be exactly the
-/// newest `MAX_SUBAGENT_ROW_LOGS` lines in stream order, with the oldest ones gone.
-#[test]
-fn a_long_running_worker_stays_at_the_per_row_log_cap_at_every_pump_and_keeps_the_newest_lines() {
-    const ROW: &str = "coder-t-9660";
-    const CHUNK: usize = 10;
-    const PUMPS: usize = 30; // 300 streamed lines, 100 past the cap
-    const MAX: usize = MAX_SUBAGENT_ROW_LOGS;
-
-    let mut r = TuiRenderer::new();
-    r.show_subagent_panel = true;
-    r.set_subagents(vec![auth_row(ROW, &[])]);
-    assert_eq!(r.subagents.len(), 1, "control: the pump opens the row");
+    let (rows, _) = draw_workers_pane(&r.subagents, 0, 0, false, 100, 30);
+    let text = rows.join("\n");
     assert!(
-        r.subagents[0].logs.is_empty(),
-        "control: a projection-only push carries no log lines of its own"
+        text.contains("[Logs]")
+            && text.contains("started task t-9401")
+            && text.contains("calling backend (gpt-6-x) for t-9401"),
+        "the log half of the detail pane is still drawn after the log-free push, got:\n{text}"
     );
-
-    let mut streamed: Vec<String> = Vec::new();
-
-    for pump in 1..=PUMPS {
-        for k in 0..CHUNK {
-            let n = (pump - 1) * CHUNK + k;
-            r.on_event(&Event::Status(format!("{ROW}: line {n}")));
-            streamed.push(format!("line {n}"));
-            // The streaming arm has no cap of its own — only `merge_logs` trims — so
-            // between two pumps a row may sit above the cap by at most the traffic that
-            // arrived since the last pump, never by the whole run.
-            assert!(
-                r.subagents[0].logs.len() <= MAX + CHUNK,
-                "streamed line {n} (pump #{pump}): the row ran away to {} lines, more than \
-                 the cap of {MAX} plus one chunk of traffic",
-                r.subagents[0].logs.len()
-            );
-        }
-
-        // The same authoritative vector, handed over again.
-        r.set_subagents(vec![auth_row(ROW, &[])]);
-        let logs = r.subagents[0].logs.clone();
-        assert!(
-            logs.len() <= MAX,
-            "pump #{pump}: the row holds {} log lines after the push, above the cap of {MAX}",
-            logs.len()
-        );
-
-        let (rows, _) = draw_subagent_panel(&mut r, 100, CAP_TALL);
-        let drawn = drawn_line_numbers(&rows, "line ");
-        assert!(
-            drawn.len() <= MAX,
-            "pump #{pump}: the pane draws {} log lines after the push, above the cap of {MAX}",
-            drawn.len()
-        );
-
-        if streamed.len() > MAX {
-            let expected: Vec<String> = streamed[(streamed.len() - MAX)..].to_vec();
-            assert_eq!(
-                logs.len(),
-                MAX,
-                "pump #{pump}: once past the cap the row must sit exactly AT it, got {} lines",
-                logs.len()
-            );
-            assert_eq!(
-                logs, expected,
-                "pump #{pump}: past the cap the row must retain exactly the newest {MAX} lines \
-                 in their original stream order — no oldest survivor, no reorder — got {logs:?}"
-            );
-            assert!(
-                !logs.iter().any(|line| line == "line 0"),
-                "pump #{pump}: the oldest streamed line must be the first thing the cap drops"
-            );
-            let expected_drawn: Vec<usize> = ((streamed.len() - MAX)..streamed.len()).collect();
-            assert_eq!(
-                drawn, expected_drawn,
-                "pump #{pump}: the pane must draw exactly the newest {MAX} lines, in stream order"
-            );
-        } else {
-            assert_eq!(
-                logs.len(),
-                streamed.len(),
-                "pump #{pump}: below the cap nothing is dropped yet"
-            );
-            assert_eq!(
-                drawn.len(),
-                streamed.len(),
-                "pump #{pump}: below the cap every streamed line stays drawable"
-            );
-        }
-    }
+    let roster = rows
+        .iter()
+        .find(|row| row.contains("coder"))
+        .unwrap_or_else(|| panic!("the roster row for the delegation is missing:\n{text}"));
+    assert!(
+        roster.contains("1/2"),
+        "keeping the content never costs the queued rank: {roster}"
+    );
 }
 
-/// The cap is per row, not per renderer. Two workers stream at the same time and
-/// asymmetrically — one ends 60 lines past the cap, the other 34 — and every pump
-/// carries BOTH rows in one vector. Neither row may spend the other's budget: each must
-/// sit exactly at the cap holding its own newest lines, and each must still show a full
-/// capped log when it is the selected row.
+/// The per-row cap, re-established on the surviving surface: 200 lines per row, paid
+/// for by that row's own stream. Two rows are pumped with different line counts, and
+/// every pump must leave each row on exactly its own newest lines.
 #[test]
 fn the_per_row_log_cap_binds_each_row_on_its_own_stream() {
     const A: &str = "coder-t-9670";
@@ -6499,8 +7704,7 @@ fn the_per_row_log_cap_binds_each_row_on_its_own_stream() {
             }
         }
 
-        // Routing control: interleaved traffic never crosses rows, and each row's newest
-        // line is the line just streamed for it.
+        // Routing control: interleaved traffic never crosses rows.
         assert!(
             r.subagents[0]
                 .logs
@@ -6519,67 +7723,23 @@ fn the_per_row_log_cap_binds_each_row_on_its_own_stream() {
         );
 
         r.set_subagents(vec![auth_row(A, &[]), auth_row(B, &[])]);
-        let a = r.subagents[0].logs.clone();
-        let b = r.subagents[1].logs.clone();
-
         assert_eq!(
-            a,
+            r.subagents[0].logs,
             capped_tail(&a_stream),
-            "pump #{pump}: row {A} must retain exactly its own newest lines, got {a:?}"
+            "pump #{pump}: row {A} must retain exactly its own newest lines"
         );
         assert_eq!(
-            b,
+            r.subagents[1].logs,
             capped_tail(&b_stream),
             "pump #{pump}: row {B} must retain exactly its own newest lines — its budget is \
-             never spent by {A}'s stream — got {b:?}",
-        );
-        assert_eq!(
-            a.len() + b.len(),
-            capped_tail(&a_stream).len() + capped_tail(&b_stream).len(),
-            "pump #{pump}: the two rows are capped independently"
-        );
-
-        // Draw tier, for both rows, at every pump.
-        r.selected_subagent_idx = 0;
-        let (rows, _) = draw_subagent_panel(&mut r, 100, CAP_TALL);
-        let drawn_a = drawn_line_numbers(&rows, "step ");
-        assert_eq!(
-            drawn_a.len(),
-            capped_tail(&a_stream).len(),
-            "pump #{pump}: the pane draws exactly {A}'s retained log lines"
-        );
-        assert!(
-            drawn_line_numbers(&rows, "probe ").is_empty(),
-            "pump #{pump}: selecting {A} must never draw {B}'s log lines"
-        );
-
-        r.selected_subagent_idx = 1;
-        let (rows, _) = draw_subagent_panel(&mut r, 100, CAP_TALL);
-        let drawn_b = drawn_line_numbers(&rows, "probe ");
-        assert_eq!(
-            drawn_b.len(),
-            capped_tail(&b_stream).len(),
-            "pump #{pump}: the pane draws exactly {B}'s retained log lines"
-        );
-        assert!(
-            drawn_line_numbers(&rows, "step ").is_empty(),
-            "pump #{pump}: selecting {B} must never draw {A}'s log lines"
+             never spent by {A}'s stream"
         );
     }
 
-    // Both workers ended past the cap; both sit exactly at it, neither starved.
-    assert_eq!(
-        r.subagents[0].logs.len(),
-        MAX,
-        "row {A} streamed {} lines and must end at the cap",
-        a_stream.len()
-    );
-    assert_eq!(
-        r.subagents[1].logs.len(),
-        MAX,
-        "row {B} streamed {} lines and must end at the cap",
-        b_stream.len()
-    );
+    // Both workers ended past the cap; both sit exactly at it, neither starved, and each
+    // dropped its OWN oldest lines.
+    assert_eq!(r.subagents[0].logs.len(), MAX);
+    assert_eq!(r.subagents[1].logs.len(), MAX);
     assert_eq!(
         r.subagents[0].logs.last().map(String::as_str),
         a_stream.last().map(String::as_str),
@@ -6595,14 +7755,52 @@ fn the_per_row_log_cap_binds_each_row_on_its_own_stream() {
             && !r.subagents[1].logs.iter().any(|line| line == "probe 0"),
         "each row dropped its own oldest lines, not the other row's"
     );
+
+    // Draw tier for both rows: the pane draws the retained list, in order, one row's
+    // lines at a time, and the cap's first victim is never drawable at all.
+    for (index, prefix) in [(0usize, "step "), (1usize, "probe ")] {
+        let row = r.subagents[index].name.clone();
+        let (head, geometry) = draw_workers_pane(&r.subagents, index, 0, false, 100, 40);
+        let retained = r.subagents[index].logs.clone();
+        let shown = drawn_logs(&head);
+        assert!(
+            !shown.is_empty(),
+            "the capped row {prefix}… is still drawn at all:\n{}",
+            head.join("\n")
+        );
+        assert_eq!(
+            shown,
+            retained[..shown.len()],
+            "selecting {row} draws its own retained lines, in order, from the top"
+        );
+        assert!(
+            shown.iter().all(|line| line.starts_with(prefix)),
+            "selecting {row} draws not one line of the other row's stream"
+        );
+        assert!(
+            geometry.detail_max > 0,
+            "the capped body is taller than the pane, so the geometry says so"
+        );
+        let (tail, _) = draw_workers_pane(
+            &r.subagents,
+            index,
+            u16::try_from(geometry.detail_max).expect("a detail offset that fits a u16"),
+            false,
+            100,
+            40,
+        );
+        assert!(
+            drawn_logs(&tail)
+                .iter()
+                .any(|line| line == retained.last().expect("a retained line")),
+            "the newest retained line of {row} is reachable by scrolling the detail half"
+        );
+    }
 }
 
-/// Cross-push stability: once a row is capped, an authoritative push carrying an EMPTY
-/// log list must not shrink or clear it. That is the ordinary shape of the pump (the
-/// registry projection never writes the log field), so a capped list that such a push
-/// truncated would throw away the operator's whole visible log between two chunks of
-/// traffic. Pushed repeatedly with no new traffic in between, the list must stay
-/// byte-identical — and fully drawable — push after push.
+/// A capped row pushed empty, re-established: the empty-log push neither shrinks nor
+/// clears the capped list, and a push carrying a line the row already holds neither
+/// grows it past the cap nor reorders it.
 #[test]
 fn an_empty_log_push_after_the_cap_neither_shrinks_nor_clears_the_capped_list() {
     const ROW: &str = "coder-t-9680";
@@ -6640,62 +7838,38 @@ fn an_empty_log_push_after_the_cap_neither_shrinks_nor_clears_the_capped_list() 
             MAX,
             "empty-log push #{push}: still exactly at the cap, never shrunk or cleared"
         );
-        assert_eq!(
-            r.subagents[0].logs.first(),
-            capped.first(),
-            "empty-log push #{push}: the retained oldest line is unchanged"
-        );
-        assert_eq!(
-            r.subagents[0].logs.last(),
-            capped.last(),
-            "empty-log push #{push}: the newest line is unchanged"
-        );
-        let (rows, _) = draw_subagent_panel(&mut r, 100, CAP_TALL);
-        assert_eq!(
-            drawn_line_numbers(&rows, "line ").len(),
-            MAX,
-            "empty-log push #{push}: the whole capped list is still drawable"
-        );
     }
 
-    // A push carrying a line the capped row already holds is just as harmless: the list
-    // neither grows past the cap nor reorders.
+    // A push carrying a line the capped row already holds is just as harmless.
     let newest = r.subagents[0]
         .logs
         .last()
         .cloned()
-        .expect("a capped row has a last line");
+        .expect("the capped row has a newest line");
     r.set_subagents(vec![auth_row(ROW, &[newest.as_str()])]);
+    assert_eq!(r.subagents[0].logs.len(), MAX, "still exactly at the cap");
     assert_eq!(
-        r.subagents[0].logs.join("\n").into_bytes(),
-        capped_bytes,
-        "re-pushing a line the capped row already holds must not grow or reorder it, got {:?}",
-        r.subagents[0].logs
+        r.subagents[0].logs, capped,
+        "and unchanged in content and order"
     );
 
-    // And the cap still holds once traffic resumes after those pushes.
-    for n in STREAM..(STREAM + 30) {
-        r.on_event(&Event::Status(format!("{ROW}: line {n}")));
-    }
-    r.set_subagents(vec![auth_row(ROW, &[])]);
+    // The retained window is still drawn, from its oldest retained line.
+    let (rows, _) = draw_workers_pane(&r.subagents, 0, 0, false, 100, 40);
+    let shown = drawn_logs(&rows);
     assert_eq!(
-        r.subagents[0].logs.len(),
-        MAX,
-        "the row is back at the cap once traffic resumes"
+        shown,
+        capped[..shown.len()],
+        "the capped head of the list is drawn"
     );
-    assert_eq!(
-        r.subagents[0].logs.last().map(String::as_str),
-        Some(format!("line {}", STREAM + 29)).as_deref(),
-        "and it ends on the newest streamed line"
+    assert!(
+        !shown.iter().any(|line| line == "line 0"),
+        "the line the cap dropped is not drawn, got {shown:?}"
     );
 }
 
-/// PINNED FINDING, not an endorsement — no production code was changed. The merge rule
-/// "the losing side's missing lines are appended" (`merge_logs`) meets the cap: a
-/// lifecycle line the loop's row still carries can be trimmed OUT of the row by the cap,
-/// and the very next pump appends it again — at the TAIL — so a line reappears long after
-/// it scrolled past, at the cost of one genuinely newer line. Bounded and deterministic,
-/// so the assertions below pin today's behaviour for review rather than change it.
+/// The cap's interaction with the loop's own lifecycle line, re-established: the pump
+/// that trims drops the oldest entry (the lifecycle line), and the next pump puts it
+/// back — at the tail, because the merge is append-only.
 #[test]
 fn a_lifecycle_line_the_cap_has_already_trimmed_is_re_appended_at_the_tail_by_the_next_pump() {
     const ROW: &str = "coder-t-9690";
@@ -6705,7 +7879,6 @@ fn a_lifecycle_line_the_cap_has_already_trimmed_is_re_appended_at_the_tail_by_th
     let mut r = TuiRenderer::new();
     r.show_subagent_panel = true;
 
-    // The loop opens the row with the one lifecycle line its row carries.
     r.set_subagents(vec![auth_row(ROW, &[LIFECYCLE])]);
     assert_eq!(
         r.subagents[0].logs,
@@ -6734,11 +7907,7 @@ fn a_lifecycle_line_the_cap_has_already_trimmed_is_re_appended_at_the_tail_by_th
     // Pump 2: the loop still carries that line and the row no longer holds it, so the
     // merge appends it at the tail and a genuinely newer line pays for it.
     r.set_subagents(vec![auth_row(ROW, &[LIFECYCLE])]);
-    assert_eq!(
-        r.subagents[0].logs.len(),
-        MAX,
-        "the row is still exactly at the cap"
-    );
+    assert_eq!(r.subagents[0].logs.len(), MAX, "still exactly at the cap");
     assert_eq!(
         r.subagents[0].logs.last().map(String::as_str),
         Some(LIFECYCLE),
@@ -6750,8 +7919,7 @@ fn a_lifecycle_line_the_cap_has_already_trimmed_is_re_appended_at_the_tail_by_th
         "the line the cap drops is the oldest streamed one, not the re-appended stale line"
     );
 
-    // From then on it behaves like any other line: it drifts forward through the stream
-    // and is only dropped when it reaches the front again.
+    // From then on it behaves like any other line: it drifts forward through the stream.
     r.on_event(&Event::Status(format!("{ROW}: line {MAX}")));
     r.set_subagents(vec![auth_row(ROW, &[LIFECYCLE])]);
     assert_eq!(r.subagents[0].logs.len(), MAX);
@@ -6773,19 +7941,1835 @@ fn a_lifecycle_line_the_cap_has_already_trimmed_is_re_appended_at_the_tail_by_th
     assert_eq!(
         at,
         MAX - 2,
-        "it now sits in the middle of the stream, between the traffic it displaced and the \
-         newest line"
+        "it now sits inside the stream, not at either end"
     );
 
-    let (rows, _) = draw_subagent_panel(&mut r, 100, CAP_TALL);
+    let (rows, _) = draw_workers_pane(&r.subagents, 0, 0, false, 100, 40);
     assert_eq!(
         drawn_occurrences(&rows, LIFECYCLE),
-        1,
-        "the resurrected lifecycle line is drawn once, inside the capped window"
+        0,
+        "the resurrected line is inside the capped window, past the drawn head"
+    );
+    let shown = drawn_logs(&rows);
+    assert_eq!(shown.first().map(String::as_str), Some("line 2"));
+}
+
+// ---- t-015: the queue rank and the arbitration pause on the new roster ----------
+
+/// The one frame row of the Workers pane that names `needle` (the roster row and the
+/// detail header repeat the same spans, so the caller picks which one it wants).
+fn roster_row_of(rows: &[String], needle: &str) -> String {
+    rows.iter()
+        .find(|row| row.contains(needle) && !row.contains("[Logs]"))
+        .cloned()
+        .unwrap_or_else(|| panic!("no drawn row carries {needle:?}:\n{}", rows.join("\n")))
+}
+
+/// The roster half of a drawn Workers pane, in row order: everything between the
+/// frame's top border and the divider that opens the detail half. A registry row is
+/// badged and measured from its entry, not labelled with its key, so the collision
+/// tests need the row itself rather than a needle search.
+fn roster_lines(rows: &[String]) -> Vec<String> {
+    rows.iter()
+        .skip(1)
+        .take_while(|row| !row.trim_start_matches('│').starts_with('─'))
+        .filter(|row| {
+            row.contains('\u{25b6}')
+                || row.contains('\u{23f8}')
+                || row.contains('\u{29d7}')
+                || row.contains('\u{2713}')
+        })
+        .cloned()
+        .collect()
+}
+
+/// The queue rank, re-established on the surviving row: the rank rides the state
+/// fields, and the neighbours of a queued row keep the state and metrics they own.
+/// This is also where the per-row `N ctx` and the elapsed clock are re-pinned — the
+/// two counters the retired `render_subagents` tests used to assert.
+#[test]
+fn a_queued_row_is_ranked_on_its_roster_row_and_its_neighbours_keep_their_own_state() {
+    let now = std::time::Instant::now();
+    let mut queued = queue_row(
+        "coder-t-9701",
+        true,
+        Some(crate::ui::QueueState { position: 2, of: 4 }),
+    );
+    queued.task_id = Some("t-9701".to_string());
+    queued.context_tokens = 3_500;
+    queued.started_at = Some(now - Duration::from_secs(5));
+    let mut running = queue_row("coder_specialist-t-9702", true, None);
+    running.task_id = Some("t-9702".to_string());
+    running.context_tokens = 1_200;
+    running.worked_duration = Duration::from_secs(61);
+    let mut closed = queue_row("researcher-t-9703", false, None);
+    closed.task_id = Some("t-9703".to_string());
+    closed.context_tokens = 400;
+    let rows = vec![queued, running, closed];
+
+    let (drawn, _) = draw_workers_pane(&rows, 0, 0, false, 90, 16);
+
+    let queued_row = roster_row_of(&drawn, "coder");
+    assert!(
+        queued_row.contains('\u{29d7}') && queued_row.contains("queued"),
+        "a queued row reads as waiting for a slot, never as holding one: {queued_row:?}"
+    );
+    assert!(
+        queued_row.contains("2/4"),
+        "the rank is on the row: {queued_row:?}"
+    );
+    assert!(
+        queued_row.contains("3.5k ctx"),
+        "the row's own ctx mirror survives next to the rank: {queued_row:?}"
+    );
+    assert!(
+        queued_row.contains("5s"),
+        "the row's own clock survives next to the rank: {queued_row:?}"
+    );
+    assert!(
+        !queued_row.contains("running"),
+        "a queued row does not claim it holds its slot: {queued_row:?}"
+    );
+    assert!(
+        !queued_row.contains("done"),
+        "a queued row is still part of the round: {queued_row:?}"
+    );
+
+    // Neighbours: the row that holds its slot is unranked and keeps its own counters,
+    // and the closed row is neither ranked nor counted as live.
+    let running_row = roster_row_of(&drawn, "t-9702");
+    assert!(
+        running_row.contains('\u{25b6}'),
+        "the row holding its slot reads running: {running_row:?}"
+    );
+    assert!(
+        !running_row.contains("2/4"),
+        "the rank belongs to the queued row only: {running_row:?}"
+    );
+    assert!(
+        running_row.contains("1.2k ctx") && running_row.contains("1m 1s"),
+        "the unranked row keeps its own ctx and elapsed: {running_row:?}"
+    );
+    let closed_row = roster_row_of(&drawn, "t-9703");
+    assert!(
+        closed_row.contains('\u{2713}'),
+        "a finished row reads done: {closed_row:?}"
+    );
+    assert!(
+        closed_row.contains("400 ctx"),
+        "a closed row keeps its ctx for recall: {closed_row:?}"
+    );
+    assert!(
+        !closed_row.contains("3/5") && !closed_row.contains("2/4"),
+        "the rank belongs to one row only: {closed_row:?}"
+    );
+}
+
+/// A row the round no longer holds must never advertise a slot position, re-established.
+/// The rank is suppressed for a row that is not part of the round; the *glyph* on the
+/// other hand follows the projected queue flag (§7.2), which is why this test asserts
+/// the rank and not the word label the retired pane printed.
+#[test]
+fn a_row_that_is_not_running_never_shows_a_queue_position() {
+    let rows = vec![queue_row(
+        "coder-t-9704",
+        false,
+        Some(crate::ui::QueueState { position: 3, of: 5 }),
+    )];
+    let (drawn, geometry) = draw_workers_pane(&rows, 0, 0, false, 90, 16);
+    let text = drawn.join("\n");
+    assert!(
+        !text.contains("3/5"),
+        "no queue rank for a row that is not running, got:\n{text}"
+    );
+    assert!(
+        !geometry.detail_present || !text.contains("why: a steering instruction"),
+        "a closed row states no live cause, got:\n{text}"
+    );
+}
+
+/// Selection and list window are renderer state, re-established: a slot transition
+/// never reselects a row and never scrolls the roster window out from under the
+/// operator, however the rank digits move.
+#[test]
+fn queue_position_updates_never_move_the_selection_or_the_list_window() {
+    let mut r = TuiRenderer::new();
+    for n in 1..=7 {
+        let mut detail = queue_row(&format!("coder-t-{n}"), true, None);
+        detail.task_id = Some(format!("t-{n}"));
+        r.subagents.push(detail);
+    }
+    // Seven rows in a five-row window: the selection has to be scrolled into view,
+    // which is exactly the state a reselect would silently destroy.
+    r.selected_subagent_idx = 6;
+
+    let (before, geometry) =
+        draw_workers_pane(&r.subagents, r.selected_subagent_idx, 0, false, 90, 12);
+    assert_eq!(
+        geometry.roster_scroll, 2,
+        "the selected row is scrolled into view once, with the top rows out of the window"
+    );
+    let selected_line = before
+        .iter()
+        .position(|line| line.contains("> ") && line.contains("coder t-7 "))
+        .expect("the selected row is visible");
+    assert!(
+        !before.iter().any(|line| line.contains("coder t-1 ")),
+        "the first rows are scrolled out of the window:\n{}",
+        before.join("\n")
+    );
+
+    for (position, of) in [(4usize, 6usize), (2, 6), (1, 3)] {
+        // Half of the round queues: once through the renderer's own delegation arm,
+        // once through the session loop's authoritative push.
+        for task in ["t-3", "t-7"] {
+            r.on_event(&Event::Delegation(
+                crate::orchestrator::DelegationEvent::Queued {
+                    agent: crate::agents::Agent::Coder,
+                    task: Some(task.to_string()),
+                    position,
+                    of,
+                },
+            ));
+        }
+        let mut authoritative = r.subagents.clone();
+        for detail in &mut authoritative {
+            detail.queue = match detail.name.as_str() {
+                "coder-t-3" | "coder-t-7" => Some(crate::ui::QueueState { position, of }),
+                _ => None,
+            };
+        }
+        r.set_subagents(authoritative);
+
+        assert_eq!(
+            r.selected_subagent_idx, 6,
+            "a slot transition never reselects"
+        );
+        let (after, geometry) = draw_workers_pane(
+            &r.subagents,
+            r.selected_subagent_idx,
+            geometry.roster_scroll,
+            false,
+            90,
+            12,
+        );
+        assert_eq!(
+            geometry.roster_scroll, 2,
+            "a slot transition never scrolls the list window"
+        );
+        assert_eq!(
+            after
+                .iter()
+                .position(|line| line.contains("> ") && line.contains("coder t-7 ")),
+            Some(selected_line),
+            "the selected row stays on the same terminal line, got:\n{}",
+            after.join("\n")
+        );
+        let queued_row = after
+            .iter()
+            .find(|line| line.contains("coder t-3 "))
+            .expect("the other queued row is still in the window");
+        assert!(
+            queued_row.contains(&format!("{position}/{of}")),
+            "only the two queued labels change, and only their digits: {queued_row:?}"
+        );
+        assert!(
+            !queued_row.contains("> "),
+            "the unselected row keeps its gutter: {queued_row:?}"
+        );
+    }
+}
+
+/// Every rank edge, re-established through both writers: the loop's authoritative push
+/// and the renderer's own delegation fold, in both directions, with no residue of the
+/// rank that was and no emptied detail pane.
+#[test]
+fn a_re_queued_row_follows_every_rank_edge_in_its_label_and_its_bar() {
+    let row = |queue: Option<crate::ui::QueueState>| SubagentDetail {
+        name: "coder-t-9705".to_string(),
+        task_id: Some("t-9705".to_string()),
+        is_active: true,
+        queue,
+        content: "first round of the delegation".to_string(),
+        logs: vec!["started task t-9705".to_string()],
+        ..SubagentDetail::default()
+    };
+
+    // Edge 1: queued 2/3, pushed authoritatively by the session loop.
+    let rows = vec![row(Some(crate::ui::QueueState { position: 2, of: 3 }))];
+    let (drawn, _) = draw_workers_pane(&rows, 0, 0, true, 90, 24);
+    let text = drawn.join("\n");
+    let roster = roster_row_of(&drawn, "coder");
+    assert!(
+        roster.contains("2/3") && roster.contains('\u{29d7}'),
+        "the queued row is ranked and marked: {roster:?}"
+    );
+    assert!(
+        text.contains("[Output]")
+            && text.contains("first round of the delegation")
+            && text.contains("[Logs]")
+            && text.contains("started task t-9705"),
+        "a queued row is never an empty row, got:\n{text}"
+    );
+
+    // Edge 2: the first in the queue, same writer.
+    let rows = vec![row(Some(crate::ui::QueueState { position: 1, of: 3 }))];
+    let (drawn, _) = draw_workers_pane(&rows, 0, 0, true, 90, 24);
+    let roster = roster_row_of(&drawn, "coder");
+    assert!(
+        roster.contains("1/3") && !roster.contains("2/3"),
+        "a re-queued row shows its new rank with no residue: {roster:?}"
+    );
+
+    // Edge 3: the last in the queue.
+    let rows = vec![row(Some(crate::ui::QueueState { position: 3, of: 3 }))];
+    let (drawn, _) = draw_workers_pane(&rows, 0, 0, true, 90, 24);
+    let roster = roster_row_of(&drawn, "coder");
+    assert!(
+        roster.contains("3/3"),
+        "the last rank is drawn too: {roster:?}"
+    );
+
+    // The same edges through the other writer: the delegation-event fold.
+    let mut r = TuiRenderer::new();
+    r.set_subagents(vec![row(Some(crate::ui::QueueState {
+        position: 1,
+        of: 2,
+    }))]);
+    let (drawn, _) = draw_workers_pane(&r.subagents, 0, 0, true, 90, 24);
+    let roster = roster_row_of(&drawn, "coder");
+    assert!(
+        roster.contains("1/2"),
+        "the pushed rank is on the row: {roster:?}"
+    );
+
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Running {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-9705".to_string()),
+        },
+    ));
+    let (drawn, _) = draw_workers_pane(&r.subagents, 0, 0, true, 90, 24);
+    let text = drawn.join("\n");
+    let roster = roster_row_of(&drawn, "coder");
+    assert!(
+        roster.contains('\u{25b6}') && !text.contains("1/2"),
+        "the `Running` fold takes the rank down and the row reads running, got:\n{text}"
+    );
+
+    r.on_event(&Event::Delegation(
+        crate::orchestrator::DelegationEvent::Queued {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-9705".to_string()),
+            position: 3,
+            of: 5,
+        },
+    ));
+    let (drawn, _) = draw_workers_pane(&r.subagents, 0, 0, true, 90, 24);
+    let text = drawn.join("\n");
+    let roster = roster_row_of(&drawn, "coder");
+    assert!(
+        roster.contains("3/5") && roster.contains('\u{29d7}'),
+        "the `Queued` fold restores the rank with the new digits, got:\n{text}"
+    );
+    assert!(
+        text.contains("first round of the delegation") && text.contains("[Logs]"),
+        "a queue edge never empties the detail pane, got:\n{text}"
+    );
+}
+
+/// The arbitration pause, re-established: a held stream is marked and counted, keeps
+/// the live shape (role, ctx, clock) of the row it belongs to, and is never ranked.
+#[test]
+fn a_held_stream_is_labelled_paused_and_keeps_its_live_shape() {
+    let mut held = queue_row("coder-t-9706", true, None);
+    held.paused = true;
+    held.task_id = Some("t-9706".to_string());
+    held.context_tokens = 4_300;
+    held.worked_duration = Duration::from_secs(42);
+    let rows = vec![held];
+
+    let (drawn, geometry) = draw_workers_pane(&rows, 0, 0, false, 90, 16);
+    let text = drawn.join("\n");
+    let roster = roster_row_of(&drawn, "coder");
+    assert!(
+        roster.contains('\u{23f8}') && roster.contains("paused"),
+        "the roster states the pause: {roster:?}"
+    );
+    assert!(
+        roster.contains("4.3k ctx") && roster.contains("42s"),
+        "a held stream keeps its metrics — the pause is not a reset: {roster:?}"
+    );
+    assert!(
+        roster.contains('\u{29d7}') || !roster.contains('/'),
+        "a held stream that was never queued is not ranked: {roster:?}"
+    );
+    assert!(
+        text.contains("\u{23f8} paused 1"),
+        "the pane tally counts the held stream: {text}"
+    );
+    assert!(
+        geometry.detail_present,
+        "the held row still gets a detail half"
+    );
+
+    // And it is still part of the round on the status row: a paused row keeps the
+    // active count and adds its own segment, exactly as the retired status line did.
+    let mut r = TuiRenderer::new();
+    r.set_view_mode(state::ViewMode::Split);
+    r.subagents = rows;
+    let frame = draw_new_frame(&mut r, 140, 40).join("\n");
+    assert!(
+        frame.contains("2a") || frame.contains("1a"),
+        "the held stream is still counted in the round: {frame}"
+    );
+    assert!(frame.contains("1p"), "and counted as held: {frame}");
+    assert!(frame.contains("coder-t-9706"), "and named: {frame}");
+}
+
+/// Who owns the pause label, re-established: the session loop's rows do. A renderer
+/// that only saw the typed transition must lose the flag when the loop's teardown
+/// says the stream is over.
+#[test]
+fn the_authoritative_rows_from_the_loop_own_the_pause_label() {
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.subagents.push(queue_row("coder-t-9707", true, None));
+
+    // A renderer-local pause ...
+    r.on_event(&Event::SubagentStreamPause {
+        agent_tag: "coder-t-9707".to_string(),
+        paused: true,
+    });
+    assert!(r.subagents[0].paused);
+    // ... cannot outlive a loop push that says otherwise.
+    let mut authoritative = r.subagents.clone();
+    authoritative[0].paused = false;
+    r.set_subagents(authoritative);
+    assert!(
+        !r.subagents[0].paused,
+        "the loop folds the typed transition, so its resume edge wins"
+    );
+
+    let mut authoritative = r.subagents.clone();
+    authoritative[0].paused = true;
+    r.set_subagents(authoritative);
+    assert!(
+        r.subagents[0].paused,
+        "and adopting a pause works the same way"
+    );
+
+    // The loop's teardown of a finished worker takes the flag down with it, and a
+    // renderer that missed the closing edge still loses its stale pause.
+    let mut authoritative = r.subagents.clone();
+    authoritative[0].is_active = false;
+    authoritative[0].paused = false;
+    r.set_subagents(authoritative);
+    assert!(!r.subagents[0].is_active);
+    let (drawn, _) = draw_workers_pane(&r.subagents, 0, 0, false, 90, 16);
+    let text = drawn.join("\n");
+    assert!(
+        !text.contains("model slot") && !text.contains("why: a steering instruction"),
+        "no stale pause explanation survives the loop's teardown, got:\n{text}"
+    );
+    assert!(
+        text.contains("\u{23f8} paused 0"),
+        "and the tally counts no held stream, got:\n{text}"
+    );
+    assert!(
+        roster_row_of(&drawn, "coder").contains('\u{2713}'),
+        "the closed row reads done, got:\n{text}"
+    );
+}
+
+// ---- t-015: the status row, the wait clock and the thinking half ----------------
+
+/// One live worker row for the status/wait-clock tests, with the fields those rows
+/// print already in place.
+fn status_row_worker(name: &str, task: &str) -> SubagentDetail {
+    SubagentDetail {
+        name: name.to_string(),
+        task_id: Some(task.to_string()),
+        is_active: true,
+        context_tokens: 1_200,
+        worked_duration: Duration::from_secs(30),
+        ..SubagentDetail::default()
+    }
+}
+
+/// The metrics row of a drawn frame: the only row that starts with the token field.
+fn metrics_row(rows: &[String]) -> String {
+    rows.iter()
+        .map(|row| row.trim_end())
+        .find(|row| row.trim_start().starts_with("Tokens"))
+        .unwrap_or_else(|| panic!("no metrics row in:\n{}", rows.join("\n")))
+        .to_string()
+}
+
+/// The retired status line's "a queued row still counts as active, and a held stream
+/// is named without being dropped from the round", re-established on the new metrics
+/// row: the round count keeps both kinds of row, each gets its own segment, and the
+/// name list still names all of them.
+#[test]
+fn the_status_row_names_held_and_queued_streams_and_keeps_every_count() {
+    let mut r = TuiRenderer::new();
+    r.set_view_mode(state::ViewMode::Split);
+    let mut queued = status_row_worker("coder-t-9710", "t-9710");
+    queued.queue = Some(crate::ui::QueueState { position: 1, of: 2 });
+    let mut held = status_row_worker("validator-t-9711", "t-9711");
+    held.paused = true;
+    r.subagents = vec![
+        status_row_worker("coder_specialist-t-9712", "t-9712"),
+        queued,
+        held,
+    ];
+    r.tokens_in = 4_500;
+    r.tokens_out = 1_500;
+
+    let rows = draw_new_frame(&mut r, 150, 40);
+    let line = metrics_row(&rows);
+    assert!(
+        line.contains("3a"),
+        "a queued and a held row are both still in the round: {line:?}"
+    );
+    assert!(
+        line.contains("1p"),
+        "the held stream gets its own segment: {line:?}"
+    );
+    assert!(
+        line.contains("1q"),
+        "the queued stream gets its own segment: {line:?}"
+    );
+    for name in [
+        "coder-t-9710",
+        "validator-t-9711",
+        "coder_specialist-t-9712",
+    ] {
+        assert!(line.contains(name), "the name list names {name}: {line:?}");
+    }
+
+    // §F1 (research): the metrics row is **one** DarkGray band, so every element on
+    // it has to name its own `fg`. The defect was `text_dim` (DarkGray, no `bg`)
+    // painted inside that band — the separators, the `ctx` field and the whole
+    // worker-name list were DarkGray-on-DarkGray and therefore invisible. The row is
+    // now routed through the band tokens (`band_surface` for the fill, `chip_neutral`
+    // / `chip_muted` / `chip_value` for the contents), and this pins the invariant on
+    // the painted frame: no cell of the band ever carries the band colour as ink.
+    let (drawn, styles) = draw_new_frame_styled(&mut r, 150, 40);
+    let band = theme::band_surface().bg;
+    assert_eq!(
+        theme::band_surface().fg,
+        None,
+        "the band surface owns no ink of its own"
+    );
+    let (row, metrics) = drawn
+        .iter()
+        .enumerate()
+        .find(|(_, row)| row.trim_start().starts_with("Tokens"))
+        .expect("the metrics row is drawn");
+    for (cell, style) in styles[row].iter().enumerate() {
+        assert_eq!(
+            style.bg, band,
+            "cell {cell} of the metrics row is not the band: {metrics:?}"
+        );
+        if let Some(fg) = style.fg {
+            assert_ne!(
+                Some(fg),
+                band,
+                "cell {cell} paints {fg:?} on the band: {metrics:?}"
+            );
+        }
+    }
+    // Element by element: the separators and the name list are the band's own muted
+    // rung, the counts are the neutral band chip, and the token pair is the band's
+    // readable-number rung.
+    let painted = |needle: &str| {
+        let cell = metrics
+            .find(needle)
+            .map(|byte| metrics[..byte].chars().count())
+            .unwrap_or_else(|| panic!("{needle:?} is not on the drawn metrics row: {metrics:?}"));
+        styles[row][cell]
+    };
+    for needle in [
+        " | ",
+        "coder-t-9710",
+        "validator-t-9711",
+        "coder_specialist-t-9712",
+    ] {
+        assert_eq!(
+            painted(needle).fg,
+            theme::chip_muted().fg,
+            "{needle:?} is the band's muted rung, not the chrome rung: {metrics:?}"
+        );
+        assert_eq!(
+            painted(needle).bg,
+            band,
+            "{needle:?} carries the band: {metrics:?}"
+        );
+    }
+    for needle in ["3a", "1p", "1q"] {
+        assert_eq!(
+            painted(needle).fg,
+            theme::chip_neutral().fg,
+            "the {needle} count is the neutral band chip: {metrics:?}"
+        );
+    }
+    assert_eq!(
+        painted(" Tokens ").fg,
+        theme::chip_neutral().fg,
+        "the token label is the neutral band chip: {metrics:?}"
     );
     assert_eq!(
-        drawn_line_numbers(&rows, "line ").len(),
-        MAX - 1,
-        "the resurrected line costs one drawable line of real traffic"
+        painted("in /").fg,
+        theme::chip_value().fg,
+        "the token pair is the band's number rung, not the fg-less body slot: {metrics:?}"
+    );
+
+    // Control: one running row adds no pause and no queue segment, so those counts
+    // cannot be a standing caption.
+    let mut plain = TuiRenderer::new();
+    plain.set_view_mode(state::ViewMode::Split);
+    plain.subagents = vec![status_row_worker("coder-t-9713", "t-9713")];
+    let line = metrics_row(&draw_new_frame(&mut plain, 150, 40));
+    assert!(
+        line.contains("1a"),
+        "the round still counts the row: {line:?}"
+    );
+    assert!(!line.contains("1p"), "no pause segment: {line:?}");
+    assert!(!line.contains("1q"), "no queue segment: {line:?}");
+}
+
+/// The token counters, re-established: the same compact spelling the retired status
+/// line used, from the one formatter the surviving surface has.
+#[test]
+fn token_counters_are_formatted_the_same_way_on_the_new_row() {
+    for (count, expected) in [
+        (0usize, "0"),
+        (450, "450"),
+        (999, "999"),
+        (1_000, "1.0k"),
+        (1_500, "1.5k"),
+        (12_400, "12.4k"),
+        (1_200_000, "1.2M"),
+    ] {
+        assert_eq!(
+            components::status_bar::format_count(count),
+            expected,
+            "{count} must read {expected}"
+        );
+    }
+
+    let mut r = TuiRenderer::new();
+    r.set_view_mode(state::ViewMode::Split);
+    r.subagents = vec![status_row_worker("coder-t-9714", "t-9714")];
+    r.tokens_in = 12_400;
+    r.tokens_out = 3_200;
+    let line = metrics_row(&draw_new_frame(&mut r, 150, 40));
+    assert!(
+        line.starts_with(" Tokens ") && line.contains(" in / ") && line.contains(" out"),
+        "the mandatory token pair stays on the row: {line:?}"
+    );
+}
+
+/// The ctx ratio, re-established: it is the renderer's own pair of counters, printed
+/// as a percentage, and withheld when no budget was plumbed.
+#[test]
+fn the_ctx_ratio_is_the_renderers_own_pair_and_is_withheld_without_a_budget() {
+    let mut r = TuiRenderer::new();
+    r.set_view_mode(state::ViewMode::Split);
+    r.subagents = vec![status_row_worker("coder-t-9715", "t-9715")];
+    r.orchestrator_context_tokens = 13_500;
+    r.max_context_tokens = 30_000;
+    let line = metrics_row(&draw_new_frame(&mut r, 150, 40));
+    assert!(
+        line.contains("ctx 45%"),
+        "the ratio of the renderer's own pair is on the row: {line:?}"
+    );
+
+    // No budget plumbed: the ratio is not invented.
+    let mut unbounded = TuiRenderer::new();
+    unbounded.set_view_mode(state::ViewMode::Split);
+    unbounded.subagents = vec![status_row_worker("coder-t-9716", "t-9716")];
+    unbounded.orchestrator_context_tokens = 13_500;
+    let line = metrics_row(&draw_new_frame(&mut unbounded, 150, 40));
+    assert!(
+        !line.contains("ctx"),
+        "a ctx ratio without a budget would be a guess: {line:?}"
+    );
+
+    // A budget with nothing spent is stated as zero, not hidden.
+    let mut empty = TuiRenderer::new();
+    empty.set_view_mode(state::ViewMode::Split);
+    empty.subagents = vec![status_row_worker("coder-t-9717", "t-9717")];
+    empty.orchestrator_context_tokens = 0;
+    empty.max_context_tokens = 30_000;
+    let frame = draw_new_frame(&mut empty, 150, 40).join("\n");
+    assert!(
+        !frame.contains("ctx 0%") && !frame.contains("ctx %"),
+        "no spend, no ratio claim, got:\n{frame}"
+    );
+}
+
+/// The project clock, re-established: it is the last field of the row, and the first
+/// field the §2.5 ladder takes back — the counters it is next to are not.
+#[test]
+fn the_project_clock_is_the_last_field_of_the_row_and_the_first_the_ladder_takes_back() {
+    let mut r = live_worker_scenario();
+    let line = metrics_row(&draw_new_frame(&mut r, 120, 30));
+    assert!(
+        line.contains("elapsed 10m 12s"),
+        "the session clock is spelled in human units: {line:?}"
+    );
+    let at = line.find("elapsed ").expect("the clock is on the row");
+    let tokens = line.find(" Tokens ").expect("the token pair is on the row");
+    assert!(
+        tokens < at,
+        "the clock is the last field of the row: {line:?}"
+    );
+
+    // The narrow rung of the ladder: the clock leaves, the counters do not.
+    let mut narrow = live_worker_scenario();
+    let line = metrics_row(&draw_new_frame(&mut narrow, 60, 16));
+    assert!(
+        !line.contains("elapsed"),
+        "the clock is the first to go: {line:?}"
+    );
+    assert!(
+        line.starts_with(" Tokens ")
+            && line.contains("3a")
+            && line.contains("1p")
+            && line.contains("1q"),
+        "the counters the ladder must keep stay: {line:?}"
+    );
+}
+
+/// The two deliberate silences — waiting for a backend slot and a stream parked
+/// behind the arbitrator — re-established on the state the wait clock reads, which is
+/// what the retired spinner tests used to assert through the status line.
+#[test]
+fn the_slot_wait_and_parked_stream_sentences_arm_the_backend_wait_clock() {
+    let mut r = TuiRenderer::new();
+    assert!(
+        r.waiting_for_token_since.is_none(),
+        "control: nothing waiting"
+    );
+
+    r.on_event(&Event::Status(
+        "queued for a backend slot (2 of 4) — Manager".to_string(),
+    ));
+    assert!(
+        r.waiting_for_token_since.is_some(),
+        "a slot wait is a wait the clock must cover, status line {:?}",
+        r.status_line
+    );
+
+    r.on_event(&Event::Status("Ready".to_string()));
+    assert!(
+        r.waiting_for_token_since.is_none(),
+        "an idle round takes the clock back down"
+    );
+
+    r.on_event(&Event::Status(
+        "coder-t-9720 — stream paused by the arbitrator".to_string(),
+    ));
+    assert!(
+        r.waiting_for_token_since.is_some(),
+        "a parked stream is the same kind of deliberate silence"
+    );
+
+    r.on_event(&Event::Status(
+        "calling backend (gpt-6-x) for t-9720".to_string(),
+    ));
+    assert!(
+        r.waiting_for_token_since.is_some(),
+        "and so is the model call itself"
+    );
+}
+
+/// The thinking half, re-established on the new pane: the toggle decides whether the
+/// reasoning *text* is printed at all, the budget the worker was launched with is
+/// reported with it, and neither the toggle nor the cap ever moves the queue rank.
+#[test]
+fn the_thinking_half_is_gated_by_the_toggle_and_reports_its_budget() {
+    let mut r = TuiRenderer::new();
+    r.default_thinking_budget = 10_000;
+    r.set_subagents(vec![SubagentDetail {
+        name: "coder-t-9730".to_string(),
+        task_id: Some("t-9730".to_string()),
+        is_active: true,
+        queue: Some(crate::ui::QueueState { position: 2, of: 4 }),
+        ..SubagentDetail::default()
+    }]);
+    r.on_event(&Event::SubagentThinking {
+        agent_tag: "coder-t-9730".to_string(),
+        text: "a".repeat(4_000),
+    });
+    assert_eq!(
+        r.subagents[0].queue,
+        Some(crate::ui::QueueState { position: 2, of: 4 }),
+        "streamed reasoning never disturbs the slot state"
+    );
+
+    // Toggle off (§8.2): the size of the buffer is stated, its text never leaks.
+    let (hidden, _) = draw_workers_pane(&r.subagents, 0, 0, false, 100, 30);
+    let text = hidden.join("\n");
+    assert!(
+        text.contains("[Thinking]") && text.contains("4000 chars — hidden (Ctrl+T)"),
+        "the hidden half states the size, got:\n{text}"
+    );
+    assert!(
+        !text.contains("aaaa"),
+        "the reasoning text must not leak without the toggle, got:\n{text}"
+    );
+    let roster = roster_row_of(&hidden, "coder");
+    assert!(
+        roster.contains("2/4"),
+        "hiding the thought costs no rank: {roster:?}"
+    );
+
+    // Toggle on, through the renderer seam (it is what hands the pane the budget the
+    // worker was launched with): the text and the countdown ride the same header line.
+    // The header sits at the head of the thinking half, so the fixture holds the detail
+    // there instead of letting the follow flag answer itself: with
+    // `subagent_autoscroll` on — the boot default — the pane now pins a body longer than
+    // the viewport to its tail, which is exactly what the retired `render.rs` pass used
+    // to do to `subagent_scroll` off-file, and a 4000-char reasoning body scrolls the
+    // header away (pinned separately below by
+    // `the_detail_follow_flag_pins_the_pane_to_the_tail_it_measured`).
+    r.set_view_mode(state::ViewMode::Workers);
+    r.show_thought = true;
+    r.subagent_autoscroll = false;
+    let frame = draw_new_frame(&mut r, 120, 40);
+    let text = frame.join("\n");
+    assert!(
+        text.contains("~1.0k tokens of 10.0k budget (9.0k remaining)"),
+        "the budget countdown is the header of the thinking half, got:\n{text}"
+    );
+    assert!(
+        text.contains("aaaa"),
+        "the reasoning is printed, got:\n{text}"
+    );
+    let roster = only_row(&frame, "coder", (120, 40));
+    assert!(
+        roster.contains("2/4"),
+        "and the rank is still there: {roster:?}"
+    );
+}
+
+/// The key path and the draw path on one geometry (audit defect 11): the transcript's
+/// `↑` steps against the maximum the **last frame drew** — `BodyReport::max_scroll`
+/// published by the write-back in `draw_new_ui` — and not against a line-count estimate
+/// measured off-file. Before the repair the key clamped against
+/// `estimated_chat_lines(...)` while the pane clamped and pinned the body against the
+/// lines it had actually drawn at its own width, one column narrower once its scrollbar
+/// was needed, so a step taken before a frame wrote back could land anywhere.
+#[test]
+fn a_transcript_step_measures_the_geometry_the_last_frame_drew() {
+    let mut r = TuiRenderer::new();
+    r.set_view_mode(state::ViewMode::Transcript);
+    r.messages = (1..=80)
+        .map(|n| format!("message {n:02} — one line each, long enough to be counted"))
+        .collect();
+    draw_new_frame(&mut r, 120, 40);
+    let measured = r
+        .transcript_measured_max
+        .get()
+        .expect("the pane reported its measure");
+    assert!(
+        measured > 10,
+        "the fixture needs a body to scroll: {measured}"
+    );
+    assert!(r.follow, "follow is the boot default");
+    assert_eq!(
+        usize::from(r.chat_scroll),
+        measured,
+        "the frame pinned the body at the tail it measured"
+    );
+
+    // One press, one row — the step is measured against that published maximum.
+    r.set_focus(state::FocusPane::Transcript);
+    r.scroll_up(1);
+    assert_eq!(
+        usize::from(r.chat_scroll),
+        measured - 1,
+        "one press stepped one row off the geometry the frame drew"
+    );
+    assert!(!r.follow, "stepping off the tail takes follow off");
+
+    // The chip row states the same numbers the keys stepped from, so the follow chip
+    // and the viewport are one decision and not two measurements.
+    let frame = draw_new_frame(&mut r, 120, 40);
+    assert_eq!(
+        usize::from(r.chat_scroll),
+        measured - 1,
+        "the frame kept the offset the operator parked"
+    );
+    let text = frame.join("\n");
+    assert!(
+        text.contains(&format!(" scroll {}/{} ", measured - 1, measured)),
+        "the readout names the drawn maximum the key path used, got:\n{text}"
+    );
+    assert!(
+        text.contains(" ↓ 1 new "),
+        "and the unseen count is stated against it: {text}"
+    );
+    assert!(
+        !text.contains("● LIVE"),
+        "the follow chip agrees with a viewport that is off the tail: {text}"
+    );
+}
+
+/// The follow flag answers itself inside the pane (defect 12, defect 15): with
+/// `subagent_autoscroll` on, a detail body longer than the viewport is pinned to the tail
+/// the pane *measured*, not to a line-count estimate written from outside it. The pin is
+/// checked at the frame seam because that is where the flag is handed over, and the
+/// reported maximum is what the scroll keys in `events.rs` clamp against on the next
+/// press — the chip row, the viewport and the key path all read one decision.
+#[test]
+fn the_detail_follow_flag_pins_the_pane_to_the_tail_it_measured() {
+    let mut r = TuiRenderer::new();
+    r.show_subagent_panel = true;
+    r.set_focus(state::FocusPane::Workers);
+    r.subagents.push(SubagentDetail {
+        name: "coder-t-9731".to_string(),
+        task_id: Some("t-9731".to_string()),
+        is_active: true,
+        logs: (1..=60).map(|n| format!("log line {n}")).collect(),
+        ..SubagentDetail::default()
+    });
+    // The operator has scrolled up: the offset is theirs, and the flag is what asks for
+    // the tail back.
+    r.subagent_scroll = 4;
+    assert!(r.subagent_autoscroll, "follow is the boot default");
+
+    let frame = draw_new_frame(&mut r, 120, 40);
+    let measured = r
+        .detail_measured_max
+        .get()
+        .expect("the pane reported its measure");
+    assert!(
+        measured > 0,
+        "60 log lines do not fit the detail half, so there is a tail to pin"
+    );
+    assert_eq!(
+        usize::from(r.subagent_scroll),
+        measured,
+        "the frame parks the offset at the tail this pass measured"
+    );
+    let text = frame.join("\n");
+    assert!(
+        text.contains("log line 60"),
+        "the newest line is on screen while following, got:\n{text}"
+    );
+    assert!(
+        !text.contains("log line 1 "),
+        "and the head of the body is off screen: {text}"
+    );
+
+    // The same frame is the one the key path steps from: holding the flag off and
+    // pressing `↑` moves exactly one row off the measured tail, never a jump.
+    r.subagent_autoscroll = false;
+    r.scroll_up(1);
+    assert_eq!(
+        usize::from(r.subagent_scroll),
+        measured - 1,
+        "one press steps one row off the geometry the frame drew"
+    );
+}
+
+/// Audit defect 13, asserted at the seam that opened it: a started delegation records
+/// which task is in flight and says **nothing** about the plan viewport. The plan the
+/// operator parked off-centre is not handed back to the in-flight task by new task
+/// traffic — centring is armed only by a plan document this process has never seen
+/// (`arm_plan_centring`, on the `had_active_plan` edge in `render.rs::refresh_plan_cache`)
+/// and released by a plan scroll key (`events.rs::scroll_plan_to`).
+///
+/// The fixture states `had_active_plan` up front because that is the defect-13 case: the
+/// plan on screen is one this process has already seen, so there is no centring edge to
+/// fire. The drawn-window half of the pin is asserted **before** the delegation on
+/// purpose: `on_event` ends in a throttled `force_flush`/`flush` → `render_terminal` →
+/// `draw`, and that legacy paint path re-reads `.marmel/execution_plan.md` from disk on
+/// its own 250 ms cadence, so a test renderer reached through `on_event` can end up
+/// drawing whatever plan file the machine happens to hold. What the delegation must not
+/// do — arm centring — is a state fact, and is asserted after the seam.
+#[test]
+fn a_started_delegation_never_hands_the_plan_viewport_back_to_the_in_flight_task() {
+    let mut r = TuiRenderer::new();
+    r.set_view_mode(state::ViewMode::Split);
+    r.plan_content = (1..=60)
+        .map(|n| format!("- [ ] [t-99{n:02}] plan step {n:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    r.had_active_plan = true;
+    draw_new_frame(&mut r, 120, 40);
+    let tail = usize::from(r.plan_max_scroll);
+    assert!(
+        tail > 10,
+        "the fixture needs a plan taller than its pane, got {tail}"
+    );
+
+    // An operator gesture, twice over: down to the tail, then three rows back up. The
+    // gesture owns the offset and the release of centring.
+    r.set_focus(state::FocusPane::Plan);
+    assert!(r.scroll_to_bottom(), "the plan had a tail to reach");
+    assert_eq!(
+        usize::from(r.plan_scroll),
+        tail,
+        "the key stepped to the maximum the pane measured"
+    );
+    assert!(r.scroll_up(3), "and stepped back off it");
+    let held = usize::from(r.plan_scroll);
+    assert!(
+        !r.plan_auto_scroll,
+        "a plan gesture releases centring on the in-flight task"
+    );
+
+    // The frame under a released centring draws the operator's window and nothing else:
+    // three rows short of the tail (`plan step 57` is the last line of the 60-line body
+    // at that offset), neither nailed to the tail nor centred on the task in flight.
+    let parked = draw_new_frame(&mut r, 120, 40);
+    assert_eq!(
+        usize::from(r.plan_scroll),
+        held,
+        "the frame moved a plan offset the operator parked"
+    );
+    let rects = layout::compute_layout(Rect::new(0, 0, 120, 40), &state::UiView::from_renderer(&r));
+    let plan = rects.plan.expect("the plan pane is on");
+    let shown = pane_says(&parked, plan);
+    assert!(
+        shown.contains("plan step 57"),
+        "the parked window — three rows above the tail — is what is drawn: {shown}"
+    );
+    assert!(
+        !shown.contains("plan step 60"),
+        "the frame did not nail the plan back to its tail: {shown}"
+    );
+    assert!(
+        !shown.contains("plan step 01"),
+        "the frame did not centre the plan on the task in flight: {shown}"
+    );
+
+    // Task traffic, three times over: a started task, that task completing, another
+    // started task. None of the three may arm centring.
+    let traffic = [
+        Event::Delegation(crate::orchestrator::DelegationEvent::Started {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-9901".to_string()),
+        }),
+        Event::Delegation(crate::orchestrator::DelegationEvent::Completed {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-9901".to_string()),
+        }),
+        Event::Delegation(crate::orchestrator::DelegationEvent::Started {
+            agent: crate::agents::Agent::Coder,
+            task: Some("t-9902".to_string()),
+        }),
+    ];
+    for (index, event) in traffic.iter().enumerate() {
+        r.on_event(event);
+        assert!(
+            !r.plan_auto_scroll,
+            "delegation traffic {index} re-armed plan centring"
+        );
+    }
+    assert_eq!(
+        r.active_plan_task.as_deref(),
+        Some("t-9902"),
+        "the task in flight is still recorded — only its power to re-centre is gone"
+    );
+}
+
+// ---- t-015: the restore seam and the registry identity rules --------------------
+
+/// The queue rank is durable state (design §9.4 D2), re-established: the bundle
+/// records the rank the screen was showing, the restored row carries it, and the
+/// restored row is drawn with it. A bundle written before the field existed restores
+/// without inventing one.
+#[test]
+fn a_restored_row_carries_the_queue_position_the_bundle_recorded() {
+    let mut live = TuiRenderer::new();
+    live.show_subagent_panel = true;
+    let mut queued = queue_row(
+        "coder-t-9740",
+        true,
+        Some(crate::ui::QueueState { position: 7, of: 9 }),
+    );
+    queued.task_id = Some("t-9740".to_string());
+    live.subagents.push(queued);
+
+    let section = live.capture_ui();
+    let mut restored = TuiRenderer::new();
+    restored.restore_panes(&section);
+
+    assert_eq!(restored.subagents.len(), 1);
+    assert_eq!(
+        restored.subagents[0].queue,
+        Some(crate::ui::QueueState { position: 7, of: 9 }),
+        "the panel carries the rank the screen was showing, so a queued row does not \
+         come back claiming to hold a slot"
+    );
+    assert!(
+        restored.subagents[0].is_active,
+        "the delegation was still dispatched when the session was captured"
+    );
+
+    let (drawn, _) = draw_workers_pane(&restored.subagents, 0, 0, false, 90, 16);
+    let roster = roster_row_of(&drawn, "coder");
+    assert!(
+        roster.contains("7/9") && roster.contains('\u{29d7}'),
+        "the restored row is drawn the way it was drawn before the restart: {roster:?}"
+    );
+
+    // The backwards-compatible half: a bundle written before D2 records no rank, and
+    // the row comes back without one — never an invented rank.
+    let mut legacy_section = section.clone();
+    for panel in &mut legacy_section.subagent_panels {
+        panel.queue = None;
+    }
+    let mut legacy = TuiRenderer::new();
+    legacy.restore_panes(&legacy_section);
+    assert_eq!(
+        legacy.subagents[0].queue, None,
+        "a pre-D2 bundle restores without a queue position"
+    );
+}
+
+/// The arbitration pause is durable state too (design §9.4 D2), re-established with
+/// its pre-D2 degradation and its drawn half.
+#[test]
+fn a_restored_row_carries_the_pause_the_bundle_recorded() {
+    let mut live = TuiRenderer::new();
+    live.show_subagent_panel = true;
+    let mut held = queue_row("coder-t-9741", true, None);
+    held.paused = true;
+    held.task_id = Some("t-9741".to_string());
+    live.subagents.push(held);
+
+    let section = live.capture_ui();
+    let mut restored = TuiRenderer::new();
+    restored.restore_panes(&section);
+
+    assert_eq!(restored.subagents.len(), 1);
+    assert!(
+        restored.subagents[0].paused,
+        "the screen was showing a held stream, so the restored row says so"
+    );
+
+    let (drawn, _) = draw_workers_pane(&restored.subagents, 0, 0, false, 90, 16);
+    let text = drawn.join("\n");
+    let roster = roster_row_of(&drawn, "coder");
+    assert!(
+        roster.contains('\u{23f8}') && roster.contains("paused"),
+        "the restored row is drawn as held: {roster:?}"
+    );
+    assert!(
+        text.contains("yielded its model slot to the Steer Arbitrator"),
+        "and the detail half explains the pause it restored, got:\n{text}"
+    );
+
+    // The backwards-compatible half: a pre-D2 bundle records no pause, so the row
+    // comes back unheld.
+    let mut legacy_section = section.clone();
+    for panel in &mut legacy_section.subagent_panels {
+        panel.paused = false;
+    }
+    let mut legacy = TuiRenderer::new();
+    legacy.restore_panes(&legacy_section);
+    assert!(
+        !legacy.subagents[0].paused,
+        "a pre-D2 bundle restores without a pause"
+    );
+    let (drawn, _) = draw_workers_pane(&legacy.subagents, 0, 0, false, 90, 16);
+    assert!(
+        !drawn.join("\n").contains("model slot"),
+        "and the pane states no pause cause for it, got:\n{}",
+        drawn.join("\n")
+    );
+}
+
+/// The collided row, re-established on the new roster: the row is measured and badged
+/// from the entry that owns its exact key, and a plain key is neither badged nor given
+/// the other worker's counters.
+#[test]
+fn a_collided_row_is_badged_and_measured_from_the_entry_that_owns_its_key() {
+    use crate::orchestrator::workers;
+    // Registration touches the process-global table other suites assert over.
+    let _workers = workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // Private task ids keep these keys out of every other test's way.
+    let first = workers::register_active_worker(
+        Some("t-9501".to_string()),
+        "coder".to_string(),
+        "brief one".to_string(),
+    );
+    let second = workers::register_active_worker(
+        Some("t-9501".to_string()),
+        "coder".to_string(),
+        "brief two".to_string(),
+    );
+    let audit = workers::register_active_worker(
+        Some("t-9502".to_string()),
+        "validator-coder".to_string(),
+        "audit brief".to_string(),
+    );
+    let (plain, collided, audit_key) = (first.0.clone(), second.0.clone(), audit.0.clone());
+    let _plain_guard = EntryCleanup { key: plain.clone() };
+    let _collided_guard = EntryCleanup {
+        key: collided.clone(),
+    };
+    let _audit_guard = EntryCleanup {
+        key: audit_key.clone(),
+    };
+    workers::update_active_worker_context(&collided, 4_321);
+    assert_ne!(plain, collided, "the second worker took a collision key");
+
+    let rows: Vec<SubagentDetail> = [&plain, &collided, &audit_key]
+        .iter()
+        .map(|key| SubagentDetail {
+            name: (*key).clone(),
+            is_active: true,
+            ..SubagentDetail::default()
+        })
+        .collect();
+    let (drawn, _) = draw_workers_pane(&rows, 0, 0, false, 120, 20);
+    let text = drawn.join("\n");
+    // A registry row is badged from its entry rather than labelled with its key, so
+    // the three rows are read back in roster order.
+    let roster = roster_lines(&drawn);
+    assert_eq!(
+        roster.len(),
+        3,
+        "three registrations, three roster rows:\n{text}"
+    );
+    let (plain_row, collided_row, audit_row) = (&roster[0], &roster[1], &roster[2]);
+
+    assert!(
+        collided_row.contains("4.3k ctx"),
+        "the ctx of a `{collided}` row comes from the entry holding that exact key: \
+         {collided_row:?}\n{text}"
+    );
+    let handle = collided.split_once('#').expect("collision key").1;
+    assert!(
+        collided_row.contains(&format!("Dup #{handle}")),
+        "a duplicate-key row labels its collision handle: {collided_row:?}"
+    );
+
+    assert!(
+        audit_row.contains("Audit"),
+        "a validator-family row reads as an audit run: {audit_row:?}"
+    );
+
+    assert!(
+        !plain_row.contains("Dup #") && !plain_row.contains("Audit"),
+        "a plain key carries no badge: {plain_row:?}"
+    );
+    assert!(
+        !plain_row.contains("4.3k ctx"),
+        "and no invented ctx from the worker that collided with it: {plain_row:?}"
+    );
+}
+
+/// The runner's second registration, re-established: re-registering the same identity
+/// while the Manager still holds its guard must not open a second roster row, must not
+/// put a `{base}#N` row on screen, and must not move the selection off the row that
+/// carries the streamed history.
+#[test]
+fn the_runners_second_registration_opens_no_roster_row_and_never_steals_the_selection() {
+    use crate::orchestrator::workers;
+    // The projection enumerates the process-global registry, so it is serialized with
+    // the other suites that assert over that table.
+    let _workers = workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let manager = workers::register_active_worker(
+        Some("t-9530".to_string()),
+        "coder".to_string(),
+        "brief one".to_string(),
+    );
+    let plain = manager.0.clone();
+    let _plain_guard = EntryCleanup { key: plain.clone() };
+
+    // The loop's authoritative buffer as the shipped panel leaves it: all of the
+    // delegation's status traffic lands on the plain key.
+    let lines: Vec<String> = (0..16)
+        .map(|i| format!("thinking / calling model {i}"))
+        .collect();
+    let mut loop_rows = vec![SubagentDetail {
+        name: plain.clone(),
+        is_active: true,
+        logs: lines.clone(),
+        ..SubagentDetail::default()
+    }];
+
+    // Refresh edge #1 — project, then push: one delegated task, one row, followed.
+    let _ = crate::ui::helpers::project_subagent_rows(&mut loop_rows);
+    loop_rows.retain(|row| row.name == plain);
+    let mut r = TuiRenderer::new();
+    r.set_subagents(loop_rows.clone());
+    let ui = r.capture_ui();
+    assert_eq!(ui.subagent_panels.len(), 1, "one delegated task, one row");
+    assert_eq!(ui.subagent_panels[0].name, plain);
+    assert_eq!(
+        ui.view.selected_subagent_idx, 0,
+        "the pane follows the live row"
+    );
+    assert_eq!(ui.subagent_panels[0].logs, lines);
+
+    // Refresh edge #2 — the runner re-registers the same identity while the Manager
+    // guard is still held, so the registry now also holds the `{base}#N` twin.
+    let runner = workers::register_active_worker(
+        Some("t-9530".to_string()),
+        "coder".to_string(),
+        "brief two".to_string(),
+    );
+    let twin = runner.0.clone();
+    let _twin_guard = EntryCleanup { key: twin.clone() };
+    assert!(
+        twin.contains('#'),
+        "the second registration took a collision key: {twin}"
+    );
+
+    let _ = crate::ui::helpers::project_subagent_rows(&mut loop_rows);
+    loop_rows.retain(|row| row.name == plain || row.name == twin);
+    r.set_subagents(loop_rows.clone());
+
+    let ui = r.capture_ui();
+    let names: Vec<&str> = ui.subagent_panels.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(
+        ui.subagent_panels.len(),
+        1,
+        "one delegated task keeps exactly one row across the re-registration, got {names:?}"
+    );
+    assert!(
+        names.iter().all(|name| !name.contains('#')),
+        "no `{twin}` row ever reaches the pane, got {names:?}"
+    );
+    let selected = ui
+        .subagent_panels
+        .get(ui.view.selected_subagent_idx)
+        .unwrap_or_else(|| {
+            panic!(
+                "selection {} names no row: {names:?}",
+                ui.view.selected_subagent_idx
+            )
+        });
+    assert_eq!(
+        selected.name, plain,
+        "the selection still follows the row that has the history"
+    );
+    assert_eq!(selected.logs, lines, "with every line it had");
+
+    // And the drawn roster agrees with the state: one row, no collision key on
+    // screen, and the history still scrollable to its last line.
+    let (drawn, geometry) =
+        draw_workers_pane(&r.subagents, r.selected_subagent_idx, 0, false, 120, 24);
+    let text = drawn.join("\n");
+    assert!(
+        !text.contains(&twin),
+        "the `{twin}` key is never drawn, got:\n{text}"
+    );
+    assert_eq!(
+        roster_lines(&drawn).len(),
+        1,
+        "one delegated task, one roster row:\n{text}"
+    );
+    assert!(
+        geometry.detail_max > 0,
+        "the history does not fit at once, so it must be scrollable: {geometry:?}"
+    );
+    assert!(
+        text.contains("[Logs]") && text.contains("thinking / calling model 0"),
+        "the surviving row's history is drawn for it from its first line, got:\n{text}"
+    );
+    let (tail, _) = draw_workers_pane(
+        &r.subagents,
+        r.selected_subagent_idx,
+        u16::MAX,
+        false,
+        120,
+        24,
+    );
+    let tail_text = tail.join("\n");
+    assert!(
+        tail_text.contains("thinking / calling model 15"),
+        "and every line of it is reachable by scrolling, got:\n{tail_text}"
+    );
+}
+
+/// The other half of the retired stale-thinking test: closing the worker never takes
+/// its recallable history away. The pane makes no liveness claim out of the thinking
+/// buffer — the glyph comes from the row's state and the registry label — so what the
+/// test can honestly pin is that a closed row keeps its sections and reads done.
+#[test]
+fn a_closed_row_still_recalls_its_thinking_and_its_logs() {
+    let rows = vec![SubagentDetail {
+        name: "coder-t-9731".to_string(),
+        task_id: Some("t-9731".to_string()),
+        is_active: false,
+        thinking: "half a thought, still on screen".to_string(),
+        content: "the deliverable it shipped".to_string(),
+        logs: vec!["started task t-9731".to_string(), "[Completed]".to_string()],
+        ..SubagentDetail::default()
+    }];
+    let (drawn, _) = draw_workers_pane(&rows, 0, 0, true, 100, 30);
+    let text = drawn.join("\n");
+    let roster = roster_row_of(&drawn, "coder");
+    assert!(
+        roster.contains('\u{2713}'),
+        "a closed row reads done: {roster:?}"
+    );
+    for section in ["[Thinking]", "[Output]", "[Logs]"] {
+        assert!(
+            text.contains(section),
+            "{section} is still recallable:\n{text}"
+        );
+    }
+    assert!(
+        text.contains("half a thought, still on screen")
+            && text.contains("the deliverable it shipped")
+            && text.contains("[Completed]"),
+        "with every section's content, got:\n{text}"
+    );
+}
+
+/// Draw one new-UI frame and report both the text of every row and the style of
+/// every cell, so the §7.1 palette contract can be asserted on the frame itself.
+fn draw_new_frame_styled(
+    r: &mut TuiRenderer,
+    width: u16,
+    height: u16,
+) -> (Vec<String>, Vec<Vec<ratatui::style::Style>>) {
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            r.draw_new_ui(frame);
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let text = (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect();
+    let styles = (0..height)
+        .map(|y| (0..width).map(|x| buffer[(x, y)].style()).collect())
+        .collect();
+    (text, styles)
+}
+
+/// The style a drawn row was painted with, read at the cell where `needle` itself
+/// starts. Every span of a plan body line shares one style, so any glyph of the
+/// line answers for the whole line. The column is taken from the needle rather
+/// than from the first content cell of the row: a drawn row can
+/// carry the text of two panes at once (the wide leading pane and the trailing side
+/// column), and the left-hand one is not guaranteed to be the pane the needle belongs
+/// to.
+fn row_style(
+    styles: &[Vec<ratatui::style::Style>],
+    rows: &[String],
+    needle: &str,
+) -> ratatui::style::Style {
+    let y = rows
+        .iter()
+        .position(|row| row.contains(needle))
+        .unwrap_or_else(|| panic!("no drawn row carries {needle:?}:\n{}", rows.join("\n")));
+    let cell = rows[y]
+        .find(needle)
+        .map(|byte| rows[y][..byte].chars().count())
+        .expect("the row that matched carries the needle");
+    styles[y][cell.min(styles[y].len().saturating_sub(1))]
+}
+
+/// Plan auto-scroll, re-established on the new pane: the renderer asks for the task
+/// in flight and the pane answers with an offset that puts it on screen — the old
+/// `test_plan_auto_scrolls_to_started_task`, whose subject is now data in, geometry
+/// out.
+#[test]
+fn a_long_plan_auto_scrolls_to_the_task_in_flight() {
+    let mut plan = String::from("# Plan\n");
+    for i in 1..=30 {
+        plan.push_str(&format!("- [x] [t-{i:03}] a finished step {i}\n"));
+    }
+    plan.push_str("- [ ] [t-9] the task in flight\n");
+    plan.push_str("- [ ] [t-90] a later task\n");
+    plan.push_str("- [ ] [t-91] the task after that\n");
+
+    let mut r = TuiRenderer::new();
+    r.plan_content = plan;
+    r.set_view_mode(state::ViewMode::Plan);
+    r.active_plan_task = Some("t-9".to_string());
+    r.plan_auto_scroll = true;
+    let drawn = draw_new_frame(&mut r, 120, 30).join("\n");
+    let scroll = r.plan_scroll;
+
+    assert!(
+        scroll > 0,
+        "auto-scroll moved the viewport off the top of the plan, got {scroll}\n{drawn}"
+    );
+    assert!(
+        drawn.contains("[t-9] the task in flight"),
+        "the task in flight is on screen:\n{drawn}"
+    );
+    assert!(
+        !drawn.contains("# Plan"),
+        "and the top of the plan is off screen:\n{drawn}"
+    );
+
+    // The control: with auto-scroll off the same renderer draws from the offset it
+    // was handed, and the in-flight task is below the fold.
+    r.plan_auto_scroll = false;
+    r.plan_scroll = 0;
+    let drawn = draw_new_frame(&mut r, 120, 30).join("\n");
+    assert!(
+        drawn.contains("# Plan"),
+        "a manual offset of 0 starts at the top:\n{drawn}"
+    );
+    assert!(
+        !drawn.contains("[t-9] the task in flight"),
+        "and nothing is pulled into view on its own:\n{drawn}"
+    );
+}
+
+/// A plan whose body sits at the top still auto-scrolls: the offset is clamped, so
+/// the in-flight task stays visible rather than the viewport jumping.
+#[test]
+fn a_short_plan_auto_scroll_clamps_instead_of_jumping_the_viewport() {
+    let mut r = TuiRenderer::new();
+    r.plan_content =
+        "- [x] [t-001] one\n- [ ] [t-9] the task in flight\n- [ ] [t-90] later\n".to_string();
+    r.set_view_mode(state::ViewMode::Plan);
+    r.active_plan_task = Some("t-9".to_string());
+    r.plan_auto_scroll = true;
+    let drawn = draw_new_frame(&mut r, 120, 30).join("\n");
+    assert_eq!(r.plan_scroll, 0, "there is nothing to scroll past");
+    assert!(
+        drawn.contains("[t-9] the task in flight"),
+        "and the whole plan is on screen anyway:\n{drawn}"
+    );
+}
+
+/// The plan's in-flight marking, re-established: every task in flight — the plan's
+/// own and each live worker row's — is drawn as an active line, and a task id that
+/// merely contains another one as a prefix is not swept up with it.
+#[test]
+fn every_task_in_flight_is_marked_and_a_prefixed_sibling_is_not() {
+    let mut r = TuiRenderer::new();
+    r.plan_content = "- [ ] [t-9] in flight one\n\
+                      - [ ] [t-77] in flight two\n\
+                      - [ ] [t-90] a prefixed sibling\n\
+                      - [x] [t-5] already finished\n"
+        .to_string();
+    r.set_view_mode(state::ViewMode::Plan);
+    r.active_plan_task = Some("t-9".to_string());
+    r.subagents = vec![SubagentDetail {
+        name: "coder-t-77".to_string(),
+        task_id: Some("t-77".to_string()),
+        is_active: true,
+        ..SubagentDetail::default()
+    }];
+    assert_eq!(
+        r.active_plan_tasks(),
+        vec!["t-77".to_string(), "t-9".to_string()],
+        "both live tasks name a line, and the plan's own id is deduplicated in"
+    );
+
+    let (drawn, styles) = draw_new_frame_styled(&mut r, 100, 20);
+    for line in ["[t-9] in flight one", "[t-77] in flight two"] {
+        let style = row_style(&styles, &drawn, line);
+        assert_eq!(
+            style.fg,
+            theme::state_running().fg,
+            "an in-flight line wears the in-flight slot: {line}"
+        );
+        assert!(
+            style.add_modifier.contains(Modifier::BOLD),
+            "and bold, as §7.1 spells it: {line}"
+        );
+    }
+    let sibling = row_style(&styles, &drawn, "[t-90] a prefixed sibling");
+    assert_eq!(
+        sibling.fg,
+        theme::state_queued().fg,
+        "t-90 is not t-9: it stays an open line, so it wears the waiting slot"
+    );
+    // §F4: an open task is waiting, not wrong. The warm hues are reserved for
+    // problems (`state_failed`, `state_replan`) and for work in flight
+    // (`state_running`), so an open line may never sit one lightness step from an
+    // error — it has to be cool or neutral.
+    for warm in [
+        theme::state_failed().fg,
+        theme::state_replan().fg,
+        theme::state_running().fg,
+    ] {
+        assert_ne!(
+            sibling.fg, warm,
+            "an open plan line never wears a warm hue (§F4)"
+        );
+    }
+    assert!(
+        matches!(
+            sibling.fg,
+            Some(Color::Blue | Color::LightBlue | Color::Gray | Color::White)
+        ),
+        "the open-state hue is cool or neutral (§F4), got {:?}",
+        sibling.fg
+    );
+    let done = row_style(&styles, &drawn, "[t-5] already finished");
+    assert_eq!(done.fg, theme::state_done().fg, "a checked line reads done");
+}
+
+/// The streaming half of the transcript, re-established: the content buffer is
+/// always on screen and the reasoning buffer rides the `Ctrl+T` / `/thought`
+/// toggle — the old `test_chat_renders_white_content_and_gates_thought`.
+#[test]
+fn the_transcript_prints_the_streamed_content_and_gates_the_thought_buffer() {
+    let mut r = TuiRenderer::new();
+    r.set_view_mode(state::ViewMode::Transcript);
+    r.messages = vec!["the settled conversation".to_string()];
+    r.current_content = "content arriving right now".to_string();
+    r.current_thought = "the reasoning stream nobody asked to see".to_string();
+
+    r.show_thought = false;
+    let drawn = draw_new_frame(&mut r, 100, 24).join("\n");
+    assert!(
+        drawn.contains("the settled conversation") && drawn.contains("content arriving right now"),
+        "the conversation and the in-flight content are drawn:\n{drawn}"
+    );
+    assert!(
+        !drawn.contains("the reasoning stream nobody asked to see"),
+        "while the toggle is off the thought buffer is not:\n{drawn}"
+    );
+
+    r.show_thought = true;
+    let drawn = draw_new_frame(&mut r, 100, 24).join("\n");
+    assert!(
+        drawn.contains("the reasoning stream nobody asked to see"),
+        "and the moment it is on, the buffer is on screen:\n{drawn}"
+    );
+    assert!(
+        drawn.contains("content arriving right now"),
+        "without taking the content away:\n{drawn}"
+    );
+}
+
+/// Transcript auto-scroll, re-established: while the operator is following, the
+/// viewport is pinned to the bottom of a long answer, and the renderer's
+/// `chat_scroll` write-back says where the pane actually drew.
+#[test]
+fn a_followed_transcript_shows_the_last_lines_of_a_long_answer() {
+    let mut r = TuiRenderer::new();
+    r.set_view_mode(state::ViewMode::Transcript);
+    r.messages = (0..40)
+        .map(|i| format!("line {i:02} of a long answer"))
+        .collect();
+    r.set_follow(true);
+    let drawn = draw_new_frame(&mut r, 100, 24).join("\n");
+
+    assert!(
+        drawn.contains("line 39 of a long answer"),
+        "the newest line is on screen:\n{drawn}"
+    );
+    assert!(
+        !drawn.contains("line 00 of a long answer"),
+        "and the oldest is above the fold:\n{drawn}"
+    );
+    assert!(
+        r.chat_scroll > 0,
+        "the pane reports the offset it drew, got {}",
+        r.chat_scroll
+    );
+}
+
+/// The scrolled-up half: with follow off the viewport holds its window at the
+/// offset it was left at, and the pane counts what is still below it instead of
+/// silently scrolling (G7).
+#[test]
+fn a_transcript_scrolled_away_from_the_bottom_counts_what_is_below_it() {
+    let mut r = TuiRenderer::new();
+    r.set_view_mode(state::ViewMode::Transcript);
+    r.messages = (0..40)
+        .map(|i| format!("line {i:02} of a long answer"))
+        .collect();
+    r.set_follow(false);
+    r.chat_scroll = 0;
+    let drawn = draw_new_frame(&mut r, 100, 24).join("\n");
+
+    assert!(
+        drawn.contains("line 00 of a long answer"),
+        "the window stays where the operator left it:\n{drawn}"
+    );
+    assert!(
+        !drawn.contains("line 39 of a long answer"),
+        "the rest is not dragged into view:\n{drawn}"
+    );
+    assert_eq!(r.chat_scroll, 0, "and the offset is not moved under them");
+    assert!(
+        drawn.contains('\u{2193}') && drawn.contains(" new "),
+        "the pane states how many lines are unseen:\n{drawn}"
+    );
+}
+
+/// Draw only the Execution Plan pane at a chosen size and offset. The auto-scroll
+/// fallbacks live inside the pane, so the fallback branches are asserted here rather
+/// than through the whole frame.
+fn draw_plan_pane(
+    text: &str,
+    scroll: u16,
+    active_tasks: &[String],
+    auto_scroll: bool,
+    target_task: Option<&str>,
+    width: u16,
+    height: u16,
+) -> Vec<String> {
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let progress = state::PlanProgress::from_plan(text, target_task, &[]);
+    terminal
+        .draw(|frame| {
+            let data = components::plan_pane::PlanData {
+                focus: true,
+                progress: &progress,
+                scroll,
+                text,
+                active_tasks,
+                auto_scroll,
+                target_task,
+            };
+            components::plan_pane::render(
+                frame,
+                ratatui::layout::Rect::new(0, 0, width, height),
+                &data,
+            );
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect()
+}
+
+/// Auto-scroll with nothing in flight: the first open task, and the bottom of a plan
+/// that has none — the two fallbacks the retired plan pane pinned.
+#[test]
+fn the_plan_pane_falls_back_to_its_first_open_task_and_then_to_its_tail() {
+    let mut plan = String::from("# Plan\n");
+    for i in 1..=30 {
+        plan.push_str(&format!("- [x] [t-{i:03}] a finished step {i}\n"));
+    }
+    plan.push_str("- [ ] [t-031] the first open task\n");
+    plan.push_str("- [ ] [t-032] the second open task\n");
+
+    let rows = draw_plan_pane(&plan, 0, &[], true, None, 60, 20);
+    let drawn = rows.join("\n");
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("[t-031] the first open task")),
+        "the first open task is the scroll target:\n{drawn}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.contains("[t-001] a finished step 1")),
+        "and the finished head is off screen:\n{drawn}"
+    );
+
+    // A plan with nothing open at all lands on its last line.
+    let mut finished = String::from("# Plan\n");
+    for i in 1..=30 {
+        finished.push_str(&format!("- [x] [t-{i:03}] step {i}\n"));
+    }
+    let rows = draw_plan_pane(&finished, 0, &[], true, None, 60, 20);
+    let drawn = rows.join("\n");
+    assert!(
+        rows.iter().any(|row| row.contains("[t-029] step 29")),
+        "a finished plan shows its tail:\n{drawn}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("[t-001] step 1")),
+        "and not its head:\n{drawn}"
+    );
+}
+
+/// The other auto-scroll branch, re-established: with nothing in flight the pane
+/// scrolls to the first open task rather than to the bottom or nowhere.
+#[test]
+fn a_plan_with_nothing_in_flight_scrolls_to_its_first_open_task() {
+    let mut plan = String::from("# Plan\n");
+    for i in 1..=30 {
+        plan.push_str(&format!("- [x] [t-{i:03}] a finished step {i}\n"));
+    }
+    plan.push_str("- [ ] [t-031] the first open task\n");
+    plan.push_str("- [ ] [t-032] the second open task\n");
+    plan.push_str("- [ ] [t-033] the third open task\n");
+
+    let mut r = TuiRenderer::new();
+    r.plan_content = plan;
+    r.set_view_mode(state::ViewMode::Plan);
+    r.plan_auto_scroll = true;
+    let drawn = draw_new_frame(&mut r, 120, 30).join("\n");
+
+    assert!(
+        r.plan_scroll > 0,
+        "the fallback target still moves the viewport, got {}",
+        r.plan_scroll
+    );
+    assert!(
+        drawn.contains("[t-031] the first open task"),
+        "the first open task is on screen:\n{drawn}"
+    );
+    assert!(
+        !drawn.contains("[t-001] a finished step 1"),
+        "and the finished head is not:\n{drawn}"
+    );
+}
+
+/// Streaming and queue state do not interfere, re-established: half a thought and
+/// half an answer pushed into a queued row land on it without taking its rank off.
+#[test]
+fn a_queued_row_keeps_its_rank_while_thinking_and_output_stream_into_it() {
+    let mut row = queue_row(
+        "coder-t-9712",
+        true,
+        Some(crate::ui::QueueState { position: 2, of: 3 }),
+    );
+    row.task_id = Some("t-9712".to_string());
+    let mut r = TuiRenderer::new();
+    r.set_subagents(vec![row]);
+    // The stream traffic belongs to this delegation, which is what the
+    // delegation-event fold would have recorded for a live row.
+    r.active_agent = "coder-t-9712".to_string();
+    let (drawn, _) = draw_workers_pane(&r.subagents, 0, 0, true, 90, 26);
+    let roster = roster_row_of(&drawn, "coder");
+    assert!(
+        roster.contains("2/3") && roster.contains('\u{29d7}'),
+        "the row starts ranked and queued: {roster:?}"
+    );
+
+    r.on_event(&Event::Thinking("weighing two designs".to_string()));
+    r.on_event(&Event::Message("the answer takes shape".to_string()));
+    assert_eq!(
+        r.subagents[0].queue,
+        Some(crate::ui::QueueState { position: 2, of: 3 }),
+        "streaming into the row never takes its rank off"
+    );
+
+    let (drawn, _) = draw_workers_pane(&r.subagents, 0, 0, true, 90, 26);
+    let text = drawn.join("\n");
+    let roster = roster_row_of(&drawn, "coder");
+    assert!(
+        roster.contains("2/3") && roster.contains('\u{29d7}'),
+        "and the drawn row still says so: {roster:?}"
+    );
+    assert!(
+        text.contains("weighing two designs") && text.contains("the answer takes shape"),
+        "with both streamed halves on the detail half:\n{text}"
     );
 }

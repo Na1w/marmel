@@ -2,54 +2,102 @@
 # =============================================================================
 # scripts/cross_platform_check.sh — local cross-platform parity gate (Linux host)
 #
-# Implements the gate designed and measured in docs/cross_platform_gating.md §A.
+# Implements the local cross-platform parity gate: the four host legs, plus a check and a
+# clippy leg for every triple that config/gate_targets.txt scopes to `local`/`both`.
+#
+# Citation hygiene (documentation-only fix, 2026-10-28).  This script used to cite section
+# anchors in docs/cross_platform_gating.md (§A, §3.1–§3.4, §D) and docs/fix_verification.md
+# (§A/§B/§C).  Neither file exists in this tree — `git ls-files docs/` lists neither, and
+# they are not deleted files either — so every one of those citations led nowhere.  They
+# have now been dropped from the comments, the usage text and the run summary, and what a
+# § anchor used to vouch for is stated inline with the date it was measured.  Nothing but
+# citation/comment prose was touched here: no leg, flag, exit code, leg order or SKIPS
+# entry changed.  The measured evidence for the current state of the skip list, of the host
+# PTY hole and of the serial-run counts is in docs/fix_pty_gating.md, which DOES exist;
+# where this header quotes a number, it says when it was measured.
 #
 # The target list is NOT hard-coded in this script: it is read from
-# config/gate_targets.txt, the single list shared with CI (§D "keep one shared list
-# in the repo … so adding a target is a single edit").  Do NOT iterate "every
+# config/gate_targets.txt, the single list shared with CI (design rule: keep ONE shared
+# list in the repo so adding a target is a single edit).  Do NOT iterate "every
 # installed target": the bare-metal (thumb*) and wasm32 legs cannot build this crate,
 # and x86_64-pc-windows-msvc is proven red locally because onig_sys/aws-lc-sys need an
-# MSVC-targeting C toolchain (§3.2).  Hence the FIXED allow-list.
+# MSVC-targeting C toolchain (measured on this box).  Hence the FIXED allow-list.
 #
-# Legs, in §A order:
+# Legs, in execution order:
 #   host:fmt       cargo fmt --all -- --check                                [ci job `lint`]
 #   host:clippy    cargo clippy --all-targets --all-features -- -D warnings  [ci job `lint`]
 #   host:test      cargo test --all-targets --all-features --no-fail-fast
-#                    -- --test-threads=1 --skip <6 env/state-blocked tests:
-#                       4 PTY-device-blocked + 1 PTY-path-blocked + 1 session-state-sensitive>
+#                    -- --test-threads=1 --nocapture --skip <1 session-state-sensitive test>
+#                    (the 5 PTY-dependent tests are NOT skipped: they self-gate on a
+#                     runtime capability probe and print `SKIP ` — see below.  --nocapture
+#                     is there for exactly those lines: a self-skipped test returns and is
+#                     therefore counted `ok`, and cargo captures the output of a test that
+#                     ends ok, so without --nocapture the skip would be invisible here too)
 #   host:doc-test  cargo test --doc --all-features
 #   cross:check    cargo check  --all-targets --all-features --target T
 #   cross:clippy   cargo clippy --all-targets --target T -- -D warnings
 #
-# Why BOTH cross legs (§3.1, measured): `cargo clippy … --target T -- -D warnings` did
+# Why BOTH cross legs (measured on this box): `cargo clippy … --target T -- -D warnings` did
 # NOT replay the four src/harness/sandbox.rs rustc diagnostics that plain `cargo check`
 # emitted for the same target, while clippy added the src/config.rs lint that check
 # never sees.  The two legs are not interchangeable.
 #
-# Why --test-threads=1 plus 6 exact skips (§3.4, measured exit 0 / 954 passed).  The 6
-# skips are NOT one category — "PTY-dependent" is accurate for only 5 of them, and the
-# 6th is a repo-state sensitivity (docs/fix_verification.md §A/§B/§C, coverage concern C1):
-#   * PTY-DEVICE-BLOCKED (4): harness::pty::tests::test_harness_pty_process_group_kill,
-#     test_interactive_pty_manager_lifecycle, test_run_command_parses_timeout_seconds_argument,
-#     test_run_command_pty_cancelled_by_worker_token — /dev/pts/ptmx is mode 000 in this
-#     sandbox, so openpty() fails with EACCES (fixtures at src/harness/pty_tests.rs:7, 92,
-#     107, 164).  Purely an environment/device hole.
-#   * PTY-PATH-BLOCKED (1): test_prompt_based_tool_gating (tests/test_role_gating.rs:296)
-#     reaches the same openpty EACCES through the real dispatch path
-#     (dispatch_for(run_command …) -> pty::run_command); it reproduces identically on a
-#     pristine tree, so it is device-blocked, not a defect.
+# Why --test-threads=1 plus 1 exact skip.  Re-measured here on 2026-10-28 08:34: the serial
+# host:test leg reported 1904 passed / 0 failed / 2 ignored / 1 filtered out (the "954 passed"
+# figure inherited from the original design note predates the current suite, and totals drift because several agents
+# edit this tree at once — a later run the same day reported 1906/1/2/1 with the single failure
+# in another agent's file).  The
+# remaining skip is NOT an environment category — it is a repo-state sensitivity
+# (coverage concern C1; the document that originally justified it, docs/fix_verification.md,
+# is not in this tree, so the claim below is recorded as unverified rather than as fact):
 #   * STATE-SENSITIVE / FLAKY (1), NOT PTY: harness::tests::test_harness_delegate_task_manager_routes_and_returns_deliverable
 #     (src/harness/mod.rs:1251) fails at src/harness/mod.rs:1261 if and only if a `.marmel/`
-#     session dir exists in CWD (2x2 tree/presence matrix, docs/fix_verification.md §B).
+#     session dir exists in CWD (the 2x2 tree/presence matrix behind that claim lives only in
+#     the missing document, so it cannot be re-read here).
 #     CI never has such a dir, so the failure mode is invisible there — the skip is a
 #     workaround for a dirty working tree, NOT a PTY classification; it needs its own ticket.
+#     RATIONALE RE-CHECKED 2026-10-28 09:12, and it no longer reproduces here: `.marmel/` IS
+#     present in CWD and running the test explicitly
+#     (`cargo test --lib -- --exact harness::tests::test_harness_delegate_task_manager_routes_and_returns_deliverable`)
+#     gives `1 passed; 0 failed`.  The line anchors above have also drifted (that test now starts
+#     at src/harness/mod.rs:1298 in a file other agents are editing).  The skip is therefore
+#     currently hiding a GREEN test.  It is kept anyway — it is inherited, the document that
+#     justified it is missing (see the dangling-citations note at the top), and deleting the last
+#     documented skip because one host observation says so is not this change's call.  What is on
+#     the record is that the skip's stated reason is unverified as of this date.
 #   * FLAKY CASCADING FAILURES — deliberately NOT skipped: the parallel-mode failures
 #     (harness::tool_resolution_tests::*, poisoned LazyLock over the process-global MCP
 #     registry) are removed by the serial run; skip alone does not remove them.
-# The skip names are SUBSTRING matches, so the exact test paths are named instead of
-# `harness::pty::` (which would silently filter 30 tests, 25 of them passing and relevant).
+# The skip name is a SUBSTRING match, so the exact test path is named instead of
+# `harness::pty::` (measured 2026-10-28 with `cargo test --lib -- --list | grep -c
+# '^harness::pty::'` = 31 tests: that prefix would silently drop all 31, 27 of which run and
+# are relevant on any host).
 #
-# Fail-closed rule (§A): every triple listed `local`/`both` in config/gate_targets.txt
+# The 5 PTY-dependent tests formerly skipped here (4 "PTY-DEVICE-BLOCKED" in
+# src/harness/pty_tests.rs + 1 "PTY-PATH-BLOCKED", test_prompt_based_tool_gating in
+# tests/test_role_gating.rs) are NO LONGER in the skip list.  They now self-gate on a
+# runtime capability probe, `pty_allocation_blocker` (src/harness/pty.rs), and announce
+# `SKIP ` — the same convention `integration_host` uses for a missing Landlock kernel
+# (src/harness/sandbox.rs:1637-1651) and that
+# test_sandbox_tests_never_rebuild_the_binary_path_from_a_name pins.  The probe opens
+# the very resource the product needs, so the verdict is the host's, not a guess.
+# It fails closed: on a host that CAN allocate a pty the probe stays silent and every
+# assertion runs unconditionally — verified by mutating the probe to lie, which turned
+# all 5 of these tests red again (docs/fix_pty_gating.md §2.4).  What no probe can do is
+# produce a "skipped" row: the Rust harness has only ok/failed, so a host-blocked test is
+# counted as passed and the `SKIP <name>: <syscall reason>` line is the record — which is
+# why this leg runs with --nocapture.
+#
+# Why the probe replaces the `--skip`s rather than supplementing them: `--skip` is blind
+# to the host.  On a CI runner with a working /dev/pts it silently drops 5 tests that
+# would have passed (green = not checked); locally it reports a bare "filtered out" and
+# never says why.  The probe is green-when-possible and honestly skipped otherwise, and
+# it names the syscall reason.  Evidence for the host hole: /dev/pts/ptmx is `c---------`
+# (devpts mounted ptmxmode=000) so openpty() answers EACCES — docs/fix_pty_gating.md §1.
+# test_prompt_based_tool_gating keeps asserting its GATE verdict unconditionally; only
+# its execution leg is host-gated, because pty::run_command reaches the same openpty.
+#
+# Fail-closed rule: every triple listed `local`/`both` in config/gate_targets.txt
 # must have its rust-std installed, otherwise the gate exits non-zero — unless the
 # caller explicitly tolerates that one specific triple with
 #     --allow-missing-target <triple>      (repeatable)
@@ -70,28 +118,13 @@ script_dir=$(cd -P -- "$(dirname -- "$script_src")" >/dev/null && pwd)
 repo_root=$(cd -P -- "$script_dir/.." >/dev/null && pwd)
 target_list=$repo_root/config/gate_targets.txt
 
-# Skip list: 6 names, but THREE different reasons (labels matter — reviewers must be
-# able to tell an environment hole from a real code smell).  Evidence:
-# docs/fix_verification.md §A/§B/§C and coverage concern C1.
-#   PTY-DEVICE-BLOCKED — openpty() EACCES, /dev/pts/ptmx is mode 000 on this box:
-#       --skip harness::pty::tests::test_harness_pty_process_group_kill
-#       --skip harness::pty::tests::test_interactive_pty_manager_lifecycle
-#       --skip harness::pty::tests::test_run_command_parses_timeout_seconds_argument
-#       --skip harness::pty::tests::test_run_command_pty_cancelled_by_worker_token
-#   PTY-PATH-BLOCKED — same openpty failure reached via dispatch_for(run_command …)
-#   -> pty::run_command (tests/test_role_gating.rs:296); device-blocked, not a defect:
-#       --skip test_prompt_based_tool_gating
-#   STATE-SENSITIVE / FLAKY — NOT PTY: fails at src/harness/mod.rs:1261 iff a `.marmel/`
-#   session dir exists in CWD (src/harness/mod.rs:1251); passes in a clean tree, so CI
-#   never sees it and this skip hides a working-tree/state problem, not a PTY one:
-#       --skip harness::tests::test_harness_delegate_task_manager_routes_and_returns_deliverable
+# Skip list: 1 name.  Reviewers must be able to tell an environment hole from a real
+# code smell, so the label matters: this one is NOT PTY-dependent, it is a repo-state
+# sensitivity, and it is the only leg the script still hides.  The 5 PTY-dependent
+# tests above it self-gate and announce `SKIP `, which keeps CI and local runs in
+# agreement without either silently lying.
 readonly SKIPS=(
-    --skip harness::pty::tests::test_harness_pty_process_group_kill
-    --skip harness::pty::tests::test_interactive_pty_manager_lifecycle
-    --skip harness::pty::tests::test_run_command_parses_timeout_seconds_argument
-    --skip harness::pty::tests::test_run_command_pty_cancelled_by_worker_token
     --skip harness::tests::test_harness_delegate_task_manager_routes_and_returns_deliverable
-    --skip test_prompt_based_tool_gating
 )
 
 usage() {
@@ -105,7 +138,13 @@ Runs, from the repository root (resolved from $0, so any CWD works):
     1. host legs    cargo fmt --all -- --check
                     cargo clippy --all-targets --all-features -- -D warnings
                     cargo test --all-targets --all-features --no-fail-fast
-                        -- --test-threads=1 <6 documented --skip names>
+                        -- --test-threads=1 --nocapture <1 documented --skip name>
+                        (the 5 PTY-dependent tests are not skipped: they self-gate
+                         on a runtime capability probe and print SKIP — see the
+                         header of this script and docs/fix_pty_gating.md; --nocapture
+                         is what makes those SKIP lines visible, because cargo captures
+                         the output of a test that ends ok and a self-skipped test ends
+                         ok)
                     cargo test --doc --all-features
     2. cross legs   for every <triple> with scope local|both in config/gate_targets.txt
                     cargo check  --all-targets --all-features --target T
@@ -128,7 +167,7 @@ OPTIONS:
                               Today's real case:
                                   --allow-missing-target aarch64-apple-darwin
                               (rustup cannot install any new target on this box:
-                              ~/.rustup is read-only, docs/cross_platform_gating.md §3.3;
+                              ~/.rustup is read-only;
                               CI job `test` / Test (macos-latest) is load-bearing, and
                               x86_64-pc-windows-gnu is carried by CI job `cross-check` /
                               "Cross-target check (windows-gnu)", gated by job `lint`.)
@@ -362,10 +401,10 @@ printf 'ci-only     : %s\n' "${ci_only_targets[*]:-<none>}"
 run_leg "host:fmt" "$host_target" cargo fmt --all -- --check
 run_leg "host:clippy" "$host_target" cargo clippy --all-targets --all-features -- -D warnings
 run_leg "host:test" "$host_target" cargo test --all-targets --all-features --no-fail-fast -- \
-    --test-threads=1 "${SKIPS[@]}"
+    --test-threads=1 --nocapture "${SKIPS[@]}"
 run_leg "host:doc-test" "$host_target" cargo test --doc --all-features
 
-# --- 3: cross-target legs (check AND clippy per target, §A) ----------------------
+# --- 3: cross-target legs (check AND clippy per target) --------------------------
 missing_now=()
 
 if [ "$only_host" -eq 1 ]; then
@@ -383,7 +422,7 @@ else
                 mark_allow_used "$target"
                 skipped=$((skipped + 1))
                 add_row "cross:check+clippy" "$target" "SKIPPED (std missing)" "-"
-                tolerated+=("$target not installable locally — rust-std not installed (rustup cannot install any target on this box: ~/.rustup is read-only, docs/cross_platform_gating.md §3.3) — tolerated only because --allow-missing-target $target was passed — covered by $(ci_owner "$target").")
+                tolerated+=("$target not installable locally — rust-std not installed (rustup cannot install any target on this box: ~/.rustup is read-only) — tolerated only because --allow-missing-target $target was passed — covered by $(ci_owner "$target").")
                 printf '\nWARN: target %s not installed — its cfg class is NOT checked locally.\n      Tolerated because --allow-missing-target %s was passed.\n      Coverage responsibility handed to: %s\n' \
                     "$target" "$target" "$(ci_owner "$target")" >&2
             else
@@ -401,7 +440,7 @@ else
     for target in ${ci_only_targets[@]+"${ci_only_targets[@]}"}; do
         skipped=$((skipped + 1))
         add_row "cross:*" "$target" "NOT-CHECKED (scope=ci)" "-"
-        tolerated+=("$target scope=ci by design — cross-compiling it from Linux is proven red (onig_sys + aws-lc-sys build scripts, docs/cross_platform_gating.md §3.2) — covered by $(ci_owner "$target").")
+        tolerated+=("$target scope=ci by design — cross-compiling it from Linux is proven red on this box (onig_sys + aws-lc-sys build scripts) — covered by $(ci_owner "$target").")
     done
 fi
 
@@ -443,17 +482,28 @@ if [ ${#tolerated[@]} -gt 0 ]; then
         printf '  - %s\n' "$g"
     done
 fi
-printf '  - %s tests are skipped locally, split across three reasons (docs/fix_verification.md\n' "$(( ${#SKIPS[@]} / 2 ))"
-printf '    §A/§B/§C): 4 are PTY-device-blocked (/dev/pts/ptmx is mode 000 here, so openpty\n'
-printf '    fails EACCES) and test_prompt_based_tool_gating is PTY-path-blocked (its\n'
-printf '    dispatch_for(run_command …) reaches the same pty::run_command call); the 6th,\n'
-printf '    test_harness_delegate_task_manager_routes_and_returns_deliverable, is NOT PTY-dependent\n'
-printf '    but state-sensitive/flaky — it fails at src/harness/mod.rs:1261 only when a .marmel/\n'
-printf '    session dir exists in the working tree. The 5 PTY-blocked ones run natively in the\n'
-printf '    CI job '\''test'\'' legs: Test (ubuntu-latest), Test (macos-latest), Test (windows-latest).\n'
+printf '  - %s test is skipped locally, for a reason that is NOT an environment hole\n' "$(( ${#SKIPS[@]} / 2 ))"
+printf '    (justified only in docs/fix_verification.md, which is NOT in this tree, so the\n'
+printf '    rationale below is unverified as written): the skip is\n'
+printf '    harness::tests::test_harness_delegate_task_manager_routes_and_returns_deliverable,\n'
+printf '    documented as failing only when a .marmel/ session dir exists in the working tree. That\n'
+printf '    rationale was re-checked on 2026-10-28 and does NOT reproduce: .marmel/ is present here and\n'
+printf '    the test passes when run explicitly (1 passed / 0 failed), so this skip currently hides a\n'
+printf '    green test. Kept because it is inherited and unproven either way — it needs its own ticket.\n'
+printf '  - The 5 PTY-dependent tests are NOT skipped. They self-gate on a runtime probe\n'
+printf '    (pty_allocation_blocker, src/harness/pty.rs) that opens a pty right now; when the\n'
+printf '    host cannot provide one they print SKIP <name>: <syscall reason> instead of running\n'
+printf '    (on this box /dev/pts/ptmx is c---------: devpts is mounted ptmxmode=000, so openpty()\n'
+printf '    answers EACCES). host:test passes --nocapture so those SKIP lines are actually visible\n'
+printf '    in this leg — cargo captures the output of a test that ends ok, and the harness has no\n'
+printf '    skip result, so a host-blocked test is counted as passed and the SKIP line is the only\n'
+printf '    record of it. On a pty-capable host the probe stays silent and the full assertions run\n'
+printf '    natively — the CI job '\''test'\'' legs: Test (ubuntu-latest), Test (macos-latest),\n'
+printf '    Test (windows-latest) — so a real regression there still turns this leg red.\n'
+printf '    Measured evidence: docs/fix_pty_gating.md.\n'
 printf '  - check/clippy do not link and no target binary is executed: behavioural parity\n'
 printf '    (PTY, crossterm/console, landlock, process groups, path separators) remains\n'
-printf '    CI-only (docs/cross_platform_gating.md §3.4, Residual risk 1–3).\n'
+printf '    CI-only (residual risk 1–3; see docs/fix_pty_gating.md §5 point 4).\n'
 
 # An --allow-missing-target that tolerated nothing is a caller mistake (typo, or the std
 # got installed meanwhile) worth surfacing — but not a reason to fail a green gate.

@@ -48,16 +48,40 @@ async fn notice_lock() -> tokio::sync::MutexGuard<'static, ()> {
 /// other tests.
 struct ActiveConfigGuard {
     previous: Option<crate::config::Config>,
+    armed: crate::config::Config,
 }
 
 impl ActiveConfigGuard {
     fn with_backend(base_url: String) -> Self {
         let previous = crate::config::get_active();
-        crate::config::set_active(crate::config::Config {
+        let armed = crate::config::Config {
             backend_url: base_url,
             ..Default::default()
-        });
-        Self { previous }
+        };
+        crate::config::set_active(armed.clone());
+        Self { previous, armed }
+    }
+
+    /// Re-arm **this test's** config immediately before a model round trip.
+    ///
+    /// `handle_reply_to_arbitrator_async` resolves the arbitrator backend out of
+    /// `ACTIVE_CONFIG` *at call time*, and `ACTIVE_CONFIG` is a process global that other
+    /// modules of this binary write while the suite runs in parallel — `orchestrator::pool`'s
+    /// `config_pool_test` installs its own config and then calls `config::clear_active()`.
+    /// Installing the guard once at the top of a test is therefore not enough: the global can
+    /// be swapped or cleared between the guard and the model call, and the arbitrator turn
+    /// then runs against somebody else's backend (or against `Config::default()`'s
+    /// `http://localhost:8000/v1`), which is the "the mock saw zero requests" half of the
+    /// race documented in `docs/fix_notice_reply_flakiness.md`.
+    ///
+    /// Re-arming with no `await` between the write and the tool call — whose first poll
+    /// reaches the config read synchronously — shrinks the vulnerable window from the whole
+    /// test to that read. Those other drivers hold locks this file must never take
+    /// (`config::sandbox_env_test_lock` carries a one-second acquisition watchdog, and
+    /// `workers::TEST_WORKERS_MUTEX` inverts against the notice lock), so the same discipline
+    /// as `src/orchestrator/notice_tests.rs::arm_reply_backend` is what keeps this sound.
+    fn arm(&self) {
+        crate::config::set_active(self.armed.clone());
     }
 }
 
@@ -80,6 +104,31 @@ fn sse_delta(content: &str) -> String {
         "data: {}\n\ndata: [DONE]\n\n",
         serde_json::to_string(&obj).unwrap()
     )
+}
+
+/// How many of the requests this test's mock server observed are arbitrator turns
+/// **of one dialogue**.
+///
+/// The raw request count of a mock server is not a per-test quantity, because the arbitrator
+/// backend is resolved out of the process-global `ACTIVE_CONFIG` at call time: while this
+/// test's config guard is in force, *any* concurrent model round trip that resolves its
+/// backend in that window is pointed at **this** mock server, and its `POST /chat/completions`
+/// lands in this test's capture vector. That is what turned this assertion red at
+/// `left: 4 / right: 1` (three POSTs from another run, one from this dialogue) — see
+/// `docs/fix_notice_reply_flakiness.md`.
+///
+/// A turn belongs to this dialogue only when the request carries this dialogue's payload.
+/// [`crate::orchestrator::evaluate_worker_reply`] builds its user prompt as
+/// `Original User Inquiry:\n"<inquiry>" … Specialist Worker [<tag>] Reply to Arbitrator:\n"<reply>"`,
+/// so the notice's inquiry and the worker's reply message — both chosen by the test that owns
+/// the dialogue — are the per-dialogue markers, and they are as unique as the notice id.
+/// A duplicated evaluation of *this* reply still carries both markers, so exactly-once is
+/// still enforced; only traffic that belongs to another run stops being charged here.
+fn arbitrator_turns_for(bodies: &[String], inquiry: &str, reply: &str) -> usize {
+    bodies
+        .iter()
+        .filter(|body| body.contains(inquiry) && body.contains(reply))
+        .count()
 }
 
 // 1. Reply targeting
@@ -350,7 +399,13 @@ async fn test_notice_reply_round_trip_reaches_the_user_exactly_once() {
         })
         .mount(&server)
         .await;
-    let _config = ActiveConfigGuard::with_backend(server.uri());
+    let config = ActiveConfigGuard::with_backend(server.uri());
+
+    // Per-dialogue markers. The arbitrator request carries the notice's inquiry and the
+    // worker's reply verbatim, so these two strings — not the mock server's raw request
+    // count — decide which captured request belongs to this dialogue.
+    const INQUIRY: &str = "Is the refactor done yet?";
+    const WORKER_REPLY: &str = "Refactor done, cargo test is green.";
 
     // A live worker: the notice is filed under the key this worker drains with, and the reply
     // is attributed through the very token the runner scoped around its turn.
@@ -367,11 +422,7 @@ async fn test_notice_reply_round_trip_reaches_the_user_exactly_once() {
     crate::orchestrator::set_event_sender(event_tx);
 
     // Exactly one notice for this instruction, addressed by the effective key.
-    post_notice_to_worker(
-        &worker_key,
-        "Is the refactor done yet?",
-        Some("notice-t0520-round"),
-    );
+    post_notice_to_worker(&worker_key, INQUIRY, Some("notice-t0520-round"));
     assert_eq!(
         crate::orchestrator::notice::worker_inbox_len(&worker_key),
         1,
@@ -387,9 +438,13 @@ async fn test_notice_reply_round_trip_reaches_the_user_exactly_once() {
         name: TOOL_REPLY_TO_ARBITRATOR.to_string(),
         arguments: serde_json::json!({
             "notice_id": "notice-t0520-round",
-            "message": "Refactor done, cargo test is green."
+            "message": WORKER_REPLY
         }),
     };
+    // No `await` between this write and the tool call: the arbitrator turn reads the
+    // process-global config on its first poll, and another module may have swapped or cleared
+    // that global since the guard was installed.
+    config.arm();
     let res = crate::orchestrator::CURRENT_WORKER_TOKEN
         .scope(
             token.clone(),
@@ -399,11 +454,22 @@ async fn test_notice_reply_round_trip_reaches_the_user_exactly_once() {
         .expect("the addressed worker's reply must be accepted");
     assert!(!res.is_error);
 
-    // One arbitrator turn — no duplicate evaluation call.
+    // One arbitrator turn — no duplicate evaluation call. Counted **for this dialogue**: a
+    // mock server's raw request count is not a per-test quantity, because every concurrent
+    // model round trip whose backend is resolved while this test's config guard is in force is
+    // pointed at *this* server and lands in `received_bodies`.
+    let (turns, observed) = {
+        let bodies = received_bodies.lock().unwrap();
+        (
+            arbitrator_turns_for(&bodies, INQUIRY, WORKER_REPLY),
+            bodies.len(),
+        )
+    };
     assert_eq!(
-        received_bodies.lock().unwrap().len(),
-        1,
-        "one accepted reply must cost exactly one arbitrator turn"
+        turns, 1,
+        "one accepted reply must cost exactly one arbitrator turn (this mock observed \
+         {observed} POST(s) in total; exactly one of them may carry this dialogue's payload) \
+         — see docs/fix_notice_reply_flakiness.md"
     );
 
     // The notice is resolved and the reply recorded against it.
@@ -436,6 +502,172 @@ async fn test_notice_reply_round_trip_reaches_the_user_exactly_once() {
     drop(worker);
 }
 
+/// Regression guard for the flake recorded in `docs/fix_notice_reply_flakiness.md`.
+///
+/// The arbitrator backend is resolved out of the **process-global** `ACTIVE_CONFIG` at call
+/// time (`src/harness/mod.rs`, `handle_reply_to_arbitrator_async`). While one test's config
+/// guard is in force, every *other* concurrent model round trip that resolves its backend in
+/// that window is pointed at this test's mock server — in the full suite the observed foreign
+/// source was the `create_plan` plan audit (`harness::plan::write_plan_internal` →
+/// `agents::validation::run_plan_validation` → `resolve_validator_backend(cfg)`), whose fix
+/// loop put four `POST /chat/completions` on a round-trip test's mock, and the raw hit count
+/// the assertion read was `4`.
+///
+/// This test forces that interleaving on purpose: three arbitrator turns of **another**
+/// dialogue are run through a client built from the process-global config, all three land on
+/// this mock, and the round trip then runs on top of that traffic. Exactly one turn — the one
+/// carrying this dialogue's payload — may be charged to this dialogue, and the user still gets
+/// exactly one answer. The interleaving itself is pinned by payload attribution — those three
+/// foreign turns must really reach this mock — while the raw hit count is only a lower bound,
+/// because it counts other tests' traffic too and is therefore environmental.
+#[tokio::test]
+async fn test_a_foreign_turn_on_the_shared_backend_is_not_charged_to_this_dialogue() {
+    let _notice_lock = notice_lock().await;
+    clear_all_notices();
+    let history = HistoryGuard::install();
+
+    let server = MockServer::start().await;
+    let received_bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let rb = std::sync::Arc::clone(&received_bodies);
+    let decision = serde_json::json!({
+        "decision": "SynthesizeResponse",
+        "response": "Answered once for this dialogue.",
+        "follow_up_prompt": null,
+        "user_status": null
+    });
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(move |req: &wiremock::Request| {
+            rb.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&req.body).to_string());
+            ResponseTemplate::new(200).set_body_string(sse_delta(&decision.to_string()))
+        })
+        .mount(&server)
+        .await;
+    let config = ActiveConfigGuard::with_backend(server.uri());
+
+    const INQUIRY: &str = "Is the migration finished?";
+    const WORKER_REPLY: &str = "Migration finished, the suite is green.";
+    const FOREIGN_INQUIRY: &str = "Foreign run: unrelated status check";
+    const FOREIGN_REPLY: &str = "Foreign run: unrelated answer";
+
+    // Traffic from other runs, through the same process-global backend resolution the plan
+    // auditor and the delegation validator use.
+    let cfg = crate::config::get_active().expect("the guard armed the global config");
+    let client = crate::llm::ChatClient::from_config(&cfg);
+    let stats = crate::harness::HarnessStats::new();
+    for round in 0..3 {
+        let foreign_notice = SteerNotice {
+            notice_id: format!("notice-foreign-shared-{round}"),
+            user_inquiry: FOREIGN_INQUIRY.to_string(),
+            target_worker: "coder-foreign-t-9400".to_string(),
+            created_at_ms: 0,
+        };
+        let _eval = crate::orchestrator::evaluate_worker_reply(
+            &client,
+            &stats,
+            &foreign_notice,
+            "coder-foreign-t-9400",
+            &format!("{FOREIGN_REPLY} {round}"),
+            |_| {},
+        )
+        .await;
+    }
+    // Counted **by payload**, never by the mock's raw length: another test's round trip that
+    // resolves `ACTIVE_CONFIG` inside this window is charged here too, so only the turns
+    // carrying `FOREIGN_INQUIRY` are this test's own traffic.
+    let foreign_arrived = received_bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|body| body.contains(FOREIGN_INQUIRY))
+        .count();
+    assert_eq!(
+        foreign_arrived, 3,
+        "the three foreign turns must have reached this mock — that is the interleaving \
+         under test, and it is what the pre-fix assertion mistook for duplicate delivery"
+    );
+
+    // The dialogue this test owns, on top of that traffic.
+    let token = tokio_util::sync::CancellationToken::new();
+    let worker = crate::orchestrator::register_active_worker_with_token(
+        Some("t-0524".to_string()),
+        "coder".to_string(),
+        "finish the migration".to_string(),
+        Some(token.clone()),
+    );
+    let worker_key = worker.0.clone();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    crate::orchestrator::set_event_sender(event_tx);
+    post_notice_to_worker(&worker_key, INQUIRY, Some("notice-t0524-shared-backend"));
+    let delivered = crate::orchestrator::notice::drain_worker_notices(&worker_key);
+    assert_eq!(delivered.len(), 1);
+
+    let invocation = ToolInvocation {
+        name: TOOL_REPLY_TO_ARBITRATOR.to_string(),
+        arguments: serde_json::json!({
+            "notice_id": "notice-t0524-shared-backend",
+            "message": WORKER_REPLY
+        }),
+    };
+    config.arm();
+    let res = crate::orchestrator::CURRENT_WORKER_TOKEN
+        .scope(
+            token.clone(),
+            dispatch_for_async(&invocation, ToolCaller::Specialist(Agent::Coder)),
+        )
+        .await
+        .expect("the addressed worker's reply must be accepted");
+    assert!(!res.is_error);
+
+    let (turns, foreign_turns, observed) = {
+        let bodies = received_bodies.lock().unwrap();
+        (
+            arbitrator_turns_for(&bodies, INQUIRY, WORKER_REPLY),
+            bodies
+                .iter()
+                .filter(|body| body.contains(FOREIGN_INQUIRY))
+                .count(),
+            bodies.len(),
+        )
+    };
+    // At least the shape the flake produced: four POSTs on this one mock server. The raw count
+    // is environmental — foreign round trips resolved through `ACTIVE_CONFIG` in this window
+    // land here as well (the `left: 5, right: 4` flake) — so it is only a lower bound, while
+    // the attribution below stays exact.
+    assert!(
+        observed >= 4,
+        "three foreign turns plus this dialogue's own must all be visible on this mock \
+         (observed {observed} POST(s))"
+    );
+    // …and the only honest reading of that traffic.
+    assert_eq!(
+        turns, 1,
+        "one accepted reply costs exactly one arbitrator turn of **this** dialogue, however \
+         much other traffic the shared backend routes here"
+    );
+    assert_eq!(
+        foreign_turns, 3,
+        "the foreign turns stay attributed to their own dialogues"
+    );
+
+    let mut answers: Vec<String> = Vec::new();
+    while let Ok(event) = event_rx.try_recv() {
+        if let crate::ui::Event::SteerResponse(text) = event {
+            answers.push(text);
+        }
+    }
+    assert_eq!(
+        answers.len(),
+        1,
+        "the user must get exactly one arbitrator answer, got {answers:?}"
+    );
+    assert_eq!(history.snapshot().len(), 1, "one dialogue, one entry");
+
+    drop(worker);
+}
+
 /// (c) Round two of a dialogue must reach **the worker that was addressed**, and a second worker
 /// of the same role must be able neither to receive the follow-up nor to answer the first
 /// worker's notice. Before the fix the follow-up was filed under the bare role name (`coder`),
@@ -458,7 +690,7 @@ async fn test_follow_up_reaches_the_addressed_worker_and_not_its_same_role_sibli
         .respond_with(ResponseTemplate::new(200).set_body_string(sse_delta(&decision.to_string())))
         .mount(&server)
         .await;
-    let _config = ActiveConfigGuard::with_backend(server.uri());
+    let config = ActiveConfigGuard::with_backend(server.uri());
 
     // Two live workers of the **same role**.
     let token_a = tokio_util::sync::CancellationToken::new();
@@ -523,6 +755,9 @@ async fn test_follow_up_reaches_the_addressed_worker_and_not_its_same_role_sibli
             "message": "Landed, and the crate suite is green."
         }),
     };
+    // Re-armed immediately before the call: the follow-up only exists if this test's own
+    // arbitrator turn reached this test's backend.
+    config.arm();
     crate::orchestrator::CURRENT_WORKER_TOKEN
         .scope(
             token_a.clone(),
@@ -813,7 +1048,12 @@ async fn test_reply_from_a_tokenless_registration_is_keyed_to_the_notice_key() {
         })
         .mount(&server)
         .await;
-    let _config = ActiveConfigGuard::with_backend(server.uri());
+    let config = ActiveConfigGuard::with_backend(server.uri());
+
+    // Per-dialogue markers, same instrument as in
+    // `test_notice_reply_round_trip_reaches_the_user_exactly_once`.
+    const INQUIRY: &str = "Did the suite go green?";
+    const WORKER_REPLY: &str = "Green: the crate suite passed.";
 
     // No token is registered, and the token below is the one the turn runs under.
     let token = tokio_util::sync::CancellationToken::new();
@@ -829,11 +1069,7 @@ async fn test_reply_from_a_tokenless_registration_is_keyed_to_the_notice_key() {
     );
 
     // Addressed by the task id — a token a bare role name cannot route in either direction.
-    let posted = post_notice_to_worker(
-        "t-0532",
-        "Did the suite go green?",
-        Some("notice-t0532-tokenless"),
-    );
+    let posted = post_notice_to_worker("t-0532", INQUIRY, Some("notice-t0532-tokenless"));
     assert_eq!(posted.target_worker, "t-0532");
     let delivered = crate::orchestrator::notice::drain_worker_notices(&worker_key);
     assert_eq!(
@@ -847,6 +1083,9 @@ async fn test_reply_from_a_tokenless_registration_is_keyed_to_the_notice_key() {
         "the id the worker is told to echo back"
     );
 
+    // Re-armed with no `await` before the call, so this turn is charged to this test's
+    // backend even if another module rewrote the process-global config meanwhile.
+    config.arm();
     let res = crate::orchestrator::CURRENT_WORKER_TOKEN
         .scope(
             token.clone(),
@@ -854,7 +1093,7 @@ async fn test_reply_from_a_tokenless_registration_is_keyed_to_the_notice_key() {
                 "tokenlessreply",
                 &serde_json::json!({
                     "notice_id": "notice-t0532-tokenless",
-                    "message": "Green: the crate suite passed."
+                    "message": WORKER_REPLY
                 }),
             ),
         )
@@ -871,10 +1110,18 @@ async fn test_reply_from_a_tokenless_registration_is_keyed_to_the_notice_key() {
         "the reply must be recorded under the key the notice was filed under, not under a \
          role name no single worker owns"
     );
+    let (turns, observed) = {
+        let bodies = received_bodies.lock().unwrap();
+        (
+            arbitrator_turns_for(&bodies, INQUIRY, WORKER_REPLY),
+            bodies.len(),
+        )
+    };
     assert_eq!(
-        received_bodies.lock().unwrap().len(),
-        1,
-        "one accepted reply, exactly one arbitrator turn"
+        turns, 1,
+        "one accepted reply, exactly one arbitrator turn (this mock observed {observed} \
+         POST(s) in total; only one of them may carry this dialogue's payload) — see \
+         docs/fix_notice_reply_flakiness.md"
     );
 
     // The contract is not loosened: a notice addressed to a different worker stays refused.
@@ -884,6 +1131,7 @@ async fn test_reply_from_a_tokenless_registration_is_keyed_to_the_notice_key() {
         Some("notice-t0533-foreign"),
     );
     assert_eq!(foreign.target_worker, "t-0533");
+    config.arm();
     let rejected = crate::orchestrator::CURRENT_WORKER_TOKEN
         .scope(
             token.clone(),
@@ -904,10 +1152,18 @@ async fn test_reply_from_a_tokenless_registration_is_keyed_to_the_notice_key() {
     );
     assert!(get_pending_notice("notice-t0533-foreign").is_some());
     assert!(get_worker_reply("notice-t0533-foreign").is_none());
+    let (turns, observed) = {
+        let bodies = received_bodies.lock().unwrap();
+        (
+            arbitrator_turns_for(&bodies, INQUIRY, WORKER_REPLY),
+            bodies.len(),
+        )
+    };
     assert_eq!(
-        received_bodies.lock().unwrap().len(),
-        1,
-        "a rejected reply must spend no arbitrator turn"
+        turns, 1,
+        "a rejected reply must spend no arbitrator turn (this mock observed {observed} \
+         POST(s) in total, still exactly one of them carrying this dialogue's payload) — see \
+         docs/fix_notice_reply_flakiness.md"
     );
     assert_eq!(
         history.snapshot().len(),

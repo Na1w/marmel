@@ -1,65 +1,59 @@
 //! Formatting, text parsing, terminal math, and word wrapping utilities for TUI.
 
+use crate::ui::tui::theme;
 use ansi_to_tui::IntoText;
-use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 /// Choose the message-level style by prefix matching.
 /// Returns `(style, has_special_style)`.
+///
+/// This is the transcript **role palette** (§B.1): it used to name raw
+/// `Color::` values here, which put a second, competing copy of the palette
+/// outside `theme.rs`. Every slot is now a role/text token, so a hue moves in
+/// one file only, and the body branch stays fg-less on purpose (§F2: forcing
+/// `White` is white-on-white on a light profile).
 pub fn message_style(msg: &str) -> (Style, bool) {
     let first = msg.lines().next().unwrap_or("");
     if first.starts_with("--- Turn") || first.starts_with("=== Turn") {
-        (
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-            true,
-        )
+        (theme::role_turn(), true)
     } else if first.starts_with("[Status] ") || first.starts_with("[CLI] ") {
-        (Style::default().fg(Color::Yellow), true)
+        (theme::role_status(), true)
     } else if first.starts_with("System Error: ") {
-        (
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            true,
-        )
+        (theme::state_failed(), true)
     } else if first.starts_with("User: ") || first.starts_with("User (Steer): ") {
-        (
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            true,
-        )
+        (theme::role_user(), true)
     } else if first.starts_with("Marmennill: ") || first.starts_with("[Steer Arbitrator]") {
-        (
-            Style::default()
-                .fg(Color::LightYellow)
-                .add_modifier(Modifier::BOLD),
-            true,
-        )
+        (theme::role_manager(), true)
     } else if first.starts_with('[') && first.ends_with("completed.") {
-        (
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-            true,
-        )
+        (theme::state_done(), true)
     } else if first.starts_with('[')
         && (first.ends_with("failed.")
             || first.ends_with("failed]")
             || first.contains(" failed:")
             || first.contains(" failed]"))
     {
-        (
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            true,
-        )
+        (theme::state_failed(), true)
     } else {
-        // Orchestrator / Model content defaults to white text.
-        (Style::default().fg(Color::White), false)
+        // Orchestrator / Model content: body text inherits the operator's own
+        // terminal foreground (`text_primary`, research §F2).
+        (theme::text_primary(), false)
     }
+}
+
+/// The reasoning tier: the palette's [`theme::text_thought`] slot **plus a
+/// weight step** (§F7). Italics alone are not a signal — a terminal that drops
+/// `ITALIC` collapsed the tier into [`theme::text_muted`] chrome, which is how
+/// reasoning silently turned into gutter text. `DIM` is the weight counterpart
+/// of the `BOLD` the role tokens already carry, so the tier stays readable
+/// without italics, stays distinct from `role_turn` (`DarkGray` + `BOLD`), and
+/// borrows no hue. The three thought sites (message lines, the streaming
+/// buffer, the transcript region) share this one helper so the tier cannot drift
+/// into three different shapes again.
+pub(crate) fn thought_style() -> Style {
+    theme::text_thought().add_modifier(Modifier::DIM)
 }
 
 /// Segment of a rendered line representing either reasoning thought or visible content.
@@ -766,12 +760,7 @@ pub fn render_message_lines(msg: &str, show_thought: bool) -> Vec<Line<'static>>
             for line in t.lines() {
                 let cleaned = format_terminal_math(line.trim());
                 if !cleaned.is_empty() {
-                    chat_lines.push(Line::from(Span::styled(
-                        cleaned,
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    )));
+                    chat_lines.push(Line::from(Span::styled(cleaned, thought_style())));
                 }
             }
         }
@@ -797,12 +786,7 @@ pub fn render_message_lines(msg: &str, show_thought: bool) -> Vec<Line<'static>>
                         continue;
                     }
                     let cleaned = format_terminal_math(trimmed);
-                    chat_lines.push(Line::from(Span::styled(
-                        cleaned,
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    )));
+                    chat_lines.push(Line::from(Span::styled(cleaned, thought_style())));
                 }
                 LineSegment::Content(c) => {
                     let trimmed = c.trim();
@@ -823,18 +807,12 @@ pub fn render_message_lines(msg: &str, show_thought: bool) -> Vec<Line<'static>>
                         if cleaned.contains('\x1b') {
                             chat_lines.extend(parse_ansi_lines(&cleaned));
                         } else {
-                            chat_lines.push(Line::from(Span::styled(
-                                cleaned,
-                                Style::default().fg(Color::Magenta),
-                            )));
+                            chat_lines.push(Line::from(Span::styled(cleaned, theme::role_tool())));
                         }
                     } else if cleaned.contains('\x1b') {
                         chat_lines.extend(parse_ansi_lines(&cleaned));
                     } else {
-                        chat_lines.push(Line::from(Span::styled(
-                            cleaned,
-                            Style::default().fg(Color::White),
-                        )));
+                        chat_lines.push(Line::from(Span::styled(cleaned, theme::text_primary())));
                     }
                 }
             }
@@ -1128,10 +1106,6 @@ pub fn extract_complete_sentences(buffer: &mut String) -> Vec<String> {
     sentences
 }
 
-pub fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
-    x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)
-}
-
 /// Parse a string that may contain ANSI escape sequences into Ratatui `Line`s.
 /// If ANSI sequences are present and successfully parsed, returns styled lines.
 /// Otherwise returns plain text lines.
@@ -1267,5 +1241,47 @@ mod tests {
             wrapped.is_some_and(|off| off >= 2),
             "wrapped offset: {wrapped:?}"
         );
+    }
+
+    /// The transcript role palette belongs to `theme.rs`, not to this file: a
+    /// `[Tool Call]` line takes [`theme::role_tool`] and a plain body line takes
+    /// [`theme::text_primary`] — an explicit **no** foreground, so a light
+    /// terminal still reads the transcript (research §F2, which is exactly what
+    /// the hard-coded `Color::White` used to break).
+    #[test]
+    fn tool_and_body_lines_take_a_palette_slot_never_a_raw_colour() {
+        let tool = render_message_lines("[Tool Call] read_file(src/main.rs)", false);
+        assert_eq!(tool.len(), 1, "got: {tool:?}");
+        assert_eq!(tool[0].spans[0].style, theme::role_tool());
+
+        let body = render_message_lines("plain orchestrator body", false);
+        assert_eq!(body.len(), 1, "got: {body:?}");
+        assert_eq!(body[0].spans[0].style, theme::text_primary());
+        assert_eq!(
+            body[0].spans[0].style.fg, None,
+            "body text must stay fg-less and inherit the operator's profile"
+        );
+    }
+
+    /// The reasoning tier keeps `ITALIC` **and** carries a weight step, so a
+    /// terminal that ignores italics still separates reasoning from the dim
+    /// chrome it used to collapse into (§F7). The tier never falls back to a
+    /// colour-only signal.
+    #[test]
+    fn the_thought_tier_keeps_italic_and_a_weight_step() {
+        let style = thought_style();
+        assert!(style.add_modifier.contains(Modifier::ITALIC));
+        assert!(
+            style.add_modifier.contains(Modifier::DIM),
+            "the tier needs a step that survives a terminal without italics"
+        );
+        assert_ne!(style, theme::text_muted(), "reasoning vs gutter chrome");
+        assert_ne!(style, theme::role_turn(), "reasoning vs a turn separator");
+
+        let lines = render_message_lines("<think>weigh the seam</think>\nvisible answer", true);
+        assert_eq!(lines.len(), 2, "got: {lines:?}");
+        assert_eq!(lines[0].spans[0].content, "weigh the seam");
+        assert_eq!(lines[0].spans[0].style, style, "thought takes the tier");
+        assert_eq!(lines[1].spans[0].style, theme::text_primary());
     }
 }
