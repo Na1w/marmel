@@ -13,24 +13,23 @@
 //! the mode the frame was built from, including where the §2.5 ladder overrides
 //! it.
 //!
-//! **Slot assignment — one global rule (t-024b).** In every shape that draws both
-//! the Plan and the Transcript, the Execution Plan pane owns the **leading** slot
-//! and the Transcript pane the **trailing** one. Leading is the leftmost column of
-//! a columns split, the topmost row of a stacked split, and the wide column of the
-//! short-terminal fallback in which the side column cannot stack; trailing is the
-//! slot on the far side of the same split. So M2 draws the Plan in the wide left
-//! column and the Transcript in the right one, M4 draws the Plan in the wide column
-//! with the Transcript at the head of the side column over the roster, and the
-//! `width < 90` stack puts the Plan on top. The rule is about slots only: a slot
-//! keeps its own §2.3 width (`55/45`, `60/40`), and the Plan never jumps sides
-//! between modes — one geometry, read the same way in every shape.
+//! **Slot assignment — one global rule.** In every shape that draws the
+//! Transcript alongside the Plan and/or Workers panes, the Transcript pane owns
+//! the **leading** slot and the side panes own the **trailing** one. Leading is
+//! the leftmost column of a columns split, the topmost row of a stacked split,
+//! and the wide column of the short-terminal fallback in which the side column
+//! cannot stack; trailing is the slot on the far side of the same split. So M2
+//! draws the Transcript in the wide left column and the Plan in the right one,
+//! M3 draws the Transcript in the wide left column and the Workers pane in the
+//! right one, M4 draws the Transcript in the wide left column with the Plan at
+//! the head of the side column over the roster, and the `width < 90` stack puts
+//! the Transcript on top. The rule is about slots only: a slot keeps its own
+//! §2.3 width (`55/45`, `60/40`), and the Transcript never jumps sides between
+//! modes — one geometry, read the same way in every shape.
 //!
-//! Where a shape draws no Plan pane the rule has nothing to place and the older
-//! arrangement stands: M3 keeps the roster in the wide left column over the
-//! Transcript, a stacked or side-column fallback that keeps the roster instead of
-//! the Plan heads with the Transcript, and the shapes the §2.5 ladder reduces to a
-//! single pane (`width < 60`, and `width < 90` with no side pane on screen) place
-//! nothing at all.
+//! Where the §2.5 ladder reduces M2 or M3 (`width < 60`) to a single pane
+//! isolating the side pane, there is only one pane on screen and nothing to
+//! split.
 
 use super::state::{FocusPane, UiView, ViewMode};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -60,10 +59,9 @@ enum Shape {
     Full,
     /// Side-by-side columns (`Percentage` pair of §2.3).
     Columns,
-    /// Two panes stacked (`vertical([Min(6), Min(6)])`). With the Plan on screen it
-    /// holds the leading (top) slot and the Transcript the trailing (bottom) one —
-    /// the global rule read vertically. When the §2.5 ladder keeps the roster
-    /// instead of the Plan there is no Plan to place and the Transcript stays on top.
+    /// Two panes stacked (`vertical([Min(6), Min(6)])`). The Transcript holds the
+    /// leading (top) slot and the focused side pane (Plan or Workers) the trailing
+    /// (bottom) one — the global rule read vertically.
     Stacked,
 }
 
@@ -204,37 +202,33 @@ pub fn compute_layout(area: Rect, view: &UiView) -> PaneRects {
         (ViewMode::Plan, Shape::Full) => rects.plan = Some(body),
         (ViewMode::Workers, Shape::Full) => rects.workers = Some(body),
         (ViewMode::Plan, _) => {
-            // M2 under the global rule: the Plan owns the leading (left) column and
-            // the Transcript the trailing (right) one — the same reading order M4
-            // gives its columns, so the Plan never moves to the far side of a split.
-            // The `55/45` pair is the §2.3 pair unchanged; the rule fixes which pane
-            // owns which slot, never a width.
+            // M2 under the global rule: the Transcript owns the leading (left) column
+            // and the Plan the trailing (right) one — the same reading order M3 and M4
+            // give their columns, so the Transcript never moves to the far side of a
+            // split. The `55/45` pair is the §2.3 pair unchanged.
             let cols = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
                 .split(body);
-            rects.plan = Some(cols[0]);
-            rects.transcript = Some(cols[1]);
+            rects.transcript = Some(cols[0]);
+            rects.plan = Some(cols[1]);
         }
         (ViewMode::Workers, _) => {
-            // M3 has no Plan pane, so the global rule has nothing to place here: the
-            // roster keeps the wide left column and the Transcript the right one.
+            // M3 under the global rule: the Transcript owns the leading (left) column
+            // and the roster the trailing (right) one.
             let cols = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
                 .split(body);
-            rects.workers = Some(cols[0]);
-            rects.transcript = Some(cols[1]);
+            rects.transcript = Some(cols[0]);
+            rects.workers = Some(cols[1]);
         }
         (ViewMode::Split, Shape::Stacked) => {
             // §2.5 `width < 90`: the body stacks two panes, and the focused side
-            // pane stands in for one of the three. Where the survivor is the Plan the
-            // global rule places it exactly as it does in the columns below — the Plan
-            // leads the stack (top row) and the Transcript takes the row under it.
-            // Where the roster survives there is no Plan on screen to place, and the
-            // Transcript keeps the leading row.
+            // pane stands in for one of the three. The Transcript always leads the
+            // stack (top row) and the surviving side pane takes the row under it.
             let stack = Layout::vertical([Constraint::Min(BODY_MIN), Constraint::Min(BODY_MIN)])
                 .split(body);
             match side_pane(view) {
                 Some(FocusPane::Plan) => {
-                    rects.plan = Some(stack[0]);
-                    rects.transcript = Some(stack[1]);
+                    rects.transcript = Some(stack[0]);
+                    rects.plan = Some(stack[1]);
                 }
                 Some(FocusPane::Workers) => {
                     rects.transcript = Some(stack[0]);
@@ -244,41 +238,37 @@ pub fn compute_layout(area: Rect, view: &UiView) -> PaneRects {
             }
         }
         (ViewMode::Split, _) => {
-            // M4 under the global rule: the Plan owns the leading (wide) column and
-            // the Transcript the head of the side column, over the roster. The
+            // M4 under the global rule: the Transcript owns the leading (wide) column
+            // and the Plan sits at the head of the side column, over the roster. The
             // `60/40` pair is the §2.3 pair unchanged.
             let cols = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
                 .split(body);
             let (wide, side) = (cols[0], cols[1]);
+            rects.transcript = Some(wide);
             match (view.plan_visible, view.workers_visible) {
                 (true, true) if side.height >= 2 * BODY_MIN => {
                     let stack =
                         Layout::vertical([Constraint::Min(BODY_MIN), Constraint::Min(BODY_MIN)])
                             .split(side);
-                    rects.plan = Some(wide);
-                    rects.transcript = Some(stack[0]);
+                    rects.plan = Some(stack[0]);
                     rects.workers = Some(stack[1]);
                 }
                 // The side column cannot stack two panes: only one of the two side
                 // panes is drawn, and [`side_pane`] picks the one that keeps the
-                // focus on screen. Where that is the Plan, the global rule puts it in
-                // the leading (wide) column with the Transcript in the side one.
+                // focus on screen. The Transcript stays in the leading (wide) column
+                // and the surviving side pane takes the side column.
                 (true, true) => match side_pane(view) {
                     Some(FocusPane::Workers) => {
-                        rects.transcript = Some(wide);
                         rects.workers = Some(side);
                     }
                     _ => {
-                        rects.plan = Some(wide);
-                        rects.transcript = Some(side);
+                        rects.plan = Some(side);
                     }
                 },
                 (true, false) => {
-                    rects.plan = Some(wide);
-                    rects.transcript = Some(side);
+                    rects.plan = Some(side);
                 }
                 (false, true) => {
-                    rects.transcript = Some(wide);
                     rects.workers = Some(side);
                 }
                 (false, false) => rects.transcript = Some(body),

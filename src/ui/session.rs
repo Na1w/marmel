@@ -1909,6 +1909,7 @@ pub async fn run_session_with_bounds_report(
 
     let mut steer_queue = Vec::<String>::new();
     let mut steer_abort_requested = false;
+    let mut execution_paused = false;
     // A resumed session adopts the restored subagent panes as the loop's
     // authoritative list instead of starting from an empty one, so the subagent
     // panes and the status line keep showing the interrupted delegations. Those
@@ -2466,7 +2467,8 @@ pub async fn run_session_with_bounds_report(
                         Vec::new()
                     }
                 };
-                if !steer_abort_requested
+                if !execution_paused
+                    && !steer_abort_requested
                     && !renderer.aborted()
                     && !crate::orchestrator::is_globally_cancelled()
                     && !pending.is_empty()
@@ -2480,7 +2482,7 @@ pub async fn run_session_with_bounds_report(
                     renderer.flush()?;
                     ctx.append(Message::User {
                         content: format!(
-                            "(SYSTEM NOTICE: The execution plan is active on disk with pending tasks: [{pending_str}]. You are in the EXECUTING phase. You must call `delegate_task` to dispatch these pending tasks to specialists. Do NOT call `create_plan` again, and do NOT output conversational filler until all tasks are marked [x].)"
+                            "(SYSTEM NOTICE: The execution plan has pending tasks: [{pending_str}]. If you need to revise the plan based on user instructions, call `create_plan` to update it; otherwise, call `delegate_task` to continue executing the pending tasks. Do not remain idle.)"
                         ),
                     });
                     continue;
@@ -2508,6 +2510,12 @@ pub async fn run_session_with_bounds_report(
                         .unwrap_or_else(|_| serde_json::Value::String(args_str.clone()));
 
                     let is_delegate = name == crate::tool_names::TOOL_DELEGATE_TASK;
+                    if name == crate::tool_names::TOOL_PAUSE_EXECUTION
+                        || name == "stop_execution"
+                        || name == "abort_execution"
+                    {
+                        execution_paused = true;
+                    }
                     let delegated_agent = if is_delegate {
                         args_val
                             .get("agent_name")
@@ -3056,6 +3064,12 @@ pub async fn run_session_with_bounds_report(
                         .unwrap_or_else(|_| serde_json::Value::String(args_str.clone()));
 
                     let is_delegate = name == crate::tool_names::TOOL_DELEGATE_TASK;
+                    if name == crate::tool_names::TOOL_PAUSE_EXECUTION
+                        || name == "stop_execution"
+                        || name == "abort_execution"
+                    {
+                        execution_paused = true;
+                    }
                     let args_obj = args_val.as_object();
                     let delegated_agent = if is_delegate {
                         args_obj
@@ -3114,12 +3128,9 @@ pub async fn run_session_with_bounds_report(
                     );
 
                     if name == crate::tool_names::TOOL_REBIRTH {
-                        renderer
-                            .on_event(&Event::ToolCall(format_tool_call_display(&name, &args_val)));
-                        renderer.flush()?;
                         let res = crate::harness::handle_rebirth(&mut ctx, &args_val);
                         match res {
-                            Ok(r) => {
+                            Ok(ref r) => {
                                 renderer.on_event(&Event::ToolResult(r.content.clone()));
                                 if !r.is_error {
                                     ui_transcript.append(UiRecord::Status {
@@ -3183,7 +3194,7 @@ pub async fn run_session_with_bounds_report(
                                     );
                                 }
                             }
-                            Err(e) => {
+                            Err(ref e) => {
                                 renderer.on_event(&Event::ToolResult(format!("ERROR: {e}")));
                                 ctx.append(Message::Tool {
                                     tool_call_id: call.id.clone(),
@@ -3198,6 +3209,11 @@ pub async fn run_session_with_bounds_report(
                             }
                         }
                         renderer.flush()?;
+                        if let Ok(ref r) = res
+                            && !r.is_error
+                        {
+                            break;
+                        }
                         continue;
                     }
 
@@ -3738,6 +3754,7 @@ pub async fn run_session_with_bounds_report(
                 steer_abort_requested = false;
                 renderer.clear_abort();
                 crate::orchestrator::reset_cancellation();
+                execution_paused = true;
                 // No row is closed or rewritten here: the row disappears when the
                 // worker registry entry goes inactive (the cancellation lands on
                 // the worker thread), and the projection below folds that in.
@@ -3754,7 +3771,7 @@ pub async fn run_session_with_bounds_report(
                 }
                 capture_and_request(&mut commit_pump, CommitTrigger::UiEvent, &ctx, &*renderer);
                 renderer.on_event(&Event::Status(
-                    "Steering redirection: aborted current turn, starting next turn with updated context".to_string(),
+                    "Steering redirection: aborted current turn, execution paused. Enter 'fortsätt' or instructions to proceed.".to_string(),
                 ));
                 renderer.flush()?;
                 continue;
@@ -3797,6 +3814,7 @@ pub async fn run_session_with_bounds_report(
                     continue;
                 }
                 if !line.trim().is_empty() {
+                    execution_paused = false;
                     crate::debug_log::log_user_input("interactive_input", &line);
                     ctx.append(Message::User {
                         content: line.clone(),

@@ -3,10 +3,10 @@
 use crate::tool_names::{
     TERMINAL_GLOB, TERMINAL_GREP_SEARCH, TERMINAL_READ_FILE, TERMINAL_REPLACE,
     TERMINAL_RUN_COMMAND, TERMINAL_SLEEP, TERMINAL_WRITE_FILE, TOOL_ARCHIVE_PLAN, TOOL_CREATE_PLAN,
-    TOOL_DELEGATE_TASK, TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_LEAVE_VERDICT, TOOL_PTY_CLOSE,
-    TOOL_PTY_LIST, TOOL_PTY_READ, TOOL_PTY_SPAWN, TOOL_PTY_WRITE, TOOL_READ_FILE, TOOL_REBIRTH,
-    TOOL_REPLACE, TOOL_REPLY_TO_ARBITRATOR, TOOL_RUN_COMMAND, TOOL_SLEEP, TOOL_WRITE_FILE,
-    is_sleep_tool_name,
+    TOOL_DELEGATE_TASK, TOOL_GLOB, TOOL_GREP_SEARCH, TOOL_LEAVE_VERDICT, TOOL_PAUSE_EXECUTION,
+    TOOL_PTY_CLOSE, TOOL_PTY_LIST, TOOL_PTY_READ, TOOL_PTY_SPAWN, TOOL_PTY_WRITE, TOOL_READ_FILE,
+    TOOL_REBIRTH, TOOL_REPLACE, TOOL_REPLY_TO_ARBITRATOR, TOOL_RUN_COMMAND, TOOL_SLEEP,
+    TOOL_WRITE_FILE, is_sleep_tool_name,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -27,7 +27,7 @@ mod tool_resolution_tests;
 pub mod workspace;
 
 pub use common::{HarnessStats, ToolCaller, ToolError, ToolInvocation, ToolResult};
-use plan::{archive_plan, write_plan};
+use plan::{archive_plan, handle_pause_execution, write_plan};
 use sleep::{handle_sleep, handle_sleep_async};
 
 /// The policy-filtered MCP registry (see [`McpDispatchGate`]); the single source of
@@ -392,6 +392,7 @@ pub fn dispatch(tool: &ToolInvocation) -> Result<ToolResult, ToolError> {
             }
         }
         TOOL_ARCHIVE_PLAN => archive_plan(),
+        TOOL_PAUSE_EXECUTION => handle_pause_execution(&tool.arguments),
         // Every accepted sleep spelling (the whole sleep family of the shared
         // table) normalizes onto `TERMINAL_SLEEP`, so one arm covers them all.
         TOOL_SLEEP | TERMINAL_SLEEP => handle_sleep(&tool.arguments),
@@ -612,6 +613,7 @@ async fn dispatch_manager_async(
             )),
         },
         TOOL_ARCHIVE_PLAN => archive_plan(),
+        TOOL_PAUSE_EXECUTION => handle_pause_execution(&tool.arguments),
         TOOL_REBIRTH => {
             if let Some(eng) = engine {
                 handle_rebirth(eng, &tool.arguments)
@@ -665,6 +667,11 @@ async fn dispatch_specialist_async(
     // survived the registration policy (`set_mcp_manager` -> `McpDispatchGate`), and
     // stay reachable for specialists.
     if let Some(mcp) = mcp_route(name) {
+        if name != TOOL_REBIRTH
+            && let Some(ref mut eng) = engine
+        {
+            eng.reset_consecutive_rebirths();
+        }
         return match mcp.call_tool(name, &tool.arguments).await {
             Ok(content) => Ok(ToolResult::ok(content)),
             Err(e) => Ok(ToolResult::err(format!("MCP tool error: {e}"))),
@@ -973,6 +980,7 @@ fn dispatch_manager(
             )),
         },
         TOOL_ARCHIVE_PLAN => archive_plan(),
+        TOOL_PAUSE_EXECUTION => handle_pause_execution(&tool.arguments),
         TOOL_REBIRTH => {
             if let Some(eng) = engine {
                 handle_rebirth(eng, &tool.arguments)
@@ -1058,6 +1066,11 @@ fn dispatch_specialist(
 
     // Resolution order is the one stated on `dispatch`: built-ins first, MCP last.
     if let Some(mcp) = mcp_route(name) {
+        if name != TOOL_REBIRTH
+            && let Some(ref mut eng) = engine
+        {
+            eng.reset_consecutive_rebirths();
+        }
         let mcp_res = block_on_safe(mcp.call_tool(name, &tool.arguments));
         return match mcp_res {
             Ok(content) => Ok(ToolResult::ok(content)),

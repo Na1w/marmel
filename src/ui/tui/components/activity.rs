@@ -550,8 +550,8 @@ fn draw_detail(
         present: true,
         scroll: offset as u16,
         max,
-        width: usize::from(area.width.saturating_sub(1)),
-        height: usize::from(area.height),
+        width: usize::from(text_width),
+        height: usize::from(body.height),
     }
 }
 

@@ -111,6 +111,9 @@ pub(crate) const ACTIVITY_STATUS_KEYWORDS: &[&str] = &[
     "Paused",
 ];
 
+/// The frame set both spinners cycle through at 125 ms cadence (8 FPS).
+pub(crate) const SPINNER_FRAMES: [char; 4] = ['-', '\\', '|', '/'];
+
 /// One error kept in renderer state so the failure outlives the status line that
 /// carried it (spec §8.5).
 ///
@@ -479,7 +482,7 @@ pub struct TuiRenderer {
 impl TuiRenderer {
     pub fn new() -> Self {
         let (tx, rx) = channel::<String>();
-        Self {
+        let mut r = Self {
             messages: Vec::new(),
             current_thought: String::new(),
             current_content: String::new(),
@@ -588,7 +591,9 @@ impl TuiRenderer {
             subagent_is_thinking: std::collections::HashMap::new(),
             plan_start_time: None,
             plan_completed_time: None,
-        }
+        };
+        r.apply_textarea_styles();
+        r
     }
 
     /// Populate thinking budget limits per specialist and globally from config.
@@ -736,13 +741,8 @@ impl TuiRenderer {
         self.refresh_global_token_snapshot();
         self.last_render = std::time::Instant::now();
         self.frame_counter = self.frame_counter.wrapping_add(1);
-        let mut terminal = match self.terminal.take() {
-            Some(t) => t,
-            None => {
-                let stdout = io::stdout();
-                let backend = CrosstermBackend::new(stdout);
-                Terminal::new(backend)?
-            }
+        let Some(mut terminal) = self.terminal.take() else {
+            return Ok(());
         };
         let res = self.draw(&mut terminal);
         self.terminal = Some(terminal);
@@ -765,10 +765,9 @@ impl TuiRenderer {
     ///
     /// The numbered passes below are the **paint order**, not the on-screen order:
     /// which pane sits in which slot is decided solely by
-    /// [`layout::compute_layout`], whose single rule puts the Plan in the leading
-    /// slot and the Transcript in the trailing one of every shape that draws both —
-    /// so in M4 the Plan is painted second but sits left of the Transcript. Nothing
-    /// here may restate that geometry.
+    /// [`layout::compute_layout`], whose single rule puts the Transcript in the
+    /// leading slot and the Plan / Workers panes in the trailing one of every shape
+    /// that draws both. Nothing here may restate that geometry.
     pub(crate) fn draw_new_ui(&mut self, frame: &mut ratatui::Frame) -> layout::PaneRects {
         // The frame is built from stored view state, so anything a writer outside
         // the key path changed on the legacy fields (a worker activating opens the
@@ -979,6 +978,11 @@ impl TuiRenderer {
                 elapsed,
                 val_rounds,
                 queued_steers: self.queued_steers(),
+                spinner: self.spinner_char(),
+                status_line: Some(&self.status_line),
+                waiting_secs: self
+                    .waiting_for_token_since
+                    .map(|s| s.elapsed().as_secs_f32()),
             };
             components::status_bar::render(frame, rect, &data);
         }
@@ -1081,10 +1085,27 @@ impl TuiRenderer {
     /// swallow the caret), and its block is cleared — the composer component draws
     /// the one border, title and chip row, so a block on the widget would paint a
     /// second frame over it.
+    pub(crate) fn apply_textarea_styles(&mut self) {
+        self.textarea.set_block(ratatui::widgets::Block::default());
+        self.textarea
+            .set_cursor_line_style(ratatui::style::Style::default());
+        self.textarea.set_cursor_style(
+            ratatui::style::Style::default()
+                .fg(ratatui::style::Color::Cyan)
+                .add_modifier(ratatui::style::Modifier::UNDERLINED),
+        );
+        self.textarea.set_selection_style(
+            ratatui::style::Style::default()
+                .bg(ratatui::style::Color::Cyan)
+                .fg(ratatui::style::Color::Black),
+        );
+        self.textarea
+            .set_style(ratatui::style::Style::default().fg(ratatui::style::Color::Cyan));
+    }
+
     pub(crate) fn prepare_textarea(&mut self) {
         self.ensure_textarea_in_sync();
-        self.textarea.set_block(ratatui::widgets::Block::default());
-        self.textarea.set_cursor_line_style(theme::caret_line());
+        self.apply_textarea_styles();
     }
 
     /// The elapsed clock both chrome panes print, as whole seconds.
@@ -1465,6 +1486,31 @@ impl TuiRenderer {
         }
     }
 
+    /// Whether an activity spinner is currently active (a worker is active,
+    /// a backend request or token is in flight, or status line indicates activity).
+    pub(crate) fn is_spinner_active(&self) -> bool {
+        self.subagents.iter().any(|s| s.is_active)
+            || self.waiting_for_token_since.is_some()
+            || !self.current_thought.is_empty()
+            || !self.current_content.is_empty()
+            || !self.steer_sentence_buffer.is_empty()
+            || ACTIVITY_STATUS_KEYWORDS
+                .iter()
+                .any(|k| self.status_line.contains(k))
+    }
+
+    /// The current spinner character from the cycling `SPINNER_FRAMES` sequence (`-\|/`).
+    /// Derived from `session_start` at 125 ms interval. Returns `None` when idle.
+    pub(crate) fn spinner_char(&self) -> Option<char> {
+        if self.is_spinner_active() {
+            let idx = ((self.session_start.elapsed().as_millis() / 125)
+                % SPINNER_FRAMES.len() as u128) as usize;
+            Some(SPINNER_FRAMES[idx])
+        } else {
+            None
+        }
+    }
+
     /// Drain pending terminal events and apply render-throttling:
     /// - Force a full re-render when terminal events were handled.
     /// - When state is dirty (new events, tokens, status updates), flush up to 40 FPS (25 ms).
@@ -1484,10 +1530,7 @@ impl TuiRenderer {
             self.dirty = false;
             let _ = self.force_flush();
         } else {
-            let active_spinner = self.subagents.iter().any(|s| s.is_active)
-                || ACTIVITY_STATUS_KEYWORDS
-                    .iter()
-                    .any(|k| self.status_line.contains(k));
+            let active_spinner = self.is_spinner_active();
 
             if self.dirty {
                 if self.last_render.elapsed() >= Duration::from_millis(25) {
@@ -1829,6 +1872,13 @@ impl Renderer for TuiRenderer {
             Event::ToolResult(text) => {
                 self.waiting_for_token_since = None;
                 self.commit_turn_content();
+                // Invalidate the plan poll timer so tools like `create_plan` or
+                // `archive_plan` update the Plan pane on the very next frame.
+                self.plan_mtime = None;
+                self.archive_mtime = None;
+                self.last_plan_check = std::time::Instant::now()
+                    .checked_sub(Duration::from_secs(10))
+                    .unwrap_or_else(std::time::Instant::now);
                 let is_active_subagent = self.active_agent != "Manager"
                     && self
                         .subagents
@@ -1857,6 +1907,21 @@ impl Renderer for TuiRenderer {
                 if !self.steer_sentence_buffer.trim().is_empty() {
                     let remaining = std::mem::take(&mut self.steer_sentence_buffer);
                     self.append_steer_sentence(remaining.trim());
+                }
+                if text == "Execution plan reset" {
+                    self.commit_turn_content();
+                    self.plan_content = "No active execution plan.".to_string();
+                    self.active_plan_task = None;
+                    self.had_active_plan = false;
+                    self.plan_is_archived = false;
+                    self.plan_mtime = None;
+                    self.archive_mtime = None;
+                    self.plan_start_time = None;
+                    self.plan_completed_time = None;
+                    self.plan_scroll = 0;
+                    self.plan_max_scroll = 0;
+                    self.plan_auto_scroll = false;
+                    self.steer_traces.clear();
                 }
                 if !self.is_abort_armed() {
                     self.status_line = text.lines().next().unwrap_or("").to_string();

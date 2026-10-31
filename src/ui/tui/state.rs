@@ -33,15 +33,14 @@ use crate::plan_parse::{CheckboxState, parse_tasks};
 pub enum ViewMode {
     /// M1 — Transcript fills the body; Plan/Workers absent.
     Transcript,
-    /// M2 — Plan left (55 %), Transcript right (45 %): the leading/trailing pair of
+    /// M2 — Transcript left (55 %), Plan right (45 %): the leading/trailing pair of
     /// the single slot rule, on the §2.3 `55/45` pair.
     Plan,
-    /// M3 — Workers left (55 %), Transcript right (45 %). No Plan pane, so the slot
-    /// rule has nothing to place in this mode.
+    /// M3 — Transcript left (55 %), Workers right (45 %).
     Workers,
-    /// M4 — Plan left in the wide column (60 %), Transcript over Workers in the side
-    /// column (40 %). The Plan holds the leading slot here exactly as it does in M2,
-    /// so it never changes side between the two modes.
+    /// M4 — Transcript left in the wide column (60 %), Plan over Workers in the side
+    /// column (40 %). The Transcript holds the leading slot in every mode, so it
+    /// never changes side between modes.
     Split,
 }
 

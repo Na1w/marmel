@@ -333,6 +333,9 @@ impl TuiRenderer {
     /// event meant something, which is what lets the entry path repaint exactly once
     /// per meaningful event instead of on every key release.
     pub(crate) fn handle_events(&mut self, blocking: bool) -> bool {
+        if !self.terminal_owned || self.terminal_torn_down {
+            return false;
+        }
         let mut handled = false;
         loop {
             let available = if blocking {
@@ -376,6 +379,10 @@ impl TuiRenderer {
                 true
             }
             TermEvent::Resize(_, _) => {
+                // Invalidate stale measured scroll maxima so clamp_scrolls recomputes
+                // against the fallback estimate before the next frame redraws.
+                self.transcript_measured_max.set(None);
+                self.detail_measured_max.set(None);
                 // Clamp every scroll offset to its recomputed maximum, then mark the
                 // frame dirty: the entry path force-flushes for any handled event, so
                 // a resized viewport is redrawn immediately and never shows blank
@@ -681,13 +688,11 @@ impl TuiRenderer {
     /// inventory, so the key is never a silent no-op: the toggles move with it and a
     /// focus the new mode would orphan is pulled back onto a pane that is on screen.
     ///
-    /// The walk order is independent of the geometry, and the geometry no longer
-    /// argues with it: under the single slot rule of [`super::layout`] the pane that
-    /// holds the **leading** slot (the left column of a columns split, the top row of
-    /// a stack, or the whole body in M1) is the Plan in both modes that draw a Plan
-    /// (M2 and M4), the Transcript in M1 and the roster in M3. Walking
-    /// M1 → M2 → M3 → M4 therefore never carries the Plan from one side of the frame
-    /// to the other; the leading slot is the Plan wherever a Plan is on screen.
+    /// Under the single slot rule of [`super::layout`] the pane that holds the
+    /// **leading** slot (the left column of a columns split, the top row of a stack,
+    /// or the whole body in M1) is the Transcript in every mode. Walking
+    /// M1 → M2 → M3 → M4 therefore never carries the Transcript from one side of the
+    /// frame to the other.
     fn cycle_view_mode(&mut self) {
         let next = match self.view_mode {
             ViewMode::Split => ViewMode::Transcript,
@@ -1063,10 +1068,11 @@ impl TuiRenderer {
                 line: trimmed.to_string(),
             });
         }
-        if let Some(argument) = token.strip_prefix("/cancel ")
-            && !argument.trim().is_empty()
-        {
-            return self.request_cancel_worker_by_argument(argument);
+        if token.starts_with("/cancel ") {
+            let argument = &trimmed["/cancel ".len()..];
+            if !argument.trim().is_empty() {
+                return self.request_cancel_worker_by_argument(argument);
+            }
         }
         if is_abort(&token) {
             return self.show_request(ConfirmAction::Command {
@@ -1265,13 +1271,33 @@ impl TuiRenderer {
             return false;
         }
         // The caret goes to the end of the typed token on line 1, so a draft with a
-        // caret in the middle of the command still completes in place.
+        // caret in the middle of the command still completes in place. When the
+        // typed prefix differs in ASCII case from the canonical command spelling,
+        // replace the whole token so `/PL` completes to `/plan` rather than `/PLan`.
         let first_line = self.textarea.lines().first().cloned().unwrap_or_default();
         let leading = first_line.chars().count() - first_line.trim_start().chars().count();
         let column = (leading + token.chars().count()) as u16;
-        self.textarea
-            .move_cursor(ratatui_textarea::CursorMove::Jump(0, column));
-        self.textarea.insert_str(tail);
+        if &completion[..token_len] != token {
+            let rest = &first_line.trim_start()[token_len..];
+            let prefix: String = first_line.chars().take(leading).collect();
+            let mut lines: Vec<String> = self
+                .textarea
+                .lines()
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            if let Some(first) = lines.first_mut() {
+                *first = format!("{prefix}{completion}{rest}");
+            }
+            self.textarea = ratatui_textarea::TextArea::new(lines);
+            let new_col = (leading + completion.chars().count()) as u16;
+            self.textarea
+                .move_cursor(ratatui_textarea::CursorMove::Jump(0, new_col));
+        } else {
+            self.textarea
+                .move_cursor(ratatui_textarea::CursorMove::Jump(0, column));
+            self.textarea.insert_str(tail);
+        }
         self.sync_input_from_textarea();
         self.end_history_walk_if_edited(&buffer);
         self.dirty = true;
@@ -1581,6 +1607,7 @@ impl TuiRenderer {
                 self.input_text.split('\n').map(|s| s.to_string()).collect()
             };
             self.textarea = ratatui_textarea::TextArea::new(lines);
+            self.apply_textarea_styles();
             self.textarea.move_cursor(ratatui_textarea::CursorMove::End);
         }
     }
@@ -2113,6 +2140,7 @@ impl TuiRenderer {
             self.textarea.lines().join("\n")
         };
         self.textarea = ratatui_textarea::TextArea::default();
+        self.apply_textarea_styles();
         self.input_text.clear();
         self.cursor = 0;
         if line.trim().is_empty() {

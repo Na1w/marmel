@@ -238,6 +238,26 @@ impl ToolDef {
         }
     }
 
+    pub fn pause_execution() -> ToolDef {
+        ToolDef {
+            kind: "function".to_string(),
+            function: ToolFunctionDef {
+                name: TOOL_PAUSE_EXECUTION.to_string(),
+                description: "Pause the autonomous execution loop and halt active task delegations to consult with the user or await user instructions. Call this tool whenever the user asks to stop, pause, halt, cancel, or when you need user clarification or input before continuing.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "reason": {
+                            "type": "string",
+                            "description": "The reason for pausing execution (e.g. user requested to stop/pause, user clarification needed, etc.)"
+                        }
+                    },
+                    "required": ["reason"]
+                }),
+            },
+        }
+    }
+
     pub fn pty_spawn() -> ToolDef {
         ToolDef {
             kind: "function".to_string(),
@@ -463,6 +483,7 @@ impl ToolDef {
             Self::delegate_task(roles),
             Self::create_plan(),
             Self::archive_current_plan(),
+            Self::pause_execution(),
             Self::read_file(),
             Self::write_file(),
             Self::replace(),
@@ -494,6 +515,7 @@ impl ToolDef {
             Self::delegate_task(roles),
             Self::create_plan(),
             Self::archive_current_plan(),
+            Self::pause_execution(),
             Self::read_file(),
             Self::grep_search(),
             Self::glob(),

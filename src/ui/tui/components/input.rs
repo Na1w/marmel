@@ -224,6 +224,10 @@ fn common_prefix(names: &[&str]) -> String {
 /// `Tab` accepts the result by inserting the remainder after the caret; the key
 /// binding lives in the key handler (t-011), which calls this pure function.
 pub fn suggest(buffer: &str) -> Option<String> {
+    let first_line = buffer.lines().next()?;
+    if first_line.trim_start().contains(char::is_whitespace) {
+        return None;
+    }
     let token = command_token(buffer)?;
     let matches = candidates(token);
     match matches.len() {
@@ -270,8 +274,15 @@ pub fn suggestion_row(buffer: &str) -> Option<String> {
             Some(format!("{completion}{args}  ({more} more)  Tab"))
         }
         // More than one candidate and nothing completable: the count is the
-        // honest answer (spec §6: `/` alone shows the candidate count).
-        None => Some(format!("{} commands match {token}", matches.len())),
+        // honest answer, or if an exact match was typed with space, its args syntax.
+        None => {
+            if let Some(cmd) = matches.iter().find(|c| c.name.eq_ignore_ascii_case(token))
+                && !cmd.args.is_empty()
+            {
+                return Some(format!("{} {}", cmd.name, cmd.args));
+            }
+            Some(format!("{} commands match {token}", matches.len()))
+        }
     }
 }
 
@@ -336,13 +347,36 @@ const fn visible_draft_lines(height: u16) -> usize {
 /// (§2.5 puts the overflow marker on the border title), and the whole run is
 /// clipped to the frame width by [`fit_spans`] (§7.4).
 fn composer_frame(data: &InputData<'_>, state: &ComposerState<'_>, rect: Rect) -> Block<'static> {
-    let title = format!("{} ({KEY_HINT})", FocusPane::Input.label());
+    let budget = title_width(rect);
+    let full_title = format!("{} ({KEY_HINT})", FocusPane::Input.label());
+    let short_title = FocusPane::Input.label();
+    let badge_width = if data.focus { 4 } else { 2 };
+    let suggestion = state.buffer.and_then(suggestion_row);
+
+    let full_w = full_title.chars().count() + badge_width;
+    let (title, left_width) = match &suggestion {
+        Some(row) => {
+            let row_w = row.chars().count() + 2;
+            if budget as usize > full_w + row_w {
+                (full_title, full_w)
+            } else {
+                let short_w = short_title.chars().count() + badge_width;
+                (short_title.to_string(), short_w)
+            }
+        }
+        None => (full_title, full_w),
+    };
+
     let mut frame = pane_block(&title, data.focus, border_style(data));
-    if let Some(row) = state.buffer.and_then(suggestion_row) {
-        frame = frame.title(
-            Line::from(Span::styled(format!(" {row} "), theme::chip_neutral()))
-                .alignment(Alignment::Right),
+    if let Some(row) = suggestion {
+        let right_budget = budget.saturating_sub(left_width as u16 + 1);
+        let fitted = fit_spans(
+            vec![Span::styled(format!(" {row} "), theme::chip_neutral())],
+            right_budget,
         );
+        if !fitted.is_empty() {
+            frame = frame.title(Line::from(fitted).alignment(Alignment::Right));
+        }
     }
     let mut chips: Vec<Span<'static>> = Vec::new();
     let buffer = state.buffer.unwrap_or("");

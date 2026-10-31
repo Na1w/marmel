@@ -397,7 +397,7 @@ pub fn text_muted() -> Style {
 /// The reasoning stream. Luminance step plus italics, so it survives a terminal
 /// that drops the modifier; the block must still be introduced by a label.
 pub fn text_thought() -> Style {
-    fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
+    fg(Color::LightCyan).add_modifier(Modifier::ITALIC)
 }
 
 // ---------------------------------------------------------------------------
@@ -589,10 +589,8 @@ pub fn notice_expired() -> Style {
     fg(Color::LightRed)
 }
 
-/// The composer line that holds the caret — the only caret affordance on a light
-/// profile, where a default-coloured caret can vanish. It is a fill, so it is
-/// the one slot that simply disappears in monochrome: the caret itself is still
-/// drawn by the terminal, and nothing else in the palette relies on this fill.
+/// The composer line that holds the caret.
+#[allow(dead_code)]
 pub fn caret_line() -> Style {
     surface()
 }

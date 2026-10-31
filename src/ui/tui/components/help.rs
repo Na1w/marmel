@@ -174,7 +174,7 @@ pub fn legend() -> Vec<LegendRow> {
         },
         LegendRow {
             keys: "F2",
-            action: "cycle mode M4 → M1 → M2 → M3 (plan left)",
+            action: "cycle mode M4 → M1 → M2 → M3 (transcript left)",
             scope: "global",
             footer: "F2 mode",
         },
@@ -492,16 +492,27 @@ pub fn render(frame: &mut Frame, rect: Rect, data: &HelpData) {
                 .collect();
             if source.len() > room && room > 1 {
                 lines.truncate(room - 1);
-                lines.push(format!("{} see /help for the full table", theme::ELLIPSIS));
+                let hint = if overlay == OverlayState::Help {
+                    format!("{} see /help for the full table", theme::ELLIPSIS)
+                } else {
+                    format!("{} ...", theme::ELLIPSIS)
+                };
+                lines.push(clip(&hint, inner_width));
             }
             let text: Vec<Line<'static>> = lines.into_iter().map(Line::from).collect();
             frame.render_widget(Clear, area);
-            let block = pane_block(title, false, border)
-                .title_bottom(Line::from(CLOSE_HINT))
-                .title_bottom(
-                    Line::from(Span::styled(MORE_HINT, theme::text_secondary()))
-                        .alignment(Alignment::Right),
+            let mut block = pane_block(title, false, border).title_bottom(Line::from(CLOSE_HINT));
+            if overlay == OverlayState::Help {
+                let close_hint_len = CLOSE_HINT.chars().count() + 2;
+                let right_budget = inner_width.saturating_sub(close_hint_len as u16);
+                let fitted_more = fit_spans(
+                    vec![Span::styled(MORE_HINT, theme::text_secondary())],
+                    right_budget,
                 );
+                if !fitted_more.is_empty() {
+                    block = block.title_bottom(Line::from(fitted_more).alignment(Alignment::Right));
+                }
+            }
             frame.render_widget(Paragraph::new(text).block(block), area);
         }
     }

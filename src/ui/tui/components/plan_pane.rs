@@ -103,9 +103,12 @@ pub fn render(frame: &mut Frame, rect: Rect, data: &PlanData<'_>) -> PlanGeometr
     };
     // Border rows lose one cell to each corner, which is what the titles may use.
     let title_width = super::title_width(rect);
+    let left_title_len =
+        (FocusPane::Plan.label().chars().count() + if data.focus { 4 } else { 2 }) as u16;
+    let right_budget = title_width.saturating_sub(left_title_len + 1);
     let block = pane_block(FocusPane::Plan.label(), data.focus, border)
         .title(
-            Line::from(fit_spans(counter_spans(data.progress), title_width))
+            Line::from(fit_spans(counter_spans(data.progress), right_budget))
                 .alignment(Alignment::Right),
         )
         .title_bottom(Line::from(fit_spans(
@@ -124,10 +127,19 @@ pub fn render(frame: &mut Frame, rect: Rect, data: &PlanData<'_>) -> PlanGeometr
 /// behaviour and a manual offset is still only ever lowered to stay legal.
 fn draw_body(frame: &mut Frame, rect: Rect, data: &PlanData<'_>) -> PlanGeometry {
     let inner = rect.inner(Margin::new(1, 1));
-    let width = usize::from(inner.width).max(1);
+    let mut width = usize::from(inner.width).max(1);
     let height = usize::from(inner.height);
     let total = wrapped_lines(data.text, width);
-    let max_scroll = total.saturating_sub(height) as u16;
+    let mut max_scroll = total.saturating_sub(height) as u16;
+    let mut text_rect = inner;
+
+    if max_scroll > 0 && inner.width > 1 {
+        text_rect.width = inner.width - 1;
+        width = usize::from(text_rect.width);
+        let total_adjusted = wrapped_lines(data.text, width);
+        max_scroll = total_adjusted.saturating_sub(height) as u16;
+    }
+
     let scroll = if data.auto_scroll {
         auto_scroll_offset(data, width).min(max_scroll)
     } else {
@@ -138,7 +150,7 @@ fn draw_body(frame: &mut Frame, rect: Rect, data: &PlanData<'_>) -> PlanGeometry
         let paragraph = Paragraph::new(body_lines(data))
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0));
-        frame.render_widget(paragraph, inner);
+        frame.render_widget(paragraph, text_rect);
         if max_scroll > 0 {
             let mut state =
                 ScrollbarState::new(usize::from(max_scroll)).position(usize::from(scroll));
@@ -155,7 +167,7 @@ fn draw_body(frame: &mut Frame, rect: Rect, data: &PlanData<'_>) -> PlanGeometry
     PlanGeometry {
         scroll,
         max_scroll,
-        inner_width: usize::from(inner.width),
+        inner_width: width,
         inner_height: height,
     }
 }

@@ -3927,20 +3927,19 @@ fn every_view_mode_changes_the_rects_compute_layout_actually_produces() {
                 assert_eq!(rects.workers, None, "M2 has no workers pane");
                 assert_eq!(plan.width + transcript.width, body.width);
                 assert!(
-                    plan.width > transcript.width,
-                    "M2 is the 55/45 pair with the plan in the wider — leading — \
-                     column: plan {} transcript {}",
-                    plan.width,
-                    transcript.width
+                    transcript.width > plan.width,
+                    "M2 is the 55/45 pair with the transcript in the wider — leading — \
+                     column: transcript {} plan {}",
+                    transcript.width,
+                    plan.width
                 );
                 assert_eq!(
-                    plan.x, body.x,
-                    "M2 puts the plan in the leading (left) column: plan {plan:?}"
+                    transcript.x, body.x,
+                    "M2 puts the transcript in the leading (left) column: transcript {transcript:?}"
                 );
                 assert!(
-                    plan.x < transcript.x,
-                    "M2 leads with the plan and trails with the transcript, exactly \
-                     the way M4 orders its columns: plan {plan:?} transcript {transcript:?}"
+                    transcript.x < plan.x,
+                    "M2 leads with the transcript and trails with the plan: transcript {transcript:?} plan {plan:?}"
                 );
             }
             state::ViewMode::Workers => {
@@ -3948,38 +3947,43 @@ fn every_view_mode_changes_the_rects_compute_layout_actually_produces() {
                 assert_eq!(rects.plan, None, "M3 has no plan pane");
                 assert_eq!(workers.width + transcript.width, body.width);
                 assert!(
-                    workers.width > transcript.width,
-                    "M3 is 55/45 with the roster in the wider column: workers {} transcript {}",
-                    workers.width,
-                    transcript.width
+                    transcript.width > workers.width,
+                    "M3 is 55/45 with the transcript in the wider column: transcript {} workers {}",
+                    transcript.width,
+                    workers.width
                 );
+                assert_eq!(transcript.x, body.x);
+                assert!(transcript.x < workers.x);
             }
             state::ViewMode::Split => {
                 let plan = rects.plan.expect("M4 shows the plan pane");
                 let workers = rects.workers.expect("M4 shows the workers pane");
                 assert_eq!(plan.width + transcript.width, body.width);
                 assert!(
-                    plan.width > transcript.width,
-                    "M4 is the 60/40 pair with the plan in the wide — leading — \
-                     column: plan {} side {}",
-                    plan.width,
-                    transcript.width
+                    transcript.width > plan.width,
+                    "M4 is the 60/40 pair with the transcript in the wide — leading — \
+                     column: transcript {} plan {}",
+                    transcript.width,
+                    plan.width
                 );
-                assert_eq!(plan.height, body.height, "the plan owns a whole column");
                 assert_eq!(
-                    transcript.width, workers.width,
+                    transcript.height, body.height,
+                    "transcript owns a whole column"
+                );
+                assert_eq!(
+                    plan.width, workers.width,
                     "the side column stacks two panes"
                 );
-                assert_eq!(transcript.height + workers.height, body.height);
+                assert_eq!(plan.height + workers.height, body.height);
                 assert!(
-                    plan.x < transcript.x && plan.x < workers.x,
-                    "the plan column comes first, the stacked side column after it: \
-                     plan {plan:?} transcript {transcript:?} workers {workers:?}"
+                    transcript.x < plan.x && transcript.x < workers.x,
+                    "the transcript column comes first, the stacked side column after it: \
+                     transcript {transcript:?} plan {plan:?} workers {workers:?}"
                 );
                 assert!(
-                    transcript.y < workers.y && transcript.x == workers.x,
-                    "the transcript heads the side column and the roster stacks under \
-                     it: transcript {transcript:?} workers {workers:?}"
+                    plan.y < workers.y && plan.x == workers.x,
+                    "the plan heads the side column and the roster stacks under \
+                     it: plan {plan:?} workers {workers:?}"
                 );
             }
         }
@@ -4047,22 +4051,22 @@ fn the_plan_holds_the_leading_slot_in_every_shape_at_every_ladder_width() {
                 };
                 let body = rects.body.expect("a frame that draws two panes has a body");
                 assert_eq!(
-                    plan.x, body.x,
-                    "{label}: the plan owns the body's leading edge: {rects:?}"
+                    transcript.x, body.x,
+                    "{label}: the transcript owns the body's leading edge: {rects:?}"
                 );
                 if plan.x == transcript.x {
                     assert!(
-                        plan.y < transcript.y,
-                        "{label}: one column, so the plan holds the top row: {rects:?}"
+                        transcript.y < plan.y,
+                        "{label}: one column, so transcript holds the top row: {rects:?}"
                     );
                 } else {
                     assert!(
-                        plan.x < transcript.x,
-                        "{label}: the plan holds the leading column: {rects:?}"
+                        transcript.x < plan.x,
+                        "{label}: transcript holds the leading column: {rects:?}"
                     );
                 }
                 assert!(
-                    plan.width >= transcript.width,
+                    transcript.width >= plan.width,
                     "{label}: the leading slot is never the narrower one: {rects:?}"
                 );
             }
@@ -6892,9 +6896,10 @@ fn a_queued_steer_from_the_bridge_lands_in_the_transcript_and_arms_the_chip() {
     let view = state::UiView::from_renderer(&r);
     let rects = layout::compute_layout(Rect::new(0, 0, 100, 30), &view);
     let transcript = rects.transcript.expect("M4 draws the transcript");
-    assert!(
-        transcript.x > rects.body.expect("a 100x30 body").x,
-        "the transcript is the trailing side column, the plan leads on the left: {rects:?}"
+    assert_eq!(
+        transcript.x,
+        rects.body.expect("a 100x30 body").x,
+        "the transcript is the leading column on the left: {rects:?}"
     );
     let said = pane_says(&rows, transcript);
     assert!(said.contains("[Steer queued"), "{said}\n{frame}");
@@ -8684,6 +8689,47 @@ fn the_slot_wait_and_parked_stream_sentences_arm_the_backend_wait_clock() {
         r.waiting_for_token_since.is_some(),
         "and so is the model call itself"
     );
+}
+
+#[test]
+fn the_spinner_animates_during_activity_and_rests_when_idle() {
+    let mut r = TuiRenderer::new();
+    r.status_line = "Ready".to_string();
+    assert!(
+        !r.is_spinner_active(),
+        "an idle renderer has no active spinner"
+    );
+    assert_eq!(
+        r.spinner_char(),
+        None,
+        "an idle renderer yields no spinner char"
+    );
+
+    // 1. Activity via status line keywords
+    r.status_line = "Running task t-001".to_string();
+    assert!(r.is_spinner_active());
+    assert!(SPINNER_FRAMES.contains(&r.spinner_char().expect("spinner char")));
+
+    // 2. Activity via active subagent
+    r.status_line = "Ready".to_string();
+    r.subagents = vec![SubagentDetail {
+        name: "coder".to_string(),
+        is_active: true,
+        ..SubagentDetail::default()
+    }];
+    assert!(r.is_spinner_active());
+    assert!(SPINNER_FRAMES.contains(&r.spinner_char().expect("spinner char")));
+
+    // 3. Activity via waiting for token
+    r.subagents.clear();
+    r.waiting_for_token_since = Some(std::time::Instant::now());
+    assert!(r.is_spinner_active());
+    assert!(SPINNER_FRAMES.contains(&r.spinner_char().expect("spinner char")));
+
+    // 4. Return to idle
+    r.waiting_for_token_since = None;
+    assert!(!r.is_spinner_active());
+    assert_eq!(r.spinner_char(), None);
 }
 
 /// The thinking half, re-established on the new pane: the toggle decides whether the

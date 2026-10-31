@@ -93,6 +93,14 @@ pub struct StatusData<'a> {
     /// reported to it — it is never an estimate, never a turn count, and never
     /// printed at all when nothing is queued.
     pub queued_steers: usize,
+    /// Animated activity spinner character (`-`, `\`, `|`, `/`) while the model
+    /// or agents are active. `None` when idle.
+    pub spinner: Option<char>,
+    /// Status line prose (e.g. "calling model...", "Thinking...") displayed when
+    /// no subagents are active.
+    pub status_line: Option<&'a str>,
+    /// Seconds elapsed waiting for backend response.
+    pub waiting_secs: Option<f32>,
     // There is deliberately no `follow` / `unseen` pair here any more: the
     // scroll-state chip (`● LIVE` / `↓ N new`) belongs to the transcript pane that
     // owns the viewport, and drawing it here as well put the same chip on screen
@@ -123,11 +131,9 @@ const DROP_CTX: u8 = 4;
 const DROP_THOUGHT_CHIP: u8 = 0;
 const DROP_WORKERS_CHIP: u8 = 1;
 const DROP_PLAN_CHIP: u8 = 2;
-const DROP_COUNTS_CHIP: u8 = 3;
-// The queued-steer chip outranks the aggregate worker counts: §8.3's counts describe
-// the specialists, while this one answers the operator's own question — what happened
-// to the instruction I just typed — and it is the only chip on the frame that can.
-const DROP_STEERS_CHIP: u8 = 4;
+// The queued-steer chip outranks toggles: answers the operator's own question —
+// what happened to the instruction I just typed — and is the only chip that can.
+const DROP_STEERS_CHIP: u8 = 3;
 
 /// One field of a single-row bar and its place in that row's ladder
 /// (`None` = never dropped).
@@ -442,10 +448,44 @@ fn metrics(data: &StatusData<'_>, tokens: (usize, usize), elapsed: Option<u64>) 
             let lead = if index == 0 { "" } else { ", " };
             spans.push(Span::styled(format!("{lead}{name}"), theme::chip_muted()));
         }
+        if let Some(secs) = data.waiting_secs {
+            spans.push(Span::styled(format!(" ({secs:.1}s)"), theme::chip_muted()));
+        }
+        if let Some(sp) = data.spinner {
+            spans.push(Span::styled(format!(" {sp}"), theme::chip_value()));
+        }
         fields.push(Field {
             drop: None,
             flex: true,
             spans,
+        });
+    } else if let Some(status) = data
+        .status_line
+        .filter(|s| !s.trim().is_empty() && *s != "Ready")
+    {
+        let mut spans = vec![
+            Span::styled(" | ", theme::chip_muted()),
+            Span::styled(status.to_string(), theme::chip_muted()),
+        ];
+        if let Some(secs) = data.waiting_secs {
+            spans.push(Span::styled(format!(" ({secs:.1}s)"), theme::chip_muted()));
+        }
+        if let Some(sp) = data.spinner {
+            spans.push(Span::styled(format!(" {sp}"), theme::chip_value()));
+        }
+        fields.push(Field {
+            drop: None,
+            flex: true,
+            spans,
+        });
+    } else if let Some(sp) = data.spinner {
+        fields.push(Field {
+            drop: None,
+            flex: true,
+            spans: vec![
+                Span::styled(" | ", theme::chip_muted()),
+                Span::styled(format!("{sp}"), theme::chip_value()),
+            ],
         });
     }
     if let Some(secs) = elapsed {
@@ -521,23 +561,6 @@ fn chips(data: &StatusData<'_>) -> Vec<Field> {
                     theme::chip_neutral(),
                 ),
             ],
-        });
-    }
-    if !data.abort_armed {
-        let active = data.workers.iter().filter(|row| row.is_active).count();
-        let paused = data.workers.iter().filter(|row| row.paused).count();
-        let queued = data
-            .workers
-            .iter()
-            .filter(|row| row.queue.is_some())
-            .count();
-        chips.push(Field {
-            drop: Some(DROP_COUNTS_CHIP),
-            flex: false,
-            spans: vec![Span::styled(
-                format!(" {active}a {paused}p {queued}q "),
-                theme::chip_neutral(),
-            )],
         });
     }
     chips
@@ -741,6 +764,9 @@ mod tests {
 
             val_rounds: 0,
             queued_steers: 0,
+            spinner: None,
+            status_line: None,
+            waiting_secs: None,
         }
     }
 
@@ -818,7 +844,6 @@ mod tests {
         assert!(rows[1].contains("plan:on"), "{rows:?}");
         assert!(rows[1].contains("workers:on"), "{rows:?}");
         assert!(rows[1].contains("think:off"), "{rows:?}");
-        assert!(rows[1].contains("1a 0p 0q"), "counts on row 2: {rows:?}");
         assert!(
             !rows[1].contains("abort"),
             "no armed prompt while unarmed: {rows:?}"
@@ -838,7 +863,6 @@ mod tests {
         assert!(rows[1].contains("plan:off"), "{rows:?}");
         assert!(rows[1].contains("workers:off"), "{rows:?}");
         assert!(rows[1].contains("think:on"), "{rows:?}");
-        assert!(rows[1].contains("0a 0p 0q"), "G5 with zero rows: {rows:?}");
     }
 
     #[test]
@@ -1251,7 +1275,7 @@ mod tests {
             ..data(&workers, false)
         };
         let rows = draw(120, 2, &held);
-        assert!(rows[1].contains("3 steers "), "{rows:?}");
+        assert!(rows[1].contains("3 steers"), "{rows:?}");
         assert!(
             rows[1].contains('⧗'),
             "the pending glyph leads it: {rows:?}"
@@ -1268,12 +1292,11 @@ mod tests {
         }
     }
 
-    /// The chip row's ladder ranks the operator's own question above §8.3's
-    /// aggregate worker counts: reading the ladder off the row, the `Na Np Nq` counts
-    /// leave at a strictly wider terminal than the `N steers` chip does — and the
-    /// steer chip is still on the row at the width where the counts already went.
+    /// The chip row's ladder ranks the operator's own question above toggle chips:
+    /// reading the ladder off the row, toggles (`think:off`, etc.) leave at a strictly
+    /// wider terminal than the `N steers` chip does.
     #[test]
-    fn the_steer_chip_leaves_the_chip_row_after_the_worker_counts() {
+    fn the_steer_chip_leaves_the_chip_row_after_toggle_chips() {
         let workers = [worker("coder_specialist", true, true, true)];
         let held = StatusData {
             queued_steers: 2,
@@ -1284,30 +1307,30 @@ mod tests {
         // Wide enough for both.
         let wide = at(120);
         assert!(
-            wide.contains("2 steers") && wide.contains("1a 1p 1q"),
+            wide.contains("2 steers") && wide.contains("think:off"),
             "{wide:?}"
         );
 
-        let mut counts_gone_at: Option<u16> = None;
+        let mut think_gone_at: Option<u16> = None;
         let mut steers_gone_at: Option<u16> = None;
         for width in (4..=120u16).rev() {
             let row = at(width);
-            if counts_gone_at.is_none() && !row.contains("1a 1p 1q") {
-                counts_gone_at = Some(width);
+            if think_gone_at.is_none() && !row.contains("think:off") {
+                think_gone_at = Some(width);
                 assert!(
                     row.contains("2 steers"),
-                    "the steer chip must still be on the row when the counts go: {row:?}"
+                    "the steer chip must still be on the row when toggles go: {row:?}"
                 );
             }
             if steers_gone_at.is_none() && !row.contains("2 steers") {
                 steers_gone_at = Some(width);
             }
         }
-        let counts = counts_gone_at.expect("the counts leave at some width");
+        let think = think_gone_at.expect("toggles leave at some width");
         let steers = steers_gone_at.expect("the steer chip leaves only when it must");
         assert!(
-            steers < counts,
-            "one field at a time, counts first: counts gone at {counts}, steers gone at {steers}"
+            steers < think,
+            "one field at a time, toggles first: toggles gone at {think}, steers gone at {steers}"
         );
     }
 
@@ -1706,6 +1729,48 @@ mod tests {
             assert!(
                 !source.contains(call),
                 "`{call}` is a frozen alias or a band-unsafe rung and has no call site here"
+            );
+        }
+    }
+
+    #[test]
+    fn animated_activity_spinner_and_status_line_render_in_status_bar() {
+        // 1. When model is running (no subagents), status line and spinner render.
+        let working_model = StatusData {
+            spinner: Some('/'),
+            status_line: Some("calling model (claude-3-5-sonnet)..."),
+            waiting_secs: Some(2.4),
+            ..data(&[], false)
+        };
+        let rows = draw(120, 2, &working_model);
+        assert!(
+            rows[0].contains("calling model (claude-3-5-sonnet)..."),
+            "{rows:?}"
+        );
+        assert!(rows[0].contains("(2.4s)"), "{rows:?}");
+        assert!(rows[0].contains('/'), "{rows:?}");
+
+        // 2. When subagents are active, worker names and spinner render.
+        let workers = [worker("coder_specialist", true, false, false)];
+        let working_workers = StatusData {
+            spinner: Some('-'),
+            waiting_secs: Some(1.1),
+            ..data(&workers, false)
+        };
+        let rows = draw(120, 2, &working_workers);
+        assert!(rows[0].contains("coder_specialist"), "{rows:?}");
+        assert!(rows[0].contains("(1.1s)"), "{rows:?}");
+        assert!(rows[0].contains('-'), "{rows:?}");
+
+        // 3. When idle, no spinner is rendered.
+        let idle = data(&[], false);
+        let rows = draw(120, 2, &idle);
+        for frame in ['-', '\\', '|', '/'] {
+            // Note: Tokens 0 in / 0 out contains '/', so check the flexible status part after 0a
+            let tail = &rows[0][rows[0].find("0a").unwrap()..];
+            assert!(
+                !tail.contains(frame),
+                "idle tail must not have spinner frame: {tail:?}"
             );
         }
     }

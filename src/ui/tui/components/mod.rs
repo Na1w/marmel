@@ -27,7 +27,7 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 /// A single-line bordered pane block with its title and, when focused, the `●`
 /// badge that makes focus readable without colour (§7.3, G6).
@@ -97,15 +97,15 @@ pub fn fit_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Span<'static>> {
         let style = span.style;
         let mut piece = String::new();
         let mut piece_width = 0usize;
-        for ch in span.content.as_ref().chars() {
-            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if used + piece_width + ch_width > budget {
+        for g in unicode_segmentation::UnicodeSegmentation::graphemes(span.content.as_ref(), true) {
+            let g_width = UnicodeWidthStr::width(g);
+            if used + piece_width + g_width > budget {
                 // Out of room: keep what this span contributed and stop.
                 kept.push(Span::styled(std::mem::take(&mut piece), style));
                 break 'spans;
             }
-            piece.push(ch);
-            piece_width += ch_width;
+            piece.push_str(g);
+            piece_width += g_width;
         }
         used += piece_width;
         kept.push(Span::styled(piece, style));

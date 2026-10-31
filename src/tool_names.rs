@@ -44,6 +44,8 @@ pub const TOOL_LEAVE_VERDICT: &str = "leave_verdict";
 pub const TOOL_SLEEP: &str = "sleep";
 /// `reply_to_arbitrator` — send a response or clarification back to the Steer Arbitrator.
 pub const TOOL_REPLY_TO_ARBITRATOR: &str = "reply_to_arbitrator";
+/// `pause_execution` — halt/pause task delegations and autonomous loop to converse with the user.
+pub const TOOL_PAUSE_EXECUTION: &str = "pause_execution";
 
 /// `terminal__read_file` — caesar-style namespaced variant of `read_file`.
 pub const TERMINAL_READ_FILE: &str = "terminal__read_file";
@@ -110,6 +112,7 @@ pub const CANONICAL_TOOL_NAMES: &[&str] = &[
     TOOL_DELEGATE_TASK,
     TOOL_CREATE_PLAN,
     TOOL_ARCHIVE_PLAN,
+    TOOL_PAUSE_EXECUTION,
     TOOL_READ_FILE,
     TERMINAL_READ_FILE,
     TOOL_WRITE_FILE,
@@ -206,6 +209,10 @@ pub const TOOL_ALIAS_TABLE: &[(&str, &str)] = &[
     ("pty__read", TOOL_PTY_READ),
     ("pty__close", TOOL_PTY_CLOSE),
     ("pty__list", TOOL_PTY_LIST),
+    // pause / stop family
+    ("stop_execution", TOOL_PAUSE_EXECUTION),
+    ("abort_execution", TOOL_PAUSE_EXECUTION),
+    ("pause_plan", TOOL_PAUSE_EXECUTION),
 ];
 
 /// `true` when `name` is one of the canonical spellings in
@@ -398,6 +405,7 @@ mod tests {
             TOOL_DELEGATE_TASK,
             TOOL_CREATE_PLAN,
             TOOL_ARCHIVE_PLAN,
+            TOOL_PAUSE_EXECUTION,
             TOOL_READ_FILE,
             TOOL_WRITE_FILE,
             TOOL_REPLACE,
