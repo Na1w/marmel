@@ -25,7 +25,7 @@
 //!    words, section labels). Hues separate *neighbours*, not *meanings*.
 //! 4. **Warm = problem.** `Red` is failure/irreversible only; `LightRed` is
 //!    "needs attention, nothing broke" only. Waiting/live/new/queued states are
-//!    cool (`Blue`/`LightBlue`) or neutral (`Gray`/`White`) so a benign chip can
+//!    cool (`LightBlue`/`LightCyan`) or neutral (`Gray`/`White`) so a benign chip can
 //!    never read as one lightness step from an error.
 //! 5. **Band-aware.** The status row is painted over the `BAND` background, and a
 //!    style with no `bg` inherits it: `text_muted` (DarkGray) on the band is
@@ -157,7 +157,7 @@
 //! | `chip_muted` | the muted rung *inside* the band | Gray on DarkGray | separators/labels on the band; this is the band-safe twin of `text_muted` |
 //! | `chip_value` | a number worth reading inside the band | White on DarkGray + BOLD | token counts / metrics on the band; `text_primary` has no bg and must not be used there |
 //! | `state_running` | in flight: active task, active worker, `▶` | Yellow + BOLD | in-flight only; do not re-add `BOLD` at the call site, and do not use it for selection |
-//! | `state_queued` | waiting: `⧗`, open plan line, queue rank, queued steers, validating | Blue | waiting only; never failure-adjacent, never `val N` |
+//! | `state_queued` | waiting: `⧗`, open plan line, queue rank, queued steers, validating | LightBlue | waiting only; never failure-adjacent, never `val N` |
 //! | `state_paused` | parked stream, `⏸` | Gray | paused only; must stay distinct from queued and from the neutral chip |
 //! | `state_done` | delivered/approved/checked, `✓` | Green | success only; never the product wordmark, never "live/following" |
 //! | `state_failed` | failed/aborted/rejected, `✗`, sticky error text | Red + BOLD | failure only; never a section header, never a warning |
@@ -172,7 +172,7 @@
 //! | `role_tool` | `[Tool Call]` / `[Tool Result]` lines | Magenta | tool lines only |
 //! | `role_turn` | turn separator rules | DarkGray + BOLD | separators; free the success hue from running across the transcript |
 //! | `scroll_live` | following the live edge (`● LIVE`) | LightBlue | follow-on chip; must not use the success hue |
-//! | `scroll_unseen` | new output below the fold (`↓ N new`) | Blue | unseen count; never `LightRed` |
+//! | `scroll_unseen` | new output below the fold (`↓ N new`) | LightCyan | unseen count; never `LightRed` |
 //! | `scroll_stale` | follow is off / viewport is stale | Gray | follow-off chip; neutral, it is the operator's own choice |
 //! | `scrollbar_thumb` | pane scrollbar thumb | Gray | `Scrollbar::thumb_style` |
 //! | `scrollbar_track` | pane scrollbar track | DarkGray | `Scrollbar::track_style`; must stay readable next to `scrollbar_thumb` |
@@ -457,7 +457,7 @@ pub fn state_running() -> Style {
 /// Waiting on a slot or on the review loop: `⧗`, an open plan line, a queue
 /// rank, a queued steer. Cool, because nothing is wrong (§F4).
 pub fn state_queued() -> Style {
-    fg(Color::Blue)
+    fg(Color::LightBlue)
 }
 
 /// Held/parked: a stream stopped behind the arbitrator (`⏸`).
@@ -550,7 +550,7 @@ pub fn scroll_live() -> Style {
 
 /// Output arrived below the fold while the operator is scrolled back (`↓ N new`).
 pub fn scroll_unseen() -> Style {
-    fg(Color::Blue)
+    fg(Color::LightCyan)
 }
 
 /// Follow is off: the viewport is deliberately stale — the operator's own choice,
