@@ -99,12 +99,19 @@ fn steer_stage_of(text: &str) -> Option<SteerStage> {
 /// verdict badge [`verdict_marks`] puts on a line whose quoted instruction happens to
 /// carry a marker word.
 fn steer_mark(line: Line<'static>) -> Line<'static> {
-    let text: String = line
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect();
-    let Some(stage) = steer_stage_of(&text) else {
+    let has_match = if line.spans.is_empty() {
+        None
+    } else if line.spans.len() == 1 {
+        steer_stage_of(&line.spans[0].content)
+    } else {
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        steer_stage_of(&text)
+    };
+    let Some(stage) = has_match else {
         return line;
     };
     let style = steer_style(stage);
@@ -229,17 +236,19 @@ pub(crate) fn draw_body(
     // body is counted: when the body wraps to more rows than fit, the text column
     // shrinks by one and the row count is re-measured at that width. Counting and
     // drawing must use the *same* width or `max_scroll` is a lie.
-    let total = count_wrapped_rendered_lines(&lines, usize::from(inner.width));
-    let scrollbar = total > height && inner.width > 1;
-    let text_width = if scrollbar {
+    let scrollbar_needed = lines.len() > height && inner.width > 1;
+    let candidate_width = if scrollbar_needed {
         inner.width - 1
     } else {
         inner.width
     };
-    let total = if scrollbar {
-        count_wrapped_rendered_lines(&lines, usize::from(text_width))
+    let total = count_wrapped_rendered_lines(&lines, usize::from(candidate_width));
+    let scrollbar = total > height && inner.width > 1;
+    let (text_width, total) = if scrollbar && !scrollbar_needed {
+        let w = inner.width - 1;
+        (w, count_wrapped_rendered_lines(&lines, usize::from(w)))
     } else {
-        total
+        (candidate_width, total)
     };
     let max_scroll = total.saturating_sub(height);
     let offset = if follow {
@@ -274,9 +283,25 @@ pub(crate) fn draw_body(
                 width: text_width,
                 ..inner
             };
-            let paragraph = Paragraph::new(lines)
+            let (draw_lines, draw_scroll) =
+                if (follow || offset >= max_scroll) && lines.len() > height * 3 {
+                    let tail_count = (height * 3).max(60);
+                    let start_idx = lines.len().saturating_sub(tail_count);
+                    let tail_slice = &lines[start_idx..];
+                    let tail_wrapped =
+                        count_wrapped_rendered_lines(tail_slice, usize::from(text_width));
+                    if tail_wrapped >= height {
+                        let tail_scroll = (tail_wrapped - height) as u16;
+                        (tail_slice.to_vec(), tail_scroll)
+                    } else {
+                        (lines, offset as u16)
+                    }
+                } else {
+                    (lines, offset as u16)
+                };
+            let paragraph = Paragraph::new(draw_lines)
                 .wrap(Wrap { trim: false })
-                .scroll((offset as u16, 0));
+                .scroll((draw_scroll, 0));
             frame.render_widget(paragraph, text);
             if scrollbar {
                 let mut state = ScrollbarState::new(max_scroll).position(offset);
@@ -345,12 +370,28 @@ fn thought_lines(thought: &str) -> Vec<Line<'static>> {
     let style = thought_style();
     let mut lines = Vec::new();
     for raw in thought.lines() {
-        let line = raw.replace('\t', "    ");
+        if is_think_tag(raw) {
+            continue;
+        }
+        let line = if raw.contains('\t') {
+            std::borrow::Cow::Owned(raw.replace('\t', "    "))
+        } else {
+            std::borrow::Cow::Borrowed(raw)
+        };
         if is_think_tag(&line) {
             continue;
         }
-        let cleaned = format_terminal_math(&strip_think_tags(&line));
-        if cleaned.trim().is_empty() && !line.trim().is_empty() {
+        let stripped = if line.contains("<think") || line.contains("<thought") {
+            std::borrow::Cow::Owned(strip_think_tags(&line))
+        } else {
+            line
+        };
+        let cleaned = if stripped.contains('\\') || stripped.contains('$') {
+            format_terminal_math(&stripped)
+        } else {
+            stripped.into_owned()
+        };
+        if cleaned.trim().is_empty() && !raw.trim().is_empty() {
             continue;
         }
         lines.push(Line::from(Span::styled(cleaned, style)));
@@ -366,12 +407,28 @@ fn stream_lines(content: &str) -> Vec<Line<'static>> {
     }
     let mut lines = Vec::new();
     for raw in content.lines() {
-        let line = raw.replace('\t', "    ");
+        if is_think_tag(raw) {
+            continue;
+        }
+        let line = if raw.contains('\t') {
+            std::borrow::Cow::Owned(raw.replace('\t', "    "))
+        } else {
+            std::borrow::Cow::Borrowed(raw)
+        };
         if is_think_tag(&line) {
             continue;
         }
-        let cleaned = format_terminal_math(&strip_think_tags(&line));
-        if cleaned.trim().is_empty() && !line.trim().is_empty() {
+        let stripped = if line.contains("<think") || line.contains("<thought") {
+            std::borrow::Cow::Owned(strip_think_tags(&line))
+        } else {
+            line
+        };
+        let cleaned = if stripped.contains('\\') || stripped.contains('$') {
+            format_terminal_math(&stripped)
+        } else {
+            stripped.into_owned()
+        };
+        if cleaned.trim().is_empty() && !raw.trim().is_empty() {
             continue;
         }
         if cleaned.contains('\x1b') {
@@ -471,12 +528,19 @@ impl Verdict {
 /// whole line takes the verdict colour, which is what makes a verdict readable
 /// apart from body text at a glance.
 fn verdict_mark(line: Line<'static>) -> Line<'static> {
-    let text: String = line
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect();
-    let Some(verdict) = verdict_of(&text) else {
+    let has_match = if line.spans.is_empty() {
+        None
+    } else if line.spans.len() == 1 {
+        verdict_of(&line.spans[0].content)
+    } else {
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        verdict_of(&text)
+    };
+    let Some(verdict) = has_match else {
         return line;
     };
 

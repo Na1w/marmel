@@ -739,13 +739,13 @@ impl TuiRenderer {
         // Audit D5: the process-wide counters are read exactly once per painted
         // frame, right here, and the frame below reads only the snapshot.
         self.refresh_global_token_snapshot();
-        self.last_render = std::time::Instant::now();
         self.frame_counter = self.frame_counter.wrapping_add(1);
         let Some(mut terminal) = self.terminal.take() else {
             return Ok(());
         };
         let res = self.draw(&mut terminal);
         self.terminal = Some(terminal);
+        self.last_render = std::time::Instant::now();
         res
     }
 

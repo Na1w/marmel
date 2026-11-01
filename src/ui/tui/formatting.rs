@@ -826,7 +826,14 @@ pub fn count_wrapped_rendered_lines(lines: &[Line<'_>], width: usize) -> usize {
     let mut total = 0;
     for line in lines {
         let line_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
-        if line_len == 0 {
+        if line_len == 0
+            || (width > 0
+                && line_len <= width
+                && !line
+                    .spans
+                    .iter()
+                    .any(|s| s.content.contains('\t') || s.content.contains('\n')))
+        {
             total += 1;
         } else if line.spans.len() == 1 {
             total += wrapped_lines(&line.spans[0].content, width).max(1);
