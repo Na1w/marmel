@@ -3888,7 +3888,7 @@ fn plan_focus_arrows_walk_the_drawn_plan_window_and_leave_the_composer_alone() {
 }
 
 /// Contract row (c), the roster half: with the **Workers** pane focused, a run of
-/// plain `Up` / `Down` presses walks only the drawn roster window. The composer keeps
+/// `Shift+Up` / `Shift+Down` presses walks only the drawn roster window. The composer keeps
 /// its pixels, its draft, its caret and its history bookkeeping press for press, and
 /// the detail log — the pane's other viewport — stays where its own keys left it.
 #[test]
@@ -3922,7 +3922,7 @@ fn workers_focus_arrows_walk_the_drawn_roster_window_and_leave_the_composer_alon
     let mut at = usize::from(r.subagent_list_scroll);
     for step in 1..=3 {
         assert!(
-            key(&mut r, KeyCode::Down),
+            press(&mut r, KeyCode::Down, KeyModifiers::SHIFT),
             "the roster refused the `Down` it owns at step {step}"
         );
         assert_eq!(
@@ -3957,7 +3957,7 @@ fn workers_focus_arrows_walk_the_drawn_roster_window_and_leave_the_composer_alon
 
     for step in 1..=2 {
         assert!(
-            key(&mut r, KeyCode::Up),
+            press(&mut r, KeyCode::Up, KeyModifiers::SHIFT),
             "the roster swallowed its `Up` at step {step}"
         );
         assert_eq!(
@@ -4431,16 +4431,10 @@ fn drawn_log(rows: &[String], pane: Rect) -> Vec<String> {
         .collect()
 }
 
-/// Contract row (b), the second pane: the Workers pane has **two** viewports and the
-/// keys never cross them. `Up`/`Down` walk the drawn roster window one row per press
-/// and leave the drawn detail log pixel-identical; `PageUp`/`PageDown`/`Home`/`End`
-/// walk the log and leave the drawn roster window pixel-identical; a press at the end
-/// of the roster window moves nothing and asks for no repaint. The state-level half is
-/// pinned in `events.rs`
-/// (`the_workers_arrows_walk_the_roster_window_and_leave_the_log_alone`,
-/// `the_detail_page_and_jump_keys_leave_the_roster_window_where_it_stands`); what was
-/// never pinned is the frame — which names and which log lines are on screen after
-/// each press (audit defect 14).
+/// Contract row (b), the second pane: the Workers pane has **two** viewports:
+/// `Shift+Up`/`Shift+Down` walk the drawn roster window one row per press
+/// and leave the drawn detail log pixel-identical; plain `Up`/`Down` and `PageUp`/`PageDown`
+/// walk the detail log and leave the drawn roster window pixel-identical.
 #[test]
 fn the_workers_arrows_walk_the_drawn_roster_window_while_the_page_keys_walk_the_drawn_log() {
     const ROWS: usize = 12;
@@ -4490,11 +4484,14 @@ fn the_workers_arrows_walk_the_drawn_roster_window_while_the_page_keys_walk_the_
         "the window does not show its own selection: {drawn:?}"
     );
 
-    // `Down` walks the window one row per press, and the log is untouched pixel for
+    // `Shift+Down` walks the window one row per press, and the log is untouched pixel for
     // pixel at every step.
     let mut step = usize::from(r.subagent_list_scroll);
     while step < upper {
-        assert!(key(&mut r, KeyCode::Down), "Down was swallowed");
+        assert!(
+            press(&mut r, KeyCode::Down, KeyModifiers::SHIFT),
+            "Shift+Down was swallowed"
+        );
         let (rows, _, rects) = draw_frame(&mut r, 140, 24);
         let pane = rects.workers.expect("M3 draws the Workers pane");
         step += 1;
@@ -4526,7 +4523,10 @@ fn the_workers_arrows_walk_the_drawn_roster_window_while_the_page_keys_walk_the_
     // The press past the end of the window: claimed by the pane, but it moves
     // nothing and asks for no repaint.
     r.dirty = false;
-    assert!(key(&mut r, KeyCode::Down), "Down is still a pane key");
+    assert!(
+        press(&mut r, KeyCode::Down, KeyModifiers::SHIFT),
+        "Shift+Down is still a pane key"
+    );
     assert_eq!(
         usize::from(r.subagent_list_scroll),
         upper,
@@ -4544,6 +4544,36 @@ fn the_workers_arrows_walk_the_drawn_roster_window_while_the_page_keys_walk_the_
         drawn_log(&rows, pane),
         log,
         "a press at the end of the window moved the detail log"
+    );
+
+    // Plain `Down` scrolls the detail log by 1 line without moving the roster window.
+    assert!(key(&mut r, KeyCode::Down), "Down is a pane key");
+    let (rows, _, rects) = draw_frame(&mut r, 140, 24);
+    let pane = rects.workers.expect("M3 draws the Workers pane");
+    assert_ne!(
+        drawn_log(&rows, pane),
+        log,
+        "Down left the drawn log exactly where it was"
+    );
+    assert_eq!(
+        drawn_roster_rows(&rows, pane, ROWS),
+        at_end,
+        "Down moved the roster window"
+    );
+
+    // Plain `Up` walks it back to where it started.
+    assert!(key(&mut r, KeyCode::Up), "Up is a pane key");
+    let (rows, _, rects) = draw_frame(&mut r, 140, 24);
+    let pane = rects.workers.expect("M3 draws the Workers pane");
+    assert_eq!(
+        drawn_log(&rows, pane),
+        log,
+        "Up did not walk the log back to the top"
+    );
+    assert_eq!(
+        drawn_roster_rows(&rows, pane, ROWS),
+        at_end,
+        "Up moved the roster window"
     );
 
     // `PageUp` / `PageDown` belong to the other viewport: the log moves, the drawn

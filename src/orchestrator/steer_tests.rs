@@ -13,6 +13,7 @@ fn decision(decision: &str, response: Option<&str>) -> SteerDecision {
         model: None,
         subtasks: Vec::new(),
         sleep_seconds: None,
+        ..Default::default()
     }
 }
 

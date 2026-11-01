@@ -763,8 +763,10 @@ mod tests {
                 agent_name: Some("coder".to_string()),
                 prompt: None,
                 sleep_seconds: None,
+                ..Default::default()
             }],
             sleep_seconds: None,
+            ..Default::default()
         };
 
         handle.complete_with_subtask_decision(Some(&decision));
@@ -973,6 +975,7 @@ mod tests {
                     agent_name: Some("researcher".to_string()),
                     prompt: None,
                     sleep_seconds: None,
+                    ..Default::default()
                 },
                 crate::orchestrator::steer::SteerSubtaskDecision {
                     tool_call_id: "steer-task-1".to_string(),
@@ -981,9 +984,11 @@ mod tests {
                     agent_name: Some("coder".to_string()),
                     prompt: Some("Investigate stalled task".to_string()),
                     sleep_seconds: None,
+                    ..Default::default()
                 },
             ],
             sleep_seconds: None,
+            ..Default::default()
         };
 
         handle.complete_with_subtask_decision(Some(&decision));
@@ -1249,8 +1254,10 @@ mod tests {
                     agent_name: Some("coder".to_string()),
                     prompt: None,
                     sleep_seconds: None,
+                    ..Default::default()
                 }],
                 sleep_seconds: None,
+                ..Default::default()
             };
 
             handle.complete_with_subtask_decision(Some(&decision));
@@ -1312,8 +1319,10 @@ mod tests {
                     agent_name: Some("coder".to_string()),
                     prompt: None,
                     sleep_seconds: None,
+                    ..Default::default()
                 }],
                 sleep_seconds: None,
+                ..Default::default()
             };
 
             handle.complete_with_subtask_decision(Some(&decision));
@@ -1427,9 +1436,11 @@ mod tests {
                     agent_name: Some(NAMES[label].to_string()),
                     prompt: None,
                     sleep_seconds: None,
+                    ..Default::default()
                 })
                 .collect(),
             sleep_seconds: None,
+            ..Default::default()
         };
         handle.complete_with_subtask_decision(Some(&decision));
 
@@ -1578,8 +1589,10 @@ mod tests {
                 agent_name: Some("coder".to_string()),
                 prompt: None,
                 sleep_seconds: None,
+                ..Default::default()
             }],
             sleep_seconds: None,
+            ..Default::default()
         };
         handle.complete_with_subtask_decision(Some(&decision));
 

@@ -456,6 +456,36 @@ fn row_spans(row: &SubagentDetail, entry: Option<&WorkerEntry>) -> Vec<Span<'sta
 
 /// Detail half for the selected row: header, `[Thinking]` size line, `[Output]`,
 /// `[Logs]`, and its own scroll + scrollbar.
+/// Maximum lines rendered for a worker's streaming output in the detail pane.
+/// Bounded to ensure wrapping and rendering take sub-millisecond time even for long-running workers.
+pub(crate) const MAX_DETAIL_RENDERED_CONTENT_LINES: usize = 500;
+
+/// Maximum lines rendered for a worker's thinking buffer in the detail pane.
+pub(crate) const MAX_DETAIL_RENDERED_THINKING_LINES: usize = 300;
+
+/// Keep the newest `max_lines` of text, returning the sliced text and the total line count.
+fn tail_lines(text: &str, max_lines: usize) -> (&str, usize, bool) {
+    let total_lines = text.lines().count();
+    if total_lines <= max_lines {
+        return (text, total_lines, false);
+    }
+    let skip_lines = total_lines - max_lines;
+    let mut byte_offset = 0;
+    for (idx, line) in text.lines().enumerate() {
+        if idx >= skip_lines {
+            break;
+        }
+        byte_offset += line.len() + 1;
+    }
+    let byte_offset = byte_offset.min(text.len());
+    let safe_offset = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .find(|&i| i >= byte_offset)
+        .unwrap_or(text.len());
+    (&text[safe_offset..], total_lines, true)
+}
+
 fn draw_detail(
     frame: &mut Frame,
     area: Rect,
@@ -497,18 +527,21 @@ fn draw_detail(
         data.thinking_budget,
         data.steering,
     );
-    let total = count_wrapped_rendered_lines(&lines, usize::from(body.width));
-    let scrollbar = total > height && body.width > 1;
-    let text_width = if scrollbar {
-        let width = body.width - 1;
-        if let Some(header) = lines.first_mut() {
-            *header = Line::from(fit_spans(row_spans(row, entry), width));
-        }
-        width
+    let candidate_width = if body.width > 1 {
+        body.width - 1
     } else {
         body.width
     };
-    let total = count_wrapped_rendered_lines(&lines, usize::from(text_width));
+    let total = count_wrapped_rendered_lines(&lines, usize::from(candidate_width));
+    let scrollbar = total > height && body.width > 1;
+    let text_width = if scrollbar {
+        if let Some(header) = lines.first_mut() {
+            *header = Line::from(fit_spans(row_spans(row, entry), candidate_width));
+        }
+        candidate_width
+    } else {
+        body.width
+    };
     let max = total.saturating_sub(height);
     // Two spellings of what this half is asked to show, and both are decided here
     // rather than anywhere that has to guess how long this body is:
@@ -703,8 +736,16 @@ fn detail_lines(
             // a thought reads identically in the transcript, the streaming buffer
             // and here — a fourth hand-written copy of `text_dim + ITALIC` is what
             // let the tier drift (§F7).
+            let (thinking_to_render, total_lines, truncated) =
+                tail_lines(&row.thinking, MAX_DETAIL_RENDERED_THINKING_LINES);
+            if truncated {
+                sections.push(Line::styled(
+                    format!(" … [earlier thoughts truncated ({total_lines} lines total)] …"),
+                    theme::text_muted(),
+                ));
+            }
             let style = thought_style();
-            for line in row.thinking.lines() {
+            for line in thinking_to_render.lines() {
                 sections.push(Line::styled(
                     format!(" {}", crate::ui::tui::formatting::strip_think_tags(line)),
                     style,
@@ -726,10 +767,18 @@ fn detail_lines(
             "[Output]".to_string(),
             theme::section_header(),
         ));
-        if row.content.contains("```") {
-            sections.extend(render_markdown_lines(&row.content));
+        let (content_to_render, total_lines, truncated) =
+            tail_lines(&row.content, MAX_DETAIL_RENDERED_CONTENT_LINES);
+        if truncated {
+            sections.push(Line::styled(
+                format!(" … [earlier output truncated ({total_lines} lines total)] …"),
+                theme::text_muted(),
+            ));
+        }
+        if content_to_render.contains("```") {
+            sections.extend(render_markdown_lines(content_to_render));
         } else {
-            for line in row.content.lines() {
+            for line in content_to_render.lines() {
                 if line.contains('\x1b') {
                     sections.extend(parse_ansi_lines(line));
                 } else {

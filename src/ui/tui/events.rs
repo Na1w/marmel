@@ -811,14 +811,17 @@ impl TuiRenderer {
         }
         if !self.composer_has_focus() {
             if self.focus == FocusPane::Workers {
-                // Defect 14: the roster window (`subagent_list_scroll`) had no key
-                // owner at all — only a resize clamp — while the pane itself
-                // advertised `↑`/`↓` as the keys that scroll it. They are, and they
-                // are its only owner. The detail half one level in keeps
-                // `PageUp`/`PageDown`/`Home`/`End`, so the pane's two viewports
-                // still answer to two different keys.
-                if self.scroll_worker_roster_by(up, 1) {
-                    self.dirty = true;
+                let detail_present = if self.subagent_area.width > 0 {
+                    super::layout::workers_detail_present(self.subagent_area.width)
+                } else {
+                    super::layout::workers_detail_present(self.subagent_width.get() as u16)
+                };
+                if key.modifiers.contains(KeyModifiers::SHIFT) || !detail_present {
+                    if self.scroll_worker_roster_by(up, 1) {
+                        self.dirty = true;
+                    }
+                } else {
+                    self.scroll_by(up, 1);
                 }
             } else {
                 self.scroll_by(up, 1);
@@ -1869,10 +1872,10 @@ impl TuiRenderer {
     /// focus — a scroll of a pane the operator was not looking at. The composer owns
     /// no viewport, so it names no scroll target and returns `false`.
     ///
-    /// For the Workers pane the target is the **detail** half. Plain `Up` / `Down` no
-    /// longer reach this function there — they own the roster window
-    /// ([`Self::scroll_worker_roster_by`]) — so what arrives here is the
-    /// `PageUp` / `PageDown` page gesture.
+    /// For the Workers pane the target is the **detail** half (the agent's
+    /// logs and history). Plain `Up` / `Down` scroll this detail by 1 line (and
+    /// `PageUp` / `PageDown` by 10), while `Shift+Up` / `Shift+Down` (or plain
+    /// arrows on narrow layouts without detail) scroll the roster window.
     pub(crate) fn scroll_up(&mut self, amount: u16) -> bool {
         match self.focus {
             FocusPane::Input => false,
@@ -3724,13 +3727,9 @@ mod tests {
         )
     }
 
-    /// Defect 14: the Workers pane has two viewports, and `↑`/`↓` own the **outer**
-    /// one — the roster window. The presses walk it one row at a time against the
-    /// bounds the pane publishes, stop at both ends instead of running past them, and
-    /// touch nothing else: not the selection (`←`/`→`), not the detail offset
-    /// (`PageUp`/`PageDown`/`Home`/`End`), not one follow-ish flag.
+    /// In Workers pane, Shift+Arrows walk the roster window one row at a time.
     #[test]
-    fn the_workers_arrows_walk_the_roster_window_and_leave_the_log_alone() {
+    fn the_workers_shift_arrows_walk_the_roster_window_and_leave_the_log_alone() {
         let mut renderer = workers_pane_with_roster(12);
         let (lower, upper) = roster_bounds_of(&renderer);
         assert!(
@@ -3738,45 +3737,45 @@ mod tests {
             "the fixture needs a window with room to travel: {lower}..{upper}"
         );
 
-        // Down walks toward the later rows, one step per press, and stops on the end.
+        // Shift+Down walks toward the later rows, one step per press, and stops on the end.
         for step in lower..upper {
             renderer.subagent_list_scroll = step as u16;
             renderer.dirty = false;
-            assert!(press(&mut renderer, KeyCode::Down, KeyModifiers::NONE));
+            assert!(press(&mut renderer, KeyCode::Down, KeyModifiers::SHIFT));
             assert_eq!(
                 usize::from(renderer.subagent_list_scroll),
                 step + 1,
-                "Down walked the window by one row"
+                "Shift+Down walked the window by one row"
             );
             assert!(renderer.dirty, "a moved window asks for a repaint");
         }
         renderer.dirty = false;
-        assert!(press(&mut renderer, KeyCode::Down, KeyModifiers::NONE));
+        assert!(press(&mut renderer, KeyCode::Down, KeyModifiers::SHIFT));
         assert_eq!(
             usize::from(renderer.subagent_list_scroll),
             upper,
-            "Down past the end of the window did not run off it"
+            "Shift+Down past the end of the window did not run off it"
         );
         assert!(!renderer.dirty, "a press at the end repainted nothing");
 
-        // Up walks back toward the earlier rows and stops at its own end.
+        // Shift+Up walks back toward the earlier rows and stops at its own end.
         for step in (lower + 1..=upper).rev() {
             renderer.subagent_list_scroll = step as u16;
             renderer.dirty = false;
-            assert!(press(&mut renderer, KeyCode::Up, KeyModifiers::NONE));
+            assert!(press(&mut renderer, KeyCode::Up, KeyModifiers::SHIFT));
             assert_eq!(
                 usize::from(renderer.subagent_list_scroll),
                 step - 1,
-                "Up walked the window by one row"
+                "Shift+Up walked the window by one row"
             );
         }
         renderer.subagent_list_scroll = lower as u16;
         renderer.dirty = false;
-        assert!(press(&mut renderer, KeyCode::Up, KeyModifiers::NONE));
+        assert!(press(&mut renderer, KeyCode::Up, KeyModifiers::SHIFT));
         assert_eq!(
             usize::from(renderer.subagent_list_scroll),
             lower,
-            "Up past the head of the window did not run off it"
+            "Shift+Up past the head of the window did not run off it"
         );
         assert!(!renderer.dirty, "a press at the head repainted nothing");
 
@@ -3786,7 +3785,7 @@ mod tests {
         // nothing else (no movement, no repaint).
         renderer.subagent_list_scroll = u16::MAX;
         renderer.dirty = false;
-        assert!(press(&mut renderer, KeyCode::Down, KeyModifiers::NONE));
+        assert!(press(&mut renderer, KeyCode::Down, KeyModifiers::SHIFT));
         assert_eq!(
             usize::from(renderer.subagent_list_scroll),
             upper,
@@ -3798,7 +3797,7 @@ mod tests {
         );
         // The very next press walks from that reconciled position.
         renderer.dirty = false;
-        assert!(press(&mut renderer, KeyCode::Up, KeyModifiers::NONE));
+        assert!(press(&mut renderer, KeyCode::Up, KeyModifiers::SHIFT));
         assert_eq!(
             usize::from(renderer.subagent_list_scroll),
             upper - 1,
@@ -3806,8 +3805,7 @@ mod tests {
         );
         assert!(renderer.dirty, "a moved window asks for a repaint");
 
-        // And everything the arrows do not own stayed exactly where it was, in both
-        // states of the detail's follow flag.
+        // And everything the shift arrows do not own stayed exactly where it was.
         for autoscroll in [true, false] {
             renderer.subagent_list_scroll = lower as u16;
             renderer.subagent_scroll = 5;
@@ -3818,7 +3816,7 @@ mod tests {
             let plan_scroll = renderer.plan_scroll;
             for code in [KeyCode::Up, KeyCode::Down] {
                 renderer.dirty = false;
-                assert!(press(&mut renderer, code, KeyModifiers::NONE));
+                assert!(press(&mut renderer, code, KeyModifiers::SHIFT));
                 assert_eq!(
                     renderer.selected_subagent_idx, selected,
                     "{code:?} moved the roster selection"
@@ -3846,9 +3844,32 @@ mod tests {
         }
     }
 
+    /// Plain Up/Down arrows scroll the worker detail history by 1 line (when detail is present).
+    #[test]
+    fn the_workers_plain_arrows_scroll_the_detail_log_by_one() {
+        let mut renderer = workers_pane_with_roster(12);
+        renderer.detail_measured_max.set(Some(20));
+        renderer.subagent_scroll = 5;
+        renderer.subagent_autoscroll = false;
+        let roster_scroll = renderer.subagent_list_scroll;
+
+        // Down scrolls detail down by 1
+        renderer.dirty = false;
+        assert!(press(&mut renderer, KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(renderer.subagent_scroll, 6);
+        assert_eq!(renderer.subagent_list_scroll, roster_scroll);
+        assert!(renderer.dirty);
+
+        // Up scrolls detail up by 1
+        renderer.dirty = false;
+        assert!(press(&mut renderer, KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(renderer.subagent_scroll, 5);
+        assert_eq!(renderer.subagent_list_scroll, roster_scroll);
+        assert!(renderer.dirty);
+    }
+
     /// The roster half of the no-movement-no-decision rule: a roster that fits its
-    /// half has no window to move, so an arrow is still the pane's key (it is claimed)
-    /// but moves no offset, states no flag and asks for no repaint (defect 14).
+    /// half has no window to move, so Shift+Arrow is claimed but moves no offset.
     #[test]
     fn a_roster_with_nothing_to_scroll_states_nothing_when_the_arrows_are_pressed() {
         let mut renderer = workers_pane_with_roster(2);
@@ -3861,7 +3882,7 @@ mod tests {
         for code in [KeyCode::Up, KeyCode::Down] {
             renderer.dirty = false;
             assert!(
-                press(&mut renderer, code, KeyModifiers::NONE),
+                press(&mut renderer, code, KeyModifiers::SHIFT),
                 "{code:?} is still the roster's key"
             );
             assert_eq!(

@@ -1643,8 +1643,9 @@ pub(crate) fn merge_logs(existing: &[String], incoming: &[String]) -> Vec<String
     let other = if incoming_wins { existing } else { incoming };
 
     let mut merged = base.to_vec();
+    let mut seen: std::collections::HashSet<&str> = base.iter().map(|s| s.as_str()).collect();
     for line in other {
-        if !merged.contains(line) {
+        if seen.insert(line.as_str()) {
             merged.push(line.clone());
         }
     }

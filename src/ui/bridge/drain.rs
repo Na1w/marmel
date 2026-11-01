@@ -37,6 +37,12 @@ pub(crate) fn drain_steer_arbitration_events_with_transcript(
     // same pass. It is a *witness* of what the drain already folded into rows, never a
     // second owner of delegation state.
     let mut delegated_agents: Vec<String> = Vec::new();
+    let mut delegated_deliverables: Vec<(
+        crate::agents::Agent,
+        String,
+        crate::agents::Deliverable,
+    )> = Vec::new();
+    let mut last_synthesized_answer: Option<String> = None;
     while let Ok(ev) = arb_rx.try_recv() {
         dirty = true;
         match ev {
@@ -108,15 +114,10 @@ pub(crate) fn drain_steer_arbitration_events_with_transcript(
                     });
                 }
                 delegated_agents.push(agent.as_str().to_string());
-                steer_queue.push(format!(
-                    "(User steering resulted in subtask '{task_id}' executed by specialist '{}'. Deliverable:\n{})",
-                    agent.as_str(),
-                    deliverable.content
-                ));
+                delegated_deliverables.push((agent, task_id, deliverable));
             }
             SteerArbEvent::SynthesizedAnswer { answer, .. } => {
-                // User steering inquiry was answered directly to the user by arbitrator.
-                // Do NOT push to steer_queue so it does not trigger an orchestrator turn.
+                last_synthesized_answer = Some(answer.clone());
                 if let Some(ref mut tr) = ui_transcript {
                     tr.append(crate::ui::UiRecord::SteerResponse { text: answer });
                 }
@@ -273,6 +274,63 @@ pub(crate) fn drain_steer_arbitration_events_with_transcript(
                     renderer.on_event(&Event::Status(
                         "Steering subtask delegation finished".to_string(),
                     ));
+
+                    let should_share = decision
+                        .as_ref()
+                        .map(|d| {
+                            d.share_with_orchestrator.unwrap_or(false)
+                                || d.orchestrator_note
+                                    .as_ref()
+                                    .is_some_and(|n| !n.trim().is_empty())
+                                || d.subtasks
+                                    .iter()
+                                    .any(|st| st.share_with_orchestrator.unwrap_or(false))
+                        })
+                        .unwrap_or(false);
+
+                    if should_share {
+                        let note = decision
+                            .as_ref()
+                            .and_then(|d| d.orchestrator_note.as_ref())
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty());
+
+                        let payload = match note {
+                            Some(explicit_note) => {
+                                format!("[Steer Arbitrator Context]: {explicit_note}")
+                            }
+                            None => {
+                                if let Some(ref synth) = last_synthesized_answer {
+                                    format!("[Steer Arbitrator Findings - '{user_msg}']:\n{synth}")
+                                } else if !delegated_deliverables.is_empty() {
+                                    let delivs = delegated_deliverables
+                                        .iter()
+                                        .map(|(ag, tid, deliv)| {
+                                            format!(
+                                                "Specialist {} ({}):\n{}",
+                                                ag.as_str(),
+                                                tid,
+                                                deliv.content
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n\n");
+                                    format!("[Steer Arbitrator Findings - '{user_msg}']:\n{delivs}")
+                                } else {
+                                    format!(
+                                        "[Steer Arbitrator Context]: Relevant user instruction: '{user_msg}'"
+                                    )
+                                }
+                            }
+                        };
+
+                        let trace = SteerTrace::queued(
+                            user_msg.clone(),
+                            MANAGER_TARGET,
+                            "the arbitrator determined this steering information is relevant to orchestration",
+                        );
+                        queue_steer_as(steer_queue, renderer, &trace, &payload);
+                    }
                 } else {
                     // No delegation reached a specialist, so nothing this pass witnessed is
                     // attributable to an instruction any more.
@@ -285,6 +343,20 @@ pub(crate) fn drain_steer_arbitration_events_with_transcript(
                             renderer.on_event(&Event::Status(
                                 "Answered via direct steer response".to_string(),
                             ));
+                            if let Some(note) = decision
+                                .as_ref()
+                                .and_then(|d| d.orchestrator_note.as_ref())
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty())
+                            {
+                                let payload = format!("[Steer Arbitrator Context]: {note}");
+                                let trace = SteerTrace::queued(
+                                    user_msg.clone(),
+                                    MANAGER_TARGET,
+                                    "the arbitrator shared relevant context with the orchestrator",
+                                );
+                                queue_steer_as(steer_queue, renderer, &trace, &payload);
+                            }
                         }
                         "Sleep" => {
                             renderer.on_event(&Event::Status(
@@ -502,6 +574,7 @@ mod tests {
             agent_name: agent.map(str::to_string),
             prompt: None,
             sleep_seconds: None,
+            ..Default::default()
         }
     }
 
@@ -513,6 +586,7 @@ mod tests {
             model: None,
             subtasks,
             sleep_seconds: None,
+            ..Default::default()
         }
     }
 

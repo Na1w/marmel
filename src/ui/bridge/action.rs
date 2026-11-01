@@ -263,6 +263,7 @@ mod tests {
             agent_name: None,
             prompt: None,
             sleep_seconds: None,
+            ..Default::default()
         }
     }
 

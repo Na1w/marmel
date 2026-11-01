@@ -46,10 +46,19 @@ Also decide the overall loop action:
 - 'Sleep': Select this if the user asks you to wait or pause for a period of time before acting or checking back (e.g. 'wait 10 seconds', 'sleep for 5 seconds', 'wait a moment', 'check again in 10s'), or if execution should wait for X seconds before re-evaluating. Specify 'sleep_seconds' (integer seconds, default 5) and 'response' explaining to the user in their language that you are waiting.
 - **POST-SLEEP RE-EVALUATION:** When re-evaluating after a sleep period has completed (indicated in 'Steering Conversation History' or system follow-up notices), your wait has concluded and you have woken up to re-evaluate. Do NOT sleep repeatedly in an infinite loop. Inspect the freshly updated 'Active Subtasks', 'Execution Plan Progress Breakdown', and timestamps, and deliver your direct factual answer to the user's inquiry via 'RespondDirectly' (or execute requested actions via 'DelegateTask', 'ForwardToWorker', etc.).
 
+- **SHARING RELEVANT CONTEXT/FINDINGS WITH THE ORCHESTRATOR (`share_with_orchestrator` & `orchestrator_note`):**
+  * By default, adhoc inquiries, status questions, greetings, and isolated workspace checks ('RespondDirectly', 'DelegateTask') are strictly between you and the user. Their deliverables and answers are returned directly to the user and are NOT sent to the orchestrator, preventing unnecessary interruptions or accidental aborts of running subagents.
+  * **When to share with the orchestrator:** If the user instruction provides important context, constraints, or new information relevant to the main orchestrator's ongoing mission, OR if an adhoc delegated subtask was requested to investigate something the orchestrator needs to know (e.g. discovering an API format, verifying an environmental dependency, or troubleshooting a blocker for the main task):
+    - Set `"share_with_orchestrator": true`. For 'DelegateTask', the specialist findings will be queued cleanly to the orchestrator at its next seam without interrupting active workers.
+    - And/or provide `"orchestrator_note": "Concise summary in English of the context or findings the orchestrator should know"`. When provided, this note will be queued directly to the orchestrator at the next turn boundary.
+  * DO NOT set `share_with_orchestrator: true` for pure user curiosity or isolated questions (e.g. 'what time did the plan start?', 'how many files?', 'what are you working on?').
+
 You must reply ONLY with a valid JSON object matching the following structure (put "decision" as the first key, followed by "response" if applicable, and "subtasks"):
 {
   "decision": "AbortImmediately" | "QueueAndContinue" | "RespondDirectly" | "ForwardToWorker" | "ApprovePlan" | "RejectPlan" | "DelegateTask" | "Sleep",
   "response": "Direct answer to the user in their language explaining what you decided (required for RespondDirectly, QueueAndContinue, ForwardToWorker, ApprovePlan, RejectPlan, DelegateTask, or Sleep; null only if AbortImmediately without user note).",
+  "share_with_orchestrator": false,
+  "orchestrator_note": null,
   "sleep_seconds": 5,
   "subtasks": [
     {
@@ -58,6 +67,7 @@ You must reply ONLY with a valid JSON object matching the following structure (p
       "message": "the message/instruction to forward to the subagent (null if action is Cancel or DelegateTask)",
       "agent_name": "the specialist subagent name — for DelegateTask the agent to spawn; for ForwardNotice/Cancel the 'Subagent' of the target entry (required, otherwise the notice has no routable target)",
       "prompt": "the task/instruction for the spawned subagent in English (for DelegateTask)",
+      "share_with_orchestrator": false,
       "sleep_seconds": 5
     }
   ]

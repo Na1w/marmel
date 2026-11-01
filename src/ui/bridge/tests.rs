@@ -77,8 +77,10 @@ fn test_drain_steer_delegation_events_updates_ui_and_queue() {
                 agent_name: Some("coder".to_string()),
                 prompt: Some("Check files".to_string()),
                 sleep_seconds: None,
+                ..Default::default()
             }],
             sleep_seconds: None,
+            ..Default::default()
         }),
         user_msg: "check files".to_string(),
         forwarded: Vec::new(),
@@ -97,9 +99,10 @@ fn test_drain_steer_delegation_events_updates_ui_and_queue() {
     assert_eq!(subagents[0].name, "coder-steer-task-1");
     assert!(!subagents[0].is_active);
 
-    assert_eq!(steer_queue.len(), 1);
-    assert!(steer_queue[0].contains("All files inspected cleanly."));
-    assert!(steer_queue[0].contains("steer-task-1"));
+    assert!(
+        steer_queue.is_empty(),
+        "delegated steering subtask deliverable must not leak into steer_queue, got: {steer_queue:?}"
+    );
 
     // Delegation Started and Completed events surfaced to renderer
     let delegation_events: Vec<_> = renderer
@@ -136,6 +139,119 @@ fn test_drain_steer_delegation_events_updates_ui_and_queue() {
 }
 
 #[test]
+fn test_drain_steer_delegated_task_shares_with_orchestrator_when_requested() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut renderer = TestRenderer::new();
+    let mut steer_queue = Vec::new();
+    let mut steer_abort = false;
+    let mut subagents = Vec::new();
+
+    tx.send(SteerArbEvent::DelegationStarted {
+        agent: Agent::Coder,
+        task_id: "steer-task-share-1".to_string(),
+        prompt: "Find backend port".to_string(),
+    })
+    .unwrap();
+
+    tx.send(SteerArbEvent::DelegationCompleted {
+        agent: Agent::Coder,
+        task_id: "steer-task-share-1".to_string(),
+        deliverable: Deliverable {
+            marker: MissionMarker::Complete {
+                task_id: Some("steer-task-share-1".to_string()),
+            },
+            content: "Backend runs on port 9000".to_string(),
+            task_id: Some("steer-task-share-1".to_string()),
+        },
+    })
+    .unwrap();
+
+    tx.send(SteerArbEvent::SynthesizedAnswer {
+        user_msg: "what port is backend on?".to_string(),
+        answer: "The backend is on port 9000.".to_string(),
+    })
+    .unwrap();
+
+    tx.send(SteerArbEvent::Finished {
+        decision: Some(crate::orchestrator::SteerDecision {
+            decision: "DelegateTask".to_string(),
+            response: Some("Checked port.".to_string()),
+            tier: None,
+            model: None,
+            subtasks: vec![crate::orchestrator::SteerSubtaskDecision {
+                tool_call_id: "steer-task-share-1".to_string(),
+                action: "DelegateTask".to_string(),
+                message: None,
+                agent_name: Some("coder".to_string()),
+                prompt: Some("Find backend port".to_string()),
+                sleep_seconds: None,
+                share_with_orchestrator: Some(true),
+            }],
+            sleep_seconds: None,
+            share_with_orchestrator: Some(true),
+            orchestrator_note: Some("Backend is running on port 9000".to_string()),
+        }),
+        user_msg: "what port is backend on?".to_string(),
+        forwarded: Vec::new(),
+    })
+    .unwrap();
+
+    drain_steer_arbitration_events(
+        &mut rx,
+        &mut renderer,
+        &mut steer_queue,
+        &mut steer_abort,
+        Some(&mut subagents),
+    );
+
+    assert_eq!(steer_queue.len(), 1);
+    assert_eq!(
+        steer_queue[0],
+        "[Steer Arbitrator Context]: Backend is running on port 9000"
+    );
+    assert!(!steer_abort);
+}
+
+#[test]
+fn test_drain_steer_respond_directly_with_orchestrator_note_queues_note() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut renderer = TestRenderer::new();
+    let mut steer_queue = Vec::new();
+    let mut steer_abort = false;
+
+    tx.send(SteerArbEvent::Finished {
+        decision: Some(crate::orchestrator::SteerDecision {
+            decision: "RespondDirectly".to_string(),
+            response: Some("Understood, I will inform the orchestrator.".to_string()),
+            tier: None,
+            model: None,
+            subtasks: Vec::new(),
+            sleep_seconds: None,
+            share_with_orchestrator: None,
+            orchestrator_note: Some("User requested to use Node 20 instead of 18".to_string()),
+        }),
+        user_msg: "remember to use Node 20".to_string(),
+        forwarded: Vec::new(),
+    })
+    .unwrap();
+
+    drain_steer_arbitration_events(
+        &mut rx,
+        &mut renderer,
+        &mut steer_queue,
+        &mut steer_abort,
+        None,
+    );
+
+    assert_eq!(steer_queue.len(), 1);
+    assert_eq!(
+        steer_queue[0],
+        "[Steer Arbitrator Context]: User requested to use Node 20 instead of 18"
+    );
+    assert!(!steer_abort);
+}
+
+#[test]
 fn test_drain_steer_queue_and_continue_with_streamed_response() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut renderer = TestRenderer::new();
@@ -156,6 +272,7 @@ fn test_drain_steer_queue_and_continue_with_streamed_response() {
             model: None,
             subtasks: Vec::new(),
             sleep_seconds: None,
+            ..Default::default()
         }),
         user_msg: "add an extra feature later".to_string(),
         forwarded: Vec::new(),
@@ -204,6 +321,7 @@ fn test_drain_steer_queue_and_continue_fallback_response_when_none() {
             model: None,
             subtasks: Vec::new(),
             sleep_seconds: None,
+            ..Default::default()
         }),
         user_msg: "fix docs later".to_string(),
         forwarded: Vec::new(),
@@ -254,6 +372,7 @@ fn test_drain_steer_respond_directly_does_not_queue() {
                 model: None,
                 subtasks: Vec::new(),
                 sleep_seconds: None,
+                ..Default::default()
             }),
             user_msg: "how is it going?".to_string(),
             forwarded: Vec::new(),
@@ -301,6 +420,7 @@ fn test_drain_steer_synthesized_answer_does_not_queue() {
             model: None,
             subtasks: Vec::new(),
             sleep_seconds: None,
+            ..Default::default()
         }),
         user_msg: "what is the subagent doing?".to_string(),
         forwarded: Vec::new(),
@@ -337,6 +457,7 @@ fn test_drain_steer_sleep_does_not_queue() {
             model: None,
             subtasks: Vec::new(),
             sleep_seconds: Some(5),
+            ..Default::default()
         }),
         user_msg: "wait a moment".to_string(),
         forwarded: Vec::new(),
@@ -378,6 +499,7 @@ fn test_drain_steer_fallback_with_response_does_not_queue() {
             model: None,
             subtasks: Vec::new(),
             sleep_seconds: None,
+            ..Default::default()
         }),
         user_msg: "status?".to_string(),
         forwarded: Vec::new(),
@@ -447,8 +569,10 @@ fn test_drain_steer_cancel_subtask_cancels_worker_and_updates_subagents() {
                 agent_name: Some("coder".to_string()),
                 prompt: None,
                 sleep_seconds: None,
+                ..Default::default()
             }],
             sleep_seconds: None,
+            ..Default::default()
         }),
         user_msg: "cancel coder".to_string(),
         forwarded: Vec::new(),
@@ -569,8 +693,10 @@ fn test_drain_steer_cancel_addresses_one_entry_and_leaves_the_sibling_row_open()
                 agent_name: Some("coder".to_string()),
                 prompt: None,
                 sleep_seconds: None,
+                ..Default::default()
             }],
             sleep_seconds: None,
+            ..Default::default()
         }),
         user_msg: "cancel only the second coder".to_string(),
         forwarded: Vec::new(),
@@ -758,6 +884,7 @@ fn forward_notice(
         agent_name: agent_name.map(str::to_string),
         prompt: None,
         sleep_seconds: None,
+        ..Default::default()
     }
 }
 
@@ -879,8 +1006,10 @@ fn test_bridge_stale_pane_row_cannot_report_subagents_executing() {
                 agent_name: Some("coder".to_string()),
                 prompt: None,
                 sleep_seconds: None,
+                ..Default::default()
             }],
             sleep_seconds: None,
+            ..Default::default()
         }),
         user_msg: "cancel the stale row".to_string(),
         forwarded: Vec::new(),
@@ -941,8 +1070,10 @@ fn test_drain_steer_cancel_without_a_row_buffer_still_uses_registry_truth() {
                 agent_name: None,
                 prompt: None,
                 sleep_seconds: None,
+                ..Default::default()
             }],
             sleep_seconds: None,
+            ..Default::default()
         }),
         user_msg: "cancel it".to_string(),
         forwarded: Vec::new(),
@@ -1063,6 +1194,7 @@ fn test_drain_steer_abort_cancels_all_active_workers() {
             model: None,
             subtasks: Vec::new(),
             sleep_seconds: None,
+            ..Default::default()
         }),
         user_msg: "stop all".to_string(),
         forwarded: Vec::new(),
@@ -1128,6 +1260,7 @@ fn steer_decision(
         model: None,
         subtasks: Vec::new(),
         sleep_seconds,
+        ..Default::default()
     }
 }
 
@@ -1587,6 +1720,7 @@ fn subtask_with(
         agent_name: agent_name.map(str::to_string),
         prompt: None,
         sleep_seconds: None,
+        ..Default::default()
     }
 }
 
@@ -1699,6 +1833,7 @@ fn test_bridge_drain_cancel_action_spellings_take_the_same_branch() {
                 model: None,
                 subtasks: vec![subtask_with(&task_id, spelling, Some("coder"))],
                 sleep_seconds: None,
+                ..Default::default()
             }),
             user_msg: format!("cancel the coder ({spelling})"),
             forwarded: Vec::new(),
@@ -2409,6 +2544,7 @@ fn test_bridge_notice_capacity_drop_is_observable_and_inbox_stays_bounded() {
         model: None,
         subtasks: vec![forwarded],
         sleep_seconds: None,
+        ..Default::default()
     };
 
     // **The arbitration round owns the posting** — one call, one notice per subtask.
@@ -2575,6 +2711,7 @@ fn test_bridge_forward_notice_posts_exactly_one_notice_per_steer() {
             st
         }],
         sleep_seconds: None,
+        ..Default::default()
     };
 
     // The posting owner: exactly one notice, under the addressed worker's effective key.
@@ -2874,6 +3011,7 @@ fn test_drain_steer_cancel_without_an_agent_name_addresses_one_registry_entry() 
             model: None,
             subtasks: vec![subtask_with("t-035c-named-b", "Cancel", None)],
             sleep_seconds: None,
+            ..Default::default()
         }),
         user_msg: "cancel the second build".to_string(),
         forwarded: Vec::new(),

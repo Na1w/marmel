@@ -324,6 +324,7 @@ impl StreamSink for RendererSink<'_> {
             ));
             let _ = self.renderer.flush();
 
+            let mut completed_deliverables = Vec::new();
             for (agent, task_id, prompt) in tasks {
                 self.renderer.on_event(&Event::Delegation(
                     crate::orchestrator::DelegationEvent::Started {
@@ -373,8 +374,7 @@ impl StreamSink for RendererSink<'_> {
                 let _ = self.renderer.flush();
 
                 // The instruction reached a specialist — this host ran it inline, so this is
-                // where that becomes visible. The deliverable report below still enters the
-                // queue exactly as before; the projection names the instruction itself.
+                // where that becomes visible.
                 self.renderer.note_steer(&SteerTrace {
                     stage: SteerStage::Delivered,
                     text: user_msg.to_string(),
@@ -383,13 +383,65 @@ impl StreamSink for RendererSink<'_> {
                     reason: format!("the arbitrator delegated it as subtask '{task_id}'"),
                 });
 
-                self.steer_queue.push(format!(
-                    "(User steering resulted in subtask '{task_id}' executed by specialist '{}'. Deliverable:\n{})",
-                    agent.as_str(),
-                    deliverable.content
-                ));
+                completed_deliverables.push((task_id, agent, deliverable));
             }
             self.renderer.reset_active_agent();
+
+            let should_share = decision
+                .as_ref()
+                .map(|d| {
+                    d.share_with_orchestrator.unwrap_or(false)
+                        || d.orchestrator_note
+                            .as_ref()
+                            .is_some_and(|n| !n.trim().is_empty())
+                        || d.subtasks
+                            .iter()
+                            .any(|st| st.share_with_orchestrator.unwrap_or(false))
+                })
+                .unwrap_or(false);
+
+            if should_share {
+                let note = decision
+                    .as_ref()
+                    .and_then(|d| d.orchestrator_note.as_ref())
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty());
+
+                let payload = match note {
+                    Some(explicit_note) => {
+                        format!("[Steer Arbitrator Context]: {explicit_note}")
+                    }
+                    None => {
+                        if !completed_deliverables.is_empty() {
+                            let delivs = completed_deliverables
+                                .iter()
+                                .map(|(tid, ag, deliv)| {
+                                    format!(
+                                        "Specialist {} ({}):\n{}",
+                                        ag.as_str(),
+                                        tid,
+                                        deliv.content
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n\n");
+                            format!("[Steer Arbitrator Findings - '{user_msg}']:\n{delivs}")
+                        } else {
+                            format!(
+                                "[Steer Arbitrator Context]: Relevant user instruction: '{user_msg}'"
+                            )
+                        }
+                    }
+                };
+
+                let trace = SteerTrace::queued(
+                    user_msg.to_string(),
+                    MANAGER_TARGET,
+                    "the arbitrator determined this steering information is relevant to orchestration",
+                );
+                queue_steer_as(self.steer_queue, self.renderer, &trace, &payload);
+            }
+
             PauseAction::Resume
         } else {
             let norm = crate::orchestrator::normalize_steer_decision(
@@ -400,6 +452,20 @@ impl StreamSink for RendererSink<'_> {
                     self.renderer.on_event(&Event::Status(
                         "Answered via direct steer response — resuming stream...".to_string(),
                     ));
+                    if let Some(note) = decision
+                        .as_ref()
+                        .and_then(|d| d.orchestrator_note.as_ref())
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                    {
+                        let payload = format!("[Steer Arbitrator Context]: {note}");
+                        let trace = SteerTrace::queued(
+                            user_msg.to_string(),
+                            MANAGER_TARGET,
+                            "the arbitrator shared relevant context with the orchestrator",
+                        );
+                        queue_steer_as(self.steer_queue, self.renderer, &trace, &payload);
+                    }
                     let _ = self.renderer.flush();
                     PauseAction::Resume
                 }

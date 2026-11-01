@@ -482,6 +482,7 @@ fn subtask(tool_call_id: &str, agent_name: &str, action: &str) -> SteerSubtaskDe
         agent_name: Some(agent_name.to_string()),
         prompt: None,
         sleep_seconds: None,
+        ..Default::default()
     }
 }
 
@@ -959,6 +960,7 @@ async fn test_cancel_and_abort_still_fire_when_pausing_was_skipped() {
                 subtask("t-908", "researcher", "Explode"),
             ],
             sleep_seconds: None,
+            ..Default::default()
         };
         handle.complete_with_subtask_decision(Some(&decision));
 
