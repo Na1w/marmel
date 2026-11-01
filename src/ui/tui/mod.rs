@@ -20,9 +20,10 @@ use super::{Event, Renderer, SteerStage, SteerTrace, SubagentDetail};
 use crate::config::Config;
 use crate::orchestrator::OrchestratorManager;
 use anyhow::Result;
+use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste};
+#[cfg(not(windows))]
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -1664,11 +1665,14 @@ impl Renderer for TuiRenderer {
         // on, so an `init()` that fails halfway still gets the full teardown from
         // the `Drop` of the renderer.
         self.terminal_owned = true;
+        #[cfg(not(windows))]
         execute!(
             io::stdout(),
             EnterAlternateScreen,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )?;
+        #[cfg(windows)]
+        execute!(io::stdout(), EnterAlternateScreen)?;
         let stdout = io::stdout();
         let backend = CrosstermBackend::new(stdout);
         self.terminal = Some(Terminal::new(backend)?);
@@ -3169,9 +3173,10 @@ impl Drop for TuiRenderer {
 /// two call sites used to spell out inline; the payload is pinned by
 /// `teardown_writes_exactly_the_reset_burst_to_the_writer_it_is_given`.
 fn write_terminal_resets<W: Write>(w: &mut W) -> std::io::Result<()> {
+    #[cfg(not(windows))]
+    execute!(w, PopKeyboardEnhancementFlags)?;
     execute!(
         w,
-        PopKeyboardEnhancementFlags,
         LeaveAlternateScreen,
         DisableMouseCapture,
         DisableBracketedPaste

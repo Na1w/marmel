@@ -4214,6 +4214,7 @@ fn teardown_is_idempotent_and_paints_nothing_afterwards() {
 /// touching the terminal of the process running the tests. The exact bytes are
 /// pinned so a production teardown can neither silently gain nor lose a reset.
 #[test]
+#[cfg(not(windows))]
 fn teardown_writes_exactly_the_reset_burst_to_the_writer_it_is_given() {
     let mut buf: Vec<u8> = Vec::new();
     write_terminal_resets(&mut buf).expect("a Vec<u8> sink cannot fail");
