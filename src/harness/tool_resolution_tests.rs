@@ -28,25 +28,21 @@ use std::sync::Arc;
 #[cfg(unix)]
 const MCP_MARKER: &str = "MARKER_SENTINEL_from_scripted_mcp_server";
 
-/// Tests in this module install a process-global MCP registry, so they take a
-/// shared lock and always restore an empty registry.
-#[cfg(unix)]
-static REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[cfg(unix)]
-fn registry_guard() -> std::sync::MutexGuard<'static, ()> {
-    REGISTRY_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-#[cfg(unix)]
-fn clear_global_mcp_registry() {
-    if let Ok(mut lock) = MCP_GATE.write() {
-        *lock = None;
-    }
-}
-
+// The tests in this module never write the process-global MCP registry
+// (`harness::set_mcp_manager` / the `MCP_GATE` slot). They build their own gate with
+// [`build_mcp_gate`] — the same policy [`set_mcp_manager`] applies — and run their
+// round trips inside [`with_mcp_gate`], so the gate they dispatch against belongs to
+// the current task for the whole round trip and no foreign registry install can
+// re-point it underneath them.
+//
+// That seam is what kills the race recorded in
+// `docs/fix_notice_reply_flakiness.md` §7: the other writer of that global in this
+// test binary is `src/llm/client_tests::test_policy_refused_mcp_names_are_never_advertised`,
+// which installs its own registry and then leaves an **empty** one behind, under a
+// lock (`MCP_REGISTRY_LOCK`) that no other module holds. Before the seam, that empty
+// gate made `dispatch_for(…, Manager)` answer
+// `ToolError::Forbidden` for `myserver__do_thing` — i.e. this test's dispatch was
+// charged another test's registry.
 #[cfg(unix)]
 fn multi_thread_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
@@ -154,7 +150,6 @@ fn invocation(name: &str, arguments: serde_json::Value) -> ToolInvocation {
 #[cfg(unix)]
 #[test]
 fn builtin_name_resolves_to_builtin_handler_even_when_mcp_registers_it() {
-    let _guard = registry_guard();
     let scripted = scripted_server(&[TOOL_READ_FILE]);
     let standalone = boot_in_private_runtime(&scripted, "terminal");
     // The raw registry still carries the shadowing name: the refusal lives in the
@@ -167,19 +162,21 @@ fn builtin_name_resolves_to_builtin_handler_even_when_mcp_registers_it() {
     let rt = multi_thread_runtime();
     let (rejected, allowed, dispatch_outcome) = rt.block_on(async {
         let manager = Arc::new(boot_manager(&scripted, "terminal").await);
-        set_mcp_manager(Arc::clone(&manager));
-        let gate = get_mcp_gate().expect("the gate must be installed");
-        let rejected: Vec<String> = gate
-            .rejected()
-            .iter()
-            .map(|entry| entry.qualified_name.clone())
-            .collect();
-        let allowed = gate.allowed_names();
-        let outcome = dispatch(&invocation(TERMINAL_READ_FILE, serde_json::json!({})));
+        let seen = with_mcp_gate(build_mcp_gate(&manager), async {
+            let gate = current_mcp_gate().expect("the scoped gate must govern dispatch");
+            let rejected: Vec<String> = gate
+                .rejected()
+                .iter()
+                .map(|entry| entry.qualified_name.clone())
+                .collect();
+            let allowed = gate.allowed_names();
+            let outcome = dispatch(&invocation(TERMINAL_READ_FILE, serde_json::json!({})));
+            (rejected, allowed, outcome)
+        })
+        .await;
         manager.shutdown().await;
-        (rejected, allowed, outcome)
+        seen
     });
-    clear_global_mcp_registry();
 
     assert!(
         rejected.contains(&TERMINAL_READ_FILE.to_string()),
@@ -282,31 +279,33 @@ fn server_owning_a_builtin_namespace_is_refused_at_registration() {
 #[cfg(unix)]
 #[test]
 fn booted_terminal_server_contributes_no_dispatchable_names() {
-    let _guard = registry_guard();
     let scripted = scripted_server(&[TOOL_GLOB, "safe_tool"]);
     let rt = multi_thread_runtime();
     let (rejected, allowed, reason, listed, advertised) = rt.block_on(async {
         let manager = Arc::new(boot_manager(&scripted, "terminal").await);
         let listed = manager.tools().len();
-        set_mcp_manager(Arc::clone(&manager));
-        let gate = get_mcp_gate().expect("the gate must be installed");
-        let rejected: Vec<String> = gate
-            .rejected()
-            .iter()
-            .map(|entry| entry.qualified_name.clone())
-            .collect();
-        let allowed = gate.allowed_names();
-        let reason = gate
-            .rejected()
-            .first()
-            .map(|entry| entry.reason.clone())
-            .unwrap_or_default();
-        // The advertising view must agree with the dispatch view.
-        let advertised = allowed_mcp_tools(&["terminal".to_string()]);
+        let seen = with_mcp_gate(build_mcp_gate(&manager), async {
+            let gate = current_mcp_gate().expect("the scoped gate must govern dispatch");
+            let rejected: Vec<String> = gate
+                .rejected()
+                .iter()
+                .map(|entry| entry.qualified_name.clone())
+                .collect();
+            let allowed = gate.allowed_names();
+            let reason = gate
+                .rejected()
+                .first()
+                .map(|entry| entry.reason.clone())
+                .unwrap_or_default();
+            // The advertising helper must agree with the dispatch view — and it must
+            // resolve the same (scoped) gate the dispatcher does.
+            let advertised = allowed_mcp_tools(&["terminal".to_string()]);
+            (rejected, allowed, reason, listed, advertised)
+        })
+        .await;
         manager.shutdown().await;
-        (rejected, allowed, reason, listed, advertised)
+        seen
     });
-    clear_global_mcp_registry();
 
     assert_eq!(listed, 2, "the scripted server must list two tools");
     assert!(
@@ -450,44 +449,45 @@ fn composed_name_parsing_is_total_and_unambiguous() {
 #[cfg(unix)]
 #[test]
 fn legitimate_mcp_tool_still_dispatches_to_the_mcp_path() {
-    let _guard = registry_guard();
     let scripted = scripted_server(&["do_thing"]);
     let rt = multi_thread_runtime();
     let outcomes = rt.block_on(async {
         let manager = Arc::new(boot_manager(&scripted, "myserver").await);
-        set_mcp_manager(Arc::clone(&manager));
-        let gate = get_mcp_gate().expect("the gate must be installed");
-        assert_eq!(gate.allowed_names(), vec!["myserver__do_thing".to_string()]);
-        assert!(gate.rejected().is_empty(), "nothing here may be refused");
-        // The advertising helper keeps legitimate MCP tools visible.
-        let advertised = allowed_mcp_tools(&["myserver".to_string()]);
-        assert_eq!(
-            advertised.len(),
-            1,
-            "the legitimate tool must be advertised"
-        );
-        assert_eq!(advertised[0].qualified_name(), "myserver__do_thing");
+        let seen = with_mcp_gate(build_mcp_gate(&manager), async {
+            let gate = current_mcp_gate().expect("the scoped gate must govern dispatch");
+            assert_eq!(gate.allowed_names(), vec!["myserver__do_thing".to_string()]);
+            assert!(gate.rejected().is_empty(), "nothing here may be refused");
+            // The advertising helper keeps legitimate MCP tools visible.
+            let advertised = allowed_mcp_tools(&["myserver".to_string()]);
+            assert_eq!(
+                advertised.len(),
+                1,
+                "the legitimate tool must be advertised"
+            );
+            assert_eq!(advertised[0].qualified_name(), "myserver__do_thing");
 
-        let direct = dispatch(&invocation(
-            "myserver__do_thing",
-            serde_json::json!({"x": 1}),
-        ));
-        let manager_path = dispatch_for_async(
-            &invocation("myserver__do_thing", serde_json::json!({})),
-            ToolCaller::Manager,
-        )
+            let direct = dispatch(&invocation(
+                "myserver__do_thing",
+                serde_json::json!({"x": 1}),
+            ));
+            let manager_path = dispatch_for_async(
+                &invocation("myserver__do_thing", serde_json::json!({})),
+                ToolCaller::Manager,
+            )
+            .await;
+            let specialist_path = dispatch_for(
+                &invocation("myserver__do_thing", serde_json::json!({})),
+                ToolCaller::SpecialistWithTools {
+                    agent: crate::agents::Agent::Coder,
+                    allowed_tools: vec![TOOL_GLOB.to_string()],
+                },
+            );
+            (direct, manager_path, specialist_path)
+        })
         .await;
-        let specialist_path = dispatch_for(
-            &invocation("myserver__do_thing", serde_json::json!({})),
-            ToolCaller::SpecialistWithTools {
-                agent: crate::agents::Agent::Coder,
-                allowed_tools: vec![TOOL_GLOB.to_string()],
-            },
-        );
         manager.shutdown().await;
-        (direct, manager_path, specialist_path)
+        seen
     });
-    clear_global_mcp_registry();
 
     for (label, outcome) in [
         ("dispatch", outcomes.0),
@@ -508,6 +508,126 @@ fn legitimate_mcp_tool_still_dispatches_to_the_mcp_path() {
     }
 }
 
+// ── (d′) the dispatch view is owned by the call site, not by the process ───
+
+/// (d′) Regression guard for the global-state race recorded in
+/// `docs/fix_notice_reply_flakiness.md` §7.
+///
+/// `legitimate_mcp_tool_still_dispatches_to_the_mcp_path` used to publish its registry
+/// through the process-global `set_mcp_manager` slot. Another module in this same test
+/// binary (`src/llm/client_tests::test_policy_refused_mcp_names_are_never_advertised`)
+/// publishes *its* registry and then leaves an **empty** one behind, under a lock no
+/// other module holds. Whenever that write landed inside this test's round trip, the
+/// dispatcher resolved the foreign gate and answered
+/// `ToolError::Forbidden { tool: "myserver__do_thing", caller: "Manager" }` — the whole
+/// module's assertions were charged somebody else's registry.
+///
+/// The seam that fixes it is per-call-site resolution: `mcp_route` /
+/// `allowed_mcp_tools` consult the **task's** gate when one is installed. This test
+/// proves that without touching the global slot at all: the scoped gate alone routes
+/// the tool, and the process-global gate (whatever a foreign test left there — usually
+/// nothing, usually an empty registry) is provably *not* the gate being used. Before
+/// the seam this failed with `Forbidden`, exactly like the CI flake.
+///
+/// The two "not the global slot" checks compare **gate identity**, never contents: the
+/// foreign publisher really does advertise a `myserver__do_thing` of its own
+/// (`src/llm/client_tests.rs` boots a scripted `myserver` exposing `do_thing` and
+/// publishes that gate globally for a couple of seconds), so a content-based assertion
+/// here would repeat the very mistake this test exists to prevent — charging a foreign
+/// registry's traffic to this round trip. It did, once, and failed 1 run in 10 under a
+/// widened mixed filter.
+#[cfg(unix)]
+#[test]
+fn scoped_mcp_gate_survives_a_foreign_process_global_registry() {
+    let scripted = scripted_server(&["do_thing"]);
+    let rt = multi_thread_runtime();
+    let outcome = rt.block_on(async {
+        let manager = Arc::new(boot_manager(&scripted, "myserver").await);
+        let gate = build_mcp_gate(&manager);
+        // Kept alive so its address stays meaningful after the scope closes.
+        let ours = Arc::clone(&gate);
+        let outcome = with_mcp_gate(gate, async {
+            let scoped = current_mcp_gate().expect("the scoped gate must govern dispatch");
+            // The process-global slot is somebody else's business: it is either empty
+            // or holds another test's registry — never this one.
+            let global = get_mcp_gate();
+            assert!(
+                global
+                    .as_ref()
+                    .is_none_or(|published| !Arc::ptr_eq(published, &scoped)),
+                "the scoped gate must not be published into the process-global slot"
+            );
+            dispatch_for_async(
+                &invocation("myserver__do_thing", serde_json::json!({})),
+                ToolCaller::Manager,
+            )
+            .await
+        })
+        .await;
+        manager.shutdown().await;
+        (outcome, ours)
+    });
+
+    let (outcome, ours) = outcome;
+    let outcome = outcome.expect("the scoped gate must resolve the tool, not forbid it");
+    assert!(
+        !outcome.is_error,
+        "the scoped MCP call must succeed: {}",
+        outcome.content
+    );
+    assert!(
+        outcome.content.contains(MCP_MARKER),
+        "the scoped gate must reach this test's MCP server, got {:?}",
+        outcome.content
+    );
+    // Leaving the scope must drop the override again, so nothing leaks to siblings:
+    // resolution goes back to whatever owns the process-global slot, which is
+    // provably not this test's gate.
+    assert!(
+        current_mcp_gate()
+            .as_ref()
+            .is_none_or(|active| !Arc::ptr_eq(active, &ours)),
+        "the scoped gate must not survive the scope"
+    );
+}
+
+// ── (d″) no harness source may publish into the process-global slot ───────
+
+/// (d″) Structural guard for the same §7 race: the harness's own sources must never
+/// write the process-global MCP slot. In production exactly one call site owns it
+/// (`src/main.rs`, once at startup). Inside the test binary that left a single shared
+/// slot handed between modules with incompatible lock conventions, which is what made
+/// `legitimate_mcp_tool_still_dispatches_to_the_mcp_path` load-dependent.
+///
+/// If this goes red, the answer is `with_mcp_gate(build_mcp_gate(&manager), …)` — a
+/// gate the calling test owns for the duration of its round trip — not a second writer
+/// on the process-global slot.
+#[test]
+fn harness_sources_never_publish_into_the_process_global_mcp_slot() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/harness");
+    let mut offenders: Vec<String> = Vec::new();
+    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{} must be readable: {e}", dir.display()))
+        .map(|entry| entry.expect("a harness source entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    entries.sort();
+    for path in entries {
+        let text = std::fs::read_to_string(&path).expect("a harness source must be readable");
+        for (number, line) in text.lines().enumerate() {
+            if line.contains("set_mcp_manager(") && !line.contains("pub fn set_mcp_manager") {
+                offenders.push(format!("{}:{}", path.display(), number + 1));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "harness sources must resolve their dispatch view through `with_mcp_gate`, never \
+         by writing the process-global MCP slot (one startup writer, `src/main.rs`); \
+         offenders: {offenders:?}"
+    );
+}
+
 // ── (e) legitimate built-ins still reach the built-in handlers ───────────
 
 /// (e) With a legitimate MCP manager installed, ordinary built-in names keep
@@ -515,7 +635,6 @@ fn legitimate_mcp_tool_still_dispatches_to_the_mcp_path() {
 #[cfg(unix)]
 #[test]
 fn legitimate_builtin_still_dispatches_to_the_builtin_path() {
-    let _guard = registry_guard();
     let scripted = scripted_server(&["do_thing"]);
     let workspace = tempfile::tempdir().expect("scoped workspace");
     std::fs::write(workspace.path().join("probe.txt"), "payload").expect("write probe file");
@@ -523,28 +642,29 @@ fn legitimate_builtin_still_dispatches_to_the_builtin_path() {
     let rt = multi_thread_runtime();
     let outcomes = rt.block_on(async {
         let manager = Arc::new(boot_manager(&scripted, "myserver").await);
-        set_mcp_manager(Arc::clone(&manager));
-        let outcomes = with_workspace_root(workspace.path(), async {
-            let direct = dispatch(&invocation(
-                TOOL_GLOB,
-                serde_json::json!({"pattern": "*.txt"}),
-            ));
-            let aliased = dispatch(&invocation(
-                TERMINAL_GLOB,
-                serde_json::json!({"pattern": "*.txt"}),
-            ));
-            let manager_path = dispatch_for_async(
-                &invocation(TOOL_GLOB, serde_json::json!({"pattern": "*.txt"})),
-                ToolCaller::Manager,
-            )
-            .await;
-            (direct, aliased, manager_path)
-        })
+        let outcomes = with_mcp_gate(
+            build_mcp_gate(&manager),
+            with_workspace_root(workspace.path(), async {
+                let direct = dispatch(&invocation(
+                    TOOL_GLOB,
+                    serde_json::json!({"pattern": "*.txt"}),
+                ));
+                let aliased = dispatch(&invocation(
+                    TERMINAL_GLOB,
+                    serde_json::json!({"pattern": "*.txt"}),
+                ));
+                let manager_path = dispatch_for_async(
+                    &invocation(TOOL_GLOB, serde_json::json!({"pattern": "*.txt"})),
+                    ToolCaller::Manager,
+                )
+                .await;
+                (direct, aliased, manager_path)
+            }),
+        )
         .await;
         manager.shutdown().await;
         outcomes
     });
-    clear_global_mcp_registry();
 
     for (label, outcome) in [
         ("builtin bare", outcomes.0),

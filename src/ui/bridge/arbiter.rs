@@ -1173,6 +1173,7 @@ mod tests {
             model: None,
             subtasks: Vec::new(),
             sleep_seconds: Some(0),
+            ..Default::default()
         };
         assert_eq!(
             recorded_response(Some(&no_response), None, &[], &[]),
@@ -1185,6 +1186,7 @@ mod tests {
             model: None,
             subtasks: Vec::new(),
             sleep_seconds: None,
+            ..Default::default()
         };
         assert_eq!(
             recorded_response(Some(&missing), None, &[], &[]),

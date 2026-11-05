@@ -1209,7 +1209,7 @@ async fn test_a_full_pair_at_the_pause_gate_pauses_the_row_and_a_free_slot_does_
     );
     let handle = preempt_conflicting_stream_on_backend(full_pair, &model, "steer mid-flight").await;
     let targeted = match &handle {
-        PreemptHandle::Active(list) => list
+        PreemptHandle::Active(list) | PreemptHandle::Combined { active: list, .. } => list
             .iter()
             .map(|(identity, _ack)| identity.agent_tag.clone())
             .collect::<Vec<_>>(),

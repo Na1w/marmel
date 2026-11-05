@@ -1594,14 +1594,23 @@ fn subagent_detail_from_panel(panel: &SubagentPanel) -> SubagentDetail {
         content: panel.content.clone(),
         is_active: panel.is_active,
         context_tokens: panel.context_tokens,
-        // Neither slot state survives a restore: `queue` belongs to a live
-        // delegation and `paused` to a stream the preemption handshake is holding.
-        // A journaled pane records a round that was interrupted, never a stream
-        // that is parked behind the arbitrator right now, so both start clean and
-        // only a fresh typed transition (`Event::SubagentStreamPause`) or a fresh
-        // queue event can set them again.
-        queue: None,
-        paused: false,
+        // Plumbing delta D2 (design §9.4): both slot states are carried by the
+        // bundle now, so the restored row reads exactly as it was drawn instead of
+        // downgrading a `(Queued n/m)` or `(Paused)` row to idle. A panel written
+        // before D2 has no such fields (`#[serde(default)]`), and then both come
+        // back clean, which is what happened before too.
+        queue: panel.queue.map(|queue| crate::ui::QueueState {
+            position: queue.position,
+            of: queue.of,
+        }),
+        paused: panel.paused,
+        // The D1 lifecycle fields are mirrored from the worker registry, which is
+        // their only source: a restored row re-derives them from the live entry
+        // behind its key rather than reviving a label out of a file.
+        status_label: None,
+        implementation_turns: 0,
+        validation_rounds: 0,
+        latest_validator_feedback: None,
     }
 }
 
@@ -1900,6 +1909,7 @@ pub async fn run_session_with_bounds_report(
 
     let mut steer_queue = Vec::<String>::new();
     let mut steer_abort_requested = false;
+    let mut execution_paused = false;
     // A resumed session adopts the restored subagent panes as the loop's
     // authoritative list instead of starting from an empty one, so the subagent
     // panes and the status line keep showing the interrupted delegations. Those
@@ -1964,7 +1974,7 @@ pub async fn run_session_with_bounds_report(
             None => loop {
                 match renderer.read_input() {
                     Some(line) => {
-                        if is_abort_command(&line) {
+                        if is_abort_for_renderer(renderer, &line) {
                             crate::debug_log::log_user_input("command", &line);
                             // An abort here is still an exit path and gets a mandatory ending
                             // commit — but only if THIS run already wrote the bundle. Marking it
@@ -2077,8 +2087,13 @@ pub async fn run_session_with_bounds_report(
             Some(&mut ui_transcript),
         );
 
+        // The loop's own mid-flight poll. It shares its abort dispatch with the
+        // stream sink's mid-turn poll (`bridge::sink::RendererSink::poll_control`)
+        // through the single owner [`helpers::is_abort_for_renderer`], so the
+        // destructive-command gate (§5, §6, G3) cannot be applied on one path and
+        // missed on the other.
         if let Some(steer) = renderer.poll_input() {
-            if is_abort_command(&steer) {
+            if is_abort_for_renderer(renderer, &steer) {
                 crate::debug_log::log_user_input("command", &steer);
                 renderer.request_user_exit();
                 break;
@@ -2452,7 +2467,8 @@ pub async fn run_session_with_bounds_report(
                         Vec::new()
                     }
                 };
-                if !steer_abort_requested
+                if !execution_paused
+                    && !steer_abort_requested
                     && !renderer.aborted()
                     && !crate::orchestrator::is_globally_cancelled()
                     && !pending.is_empty()
@@ -2466,7 +2482,7 @@ pub async fn run_session_with_bounds_report(
                     renderer.flush()?;
                     ctx.append(Message::User {
                         content: format!(
-                            "(SYSTEM NOTICE: The execution plan is active on disk with pending tasks: [{pending_str}]. You are in the EXECUTING phase. You must call `delegate_task` to dispatch these pending tasks to specialists. Do NOT call `create_plan` again, and do NOT output conversational filler until all tasks are marked [x].)"
+                            "(SYSTEM NOTICE: The execution plan has pending tasks: [{pending_str}]. If you need to revise the plan based on user instructions, call `create_plan` to update it; otherwise, call `delegate_task` to continue executing the pending tasks. Do not remain idle.)"
                         ),
                     });
                     continue;
@@ -2494,6 +2510,12 @@ pub async fn run_session_with_bounds_report(
                         .unwrap_or_else(|_| serde_json::Value::String(args_str.clone()));
 
                     let is_delegate = name == crate::tool_names::TOOL_DELEGATE_TASK;
+                    if name == crate::tool_names::TOOL_PAUSE_EXECUTION
+                        || name == "stop_execution"
+                        || name == "abort_execution"
+                    {
+                        execution_paused = true;
+                    }
                     let delegated_agent = if is_delegate {
                         args_val
                             .get("agent_name")
@@ -2820,7 +2842,7 @@ pub async fn run_session_with_bounds_report(
                                     Some(&mut ui_transcript),
                                 );
                                 if let Some(input) = renderer.poll_input() {
-                                    if is_abort_command(&input) {
+                                    if is_abort_for_renderer(renderer, &input) {
                                         crate::debug_log::log_user_input("command", &input);
                                         renderer.request_user_exit();
                                     } else if is_reset_command(&input) {
@@ -3042,6 +3064,12 @@ pub async fn run_session_with_bounds_report(
                         .unwrap_or_else(|_| serde_json::Value::String(args_str.clone()));
 
                     let is_delegate = name == crate::tool_names::TOOL_DELEGATE_TASK;
+                    if name == crate::tool_names::TOOL_PAUSE_EXECUTION
+                        || name == "stop_execution"
+                        || name == "abort_execution"
+                    {
+                        execution_paused = true;
+                    }
                     let args_obj = args_val.as_object();
                     let delegated_agent = if is_delegate {
                         args_obj
@@ -3100,12 +3128,9 @@ pub async fn run_session_with_bounds_report(
                     );
 
                     if name == crate::tool_names::TOOL_REBIRTH {
-                        renderer
-                            .on_event(&Event::ToolCall(format_tool_call_display(&name, &args_val)));
-                        renderer.flush()?;
                         let res = crate::harness::handle_rebirth(&mut ctx, &args_val);
                         match res {
-                            Ok(r) => {
+                            Ok(ref r) => {
                                 renderer.on_event(&Event::ToolResult(r.content.clone()));
                                 if !r.is_error {
                                     ui_transcript.append(UiRecord::Status {
@@ -3169,7 +3194,7 @@ pub async fn run_session_with_bounds_report(
                                     );
                                 }
                             }
-                            Err(e) => {
+                            Err(ref e) => {
                                 renderer.on_event(&Event::ToolResult(format!("ERROR: {e}")));
                                 ctx.append(Message::Tool {
                                     tool_call_id: call.id.clone(),
@@ -3184,6 +3209,11 @@ pub async fn run_session_with_bounds_report(
                             }
                         }
                         renderer.flush()?;
+                        if let Ok(ref r) = res
+                            && !r.is_error
+                        {
+                            break;
+                        }
                         continue;
                     }
 
@@ -3399,7 +3429,7 @@ pub async fn run_session_with_bounds_report(
                                     Some(&mut ui_transcript),
                                 );
                                 if let Some(input) = renderer.poll_input() {
-                                    if is_abort_command(&input) {
+                                    if is_abort_for_renderer(renderer, &input) {
                                         crate::debug_log::log_user_input("command", &input);
                                         renderer.request_user_exit();
                                     } else if is_reset_command(&input) {
@@ -3724,6 +3754,7 @@ pub async fn run_session_with_bounds_report(
                 steer_abort_requested = false;
                 renderer.clear_abort();
                 crate::orchestrator::reset_cancellation();
+                execution_paused = true;
                 // No row is closed or rewritten here: the row disappears when the
                 // worker registry entry goes inactive (the cancellation lands on
                 // the worker thread), and the projection below folds that in.
@@ -3740,7 +3771,7 @@ pub async fn run_session_with_bounds_report(
                 }
                 capture_and_request(&mut commit_pump, CommitTrigger::UiEvent, &ctx, &*renderer);
                 renderer.on_event(&Event::Status(
-                    "Steering redirection: aborted current turn, starting next turn with updated context".to_string(),
+                    "Steering redirection: aborted current turn, execution paused. Enter 'fortsätt' or instructions to proceed.".to_string(),
                 ));
                 renderer.flush()?;
                 continue;
@@ -3765,7 +3796,7 @@ pub async fn run_session_with_bounds_report(
 
         match renderer.read_input() {
             Some(line) => {
-                if is_abort_command(&line) {
+                if is_abort_for_renderer(renderer, &line) {
                     crate::debug_log::log_user_input("command", &line);
                     renderer.request_user_exit();
                     break;
@@ -3783,6 +3814,7 @@ pub async fn run_session_with_bounds_report(
                     continue;
                 }
                 if !line.trim().is_empty() {
+                    execution_paused = false;
                     crate::debug_log::log_user_input("interactive_input", &line);
                     ctx.append(Message::User {
                         content: line.clone(),
@@ -4297,7 +4329,7 @@ mod budget_tests {
 mod restored_subagent_row_tests {
     use super::{seed_restored_subagent_rows, subagent_detail_from_panel};
     use crate::orchestrator::workers;
-    use crate::session::format::{SubagentPanel, TimePoint};
+    use crate::session::format::{QueuePanel, SubagentPanel, TimePoint, UiSection};
 
     fn panel(name: &str) -> SubagentPanel {
         SubagentPanel {
@@ -4314,6 +4346,8 @@ mod restored_subagent_row_tests {
             last_activity_at: Some(TimePoint::now()),
             turn_thinking: None,
             is_thinking: None,
+            queue: None,
+            paused: false,
         }
     }
 
@@ -4368,6 +4402,84 @@ mod restored_subagent_row_tests {
         for key in [&key_a, &key_b] {
             workers::remove_worker_entry_for_test(key);
         }
+    }
+
+    /// The other half of the D2 restore: the **live seam** must turn a journaled
+    /// queue rank and arbitration pause back into a UI row that still carries both.
+    ///
+    /// `session::format::ui` pins that the durable bytes keep the pair; nothing here
+    /// pinned that `subagent_detail_from_panel` reads them — with the fixture pinned
+    /// at `queue: None, paused: false`, a dropped field in the restore projection
+    /// was invisible: a `(Queued 2/3)` row came back as a running row and a paused
+    /// row came back unheld. So this round-trips a panel written **with** both states
+    /// through the same seam the session loop calls on restore.
+    #[test]
+    fn a_journaled_queue_rank_and_pause_restore_into_the_row_the_pane_was_showing() {
+        // One fixture value: `panel()` re-samples `TimePoint::now()`, so building the
+        // expectation twice would compare two different clocks.
+        let mut held = panel("coder-t-9301");
+        held.queue = Some(QueuePanel { position: 2, of: 3 });
+        held.paused = true;
+
+        // Persist: `UiSection` is what the `ui.json` member holds, and the read side
+        // re-parses exactly these bytes.
+        let encoded = serde_json::to_string(&UiSection {
+            subagent_panels: vec![held.clone()],
+            ..UiSection::default()
+        })
+        .expect("a captured section always serialises");
+        let decoded: UiSection =
+            serde_json::from_str(&encoded).expect("the session's own bytes re-read");
+        assert_eq!(decoded.subagent_panels, vec![held], "{encoded}");
+
+        // Restore through the seam the loop actually calls. No interrupted registry
+        // key is joined in, so no process-global `WORKERS` state is touched.
+        let rows = seed_restored_subagent_rows(&decoded.subagent_panels, &[]);
+        assert_eq!(rows.len(), 1, "one panel in, one row out");
+        let row = &rows[0];
+        assert_eq!(
+            row.queue,
+            Some(crate::ui::QueueState { position: 2, of: 3 }),
+            "the rank the pane was showing must survive the restore: {encoded}"
+        );
+        assert!(row.paused, "a stream held by arbitration comes back held");
+        assert!(row.is_active, "and it is still the same row");
+        assert_eq!(row.name, "coder-t-9301");
+        assert_eq!(row.context_tokens, 7, "the untouched fields still arrive");
+
+        // The non-queue case still restores cleanly: nothing journaled, nothing
+        // claimed — never an invented rank or pause.
+        let plain = seed_restored_subagent_rows(&[panel("coder-t-9302")], &[]);
+        assert_eq!(plain.len(), 1);
+        assert_eq!(
+            plain[0].queue, None,
+            "no rank was journaled, none is claimed"
+        );
+        assert!(!plain[0].paused, "no pause was journaled, none is claimed");
+
+        // And a panel written before the two fields existed still restores — that is
+        // the compatibility promise `#[serde(default)]` bought, proven at the seam
+        // rather than at the format layer.
+        let legacy_bytes =
+            serde_json::to_value(&decoded.subagent_panels[0]).expect("a panel is serialisable");
+        let mut legacy_value = legacy_bytes;
+        let object = legacy_value.as_object_mut().expect("a panel object");
+        for field in ["queue", "paused"] {
+            assert!(
+                object.remove(field).is_some(),
+                "the fixture must really carry {field} before it is stripped"
+            );
+        }
+        let legacy: SubagentPanel =
+            serde_json::from_value(legacy_value).expect("a pre-D2 panel must still load");
+        let legacy_rows = seed_restored_subagent_rows(&[legacy], &[]);
+        assert_eq!(legacy_rows.len(), 1);
+        assert_eq!(
+            legacy_rows[0].name, "coder-t-9301",
+            "the row itself survives"
+        );
+        assert_eq!(legacy_rows[0].queue, None, "no rank, so none is invented");
+        assert!(!legacy_rows[0].paused, "no pause, so none is invented");
     }
 
     /// Whether a mid-flight steer gets its own arbitration round is asked of the

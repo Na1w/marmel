@@ -202,7 +202,7 @@ pub struct Plan {
 
 impl Default for Plan {
     fn default() -> Self {
-        Self::at(MARMEL_DIR)
+        Self::at(crate::harness::get_workspace_root().join(MARMEL_DIR))
     }
 }
 

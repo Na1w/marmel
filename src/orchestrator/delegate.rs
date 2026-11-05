@@ -1,8 +1,8 @@
 //! The harness-level `delegate_task` handler and per-specialist tool allowlist.
 
-use super::OrchestratorManager;
 use super::pool;
 use super::registry::SpecialistRegistry;
+use super::{OrchestratorManager, RecursionDepth};
 use crate::agents::Agent;
 use crate::agents::{DelegationRequest, Deliverable, MissionMarker};
 use crate::harness::{HarnessStats, ToolError, ToolResult};
@@ -103,12 +103,15 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
         .or_else(|| crate::config::load(None).ok())
         .unwrap_or_default();
     let stats = Arc::new(HarnessStats::new());
-    let manager = OrchestratorManager::from_config(
+    let parent_context = pool::current_call_context();
+    let current_depth = parent_context.as_ref().map(|p| p.depth).unwrap_or(0);
+    let mut manager = OrchestratorManager::from_config(
         ChatClient::new_with_token(&cfg.backend_url, &cfg.model, &cfg.auth_token),
         Plan::default(),
         stats,
         &cfg,
     );
+    manager.depth = RecursionDepth(current_depth);
 
     // 4. Call context for the nested delegation. Whatever dispatched this tool
     //    call installed its own context — a Manager turn, or a parent specialist
@@ -120,8 +123,7 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
     //    that triggered it. The sync scope restores the previous context on the way
     //    out — including on unwind — so nothing leaks back to the caller when this
     //    delegation returns.
-    let parent_context = pool::current_call_context();
-    let nested_context = pool::CallContext::for_agent(
+    let nested_context = pool::CallContext::for_agent_with_depth(
         pool::CallClass::Specialist,
         req.agent_name.as_str(),
         req.task_id.clone().or_else(|| {
@@ -129,6 +131,7 @@ pub fn handle_delegate_task(args: &serde_json::Value) -> Result<ToolResult, Tool
                 .as_ref()
                 .and_then(|parent| parent.task.clone())
         }),
+        current_depth + 1,
     );
     if let Some(parent) = parent_context.as_ref() {
         tracing::debug!(

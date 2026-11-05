@@ -32,7 +32,7 @@ pub const STEER_ARBITRATOR_SYSTEM_PROMPT: &str = include_str!("../../prompts/ste
 const STEER_CALL_TIMEOUT_SECS: u64 = 60;
 
 /// A per-subtask decision, matching caesar `SteerSubtaskDecision`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SteerSubtaskDecision {
     /// The arbitrator's handle for the target subagent. **Tolerant by design**: every
     /// sibling field already carries `#[serde(default)]`, and a missing handle must not
@@ -56,6 +56,8 @@ pub struct SteerSubtaskDecision {
     pub prompt: Option<String>,
     #[serde(default)]
     pub sleep_seconds: Option<u64>,
+    #[serde(default)]
+    pub share_with_orchestrator: Option<bool>,
 }
 
 /// The steer decision JSON, matching caesar `SteerDecisionResponse`.
@@ -63,7 +65,7 @@ pub struct SteerSubtaskDecision {
 /// `decision` is one of `RespondDirectly`, `AbortImmediately`,
 /// `QueueAndContinue`, `ForwardToWorker`, `ApprovePlan`, `RejectPlan`,
 /// `DelegateTask`, `Sleep`, `SwitchTier`, `SwitchModel`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SteerDecision {
     pub decision: String,
     pub response: Option<String>,
@@ -75,6 +77,10 @@ pub struct SteerDecision {
     pub subtasks: Vec<SteerSubtaskDecision>,
     #[serde(default)]
     pub sleep_seconds: Option<u64>,
+    #[serde(default)]
+    pub share_with_orchestrator: Option<bool>,
+    #[serde(default)]
+    pub orchestrator_note: Option<String>,
 }
 
 /// Outcome of a steer arbitration, including the unavailable-arbitrator
@@ -133,6 +139,8 @@ pub(crate) fn sleep_steer_decision(arguments: &str) -> SteerDecision {
         model: None,
         subtasks: Vec::new(),
         sleep_seconds: Some(secs),
+        share_with_orchestrator: None,
+        orchestrator_note: None,
     }
 }
 
@@ -393,6 +401,8 @@ where
                     model: None,
                     subtasks: Vec::new(),
                     sleep_seconds: None,
+                    share_with_orchestrator: None,
+                    orchestrator_note: None,
                 })
             } else {
                 None

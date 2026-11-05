@@ -122,3 +122,14 @@ pub(crate) fn archive_plan() -> Result<ToolResult, ToolError> {
         Err(e) => Err(ToolError::Execution(e)),
     }
 }
+
+pub(crate) fn handle_pause_execution(args: &serde_json::Value) -> Result<ToolResult, ToolError> {
+    crate::orchestrator::cancel_all();
+    let reason = args
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Paused by manager");
+    Ok(ToolResult::ok(format!(
+        "Execution paused: {reason}. All active tasks halted and autonomous loop paused. You may now respond directly to the user to explain that execution has paused and await their instructions."
+    )))
+}

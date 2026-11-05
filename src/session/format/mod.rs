@@ -27,8 +27,8 @@ pub use restore::{
     RepairReport, RestoreOutcome, RestoredSession, WorkerRepairCounts, witness_of,
 };
 pub use ui::{
-    BudgetWitness, ComposerState, FOCUSED_PANELS, SubagentPanel, UiFile, UiJournalRecord,
-    UiSection, ViewState,
+    BudgetWitness, ComposerState, FOCUSED_PANELS, QueuePanel, SubagentPanel, UiFile,
+    UiJournalRecord, UiSection, ViewState,
 };
 pub use worker::{
     DanglingCall, DanglingToolCallState, HistorySource, WorkerCounters, WorkerFile, WorkerSection,
