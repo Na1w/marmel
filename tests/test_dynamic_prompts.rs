@@ -6,8 +6,8 @@
 //!    validation prompt durably as `<task_id>-validation-skip.md` for the tasks it
 //!    designates validation-free (research / documentation work).
 //! 2. Disk-first lookup in `delegate()` restores the exact saved prompt specifications.
-//! 3. Planner agent blueprint includes `AGENTS.md` archetypes and strictly zero micro-skills.
-//! 4. Project-level `skills/` and `AGENTS.md` override and augment catalog archetypes.
+//! 3. Planner agent blueprint includes `ARCHETYPES.md` archetypes and strictly zero micro-skills.
+//! 4. Project-level `skills/` and `ARCHETYPES.md` override and augment catalog archetypes.
 //! 5. All tests run offline against deterministic mock/canned data.
 
 use marmennill::agents::{
@@ -567,7 +567,7 @@ Ensure all network RPCs are idempotent.
 "#;
     std::fs::write(skills_dir.join("distributed.md"), custom_skill).unwrap();
 
-    // 2. Create custom project-level AGENTS.md
+    // 2. Create custom project-level ARCHETYPES.md
     let custom_agents = r#"# Project Agent Archetypes
 
 ## Site Reliability Engineer
@@ -575,7 +575,7 @@ description: Resilient systems, fault tolerance, and chaos verification.
 skills: distributed_systems, testing
 tools: read_file, run_command, grep_search, glob, rebirth
 "#;
-    std::fs::write(tmp.path().join("AGENTS.md"), custom_agents).unwrap();
+    std::fs::write(tmp.path().join("ARCHETYPES.md"), custom_agents).unwrap();
 
     let catalog = Catalog::discover(tmp.path());
 

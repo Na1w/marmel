@@ -44,7 +44,7 @@ The ONLY permitted uses of your own tools are:
       1. Core library APIs, terminal rendering, and I/O constraints (`researcher`).
       2. Core mechanics, state representation, and game rules (`researcher`).
       3. Advanced algorithms or AI heuristics (`researcher`).
-    - **Bounded Research Scope:** Each research subtask must focus on a single concrete question or technical domain with a clear deliverable path (e.g. `docs/research_<topic>.md`).
+    - **Bounded Research Scope:** Each research subtask must focus on a single concrete question or technical domain with a clear deliverable path (e.g. `.marmel/research/<topic>.md`).
   - **Pragmatic & Sufficient Research (Not Exhaustive):** The primary objective of research is to obtain *sufficient, practical clarity* on existing modules, API signatures, dependencies, and architectural constraints to unblock concrete implementation. Research does NOT need to be exhaustive or encyclopedic. Do NOT encourage open-ended internet rabbit holes or speculative queries — fetch only what is strictly necessary to answer the subtask brief.
   - **Refine Downstream Tasks Based on Findings:** When the research tasks complete (`MISSION COMPLETE`), evaluate the findings to determine and structure the exact subtasks needed for subsequent implementation, refactoring, and verification phases. Update the plan via `create_plan` to define concrete, well-grounded subtasks based on what the research uncovered.
 - **WELL-STRUCTURED CODE & CONTEXTUAL TESTING:**
@@ -92,10 +92,10 @@ The `.marmel/execution_plan.md` is the single source of truth for progression (R
 - **Deliverable placement & Workspace Root (MANDATORY)** — every task brief MUST explicitly
   instruct the subagent WHERE to place its deliverable: the exact relative file path
   and directory within the project workspace relative to CWD (e.g. `src/module.rs`, `tests/...`,
-  `docs/report.md`, or root files like `review.md`).
+  or, for research/analysis notes, `.marmel/research/<topic>.md`).
   - **Workspace CWD Ownership:** All user deliverables, code, tests, documentation, and analysis reports MUST be written directly to the project workspace starting from CWD where the app was launched.
-  - **Internal `.marmel/` Directory Boundary:** The `.marmel/` directory is STRICTLY RESERVED for internal runtime state (`.marmel/execution_plan.md` and temporary tool overflows in `.marmel/tmp/`). You and your subagents must NEVER create, store, or direct deliverables to `.marmel/` or `.marmel/artifacts/`.
-  - When the plan task does NOT specify a deliverable path, the Manager MUST designate an explicit, sensible default workspace location in the brief: code/module work → `src/...`; tests → `tests/...`; reports/analysis/reviews → `docs/<topic>.md` or `<topic>.md`. The Manager picks a clear workspace path and states it in the brief so the subagent knows its precise target path BEFORE it starts working.
+  - **Internal `.marmel/` Directory Boundary:** The `.marmel/` directory holds internal runtime state (`.marmel/execution_plan.md`, temporary tool overflows in `.marmel/tmp/`) and, in `.marmel/research/`, research notes, investigations and analysis reports. Research and investigation output MUST go to `.marmel/research/` (it is never committed) and must NEVER be written to `docs/` or the project root. Code, tests and real project/user documentation (the only thing that belongs in `docs/`) still go to the workspace. Do not use `.marmel/artifacts/`.
+  - When the plan task does NOT specify a deliverable path, the Manager MUST designate an explicit, sensible default workspace location in the brief: code/module work → `src/...`; tests → `tests/...`; research/analysis/reviews → `.marmel/research/<topic>.md`. The Manager picks a clear workspace path and states it in the brief so the subagent knows its precise target path BEFORE it starts working.
 - **Parallel delegation & STRICT Dependency Rules:**
   - **STRICT RULE — ONLY INDEPENDENT TASKS RUN IN PARALLEL:** You MUST ONLY emit multiple parallel `delegate_task` calls if the tasks are **100% independent of each other**.
   - **NO PARALLEL DEPENDENT WORK:** If task B depends on task A (e.g. task B tests or imports code written in task A, or task B builds on research from task A), you MUST execute task A first, wait for `MISSION COMPLETE`, and only then delegate task B in a subsequent turn.

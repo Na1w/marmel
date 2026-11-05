@@ -1,9 +1,13 @@
 //! Skill & Agent Catalog — manages discovery and resolution of skills and archetypes.
 //!
 //! Precedence order:
-//! 1. Project-level: `<workspace>/skills/*.md`, `<workspace>/skills/*/SKILL.md`, `<workspace>/AGENTS.md`
-//! 2. User-level: `~/.marmel/skills/*.md`, `~/.marmel/skills/*/SKILL.md`, `~/.marmel/AGENTS.md`
+//! 1. Project-level: `<workspace>/skills/*.md`, `<workspace>/skills/*/SKILL.md`, `<workspace>/ARCHETYPES.md`
+//! 2. User-level: `~/.marmel/skills/*.md`, `~/.marmel/skills/*/SKILL.md`, `~/.marmel/ARCHETYPES.md`
 //! 3. Built-in: embedded base skills compiled in at build time.
+//!
+//! `AGENTS.md` is *not* part of the catalog: it holds free-form project instructions
+//! (git workflow, required checks, conventions) that are injected verbatim into the
+//! agents' prompts. See [`load_project_instructions`].
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -14,6 +18,59 @@ use crate::tool_names::{
     TOOL_PTY_LIST, TOOL_PTY_READ, TOOL_PTY_SPAWN, TOOL_PTY_WRITE, TOOL_READ_FILE, TOOL_REBIRTH,
     TOOL_REPLACE, TOOL_REPLY_TO_ARBITRATOR, TOOL_RUN_COMMAND, TOOL_WRITE_FILE,
 };
+
+/// File holding custom archetype definitions (`## <Role>` sections).
+pub const ARCHETYPES_FILE: &str = "ARCHETYPES.md";
+/// File holding free-form project instructions for agents.
+pub const AGENTS_FILE: &str = "AGENTS.md";
+/// Upper bound for the injected instruction text, to protect the context window.
+const MAX_INSTRUCTIONS_BYTES: usize = 32 * 1024;
+
+/// Load project instructions from `~/.marmel/AGENTS.md` (first) and
+/// `<workspace_root>/AGENTS.md` (second) and render them as a prompt section.
+///
+/// Returns `None` when neither file exists or both are blank. The text is included
+/// verbatim (it is not parsed for archetypes) and truncated at a char boundary if it
+/// exceeds [`MAX_INSTRUCTIONS_BYTES`].
+pub fn load_project_instructions(workspace_root: &Path) -> Option<String> {
+    let mut sources: Vec<PathBuf> = Vec::new();
+    if let Some(home) = crate::config::home_dir() {
+        sources.push(home.join(".marmel").join(AGENTS_FILE));
+    }
+    let project = workspace_root.join(AGENTS_FILE);
+    if !sources.contains(&project) {
+        sources.push(project);
+    }
+
+    let mut body = String::new();
+    for path in sources {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str(text);
+    }
+    if body.is_empty() {
+        return None;
+    }
+    if body.len() > MAX_INSTRUCTIONS_BYTES {
+        let mut end = MAX_INSTRUCTIONS_BYTES;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
+        body.push_str("\n[... AGENTS.md truncated ...]");
+    }
+    Some(format!(
+        "\n\n# Project Instructions (AGENTS.md)\nThese rules are mandatory for all work in this repository.\n\n{body}\n"
+    ))
+}
 
 /// Origin of a loaded skill or archetype.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,14 +121,14 @@ impl Catalog {
     pub fn discover(workspace_root: &Path) -> Self {
         let mut catalog = Self::new();
 
-        // 1. User level (~/.marmel/skills/ and ~/.marmel/AGENTS.md)
+        // 1. User level (~/.marmel/skills/ and ~/.marmel/ARCHETYPES.md)
         if let Some(home) = crate::config::home_dir() {
             let user_marmel = home.join(".marmel");
             let user_skills_dir = user_marmel.join("skills");
             if user_skills_dir.is_dir() {
                 catalog.load_skills_from_dir(&user_skills_dir, SkillSource::User);
             }
-            let user_agents_file = user_marmel.join("AGENTS.md");
+            let user_agents_file = user_marmel.join(ARCHETYPES_FILE);
             if user_agents_file.is_file() {
                 catalog.load_agents_from_file(
                     &user_agents_file,
@@ -80,12 +137,12 @@ impl Catalog {
             }
         }
 
-        // 2. Project level (<workspace>/skills/ and <workspace>/AGENTS.md)
+        // 2. Project level (<workspace>/skills/ and <workspace>/ARCHETYPES.md)
         let project_skills_dir = workspace_root.join("skills");
         if project_skills_dir.is_dir() {
             catalog.load_skills_from_dir(&project_skills_dir, SkillSource::Project);
         }
-        let project_agents_file = workspace_root.join("AGENTS.md");
+        let project_agents_file = workspace_root.join(ARCHETYPES_FILE);
         if project_agents_file.is_file() {
             catalog.load_agents_from_file(
                 &project_agents_file,
@@ -542,7 +599,8 @@ impl Catalog {
     /// Formats the catalog's agent archetypes for the Planner's strategic context.
     /// Excludes micro-skills to keep the planner focused on high-level architecture.
     pub fn format_agents_for_planner(&self) -> String {
-        let mut out = String::from("## Available Agent Archetypes (from AGENTS.md & defaults)\n");
+        let mut out =
+            String::from("## Available Agent Archetypes (from ARCHETYPES.md & defaults)\n");
         let mut sorted_agents: Vec<&AgentArchetype> = self.agents.values().collect();
         sorted_agents.sort_by(|a, b| a.id.cmp(&b.id));
 
@@ -616,5 +674,36 @@ tools: read_file, grep_search
             agents[1].default_tools,
             vec![TOOL_READ_FILE, TOOL_GREP_SEARCH]
         );
+    }
+}
+
+#[cfg(test)]
+mod project_instructions_tests {
+    use super::*;
+
+    #[test]
+    fn agents_md_is_instructions_not_archetypes() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(AGENTS_FILE),
+            "# Rules\n\n## Git\ndescription: not a role\nRun clippy.\n",
+        )
+        .unwrap();
+        let catalog = Catalog::discover(tmp.path());
+        assert!(catalog.get_agent("git").is_none());
+        let section = load_project_instructions(tmp.path()).expect("instructions");
+        assert!(section.contains("Run clippy."));
+        assert!(section.contains("Project Instructions"));
+    }
+
+    #[test]
+    fn missing_or_blank_agents_md_yields_none_for_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(AGENTS_FILE), "  \n").unwrap();
+        let out = load_project_instructions(tmp.path());
+        if let Some(text) = out {
+            // Only a user-level ~/.marmel/AGENTS.md may contribute here.
+            assert!(!text.contains(tmp.path().to_str().unwrap()));
+        }
     }
 }

@@ -11,7 +11,7 @@
   - Use `run_command` to retrieve live web data, crate/package documentation, and API specifications using command-line utilities (e.g. `curl -sL <url>`, querying crates.io, GitHub repos, or docs.rs).
   - Always cite retrieved sources with exact URLs and references in your deliverable.
 - Use `run_command` to execute command-line queries, lookups, package/tool diagnostics, and tests.
-- Use `write_file` to record structured research deliverables and findings in the project workspace (e.g. `docs/research_<topic>.md`).
+- Use `write_file` to record structured research deliverables and findings in `.marmel/research/` (e.g. `.marmel/research/<topic>.md`); never write research notes to `docs/` or the project root.
 - Use `delegate_task` to delegate subtasks to other specialists if needed.
 
 **Execution Protocol (STRICT):**

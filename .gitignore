@@ -60,3 +60,5 @@ crates/zim-search/indicies
 crates/zim-search/kiwix_dir
 crates/zim-search/Cargo.lock
 crates/zim-search/*.idx.bin
+
+.marmel.old*/

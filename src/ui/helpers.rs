@@ -131,6 +131,11 @@ pub(crate) fn load_system_prompt_with_plan_and_warning(
     if !mcp_block.is_empty() {
         prompt.push_str(&mcp_block);
     }
+    if let Some(instructions) =
+        crate::agents::load_project_instructions(&crate::harness::get_workspace_root())
+    {
+        prompt.push_str(&instructions);
+    }
     let (plan_section, warning) = plan_prompt_section(plan);
     if let Some(warning) = warning.as_ref() {
         tracing::warn!("{warning}");

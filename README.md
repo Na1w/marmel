@@ -20,7 +20,8 @@ A terminal-driven autonomous coding assistant in Rust. Marmel connects to any Op
 - [Real-Time Steering & Live Dialogue](#real-time-steering--live-dialogue)
 - [Agent Archetypes & Customization](#agent-archetypes--customization)
   - [Built-In Archetypes](#built-in-archetypes)
-  - [Custom Archetypes (`AGENTS.md`)](#custom-archetypes-agentsmd)
+  - [Custom Archetypes (`ARCHETYPES.md`)](#custom-archetypes-archetypesmd)
+  - [Project Instructions (`AGENTS.md`)](#project-instructions-agentsmd)
   - [Custom Skills (`skills/`)](#custom-skills-skills)
 - [Security & Sandboxing](#security--sandboxing)
 - [Testing](#testing)
@@ -63,7 +64,7 @@ Marmel is designed for autonomous multi-step software engineering with continuou
       ┌───────────────────────────────────┐                       │
       │       Agent Architect (JIT)       │                       │
       │  • Dynamic Skill Catalog          │                       │
-      │    (skills/*.md, AGENTS.md)       │                       │
+      │    (skills/*.md, ARCHETYPES.md)       │                       │
       │  • Tailored prompt + tool list    │                       │
       │  • Writes .marmel/prompts/        │                       │
       └─────────────────┬─────────────────┘                       │
@@ -525,9 +526,9 @@ Marmel comes with 6 built-in archetypes preconfigured in the binary, and they ar
 
 Two rules are enforced ahead of any allowlist: `leave_verdict` is Validator-only, and `create_plan` executes only through the Manager — the same call routed through a specialist is refused even when its allowlist or a synthesized blueprint names it. `reply_to_arbitrator` is granted to every specialist unconditionally. A specialist can delegate at all only because `delegate_task` sits in its own allowlist — every built-in except the **Planner** carries it — and only the **Coder** and **Generalist** declare recursion; nested delegation stays bounded by `max_recursion_depth`. A plan line's `(validate)` / `(no-validate)` directive changes only whether that task's deliverable is audited — never which role receives the task — and the **Validator** and **Planner** rows are exempt from validation by role, so no directive buys their audit back.
 
-### Custom Archetypes (`AGENTS.md`)
+### Custom Archetypes (`ARCHETYPES.md`)
 
-To adjust what the built-in roles advertise, add an `AGENTS.md` file to your workspace root (or globally at `~/.marmel/AGENTS.md`). A section whose heading maps onto a built-in id overrides that role's default skills and tools; a new heading is surfaced to the planner as guidance but cannot itself be delegated to, because `delegate_task` resolves only the six built-in ids:
+To adjust what the built-in roles advertise, add an `ARCHETYPES.md` file to your workspace root (or globally at `~/.marmel/ARCHETYPES.md`). A section whose heading maps onto a built-in id overrides that role's default skills and tools; a new heading is surfaced to the planner as guidance but cannot itself be delegated to, because `delegate_task` resolves only the six built-in ids:
 
 ```markdown
 ## SecurityAuditor
@@ -536,7 +537,11 @@ skills: verification, research
 tools: read_file, grep_search, glob, run_command, leave_verdict, reply_to_arbitrator
 ```
 
-Only `description:`, `skills:`, and `tools:` are read; every other `key:` line and all free text are ignored. `##` and `###` headings both work, and the role id is the heading lowercased with spaces and hyphens turned into underscores — so the section above registers as `securityauditor`, which matches no built-in id and is therefore planner guidance only. `~/.marmel/AGENTS.md` is read first and `<workspace>/AGENTS.md` second, both keyed by id, so the project file wins on a collision.
+Only `description:`, `skills:`, and `tools:` are read; every other `key:` line and all free text are ignored. `##` and `###` headings both work, and the role id is the heading lowercased with spaces and hyphens turned into underscores — so the section above registers as `securityauditor`, which matches no built-in id and is therefore planner guidance only. `~/.marmel/ARCHETYPES.md` is read first and `<workspace>/ARCHETYPES.md` second, both keyed by id, so the project file wins on a collision.
+
+### Project Instructions (`AGENTS.md`)
+
+`AGENTS.md` follows the common convention: free-form project rules (git workflow, required checks, conventions) for any agent working in the repository. Marmel is no longer parsing it for roles. Instead, its full text is appended as a `# Project Instructions (AGENTS.md)` section to the Manager's system prompt and to every delegated worker's prompt. `~/.marmel/AGENTS.md` is included first and `<workspace>/AGENTS.md` second; the combined text is capped at 32 KiB.
 
 ### Custom Skills (`skills/`)
 
