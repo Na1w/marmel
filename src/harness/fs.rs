@@ -520,6 +520,16 @@ pub fn read_file(args: &Value) -> Result<ToolResult, ToolError> {
         ));
     }
 
+    // First page only, so paging through a file does not repeat the rules.
+    if start == 0
+        && let Some(extra) = crate::agents::nested_instructions_for(
+            &crate::harness::get_workspace_root(),
+            &safe_path,
+        )
+    {
+        out.push_str(&extra);
+    }
+
     Ok(ToolResult::ok(out))
 }
 

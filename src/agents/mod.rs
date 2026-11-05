@@ -15,7 +15,9 @@ pub mod validator;
 /// precedence rules and parser — has a single owner in [`crate::markers`];
 /// the agents layer republishes that owner under its own name.
 pub use crate::markers::MissionMarker;
-pub use catalog::{AgentArchetype, Catalog, Skill, SkillSource, load_project_instructions};
+pub use catalog::{
+    AgentArchetype, Catalog, Skill, SkillSource, load_project_instructions, nested_instructions_for,
+};
 pub use coder::Coder;
 pub use debugger::Debugger;
 pub use generalist::Generalist;

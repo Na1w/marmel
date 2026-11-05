@@ -594,3 +594,34 @@ tools: read_file, run_command, grep_search, glob, rebirth
     );
     assert!(arch.default_tools.contains(&"run_command".to_string()));
 }
+
+#[tokio::test]
+async fn read_file_appends_nested_agents_md_on_first_page_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sub = tmp.path().join("crates").join("lib");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("AGENTS.md"), "NESTED-RULE").unwrap();
+    std::fs::write(sub.join("a.txt"), "hello world").unwrap();
+    std::fs::write(tmp.path().join("top.txt"), "top").unwrap();
+
+    marmennill::harness::with_workspace_root(tmp.path(), async {
+        let read = |args: serde_json::Value| {
+            marmennill::harness::dispatch(&marmennill::harness::ToolInvocation {
+                name: "read_file".to_string(),
+                arguments: args,
+            })
+            .expect("read_file succeeds")
+            .content
+        };
+        let first = read(serde_json::json!({"path": "crates/lib/a.txt"}));
+        assert!(first.contains("hello world"));
+        assert!(first.contains("NESTED-RULE"));
+
+        let later_page = read(serde_json::json!({"path": "crates/lib/a.txt", "offset": 3}));
+        assert!(!later_page.contains("NESTED-RULE"));
+
+        let top = read(serde_json::json!({"path": "top.txt"}));
+        assert!(!top.contains("NESTED-RULE"));
+    })
+    .await;
+}
