@@ -294,8 +294,13 @@ impl OrchestratorManager {
             }
         };
 
-        let ctx = IsolatedContext::from_request(blueprint.system_prompt.clone(), &req)
+        let mut ctx = IsolatedContext::from_request(blueprint.system_prompt.clone(), &req)
             .with_blueprint(blueprint);
+        // Project rules from AGENTS.md apply to every worker; appended after the
+        // blueprint is parsed so they never interfere with blueprint parsing.
+        if let Some(instructions) = crate::agents::load_project_instructions(ws_root) {
+            ctx.role_system_prompt.push_str(&instructions);
+        }
 
         let child_token = self.cancellation_token.child_token();
 
