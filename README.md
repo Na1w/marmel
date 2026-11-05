@@ -543,6 +543,10 @@ Only `description:`, `skills:`, and `tools:` are read; every other `key:` line a
 
 `AGENTS.md` follows the common convention: free-form project rules (git workflow, required checks, conventions) for any agent working in the repository. Its full text is appended as a `# Project Instructions (AGENTS.md)` section to the Manager's system prompt and to every delegated worker's prompt. `~/.marmel/AGENTS.md` is included first and `<workspace>/AGENTS.md` second; the combined text is capped at 32 KiB.
 
+If a directory has no `AGENTS.md`, `CLAUDE.md` and then `GEMINI.md` are used instead, so repositories that already ship one of those work unchanged.
+
+`AGENTS.md` files in subdirectories apply to the files beneath them: when an agent reads the first page of a file, the instruction files found between the workspace root and that file's directory are appended to the result (outermost first, capped at 8 KiB). They take precedence over the project-level rules.
+
 ### Custom Skills (`skills/`)
 
 Skills provide reusable domain knowledge and automatically grant suggested tools. A skill is a top-level `*.md` file or a subdirectory holding a `SKILL.md` — the file stem or directory name becomes its id, and a top-level `README.md` is skipped — inside `<workspace>/skills/` or `~/.marmel/skills/`. Registration runs built-ins first, then `~/.marmel/skills/`, then `<workspace>/skills/`, always keyed by id, so a project skill shadows a user skill, which shadows a built-in:

@@ -23,22 +23,81 @@ use crate::tool_names::{
 pub const ARCHETYPES_FILE: &str = "ARCHETYPES.md";
 /// File holding free-form project instructions for agents.
 pub const AGENTS_FILE: &str = "AGENTS.md";
+/// Instruction file names, in priority order. The first one that exists in a
+/// directory is used, so a repository that only ships `CLAUDE.md` or `GEMINI.md`
+/// still gets its rules applied while `AGENTS.md` always wins.
+pub const INSTRUCTION_FILES: [&str; 3] = [AGENTS_FILE, "CLAUDE.md", "GEMINI.md"];
+/// Upper bound for the nested instruction text appended to a `read_file` result.
+const MAX_NESTED_INSTRUCTIONS_BYTES: usize = 8 * 1024;
 /// Upper bound for the injected instruction text, to protect the context window.
 const MAX_INSTRUCTIONS_BYTES: usize = 32 * 1024;
 
-/// Load project instructions from `~/.marmel/AGENTS.md` (first) and
-/// `<workspace_root>/AGENTS.md` (second) and render them as a prompt section.
+/// First existing instruction file in `dir` (see [`INSTRUCTION_FILES`]).
+fn instruction_file_in(dir: &Path) -> Option<PathBuf> {
+    INSTRUCTION_FILES
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|p| p.is_file())
+}
+
+/// Nested instructions that apply to `file`: every instruction file found in the
+/// directories between `workspace_root` (exclusive, it is already in the prompt)
+/// and the file's own directory, outermost first so the closest one reads last.
+///
+/// Returns `None` when `file` is outside the workspace or no nested file exists.
+pub fn nested_instructions_for(workspace_root: &Path, file: &Path) -> Option<String> {
+    let rel_dir = file.strip_prefix(workspace_root).ok()?.parent()?;
+    let mut dir = workspace_root.to_path_buf();
+    let mut parts: Vec<String> = Vec::new();
+    for comp in rel_dir.components() {
+        dir.push(comp);
+        let Some(path) = instruction_file_in(&dir) else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let shown = path.strip_prefix(workspace_root).unwrap_or(&path);
+        parts.push(format!("## {}\n{text}", shown.display()));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let mut body = parts.join("\n\n");
+    if body.len() > MAX_NESTED_INSTRUCTIONS_BYTES {
+        let mut end = MAX_NESTED_INSTRUCTIONS_BYTES;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
+        body.push_str("\n[... nested instructions truncated ...]");
+    }
+    Some(format!(
+        "\n\n[Directory-specific instructions that apply to this file; they take precedence over the project-level rules]\n{body}"
+    ))
+}
+
+/// Load project instructions from `~/.marmel/` (first) and `<workspace_root>`
+/// (second) and render them as a prompt section. In each directory the first
+/// existing file of [`INSTRUCTION_FILES`] is used.
 ///
 /// Returns `None` when neither file exists or both are blank. The text is included
 /// verbatim (it is not parsed for archetypes) and truncated at a char boundary if it
 /// exceeds [`MAX_INSTRUCTIONS_BYTES`].
 pub fn load_project_instructions(workspace_root: &Path) -> Option<String> {
     let mut sources: Vec<PathBuf> = Vec::new();
-    if let Some(home) = crate::config::home_dir() {
-        sources.push(home.join(".marmel").join(AGENTS_FILE));
+    if let Some(home) = crate::config::home_dir()
+        && let Some(user) = instruction_file_in(&home.join(".marmel"))
+    {
+        sources.push(user);
     }
-    let project = workspace_root.join(AGENTS_FILE);
-    if !sources.contains(&project) {
+    if let Some(project) = instruction_file_in(workspace_root)
+        && !sources.contains(&project)
+    {
         sources.push(project);
     }
 
@@ -694,6 +753,38 @@ mod project_instructions_tests {
         let section = load_project_instructions(tmp.path()).expect("instructions");
         assert!(section.contains("Run clippy."));
         assert!(section.contains("Project Instructions"));
+    }
+
+    #[test]
+    fn claude_md_is_used_as_fallback_but_agents_md_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("CLAUDE.md"), "claude rule").unwrap();
+        assert_eq!(
+            instruction_file_in(tmp.path()),
+            Some(tmp.path().join("CLAUDE.md"))
+        );
+        std::fs::write(tmp.path().join(AGENTS_FILE), "agents rule").unwrap();
+        assert_eq!(
+            instruction_file_in(tmp.path()),
+            Some(tmp.path().join(AGENTS_FILE))
+        );
+    }
+
+    #[test]
+    fn nested_instructions_are_outermost_first_and_skip_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join(AGENTS_FILE), "root rule").unwrap();
+        std::fs::write(root.join("a").join(AGENTS_FILE), "a rule").unwrap();
+        std::fs::write(root.join("a/b").join("GEMINI.md"), "b rule").unwrap();
+        let out = nested_instructions_for(root, &root.join("a/b/file.rs")).unwrap();
+        assert!(!out.contains("root rule"));
+        let a = out.find("a rule").unwrap();
+        let b = out.find("b rule").unwrap();
+        assert!(a < b);
+        assert!(nested_instructions_for(root, &root.join("file.rs")).is_none());
+        assert!(nested_instructions_for(root, Path::new("/elsewhere/x.rs")).is_none());
     }
 
     #[test]
