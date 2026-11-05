@@ -1221,6 +1221,10 @@ pub async fn run_fix_loop(
                         turn_had_successful_tool_call = true;
                     }
                     append_tool_result(p.engine, tc, content, succeeded, &p.rebirth_notice);
+                    if tc.function.name == tool_names::TOOL_REBIRTH && succeeded {
+                        update_active_worker_context(&p.worker_key, p.engine.token_count());
+                        break;
+                    }
                 }
                 None => {
                     return Ok(FixLoopResult::Aborted);

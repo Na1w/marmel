@@ -678,32 +678,42 @@ async fn run_specialist_live_inner(
                 continue;
             }
 
-            if budget_exceeded && nudge_count < 2 {
-                nudge_count += 1;
-                tracing::warn!(
-                    "{agent_tag}: output budget exceeded — injecting corrective nudge ({nudge_count}/2)"
-                );
-                mirror_replace_last(
-                    &mut engine,
-                    Some(&journal),
-                    crate::types::Message::Assistant {
-                        content: Some(format!(
-                            "[Generation truncated: exceeded {max_tokens} token single-turn limit]"
-                        )),
-                        reasoning_content: None,
-                        tool_calls: Vec::new(),
-                    },
-                );
-                mirror_append(
-                    &mut engine,
-                    Some(&journal),
-                    crate::types::Message::User {
-                        content: format!(
-                            "SYSTEM NOTICE: Your response exceeded the single-turn output budget limit ({max_tokens} tokens) and was truncated. Please be concise, call your required tools (such as `read_file`, `write_file`, `replace`, `run_command`, etc.) to perform the work, or conclude with '{MARKER_COMPLETE}'."
-                        ),
-                    },
-                );
-                continue;
+            if budget_exceeded {
+                if nudge_count < 2 {
+                    nudge_count += 1;
+                    tracing::warn!(
+                        "{agent_tag}: output budget exceeded — injecting corrective nudge ({nudge_count}/2)"
+                    );
+                    mirror_replace_last(
+                        &mut engine,
+                        Some(&journal),
+                        crate::types::Message::Assistant {
+                            content: Some(format!(
+                                "[Generation truncated: exceeded {max_tokens} token single-turn limit]"
+                            )),
+                            reasoning_content: None,
+                            tool_calls: Vec::new(),
+                        },
+                    );
+                    mirror_append(
+                        &mut engine,
+                        Some(&journal),
+                        crate::types::Message::User {
+                            content: format!(
+                                "SYSTEM NOTICE: Your response exceeded the single-turn output budget limit ({max_tokens} tokens) and was truncated. Please be concise, call your required tools (such as `read_file`, `write_file`, `replace`, `run_command`, etc.) to perform the work, or conclude with '{MARKER_COMPLETE}'."
+                            ),
+                        },
+                    );
+                    continue;
+                } else {
+                    tracing::warn!(
+                        "{agent_tag}: output budget exceeded repeatedly — failing closed with replan"
+                    );
+                    let task_ref = ctx.task_id.as_deref().unwrap_or("task");
+                    return Ok(format!(
+                        "{MARKER_REPLAN} ({task_ref}): Specialist exceeded output token budget {max_tokens} repeatedly without completing work or issuing tools."
+                    ));
+                }
             }
 
             if is_repeating {
@@ -936,6 +946,19 @@ async fn run_specialist_live_inner(
                                 );
                                 return Ok(aborted_deliverable());
                             }
+                            validation_passed = false;
+                            let critique = format!("Validation failed with error: {e}");
+                            validator_critique = Some(critique.clone());
+                            crate::orchestrator::update_active_worker_progress(
+                                &_active_guard.0,
+                                _turn,
+                                val_iter,
+                                Some(critique),
+                            );
+                            crate::orchestrator::set_active_worker_status(
+                                &_active_guard.0,
+                                "Failed (validation error)",
+                            );
                             break;
                         }
                     }
@@ -1126,6 +1149,13 @@ async fn run_specialist_live_inner(
                     &rebirth_notice(),
                 );
             });
+            if tc.function.name == TOOL_REBIRTH && execution_succeeded {
+                crate::orchestrator::update_active_worker_context(
+                    &_active_guard.0,
+                    engine.token_count(),
+                );
+                break;
+            }
             crate::orchestrator::update_active_worker_context(
                 &_active_guard.0,
                 engine.token_count(),

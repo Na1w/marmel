@@ -891,6 +891,8 @@ pub struct CallContext {
     pub agent: Option<String>,
     /// Task id, when known.
     pub task: Option<String>,
+    /// Fractal recursion depth.
+    pub depth: usize,
 }
 
 /// Agent label carried by Manager/UI turns. A Manager turn has no plan task, so
@@ -904,6 +906,7 @@ impl CallContext {
             class,
             agent: None,
             task: None,
+            depth: 0,
         }
     }
 
@@ -914,6 +917,22 @@ impl CallContext {
             class,
             agent: Some(agent.into()),
             task,
+            depth: 0,
+        }
+    }
+
+    /// Context for a named agent with explicit recursion depth.
+    pub fn for_agent_with_depth(
+        class: CallClass,
+        agent: impl Into<String>,
+        task: Option<String>,
+        depth: usize,
+    ) -> Self {
+        Self {
+            class,
+            agent: Some(agent.into()),
+            task,
+            depth,
         }
     }
 
@@ -924,6 +943,7 @@ impl CallContext {
             class,
             agent: self.agent.clone(),
             task: self.task.clone(),
+            depth: self.depth,
         }
     }
 
@@ -2156,6 +2176,7 @@ mod tests {
                 class: CallClass::Specialist,
                 agent: None,
                 task: Some("t-005".to_string()),
+                depth: 0,
             }
             .describe(),
             "specialist [t-005]"

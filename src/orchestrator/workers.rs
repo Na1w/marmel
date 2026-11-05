@@ -1316,6 +1316,8 @@ pub fn get_active_subtasks_str() -> String {
             }
             out.push('\n');
         }
+    } else if !completed.is_empty() {
+        out.push_str("Active Background Subagents: None (no subagents currently running)\n\n");
     }
 
     if !completed.is_empty() {

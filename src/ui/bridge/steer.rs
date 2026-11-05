@@ -40,6 +40,44 @@ pub enum SteerArbEvent {
         /// subtask, or every target was refused as unroutable.
         forwarded: Vec<(String, String)>,
     },
+    /// A `ForwardNotice` subtask the round **refused to file**: `token` addressed no live
+    /// worker, so nothing entered an inbox. Additive progress for the UI only — the refusal
+    /// itself is decided and worded by [`super::arbiter`], and the same refusal already
+    /// streams through [`SteerArbEvent::Delta`] as arbitrator prose. The host must not
+    /// re-post, and must not treat this as a change of decision.
+    UnroutableTarget {
+        token: String,
+        user_msg: String,
+    },
+}
+
+/// Hand a steering instruction to the host's steer queue **and** tell the renderer the same
+/// fact, from the same value.
+///
+/// The push and the projection are one statement so they can never disagree: what the
+/// renderer announces is literally what the queue received. Behaviour is unchanged — the
+/// queue receives exactly the string it used to receive.
+pub(crate) fn queue_steer(
+    steer_queue: &mut Vec<String>,
+    renderer: &mut dyn Renderer,
+    trace: &crate::ui::SteerTrace,
+) {
+    steer_queue.push(trace.text.clone());
+    renderer.note_steer(trace);
+}
+
+/// [`queue_steer`] for the arms that queue a **wrapper** around the operator's words
+/// (`"User approved plan."`, `"User rejected plan: …"`) rather than the words themselves.
+/// The queue still receives exactly the wrapped string it used to; the trace keeps naming
+/// the instruction the operator actually sent.
+pub(crate) fn queue_steer_as(
+    steer_queue: &mut Vec<String>,
+    renderer: &mut dyn Renderer,
+    trace: &crate::ui::SteerTrace,
+    queued_text: &str,
+) {
+    steer_queue.push(queued_text.to_string());
+    renderer.note_steer(trace);
 }
 
 pub use crate::orchestrator::SharedSteeringHistory;
@@ -201,6 +239,13 @@ pub fn spawn_steer_arbitration(
                     // Never filed into an inbox nobody drains: the failure is told to the user.
                     let text = arbiter::unroutable_target_text(token);
                     let _ = tx.send(SteerArbEvent::Delta(format!("\n[Arbitrator]: {text}\n")));
+                    // The same refusal as a typed fact for the panes, alongside the prose the
+                    // arbitrator has always streamed. Posting and routing decisions are
+                    // untouched: this only names the outcome the round already produced.
+                    let _ = tx.send(SteerArbEvent::UnroutableTarget {
+                        token: token.clone(),
+                        user_msg: msg.clone(),
+                    });
                 }
             }
         }

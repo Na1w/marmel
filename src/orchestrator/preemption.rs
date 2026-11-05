@@ -322,11 +322,17 @@ pub enum PreemptHandle {
     /// Streams that yielded their model slot and are waiting on the handshake.
     Active(Vec<(StreamIdentity, oneshot::Sender<PauseAction>)>),
     /// Streams left running because the arbitrator had spare capacity of its
-    /// own: no pause was ever sent to them, so there is nothing to resume, but a
-    /// decision may still cancel them by identity (see
+    /// own, or because they did not acknowledge preemption in time: no pause was
+    /// delivered to them, so there is nothing to resume, but a decision may
+    /// still cancel them by identity (see
     /// [`PreemptHandle::complete_with_subtask_decision`] and
     /// [`PreemptHandle::complete_all`]).
     Running(Vec<StreamIdentity>),
+    /// A mix of streams that paused and streams left running.
+    Combined {
+        active: Vec<(StreamIdentity, oneshot::Sender<PauseAction>)>,
+        running: Vec<StreamIdentity>,
+    },
 }
 
 /// The subtasks an arbitration decision explicitly orders cancelled, routed
@@ -375,6 +381,23 @@ impl PreemptHandle {
                     let _ = tx.send(action);
                 }
             }
+            PreemptHandle::Combined { active, running } => {
+                if matches!(action, PauseAction::Abort) {
+                    for identity in running {
+                        if let Some(ref token) = identity.cancel_token {
+                            token.cancel();
+                        }
+                    }
+                }
+                for (identity, tx) in active {
+                    if matches!(action, PauseAction::Abort)
+                        && let Some(ref token) = identity.cancel_token
+                    {
+                        token.cancel();
+                    }
+                    let _ = tx.send(action);
+                }
+            }
         }
     }
 
@@ -385,7 +408,7 @@ impl PreemptHandle {
         let cancel_subtasks = cancel_subtasks_of(decision);
         match self {
             PreemptHandle::None => {}
-            // Pausing was skipped for spare capacity: a `Cancel` still cancels
+            // Pausing was skipped for spare capacity or timed out: a `Cancel` still cancels
             // the worker through its own token, everything else leaves the
             // stream running.
             PreemptHandle::Running(identities) => {
@@ -408,6 +431,26 @@ impl PreemptHandle {
                         // Defined fallback for every non-Cancel action — including a
                         // rejected/unknown action, whose rejection is logged by the
                         // normalizer: keep the stream alive instead of guessing.
+                        PauseAction::Resume
+                    };
+                    let _ = tx.send(action);
+                }
+            }
+            PreemptHandle::Combined { active, running } => {
+                for identity in running {
+                    if cancels_subtask(&identity, &cancel_subtasks)
+                        && let Some(ref token) = identity.cancel_token
+                    {
+                        token.cancel();
+                    }
+                }
+                for (identity, tx) in active {
+                    let action = if cancels_subtask(&identity, &cancel_subtasks) {
+                        if let Some(ref token) = identity.cancel_token {
+                            token.cancel();
+                        }
+                        PauseAction::Abort
+                    } else {
                         PauseAction::Resume
                     };
                     let _ = tx.send(action);
@@ -607,35 +650,37 @@ async fn preempt_streams(
         }
     }
 
-    // 3. Cancel every stream that never acknowledged: an identity left
-    //    untouched keeps its worker stream emitting until the turn ends.
+    // 3. Streams that never acknowledged within the deadline (e.g. they
+    //    are blocked mid-tool-call or waiting for model TTFT).
+    //    CRITICAL: they MUST NOT be cancelled here! The user did NOT ask to cancel
+    //    ongoing work, and the arbitrator has not even made its decision yet.
+    //    Cancelling here would abort healthy workers whenever steering occurs.
+    //    Instead, they are preserved as running streams: if the arbitrator
+    //    subsequently orders an explicit AbortImmediately or Cancel for them,
+    //    `PreemptHandle` will cancel them then; otherwise they continue safely.
+    let mut unpaused_running = Vec::new();
     for waiter in waiters.iter() {
         let identity = &waiter.identity;
-        match identity.cancel_token.as_ref() {
-            Some(token) => {
-                tracing::warn!(
-                    agent_tag = %identity.agent_tag,
-                    task_id = identity.task_id.as_deref().unwrap_or(""),
-                    ack_timeout_ms = PREEMPT_ACK_TIMEOUT.as_millis() as u64,
-                    "Preemption not acknowledged within deadline — cancelling non-acking stream (it may be blocked mid-tool-call and unable to yield its model slot)"
-                );
-                token.cancel();
-            }
-            None => {
-                tracing::warn!(
-                    agent_tag = %identity.agent_tag,
-                    task_id = identity.task_id.as_deref().unwrap_or(""),
-                    ack_timeout_ms = PREEMPT_ACK_TIMEOUT.as_millis() as u64,
-                    "Preemption not acknowledged and stream has no cancellation token — excluded from the preempt handle"
-                );
-            }
-        }
+        tracing::debug!(
+            agent_tag = %identity.agent_tag,
+            task_id = identity.task_id.as_deref().unwrap_or(""),
+            ack_timeout_ms = PREEMPT_ACK_TIMEOUT.as_millis() as u64,
+            "Preemption not acknowledged within deadline — stream left running without pause"
+        );
+        unpaused_running.push(identity.clone());
     }
 
-    if active_senders.is_empty() {
+    if active_senders.is_empty() && unpaused_running.is_empty() {
         PreemptHandle::None
-    } else {
+    } else if unpaused_running.is_empty() {
         PreemptHandle::Active(active_senders)
+    } else if active_senders.is_empty() {
+        PreemptHandle::Running(unpaused_running)
+    } else {
+        PreemptHandle::Combined {
+            active: active_senders,
+            running: unpaused_running,
+        }
     }
 }
 
@@ -718,8 +763,10 @@ mod tests {
                 agent_name: Some("coder".to_string()),
                 prompt: None,
                 sleep_seconds: None,
+                ..Default::default()
             }],
             sleep_seconds: None,
+            ..Default::default()
         };
 
         handle.complete_with_subtask_decision(Some(&decision));
@@ -928,6 +975,7 @@ mod tests {
                     agent_name: Some("researcher".to_string()),
                     prompt: None,
                     sleep_seconds: None,
+                    ..Default::default()
                 },
                 crate::orchestrator::steer::SteerSubtaskDecision {
                     tool_call_id: "steer-task-1".to_string(),
@@ -936,9 +984,11 @@ mod tests {
                     agent_name: Some("coder".to_string()),
                     prompt: Some("Investigate stalled task".to_string()),
                     sleep_seconds: None,
+                    ..Default::default()
                 },
             ],
             sleep_seconds: None,
+            ..Default::default()
         };
 
         handle.complete_with_subtask_decision(Some(&decision));
@@ -951,10 +1001,10 @@ mod tests {
         );
     }
 
-    // Bounded acknowledgement: non-acking streams get cancelled
+    // Bounded acknowledgement: non-acking streams are left running (never killed by preemption timeout)
 
-    /// A preemption stream that never acknowledges must be cancelled, not left
-    /// running until the turn ends.
+    /// A preemption stream that never acknowledges must NOT be cancelled by preemption
+    /// timeout; it must be left running as a Running stream in the handle.
     #[tokio::test]
     async fn test_non_acking_preemption_stream_is_cancelled_within_bound() {
         let cancel_token = tokio_util::sync::CancellationToken::new();
@@ -977,12 +1027,17 @@ mod tests {
             "the handshake must be bounded by the shared ack deadline, took {elapsed:?}"
         );
         assert!(
-            matches!(handle, PreemptHandle::None),
-            "a stream that never acknowledged must not be part of the preempt handle"
+            matches!(handle, PreemptHandle::Running(_)),
+            "a stream that never acknowledged must be left running in the preempt handle"
         );
         assert!(
+            !cancel_token.is_cancelled(),
+            "the non-acking stream's cancellation token must NOT be cancelled by preemption timeout"
+        );
+        handle.complete_all(PauseAction::Abort);
+        assert!(
             cancel_token.is_cancelled(),
-            "H2: the non-acking stream's cancellation token must be fired by the round lifecycle"
+            "global abort must cancel the running stream"
         );
     }
 
@@ -1038,13 +1093,20 @@ mod tests {
             "H2: 3 streams must share one ack deadline (<= {:?}), took {elapsed:?}",
             PREEMPT_ACK_TIMEOUT * 2
         );
-        let PreemptHandle::Active(list) = handle else {
-            panic!("H2: the acknowledging stream must be held by the preempt handle");
+        let (list, running) = match handle {
+            PreemptHandle::Combined { active, running } => (active, running),
+            PreemptHandle::Active(list) => (list, Vec::new()),
+            _ => panic!("H2: the acknowledging stream must be held by the preempt handle"),
         };
         assert_eq!(
             list.len(),
             1,
-            "H2: only the acknowledging stream may be held by the handle"
+            "H2: only the acknowledging stream may be held in active list"
+        );
+        assert_eq!(
+            running.len(),
+            2,
+            "H2: the 2 non-acknowledging streams are kept in running list"
         );
         for (_identity, tx) in list {
             let _ = tx.send(PauseAction::Resume);
@@ -1060,14 +1122,13 @@ mod tests {
         );
         for (idx, token) in tokens.iter().enumerate() {
             assert!(
-                token.is_cancelled(),
-                "H2: non-acking stream #{idx} was left uncancelled"
+                !token.is_cancelled(),
+                "H2: non-acking stream #{idx} must not be cancelled by the handshake timeout"
             );
         }
     }
 
-    /// The cancelled stream's task must terminate on its own: no leaked stream
-    /// task after the preemption round ends.
+    /// The stream's task terminates when cancelled by explicit abort.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_non_acking_stream_task_does_not_leak() {
         let cancel_token = tokio_util::sync::CancellationToken::new();
@@ -1094,7 +1155,8 @@ mod tests {
         });
 
         let handle = preempt_conflicting_stream("model-h2-leak", "steer now").await;
-        assert!(matches!(handle, PreemptHandle::None));
+        assert!(matches!(handle, PreemptHandle::Running(_)));
+        handle.complete_all(PauseAction::Abort);
 
         let finished = tokio::time::timeout(
             PREEMPT_ACK_TIMEOUT + Duration::from_millis(500),
@@ -1103,7 +1165,7 @@ mod tests {
         .await;
         assert!(
             matches!(finished, Ok(Ok(_))),
-            "H2: the non-acking stream task must be cancelled, not leak until the turn ends"
+            "H2: the stream task must be cancelled on abort, not leak until the turn ends"
         );
     }
 
@@ -1122,8 +1184,8 @@ mod tests {
         );
 
         let handle = preempt_conflicting_stream("model-h2-stale", "steer now").await;
-        assert!(matches!(handle, PreemptHandle::None));
-        assert!(cancel_token.is_cancelled());
+        assert!(matches!(handle, PreemptHandle::Running(_)));
+        assert!(!cancel_token.is_cancelled());
 
         assert_eq!(
             sink.poll_control(),
@@ -1192,8 +1254,10 @@ mod tests {
                     agent_name: Some("coder".to_string()),
                     prompt: None,
                     sleep_seconds: None,
+                    ..Default::default()
                 }],
                 sleep_seconds: None,
+                ..Default::default()
             };
 
             handle.complete_with_subtask_decision(Some(&decision));
@@ -1255,8 +1319,10 @@ mod tests {
                     agent_name: Some("coder".to_string()),
                     prompt: None,
                     sleep_seconds: None,
+                    ..Default::default()
                 }],
                 sleep_seconds: None,
+                ..Default::default()
             };
 
             handle.complete_with_subtask_decision(Some(&decision));
@@ -1332,15 +1398,25 @@ mod tests {
             "the ack handshake must stay bounded, took {elapsed:?}"
         );
 
-        let PreemptHandle::Active(list) = handle else {
-            panic!("H2: the acknowledging streams must be held by the preempt handle");
+        let (list, running) = match handle {
+            PreemptHandle::Combined { active, running } => (active, running),
+            PreemptHandle::Active(list) => (list, Vec::new()),
+            _ => panic!("H2: the acknowledging streams must be held by the preempt handle"),
         };
         assert_eq!(
             list.len(),
             NAMES.len() - 1,
-            "H2: exactly the acknowledging streams may be held by the handle"
+            "H2: exactly the acknowledging streams may be held in active list"
         );
-        let handle = PreemptHandle::Active(list);
+        assert_eq!(
+            running.len(),
+            1,
+            "H2: the non-acking stream is preserved in running list"
+        );
+        let handle = PreemptHandle::Combined {
+            active: list,
+            running,
+        };
 
         let decision = SteerDecision {
             decision: "ForwardToWorker".to_string(),
@@ -1360,9 +1436,11 @@ mod tests {
                     agent_name: Some(NAMES[label].to_string()),
                     prompt: None,
                     sleep_seconds: None,
+                    ..Default::default()
                 })
                 .collect(),
             sleep_seconds: None,
+            ..Default::default()
         };
         handle.complete_with_subtask_decision(Some(&decision));
 
@@ -1387,8 +1465,8 @@ mod tests {
             );
         }
         assert!(
-            tokens[7].is_cancelled(),
-            "H2: the stream that never acknowledged must be cancelled"
+            !tokens[7].is_cancelled(),
+            "the stream that never acknowledged must NOT be cancelled when not targeted by Cancel"
         );
     }
 
@@ -1511,8 +1589,10 @@ mod tests {
                 agent_name: Some("coder".to_string()),
                 prompt: None,
                 sleep_seconds: None,
+                ..Default::default()
             }],
             sleep_seconds: None,
+            ..Default::default()
         };
         handle.complete_with_subtask_decision(Some(&decision));
 

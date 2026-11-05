@@ -130,6 +130,7 @@ pub const MANAGER_TOOL_NAMES: &[&str] = &[
     crate::tool_names::TOOL_DELEGATE_TASK,
     crate::tool_names::TOOL_CREATE_PLAN,
     crate::tool_names::TOOL_ARCHIVE_PLAN,
+    crate::tool_names::TOOL_PAUSE_EXECUTION,
     crate::tool_names::TOOL_READ_FILE,
     crate::tool_names::TOOL_GREP_SEARCH,
     crate::tool_names::TOOL_GLOB,
@@ -850,7 +851,7 @@ impl ContextEngine {
             "Context compaction executed (automatic): {initial_tokens} tokens ({initial_msgs} msgs) -> {final_tokens} tokens ({final_msgs} msgs, target budget: {target}, removed: {messages_removed} msgs / {tokens_reclaimed} tokens)"
         );
 
-        if self.token_count() <= rebirth_advisory_threshold(self.max_context_tokens) {
+        if self.request_token_count() <= rebirth_advisory_threshold(self.max_context_tokens) {
             self.rebirth_advisory_emitted = false;
         }
 
@@ -963,7 +964,7 @@ impl ContextEngine {
         );
 
         self.consecutive_rebirths = self.consecutive_rebirths.saturating_add(1);
-        if self.token_count() <= rebirth_advisory_threshold(self.max_context_tokens) {
+        if self.request_token_count() <= rebirth_advisory_threshold(self.max_context_tokens) {
             self.rebirth_advisory_emitted = false;
         }
         if let Some(stats) = &self.stats {

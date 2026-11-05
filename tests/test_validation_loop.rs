@@ -17,6 +17,34 @@ use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+// ── process-global serialisation for this file ─────────────────────────────
+//
+// The worker registry (`marmennill::orchestrator::workers`) is a **process** global:
+// every specialist run in this binary registers a worker entry there, and on
+// completion that entry joins a completed ring capped at
+// `MAX_RECENT_COMPLETED = 10` entries and evicted **oldest first**. Six tests here
+// then assert that their own entry is still in that ring
+// (`workers::worker_state_snapshot(...).expect("the worker entry survives its run in
+// the completed ring")`), which under libtest's default parallelism is a
+// whole-process quantity: enough sibling runs complete first and this test's entry is
+// evicted before it can be read — the load-dependent flake recorded in
+// `docs/fix_notice_reply_flakiness.md` §7 (3 failing runs in 10 at
+// `--test-threads=24` under CPU load; 0 runs failing with `--test-threads=1`).
+//
+// Every test in this file drives at least one specialist run, so the file serialises
+// them on one mutex: a test's own completion is then the newest entry in the ring at
+// the moment it asserts, and the assertion is a per-test quantity again. The mutex is
+// async (`tokio::sync::Mutex`) because the tests hold it across awaits — the same
+// convention as `orchestrator::notice::TEST_NOTICE_MUTEX`; a `std::sync::MutexGuard`
+// held across an `.await` is `clippy::await_holding_lock`, which this crate denies.
+//
+// Cost: the file runs serially (2.6 s instead of 0.7 s at full parallelism).
+static WORKER_REGISTRY_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn worker_registry_serial() -> tokio::sync::MutexGuard<'static, ()> {
+    WORKER_REGISTRY_SERIAL.lock().await
+}
+
 fn tool_call_sse(call_id: &str, tool_name: &str, args_json: &str) -> String {
     format!(
         "data: {}\n\ndata: [DONE]\n\n",
@@ -58,6 +86,7 @@ fn text_sse(text: &str) -> String {
 
 #[tokio::test]
 async fn test_specialist_validation_rejection_and_revision_loop() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -199,6 +228,7 @@ async fn test_specialist_validation_rejection_and_revision_loop() {
 
 #[tokio::test]
 async fn test_specialist_chatter_loop_terminates_fast() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -279,6 +309,7 @@ async fn test_specialist_chatter_loop_terminates_fast() {
 
 #[tokio::test]
 async fn test_specialist_recovers_after_repetition_nudge_and_succeeds() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -385,6 +416,7 @@ async fn test_specialist_recovers_after_repetition_nudge_and_succeeds() {
 
 #[tokio::test]
 async fn test_specialist_revision_recovers_after_repetition_nudge_and_succeeds() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -501,6 +533,7 @@ async fn test_specialist_revision_recovers_after_repetition_nudge_and_succeeds()
 // cannot pass silently.
 #[tokio::test]
 async fn test_specialist_without_marker_is_nudged_then_approved_by_validator() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -592,6 +625,7 @@ async fn test_specialist_without_marker_is_nudged_then_approved_by_validator() {
 // opt out of validation.
 #[tokio::test]
 async fn test_validator_reminded_3_times_and_fails_closed_without_verdict() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -689,6 +723,7 @@ async fn test_validator_reminded_3_times_and_fails_closed_without_verdict() {
 
 #[tokio::test]
 async fn test_delegated_validator_approved_leave_verdict_stops_loop_immediately() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -786,6 +821,7 @@ async fn test_delegated_validator_approved_leave_verdict_stops_loop_immediately(
 
 #[tokio::test]
 async fn test_delegated_validator_rejected_leave_verdict_stops_loop_immediately() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -883,6 +919,7 @@ async fn test_delegated_validator_rejected_leave_verdict_stops_loop_immediately(
 
 #[tokio::test]
 async fn test_delegated_validator_skips_subsequent_tools_in_same_turn_after_leave_verdict() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -1173,6 +1210,7 @@ fn researcher_turns(task_id: &str) -> Vec<String> {
 /// as not validated and its plan line stays unchecked (the `5c2231b` guard).
 #[tokio::test]
 async fn test_missing_validation_verdict_file_fails_and_leaves_plan_unchecked() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -1261,6 +1299,7 @@ async fn test_missing_validation_verdict_file_fails_and_leaves_plan_unchecked() 
 /// non-failure label `Completed (validation skipped by design)`.
 #[tokio::test]
 async fn test_validation_skip_record_completes_the_run_and_checks_the_plan_line() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -1370,6 +1409,7 @@ async fn test_validation_skip_record_completes_the_run_and_checks_the_plan_line(
 /// be bought with an empty file.
 #[tokio::test]
 async fn test_blank_validation_skip_record_is_not_a_decision_and_fails_closed() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -1456,6 +1496,7 @@ async fn test_blank_validation_skip_record_is_not_a_decision_and_fails_closed() 
 /// the resulting state (no brief, **no record**) must stay fail closed.
 #[tokio::test]
 async fn test_failed_validation_brief_write_is_not_reported_as_a_skip() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -1558,6 +1599,7 @@ async fn test_failed_validation_brief_write_is_not_reported_as_a_skip() {
 
 #[tokio::test]
 async fn test_present_validation_verdict_with_explicit_approval_still_succeeds() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -1623,6 +1665,7 @@ async fn test_present_validation_verdict_with_explicit_approval_still_succeeds()
 
 #[tokio::test]
 async fn test_present_validation_verdict_with_explicit_rejection_fails() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -1689,6 +1732,7 @@ async fn test_present_validation_verdict_with_explicit_rejection_fails() {
 
 #[tokio::test]
 async fn test_unreadable_validation_verdict_file_is_a_hard_failure() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -1749,6 +1793,7 @@ async fn test_unreadable_validation_verdict_file_is_a_hard_failure() {
 
 #[tokio::test]
 async fn test_blank_validation_verdict_file_is_a_hard_failure() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -1800,6 +1845,7 @@ async fn test_blank_validation_verdict_file_is_a_hard_failure() {
 /// the captured request bodies both prove it, so nothing here rests on wording.
 #[tokio::test]
 async fn test_a_no_validate_coder_line_authors_no_brief_and_never_reaches_the_validator() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -1906,6 +1952,7 @@ async fn test_a_no_validate_coder_line_authors_no_brief_and_never_reaches_the_va
 /// buys validation rather than only disabling it.
 #[tokio::test]
 async fn test_a_validate_researcher_line_authors_the_brief_and_drives_a_verdict_round() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -2037,6 +2084,7 @@ async fn test_a_validate_researcher_line_authors_the_brief_and_drives_a_verdict_
 /// none for that id).
 #[tokio::test]
 async fn test_adhoc_steering_task_defaults_to_no_validate() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -2161,6 +2209,7 @@ async fn test_adhoc_steering_task_defaults_to_no_validate() {
 /// implemented in the delegation/typo path either.
 #[tokio::test]
 async fn test_adhoc_plan_absent_id_without_a_record_still_fails_closed() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -2238,6 +2287,7 @@ async fn test_adhoc_plan_absent_id_without_a_record_still_fails_closed() {
 /// "no verdict recorded" and the deliverable still fails closed.
 #[tokio::test]
 async fn test_adhoc_record_never_rescues_a_blank_brief() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
@@ -2308,6 +2358,7 @@ async fn test_adhoc_record_never_rescues_a_blank_brief() {
 /// exemption can never be smuggled in through the ad-hoc path.
 #[tokio::test]
 async fn test_adhoc_record_never_exempts_an_id_that_is_a_plan_line() {
+    let _serial = worker_registry_serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
