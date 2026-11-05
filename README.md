@@ -64,7 +64,7 @@ Marmel is designed for autonomous multi-step software engineering with continuou
       ┌───────────────────────────────────┐                       │
       │       Agent Architect (JIT)       │                       │
       │  • Dynamic Skill Catalog          │                       │
-      │    (skills/*.md, ARCHETYPES.md)       │                       │
+      │    (skills/*.md, ARCHETYPES.md)   │                       │
       │  • Tailored prompt + tool list    │                       │
       │  • Writes .marmel/prompts/        │                       │
       └─────────────────┬─────────────────┘                       │
@@ -541,7 +541,7 @@ Only `description:`, `skills:`, and `tools:` are read; every other `key:` line a
 
 ### Project Instructions (`AGENTS.md`)
 
-`AGENTS.md` follows the common convention: free-form project rules (git workflow, required checks, conventions) for any agent working in the repository. Marmel is no longer parsing it for roles. Instead, its full text is appended as a `# Project Instructions (AGENTS.md)` section to the Manager's system prompt and to every delegated worker's prompt. `~/.marmel/AGENTS.md` is included first and `<workspace>/AGENTS.md` second; the combined text is capped at 32 KiB.
+`AGENTS.md` follows the common convention: free-form project rules (git workflow, required checks, conventions) for any agent working in the repository. Its full text is appended as a `# Project Instructions (AGENTS.md)` section to the Manager's system prompt and to every delegated worker's prompt. `~/.marmel/AGENTS.md` is included first and `<workspace>/AGENTS.md` second; the combined text is capped at 32 KiB.
 
 ### Custom Skills (`skills/`)
 
