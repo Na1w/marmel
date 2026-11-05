@@ -444,6 +444,12 @@ async fn run_automated_validation_inner(
     if !mcp_block.is_empty() {
         full_validator_prompt.push_str(&mcp_block);
     }
+    // Validators must audit against the same project rules the workers follow.
+    if let Some(instructions) =
+        crate::agents::load_project_instructions(&crate::harness::get_workspace_root())
+    {
+        full_validator_prompt.push_str(&instructions);
+    }
 
     let mut engine = crate::manager::ContextEngineFactory::new(cfg.max_context_tokens)
         .specialist_context(full_validator_prompt, brief);
@@ -632,8 +638,16 @@ async fn run_plan_validation_inner(
         plan_markdown
     );
 
+    // The plan auditor checks the plan against the project rules (AGENTS.md) too.
+    let mut plan_auditor_prompt = validator_prompt.to_string();
+    if let Some(instructions) =
+        crate::agents::load_project_instructions(&crate::harness::get_workspace_root())
+    {
+        plan_auditor_prompt.push_str(&instructions);
+    }
+
     let mut engine = crate::manager::ContextEngineFactory::new(cfg.max_context_tokens)
-        .specialist_context(validator_prompt.to_string(), brief);
+        .specialist_context(plan_auditor_prompt, brief);
 
     let registry = crate::orchestrator::SpecialistRegistry::canonical();
     let val_entry = registry
