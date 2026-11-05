@@ -909,3 +909,509 @@ fn granted_canonical_run_command_still_passes_the_gate() {
         );
     }
 }
+
+// ── (f) the bounded readiness gate on the MCP dispatch path ────────────────
+
+/// How long the boot of a deliberately slow scripted server is stretched, so the
+/// manager's verdict is still `Booting` while a call is made.
+#[cfg(unix)]
+const BOOT_DELAY_SECS: u64 = 2;
+
+/// A [`scripted_server`] whose canned frames are held back by `sleep BOOT_DELAY_SECS`:
+/// the `initialize` handshake — and therefore the whole boot — lands late, so the
+/// verdict stays `Booting` and the registry stays empty for that long.
+#[cfg(unix)]
+fn delayed_scripted_server(tools: &[&str]) -> ScriptedServer {
+    let base = scripted_server(tools);
+    let script = base
+        .config
+        .args
+        .get(1)
+        .expect("the scripted server carries its replay script")
+        .clone();
+    let mut config = base.config;
+    config.args[1] = format!("sleep {} ; {script}", BOOT_DELAY_SECS);
+    ScriptedServer {
+        _dir: base._dir,
+        config,
+    }
+}
+
+/// A server that answers **nothing** inside the readiness budget: the boot is parked
+/// in the `initialize` handshake, so the verdict stays `Booting` and no tool ever
+/// lands for as long as the child holds its stdout open. The hold must outlive every
+/// readiness wait the test makes — each leg pays its **own** full budget, so the legs
+/// together take `2 x MCP_READY_TIMEOUT` — and it must stay well under the transport's
+/// own `MCP_REQUEST_TIMEOUT` (30 s) handshake deadline, so that nothing but the
+/// readiness budget can end these waits.
+#[cfg(unix)]
+fn unresponsive_server() -> ScriptedServer {
+    let dir = tempfile::tempdir().expect("tempdir for the unresponsive MCP server");
+    let hold = 4 * super::MCP_READY_TIMEOUT.as_secs();
+    ScriptedServer {
+        _dir: dir,
+        config: McpServerConfig {
+            command: Some("sh".to_string()),
+            args: vec!["-c".to_string(), format!("sleep {hold}")],
+            ..Default::default()
+        },
+    }
+}
+
+/// A boot that cannot happen at all: the configured command does not exist, so the
+/// only configured server fails to connect and the verdict is `Failed(reason)`.
+#[cfg(unix)]
+fn offline_config() -> McpServerConfig {
+    McpServerConfig {
+        command: Some("/nonexistent/marmennill/this-server-does-not-exist".to_string()),
+        ..Default::default()
+    }
+}
+
+/// Configure exactly one server under `name`, for [`McpManager::spawn_boot`].
+#[cfg(unix)]
+fn one_server(name: &str, cfg: &McpServerConfig) -> HashMap<String, McpServerConfig> {
+    let mut servers = HashMap::new();
+    servers.insert(name.to_string(), cfg.clone());
+    servers
+}
+
+/// (f1) A call made **before the servers are up** must block (bounded) on the
+/// readiness gate and then be served, on both the awaitable path
+/// (`dispatch_for_async`) and the `block_on_safe` path (`dispatch_for`, the shape
+/// `src/ui/session.rs` runs Manager dispatch in). The boot delay must have elapsed
+/// before either call answers, which is what makes "it blocked" observable.
+#[cfg(unix)]
+#[test]
+fn a_call_made_while_the_servers_are_booting_waits_for_the_verdict_then_succeeds() {
+    let scripted = delayed_scripted_server(&["do_thing"]);
+    let rt = multi_thread_runtime();
+    let handle = rt.handle().clone();
+
+    // ── the awaitable path ──────────────────────────────────────────────────
+    let (snapshot, verdict_at_call, live_at_call, outcome, elapsed, verdict_after) =
+        rt.block_on(async {
+            let manager = Arc::new(McpManager::spawn_boot(
+                &handle,
+                &one_server("myserver", &scripted.config),
+            ));
+            let gate = build_mcp_gate(&manager);
+            let snapshot = gate.allowed_names();
+            let verdict_at_call = manager.status();
+            let live_at_call = manager.has_tool("myserver__do_thing");
+            let started = std::time::Instant::now();
+            let outcome = with_mcp_gate(gate, async {
+                dispatch_for_async(
+                    &invocation("myserver__do_thing", serde_json::json!({"x": 1})),
+                    ToolCaller::Manager,
+                )
+                .await
+            })
+            .await;
+            let elapsed = started.elapsed();
+            let verdict_after = manager.status();
+            manager.shutdown().await;
+            (
+                snapshot,
+                verdict_at_call,
+                live_at_call,
+                outcome,
+                elapsed,
+                verdict_after,
+            )
+        });
+
+    // The window this gate exists for: a frozen snapshot of an empty registry, with
+    // the requested name nowhere in it and nothing answering it yet.
+    assert!(
+        snapshot.is_empty(),
+        "the gate registered while booting must carry an empty snapshot, got {snapshot:?}"
+    );
+    assert_eq!(
+        verdict_at_call,
+        crate::mcp::McpBootStatus::Booting,
+        "the call must have been made inside the `Booting` window"
+    );
+    assert!(
+        !live_at_call,
+        "the requested tool must not have landed yet, or this would not be a wait"
+    );
+
+    let outcome = outcome.expect("a still-booting registry must not hard-error the caller");
+    assert!(
+        !outcome.is_error,
+        "the call must be served once the verdict lands, got: {}",
+        outcome.content
+    );
+    assert!(
+        outcome.content.contains(MCP_MARKER),
+        "the call must reach this test's MCP server, got {:?}",
+        outcome.content
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(BOOT_DELAY_SECS * 1_000 - 300),
+        "the call must have waited for the boot, it answered in {elapsed:?}"
+    );
+    assert_eq!(
+        verdict_after,
+        crate::mcp::McpBootStatus::Ready,
+        "the verdict the readiness gate was waiting on must have landed"
+    );
+
+    // ── the synchronous bridge, same window, same budget ────────────────────
+    let scripted_sync = delayed_scripted_server(&["do_thing"]);
+    let handle_sync = rt.handle().clone();
+    let (sync_outcome, sync_elapsed) = rt.block_on(async {
+        let manager = Arc::new(McpManager::spawn_boot(
+            &handle_sync,
+            &one_server("myserver", &scripted_sync.config),
+        ));
+        let gate = build_mcp_gate(&manager);
+        assert_eq!(
+            manager.status(),
+            crate::mcp::McpBootStatus::Booting,
+            "the sync scenario must start inside the `Booting` window"
+        );
+        let started = std::time::Instant::now();
+        let outcome = with_mcp_gate(gate, async {
+            dispatch_for(
+                &invocation("myserver__do_thing", serde_json::json!({"x": 1})),
+                ToolCaller::Manager,
+            )
+        })
+        .await;
+        let sync_elapsed = started.elapsed();
+        manager.shutdown().await;
+        (outcome, sync_elapsed)
+    });
+
+    let sync_outcome = sync_outcome.expect("the sync path must not hard-error either");
+    assert!(
+        !sync_outcome.is_error,
+        "the `block_on_safe` path must serve the call too: {}",
+        sync_outcome.content
+    );
+    assert!(
+        sync_outcome.content.contains(MCP_MARKER),
+        "the sync path must reach the MCP server, got {:?}",
+        sync_outcome.content
+    );
+    assert!(
+        sync_elapsed >= std::time::Duration::from_millis(BOOT_DELAY_SECS * 1_000 - 300),
+        "the sync call must have waited for the boot too, it answered in {sync_elapsed:?}"
+    );
+}
+
+/// (f2) A boot that never brought a single server up must answer the model with the
+/// boot's own reason — a clean tool error — instead of the `UnknownTool`/`Forbidden`
+/// dead end the empty snapshot used to produce.
+#[cfg(unix)]
+#[test]
+fn a_failed_boot_answers_the_model_with_the_boot_failure_reason() {
+    let rt = multi_thread_runtime();
+    let handle = rt.handle().clone();
+    let (async_outcome, sync_outcome, verdict) = rt.block_on(async {
+        let manager = Arc::new(McpManager::spawn_boot(
+            &handle,
+            &one_server("offline", &offline_config()),
+        ));
+        let gate = build_mcp_gate(&manager);
+        let async_outcome = with_mcp_gate(Arc::clone(&gate), async {
+            dispatch_for_async(
+                &invocation("offline__do_thing", serde_json::json!({})),
+                ToolCaller::Manager,
+            )
+            .await
+        })
+        .await;
+        let sync_outcome = with_mcp_gate(Arc::clone(&gate), async {
+            dispatch_for(
+                &invocation("offline__do_thing", serde_json::json!({})),
+                ToolCaller::Manager,
+            )
+        })
+        .await;
+        let verdict = manager.await_ready().await;
+        (async_outcome, sync_outcome, verdict)
+    });
+
+    assert!(
+        matches!(verdict, crate::mcp::McpBootStatus::Failed(_)),
+        "the only configured server could not be started, so the verdict must be \
+         `Failed`, got {verdict:?}"
+    );
+    for (label, outcome) in [("async", async_outcome), ("sync", sync_outcome)] {
+        let outcome = outcome.unwrap_or_else(|error| {
+            panic!("a failed boot must reach the model as a tool error, not {error:?} ({label})")
+        });
+        assert!(
+            outcome.is_error,
+            "the failed boot must be reported as a tool error ({label}): {}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains("MCP boot failed"),
+            "{label} must name the boot failure, got {:?}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains("offline"),
+            "{label} must carry the boot's own reason, got {:?}",
+            outcome.content
+        );
+    }
+}
+
+/// (f3) A server that never answers the handshake at all: the readiness budget is the
+/// only thing that can end the wait, and the answer must be a clean tool error naming
+/// the budget it used — never a panic, and on the sync half never a timer on a thread
+/// without a reactor, because that wait is driven through `block_on_safe`.
+///
+/// Each leg runs against its **own** boot, and sequentially: they cannot share one
+/// manager inside a single task, because the blocking half (`dispatch_for`) holds the
+/// thread it runs on and lets the *transport's* own `MCP_REQUEST_TIMEOUT` (30 s)
+/// publish a `Failed` verdict in the middle of the async half's wait — and
+/// `tokio::time::timeout` polls its **inner** future first, so a late verdict would
+/// answer the call instead of the budget this gate is supposed to have enforced. A
+/// fresh boot per leg means each one's budget elapses with nothing publishing a
+/// verdict: the child stays alive, so the verdict is still `Booting` when the budget
+/// is spent.
+#[cfg(unix)]
+#[test]
+fn a_server_that_never_answers_times_out_with_a_clean_tool_error() {
+    let budget = super::MCP_READY_TIMEOUT;
+    let rt = multi_thread_runtime();
+
+    // ── the awaitable path, its own boot, its own full budget ─────────────────
+    let handle = rt.handle().clone();
+    let (async_outcome, async_elapsed, verdict_after_async) = rt.block_on(async {
+        let scripted = unresponsive_server();
+        let manager = Arc::new(McpManager::spawn_boot(
+            &handle,
+            &one_server("myserver", &scripted.config),
+        ));
+        let gate = build_mcp_gate(&manager);
+        assert_eq!(
+            manager.status(),
+            crate::mcp::McpBootStatus::Booting,
+            "the handshake is unanswered, so the verdict must be `Booting`"
+        );
+        let started = std::time::Instant::now();
+        let outcome = with_mcp_gate(gate, async {
+            dispatch_for_async(
+                &invocation("myserver__do_thing", serde_json::json!({})),
+                ToolCaller::Manager,
+            )
+            .await
+        })
+        .await;
+        let elapsed = started.elapsed();
+        let verdict = manager.status();
+        manager.shutdown_boot_task();
+        manager.shutdown().await;
+        (outcome, elapsed, verdict)
+    });
+
+    // ── the `block_on_safe` path, a second boot, the same budget ──────────────
+    let handle = rt.handle().clone();
+    let (sync_outcome, sync_elapsed, verdict_after_sync) = rt.block_on(async {
+        let scripted = unresponsive_server();
+        let manager = Arc::new(McpManager::spawn_boot(
+            &handle,
+            &one_server("myserver", &scripted.config),
+        ));
+        let gate = build_mcp_gate(&manager);
+        assert_eq!(
+            manager.status(),
+            crate::mcp::McpBootStatus::Booting,
+            "the sync scenario must start inside the `Booting` window"
+        );
+        let started = std::time::Instant::now();
+        let outcome = with_mcp_gate(gate, async {
+            dispatch_for(
+                &invocation("myserver__do_thing", serde_json::json!({})),
+                ToolCaller::Manager,
+            )
+        })
+        .await;
+        let elapsed = started.elapsed();
+        let verdict = manager.status();
+        manager.shutdown_boot_task();
+        manager.shutdown().await;
+        (outcome, elapsed, verdict)
+    });
+
+    for (label, outcome, elapsed, verdict_after) in [
+        ("async", async_outcome, async_elapsed, verdict_after_async),
+        ("sync", sync_outcome, sync_elapsed, verdict_after_sync),
+    ] {
+        let outcome = outcome.unwrap_or_else(|error| {
+            panic!(
+                "an unsettled boot must reach the model as a tool error, not {error:?} ({label})"
+            )
+        });
+        assert!(
+            outcome.is_error,
+            "the timeout must be reported as a tool error ({label}): {}",
+            outcome.content
+        );
+        assert!(
+            outcome
+                .content
+                .contains("MCP server 'myserver' is still starting"),
+            "{label} must name the server, the budget and the fact that it timed out, \
+             got {:?}",
+            outcome.content
+        );
+        assert!(
+            outcome
+                .content
+                .contains(&format!("still starting after {}s", budget.as_secs())),
+            "{label} must name the budget it used, got {:?}",
+            outcome.content
+        );
+        assert!(
+            elapsed + std::time::Duration::from_millis(300) >= budget,
+            "the {label} call must have spent the readiness budget ({elapsed:?} vs {budget:?})"
+        );
+        assert!(
+            elapsed <= budget + std::time::Duration::from_secs(5),
+            "the {label} call must be bounded by its budget, it answered in {elapsed:?}"
+        );
+        assert_eq!(
+            verdict_after,
+            crate::mcp::McpBootStatus::Booting,
+            "the boot must still be in flight after the budget: the deadline the server \
+             missed is the transport's own"
+        );
+    }
+}
+
+/// (f4) The ordering this gate must not disturb: the built-in veto stays first, the
+/// registration refusal stays a refusal, and the composed-name widening only ever
+/// happens while the verdict is unsettled.
+#[cfg(unix)]
+#[test]
+fn the_readiness_gate_keeps_the_builtin_veto_first_and_the_policy_refusal_refused() {
+    let scripted = delayed_scripted_server(&[TOOL_GLOB, "safe_tool"]);
+    let rt = multi_thread_runtime();
+    let handle = rt.handle().clone();
+    let (during_boot, builtin_outcome, after_boot, refused_live) = rt.block_on(async {
+        let manager = Arc::new(McpManager::spawn_boot(
+            &handle,
+            &one_server("terminal", &scripted.config),
+        ));
+        let gate = build_mcp_gate(&manager);
+        // Inside the `Booting` window: the veto and the policy refusal both win, even
+        // though the composed-name widening is switched on.
+        let during_boot = (
+            gate.route(TERMINAL_GLOB).is_some(),
+            gate.route("terminal__safe_tool").is_some(),
+            gate.route("other__do_thing").is_some(),
+            gate.allowed_names(),
+        );
+        // A built-in spelling is answered by the built-in handler even during the
+        // window, and never by an MCP tool error or a `Forbidden`.
+        let builtin = dispatch(&invocation(TERMINAL_READ_FILE, serde_json::json!({})));
+        let verdict = manager.await_ready().await;
+        // After readiness the same gate is settled: nothing may be widened.
+        let after_boot = (
+            gate.route(TERMINAL_GLOB).is_some(),
+            gate.route("other__do_thing").is_some(),
+            gate.route("terminal__safe_tool").is_some(),
+            verdict,
+        );
+        let refused_live = manager.has_tool(TERMINAL_GLOB);
+        manager.shutdown().await;
+        (during_boot, builtin, after_boot, refused_live)
+    });
+
+    assert!(
+        !during_boot.0 && !during_boot.1,
+        "neither '{TERMINAL_GLOB}' (built-in name) nor 'terminal__safe_tool' (refused \
+         namespace) may route to MCP, even inside the widening window"
+    );
+    assert!(
+        during_boot.2,
+        "a policy-valid composed name may route inside the unsettled window, where the \
+         bounded wait then decides whether the call can be served"
+    );
+    assert!(
+        during_boot.3.is_empty(),
+        "the snapshot taken during the boot must be empty, got {:?}",
+        during_boot.3
+    );
+    assert!(
+        matches!(
+            builtin_outcome,
+            Err(ToolError::BadArguments { ref tool, .. }) if tool == TOOL_READ_FILE
+        ),
+        "the built-in read_file handler must still own '{TERMINAL_READ_FILE}', got {builtin_outcome:?}"
+    );
+    assert!(
+        !after_boot.0 && !after_boot.1 && !after_boot.2,
+        "once the verdict is settled nothing may be routed: the `terminal` names are \
+         refused by the policy, and a settled gate never widens an unknown name"
+    );
+    assert_eq!(
+        after_boot.3,
+        crate::mcp::McpBootStatus::Ready,
+        "the `terminal` server boots, so the verdict is `Ready`"
+    );
+    assert!(
+        refused_live,
+        "the scripted `terminal` server must really have registered '{TERMINAL_GLOB}': \
+         the refusal lives in the policy-filtered view, not in the raw registry"
+    );
+}
+
+/// (f5) The live-registry half of the name policy on its own: a gate whose snapshot
+/// is stale still routes what the **live** registry has (verdict re-checked), a name
+/// the policy refused keeps its refusal even when it is live, and a settled gate
+/// widens nothing.
+#[cfg(unix)]
+#[test]
+fn a_stale_gate_routes_what_the_live_registry_has_and_nothing_more() {
+    let scripted = scripted_server(&["do_thing", "do__thing"]);
+    let rt = multi_thread_runtime();
+    let handle = rt.handle().clone();
+    let (snapshot, live_hit, refused_live, unknown, verdict) = rt.block_on(async {
+        let manager = Arc::new(McpManager::spawn_boot(
+            &handle,
+            &one_server("myserver", &scripted.config),
+        ));
+        let gate = build_mcp_gate(&manager);
+        // The stale snapshot `src/main.rs` publishes: nothing has landed yet.
+        let snapshot = gate.allowed_names();
+        let verdict = manager.await_ready().await;
+        let live_hit = gate.route("myserver__do_thing").is_some();
+        // Registered live, but breaks the composition grammar: always refused.
+        let refused_live = gate.route("myserver__do__thing").is_some();
+        // Settled verdict, and the name is nowhere: no widening.
+        let unknown = gate.route("myserver__nowhere").is_some();
+        manager.shutdown().await;
+        (snapshot, live_hit, refused_live, unknown, verdict)
+    });
+
+    assert!(
+        snapshot.is_empty(),
+        "the gate was built before the boot answered, so its snapshot must be empty"
+    );
+    assert_eq!(
+        verdict,
+        crate::mcp::McpBootStatus::Ready,
+        "the scripted server booted"
+    );
+    assert!(
+        live_hit,
+        "the live registry is what a stale snapshot must fall back to"
+    );
+    assert!(
+        !refused_live,
+        "a name the policy refused keeps its refusal, live registry or not"
+    );
+    assert!(
+        !unknown,
+        "a settled gate must not widen a name it cannot serve"
+    );
+}

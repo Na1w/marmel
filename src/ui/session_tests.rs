@@ -4274,3 +4274,188 @@ fn archive_failure_key_is_keyed_on_plan_state_not_a_constant_signature() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ── t-009: the MCP readiness read the TUI prints, display-only ──────────────
+//
+// Boot is asynchronous, so a session with slow MCP servers spends its first seconds
+// with an advertised tool snapshot that is empty, and nothing on screen saying why.
+// `ui::session::mcp_boot_state` is the only readiness read the UI layer makes, and
+// these pins are what it may and may not claim. Nothing here waits on a verdict for
+// real time: every scenario builds a manager whose verdict has already landed, or
+// reads one that has not been given the chance to.
+
+/// The manager of a config that names `alpha` but gives it no transport at all: the
+/// boot reaches its verdict with no process, no port and no clock, so the
+/// `Booting → Ready` transition under test is deterministic rather than timed.
+fn boot_manager_naming(servers: &[&str]) -> std::sync::Arc<crate::mcp::McpManager> {
+    let mut map = std::collections::HashMap::new();
+    for name in servers {
+        map.insert(
+            name.to_string(),
+            crate::mcp::McpServerConfig {
+                command: None,
+                args: Vec::new(),
+                env: std::collections::HashMap::new(),
+                url: None,
+                prompt: None,
+            },
+        );
+    }
+    let handle = tokio::runtime::Handle::current();
+    crate::mcp::McpManager::spawn_boot(&handle, &map)
+}
+
+/// Read the readiness through the gate this test owns, the way the dispatch paths do
+/// it, so no pin here depends on the process-global slot another module may be
+/// holding.
+async fn read_through(
+    gate: &std::sync::Arc<crate::harness::McpDispatchGate>,
+    configured: usize,
+) -> Option<crate::ui::tui::state::McpState> {
+    crate::harness::with_mcp_gate(std::sync::Arc::clone(gate), async {
+        crate::ui::session::mcp_boot_state(configured)
+    })
+    .await
+}
+
+/// (a) The boot window is what the read states while the boot has not landed — with
+/// the count the config named, not the count that happens to be up so far.
+/// (b) The same read changes shape once the verdict lands: `starting` does not
+/// outlive the boot it describes.
+#[tokio::test]
+async fn the_mcp_read_shows_the_boot_window_then_the_verdict() {
+    use crate::ui::tui::state::McpState;
+    let manager = boot_manager_naming(&["alpha"]);
+    let gate = crate::harness::build_mcp_gate(&manager);
+
+    assert_eq!(
+        read_through(&gate, 1).await,
+        Some(McpState::Starting {
+            configured: 1,
+            up: 0
+        }),
+        "a boot that has not landed must be stated as still starting"
+    );
+
+    let verdict = manager.await_ready().await;
+    assert!(
+        verdict.is_terminal(),
+        "the fixture must reach a settled verdict, got {verdict:?}"
+    );
+    assert_eq!(
+        read_through(&gate, 1).await,
+        Some(McpState::Settled {
+            up: 0,
+            configured: 1
+        }),
+        "the settled verdict is stated with the real counts, and `starting` is gone"
+    );
+    manager.shutdown().await;
+}
+
+/// A session that configured no MCP server at all reads as nothing, even with a
+/// settled manager behind the gate: the line degrades away, it never goes empty.
+#[tokio::test]
+async fn no_mcp_server_configured_reads_as_nothing_at_all() {
+    let manager = std::sync::Arc::new(crate::mcp::McpManager::new());
+    let gate = crate::harness::build_mcp_gate(&manager);
+    assert_eq!(read_through(&gate, 0).await, None);
+}
+
+/// A gate that is settled and carries every server it was told to carry says
+/// nothing: the healthy case gets no line, and neither does the gap case — the gap
+/// case is the one line it does get (`MCP: 1/2 up`), pinned above.
+#[tokio::test]
+async fn a_boot_that_refused_every_server_names_the_first_refusal_it_met() {
+    use crate::mcp::McpBootStatus;
+    let mut map = std::collections::HashMap::new();
+    map.insert(
+        "alpha".to_string(),
+        crate::mcp::McpServerConfig {
+            command: Some("/definitely-not-an-marmel-binary".to_string()),
+            args: Vec::new(),
+            env: std::collections::HashMap::new(),
+            url: None,
+            prompt: None,
+        },
+    );
+    let handle = tokio::runtime::Handle::current();
+    let manager = crate::mcp::McpManager::spawn_boot(&handle, &map);
+    let gate = crate::harness::build_mcp_gate(&manager);
+    let verdict = manager.await_ready().await;
+    assert!(
+        matches!(verdict, McpBootStatus::Failed(_)),
+        "a server whose binary does not exist must be a refusal, got {verdict:?}"
+    );
+
+    let read = read_through(&gate, 1).await;
+    let Some(crate::ui::tui::state::McpState::Failed { reason }) = read else {
+        panic!("a refused boot must be stated as a refusal, got {read:?}");
+    };
+    assert!(
+        reason.contains("alpha"),
+        "the refusal must name the server it refused: {reason:?}"
+    );
+    manager.shutdown().await;
+}
+
+/// The abort sentinel is not a diagnosis: `Failed("MCP boot task aborted")` says the
+/// process is going away mid-boot, and `src/main.rs` already draws that distinction
+/// at exit. The status band therefore stays silent about it rather than blaming the
+/// servers for something they never did.
+#[tokio::test]
+async fn the_abort_sentinel_states_no_failure_on_the_band() {
+    let manager = boot_manager_naming(&["alpha"]);
+    let gate = crate::harness::build_mcp_gate(&manager);
+    manager.shutdown_boot_task();
+    assert_eq!(
+        manager.status(),
+        crate::mcp::McpBootStatus::Failed(crate::mcp::McpBootStatus::BOOT_ABORT_REASON.to_string()),
+        "the sentinel must be what the fixture carries"
+    );
+    assert_eq!(
+        read_through(&gate, 1).await,
+        None,
+        "and the band says nothing about it"
+    );
+    manager.shutdown().await;
+}
+
+/// Requirement 4 of the readiness UX: the line is display-only. Producing it may not
+/// move a byte of the advertised Manager tool list — the wire/charge equality pinned
+/// in `session::budget_tests` is a tool-list property, and the status band is a
+/// rendering property, and they must stay that way.
+#[test]
+fn the_mcp_readout_never_touches_the_advertise_list() {
+    use crate::manager::context::{manager_wire_tools, tools_tokens};
+    use crate::types::ToolDef;
+    let signature =
+        |tools: &[ToolDef]| serde_json::to_string(tools).expect("tool definitions serialize");
+
+    for configured in [0usize, 3] {
+        let cfg = Config::default();
+        let advertised = manager_wire_tools(&cfg.orchestration.mcp_servers);
+        let before = signature(&advertised);
+        let before_tokens = tools_tokens(&advertised);
+
+        // The read happens, whatever it happened to say …
+        let readout = crate::ui::session::mcp_boot_state(configured);
+        let _ = &readout;
+        // … and the advertised list is byte-identical either way.
+        let after = manager_wire_tools(&cfg.orchestration.mcp_servers);
+        assert_eq!(
+            signature(&after),
+            before,
+            "the advertised list moved with {configured} configured server(s)"
+        );
+        assert_eq!(tools_tokens(&after), before_tokens);
+        // And the words the band prints are words of the band, never of the wire:
+        // nothing the read could print appears anywhere in what the Manager
+        // advertises.
+        let serialised = serde_json::to_string(&after).expect("the list serializes");
+        assert!(
+            !serialised.contains("MCP:") && !serialised.contains("server(s)"),
+            "the readiness wording reached the advertised list: {serialised}"
+        );
+    }
+}

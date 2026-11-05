@@ -24,6 +24,286 @@ struct CliArgs {
     prompt: Option<String>,
 }
 
+/// The exit signal that reached this process, spelled the way
+/// `session::format::ProcessEnding::Signal` spells it: a **name**, never a bare number.
+///
+/// Nothing in `src/` used to look at signals at all, which is why a `kill` was observed
+/// to be a hard kill: the process died in ~7 ms with the default disposition and left a
+/// half-booted stdio MCP child behind, reparented to `ppid 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalArrival {
+    /// SIGINT: a terminal interrupt, or `kill -INT`.
+    Interrupt,
+    /// SIGTERM: the usual "stop this process" signal.
+    Terminate,
+}
+
+impl SignalArrival {
+    /// The name carried by the log line (and by any `ProcessEnding::Signal` record).
+    fn name(self) -> &'static str {
+        match self {
+            Self::Interrupt => "SIGINT",
+            Self::Terminate => "SIGTERM",
+        }
+    }
+
+    /// The signal number this arrival stands for (`man 7 signal`: SIGINT is 2,
+    /// SIGTERM is 15).
+    fn signum(self) -> i32 {
+        match self {
+            Self::Interrupt => 2,
+            Self::Terminate => 15,
+        }
+    }
+
+    /// The exit code a process that **chose** to stop on a signal should report: the
+    /// shell convention `128 + signum`, i.e. 130 for SIGINT and 143 for SIGTERM. It is
+    /// the honest verdict for a run that was cut short and therefore never produced a
+    /// session outcome of its own.
+    fn exit_code(self) -> i32 {
+        128 + self.signum()
+    }
+
+    /// The marker carried in shared state: the signum (2 or 15), never 0, because 0 is
+    /// the "no arrival yet" value of the atom that holds it.
+    fn marker(self) -> u8 {
+        self.signum() as u8
+    }
+
+    /// Reverse of [`Self::marker`]; `None` for the `0` sentinel and for anything else.
+    fn from_marker(marker: u8) -> Option<Self> {
+        match marker {
+            2 => Some(Self::Interrupt),
+            15 => Some(Self::Terminate),
+            _ => None,
+        }
+    }
+}
+
+/// The half of the signal wiring that the watcher task and `main` share.
+#[derive(Debug, Default)]
+struct SignalState {
+    /// How many exit signals have been seen: `0` means none, `1` means "request the
+    /// exit", `2` and above mean "stop waiting and let the bounded teardown run".
+    count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Which signal requested the exit (the **first** arrival), as the signum; `0` until
+    /// an arrival records it.
+    exit_marker: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// Woken by the first arrival only (`notify_one` stores its permit, so it is never
+    /// missed even if it lands before anything awaits it).
+    exit_request: std::sync::Arc<tokio::sync::Notify>,
+    /// Woken by the second and every later arrival.
+    force_request: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl SignalState {
+    /// Record one arrival and wake the right waiter. Split out so the counting rules can
+    /// be tested without an OS signal.
+    fn observe(&self, arrival: SignalArrival) -> u32 {
+        let seen = self
+            .count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        if seen == 1 {
+            self.exit_marker
+                .store(arrival.marker(), std::sync::atomic::Ordering::Relaxed);
+            self.exit_request.notify_one();
+        } else {
+            self.force_request.notify_one();
+        }
+        seen
+    }
+
+    /// Arrivals seen so far (a plain counter read, nothing to lock).
+    fn arrival_count(&self) -> u32 {
+        self.count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The arrival that requested the exit. The fallback only matters if the atom was
+    /// written out of order; a signal that stopped this run always records it.
+    fn exit_arrival(&self) -> SignalArrival {
+        SignalArrival::from_marker(self.exit_marker.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(SignalArrival::Terminate)
+    }
+}
+
+/// The installed watcher: shared state, plus the task that owns the OS handlers.
+struct SignalWatch {
+    state: std::sync::Arc<SignalState>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl SignalWatch {
+    /// Stop watching for signals: the run has already decided how it ends, so a later
+    /// arrival must not wake anything, and the installed handlers go back to the default
+    /// disposition once the last stream handle is dropped.
+    fn stop(&self) {
+        self.task.abort();
+    }
+}
+
+/// How long a run gets, after an exit signal, to reach **its own** quit path before the
+/// forced teardown happens. It is the same 250 ms budget the MCP client sweep already
+/// uses — the signal path must not invent a new, unbounded wait.
+const SIGNAL_RUN_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// What happened to the UI/session run: it either returned its own verdict, or an exit
+/// signal stopped it.
+#[derive(Debug)]
+enum RunOutcome {
+    /// The run finished on its own, `cleanTail` commit-on-exit included.
+    Completed(Result<()>),
+    /// An exit signal requested the exit: the run either never started (the signal
+    /// landed during MCP startup) or was cut short after its bounded grace.
+    Signalled,
+}
+
+/// Install the SIGINT/SIGTERM handlers and start the task that forwards arrivals into
+/// `state`.
+///
+/// This lives **before** `McpManager::spawn_boot`, deliberately: the first stdio child is
+/// spawned by the boot task, so a signal arriving while MCP is still booting is covered by
+/// the handlers, and only the graceful teardown can reap that child. `tokio::signal::unix`
+/// needs a runtime context to register its self-pipe handler, hence the one-shot
+/// `block_on` on this thread: it returns as soon as the handlers exist, having awaited
+/// nothing that can stall.
+#[cfg(unix)]
+fn install_exit_signal_watcher(rt: &tokio::runtime::Runtime) -> SignalWatch {
+    let state = std::sync::Arc::new(SignalState::default());
+    let task = rt.block_on(register_exit_signals(std::sync::Arc::clone(&state)));
+    match task {
+        Some(task) => SignalWatch { state, task },
+        None => {
+            tracing::warn!(
+                "could not install the SIGINT/SIGTERM handlers: a signal falls back to the \
+                 default disposition, which may orphan an MCP child that is still booting"
+            );
+            // Keep the shape of the contract: without handlers there is nothing to stop,
+            // so the state simply never reports an arrival.
+            SignalWatch {
+                state,
+                task: rt.spawn(async {}),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn register_exit_signals(
+    state: std::sync::Arc<SignalState>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let mut interrupt =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok()?;
+    let mut terminate =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok()?;
+    // The streams own the OS handlers, so they live (and stay registered) for as long as
+    // this task does; `SignalWatch::stop` aborts the task and drops them.
+    Some(tokio::spawn(async move {
+        loop {
+            let arrival = tokio::select! {
+                Some(()) = interrupt.recv() => SignalArrival::Interrupt,
+                Some(()) = terminate.recv() => SignalArrival::Terminate,
+                // A stream that closed means the reactor side went away: nothing more to
+                // watch, and every waiter below is already bounded.
+                else => return,
+            };
+            let seen = state.observe(arrival);
+            if seen == 1 {
+                tracing::warn!(
+                    "signal {} received: requesting exit and reaping MCP children",
+                    arrival.name()
+                );
+            } else {
+                tracing::warn!(
+                    "signal {} received again (arrival {seen}): skipping the grace and \
+                     forcing the bounded teardown",
+                    arrival.name()
+                );
+            }
+        }
+    }))
+}
+
+/// Install the exit-signal watcher on a platform without `SIGINT`/`SIGTERM`.
+#[cfg(not(unix))]
+fn install_exit_signal_watcher(rt: &tokio::runtime::Runtime) -> SignalWatch {
+    let state = std::sync::Arc::new(SignalState::default());
+    let task = rt.block_on(register_console_signals(std::sync::Arc::clone(&state)));
+    SignalWatch { state, task }
+}
+
+#[cfg(not(unix))]
+async fn register_console_signals(
+    state: std::sync::Arc<SignalState>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            // `ctrl_c` re-arms its own handler per call; an error means the console is
+            // gone, so the loop ends rather than spinning.
+            if tokio::signal::ctrl_c().await.is_err() {
+                return;
+            }
+            state.observe(SignalArrival::Interrupt);
+        }
+    })
+}
+
+/// Compose the UI future and the exit-signal future **on the runtime**, so that whichever
+/// way the run ends, control reaches the same teardown lines in `main`
+/// (`cancel_all()` → `shutdown_boot_task()` → bounded `shutdown()` → `shutdown_timeout`).
+///
+/// The documented semantics, including the raw/TUI caveat:
+///
+/// * While the terminal is in raw mode the TUI owns Ctrl-C: the terminal's `ISIG` is off,
+///   so a Ctrl-C key press is already a crossterm event handled by
+///   `ui::tui::TuiRenderer::request_user_exit` — no signal is generated and this handler
+///   never sees it. This is left untouched, so interactive behaviour does not change.
+/// * A real SIGINT/SIGTERM arriving **during** the run (an external `kill`, a service
+///   stop, job control) is treated as a process-level exit request. It first replays what
+///   the UI's own quit path does — `orchestrator::cancel_all()`, exactly what
+///   `request_user_exit` calls — so the session loop's abort/commit path (the `T-6`/`T-7`
+///   triggers) gets its bounded chance to run, and only then is the run abandoned. That
+///   keeps the UI's own bundle commit first, and the bounded teardown second.
+/// * A signal that arrives **before** the run starts (e.g. during MCP startup) means "do
+///   not start this run at all".
+///
+/// The wait for the run's own quit path is bounded by [`SIGNAL_RUN_GRACE`]; a second
+/// arrival stops that wait immediately, so the twice-over case cannot deadlock.
+async fn run_reacting_to_exit_signal<R>(
+    state: &SignalState,
+    grace: std::time::Duration,
+    run: R,
+) -> RunOutcome
+where
+    R: std::future::Future<Output = Result<()>>,
+{
+    if state.arrival_count() > 0 {
+        tracing::warn!("exit signal received before the run started: skipping the session run");
+        return RunOutcome::Signalled;
+    }
+    tokio::pin!(run);
+    tokio::select! {
+        outcome = &mut run => return RunOutcome::Completed(outcome),
+        _ = state.exit_request.notified() => {}
+    }
+    // First arrival: let the run wind down on its own terms for as long as the bound
+    // allows. `cancel_all()` is the same call the UI quit path makes.
+    orchestrator::cancel_all();
+    let grace = tokio::time::timeout(grace, &mut run);
+    tokio::pin!(grace);
+    tokio::select! {
+        outcome = grace => {
+            match outcome {
+                Ok(inner) => return RunOutcome::Completed(inner),
+                Err(_elapsed) => {}
+            }
+        }
+        _ = state.force_request.notified() => {}
+    }
+    tracing::warn!("run not finished within its grace: forcing the bounded teardown");
+    RunOutcome::Signalled
+}
+
 fn main() -> Result<()> {
     let mut raw_args = std::env::args().skip(1);
     if is_sandbox_reentry(raw_args.next().as_deref()) {
@@ -69,6 +349,21 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
 
+    // Exit signals are wired up **here, before MCP is started**: the first stdio child is
+    // spawned by the boot task below, so a `SIGINT`/`SIGTERM` that lands while MCP is still
+    // booting has to be covered by the handlers, or the child is orphaned. Nothing is
+    // awaited that could stall — the call returns as soon as the handlers exist.
+    //
+    // The raw/TUI caveat, and the behaviour chosen for it: while the terminal is in raw
+    // mode the TUI owns Ctrl-C (`ISIG` is off, so a Ctrl-C press is a crossterm key event
+    // that `ui::tui::TuiRenderer::request_user_exit` already handles, and no signal is
+    // generated at all) — interactive behaviour is untouched. A *real* signal arriving
+    // during the run is therefore treated as a process-level exit request: it first
+    // replays the UI's own quit path (`orchestrator::cancel_all()`, the very call
+    // `request_user_exit` makes) so the session loop gets its bounded chance to wind down
+    // and commit, and only then runs the same bounded teardown this function already runs.
+    let signal = install_exit_signal_watcher(&rt);
+
     // One honest line about the shared HTTP client before anything needs it — the
     // MCP boot, the Manager and every session turn below all talk to a backend
     // through it. A host with no TLS trust store makes that client impossible to
@@ -77,22 +372,133 @@ fn main() -> Result<()> {
     // the process keeps the exit code its session outcome produces.
     report_http_client_verdict(use_raw);
 
-    if !cfg.mcp_servers.is_empty()
-        && let Ok(mcp_mgr) = rt.block_on(mcp::McpManager::boot(&cfg.mcp_servers))
-    {
-        harness::set_mcp_manager(std::sync::Arc::new(mcp_mgr));
-    }
+    // MCP is started, never waited on: **startup returns without waiting for MCP.**
+    // `spawn_boot` hands back the still-filling manager without awaiting anything, and the
+    // gate is registered in the same breath, so the harness slot exists before the first
+    // dispatch. That first gate is a frozen snapshot of an empty registry, hence its
+    // `allowed` set is empty at this point — expected, not a regression: MCP tools are
+    // simply undispatchable until the verdict lands.
+    //
+    // The readiness continuation lives **here**, in main.rs, keeping the invariant that
+    // main.rs is the only production writer of the global gate slot: it awaits the boot
+    // verdict and, on `Ready`, re-registers the *same* manager, at which point
+    // `build_mcp_gate` recomputes `allowed`/`rejected` from the now-populated tool
+    // snapshot. On `Failed` (not one configured server came up) nothing is re-registered —
+    // the empty gate and every built-in name are untouched — and the reason is logged.
+    //
+    // A `Failed` payload comes in two shapes and they are logged differently, because the
+    // catch-all wording is wrong for the common one: the payload an **aborted boot task**
+    // publishes (`mcp::McpBootStatus::BOOT_ABORT_REASON`) only means "this run ended while
+    // the boot was still in flight" — the usual shape when the user simply quit. That
+    // verdict is reported as *startup still in progress*, together with the count of
+    // servers that **did** come up; only a real per-server failure list is reported as a
+    // boot failure.
+    //
+    // `spawn_boot` already returns `Arc<Self>`, so no extra allocation is needed; the Arc
+    // is kept locally for the exit-path teardown below.
+    let mcp_manager: Option<std::sync::Arc<mcp::McpManager>> = if cfg.mcp_servers.is_empty() {
+        None
+    } else {
+        let mgr = mcp::McpManager::spawn_boot(rt.handle(), &cfg.mcp_servers);
+        harness::set_mcp_manager(std::sync::Arc::clone(&mgr));
+        let watcher = std::sync::Arc::clone(&mgr);
+        // How many servers were configured — captured as a plain number so the
+        // continuation can state `N of M` without moving `cfg` into the task.
+        let configured = cfg.mcp_servers.len();
+        rt.spawn(async move {
+            match watcher.await_ready().await {
+                mcp::McpBootStatus::Ready => harness::set_mcp_manager(watcher),
+                mcp::McpBootStatus::Failed(reason) => {
+                    let came_up = watcher.booted_server_count();
+                    if mcp::McpBootStatus::is_boot_abort_reason(&reason) {
+                        // The boot was cut short by this run ending: not a failure
+                        // diagnosis, and not necessarily an empty registry.
+                        tracing::warn!(
+                            "MCP startup still in progress at exit — {came_up} of \
+                             {configured} server(s) came up, the rest were still starting"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "MCP boot failed: {reason} — no MCP server came up \
+                             ({configured} configured)"
+                        );
+                    }
+                }
+                // `await_ready` only publishes a terminal verdict while the manager lives;
+                // `Booting` here means the publisher was closed mid-boot, which the local
+                // Arc cannot cause. Treat it as "nothing to re-register".
+                mcp::McpBootStatus::Booting => {}
+            }
+        });
+        Some(mgr)
+    };
 
     let manager = Some(boot_manager(&cfg));
 
-    let res = if use_raw {
-        rt.block_on(ui::raw::run(&cfg, args.prompt, manager))
+    // The UI future and the exit-signal future are composed **on the runtime**, so a
+    // signal cannot skip the teardown below: whichever way this returns, the same
+    // `cancel_all()` → MCP reap → `shutdown_timeout()` lines run next, and they run
+    // bounded.
+    let outcome = if use_raw {
+        let run = ui::raw::run(&cfg, args.prompt, manager);
+        rt.block_on(run_reacting_to_exit_signal(
+            &signal.state,
+            SIGNAL_RUN_GRACE,
+            run,
+        ))
     } else {
-        rt.block_on(ui::tui::run(&cfg, args.prompt, manager))
+        let run = ui::tui::run(&cfg, args.prompt, manager);
+        rt.block_on(run_reacting_to_exit_signal(
+            &signal.state,
+            SIGNAL_RUN_GRACE,
+            run,
+        ))
     };
 
+    // The run has decided how it ends, so stop watching: a later arrival must not wake
+    // anything. Aborting the task drops the stream handles, and the last handle for a
+    // signal is what puts the OS handler back to the disposition it had before this
+    // process installed one.
+    signal.stop();
+    if matches!(outcome, RunOutcome::Signalled) {
+        // The abandoned UI future never reached its own leave-alt-screen / raw-mode
+        // restore, so the terminal is put back before the bounded teardown below runs.
+        ui::restore();
+    }
+
     orchestrator::cancel_all();
+    // Best-effort MCP teardown, bounded so it can never stall the exit. Two steps, in this
+    // order: `shutdown_boot_task()` aborts the background boot where it stands (dropping a
+    // half-booted stdio child, whose `kill_on_drop(true)` then reaps it), and
+    // `McpManager::shutdown()` kills every client that did come up. Without this the only
+    // thing stopping the runtime is `shutdown_timeout`, which forgets tasks and connection
+    // tasks without ever reaping the children — i.e. every stdio MCP server would be
+    // orphaned and outlive this process.
+    if let Some(mgr) = mcp_manager.as_ref() {
+        mgr.shutdown_boot_task();
+        let mgr = std::sync::Arc::clone(mgr);
+        let _ = rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(250), mgr.shutdown()).await
+        });
+    }
     rt.shutdown_timeout(std::time::Duration::from_millis(300));
+    // A run stopped by an exit signal never produced a session verdict of its own, so the
+    // verdict it reports is the shell convention `128 + signum`: 130 for SIGINT, 143 for
+    // SIGTERM, for the signal that actually asked this process to stop. This sits **after**
+    // the teardown above, so choosing to stop this way never skipped a reap.
+    let res = match outcome {
+        RunOutcome::Completed(result) => result,
+        RunOutcome::Signalled => {
+            let arrival = signal.state.exit_arrival();
+            eprintln!(
+                "run stopped by {}: exiting {} (MCP children reaped; the session bundle is \
+                 left exactly as it was last committed)",
+                arrival.name(),
+                arrival.exit_code()
+            );
+            std::process::exit(arrival.exit_code())
+        }
+    };
     // A **refused** `--resume` is a first-class verdict, not a runtime error:
     // `main() -> Result<()>` can only ever exit `1`, so the typed
     // `session::RestoreRefused` returned by the boot pass is mapped here — after the
@@ -716,6 +1122,523 @@ mod tests {
         assert!(
             parser.contains("--resume | --fresh") || parser.contains("--resume         rehydrate"),
             "the help block must document both flags"
+        );
+    }
+
+    // ---------------------------------------------------------------- signals (#t-015)
+
+    /// Shared by the scans below: `main()` is one function, so its text can be sliced out
+    /// the same way the MCP boot test does it.
+    fn main_fn_text(src: &str) -> String {
+        let from = src
+            .find("fn main() -> Result<()>")
+            .expect("main() must stay one function");
+        let rest = &src[from..];
+        let end = rest
+            .find("fn is_sandbox_reentry(")
+            .expect("`fn is_sandbox_reentry(` must follow main()");
+        rest[..end].to_string()
+    }
+
+    /// The signal wiring is the difference between a bounded reap and an orphan: the
+    /// watcher must be installed **before** the boot task can spawn a child, the run must
+    /// be composed with the signal future on the runtime, and the outcome of that race
+    /// must hand over to the very same teardown lines the normal exit path runs.
+    #[test]
+    fn exit_signal_wiring_is_installed_before_mcp_boot_and_reaches_the_same_teardown() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("src/main.rs must be readable");
+        let main_fn = main_fn_text(&src);
+
+        // (a) Handlers live before the first stdio child can exist.
+        let install = main_fn
+            .find("install_exit_signal_watcher(&rt)")
+            .expect("main must install the SIGINT/SIGTERM watcher");
+        let boot = main_fn
+            .find("mcp::McpManager::spawn_boot(rt.handle(), &cfg.mcp_servers)")
+            .expect("MCP boot must stay in main()");
+        assert!(
+            install < boot,
+            "the exit-signal watcher must be installed before `spawn_boot`, or a signal \
+             during MCP startup orphans the still-booting child"
+        );
+
+        // (b) Both run modes are raced against the signal future, not awaited bare.
+        assert_eq!(
+            main_fn
+                .matches("rt.block_on(run_reacting_to_exit_signal(")
+                .count(),
+            2,
+            "both the raw and the TUI run must be composed with the exit-signal future"
+        );
+        assert!(
+            main_fn.contains("SIGNAL_RUN_GRACE,"),
+            "the grace handed to the race must be the documented, bounded one"
+        );
+
+        // (c) The signal outcome falls through to the SAME teardown: watcher stopped,
+        // then cancel_all, then the MCP reap, then the runtime stop.
+        let stop_watch = main_fn
+            .find("signal.stop()")
+            .expect("the watcher must be stopped once the run has decided how it ends");
+        let cancel = main_fn
+            .find("orchestrator::cancel_all();")
+            .expect("every worker must be cancelled before teardown");
+        let reap = main_fn
+            .find("shutdown_boot_task()")
+            .expect("the boot task must be aborted on the exit path");
+        let stop = main_fn
+            .find("rt.shutdown_timeout(")
+            .expect("the runtime must be shut down with a timeout");
+        let verdict = main_fn
+            .find("RunOutcome::Signalled =>")
+            .expect("a signal-stopped run must report a verdict");
+        assert!(
+            stop_watch < cancel && cancel < reap && reap < stop && stop < verdict,
+            "the watcher must be stopped before the teardown runs, the teardown must stay \
+             between cancel_all() and shutdown_timeout(), and the signal verdict must be \
+             taken only AFTER the bounded MCP teardown"
+        );
+        assert!(
+            main_fn.contains("std::process::exit(arrival.exit_code())"),
+            "a run stopped by a signal must exit with the signal's own exit code"
+        );
+        assert!(
+            main_fn.contains("RunOutcome::Completed(result) => result"),
+            "the run's own verdict must still win when the run finishes on its own"
+        );
+
+        // (d) A run abandoned mid-TUI must not leave the terminal in raw mode / the
+        // alternate screen behind.
+        assert!(
+            main_fn.contains("RunOutcome::Signalled") && main_fn.contains("ui::restore();"),
+            "the signal path must restore the terminal before the teardown"
+        );
+    }
+
+    /// The raw/TUI caveat is a documented decision, pinned here: Ctrl-C while the terminal
+    /// is in raw mode stays a crossterm key event owned by the TUI's own quit path
+    /// (`request_user_exit`), and a real signal arriving during the run deliberately
+    /// replays that same quit path before it forces the bounded teardown.
+    #[test]
+    fn raw_mode_ctrl_c_stays_with_the_ui_quit_path_and_a_real_signal_replays_it() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("src/main.rs must be readable");
+        let main_fn = main_fn_text(&src);
+        let caveat = main_fn
+            .find("let signal = install_exit_signal_watcher(&rt);")
+            .expect("the watcher must be installed by main()");
+        let comment = &main_fn[..caveat];
+        assert!(
+            comment.contains("Ctrl-C") && comment.contains("crossterm"),
+            "main() must document that Ctrl-C in raw mode is a crossterm key event, not a \
+             signal, so the TUI's handling is untouched"
+        );
+        assert!(
+            comment.contains("request_user_exit"),
+            "main() must name the UI's own quit path it defers to"
+        );
+        assert!(
+            comment.contains("orchestrator::cancel_all()"),
+            "main() must document that a real signal replays the UI quit path's cancel_all \
+             before forcing the bounded teardown"
+        );
+    }
+
+    /// The race must stay bounded, and it must give the UI's own quit path the first turn.
+    #[test]
+    fn the_signal_race_is_bounded_and_lets_the_run_quit_itself_first() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("src/main.rs must be readable");
+        let from = src
+            .find("async fn run_reacting_to_exit_signal")
+            .expect("the signal race must exist");
+        let rest = &src[from..];
+        let end = rest
+            .find("\nfn main() -> Result<()>")
+            .expect("the race is defined immediately before main()");
+        let race = &rest[..end];
+
+        // The grace reuses the existing 250 ms budget: no new, invented wait.
+        assert!(
+            src.contains("const SIGNAL_RUN_GRACE: std::time::Duration = std::time::Duration::from_millis(250);"),
+            "the run grace must be the 250 ms budget the MCP sweep already uses"
+        );
+        // Nothing unbounded is awaited on the signal path: the wait for the run is a
+        // `timeout`, there is no `pending()`/`sleep`-forever stand-in, and no new blocking
+        // wait is introduced.
+        assert!(
+            race.contains("tokio::time::timeout(grace, &mut run)")
+                && race.contains("_ = state.force_request.notified()"),
+            "the grace must be a timeout, and a second arrival must break it"
+        );
+        assert!(
+            !race.contains("block_on") && !race.contains("std::future::pending"),
+            "the signal path must not add a blocking or open-ended wait"
+        );
+        // The UI's own quit path runs first: `cancel_all()` (exactly what
+        // `request_user_exit` does) precedes the grace, and the skip-the-run branch comes
+        // before everything else.
+        let skip = race
+            .find("state.arrival_count() > 0")
+            .expect("a signal that arrived before the run must skip the run");
+        let cancel = race
+            .find("orchestrator::cancel_all();")
+            .expect("the signal path must cancel every worker");
+        let timed = race
+            .find("tokio::time::timeout(grace,")
+            .expect("the grace must be a timeout");
+        assert!(
+            skip < cancel && cancel < timed,
+            "a signal before the run skips it; during the run the UI's own quit path is \
+             triggered before the bounded grace"
+        );
+    }
+
+    /// The counting rules, driven for real: one arrival requests the exit, every later one
+    // forces it, and the permits are exact — no storm of wakeups, no lost arrival.
+    #[test]
+    fn the_first_arrival_requests_the_exit_and_later_arrivals_force_it() {
+        let state = SignalState::default();
+        assert_eq!(state.arrival_count(), 0);
+        assert_eq!(state.observe(SignalArrival::Terminate), 1);
+        assert_eq!(state.observe(SignalArrival::Interrupt), 2);
+        assert_eq!(state.observe(SignalArrival::Interrupt), 3);
+        assert_eq!(state.arrival_count(), 3);
+        assert_eq!(
+            state.exit_arrival(),
+            SignalArrival::Terminate,
+            "the exit verdict names the arrival that requested it, not a later one"
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime to drive the notifies");
+        let state = &state;
+        rt.block_on(async move {
+            let bound = std::time::Duration::from_millis(200);
+            // The exit request fires exactly once …
+            assert!(
+                tokio::time::timeout(bound, state.exit_request.notified())
+                    .await
+                    .is_ok(),
+                "the first arrival must have requested the exit"
+            );
+            assert!(
+                tokio::time::timeout(bound, state.exit_request.notified())
+                    .await
+                    .is_err(),
+                "only the first arrival may request the exit: no permit may be left over"
+            );
+            // … and later arrivals merge into exactly **one** force wake-up: a `Notify`
+            // stores at most one permit, which is precisely what the bounded path needs —
+            // it consumes that permit once (or not at all) and never waits again.
+            assert!(
+                tokio::time::timeout(bound, state.force_request.notified())
+                    .await
+                    .is_ok(),
+                "a later arrival must force the teardown"
+            );
+            assert!(
+                tokio::time::timeout(bound, state.force_request.notified())
+                    .await
+                    .is_err(),
+                "the force permits merge: arrivals 2 and 3 leave exactly one wake-up, so a \
+                 repeated press cannot build up a queue of wake-ups"
+            );
+        });
+    }
+
+    /// The exit codes and names this wiring reports, pinned: the shell convention
+    /// `128 + signum`, spelled the way `session::format::ProcessEnding::Signal` spells it.
+    #[test]
+    fn signal_exit_codes_follow_the_shell_convention_and_names_are_spelled_not_numbers() {
+        assert_eq!(SignalArrival::Interrupt.name(), "SIGINT");
+        assert_eq!(SignalArrival::Terminate.name(), "SIGTERM");
+        assert_eq!(SignalArrival::Interrupt.signum(), 2);
+        assert_eq!(SignalArrival::Terminate.signum(), 15);
+        assert_eq!(SignalArrival::Interrupt.exit_code(), 130);
+        assert_eq!(SignalArrival::Terminate.exit_code(), 143);
+        // The shared marker round-trips, and `0` stays the "no arrival yet" sentinel.
+        for arrival in [SignalArrival::Interrupt, SignalArrival::Terminate] {
+            assert_eq!(SignalArrival::from_marker(arrival.marker()), Some(arrival));
+        }
+        assert_eq!(SignalArrival::from_marker(0), None);
+        assert_eq!(SignalArrival::from_marker(9), None);
+    }
+
+    /// Behavioural proof, not a text scan: a run that never finishes must be stopped by the
+    /// first arrival, inside its grace, and the signal path must have cancelled the
+    /// in-flight work so the session loop's own abort/commit path got its turn.
+    #[test]
+    fn a_signal_arriving_mid_run_stops_the_run_inside_the_grace() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the race");
+        let state = std::sync::Arc::new(SignalState::default());
+        let began = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let grace = std::time::Duration::from_millis(60);
+        let observed = std::sync::Arc::clone(&state);
+        let began_run = std::sync::Arc::clone(&began);
+
+        rt.block_on(async move {
+            let signaller = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                observed.observe(SignalArrival::Terminate);
+            });
+            let started = std::time::Instant::now();
+            let outcome = run_reacting_to_exit_signal(state.as_ref(), grace, async move {
+                began_run.store(true, std::sync::atomic::Ordering::Relaxed);
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+            .await;
+            let elapsed = started.elapsed();
+            signaller.await.unwrap();
+
+            assert!(
+                matches!(outcome, RunOutcome::Signalled),
+                "the never-ending run must have been abandoned, got {outcome:?}"
+            );
+            assert!(
+                began.load(std::sync::atomic::Ordering::Relaxed),
+                "the run must have started before the signal stopped it"
+            );
+            assert!(
+                elapsed >= grace && elapsed < grace + std::time::Duration::from_millis(500),
+                "the grace is the bound: measured {elapsed:?} against grace {grace:?}"
+            );
+            assert!(
+                orchestrator::is_globally_cancelled(),
+                "the signal path must first replay the UI quit path's `cancel_all()`, so the \
+                 session loop's own abort/commit path gets its turn before the run is \
+                 abandoned"
+            );
+            // Leave the process-global token as we found it: this test cancels, so the
+            // reset is part of the assertion, not an afterthought.
+            orchestrator::reset_cancellation();
+            assert_eq!(
+                state.exit_arrival().exit_code(),
+                143,
+                "the arrival that stopped the run is the one the exit code names"
+            );
+        });
+    }
+
+    /// The twice-over case must not deadlock: a second arrival breaks the grace
+    /// immediately instead of waiting it out.
+    #[test]
+    fn a_second_arrival_skips_the_grace_instead_of_deadlocking() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the race");
+        let state = std::sync::Arc::new(SignalState::default());
+        let began = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let grace = std::time::Duration::from_millis(2_000);
+        let observed = std::sync::Arc::clone(&state);
+        let began_run = std::sync::Arc::clone(&began);
+
+        rt.block_on(async move {
+            let signaller = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                observed.observe(SignalArrival::Interrupt);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                observed.observe(SignalArrival::Interrupt);
+            });
+            let started = std::time::Instant::now();
+            let outcome = run_reacting_to_exit_signal(state.as_ref(), grace, async move {
+                began_run.store(true, std::sync::atomic::Ordering::Relaxed);
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+            .await;
+            let elapsed = started.elapsed();
+            signaller.await.unwrap();
+
+            assert!(
+                matches!(outcome, RunOutcome::Signalled),
+                "the forced arrival must have ended the run"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_millis(1_000),
+                "the grace must NOT have been waited out: measured {elapsed:?} against \
+                 grace {grace:?}"
+            );
+        });
+    }
+
+    /// A signal that lands while MCP is still booting means "do not start this run at
+    /// all": the run is skipped instead of being started and then abandoned.
+    #[test]
+    fn a_signal_before_the_run_starts_never_starts_the_run() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the race");
+        let state = std::sync::Arc::new(SignalState::default());
+        // The watcher records the arrival while MCP boots, before any run exists.
+        assert_eq!(state.observe(SignalArrival::Interrupt), 1);
+        let began = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let began_run = std::sync::Arc::clone(&began);
+
+        let outcome = rt.block_on(run_reacting_to_exit_signal(
+            state.as_ref(),
+            std::time::Duration::from_millis(500),
+            async move {
+                began_run.store(true, std::sync::atomic::Ordering::Relaxed);
+                std::future::pending::<()>().await;
+                Ok(())
+            },
+        ));
+
+        assert!(
+            matches!(outcome, RunOutcome::Signalled),
+            "the run must be reported as signal-stopped, got {outcome:?}"
+        );
+        assert!(
+            !began.load(std::sync::atomic::Ordering::Relaxed),
+            "a run that never started must not be started by the signal path"
+        );
+        assert_eq!(state.exit_arrival().exit_code(), 130);
+    }
+
+    /// The normal exit path is unchanged: a run that ends on its own keeps its own verdict,
+    /// which is what preserves the `cleanTail` commit-on-exit behaviour.
+    #[test]
+    fn a_run_that_ends_on_its_own_keeps_its_verdict_and_commits() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the race");
+        let state = std::sync::Arc::new(SignalState::default());
+
+        let outcome = rt.block_on(run_reacting_to_exit_signal(
+            state.as_ref(),
+            std::time::Duration::from_millis(500),
+            async { Ok(()) },
+        ));
+
+        assert!(
+            matches!(outcome, RunOutcome::Completed(Ok(()))),
+            "the run's own verdict must survive, got {outcome:?}"
+        );
+        assert_eq!(state.arrival_count(), 0, "no signal, no signal verdict");
+    }
+
+    /// `setup_panic_hook` must keep working next to the new wiring: a panic still restores
+    /// the terminal, still flushes the bundle, and the signal watcher is stopped before the
+    /// runtime is shut down so it can never turn a panic into a hang.
+    #[test]
+    fn the_panic_hook_still_flushes_and_the_watcher_stops_before_runtime_shutdown() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("src/main.rs must be readable");
+        let from = src
+            .find("fn setup_panic_hook(use_raw: bool)")
+            .expect("setup_panic_hook must exist");
+        let rest = &src[from..];
+        let end = rest
+            .find("\nfn stdout_is_terminal()")
+            .expect("setup_panic_hook is followed by stdout_is_terminal");
+        let hook = &rest[..end];
+        assert!(
+            hook.contains("std::panic::set_hook")
+                && hook.contains("ui::restore()")
+                && hook.contains("commit_from_panic()"),
+            "the panic hook must restore the terminal and flush the session bundle"
+        );
+        assert!(
+            hook.contains("catch_unwind"),
+            "the hook must stay panic-safe, so a panic cannot hang the process"
+        );
+
+        let main_fn = main_fn_text(&src);
+        let stop_watch = main_fn
+            .find("signal.stop()")
+            .expect("the watcher must be stopped first");
+        let shutdown = main_fn
+            .find("rt.shutdown_timeout(")
+            .expect("the runtime must be shut down with a timeout");
+        assert!(
+            stop_watch < shutdown,
+            "the watcher must be aborted before the runtime is shut down: nothing may be \
+             left awaiting a signal while the process unwinds"
+        );
+    }
+
+    /// Fast start is a contract, not an optimisation: `main` must reach the UI **without
+    /// ever awaiting the MCP boot**, must keep the gate slot's writes inside `main`
+    /// (exactly two of them: the immediate registration of the still-filling manager, and
+    /// the re-registration once the verdict is `Ready`), and must reap MCP children on the
+    /// exit path so no stdio server is orphaned. The only executable proof of that behaviour
+    /// is a real stdio MCP server, which nothing on this host can spawn — so, like the
+    /// sandbox re-entry tests above, it is pinned at the source text.
+    #[test]
+    fn mcp_boot_is_async_and_main_owns_every_gate_write() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("src/main.rs must be readable");
+        // Scope the scan to `main()` itself: the assertions below spell out the very
+        // strings they look for, so a scan of the whole file would match the test too.
+        let main_fn = src
+            .find("fn main() -> Result<()>")
+            .map(|from| {
+                let rest = &src[from..];
+                let end = rest
+                    .find("fn is_sandbox_reentry(")
+                    .expect("`fn is_sandbox_reentry(` must follow main()");
+                rest[..end].to_string()
+            })
+            .expect("main() must stay one function");
+
+        // (a) Nothing on the way into the UI may block on MCP.
+        assert!(
+            main_fn.contains("mcp::McpManager::spawn_boot(rt.handle(), &cfg.mcp_servers)"),
+            "MCP must be started with `spawn_boot` on the runtime main is running on"
+        );
+        assert!(
+            !main_fn.contains("rt.block_on(mcp")
+                && !main_fn.contains("mcp::McpManager::boot(&cfg.mcp_servers)"),
+            "the eager `rt.block_on(McpManager::boot…)` startup must not come back"
+        );
+
+        // (b) The readiness verdict is resolved by a continuation task, in this file:
+        // re-registration on `Ready`, warn-and-retain on `Failed`.
+        assert!(
+            main_fn.contains(".await_ready().await"),
+            "the continuation must await `await_ready`"
+        );
+        assert!(
+            main_fn.contains("mcp::McpBootStatus::Ready =>")
+                && main_fn.contains("mcp::McpBootStatus::Failed(reason)"),
+            "the continuation must branch on the boot verdict"
+        );
+        let writers = main_fn.matches("harness::set_mcp_manager(").count();
+        assert_eq!(
+            writers, 2,
+            "exactly two gate writes belong in main(): the immediate registration of the \
+             still-filling manager and the re-registration once the boot is Ready"
+        );
+
+        // (c) The exit path reaps MCP children between cancelling every worker and
+        // stopping the runtime, bounded so a wedged server can never stall the exit.
+        let cancel = main_fn
+            .find("orchestrator::cancel_all();")
+            .expect("every worker must be cancelled before teardown");
+        let stop = main_fn
+            .find("rt.shutdown_timeout(")
+            .expect("the runtime must be shut down with a timeout");
+        let reap = main_fn
+            .find("shutdown_boot_task()")
+            .expect("the boot task must be aborted on the exit path");
+        assert!(
+            cancel < reap && reap < stop,
+            "the MCP teardown must sit between cancel_all() and shutdown_timeout()"
+        );
+        assert!(
+            main_fn.contains("tokio::time::timeout(std::time::Duration::from_millis(250)"),
+            "the MCP client shutdown must be bounded"
         );
     }
 }

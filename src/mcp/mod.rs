@@ -23,7 +23,7 @@ pub mod http;
 mod http_tests;
 mod protocol;
 
-pub use client::{McpClient, McpManager, McpServerConfig, McpTool};
+pub use client::{McpBootStatus, McpClient, McpManager, McpRegistry, McpServerConfig, McpTool};
 pub use http::HttpSseConnection;
 
 /// The separator that composes an MCP server name with a raw tool name

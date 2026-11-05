@@ -1,5 +1,6 @@
 //! Tool harness: dispatcher and built-in tool implementations.
 
+use crate::mcp::McpBootStatus;
 use crate::tool_names::{
     TERMINAL_GLOB, TERMINAL_GREP_SEARCH, TERMINAL_READ_FILE, TERMINAL_REPLACE,
     TERMINAL_RUN_COMMAND, TERMINAL_SLEEP, TERMINAL_WRITE_FILE, TOOL_ARCHIVE_PLAN, TOOL_CREATE_PLAN,
@@ -10,6 +11,7 @@ use crate::tool_names::{
 };
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub mod common;
 #[cfg(test)]
@@ -139,6 +141,45 @@ pub struct McpToolRejection {
     pub reason: String,
 }
 
+/// How long a single MCP tool call is allowed to wait for the MCP servers to come
+/// up before it gives up and answers the model with a clean tool error.
+///
+/// **10 s.** A stdio server (`command = …`) costs one fork/exec plus the
+/// `initialize` + `tools/list` round trip, and a localhost HTTP/SSE endpoint costs
+/// one connect + two POSTs: milliseconds to a couple of seconds. 10 s absorbs the
+/// cold-start cases that are real on this host (a JVM/Node runtime warming up, a
+/// first container start, a network mount) without turning a tool call into an
+/// open-ended stall, and it stays **far below the transport's own 30 s request
+/// deadline** (`MCP_REQUEST_TIMEOUT`, `src/mcp/http.rs:42` — pinned by
+/// `src/mcp/http_tests.rs:414-419`, and untouched here), so a wedged registry costs
+/// the caller one bounded wait instead of the whole request budget twice: one tool
+/// call is at worst `MCP_READY_TIMEOUT` (boot) + `MCP_REQUEST_TIMEOUT` (the call
+/// itself), never a 60 s "is it still going".
+///
+/// It is never paid by startup or by advertising: the wait lives on the dispatch
+/// path only ([`McpDispatchGate::gate_is_ready`]), and [`allowed_mcp_tools`] stays
+/// synchronous and non-blocking (advertise-late, `docs/mcp_async_design.md`
+/// Decision 4).
+pub(crate) const MCP_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The tool-error text for a registry whose boot has not settled in time.
+fn mcp_still_starting_error(name: &str) -> String {
+    // Name the *server* the model asked about when the wire name parses, so the text
+    // is actionable, and fall back to the requested name verbatim otherwise.
+    let server = crate::mcp::split_composed_name(name)
+        .map(|(server, _)| server)
+        .unwrap_or(name);
+    format!(
+        "MCP server '{server}' is still starting after {}s",
+        MCP_READY_TIMEOUT.as_secs()
+    )
+}
+
+/// The tool-error text for a boot that never brought a single configured server up.
+fn mcp_boot_failed_error(reason: &str) -> String {
+    format!("MCP boot failed: {reason}")
+}
+
 /// The dispatch-visible view of the MCP registry: only names that survived the name
 /// policy can be routed.
 pub struct McpDispatchGate {
@@ -184,9 +225,32 @@ impl McpDispatchGate {
 
     /// Route `name` to the MCP manager, if the policy allows it.
     ///
-    /// Built-in names always lose: a name the built-in dispatcher claims is never
-    /// routed to MCP, even if it somehow reached the allowed set. [`set_mcp_manager`]
-    /// refuses such names at registration; this is the dispatch-time half.
+    /// **The veto stays first, always:** built-in names always lose — a name the
+    /// built-in dispatcher claims is never routed to MCP, even if it somehow reached
+    /// the allowed set. [`set_mcp_manager`] refuses such names at registration; this
+    /// is the dispatch-time half. Everything below widens *inside* the MCP-owns-the-name
+    /// question and can never re-admit a vetoed name.
+    ///
+    /// `allowed` is a **snapshot** taken when the gate was built, and while the boot is
+    /// in flight that snapshot is stale by construction: `src/main.rs` registers the
+    /// gate of the still-filling registry (its `allowed` is empty) and only re-registers
+    /// a recomputed gate once the verdict is `Ready`. Name resolution therefore falls
+    /// back through three steps — the recommended **live-registry** policy (a), chosen
+    /// because re-registration after readiness is itself a race: a request built
+    /// against the *old* advertising can arrive after the old gate was published and
+    /// before the new one is.
+    ///
+    /// 1. the frozen snapshot — the settled case, and the only one that ever applies
+    ///    once the verdict is `Ready` (readiness re-publishes the snapshot);
+    /// 2. the **live registry** (`McpManager::has_tool`), re-checked against the
+    ///    registration verdict, so a tool that landed after this snapshot was taken is
+    ///    dispatchable immediately, and a name the policy refused stays undispatchable;
+    /// 3. while the verdict is *not* settled — `Booting`, or `Failed` (whose gate is
+    ///    never re-published: `src/main.rs` re-registers only on `Ready`) — accept any
+    ///    **policy-valid composed name**. The bounded readiness wait
+    ///    ([`McpDispatchGate::gate_is_ready`]) then either lands the tool or answers a
+    ///    clean tool error, instead of the `UnknownTool`/`Forbidden` dead end this
+    ///    window used to produce.
     pub fn route(&self, name: &str) -> Option<&Arc<crate::mcp::McpManager>> {
         if resolves_to_builtin_handler(name) {
             if self.manager.has_tool(name) {
@@ -196,10 +260,115 @@ impl McpDispatchGate {
             }
             return None;
         }
-        if self.allowed.contains(name) {
+        if self.allowed.contains(name) || self.live_registry_serves(name) {
+            return Some(&self.manager);
+        }
+        // Step 3: an unsettled verdict, and a name that only the composed-name
+        // grammar can describe. Both verdicts below mean the same thing for routing:
+        // the snapshot on this gate predates (or gave up on) the boot.
+        if !matches!(self.manager.status(), McpBootStatus::Ready)
+            && Self::composed_name_is_policy_valid(name)
+        {
             return Some(&self.manager);
         }
         None
+    }
+
+    /// `true` when `name` is a composed MCP name the name policy would accept: it
+    /// parses under the composition grammar and its verdict is `Ok` — which includes
+    /// the built-in veto, because `mcp_registration_verdict` re-runs it.
+    fn composed_name_is_policy_valid(name: &str) -> bool {
+        let Some((server, raw)) = crate::mcp::split_composed_name(name) else {
+            return false;
+        };
+        match mcp_registration_verdict(server, raw) {
+            // The recomposition must be exact: `name` is the wire name a policy-valid
+            // registration of that server/tool pair publishes, nothing else.
+            Ok(qualified) => qualified == name,
+            Err(_) => false,
+        }
+    }
+
+    /// `true` when the **live** registry can answer `name` right now: a policy-valid
+    /// composed name whose server has been booted and registered (see
+    /// `McpManager::boot_one`, which registers the client only after the handshake and
+    /// `tools/list` both succeeded).
+    fn live_registry_serves(&self, name: &str) -> bool {
+        Self::composed_name_is_policy_valid(name) && self.manager.has_tool(name)
+    }
+
+    /// Await this manager's final boot verdict, bounded by [`MCP_READY_TIMEOUT`].
+    ///
+    /// `None` = the budget elapsed with the registry still `Booting`. A
+    /// `Ok(McpBootStatus::Booting)` (the publisher closed mid-boot without publishing a
+    /// verdict; `shutdown_boot_task` publishes `Failed` instead) is treated exactly
+    /// like the elapsed case.
+    async fn await_verdict_within_ready_budget(&self) -> Option<McpBootStatus> {
+        match tokio::time::timeout(MCP_READY_TIMEOUT, self.manager.await_ready()).await {
+            // `Ok(McpBootStatus::Booting)` (the publisher closed mid-boot without ever
+            // publishing a verdict; `shutdown_boot_task` publishes `Failed` instead)
+            // means the same thing as the elapsed case: no verdict inside the budget.
+            Ok(status @ (McpBootStatus::Ready | McpBootStatus::Failed(_))) => Some(status),
+            _ => None,
+        }
+    }
+
+    /// The readiness gate every async MCP dispatch goes through, **before** the tool
+    /// call is made.
+    ///
+    /// `Err(text)` is not an exception: the callers hand the text straight back to the
+    /// model as a `ToolResult::err`, the same channel every other MCP failure uses
+    /// (`MCP tool error: …`), so a still-booting registry reads to the model as a tool
+    /// error and never as a panic, a crash or an `UnknownTool`/`Forbidden` dead end.
+    ///
+    /// Never a wait where there is nothing to wait for:
+    /// * a `Ready` verdict ends the question synchronously — the settled registry is
+    ///   exactly what the snapshot already offers;
+    /// * a `Failed` verdict answers with the boot's own assembled reason;
+    /// * `Booting` **and** the tool already live: its server is up by construction, so
+    ///   the call goes out without waiting on the *global* verdict (one slow server
+    ///   must not stall a call to a server that is already answering).
+    pub(crate) async fn gate_is_ready(&self, name: &str) -> Result<(), String> {
+        match self.manager.status() {
+            McpBootStatus::Ready => return Ok(()),
+            McpBootStatus::Failed(reason) => return Err(mcp_boot_failed_error(&reason)),
+            McpBootStatus::Booting => {}
+        }
+        if self.live_registry_serves(name) {
+            return Ok(());
+        }
+        match self.await_verdict_within_ready_budget().await {
+            Some(McpBootStatus::Ready) => Ok(()),
+            Some(McpBootStatus::Failed(reason)) => Err(mcp_boot_failed_error(&reason)),
+            Some(McpBootStatus::Booting) => Err(mcp_still_starting_error(name)),
+            None => Err(mcp_still_starting_error(name)),
+        }
+    }
+
+    /// Sync twin of [`McpDispatchGate::gate_is_ready`]: the same verdicts and the same
+    /// budget, with the bounded wait driven through [`block_on_safe`] — the bridge
+    /// every synchronous MCP call in this file already uses, and the only way a
+    /// `spawn_blocking` thread (`src/ui/session.rs:2649-2660`, `:3304-3311`) gets a
+    /// reactor *and* a timer for `tokio::time::timeout`: with no runtime around,
+    /// `block_on_safe` builds a current-thread one via `enable_all()`, and inside a
+    /// running runtime it re-enters the live handle. `tokio::time::timeout` on a plain
+    /// thread with no reactor would panic, which is why this half never calls it
+    /// directly.
+    fn gate_is_ready_blocking(&self, name: &str) -> Result<(), String> {
+        match self.manager.status() {
+            McpBootStatus::Ready => return Ok(()),
+            McpBootStatus::Failed(reason) => return Err(mcp_boot_failed_error(&reason)),
+            McpBootStatus::Booting => {}
+        }
+        if self.live_registry_serves(name) {
+            return Ok(());
+        }
+        let waited = block_on_safe(self.await_verdict_within_ready_budget());
+        match waited {
+            Some(McpBootStatus::Ready) => Ok(()),
+            Some(McpBootStatus::Failed(reason)) => Err(mcp_boot_failed_error(&reason)),
+            Some(McpBootStatus::Booting) | None => Err(mcp_still_starting_error(name)),
+        }
     }
 
     /// The names that survived registration, sorted for stable assertions.
@@ -304,14 +473,31 @@ pub fn allowed_mcp_tools(servers: &[String]) -> Vec<crate::mcp::McpTool> {
         .collect()
 }
 
-/// Resolve the manager that is allowed to serve `name` (see [`McpDispatchGate::route`]).
-fn mcp_route(name: &str) -> Option<Arc<crate::mcp::McpManager>> {
-    current_mcp_gate().and_then(|gate| gate.route(name).map(Arc::clone))
+/// Resolve the (`gate`, `manager`) pair that owns `name` for dispatch (see
+/// [`McpDispatchGate::route`]).
+///
+/// The gate is returned with the manager on purpose: both halves of one MCP round
+/// trip — name resolution *and* the bounded readiness wait — must be decided against
+/// the *same* gate, not against two `current_mcp_gate()` lookups that a concurrent
+/// re-registration could disagree with.
+fn mcp_route(name: &str) -> Option<(Arc<McpDispatchGate>, Arc<crate::mcp::McpManager>)> {
+    let gate = current_mcp_gate()?;
+    let manager = Arc::clone(&gate.manager);
+    gate.route(name)?;
+    Some((gate, manager))
 }
 
 /// Execute an MCP tool call, or `None` when no MCP tool is routed for the invocation.
+///
+/// The readiness gate runs on the resolved name **before any `tools/call` goes out**:
+/// a registry that is still booting must not answer as `UnknownTool`/`Forbidden`, and
+/// a boot that failed must say so. Both answers are ordinary tool errors, exactly
+/// like the `MCP tool error: …` of a failing round trip.
 fn dispatch_mcp_sync(tool: &ToolInvocation) -> Option<Result<ToolResult, ToolError>> {
-    let manager = mcp_route(&tool.name)?;
+    let (gate, manager) = mcp_route(&tool.name)?;
+    if let Err(reason) = gate.gate_is_ready_blocking(&tool.name) {
+        return Some(Ok(ToolResult::err(reason)));
+    }
     let mcp_res = block_on_safe(manager.call_tool(&tool.name, &tool.arguments));
     Some(match mcp_res {
         Ok(content) => Ok(ToolResult::ok(content)),
@@ -319,9 +505,13 @@ fn dispatch_mcp_sync(tool: &ToolInvocation) -> Option<Result<ToolResult, ToolErr
     })
 }
 
-/// Async counterpart of [`dispatch_mcp_sync`].
+/// Async counterpart of [`dispatch_mcp_sync`] — same resolution, same readiness gate
+/// (the awaitable form, [`McpDispatchGate::gate_is_ready`]), same tool-error channel.
 async fn dispatch_mcp_async(tool: &ToolInvocation) -> Option<Result<ToolResult, ToolError>> {
-    let manager = mcp_route(&tool.name)?;
+    let (gate, manager) = mcp_route(&tool.name)?;
+    if let Err(reason) = gate.gate_is_ready(&tool.name).await {
+        return Some(Ok(ToolResult::err(reason)));
+    }
     Some(match manager.call_tool(&tool.name, &tool.arguments).await {
         Ok(content) => Ok(ToolResult::ok(content)),
         Err(e) => Ok(ToolResult::err(format!("MCP tool error: {e}"))),
@@ -665,14 +855,19 @@ async fn dispatch_specialist_async(
     // alias normalization), so a built-in handler can never be shadowed by an MCP
     // server. Names the built-ins do not own are served by the MCP tool only if it
     // survived the registration policy (`set_mcp_manager` -> `McpDispatchGate`), and
-    // stay reachable for specialists.
-    if let Some(mcp) = mcp_route(name) {
+    // stay reachable for specialists. The readiness gate runs on the resolved name
+    // before the call, so a specialist's MCP call made while the servers are still
+    // booting waits (bounded) instead of dying as `Forbidden`.
+    if let Some((gate, manager)) = mcp_route(name) {
         if name != TOOL_REBIRTH
             && let Some(ref mut eng) = engine
         {
             eng.reset_consecutive_rebirths();
         }
-        return match mcp.call_tool(name, &tool.arguments).await {
+        if let Err(reason) = gate.gate_is_ready(name).await {
+            return Ok(ToolResult::err(reason));
+        }
+        return match manager.call_tool(name, &tool.arguments).await {
             Ok(content) => Ok(ToolResult::ok(content)),
             Err(e) => Ok(ToolResult::err(format!("MCP tool error: {e}"))),
         };
@@ -1065,13 +1260,18 @@ fn dispatch_specialist(
     }
 
     // Resolution order is the one stated on `dispatch`: built-ins first, MCP last.
-    if let Some(mcp) = mcp_route(name) {
+    // The bounded readiness gate runs on the resolved name before the call, like every
+    // other MCP dispatch site in this file.
+    if let Some((gate, manager)) = mcp_route(name) {
         if name != TOOL_REBIRTH
             && let Some(ref mut eng) = engine
         {
             eng.reset_consecutive_rebirths();
         }
-        let mcp_res = block_on_safe(mcp.call_tool(name, &tool.arguments));
+        if let Err(reason) = gate.gate_is_ready_blocking(name) {
+            return Ok(ToolResult::err(reason));
+        }
+        let mcp_res = block_on_safe(manager.call_tool(name, &tool.arguments));
         return match mcp_res {
             Ok(content) => Ok(ToolResult::ok(content)),
             Err(e) => Ok(ToolResult::err(format!("MCP tool error: {e}"))),
