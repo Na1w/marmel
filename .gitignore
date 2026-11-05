@@ -44,3 +44,19 @@ marmel.toml.cloud
 
 # IDE
 .idea/
+
+# ---------------------------------------------------------------------------
+# Copied crate `crates/zim-search` (ex-kiwix, now a workspace member).
+# The .gitignore shipped INSIDE the copied crate is not inherited by this repo,
+# so the parent must cover the member's own artifacts explicitly here.
+# (Nested Cargo.lock is ignored by cargo inside a workspace — only the
+# workspace-root lock is consulted — but it is still ignored to keep the tree clean.)
+# ---------------------------------------------------------------------------
+crates/zim-search/target/
+crates/zim-search/.fastembed_cache/
+crates/zim-search/.indexes/
+crates/zim-search/indices
+crates/zim-search/indicies
+crates/zim-search/kiwix_dir
+crates/zim-search/Cargo.lock
+crates/zim-search/*.idx.bin

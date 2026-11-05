@@ -1,0 +1,8 @@
+/target
+.fastembed_cache
+.indexes
+indices
+indicies
+kiwix_dir
+*.idx.bin
+/.marmel/

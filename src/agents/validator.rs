@@ -5,7 +5,7 @@
 //! incomplete work with actionable feedback; never inflates pass status.
 //!
 //! Allowed tool namespaces: `delegate_task`, `read_file`, `grep_search`,
-//! `glob`, `pty_*`, `leave_verdict`, `rebirth`, `sleep`.
+//! `glob`, `pty_*`, `leave_verdict`, `rebirth`, `sleep`, `kiwix__*`.
 
 use crate::agents::{Agent, Specialist};
 use async_trait::async_trait;
@@ -62,6 +62,7 @@ impl Specialist for Validator {
             crate::tool_names::TOOL_PTY_LIST,
             "pty__*",
             "pty_*",
+            "kiwix__*",
             crate::tool_names::TOOL_LEAVE_VERDICT,
             crate::tool_names::TOOL_REBIRTH,
             crate::tool_names::TOOL_SLEEP,
@@ -89,6 +90,7 @@ mod tests {
                 crate::tool_names::TOOL_PTY_READ,
                 crate::tool_names::TOOL_LEAVE_VERDICT,
                 crate::tool_names::TOOL_REBIRTH,
+                "kiwix__*",
             ],
             &[
                 crate::tool_names::TOOL_WRITE_FILE,
