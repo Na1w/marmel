@@ -2972,4 +2972,54 @@ session_max_bundle_bytes = 4096
             700
         );
     }
+
+    // ------------------------------------------------- the shipped example file
+    //
+    // `marmel.toml.example` is what users copy, so a registration written there
+    // must survive **marmel's own** deserializer — a generic TOML parser is not
+    // proof. The sibling four-places tests above deliberately leave this leg out
+    // and note the example file is owned by the docs task; this test is the
+    // matching leg for the shipped `kiwix` MCP server registration.
+
+    #[test]
+    fn the_example_registers_and_allowlists_the_kiwix_mcp_server() {
+        let example =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/marmel.toml.example"))
+                .expect("marmel.toml.example must be readable");
+        let partial: PartialConfig =
+            toml::from_str(&example).expect("marmel.toml.example must parse as PartialConfig");
+        let cfg = merge(Config::default(), partial);
+
+        let kiwix = cfg
+            .mcp_servers
+            .get("kiwix")
+            .expect("the example must register [mcp_servers.kiwix]");
+        assert_eq!(
+            kiwix.command.as_deref(),
+            Some("/home/fredrik/marmel/wip/target/release/zim-search"),
+            "the example must ship the workspace-built binary path"
+        );
+        assert_eq!(
+            kiwix.args.join(" "),
+            "mcp --kiwix-dir /mnt/extradisk/kiwix --index /mnt/extradisk/kiwixidx",
+            "the example must ship the mcp subcommand with both data paths"
+        );
+
+        assert_eq!(
+            cfg.orchestration.mcp_servers,
+            vec!["kiwix".to_string()],
+            "[orchestration] must allowlist kiwix for the Manager"
+        );
+        for role in ["coder", "debugger", "researcher", "validator", "generalist"] {
+            assert_eq!(
+                cfg.orchestration
+                    .specialists
+                    .get(role)
+                    .unwrap_or_else(|| panic!("the example must document the {role} role"))
+                    .mcp_servers,
+                vec!["kiwix".to_string()],
+                "{role} must allowlist kiwix"
+            );
+        }
+    }
 }

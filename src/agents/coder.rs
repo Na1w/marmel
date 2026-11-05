@@ -4,7 +4,8 @@
 //! implementation.
 //!
 //! Allowed tool namespaces: `delegate_task`, `write_file`, `replace`,
-//! `read_file`, `run_command`, `grep_search`, `glob`, `rebirth`, `sleep`.
+//! `read_file`, `run_command`, `grep_search`, `glob`, `rebirth`, `sleep`,
+//! `kiwix__*`.
 
 use crate::agents::{Agent, Specialist};
 use async_trait::async_trait;
@@ -35,6 +36,7 @@ impl Specialist for Coder {
             crate::tool_names::TOOL_REBIRTH,
             crate::tool_names::TOOL_SLEEP,
             crate::tool_names::TERMINAL_SLEEP,
+            "kiwix__*",
             crate::tool_names::TOOL_REPLY_TO_ARBITRATOR,
         ]
     }
@@ -58,6 +60,7 @@ mod tests {
             &[
                 crate::tool_names::TOOL_WRITE_FILE,
                 crate::tool_names::TOOL_REBIRTH,
+                "kiwix__*",
             ],
             &[],
             true,

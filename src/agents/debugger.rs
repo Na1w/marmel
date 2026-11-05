@@ -4,7 +4,8 @@
 //! diagnostics, and root-cause analysis.
 //!
 //! Allowed tool namespaces: `delegate_task`, `write_file`, `replace`,
-//! `read_file`, `run_command`, `grep_search`, `glob`, `pty_*`, `rebirth`, `sleep`.
+//! `read_file`, `run_command`, `grep_search`, `glob`, `pty_*`, `rebirth`,
+//! `sleep`, `kiwix__*`.
 
 use crate::agents::{Agent, Specialist};
 use async_trait::async_trait;
@@ -38,6 +39,7 @@ impl Specialist for Debugger {
             crate::tool_names::TOOL_PTY_LIST,
             "pty__*",
             "pty_*",
+            "kiwix__*",
             crate::tool_names::TOOL_REBIRTH,
             crate::tool_names::TOOL_SLEEP,
             crate::tool_names::TERMINAL_SLEEP,
@@ -58,6 +60,7 @@ mod tests {
             &[
                 crate::tool_names::TOOL_RUN_COMMAND,
                 crate::tool_names::TOOL_REBIRTH,
+                "kiwix__*",
             ],
             &[],
             false,

@@ -9,6 +9,21 @@ default-run = "marmel"
 name = "marmel"
 path = "src/main.rs"
 
+# Workspace root: this package (`marmennill`) stays the implicit default target for
+# bare `cargo build/check/test/clippy` legs, so no `default-members` key is needed.
+# The quoted rationale comes from the integration research notes in the OUTER marmel
+# workspace `docs/` directory (i.e. `<marmel>/docs/`, outside this repository):
+# `research_dependency_audit.md` §6 — "when unspecified, the root package will be
+# used". The same layout is documented in this repo under `docs/kiwix_subcrate.md`.
+# CI/gate legs are all bare, `-p`/`--workspace` greps zero hits.
+# `crates/zim-search` is reached over MCP stdio only, so it is a member here but is
+# deliberately NOT a path dependency of `marmennill` (no tantivy/zim in this graph).
+# `semantic` (ONNX/fastembed) stays opt-in manual: CI runs `--all-features`
+# (risk R1) and would force the libonnxruntime link.
+[workspace]
+resolver = "2"
+members = ["crates/zim-search"]
+
 [dependencies]
 # Async runtime & Streams
 tokio = { version = "1.54", features = ["full"] }
