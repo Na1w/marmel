@@ -5168,3 +5168,199 @@ fn a_leading_question_mark_opens_the_legend_in_every_focus_and_types_after_one_c
         );
     }
 }
+
+// ---- t-009: the MCP readiness line on the status band ----------------------
+//
+// Boot is asynchronous, so the first seconds of a session with slow MCP servers show
+// an empty tool snapshot and no reason for it. These pins are the frame half of that
+// readiness UX: what one `TestBackend` pass must show, what the throttled read may
+// and may not do, and where it never runs at all.
+
+/// A manager whose configured server has no transport: the boot reaches its verdict
+/// with no process, no port and no clock, so `Booting → Ready` here is deterministic.
+fn mcp_boot_manager(names: &[&str]) -> std::sync::Arc<crate::mcp::McpManager> {
+    let mut map = std::collections::HashMap::new();
+    for name in names {
+        map.insert(
+            name.to_string(),
+            crate::mcp::McpServerConfig {
+                command: None,
+                args: Vec::new(),
+                env: std::collections::HashMap::new(),
+                url: None,
+                prompt: None,
+            },
+        );
+    }
+    let handle = tokio::runtime::Handle::current();
+    crate::mcp::McpManager::spawn_boot(&handle, &map)
+}
+
+/// (a) The boot window rides a whole frame: while a configured boot is in flight the
+/// band says so, and the counters of row 1 keep counting regardless.
+/// (b) Once the verdict lands the same band states the real counts instead — the
+/// transient wording is replaced, not left beside it.
+/// (c) … and with nothing to report the frame says nothing about MCP at all.
+#[test]
+fn the_mcp_boot_window_settles_inside_the_status_band() {
+    let mut r = m4_renderer();
+    r.mcp_configured = 2;
+    r.mcp_state = Some(state::McpState::Starting {
+        configured: 2,
+        up: 0,
+    });
+    let rows = frame_text(&mut r, 100, 30);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("MCP: starting 2 server(s)")),
+        "the boot window must be on screen while it lasts: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("Tokens")),
+        "row 1 keeps counting whatever the chip does: {rows:?}"
+    );
+
+    r.mcp_state = Some(state::McpState::Settled {
+        up: 1,
+        configured: 2,
+    });
+    let rows = frame_text(&mut r, 100, 30);
+    assert!(
+        rows.iter().any(|row| row.contains("MCP: 1/2 up")),
+        "{rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("starting")),
+        "the transient line is gone once the verdict landed: {rows:?}"
+    );
+
+    r.mcp_state = None;
+    let rows = frame_text(&mut r, 100, 30);
+    for row in &rows {
+        assert!(
+            !row.contains("MCP"),
+            "nothing to report, so no line anywhere in the frame: {row:?}"
+        );
+    }
+}
+
+/// The denominator of every readiness count comes from the config, once, at the only
+/// hand-over a `Config` gets into the renderer — and it is what a session names, not
+/// what came up.
+#[test]
+fn the_configured_server_count_is_seeded_from_the_config_once() {
+    let mut r = TuiRenderer::new();
+    assert_eq!(r.mcp_configured, 0, "nothing configured yet");
+
+    let mut cfg = Config::default();
+    cfg.mcp_servers.insert(
+        "alpha".to_string(),
+        crate::mcp::McpServerConfig {
+            command: None,
+            args: Vec::new(),
+            env: std::collections::HashMap::new(),
+            url: None,
+            prompt: None,
+        },
+    );
+    r.set_thinking_budgets(&cfg);
+    assert_eq!(r.mcp_configured, 1, "the config names one server");
+}
+
+/// (d) The read is never even made for a screen the TUI does not own: the headless
+/// (`--raw`) renderer installs no terminal, and a torn-down terminal owns none. Both
+/// leave the readout untouched, so no readiness line is ever computed for a band that
+/// is not drawn — and the frame of such a renderer shows nothing about MCP.
+#[test]
+fn no_readiness_is_read_for_a_screen_the_tui_never_owned() {
+    let mut r = TuiRenderer::new();
+    r.mcp_configured = 2;
+    assert!(
+        !r.terminal_owned,
+        "a renderer that never called `init` owns no terminal"
+    );
+    assert!(!r.refresh_mcp_state(), "so the read is not made at all");
+    assert!(r.mcp_state.is_none());
+
+    r.terminal_owned = true;
+    r.terminal_torn_down = true;
+    assert!(!r.refresh_mcp_state(), "a torn-down terminal reads neither");
+    assert!(r.mcp_state.is_none());
+
+    let rows = frame_text(&mut r, 100, 30);
+    for row in &rows {
+        assert!(
+            !row.contains("MCP"),
+            "and its band says nothing about MCP: {row:?}"
+        );
+    }
+}
+
+/// The read is throttled, never polled: a pass that lands inside the interval does no
+/// work, and the pass after the interval is the one that sees the verdict — which it
+/// reports back as a change, so the existing 25 ms repaint rule is what puts it on the
+/// screen. Nothing here awaits, sleeps or spins: the boot verdict of this fixture has
+/// already landed, and the renderer reads it through the gate its own call owns.
+#[tokio::test]
+async fn the_readiness_read_stays_throttled_and_reports_its_own_change() {
+    let manager = mcp_boot_manager(&["alpha"]);
+    let gate = crate::harness::build_mcp_gate(&manager);
+    let mut r = TuiRenderer::new();
+    r.terminal_owned = true;
+    r.mcp_configured = 1;
+
+    let outcome = crate::harness::with_mcp_gate(gate, async {
+        // The constructor back-dates the clock, so the first pass reads the window.
+        let first_changed = r.refresh_mcp_state();
+        let first_state = r.mcp_state.clone();
+        // … and a pass straight after it reads nothing at all: same verdict, same
+        // state, and no work done.
+        let second_changed = r.refresh_mcp_state();
+        let second_state = r.mcp_state.clone();
+
+        manager.await_ready().await;
+        r.last_mcp_check = std::time::Instant::now()
+            - std::time::Duration::from_millis(10)
+            - TuiRenderer::MCP_STATE_INTERVAL;
+        let third_changed = r.refresh_mcp_state();
+        let third_state = r.mcp_state.clone();
+        (
+            first_changed,
+            first_state,
+            second_changed,
+            second_state,
+            third_changed,
+            third_state,
+        )
+    })
+    .await;
+
+    assert!(outcome.0, "the first pass reads the boot window");
+    assert_eq!(
+        outcome.1,
+        Some(state::McpState::Starting {
+            configured: 1,
+            up: 0
+        }),
+        "and states it as starting"
+    );
+    assert!(
+        !outcome.2,
+        "a pass inside the interval reads nothing, so nothing changes"
+    );
+    assert_eq!(outcome.3, outcome.1, "and the band is untouched by it");
+
+    manager.shutdown().await;
+    assert!(
+        outcome.4,
+        "the settled verdict reaches the band as a change"
+    );
+    assert_eq!(
+        outcome.5,
+        Some(state::McpState::Settled {
+            up: 0,
+            configured: 1
+        }),
+        "and the settled verdict is stated with the real counts"
+    );
+}

@@ -41,6 +41,7 @@
 
 use super::{fit_spans, spans_width};
 use crate::ui::SubagentDetail;
+use crate::ui::tui::state::McpState;
 use crate::ui::tui::theme::{self, Glyph};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -101,6 +102,16 @@ pub struct StatusData<'a> {
     pub status_line: Option<&'a str>,
     /// Seconds elapsed waiting for backend response.
     pub waiting_secs: Option<f32>,
+    /// The MCP boot readiness this frame may state (issue t-009 readiness UX).
+    ///
+    /// Handed over from renderer state, never read here: the boot verdict arrives
+    /// through `crate::ui::session::mcp_boot_state`, and the chip rules below decide
+    /// what to print. `None` means there is nothing to report — no server configured,
+    /// a settled boot with every configured server up, or no gate in this process —
+    /// and then no chip is drawn at all. It is display-only by construction: the same
+    /// verdict also empties or fills the advertised tool list, and that list is
+    /// computed from the harness gate independently of this row.
+    pub mcp: Option<&'a McpState>,
     // There is deliberately no `follow` / `unseen` pair here any more: the
     // scroll-state chip (`● LIVE` / `↓ N new`) belongs to the transcript pane that
     // owns the viewport, and drawing it here as well put the same chip on screen
@@ -134,6 +145,11 @@ const DROP_PLAN_CHIP: u8 = 2;
 // The queued-steer chip outranks toggles: answers the operator's own question —
 // what happened to the instruction I just typed — and is the only chip that can.
 const DROP_STEERS_CHIP: u8 = 3;
+// …and the MCP readiness chip outranks the queued-steer chip: when MCP tools are
+// missing, a chip that never leaves the row is what turns "my tools vanished" into
+// "MCP is still coming up, 1 of 2 so far". The toggle echoes all reappear the moment
+// the operator toggles them back, so on a bar too narrow for all of them they go first.
+const DROP_MCP_CHIP: u8 = 4;
 
 /// One field of a single-row bar and its place in that row's ladder
 /// (`None` = never dropped).
@@ -563,7 +579,71 @@ fn chips(data: &StatusData<'_>) -> Vec<Field> {
             ],
         });
     }
+    if let Some(state) = data.mcp
+        && let Some(spans) = mcp_chip(state)
+    {
+        chips.push(Field {
+            drop: Some(DROP_MCP_CHIP),
+            flex: false,
+            spans,
+        });
+    }
     chips
+}
+
+/// The MCP readiness chip, or `None` when the state carries nothing to say.
+///
+/// Three strings, all short, all naming the count it is talking about (issue t-009
+/// readiness UX):
+///
+/// * `MCP: starting N server(s)…` while the boot is still in flight — the row the
+///   operator needs the moment their MCP tools are missing, and the reason the
+///   10 s "still starting" tool error stops being a mystery.
+/// * `MCP: up/total up` once the verdict landed and left a gap.
+/// * `MCP: failed — <first reason>` when not one configured server came up.
+///
+/// The chip is deliberately the only MCP surface in this component: it never touches
+/// the advertised tool list, the session prompt or `messages[0]`, so the pinned
+/// wire/charge equality of the Manager schema cannot move with what it prints.
+fn mcp_chip(state: &McpState) -> Option<Vec<Span<'static>>> {
+    match state {
+        McpState::Starting { configured, .. } => Some(vec![Span::styled(
+            // `configured`, not `up`: what the operator is waiting for is the set the
+            // config named, and a boot that has registered one server of five is still
+            // "starting 2 server(s)" for the row's purpose.
+            format!(" MCP: starting {configured} server(s){} ", theme::ELLIPSIS),
+            theme::state_running(),
+        )]),
+        McpState::Settled { up, configured } => Some(vec![Span::styled(
+            format!(" MCP: {up}/{configured} up "),
+            theme::chip_neutral(),
+        )]),
+        McpState::Failed { reason } => Some(vec![
+            Span::styled(" MCP: failed ", theme::state_failed()),
+            Span::styled(short_verdict(reason), theme::chip_muted()),
+        ]),
+    }
+}
+
+/// The first per-server reason of a `Failed` payload, cut to what a status row can
+/// hold. The payload is the per-server failure list joined with `"; "`
+/// (`src/mcp/client.rs:688`): the first entry names the first thing that broke, and
+/// the rest is detail the operator reads in `.marmel/marmel.log`.
+fn short_verdict(reason: &str) -> String {
+    const CELLS: usize = 40;
+    let head = reason.split("; ").next().unwrap_or(reason).trim();
+    let mut out = String::with_capacity(head.len());
+    let mut used = 0usize;
+    for g in unicode_segmentation::UnicodeSegmentation::graphemes(head, true) {
+        let width = UnicodeWidthStr::width(g);
+        if used + width > CELLS {
+            out.push(theme::ELLIPSIS);
+            break;
+        }
+        out.push_str(g);
+        used += width;
+    }
+    out
 }
 
 /// The three honest states of a pane-presence chip: drawn this frame (`on`),
@@ -767,6 +847,7 @@ mod tests {
             spinner: None,
             status_line: None,
             waiting_secs: None,
+            mcp: None,
         }
     }
 
@@ -784,6 +865,14 @@ mod tests {
             ctx_limit: ctx.1,
             elapsed: Some(723),
             ..data(workers, false)
+        }
+    }
+
+    /// The bar with an MCP readiness line handed over (issue t-009 readiness UX).
+    fn mcp_bar<'a>(state: &'a McpState) -> StatusData<'a> {
+        StatusData {
+            mcp: Some(state),
+            ..data(&[], false)
         }
     }
 
@@ -1773,5 +1862,141 @@ mod tests {
                 "idle tail must not have spinner frame: {tail:?}"
             );
         }
+    }
+
+    // ---- MCP readiness line (issue t-009 readiness UX) --------------------
+    //
+    // Boot is asynchronous, so for the first seconds of a session the advertised MCP
+    // tool snapshot is empty and nothing on screen says why. These pins are the
+    // display half of that fix: the verdict arrives through `StatusData::mcp` (it is
+    // read off renderer state, never off the harness at frame time), and the chip is
+    // the only thing this component ever says about it — it is not a tool, not a wire
+    // field, and not part of `messages[0]`.
+
+    /// (a) The boot window is visible while it lasts, and names the servers the
+    /// config asked for rather than a guess at what came up.
+    #[test]
+    fn the_boot_window_shows_until_the_last_configured_server() {
+        let starting = McpState::Starting {
+            configured: 2,
+            up: 0,
+        };
+        let rows = draw(120, 2, &mcp_bar(&starting));
+        assert!(
+            rows[1].contains("MCP: starting 2 server(s)"),
+            "the boot window must be on screen while it lasts: {rows:?}"
+        );
+        // The metrics row keeps counting regardless (the t-009b rule): the chip lives
+        // on the chip row, so it can never take the counters away.
+        assert!(rows[0].contains("Tokens"), "{rows:?}");
+    }
+
+    /// (b) The transient line is replaced, not kept beside the counters, once the
+    /// verdict lands: what remains states the real counts.
+    #[test]
+    fn the_boot_window_gives_way_to_the_real_counts_when_it_settles() {
+        let settled = McpState::Settled {
+            up: 1,
+            configured: 2,
+        };
+        let rows = draw(120, 2, &mcp_bar(&settled));
+        assert!(rows[1].contains("MCP: 1/2 up"), "{rows:?}");
+        assert!(
+            !rows[1].contains("starting"),
+            "the transient wording is gone once the verdict landed: {rows:?}"
+        );
+    }
+
+    /// (c) Nothing is drawn when there is nothing to report — no server configured,
+    /// a settled boot with every configured server up, or no gate in the process.
+    #[test]
+    fn nothing_is_said_when_there_is_nothing_to_say() {
+        for width in [120u16, 80, 60] {
+            let rows = draw(width, 2, &data(&[], false));
+            for row in &rows {
+                assert!(
+                    !row.contains("MCP") && !row.contains("server"),
+                    "no MCP configured at {width} cols, no line: {row:?}"
+                );
+            }
+        }
+    }
+
+    /// A verdict that refused every server says so, and says which one first. Only
+    /// the first entry of the joined per-server payload is echoed; the rest lives in
+    /// `.marmel/marmel.log`.
+    #[test]
+    fn a_failed_verdict_names_the_first_reason_it_met() {
+        let failed = McpState::Failed {
+            reason: "failed to start MCP server 'fs': No such file or directory (os error 2); \
+                     failed to start MCP server 'db': connection timed out"
+                .to_string(),
+        };
+        let rows = draw(120, 2, &mcp_bar(&failed));
+        assert!(rows[1].contains("MCP: failed"), "{rows:?}");
+        assert!(
+            rows[1].contains("failed to start MCP server 'fs'"),
+            "{rows:?}"
+        );
+        assert!(
+            !rows[1].contains("'db'"),
+            "the second entry is not echoed on the row: {rows:?}"
+        );
+    }
+
+    /// … and the cut is marked, so a long diagnosis never looks like the whole of it.
+    #[test]
+    fn a_long_reason_is_cut_with_the_mark_that_names_the_cut() {
+        let long = McpState::Failed {
+            reason: format!("{}; the second server", "x".repeat(200)),
+        };
+        let rows = draw(120, 2, &mcp_bar(&long));
+        assert!(rows[1].contains('…'), "the cut is marked: {rows:?}");
+        assert!(
+            !rows[1].contains("second server"),
+            "and it is a cut, not a wrap: {rows:?}"
+        );
+    }
+
+    /// The §7.4 ladder: the readiness chip is the last chip a narrow bar gives up —
+    /// it is the one chip that explains a missing tool — while row 1 keeps counting
+    /// whatever happens to the chips.
+    #[test]
+    fn the_readiness_chip_outranks_the_toggle_echoes_on_a_narrow_bar() {
+        let settled = McpState::Settled {
+            up: 1,
+            configured: 2,
+        };
+        let rows = draw(18, 2, &mcp_bar(&settled));
+        assert!(rows[0].contains("Tokens"), "row 1 keeps counting: {rows:?}");
+        assert!(
+            rows[1].contains("MCP: 1/2 up"),
+            "the readiness chip is still on a narrow bar: {rows:?}"
+        );
+        for toggle in ["plan:", "workers:", "think:"] {
+            assert!(
+                !rows[1].contains(toggle),
+                "{toggle} went before the readiness chip: {rows:?}"
+            );
+        }
+    }
+
+    /// (d) The chip row only exists when the bar has one: a terminal the §2.5 ladder
+    /// collapses to a single status row keeps its counters and drops every chip,
+    /// readiness chip included. The headless (`--raw`) renderer draws no status bar at
+    /// all, and `TuiRenderer::refresh_mcp_state` never even reads the verdict until a
+    /// terminal is owned — both pinned in `tui::tests_new_ui`.
+    #[test]
+    fn a_collapsed_one_row_bar_carries_no_readiness_chip() {
+        let starting = McpState::Starting {
+            configured: 2,
+            up: 0,
+        };
+        let rows = draw(80, 1, &mcp_bar(&starting));
+        assert_eq!(rows.len(), 1, "one row as the ladder left it: {rows:?}");
+        assert!(
+            !rows[0].contains("MCP"),
+            "no chip row, so no readiness chip: {rows:?}"
+        );
     }
 }

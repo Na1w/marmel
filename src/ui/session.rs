@@ -221,6 +221,65 @@ pub fn sync_manager_tool_schema(ctx: &mut ContextEngine, cfg: &Config) -> usize 
 }
 
 // ---------------------------------------------------------------------------
+// MCP readiness, for the operator's eye only (t-009 readiness UX)
+// ---------------------------------------------------------------------------
+
+/// The MCP boot verdict the TUI may print on its status band, or `None` when there is
+/// nothing to say.
+///
+/// Boot is asynchronous (`mcp::McpManager::spawn_boot`, registered by `src/main.rs`
+/// before the UI starts): for the first seconds of a session the advertised
+/// tool-snapshot is empty and the operator cannot tell `not yet` from `not
+/// configured`, because the verdict lines land in `.marmel/marmel.log` and are
+/// invisible in the TUI. This is the only readiness read the UI layer performs, and
+/// it is made entirely through accessors that were already public and already
+/// synchronous:
+///
+/// * [`crate::harness::get_mcp_manager`] (`src/harness/mod.rs:448`) — the same
+///   gate read every advertiser already goes through (`current_mcp_gate` behind
+///   `allowed_mcp_tools`); task-local under [`crate::harness::with_mcp_gate`],
+///   process-global otherwise.
+/// * `mcp::McpManager::status()` (`src/mcp/client.rs:696`) — a `watch` receiver
+///   borrow: never a wait, never a poll loop.
+/// * `mcp::McpManager::booted_server_count()` (`src/mcp/client.rs:773`) — one
+///   registry read guard; the same count `src/main.rs` states at exit.
+///
+/// Nothing here awaits, and nothing here is wire-visible: what this returns is drawn
+/// on the status band and nowhere else. The advertised tool list is computed from the
+/// gate by `manager_wire_tools` / `build_request` on its own, so the pinned
+/// wire/charge equality (`budget_tests::charged_manager_schema_is_exactly_the_wire_schema`)
+/// is untouched by whatever this prints.
+///
+/// `configured` is `Config::mcp_servers.len()` — the servers the config names, not the
+/// servers that came up. The TUI is handed it once, at the single place a `Config`
+/// reaches the renderer (`TuiRenderer::set_thinking_budgets`). It is the denominator
+/// of every count the band prints, and the reason a session with **no** MCP servers
+/// configured gets no line at all instead of an empty one.
+pub fn mcp_boot_state(configured: usize) -> Option<crate::ui::tui::state::McpState> {
+    use crate::mcp::McpBootStatus as Boot;
+
+    // Nothing named in config: no readiness to report, and no noise saying so.
+    if configured == 0 {
+        return None;
+    }
+    // No gate in this process means nothing is booting: say nothing, rather than
+    // invent a state the harness never had.
+    let manager = crate::harness::get_mcp_manager()?;
+    let up = manager.booted_server_count();
+    match manager.status() {
+        Boot::Booting => Some(crate::ui::tui::state::McpState::Starting { configured, up }),
+        // Every named server came up: settled, and settled needs no announcement.
+        Boot::Ready if up >= configured => None,
+        Boot::Ready => Some(crate::ui::tui::state::McpState::Settled { up, configured }),
+        // The abort sentinel (`McpBootStatus::BOOT_ABORT_REASON`) says this process is
+        // going away mid-boot, not that the servers are broken — `src/main.rs` already
+        // draws that distinction at exit, and the band stays quiet about it.
+        Boot::Failed(ref reason) if Boot::is_boot_abort_reason(reason) => None,
+        Boot::Failed(reason) => Some(crate::ui::tui::state::McpState::Failed { reason }),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Boot-time restore: the ONE exact restore pass
 // ---------------------------------------------------------------------------
 

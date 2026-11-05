@@ -450,6 +450,37 @@ impl UiView {
     }
 }
 
+/// The MCP boot verdict in the only shape the status bar is allowed to state
+/// (issue t-009 readiness UX).
+///
+/// A **display** view model, and the whole point of it is what it never does: the
+/// text derived from it is drawn on the status band and nothing else. It is never a
+/// tool, never a wire field, never part of the session-pinned prompt — the advertised
+/// tool list (`llm::stream::build_request`, `manager::context::manager_wire_tools`)
+/// is computed from the harness gate on its own, so what this enum says and what the
+/// model is told about MCP cannot drift apart.
+///
+/// It is produced by [`crate::ui::session::mcp_boot_state`], which reads the boot
+/// verdict through the harness gate (`harness::get_mcp_manager` →
+/// `McpManager::status` / `booted_server_count`) — a synchronous read, so no frame,
+/// no session loop and no `tokio` task ever waits on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpState {
+    /// The boot is still in flight: `configured` servers were named in config and
+    /// `up` of them hold a live client at this instant (a boot registers servers one
+    /// at a time while the overall verdict stays `Booting`).
+    Starting { configured: usize, up: usize },
+    /// The verdict landed and it left a gap: `up` of `configured` servers came up.
+    /// Only ever produced while `up < configured` — with every configured server up
+    /// there is nothing to report, and the read path hands back `None` instead.
+    Settled { up: usize, configured: usize },
+    /// No configured server came up, and `reason` is the payload
+    /// `mcp::McpBootStatus::Failed` carries (the per-server failure list). The
+    /// boot-abort sentinel never reaches this variant: it says the process is going
+    /// away, not that the servers are broken.
+    Failed { reason: String },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

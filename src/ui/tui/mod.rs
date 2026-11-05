@@ -6,7 +6,7 @@ mod render;
 
 mod components;
 mod layout;
-mod state;
+pub(crate) mod state;
 mod theme;
 
 pub use formatting::*;
@@ -439,6 +439,20 @@ pub struct TuiRenderer {
     pub(crate) last_render: std::time::Instant,
     pub(crate) waiting_for_token_since: Option<std::time::Instant>,
     pub(crate) last_plan_check: std::time::Instant,
+    /// Throttle for [`Self::refresh_mcp_state`], mirroring `last_plan_check`: the MCP
+    /// boot verdict is read at most once per [`Self::MCP_STATE_INTERVAL`], on the
+    /// entry-path cadence that already exists, and never on a clock of its own.
+    pub(crate) last_mcp_check: std::time::Instant,
+    /// How many MCP servers the config names (`Config::mcp_servers.len()`), i.e. the
+    /// denominator of every readiness count. `0` means none were configured, and the
+    /// readiness line is then never drawn at all. Written once, by
+    /// [`Self::set_thinking_budgets`] — the only place a `Config` reaches this
+    /// renderer.
+    pub(crate) mcp_configured: usize,
+    /// The MCP readiness the status band may state this frame (`None` = draw nothing).
+    /// Display-only by construction: it is never a tool, never a wire field, never
+    /// part of the session-pinned prompt.
+    pub(crate) mcp_state: Option<state::McpState>,
     pub(crate) plan_mtime: Option<std::time::SystemTime>,
     pub(crate) archive_mtime: Option<std::time::SystemTime>,
     pub(crate) plan_is_archived: bool,
@@ -582,6 +596,13 @@ impl TuiRenderer {
             last_plan_check: std::time::Instant::now()
                 .checked_sub(Duration::from_secs(10))
                 .unwrap_or_else(std::time::Instant::now),
+            // Back-dated like `last_plan_check`, so the first frame of a session reads
+            // the boot verdict immediately instead of waiting out the interval.
+            last_mcp_check: std::time::Instant::now()
+                .checked_sub(Duration::from_secs(10))
+                .unwrap_or_else(std::time::Instant::now),
+            mcp_configured: 0,
+            mcp_state: None,
             plan_mtime: None,
             archive_mtime: None,
             plan_is_archived: false,
@@ -614,6 +635,12 @@ impl TuiRenderer {
         };
         self.default_thinking_budget = global_budget;
         self.max_context_tokens = cfg.max_context_tokens;
+        // The readiness line needs to know how many servers the config **names**, so
+        // that a session which configures none prints nothing at all, and a session
+        // with a gap prints a real fraction. This is the one hand-over where a
+        // `Config` reaches the renderer, so the count is seeded here and never
+        // re-read.
+        self.mcp_configured = cfg.mcp_servers.len();
         self.thinking_budgets.clear();
         for (role, spec) in &cfg.orchestration.specialists {
             if let Some(b) = spec.max_thinking_tokens {
@@ -740,6 +767,10 @@ impl TuiRenderer {
         // Audit D5: the process-wide counters are read exactly once per painted
         // frame, right here, and the frame below reads only the snapshot.
         self.refresh_global_token_snapshot();
+        // Same once-per-painted-frame discipline for the MCP readiness line: the read
+        // is throttled (`MCP_STATE_INTERVAL`), so a frame that is being painted for
+        // another reason picks the current verdict up without any extra pass.
+        let _ = self.refresh_mcp_state();
         self.frame_counter = self.frame_counter.wrapping_add(1);
         let Some(mut terminal) = self.terminal.take() else {
             return Ok(());
@@ -981,6 +1012,9 @@ impl TuiRenderer {
                 queued_steers: self.queued_steers(),
                 spinner: self.spinner_char(),
                 status_line: Some(&self.status_line),
+                // The MCP readiness line, from renderer state (never a live read at
+                // frame time, so the frame stays a pure function of it — audit D5).
+                mcp: self.mcp_state.as_ref(),
                 waiting_secs: self
                     .waiting_for_token_since
                     .map(|s| s.elapsed().as_secs_f32()),
@@ -1512,12 +1546,58 @@ impl TuiRenderer {
         }
     }
 
+    /// How long the MCP readiness read may sit before it is re-read.
+    ///
+    /// The interval is a throttle, not a poll: the read happens only on a pass the
+    /// entry path already makes ([`Self::drain_and_throttle_flush`] — the input wait
+    /// the session loop is already sitting in) or on a frame that is being painted
+    /// anyway (`render_terminal`). A boot that never lands costs at most one `watch`
+    /// borrow per half second, and an idle terminal stays idle.
+    pub(crate) const MCP_STATE_INTERVAL: Duration = Duration::from_millis(500);
+
+    /// One throttled read of the MCP boot verdict for the status band (t-009
+    /// readiness UX).
+    ///
+    /// Returns whether the readout **changed**, which is how a verdict that lands
+    /// while the operator sits at the prompt reaches the screen: the drain pass that
+    /// saw it marks the frame dirty and the existing 25 ms throttle repaints it. No
+    /// new timer, no await, no spinner, and no second reader of the gate — the read
+    /// is `crate::ui::session::mcp_boot_state`, which goes through the harness gate
+    /// with the synchronous accessors `mcp::McpManager::status` /
+    /// `booted_server_count` already expose.
+    ///
+    /// Nothing is read at all when the TUI has no screen to state it on: the headless
+    /// (`--raw`) renderer never installs a terminal, and a torn-down terminal has no
+    /// row left to paint, so both leave the readout untouched.
+    pub(crate) fn refresh_mcp_state(&mut self) -> bool {
+        if !self.terminal_owned || self.terminal_torn_down {
+            return false;
+        }
+        if self.last_mcp_check.elapsed() < Self::MCP_STATE_INTERVAL {
+            return false;
+        }
+        self.last_mcp_check = std::time::Instant::now();
+        let readout = crate::ui::session::mcp_boot_state(self.mcp_configured);
+        if readout == self.mcp_state {
+            return false;
+        }
+        self.mcp_state = readout;
+        true
+    }
+
     /// Drain pending terminal events and apply render-throttling:
     /// - Force a full re-render when terminal events were handled.
     /// - When state is dirty (new events, tokens, status updates), flush up to 40 FPS (25 ms).
     /// - When an animated spinner is active, flush at 8 FPS (125 ms).
     /// - When completely idle and clean, do NOT re-render (0% CPU idle).
     pub(crate) fn drain_and_throttle_flush(&mut self, blocking: bool) {
+        // The MCP readiness line rides the cadence that already exists: this is the
+        // pass the input wait makes anyway, and a readout that changed gets the frame
+        // marked dirty so the settled verdict reaches the screen inside the existing
+        // throttle (see `refresh_mcp_state`).
+        if self.refresh_mcp_state() {
+            self.dirty = true;
+        }
         let handled = self.handle_events(blocking);
         // The key path still writes the pre-rebuild view fields directly (t-011
         // moves those keys onto the transition helpers), so every pass through
