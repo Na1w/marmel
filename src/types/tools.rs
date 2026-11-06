@@ -130,14 +130,16 @@ impl ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
                 name: TOOL_REPLACE.to_string(),
-                description: "Replace an exact, unique block of text within a file. Supports multiline blocks; include surrounding context to select one occurrence. Use successive calls for separate edits. Fails if old_str matches 0 or >1 times."
+                description: "Replace text in a file, atomically. Default mode='exact' requires one unique literal match and supports multiline blocks. Optional mode='regex' treats old_str as a Rust regex, requires a positive expected_matches count, and replaces all matches only if that count agrees. Regex new_str supports ${1}/${name} capture references and $$ for a literal dollar sign; use (?m) for multiline anchors and (?s) for dot matching newlines. Invalid patterns or count mismatches leave the file unchanged."
                     .to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "Relative path to the file." },
-                        "old_str": { "type": "string", "description": "Exact text block to replace." },
-                        "new_str": { "type": "string", "description": "New text block to insert." }
+                        "old_str": { "type": "string", "description": "Exact text block, or Rust regex pattern when mode='regex'." },
+                        "new_str": { "type": "string", "description": "Replacement text; regex mode expands ${1}/${name} captures and $$ escapes a dollar sign." },
+                        "mode": { "type": "string", "enum": ["exact", "regex"], "description": "Default: exact. Use regex for structured replacements across multiple occurrences." },
+                        "expected_matches": { "type": "integer", "minimum": 1, "description": "Required only in regex mode: exact number of matches expected before any write." }
                     },
                     "required": ["path", "old_str", "new_str"]
                 }),

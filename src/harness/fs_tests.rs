@@ -1,6 +1,89 @@
 use super::*;
 use std::fs;
 
+#[test]
+fn regex_replace_expands_captures_and_supports_multiline_patterns() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("file.txt");
+    fs::write(&path, "name: alpha\nvalue: 1\nname: beta\nvalue: 2\n").unwrap();
+    let result = replace(&serde_json::json!({
+        "path": path,
+        "mode": "regex",
+        "old_str": r"(?m)^name: (?P<name>\w+)\nvalue: (\d+)$",
+        "new_str": "${name} = ${2} $$",
+        "expected_matches": 2,
+    }))
+    .unwrap();
+    assert!(!result.is_error, "{}", result.content);
+    assert_eq!(
+        fs::read_to_string(path).unwrap(),
+        "alpha = 1 $\nbeta = 2 $\n"
+    );
+}
+
+#[test]
+fn regex_replace_rejects_bad_parameters_and_counts_without_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("file.txt");
+    let original = "item1 item2\n";
+    fs::write(&path, original).unwrap();
+    let base = serde_json::json!({
+        "path": path,
+        "old_str": r"item\d",
+        "new_str": "changed",
+        "mode": "regex",
+        "expected_matches": 2,
+    });
+    for patch in [
+        serde_json::json!({"expected_matches": null}),
+        serde_json::json!({"expected_matches": 0}),
+        serde_json::json!({"expected_matches": -1}),
+        serde_json::json!({"expected_matches": 1.5}),
+        serde_json::json!({"expected_matches": "2"}),
+        serde_json::json!({"expected_matches": 1}),
+        serde_json::json!({"expected_matches": 3}),
+        serde_json::json!({"old_str": "absent"}),
+        serde_json::json!({"old_str": "["}),
+        serde_json::json!({"mode": "unknown"}),
+        serde_json::json!({"mode": false}),
+        serde_json::json!({"mode": "exact"}),
+    ] {
+        let mut args = base.clone();
+        for (key, value) in patch.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        let result = replace(&args).unwrap();
+        assert!(result.is_error, "must reject {args}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+    let mut missing_count = base;
+    missing_count
+        .as_object_mut()
+        .unwrap()
+        .remove("expected_matches");
+    assert!(replace(&missing_count).unwrap().is_error);
+    assert_eq!(fs::read_to_string(path).unwrap(), original);
+}
+
+#[test]
+fn exact_replace_keeps_regex_syntax_and_dollars_literal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("file.txt");
+    for mode in [None, Some("exact")] {
+        fs::write(&path, "before [item.*] after").unwrap();
+        let mut args = serde_json::json!({
+            "path": path,
+            "old_str": "[item.*]",
+            "new_str": "${1} $$",
+        });
+        if let Some(mode) = mode {
+            args["mode"] = mode.into();
+        }
+        assert!(!replace(&args).unwrap().is_error);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "before ${1} $$ after");
+    }
+}
+
 fn temp_dir() -> std::path::PathBuf {
     tempfile::tempdir().unwrap().keep()
 }
