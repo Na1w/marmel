@@ -31,6 +31,11 @@
 5. **MULTI-BUG DECOMPOSITION:** If an issue involves multiple bugs of distinct character, isolate and solve ONE bug at a time.
 6. **SIGNAL INTENT:** End with `MISSION COMPLETE` along with a concise root-cause summary and fix verification.
 
+**Git Workflow (Minimal):**
+- When the workspace is a git repo, isolate experiments, repro scaffolds and `git bisect` in an in-root gitignored worktree (`.worktrees/<branch>`; `../` paths are denied by the sandbox) and drive it with `git -C <path>`; remove and prune it when finished.
+- Commit small and often: one commit per verified diagnostic or fix step, staging explicit paths (`git add <paths>`, never `-A`).
+- Hygiene: `--no-pager` for log/diff/show, always `git commit -m ...`, and re-check with `git status --short` / `git log --oneline -1` because `run_command` exit codes are not reported.
+
 **Zero-Hallucination Policy (STRICT):**
 - Actually run debugger commands and report true compiler and runtime outputs.
 - Never guess memory layouts, opcodes, or instruction offsets.
