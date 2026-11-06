@@ -53,13 +53,29 @@
 //!    `NO_COLOR=` (empty) is *not* "off" — the convention defines presence with
 //!    content as the switch, so an empty value leaves colour on
 //!    (`no_color_empty_does_not_disable_colour`).
-//! 2. `TERM=dumb`, or `TERM` absent/empty → monochrome. A ratatui app still
-//!    needs ANSI to draw anything, but `dumb`/unlabelled is a promise that the
-//!    named colours are not mapped to anything readable, so nothing is painted.
-//!    The palette also stops depending on background fills there: `band_surface`
-//!    and `caret_line` drop `bg(BAND)` and the band chips drop their fill, so a
-//!    `dumb` profile is never handed a fill it may not render.
-//! 3. Anything else → the designed palette, byte-identical to before this layer
+//! 2. `TERM=dumb` → monochrome. A ratatui app still needs ANSI to draw anything,
+//!    but `dumb` is a promise that the named colours are not mapped to anything
+//!    readable, so nothing is painted. The palette also stops depending on
+//!    background fills there: `band_surface` and `caret_line` drop `bg(BAND)` and
+//!    the band chips drop their fill, so a `dumb` profile is never handed a fill
+//!    it may not render.
+//! 3. `TERM` present, non-empty and not `dumb` → the designed palette: a labelled
+//!    profile is a colour contract, on either host.
+//! 4. `TERM` absent/empty/whitespace, [`Host::Unix`] → monochrome. An unlabelled
+//!    Unix profile may not be trusted with the named colours.
+//! 5. `TERM` absent/empty/whitespace, [`Host::Windows`] → colour **iff stdout is
+//!    a terminal**, monochrome otherwise. `TERM` is a terminfo name and does not
+//!    exist on Windows at all (`cmd.exe`/conhost never sets it; Windows Terminal
+//!    exports only `WT_SESSION`/`WT_PROFILE_ID`), so its absence there means
+//!    "unlabelled" only because the label cannot exist — the honest substitute is
+//!    "is a console attached". `crossterm` enables
+//!    `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on `CONOUT$` when it enters the alt
+//!    screen and falls back to `SetConsoleTextAttribute` when ANSI is unsupported,
+//!    so the named ANSI-16 ramp of design rule 2 renders in `cmd.exe` either way.
+//!    The substitute is deliberately conservative: a redirected stdout still gets
+//!    no colour. `NO_COLOR` and `TERM=dumb` sit above this rule on both hosts, so
+//!    the accessibility contract is unchanged.
+//! 6. Anything else → the designed palette, byte-identical to before this layer
 //!    existed.
 //!
 //! In monochrome a style keeps its **modifiers** (`BOLD`, `ITALIC`) and drops
@@ -214,49 +230,120 @@ const BAND: Color = Color::DarkGray;
 /// 16/256/truecolour ladder — design rule 2 keeps the ramp named, so the only
 /// thing worth detecting is *whether to use colour at all*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Capability {
+pub(super) enum Capability {
     /// Named ANSI-16 colours are emitted: the palette exactly as specified.
     Colour,
     /// No `fg` and no `bg` at all; modifiers, glyphs and words carry the signal.
     Monochrome,
 }
 
-/// The rule set as a pure function of the two environment variables the
-/// convention defines. It takes the values rather than reading them because a
-/// test that reads or writes process globals is charged another test's traffic
+/// The platform whose console semantics apply, as a **value** rather than a
+/// `#[cfg]` fork — the same shape as `harness::fs::PathFamily`.
+///
+/// The reason is the same too: the Windows branch has to be *compiled and
+/// asserted on Linux and macOS*. A `#[cfg(windows)]`-only body would be a guard
+/// that never runs in CI's Linux test job, so the Windows answer below is pinned
+/// by [`capability_of`]'s tests on every host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Host {
+    /// `TERM` is meaningful here: it is the terminfo name the profile exports.
+    Unix,
+    /// `TERM` does not exist here (conhost and Windows Terminal never export it),
+    /// so an attached console is the only honest capability signal.
+    Windows,
+}
+
+impl Host {
+    /// The host this binary was **built** for — the value every production call
+    /// site passes. `cfg!` (not `#[cfg]`) keeps both arms compiled everywhere.
+    const fn current() -> Self {
+        if cfg!(windows) {
+            Host::Windows
+        } else {
+            Host::Unix
+        }
+    }
+}
+
+/// The rule set as a pure function of everything that decides it: the host, the
+/// two environment variables the convention defines, and whether stdout is a
+/// terminal. It takes those as values rather than reading them because a test
+/// that reads or writes process globals is charged another test's traffic
 /// (`docs/fix_notice_reply_flakiness.md` §7), and the palette's rules must be
 /// pinned without mutating the environment of the test binary.
 ///
 /// Order matters: an explicit operator preference (`NO_COLOR`) beats a terminal
-/// that claims capability.
-fn capability_of(no_color: Option<&str>, term: Option<&str>) -> Capability {
+/// that claims capability, and both beat the platform fallback.
+///
+/// The platform only moves the **absent `TERM`** cell. An absent `TERM` means
+/// "unlabelled", and on Windows the label simply does not exist — `TERM` is a
+/// terminfo name, and neither `cmd.exe`/conhost nor Windows Terminal exports it.
+/// The honest substitute there is "is a console attached", which is conservative:
+/// a redirected stdout still gets no colour. `crossterm` enables
+/// `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on `CONOUT$` when it enters the alternate
+/// screen and falls back to `SetConsoleTextAttribute` when ANSI is unsupported, so
+/// the named ANSI-16 ramp this palette uses renders in `cmd.exe` either way.
+pub(super) fn capability_of(
+    host: Host,
+    no_color: Option<&str>,
+    term: Option<&str>,
+    stdout_is_terminal: bool,
+) -> Capability {
     // no-color.org: the value is never parsed, only presence *with content* is
     // the switch. `NO_COLOR=` is therefore not "off", and `NO_COLOR=0` is.
     if no_color.is_some_and(|value| !value.is_empty()) {
         return Capability::Monochrome;
     }
-    // An absent, empty or whitespace-only `TERM` does not mean "uncoloured", it
-    // means "unlabelled": the only honest reading is that the named colours may
-    // not be mapped to anything readable, so nothing is painted.
     match term.map(str::trim).filter(|value| !value.is_empty()) {
-        None => Capability::Monochrome,
+        // `dumb` is a promise that the named colours are not mapped to anything
+        // readable, on any host.
         Some(value) if value.eq_ignore_ascii_case("dumb") => Capability::Monochrome,
+        // A labelled, non-`dumb` profile is a colour contract, on any host.
         Some(_) => Capability::Colour,
+        // An absent, empty or whitespace-only `TERM` means "unlabelled". What
+        // that implies is the one host-dependent cell: on Unix nothing may be
+        // painted, on Windows the missing label is substituted by the console
+        // probe (see the doc comment above).
+        None => match host {
+            Host::Unix => Capability::Monochrome,
+            Host::Windows if stdout_is_terminal => Capability::Colour,
+            Host::Windows => Capability::Monochrome,
+        },
     }
 }
 
 /// The one environment read, done at most once per process — the same shape as
 /// the `OnceLock` probe in `harness::sandbox::kernel_has_landlock`, so a frame
-/// never pays for `getenv`.
+/// never pays for `getenv`. The console probe is `std::io::IsTerminal` (std, no
+/// dependency), the same call `main::stdout_is_terminal` uses.
 fn resolved_capability() -> Capability {
     static CACHED: std::sync::OnceLock<Capability> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
         #[cfg(test)]
         ENV_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        capability_of(
-            std::env::var("NO_COLOR").ok().as_deref(),
-            std::env::var("TERM").ok().as_deref(),
-        )
+        let host = Host::current();
+        let no_color = std::env::var("NO_COLOR").ok();
+        let term = std::env::var("TERM").ok();
+        let stdout_is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdout());
+        let capability = capability_of(
+            host,
+            no_color.as_deref(),
+            term.as_deref(),
+            stdout_is_terminal,
+        );
+        // One line, once per process, naming every input that decided it. The
+        // `NO_COLOR` *value* is never logged: the convention says it is never
+        // parsed, so echoing it would invite exactly the reading the rule
+        // forbids — whether it was set (with content) is the whole signal.
+        tracing::info!(
+            host = ?host,
+            no_color_set = no_color.is_some_and(|value| !value.is_empty()),
+            term = term.as_deref().unwrap_or("<unset>"),
+            stdout_is_terminal,
+            ?capability,
+            "terminal colour capability resolved"
+        );
+        capability
     })
 }
 
@@ -280,9 +367,16 @@ fn capability() -> Capability {
 // Thread-local on purpose — libtest runs the tests of one binary in parallel
 // threads sharing one process, so a process-global override would leak into
 // unrelated tests exactly like `std::env::set_var` does.
+//
+// `pub(super)` so the crate-level §7.1 palette contract suite
+// (`ui::tui::tests`) can put a *decided* profile in force: it feeds the answer
+// `capability_of` gives for a concrete host/`NO_COLOR`/`TERM`/console
+// combination into the palette and asserts the slots that come back, instead of
+// re-testing the rule table. Visibility only — the cell, its type and the
+// resolution order are unchanged.
 #[cfg(test)]
 thread_local! {
-    static FORCED_CAPABILITY: std::cell::Cell<Option<Capability>> =
+    pub(super) static FORCED_CAPABILITY: std::cell::Cell<Option<Capability>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -1176,69 +1270,217 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Capability layer (research §F9): NO_COLOR / TERM, cached once
+    // Capability layer (research §F9, t-006): NO_COLOR / TERM / host console,
+    // resolved once. Both hosts are pinned here, on every platform.
     // -----------------------------------------------------------------------
+
+    /// Both hosts, always — the Windows arm of [`capability_of`] must be compiled
+    /// and asserted on Linux/macOS, not only on a Windows runner.
+    const HOSTS: [Host; 2] = [Host::Unix, Host::Windows];
 
     #[test]
     fn no_color_empty_does_not_disable_colour() {
         // no-color.org: presence *with content* is the switch, so an empty value
-        // is not "off" and colour stays on.
-        for term in ["xterm-256color", "tmux-256color", "linux"] {
-            assert_eq!(
-                capability_of(Some(""), Some(term)),
-                Capability::Colour,
-                "`NO_COLOR=` must not disable colour (TERM={term})"
-            );
+        // is not "off" and colour stays on. Host-independent (rule 3), and the
+        // console probe must not matter while a `TERM` label exists.
+        for host in HOSTS {
+            for stdout_is_terminal in [true, false] {
+                for term in ["xterm-256color", "tmux-256color", "linux"] {
+                    assert_eq!(
+                        capability_of(host, Some(""), Some(term), stdout_is_terminal),
+                        Capability::Colour,
+                        "`NO_COLOR=` must not disable colour ({host:?}, TERM={term})"
+                    );
+                }
+            }
         }
-        // The value is never parsed, so the "false-ish" spellings still disable.
-        for value in ["1", "0", "false", "auto", " "] {
-            assert_eq!(
-                capability_of(Some(value), Some("xterm-256color")),
-                Capability::Monochrome,
-                "`NO_COLOR={value:?}` disables colour by convention"
-            );
+        // The value is never parsed, so the "false-ish" spellings still disable
+        // (rule 1 beats a labelled `TERM` on either host).
+        for host in HOSTS {
+            for value in ["1", "0", "false", "auto", " "] {
+                assert_eq!(
+                    capability_of(host, Some(value), Some("xterm-256color"), true),
+                    Capability::Monochrome,
+                    "`NO_COLOR={value:?}` disables colour by convention ({host:?})"
+                );
+            }
         }
         // An explicit preference beats a terminal that claims capability.
-        assert_eq!(
-            capability_of(Some("1"), Some("dumb")),
-            Capability::Monochrome,
-            "both signals point the same way"
-        );
-        assert_eq!(
-            capability_of(Some("1"), None),
-            Capability::Monochrome,
-            "`NO_COLOR` alone is enough"
-        );
+        for host in HOSTS {
+            assert_eq!(
+                capability_of(host, Some("1"), Some("dumb"), true),
+                Capability::Monochrome,
+                "both signals point the same way ({host:?})"
+            );
+            assert_eq!(
+                capability_of(host, Some("1"), None, true),
+                Capability::Monochrome,
+                "`NO_COLOR` alone is enough, even on a Windows console ({host:?})"
+            );
+        }
     }
 
     #[test]
     fn dumb_or_absent_term_degrades_to_monochrome() {
-        for term in [None, Some(""), Some("   "), Some("dumb"), Some("Dumb")] {
-            assert_eq!(
-                capability_of(None, term),
-                Capability::Monochrome,
-                "TERM={term:?} is not a colour contract"
-            );
+        // `TERM=dumb` (rule 2) is a promise that the named colours are not mapped
+        // to anything readable — true on both hosts, console attached or not.
+        for host in HOSTS {
+            for stdout_is_terminal in [true, false] {
+                for term in ["dumb", "Dumb", "DUMB", " dumb "] {
+                    assert_eq!(
+                        capability_of(host, None, Some(term), stdout_is_terminal),
+                        Capability::Monochrome,
+                        "TERM={term:?} is not a colour contract ({host:?})"
+                    );
+                }
+            }
         }
-        for term in [
-            "xterm",
-            "xterm-256color",
-            "tmux-256color",
-            "screen-256color",
-            "vt100",
-            "linux",
-        ] {
-            assert_eq!(
-                capability_of(None, Some(term)),
-                Capability::Colour,
-                "TERM={term} is a labelled profile"
-            );
+        // An absent/empty `TERM` is "unlabelled". On **Unix** that still means
+        // monochrome, console attached or not (rule 4) — the intent this test
+        // always pinned.
+        for term in [None, Some(""), Some("   ")] {
+            for stdout_is_terminal in [true, false] {
+                assert_eq!(
+                    capability_of(Host::Unix, None, term, stdout_is_terminal),
+                    Capability::Monochrome,
+                    "Unix TERM={term:?} is not a colour contract"
+                );
+            }
+        }
+        // A labelled profile is a colour contract on either host (rule 3).
+        for host in HOSTS {
+            for term in [
+                "xterm",
+                "xterm-256color",
+                "tmux-256color",
+                "screen-256color",
+                "vt100",
+                "linux",
+            ] {
+                assert_eq!(
+                    capability_of(host, None, Some(term), false),
+                    Capability::Colour,
+                    "TERM={term} is a labelled profile ({host:?})"
+                );
+            }
         }
         // With no `NO_COLOR` and a capable `TERM`, the designed palette is used.
         assert_eq!(
-            capability_of(None, Some("xterm-256color")),
+            capability_of(Host::Unix, None, Some("xterm-256color"), true),
             Capability::Colour
         );
+    }
+
+    /// Regression guard for the `cmd.exe` defect (t-006): `TERM` does not exist on
+    /// Windows, so reading its absence as "uncoloured" blanked the whole TUI on a
+    /// real console. Fails if the Windows absent-`TERM` cell ever silently returns
+    /// `Monochrome` while a console is attached.
+    #[test]
+    fn windows_absent_term_with_a_console_attached_keeps_colour() {
+        for term in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                capability_of(Host::Windows, None, term, true),
+                Capability::Colour,
+                "a Windows console attached with TERM={term:?} must keep the palette"
+            );
+        }
+        // The substitute stays conservative: a redirected stdout gets no colour
+        // (rule 6), so the fix cannot turn `marmel > file` into ANSI bytes.
+        for term in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                capability_of(Host::Windows, None, term, false),
+                Capability::Monochrome,
+                "a redirected stdout is not a colour contract (TERM={term:?})"
+            );
+        }
+        // The production call site passes `Host::current()`, so the arm above is
+        // the one a Windows build actually reaches.
+        assert_eq!(
+            Host::current() == Host::Windows,
+            cfg!(windows),
+            "Host::current() must follow the build platform"
+        );
+    }
+
+    /// The full rule table, literal inputs, **both** hosts, on any host:
+    ///
+    /// | # | Host | `NO_COLOR` | `TERM` | stdout tty | Result |
+    /// |---|---|---|---|---|---|
+    /// | 1 | any | non-empty | any | any | `Monochrome` |
+    /// | 2 | any | absent/empty | `dumb` | any | `Monochrome` |
+    /// | 3 | any | absent/empty | present, not `dumb` | any | `Colour` |
+    /// | 4 | `Unix` | absent/empty | absent/empty | any | `Monochrome` |
+    /// | 5 | `Windows` | absent/empty | absent/empty | `true` | `Colour` |
+    /// | 6 | `Windows` | absent/empty | absent/empty | `false` | `Monochrome` |
+    #[test]
+    fn capability_rule_table_holds_for_every_host() {
+        let absent_terms: [Option<&str>; 3] = [None, Some(""), Some("   ")];
+        let labels = ["xterm-256color", "tmux-256color", "linux"];
+
+        for host in HOSTS {
+            for stdout_is_terminal in [true, false] {
+                // Rule 1 — an explicit operator preference beats every other
+                // signal, including a Windows console.
+                for term in [None, Some(""), Some("   "), Some("dumb"), Some(labels[0])] {
+                    assert_eq!(
+                        capability_of(host, Some("1"), term, stdout_is_terminal),
+                        Capability::Monochrome,
+                        "rule 1 ({host:?}, TERM={term:?}, tty={stdout_is_terminal})"
+                    );
+                }
+
+                // Rule 2 — `dumb`, trimmed and ASCII-case-insensitive, is
+                // monochrome on either host; `NO_COLOR=` does not change that.
+                for term in ["dumb", "Dumb", "DUMB", " dumb "] {
+                    assert_eq!(
+                        capability_of(host, None, Some(term), stdout_is_terminal),
+                        Capability::Monochrome,
+                        "rule 2 ({host:?}, TERM={term:?}, tty={stdout_is_terminal})"
+                    );
+                    assert_eq!(
+                        capability_of(host, Some(""), Some(term), stdout_is_terminal),
+                        Capability::Monochrome,
+                        "rule 2 with `NO_COLOR=` ({host:?}, TERM={term:?})"
+                    );
+                }
+
+                // Rule 3 — a labelled, non-`dumb` profile is a colour contract on
+                // either host, console attached or not.
+                for term in labels {
+                    assert_eq!(
+                        capability_of(host, None, Some(term), stdout_is_terminal),
+                        Capability::Colour,
+                        "rule 3 ({host:?}, TERM={term}, tty={stdout_is_terminal})"
+                    );
+                }
+            }
+
+            // Rules 4/5/6 — the only host-dependent cell: absent/empty `TERM`.
+            for term in absent_terms {
+                // Rules 4/5: with a console attached the answer is the one cell
+                // that moves between hosts.
+                let attached = match host {
+                    Host::Unix => Capability::Monochrome,
+                    Host::Windows => Capability::Colour,
+                };
+                assert_eq!(
+                    capability_of(host, None, term, true),
+                    attached,
+                    "rules 4/5 ({host:?}, TERM={term:?}, tty=true)"
+                );
+                assert_eq!(
+                    capability_of(host, Some(""), term, true),
+                    attached,
+                    "rules 4/5 with `NO_COLOR=` ({host:?}, TERM={term:?})"
+                );
+                // Rules 4/6: no console attached means no colour, on either host.
+                assert_eq!(
+                    capability_of(host, None, term, false),
+                    Capability::Monochrome,
+                    "rules 4/6 ({host:?}, TERM={term:?}, tty=false)"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1428,7 +1670,7 @@ mod tests {
         // terminal `degrade` changes nothing, so no slot value moved.
         let _colour = Forced::colour();
         assert_eq!(
-            capability_of(None, Some("xterm-256color")),
+            capability_of(Host::Unix, None, Some("xterm-256color"), true),
             Capability::Colour
         );
         for (name, style) in slots().into_iter().chain(aliases()) {
