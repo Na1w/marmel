@@ -709,4 +709,6 @@ cargo fmt --all -- --check
 
 ## License
 
-No license is declared in this repository yet: the `marmennill` package (and the `zim-search` crate under `crates/`) carries no `license` field in its `Cargo.toml`, and there is no `LICENSE` file in the repository root — so no license terms are stated anywhere in the tree, and no `LICENSE` link can be pointed at. Until a license file is added, treat the sources as all-rights-reserved rather than MIT-licensed.
+Marmel, including the `zim-search` crate, is licensed under the [MIT License](LICENSE).
+
+Copyright (c) 2026 Fredrik Andersson.
