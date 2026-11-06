@@ -16,6 +16,7 @@ A terminal-driven autonomous coding assistant in Rust. Marmel connects to any Op
   - [Keyboard Shortcuts](#keyboard-shortcuts)
   - [Slash Commands](#slash-commands)
   - [Headless Raw Mode](#headless-raw-mode)
+  - [Terminal Commands (`run_command` & PTY)](#terminal-commands-run_command--pty)
   - [Runtime Directory (`.marmel/`)](#runtime-directory-marmel)
 - [Real-Time Steering & Live Dialogue](#real-time-steering--live-dialogue)
 - [Agent Archetypes & Customization](#agent-archetypes--customization)
@@ -386,6 +387,7 @@ The rebuilt TUI (branch `feature/new-ui`) is a titled-pane layout: a **header** 
 - **Keyboard only.** Mouse capture is not enabled, so terminal-native selection and copy keep working. Scrolling is split per viewport: the transcript body and the plan body take `Up` / `Down` (one line), `PageUp` / `PageDown` (ten lines) and `Home` / `End` for the ends, while in the Workers pane plain `Up` / `Down` scroll the selected worker's **detail log** and `Shift+Up` / `Shift+Down` walk the **roster window** — plain `Up` / `Down` walk the roster instead only where no detail pane is drawn (frame narrower than the 60-column `DETAIL_COLS` floor, `workers_detail_present` in `src/ui/tui/layout.rs`) — and `PageUp` / `PageDown` / `Home` / `End` scroll the selected worker's **detail log**.
 - **One key, one owner: focus decides it.** The keys that could belong to either the composer or a pane — `Up` / `Down` / `PageUp` / `PageDown` / `Home` / `End` — go to the composer **iff** the composer holds focus (`composer_has_focus` in `src/ui/tui/state.rs`) and to a pane viewport otherwise; with the composer focused, `PageUp` / `PageDown` have no owner and do nothing at all. Input history is `Ctrl+Up` / `Ctrl+Down` from **any** focus, and that chord is the **only** history binding there is: plain `Up` / `Down` never recall an entry — with composer focus they move the caret inside a multi-line draft, and where the caret has nowhere to go the press is not claimed at all (no scroll, no repaint, no follow change), while with a pane focused they step that pane by one line. The shape of the draft never decides who gets the key.
 - **Follow never lags the viewport.** The transcript's own border carries the chip: `● LIVE` while following, `↓ N new` for lines below the viewport once you have scrolled away, `↓ follow off` when follow is off and nothing is unseen, plus `scroll <offset>/<max>` whenever there is somewhere to scroll. A scroll that actually moved away from the tail turns follow off; only a scroll that **arrived** back on the tail turns it on; a press with nowhere to go — and a pane with nothing to scroll — states nothing and repaints nothing. Submitting a message never re-arms follow; `Ctrl+F` or `/follow on` does.
+- **Colour is a platform question, not only a `TERM` question.** `NO_COLOR` wins everywhere — any non-empty value turns colour off — and `TERM=dumb` degrades to monochrome whatever else is set. An absent `TERM` means "unlabelled": on Linux and macOS that still means monochrome, exactly as before, while on Windows `TERM` is simply never set (neither `cmd.exe` nor Windows Terminal exports it), so the attached console answers instead — the palette is used when stdout is a console, and monochrome when it is redirected. Monochrome loses no meaning: the foreground and background colours go, while bold, italic, the glyphs and the words that carry the same signal stay.
 - **Degrades cleanly**: below 90 columns the split restacks, below 70 the header sheds optional chips, below 20 rows the status bar drops to one row and the footer legend goes, and below 40×10 a single "Terminal too small" notice is drawn.
 
 ### Keyboard Shortcuts
@@ -469,6 +471,17 @@ Output format:
 - **No input, no commands.** Raw mode never reads stdin: `marmel --raw` with no `[PROMPT]` exits `0` immediately, and slash commands, keyboard shortcuts, and mid-flight steering are unreachable.
 - **Full event vocabulary.** Besides the tags above there are `[steer]`, `[thinking]`, `[status]`, `<agent_tag>:content`, `<agent_tag>:thinking`, and `[delegation] STARTED → …` / `DONE    …` / `FAILED  …`. A `--resume` run additionally labels the replayed pane content and the repair report: `[restored]` echoes each restored transcript line, and `[restore]` / `[restore-warning]` / `[restore-lost]` / `[restore-skipped]` carry the restore summary, the warnings, the lost entries and the panels raw mode cannot redraw. Token counters and queue-state transitions are silent, so headless output is byte-stable.
 - **Logs go to stderr.** In raw mode `tracing` writes to stderr instead of the rotating `.marmel/marmel.log`.
+
+### Terminal Commands (`run_command` & PTY)
+
+`run_command` is the one-shot shell tool carried by the `coder`, `researcher`, `debugger` and `validator` rosters, while the `pty_spawn` / `pty_write` / `pty_read` / `pty_close` / `pty_list` family drives interactive terminal sessions for `debugger` and `validator` (see [Built-In Archetypes](#built-in-archetypes)). Both are bounded by `command_timeout_secs` — 60 seconds by default, 300 at most.
+
+On Windows a one-shot command is not a pseudo-terminal session at all: it runs as a plain child process, and that changes what you get back.
+
+- **The shell is the platform's own.** On Linux and macOS a command runs through `sh -c`, inside the [Landlock sandbox](#security--sandboxing) where the platform provides one. On Windows the shell is `%COMSPEC%` when that variable is set to something non-empty, and `cmd.exe` otherwise; the command payload reaches `cmd /C` **verbatim**, so quoting, `&&`, redirection and paths with spaces behave exactly as they do in a normal `cmd.exe` session, and the working directory is the workspace root. Its stdin is not connected, so a command that waits for input sees end-of-file instead of stalling the run.
+- **The exit status is part of the answer.** A clean exit returns the captured output alone, while a non-zero exit appends one line — `[exit code: N]` — so a failed command no longer reads like a successful one.
+- **Output survives the deadline.** A timeout or an abort appends its notice (`[command timed out after 60s and was killed]`, `[command aborted by cancellation signal]`) to the output captured up to that moment instead of throwing it away, and the whole child process tree is terminated, so nothing keeps running behind the run.
+- **Interactive PTY sessions are unaffected**: `pty_spawn` and its siblings still drive a real pseudo-terminal on Windows as they do on Linux and macOS.
 
 ### Runtime Directory (`.marmel/`)
 
