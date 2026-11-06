@@ -474,7 +474,7 @@ Output format:
 
 ### Terminal Commands (`run_command` & PTY)
 
-`run_command` is the one-shot shell tool carried by the `coder`, `researcher`, `debugger` and `validator` rosters, while the `pty_spawn` / `pty_write` / `pty_read` / `pty_close` / `pty_list` family drives interactive terminal sessions for `debugger` and `validator` (see [Built-In Archetypes](#built-in-archetypes)). Both are bounded by `command_timeout_secs` — 60 seconds by default, 300 at most.
+`run_command` is the one-shot shell tool carried by the `coder`, `researcher`, `debugger` and `validator` rosters, while the `pty_spawn` / `pty_write` / `pty_read` / `pty_close` / `pty_list` family drives interactive terminal sessions for `debugger` and `validator` (see [Built-In Archetypes](#built-in-archetypes)). `run_command` is bounded by `command_timeout_secs` — 60 seconds by default, 300 at most. The interactive tools are not: `pty_spawn` takes no timeout of its own, `pty_write` and `pty_read` wait for a per-call `wait_ms` (300 ms and 0 ms when the caller passes none), and a session left idle for 300 seconds is reaped — which bounds inactivity, not how long a command inside the session may run.
 
 On Windows a one-shot command is not a pseudo-terminal session at all: it runs as a plain child process, and that changes what you get back.
 
