@@ -131,6 +131,7 @@ impl Drop for SessionEnvGuard {
 /// env reads and cwd/`HOME` writes performed here all happen under that lock.
 struct PathIsolation {
     saved_home: Option<OsString>,
+    saved_userprofile: Option<OsString>,
     saved_cwd: PathBuf,
     home_dir: tempfile::TempDir,
     cwd_dir: tempfile::TempDir,
@@ -164,6 +165,10 @@ impl Drop for PathIsolation {
                 Some(home) => std::env::set_var("HOME", home),
                 None => std::env::remove_var("HOME"),
             }
+            match &self.saved_userprofile {
+                Some(profile) => std::env::set_var("USERPROFILE", profile),
+                None => std::env::remove_var("USERPROFILE"),
+            }
         }
     }
 }
@@ -177,6 +182,7 @@ impl SessionEnvGuard {
         let home_dir = tempfile::tempdir().expect("tempdir for the isolated HOME");
         let cwd_dir = tempfile::tempdir().expect("tempdir for the isolated cwd");
         let saved_home = std::env::var_os("HOME");
+        let saved_userprofile = std::env::var_os("USERPROFILE");
         let saved_cwd = std::env::current_dir().expect("the test process must have a cwd");
         // SAFETY: same rationale as `SessionEnvGuard::with_env` — the mutex is
         // held by the guard this method was called on, no other test in this
@@ -184,10 +190,12 @@ impl SessionEnvGuard {
         // happens in `PathIsolation::drop` while that lock is still held.
         unsafe {
             std::env::set_var("HOME", home_dir.path());
+            std::env::remove_var("USERPROFILE");
         }
         std::env::set_current_dir(cwd_dir.path()).expect("the isolated cwd must be enterable");
         PathIsolation {
             saved_home,
+            saved_userprofile,
             saved_cwd,
             home_dir,
             cwd_dir,
@@ -737,6 +745,30 @@ fn load_none_walks_the_home_candidates_in_documented_order() {
         13,
         "`{}` (3rd) must outrank `.config/marmel/marmel.toml` (4th)",
         winner.display()
+    );
+}
+
+#[test]
+fn load_none_falls_back_to_userprofile_when_home_is_unset() {
+    let env_guard = SessionEnvGuard::cleared();
+    let paths = env_guard.isolated_paths();
+
+    // Simulate a Windows shell (cmd.exe / PowerShell) where `HOME` is unset
+    // and `USERPROFILE` points to the user profile directory.
+    // SAFETY: `SessionEnvGuard` holds `SESSION_ENV_TEST_SERIAL` for this test,
+    // and `PathIsolation::drop` restores both `HOME` and `USERPROFILE`.
+    unsafe {
+        std::env::remove_var("HOME");
+        std::env::set_var("USERPROFILE", paths.home());
+    }
+
+    let found = write_candidate(paths.home(), ".marmel/marmel.toml", 19);
+    let cfg = load(None).expect("USERPROFILE must be searched when HOME is unset");
+    assert_eq!(
+        cfg.session_worker_mirror_max_messages,
+        19,
+        "`{}` must be resolved via USERPROFILE when HOME is unset",
+        found.display()
     );
 }
 
