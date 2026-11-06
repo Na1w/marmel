@@ -142,6 +142,20 @@ pub(crate) fn load_system_prompt_with_plan_and_warning(
     if !mcp_block.is_empty() {
         prompt.push_str(&mcp_block);
     }
+    // Git state of the workspace, read from the filesystem only (never by shelling
+    // out to `git`): the Manager is told which half of the git/worktree guidance
+    // applies to this workspace, before the project instructions and plan block.
+    // The session's `git_workflow_policy` decides whether that fragment is appended
+    // at all and how worktree isolation is phrased — the single owner of that
+    // mapping, `crate::config::git_prompt_block`, is called the same way by the
+    // specialist runner.
+    let git_block = crate::config::git_prompt_block(
+        &crate::harness::workspace::detect_git_workspace(&crate::harness::get_workspace_root()),
+        cfg.git_workflow_policy,
+    );
+    if !git_block.is_empty() {
+        prompt.push_str(&git_block);
+    }
     if let Some(instructions) =
         crate::agents::load_project_instructions(&crate::harness::get_workspace_root())
     {
@@ -1714,6 +1728,121 @@ mod tests {
             .expect("load success");
         assert!(single_slot_prompt.contains("Single-Session Backend Scheduling"));
         assert!(single_slot_prompt.contains("emit ONLY ONE"));
+    }
+
+    /// The Manager prompt carries the same detected-git fragment the worker path
+    /// appends: it is embedded once, after the environment block and before the plan
+    /// block, and it states the live workspace's git state (root and branch come
+    /// from the filesystem, not from a `git` subprocess).
+    #[test]
+    fn test_load_system_prompt_appends_detected_git_state_in_fragment_order() {
+        let cfg = Config::default();
+        let plan = crate::manager::phase::Plan::default();
+        let prompt = load_system_prompt_with_plan_and_warning(&cfg, &plan)
+            .map(|(prompt, _warning)| prompt)
+            .expect("load success");
+        let detected =
+            crate::harness::workspace::detect_git_workspace(&crate::harness::get_workspace_root());
+        let block = crate::harness::workspace::format_git_prompt_block(&detected);
+        assert!(
+            !block.is_empty(),
+            "the live workspace root must yield a git verdict either way: {detected:?}"
+        );
+        assert_eq!(
+            prompt.matches("## Git workspace state").count(),
+            1,
+            "the fragment is embedded exactly once"
+        );
+        assert!(
+            prompt.contains(&block),
+            "the composed prompt must embed the detected state verbatim"
+        );
+        assert!(
+            block.contains("git_workflow"),
+            "the fragment points at the procedure"
+        );
+
+        let env_at = prompt
+            .find("## Workspace & Environment")
+            .expect("environment block");
+        let git_at = prompt.find("## Git workspace state").expect("git fragment");
+        let plan_at = prompt
+            .find("## Active Execution Plan")
+            .unwrap_or(prompt.len());
+        assert!(
+            env_at < git_at,
+            "the git fragment follows the environment block"
+        );
+        assert!(
+            git_at < plan_at,
+            "the git fragment precedes the plan block, so the plan is still last"
+        );
+    }
+
+    /// `git_workflow_policy = "off"` silences the fragment on the Manager path as
+    /// well: the composed prompt is the default prompt minus exactly that fragment,
+    /// so nothing else — neither the git text of the role prompts and skills nor any
+    /// other block — is gated on this key.
+    #[test]
+    fn test_load_system_prompt_omits_git_fragment_when_policy_is_off() {
+        let cfg = Config {
+            git_workflow_policy: crate::config::GitWorkflowPolicy::Off,
+            ..Config::default()
+        };
+        let plan = crate::manager::phase::Plan::default();
+        let prompt = load_system_prompt_with_plan_and_warning(&cfg, &plan)
+            .map(|(prompt, _warning)| prompt)
+            .expect("load success");
+        assert_eq!(
+            prompt.matches("## Git workspace state").count(),
+            0,
+            "off must render no git fragment anywhere"
+        );
+
+        let detected =
+            crate::harness::workspace::detect_git_workspace(&crate::harness::get_workspace_root());
+        let fragment = crate::harness::workspace::format_git_prompt_block(&detected);
+        let default_prompt = load_system_prompt_with_plan_and_warning(&Config::default(), &plan)
+            .map(|(prompt, _warning)| prompt)
+            .expect("load success");
+        assert_eq!(
+            prompt,
+            default_prompt.replace(&fragment, ""),
+            "off drops exactly the detected git fragment and nothing else"
+        );
+    }
+
+    /// `git_workflow_policy = "enforce_worktree"` embeds the same detected state,
+    /// with worktree isolation phrased as a requirement rather than a preference.
+    #[test]
+    fn test_load_system_prompt_states_the_worktree_requirement_when_enforced() {
+        let cfg = Config {
+            git_workflow_policy: crate::config::GitWorkflowPolicy::EnforceWorktree,
+            ..Config::default()
+        };
+        let plan = crate::manager::phase::Plan::default();
+        let prompt = load_system_prompt_with_plan_and_warning(&cfg, &plan)
+            .map(|(prompt, _warning)| prompt)
+            .expect("load success");
+        let detected =
+            crate::harness::workspace::detect_git_workspace(&crate::harness::get_workspace_root());
+        let enforced = crate::config::git_prompt_block(
+            &detected,
+            crate::config::GitWorkflowPolicy::EnforceWorktree,
+        );
+        assert!(
+            enforced.contains("REQUIRED"),
+            "the enforced fragment states the requirement: {enforced}"
+        );
+        assert_eq!(
+            prompt.matches("## Git workspace state").count(),
+            1,
+            "the fragment is embedded exactly once"
+        );
+        assert!(
+            prompt.contains(&enforced),
+            "the composed prompt embeds the enforced fragment verbatim"
+        );
     }
 
     /// This owned UI seam is a pure delegation to `crate::task_id`: re-spelling the
