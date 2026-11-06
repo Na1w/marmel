@@ -23,6 +23,8 @@ A terminal-driven autonomous coding assistant in Rust. Marmel connects to any Op
   - [Custom Archetypes (`ARCHETYPES.md`)](#custom-archetypes-archetypesmd)
   - [Project Instructions (`AGENTS.md`)](#project-instructions-agentsmd)
   - [Custom Skills (`skills/`)](#custom-skills-skills)
+- [Offline Reference Search (zim-search + kiwix MCP)](#offline-reference-search-zim-search--kiwix-mcp)
+  - [Build, Index, Register](#build-index-register)
 - [Security & Sandboxing](#security--sandboxing)
 - [Testing](#testing)
 - [License](#license)
@@ -37,7 +39,7 @@ Marmel is designed for autonomous multi-step software engineering with continuou
 - **Dynamic Subagents & JIT Prompt Architect:** Tasks are not sent to static prompts. An Agent Architect dynamically synthesizes a bespoke subagent blueprint (`.marmel/prompts/<task_id>.md`) combining archetype capabilities, domain skills (`skills/`), and least-privilege tool allowlists before delegation.
 - **Automated Validation:** Work produced by specialists is audited by an independent Validator subagent. If tests fail or requirements are missed, feedback is returned for revision. The audit is not unconditional: precedence runs role opt-out (`validator` / `planner`), then operator config (`enable_validator = false` or `max_validator_iterations = 0`), then the per-task `(no-validate)` / `(validate)` plan directive, then the role/config default — and a task designated validation-free still completes normally and checks its box off.
 - **Real-Time Steering & Interactive Dialogue:** You can type into the prompt at any point. Marmel pauses active subagents to answer questions, adjust the execution plan, or converse directly with working agents in real time.
-- **Model Context Protocol (MCP):** Connect external tool servers via stdio or HTTP/SSE using standard MCP configurations.
+- **Model Context Protocol (MCP):** Connect external tool servers via stdio or HTTP/SSE using standard MCP configurations — including the bundled `zim-search` server, which serves offline reference corpora (see [Offline Reference Search](#offline-reference-search-zim-search--kiwix-mcp)).
 - **Workspace Security:** File operations are strictly confined to the workspace. On Linux, terminal commands are isolated using Linux Landlock LSM to protect sensitive directories like `~/.ssh` and `~/.gnupg`.
 
 ```text
@@ -167,7 +169,7 @@ Marmel reads exactly one configuration file — the first candidate below wins, 
 | `preserve_thinking` | `true` | Retain thinking blocks in the session transcript. |
 | `command_timeout_secs` | `60` | Timeout per terminal command or PTY invocation. Valid range `1..=300` seconds; an out-of-range value is logged and clamped into that range, never applied verbatim. |
 | `sandbox_disabled` | `false` | Fail-closed opt-out of the Linux Landlock command sandbox: `true` runs commands unsandboxed and always logs an attributable warning. `MARMEL_DISABLE_SANDBOX=1` is an equivalent escape hatch — either source opts out. |
-| `sandbox_extra_readonly_paths` | `[]` | TOML array of strings: paths the Landlock sandbox additionally allows **read + execute** for, beyond the built-in allow-list (which already covers `/usr`, `/bin`, `/lib`, `/lib64`, `/opt` and the package stores `/nix/store` and `/gnu/store`). For toolchain locations it does not cover — a non-default `store =` prefix in `nix.conf`, a store under another path, another read-only toolchain dir — e.g. `["/mnt/nix/store"]`. Entries must be **absolute**; relative, missing or already-built-in entries are skipped with a warning. Never grants write. Empty ⇒ built-in list only; a non-empty value **replaces** the list rather than appending (same merge semantics as `orchestration.mcp_servers`). See [Extra Sandbox Read-Only Paths](#extra-sandbox-read-only-paths-sandbox_extra_readonly_paths). |
+| `sandbox_extra_readonly_paths` | `[]` | TOML array of strings: paths the Landlock sandbox additionally allows **read + execute** for, beyond the built-in allow-list (which already covers the FHS prefixes `/usr`, `/bin`, `/lib`, `/lib64`, `/opt`, `/etc`, `/dev`, `/proc`, `/sys`, `/run`, `/var` and the package stores `/nix/store` and `/gnu/store`). For toolchain locations it does not cover — a non-default `store =` prefix in `nix.conf`, a store under another path, another read-only toolchain dir — e.g. `["/mnt/nix/store"]`. Entries must be **absolute**; relative, missing or already-built-in entries are skipped with a warning. Never grants write. Empty ⇒ built-in list only; a non-empty value **replaces** the list rather than appending (same merge semantics as `orchestration.mcp_servers`). See [Extra Sandbox Read-Only Paths](#extra-sandbox-read-only-paths-sandbox_extra_readonly_paths). |
 | `max_repetition_threshold` | `5` | Accepted for compatibility and merged, but no longer read: the effective threshold is `[monitoring] repetition_threshold`. |
 | `enable_xml_rescue` | `true` | Parse pseudo-XML tool calls into valid JSON tool calls. |
 | `ui_mode` | `"tui"` | Interface mode: `"tui"` (Ratatui) or `"raw"` (streaming stdout). Raw mode is selected automatically whenever stdout is not a terminal — a pipe or a redirect — even with `"tui"` set. |
@@ -183,9 +185,9 @@ Marmel reads exactly one configuration file — the first candidate below wins, 
 | `[monitoring]` | — | Loop-breaker and stream-budget block: `enabled`, `repetition_threshold` (default `5`), `min_pattern_len` (`5`), `max_stream_tokens` (`32768`), `max_thinking_tokens` (`32768`). |
 | `[orchestration]` | — | Top-level settings: `max_recursion_depth` (default `3`; `0` restores the default), `mcp_servers` (Manager-visible server names), `manager_module`. |
 | `[orchestration.concurrency]` | _unset_ | Simultaneous-session cap per **backend URL + model** pair: `max_sessions` plus quoted per-URL overrides (e.g. `"http://host:8080/v1" = 2`). Unset ⇒ **unlimited** (nothing is metered); `0` ⇒ unlimited plus a warning. See [Session Concurrency](#session-concurrency-orchestrationconcurrency). |
-| `[orchestration.specialists.<role>]` | — | Per-role overrides for `model`, `backend_url`, `auth_token`, `tools`, `mcp_servers`, `reasoning_effort`, and validator settings (`validator_model`, `validator_backend_url`, `validator_auth_token`, `validator_reasoning_effort`, `max_validator_iterations`, `max_fix_loop_rounds`, `enable_validator`). Top-level `max_fix_loop_rounds` is silently dropped — declare it per role (precedence: role, then `[orchestration.specialists.validator]`, then the built-in `200`). |
-| Role ids | — | `coder`, `researcher`, `debugger`, `validator`, `generalist`, `planner` — the only names that resolve. `deepbrain` aliases `generalist`. These are also the `(role)` hints of a plan line; `validator` and `planner` deliverables are never validated, a role opt-out that outranks any `(validate)` directive. |
-| `[mcp_servers.<name>]` | — | External MCP server registration (`command`, `args`, `env`, `url`): exactly one transport, and `command` wins if both `command` and `url` are set. Tools arrive named `<server>__<tool>`. No `enabled`, `timeout`, or `headers` key exists. |
+| `[orchestration.specialists.<role>]` | — | Per-role overrides for `model`, `backend_url`, `auth_token`, `tools`, `mcp_servers`, `reasoning_effort`, `max_thinking_tokens` (aliases `reasoning_budget` / `thinking_budget`), an optional `prompt` (aliases `instructions` / `system_prompt` / `base_prompt`) appended verbatim to that role's system prompt when non-blank, and validator settings (`validator_model`, `validator_backend_url`, `validator_auth_token`, `validator_reasoning_effort`, `max_validator_iterations`, `max_fix_loop_rounds`, `enable_validator`). A `module` key is accepted but informational only — the role → module paths are hard-coded in the registry, so the value is never read at runtime. Top-level `max_fix_loop_rounds` is silently dropped — declare it per role (precedence: role, then `[orchestration.specialists.validator]`, then the built-in `200`). |
+| Role ids | — | `coder`, `researcher`, `debugger`, `validator`, `generalist`, `planner` — the only names that resolve. `deepbrain` resolves as a `(role)` hint / `delegate_task` role name to `generalist`, but it is **not** a config section key: a `[orchestration.specialists.<role>]` block is matched by the canonical role name only, so `[orchestration.specialists.deepbrain]` is never read. These are also the `(role)` hints of a plan line; `validator` and `planner` deliverables are never validated, a role opt-out that outranks any `(validate)` directive. |
+| `[mcp_servers.<name>]` | — | External MCP server registration (`command`, `args`, `env`, `url` and the optional `prompt`, aliases `instructions` / `system_prompt`: free-form text injected into the system prompt of every agent whose allowlist names that server): exactly one transport, and `command` wins if both `command` and `url` are set. Tools arrive named `<server>__<tool>`. No `enabled`, `timeout`, or `headers` key exists. |
 
 ### Example `marmel.toml`
 
@@ -375,20 +377,20 @@ Model, backend URL, and auth token are configuration keys and environment variab
 
 ### Interactive TUI
 
-The rebuilt TUI (branch `feature/new-ui`) is a titled-pane layout: a **header** row, the **Execution Plan**, **Transcript** and **Workers** panes, a two-row **status bar**, the **composer**, and a one-row **key legend** in the footer. The full user guide — screen anatomy, view modes, focus, every binding, the small-terminal ladder, and rendered frames — is in [docs/new_ui.md](docs/new_ui.md).
+The rebuilt TUI (branch `feature/new-ui`) is a titled-pane layout: a **header** row, the **Execution Plan**, **Transcript** and **Workers** panes, a two-row **status bar**, the **composer**, and a one-row **key legend** in the footer. Screen anatomy, view modes, focus, every binding, the small-terminal ladder, and the rendered frames are defined by the code itself: the pane geometry lives in `src/ui/tui/layout.rs`, the key handling in `src/ui/tui/events.rs`, and the authoritative binding legend is generated by `legend()` in `src/ui/tui/components/help.rs`.
 
-- **Four view modes**, chosen with `F2`–`F5` or the pane toggles: `M1 Transcript`, `M2 Plan` (plan in the leading column 55 %, transcript trailing 45 %), `M3 Workers` (same split), `M4 Split` (plan in the wide leading column 60 %, transcript at the head of the trailing side column over workers, 40 %). Wherever both the plan and the transcript are on screen, the plan holds the **leading** slot and the transcript the **trailing** one — the left column of a side-by-side split, the top row when the frame stacks — in every mode and at every size. `Ctrl+P` shows or hides the Plan pane, `Ctrl+A` the Workers pane. Booting with a non-empty `.marmel/execution_plan.md` opens the plan pane, and the first active worker opens the workers pane.
+- **Four view modes**, chosen with `F2`–`F5` or the pane toggles: `M1 Transcript`, `M2 Plan` (transcript in the leading column 55 %, plan trailing 45 %), `M3 Workers` (same split, roster trailing 45 %), `M4 Split` (transcript in the wide leading column 60 %, plan at the head of the trailing side column over workers, 40 %). Wherever the transcript shares the frame with the plan and/or the workers, the transcript holds the **leading** slot and the side panes the **trailing** one — the left column of a side-by-side split, the top row when the frame stacks, the wide column when the side column cannot stack — in every mode and at every size. `Ctrl+P` shows or hides the Plan pane, `Ctrl+A` the Workers pane. Booting with a non-empty `.marmel/execution_plan.md` opens the plan pane, and the first active worker opens the workers pane.
 - **Progress is always on screen.** `✓ 3/7 done` and the task id in flight (`▶ t-004`) are drawn in the header at every size down to the 40×10 floor, and each pane counts its own contents on its bottom border (`✓ 3 done ⧗ 4 open ▶ in flight`, `▶ 1 ⏸ 1 ⧗ 1 ✓ 0`). A worker waiting for a concurrency slot reads `⧗ queued 2/3` — its queue position out of the sessions queued for that backend URL + model pair (see [Session Concurrency](#session-concurrency-orchestrationconcurrency)).
 - **Focus is visible**: a `●` badge in the focused pane's title plus the focus border colour. `Tab` / `Shift+Tab` cycle Input → Transcript → Plan → Workers, skipping panes that are not drawn.
 - **Nothing destructive runs on one keystroke**: `/reset`, `/exit`, `/cancel-all`, `Ctrl+X` and `Ctrl+D` stop at a confirm overlay that names the action and its consequence, answered by `y` / `n` / `Esc`.
-- **Keyboard only.** Mouse capture is not enabled, so terminal-native selection and copy keep working. Scrolling is split per viewport: the transcript body and the plan body take `Up` / `Down` (one line), `PageUp` / `PageDown` (ten lines) and `Home` / `End` for the ends, while in the Workers pane `Up` / `Down` walk the **roster window** and `PageUp` / `PageDown` / `Home` / `End` scroll the selected worker's **detail log**.
+- **Keyboard only.** Mouse capture is not enabled, so terminal-native selection and copy keep working. Scrolling is split per viewport: the transcript body and the plan body take `Up` / `Down` (one line), `PageUp` / `PageDown` (ten lines) and `Home` / `End` for the ends, while in the Workers pane plain `Up` / `Down` scroll the selected worker's **detail log** and `Shift+Up` / `Shift+Down` walk the **roster window** — plain `Up` / `Down` walk the roster instead only where no detail pane is drawn (frame narrower than the 60-column `DETAIL_COLS` floor, `workers_detail_present` in `src/ui/tui/layout.rs`) — and `PageUp` / `PageDown` / `Home` / `End` scroll the selected worker's **detail log**.
 - **One key, one owner: focus decides it.** The keys that could belong to either the composer or a pane — `Up` / `Down` / `PageUp` / `PageDown` / `Home` / `End` — go to the composer **iff** the composer holds focus (`composer_has_focus` in `src/ui/tui/state.rs`) and to a pane viewport otherwise; with the composer focused, `PageUp` / `PageDown` have no owner and do nothing at all. Input history is `Ctrl+Up` / `Ctrl+Down` from **any** focus, and that chord is the **only** history binding there is: plain `Up` / `Down` never recall an entry — with composer focus they move the caret inside a multi-line draft, and where the caret has nowhere to go the press is not claimed at all (no scroll, no repaint, no follow change), while with a pane focused they step that pane by one line. The shape of the draft never decides who gets the key.
 - **Follow never lags the viewport.** The transcript's own border carries the chip: `● LIVE` while following, `↓ N new` for lines below the viewport once you have scrolled away, `↓ follow off` when follow is off and nothing is unseen, plus `scroll <offset>/<max>` whenever there is somewhere to scroll. A scroll that actually moved away from the tail turns follow off; only a scroll that **arrived** back on the tail turns it on; a press with nowhere to go — and a pane with nothing to scroll — states nothing and repaints nothing. Submitting a message never re-arms follow; `Ctrl+F` or `/follow on` does.
 - **Degrades cleanly**: below 90 columns the split restacks, below 70 the header sheds optional chips, below 20 rows the status bar drops to one row and the footer legend goes, and below 40×10 a single "Terminal too small" notice is drawn.
 
 ### Keyboard Shortcuts
 
-The complete 26-row table is the on-screen legend: press `?` or `F1`, or run `/help`. Core bindings:
+The complete 25-row table is the on-screen legend: press `?` or `F1`, or run `/help`. Core bindings:
 
 | Shortcut | Action |
 |---|---|
@@ -404,7 +406,8 @@ The complete 26-row table is the on-screen legend: press `?` or `F1`, or run `/h
 | `Ctrl+F` | Toggle transcript follow — the `● LIVE` / `↓ N new` / `↓ follow off` chip on the transcript border. A scroll that moved away from the tail turns follow off; only a scroll that **lands** on the tail turns it back on. |
 | `?` / `F1` | Keymap and command overlay (`?` only with an empty composer). |
 | `PageUp` / `PageDown` | Scroll the focused pane by 10 lines — in the Workers pane that is the selected worker's **detail log**. With the composer focused the key has no owner and does nothing (the composer has no viewport). |
-| `Up` / `Down` | With composer focus: caret inside a multi-line draft — never history, and where the caret has nowhere to go the press is not claimed at all (no scroll, no repaint, no follow change). With a pane focused: that pane by 1 line — the **roster window** in the Workers pane, never its detail log. History is `Ctrl+Up` / `Ctrl+Down`, from any focus. |
+| `Up` / `Down` | With composer focus: caret inside a multi-line draft — never history, and where the caret has nowhere to go the press is not claimed at all (no scroll, no repaint, no follow change). With a pane focused: that pane by 1 line — the selected worker's **detail log** in the Workers pane; the roster window is walked instead by `Shift+Up` / `Shift+Down`, or by plain `Up` / `Down` only where no detail pane is drawn (frame below 60 columns). History is `Ctrl+Up` / `Ctrl+Down`, from any focus. |
+| `Shift+Up` / `Shift+Down` | In the Workers pane: step the **roster window** (the visible slice of the worker list) without touching the selected worker's detail log. Bound in `scroll_worker_roster_by` (`src/ui/tui/events.rs`); the chord is not one of the 25 printed legend rows. |
 | `←` / `→` | With Workers focused: previous / next worker in the roster (and the pane shows that row's newest detail line); at either end, or with no worker, the caret. Otherwise: caret. |
 | `Home` / `End` | Line start / end in the composer; otherwise the focused viewport's top / bottom — the detail log, not the roster, in the Workers pane. |
 | `Ctrl+X` | Cancel the **selected** worker (opens the confirm overlay; Workers pane focused and at least one row on the roster — otherwise the status line says why, and `/cancel <worker key or task id>` names the row instead). Both spellings stop at the same confirm. |
@@ -444,7 +447,7 @@ Type these directly into the chat input (they match case-insensitively, on line 
 | `/reset` (`/reset_plan`, `/reset-plan`, `/clear_plan`, `/clear-plan`, `/reset_execution_plan`) | Clear the execution plan, session bundle, steering history and transcript, and tell the model (confirm). |
 | `/exit` (`/quit`, `/q`, `/abort`, `/stop`, and the vim spellings `:q` / `:q!`) | Quit the session, cancel running workers, and stamp a `userAbort` ending on the bundle (confirm). |
 
-Command semantics, refusal wording and the autocomplete rules: [docs/new_ui.md §6](docs/new_ui.md).
+Command semantics, refusal wording and the autocomplete rules are implemented in `src/ui/tui/events.rs` (dispatch and refusals) and `src/ui/tui/components/input.rs` (the autocomplete table behind `slash_commands()`).
 
 ### Headless Raw Mode
 
@@ -464,7 +467,7 @@ Output format:
 ```
 
 - **No input, no commands.** Raw mode never reads stdin: `marmel --raw` with no `[PROMPT]` exits `0` immediately, and slash commands, keyboard shortcuts, and mid-flight steering are unreachable.
-- **Full event vocabulary.** Besides the tags above there are `[steer]`, `[thinking]`, `[status]`, `<agent_tag>:content`, `<agent_tag>:thinking`, and `[delegation] STARTED → …` / `DONE    …` / `FAILED  …`. Token counters and queue-state transitions are silent, so headless output is byte-stable.
+- **Full event vocabulary.** Besides the tags above there are `[steer]`, `[thinking]`, `[status]`, `<agent_tag>:content`, `<agent_tag>:thinking`, and `[delegation] STARTED → …` / `DONE    …` / `FAILED  …`. A `--resume` run additionally labels the replayed pane content and the repair report: `[restored]` echoes each restored transcript line, and `[restore]` / `[restore-warning]` / `[restore-lost]` / `[restore-skipped]` carry the restore summary, the warnings, the lost entries and the panels raw mode cannot redraw. Token counters and queue-state transitions are silent, so headless output is byte-stable.
 - **Logs go to stderr.** In raw mode `tracing` writes to stderr instead of the rotating `.marmel/marmel.log`.
 
 ### Runtime Directory (`.marmel/`)
@@ -481,7 +484,7 @@ Internal session files are stored in `.marmel/` within the workspace root:
 | `.marmel/marmel.log` | Rotating application log for TUI mode (5 MiB, 3 backups). Raw mode logs to stderr instead. |
 | `.marmel/debug.log` | LLM and tool traffic, written only under `--debug`. |
 | `.marmel/archive/` | Archived completed execution plans. |
-| `.marmel/session/` | The **session bundle**: the split-file snapshot that `--resume` reads back (see [Session Restore](docs/session_restore.md)). It is a directory, never a single file. |
+| `.marmel/session/` | The **session bundle**: the split-file snapshot that `--resume` reads back (implemented in `src/session/**`: `src/session/mod.rs`, `src/session/commit.rs`, `src/session/format/`, `src/session/restore.rs`). It is a directory, never a single file. |
 | `.marmel/session/manifest.json` | The bundle's root document and **commit point**: format/schema versions, session id, wall/monotonic anchors, how the previous process ended, the identity floors, and the member list with each member's byte length and fingerprint. It is written **LAST** — that rename *is* the commit — and it is the only file that names the member set. |
 | `.marmel/session/manager.json` | Manager member: the message history (pinned system prompt and goal preserved byte-for-byte), the pin witness, and the engine scalars. |
 | `.marmel/session/ui.json` | UI member: pane text (chat, subagents, plan panel), status line, composer text + caret + history, scroll / selection / focus, subagent panels, and the token witnesses. |
@@ -514,15 +517,15 @@ Marmel comes with 6 built-in archetypes preconfigured in the binary, and they ar
 
 | Archetype | Description | Default Tools |
 |---|---|---|
-| **Coder** | System architecture, implementation, refactoring, test suites. | `delegate_task`, `read_file`, `write_file`, `replace`, `run_command`, `grep_search`, `glob`, `rebirth`, `sleep`, `reply_to_arbitrator` |
-| **Researcher** | Codebase reconnaissance, documentation inspection, API contracts. | `delegate_task`, `read_file`, `write_file`, `replace`, `run_command`, `grep_search`, `glob`, `rebirth`, `sleep`, `reply_to_arbitrator` |
-| **Debugger** | Crash forensics, regression isolation, minimal fixes, interactive PTY. | `delegate_task`, `read_file`, `write_file`, `replace`, `run_command`, `grep_search`, `glob`, `pty_*`, `rebirth`, `sleep`, `reply_to_arbitrator` |
-| **Validator** | Independent auditor; runs test suites and issues formal verdicts. | `delegate_task`, `read_file`, `grep_search`, `glob`, `run_command`, `pty_*`, `leave_verdict`, `rebirth`, `sleep`, `reply_to_arbitrator` — no `write_file` or `replace` |
+| **Coder** | System architecture, implementation, refactoring, test suites. | `delegate_task`, `read_file`, `write_file`, `replace`, `run_command`, `grep_search`, `glob`, `rebirth`, `sleep` (the `sleep` grant also carries its `terminal__sleep` alias), the `kiwix__*` MCP wildcard, `reply_to_arbitrator` |
+| **Researcher** | Codebase reconnaissance, documentation inspection, API contracts. | `delegate_task`, `read_file`, `write_file`, `replace`, `run_command`, `grep_search`, `glob`, `rebirth`, `sleep` (plus the `terminal__sleep` alias), `kiwix__*`, `reply_to_arbitrator` |
+| **Debugger** | Crash forensics, regression isolation, minimal fixes, interactive PTY. | `delegate_task`, `read_file`, `write_file`, `replace`, `run_command`, `grep_search`, `glob`, `pty_spawn`, `pty_write`, `pty_read`, `pty_close`, `pty_list`, the `pty__*` and `pty_*` wildcards, `kiwix__*`, `rebirth`, `sleep` (plus the `terminal__sleep` alias), `reply_to_arbitrator` |
+| **Validator** | Independent auditor; runs test suites and issues formal verdicts. | `delegate_task`, `read_file`, `grep_search`, `glob`, `run_command`, `pty_spawn`, `pty_write`, `pty_read`, `pty_close`, `pty_list`, the `pty__*` and `pty_*` wildcards, `kiwix__*`, `leave_verdict`, `rebirth`, `sleep` (plus the `terminal__sleep` alias), `reply_to_arbitrator` — no `write_file` or `replace` |
 | **Generalist** | Polymath for cross-cutting logic and multi-disciplinary tasks. | `*` (every tool, `delegate_task` included) |
-| **Planner** | Mission architect for workspace reconnaissance and phased planning. | `read_file`, `grep_search`, `glob`, `create_plan`, `rebirth`, `sleep`, `reply_to_arbitrator` |
+| **Planner** | Mission architect for workspace reconnaissance and phased planning. | `read_file`, `grep_search`, `glob`, `create_plan`, `rebirth`, `sleep` (plus the `terminal__sleep` alias), `reply_to_arbitrator` |
 
 > [!NOTE]
-> The Manager is restricted to planning (`create_plan`), reading (`read_file`, `grep_search`, `glob`), and delegation (`delegate_task`). It cannot directly modify files (`write_file`, `replace`) or execute commands (`run_command`).
+> The Manager roster is exactly ten tools: planning (`create_plan`, `archive_current_plan`), pausing the loop (`pause_execution`), reading (`read_file`, `grep_search`, `glob`), delegation (`delegate_task`), context compaction and waiting (`rebirth`, `sleep`), and replying to the steer arbitrator (`reply_to_arbitrator`). It cannot directly modify files (`write_file`, `replace`) or execute commands (`run_command`).
 
 Two rules are enforced ahead of any allowlist: `leave_verdict` is Validator-only, and `create_plan` executes only through the Manager — the same call routed through a specialist is refused even when its allowlist or a synthesized blueprint names it. `reply_to_arbitrator` is granted to every specialist unconditionally. A specialist can delegate at all only because `delegate_task` sits in its own allowlist — every built-in except the **Planner** carries it — and only the **Coder** and **Generalist** declare recursion; nested delegation stays bounded by `max_recursion_depth`. A plan line's `(validate)` / `(no-validate)` directive changes only whether that task's deliverable is audited — never which role receives the task — and the **Validator** and **Planner** rows are exempt from validation by role, so no directive buys their audit back.
 
@@ -573,6 +576,45 @@ When a matching task is delegated, the skill content is injected into the specia
 
 ---
 
+## Offline Reference Search (zim-search + kiwix MCP)
+
+Marmel can hand its agents a local copy of Wikipedia. The workspace ships a second binary crate, `zim-search` (`crates/zim-search`, a member of the Cargo workspace), that reads ZIM offline content archives — the Kiwix format, e.g. a full Wikipedia or Stack Exchange dump — indexes them with Tantivy/Okapi BM25 and serves them over MCP (stdio) alongside a local HTTP viewer for humans.
+
+- **Full articles, not snippets:** `read_article` returns whole articles, `search` returns ranked passages, and `list_archives`, `list_articles`, `index_archive` and `get_archive_info` cover discovery and on-demand indexing. A `researcher` subagent can consult a Wikipedia-scale corpus offline — no network, no rate limits — before it reaches for a web tool.
+- **Nothing is compiled in:** the wiring is 100 % config-driven. `mcp_servers` defaults to empty, and `zim-search` is reached over MCP stdio only, so the agent binary never links the archive or index code. You register the server once, in the same `[mcp_servers.<name>]` table as any other external server.
+- **A registered server is visible to workers:** the built-in rosters for `coder`, `researcher`, `debugger` and `validator` already carry a `kiwix__*` wildcard (`generalist` uses `*`, `planner` none), and a server that an allowlist names gets an *MCP Server Guidance* block injected into subagent prompts, so agents know the offline corpus exists and what to use it for. Only `orchestration.mcp_servers` (Manager) and `specialists.<role>.mcp_servers` (specialists) grant MCP tools.
+- **A human-facing viewer too:** `zim-search serve` exposes the same corpus in a browser (`127.0.0.1:8080` by default, `--host` / `--port` to change it), so an operator can inspect an archive outside the agent loop.
+
+### Build, Index, Register
+
+```bash
+# 1. Build the binary from the repo root (no install step; it is a workspace member,
+#    so the artifact lands in the shared target/ dir referenced by the config below).
+cargo build --release -p zim-search                    # -> target/release/zim-search
+
+# 2. Index the corpus into its own index directory (keep it out of the archive tree).
+target/release/zim-search index --kiwix-dir /mnt/extradisk/kiwix --index /mnt/extradisk/kiwixidx
+
+# 3. Try it from the CLI (subcommands: info, list, read, index, search, serve, mcp).
+target/release/zim-search search --kiwix-dir /mnt/extradisk/kiwix --index /mnt/extradisk/kiwixidx "aeration"
+```
+
+Then register it in `marmel.toml` — the shipped `marmel.toml.example` already contains this block (`[mcp_servers.kiwix]`):
+
+```toml
+[mcp_servers.kiwix]
+command = "/home/fredrik/marmel/wip/target/release/zim-search"   # absolute path, as shipped
+args = ["mcp", "--kiwix-dir", "/mnt/extradisk/kiwix", "--index", "/mnt/extradisk/kiwixidx"]
+```
+
+Those six tools then reach agents as `kiwix__list_archives`, `kiwix__list_articles`, `kiwix__search`, `kiwix__read_article`, `kiwix__index_archive` and `kiwix__get_archive_info`. The archive and index locations shown here are the crate defaults — `/mnt/extradisk/kiwix` and `/mnt/extradisk/kiwixidx` — and are named per server through `args` (the legal per-server keys are `command`, `args`, `env`, `url` and `prompt`).
+
+Point the `prompt` key at free-form guidance and it rides along in that *MCP Server Guidance* block, which is how you tell an agent to consult the corpus before it reaches for a web tool. Build the index before the first query: the `mcp` subcommand does not index on its own (`--auto-index` defaults to off there), so run `index` once, or let an agent call `index_archive`.
+
+Registration is optional, and everything about it is opt-in: an MCP server that fails to boot logs a warning and the run continues without it. Retrieval in the default build is **lexical BM25 only** — dense ONNX vectors need the opt-in `semantic` Cargo feature and additionally per-archive opt-in at index time. Both the `search` subcommand and the `search` MCP tool **default to BM25**: vector retrieval runs only when the caller asks for it explicitly (`--mode semantic|hybrid` on the CLI, `mode` on the tool), hybrid fuses the two signals when both are available, and a vector mode requested on an index without vectors degrades to BM25. Automatic hybrid selection — hybrid is *preselected* when an archive in the library carries usable vectors — is a `serve` web-viewer behaviour. The full reference — every flag, tool schema, index layout and HTTP viewer detail — lives in [crates/zim-search/README.md](crates/zim-search/README.md).
+
+---
+
 ## Security & Sandboxing
 
 Marmel is designed to prevent accidental modifications outside the target project:
@@ -606,7 +648,7 @@ Run the test suite:
 cargo test
 ```
 
-The tests live in two places: integration tests under `tests/` (`test_orchestrator.rs`, `test_role_gating.rs`, `test_validation_loop.rs`, `test_dynamic_prompts.rs`, `test_llm_pool.rs`, `test_session_boot.rs`, and the `test_session_restore_*.rs` family) and unit tests beside the code they cover — modules named `*_tests.rs` (`src/harness/fs_tests.rs`, `src/harness/pty_tests.rs`, `src/manager/phase_tests.rs`, `src/orchestrator/steer_tests.rs`, `src/mcp/http_tests.rs`) and inline `#[cfg(test)]` modules inside files such as `src/plan_parse.rs` and `src/agents/prompt_builder.rs`.
+The tests live in two places: integration tests under `tests/` and unit tests beside the code they cover — modules named `*_tests.rs` and inline `#[cfg(test)]` modules inside source files. The names below are a **representative selection**, not the full inventory: `tests/` currently holds 38 standalone integration files and the pattern (`test_<area>*` / `*_tests`) is what matters. Named examples: `test_orchestrator.rs`, `test_role_gating.rs`, `test_validation_loop.rs`, `test_dynamic_prompts.rs`, `test_llm_pool.rs`, `test_session_boot.rs`, and the `test_session_restore_*.rs` family, plus the UI-side `test_new_ui_runtime_smoke.rs`, `test_ui_session.rs`, `test_steer_history.rs`, `test_midturn_notice.rs`, `test_panel_paused_indicator.rs`, `test_subpane_logs_repro.rs`, `test_subpane_queued_refresh.rs`, `test_delegation_queue_events.rs`, and `test_internal_fast_calls.rs`. Unit-test modules include `src/harness/fs_tests.rs`, `src/harness/pty_tests.rs`, `src/manager/phase_tests.rs`, `src/orchestrator/steer_tests.rs`, `src/mcp/http_tests.rs`, `src/ui/tui/tests.rs`, `src/ui/tui/tests_new_ui.rs`, `src/ui/bridge/tests.rs`, `src/ui/session_tests.rs`, `src/orchestrator/notice_tests.rs`, `src/harness/dispatch_integrity_tests.rs`, and `src/harness/tool_resolution_tests.rs`, and inline `#[cfg(test)]` modules inside files such as `src/plan_parse.rs` and `src/agents/prompt_builder.rs`.
 
 The test suite covers:
 - Core orchestration and recursive delegation bounds.
@@ -623,11 +665,11 @@ To verify linting and formatting:
 
 ```bash
 cargo clippy --all-targets --all-features
-cargo fmt -- --check
+cargo fmt --all -- --check
 ```
 
 ---
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+No license is declared in this repository yet: the `marmennill` package (and the `zim-search` crate under `crates/`) carries no `license` field in its `Cargo.toml`, and there is no `LICENSE` file in the repository root — so no license terms are stated anywhere in the tree, and no `LICENSE` link can be pointed at. Until a license file is added, treat the sources as all-rights-reserved rather than MIT-licensed.
