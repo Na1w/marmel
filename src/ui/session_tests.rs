@@ -4196,14 +4196,7 @@ fn archive_failure_key_is_keyed_on_plan_state_not_a_constant_signature() {
     use crate::manager::phase::Plan;
     use crate::ui::session::{archive_attempt_state, archive_failure_key};
 
-    let dir = std::env::temp_dir().join(format!(
-        "marmel_d7_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = std::env::temp_dir().join(crate::test_scratch::scratch_name("marmel_d7"));
     let _ = std::fs::remove_dir_all(&dir);
     let plan = Plan::at(&dir);
 
