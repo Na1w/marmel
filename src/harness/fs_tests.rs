@@ -315,6 +315,21 @@ fn test_harness_read_file_limit_clamping() {
         "omitted limit must default to 4000"
     );
 
+    // 4. stringified or XML-polluted integer limit is parsed gracefully
+    let args_str_limit = serde_json::json!({
+        "path": path.to_string_lossy(),
+        "offset": "100",
+        "limit": "4200\n<parameter+category-evidence-tag>\n15000",
+    });
+    let r_str = read_file(&args_str_limit).unwrap();
+    assert!(!r_str.is_error);
+    assert!(
+        r_str
+            .content
+            .contains("[Showing characters 100-4300 of 10000. Use offset=4300 to read next chunk]"),
+        "stringified/tag-polluted integer limit and offset should be coerced cleanly"
+    );
+
     fs::remove_dir_all(&dir).unwrap();
 }
 

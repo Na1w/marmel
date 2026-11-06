@@ -4452,3 +4452,65 @@ fn the_mcp_readout_never_touches_the_advertise_list() {
         );
     }
 }
+
+#[test]
+fn test_should_run_tool_round_in_parallel_serializes_multi_delegations_on_single_slot_backend() {
+    use crate::types::{ToolCall, ToolFunction};
+    use crate::ui::session::should_run_tool_round_in_parallel;
+
+    let make_call = |id: &str, name: &str, args: &str| ToolCall {
+        id: id.to_string(),
+        kind: "function".to_string(),
+        function: ToolFunction {
+            name: name.to_string(),
+            arguments: args.to_string(),
+        },
+    };
+
+    let delegate_batch = vec![
+        make_call(
+            "c1",
+            crate::tool_names::TOOL_DELEGATE_TASK,
+            r#"{"agent_name":"researcher","task_id":"t-001","prompt":"p1"}"#,
+        ),
+        make_call(
+            "c2",
+            crate::tool_names::TOOL_DELEGATE_TASK,
+            r#"{"agent_name":"researcher","task_id":"t-002","prompt":"p2"}"#,
+        ),
+    ];
+    let read_batch = vec![
+        make_call(
+            "r1",
+            crate::tool_names::TOOL_READ_FILE,
+            r#"{"path":"Cargo.toml"}"#,
+        ),
+        make_call(
+            "r2",
+            crate::tool_names::TOOL_GREP_SEARCH,
+            r#"{"pattern":"name"}"#,
+        ),
+    ];
+
+    let mut cfg = Config::default();
+    assert!(
+        should_run_tool_round_in_parallel(&delegate_batch, &cfg),
+        "uncapped backend should fan out multi-delegations in parallel"
+    );
+
+    cfg.orchestration.concurrency.max_sessions = Some(4);
+    assert!(
+        should_run_tool_round_in_parallel(&delegate_batch, &cfg),
+        "multi-slot backend (max_sessions=4) should fan out multi-delegations in parallel"
+    );
+
+    cfg.orchestration.concurrency.max_sessions = Some(1);
+    assert!(
+        !should_run_tool_round_in_parallel(&delegate_batch, &cfg),
+        "single-slot backend (max_sessions=1) must serialize multi-delegations to preserve KV-cache locality"
+    );
+    assert!(
+        should_run_tool_round_in_parallel(&read_batch, &cfg),
+        "read-only tool batches still fan out in parallel even when max_sessions=1"
+    );
+}

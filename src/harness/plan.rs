@@ -35,6 +35,24 @@ pub(crate) async fn write_plan_internal(
         .unwrap_or(true);
 
     if auto_validate_enabled {
+        let has_execution_plan_header = md
+            .lines()
+            .any(|line| line.trim().eq_ignore_ascii_case("# Execution Plan"));
+        if !has_execution_plan_header {
+            let critique = "Missing required `# Execution Plan` top-level heading. Start the plan with `# Execution Plan`.";
+            tracing::warn!("create_plan rejected by deterministic pre-check: {critique}");
+            return Ok(ToolResult::err(format!(
+                "Execution plan rejected by Strategic Plan Auditor:\n{critique}\n\nPlease revise the execution plan addressing the auditor's critique and call create_plan again."
+            )));
+        }
+        if crate::plan_parse::all_task_ids(md).is_empty() {
+            let critique =
+                "Plan contains no recognizable task items (`- [ ] [t-xxx] Description (role)`).";
+            tracing::warn!("create_plan rejected by deterministic pre-check: {critique}");
+            return Ok(ToolResult::err(format!(
+                "Execution plan rejected by Strategic Plan Auditor:\n{critique}\n\nPlease revise the execution plan addressing the auditor's critique and call create_plan again."
+            )));
+        }
         match crate::agents::validation::run_plan_validation(md, &cfg, &token).await {
             Ok((approved, critique)) => {
                 if !approved {
