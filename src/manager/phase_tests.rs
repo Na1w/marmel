@@ -7,14 +7,7 @@ use std::fs;
 
 /// Create an isolated, unique temp marmel directory.
 fn temp_marmel() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "marmel_plan_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = std::env::temp_dir().join(crate::test_scratch::scratch_name("marmel_plan"));
     let _ = fs::remove_dir_all(&dir);
     dir
 }

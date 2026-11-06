@@ -29,6 +29,12 @@ pub mod prompts;
 pub mod session;
 /// Canonical task-identifier normalization shared by the agents, harness and manager layers.
 pub mod task_id;
+/// Test-only owner of the process-unique scratch-directory names used by the
+/// unit-test binaries (`harness::fs`, `harness::search`, `manager::phase`,
+/// `ui::session`); see the module docs for why the old wall-clock token was not
+/// unique.
+#[cfg(test)]
+pub(crate) mod test_scratch;
 /// Char-boundary-safe truncation/ellipsis helpers shared across layers.
 pub mod text_util;
 /// Single owner of the one-line human preview of a tool call's JSON arguments:

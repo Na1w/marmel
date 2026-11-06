@@ -54,19 +54,14 @@ const MIXED_CASE_SLASH_TARGET: &str =
 /// so it is provably **outside** the `std::env::temp_dir()` allow-list entry —
 /// otherwise a denial test could be made green by the second allow-list entry.
 /// Lives under `target/` (scratch, gitignored).
+/// The name is process-unique through [`crate::test_scratch::scratch_name`]; a
+/// wall-clock token was not (see the module docs), which is what made this
+/// cleanup on macos-latest fail with `NotFound`.
 fn scoped_root_outside_temp() -> PathBuf {
-    let unique = format!(
-        "marmel-path-tests-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock after unix epoch")
-            .as_nanos()
-    );
     let root = std::env::current_dir()
         .expect("cwd for a scoped workspace root")
         .join("target")
-        .join(unique);
+        .join(crate::test_scratch::scratch_name("marmel-path-tests"));
     fs::create_dir_all(&root).expect("create scoped workspace root scratch dir");
     assert!(
         !root.starts_with(std::env::temp_dir()),

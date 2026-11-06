@@ -62,15 +62,10 @@ fn normalize_expected(paths: &[&str]) -> Vec<String> {
 /// The temp dir handed to the tools is a plain, non-canonicalized path, exactly
 /// what a caller would pass; only the *returned* strings are normalized for
 /// comparison (see [`normalize_for_compare`]).
+/// The name is process-unique through [`crate::test_scratch::scratch_name`], so
+/// two concurrently running tests can never share one fixture directory.
 fn temp_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "marmel_search_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = std::env::temp_dir().join(crate::test_scratch::scratch_name("marmel_search"));
     fs::create_dir_all(&dir).unwrap();
     dir
 }
