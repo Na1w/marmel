@@ -183,6 +183,7 @@ Marmel reads exactly one configuration file — the first candidate below wins, 
 | `session_max_bundle_bytes` | `33554432` | Bundle size ceiling (32 MiB). |
 | `system_prompt_path` | `prompts/system.md` | Replacement Manager prompt file; `~` is expanded and a relative path resolves against the current directory. |
 | `base_prompt` | _unset_ | Extra text appended to the Manager prompt under `## Machine Specific Guidance`. |
+| `git_workflow_policy` | `"auto"` | Closed string-enum for the git-workflow prompt behaviour, validated when the config file is read: `"auto"` autodetects the workspace git state and injects a `## Git workspace state` block into the Manager prompt and every specialist prompt, `"off"` suppresses that block, `"enforce_worktree"` states isolated `git worktree` use as a requirement instead of a preference. Git guidance in the role prompts and in the built-in `git_workflow` skill is never gated on it. See [Git Workflow & Worktrees](#git-workflow--worktrees). |
 | `[monitoring]` | — | Loop-breaker and stream-budget block: `enabled`, `repetition_threshold` (default `5`), `min_pattern_len` (`5`), `max_stream_tokens` (`32768`), `max_thinking_tokens` (`32768`). |
 | `[orchestration]` | — | Top-level settings: `max_recursion_depth` (default `3`; `0` restores the default), `mcp_servers` (Manager-visible server names), `manager_module`. |
 | `[orchestration.concurrency]` | _unset_ | Simultaneous-session cap per **backend URL + model** pair: `max_sessions` plus quoted per-URL overrides (e.g. `"http://host:8080/v1" = 2`). Unset ⇒ **unlimited** (nothing is metered); `0` ⇒ unlimited plus a warning. See [Session Concurrency](#session-concurrency-orchestrationconcurrency). |
@@ -357,6 +358,27 @@ validator endpoint falls back to the same URL and model. Point `validator_backen
 `validator_model` — or `[orchestration.specialists.validator]` — somewhere else and the
 audit traffic gets its own cap, so a saturated writer endpoint cannot stall an auditor
 aimed at another one.
+
+### Git Workflow & Worktrees
+
+Marmel's agents work on branches and commit their work, and `git_workflow_policy` decides how
+much git context they are shown — a closed, parse-time-validated set of three values:
+
+- **`auto`** (default) — the workspace git state is read from disk and a `## Git workspace state`
+  block is appended to the Manager prompt and to every specialist prompt: repository root,
+  current branch and linked worktrees when the workspace is already a git repo, or — when it is
+  not — the instruction to `git init`, write a `.gitignore` and make an initial commit before
+  real work starts.
+- **`off`** — no autodetection, and no injected block anywhere.
+- **`enforce_worktree`** — the same block, but isolated worktree use is stated as a requirement
+  for the session rather than as a preference.
+
+Git worktrees are created under the gitignored `.worktrees/<branch>` directory **inside** the
+workspace root, because the sandbox denies writes outside it — the usual `git worktree add
+../<branch>` sibling layout is refused — and every git call then addresses the worktree with
+`git -C <path>`. Agents commit small and often, staging explicit paths with conventional
+message prefixes, and `.marmel/` is never committed; the built-in `git_workflow` skill carries
+the full procedure.
 
 ---
 
@@ -585,7 +607,7 @@ tools:
 - Verify migration status with the CLI before proceeding.
 ```
 
-Only the `id`, `name`, `description`, and `suggested_tools` (or `tools`) front matter keys are read; any other key is ignored, and the body below the front matter is the content that gets injected. The compiled-in skills are `clean_code`, `debugging`, `research`, `verification`, and `testing`.
+Only the `id`, `name`, `description`, and `suggested_tools` (or `tools`) front matter keys are read; any other key is ignored, and the body below the front matter is the content that gets injected. The compiled-in skills are `clean_code`, `debugging`, `research`, `verification`, `testing`, and `git_workflow` — the last carries the worktree, branch and commit discipline described in [Git Workflow & Worktrees](#git-workflow--worktrees) and is a default skill of `coder`, `debugger`, `validator` and `generalist`.
 
 When a matching task is delegated, the skill content is injected into the specialist's prompt and its `tools` widen the allowlist for that run; `rebirth` is always appended, and neither a skill nor a synthesized blueprint can widen the verdict class — `leave_verdict` stays Validator-only.
 
