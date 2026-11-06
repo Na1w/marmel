@@ -33,6 +33,7 @@ pub const SKILL_DEBUGGING: &str = include_str!("../prompts/skills/debugging.md")
 pub const SKILL_RESEARCH: &str = include_str!("../prompts/skills/research.md");
 pub const SKILL_VERIFICATION: &str = include_str!("../prompts/skills/verification.md");
 pub const SKILL_TESTING: &str = include_str!("../prompts/skills/testing.md");
+pub const SKILL_GIT_WORKFLOW: &str = include_str!("../prompts/skills/git_workflow.md");
 
 /// Returns a markdown section describing the current operating system, shell,
 /// architecture, and workspace directory for injection into agent prompts.

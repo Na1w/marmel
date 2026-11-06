@@ -238,13 +238,22 @@ impl Catalog {
             crate::prompts::SKILL_TESTING,
             SkillSource::Builtin,
         ));
+        self.register_skill(Self::parse_skill_markdown(
+            "git_workflow",
+            crate::prompts::SKILL_GIT_WORKFLOW,
+            SkillSource::Builtin,
+        ));
 
         self.register_agent(AgentArchetype {
             id: "coder".to_string(),
             name: "Software Engineer".to_string(),
             description: "System architecture, modular design, clean coding, and test suites."
                 .to_string(),
-            default_skills: vec!["clean_code".to_string(), "testing".to_string()],
+            default_skills: vec![
+                "clean_code".to_string(),
+                "testing".to_string(),
+                "git_workflow".to_string(),
+            ],
             default_tools: vec![
                 TOOL_READ_FILE.to_string(),
                 TOOL_WRITE_FILE.to_string(),
@@ -264,7 +273,11 @@ impl Catalog {
             description:
                 "Crash forensics, root-cause isolation, interactive stepping, and surgical fixes."
                     .to_string(),
-            default_skills: vec!["debugging".to_string(), "testing".to_string()],
+            default_skills: vec![
+                "debugging".to_string(),
+                "testing".to_string(),
+                "git_workflow".to_string(),
+            ],
             default_tools: vec![
                 TOOL_READ_FILE.to_string(),
                 TOOL_REPLACE.to_string(),
@@ -306,7 +319,7 @@ impl Catalog {
             description:
                 "Independent quality verification, code inspection, and formal verdict submission."
                     .to_string(),
-            default_skills: vec!["verification".to_string()],
+            default_skills: vec!["verification".to_string(), "git_workflow".to_string()],
             default_tools: vec![
                 TOOL_READ_FILE.to_string(),
                 TOOL_GREP_SEARCH.to_string(),
@@ -326,6 +339,7 @@ impl Catalog {
                 "clean_code".to_string(),
                 "research".to_string(),
                 "testing".to_string(),
+                "git_workflow".to_string(),
             ],
             default_tools: vec![
                 TOOL_READ_FILE.to_string(),
@@ -685,9 +699,58 @@ mod tests {
         assert!(catalog.get_skill("research").is_some());
         assert!(catalog.get_skill("verification").is_some());
         assert!(catalog.get_skill("testing").is_some());
+        assert!(catalog.get_skill("git_workflow").is_some());
 
         assert!(catalog.get_agent("coder").is_some());
         assert!(catalog.get_agent("debugger").is_some());
+    }
+
+    /// The built-in `git_workflow` skill must be registered from its front matter
+    /// and wired to exactly the roles that can act on git work.
+    #[test]
+    fn git_workflow_skill_is_registered_and_wired_to_git_roles() {
+        let catalog = Catalog::new();
+        let skill = catalog
+            .get_skill("git_workflow")
+            .expect("git_workflow must be a built-in skill");
+        assert!(matches!(skill.source, SkillSource::Builtin));
+        assert_eq!(
+            skill.name,
+            "Git Workflow, Worktree Isolation & Commit Discipline"
+        );
+        assert!(!skill.description.trim().is_empty());
+        assert_eq!(
+            skill.suggested_tools,
+            [
+                TOOL_RUN_COMMAND,
+                TOOL_READ_FILE,
+                TOOL_WRITE_FILE,
+                TOOL_REPLACE,
+                TOOL_GREP_SEARCH
+            ]
+        );
+        assert!(skill.content.contains("WORKTREE ISOLATION"));
+
+        for role in ["coder", "debugger", "generalist", "validator"] {
+            assert!(
+                catalog
+                    .get_agent(role)
+                    .expect("role must exist")
+                    .default_skills
+                    .contains(&"git_workflow".to_string()),
+                "{role} must carry the git workflow skill"
+            );
+        }
+        for role in ["researcher", "planner"] {
+            assert!(
+                !catalog
+                    .get_agent(role)
+                    .expect("role must exist")
+                    .default_skills
+                    .contains(&"git_workflow".to_string()),
+                "{role} must not be given git work by default"
+            );
+        }
     }
 
     #[test]

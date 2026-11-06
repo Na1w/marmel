@@ -248,6 +248,78 @@ pub struct SpecialistConfig {
     pub prompt: Option<String>,
 }
 
+/// What `git_workflow_policy` says about the git-workflow prompt behaviour.
+///
+/// The closed vocabulary of [`Config::git_workflow_policy`]. Unlike the free-form
+/// string keys of this file ([`Config::ui_mode`],
+/// [`Config::reasoning_effort`]), the value is validated by serde **at parse time**:
+/// an undocumented spelling is a TOML parse error rather than an accepted string.
+/// `auto` is the default, so a session that never sets the key behaves exactly as
+/// it did before this key existed.
+///
+/// The wording of the git guidance itself stays owned by
+/// [`crate::harness::workspace::format_git_prompt_block`] and by the role prompts
+/// and skills — this policy only decides whether the detected-state fragment is
+/// injected at all, and how it phrases worktree isolation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GitWorkflowPolicy {
+    /// Autodetect the git state of the workspace and inject the
+    /// `## Git workspace state` fragment. Default.
+    #[default]
+    Auto,
+    /// No git autodetection and no `## Git workspace state` fragment anywhere.
+    Off,
+    /// The same detection and the same fragment as [`Self::Auto`], but the
+    /// fragment states that an isolated `git worktree` is **REQUIRED** for the
+    /// session rather than preferred.
+    EnforceWorktree,
+}
+
+impl GitWorkflowPolicy {
+    /// Does this policy want the `## Git workspace state` fragment injected?
+    ///
+    /// `off` is the only value that silences the fragment; git guidance in the
+    /// role prompts and skills is never gated on this key.
+    #[must_use]
+    pub const fn injects_git_block(&self) -> bool {
+        matches!(self, Self::Auto | Self::EnforceWorktree)
+    }
+
+    /// Does this policy phrase worktree isolation as a hard requirement rather
+    /// than as a preference?
+    #[must_use]
+    pub const fn requires_isolated_worktree(&self) -> bool {
+        matches!(self, Self::EnforceWorktree)
+    }
+}
+
+impl std::fmt::Display for GitWorkflowPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Off => "off",
+            Self::EnforceWorktree => "enforce_worktree",
+        })
+    }
+}
+
+impl std::str::FromStr for GitWorkflowPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "off" => Ok(Self::Off),
+            "enforce_worktree" => Ok(Self::EnforceWorktree),
+            other => Err(format!(
+                "invalid git_workflow_policy {other:?}: expected \"auto\", \"off\" or \
+                 \"enforce_worktree\""
+            )),
+        }
+    }
+}
+
 /// Resolved runtime configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -319,6 +391,18 @@ pub struct Config {
     pub mcp_servers: HashMap<String, crate::mcp::McpServerConfig>,
     /// Optional base prompt appended to the orchestrator system prompt.
     pub base_prompt: Option<String>,
+    /// How the git-workflow prompt behaviour is applied — see
+    /// [`GitWorkflowPolicy`] for the three documented values (`auto`, `off`,
+    /// `enforce_worktree`) and what each one does.
+    ///
+    /// Default [`GitWorkflowPolicy::Auto`]: the workspace git state is
+    /// autodetected from the filesystem and rendered as the
+    /// `## Git workspace state` fragment by
+    /// [`crate::harness::workspace::format_git_prompt_block`]. Both prompt paths
+    /// (the specialist runner and the Manager prompt) resolve the fragment through
+    /// [`git_prompt_block`]; git guidance written into the role prompts and skills
+    /// is **not** gated on this key.
+    pub git_workflow_policy: GitWorkflowPolicy,
     /// Optional global cap on fix-loop rounds per validation pass (defaults to MAX_FIX_LOOP_ROUNDS = 200).
     pub max_fix_loop_rounds: Option<usize>,
     /// Session capture/rehydration master switch. Default `true`: a bundle is
@@ -368,6 +452,7 @@ impl Default for Config {
             orchestration: OrchestrationConfig::default_depth(),
             mcp_servers: HashMap::new(),
             base_prompt: None,
+            git_workflow_policy: GitWorkflowPolicy::Auto,
             max_fix_loop_rounds: None,
             session_enabled: true,
             session_resume: false,
@@ -568,6 +653,84 @@ pub fn effective_max_sessions(backend_url: &str) -> Option<usize> {
     match get_active() {
         Some(cfg) => resolve_max_sessions(&cfg.orchestration.concurrency, backend_url),
         None => None,
+    }
+}
+
+/// The `git_workflow_policy` of the globally active config;
+/// [`GitWorkflowPolicy::default`] when no config is active — i.e. the key's own
+/// default value, so a prompt path that finds no active config behaves as if the
+/// key were unset.
+#[must_use]
+pub fn active_git_workflow_policy() -> GitWorkflowPolicy {
+    get_active()
+        .map(|cfg| cfg.git_workflow_policy)
+        .unwrap_or_default()
+}
+
+/// The worktree sentence as [`crate::harness::workspace::format_git_prompt_block`]
+/// phrases it today — the anchor [`git_prompt_block`] rewords for
+/// [`GitWorkflowPolicy::EnforceWorktree`].
+const GIT_WORKTREE_PREFER_ANCHOR: &str =
+    "Prefer an isolated `git worktree` for this session's work";
+
+/// Replacement of [`GIT_WORKTREE_PREFER_ANCHOR`] for
+/// [`GitWorkflowPolicy::EnforceWorktree`]: the same sentence, phrased as a
+/// requirement instead of a preference.
+const GIT_WORKTREE_REQUIRE_REPLACEMENT: &str =
+    "Isolated `git worktree` use is REQUIRED for this session's work";
+
+/// Standalone requirement line used when the shared fragment carries no
+/// [`GIT_WORKTREE_PREFER_ANCHOR`] to reword (a non-repo verdict, or a future
+/// rewording), so `enforce_worktree` always states the requirement.
+const GIT_WORKTREE_REQUIRE_LINE: &str = "\n- Isolated `git worktree` use is **REQUIRED** for this session — create it only under the gitignored in-root `.worktrees/<branch>` and always address it as `git -C <path>`.\n";
+
+/// The prompt fragment the git-workflow policy resolves to for `git`.
+///
+/// Both prompt paths (`src/agents/runner/execution.rs` for specialists,
+/// `src/ui/helpers.rs` for the Manager) append the result verbatim, so this is the
+/// single place where the policy changes what the model is told about git:
+///
+/// * [`GitWorkflowPolicy::Off`] — the empty string: no fragment anywhere, and no
+///   autodetection is reported.
+/// * [`GitWorkflowPolicy::Auto`] — the shared fragment
+///   ([`crate::harness::workspace::format_git_prompt_block`]) verbatim.
+/// * [`GitWorkflowPolicy::EnforceWorktree`] — the same detected state, with the
+///   worktree sentence reworded as a hard requirement.
+///
+/// An uninspected root renders the empty string under **every** policy, so no path
+/// ever asserts a git state that was not observed.
+#[must_use]
+pub fn git_prompt_block(
+    git: &crate::harness::workspace::GitWorkspace,
+    policy: GitWorkflowPolicy,
+) -> String {
+    if !policy.injects_git_block() {
+        return String::new();
+    }
+    let block = crate::harness::workspace::format_git_prompt_block(git);
+    if block.is_empty() || !policy.requires_isolated_worktree() {
+        return block;
+    }
+    // `enforce_worktree`: the detection is untouched, only the wording of the
+    // worktree guidance changes. Reword the shared sentence when the fragment
+    // still carries it, and state the requirement explicitly when it does not
+    // (a non-repo verdict, or a future rewording), so the policy can never go
+    // quiet because a sibling renderer changed its phrasing.
+    let at = block.find(GIT_WORKTREE_PREFER_ANCHOR);
+    match at {
+        Some(at) => {
+            let mut block = block;
+            block.replace_range(
+                at..at + GIT_WORKTREE_PREFER_ANCHOR.len(),
+                GIT_WORKTREE_REQUIRE_REPLACEMENT,
+            );
+            block
+        }
+        None => {
+            let mut block = block;
+            block.push_str(GIT_WORKTREE_REQUIRE_LINE);
+            block
+        }
     }
 }
 
@@ -788,6 +951,10 @@ struct PartialConfig {
     #[serde(default)]
     pub mcp_servers: HashMap<String, crate::mcp::McpServerConfig>,
     pub base_prompt: Option<String>,
+    /// String-enum mirror as `Option`: absent ⇒ [`GitWorkflowPolicy::Auto`] (the
+    /// default) survives the merge; present ⇒ serde validates the value at parse
+    /// time (see [`GitWorkflowPolicy`]).
+    pub git_workflow_policy: Option<GitWorkflowPolicy>,
     pub session_enabled: Option<bool>,
     pub session_resume: Option<bool>,
     pub session_commit_min_interval_ms: Option<u64>,
@@ -905,6 +1072,9 @@ fn merge(mut base: Config, partial: PartialConfig) -> Config {
     }
     if let Some(v) = partial.base_prompt {
         base.base_prompt = Some(v);
+    }
+    if let Some(v) = partial.git_workflow_policy {
+        base.git_workflow_policy = v;
     }
     if let Some(v) = partial.session_enabled {
         base.session_enabled = v;
@@ -2980,6 +3150,378 @@ session_max_bundle_bytes = 4096
     // proof. The sibling four-places tests above deliberately leave this leg out
     // and note the example file is owned by the docs task; this test is the
     // matching leg for the shipped `kiwix` MCP server registration.
+
+    // ----------------------------------------------------- git workflow policy
+    //
+    // `git_workflow_policy` gates the `## Git workspace state` fragment both prompt
+    // paths append, so it follows the "four places" rule and must keep the `auto`
+    // default: a session that never sets the key is unaffected by its existence.
+    // Unlike the free-form string keys of this file (`ui_mode`,
+    // `reasoning_effort`) the vocabulary is closed and validated by serde at parse
+    // time, which the parse-error test below pins.
+
+    #[test]
+    fn git_workflow_policy_defaults_to_auto() {
+        assert_eq!(
+            Config::default().git_workflow_policy,
+            GitWorkflowPolicy::Auto,
+            "`auto` is the default of a freshly built config",
+        );
+        assert_eq!(
+            Config::default().git_workflow_policy,
+            GitWorkflowPolicy::default(),
+            "the value `impl Default for Config` writes is the enum's own default",
+        );
+        assert_eq!(
+            partial_from("").git_workflow_policy,
+            GitWorkflowPolicy::Auto,
+            "an empty file keeps the default",
+        );
+        assert_eq!(
+            partial_from("backend_url = \"http://localhost:9000/v1\"\n").git_workflow_policy,
+            GitWorkflowPolicy::Auto,
+            "an absent `git_workflow_policy` keeps the default",
+        );
+    }
+
+    #[test]
+    fn git_workflow_policy_parses_each_documented_value_from_toml() {
+        for (raw, expected) in [
+            ("auto", GitWorkflowPolicy::Auto),
+            ("off", GitWorkflowPolicy::Off),
+            ("enforce_worktree", GitWorkflowPolicy::EnforceWorktree),
+        ] {
+            let cfg = partial_from(&format!("git_workflow_policy = \"{raw}\"\n"));
+            assert_eq!(
+                cfg.git_workflow_policy, expected,
+                "`git_workflow_policy = \"{raw}\"` must parse to {expected}",
+            );
+        }
+        // It also parses next to the prompt key it shares its grouping with,
+        // without disturbing that key.
+        let cfg = partial_from(
+            "base_prompt = \"single worker only\"\n\
+             git_workflow_policy = \"off\"\n",
+        );
+        assert_eq!(cfg.base_prompt.as_deref(), Some("single worker only"));
+        assert_eq!(cfg.git_workflow_policy, GitWorkflowPolicy::Off);
+    }
+
+    #[test]
+    fn git_workflow_policy_undocumented_and_mistyped_values_are_parse_errors() {
+        for (label, toml_str) in [
+            (
+                "undocumented value",
+                "git_workflow_policy = \"autodetect\"\n",
+            ),
+            ("wrong case", "git_workflow_policy = \"Auto\"\n"),
+            ("boolean", "git_workflow_policy = true\n"),
+            ("integer", "git_workflow_policy = 1\n"),
+            ("table", "git_workflow_policy = { value = \"auto\" }\n"),
+        ] {
+            assert!(
+                toml::from_str::<PartialConfig>(toml_str).is_err(),
+                "{label}: a mistyped `git_workflow_policy` must be a TOML parse error, \
+                 not an accepted value",
+            );
+        }
+    }
+
+    #[test]
+    fn git_workflow_policy_merges_and_an_absent_key_keeps_the_default() {
+        assert_eq!(
+            merged("git_workflow_policy = \"enforce_worktree\"\n").git_workflow_policy,
+            GitWorkflowPolicy::EnforceWorktree,
+            "the documented value must reach the merged config",
+        );
+        assert_eq!(
+            merged("git_workflow_policy = \"off\"\n").git_workflow_policy,
+            GitWorkflowPolicy::Off,
+            "the last leg of the four-places rule: merge applies the parsed value",
+        );
+        assert_eq!(
+            merge(
+                Config {
+                    git_workflow_policy: GitWorkflowPolicy::EnforceWorktree,
+                    ..Config::default()
+                },
+                PartialConfig::default(),
+            )
+            .git_workflow_policy,
+            GitWorkflowPolicy::EnforceWorktree,
+            "an absent key never resets a value the merged-in config already carries",
+        );
+    }
+
+    #[test]
+    fn git_workflow_policy_string_vocabulary_round_trips() {
+        for policy in [
+            GitWorkflowPolicy::Auto,
+            GitWorkflowPolicy::Off,
+            GitWorkflowPolicy::EnforceWorktree,
+        ] {
+            let text = policy.to_string();
+            assert_eq!(
+                text.parse::<GitWorkflowPolicy>().expect("parses back"),
+                policy,
+                "{policy}: Display and FromStr must round-trip the documented vocabulary",
+            );
+            // The serde representation TOML reads is the very same snake_case
+            // string, so the enum, Display/FromStr and the config key never drift.
+            assert_eq!(
+                serde_json::to_value(policy).expect("serializes"),
+                serde_json::Value::String(text.clone()),
+                "{policy}: the serde value must be the documented key value",
+            );
+        }
+        assert_eq!(
+            GitWorkflowPolicy::default().to_string(),
+            "auto",
+            "`auto` is the documented default value",
+        );
+        for bad in ["", "AUTO", "automagic", "enforce"] {
+            assert!(
+                bad.parse::<GitWorkflowPolicy>().is_err(),
+                "{bad:?} is not part of the documented vocabulary",
+            );
+        }
+    }
+
+    #[test]
+    fn git_prompt_block_gates_the_fragment_on_the_policy() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let git_dir = repo.join(".git");
+        std::fs::create_dir_all(&git_dir).expect("fixture");
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+        let git = crate::harness::workspace::detect_git_workspace(&repo);
+        let shared = crate::harness::workspace::format_git_prompt_block(&git);
+        assert!(
+            shared.contains("IS a git repository"),
+            "the fixture must yield a repo verdict: {git:?}"
+        );
+
+        assert_eq!(
+            git_prompt_block(&git, GitWorkflowPolicy::Off),
+            "",
+            "off renders no fragment at all",
+        );
+        assert_eq!(
+            git_prompt_block(&git, GitWorkflowPolicy::Auto),
+            shared,
+            "auto renders the shared fragment verbatim",
+        );
+
+        let enforced = git_prompt_block(&git, GitWorkflowPolicy::EnforceWorktree);
+        assert!(
+            enforced.contains("\n## Git workspace state\n"),
+            "enforce_worktree keeps the fragment header: {enforced}"
+        );
+        assert!(
+            enforced.contains("IS a git repository") && enforced.contains("branch `main`"),
+            "the detected state is unchanged; only the wording of the worktree guidance \
+             changes: {enforced}"
+        );
+        assert!(
+            enforced.contains("REQUIRED"),
+            "worktree isolation is stated as a requirement: {enforced}"
+        );
+        assert!(
+            !enforced.contains("Prefer an isolated"),
+            "the preference wording is replaced, not duplicated: {enforced}"
+        );
+        assert!(
+            enforced.ends_with("never commit `.marmel/`.\n"),
+            "the fragment tail is unchanged: {enforced}"
+        );
+    }
+
+    /// A non-repo verdict carries no worktree sentence to reword, so
+    /// `enforce_worktree` states the requirement explicitly. A root that was never
+    /// inspected renders nothing under **every** policy.
+    #[test]
+    fn git_prompt_block_states_the_requirement_for_a_non_repo_and_omits_nothing_verified() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fresh = temp.path().join("new_project");
+        std::fs::create_dir_all(fresh.join("src")).expect("fixture");
+        let fresh_git = crate::harness::workspace::detect_git_workspace(&fresh);
+        assert!(
+            !fresh_git.is_git_repo,
+            "the fixture must yield a non-repo verdict: {fresh_git:?}"
+        );
+
+        let enforced = git_prompt_block(&fresh_git, GitWorkflowPolicy::EnforceWorktree);
+        assert!(
+            enforced.contains("NOT a git repository"),
+            "the non-repo verdict is unchanged: {enforced}"
+        );
+        assert!(
+            enforced.contains("Isolated `git worktree` use is **REQUIRED**"),
+            "the requirement is stated explicitly when there is no worktree sentence to \
+             reword: {enforced}"
+        );
+        let auto = git_prompt_block(&fresh_git, GitWorkflowPolicy::Auto);
+        assert!(
+            !auto.contains("REQUIRED"),
+            "auto keeps the shared fragment as-is: {auto}"
+        );
+
+        let uninspected = crate::harness::workspace::GitWorkspace::default();
+        for policy in [
+            GitWorkflowPolicy::Auto,
+            GitWorkflowPolicy::Off,
+            GitWorkflowPolicy::EnforceWorktree,
+        ] {
+            assert_eq!(
+                git_prompt_block(&uninspected, policy),
+                "",
+                "{policy}: nothing is rendered for a root that was never inspected",
+            );
+        }
+    }
+
+    /// The ambient accessor both prompt-adjacent seams can reach: the installed
+    /// config's value wins, and with no config active the key's own `auto` default
+    /// applies (never `off`).
+    #[test]
+    fn active_git_workflow_policy_reads_the_installed_config() {
+        let _guard = ActiveConfigTestGuard::install(Config {
+            git_workflow_policy: GitWorkflowPolicy::EnforceWorktree,
+            ..Config::default()
+        });
+        assert_eq!(
+            active_git_workflow_policy(),
+            GitWorkflowPolicy::EnforceWorktree,
+            "the accessor must read the installed config's policy",
+        );
+    }
+
+    #[test]
+    fn active_git_workflow_policy_without_an_active_config_is_auto() {
+        let _serial = sandbox_env_test_lock();
+        let previous = get_active();
+        clear_active();
+        let observed = active_git_workflow_policy();
+        if let Some(cfg) = previous {
+            set_active(cfg);
+        }
+        assert_eq!(
+            observed,
+            GitWorkflowPolicy::Auto,
+            "no active config must never silence the git fragment",
+        );
+    }
+
+    /// The "four places" rule for `git_workflow_policy`, scraped from this file,
+    /// plus the `marmel.toml.example` leg this key must satisfy (the file is edited
+    /// in the same change). Sibling of
+    /// `sandbox_extra_readonly_paths_exists_in_config_default_partial_merge_and_example`.
+    #[test]
+    fn git_workflow_policy_exists_in_config_default_partial_merge_and_example() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/config.rs"))
+            .expect("src/config.rs must be readable");
+        let example =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/marmel.toml.example"))
+                .expect("marmel.toml.example must be readable");
+
+        let slice = |start: &str, end: &str| -> String {
+            let from = src
+                .find(start)
+                .unwrap_or_else(|| panic!("{start} must exist in src/config.rs"));
+            let rest = &src[from..];
+            let to = rest.find(end).unwrap_or(rest.len());
+            rest[..to].to_string()
+        };
+
+        let config_struct = slice("pub struct Config {", "impl Default for Config {");
+        let defaults = slice("impl Default for Config {", "static ACTIVE_CONFIG");
+        let partial_struct = slice("struct PartialConfig {", "struct PartialMonitoringConfig {");
+        let merge_body = slice("fn merge(mut base: Config", "impl Config {");
+
+        assert!(
+            config_struct.contains("pub git_workflow_policy: GitWorkflowPolicy,"),
+            "Config must declare git_workflow_policy as the GitWorkflowPolicy enum, not \
+             as a free-form String"
+        );
+        assert!(
+            config_struct
+                .find("pub base_prompt: Option<String>")
+                .expect("Config must declare base_prompt")
+                < config_struct
+                    .find("pub git_workflow_policy: GitWorkflowPolicy")
+                    .expect("Config must declare git_workflow_policy"),
+            "git_workflow_policy must sit directly below base_prompt, the other prompt \
+             key, so the prompt grouping is obvious"
+        );
+        assert!(
+            defaults.contains("git_workflow_policy: GitWorkflowPolicy::Auto,"),
+            "impl Default for Config must default git_workflow_policy to Auto"
+        );
+        // An `Option` mirror needs no `#[serde(default)]` (absent ⇒ `None`), and
+        // must not be renamed: the TOML key is the snake_case field name verbatim,
+        // as everywhere else in this file.
+        let mirror_at = partial_struct
+            .find("pub git_workflow_policy: Option<GitWorkflowPolicy>")
+            .expect("PartialConfig must mirror git_workflow_policy as Option<GitWorkflowPolicy>");
+        let base_at = partial_struct
+            .find("pub base_prompt: Option<String>,")
+            .expect("PartialConfig must mirror base_prompt");
+        assert!(
+            base_at < mirror_at,
+            "the git_workflow_policy mirror must sit below the base_prompt mirror, in the \
+             same prompt grouping as the Config field"
+        );
+        assert!(
+            !partial_struct.contains("rename"),
+            "no serde rename: config keys are snake_case field names used verbatim"
+        );
+        assert!(
+            merge_body.contains("partial.git_workflow_policy")
+                && merge_body.contains("base.git_workflow_policy ="),
+            "merge must apply git_workflow_policy, otherwise the key is silently \
+             dropped by toml"
+        );
+        let tight = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+        assert!(
+            tight(&merge_body)
+                .contains("ifletSome(v)=partial.git_workflow_policy{base.git_workflow_policy=v;}"),
+            "merge must keep the scalar replace-if-present semantics this key uses"
+        );
+        assert!(
+            example.contains("# git_workflow_policy ="),
+            "marmel.toml.example must document git_workflow_policy"
+        );
+        assert!(
+            example.contains("# git_workflow_policy = \"auto\""),
+            "the example must show the key at its documented default value"
+        );
+        assert_eq!(
+            GitWorkflowPolicy::default().to_string(),
+            "auto",
+            "the example's default must stay the enum's own default"
+        );
+        // The fragment renderer that consumes this key must exist exactly once and
+        // must take the policy it renders: both prompt paths call it instead of
+        // `format_git_prompt_block` directly. The marker is assembled here so this
+        // test's own text cannot inflate the count.
+        let definition = ["pub", "fn", "git_prompt_block("].join(" ");
+        assert_eq!(
+            src.matches(definition.as_str()).count(),
+            1,
+            "git_prompt_block is the single owner of the policy-to-fragment mapping"
+        );
+        // Whitespace-insensitive: rustfmt may wrap the signature, and the marker
+        // only matches the definition, so the slice starts at it. The region is
+        // ASCII (a fn signature), so the byte offsets are safe.
+        let at = src.find(definition.as_str()).expect("definition marker");
+        let signature = tight(&src[at..at + 170]);
+        assert!(
+            signature.contains("git:&crate::harness::workspace::GitWorkspace")
+                && signature.contains("policy:GitWorkflowPolicy")
+                && signature.contains(")->String"),
+            "git_prompt_block must take both the detected state and the policy it renders"
+        );
+    }
 
     #[test]
     fn the_example_registers_and_allowlists_the_kiwix_mcp_server() {
