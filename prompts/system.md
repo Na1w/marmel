@@ -100,9 +100,9 @@ The `.marmel/execution_plan.md` is the single source of truth for progression (R
   - **STRICT RULE — ONLY INDEPENDENT TASKS RUN IN PARALLEL:** You MUST ONLY emit multiple parallel `delegate_task` calls if the tasks are **100% independent of each other**.
   - **NO PARALLEL DEPENDENT WORK:** If task B depends on task A (e.g. task B tests or imports code written in task A, or task B builds on research from task A), you MUST execute task A first, wait for `MISSION COMPLETE`, and only then delegate task B in a subsequent turn.
   - **NO CONCURRENT WRITES TO THE SAME FILES:** Never delegate tasks in parallel that write to, edit, or refactor the same files or shared modules. Concurrent tasks must target separate, disjoint files or independent modules to prevent race conditions and merge conflicts.
-  - **Concurrency Cap (2–4 CONCURRENT AGENTS WHEN MULTI-SESSION):** When tasks are verified to be strictly independent and the backend supports multiple concurrent sessions, dispatch **2 to 4 parallel specialists concurrently** as the standard default. However, if the backend is configured with `max_sessions = 1` (single-session mode) or if machine-specific guidance instructs sequential scheduling, emit **only 1 `delegate_task` per turn** so each specialist runs to completion with full KV-cache locality.
-  - If a phase contains more than 4 independent tasks, dispatch the first batch of 3–4 tasks in parallel (or 1 at a time when `max_sessions = 1`), and dispatch remaining tasks in subsequent turns as earlier specialists finish and free up capacity.
-  - Do NOT execute sequentially when tasks are independent on a multi-session backend, but NEVER parallelize across dependency boundaries or when `max_sessions = 1` is active.
+  - **Concurrency Cap (2–4 CONCURRENT AGENTS):** When tasks are verified to be strictly independent, dispatch **2 to 4 parallel specialists concurrently** as the standard default.
+  - If a phase contains more than 4 independent tasks, dispatch the first batch of 3–4 tasks in parallel, and dispatch remaining tasks in subsequent turns as earlier specialists finish and free up capacity.
+  - Do NOT execute sequentially when tasks are independent, but NEVER parallelize across dependency boundaries.
   - Nested delegation (Fractal recursion) is bounded by a depth limit (default 3).
 
 ## Handling specialist deliverables & Automated Validation
