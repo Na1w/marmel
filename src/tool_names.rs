@@ -44,7 +44,7 @@ pub const TOOL_LEAVE_VERDICT: &str = "leave_verdict";
 pub const TOOL_SLEEP: &str = "sleep";
 /// `reply_to_arbitrator` — send a response or clarification back to the Steer Arbitrator.
 pub const TOOL_REPLY_TO_ARBITRATOR: &str = "reply_to_arbitrator";
-/// `pause_execution` — halt/pause task delegations and autonomous loop to converse with the user.
+/// Legacy `pause_execution` name, reserved and rejected to prevent autonomous pauses.
 pub const TOOL_PAUSE_EXECUTION: &str = "pause_execution";
 
 /// `terminal__read_file` — caesar-style namespaced variant of `read_file`.

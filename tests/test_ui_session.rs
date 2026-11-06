@@ -313,6 +313,61 @@ async fn test_ui_run_session_auto_nudges_when_plan_incomplete_capped_at_5() {
     );
 }
 
+#[tokio::test]
+async fn rejected_model_pause_does_not_disable_plan_progress() {
+    let _lock = TEST_MUTEX.lock().await;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with({
+            let calls = calls.clone();
+            move |_req: &wiremock::Request| {
+                let turn = calls.fetch_add(1, Ordering::SeqCst);
+                let body = if turn == 0 {
+                    tool_call_sse(
+                        "pause-1",
+                        "pause_execution",
+                        r#"{"reason":"Ask for input"}"#,
+                    )
+                } else {
+                    completion_sse("Continuing the task.")
+                };
+                ResponseTemplate::new(200).set_body_string(body)
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let cfg = config_for_backend(&server.uri());
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = marmennill::manager::phase::Plan::at(tmp.path());
+    plan.create("# Plan\n- [ ] [t-001] incomplete task\n")
+        .unwrap();
+    let manager = Arc::new(marmennill::orchestrator::OrchestratorManager::new(
+        marmennill::llm::ChatClient::new(&cfg.backend_url, "test-model"),
+        plan,
+        Arc::new(marmennill::harness::HarnessStats::new()),
+    ));
+    let mut renderer = ScriptedRenderer::new(vec!["start".to_string(), "/abort".to_string()]);
+    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(manager))
+        .await
+        .unwrap();
+    assert!(
+        calls.load(Ordering::SeqCst) >= 3,
+        "a rejected pause must not suppress auto-nudges"
+    );
+    assert!(
+        renderer
+            .events
+            .iter()
+            .any(|event| { matches!(event, Event::Status(text) if text.contains("Auto-nudge")) })
+    );
+}
+
 fn tool_call_sse(id: &str, name: &str, args: &str) -> String {
     format!(
         "data: {}\n\ndata: [DONE]\n\n",
