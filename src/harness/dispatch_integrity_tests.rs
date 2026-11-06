@@ -32,6 +32,41 @@ use crate::tool_names::{TOOL_LEAVE_VERDICT, TOOL_READ_FILE, TOOL_REPLY_TO_ARBITR
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[tokio::test]
+async fn legacy_pause_calls_are_rejected_even_with_an_explicit_grant() {
+    for name in [
+        "pause_execution",
+        "stop_execution",
+        "abort_execution",
+        "pause_plan",
+    ] {
+        let invocation = ToolInvocation {
+            name: name.to_string(),
+            arguments: serde_json::json!({"reason": "Ask the user a question"}),
+        };
+        assert!(
+            dispatch(&invocation).is_err(),
+            "raw dispatch accepted {name}"
+        );
+        for caller in [
+            ToolCaller::Manager,
+            ToolCaller::SpecialistWithTools {
+                agent: Agent::Generalist,
+                allowed_tools: vec![name.to_string()],
+            },
+        ] {
+            assert!(dispatch_for(&invocation, caller.clone()).is_err());
+            assert!(dispatch_for_async(&invocation, caller).await.is_err());
+        }
+    }
+    for tool in crate::types::ToolDef::manager_tools()
+        .into_iter()
+        .chain(crate::types::ToolDef::default_tools())
+    {
+        assert_ne!(tool.function.name, "pause_execution");
+    }
+}
+
 /// Lock shared with the notice-layer tests so the (process-global) notice store is
 /// not mutated underneath the per-id assertions here.
 ///

@@ -812,6 +812,9 @@ impl ChatClient {
     where
         F: FnMut(&str) -> bool,
     {
+        if !crate::orchestrator::worker_pause::wait_for_current_worker().await {
+            anyhow::bail!("Worker cancelled while waiting for resume");
+        }
         // No HTTP client exists in this process (the shared build failed, on a
         // host with no TLS trust store in practice). Resolved **before the pool
         // gate**: a store-less run must not occupy a concurrency slot of another

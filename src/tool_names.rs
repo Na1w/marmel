@@ -44,8 +44,12 @@ pub const TOOL_LEAVE_VERDICT: &str = "leave_verdict";
 pub const TOOL_SLEEP: &str = "sleep";
 /// `reply_to_arbitrator` — send a response or clarification back to the Steer Arbitrator.
 pub const TOOL_REPLY_TO_ARBITRATOR: &str = "reply_to_arbitrator";
-/// `pause_execution` — halt/pause task delegations and autonomous loop to converse with the user.
+/// Legacy `pause_execution` name, reserved and rejected to prevent autonomous pauses.
 pub const TOOL_PAUSE_EXECUTION: &str = "pause_execution";
+/// Cooperatively pause one live subagent without cancelling its task.
+pub const TOOL_PAUSE_SUBAGENT: &str = "pause_subagent";
+/// Resume one previously paused live subagent.
+pub const TOOL_RESUME_SUBAGENT: &str = "resume_subagent";
 
 /// `terminal__read_file` — caesar-style namespaced variant of `read_file`.
 pub const TERMINAL_READ_FILE: &str = "terminal__read_file";
@@ -113,6 +117,8 @@ pub const CANONICAL_TOOL_NAMES: &[&str] = &[
     TOOL_CREATE_PLAN,
     TOOL_ARCHIVE_PLAN,
     TOOL_PAUSE_EXECUTION,
+    TOOL_PAUSE_SUBAGENT,
+    TOOL_RESUME_SUBAGENT,
     TOOL_READ_FILE,
     TERMINAL_READ_FILE,
     TOOL_WRITE_FILE,
@@ -406,6 +412,8 @@ mod tests {
             TOOL_CREATE_PLAN,
             TOOL_ARCHIVE_PLAN,
             TOOL_PAUSE_EXECUTION,
+            TOOL_PAUSE_SUBAGENT,
+            TOOL_RESUME_SUBAGENT,
             TOOL_READ_FILE,
             TOOL_WRITE_FILE,
             TOOL_REPLACE,

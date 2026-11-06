@@ -2569,12 +2569,6 @@ pub async fn run_session_with_bounds_report(
                         .unwrap_or_else(|_| serde_json::Value::String(args_str.clone()));
 
                     let is_delegate = name == crate::tool_names::TOOL_DELEGATE_TASK;
-                    if name == crate::tool_names::TOOL_PAUSE_EXECUTION
-                        || name == "stop_execution"
-                        || name == "abort_execution"
-                    {
-                        execution_paused = true;
-                    }
                     let delegated_agent = if is_delegate {
                         args_val
                             .get("agent_name")
@@ -3123,12 +3117,6 @@ pub async fn run_session_with_bounds_report(
                         .unwrap_or_else(|_| serde_json::Value::String(args_str.clone()));
 
                     let is_delegate = name == crate::tool_names::TOOL_DELEGATE_TASK;
-                    if name == crate::tool_names::TOOL_PAUSE_EXECUTION
-                        || name == "stop_execution"
-                        || name == "abort_execution"
-                    {
-                        execution_paused = true;
-                    }
                     let args_obj = args_val.as_object();
                     let delegated_agent = if is_delegate {
                         args_obj

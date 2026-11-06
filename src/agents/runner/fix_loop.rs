@@ -515,6 +515,13 @@ pub fn role_filtered_blueprint(
     let may_record = caller_may_record_verdict(caller);
     allowed_tools
         .iter()
+        .filter(|name| {
+            matches!(caller, harness::ToolCaller::Manager)
+                || !matches!(
+                    name.as_str(),
+                    tool_names::TOOL_PAUSE_SUBAGENT | tool_names::TOOL_RESUME_SUBAGENT
+                )
+        })
         .filter(|name| may_record || !is_verdict_recording_tool(name))
         .cloned()
         .collect()
@@ -546,6 +553,13 @@ pub fn advertised_tools_for_caller(
     let may_record = caller_may_record_verdict(caller);
     tools
         .iter()
+        .filter(|tool| {
+            matches!(caller, harness::ToolCaller::Manager)
+                || !matches!(
+                    tool.function.name.as_str(),
+                    tool_names::TOOL_PAUSE_SUBAGENT | tool_names::TOOL_RESUME_SUBAGENT
+                )
+        })
         .filter(|tool| may_record || !is_verdict_recording_tool(&tool.function.name))
         .cloned()
         .collect()

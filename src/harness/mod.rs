@@ -28,6 +28,7 @@ pub mod sleep;
 mod tool_resolution_tests;
 pub mod workspace;
 
+use crate::tool_names::{TOOL_PAUSE_SUBAGENT, TOOL_RESUME_SUBAGENT};
 pub use common::{HarnessStats, ToolCaller, ToolError, ToolInvocation, ToolResult};
 use plan::{archive_plan, handle_pause_execution, write_plan};
 use sleep::{handle_sleep, handle_sleep_async};
@@ -583,6 +584,8 @@ pub fn dispatch(tool: &ToolInvocation) -> Result<ToolResult, ToolError> {
         }
         TOOL_ARCHIVE_PLAN => archive_plan(),
         TOOL_PAUSE_EXECUTION => handle_pause_execution(&tool.arguments),
+        TOOL_PAUSE_SUBAGENT => plan::control_subagent(&tool.arguments, true),
+        TOOL_RESUME_SUBAGENT => plan::control_subagent(&tool.arguments, false),
         // Every accepted sleep spelling (the whole sleep family of the shared
         // table) normalizes onto `TERMINAL_SLEEP`, so one arm covers them all.
         TOOL_SLEEP | TERMINAL_SLEEP => handle_sleep(&tool.arguments),
@@ -804,6 +807,8 @@ async fn dispatch_manager_async(
         },
         TOOL_ARCHIVE_PLAN => archive_plan(),
         TOOL_PAUSE_EXECUTION => handle_pause_execution(&tool.arguments),
+        TOOL_PAUSE_SUBAGENT => plan::control_subagent(&tool.arguments, true),
+        TOOL_RESUME_SUBAGENT => plan::control_subagent(&tool.arguments, false),
         TOOL_REBIRTH => {
             if let Some(eng) = engine {
                 handle_rebirth(eng, &tool.arguments)
@@ -844,11 +849,20 @@ async fn dispatch_specialist_async(
 ) -> Result<ToolResult, ToolError> {
     let name = tool.name.as_str();
     let caller_str = caller.role_name();
-    if name == TOOL_CREATE_PLAN {
+    if matches!(
+        name,
+        TOOL_CREATE_PLAN | TOOL_PAUSE_SUBAGENT | TOOL_RESUME_SUBAGENT
+    ) {
         return Err(ToolError::Forbidden {
             tool: name.to_string(),
             caller: caller_str,
         });
+    }
+
+    if !crate::orchestrator::worker_pause::wait_for_current_worker().await {
+        return Err(ToolError::Execution(anyhow::anyhow!(
+            "Worker cancelled while paused"
+        )));
     }
 
     // `mcp_route` refuses any name the built-in dispatcher owns (verbatim or via
@@ -1176,6 +1190,8 @@ fn dispatch_manager(
         },
         TOOL_ARCHIVE_PLAN => archive_plan(),
         TOOL_PAUSE_EXECUTION => handle_pause_execution(&tool.arguments),
+        TOOL_PAUSE_SUBAGENT => plan::control_subagent(&tool.arguments, true),
+        TOOL_RESUME_SUBAGENT => plan::control_subagent(&tool.arguments, false),
         TOOL_REBIRTH => {
             if let Some(eng) = engine {
                 handle_rebirth(eng, &tool.arguments)
@@ -1252,11 +1268,20 @@ fn dispatch_specialist(
 ) -> Result<ToolResult, ToolError> {
     let name = tool.name.as_str();
     let caller_str = caller.role_name();
-    if name == TOOL_CREATE_PLAN {
+    if matches!(
+        name,
+        TOOL_CREATE_PLAN | TOOL_PAUSE_SUBAGENT | TOOL_RESUME_SUBAGENT
+    ) {
         return Err(ToolError::Forbidden {
             tool: name.to_string(),
             caller: caller_str,
         });
+    }
+
+    if !block_on_safe(crate::orchestrator::worker_pause::wait_for_current_worker()) {
+        return Err(ToolError::Execution(anyhow::anyhow!(
+            "Worker cancelled while paused"
+        )));
     }
 
     // Resolution order is the one stated on `dispatch`: built-ins first, MCP last.

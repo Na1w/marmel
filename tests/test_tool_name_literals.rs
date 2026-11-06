@@ -24,6 +24,8 @@ const KNOWN_TOOL_NAMES: &[&str] = &[
     "glob",
     "create_plan",
     "archive_current_plan",
+    "pause_subagent",
+    "resume_subagent",
     "rebirth",
     "pty_spawn",
     "pty_write",

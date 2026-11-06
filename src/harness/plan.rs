@@ -123,13 +123,40 @@ pub(crate) fn archive_plan() -> Result<ToolResult, ToolError> {
     }
 }
 
-pub(crate) fn handle_pause_execution(args: &serde_json::Value) -> Result<ToolResult, ToolError> {
-    crate::orchestrator::cancel_all();
-    let reason = args
-        .get("reason")
+pub(crate) fn handle_pause_execution(_args: &serde_json::Value) -> Result<ToolResult, ToolError> {
+    // Keep the legacy name reserved so stale model calls cannot reach an MCP
+    // replacement or cancel workers. Pausing is controlled by user input only.
+    Err(ToolError::Forbidden {
+        tool: crate::tool_names::TOOL_PAUSE_EXECUTION.to_string(),
+        caller: "model (execution control belongs to the user)".to_string(),
+    })
+}
+
+pub(crate) fn control_subagent(
+    args: &serde_json::Value,
+    paused: bool,
+) -> Result<ToolResult, ToolError> {
+    let tool = if paused {
+        crate::tool_names::TOOL_PAUSE_SUBAGENT
+    } else {
+        crate::tool_names::TOOL_RESUME_SUBAGENT
+    };
+    let key = args
+        .get("worker_key")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("Paused by manager");
-    Ok(ToolResult::ok(format!(
-        "Execution paused: {reason}. All active tasks halted and autonomous loop paused. You may now respond directly to the user to explain that execution has paused and await their instructions."
-    )))
+        .filter(|key| !key.trim().is_empty())
+        .ok_or_else(|| ToolError::BadArguments {
+            tool: tool.to_string(),
+            detail: "worker_key must name exactly one live subagent registry key".to_string(),
+        })?;
+    match crate::orchestrator::worker_pause::set_paused(key, paused) {
+        Ok(()) => Ok(ToolResult::ok(if paused {
+            format!(
+                "Pause requested for {key}; current tools may finish first. Task and context are preserved. Call resume_subagent to continue it."
+            )
+        } else {
+            format!("Resume requested for {key}; the same task continues.")
+        })),
+        Err(message) => Ok(ToolResult::err(message)),
+    }
 }

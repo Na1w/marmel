@@ -240,21 +240,32 @@ impl ToolDef {
         }
     }
 
-    pub fn pause_execution() -> ToolDef {
+    pub fn pause_subagent() -> ToolDef {
+        Self::subagent_control(
+            TOOL_PAUSE_SUBAGENT,
+            "Request a cooperative pause of exactly one live subagent by its registry key from 'Address This Worker With'. Preserves its task and context; never pauses the Manager or arbitrator. An in-flight tool may finish before pausing. Use resume_subagent to continue the task.",
+        )
+    }
+
+    pub fn resume_subagent() -> ToolDef {
+        Self::subagent_control(
+            TOOL_RESUME_SUBAGENT,
+            "Resume exactly one live subagent previously paused with pause_subagent. Use its registry key from 'Address This Worker With'. Does not redelegate or restart the task.",
+        )
+    }
+
+    fn subagent_control(name: &str, description: &str) -> ToolDef {
         ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
-                name: TOOL_PAUSE_EXECUTION.to_string(),
-                description: "Pause the autonomous execution loop and halt active task delegations to consult with the user or await user instructions. Call this tool whenever the user asks to stop, pause, halt, cancel, or when you need user clarification or input before continuing.".to_string(),
+                name: name.to_string(),
+                description: description.to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "reason": {
-                            "type": "string",
-                            "description": "The reason for pausing execution (e.g. user requested to stop/pause, user clarification needed, etc.)"
-                        }
+                        "worker_key": {"type": "string", "description": "Exact live subagent registry key; no role names, task-only IDs, or wildcards."}
                     },
-                    "required": ["reason"]
+                    "required": ["worker_key"]
                 }),
             },
         }
@@ -485,7 +496,6 @@ impl ToolDef {
             Self::delegate_task(roles),
             Self::create_plan(),
             Self::archive_current_plan(),
-            Self::pause_execution(),
             Self::read_file(),
             Self::write_file(),
             Self::replace(),
@@ -517,7 +527,8 @@ impl ToolDef {
             Self::delegate_task(roles),
             Self::create_plan(),
             Self::archive_current_plan(),
-            Self::pause_execution(),
+            Self::pause_subagent(),
+            Self::resume_subagent(),
             Self::read_file(),
             Self::grep_search(),
             Self::glob(),
