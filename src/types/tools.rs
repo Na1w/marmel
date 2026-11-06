@@ -130,7 +130,7 @@ impl ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
                 name: TOOL_REPLACE.to_string(),
-                description: "Replace an exact, unique block of text within a file. Fails if old_str matches 0 or >1 times."
+                description: "Replace an exact, unique block of text within a file. Supports multiline blocks; include surrounding context to select one occurrence. Use successive calls for separate edits. Fails if old_str matches 0 or >1 times."
                     .to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -150,7 +150,7 @@ impl ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
                 name: TOOL_RUN_COMMAND.to_string(),
-                description: "Execute a command line inside a dedicated PTY with timeout and process-group isolation. For animations, TUIs, interactive programs, or servers, pass a short timeout_seconds (e.g. 3) to prevent indefinite blocking."
+                description: "Execute builds, tests, programs, and Git operations inside a dedicated PTY with timeout and process-group isolation. Use read_file, grep_search, and glob for workspace file inspection; use replace and write_file for edits. Do not inspect or edit workspace files through shell commands, redirection, or ad-hoc scripts (sed, awk, Python, Perl). Standard formatters and build/code-generation tools are permitted for their normal purpose. For animations, TUIs, interactive programs, or servers, pass a short timeout_seconds (e.g. 3) to prevent indefinite blocking."
                     .to_string(),
                 parameters: serde_json::json!({
                     "type": "object",

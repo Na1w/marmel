@@ -1284,10 +1284,10 @@ fn test_reply_contract_wording_is_pinned_in_schema_prompt_and_notice() {
         !prompt.contains("steer-1"),
         "the prompt must never show a notice id the system cannot issue"
     );
-    // The compiled-in copy the rest of the app embeds is the same text.
+    // The compiled-in copy preserves the contract and adds shared execution guidance.
     assert_eq!(
-        prompt,
+        format!("{prompt}\n\n{}", crate::prompts::TOOL_REASONING_GUIDANCE),
         crate::prompts::STEER_ARBITRATOR_PROMPT,
-        "one prompt file, one contract"
+        "one prompt file, one contract, shared execution guidance"
     );
 }
