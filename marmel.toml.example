@@ -67,6 +67,17 @@ enable_xml_rescue = true
 # UI mode: "tui" (ratatui) or "raw" (plain streaming).
 ui_mode = "tui"
 
+# Git-workflow prompt behaviour: "auto" (autodetect the workspace git state from
+# the filesystem and inject the `## Git workspace state` prompt fragment — the
+# default), "off" (no autodetection and no fragment anywhere) or
+# "enforce_worktree" (the same fragment, but isolated `git worktree` use is
+# stated as REQUIRED for the session rather than preferred). The git guidance
+# written into the role prompts and the `git_workflow` skill applies either way;
+# only the detected-state fragment is gated on this key. The vocabulary is closed
+# and validated when the file is read, so an undocumented spelling is a config
+# parse error rather than an accepted string.
+# git_workflow_policy = "auto"
+
 # ---------------------------------------------------------------------------
 # Session capture / restore (the `.marmel/session/` bundle: manifest.json —
 # written LAST, the commit point — plus manager.json, ui.json and
