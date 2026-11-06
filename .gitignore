@@ -8,6 +8,8 @@ __pycache__/
 # Marmel workspace metadata
 .marmel/
 .marmel.research/
+# In-root git worktrees are local scratch checkouts; never commit them
+.worktrees/
 
 # Logs
 *.log

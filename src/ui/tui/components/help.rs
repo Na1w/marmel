@@ -128,7 +128,9 @@ pub fn legend() -> Vec<LegendRow> {
         // reported follow-up: one predicate decides the owner of these keys —
         // `FocusPane::Input` holds focus, or it does not — so the legend states the
         // owner first and the gesture second. Inside the composer the draft only ever
-        // chooses where the caret goes; the history walk belongs to the chord row
+        // chooses where the caret goes, and once the caret has nowhere to go (a
+        // single-line draft, or the first/last line) the same press steps the
+        // transcript viewport by one line; the history walk belongs to the chord row
         // above and to nothing else, so no arrow row can advertise it.
         LegendRow {
             keys: "Ctrl+Up / Ctrl+Down",
@@ -138,7 +140,7 @@ pub fn legend() -> Vec<LegendRow> {
         },
         LegendRow {
             keys: "Up / Down",
-            action: "caret in a multi-line draft · pane scroll by 1",
+            action: "caret, else transcript by 1 · pane scroll by 1",
             scope: "composer / pane",
             footer: "",
         },
@@ -642,6 +644,29 @@ mod tests {
         // §5: `Ctrl+D` is a confirm, not an un-armed exit.
         assert!(find("Ctrl+D").unwrap().action.contains("confirm"));
         assert!(find("Ctrl+D").unwrap().action.contains("un-armed"));
+    }
+
+    #[test]
+    fn up_down_row_states_the_caret_then_transcript_fallback() {
+        // With composer focus the arrow moves the caret, and once the caret has
+        // nowhere to go in the draft the same press scrolls the transcript by one
+        // line; with a pane focused it steps that pane by one line. The row states
+        // both owners, and it still never advertises the history walk — that is the
+        // chord row's alone.
+        let rows = legend();
+        let row = rows
+            .iter()
+            .find(|row| row.keys == "Up / Down")
+            .expect("the legend lost its Up / Down row");
+        assert!(row.action.contains("caret"), "{}", row.action);
+        assert!(row.action.contains("transcript"), "{}", row.action);
+        assert!(row.action.contains("pane"), "{}", row.action);
+        assert_eq!(row.scope, "composer / pane");
+        assert!(
+            !row.action.to_ascii_lowercase().contains("history"),
+            "the arrow row advertises the history walk: {}",
+            row.action
+        );
     }
 
     #[test]

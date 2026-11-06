@@ -28,8 +28,13 @@
 //!   left alone. Composer history is reachable through the `Ctrl+Up` / `Ctrl+Down`
 //!   chord **alone**, in every focus: the plain arrows are never a history recall at
 //!   all. With the composer focused they move the caret inside a multi-line draft,
-//!   and where the caret has nowhere to go the press is an explicit no-op — not
-//!   claimed, not repaint-worthy, and never a pane scroll either. This is what keeps
+//!   and where the caret has nowhere to go the press steps the **transcript**
+//!   viewport by one line instead — arrows in the input field scroll the chat
+//!   (operator request). A press that cannot move that viewport either — a
+//!   transcript that fits its pane, or a viewport already at the end the press asked
+//!   for — is still an explicit no-op: not claimed and not repaint-worthy, so no
+//!   `follow` decision or scroll offset is left describing a movement that never
+//!   happened. This is what keeps
 //!   "scroll the views" and "walk the input history" from being the same keystroke:
 //!   an arrow that only ever *walked* a single-line draft was still reaching into the
 //!   composer while the operator was reaching for the transcript (operator request,
@@ -752,6 +757,13 @@ impl TuiRenderer {
     /// the tail turns it back on — so the chip can never lag the viewport, and no
     /// caller has to restate it from the legacy mirror.
     ///
+    /// This is the **focused pane's** gesture and nothing else: the composer owns no
+    /// viewport, so with the composer focused there is no pane here to move and the
+    /// call is a no-op. The one path that steps a viewport the composer does not own
+    /// is the composer's terminal plain arrow, and it names the transcript
+    /// explicitly ([`Self::scroll_transcript_by`]) rather than borrowing this
+    /// function's focus question.
+    ///
     /// The frame is only marked dirty when a viewport actually moved: a press at an
     /// extreme, or on a pane that has nothing to scroll, has nothing to repaint, and
     /// leaving `dirty` set there is what used to make the chip look like it had
@@ -780,11 +792,13 @@ impl TuiRenderer {
     ///   the walk at all: the operator who wants the previous submission asks for it
     ///   by name instead of arrowing into it.
     /// * With the **composer** focused: the caret moves inside a multi-line draft
-    ///   whenever it can. Everywhere else the plain keys belong to nothing — they are
-    ///   not a history recall (that was the reported conflict: an arrow spent on
-    ///   scrolling replaced the draft), they are not a pane step (the composer owns
-    ///   the key), and they are not claimed, so no repaint, `follow` decision or
-    ///   scroll offset is left describing a movement that never happened.
+    ///   whenever it can. Where the caret has nowhere to go the press steps the
+    ///   **transcript** viewport by one line ([`Self::scroll_transcript_by`]): the
+    ///   operator asked for the arrows in the input field to scroll the chat, and the
+    ///   draft's own caret is served first. The history walk is still not the
+    ///   fallback — `Ctrl+Up` / `Ctrl+Down` is the only history binding, so an arrow
+    ///   can never replace the draft (the reported conflict). A press that cannot
+    ///   move the transcript either states nothing and is not claimed.
     /// * With a **pane** focused: one step of that pane's viewport, and never a
     ///   touch on the composer — not its draft, not its caret, not its history
     ///   bookkeeping. The Workers pane is the one pane with two viewports, so its
@@ -793,9 +807,9 @@ impl TuiRenderer {
     ///   keeps the page and jump keys — the two-viewport rule is spelled out at
     ///   [`Self::scroll_worker_detail_to`].
     ///
-    /// Returns whether the key did something. A composer press with nowhere for the
-    /// caret to go is not claimed: it neither repaints nor leaves `follow` and a
-    /// scroll offset stating a movement that never happened.
+    /// Returns whether the key did something. A composer press that moves neither the
+    /// caret nor the transcript is not claimed: it neither repaints nor leaves
+    /// `follow` and a scroll offset stating a movement that never happened.
     fn scroll_or_history(&mut self, key: KeyEvent, ctrl: bool) -> bool {
         let up = key.code == KeyCode::Up;
         if ctrl {
@@ -836,13 +850,14 @@ impl TuiRenderer {
             self.edit_key(key);
             return true;
         }
-        // The composer holds the key, and there is nothing inside the composer for
-        // it to do: the caret is against the edge of the draft. The history walk is
-        // **not** the fallback any more — a plain arrow here belongs to no one, and
-        // is reported as not a key press. Claiming it (or walking the history
-        // through it) is exactly what made the operator's scroll attempt rewrite the
-        // draft, and it is what the `Ctrl+Up` / `Ctrl+Down` chord of §5 is there to
-        // make unnecessary.
+        // The caret is against the edge of the draft, so the arrow has nothing to do
+        // inside the composer: it steps the transcript viewport instead (operator
+        // request — arrows in the input field scroll the chat). The history walk is
+        // still not the fallback; `Ctrl+Up` / `Ctrl+Down` is the only history binding.
+        if self.scroll_transcript_by(up, 1) {
+            self.dirty = true;
+            return true;
+        }
         false
     }
 
@@ -1711,6 +1726,34 @@ impl TuiRenderer {
         true
     }
 
+    /// Step the **transcript** viewport by `amount` lines, whichever pane holds the
+    /// focus.
+    ///
+    /// Every other scroll helper in this file addresses *the focused pane*; this one
+    /// names its viewport, because it has two callers that must not drift: the
+    /// `FocusPane::Transcript` arm of [`Self::scroll_up`] / [`Self::scroll_down`],
+    /// where the transcript is the pane that owns the key, and the composer's
+    /// terminal plain arrow in [`Self::scroll_or_history`], where the caret has
+    /// nowhere to go inside the draft and the press is spent on the transcript the
+    /// operator is looking at (operator request).
+    ///
+    /// The follow decision stays where it belongs: [`Self::scroll_transcript_to`]
+    /// states it, and only for a movement that expresses one — an away step turns
+    /// follow off, a step that arrives on the tail turns it back on, and a press that
+    /// moves nothing states nothing. So a transcript that fits its pane
+    /// (`transcript_tail() == 0`), or a viewport already at the end the press asked
+    /// for, is reported as not moved and is not claimed by the caller.
+    fn scroll_transcript_by(&mut self, up: bool, amount: u16) -> bool {
+        if up {
+            let target = self.chat_scroll.saturating_sub(amount);
+            self.scroll_transcript_to(target, false)
+        } else {
+            let tail = self.transcript_tail();
+            let target = self.chat_scroll.saturating_add(amount).min(tail);
+            self.scroll_transcript_to(target, true)
+        }
+    }
+
     /// Put the plan viewport where the operator asked for it.
     ///
     /// `plan_auto_scroll` does **not** mean "the viewport sits at the tail". It
@@ -1870,7 +1913,14 @@ impl TuiRenderer {
     /// The fold spells `Input` and `Transcript` with one `Chat` token, so resolving
     /// the target from it moved the transcript viewport while the composer held
     /// focus — a scroll of a pane the operator was not looking at. The composer owns
-    /// no viewport, so it names no scroll target and returns `false`.
+    /// no viewport, so it names no scroll target and returns `false`; the one
+    /// transcript step a composer press can still make is the explicit call in
+    /// [`Self::scroll_or_history`] ([`Self::scroll_transcript_by`]), where the
+    /// composer asks for the transcript by name instead of borrowing this focus
+    /// question.
+    ///
+    /// The transcript arm is that same helper, so the focused-pane step and the
+    /// composer's step can never drift apart.
     ///
     /// For the Workers pane the target is the **detail** half (the agent's
     /// logs and history). Plain `Up` / `Down` scroll this detail by 1 line (and
@@ -1879,10 +1929,7 @@ impl TuiRenderer {
     pub(crate) fn scroll_up(&mut self, amount: u16) -> bool {
         match self.focus {
             FocusPane::Input => false,
-            FocusPane::Transcript => {
-                let target = self.chat_scroll.saturating_sub(amount);
-                self.scroll_transcript_to(target, false)
-            }
+            FocusPane::Transcript => self.scroll_transcript_by(true, amount),
             FocusPane::Plan => {
                 let target = self.plan_scroll.saturating_sub(amount);
                 self.scroll_plan_to(target)
@@ -1899,14 +1946,15 @@ impl TuiRenderer {
     /// the viewport and states no decision, and a press already sitting on the tail
     /// moves nothing and states nothing. The plan arm never re-arms centring at all
     /// (defect 13, [`Self::scroll_plan_to`]).
+    ///
+    /// The transcript arm is [`Self::scroll_transcript_by`] — the same helper the
+    /// composer's terminal plain arrow calls — so "one line toward the tail, clamped
+    /// to it" is written once for both callers. `FocusPane::Input` still answers
+    /// `false`: the composer holds no viewport of its own.
     pub(crate) fn scroll_down(&mut self, amount: u16) -> bool {
         match self.focus {
             FocusPane::Input => false,
-            FocusPane::Transcript => {
-                let tail = self.transcript_tail();
-                let target = self.chat_scroll.saturating_add(amount).min(tail);
-                self.scroll_transcript_to(target, true)
-            }
+            FocusPane::Transcript => self.scroll_transcript_by(false, amount),
             FocusPane::Plan => {
                 let target = self
                     .plan_scroll
@@ -3038,33 +3086,36 @@ mod tests {
     // [`FocusPane::composer_has_focus`]), and a pane owns them otherwise. Every one
     // of them drives the public seam the live loop calls.
 
-    /// Defects 1, 2, 5 and 7 plus the reported scroll conflict: the composer's keys
-    /// never move a pane viewport or state a follow decision, a pane's keys never
-    /// touch the composer — not its draft, not its caret, not its history
-    /// bookkeeping — and a plain arrow is never a history recall in either focus.
+    /// Defects 1, 2, 5 and 7 plus the reported scroll conflict: a plain arrow is never
+    /// a history recall in either focus, a pane's keys never touch the composer — not
+    /// its draft, not its caret, not its history bookkeeping — and with the composer
+    /// focused the arrow is spent on the caret first and on the **transcript** second,
+    /// never on the input history (operator request: arrows in the input field scroll
+    /// the chat).
     #[test]
     fn up_and_down_follow_the_focus_and_never_cross_the_line() {
-        // Composer focused with a scrollback transcript waiting and a history to
-        // walk: `Up` recalls **nothing**. The composer owns the key, there is no
-        // caret movement to make, and the walk is reachable by the chord alone, so
-        // the press is an explicit no-op — no recall, no scroll, no repaint.
+        // Composer focused, with a scrollback transcript waiting and a history to
+        // walk: `Up` recalls **nothing**. The caret has no movement to make, so the
+        // press steps the transcript by one line instead, and the walk stays behind
+        // the `Ctrl+Up` chord.
         let mut renderer = transcript_with_scrollback();
         renderer.set_focus(FocusPane::Input);
         renderer.chat_width.set(80);
         renderer.chat_height.set(10);
+        let tail = transcript_tail_of(&renderer);
+        assert!(tail > 1, "the fixture needs room to scroll: {tail}");
         renderer.history = vec!["earlier note".to_string()];
         renderer.set_input_content("");
         // Park the transcript's viewport somewhere in the middle of its scrollback so
-        // "no pane viewport moved" is an offset claim, not a tautology.
+        // "one line" is an offset claim, not a tautology.
+        renderer.set_follow(false);
         renderer.chat_scroll = 12;
-        let offset = renderer.chat_scroll;
-        let follow = follow_pair(&renderer);
         renderer.dirty = false;
         assert!(
-            !press(&mut renderer, KeyCode::Up, KeyModifiers::NONE),
-            "a plain `Up` behind the composer is not claimed once the history \
-             fallback is gone"
+            press(&mut renderer, KeyCode::Up, KeyModifiers::NONE),
+            "a plain `Up` behind the composer steps the transcript it is looking at"
         );
+        assert_eq!(renderer.chat_scroll, 11, "by exactly one line, upward");
         assert!(
             renderer.input_text.is_empty(),
             "the draft was not replaced by a history entry: {:?}",
@@ -3074,16 +3125,25 @@ mod tests {
             renderer.history_index, None,
             "and no walk was started behind the operator's back"
         );
-        assert!(!renderer.dirty, "an unclaimed press asked for no repaint");
-        assert_eq!(renderer.chat_scroll, offset, "no pane viewport moved");
+        assert!(renderer.dirty, "a moved viewport asks for a repaint");
         assert_eq!(
             follow_pair(&renderer),
-            follow,
-            "and no follow decision was stated for a gesture the operator never made"
+            (false, false),
+            "and the away step stated the follow decision it is"
         );
-        // The same arrow one focus over *does* own the key and steps the pane — which
-        // is the whole point of the operator's report.
+        // The other direction is the same key, one line down, still short of the tail
+        // and therefore still no follow decision.
+        assert!(press(&mut renderer, KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(renderer.chat_scroll, 12, "`Down` stepped it back");
+        assert_eq!(
+            follow_pair(&renderer),
+            (false, false),
+            "a step short of the tail armed follow"
+        );
+        // The same arrow one focus over owns the key for the pane it names, which is
+        // the whole point of the operator's report.
         renderer.set_focus(FocusPane::Transcript);
+        let offset = renderer.chat_scroll;
         assert!(
             press(&mut renderer, KeyCode::Up, KeyModifiers::NONE),
             "the transcript took the same key"
@@ -3153,85 +3213,339 @@ mod tests {
         assert_eq!(renderer.chat_scroll, above + 1, "and it moved the viewport");
     }
 
-    /// Defect 4, in its new and stronger form: with the composer focused and nothing
-    /// inside the composer for the arrow to do, the press is an explicit no-op **even
-    /// when a history is waiting to be walked**. It does not claim the event, so
-    /// nothing repaints and no `follow` / scroll state is left describing a movement
-    /// that never happened.
+    /// Defect 4, in its new form: with the composer focused, a plain arrow is **never**
+    /// a history recall, and where there is nothing for it to do inside the composer it
+    /// steps the transcript instead (operator request). Where the transcript has nothing
+    /// to step either — a body that fits its pane — the press is still an explicit
+    /// no-op: not claimed, so nothing repaints and no `follow` / scroll state is left
+    /// describing a movement that never happened.
     #[test]
     fn a_composer_press_with_nothing_to_walk_is_not_claimed() {
+        // A transcript that fits its pane has no viewport to step, so the press has
+        // nowhere to go in either direction. An empty history is not the reason: the
+        // history is never what a plain arrow walks.
         let mut renderer = transcript_with_scrollback();
         renderer.set_focus(FocusPane::Input);
+        renderer.chat_width.set(400);
+        renderer.chat_height.set(400);
+        assert_eq!(
+            transcript_tail_of(&renderer),
+            0,
+            "the fixture must have nothing to scroll"
+        );
         renderer.history.clear();
         renderer.set_input_content("");
         let follow = follow_pair(&renderer);
+        renderer.dirty = false;
 
         assert!(
             !press(&mut renderer, KeyCode::Up, KeyModifiers::NONE),
-            "an empty history is not a key press"
+            "an immovable transcript is not a key press either"
         );
         assert!(renderer.input_text.is_empty(), "and it restated nothing");
         assert_eq!(follow_pair(&renderer), follow, "and it stated no decision");
+        assert!(!renderer.dirty, "and nothing was scheduled for repaint");
 
         assert!(
             !press(&mut renderer, KeyCode::Down, KeyModifiers::NONE),
             "nor is `Down` with no walk in progress"
         );
         assert!(renderer.history_index.is_none());
+        assert!(!renderer.dirty, "and `Down` asked for no repaint either");
 
-        // The walk is no longer what rescues the key: a **full** history behind an
-        // empty single-line draft still leaves the plain arrows unclaimed. This is
-        // the reported conflict — the operator's arrow was recalling history while
-        // they were trying to scroll.
-        let mut renderer = transcript_with_scrollback();
-        renderer.set_focus(FocusPane::Input);
-        renderer.chat_scroll = 12;
+        // A **full** history behind an empty single-line draft changes nothing: the
+        // press is still not a walk, and an immovable transcript is still not a
+        // scroll. This is the reported conflict — the operator's arrow was recalling
+        // history while they were trying to scroll.
         renderer.history = vec!["older entry".to_string(), "newest entry".to_string()];
-        renderer.set_input_content("");
+        renderer.dirty = false;
         let before = (
             renderer.input_text.clone(),
             renderer.history_index,
             renderer.chat_scroll,
-            follow_pair(&renderer),
         );
-        renderer.dirty = false;
-        assert!(
-            !press(&mut renderer, KeyCode::Up, KeyModifiers::NONE),
-            "a waiting history does not make a plain composer `Up` a key press"
-        );
-        assert!(
-            !press(&mut renderer, KeyCode::Down, KeyModifiers::NONE),
-            "nor does it make a plain composer `Down` one"
-        );
-        assert_eq!(
-            renderer.input_text, before.0,
-            "the draft stayed the operator's"
-        );
-        assert_eq!(
-            renderer.history_index, before.1,
-            "and the walk never started"
-        );
-        assert_eq!(renderer.chat_scroll, before.2, "and no viewport moved");
-        assert_eq!(
-            follow_pair(&renderer),
-            before.3,
-            "and no decision was stated"
-        );
-        assert!(!renderer.dirty, "and nothing was scheduled for repaint");
+        for code in [KeyCode::Up, KeyCode::Down] {
+            assert!(
+                !press(&mut renderer, code, KeyModifiers::NONE),
+                "a waiting history does not make a plain composer {code:?} a key press"
+            );
+            assert_eq!(
+                renderer.input_text, before.0,
+                "{code:?}: the draft stayed the operator's"
+            );
+            assert_eq!(
+                renderer.history_index, before.1,
+                "{code:?}: and the walk never started"
+            );
+            assert_eq!(
+                renderer.chat_scroll, before.2,
+                "{code:?}: and no viewport moved"
+            );
+            assert_eq!(
+                follow_pair(&renderer),
+                follow,
+                "{code:?}: and no decision was stated"
+            );
+            assert!(!renderer.dirty, "{code:?}: and nothing was scheduled");
+        }
 
-        // A multi-line draft with the caret against its edge has nowhere to go
-        // either, and no draft shape turns a plain arrow into a walk.
+        // A multi-line draft with the caret against its top edge has nowhere to go
+        // inside the composer either, and no draft shape turns a plain arrow into a
+        // walk. This transcript **can** move, so the press is spent there — while the
+        // caret stays on line 0 and the draft stays the operator's.
         let mut renderer = transcript_with_scrollback();
         renderer.set_focus(FocusPane::Input);
+        renderer.chat_width.set(80);
+        renderer.chat_height.set(10);
+        let tail = transcript_tail_of(&renderer);
+        assert!(tail > 1, "the fixture needs room to scroll: {tail}");
+        renderer.chat_scroll = tail;
         renderer.history = vec!["first\nsecond".to_string()];
         renderer.set_input_content("keep\nthis");
         let before = (renderer.input_text.clone(), renderer.history_index);
+        assert_eq!(
+            renderer.textarea.cursor().0,
+            0,
+            "the fixture parks the caret on the first line"
+        );
         assert!(
-            !press(&mut renderer, KeyCode::Up, KeyModifiers::NONE),
-            "the caret is already on the first line"
+            press(&mut renderer, KeyCode::Up, KeyModifiers::NONE),
+            "the caret is already on the first line, so the transcript takes the press"
         );
         assert_eq!(renderer.input_text, before.0, "and the draft stayed put");
-        assert_eq!(renderer.history_index, before.1);
+        assert_eq!(renderer.history_index, before.1, "and the walk never began");
+        assert_eq!(
+            renderer.textarea.cursor().0,
+            0,
+            "and the caret was not disturbed"
+        );
+        assert_eq!(
+            renderer.chat_scroll,
+            tail - 1,
+            "the transcript stepped one line up"
+        );
+    }
+
+    /// The rule the operator asked for, in the plainest case: the composer is focused
+    /// and holds an empty single-line draft, so the caret has nowhere to go and the
+    /// press is spent on the **transcript**. `Up` is one line up and states the follow
+    /// decision it is (off the tail turns follow off); `Down` is one line down and
+    /// re-arms follow only by arriving on the tail.
+    #[test]
+    fn a_composer_arrow_at_the_drafts_edge_scrolls_the_transcript() {
+        let mut renderer = transcript_with_scrollback();
+        renderer.set_focus(FocusPane::Input);
+        renderer.chat_width.set(80);
+        renderer.chat_height.set(10);
+        let tail = transcript_tail_of(&renderer);
+        assert!(tail > 1, "the fixture needs room to scroll: {tail}");
+        renderer.set_input_content("");
+        assert_eq!(
+            renderer.textarea.cursor().0,
+            0,
+            "an empty draft is one line, so the caret has nowhere to go"
+        );
+        // Park the viewport on the tail, where follow pins it, so "one line up" is an
+        // offset claim.
+        renderer.set_follow(true);
+        renderer.chat_scroll = tail;
+        renderer.dirty = false;
+
+        assert!(
+            press(&mut renderer, KeyCode::Up, KeyModifiers::NONE),
+            "the press is claimed: it stepped the transcript"
+        );
+        assert_eq!(
+            renderer.chat_scroll,
+            tail - 1,
+            "`Up` in the composer is one line up the transcript"
+        );
+        assert_eq!(
+            follow_pair(&renderer),
+            (false, false),
+            "and the viewport left the tail, so follow is off"
+        );
+        assert!(renderer.dirty, "a moved viewport asks for a repaint");
+
+        assert!(
+            press(&mut renderer, KeyCode::Down, KeyModifiers::NONE),
+            "`Down` is claimed the same way"
+        );
+        assert_eq!(
+            renderer.chat_scroll, tail,
+            "and it stepped back onto the tail"
+        );
+        assert_eq!(
+            follow_pair(&renderer),
+            (true, true),
+            "an arrival on the tail re-arms follow"
+        );
+    }
+
+    /// The caret comes first: inside a multi-line draft the arrow is the composer's,
+    /// and the transcript under it does not move — not its offset, not its follow
+    /// state, not the frame.
+    #[test]
+    fn a_composer_arrow_inside_a_multiline_draft_leaves_the_transcript_alone() {
+        let mut renderer = transcript_with_scrollback();
+        renderer.set_focus(FocusPane::Input);
+        renderer.chat_width.set(80);
+        renderer.chat_height.set(10);
+        let tail = transcript_tail_of(&renderer);
+        assert!(tail > 1, "the fixture needs room to scroll: {tail}");
+        renderer.chat_scroll = tail;
+        renderer.set_follow(true);
+        renderer.set_input_content("one\ntwo\nthree");
+        // The caret in the middle of the draft, with a line above it and a line below.
+        renderer
+            .textarea
+            .move_cursor(ratatui_textarea::CursorMove::Jump(1, 0));
+        let offset = renderer.chat_scroll;
+        let follow = follow_pair(&renderer);
+        renderer.dirty = false;
+
+        assert!(
+            press(&mut renderer, KeyCode::Up, KeyModifiers::NONE),
+            "the caret took the key"
+        );
+        assert_eq!(
+            renderer.textarea.cursor().0,
+            0,
+            "and it stepped one line up"
+        );
+        assert_eq!(
+            renderer.input_text, "one\ntwo\nthree",
+            "the draft is the operator's, caret movement only"
+        );
+        assert_eq!(
+            renderer.chat_scroll, offset,
+            "the transcript moved while the caret did"
+        );
+        assert_eq!(
+            follow_pair(&renderer),
+            follow,
+            "and a caret move stated a follow decision"
+        );
+        assert!(renderer.dirty, "the caret moved, so the frame is stale");
+    }
+
+    /// The edge of a multi-line draft is the case the operator reported: the caret is
+    /// already on the first line, so `Up` steps the **transcript** by one line and
+    /// leaves the caret exactly where it was.
+    #[test]
+    fn a_composer_arrow_on_the_first_line_scrolls_the_transcript_and_keeps_the_caret() {
+        let mut renderer = transcript_with_scrollback();
+        renderer.set_focus(FocusPane::Input);
+        renderer.chat_width.set(80);
+        renderer.chat_height.set(10);
+        let tail = transcript_tail_of(&renderer);
+        assert!(tail > 1, "the fixture needs room to scroll: {tail}");
+        renderer.chat_scroll = tail;
+        renderer.set_follow(true);
+        renderer.set_input_content("first line\nsecond line");
+        assert_eq!(
+            renderer.textarea.cursor().0,
+            0,
+            "a fresh draft parks the caret on its first line"
+        );
+        let draft = renderer.input_text.clone();
+
+        assert!(
+            press(&mut renderer, KeyCode::Up, KeyModifiers::NONE),
+            "the transcript took the press the caret could not use"
+        );
+        assert_eq!(
+            renderer.chat_scroll,
+            tail - 1,
+            "`Up` stepped the transcript one line"
+        );
+        assert_eq!(
+            renderer.textarea.cursor().0,
+            0,
+            "and the caret is still on line 0"
+        );
+        assert_eq!(renderer.input_text, draft, "and the draft is untouched");
+        assert_eq!(
+            follow_pair(&renderer),
+            (false, false),
+            "the away step turned follow off"
+        );
+    }
+
+    /// `Ctrl+Up` stays the **only** history binding, in the composer focus too: the
+    /// walk runs, and the transcript under it keeps its offset and its follow state.
+    #[test]
+    fn the_history_chord_still_walks_from_the_composer_and_never_scrolls() {
+        let mut renderer = transcript_with_scrollback();
+        renderer.set_focus(FocusPane::Input);
+        renderer.chat_width.set(80);
+        renderer.chat_height.set(10);
+        let tail = transcript_tail_of(&renderer);
+        assert!(tail > 1, "the fixture needs room to scroll: {tail}");
+        renderer.chat_scroll = tail;
+        renderer.set_follow(true);
+        renderer.set_input_content("");
+        renderer.history = vec!["an earlier note".to_string()];
+        let offset = renderer.chat_scroll;
+        let follow = follow_pair(&renderer);
+
+        assert!(
+            press(&mut renderer, KeyCode::Up, KeyModifiers::CONTROL),
+            "`Ctrl+Up` is the history binding"
+        );
+        assert_eq!(
+            renderer.input_text, "an earlier note",
+            "the entry came back"
+        );
+        assert_eq!(renderer.history_index, Some(0), "and the walk is recorded");
+        assert_eq!(
+            renderer.chat_scroll, offset,
+            "the chord moved the transcript instead of the draft"
+        );
+        assert_eq!(
+            follow_pair(&renderer),
+            follow,
+            "and stated a follow decision for a walk"
+        );
+    }
+
+    /// The no-movement-no-decision rule, at the new call site: a transcript that fits
+    /// its pane (`transcript_tail() == 0`) has no line to give, so the press states
+    /// nothing — no follow change, no chip flap, no repaint — and is reported as not
+    /// claimed.
+    #[test]
+    fn a_composer_arrow_over_a_transcript_that_fits_is_not_claimed() {
+        let mut renderer = transcript_with_scrollback();
+        renderer.set_focus(FocusPane::Input);
+        // Wide and tall: every line of the fixture is on screen, `max_scroll == 0`.
+        renderer.chat_width.set(400);
+        renderer.chat_height.set(400);
+        assert_eq!(
+            transcript_tail_of(&renderer),
+            0,
+            "the fixture must have nothing to scroll"
+        );
+        renderer.set_input_content("");
+        let follow = follow_pair(&renderer);
+        assert_eq!(follow, (true, true), "follow starts on");
+
+        for code in [KeyCode::Up, KeyCode::Down] {
+            renderer.dirty = false;
+            assert!(
+                !press(&mut renderer, code, KeyModifiers::NONE),
+                "{code:?} claimed a press that had nowhere to go"
+            );
+            assert_eq!(
+                renderer.chat_scroll, 0,
+                "{code:?} moved an immovable offset"
+            );
+            assert_eq!(
+                follow_pair(&renderer),
+                follow,
+                "{code:?} flapped the follow chip on a pane with nothing to scroll"
+            );
+            assert!(!renderer.dirty, "{code:?} repainted a still viewport");
+        }
     }
 
     /// Defects 6 and 8: the walk is driven by the explicit `Ctrl+Up`/`Ctrl+Down`
