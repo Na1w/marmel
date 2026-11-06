@@ -7,6 +7,14 @@
 //! `stty -echo` stops the echoed command line from polluting stdout; `ulimit -f` caps
 //! each command's file write to 2 GiB (1 GiB fallback).
 //!
+//! On Windows a one-shot `run_command` does **not** use a PTY at all: ConPTY closes its
+//! output pipe only during `ClosePseudoConsole`, i.e. after the read loop, so a PTY reader
+//! there never sees EOF and every command could only ever time out with its output
+//! discarded. The Windows branch spawns `%COMSPEC% /C <command>` with
+//! `std::process::Command`, terminates on **child exit**, reports the exit status and
+//! kills the whole tree with `taskkill /F /T` on timeout or cancellation. Interactive
+//! `pty_spawn` sessions keep using portable-pty on both platforms.
+//!
 //! Completion, timeout (strict 300 s) and teardown all issue `libc::kill(-pid,
 //! libc::SIGKILL)` to the *entire process group* (negative pid), then reap the child
 //! exactly once through one idempotent, bounded `try_wait()` path (a child still running
@@ -720,41 +728,169 @@ fn wire_extra_readonly_paths_env(
     }
 }
 
+/// Which spawn rules apply to the `run_command`/PTY path: the Windows rules
+/// (`%COMSPEC%`, `/C`, an extension-qualified program, a `cmd.exe`-safe current
+/// directory) or the Unix rules (Landlock re-entry, else `sh -c`).
+///
+/// The spawn builders take this as a parameter instead of reading `cfg!` inline so the
+/// **Windows** decision can be asserted on a macOS or Linux host with literal Windows
+/// inputs — CI's `cross-check` job only *compiles* the Windows target, so a
+/// `#[cfg(windows)]`-only body would be a guard that never runs. Production always
+/// passes [`SpawnFamily::current`], so live behaviour is exactly what the platform
+/// requires. Same idiom as `PathFamily` in `src/harness/fs.rs`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SpawnFamily {
+    Unix,
+    Windows,
+}
+
+impl SpawnFamily {
+    /// The family of the platform this binary was **built** for — the value every
+    /// production call site passes.
+    pub(crate) const fn current() -> Self {
+        if cfg!(windows) {
+            SpawnFamily::Windows
+        } else {
+            SpawnFamily::Unix
+        }
+    }
+}
+
+/// The shell spellings that make a bare command an *interactive shell request* (R1 of
+/// [`windows_shell_argv`]), compared ASCII-case-insensitively against the trimmed input.
+const WINDOWS_INTERACTIVE_SHELLS: &[&str] = &["cmd", "cmd.exe", "powershell", "powershell.exe"];
+
+/// The `cmd.exe` program token of R2: a non-empty trimmed `%COMSPEC%`, else the literal
+/// `cmd.exe`. An empty or whitespace-only `comspec` never wins.
+fn windows_cmd_program(comspec: Option<&str>) -> String {
+    comspec
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| "cmd.exe".to_string())
+}
+
+/// Program + arguments for one spawn on Windows, decided from its inputs only so every
+/// rule below is assertable with literal Windows inputs on a macOS host.
+///
+/// Rules:
+///
+/// * **R1 — a bare shell is an interactive request.** When `command.trim()` is exactly
+///   `cmd`, `cmd.exe`, `powershell` or `powershell.exe` (ASCII case-insensitive), the
+///   program *is* that shell and there is **no** `/C` payload: the child starts an
+///   interactive shell whose commands arrive from the PTY. That is the form
+///   `pty_spawn` needs, because it writes into the session afterwards. A **one-shot**
+///   caller must not use it: it never writes to the PTY and never closes a writer, so a
+///   payload-less shell can only sit at its prompt until the timeout kills it. Removing
+///   that hazard belongs to the one-shot rewrite (t-009); [`build_sandboxed_command`]
+///   keeps the interactive form because it serves both callers and cannot tell them
+///   apart.
+/// * **R2 — `cmd` is always extension-qualified.** `CreateProcessW` does not append
+///   `.exe` to `lpApplicationName` and cannot launch a `.CMD`/`.BAT` at all, so a bare
+///   `cmd` token is a latent `ERROR_FILE_NOT_FOUND` (or a wrongly resolved `.CMD`). The
+///   program is therefore `%COMSPEC%` when `comspec` is `Some` and non-empty after
+///   trimming, and the literal `cmd.exe` otherwise.
+/// * **R3 — other shells are passed through as written.** `powershell`/`powershell.exe`
+///   (any casing) are used verbatim (trimmed): `%COMSPEC%` names `cmd.exe`, so
+///   substituting it would silently run a different shell than the caller asked for.
+/// * **R4 — everything else is `cmd /C <command>`.** A normal command is one `/C`
+///   payload argument, i.e. `[program, "/C", command]` with the program from R2.
+/// * **R5 — the payload is verbatim.** `command` reaches the child byte for byte: no
+///   trimming, no re-quoting, no POSIX preamble. Quoting/escaping of the payload
+///   (portable-pty's `append_quoted` applies MSVCRT backslash rules while `cmd.exe` has
+///   no backslash escape) is deliberately out of scope here and belongs to t-009.
+pub(crate) fn windows_shell_argv(command: &str, comspec: Option<&str>) -> (String, Vec<String>) {
+    let trimmed = command.trim();
+    if WINDOWS_INTERACTIVE_SHELLS
+        .iter()
+        .any(|shell| trimmed.eq_ignore_ascii_case(shell))
+    {
+        let is_cmd_family =
+            trimmed.eq_ignore_ascii_case("cmd") || trimmed.eq_ignore_ascii_case("cmd.exe");
+        let program = if is_cmd_family {
+            windows_cmd_program(comspec)
+        } else {
+            trimmed.to_string()
+        };
+        return (program, Vec::new());
+    }
+    (
+        windows_cmd_program(comspec),
+        vec!["/C".to_string(), command.to_string()],
+    )
+}
+
+/// Drop `prefix` from `raw` when it matches ASCII-case-insensitively, else `None`.
+/// Every prefix used here is ASCII, so the returned tail always starts on a `char`
+/// boundary.
+fn strip_ascii_prefix<'a>(raw: &'a str, prefix: &str) -> Option<&'a str> {
+    let bytes = raw.as_bytes();
+    let wanted = prefix.as_bytes();
+    (bytes.len() >= wanted.len() && bytes[..wanted.len()].eq_ignore_ascii_case(wanted))
+        .then(|| &raw[wanted.len()..])
+}
+
+/// The current directory to hand to a Windows child, decided from its input only.
+///
+/// [`PtySession::spawn`] and [`PtyManager::spawn`] pass
+/// [`crate::harness::get_workspace_root`], and `set_workspace_root` canonicalises it,
+/// which on Windows yields a `\\?\`-verbatim path (`\\?\C:\work\proj`).
+/// `CreateProcessW` accepts that spelling, but `cmd.exe` reads a leading `\\` as a UNC
+/// path and refuses to use one as its current directory — the command then quietly runs
+/// in `C:\Windows`. Rules:
+///
+/// * **C1 — a verbatim UNC path loses only the verbatim prefix.** `\\?\UNC\srv\share\p`
+///   becomes `\\srv\share\p`, the plain UNC spelling `cmd.exe` understands.
+/// * **C2 — a verbatim volume path loses only the prefix.** `\\?\C:\work\proj` becomes
+///   `C:\work\proj`.
+/// * **C3 — every other path is returned untouched**, byte for byte: a plain
+///   `C:\work`, a relative path, a Unix path, and a degenerate `\\?\` (or `\\?\UNC\`)
+///   with nothing behind it, which is left as-is instead of collapsing to an empty path.
+/// * **C4 — never a substitution.** A directory that does not exist is *not* replaced by
+///   another one (portable-pty would otherwise fall back to `%USERPROFILE%`); the caller
+///   decides, and the path it asked for is the path it gets.
+///
+/// The prefix match is ASCII-case-insensitive because the Windows namespace prefix is.
+/// `\\.\` and `\\localhost\` are deliberately *not* rewritten: they are device
+/// spellings, not verbatim ones (unlike `fs::WINDOWS_PATH_PREFIXES`, which serves
+/// comparison keys rather than a child's working directory). A de-verbatimised path is
+/// rebuilt from its string spelling — the removed prefix is pure ASCII, so only a path
+/// carrying an unpaired surrogate would not round-trip — while every untouched path is
+/// returned as the original `PathBuf`.
+pub(crate) fn windows_child_cwd(cwd: &std::path::Path) -> std::path::PathBuf {
+    const VERBATIM_UNC: &str = r"\\?\UNC\";
+    const VERBATIM: &str = r"\\?\";
+    let raw = cwd.as_os_str().to_string_lossy();
+    let spelled: &str = &raw;
+    if let Some(rest) = strip_ascii_prefix(spelled, VERBATIM_UNC) {
+        if !rest.is_empty() {
+            return std::path::PathBuf::from(format!(r"\\{rest}"));
+        }
+        return cwd.to_path_buf();
+    }
+    if let Some(rest) = strip_ascii_prefix(spelled, VERBATIM)
+        && !rest.is_empty()
+    {
+        return std::path::PathBuf::from(rest);
+    }
+    cwd.to_path_buf()
+}
+
 /// Build the shell command for one `run_command`/PTY execution.
 ///
 /// Landlock is applied on Linux through [`SANDBOX_EXEC_ARG`] re-entry decided by [`should_apply_sandbox`] —
 /// from the resolved exe path, platform support and an explicit opt-out, **never** from the executable's name.
 /// `Err` is returned when the sandbox is required but cannot be applied (fail-closed). On Windows there is no
-/// Landlock: the skip is logged and the command is built unchanged.
+/// Landlock: the skip is logged and the command is built by [`windows_shell_argv`] in the
+/// [`windows_child_cwd`]-sanitised directory (see both for the rule set).
 pub fn build_sandboxed_command(
     command: &str,
     cwd: &std::path::Path,
 ) -> Result<CommandBuilder, ToolError> {
-    if cfg!(target_os = "windows") {
-        let trimmed = command.trim();
-        tracing::warn!(
-            resolved_exe = %resolved_exe_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<unresolved>".to_string()),
-            mode = "unsandboxed",
-            reason = "platform has no Landlock",
-            "pty sandbox SKIPPED: Windows has no Landlock, this command runs unsandboxed"
-        );
-        if trimmed.eq_ignore_ascii_case("cmd")
-            || trimmed.eq_ignore_ascii_case("cmd.exe")
-            || trimmed.eq_ignore_ascii_case("powershell")
-            || trimmed.eq_ignore_ascii_case("powershell.exe")
-        {
-            let mut cmd = CommandBuilder::new(trimmed);
-            cmd.cwd(cwd);
-            Ok(cmd)
-        } else {
-            let mut cmd = CommandBuilder::new("cmd");
-            cmd.args(["/C", command]);
-            cmd.cwd(cwd);
-            Ok(cmd)
-        }
-    } else {
+    // The Unix branch is returned early so its argv, its extras-channel wiring and its
+    // cwd stay byte-identical to the pre-value version; only the branch *selector* moved
+    // from `cfg!` to [`SpawnFamily::current`].
+    if SpawnFamily::current() == SpawnFamily::Unix {
         let decision = sandbox_decision_for_current_process();
         let (program, args) = sandbox_command_argv(&decision, command, cwd)?;
         let mut cmd = CommandBuilder::new(program);
@@ -766,8 +902,30 @@ pub fn build_sandboxed_command(
         // and cleared otherwise so nothing ambient is inherited.
         wire_extra_readonly_paths_env(&mut cmd, &decision, extra_readonly_paths_env_value());
         cmd.cwd(cwd);
-        Ok(cmd)
+        return Ok(cmd);
     }
+
+    // Windows has no Landlock, so the skip is never silent.
+    tracing::warn!(
+        resolved_exe = %resolved_exe_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<unresolved>".to_string()),
+        mode = "unsandboxed",
+        reason = "platform has no Landlock",
+        "pty sandbox SKIPPED: Windows has no Landlock, this command runs unsandboxed"
+    );
+    // The program token is decided here and never left as a bare `cmd`: portable-pty
+    // resolves argv[0] through PATH+PATHEXT but passes the result to `CreateProcessW` as
+    // `lpApplicationName`, which does not append `.exe`.
+    let comspec = std::env::var("COMSPEC").ok();
+    let (program, args) = windows_shell_argv(command, comspec.as_deref());
+    let mut cmd = CommandBuilder::new(program);
+    cmd.args(args);
+    // `cmd.exe` treats a `\\`-prefixed path as UNC and refuses it as its current
+    // directory, so the canonicalised (verbatim) workspace root is de-verbatimised before
+    // it reaches `CreateProcessW`.
+    cmd.cwd(windows_child_cwd(cwd));
+    Ok(cmd)
 }
 
 impl PtySession {
@@ -901,13 +1059,162 @@ pub fn run_command(args: &Value) -> Result<ToolResult, ToolError> {
     Ok(ToolResult::ok(output))
 }
 
-/// Core PTY execution: spawn the sandbox, read output with a timeout, and always tear down
-/// the process group **and reap the child** afterwards. The `timeout` is strict (default
-/// 300 s) and preempts a hung child by SIGKILLing the entire process group. Every exit
-/// path — normal completion, timeout, cancellation signal, abrupt disconnect, or an error
-/// from `?` before the loop even starts — ends in [`PtySession::teardown`] /
-/// `Drop as PtySession`, so no `<defunct>` child survives a `run_command`.
+// One-shot outcome reporting — pure, so it is asserted on every host
+//
+// `run_command` has one channel to the caller, the returned string, so a failure must
+// never be spelled like a success: a non-zero exit carries an explicit status line and a
+// timeout/cancellation keeps the output it already captured. Both rules are functions of
+// their arguments only, which is why they are unit-tested on a macOS/Linux host; the
+// `cfg(any(windows, test))` gate keeps a production build on those hosts free of the
+// otherwise unused code (the only production caller is the Windows one-shot path).
+
+/// How a one-shot execution ended, reduced to what the result string must say.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OneShotEnd {
+    /// The child exited on its own; `None` when the platform reported no exit code.
+    Exited(Option<i32>),
+    /// The deadline elapsed first; the whole child tree was killed.
+    TimedOut(Duration),
+    /// A cancellation signal preempted the run; the whole child tree was killed.
+    Cancelled,
+}
+
+/// Render the string `run_command` returns for `captured` output that ended as `end`.
+///
+/// The shape mirrors the PTY path: the captured bytes get [`sanitize_terminal_output`]
+/// and lose their trailing newlines, so a clean exit returns the output alone, exactly
+/// like the Unix path does today. Anything else appends **one** bracketed line — the exit
+/// status, the timeout notice or the cancellation notice — so the outcome can no longer be
+/// mistaken for success and the captured output is never thrown away.
+#[cfg(any(windows, test))]
+pub(crate) fn render_one_shot_result(captured: &str, end: OneShotEnd) -> String {
+    let body = sanitize_terminal_output(captured)
+        .trim_end_matches('\n')
+        .to_string();
+    let notice = match end {
+        OneShotEnd::Exited(Some(0)) => return body,
+        OneShotEnd::Exited(Some(code)) => format!("[exit code: {code}]"),
+        OneShotEnd::Exited(None) => "[exit status unavailable]".to_string(),
+        OneShotEnd::TimedOut(timeout) => format!(
+            "[command timed out after {}s and was killed]",
+            timeout.as_secs()
+        ),
+        OneShotEnd::Cancelled => "[command aborted by cancellation signal]".to_string(),
+    };
+    if body.is_empty() {
+        notice
+    } else {
+        format!("{body}\n{notice}")
+    }
+}
+
+/// Program + arguments of a **one-shot** Windows spawn.
+///
+/// A one-shot command has no terminal and writes nothing to the child, so R1 of
+/// [`windows_shell_argv`] — the payload-less interactive shell — can only sit at its
+/// prompt until the timeout kills it. That form is refused here with an actionable
+/// detail instead of being spawned; everything else is [`windows_shell_argv`] unchanged
+/// (R2-R5), so a normal command is `[program, "/C", command]` with the payload reaching
+/// the child byte for byte.
+#[cfg(any(windows, test))]
+pub(crate) fn windows_oneshot_argv(
+    command: &str,
+    comspec: Option<&str>,
+) -> Result<(String, Vec<String>), String> {
+    let (program, args) = windows_shell_argv(command, comspec);
+    if args.is_empty() {
+        return Err(format!(
+            "`{program}` is an interactive shell, not a command: a one-shot run_command has \
+             no terminal to type into, so the shell would wait for input until the timeout. \
+             Use pty_spawn for an interactive session, or pass the command to run"
+        ));
+    }
+    Ok((program, args))
+}
+
+/// What one iteration of the one-shot poll loop decides.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OneShotPoll {
+    /// The child exited on its own; `None` when the platform reported no exit code.
+    Exited(Option<i32>),
+    /// A cancellation signal preempted the run.
+    Cancelled,
+    /// The deadline elapsed first.
+    TimedOut,
+    /// Nothing has happened yet: keep polling.
+    Running,
+}
+
+/// The one-shot poll loop's decision, decided from its inputs only.
+///
+/// `exit_code` is `Some(..)` once the child has exited (`Some(None)` when the platform
+/// reported no code), `elapsed` is the time since the spawn. The **order** is the
+/// contract, not an implementation detail:
+///
+/// * an observed exit wins over everything — a command that finished inside (or exactly
+///   at) its budget is reported with its own status and its output, never as
+///   "timed out and was killed";
+/// * a cancellation signal wins over the deadline — the caller asked for it;
+/// * the deadline is `elapsed >= timeout`, so a degenerate `timeout` of zero means "stop
+///   at the first poll" and can never mean "wait forever".
+///
+/// The loop lives in `#[cfg(windows)]` code that no non-Windows host can execute, so this
+/// decision is a pure function: the arithmetic (including a zero/sub-second budget) is
+/// assertable on every host instead of only where the loop runs.
+#[cfg(any(windows, test))]
+pub(crate) fn one_shot_poll_decision(
+    exit_code: Option<Option<i32>>,
+    cancelled: bool,
+    elapsed: Duration,
+    timeout: Duration,
+) -> OneShotPoll {
+    if let Some(code) = exit_code {
+        return OneShotPoll::Exited(code);
+    }
+    if cancelled {
+        return OneShotPoll::Cancelled;
+    }
+    if elapsed >= timeout {
+        return OneShotPoll::TimedOut;
+    }
+    OneShotPoll::Running
+}
+
+/// One-shot execution of a `run_command` command with a strict `timeout`.
+///
+/// A one-shot command needs no terminal, and on Windows the PTY *is* ConPTY: its output
+/// pipe is closed only as part of `ClosePseudoConsole`, which `portable-pty` runs when the
+/// session is dropped — i.e. **after** the read loop — so a PTY reader there never sees
+/// EOF, and every command could only ever burn its full timeout and discard the bytes it
+/// had already captured. The Windows branch therefore spawns the shell directly with
+/// `std::process::Command` (`run_command_windows_oneshot`) and terminates on **child
+/// exit**, while interactive sessions (`pty_spawn`) keep using portable-pty on both
+/// platforms.
+///
+/// The Unix branch is the PTY implementation, unchanged (`run_command_via_pty`).
 pub fn run_command_pty(command: &str, timeout: Duration) -> Result<String, ToolError> {
+    #[cfg(windows)]
+    {
+        run_command_windows_oneshot(command, timeout)
+    }
+
+    #[cfg(not(windows))]
+    {
+        run_command_via_pty(command, timeout)
+    }
+}
+
+/// Unix one-shot execution: spawn the sandbox into a PTY, read output with a timeout, and
+/// always tear down the process group **and reap the child** afterwards. The `timeout` is
+/// strict (default 300 s) and preempts a hung child by SIGKILLing the entire process
+/// group. Every exit path — normal completion, timeout, cancellation signal, abrupt
+/// disconnect, or an error from `?` before the loop even starts — ends in
+/// [`PtySession::teardown`] / `Drop as PtySession`, so no `<defunct>` child survives a
+/// `run_command`.
+#[cfg(not(windows))]
+fn run_command_via_pty(command: &str, timeout: Duration) -> Result<String, ToolError> {
     let mut session = PtySession::spawn(command)?;
 
     // Spawn the writer so EOF can be generated on drop (avoids deadlock).
@@ -965,6 +1272,221 @@ pub fn run_command_pty(command: &str, timeout: Duration) -> Result<String, ToolE
     Ok(sanitize_terminal_output(&output)
         .trim_end_matches('\n')
         .to_string())
+}
+
+// Windows one-shot execution: no ConPTY
+//
+// A one-shot command has no terminal to talk to, so the Windows branch spawns it with
+// `std::process::Command` and keeps portable-pty for interactive sessions only.
+
+/// How much of the command the one-shot `tracing::debug!` line keeps: enough to identify
+/// what ran, bounded so a multi-KiB heredoc cannot flood the log.
+#[cfg(windows)]
+const ONESHOT_LOG_COMMAND_CHARS: usize = 200;
+
+/// How long the pipe readers get to drain once the child is gone. Bounded on purpose: a
+/// `run_command` must never block indefinitely on a pipe that a stray grandchild still
+/// holds open.
+#[cfg(windows)]
+const ONESHOT_DRAIN_GRACE: Duration = Duration::from_millis(300);
+
+/// One-shot Windows execution with `std::process::Command` — no ConPTY anywhere.
+///
+/// Why not the PTY path (see [`run_command_pty`]): under ConPTY the output pipe is closed
+/// only by `ClosePseudoConsole`, which `portable-pty` invokes in `PseudoConsole::drop`,
+/// i.e. after the read loop — so the reader never reaches EOF and a `run_command` could
+/// only ever time out, discarding the output it had already captured and never reporting
+/// the exit code.
+///
+/// Properties this path guarantees:
+///
+/// * the payload reaches `cmd.exe` verbatim (`raw_arg`, never `args()`, whose MSVCRT
+///   quoting mangles `"` — `cmd.exe` has no backslash escape);
+/// * `stdin` is null, so a command can never block waiting for input;
+/// * `stdout` and `stderr` are drained concurrently into one shared buffer, so a chatty
+///   child cannot deadlock on a full pipe and partial output survives a timeout;
+/// * the child is polled with `try_wait()` against the same deadline and 50 ms cadence as
+///   the Unix path, and cancellation still preempts;
+/// * a timeout or cancellation kills the whole **tree** (`taskkill /F /T`), then reaps
+///   the direct child, so nothing is left running or unreaped.
+#[cfg(windows)]
+fn run_command_windows_oneshot(command: &str, timeout: Duration) -> Result<String, ToolError> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let cwd = windows_child_cwd(&crate::harness::get_workspace_root());
+    let comspec = std::env::var("COMSPEC").ok();
+    let (program, args) = windows_oneshot_argv(command, comspec.as_deref()).map_err(|detail| {
+        ToolError::BadArguments {
+            tool: TOOL_RUN_COMMAND.into(),
+            detail,
+        }
+    })?;
+
+    // One line, so the next Windows report is diagnosable from the log alone.
+    tracing::debug!(
+        platform = std::env::consts::OS,
+        shell = %program,
+        cwd = %cwd.display(),
+        command = %crate::text_util::truncate_chars(command, ONESHOT_LOG_COMMAND_CHARS),
+        "run_command one-shot spawn (std::process::Command, no ConPTY)"
+    );
+
+    let mut cmd = Command::new(&program);
+    cmd.current_dir(&cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // `raw_arg` for both `/C` and the payload: the argument reaches the child as written,
+    // which is the whole point of not going through `args()`.
+    for arg in &args {
+        cmd.raw_arg(arg);
+    }
+    let mut child = cmd.spawn().map_err(|err| {
+        // A spawn failure is a real error, never a notice string: name the shell, the
+        // directory it was given and the OS error.
+        ToolError::Execution(anyhow::anyhow!(
+            "failed to spawn `{program}` in `{}`: {err}",
+            cwd.display()
+        ))
+    })?;
+
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let mut readers = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        readers.push(spawn_pipe_reader(stdout, std::sync::Arc::clone(&captured)));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        readers.push(spawn_pipe_reader(stderr, std::sync::Arc::clone(&captured)));
+    }
+
+    // Terminate on child exit, not on pipe EOF — the same deadline and cadence as the
+    // Unix poll loop, and cancellation still preempts the run.
+    let start = std::time::Instant::now();
+    let poll_interval = Duration::from_millis(50);
+    let end = loop {
+        let exit_code = match child.try_wait() {
+            Ok(Some(status)) => Some(status.code()),
+            Ok(None) => None,
+            Err(err) => {
+                // The child's state is unknown from here on: kill and reap it rather
+                // than leak it, and report the exit status as unavailable.
+                tracing::warn!(error = %err, "run_command could not poll the child");
+                kill_windows_tree(&mut child);
+                break OneShotEnd::Exited(None);
+            }
+        };
+        match one_shot_poll_decision(
+            exit_code,
+            crate::orchestrator::is_current_or_global_cancelled(),
+            start.elapsed(),
+            timeout,
+        ) {
+            OneShotPoll::Exited(code) => break OneShotEnd::Exited(code),
+            OneShotPoll::Cancelled => {
+                kill_windows_tree(&mut child);
+                break OneShotEnd::Cancelled;
+            }
+            OneShotPoll::TimedOut => {
+                kill_windows_tree(&mut child);
+                break OneShotEnd::TimedOut(timeout);
+            }
+            OneShotPoll::Running => std::thread::sleep(poll_interval),
+        }
+    };
+
+    // Bounded grace: both pipes close once the child (and the killed tree) is gone, so
+    // this is normally immediate. It exists only so that output already written is not
+    // lost to a reader thread that has not been scheduled yet.
+    let grace_start = std::time::Instant::now();
+    while grace_start.elapsed() < ONESHOT_DRAIN_GRACE && readers.iter().any(|h| !h.is_finished()) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for handle in readers {
+        if handle.is_finished() {
+            if handle.join().is_err() {
+                tracing::warn!("a run_command pipe reader panicked; output may be truncated");
+            }
+        } else {
+            // A stray grandchild still holds a pipe end. Detach the reader instead of
+            // joining it: `run_command` must never block indefinitely.
+            tracing::warn!("a run_command pipe reader did not finish within the drain grace");
+        }
+    }
+
+    let text = match captured.lock() {
+        Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
+        Err(poisoned) => {
+            // A reader panicked mid-push; the bytes it already stored are still valid,
+            // so recover them instead of discarding the output.
+            tracing::warn!("run_command output buffer was poisoned; recovering captured bytes");
+            String::from_utf8_lossy(&poisoned.into_inner()).into_owned()
+        }
+    };
+    Ok(render_one_shot_result(&text, end))
+}
+
+/// Drain one child pipe into the shared capture buffer on its own thread.
+///
+/// Streaming rather than buffering until EOF is what keeps the output on a timeout, and
+/// reading both pipes concurrently is what stops a chatty child from blocking on a full
+/// pipe buffer. Chunks from `stdout` and `stderr` interleave, which is the same
+/// best-effort interleaving a terminal gives.
+#[cfg(windows)]
+fn spawn_pipe_reader<R: Read + Send + 'static>(
+    mut pipe: R,
+    sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut tmp = [0u8; 4096];
+        loop {
+            match pipe.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => match sink.lock() {
+                    Ok(mut buf) => buf.extend_from_slice(&tmp[..n]),
+                    // A poisoned buffer means the other reader panicked while holding
+                    // the lock, so the capture is already broken: stop here instead of
+                    // spinning on it (the caller still recovers the stored bytes).
+                    Err(_) => break,
+                },
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+/// Kill the whole child tree on Windows, then reap the direct child.
+///
+/// `portable-pty` creates no Job Object and `Child::kill` only `TerminateProcess`es the
+/// direct child, so a grandchild of `cmd.exe` survives it. Without a Job Object the
+/// dependency-free route to the tree is `taskkill /F /T /PID <pid>`, which walks the
+/// parent-child relation. A non-zero `taskkill` exit normally just means the tree is
+/// already gone, so it is not treated as a failure; `child.kill()` remains the fallback
+/// for the direct child (and for a machine without `taskkill`), and `child.wait()` reaps
+/// it so nothing is left unreaped.
+#[cfg(windows)]
+fn kill_windows_tree(child: &mut std::process::Child) {
+    let pid = child.id().to_string();
+    match std::process::Command::new("taskkill")
+        .args(["/F", "/T", "/PID", pid.as_str()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) if !status.success() => {
+            tracing::debug!(pid = %pid, code = ?status.code(), "taskkill did not report success");
+        }
+        Ok(_) => {}
+        Err(err) => tracing::warn!(pid = %pid, error = %err, "taskkill is unavailable"),
+    }
+    if let Err(err) = child.kill() {
+        // An already-exited child fails here too; the `wait` below still reaps it.
+        tracing::debug!(error = %err, "child.kill() after taskkill");
+    }
+    if let Err(err) = child.wait() {
+        tracing::warn!(error = %err, "could not reap the killed run_command child");
+    }
 }
 
 // Interactive Multi-Turn PTY Manager

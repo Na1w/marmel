@@ -4569,6 +4569,139 @@ fn theme_glyphs_are_the_spec_table_and_the_picker_follows_row_state() {
     assert_eq!(theme::FOCUS_BADGE, '●');
 }
 
+// ---------------------------------------------------------------------------
+// §7.1 palette × capability contract (t-008)
+//
+// `theme`'s own `mod tests` pins the capability *rule table* — `capability_of`
+// against literal host / `NO_COLOR` / `TERM` / console inputs — plus the
+// exhaustive monochrome degrade sweep. The tests below ask the other question a
+// pane actually depends on: **given the profile a host decides, does the palette
+// hand back the designed styles?** That is the assertion the `cmd.exe` defect
+// would have failed: on Windows `TERM` is never exported, and reading its
+// absence as "uncoloured" blanked every slot of the TUI on a real console.
+// ---------------------------------------------------------------------------
+
+/// Put a decided [`theme::Capability`] in force for one test and restore the
+/// previous profile on drop.
+///
+/// The seam is `theme`'s `cfg(test)`-only, thread-local `FORCED_CAPABILITY`:
+/// libtest runs the tests of one binary in parallel threads inside one process,
+/// so a test must never mutate a process-global environment variable to pick a
+/// profile. Forcing the exact *value* `capability_of` returns also keeps these
+/// assertions honest against the `cfg(test)` default (which pins colour): the
+/// `Monochrome` cases would otherwise pass without the decision reaching the
+/// palette at all.
+struct CapabilityProfile {
+    previous: Option<theme::Capability>,
+}
+
+impl CapabilityProfile {
+    fn force(capability: theme::Capability) -> Self {
+        Self {
+            previous: theme::FORCED_CAPABILITY.with(|cell| cell.replace(Some(capability))),
+        }
+    }
+}
+
+impl Drop for CapabilityProfile {
+    fn drop(&mut self) {
+        theme::FORCED_CAPABILITY.with(|cell| cell.set(self.previous));
+    }
+}
+
+#[test]
+fn a_windows_console_attached_paints_the_designed_palette() {
+    // The Windows cell of the rule (t-006): `TERM` does not exist there — neither
+    // `cmd.exe`/conhost nor Windows Terminal exports it — so the attached-console
+    // probe is the capability signal, and it says colour.
+    let decided = theme::capability_of(theme::Host::Windows, None, None, true);
+    assert_eq!(
+        decided,
+        theme::Capability::Colour,
+        "a Windows console attached with no TERM must keep the palette"
+    );
+
+    // The seam must actually reach the slots, or the assertions below would pass
+    // on the `cfg(test)` default rather than on the decision.
+    {
+        let _opposite = CapabilityProfile::force(theme::Capability::Monochrome);
+        assert_eq!(
+            theme::frame_focus().fg,
+            None,
+            "the forced profile never reached the palette"
+        );
+    }
+
+    let _windows_console = CapabilityProfile::force(decided);
+
+    // Pane chrome.
+    assert_eq!(theme::frame_focus().fg, Some(Color::Cyan), "focused frame");
+    assert_eq!(theme::frame_idle().fg, Some(Color::DarkGray), "idle frame");
+    // State tokens: hue *and* weight, because weight is the non-colour half of
+    // the signal (design rule 3).
+    assert_eq!(theme::state_running().fg, Some(Color::Yellow));
+    assert!(theme::state_running().add_modifier.contains(Modifier::BOLD));
+    assert_eq!(theme::state_done().fg, Some(Color::Green));
+    assert_eq!(theme::state_failed().fg, Some(Color::Red));
+    assert!(theme::state_failed().add_modifier.contains(Modifier::BOLD));
+    // Transcript roles.
+    assert_eq!(theme::role_tool().fg, Some(Color::Magenta));
+    assert_eq!(theme::role_manager().fg, Some(Color::LightYellow));
+    assert!(theme::role_manager().add_modifier.contains(Modifier::BOLD));
+    // A band chip: it must keep its own fill, otherwise it inherits the band and
+    // the dark `fg` disappears (§F1).
+    assert_eq!(theme::chip_value().fg, Some(Color::White));
+    assert_eq!(theme::chip_value().bg, Some(Color::DarkGray));
+    assert!(theme::chip_value().add_modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn a_windows_redirected_stdout_degrades_every_sampled_slot_but_keeps_its_modifiers() {
+    // Rule 6 from the palette's side: the console substitute stays conservative,
+    // so `marmel > file` is never handed ANSI bytes. The exhaustive per-slot
+    // sweep is `theme::tests::monochrome_strips_colour_from_every_slot_and_keeps_its_modifiers`;
+    // this pins that the *Windows* decision reaches the slots a pane reads.
+    let decided = theme::capability_of(theme::Host::Windows, None, None, false);
+    assert_eq!(
+        decided,
+        theme::Capability::Monochrome,
+        "a redirected stdout is not a colour contract, even on Windows"
+    );
+    let _windows_redirect = CapabilityProfile::force(decided);
+
+    let sampled = [
+        ("frame_focus", theme::frame_focus()),
+        ("frame_idle", theme::frame_idle()),
+        ("text_primary", theme::text_primary()),
+        ("text_thought", theme::text_thought()),
+        ("section_header", theme::section_header()),
+        ("selection", theme::selection()),
+        ("band_surface", theme::band_surface()),
+        ("chip_value", theme::chip_value()),
+        ("state_running", theme::state_running()),
+        ("state_done", theme::state_done()),
+        ("state_failed", theme::state_failed()),
+        ("role_tool", theme::role_tool()),
+        ("role_manager", theme::role_manager()),
+        ("scroll_live", theme::scroll_live()),
+    ];
+    for (name, style) in sampled {
+        assert_eq!(style.fg, None, "`{name}` still names a foreground");
+        assert_eq!(style.bg, None, "`{name}` still names a background");
+    }
+    // The informational half survives: weight and slant are what the palette
+    // falls back on once colour is gone.
+    assert!(theme::state_running().add_modifier.contains(Modifier::BOLD));
+    assert!(theme::state_failed().add_modifier.contains(Modifier::BOLD));
+    assert!(theme::chip_value().add_modifier.contains(Modifier::BOLD));
+    assert!(theme::role_manager().add_modifier.contains(Modifier::BOLD));
+    assert!(
+        theme::text_thought()
+            .add_modifier
+            .contains(Modifier::ITALIC)
+    );
+}
+
 /// Plumbing delta D1 (design §9.3) at the boundary it was asked for: the four worker
 /// lifecycle fields the orchestrator already keeps (`status_label`,
 /// `implementation_turns`, `validation_rounds`, `latest_validator_feedback`) reach the
