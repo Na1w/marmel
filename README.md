@@ -90,6 +90,7 @@ Marmel is designed for autonomous multi-step software engineering with continuou
 
 - **Rust toolchain 1.98+** (edition 2024).
 - An **OpenAI-compatible LLM backend** reachable over HTTP (e.g. Ollama at `http://localhost:11434/v1`, vLLM, or OpenRouter).
+- **Platform support:** Marmel is developed and tested regularly primarily on **Linux** (which also provides kernel-enforced Landlock command sandboxing) and extensively on **macOS**. **Windows** support is maintained on a **best-effort** basis and receives significantly less real-world testing.
 
 ### Installation & Build
 
@@ -152,6 +153,8 @@ Marmel reads exactly one configuration file — the first candidate below wins, 
 10. Environment variables (`MARMEL_BACKEND_URL`, `MARMEL_MODEL`, `MARMEL_AUTH_TOKEN`) — applied after the file, so they override it; `MARMEL_AUTH_TOKEN` applies only when the resolved token is still empty.
 11. Session environment variables (`MARMEL_RESUME`, one-way `MARMEL_SESSION_DISABLE`, `MARMEL_SESSION_COMMIT_MIN_MS`) — they fold into the `session_*` keys the same way, with `--resume` / `--fresh` beating all three.
 12. Built-in defaults.
+
+> **Home directory (`~`) across platforms:** `~` resolves from `$HOME` when set and non-empty, then falls back to `%USERPROFILE%` (standard on Windows in `cmd.exe` and PowerShell, e.g. `C:\Users\<user>`), and finally to the OS password database (`getpwuid`) on Unix. On Windows you can place your global configuration at `%USERPROFILE%\.marmel\marmel.toml` (or `%USERPROFILE%\.marmel\config.toml`, `%USERPROFILE%\.config\marmel\config.toml`, `%USERPROFILE%\.config\marmel\marmel.toml`). The same home-directory resolution applies to `~` expansion in `system_prompt_path` and to user-level `~/.marmel/AGENTS.md`, `~/.marmel/ARCHETYPES.md`, and `~/.marmel/skills/`.
 
 ### Configuration Reference (`marmel.toml`)
 

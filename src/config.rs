@@ -1170,15 +1170,29 @@ impl Config {
     }
 }
 
-pub(crate) fn home_dir() -> Option<PathBuf> {
-    // `HOME` wins when it is set. The fallback is written as an early return and
-    // not as an `or_else` closure: on non-unix targets the closure body degenerates
-    // into a plain `None`, which makes clippy raise
-    // `clippy::unnecessary_lazy_evaluations` on the windows target only, and a
-    // cross-target `-D warnings` build must stay green. Semantics are unchanged:
-    // `HOME` first, platform fallback second.
-    if let Some(home) = std::env::var_os("HOME") {
+pub(crate) fn home_dir_from_env(
+    home: Option<std::ffi::OsString>,
+    userprofile: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(home) = home.filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(home));
+    }
+    if let Some(profile) = userprofile.filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(profile));
+    }
+    None
+}
+
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    // `HOME` wins when it is set, followed by `USERPROFILE` (standard on Windows
+    // in cmd.exe / PowerShell where `HOME` is unset). The fallback is written as
+    // an early return and not as an `or_else` closure: on non-unix targets the
+    // closure body degenerates into a plain `None`, which makes clippy raise
+    // `clippy::unnecessary_lazy_evaluations` on the windows target only, and a
+    // cross-target `-D warnings` build must stay green.
+    if let Some(dir) = home_dir_from_env(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+    {
+        return Some(dir);
     }
 
     #[cfg(unix)]
@@ -1195,7 +1209,7 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
     }
     #[cfg(not(unix))]
     {
-        // No passwd database to fall back on: `HOME` is the only source.
+        // No passwd database to fall back on: `HOME` and `USERPROFILE` are the only sources.
         None
     }
 }
@@ -3563,5 +3577,47 @@ session_max_bundle_bytes = 4096
                 "{role} must allowlist kiwix"
             );
         }
+    }
+
+    #[test]
+    fn home_dir_from_env_prefers_home_and_falls_back_to_userprofile() {
+        use std::ffi::OsString;
+
+        assert_eq!(
+            home_dir_from_env(Some(OsString::from("/home/alice")), None),
+            Some(PathBuf::from("/home/alice")),
+            "HOME must be returned when set"
+        );
+        assert_eq!(
+            home_dir_from_env(None, Some(OsString::from(r"C:\Users\alice"))),
+            Some(PathBuf::from(r"C:\Users\alice")),
+            "USERPROFILE must be used when HOME is unset"
+        );
+        assert_eq!(
+            home_dir_from_env(
+                Some(OsString::from("")),
+                Some(OsString::from(r"C:\Users\alice")),
+            ),
+            Some(PathBuf::from(r"C:\Users\alice")),
+            "an empty HOME must fall through to USERPROFILE"
+        );
+        assert_eq!(
+            home_dir_from_env(
+                Some(OsString::from("/c/Users/alice")),
+                Some(OsString::from(r"C:\Users\alice")),
+            ),
+            Some(PathBuf::from("/c/Users/alice")),
+            "HOME must win when both HOME and USERPROFILE are set"
+        );
+        assert_eq!(
+            home_dir_from_env(None, None),
+            None,
+            "neither variable set must return None"
+        );
+        assert_eq!(
+            home_dir_from_env(Some(OsString::from("")), Some(OsString::from(""))),
+            None,
+            "empty variables must return None rather than a relative PathBuf::new()"
+        );
     }
 }
