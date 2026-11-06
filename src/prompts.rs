@@ -1,19 +1,32 @@
 //! Statically embedded prompts (compiled in at build time via `include_str!`).
 
-pub const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
-pub const STEER_ARBITRATOR_PROMPT: &str = include_str!("../prompts/steer_arbitrator.md");
-pub const CODER_PROMPT: &str = include_str!("../prompts/coder.md");
-pub const DEBUGGER_PROMPT: &str = include_str!("../prompts/debugger.md");
-pub const RESEARCHER_PROMPT: &str = include_str!("../prompts/researcher.md");
-pub const GENERALIST_PROMPT: &str = include_str!("../prompts/generalist.md");
-pub const VALIDATOR_PROMPT: &str = include_str!("../prompts/validator.md");
-pub const VALIDATOR_CODER_PROMPT: &str = include_str!("../prompts/validator_coder.md");
-pub const VALIDATOR_DEBUGGER_PROMPT: &str = include_str!("../prompts/validator_debugger.md");
-pub const VALIDATOR_RESEARCHER_PROMPT: &str = include_str!("../prompts/validator_researcher.md");
-pub const VALIDATOR_GENERALIST_PROMPT: &str = include_str!("../prompts/validator_generalist.md");
-pub const VALIDATOR_PLANNER_PROMPT: &str = include_str!("../prompts/validator_planner.md");
-pub const PLANNER_PROMPT: &str = include_str!("../prompts/planner.md");
-pub const PROMPT_BUILDER_PROMPT: &str = include_str!("../prompts/prompt_builder.md");
+pub const TOOL_REASONING_GUIDANCE: &str = include_str!("../prompts/tool_reasoning.md");
+
+// Share the same guidance across all built-in roles, including validators.
+macro_rules! role_prompt {
+    ($path:literal) => {
+        concat!(
+            include_str!($path),
+            "\n\n",
+            include_str!("../prompts/tool_reasoning.md")
+        )
+    };
+}
+
+pub const SYSTEM_PROMPT: &str = role_prompt!("../prompts/system.md");
+pub const STEER_ARBITRATOR_PROMPT: &str = role_prompt!("../prompts/steer_arbitrator.md");
+pub const CODER_PROMPT: &str = role_prompt!("../prompts/coder.md");
+pub const DEBUGGER_PROMPT: &str = role_prompt!("../prompts/debugger.md");
+pub const RESEARCHER_PROMPT: &str = role_prompt!("../prompts/researcher.md");
+pub const GENERALIST_PROMPT: &str = role_prompt!("../prompts/generalist.md");
+pub const VALIDATOR_PROMPT: &str = role_prompt!("../prompts/validator.md");
+pub const VALIDATOR_CODER_PROMPT: &str = role_prompt!("../prompts/validator_coder.md");
+pub const VALIDATOR_DEBUGGER_PROMPT: &str = role_prompt!("../prompts/validator_debugger.md");
+pub const VALIDATOR_RESEARCHER_PROMPT: &str = role_prompt!("../prompts/validator_researcher.md");
+pub const VALIDATOR_GENERALIST_PROMPT: &str = role_prompt!("../prompts/validator_generalist.md");
+pub const VALIDATOR_PLANNER_PROMPT: &str = role_prompt!("../prompts/validator_planner.md");
+pub const PLANNER_PROMPT: &str = role_prompt!("../prompts/planner.md");
+pub const PROMPT_BUILDER_PROMPT: &str = role_prompt!("../prompts/prompt_builder.md");
 
 pub const SKILL_CLEAN_CODE: &str = include_str!("../prompts/skills/clean_code.md");
 pub const SKILL_DEBUGGING: &str = include_str!("../prompts/skills/debugging.md");
@@ -96,6 +109,28 @@ pub fn format_mcp_prompt_block(cfg: &crate::config::Config, mcp_servers: &[Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_builtin_roles_receive_proportionate_tool_reasoning_guidance() {
+        for prompt in [
+            SYSTEM_PROMPT,
+            STEER_ARBITRATOR_PROMPT,
+            CODER_PROMPT,
+            DEBUGGER_PROMPT,
+            RESEARCHER_PROMPT,
+            GENERALIST_PROMPT,
+            VALIDATOR_PROMPT,
+            VALIDATOR_CODER_PROMPT,
+            VALIDATOR_DEBUGGER_PROMPT,
+            VALIDATOR_RESEARCHER_PROMPT,
+            VALIDATOR_GENERALIST_PROMPT,
+            VALIDATOR_PLANNER_PROMPT,
+            PLANNER_PROMPT,
+            PROMPT_BUILDER_PROMPT,
+        ] {
+            assert_eq!(prompt.matches(TOOL_REASONING_GUIDANCE).count(), 1);
+        }
+    }
 
     #[test]
     fn test_format_environment_block_contains_os_and_arch() {

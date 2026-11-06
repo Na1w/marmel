@@ -1,8 +1,8 @@
 //! Filesystem tools: `read_file` (paginated, byte-capped), `replace` (strict),
 //! `write_file`.
 //!
-//! [`replace`] writes only when the target string occurs exactly once — 0 or ≥2
-//! matches return an error without touching the file. [`read_file`] is
+//! [`replace`] defaults to exactly one literal match; regex mode requires an
+//! explicit positive expected match count. Mismatches never write. [`read_file`] is
 //! character-paginated (`offset`, `limit`, `[Showing characters X-Y of Z...]`
 //! footer) and never loads more than [`READ_FILE_MAX_BYTES`] from one file: a
 //! larger file yields the requested window of the loaded head plus a
@@ -621,10 +621,10 @@ fn read_truncation_footer(
     footer
 }
 
-/// `replace(path, old_str, new_str)` — fails safely on 0 or ≥2 matches.
+/// `replace(path, old_str, new_str)` defaults to one exact match.
 ///
-/// Counts occurrences of `old_str`. Only when exactly one match exists does it
-/// perform the replacement; otherwise it returns an error and never writes.
+/// Regex mode requires a positive `expected_matches` count and expands capture
+/// references in `new_str`. A count mismatch returns an error without writing.
 ///
 /// The whole read-modify-write cycle is serialised per target path (see
 /// [`replace_path_lock`]) and the write itself goes through
@@ -635,10 +635,51 @@ pub fn replace(args: &Value) -> Result<ToolResult, ToolError> {
     let old_str = str_arg(args, "old_str", TOOL_REPLACE)?;
     let new_str = str_arg(args, "new_str", TOOL_REPLACE)?;
 
+    let mode = match args.get("mode") {
+        None => "exact",
+        Some(Value::String(mode)) if matches!(mode.as_str(), "exact" | "regex") => mode,
+        Some(_) => return Ok(ToolResult::err("mode must be 'exact' or 'regex'")),
+    };
+    let regex_options = if mode == "regex" {
+        let Some(expected) = args
+            .get("expected_matches")
+            .and_then(Value::as_u64)
+            .filter(|count| *count > 0)
+        else {
+            return Ok(ToolResult::err(
+                "regex mode requires expected_matches as a positive integer",
+            ));
+        };
+        let pattern = match regex::Regex::new(old_str) {
+            Ok(pattern) => pattern,
+            Err(error) => return Ok(ToolResult::err(format!("Invalid regex: {error}"))),
+        };
+        Some((pattern, expected))
+    } else {
+        if args.get("expected_matches").is_some() {
+            return Ok(ToolResult::err(
+                "expected_matches is only supported in regex mode",
+            ));
+        }
+        None
+    };
+
     let safe_path = resolve_safe_path(path, TOOL_REPLACE)?;
     let _target_guard = replace_path_lock(&safe_path);
 
     let content = std::fs::read_to_string(&safe_path).map_err(anyhow::Error::from)?;
+
+    if let Some((pattern, expected)) = regex_options {
+        let count = pattern.find_iter(&content).count();
+        if count as u64 != expected {
+            return Ok(ToolResult::err(format!(
+                "Regex matched {count} times in {path}; expected {expected}. File unchanged."
+            )));
+        }
+        let new_content = pattern.replace_all(&content, new_str);
+        write_file_atomic(&safe_path, new_content.as_bytes())?;
+        return Ok(ToolResult::ok(format!("replace applied ({count} matches)")));
+    }
     let count = content.matches(old_str).count();
 
     if count == 0 {

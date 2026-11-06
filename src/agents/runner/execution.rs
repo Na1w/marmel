@@ -287,9 +287,18 @@ async fn run_specialist_live_inner(
     }
     let tools_list = advertised_names.join("`, `");
 
+    // Synthesized and custom role prompts may not contain the built-in guidance.
+    let reasoning_guidance = if ctx
+        .role_system_prompt
+        .contains(crate::prompts::TOOL_REASONING_GUIDANCE)
+    {
+        ""
+    } else {
+        crate::prompts::TOOL_REASONING_GUIDANCE
+    };
     let env_block = crate::prompts::format_environment_block();
     let mut enhanced_system_prompt = format!(
-        "{}\n\n{}\n- Tools available: `{}`.\n- You MUST save files and execute real work to complete the task.\n- Context Preservation: If context usage is high (>= 80%) or advised, call `rebirth` with a detailed summary capturing all pertinent state (including active file paths, current read offsets or line numbers reached in `read_file`, intermediate findings, and next actions) so work resumes seamlessly without starting over.",
+        "{}\n\n{reasoning_guidance}\n\n{}\n- Tools available: `{}`.\n- You MUST save files and execute real work to complete the task.\n- Context Preservation: If context usage is high (>= 80%) or advised, call `rebirth` with a detailed summary capturing all pertinent state (including active file paths, current read offsets or line numbers reached in `read_file`, intermediate findings, and next actions) so work resumes seamlessly without starting over.",
         ctx.role_system_prompt, env_block, tools_list
     );
     if let Some(custom_specialist_prompt) = specialist_cfg
