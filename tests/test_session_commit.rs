@@ -174,6 +174,10 @@ fn config_for_backend(backend: &str) -> Config {
         backend_url: format!("{backend}/v1"),
         system_prompt_path: PathBuf::from("prompts/system.md"),
         ui_mode: "tui".to_string(),
+        // These cases assert the final persisted tool batch as well as commit
+        // triggers. Leave room for the real prompt and schemas so compaction
+        // cannot discard that batch; compaction is covered in its own tests.
+        max_context_tokens: 32_768,
         ..Config::default()
     }
 }

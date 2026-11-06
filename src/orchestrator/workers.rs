@@ -230,6 +230,7 @@ impl Drop for ActiveWorkerGuard {
             // one to the read model (the panel's teardown clear keys on
             // `is_active`, but the registry itself must not hold the stale rank).
             entry.queue_position = None;
+            super::worker_pause::clear(&self.0);
         }
         // Bounded completed ring: evict oldest completed entries while over cap.
         evict_completed_ring();
@@ -380,6 +381,43 @@ pub fn retire_restored_worker(worker_key: &str, status_label: &str) -> Option<u6
 /// a `WorkerSection`, and `WORKERS` is private to this module.
 pub fn worker_state_snapshot(worker_key: &str) -> Option<WorkerState> {
     WORKERS.get(worker_key).map(|entry| entry.value().clone())
+}
+
+/// Execute a short synchronous control update while this registration is live.
+/// The callback must not access the worker registry or perform blocking work.
+pub(crate) fn with_live_worker<T>(worker_key: &str, update: impl FnOnce() -> T) -> Option<T> {
+    let entry = WORKERS.get(worker_key)?;
+    if entry
+        .info
+        .agent_name
+        .split('-')
+        .next()
+        .unwrap_or_default()
+        .parse::<crate::agents::Agent>()
+        .is_err()
+        || !entry.is_active()
+        || entry
+            .info
+            .cancel_token
+            .as_ref()
+            .is_none_or(|t| t.is_cancelled())
+    {
+        return None;
+    }
+    Some(update())
+}
+
+/// Registrations sharing a task's exact token include its current auditor pass.
+pub(crate) fn active_worker_keys_for_token(
+    token: &tokio_util::sync::CancellationToken,
+) -> Vec<String> {
+    WORKERS
+        .iter()
+        .filter(|entry| {
+            entry.is_active() && entry.info.cancel_token.as_ref().is_some_and(|t| t == token)
+        })
+        .map(|entry| entry.key().clone())
+        .collect()
 }
 
 /// Snapshot every entry as `(key, state)`, no guard outliving the call. The
@@ -1268,9 +1306,17 @@ pub fn get_active_subtasks_str() -> String {
             let duration_str = format_duration_human(elapsed_secs);
             let task_id_str = info.task_id.as_deref().unwrap_or(id);
             let start_wall_str = info.started_wall.format("%H:%M:%S");
+            let status = if super::worker_pause::is_paused(id) {
+                format!(
+                    "Pause requested (resume_subagent to continue); {}",
+                    info.status
+                )
+            } else {
+                info.status.clone()
+            };
             out.push_str(&format!(
                 "- Tool Call ID: {}\n  Subagent Tag: {}\n  Address This Worker With: {}\n  Subagent: {}\n  Status: {}\n  Task Prompt: {}\n  Started At: {} (running for {}, {elapsed_secs} total seconds)\n  Implementation Turns: {}\n  Validation Rounds: {}\n",
-                task_id_str, id, id, info.agent_name, info.status, info.prompt, start_wall_str,
+                task_id_str, id, id, info.agent_name, status, info.prompt, start_wall_str,
                 duration_str, info.implementation_turns, info.validation_rounds
             ));
             // The per-worker prompt read is grammar-validated (see

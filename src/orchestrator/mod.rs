@@ -25,6 +25,7 @@ pub mod steer;
 pub mod steer_extractor;
 #[cfg(test)]
 mod steer_tests;
+pub mod worker_pause;
 pub mod workers;
 
 pub use notice::{

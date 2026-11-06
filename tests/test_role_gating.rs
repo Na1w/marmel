@@ -250,9 +250,10 @@ fn all_specialists_and_validator_permitted_rebirth() {
 /// Sleep is permitted to ALL callers, including Manager and all specialists.
 #[test]
 fn all_agents_permitted_sleep() {
-    // Cancel immediately so the test verifies permission/role-gating without
-    // blocking the test thread for 6 redundant seconds.
-    marmennill::orchestrator::cancel_all();
+    // Cancel only this test's calls, without cancelling unrelated tests that
+    // dispatch tools concurrently in this process.
+    let token = tokio_util::sync::CancellationToken::new();
+    token.cancel();
 
     let sleep_tool = ToolInvocation {
         name: "sleep".to_string(),
@@ -263,7 +264,9 @@ fn all_agents_permitted_sleep() {
     };
 
     // 1. Manager must be permitted sleep
-    let mgr_res = marmennill::harness::dispatch_for(&sleep_tool, ToolCaller::Manager);
+    let mgr_res = marmennill::orchestrator::CURRENT_WORKER_TOKEN.sync_scope(token.clone(), || {
+        marmennill::harness::dispatch_for(&sleep_tool, ToolCaller::Manager)
+    });
     assert!(
         mgr_res.is_ok(),
         "Manager must be permitted sleep, got: {:?}",
@@ -279,15 +282,15 @@ fn all_agents_permitted_sleep() {
         Agent::Generalist,
     ];
     for role in roles {
-        let res = marmennill::harness::dispatch_for(&sleep_tool, ToolCaller::Specialist(role));
+        let res = marmennill::orchestrator::CURRENT_WORKER_TOKEN.sync_scope(token.clone(), || {
+            marmennill::harness::dispatch_for(&sleep_tool, ToolCaller::Specialist(role))
+        });
         assert!(
             res.is_ok(),
             "{role} must be permitted to call sleep, got error: {:?}",
             res.err()
         );
     }
-
-    marmennill::orchestrator::reset_cancellation();
 }
 
 #[tokio::test]

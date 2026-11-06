@@ -126,6 +126,7 @@ pub struct PreemptibleStreamSink {
     model: String,
     pause_rx: mpsc::UnboundedReceiver<PauseSignal>,
     pending_signal: Option<PauseSignal>,
+    manual_pause_key: Option<String>,
 }
 
 impl PreemptibleStreamSink {
@@ -184,6 +185,7 @@ impl PreemptibleStreamSink {
             model,
             pause_rx,
             pending_signal: None,
+            manual_pause_key: None,
         }
     }
 
@@ -248,6 +250,17 @@ impl StreamSink for PreemptibleStreamSink {
     }
 
     fn poll_control(&mut self) -> StreamControl {
+        if let Some(key) = self
+            .identity
+            .cancel_token
+            .as_ref()
+            .and_then(super::worker_pause::paused_key_for_token)
+        {
+            self.manual_pause_key = Some(key);
+            return StreamControl::Pause {
+                user_input: "Subagent pause requested".to_string(),
+            };
+        }
         while let Ok(signal) = self.pause_rx.try_recv() {
             // When the coordinator gives up on this stream it drops the
             // acknowledgement receiver and cancels the stream instead. A signal
@@ -268,6 +281,15 @@ impl StreamSink for PreemptibleStreamSink {
     }
 
     async fn on_pause(&mut self, _user_input: &str) -> PauseAction {
+        if let (Some(key), Some(token)) =
+            (self.manual_pause_key.take(), &self.identity.cancel_token)
+        {
+            return if super::worker_pause::wait(&key, token).await {
+                PauseAction::Resume
+            } else {
+                PauseAction::Abort
+            };
+        }
         if let Some(signal) = self.pending_signal.take() {
             crate::orchestrator::emit_status(format!(
                 "[{}] Yielded model slot ({}) to Steer Arbitrator — stream paused",
