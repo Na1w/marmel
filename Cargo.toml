@@ -2,6 +2,8 @@
 name = "marmennill"
 version = "1.0.0"
 edition = "2024"
+authors = ["Fredrik Andersson"]
+license = "MIT"
 rust-version = "1.98"
 default-run = "marmel"
 
