@@ -169,6 +169,32 @@ pub fn sync_specialist_tool_schema(
     super::fix_loop::charge_engine_tool_schema(engine, advertised)
 }
 
+/// Append the compact `## Git workspace state` fragment to a specialist's system
+/// prompt, with the git state of `root` detected from filesystem metadata alone
+/// (never by running `git`, never failing on IO errors).
+///
+/// `policy` (the session's `git_workflow_policy`) decides what is appended — see
+/// [`crate::config::git_prompt_block`], the single owner of that mapping which the
+/// Manager prompt path in `src/ui/helpers.rs` calls the same way: `off` appends
+/// nothing, `auto` appends the shared fragment as
+/// [`crate::harness::workspace::format_git_prompt_block`] renders it, and
+/// `enforce_worktree` renders the same detection with worktree isolation stated as
+/// a requirement. Git guidance in the role prompts and skills is unaffected either
+/// way. Nothing is appended when no verdict could be observed for `root`.
+fn append_git_state_block(
+    enhanced_system_prompt: &mut String,
+    root: &std::path::Path,
+    policy: crate::config::GitWorkflowPolicy,
+) {
+    let block = crate::config::git_prompt_block(
+        &crate::harness::workspace::detect_git_workspace(root),
+        policy,
+    );
+    if !block.is_empty() {
+        enhanced_system_prompt.push_str(&block);
+    }
+}
+
 pub async fn run_specialist_live(
     client: &crate::llm::ChatClient,
     agent: Agent,
@@ -313,6 +339,16 @@ async fn run_specialist_live_inner(
     if !mcp_block.is_empty() {
         enhanced_system_prompt.push_str(&mcp_block);
     }
+    // The workspace's git state, read from the filesystem only (never by shelling
+    // out to `git`): the specialist is told which half of the git/worktree guidance
+    // applies to *this* workspace. The session's `git_workflow_policy` decides
+    // whether the fragment is appended at all and how worktree isolation is
+    // phrased; `off` appends nothing and `enforce_worktree` states the requirement.
+    append_git_state_block(
+        &mut enhanced_system_prompt,
+        &crate::harness::get_workspace_root(),
+        cfg.git_workflow_policy,
+    );
 
     // The engine is built **through** `build_specialist_context`, on the very line
     // the advertised list exists, so it is charged with exactly that list before the
@@ -1299,7 +1335,8 @@ async fn run_specialist_live_inner(
 #[cfg(test)]
 mod tests {
     use super::{
-        validation_configured_for_role, validation_probe_engaged, validation_verdict_required,
+        append_git_state_block, validation_configured_for_role, validation_probe_engaged,
+        validation_verdict_required,
     };
     use crate::agents::Agent;
 
@@ -1379,5 +1416,100 @@ mod tests {
         assert!(!validation_probe_engaged(Agent::Debugger, true, 5, false));
         assert!(!validation_probe_engaged(Agent::Debugger, false, 5, true));
         assert!(!validation_probe_engaged(Agent::Coder, true, 5, false));
+    }
+
+    /// The worker prompt path appends the detected git state of the workspace root:
+    /// the fragment lands at the **end** of the assembled system prompt, names the
+    /// detected root and branch, and points at the git procedure.
+    #[test]
+    fn append_git_state_block_appends_detected_state_for_a_checkout_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let git_dir = repo.join(".git");
+        std::fs::create_dir_all(&git_dir).expect("fixture");
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+
+        let mut prompt = "role prompt".to_string();
+        append_git_state_block(&mut prompt, &repo, crate::config::GitWorkflowPolicy::Auto);
+        assert!(prompt.starts_with("role prompt"), "{prompt}");
+        assert!(prompt.contains("\n## Git workspace state\n"), "{prompt}");
+        assert!(prompt.contains("IS a git repository"), "{prompt}");
+        assert!(prompt.contains("branch `main`"), "{prompt}");
+        assert!(
+            prompt.ends_with("never commit `.marmel/`.\n"),
+            "the fragment must be the last thing appended: {prompt}"
+        );
+    }
+
+    /// A directory with no repository is told so, and a root that could not be
+    /// inspected at all appends **nothing**: the prompt never asserts a state that
+    /// was not observed.
+    #[test]
+    fn append_git_state_block_states_fresh_dirs_and_omits_uninspected_roots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fresh = temp.path().join("new_project");
+        std::fs::create_dir_all(fresh.join("src")).expect("fixture");
+
+        let mut prompt = "role prompt".to_string();
+        append_git_state_block(&mut prompt, &fresh, crate::config::GitWorkflowPolicy::Auto);
+        assert!(prompt.contains("NOT a git repository"), "{prompt}");
+        assert!(prompt.contains("git init"), "{prompt}");
+        assert!(prompt.contains(&fresh.display().to_string()), "{prompt}");
+
+        let mut prompt = "role prompt".to_string();
+        append_git_state_block(
+            &mut prompt,
+            &temp.path().join("never_created"),
+            crate::config::GitWorkflowPolicy::Auto,
+        );
+        assert_eq!(
+            prompt, "role prompt",
+            "an uninspectable root must append nothing, got {prompt:?}"
+        );
+    }
+
+    /// The `git_workflow_policy` gate on the worker prompt path: `off` appends no
+    /// git fragment at all and leaves the role prompt untouched, and
+    /// `enforce_worktree` appends the same detected state with worktree isolation
+    /// phrased as a hard requirement rather than a preference.
+    #[test]
+    fn append_git_state_block_gates_on_the_git_workflow_policy() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let git_dir = repo.join(".git");
+        std::fs::create_dir_all(&git_dir).expect("fixture");
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+
+        let mut prompt = "role prompt".to_string();
+        append_git_state_block(&mut prompt, &repo, crate::config::GitWorkflowPolicy::Off);
+        assert_eq!(
+            prompt, "role prompt",
+            "`off` must append no git fragment and must not touch the role prompt"
+        );
+
+        let mut prompt = "role prompt".to_string();
+        append_git_state_block(
+            &mut prompt,
+            &repo,
+            crate::config::GitWorkflowPolicy::EnforceWorktree,
+        );
+        assert!(
+            prompt.contains("IS a git repository")
+                && prompt.contains("branch `main`")
+                && prompt.contains("REQUIRED")
+                && !prompt.contains("Prefer an isolated"),
+            "enforce_worktree keeps the detected state and states the requirement: {prompt}"
+        );
+        assert_eq!(
+            prompt,
+            format!(
+                "role prompt{}",
+                crate::config::git_prompt_block(
+                    &crate::harness::workspace::detect_git_workspace(&repo),
+                    crate::config::GitWorkflowPolicy::EnforceWorktree,
+                )
+            ),
+            "the fragment lands at the very end of the assembled system prompt"
+        );
     }
 }
