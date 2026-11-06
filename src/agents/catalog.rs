@@ -103,10 +103,11 @@ pub fn load_project_instructions(workspace_root: &Path) -> Option<String> {
 
     let mut body = String::new();
     for path in sources {
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(raw_text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let text = text.trim();
+        let normalized = raw_text.replace("\r\n", "\n");
+        let text = normalized.trim();
         if text.is_empty() {
             continue;
         }

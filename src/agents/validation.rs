@@ -630,10 +630,10 @@ async fn run_plan_validation_inner(
     let brief = format!(
         "Proposed Execution Plan:\n```markdown\n{}\n```\n\n\
          Instructions:\n\
-         1. Inspect the workspace and examine files using available inspection tools (`read_file`, `grep_search`, `glob`) if needed to evaluate feasibility and existing structure.\n\
+         1. Evaluate the plan primarily from the markdown above; only use inspection tools (`read_file`, `grep_search`, `glob`) for a quick spot-check (0-3 tool calls max) if a specific path or module reference is ambiguous.\n\
          2. You are an auditor: you cannot execute shell commands or modify files. Solely analyze, inspect, and evaluate the proposed plan.\n\
          3. Audit the plan against dynamic criteria: proper format (# Execution Plan, `- [ ] [t-xxx]`, optionally carrying a `(validate)` / `(no-validate)` directive immediately before the `(role)` hint — that directive is honoured downstream and its presence or absence is never itself a rejection reason), phase headers, atomic task granularity (no monolithic catch-all tasks), and contextual testing/verification (unit/integration tests ONLY when relevant to the project scope and deliverable — do not demand tests for docs, scripts, or simple configs).\n\
-         4. When your verification is complete, you MUST call the `leave_verdict` tool with `verdict` ('APPROVED' or 'REJECTED') and detailed `comments`.\n\
+         4. When your verification is complete, you MUST immediately call the `leave_verdict` tool with `verdict` ('APPROVED' or 'REJECTED') and detailed `comments`.\n\
          5. If rejected, provide clear, actionable critique explaining what must be decomposed or fixed so the Manager can revise the plan.",
         plan_markdown
     );
@@ -658,7 +658,18 @@ async fn run_plan_validation_inner(
         .filter(|s| !s.is_empty())
         .or_else(|| planner_cfg.map(|sc| sc.mcp_servers.clone()))
         .unwrap_or_default();
-    let tools = assemble_tools(None, |name| val_entry.allows(name), &mcp_servers);
+    let plan_audit_tools = vec![
+        crate::tool_names::TOOL_READ_FILE.to_string(),
+        crate::tool_names::TOOL_GREP_SEARCH.to_string(),
+        crate::tool_names::TOOL_GLOB.to_string(),
+        crate::tool_names::TOOL_LEAVE_VERDICT.to_string(),
+        crate::tool_names::TOOL_REBIRTH.to_string(),
+    ];
+    let tools = assemble_tools(
+        Some(&plan_audit_tools),
+        |name| val_entry.allows(name),
+        &mcp_servers,
+    );
 
     let val_tag = "validator-planner".to_string();
     let _active_guard = register_loop_worker(
@@ -736,7 +747,10 @@ async fn run_plan_validation_inner(
         run_fix_loop(
             &mut params,
             &mut monitor,
-            crate::harness::ToolCaller::Specialist(Agent::Validator),
+            crate::harness::ToolCaller::SpecialistWithTools {
+                agent: Agent::Validator,
+                allowed_tools: plan_audit_tools,
+            },
         ),
     )
     .await

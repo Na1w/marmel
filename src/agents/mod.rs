@@ -70,6 +70,17 @@ impl Agent {
         }
     }
 
+    pub fn system_prompt(&self) -> &'static str {
+        match self {
+            Agent::Coder => crate::prompts::CODER_PROMPT,
+            Agent::Researcher => crate::prompts::RESEARCHER_PROMPT,
+            Agent::Debugger => crate::prompts::DEBUGGER_PROMPT,
+            Agent::Validator => crate::prompts::VALIDATOR_PROMPT,
+            Agent::Generalist => crate::prompts::GENERALIST_PROMPT,
+            Agent::Planner => crate::prompts::PLANNER_PROMPT,
+        }
+    }
+
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {

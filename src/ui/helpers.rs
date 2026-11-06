@@ -109,12 +109,13 @@ pub(crate) fn load_system_prompt_with_plan_and_warning(
     cfg: &Config,
     plan: &crate::manager::phase::Plan,
 ) -> Result<(String, Option<String>)> {
-    let content = if cfg.system_prompt_path.exists() {
+    let raw_content = if cfg.system_prompt_path.exists() {
         std::fs::read_to_string(&cfg.system_prompt_path)
             .unwrap_or_else(|_| include_str!("../../prompts/system.md").to_string())
     } else {
         include_str!("../../prompts/system.md").to_string()
     };
+    let content = raw_content.replace("\r\n", "\n");
     let env_block = crate::prompts::format_environment_block();
     let mut prompt = format!("{content}\n\n{env_block}\n");
     if let Some(ref base_prompt) = cfg.base_prompt {
@@ -126,6 +127,17 @@ pub(crate) fn load_system_prompt_with_plan_and_warning(
                 prompt.push_str(&format!("\n## Machine Specific Guidance\n{trimmed}\n"));
             }
         }
+    }
+    if crate::config::resolve_max_sessions(&cfg.orchestration.concurrency, &cfg.backend_url)
+        == Some(1)
+    {
+        prompt.push_str(
+            "\n## Single-Session Backend Scheduling (`max_sessions = 1`)\n\
+             The active LLM backend is configured with `max_sessions = 1` (a single inference slot). \
+             To preserve KV-cache prefix locality and avoid turn-by-turn prompt eviction across concurrent subagents, \
+             **you MUST schedule `delegate_task` calls sequentially: emit ONLY ONE `delegate_task` call per turn** \
+             and wait for that specialist to complete before delegating the next pending task.\n",
+        );
     }
     let mcp_block = crate::prompts::format_mcp_prompt_block(cfg, &cfg.orchestration.mcp_servers);
     if !mcp_block.is_empty() {
@@ -1702,6 +1714,23 @@ mod tests {
         assert!(!prompt.contains("## Machine Specific Guidance"));
     }
 
+    #[test]
+    fn test_load_system_prompt_injects_sequential_scheduling_when_max_sessions_one() {
+        let plan = crate::manager::phase::Plan::default();
+        let mut cfg = Config::default();
+        let default_prompt = load_system_prompt_with_plan_and_warning(&cfg, &plan)
+            .map(|(prompt, _warning)| prompt)
+            .expect("load success");
+        assert!(!default_prompt.contains("Single-Session Backend Scheduling"));
+
+        cfg.orchestration.concurrency.max_sessions = Some(1);
+        let single_slot_prompt = load_system_prompt_with_plan_and_warning(&cfg, &plan)
+            .map(|(prompt, _warning)| prompt)
+            .expect("load success");
+        assert!(single_slot_prompt.contains("Single-Session Backend Scheduling"));
+        assert!(single_slot_prompt.contains("emit ONLY ONE"));
+    }
+
     /// The Manager prompt carries the same detected-git fragment the worker path
     /// appends: it is embedded once, after the environment block and before the plan
     /// block, and it states the live workspace's git state (root and branch come
@@ -3248,5 +3277,38 @@ mod tests {
                 "the old `if let Ok(Some(..))` shape must be provably unable to see this plan"
             );
         });
+    }
+
+    /// Regression test for Windows CI (`test_ui_session_persists_the_visible_turn_to_the_bundle`):
+    /// CRLF line endings must be normalized out of the Manager system prompt, and
+    /// the initial turn on a default 8,192-token budget must remain strictly below
+    /// `compaction_threshold` so the first assistant reply is never evicted.
+    #[test]
+    fn test_load_system_prompt_normalizes_crlf_and_fits_first_turn_within_default_budget() {
+        let cfg = Config::default();
+        let (_tmp, _plan_path, (prompt, _warning)) = with_isolated_plan(|plan| {
+            let cfg = cfg.clone();
+            async move { load_system_prompt_with_plan_and_warning(&cfg, &plan).expect("prompt loads") }
+        });
+        assert!(
+            !prompt.contains("\r\n"),
+            "system prompt must normalize CRLF to LF for cross-platform token parity"
+        );
+
+        let mut ctx = crate::ui::session::build_manager_context(&cfg, prompt);
+        ctx.set_goal("First goal".to_string());
+        ctx.inject_rebirth_advisory();
+        ctx.append(Message::Assistant {
+            content: Some("First assistant reply.".to_string()),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+        });
+
+        let tokens = ctx.request_token_count();
+        let threshold = crate::manager::context::compaction_threshold(cfg.max_context_tokens);
+        assert!(
+            !ctx.should_compact(),
+            "first visible turn ({tokens} tokens) must not exceed compaction threshold ({threshold} tokens)"
+        );
     }
 }

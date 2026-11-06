@@ -829,3 +829,32 @@ fn normalize_for_compare_is_identity_on_unix_and_canonical_on_windows() {
     );
     fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn grep_repairs_unbalanced_parentheses_and_brackets() {
+    let dir = temp_dir();
+    fs::write(
+        dir.join("sample.rs"),
+        "#[serde(rename_all = \"snake_case\")]\npub enum Kind {\n    A,\n}\n",
+    )
+    .unwrap();
+
+    // Unclosed `(` in `#\[serde(` (observed in marmel.log)
+    let args1 = serde_json::json!({
+        "pattern": r"#\[serde(",
+        "path": dir.to_string_lossy(),
+    });
+    let res1 = grep_search(&args1).expect("unclosed `(` should be auto-escaped");
+    assert!(res1.content.contains("serde(rename_all"));
+
+    // Unclosed `(` inside alternation `enum |serde(rename|derive_str` (observed in marmel.log)
+    let args2 = serde_json::json!({
+        "pattern": "enum |serde(rename|derive_str",
+        "path": dir.to_string_lossy(),
+    });
+    let res2 = grep_search(&args2).expect("unclosed `(` in alternation should be auto-escaped");
+    assert!(res2.content.contains("serde(rename_all"));
+    assert!(res2.content.contains("pub enum Kind"));
+
+    fs::remove_dir_all(&dir).unwrap();
+}

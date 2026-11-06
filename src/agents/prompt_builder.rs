@@ -569,8 +569,9 @@ impl PromptBuilder {
 
         let role_name = format!("{}_specialist", req.agent_name.as_str());
         let mut system_prompt = format!(
-            "# Marmel: {}\n\n**Mission:** You are a dynamically synthesized specialist dedicated to executing the delegated task with surgical precision.\n\n",
-            role_name
+            "# Marmel: {}\n\n**Mission:** You are a dynamically synthesized specialist dedicated to executing the delegated task with surgical precision.\n\n{}\n\n",
+            role_name,
+            req.agent_name.system_prompt().trim()
         );
 
         system_prompt.push_str("## Active Domain Skills\n");
@@ -1052,7 +1053,7 @@ impl PromptBuilder {
                     };
                     let val_dest = prompts_dir.join(&val_filename);
                     let val_content = format!(
-                        "---\nrole_name: \"validator\"\ntask_id: \"{}\"\ntarget_brief: \"{}\"\ncreated_at: \"{}\"\nallowed_tools:\n  - \"read_file\"\n  - \"grep_search\"\n  - \"glob\"\n  - \"run_command\"\n  - \"leave_verdict\"\n  - \"rebirth\"\n---\n\n# Independent Quality Verification for {}\n\n**Mission:** Independently audit the deliverable for task `{}`.\n**Brief:** {}\n\n## Verification Protocol:\n1. Inspect created or modified files to verify correctness and conformance. Keep inspection targeted and concise (aim for 2–5 inspection tool calls; avoid exhaustive codebase exploration).\n2. Execute test suites or checks if applicable.\n3. Conclude promptly by calling `leave_verdict(verdict=\"APPROVED\" | \"REJECTED\", comments=\"...\")`.\n",
+                        "---\nrole_name: \"validator\"\ntask_id: \"{}\"\ntarget_brief: \"{}\"\ncreated_at: \"{}\"\nallowed_tools:\n  - \"read_file\"\n  - \"grep_search\"\n  - \"glob\"\n  - \"run_command\"\n  - \"leave_verdict\"\n  - \"rebirth\"\n---\n\n# Independent Quality Verification for {}\n\n**Mission:** Independently audit the deliverable for task `{}`.\n**Brief:** {}\n\n## Verification Protocol:\n1. Inspect created or modified files to verify correctness and conformance. Keep inspection targeted and concise (aim for 2–5 inspection tool calls; avoid exhaustive codebase exploration).\n2. Do NOT re-run full test suites if the specialist deliverable already includes passing test output and your code inspection confirms the changes; only run a targeted check if evidence is missing or contradictory.\n3. Conclude promptly by calling `leave_verdict(verdict=\"APPROVED\" | \"REJECTED\", comments=\"...\")`.\n",
                         item.task_id,
                         item.description.replace('"', "\\\""),
                         chrono::Utc::now().to_rfc3339(),
@@ -1148,6 +1149,7 @@ mod tests {
                 .contains(&TOOL_RUN_COMMAND.to_string())
         );
         assert!(blueprint.allowed_tools.contains(&TOOL_REPLACE.to_string()));
+        assert!(blueprint.system_prompt.contains("# Marmel: Coder"));
         assert!(blueprint.system_prompt.contains("Active Domain Skills"));
     }
 

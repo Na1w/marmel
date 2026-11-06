@@ -73,7 +73,7 @@ pub fn grep_search(args: &Value) -> Result<ToolResult, ToolError> {
     let requested = usize_arg(args, "max_results", 100, TOOL_GREP_SEARCH)?;
     let max_results = requested.min(GREP_HARD_CAP);
 
-    let re = Regex::new(pattern).map_err(|e| ToolError::BadArguments {
+    let re = compile_grep_regex(pattern).map_err(|e| ToolError::BadArguments {
         tool: TOOL_GREP_SEARCH.into(),
         detail: format!("invalid regex: {e}"),
     })?;
@@ -91,6 +91,67 @@ pub fn grep_search(args: &Value) -> Result<ToolResult, ToolError> {
         );
     }
     Ok(ToolResult::ok(content))
+}
+
+/// Compile a `grep_search` regex, automatically escaping unbalanced `(` / `)` or
+/// `[` / `]` delimiters when a model emits a literal delimiter (e.g. `#\[serde(`
+/// or `enum |serde(rename|derive_str`) without escaping it.
+fn compile_grep_regex(pattern: &str) -> Result<Regex, regex::Error> {
+    match Regex::new(pattern) {
+        Ok(re) => Ok(re),
+        Err(orig_err) => {
+            let repaired = repair_unbalanced_regex(pattern);
+            if repaired != pattern
+                && let Ok(re) = Regex::new(&repaired)
+            {
+                return Ok(re);
+            }
+            Err(orig_err)
+        }
+    }
+}
+
+fn repair_unbalanced_regex(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut unescaped_open_parens: Vec<usize> = Vec::new();
+    let mut unescaped_open_brackets: Vec<usize> = Vec::new();
+    let mut unmatched_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        match chars[i] {
+            '(' => unescaped_open_parens.push(i),
+            ')' if unescaped_open_parens.pop().is_none() => {
+                unmatched_indices.insert(i);
+            }
+            '[' => unescaped_open_brackets.push(i),
+            ']' if unescaped_open_brackets.pop().is_none() => {
+                unmatched_indices.insert(i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    unmatched_indices.extend(unescaped_open_parens);
+    unmatched_indices.extend(unescaped_open_brackets);
+
+    if unmatched_indices.is_empty() {
+        return pattern.to_string();
+    }
+
+    let mut out = String::with_capacity(pattern.len() + unmatched_indices.len());
+    for (idx, ch) in chars.into_iter().enumerate() {
+        if unmatched_indices.contains(&idx) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Walk `root`, materialising at most `max_results` match lines while counting

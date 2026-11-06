@@ -1064,9 +1064,13 @@ pub(crate) fn usize_arg(
     tool: &str,
 ) -> Result<usize, ToolError> {
     match args.get(key) {
-        None => Ok(default),
+        None | Some(Value::Null) => Ok(default),
         Some(v) => v
             .as_u64()
+            .or_else(|| {
+                v.as_str()
+                    .and_then(|s| s.lines().next()?.trim().parse::<u64>().ok())
+            })
             .map(|u| u as usize)
             .ok_or_else(|| ToolError::BadArguments {
                 tool: tool.into(),

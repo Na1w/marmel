@@ -1645,4 +1645,23 @@ mod tests {
             assert!(res.content.contains("Strategic Plan Auditor"));
         }
     }
+
+    #[test]
+    fn test_harness_write_plan_internal_rejects_missing_execution_plan_header_instantly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = crate::manager::phase::Plan::at(tmp.path().join(".marmel"));
+        let res = block_on_safe(async {
+            write_plan_internal(
+                "# Plan: Wrong Header\n## Phase 1\n- [ ] [t-001] Step one (coder)\n",
+                Some(plan.clone()),
+            )
+            .await
+        })
+        .unwrap();
+
+        assert!(res.is_error);
+        assert!(res.content.contains("Strategic Plan Auditor"));
+        assert!(res.content.contains("# Execution Plan"));
+        assert!(!plan.plan_path().exists());
+    }
 }

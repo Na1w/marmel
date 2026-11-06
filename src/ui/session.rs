@@ -4230,6 +4230,10 @@ pub fn marker_gated_check_off(
     let line_present =
         bound.is_some_and(|tid| crate::plan_parse::find_task_line(content, tid).is_some());
     let already_checked = bound.is_some_and(|tid| crate::plan_parse::is_checked_task(content, tid));
+    let still_pending = bound.is_some_and(|tid| crate::plan_parse::is_pending_task(content, tid));
+    if already_checked && !still_pending {
+        return CheckOffOutcome::AlreadyChecked;
+    }
 
     match plan.check_plan_on_deliverable(None, task_id, deliverable) {
         Ok(true) => return CheckOffOutcome::Flipped,
