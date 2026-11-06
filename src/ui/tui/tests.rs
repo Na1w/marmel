@@ -5441,13 +5441,13 @@ fn every_legend_row_is_a_real_handler_path() {
                 && r.chat_scroll < above;
             // With the composer focused the same two keys never reach a viewport,
             // and they never reach the history either: the row promises caret and
-            // scroll, nothing else, so a press with nowhere for the caret to go is
-            // not claimed at all — no recall, no repaint, no follow decision.
+            // scroll, nothing else, so a press with nowhere for the caret to go steps
+            // the transcript by one line instead — and no walk ever starts.
             r.set_focus(state::FocusPane::Input);
             let parked = r.chat_scroll;
             let follow = (r.follow, r.chat_auto_scroll);
-            let no_recall = !press(r, KeyCode::Up, KeyModifiers::NONE)
-                && !press(r, KeyCode::Down, KeyModifiers::NONE)
+            let no_recall = press(r, KeyCode::Up, KeyModifiers::NONE)
+                && press(r, KeyCode::Down, KeyModifiers::NONE)
                 && r.input_text.is_empty()
                 && r.history_index.is_none()
                 && r.chat_scroll == parked

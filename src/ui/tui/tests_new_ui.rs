@@ -3447,14 +3447,14 @@ fn assert_frame_agrees_with_its_chip(
 }
 
 /// Contract row (a): with the **composer** focused, `Up` / `Down` are the composer's
-/// caret keys inside a multi-line draft, and belong to nothing at all when the caret
-/// has nowhere to go — they never recall history (the reported conflict: the operator
-/// was scrolling and the draft got replaced), they never move a drawn pane and they
-/// never restate its follow chip. The multi-line case is pinned too, because it used
-/// to be the draft shape, not the focus, that decided who got the key (defects 1, 2
-/// and 5).
+/// caret keys inside a multi-line draft, and where the caret has nowhere to go they
+/// step the **transcript** viewport by one line (operator request) — they never recall
+/// history (the reported conflict: the operator was scrolling and the draft got
+/// replaced), and no drawn pane is redrawn by a step that did not move it. The
+/// multi-line cases are pinned too, because it used to be the draft shape, not the
+/// focus, that decided who got the key (defects 1, 2 and 5).
 #[test]
-fn arrows_behind_the_composer_leave_every_drawn_pane_where_it_stands() {
+fn arrows_behind_the_composer_step_the_transcript_and_recall_nothing() {
     let mut r = scrollback_renderer();
     r.set_focus(state::FocusPane::Input);
     r.history = vec!["first note".to_string(), "second note".to_string()];
@@ -3469,54 +3469,73 @@ fn arrows_behind_the_composer_leave_every_drawn_pane_where_it_stands() {
         chip.contains("LIVE"),
         "the boot frame follows the tail: {chip:?}"
     );
+    assert!(
+        offset > 0,
+        "the fixture must have a tail to step off: {offset}"
+    );
 
     // One plain `Up`, with a two-entry history waiting behind an empty draft: the
-    // press is refused. Nothing is recalled, nothing is scrolled, nothing is marked
-    // for repaint — the history is reachable by the `Ctrl+Up` chord alone.
+    // press steps the transcript by one line and states the follow decision it is.
+    // Nothing is recalled — the history is reachable by the `Ctrl+Up` chord alone.
     r.dirty = false;
     assert!(
-        !key(&mut r, KeyCode::Up),
-        "a plain `Up` behind the composer is not claimed once it is no longer the \
-         history fallback"
+        key(&mut r, KeyCode::Up),
+        "a plain `Up` behind the composer steps the transcript"
     );
     assert!(r.input_text.is_empty(), "the draft stayed the operator's");
     assert_eq!(
         r.history_index, None,
         "and no history walk was started behind their back"
     );
-    assert!(!r.dirty, "an unclaimed press asked for no repaint");
+    assert!(r.dirty, "a moved viewport asks for a repaint");
+    let (rows, _, _) = draw_frame(&mut r, 100, 30);
+    assert_ne!(
+        snapshot(&transcript_body(&rows, pane)),
+        body,
+        "the drawn transcript did not move"
+    );
+    assert_eq!(
+        r.chat_scroll,
+        offset - 1,
+        "one line up the transcript, and no further"
+    );
+    assert!(
+        !r.follow && !r.chat_auto_scroll,
+        "the viewport left the tail, so follow is off"
+    );
+    let chip_up = transcript_chip(&rows, pane);
+    assert!(
+        chip_up.contains("new") && !chip_up.contains("LIVE"),
+        "the chip counts what is still below the window: {chip_up:?}"
+    );
+
+    // `Down` is the same rule the other way: it walks the window back onto the tail
+    // and re-arms follow by arriving there — never by being pressed.
+    r.dirty = false;
+    assert!(
+        key(&mut r, KeyCode::Down),
+        "`Down` steps the transcript back"
+    );
+    assert!(r.input_text.is_empty());
+    assert!(r.history_index.is_none());
+    assert!(r.dirty, "again a moved viewport asks for a repaint");
     let (rows, _, _) = draw_frame(&mut r, 100, 30);
     assert_eq!(
         snapshot(&transcript_body(&rows, pane)),
         body,
-        "a composer arrow scrolled the transcript"
+        "the drawn window did not come back to where it started"
     );
     assert_eq!(
         transcript_chip(&rows, pane),
         chip,
-        "a composer arrow restated the follow chip"
+        "and the chip says `LIVE` again"
     );
-    assert_eq!(r.chat_scroll, offset, "and no viewport offset moved");
+    assert_eq!(r.chat_scroll, offset);
     assert_eq!(
         (r.follow, r.chat_auto_scroll),
         follow,
-        "and no follow decision was stated for a gesture inside the composer"
+        "an arrival on the tail re-armed follow and its mirror"
     );
-
-    // `Down` is refused on the same grounds: there is no walk to walk back.
-    r.dirty = false;
-    assert!(!key(&mut r, KeyCode::Down), "and so is `Down`");
-    assert!(r.input_text.is_empty());
-    assert!(r.history_index.is_none());
-    assert!(!r.dirty, "again no repaint was requested");
-    let (rows, _, _) = draw_frame(&mut r, 100, 30);
-    assert_eq!(
-        snapshot(&transcript_body(&rows, pane)),
-        body,
-        "a composer arrow scrolled the transcript"
-    );
-    assert_eq!(transcript_chip(&rows, pane), chip);
-    assert_eq!(r.chat_scroll, offset);
 
     // The chord, from the very same focus, does walk — and still leaves every drawn
     // pane where it stands.
@@ -3553,7 +3572,7 @@ fn arrows_behind_the_composer_leave_every_drawn_pane_where_it_stands() {
     // A multi-line draft: the arrows move the caret inside the draft, and the pane
     // viewport still does not move. A taller draft legitimately costs the body a
     // row (§2.1 `input_h`), so the baseline is re-taken for this part: the pin is
-    // that the **arrows** change nothing in it.
+    // that the **arrows** change nothing in it while the caret has somewhere to go.
     type_text(&mut r, "one");
     assert!(press(&mut r, KeyCode::Char('j'), KeyModifiers::CONTROL));
     type_text(&mut r, "two");
@@ -3575,18 +3594,45 @@ fn arrows_behind_the_composer_leave_every_drawn_pane_where_it_stands() {
     );
     assert_eq!(transcript_chip(&rows, pane), chip);
     assert_eq!(r.chat_scroll, offset, "and the caret case moved an offset");
+
+    // With the caret against the **top edge** of the multi-line draft the press has
+    // nowhere to go inside the composer, so it steps the transcript instead: the
+    // caret stays on line 0, the draft stays the operator's, no history entry is
+    // swapped in, and the drawn window moves by exactly one row. The geometry is
+    // re-read first, because a two-line draft legitimately costs the body a row
+    // (§2.1 `input_h`).
+    let (rows, _, rects) = draw_frame(&mut r, 100, 30);
+    let pane = rects.transcript.expect("M1 draws the transcript");
+    let body = snapshot(&transcript_body(&rows, pane));
+    let chip = transcript_chip(&rows, pane);
+    let offset = r.chat_scroll;
     assert!(
-        !key(&mut r, KeyCode::Up),
-        "with the caret against the top edge of a multi-line draft the press is not \
-         claimed, so no follow state is left describing a movement that never happened \
-         and no history entry is swapped in"
+        chip.contains("LIVE"),
+        "the window sits on the tail before the press: {chip:?}"
+    );
+    assert!(
+        key(&mut r, KeyCode::Up),
+        "the caret is on the first line, so the transcript takes the press"
     );
     assert_eq!(draft(&mut r), "one\ntwo", "and the draft stayed put");
+    assert_eq!(r.textarea.cursor().0, 0, "and the caret was not disturbed");
     assert!(r.history_index.is_none(), "and the walk never began");
+    assert_eq!(r.chat_scroll, offset - 1, "one line up the transcript");
+    assert!(
+        !r.follow,
+        "and the away step stated the follow decision it is"
+    );
     let (rows, _, _) = draw_frame(&mut r, 100, 30);
-    assert_eq!(snapshot(&transcript_body(&rows, pane)), body);
-    assert_eq!(transcript_chip(&rows, pane), chip);
-    assert_eq!(r.chat_scroll, offset);
+    assert_ne!(
+        snapshot(&transcript_body(&rows, pane)),
+        body,
+        "the drawn window did not move for the press that scrolled it"
+    );
+    let chip_at_edge = transcript_chip(&rows, pane);
+    assert!(
+        chip_at_edge.contains("new") && !chip_at_edge.contains("LIVE"),
+        "the chip did not follow the viewport off the tail: {chip_at_edge:?}"
+    );
 }
 
 /// The visible half of the reported conflict: the operator was trying to **scroll**
