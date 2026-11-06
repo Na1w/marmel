@@ -127,6 +127,17 @@ pub(crate) fn load_system_prompt_with_plan_and_warning(
             }
         }
     }
+    if crate::config::resolve_max_sessions(&cfg.orchestration.concurrency, &cfg.backend_url)
+        == Some(1)
+    {
+        prompt.push_str(
+            "\n## Single-Session Backend Scheduling (`max_sessions = 1`)\n\
+             The active LLM backend is configured with `max_sessions = 1` (a single inference slot). \
+             To preserve KV-cache prefix locality and avoid turn-by-turn prompt eviction across concurrent subagents, \
+             **you MUST schedule `delegate_task` calls sequentially: emit ONLY ONE `delegate_task` call per turn** \
+             and wait for that specialist to complete before delegating the next pending task.\n",
+        );
+    }
     let mcp_block = crate::prompts::format_mcp_prompt_block(cfg, &cfg.orchestration.mcp_servers);
     if !mcp_block.is_empty() {
         prompt.push_str(&mcp_block);
@@ -1686,6 +1697,23 @@ mod tests {
             .map(|(prompt, _warning)| prompt)
             .expect("load success");
         assert!(!prompt.contains("## Machine Specific Guidance"));
+    }
+
+    #[test]
+    fn test_load_system_prompt_injects_sequential_scheduling_when_max_sessions_one() {
+        let plan = crate::manager::phase::Plan::default();
+        let mut cfg = Config::default();
+        let default_prompt = load_system_prompt_with_plan_and_warning(&cfg, &plan)
+            .map(|(prompt, _warning)| prompt)
+            .expect("load success");
+        assert!(!default_prompt.contains("Single-Session Backend Scheduling"));
+
+        cfg.orchestration.concurrency.max_sessions = Some(1);
+        let single_slot_prompt = load_system_prompt_with_plan_and_warning(&cfg, &plan)
+            .map(|(prompt, _warning)| prompt)
+            .expect("load success");
+        assert!(single_slot_prompt.contains("Single-Session Backend Scheduling"));
+        assert!(single_slot_prompt.contains("emit ONLY ONE"));
     }
 
     /// This owned UI seam is a pure delegation to `crate::task_id`: re-spelling the

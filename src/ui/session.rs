@@ -2551,7 +2551,12 @@ pub async fn run_session_with_bounds_report(
 
             nudge_count = 0;
 
-            if should_run_tool_round_in_parallel(&tool_calls, cfg) {
+            let all_parallel = tool_calls.iter().all(|c| {
+                c.function.name == crate::tool_names::TOOL_DELEGATE_TASK
+                    || crate::manager::is_read_tool(&c.function.name)
+            });
+
+            if all_parallel && tool_calls.len() > 1 {
                 ctx.reset_consecutive_rebirths();
                 let mut handles = Vec::new();
                 // Aligned index-for-index with `handles`: which unit of work each
@@ -4316,61 +4321,6 @@ pub fn check_off_warning(task_id: Option<&str>, outcome: &CheckOffOutcome) -> Op
             "plan check-off for [{tid}] was refused: {detail} — the box stays unchecked"
         )),
     }
-}
-
-/// Decide whether a Manager tool-call batch should be fanned out concurrently.
-///
-/// Read-only tool batches always fan out when `tool_calls.len() > 1`.
-/// Multi-`delegate_task` batches also fan out in parallel **unless** any
-/// delegated specialist resolves to a single-slot backend (`max_sessions == 1`).
-/// On a `max_sessions == 1` backend (e.g. a single-slot local `llama-server`),
-/// concurrent subagents cannot run inference in parallel and instead interleave
-/// turn-by-turn on the single semaphore slot, evicting each other's 10k–40k
-/// token prompt from the KV cache on every turn and racing on the workspace.
-/// Running them sequentially lets each specialist run to completion with full
-/// KV-cache prefix reuse before the next specialist starts.
-pub(crate) fn should_run_tool_round_in_parallel(
-    tool_calls: &[crate::types::ToolCall],
-    cfg: &Config,
-) -> bool {
-    if tool_calls.len() <= 1 {
-        return false;
-    }
-    let all_parallel_capable = tool_calls.iter().all(|c| {
-        c.function.name == crate::tool_names::TOOL_DELEGATE_TASK
-            || crate::manager::is_read_tool(&c.function.name)
-    });
-    if !all_parallel_capable {
-        return false;
-    }
-    let delegate_calls: Vec<&crate::types::ToolCall> = tool_calls
-        .iter()
-        .filter(|c| c.function.name == crate::tool_names::TOOL_DELEGATE_TASK)
-        .collect();
-    if delegate_calls.len() <= 1 {
-        return true;
-    }
-    for call in delegate_calls {
-        let agent_name = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
-            .ok()
-            .and_then(|v| {
-                v.get("agent_name")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            });
-        let backend_url = agent_name
-            .as_deref()
-            .and_then(|a| cfg.orchestration.specialists.get(a))
-            .and_then(|sc| sc.backend_url.as_deref())
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(&cfg.backend_url);
-        if crate::config::resolve_max_sessions(&cfg.orchestration.concurrency, backend_url)
-            == Some(1)
-        {
-            return false;
-        }
-    }
-    true
 }
 
 #[cfg(test)]

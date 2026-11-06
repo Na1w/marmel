@@ -98,8 +98,17 @@ pub(crate) async fn write_plan_internal(
             } else {
                 pending.join(", ")
             };
+            let dispatch_hint = if crate::config::resolve_max_sessions(
+                &cfg.orchestration.concurrency,
+                &cfg.backend_url,
+            ) == Some(1)
+            {
+                "Phase is now EXECUTING. Because `max_sessions = 1` on the active backend, you MUST schedule tasks sequentially: emit ONLY ONE `delegate_task` tool call per turn (starting with the first pending task) and wait for it to finish before delegating the next task. Do NOT call create_plan again unless you explicitly intend to overwrite the plan."
+            } else {
+                "Phase is now EXECUTING. You must proceed immediately to emit `delegate_task` tool calls for the first pending task(s). Do NOT call create_plan again unless you explicitly intend to overwrite the plan."
+            };
             ToolResult::ok(format!(
-                "Execution plan written to .marmel/execution_plan.md.\nRecognized pending tasks: [{pending_str}].\nPhase is now EXECUTING. You must proceed immediately to emit `delegate_task` tool calls for the first pending task(s). Do NOT call create_plan again unless you explicitly intend to overwrite the plan."
+                "Execution plan written to .marmel/execution_plan.md.\nRecognized pending tasks: [{pending_str}].\n{dispatch_hint}"
             ))
         })
         .map_err(ToolError::Execution)
