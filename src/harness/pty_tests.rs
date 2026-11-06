@@ -210,9 +210,19 @@ async fn test_run_command_pty_cancelled_by_worker_token() {
         token_clone.cancel();
     });
 
+    // `run_command_pty` takes a command *string*, so the long-running command is spelled
+    // per platform exactly like `test_run_command_parses_timeout_seconds_argument` below:
+    // `sleep` does not exist on Windows, where `cmd /C sleep 10` exits immediately with a
+    // "not recognized" status, so the cancellation signal could never be observed and the
+    // assertion below could not hold on that platform.
+    #[cfg(unix)]
+    let cmd = "sleep 10";
+    #[cfg(windows)]
+    let cmd = "ping -n 30 127.0.0.1";
+
     let res = crate::orchestrator::CURRENT_WORKER_TOKEN
         .scope(token, async {
-            run_command_pty("sleep 10", Duration::from_secs(10))
+            run_command_pty(cmd, Duration::from_secs(10))
         })
         .await;
 
@@ -1122,14 +1132,22 @@ fn test_sandbox_gate_unresolved_exe_fails_closed_and_is_logged() {
 
 /// Expected shell argv prefix of `build_sandboxed_command` on this platform, following
 /// the same platform spawn-spec idiom as `short_lived_child_spec`/`long_running_child_spec`
-/// above. Grounded in the production builder: Windows takes its own branch and emits the
-/// bare `cmd` token plus `/C` (portable-pty keeps argv0 verbatim; the OS resolves `cmd` to
-/// `cmd.exe` only at spawn time), while every unix skip emits `sh` plus `-c`.
-fn expected_sandbox_shell() -> (&'static str, &'static str) {
+/// above. Grounded in the production builder: every unix skip emits `sh` plus `-c`.
+///
+/// Windows: this helper used to pin the pre-t-007 spelling `("cmd", "/C")`, which is now
+/// **superseded**. Rule R2 of [`windows_shell_argv`] makes the program token the trimmed
+/// `%COMSPEC%` when it carries a value and the extension-qualified `cmd.exe` otherwise —
+/// never a bare `cmd`, because `CreateProcessW` receives it as `lpApplicationName` and
+/// does not append `.exe`. The expectation is therefore resolved through the production
+/// seam ([`windows_cmd_program`]) instead of being spelled out a second time, so it
+/// cannot drift from the rule, and it is an owned `String` because `%COMSPEC%` is a
+/// runtime value.
+fn expected_sandbox_shell() -> (String, &'static str) {
     if cfg!(windows) {
-        ("cmd", "/C")
+        let comspec = std::env::var("COMSPEC").ok();
+        (windows_cmd_program(comspec.as_deref()), "/C")
     } else {
-        ("sh", "-c")
+        ("sh".to_string(), "-c")
     }
 }
 
@@ -1312,4 +1330,714 @@ fn test_sandbox_gate_extras_channel_follows_the_config_and_the_decision() {
             "the plain-shell argv stays program + flag + payload"
         );
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Windows spawn seams (t-007): `windows_shell_argv` and `windows_child_cwd`
+// ──────────────────────────────────────────────────────────────────────────
+//
+// Three Windows-only defects in the `run_command` spawn path are pinned here:
+//
+// 1. a bare `cmd` program token reaches `CreateProcessW` as `lpApplicationName`,
+//    which does **not** append `.exe` (portable-pty's PATH+PATHEXT scan may miss,
+//    and a resolved `.CMD`/`.BAT` cannot be launched at all);
+// 2. `cmd.exe` refuses a `\\?\`-verbatim current directory — it reads a leading
+//    `\\` as UNC — so the canonicalised workspace root made commands run in
+//    `C:\Windows`;
+// 3. a payload-less bare shell is an *interactive* request and can only time out on
+//    the one-shot path.
+//
+// Every assertion below feeds **literal Windows inputs** and never spawns a process,
+// so it runs on this host: that is exactly why the decisions live in pure functions
+// and the platform is a `Copy` value (`SpawnFamily`), instead of a `#[cfg(windows)]`
+// body that CI only ever compiles.
+//
+// Note for the one-shot work (t-009): `expected_sandbox_shell` above used to pin the
+// pre-t-007 Windows spelling `("cmd", "/C")`. Under R2 below the program token is
+// `%COMSPEC%` or `cmd.exe`, so that helper's Windows leg now resolves through
+// `windows_cmd_program` instead.
+
+/// The `%COMSPEC%` spelling a normal Windows install carries, used as the literal
+/// `Some(...)` input of the `comspec` parameter.
+const TEST_COMSPEC: &str = r"C:\Windows\System32\cmd.exe";
+
+/// The platform value production passes selects exactly the build platform, and the
+/// two variants are distinct values (nothing compares by name or by `cfg!` at a call
+/// site).
+#[test]
+fn test_spawn_family_current_follows_the_build_platform() {
+    let expected = if cfg!(windows) {
+        SpawnFamily::Windows
+    } else {
+        SpawnFamily::Unix
+    };
+    assert_eq!(SpawnFamily::current(), expected);
+    assert_ne!(SpawnFamily::Unix, SpawnFamily::Windows);
+}
+
+/// R2/R4: a normal command becomes `[program, "/C", command]`, where the program is
+/// `%COMSPEC%` when it carries a value and the literal `cmd.exe` otherwise. An empty or
+/// whitespace-only `%COMSPEC%` must never win — `CommandBuilder::new("")` would be a
+/// spawn of nothing.
+#[test]
+fn test_windows_shell_argv_normal_command_uses_comspec_or_cmd_exe() {
+    // No `%COMSPEC%` at all: the extension-qualified literal, never a bare `cmd`.
+    assert_eq!(
+        windows_shell_argv("dir", None),
+        (
+            "cmd.exe".to_string(),
+            vec!["/C".to_string(), "dir".to_string()]
+        ),
+        "the program token must carry `.exe`: CreateProcessW does not append it"
+    );
+
+    // A real `%COMSPEC%` is used verbatim as the program.
+    assert_eq!(
+        windows_shell_argv("dir", Some(TEST_COMSPEC)),
+        (
+            TEST_COMSPEC.to_string(),
+            vec!["/C".to_string(), "dir".to_string()]
+        ),
+        "a set %COMSPEC% is the interpreter path the shell itself would use"
+    );
+
+    // `%COMSPEC%` present but blank: it must not win over the literal.
+    for blank in ["", " ", "   ", "\t\n"] {
+        assert_eq!(
+            windows_shell_argv("dir", Some(blank)),
+            (
+                "cmd.exe".to_string(),
+                vec!["/C".to_string(), "dir".to_string()]
+            ),
+            "a blank %COMSPEC% ({blank:?}) must fall back to `cmd.exe`"
+        );
+    }
+
+    // Surrounding whitespace in a real value is trimmed, not spawned as part of the path.
+    assert_eq!(
+        windows_shell_argv("dir", Some("  C:\\Windows\\System32\\cmd.exe  ")).0,
+        TEST_COMSPEC,
+        "the program token is the trimmed %COMSPEC% value"
+    );
+}
+
+/// R1: a bare shell is an *interactive shell request* — the shell itself is the program
+/// and there is **no** `/C` payload, for both the `cmd` and the `powershell` families
+/// and for any casing/whitespace spelling of them.
+#[test]
+fn test_windows_shell_argv_bare_shell_is_interactive_and_carries_no_payload() {
+    // The `cmd` family goes through R2: `%COMSPEC%` when set, else `cmd.exe`.
+    assert_eq!(
+        windows_shell_argv("cmd", None),
+        ("cmd.exe".to_string(), Vec::new())
+    );
+    assert_eq!(
+        windows_shell_argv("cmd", Some(TEST_COMSPEC)),
+        (TEST_COMSPEC.to_string(), Vec::new())
+    );
+    assert_eq!(
+        windows_shell_argv("  CMD.EXE  ", Some(TEST_COMSPEC)),
+        (TEST_COMSPEC.to_string(), Vec::new()),
+        "the bare-shell match is trimmed and ASCII-case-insensitive"
+    );
+
+    // The `powershell` family is passed through as written (R3): `%COMSPEC%` names
+    // `cmd.exe`, so substituting it would run a different shell than asked for.
+    assert_eq!(
+        windows_shell_argv("POWERSHELL.EXE", Some(TEST_COMSPEC)),
+        ("POWERSHELL.EXE".to_string(), Vec::new())
+    );
+    assert_eq!(
+        windows_shell_argv(" powershell ", None),
+        ("powershell".to_string(), Vec::new())
+    );
+
+    // No payload on any of them: an interactive shell must not receive a command.
+    for shell in ["cmd", "cmd.exe", "powershell", "powershell.exe"] {
+        let (_, args) = windows_shell_argv(shell, Some(TEST_COMSPEC));
+        assert!(
+            args.is_empty(),
+            "the interactive form must carry no /C payload, got {args:?} for {shell:?}"
+        );
+    }
+
+    // A shell name that only *starts* with a shell token is a command, not a shell.
+    let (program, args) = windows_shell_argv("cmd /C dir", None);
+    assert_eq!(program, "cmd.exe");
+    assert_eq!(args, vec!["/C".to_string(), "cmd /C dir".to_string()]);
+}
+
+/// R5: the payload reaches the child **verbatim** — no trimming, no re-quoting, no
+/// preamble. This is the invariant the old Windows branch violated downstream of here,
+/// so it is pinned on the exact shape that broke a real command line.
+#[test]
+fn test_windows_shell_argv_preserves_the_payload_verbatim() {
+    for payload in [
+        r#"git commit -m "fix: x""#,
+        r#"dir "C:\Program Files\a b" & echo %PATH% ^& type a.txt"#,
+        "  dir  ",
+        "echo 'single quoted'",
+        "cargo test --all-targets --all-features",
+    ] {
+        let (program, args) = windows_shell_argv(payload, Some(TEST_COMSPEC));
+        assert_eq!(program, TEST_COMSPEC);
+        assert_eq!(
+            args,
+            vec!["/C".to_string(), payload.to_string()],
+            "the payload must survive byte for byte, got {args:?} for {payload:?}"
+        );
+    }
+}
+
+/// C1/C2/C3: only a verbatim prefix is removed, so `cmd.exe` accepts the directory as
+/// its current directory. Everything else is returned untouched.
+///
+/// The paths are compared by **string form**, not `PathBuf` equality: a literal Windows
+/// path is a single opaque component on a Unix host, and the string is what reaches
+/// `CreateProcessW` either way.
+#[test]
+fn test_windows_child_cwd_strips_only_the_verbatim_prefix() {
+    let spelled = |path: &str| {
+        windows_child_cwd(std::path::Path::new(path))
+            .to_string_lossy()
+            .into_owned()
+    };
+
+    // C2: a verbatim volume path loses only the prefix.
+    assert_eq!(spelled(r"\\?\C:\work\proj"), r"C:\work\proj");
+    // C1: a verbatim UNC path becomes the plain UNC spelling.
+    assert_eq!(spelled(r"\\?\UNC\srv\share\p"), r"\\srv\share\p");
+    // The namespace prefix is ASCII-case-insensitive, like the namespace itself.
+    assert_eq!(spelled(r"\\?\unc\srv\share\p"), r"\\srv\share\p");
+    assert_eq!(spelled(r"\\?\c:\work\proj"), r"c:\work\proj");
+
+    // C3: every other spelling is returned byte for byte.
+    for untouched in [
+        r"C:\work\proj",
+        r"C:\Users\runneradmin\AppData\Local\Temp",
+        r"\\srv\share\p",
+        "/tmp/x",
+        "relative/dir",
+        r"\\?\",
+        r"\\?\UNC\",
+        r"\\.\COM1",
+    ] {
+        assert_eq!(
+            spelled(untouched),
+            untouched,
+            "a non-verbatim (or degenerate) spelling must be untouched"
+        );
+    }
+
+    // C4: no substitution, ever — a directory that does not exist keeps its requested
+    // spelling instead of being replaced by another one (portable-pty would fall back to
+    // `%USERPROFILE%`).
+    assert_eq!(
+        spelled(r"\\?\C:\no\such\dir"),
+        r"C:\no\such\dir",
+        "the requested directory is never swapped for a different one"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// One-shot outcome reporting and the Windows one-shot argv (t-009)
+// ──────────────────────────────────────────────────────────────────────────
+//
+// A one-shot `run_command` has exactly one channel to the caller — the returned string —
+// so it must never spell a failure like a success, and it must never throw away output it
+// already captured. Both rules are pure functions of their inputs, which is why they are
+// pinned here on a macOS/Linux host: `render_one_shot_result` and `windows_oneshot_argv`
+// are asserted with literal inputs and no process is spawned. The Windows branch that
+// actually spawns is compiled and linted by the `x86_64-pc-windows-gnu` cross-target; its
+// end-to-end contract tests belong to the follow-up task (t-010).
+
+/// Exit 0: the output alone, with the same `sanitize_terminal_output(...)` +
+/// `trim_end_matches('\n')` treatment the PTY path applies — no status line, no notice.
+#[test]
+fn test_one_shot_result_exit_zero_is_the_output_only() {
+    assert_eq!(
+        render_one_shot_result("hello\n", OneShotEnd::Exited(Some(0))),
+        "hello",
+        "a clean exit must return the output alone, exactly like the PTY path"
+    );
+    assert_eq!(
+        render_one_shot_result("a\nb\n\n\n", OneShotEnd::Exited(Some(0))),
+        "a\nb",
+        "only trailing newlines are trimmed, interior ones are content"
+    );
+    assert_eq!(
+        render_one_shot_result("", OneShotEnd::Exited(Some(0))),
+        "",
+        "silent success stays silent — no invented notice"
+    );
+
+    // Terminal noise is sanitised on this path too: an OSC title sequence and a bell must
+    // not survive into the tool result.
+    assert_eq!(
+        render_one_shot_result("\x1b]0;title\x07done\x07\n", OneShotEnd::Exited(Some(0))),
+        "done"
+    );
+}
+
+/// Non-zero exit: the output is kept **and** an explicit exit-status line is appended, so
+/// a failing command can no longer be reported as a success.
+#[test]
+fn test_one_shot_result_non_zero_exit_appends_the_status_line() {
+    assert_eq!(
+        render_one_shot_result("boom\n", OneShotEnd::Exited(Some(3))),
+        "boom\n[exit code: 3]",
+        "the failure must be visible and the output preserved"
+    );
+    assert_eq!(
+        render_one_shot_result("", OneShotEnd::Exited(Some(1))),
+        "[exit code: 1]",
+        "a silent failure still reports its status"
+    );
+    // No code at all is reported honestly instead of being folded into success.
+    assert_eq!(
+        render_one_shot_result("x\n", OneShotEnd::Exited(None)),
+        "x\n[exit status unavailable]"
+    );
+}
+
+/// Timeout: the partial output captured so far survives, followed by the existing timeout
+/// notice text.
+#[test]
+fn test_one_shot_result_timeout_keeps_partial_output() {
+    let rendered = render_one_shot_result(
+        "line one\nline two\n",
+        OneShotEnd::TimedOut(Duration::from_secs(60)),
+    );
+    assert_eq!(
+        rendered, "line one\nline two\n[command timed out after 60s and was killed]",
+        "a timeout must not destroy the output already captured"
+    );
+    assert_eq!(
+        render_one_shot_result("", OneShotEnd::TimedOut(Duration::from_secs(5))),
+        "[command timed out after 5s and was killed]",
+        "the notice alone is the whole result when nothing was captured"
+    );
+}
+
+/// Cancellation: the partial output plus the existing cancellation notice.
+#[test]
+fn test_one_shot_result_cancellation_keeps_partial_output() {
+    assert_eq!(
+        render_one_shot_result("partial\n", OneShotEnd::Cancelled),
+        "partial\n[command aborted by cancellation signal]"
+    );
+    assert_eq!(
+        render_one_shot_result("", OneShotEnd::Cancelled),
+        "[command aborted by cancellation signal]"
+    );
+}
+
+/// The `cmd /C` argument construction is what carries the payload to `cmd.exe`: both `/C`
+/// and the command itself are separate arguments that reach the child verbatim, so
+/// `std::os::windows::process::CommandExt::raw_arg` can pass them through untouched.
+#[test]
+fn test_windows_oneshot_argv_preserves_the_payload_verbatim() {
+    for payload in [
+        r#"git commit -m "fix: x""#,
+        r#"dir "C:\Program Files\a b" & echo %PATH% ^& type a.txt"#,
+        "  dir  ",
+        "cargo test --all-targets --all-features",
+    ] {
+        let (program, args) = windows_oneshot_argv(payload, Some(TEST_COMSPEC))
+            .expect("a real command is always spawnable");
+        assert_eq!(
+            program, TEST_COMSPEC,
+            "the program token is the trimmed %COMSPEC% (R2)"
+        );
+        assert_eq!(
+            args,
+            vec!["/C".to_string(), payload.to_string()],
+            "the payload must reach cmd.exe byte for byte, got {args:?} for {payload:?}"
+        );
+    }
+
+    // Without `%COMSPEC%` the extension-qualified literal is used, never a bare `cmd`.
+    assert_eq!(
+        windows_oneshot_argv("dir", None),
+        Ok((
+            "cmd.exe".to_string(),
+            vec!["/C".to_string(), "dir".to_string()]
+        ))
+    );
+}
+
+/// A bare shell has no payload, so a one-shot spawn of it could only sit at its prompt
+/// until the timeout killed it. It is refused with an actionable message that names the
+/// shell and points at `pty_spawn`, instead of being spawned.
+#[test]
+fn test_windows_oneshot_argv_refuses_a_payload_less_shell() {
+    for shell in ["cmd", "cmd.exe", "CMD", " powershell ", "powershell.exe"] {
+        let err = windows_oneshot_argv(shell, Some(TEST_COMSPEC))
+            .expect_err("an interactive shell must not be spawned one-shot");
+        assert!(
+            err.contains(TOOL_PTY_SPAWN) && err.contains("interactive"),
+            "the refusal must be actionable, got {err:?} for {shell:?}"
+        );
+    }
+
+    // A shell name that only starts with a shell token is a command and is spawned.
+    let (_, args) = windows_oneshot_argv("cmd /C dir", Some(TEST_COMSPEC))
+        .expect("a command that mentions a shell is still a command");
+    assert_eq!(args, vec!["/C".to_string(), "cmd /C dir".to_string()]);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// The Windows one-shot `run_command` contract (t-010)
+// ──────────────────────────────────────────────────────────────────────────
+//
+// The defect this block exists for: on Windows **every** `run_command` returned only a
+// timeout notice and discarded the output it had already captured, because the ConPTY
+// output pipe is closed by `ClosePseudoConsole` — i.e. after the read loop — so the reader
+// never reached EOF and the run could only ever burn its whole budget. The suite was
+// blind to it: the only Windows-adjacent test asserted the *timeout string*, and nothing
+// asserted that output comes back at all. So the legs below assert the real contract, and
+// the names/doc comments say what each one prevents from coming back.
+//
+// Two halves:
+//
+// * **host-independent** — the poll decision ([`one_shot_poll_decision`]) and the
+//   renderer ([`render_one_shot_result`]) are pure functions, so the deadline arithmetic
+//   and every outcome shape are pinned on macOS/Linux as well;
+// * **`cfg!(windows)`** — real commands through the production entry point
+//   ([`run_command`]). Those bodies still *compile* on every host (they only use
+//   `run_command` and command strings), so the assertions are type-checked here and on the
+//   `x86_64-pc-windows-gnu` cross-target; only *execution* is Windows-only.
+
+/// A command that has already exited is reported with its own status — even when the
+/// deadline has passed and a cancellation signal is pending.
+///
+/// This is the ordering the reported defect violated: a run whose output existed was
+/// reported as "timed out and was killed". An observed exit must always win, so the
+/// caller sees the output and the real status.
+#[test]
+fn test_one_shot_poll_decision_reports_an_exit_before_cancellation_or_the_deadline() {
+    let timeout = Duration::from_secs(60);
+
+    // Exit inside the budget.
+    assert_eq!(
+        one_shot_poll_decision(Some(Some(0)), false, Duration::ZERO, timeout),
+        OneShotPoll::Exited(Some(0))
+    );
+    // Exit observed on the very poll where the deadline has elapsed: the exit wins.
+    assert_eq!(
+        one_shot_poll_decision(Some(Some(0)), false, timeout, timeout),
+        OneShotPoll::Exited(Some(0)),
+        "a command that finished at its deadline is a success, not a kill"
+    );
+    // Exit wins over a pending cancellation too.
+    assert_eq!(
+        one_shot_poll_decision(Some(Some(0)), true, timeout, timeout),
+        OneShotPoll::Exited(Some(0))
+    );
+    // A child that ended without an exit code is still an exit, never a timeout.
+    assert_eq!(
+        one_shot_poll_decision(Some(None), true, timeout, timeout),
+        OneShotPoll::Exited(None)
+    );
+    // A non-zero status is reported as itself, so a failure can never look like a kill.
+    assert_eq!(
+        one_shot_poll_decision(Some(Some(3)), false, Duration::ZERO, timeout),
+        OneShotPoll::Exited(Some(3))
+    );
+}
+
+/// While the child is still running the decision is cancellation first, then the
+/// deadline, then "keep polling" — the order the one-shot loop depends on.
+#[test]
+fn test_one_shot_poll_decision_prefers_cancellation_then_the_deadline() {
+    let timeout = Duration::from_secs(60);
+
+    assert_eq!(
+        one_shot_poll_decision(None, false, Duration::from_millis(59_950), timeout),
+        OneShotPoll::Running,
+        "a running child with budget left must keep being polled"
+    );
+    assert_eq!(
+        one_shot_poll_decision(None, true, Duration::ZERO, timeout),
+        OneShotPoll::Cancelled,
+        "a cancellation signal must preempt a run that still has budget left"
+    );
+    assert_eq!(
+        one_shot_poll_decision(None, true, timeout, timeout),
+        OneShotPoll::Cancelled,
+        "cancellation is decided before the deadline"
+    );
+    assert_eq!(
+        one_shot_poll_decision(None, false, timeout, timeout),
+        OneShotPoll::TimedOut,
+        "the deadline is inclusive (`elapsed >= timeout`), never exclusive"
+    );
+    assert_eq!(
+        one_shot_poll_decision(None, false, timeout + Duration::from_secs(1), timeout),
+        OneShotPoll::TimedOut
+    );
+}
+
+/// A degenerate budget still bounds the wait: `0` stops at the first poll and a one-second
+/// budget never becomes an unbounded wait. This is the arithmetic that a re-introduced
+/// "wait until the pipe closes" loop would silently turn into a hang.
+#[test]
+fn test_one_shot_poll_decision_zero_and_sub_second_budgets_stay_bounded() {
+    // Zero: never `Running`, whatever the elapsed time.
+    for elapsed in [
+        Duration::ZERO,
+        Duration::from_millis(1),
+        Duration::from_secs(3600),
+    ] {
+        assert_eq!(
+            one_shot_poll_decision(None, false, elapsed, Duration::ZERO),
+            OneShotPoll::TimedOut,
+            "a zero budget must stop at the first poll, not wait forever"
+        );
+    }
+
+    // One second: exactly one second of patience, then the deadline.
+    let one_second = Duration::from_secs(1);
+    assert_eq!(
+        one_shot_poll_decision(None, false, Duration::from_millis(950), one_second),
+        OneShotPoll::Running
+    );
+    assert_eq!(
+        one_shot_poll_decision(None, false, one_second, one_second),
+        OneShotPoll::TimedOut
+    );
+    assert_eq!(
+        one_shot_poll_decision(None, false, Duration::from_millis(1_500), one_second),
+        OneShotPoll::TimedOut
+    );
+
+    // `run_command` cannot even hand a zero budget to the loop: the documented clamp lifts
+    // it to one second, so the degenerate case above is defence in depth rather than the
+    // reachable production path.
+    assert_eq!(crate::config::effective_command_timeout_secs(Some(0)), 1);
+}
+
+/// A child that ends without an exit code is reported as such, never as success: for a
+/// one-shot `run_command` the rendered string is the **only** channel to the caller.
+#[test]
+fn test_one_shot_result_exited_without_a_status_code_never_reports_success() {
+    assert_eq!(
+        render_one_shot_result("", OneShotEnd::Exited(None)),
+        "[exit status unavailable]",
+        "silence plus an unknown status must still say something"
+    );
+    assert_eq!(
+        render_one_shot_result("\n\n", OneShotEnd::Exited(None)),
+        "[exit status unavailable]",
+        "newline-only output leaves the notice alone, exactly like a non-zero exit"
+    );
+
+    // The no-code shape is distinct from a silent success and keeps the captured output.
+    let same_input = "out\n";
+    assert_eq!(
+        render_one_shot_result(same_input, OneShotEnd::Exited(Some(0))),
+        "out"
+    );
+    let unavailable = render_one_shot_result(same_input, OneShotEnd::Exited(None));
+    assert_ne!(
+        unavailable, "out",
+        "no code must never be spelled as success"
+    );
+    assert!(
+        unavailable.starts_with("out\n") && unavailable.ends_with("[exit status unavailable]"),
+        "the captured output must survive the unknown status, got {unavailable:?}"
+    );
+}
+
+/// Host gate for the Windows one-shot `run_command` legs below.
+///
+/// [`pty_or_skip`] is the **wrong** gate for them: the Windows one-shot path is
+/// `std::process::Command` + `cmd /C` with no ConPTY and no PTY at all, so a host that
+/// cannot allocate a PTY would announce a skip for behaviour that never needs one. The
+/// gate is therefore the platform alone, announced in the same `SKIP ` spelling as every
+/// other skip in this file so it is visible instead of silent. On a Windows host the
+/// assertions run unconditionally.
+fn windows_oneshot_or_skip(test: &str) -> bool {
+    if cfg!(windows) {
+        return true;
+    }
+    eprintln!(
+        "SKIP {test}: the one-shot run_command path (std::process::Command + `cmd /C`, no ConPTY) only exists on Windows, so its contract cannot be exercised on {}",
+        std::env::consts::OS
+    );
+    false
+}
+
+/// Regression guard for the reported defect: a fast Windows command must return its **real
+/// output**, must not be reported as timed out, and must return long before its budget.
+///
+/// Under the pre-t-009 ConPTY path this call returned only
+/// `[command timed out after 30s and was killed]` — the token below was captured and then
+/// thrown away. The elapsed assertion is the second half of the same guard: a re-introduced
+/// EOF-wait burns the whole 30 s budget instead of failing late, so it is caught here in
+/// seconds rather than after a full minute of silence.
+#[test]
+fn test_run_command_windows_oneshot_returns_real_output_and_never_times_out() {
+    if !windows_oneshot_or_skip(
+        "harness::pty::tests::test_run_command_windows_oneshot_returns_real_output_and_never_times_out",
+    ) {
+        return;
+    }
+
+    let started = std::time::Instant::now();
+    let res = run_command(&serde_json::json!({
+        "command": "echo hello_windows_oneshot",
+        "timeout_seconds": 30
+    }))
+    .expect("`echo` must run through the one-shot path");
+    let elapsed = started.elapsed();
+
+    assert!(
+        res.content.contains("hello_windows_oneshot"),
+        "run_command must return the command's real output, got {:?}",
+        res.content
+    );
+    assert!(
+        !res.content.contains("timed out"),
+        "a command that exits at once must never be reported as timed out, got {:?}",
+        res.content
+    );
+    assert!(!res.is_error, "a successful command is not an error result");
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the call must return when the child exits, not when the 30s budget expires: took {elapsed:?}"
+    );
+}
+
+/// A failing Windows command reports its non-zero status **and** keeps the output, so a
+/// failure can no longer be indistinguishable from a timeout — and a command that does not
+/// exist is reported as a failure with `cmd.exe`'s own diagnostic rather than as a hang.
+#[test]
+fn test_run_command_windows_oneshot_reports_a_non_zero_exit_status() {
+    if !windows_oneshot_or_skip(
+        "harness::pty::tests::test_run_command_windows_oneshot_reports_a_non_zero_exit_status",
+    ) {
+        return;
+    }
+
+    // `cmd /C exit /b 3` terminates the shell with status 3 and prints nothing.
+    let res = run_command(&serde_json::json!({
+        "command": "exit /b 3",
+        "timeout_seconds": 30
+    }))
+    .expect("`exit /b 3` must run through the one-shot path");
+    assert!(
+        res.content.contains("[exit code: 3]"),
+        "the exit status must be reported, got {:?}",
+        res.content
+    );
+    assert!(
+        !res.content.contains("timed out"),
+        "a command that exits at once must never be reported as timed out, got {:?}",
+        res.content
+    );
+
+    // A command that does not exist: `cmd.exe` writes its diagnostic to **stderr** and
+    // exits non-zero (9009 on a normal install, but the exact code is not part of the
+    // contract, so only "non-zero" is asserted). The name is ASCII, so the diagnostic is
+    // recognisable whatever the display language of the runner.
+    let missing = "marmel_windows_oneshot_missing_command";
+    let res = run_command(&serde_json::json!({
+        "command": missing,
+        "timeout_seconds": 30
+    }))
+    .expect("an unknown command is a reported failure, not an Err");
+    assert!(
+        res.content.contains(missing),
+        "stderr must be captured: the diagnostic names the missing command, got {:?}",
+        res.content
+    );
+    assert!(
+        res.content.contains("[exit code: "),
+        "an unknown command must report its status, got {:?}",
+        res.content
+    );
+    assert!(
+        !res.content.contains("[exit code: 0]"),
+        "an unknown command must never be reported as a success, got {:?}",
+        res.content
+    );
+    assert!(
+        !res.content.contains("timed out"),
+        "an unknown command exits immediately and must not time out, got {:?}",
+        res.content
+    );
+}
+
+/// The production entry point refuses a payload-less shell instead of letting it sit at its
+/// prompt until the timeout: the caller gets an actionable `BadArguments` error naming
+/// `pty_spawn`, never a timeout notice.
+#[test]
+fn test_run_command_windows_oneshot_refuses_a_bare_shell_instead_of_timing_out() {
+    if !windows_oneshot_or_skip(
+        "harness::pty::tests::test_run_command_windows_oneshot_refuses_a_bare_shell_instead_of_timing_out",
+    ) {
+        return;
+    }
+
+    let started = std::time::Instant::now();
+    let err = run_command(&serde_json::json!({
+        "command": "cmd",
+        "timeout_seconds": 5
+    }))
+    .expect_err("an interactive shell has no one-shot form");
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(err, ToolError::BadArguments { .. }),
+        "the refusal must be an argument error, got {err:?}"
+    );
+    let text = err.to_string();
+    assert!(
+        text.contains(TOOL_PTY_SPAWN) && text.contains("interactive"),
+        "the refusal must point at pty_spawn, got {text:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the refusal must be immediate, not the 5s timeout: took {elapsed:?}"
+    );
+}
+
+/// A long-running command is cut off at its deadline, and the call returns within a small
+/// margin of it.
+///
+/// The notice text itself is already pinned by
+/// `test_run_command_parses_timeout_seconds_argument`; what was missing is the **bound**:
+/// `ping -n 10` needs roughly nine seconds, so a call that outlives a few seconds has
+/// ignored its one-second deadline (the shape of the reported hang), and one that returns
+/// before the deadline has cut a legitimate command short.
+#[test]
+fn test_run_command_windows_oneshot_timeout_is_bounded_and_reports_the_notice() {
+    if !windows_oneshot_or_skip(
+        "harness::pty::tests::test_run_command_windows_oneshot_timeout_is_bounded_and_reports_the_notice",
+    ) {
+        return;
+    }
+
+    let started = std::time::Instant::now();
+    let res = run_command(&serde_json::json!({
+        "command": "ping -n 10 127.0.0.1",
+        "timeout_seconds": 1
+    }))
+    .expect("a long-running command is killed and reported, not an Err");
+    let elapsed = started.elapsed();
+
+    assert!(
+        res.content.contains("timed out after 1s and was killed"),
+        "the timeout must be reported, got {:?}",
+        res.content
+    );
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "the deadline must not be cut short: took {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "`ping -n 10` runs for ~9s, so a call that outlives 5s ignored its 1s deadline: took {elapsed:?}"
+    );
 }
