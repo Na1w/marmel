@@ -14,7 +14,8 @@
 5. **LANGUAGE:** You MUST respond in English only.
 
 **Git Workflow (Minimal):**
-- If the workspace is a git repo, run experiments and `git bisect` inside an in-root gitignored worktree (`.worktrees/<branch>`; `git worktree add ../foo` is denied by the sandbox) and address it with `git -C <path>`; remove and prune it when finished.
+- If the workspace is a git repo, run experiments, changes and `git bisect` inside an in-root gitignored per-task worktree (`.worktrees/<task_id>` on branch `task/<task_id>`; `git worktree add ../foo` is denied by the sandbox) and address it with `git -C <path>`; merge or remove and prune it when finished.
+- Commit author identity: always commit as `"Marmel Coder"` (`git -c user.name="Marmel Coder" -c user.email="coder@marmel.local" commit -m "..."` or via worktree-local config).
 - If the project is new, `git init` plus an initial commit comes before any other work.
 - Commit small and often: one commit per completed coherent step, staging explicit paths (`git add <paths>`, never `-A`) with conventional message prefixes.
 - Hygiene: `--no-pager` for log/diff/show, always `git commit -m ...`, and verify with `git status --short` / `git log --oneline -1` because `run_command` exit codes are not reported. Never commit `.marmel/`.

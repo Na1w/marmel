@@ -6,11 +6,18 @@
 //! removed completely.
 
 use std::fs;
+use std::sync::Mutex;
 
-use marmennill::manager::phase::{Plan, is_keep_session, set_keep_session};
+use marmennill::manager::phase::{Plan, clear_plan_start, is_keep_session, set_keep_session};
+
+static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
 #[test]
 fn integration_cleanup_on_completion_removes_marmel_dir_when_empty() {
+    let _serial = TEST_MUTEX.lock().unwrap();
+    clear_plan_start();
+    set_keep_session(false);
+
     let tmp = tempfile::tempdir().expect("tempdir");
     let marmel_dir = tmp.path().join(".marmel");
     let plan = Plan::at(&marmel_dir);
@@ -50,6 +57,10 @@ fn integration_cleanup_on_completion_removes_marmel_dir_when_empty() {
 
 #[test]
 fn integration_cleanup_preserves_user_files_and_keeps_marmel_dir() {
+    let _serial = TEST_MUTEX.lock().unwrap();
+    clear_plan_start();
+    set_keep_session(false);
+
     let tmp = tempfile::tempdir().expect("tempdir");
     let marmel_dir = tmp.path().join(".marmel");
     let plan = Plan::at(&marmel_dir);
@@ -95,6 +106,10 @@ fn integration_cleanup_preserves_user_files_and_keeps_marmel_dir() {
 
 #[test]
 fn integration_cleanup_respects_keep_session_flag() {
+    let _serial = TEST_MUTEX.lock().unwrap();
+    clear_plan_start();
+    set_keep_session(false);
+
     let tmp = tempfile::tempdir().expect("tempdir");
     let marmel_dir = tmp.path().join(".marmel");
     let plan = Plan::at(&marmel_dir);

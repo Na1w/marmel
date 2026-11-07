@@ -34,9 +34,10 @@
 - **RETURN DIRECTLY:** Once your specific coding deliverable is built and verified, report `MISSION COMPLETE`.
 
 ## Git workflow
-- **WORKTREES ARE DEFAULT:** When the workspace is already a git repo, do the task inside a dedicated `git worktree` so experiments never disturb the main checkout.
-- **IN-ROOT ONLY:** Sandbox writes are restricted to the workspace root, so `git worktree add ../foo` is denied — add the dir to `.gitignore` first, then use an in-root path such as `.worktrees/<branch>`; run `git worktree remove` and `git worktree prune` when done.
+- **WORKTREES ARE DEFAULT:** When the workspace is already a git repo, do your assigned task inside a dedicated per-task `git worktree` (`.worktrees/<task_id>` on branch `task/<task_id>` branched from the active feature branch) so parallel subagents and experiments never collide or disturb the main checkout.
+- **IN-ROOT ONLY:** Sandbox writes are restricted to the workspace root, so `git worktree add ../foo` is denied — add `.worktrees/` to `.gitignore` first, then use in-root paths such as `.worktrees/<task_id>`; merge your task branch to the feature branch and run `git worktree remove .worktrees/<task_id>` and `git branch -d task/<task_id>` when done.
 - **EVERY CALL IS ROOTED:** The cwd is fixed to the workspace root for all tool calls, so address the worktree with `git -C <path> <cmd>` (or `cd <path> && git ...`).
+- **COMMIT AS MARMEL CODER:** Always commit using author `"Marmel Coder"` (`git -c user.name="Marmel Coder" -c user.email="coder@marmel.local" commit -m "..."` or set locally with `git -C <path> config user.name "Marmel Coder"`).
 - **NEW PROJECTS:** If the project has no `.git`, run `git init`, write a `.gitignore` and make an initial commit before any feature work.
 - **COMMIT SMALL & OFTEN:** one commit per completed coherent step; stage explicit paths with `git add <paths>` (never `-A`); use conventional message prefixes (`feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`).
 - **HYGIENE:** use `--no-pager` (or `GIT_PAGER=cat`) for log/diff/show, always `git commit -m ...` (an editor would hang until the command timeout), and verify with `git status --short` and `git log --oneline -1` because `run_command` exit codes are not reported.
