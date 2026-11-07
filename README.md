@@ -51,7 +51,7 @@ Marmel is built for autonomous, multi-step software development with continuous 
 - **Real-Time Steering & Live Dialogue:** You can type into the prompt at any point. Active subagents pause to answer questions, explain reasoning, incorporate feedback, or adjust the plan on the fly.
 - **Isolated Per-Task Git Worktrees:** Subagents work in isolated git worktrees (`.worktrees/<task_id>`) on dedicated task branches, commit their changes as `"Marmel Coder"`, and merge back cleanly to avoid file conflicts.
 - **Offline Reference Search (MCP):** Connect external tool servers via Model Context Protocol (stdio or SSE), including the bundled `zim-search` engine for lightning-fast offline querying of multi-gigabyte Kiwix/ZIM dumps (such as Wikipedia or Stack Overflow).
-- **Workspace Sandboxing:** File operations are strictly confined to the workspace. Terminal commands are isolated by a platform sandbox — Linux Landlock LSM on Linux, Seatbelt (`sandbox-exec`) on macOS — to protect sensitive directories like `~/.ssh` and `~/.gnupg`.
+- **Workspace Sandboxing:** File operations are strictly confined to the workspace. Terminal commands are isolated by a platform sandbox — Linux Landlock LSM on Linux, a Seatbelt (SBPL) profile enforced by Marmel itself on macOS — to protect sensitive directories like `~/.ssh` and `~/.gnupg`.
 
 ```text
                            ┌───────────────────────────┐
@@ -145,7 +145,7 @@ For a solo developer, rigorously testing an autonomous coding assistant across t
 
 - **Rust toolchain 1.98+** (edition 2024).
 - An **OpenAI-compatible LLM backend** reachable over HTTP (e.g. Ollama at `http://localhost:11434/v1`, vLLM, or OpenRouter).
-- **Platform support:** Marmel is developed primarily on **Linux** (which also provides kernel-enforced Landlock command sandboxing) and tested extensively on **macOS**, where the same command policy is enforced by Seatbelt (`sandbox-exec`). **Windows** support is maintained on a best-effort basis.
+- **Platform support:** Marmel is developed primarily on **Linux** (which also provides kernel-enforced Landlock command sandboxing) and tested extensively on **macOS**, where the same command policy is enforced by a Seatbelt (SBPL) profile that Marmel applies itself in the sandbox re-entry child. **Windows** support is maintained on a best-effort basis.
 
 ### Installation & Build
 
@@ -534,7 +534,7 @@ args = ["mcp", "--kiwix-dir", "/path/to/kiwix", "--index", "/path/to/index"]
 Marmel enforces layered security boundaries to protect your host system:
 
 1. **Path Confinement:** All file access tools (`read_file`, `write_file`, `replace`, etc.) strictly validate paths against the workspace boundary. Traversal attempts (`../../`) are blocked.
-2. **Process Sandboxing (Landlock on Linux, Seatbelt on macOS):** Terminal commands execute within an unprivileged sandbox. Read/write access is restricted to the workspace, temporary directories (`/tmp`), and language caches (`~/.cargo`, `~/.cache`). Sensitive directories (`~/.ssh`, `~/.gnupg`) are strictly inaccessible. A host with no sandbox backend, or an enforcement failure, refuses the command rather than running it unsandboxed.
+2. **Process Sandboxing (Landlock on Linux, Seatbelt/SBPL applied by Marmel itself on macOS):** Terminal commands execute within an unprivileged sandbox. Read/write access is restricted to the workspace, temporary directories (`/tmp`), and language caches (`~/.cargo`, `~/.cache`). Sensitive directories (`~/.ssh`, `~/.gnupg`) are strictly inaccessible. A host with no sandbox backend, or an enforcement failure, refuses the command rather than running it unsandboxed.
 3. **Cross-Platform Boundaries:** On macOS and Windows, workspace boundary confinement is actively enforced in-process; on macOS the command sandbox adds the same directory protections at the OS level.
 
 ### Extra Sandbox Read-Only Paths (`sandbox_extra_readonly_paths`)

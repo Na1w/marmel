@@ -37,10 +37,10 @@ max_thinking_tokens = 32768
 # Valid range 1..=300; an out-of-range value is logged and clamped into that range.
 command_timeout_secs = 60
 
-# Set to true to run commands WITHOUT the sandbox (Landlock on Linux, Seatbelt on
-# macOS) — the default is false (fail-closed: commands are sandboxed), and `true`
-# always logs an attributable warning. `MARMEL_DISABLE_SANDBOX=1` remains an
-# equivalent escape hatch.
+# Set to true to run commands WITHOUT the sandbox (Landlock on Linux, a Seatbelt/
+# SBPL profile that Marmel enforces itself on macOS) — the default is false
+# (fail-closed: commands are sandboxed), and `true` always logs an attributable
+# warning. `MARMEL_DISABLE_SANDBOX=1` remains an equivalent escape hatch.
 sandbox_disabled = false
 
 # Extra paths the sandbox additionally allows read + execute for, on top
