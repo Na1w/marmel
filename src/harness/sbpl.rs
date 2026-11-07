@@ -8,15 +8,14 @@
 //! The module is deliberately **not** `#[cfg]`-gated: nothing in it touches a syscall, a
 //! kernel API or the filesystem, so the emitted text is unit-testable on any host. The
 //! `#[cfg(target_os = "macos")]` boundary belongs to the backend that calls this and hands
-//! the string to libSystem (see `.marmel/research/seatbelt-feasibility.md` §2 and §4).
+//! the string to libSystem.
 //!
 //! What the emitter adds on top of the shared policy list, and why:
 //!
 //! * **Path translations.** SBPL filters match **literal path strings**, not resolved file
-//!   descriptors — the exact opposite of Landlock's `PathFd` rules (gotcha 1 of
-//!   `.marmel/research/seatbelt-macos.md`). `/tmp`, `/var` and `/etc` are symlinks into
-//!   `/private`, so every policy entry below those prefixes is emitted under **both**
-//!   spellings: a rule on the link spelling alone misses the path the kernel opens.
+//!   descriptors — the exact opposite of Landlock's `PathFd` rules. `/tmp`, `/var` and `/etc`
+//!   are symlinks into `/private`, so every policy entry below those prefixes is emitted under
+//!   **both** spellings: a rule on the link spelling alone misses the path the kernel opens.
 //! * **`$TMPDIR`.** The per-user temp folder on macOS is not `/tmp` but a folder under
 //!   `/private/var/folders`, and the Linux policy has no entry for it. Without it `rustc`,
 //!   `cc`, `mktemp` and `tempfile` cannot write (gotcha 2), so it is always granted
@@ -29,8 +28,8 @@
 //!   repository (research note §3 and §8).
 //!
 //! * **The proven shell floor.** Beyond the shared policy list the emitter also grants the
-//!   clauses a known-working reference profile (`profiles/default.pb` of
-//!   `.marmel/research/painless-belt-survey.md`) runs its whole tool set on: bare
+//!   clauses a known-working reference profile (the `profiles/default.pb` of the upstream
+//!   `painless-belt` project) runs its whole tool set on: bare
 //!   `file-read-metadata`, the root directory and `$HOME/.CFUserTextEncoding` as `literal`
 //!   filters, the real `/private` tree read-only, `$HOME/Library/Caches` and
 //!   `$HOME/Library/Keychains` read-write, the `/dev/ttys…` pty range and every `$PATH`
@@ -204,10 +203,9 @@ const SECTION_DYLD_COMMENT: &[&str] = &[
 /// `file-map-executable` for the dynamic linker and any JIT.
 ///
 /// The names come from the shipped `/System/Library/Sandbox/Profiles/*.sb` and from
-/// Chromium's `sandbox/policy/mac/common.sb` (research note §2 and §7 of
-/// `.marmel/research/seatbelt-macos.md`); tightening them to per-name filters
+/// Chromium's `sandbox/policy/mac/common.sb`; tightening them to per-name filters
 /// (`sysctl-name`, `global-name`, `remote tcp`) is the on-host tuning problem that
-/// `.marmel/research/seatbelt-feasibility.md` §1 marks as the only real open question.
+/// remains the only real open question for this backend.
 const NON_FILE_ALLOW_BLOCK: &[&str] = &[
     // Exec and fork: without them the wrapped payload cannot even start a shell.
     "(allow process-exec process-fork)",

@@ -9,12 +9,12 @@
 //!
 //! ## Mechanism, and why it is written by hand
 //!
-//! `painless-belt` (`.marmel/research/painless-belt.md`) calls `sandbox_init` with `flags = 0`
+//! The upstream `painless-belt` project calls `sandbox_init` with `flags = 0`
 //! and no parameter list. We call **`sandbox_init_with_parameters`** with `flags = 0` and an
 //! empty, NULL-terminated parameter list, for two reasons.
 //!
 //! The first is that the profile the emitter builds embeds **literal** paths (SBPL filters match
-//! path text, not resolved descriptors — gotcha 1 of `.marmel/research/seatbelt-macos.md`), so
+//! path text, not resolved descriptors — a well-known macOS gotcha, unlike Landlock), so
 //! there is no `$()` substitution to do, and an empty list states that explicitly instead of
 //! relying on the parameter slot being optional.
 //!
@@ -26,7 +26,7 @@
 //! The bindings are declared here rather than depended on: `libc` is already a `cfg(unix)`
 //! dependency, so this needs **no** `Cargo.toml` change, and the alternatives
 //! (`painless-belt`, `macos-sandbox-sys`) either drag in a CLI's argv parsing or exist only to
-//! hand over these declarations (`.marmel/research/seatbelt-feasibility.md` §2). Apple's API is
+//! hand over these declarations. Apple's API is
 //! undocumented and deprecated-but-live; that is a duty to re-verify per macOS major release,
 //! not an argument for a dependency.
 //!
