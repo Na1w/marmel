@@ -1955,3 +1955,178 @@ fn d4_archive_reports_failure_when_the_active_plan_is_not_removed() {
 
     fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------
+// `Plan::work_state` — the resume predicate.
+//
+// Every case below builds its `Plan` over a `tempfile::TempDir` and writes the
+// plan file with `fs::write`: no test touches the real workspace (and none uses
+// `Plan::default()`, which resolves the live workspace root).
+// ---------------------------------------------------------------------------
+
+/// A `Plan` rooted in an isolated temp dir, plus the dir that owns its lifetime.
+fn work_state_plan() -> (tempfile::TempDir, Plan) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan = Plan::at(tmp.path());
+    (tmp, plan)
+}
+
+/// A realistic multi-task plan: checked and unchecked lines in every accepted id
+/// spelling, one checklist item without an id, and a task-line **template inside
+/// a fenced code block** that the grammar must not count.
+const MIXED_PLAN_MD: &str = r#"# Execution Plan
+
+Context: migrate the store onto the shared parser.
+
+- [x] [t-001] Read the configuration module
+- [ ] [t-002] Implement the strict replace tool
+- [x] [t-003] Run cargo fmt
+- [ ] (t-004) Investigate library X (no-validate) (researcher)
+- [ ] t-005 migrate the schema
+- [ ] Wire the new tool into the registry
+- [x] [t-006] Run cargo test
+
+```text
+- [ ] [t-007] A template quoted in a fenced block is not a task line
+```
+"#;
+
+/// No plan file on disk means there is nothing to continue.
+#[test]
+fn work_state_is_no_plan_when_no_plan_file_exists() {
+    let (_tmp, plan) = work_state_plan();
+
+    assert!(
+        !plan.exists(),
+        "the temp plan dir starts without a plan file"
+    );
+    assert_eq!(
+        plan.work_state()
+            .expect("work_state is Ok for a missing plan"),
+        PlanWorkState::NoPlan
+    );
+}
+
+/// A plan that still holds open work reports `Unfinished` with the **exact**
+/// number of unchecked task lines (and nothing else).
+#[test]
+fn work_state_is_unfinished_with_the_exact_pending_count() {
+    let (_tmp, plan) = work_state_plan();
+    fs::write(plan.plan_path(), MIXED_PLAN_MD).unwrap();
+
+    assert_eq!(
+        plan.work_state()
+            .expect("work_state is Ok for a readable plan"),
+        PlanWorkState::Unfinished { pending: 4 },
+        "t-002, t-004, t-005 and the id-less checklist item are open; the three \
+         checked lines and the fenced template are not"
+    );
+
+    // Same grammar, different question: `pending_tasks()` counts task *ids*,
+    // `work_state` counts task *lines*, so the id-less item appears in the count
+    // but not in the id list.
+    assert_eq!(
+        plan.pending_tasks(),
+        vec![
+            "t-002".to_string(),
+            "t-004".to_string(),
+            "t-005".to_string()
+        ]
+    );
+}
+
+/// Every recognised task line checked means the plan is complete.
+#[test]
+fn work_state_is_complete_when_every_task_line_is_checked() {
+    let (_tmp, plan) = work_state_plan();
+    fs::write(
+        plan.plan_path(),
+        "# Execution Plan\n\
+         \n\
+         - [x] [t-001] Read the configuration module\n\
+         - [x] (t-002) Implement the strict replace tool\n\
+         - [X] Run cargo test\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        plan.work_state()
+            .expect("work_state is Ok for a readable plan"),
+        PlanWorkState::Complete
+    );
+}
+
+/// A **non-empty** plan file that yields no recognised task line is `Unknown`,
+/// never `Complete` and never `NoPlan`: the file exists but the grammar cannot
+/// say what is in it, so both readings would be guesses.
+///
+/// This is the case the parser can distinguish (see
+/// `work_state_is_no_plan_for_an_empty_or_whitespace_only_plan_file` for the
+/// empty half): bytes are there, the grammar rejects them.
+#[test]
+fn work_state_is_unknown_for_a_non_empty_plan_without_task_lines() {
+    let (_tmp, plan) = work_state_plan();
+    fs::write(
+        plan.plan_path(),
+        "# Execution Plan\n\nContext: no checklist was ever written.\n",
+    )
+    .unwrap();
+
+    match plan
+        .work_state()
+        .expect("work_state is Ok for a readable plan")
+    {
+        PlanWorkState::Unknown { warning } => assert!(
+            warning.contains("no recognised task line"),
+            "the warning must say why the state is unknown: {warning}"
+        ),
+        other => panic!("a task-line-free plan must be Unknown, got {other:?}"),
+    }
+}
+
+/// A plan file that exists but cannot be read is `Unknown` — never an error the
+/// caller could `?` into a default, and never "nothing pending".
+///
+/// Invalid UTF-8 provokes exactly the failure mode a permission error does
+/// (`read_to_string` rejects the bytes), inside a temp dir.
+#[test]
+fn work_state_is_unknown_when_the_plan_file_cannot_be_read() {
+    let (_tmp, plan) = work_state_plan();
+    fs::write(plan.plan_path(), [0xff_u8, 0xfe, 0x00, 0x41]).unwrap();
+
+    match plan
+        .work_state()
+        .expect("an unreadable plan is a state, not an Err")
+    {
+        PlanWorkState::Unknown { warning } => assert!(
+            warning.contains("could not be read"),
+            "the warning must name the read failure: {warning}"
+        ),
+        other => panic!("an unreadable plan must be Unknown, got {other:?}"),
+    }
+}
+
+/// An empty (or whitespace-only) plan file has nothing to continue, so it is
+/// `NoPlan` — the pinned rule for the zero-task-line case: the parser **can**
+/// tell "no bytes to interpret" apart from "bytes the grammar rejects", so the
+/// empty document is not lumped in with the garbled one.
+#[test]
+fn work_state_is_no_plan_for_an_empty_or_whitespace_only_plan_file() {
+    let (_tmp, plan) = work_state_plan();
+
+    fs::write(plan.plan_path(), "").unwrap();
+    assert_eq!(
+        plan.work_state()
+            .expect("work_state is Ok for a readable plan"),
+        PlanWorkState::NoPlan,
+        "an empty plan file holds no work to resume"
+    );
+
+    fs::write(plan.plan_path(), "  \n\t\n\n").unwrap();
+    assert_eq!(
+        plan.work_state()
+            .expect("work_state is Ok for a readable plan"),
+        PlanWorkState::NoPlan,
+        "a whitespace-only plan file holds no work to resume"
+    );
+}
