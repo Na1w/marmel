@@ -128,6 +128,10 @@ static PLAN_STARTED_AT: std::sync::LazyLock<std::sync::RwLock<Option<PlanStartTi
 static PLAN_COMPLETED_AT: std::sync::LazyLock<std::sync::RwLock<Option<std::time::Instant>>> =
     std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
 
+static PLAN_WAS_COMPLETED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static KEEP_SESSION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn record_plan_start() {
     record_plan_start_at(std::time::Instant::now());
 }
@@ -140,14 +144,31 @@ pub fn record_plan_start_at(inst: std::time::Instant) {
     if let Ok(mut g) = PLAN_COMPLETED_AT.write() {
         *g = None;
     }
+    PLAN_WAS_COMPLETED.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
 pub fn record_plan_completed() {
+    PLAN_WAS_COMPLETED.store(true, std::sync::atomic::Ordering::SeqCst);
     if let Ok(mut g) = PLAN_COMPLETED_AT.write()
         && g.is_none()
     {
         *g = Some(std::time::Instant::now());
     }
+}
+
+/// Query whether a plan reached completion during this session.
+pub fn was_plan_completed() -> bool {
+    PLAN_WAS_COMPLETED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Configure whether to keep session and runtime files even upon plan completion.
+pub fn set_keep_session(keep: bool) {
+    KEEP_SESSION.store(keep, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Query whether the opt-out flag `--keep-session` is active.
+pub fn is_keep_session() -> bool {
+    KEEP_SESSION.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Retrieve the instant when the plan was completed, if finished.
@@ -163,6 +184,7 @@ pub fn clear_plan_start() {
     if let Ok(mut g) = PLAN_COMPLETED_AT.write() {
         *g = None;
     }
+    PLAN_WAS_COMPLETED.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Retrieve the start time of the active execution plan, falling back to disk metadata if needed.
@@ -479,6 +501,114 @@ impl Plan {
         self.sweep_session_state();
         tracing::warn!("Execution plan CLEARED from disk (all plan files deleted).");
         Ok(())
+    }
+
+    /// Directory holding synthesized agent prompts and validator briefs (`.marmel/prompts/`).
+    pub fn prompts_dir(&self) -> PathBuf {
+        self.dir.join("prompts")
+    }
+
+    /// Clean up runtime session artifacts (execution plan, prompts, session bundle,
+    /// logs, and plan archives) when the execution plan has been completed.
+    ///
+    /// Preserves user-authored files (such as `marmel.toml`, `config.toml`, or custom
+    /// subdirectories like `research/`). If no files remain in the runtime directory,
+    /// the directory itself is removed so the workspace is left completely clean.
+    ///
+    /// Respects the [`is_keep_session`] opt-out: when `--keep-session` is set,
+    /// no files are removed.
+    ///
+    /// Returns `Ok(true)` if cleanup occurred, or `Ok(false)` if the plan was not
+    /// complete (or `--keep-session` was requested) and files were left untouched.
+    pub fn cleanup_completed(&self) -> Result<bool> {
+        let _guard = PLAN_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        if is_keep_session() {
+            tracing::info!("Plan cleanup skipped: --keep-session requested.");
+            return Ok(false);
+        }
+        if !self.is_complete_unlocked() && !was_plan_completed() {
+            tracing::debug!("Plan cleanup skipped: plan is not completed.");
+            return Ok(false);
+        }
+        if !self.dir.exists() {
+            return Ok(false);
+        }
+
+        let plan_path = self.plan_path();
+        if plan_path.exists() {
+            let _ = std::fs::remove_file(&plan_path);
+        }
+
+        let latest_archive = self.latest_archive_path();
+        if latest_archive.exists() {
+            let _ = std::fs::remove_file(&latest_archive);
+        }
+
+        let forced = self.forced_phase_path();
+        if forced.exists() {
+            let _ = std::fs::remove_file(&forced);
+        }
+
+        let legacy_transcript = self.legacy_transcript_path();
+        if legacy_transcript.exists() {
+            let _ = std::fs::remove_file(&legacy_transcript);
+        }
+
+        let legacy_ui = self.legacy_ui_journal_path();
+        if legacy_ui.exists() {
+            let _ = std::fs::remove_file(&legacy_ui);
+        }
+
+        let bundle = self.session_bundle_path();
+        if bundle.exists() {
+            let _ = std::fs::remove_dir_all(&bundle);
+        }
+
+        let prompts = self.prompts_dir();
+        if prompts.exists() {
+            let _ = std::fs::remove_dir_all(&prompts);
+        }
+
+        let archive_dir = self.archive_dir();
+        if archive_dir.exists() {
+            let _ = std::fs::remove_dir_all(&archive_dir);
+        }
+
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    let is_log = name == "marmel.log"
+                        || name.starts_with("marmel.log.")
+                        || name == "debug.log";
+                    let is_tmp = name.starts_with('.') && name.contains(".tmp");
+                    if (is_log || is_tmp) && path.is_file() {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+
+        crate::session::manager_capture::clear_capture();
+        clear_plan_start();
+
+        // Check if anything remains in self.dir. If empty, remove the directory.
+        if let Ok(mut entries) = std::fs::read_dir(&self.dir) {
+            if entries.next().is_none() {
+                let _ = std::fs::remove_dir(&self.dir);
+                tracing::info!(
+                    "Plan completed: cleaned up runtime directory {}",
+                    self.dir.display()
+                );
+            } else {
+                tracing::info!(
+                    "Plan completed: cleaned up runtime files in {}; preserving user files",
+                    self.dir.display()
+                );
+            }
+        }
+
+        Ok(true)
     }
 
     /// Parse all *unchecked* task ids (`- [ ] [t-xxx]`, `- [ ] (t-xxx)`, …) from

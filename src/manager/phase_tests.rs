@@ -2130,3 +2130,110 @@ fn work_state_is_no_plan_for_an_empty_or_whitespace_only_plan_file() {
         "a whitespace-only plan file holds no work to resume"
     );
 }
+
+// ------------------------------------------------------------- cleanup_completed
+
+#[test]
+fn test_cleanup_completed_skips_incomplete_plan() {
+    let dir = temp_marmel();
+    let plan = Plan::at(&dir);
+    plan.create("# Plan\n- [x] [t-001] Done\n- [ ] [t-002] Incomplete\n")
+        .unwrap();
+
+    let cleaned = plan.cleanup_completed().unwrap();
+    assert!(!cleaned, "incomplete plan must not be cleaned up");
+    assert!(plan.exists(), "active plan must remain");
+    assert!(dir.exists(), "runtime directory must remain");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_cleanup_completed_removes_runtime_and_deletes_empty_dir() {
+    let dir = temp_marmel();
+    let plan = Plan::at(&dir);
+    plan.create("# Plan\n- [ ] [t-001] Task 1\n").unwrap();
+    plan.check_off("t-001").unwrap();
+    assert!(plan.is_complete());
+
+    // Populate auto-generated runtime files
+    fs::create_dir_all(dir.join("prompts")).unwrap();
+    fs::write(dir.join("prompts/t-001.md"), "prompt").unwrap();
+    fs::create_dir_all(dir.join("archive")).unwrap();
+    fs::write(dir.join("archive/plan_1.md"), "archive").unwrap();
+    fs::create_dir_all(dir.join("session")).unwrap();
+    fs::write(dir.join("session/manifest.json"), "{}").unwrap();
+    fs::write(dir.join("marmel.log"), "log line").unwrap();
+    fs::write(dir.join("marmel.log.1"), "rotated log").unwrap();
+    fs::write(dir.join("debug.log"), "debug line").unwrap();
+
+    let cleaned = plan.cleanup_completed().unwrap();
+    assert!(cleaned, "completed plan must be cleaned up");
+    assert!(
+        !dir.exists(),
+        "runtime directory must be removed when no user files remain"
+    );
+}
+
+#[test]
+fn test_cleanup_completed_preserves_user_files() {
+    let dir = temp_marmel();
+    let plan = Plan::at(&dir);
+    plan.create("# Plan\n- [x] [t-001] Done\n").unwrap();
+
+    // Populate runtime files
+    fs::create_dir_all(dir.join("prompts")).unwrap();
+    fs::write(dir.join("prompts/t-001.md"), "prompt").unwrap();
+    fs::write(dir.join("marmel.log"), "log").unwrap();
+
+    // Populate user files
+    fs::write(dir.join("marmel.toml"), "model = \"custom\"").unwrap();
+    fs::create_dir_all(dir.join("research")).unwrap();
+    fs::write(dir.join("research/notes.md"), "my research").unwrap();
+
+    let cleaned = plan.cleanup_completed().unwrap();
+    assert!(cleaned, "completed plan must trigger cleanup");
+    assert!(
+        dir.exists(),
+        "runtime directory must remain because user files exist"
+    );
+    assert!(
+        dir.join("marmel.toml").exists(),
+        "user config file must be preserved"
+    );
+    assert!(
+        dir.join("research/notes.md").exists(),
+        "user research files must be preserved"
+    );
+    assert!(
+        !dir.join("prompts").exists(),
+        "runtime prompts must be removed"
+    );
+    assert!(
+        !dir.join("marmel.log").exists(),
+        "runtime logs must be removed"
+    );
+    assert!(!plan.exists(), "completed execution plan must be removed");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_cleanup_completed_respects_keep_session() {
+    let dir = temp_marmel();
+    let plan = Plan::at(&dir);
+    plan.create("# Plan\n- [x] [t-001] Done\n").unwrap();
+
+    set_keep_session(true);
+    let cleaned = plan.cleanup_completed().unwrap();
+    set_keep_session(false);
+
+    assert!(!cleaned, "--keep-session must skip cleanup");
+    assert!(
+        plan.exists(),
+        "plan must remain when keep_session is active"
+    );
+    assert!(dir.exists(), "runtime directory must remain");
+
+    fs::remove_dir_all(&dir).ok();
+}
