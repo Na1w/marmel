@@ -22,6 +22,9 @@ pub mod monitor;
 pub mod plan;
 pub mod pty;
 pub mod sandbox;
+#[cfg(target_os = "macos")]
+pub mod sandbox_seatbelt;
+pub mod sbpl;
 pub mod search;
 pub mod sleep;
 #[cfg(test)]

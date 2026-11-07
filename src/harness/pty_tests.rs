@@ -832,18 +832,18 @@ fn test_is_utf8_lead_byte_classifies_lead_and_continuation_bytes() {
     assert!(!is_utf8_lead_byte(0xA4)); // second byte of `ä`
 }
 
-// The Landlock decision must NEVER depend on the executable NAME.
+// The sandbox decision must NEVER depend on the executable NAME.
 // These tests drive [`should_apply_sandbox`] / [`sandbox_command_argv`] as pure
-// logic with injected inputs: no Landlock availability, no `/dev/pts`, no
+// logic with injected inputs: no backend availability, no `/dev/pts`, no
 // `current_exe()`, no environment mutation, so they are deterministic
 // everywhere (including sandboxes where `openpty` yields EACCES).
 
 use std::path::{Path, PathBuf};
 
-/// Production-shaped inputs: a Linux process whose exe resolved to `exe`.
+/// Production-shaped inputs: a host with a sandbox backend whose exe resolved to `exe`.
 fn production_inputs(exe: &Path) -> SandboxInputs<'_> {
     SandboxInputs {
-        landlock_supported: true,
+        backend_supported: true,
         test_harness_exe: false,
         resolved_exe: Some(exe),
         opt_out: OptOut::None,
@@ -919,7 +919,7 @@ fn test_sandbox_gate_renamed_binary_is_still_sandboxed() {
             },
             "`{name}` must be sandboxed by resolved path, not by name"
         );
-        assert_eq!(decision.mode(), "landlock-re-entry");
+        assert_eq!(decision.mode(), "sandbox-re-entry");
     }
 }
 
@@ -1052,12 +1052,13 @@ fn test_sandbox_gate_opt_out_value_must_be_unambiguous() {
     }
 }
 
-/// No Landlock on this platform ⇒ skipped, but never silently.
+/// No sandbox backend on this platform ⇒ skipped, but never silently. Linux (Landlock)
+/// and macOS (Seatbelt) both have one, so only Windows and friends take this branch.
 #[test]
 fn test_sandbox_gate_unsupported_platform_skips_with_warning() {
     let exe = Path::new("/Users/fredrik/target/debug/marmel");
     let inputs = SandboxInputs {
-        landlock_supported: false,
+        backend_supported: false,
         ..production_inputs(exe)
     };
     let decision = should_apply_sandbox(&inputs);
@@ -1070,9 +1071,74 @@ fn test_sandbox_gate_unsupported_platform_skips_with_warning() {
     );
     let (_, logs) = capture_logs(|| log_sandbox_decision(&decision));
     assert!(
-        logs.contains("WARN") && logs.contains("no Landlock"),
+        logs.contains("WARN") && logs.contains("no sandbox backend"),
         "an unavailable sandbox must be visible, got {logs:?}"
     );
+}
+
+/// The gate no longer asks "am I on Linux": both of its sites ask the one capability flag
+/// in `harness::sandbox`, so a host with a Landlock **or** a Seatbelt backend reaches the
+/// re-entry child. Asserted with the flag as production feeds it, on the current build.
+#[test]
+fn test_sandbox_gate_platform_answer_comes_from_the_shared_capability_flag() {
+    let flag = crate::harness::sandbox::backend_supports_current_platform();
+    let decision = should_apply_sandbox(&SandboxInputs {
+        backend_supported: flag,
+        ..production_inputs(Path::new(
+            "/Users/fredrik/Applications/marmel-dev.app/Contents/MacOS/marmel-dev",
+        ))
+    });
+    assert_eq!(
+        flag,
+        cfg!(any(target_os = "linux", target_os = "macos")),
+        "the shared flag must answer true for both backends and false for every other host"
+    );
+    if flag {
+        assert!(
+            matches!(decision, SandboxDecision::Apply { .. }),
+            "a host that compiles Landlock or Seatbelt must re-enter, got {decision:?}"
+        );
+        assert_eq!(decision.mode(), "sandbox-re-entry");
+    } else {
+        assert!(
+            matches!(
+                decision,
+                SandboxDecision::Skip {
+                    skip: SandboxSkip::UnsupportedPlatform,
+                    ..
+                }
+            ),
+            "a host with neither backend must skip visibly, got {decision:?}"
+        );
+    }
+}
+
+/// The macOS leg of the same contract: with a Seatbelt backend the argv handed to the PTY
+/// is the unchanged three-slot re-entry form — resolved exe, sentinel, cwd, wrapped command
+/// — exactly as on Linux. Gated to the hosts that have a backend because
+/// `sandbox_command_argv` only builds that form where one exists.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn test_sandbox_gate_reentry_argv_is_the_same_three_slots_on_macos() {
+    let exe = Path::new("/Users/fredrik/.cargo/bin/marmel-dev");
+    let decision = should_apply_sandbox(&SandboxInputs {
+        backend_supported: crate::harness::sandbox::backend_supports_current_platform(),
+        test_harness_exe: false,
+        resolved_exe: Some(exe),
+        opt_out: OptOut::None,
+    });
+    let (program, args) =
+        sandbox_command_argv(&decision, "cargo test", Path::new("/Users/fredrik/wip"))
+            .expect("a host with a backend builds the re-entry argv");
+    assert_eq!(program, exe.to_string_lossy());
+    assert_eq!(
+        args.len(),
+        3,
+        "the re-entry contract is three slots: {args:?}"
+    );
+    assert_eq!(args[0], SANDBOX_EXEC_ARG);
+    assert_eq!(args[1], "/Users/fredrik/wip");
+    assert!(args[2].ends_with("cargo test"));
 }
 
 /// A Cargo test-harness binary cannot speak the re-entry protocol; that skip is
@@ -1101,12 +1167,12 @@ fn test_sandbox_gate_test_harness_binary_skips_with_warning() {
     );
 }
 
-/// Fail-closed: on Linux, an unresolvable exe is a hard error — falling back to `sh -c`
-/// here would run the command unsandboxed in silence.
+/// Fail-closed: on a host with a backend, an unresolvable exe is a hard error — falling
+/// back to `sh -c` here would run the command unsandboxed in silence.
 #[test]
 fn test_sandbox_gate_unresolved_exe_fails_closed_and_is_logged() {
     let inputs = SandboxInputs {
-        landlock_supported: true,
+        backend_supported: true,
         test_harness_exe: false,
         resolved_exe: None,
         opt_out: OptOut::None,
