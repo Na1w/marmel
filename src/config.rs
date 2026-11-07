@@ -2402,7 +2402,7 @@ max_sessions = 4
         use crate::harness::pty::SandboxInputs;
         let exe = std::path::PathBuf::from("/usr/local/bin/marmel-dev");
         let inputs = SandboxInputs {
-            landlock_supported: true,
+            backend_supported: true,
             test_harness_exe: false,
             resolved_exe: Some(exe.as_path()),
             opt_out,

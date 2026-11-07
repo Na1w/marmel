@@ -527,7 +527,7 @@ fn main() -> Result<()> {
     res
 }
 
-/// `true` when argv starts with the Landlock re-entry sentinel.
+/// `true` when argv starts with the sandbox re-entry sentinel.
 ///
 /// The sentinel comes from [`harness::pty::SANDBOX_EXEC_ARG`], the same constant the
 /// spawn side uses, so the two ends of the protocol can never drift apart.
@@ -535,10 +535,11 @@ fn is_sandbox_reentry(first: Option<&str>) -> bool {
     first == Some(harness::pty::SANDBOX_EXEC_ARG)
 }
 
-/// The Landlock re-entry path: apply the sandbox to this process, then exec the
-/// pending command — **only if enforcement was actually established**. The order is
+/// The sandbox re-entry path: apply the backend this host has — Landlock on Linux, Seatbelt
+/// on macOS — to this process, then exec the pending command — **only if enforcement was
+/// actually established**. The order is
 /// load-bearing: resolve the cwd canonically ([`canonical_sandbox_cwd`]); honour the
-/// explicit opt-out ([`harness::pty::SANDBOX_OPTOUT_ENV`]) *before* any Landlock call,
+/// explicit opt-out ([`harness::pty::SANDBOX_OPTOUT_ENV`]) *before* any enforcement call,
 /// saying so out loud ([`harness::sandbox::optout_warning`]); otherwise attempt
 /// enforcement; then ask [`harness::sandbox::reentry_action`], which on
 /// [`harness::sandbox::ReentryAction::Refuse`] never runs the command unsandboxed:
@@ -553,7 +554,7 @@ fn run_sandbox_reentry(args: &mut impl Iterator<Item = String>) -> Result<()> {
     // file, so the spawning process published them in the variable named by
     // harness::sandbox::SANDBOX_EXTRA_RO_PATHS_ENV. Absent means the built-in
     // allow-list only. They are read once, here, and handed to the enforcement call
-    // below, which turns them into read-only Landlock rules.
+    // below, which turns them into read-only rules for whichever backend runs here.
     let extra_readonly_paths = harness::sandbox::extra_readonly_paths_from_env();
     tracing::debug!(
         count = extra_readonly_paths.len(),
@@ -562,7 +563,7 @@ fn run_sandbox_reentry(args: &mut impl Iterator<Item = String>) -> Result<()> {
 
     let resolved_exe = harness::pty::resolved_exe_path();
     let decision = harness::pty::should_apply_sandbox(&harness::pty::SandboxInputs {
-        landlock_supported: cfg!(target_os = "linux"),
+        backend_supported: harness::sandbox::backend_supports_current_platform(),
         // This file *is* the bin target that implements the re-entry protocol.
         test_harness_exe: false,
         resolved_exe: resolved_exe.as_deref(),
@@ -579,7 +580,7 @@ fn run_sandbox_reentry(args: &mut impl Iterator<Item = String>) -> Result<()> {
             ..
         } => {
             eprintln!("{}", harness::sandbox::optout_warning(setting));
-            tracing::warn!("Landlock sandbox disabled by {setting}: the command runs unsandboxed");
+            tracing::warn!("sandbox disabled by {setting}: the command runs unsandboxed");
             harness::sandbox::Enforcement::Skipped {
                 setting: setting.clone(),
             }
@@ -605,8 +606,9 @@ fn run_sandbox_reentry(args: &mut impl Iterator<Item = String>) -> Result<()> {
     }
 }
 
-/// Canonicalize the working directory handed over by the spawn side. Landlock anchors
-/// its rules on resolved inodes and the pending command inherits this directory, so a
+/// Canonicalize the working directory handed over by the spawn side. The enforcement
+/// backend anchors its rules on resolved inodes (a Landlock ruleset on Linux, the rendered
+/// Seatbelt profile on macOS) and the pending command inherits this directory, so a
 /// relative or symlinked root (`.`, `~/wip`) is resolved once, here.
 ///
 /// Fallback: if canonicalization fails (the directory vanished concurrently, a
@@ -678,7 +680,7 @@ fn exec_pending_command(command: &str, cwd: &std::path::Path) -> Result<()> {
         } else {
             " Check that the program exists and is executable."
         };
-        eprintln!("error: failed to exec {program} under the Landlock sandbox: {err}.{cause}");
+        eprintln!("error: failed to exec {program} under the active sandbox: {err}.{cause}");
         std::process::exit(1)
     }
     #[cfg(not(unix))]

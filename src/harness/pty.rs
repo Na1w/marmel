@@ -402,21 +402,22 @@ pub struct PtySession {
 }
 
 // Sandbox decision inputs — authoritative ones, never the executable's NAME: the
-// **resolved** executable path (`current_exe()` canonicalized), platform support, and an
+// **resolved** executable path (`current_exe()` canonicalized), backend support, and an
 // explicit opt-out. A renamed, copied or installed binary is sandboxed exactly like any
 // other; comparing `file_name(current_exe())` against a name literal would silently
-// disable Landlock for those binaries and enable it for unrelated programs sharing the
+// disable the sandbox for those binaries and enable it for unrelated programs sharing the
 // name. The re-entry protocol lives in the `marmel` **bin target** (`src/main.rs`), not
 // the library, so a Cargo test-harness binary (`cfg!(test)`) cannot re-enter — a
 // compile-time skip that renaming can never reach, warned about like any other skip.
 
 /// argv sentinel understood by `src/main.rs`: re-executing the **same resolved
-/// binary** with it applies Landlock in the child and then execs `sh -c <cmd>`.
+/// binary** with it applies the backend this host has (Landlock on Linux, Seatbelt on
+/// macOS) in the child and then execs `sh -c <cmd>`.
 /// `main.rs` matches it through [`SANDBOX_EXEC_ARG`], so the two ends of the
 /// protocol cannot drift apart.
 pub const SANDBOX_EXEC_ARG: &str = "--internal-sandbox-exec";
 
-/// The environment fallback for the Landlock sandbox opt-out, deliberately strict.
+/// The environment fallback for the sandbox opt-out, deliberately strict.
 ///
 /// The typed config knob `sandbox_disabled = true` in `marmel.toml` is the primary switch
 /// ([`crate::config::Config::sandbox_disabled`] via [`crate::config::sandbox_disabled`]);
@@ -446,11 +447,14 @@ pub enum OptOut {
 }
 
 /// Injected inputs of the sandbox decision — everything the decision is allowed
-/// to know, and nothing else (no executable *name*, no Landlock probe).
+/// to know, and nothing else (no executable *name*, no backend probe).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxInputs<'a> {
-    /// `true` when the platform can enforce Landlock at all (Linux).
-    pub landlock_supported: bool,
+    /// `true` when this platform has a sandbox backend at all: Landlock on Linux,
+    /// Seatbelt on macOS. Every production call site takes it from
+    /// [`crate::harness::sandbox::backend_supports_current_platform`], never from a
+    /// `target_os` test of its own, so a backend that exists cannot be gated out twice.
+    pub backend_supported: bool,
     /// `true` when this process is a Cargo test-harness binary (`cfg!(test)`):
     /// it does not implement [`SANDBOX_EXEC_ARG`], so it cannot re-enter.
     pub test_harness_exe: bool,
@@ -465,8 +469,8 @@ pub struct SandboxInputs<'a> {
 pub enum SandboxSkip {
     /// The operator opted out explicitly (attributable via `setting`).
     OptOut { setting: String },
-    /// This platform has no Landlock (macOS/Windows/…): not a choice, but it
-    /// must still be visible.
+    /// This platform has no sandbox backend (Windows, the BSDs, …): not a choice, but
+    /// it must still be visible. macOS and Linux both have one, so they never skip here.
     UnsupportedPlatform,
     /// Running inside a Cargo test-harness binary, which cannot re-enter.
     TestHarnessExe,
@@ -479,7 +483,7 @@ impl SandboxSkip {
             SandboxSkip::OptOut { setting } => {
                 format!("explicit opt-out ({setting})")
             }
-            SandboxSkip::UnsupportedPlatform => "platform has no Landlock".to_string(),
+            SandboxSkip::UnsupportedPlatform => "platform has no sandbox backend".to_string(),
             SandboxSkip::TestHarnessExe => {
                 format!("test-harness binary does not implement {SANDBOX_EXEC_ARG}")
             }
@@ -490,8 +494,8 @@ impl SandboxSkip {
 /// The outcome of [`should_apply_sandbox`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxDecision {
-    /// Apply the Landlock re-entry by exec-ing `resolved_exe` with
-    /// [`SANDBOX_EXEC_ARG`].
+    /// Apply the sandbox re-entry by exec-ing `resolved_exe` with
+    /// [`SANDBOX_EXEC_ARG`]: the child enforces Landlock on Linux and Seatbelt on macOS.
     Apply { resolved_exe: std::path::PathBuf },
     /// Run the command through plain `sh -c` — **never silently**: always
     /// accompanied by a `WARN` from [`log_sandbox_decision`].
@@ -499,7 +503,7 @@ pub enum SandboxDecision {
         resolved_exe: Option<std::path::PathBuf>,
         skip: SandboxSkip,
     },
-    /// Landlock is required here but the executable could not be resolved, so
+    /// The sandbox is required here but the executable could not be resolved, so
     /// the command must **hard-fail** instead of degrading to `sh -c`.
     UnresolvedExe,
 }
@@ -508,20 +512,20 @@ impl SandboxDecision {
     /// The chosen mode, stated in the log line at the decision point.
     pub fn mode(&self) -> &'static str {
         match self {
-            SandboxDecision::Apply { .. } => "landlock-re-entry",
+            SandboxDecision::Apply { .. } => "sandbox-re-entry",
             SandboxDecision::Skip { .. } => "unsandboxed",
             SandboxDecision::UnresolvedExe => "hard-fail",
         }
     }
 }
 
-/// Decide whether the Landlock sandbox **must** apply to the next command: pure logic over injected inputs,
+/// Decide whether the sandbox **must** apply to the next command: pure logic over injected inputs,
 /// fail-closed and name-blind — a renamed, copied, installed or coincidentally-named binary is sandboxed from
 /// its resolved exe path like any other. Only an explicit, unambiguous [`OptOut::Explicit`] disables it: the
 /// typed `sandbox_disabled` knob ([`crate::config::Config::sandbox_disabled`]) or the `MARMEL_DISABLE_SANDBOX`
 /// env fallback ([`SANDBOX_OPTOUT_ENV`]) merged by [`crate::config::sandbox_opt_out`]. An unresolved exe is a
 /// hard [`SandboxDecision::UnresolvedExe`], never a plain `sh -c`; [`SandboxDecision::Skip`] covers only no
-/// Landlock on this platform, an explicit opt-out, or a Cargo test-harness binary — and
+/// backend on this platform, an explicit opt-out, or a Cargo test-harness binary — and
 /// [`log_sandbox_decision`] warns about every skip.
 pub fn should_apply_sandbox(inputs: &SandboxInputs<'_>) -> SandboxDecision {
     let resolved_exe = inputs.resolved_exe.map(std::path::Path::to_path_buf);
@@ -536,8 +540,9 @@ pub fn should_apply_sandbox(inputs: &SandboxInputs<'_>) -> SandboxDecision {
         };
     }
 
-    // 2. No Landlock on this platform (the re-entry only exists on Linux).
-    if !inputs.landlock_supported {
+    // 2. No sandbox backend on this platform (Landlock and Seatbelt are both absent, so
+    //    there is nothing for the re-entry child to apply).
+    if !inputs.backend_supported {
         return SandboxDecision::Skip {
             resolved_exe,
             skip: SandboxSkip::UnsupportedPlatform,
@@ -610,7 +615,7 @@ pub fn log_sandbox_decision(decision: &SandboxDecision) {
             tracing::info!(
                 resolved_exe = %&resolved_exe,
                 mode = decision.mode(),
-                "terminal commands are sandboxed via Landlock re-entry"
+                "terminal commands are sandboxed via the re-entry child (Landlock on Linux, Seatbelt on macOS)"
             );
         }
         SandboxDecision::Skip { skip, .. } => {
@@ -619,7 +624,7 @@ pub fn log_sandbox_decision(decision: &SandboxDecision) {
                 resolved_exe = %&resolved_exe,
                 mode = decision.mode(),
                 reason = %&reason,
-                "pty sandbox SKIPPED: this command runs WITHOUT Landlock ({reason})"
+                "pty sandbox SKIPPED: this command runs WITHOUT the sandbox ({reason})"
             );
         }
         SandboxDecision::UnresolvedExe => {
@@ -636,7 +641,7 @@ pub fn log_sandbox_decision(decision: &SandboxDecision) {
 fn sandbox_decision_for_current_process() -> SandboxDecision {
     let resolved_exe = resolved_exe_path();
     let inputs = SandboxInputs {
-        landlock_supported: cfg!(target_os = "linux"),
+        backend_supported: crate::harness::sandbox::backend_supports_current_platform(),
         test_harness_exe: cfg!(test),
         resolved_exe: resolved_exe.as_deref(),
         // Either source opts out: the env fallback (parsed here, unchanged) and
@@ -673,7 +678,7 @@ fn sandbox_command_argv(
         )),
         SandboxDecision::Skip { .. } => Ok(("sh".to_string(), vec!["-c".to_string(), wrapped])),
         SandboxDecision::UnresolvedExe => Err(ToolError::Execution(anyhow::anyhow!(
-            "refusing to run `{command}` unsandboxed: Landlock re-entry ({SANDBOX_EXEC_ARG}) needs a resolved executable path, but `current_exe()` is unavailable on this host. Run `marmel` from a resolvable path, or opt out explicitly with {SANDBOX_OPTOUT_ENV}=1."
+            "refusing to run `{command}` unsandboxed: the sandbox re-entry ({SANDBOX_EXEC_ARG}) needs a resolved executable path, but `current_exe()` is unavailable on this host. Run `marmel` from a resolvable path, or opt out explicitly with {SANDBOX_OPTOUT_ENV}=1."
         ))),
     }
 }
@@ -878,10 +883,11 @@ pub(crate) fn windows_child_cwd(cwd: &std::path::Path) -> std::path::PathBuf {
 
 /// Build the shell command for one `run_command`/PTY execution.
 ///
-/// Landlock is applied on Linux through [`SANDBOX_EXEC_ARG`] re-entry decided by [`should_apply_sandbox`] —
-/// from the resolved exe path, platform support and an explicit opt-out, **never** from the executable's name.
-/// `Err` is returned when the sandbox is required but cannot be applied (fail-closed). On Windows there is no
-/// Landlock: the skip is logged and the command is built by [`windows_shell_argv`] in the
+/// The sandbox is applied through [`SANDBOX_EXEC_ARG`] re-entry decided by [`should_apply_sandbox`] —
+/// from the resolved exe path, the backend the host has (Landlock on Linux, Seatbelt on macOS) and an
+/// explicit opt-out, **never** from the executable's name.
+/// `Err` is returned when the sandbox is required but cannot be applied (fail-closed). On Windows there
+/// is no backend at all: the skip is logged and the command is built by [`windows_shell_argv`] in the
 /// [`windows_child_cwd`]-sanitised directory (see both for the rule set).
 pub fn build_sandboxed_command(
     command: &str,
@@ -905,14 +911,14 @@ pub fn build_sandboxed_command(
         return Ok(cmd);
     }
 
-    // Windows has no Landlock, so the skip is never silent.
+    // Windows has no sandbox backend at all, so the skip is never silent.
     tracing::warn!(
         resolved_exe = %resolved_exe_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "<unresolved>".to_string()),
         mode = "unsandboxed",
-        reason = "platform has no Landlock",
-        "pty sandbox SKIPPED: Windows has no Landlock, this command runs unsandboxed"
+        reason = "platform has no sandbox backend",
+        "pty sandbox SKIPPED: Windows has no sandbox backend, this command runs unsandboxed"
     );
     // The program token is decided here and never left as a bare `cmd`: portable-pty
     // resolves argv[0] through PATH+PATHEXT but passes the result to `CreateProcessW` as

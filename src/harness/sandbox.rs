@@ -1,4 +1,5 @@
-//! Landlock LSM sandbox for Linux process isolation.
+//! Sandbox policy and the fail-closed enforcement contract shared by both backends
+//! (Landlock on Linux, Seatbelt on macOS).
 //!
 //! The allow-list published here is shared: on macOS the same policy is rendered into an SBPL
 //! profile by `harness::sbpl` and enforced by the Seatbelt backend
@@ -21,15 +22,18 @@
 //! or already covered by a built-in rule never become rules at all, and each such entry is
 //! announced in one line on stderr ([`extra_path_skip_note`]).
 //!
-//! [`apply_sandbox`] returns `Ok(())` **only when Landlock enforcement is actually in effect for
-//! the calling process**; every way an attempt falls short is a [`SandboxError`] naming the reason —
-//! [`SandboxError::Unavailable`] (no Landlock on this build/kernel, a refused ruleset syscall, or
-//! `restrict_self()` succeeding while the kernel still reports `NotEnforced`),
+//! [`apply_sandbox`] returns `Ok(())` **only when enforcement is actually in effect for
+//! the calling process**, whichever backend ran; every way an attempt falls short is a
+//! [`SandboxError`] naming the reason —
+//! [`SandboxError::Unavailable`] (no Landlock on this build/kernel, a refused ruleset syscall,
+//! `restrict_self()` succeeding while the kernel still reports `NotEnforced`, or the active
+//! backend refusing to confine us),
 //! [`SandboxError::RuleSetup`] (a rule could not be added, so the requested policy cannot be built)
-//! or [`SandboxError::Enforcement`] (a ruleset exists but enforcing it failed, so this process is
-//! **not** restricted). "The kernel has no Landlock" and "enforcement failed" are hard errors, never
+//! or [`SandboxError::Enforcement`] (a policy exists but enforcing it failed, so this process is
+//! **not** restricted). "This host has no backend" and "enforcement failed" are hard errors, never
 //! warnings, and [`reentry_action`] turns any failure into a refusal to exec: a stderr message plus a
-//! non-zero exit.
+//! non-zero exit. The Linux wording of that refusal names Landlock; the mapping is backend-neutral,
+//! so a Seatbelt failure reaches the same refusal and the same exit code.
 //!
 //! The only legitimate way to run unsandboxed is the operator's explicit opt-out
 //! ([`SANDBOX_OPTOUT_ENV`], parsed fail-closed by [`is_optout_value`] and surfaced by
@@ -53,23 +57,22 @@ use landlock::{
 /// `sysexits.h`: the security facility the command requires is not available.
 pub const SANDBOX_REFUSE_EXIT_CODE: i32 = 73;
 
-/// Why Landlock enforcement could not be established.
+/// Why enforcement failed, whichever backend is active here (Landlock on Linux, Seatbelt on macOS).
 ///
 /// Every variant is terminal for the caller: the command must not be run. The
 /// reason string is always non-empty and is what the caller logs.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SandboxError {
-    /// Landlock does not exist on this platform, or creating a ruleset was rejected, or
-    /// one was created and the kernel still reports that nothing is enforced.
-    #[error("Landlock is unavailable here: {reason}")]
+    /// No backend is available here (Landlock is missing on this Linux build, Seatbelt
+    /// refused to confine us, or the active backend reports that nothing is enforced).
+    #[error("no sandbox backend is available here: {reason}")]
     Unavailable { reason: String },
-    /// A ruleset was created but the rule for `path` was rejected, so the requested
+    /// The active backend could not be given the rule for `path`, so the requested
     /// policy is not the policy that would be enforced.
-    #[error("Landlock policy could not be built for {path}: {reason}")]
+    #[error("sandbox policy could not be built for {path}: {reason}")]
     RuleSetup { path: String, reason: String },
-    /// A ruleset was created but enforcing it failed: this process is **not**
-    /// restricted at all.
-    #[error("Landlock enforcement failed, this process is NOT restricted: {reason}")]
+    /// Enforcement was attempted and failed: this process is **not** restricted at all.
+    #[error("sandbox enforcement failed, this process is NOT restricted: {reason}")]
     Enforcement { reason: String },
 }
 
@@ -93,7 +96,7 @@ impl SandboxError {
     }
 }
 
-/// What one Landlock attempt actually achieved, step by step.
+/// What one enforcement attempt actually achieved, step by step.
 ///
 /// This is the injection seam of the fail-closed contract: [`sandbox_outcome`] maps it
 /// to the public `Result`, and tests can feed every variant without a Landlock kernel,
@@ -185,7 +188,7 @@ pub fn apply_sandbox_with_extra_readonly_paths(
     if !granted.is_empty() {
         tracing::debug!(
             count = granted.len(),
-            "Landlock: extending the read-only allow-list with operator-configured paths"
+            "sandbox: extending the read-only allow-list with operator-configured paths"
         );
     }
 
@@ -196,13 +199,13 @@ pub fn apply_sandbox_with_extra_readonly_paths(
         Ok(()) => match attempt {
             SandboxAttempt::PartiallyEnforced { reason } => {
                 tracing::warn!(
-                    "Landlock is only PARTIALLY enforced for {}: {reason}",
+                    "the sandbox backend active here is only PARTIALLY enforced for {}: {reason}",
                     workspace_root.display()
                 );
             }
             _ => {
                 tracing::debug!(
-                    "Landlock sandbox established for {}",
+                    "sandbox established for {} by the backend this host selected",
                     workspace_root.display()
                 );
             }
@@ -211,7 +214,7 @@ pub fn apply_sandbox_with_extra_readonly_paths(
             tracing::error!(
                 kind = err.kind(),
                 workspace_root = %workspace_root.display(),
-                "Landlock sandbox NOT established: {err}"
+                "sandbox NOT established: {err}"
             );
         }
     }
@@ -557,7 +560,8 @@ pub enum Enforcement {
     /// Not attempted, because the operator explicitly opted out (attributable
     /// `setting`, e.g. `MARMEL_DISABLE_SANDBOX=1`).
     Skipped { setting: String },
-    /// A Landlock ruleset is enforcing on this process.
+    /// The backend this host selected is enforcing on this process: a Landlock ruleset
+    /// on Linux, a Seatbelt profile on macOS.
     Established,
     /// Attempted and failed — this process is **not** restricted.
     Failed { reason: String },
@@ -573,14 +577,16 @@ pub enum ReentryAction {
     Refuse { reason: String, exit_code: i32 },
 }
 
-/// Decide the re-entry action from injected inputs — no exec, no Landlock, no environment — so the
+/// Decide the re-entry action from injected inputs — no exec, no backend call, no environment — so the
 /// fail-closed choice (exit over exec) is unit-testable. Its rules are the security contract of the
-/// re-entry protocol:
+/// re-entry protocol, and they are backend-neutral on purpose: the same mapping decides a Landlock
+/// attempt on Linux and a Seatbelt attempt on macOS:
 ///
-/// * exec only when the decision demanded Landlock **and** it was established, or when the decision
+/// * exec only when the decision demanded enforcement **and** it was established, or when the decision
 ///   and the enforcement step agree on an explicit opt-out;
-/// * everything else — a failed attempt, a decision demanding Landlock without an established ruleset,
-///   a platform that cannot provide it, an unresolved executable — is a refusal with a non-zero exit code.
+/// * everything else — a failed attempt, a decision demanding enforcement without an established
+///   backend, a platform that has no backend, an unresolved executable — is a refusal with a non-zero
+///   exit code.
 #[must_use]
 pub fn reentry_action(decision: &SandboxDecision, enforcement: &Enforcement) -> ReentryAction {
     match (decision, enforcement) {
@@ -594,16 +600,16 @@ pub fn reentry_action(decision: &SandboxDecision, enforcement: &Enforcement) -> 
             Enforcement::Skipped { setting: skipped },
         ) if setting == skipped => ReentryAction::Exec,
 
-        // 2. Landlock was required and it is in effect.
+        // 2. Enforcement was required and the active backend established it.
         (SandboxDecision::Apply { .. }, Enforcement::Established) => ReentryAction::Exec,
 
         // 3. Everything else refuses to run the command.
         (_, Enforcement::Failed { reason }) => refuse(reason.clone()),
         (SandboxDecision::Apply { ..}, other) => refuse(format!(
-            "the sandbox decision requires Landlock, but enforcement did not establish it ({other:?})"
+            "the sandbox decision requires enforcement, but enforcement did not establish it ({other:?})"
         )),
         (SandboxDecision::Skip { skip, .. }, _) => refuse(format!(
-            "sandbox re-entry was requested, but this host cannot apply Landlock ({})",
+            "sandbox re-entry was requested, but this host has no sandbox backend ({})",
             skip.label()
         )),
         (SandboxDecision::UnresolvedExe, _) => refuse(
@@ -626,7 +632,8 @@ fn refuse(reason: String) -> ReentryAction {
 pub fn refusal_message(reason: &str) -> String {
     format!(
         "error: refusing to run the command: {reason}. \
-         Landlock sandboxing is enabled by default; set {SANDBOX_OPTOUT_ENV}=1 to run it unsandboxed."
+         The sandbox is enabled by default on every platform that has a backend; \
+         set {SANDBOX_OPTOUT_ENV}=1 to run it unsandboxed."
     )
 }
 
@@ -635,7 +642,10 @@ pub fn refusal_message(reason: &str) -> String {
 /// so this also goes to stderr.
 #[must_use]
 pub fn optout_warning(setting: &str) -> String {
-    format!("warning: Landlock sandbox DISABLED by {setting}: this command runs WITHOUT Landlock.")
+    format!(
+        "warning: sandbox DISABLED by {setting}: this command runs WITHOUT the sandbox backend \
+         this platform would otherwise use (Landlock on Linux, Seatbelt on macOS)."
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -764,6 +774,25 @@ fn attempt_landlock(_workspace_root: &Path, _extra_readonly_paths: &[String]) ->
     SandboxAttempt::Unavailable {
         reason: format!("{} has no Landlock support", std::env::consts::OS),
     }
+}
+
+/// Whether this build has a sandbox backend at all: **Landlock on Linux, Seatbelt on
+/// macOS**. Windows and every other target answer `false`.
+///
+/// This is the one place the *existence* of a backend is spelled out. The decision sites —
+/// [`crate::harness::pty::SandboxInputs::backend_supported`] on the spawn side and the
+/// re-entry child in `src/main.rs` — both derive their platform flag from here instead of
+/// comparing `target_os` themselves, so a host that does have a backend can never be
+/// gated out by a second, narrower literal. The flag says nothing about whether an
+/// attempt succeeded: that stays the job of [`sandbox_outcome`] and [`reentry_action`],
+/// which refuse (exit [`SANDBOX_REFUSE_EXIT_CODE`]) whenever enforcement is missing.
+///
+/// It has to agree with the `#[cfg(target_os = …)]` selectors below: exactly the hosts
+/// that compile a real backend answer `true`, every other host answers `false` and
+/// therefore skips the re-entry — visibly, through [`crate::harness::pty::SandboxSkip`].
+#[must_use]
+pub const fn backend_supports_current_platform() -> bool {
+    cfg!(any(target_os = "linux", target_os = "macos"))
 }
 
 /// Which backend this build asks for, decided by `#[cfg]` alone.
@@ -958,7 +987,7 @@ mod tests {
             "the reason must not be empty: {err}"
         );
         assert!(
-            logs.contains("Landlock sandbox NOT established"),
+            logs.contains("sandbox NOT established"),
             "an enforcement failure must be logged, got {logs:?}"
         );
     }
@@ -991,6 +1020,44 @@ mod tests {
         assert!(
             message.contains(SANDBOX_OPTOUT_ENV) && message.contains("refusing"),
             "the refusal must name the only way out: {message}"
+        );
+    }
+
+    /// The same contract on the macOS leg, where the failure arrives as a
+    /// `SandboxAttempt::EnforcementFailed` from `attempt_seatbelt` (a failing
+    /// `sandbox_init_with_parameters`, or a probe that answers `Allowed` for a path the
+    /// rendered profile denies). The mapping is backend-neutral by construction, so this
+    /// leg is deliberately **not** gated to one target: it asserts that a Seatbelt failure
+    /// reaches the very same refusal and the very same exit code as a Landlock failure.
+    #[test]
+    fn test_seatbelt_enforcement_failure_refuses_with_the_landlock_exit_code() {
+        let seatbelt = "Seatbelt: sandbox_init_with_parameters rejected the profile (rc 1)";
+        let Err(err) = sandbox_outcome(&SandboxAttempt::EnforcementFailed {
+            reason: seatbelt.to_string(),
+        }) else {
+            panic!("an enforcement failure must never map to Ok");
+        };
+        assert_eq!(err.kind(), "enforcement", "reported as {err}");
+        assert!(err.to_string().contains(seatbelt), "{err}");
+
+        let action = reentry_action(
+            &apply_decision(),
+            &Enforcement::Failed {
+                reason: err.to_string(),
+            },
+        );
+        let ReentryAction::Refuse { reason, exit_code } = action else {
+            panic!("a Seatbelt failure must refuse, got {action:?}");
+        };
+        assert_eq!(exit_code, SANDBOX_REFUSE_EXIT_CODE);
+        assert_eq!(
+            SANDBOX_REFUSE_EXIT_CODE, 73,
+            "the refusal exit code is fixed"
+        );
+        assert!(reason.contains(seatbelt), "{reason}");
+        assert!(
+            refusal_message(&reason).contains(SANDBOX_OPTOUT_ENV),
+            "the refusal must name the way out: {reason}"
         );
     }
 
@@ -1599,11 +1666,12 @@ mod tests {
     /// The one line a user sees when the allow-list misses the program the sandboxed shell
     /// tries to exec. Nothing on this host can reproduce it — there is no package store here,
     /// so no ruleset test can ever reach an exec denial — so the diagnostic promised in
-    /// `bug.md` is pinned at the source: it must name Landlock, print the **resolved**
-    /// program rather than the bare token, attribute a refusal to the allow-list, and keep
-    /// terminating the child. The pre-fix wording named neither Landlock nor a path and is
-    /// asserted away; it is spelled only here, never in `main.rs`, whose text is the scanned
-    /// side.
+    /// `bug.md` is pinned at the source: it must say a sandbox refused the exec, print the
+    /// **resolved** program rather than the bare token, attribute a refusal to the allow-list,
+    /// and keep terminating the child. The pre-fix wording named neither the sandbox nor a
+    /// path and is asserted away; it is spelled only here, never in `main.rs`, whose text is
+    /// the scanned side. The wording is deliberately backend-neutral: which backend is in
+    /// play (Landlock or Seatbelt) is decided per platform, not in this message.
     #[test]
     fn test_main_rs_exec_failure_names_the_sandbox_and_the_resolved_program() {
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
@@ -1617,8 +1685,9 @@ mod tests {
             .expect("the exec step must stay one function");
 
         assert!(
-            exec_step.contains("under the Landlock sandbox"),
-            "the failure must say which sandbox refused the exec"
+            exec_step.contains("under the active sandbox"),
+            "the failure must say a sandbox refused the exec (backend-neutral: Landlock on \
+             Linux, Seatbelt on macOS)"
         );
         assert!(
             exec_step.contains("resolve_program_path(\"sh\")"),
@@ -1709,6 +1778,84 @@ mod tests {
                 "#[cfg(not(any(target_os = {quote}linux{quote}, target_os = {quote}macos{quote})))]\nfn attempt_landlock("
             )),
             "the no-Landlock stub must cover exactly the hosts with neither mechanism"
+        );
+
+        // The capability flag the decision sites read must describe exactly the hosts that
+        // get a selector here: a narrower flag gates out a backend that exists (that is how
+        // macOS never reached Seatbelt), a wider one promises a backend nothing enforces.
+        assert!(
+            src.contains("pub const fn backend_supports_current_platform() -> bool {"),
+            "the platform capability flag must exist next to the selectors it describes"
+        );
+        assert!(
+            src.contains(&format!(
+                "cfg!(any(target_os = {quote}linux{quote}, target_os = {quote}macos{quote}))"
+            )),
+            "the capability flag must answer for exactly the two platforms that have a backend"
+        );
+    }
+
+    /// The capability flag exists so that the *same* answer decides the spawn side and the
+    /// re-entry child. Its value must be true exactly on the hosts that compile a backend
+    /// selector here, which is what a Linux host can check about macOS: the flag is the one
+    /// statement of the platform set, and neither gate site is allowed its own.
+    #[test]
+    fn test_backend_supports_current_platform_answers_for_both_backends() {
+        // One statement of the platform question, read by both gate sites: `true` for a host
+        // that compiles a backend selector (Landlock on Linux, Seatbelt on macOS), `false` for
+        // a host that compiles none. The Linux-only answer this helper replaced is exactly the
+        // difference between Seatbelt applying on macOS and never being reached from there.
+        let backend_compiled_in = cfg!(any(target_os = "linux", target_os = "macos"));
+        assert_eq!(
+            backend_supports_current_platform(),
+            backend_compiled_in,
+            "the flag must answer true for Landlock on Linux and Seatbelt on macOS alike"
+        );
+        if cfg!(target_os = "macos") {
+            assert!(
+                backend_supports_current_platform(),
+                "a macOS host must report a backend, or the Seatbelt selector is never asked"
+            );
+        }
+    }
+
+    /// Both ends of the sandbox gate — the spawn side in `pty.rs`, the re-entry child in
+    /// `main.rs` — must derive their platform input from
+    /// [`backend_supports_current_platform`], never from a `target_os` literal of their own.
+    /// One source of truth per fact is what keeps a backend that exists from being gated out
+    /// by a second, narrower copy of the same platform test.
+    #[test]
+    fn test_sandbox_gate_reads_the_shared_capability_flag() {
+        let quote = char::from(34);
+        // Spelled from parts so this file never carries the needles it is checking for.
+        let old_field = format!("l{}supported", "andlock_");
+        let pty =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/harness/pty.rs"))
+                .expect("pty.rs must be readable from the crate manifest dir");
+        let main = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("main.rs must be readable from the crate manifest dir");
+
+        for site in [&pty, &main] {
+            assert!(
+                !site.contains(&old_field),
+                "the platform-specific field name must not come back"
+            );
+            assert!(
+                !site.contains(&format!("cfg!(target_os = {quote}linux{quote})")),
+                "neither gate site may answer the platform question itself"
+            );
+        }
+        assert!(
+            pty.contains(
+                "backend_supported: crate::harness::sandbox::backend_supports_current_platform(),"
+            ),
+            "the spawn side must feed the decision the shared capability flag"
+        );
+        assert!(
+            main.contains(
+                "backend_supported: harness::sandbox::backend_supports_current_platform(),"
+            ),
+            "the re-entry child must feed the same flag, not its own platform test"
         );
     }
 
