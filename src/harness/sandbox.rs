@@ -1,11 +1,23 @@
-//! Sandbox policy and the fail-closed enforcement contract shared by both backends
-//! (Landlock on Linux, Seatbelt on macOS).
+//! Sandbox policy and the fail-closed enforcement contract shared by the three backends
+//! (Landlock on Linux, Seatbelt on macOS, AppContainer on Windows).
 //!
 //! The allow-list published here is shared: on macOS the same policy is rendered into an SBPL
 //! profile by `harness::sbpl` and enforced by the Seatbelt backend
-//! (`harness::sandbox_seatbelt.rs`, `#[cfg(target_os = "macos")]`), and the backend actually used
+//! (`harness::sandbox_seatbelt.rs`, `#[cfg(target_os = "macos")]`), on Windows it is rendered into
+//! an AppContainer policy and matching ACEs by `harness::sandbox_windows`
+//! (`harness::sandbox_windows.rs`, `#[cfg(target_os = "windows")]`), and the backend actually used
 //! is chosen by `attempt_backend` per platform rather than at the call site. Every statement
-//! below about how an attempt is judged holds for both backends.
+//! below about how an attempt is judged holds for every backend.
+//!
+//! One difference in *where* enforcement bites belongs here, because the rest of this file keeps to
+//! backend-neutral wording. On Linux and macOS the re-entry process confines **itself**
+//! (`restrict_self()` respectively `sandbox(2)`). Windows cannot do that — an AppContainer
+//! identity is carried by the process at creation, and no Win32 call downgrades a running
+//! process's own token into that identity — so confinement is established by launching the command
+//! **inside** a fresh AppContainer: the re-entry child is the confinement site, and the confined
+//! process is the command launched by `sandbox_windows::run_in_appcontainer`. The policy judgement
+//! on Windows therefore says "this run is confined and here is the confinement", not "this process
+//! itself is restricted".
 //!
 //! Restricts child processes (such as spawned PTY shells) to the workspace root, /tmp and standard build
 //! caches (~/.cargo, ~/.cache); system toolchains (/usr, /bin, /lib, ~/.rustup) and the package stores
@@ -33,7 +45,7 @@
 //! **not** restricted). "This host has no backend" and "enforcement failed" are hard errors, never
 //! warnings, and [`reentry_action`] turns any failure into a refusal to exec: a stderr message plus a
 //! non-zero exit. The Linux wording of that refusal names Landlock; the mapping is backend-neutral,
-//! so a Seatbelt failure reaches the same refusal and the same exit code.
+//! so a Seatbelt or AppContainer failure reaches the same refusal and the same exit code.
 //!
 //! The only legitimate way to run unsandboxed is the operator's explicit opt-out
 //! ([`SANDBOX_OPTOUT_ENV`], parsed fail-closed by [`is_optout_value`] and surfaced by
@@ -57,7 +69,8 @@ use landlock::{
 /// `sysexits.h`: the security facility the command requires is not available.
 pub const SANDBOX_REFUSE_EXIT_CODE: i32 = 73;
 
-/// Why enforcement failed, whichever backend is active here (Landlock on Linux, Seatbelt on macOS).
+/// Why enforcement failed, whichever backend is active here (Landlock on Linux, Seatbelt on macOS,
+/// AppContainer on Windows).
 ///
 /// Every variant is terminal for the caller: the command must not be run. The
 /// reason string is always non-empty and is what the caller logs.
@@ -561,7 +574,9 @@ pub enum Enforcement {
     /// `setting`, e.g. `MARMEL_DISABLE_SANDBOX=1`).
     Skipped { setting: String },
     /// The backend this host selected is enforcing on this process: a Landlock ruleset
-    /// on Linux, a Seatbelt profile on macOS.
+    /// on Linux, a Seatbelt profile on macOS, an AppContainer policy on Windows (where the
+    /// confined process is the command launched inside the container rather than the process
+    /// that judged the policy).
     Established,
     /// Attempted and failed — this process is **not** restricted.
     Failed { reason: String },
@@ -764,20 +779,21 @@ fn error_chain<E: std::error::Error>(err: &E) -> String {
     chain
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn attempt_landlock(_workspace_root: &Path, _extra_readonly_paths: &[String]) -> SandboxAttempt {
     // No Landlock exists on this platform, so the sandbox cannot be established at
     // all. That is reported as a failure: the caller must refuse rather than pretend
     // the command ran protected. On macOS this stub is not built at all: Seatbelt is
-    // what the macOS backend of [`attempt_backend`] applies there, and an unused
-    // Landlock stub would be dead code on that target.
+    // what the macOS backend of [`attempt_backend`] applies there, and the same holds
+    // on Windows, whose backend of [`attempt_backend`] asks for an AppContainer instead.
+    // An unused Landlock stub would be dead code on those targets.
     SandboxAttempt::Unavailable {
         reason: format!("{} has no Landlock support", std::env::consts::OS),
     }
 }
 
 /// Whether this build has a sandbox backend at all: **Landlock on Linux, Seatbelt on
-/// macOS**. Windows and every other target answer `false`.
+/// macOS, AppContainer on Windows**. Every other target answers `false`.
 ///
 /// This is the one place the *existence* of a backend is spelled out. The decision sites —
 /// [`crate::harness::pty::SandboxInputs::backend_supported`] on the spawn side and the
@@ -792,7 +808,11 @@ fn attempt_landlock(_workspace_root: &Path, _extra_readonly_paths: &[String]) ->
 /// therefore skips the re-entry — visibly, through [`crate::harness::pty::SandboxSkip`].
 #[must_use]
 pub const fn backend_supports_current_platform() -> bool {
-    cfg!(any(target_os = "linux", target_os = "macos"))
+    cfg!(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    ))
 }
 
 /// Which backend this build asks for, decided by `#[cfg]` alone.
@@ -800,7 +820,7 @@ pub const fn backend_supports_current_platform() -> bool {
 /// One selector per platform, so [`apply_sandbox_with_extra_readonly_paths`] stays
 /// platform-neutral and keeps one and the same fail-closed mapping
 /// ([`sandbox_outcome`]) regardless of which enforcement mechanism the host has. Exactly one of
-/// these is compiled into any build, and a host with neither mechanism still gets an
+/// these is compiled into any build, and a host with no mechanism at all still gets an
 /// [`SandboxAttempt::Unavailable`], which the caller turns into a refusal rather than into an
 /// unsandboxed run.
 #[cfg(target_os = "linux")]
@@ -817,8 +837,26 @@ fn attempt_backend(workspace_root: &Path, extra_readonly_paths: &[String]) -> Sa
     crate::harness::sandbox_seatbelt::attempt_seatbelt(workspace_root, extra_readonly_paths)
 }
 
-/// The selector for every host with neither Landlock nor Seatbelt (Windows, the BSDs, …).
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// The Windows selector: neither `restrict_self()` nor `sandbox(2)` exists here, so confinement is
+/// not something this process can impose on itself. The AppContainer backend of
+/// [`crate::harness::sandbox_windows`] is asked for instead, and it confines the command launched
+/// **inside** a fresh AppContainer — the re-entry child is the confinement site, because Win32 has
+/// no in-place equivalent of confining the calling process.
+///
+/// The judgement this selector runs (`attempt_windows_sandbox`) prepares the profile and the ACEs
+/// the policy needs, and parks them in that module's thread-local hand-off: the prepared
+/// profile/ACL hand-off lives on until the confined child is launched, where
+/// [`crate::harness::sandbox_windows::take_windows_policy_setup`] is how the launch layer picks it
+/// up, and [`crate::harness::sandbox_windows::discard_windows_policy_setup`] releases it when a run
+/// decides not to launch anything confined. [`apply_sandbox`] only makes the judgement; confining
+/// the pending command with it is what `sandbox_windows::run_in_appcontainer` does next.
+#[cfg(target_os = "windows")]
+fn attempt_backend(workspace_root: &Path, extra_readonly_paths: &[String]) -> SandboxAttempt {
+    crate::harness::sandbox_windows::attempt_windows_sandbox(workspace_root, extra_readonly_paths)
+}
+
+/// The selector for every host with none of Landlock, Seatbelt or AppContainer (the BSDs, …).
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn attempt_backend(workspace_root: &Path, extra_readonly_paths: &[String]) -> SandboxAttempt {
     attempt_landlock(workspace_root, extra_readonly_paths)
 }
@@ -1671,7 +1709,7 @@ mod tests {
     /// and keep terminating the child. The pre-fix wording named neither the sandbox nor a
     /// path and is asserted away; it is spelled only here, never in `main.rs`, whose text is
     /// the scanned side. The wording is deliberately backend-neutral: which backend is in
-    /// play (Landlock or Seatbelt) is decided per platform, not in this message.
+    /// play (Landlock, Seatbelt or AppContainer) is decided per platform, not in this message.
     #[test]
     fn test_main_rs_exec_failure_names_the_sandbox_and_the_resolved_program() {
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
@@ -1687,7 +1725,7 @@ mod tests {
         assert!(
             exec_step.contains("under the active sandbox"),
             "the failure must say a sandbox refused the exec (backend-neutral: Landlock on \
-             Linux, Seatbelt on macOS)"
+             Linux, Seatbelt on macOS, AppContainer on Windows)"
         );
         assert!(
             exec_step.contains("resolve_program_path(\"sh\")"),
@@ -1738,8 +1776,9 @@ mod tests {
     /// The sandbox backend is selected per platform by `#[cfg]`, and the enforcement entry point
     /// must go through that selector rather than through one hard-coded backend. Pinned at the
     /// source because a wrong `cfg` combination only ever surfaces on a target this repository
-    /// cannot run on: on Linux there is no Seatbelt, on macOS there is no Landlock, and every
-    /// other host must get neither.
+    /// cannot run on: on Linux there is no Seatbelt, on macOS there is no Landlock, on Windows
+    /// none of them apply and an AppContainer selector does, and every other host must get
+    /// neither.
     #[test]
     fn test_sandbox_backend_is_selected_by_cfg_not_by_call_site() {
         let src = std::fs::read_to_string(concat!(
@@ -1752,10 +1791,11 @@ mod tests {
         let quote = char::from(34);
         let linux = format!("#[cfg(target_os = {quote}linux{quote})]\nfn attempt_backend(");
         let macos = format!("#[cfg(target_os = {quote}macos{quote})]\nfn attempt_backend(");
+        let windows = format!("#[cfg(target_os = {quote}windows{quote})]\nfn attempt_backend(");
         let neither = format!(
-            "#[cfg(not(any(target_os = {quote}linux{quote}, target_os = {quote}macos{quote})))]\nfn attempt_backend("
+            "#[cfg(not(any(target_os = {quote}linux{quote}, target_os = {quote}macos{quote}, target_os = {quote}windows{quote})))]\nfn attempt_backend("
         );
-        for selector in [&linux, &macos, &neither] {
+        for selector in [&linux, &macos, &windows, &neither] {
             assert!(
                 src.contains(selector),
                 "every platform must name exactly one backend selector, missing: {selector}"
@@ -1763,59 +1803,96 @@ mod tests {
         }
         assert_eq!(
             src.matches("\nfn attempt_backend(").count(),
-            3,
-            "the three selectors must be one per platform, never two for the same host"
+            4,
+            "the four selectors must be one per platform, never two for the same host"
         );
 
-        // The call site goes through the selector, so both backends stay behind one contract.
+        // The call site goes through the selector, so every backend stays behind one contract.
         assert!(
             src.contains("let attempt = attempt_backend(workspace_root, &granted);"),
             "the enforcement entry point must call the selected backend, not a fixed one"
         );
         // The Landlock-only half must stay Linux-gated, and the no-Landlock stub must not be
-        // built on macOS: an unused stub is dead code, which this crate denies per target.
+        // built on macOS or Windows: an unused stub is dead code, which this crate denies per
+        // target.
         assert!(
             src.contains(&format!(
-                "#[cfg(not(any(target_os = {quote}linux{quote}, target_os = {quote}macos{quote})))]\nfn attempt_landlock("
+                "#[cfg(not(any(target_os = {quote}linux{quote}, target_os = {quote}macos{quote}, target_os = {quote}windows{quote})))]\nfn attempt_landlock("
             )),
-            "the no-Landlock stub must cover exactly the hosts with neither mechanism"
+            "the no-Landlock stub must cover exactly the hosts that have no Landlock, Seatbelt or AppContainer"
         );
 
         // The capability flag the decision sites read must describe exactly the hosts that
         // get a selector here: a narrower flag gates out a backend that exists (that is how
         // macOS never reached Seatbelt), a wider one promises a backend nothing enforces.
+        //
+        // Scoped to the production half of the file and read out of the flag's own body: the
+        // flag test below spells the same platform comparison as its own expectation, so a
+        // needle answered only by that copy would prove nothing about the flag itself.
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the test module must be split off the production half")
+            .to_string();
         assert!(
-            src.contains("pub const fn backend_supports_current_platform() -> bool {"),
+            production.contains("pub const fn backend_supports_current_platform() -> bool {"),
             "the platform capability flag must exist next to the selectors it describes"
         );
+        let flag_body = production
+            .split_once("pub const fn backend_supports_current_platform() -> bool {")
+            .map(|(_, after_flag)| {
+                let body_end = after_flag
+                    .find("\n}")
+                    .expect("the flag body must end at its closing brace");
+                &after_flag[..body_end]
+            })
+            .expect("the flag must be defined exactly once in the production half");
         assert!(
-            src.contains(&format!(
-                "cfg!(any(target_os = {quote}linux{quote}, target_os = {quote}macos{quote}))"
-            )),
-            "the capability flag must answer for exactly the two platforms that have a backend"
+            flag_body.contains("cfg!(any("),
+            "the flag must answer the platform question with one cfg!(any(…))"
         );
+        for platform in ["linux", "macos", "windows"] {
+            let spelled = format!("target_os = {quote}{platform}{quote}");
+            assert!(
+                flag_body.contains(&spelled),
+                "the flag body must name {platform}, so the flag answers for exactly the three \
+                 platforms that have a backend and no others"
+            );
+        }
     }
 
     /// The capability flag exists so that the *same* answer decides the spawn side and the
     /// re-entry child. Its value must be true exactly on the hosts that compile a backend
-    /// selector here, which is what a Linux host can check about macOS: the flag is the one
-    /// statement of the platform set, and neither gate site is allowed its own.
+    /// selector here, which is what a Linux host can check about macOS and Windows: the flag is
+    /// the one statement of the platform set, and neither gate site is allowed its own.
     #[test]
-    fn test_backend_supports_current_platform_answers_for_both_backends() {
+    fn test_backend_supports_current_platform_answers_for_every_backend() {
         // One statement of the platform question, read by both gate sites: `true` for a host
-        // that compiles a backend selector (Landlock on Linux, Seatbelt on macOS), `false` for
-        // a host that compiles none. The Linux-only answer this helper replaced is exactly the
-        // difference between Seatbelt applying on macOS and never being reached from there.
-        let backend_compiled_in = cfg!(any(target_os = "linux", target_os = "macos"));
+        // that compiles a backend selector (Landlock on Linux, Seatbelt on macOS, AppContainer on
+        // Windows), `false` for a host that compiles none. The Linux-only answer this helper
+        // replaced is exactly the difference between Seatbelt applying on macOS and never being
+        // reached from there, and the same for the AppContainer selector on Windows.
+        let backend_compiled_in = cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        ));
         assert_eq!(
             backend_supports_current_platform(),
             backend_compiled_in,
-            "the flag must answer true for Landlock on Linux and Seatbelt on macOS alike"
+            "the flag must answer true for Landlock on Linux, Seatbelt on macOS and AppContainer \
+             on Windows alike"
         );
         if cfg!(target_os = "macos") {
             assert!(
                 backend_supports_current_platform(),
                 "a macOS host must report a backend, or the Seatbelt selector is never asked"
+            );
+        }
+        if cfg!(target_os = "windows") {
+            assert!(
+                backend_supports_current_platform(),
+                "a Windows host must report a backend, or the AppContainer selector is never asked"
             );
         }
     }
