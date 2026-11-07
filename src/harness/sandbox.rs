@@ -1,5 +1,11 @@
 //! Landlock LSM sandbox for Linux process isolation.
 //!
+//! The allow-list published here is shared: on macOS the same policy is rendered into an SBPL
+//! profile by `harness::sbpl` and enforced by the Seatbelt backend
+//! (`harness::sandbox_seatbelt.rs`, `#[cfg(target_os = "macos")]`), and the backend actually used
+//! is chosen by `attempt_backend` per platform rather than at the call site. Every statement
+//! below about how an attempt is judged holds for both backends.
+//!
 //! Restricts child processes (such as spawned PTY shells) to the workspace root, /tmp and standard build
 //! caches (~/.cargo, ~/.cache); system toolchains (/usr, /bin, /lib, ~/.rustup) and the package stores
 //! (/nix/store, /gnu/store) stay strictly read-only, and sensitive directories (~/.ssh, ~/.gnupg, other
@@ -183,7 +189,7 @@ pub fn apply_sandbox_with_extra_readonly_paths(
         );
     }
 
-    let attempt = attempt_landlock(workspace_root, &granted);
+    let attempt = attempt_backend(workspace_root, &granted);
     let outcome = sandbox_outcome(&attempt);
 
     match &outcome {
@@ -748,14 +754,44 @@ fn error_chain<E: std::error::Error>(err: &E) -> String {
     chain
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn attempt_landlock(_workspace_root: &Path, _extra_readonly_paths: &[String]) -> SandboxAttempt {
     // No Landlock exists on this platform, so the sandbox cannot be established at
     // all. That is reported as a failure: the caller must refuse rather than pretend
-    // the command ran protected.
+    // the command ran protected. On macOS this stub is not built at all: Seatbelt is
+    // what the macOS backend of [`attempt_backend`] applies there, and an unused
+    // Landlock stub would be dead code on that target.
     SandboxAttempt::Unavailable {
         reason: format!("{} has no Landlock support", std::env::consts::OS),
     }
+}
+
+/// Which backend this build asks for, decided by `#[cfg]` alone.
+///
+/// One selector per platform, so [`apply_sandbox_with_extra_readonly_paths`] stays
+/// platform-neutral and keeps one and the same fail-closed mapping
+/// ([`sandbox_outcome`]) regardless of which enforcement mechanism the host has. Exactly one of
+/// these is compiled into any build, and a host with neither mechanism still gets an
+/// [`SandboxAttempt::Unavailable`], which the caller turns into a refusal rather than into an
+/// unsandboxed run.
+#[cfg(target_os = "linux")]
+fn attempt_backend(workspace_root: &Path, extra_readonly_paths: &[String]) -> SandboxAttempt {
+    attempt_landlock(workspace_root, extra_readonly_paths)
+}
+
+/// The macOS selector: Landlock does not exist there, and the Seatbelt backend of
+/// [`crate::harness::sandbox_seatbelt`] is what confines the re-entry child instead. See that
+/// module for the profile, the process-once constraint, and the probe that stands in for the
+/// `RulesetStatus` Landlock reports.
+#[cfg(target_os = "macos")]
+fn attempt_backend(workspace_root: &Path, extra_readonly_paths: &[String]) -> SandboxAttempt {
+    crate::harness::sandbox_seatbelt::attempt_seatbelt(workspace_root, extra_readonly_paths)
+}
+
+/// The selector for every host with neither Landlock nor Seatbelt (Windows, the BSDs, …).
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn attempt_backend(workspace_root: &Path, extra_readonly_paths: &[String]) -> SandboxAttempt {
+    attempt_landlock(workspace_root, extra_readonly_paths)
 }
 
 #[cfg(test)]
@@ -1627,6 +1663,52 @@ mod tests {
         assert!(
             src.contains("SKIP "),
             "a skipped integration test must announce itself as a skip"
+        );
+    }
+
+    /// The sandbox backend is selected per platform by `#[cfg]`, and the enforcement entry point
+    /// must go through that selector rather than through one hard-coded backend. Pinned at the
+    /// source because a wrong `cfg` combination only ever surfaces on a target this repository
+    /// cannot run on: on Linux there is no Seatbelt, on macOS there is no Landlock, and every
+    /// other host must get neither.
+    #[test]
+    fn test_sandbox_backend_is_selected_by_cfg_not_by_call_site() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/harness/sandbox.rs"
+        ))
+        .expect("sandbox.rs must be readable from the crate manifest dir");
+
+        let quote = char::from(34);
+        let linux = format!("#[cfg(target_os = {quote}linux{quote})]\nfn attempt_backend(");
+        let macos = format!("#[cfg(target_os = {quote}macos{quote})]\nfn attempt_backend(");
+        let neither = format!(
+            "#[cfg(not(any(target_os = {quote}linux{quote}, target_os = {quote}macos{quote})))]\nfn attempt_backend("
+        );
+        for selector in [&linux, &macos, &neither] {
+            assert!(
+                src.contains(selector),
+                "every platform must name exactly one backend selector, missing: {selector}"
+            );
+        }
+        assert_eq!(
+            src.matches("\nfn attempt_backend(").count(),
+            3,
+            "the three selectors must be one per platform, never two for the same host"
+        );
+
+        // The call site goes through the selector, so both backends stay behind one contract.
+        assert!(
+            src.contains("let attempt = attempt_backend(workspace_root, &granted);"),
+            "the enforcement entry point must call the selected backend, not a fixed one"
+        );
+        // The Landlock-only half must stay Linux-gated, and the no-Landlock stub must not be
+        // built on macOS: an unused stub is dead code, which this crate denies per target.
+        assert!(
+            src.contains(&format!(
+                "#[cfg(not(any(target_os = {quote}linux{quote}, target_os = {quote}macos{quote})))]\nfn attempt_landlock("
+            )),
+            "the no-Landlock stub must cover exactly the hosts with neither mechanism"
         );
     }
 
