@@ -22,6 +22,7 @@ pub mod monitor;
 pub mod plan;
 pub mod pty;
 pub mod sandbox;
+pub mod sbpl;
 pub mod search;
 pub mod sleep;
 #[cfg(test)]
