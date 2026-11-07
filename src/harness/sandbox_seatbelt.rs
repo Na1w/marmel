@@ -188,7 +188,7 @@ fn bad_profile_requested() -> bool {
 /// the environment of a running test process.
 #[must_use]
 fn bad_profile_from_value(raw: Option<&str>) -> bool {
-    raw.is_some_and(|value| crate::harness::pty::is_optout_value(value))
+    raw.is_some_and(crate::harness::pty::is_optout_value)
 }
 
 /// The text handed to libSystem, with the deliberate break applied when `requested` says the
@@ -268,10 +268,10 @@ pub fn attempt_seatbelt(workspace_root: &Path, extra_readonly_paths: &[String]) 
     // to free here. A non-null buffer on a successful call is not documented but leaks the same
     // allocation libSystem owns, so it is read for whatever diagnostic it holds and released
     // exactly once, never touched again.
-    if !errorbuf.is_null() {
-        if let Some(text) = take_error_text(errorbuf) {
-            tracing::debug!("Seatbelt: libSystem left an errorbuf on a successful init: {text}");
-        }
+    if !errorbuf.is_null()
+        && let Some(text) = take_error_text(errorbuf)
+    {
+        tracing::debug!("Seatbelt: libSystem left an errorbuf on a successful init: {text}");
     }
 
     // 3. `rc == 0` proves the profile compiled and was installed — not that it is enforcing.
