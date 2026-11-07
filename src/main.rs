@@ -722,7 +722,7 @@ fn parse_args() -> CliArgs {
                      --debug          log all incoming and outgoing LLM and tool traffic to debug.log\n\
                      --config <path>  override the config file path\n\
                      --resume         rehydrate the previous run from .marmel/session/\n\
-                     --fresh          start fresh even if session_resume / MARMEL_RESUME is set\n\
+                     --fresh          start fresh even if session_resume / MARMEL_RESUME is set or the plan is unfinished\n\
                      -h, --help       print this help\n\n\
                      ARGS:\n    PROMPT           optional initial prompt to start the session"
                 );

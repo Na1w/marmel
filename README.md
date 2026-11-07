@@ -12,6 +12,7 @@ A terminal-driven autonomous coding assistant in Rust. Marmel connects to any Op
 - [Configuration](#configuration)
 - [Usage & Interface](#usage--interface)
   - [CLI Flags](#cli-flags)
+  - [Resuming a Previous Run](#resuming-a-previous-run)
   - [Interactive TUI](#interactive-tui)
   - [Keyboard Shortcuts](#keyboard-shortcuts)
   - [Slash Commands](#slash-commands)
@@ -36,7 +37,7 @@ A terminal-driven autonomous coding assistant in Rust. Marmel connects to any Op
 
 Marmel is designed for autonomous multi-step software engineering with continuous user supervision:
 
-- **Plan-Driven Execution:** When given a goal, the Manager creates a disk-backed execution plan at `.marmel/execution_plan.md` using a checkbox format (`- [ ] [t-xxx]`), and a task line may additionally carry an optional validation directive from a closed set — `(validate)` or `(no-validate)` — written **immediately before** the `(role)` hint and never after it: `- [ ] [t-001] Audit the parser (no-validate) (researcher)`. No directive means the role/config default, a blank or unrecognised paren group is never read as `(no-validate)`, and the token decides validation — not the wording of the brief. Tasks are checked off only when the deliverable carries its `MISSION COMPLETE (t-xxx)` marker — `FAILED`, `REPLAN REQUIRED`, or a marker-less result leaves the box unchecked — so a resumed run continues from the next unchecked task.
+- **Plan-Driven Execution:** When given a goal, the Manager creates a disk-backed execution plan at `.marmel/execution_plan.md` using a checkbox format (`- [ ] [t-xxx]`), and a task line may additionally carry an optional validation directive from a closed set — `(validate)` or `(no-validate)` — written **immediately before** the `(role)` hint and never after it: `- [ ] [t-001] Audit the parser (no-validate) (researcher)`. No directive means the role/config default, a blank or unrecognised paren group is never read as `(no-validate)`, and the token decides validation — not the wording of the brief. Tasks are checked off only when the deliverable carries its `MISSION COMPLETE (t-xxx)` marker — `FAILED`, `REPLAN REQUIRED`, or a marker-less result leaves the box unchecked — so a resumed run continues from the next unchecked task, and an unfinished plan is exactly what makes a plain `marmel` launch resume by default (see [Resuming a Previous Run](#resuming-a-previous-run)).
 - **Dynamic Subagents & JIT Prompt Architect:** Tasks are not sent to static prompts. An Agent Architect dynamically synthesizes a bespoke subagent blueprint (`.marmel/prompts/<task_id>.md`) combining archetype capabilities, domain skills (`skills/`), and least-privilege tool allowlists before delegation.
 - **Automated Validation:** Work produced by specialists is audited by an independent Validator subagent. If tests fail or requirements are missed, feedback is returned for revision. The audit is not unconditional: precedence runs role opt-out (`validator` / `planner`), then operator config (`enable_validator = false` or `max_validator_iterations = 0`), then the per-task `(no-validate)` / `(validate)` plan directive, then the role/config default — and a task designated validation-free still completes normally and checks its box off.
 - **Real-Time Steering & Interactive Dialogue:** You can type into the prompt at any point. Marmel pauses active subagents to answer questions, adjust the execution plan, or converse directly with working agents in real time.
@@ -151,7 +152,7 @@ Marmel reads exactly one configuration file — the first candidate below wins, 
 8. `~/.config/marmel/config.toml`
 9. `~/.config/marmel/marmel.toml`
 10. Environment variables (`MARMEL_BACKEND_URL`, `MARMEL_MODEL`, `MARMEL_AUTH_TOKEN`) — applied after the file, so they override it; `MARMEL_AUTH_TOKEN` applies only when the resolved token is still empty.
-11. Session environment variables (`MARMEL_RESUME`, one-way `MARMEL_SESSION_DISABLE`, `MARMEL_SESSION_COMMIT_MIN_MS`) — they fold into the `session_*` keys the same way, with `--resume` / `--fresh` beating all three.
+11. Session environment variables (`MARMEL_RESUME`, one-way `MARMEL_SESSION_DISABLE`, `MARMEL_SESSION_COMMIT_MIN_MS`) — they fold into the `session_*` keys the same way, with `--resume` / `--fresh` beating all three. `MARMEL_RESUME=0` declines the explicit resume request but does not switch off the plan-driven default, which is not an environment variable at all.
 12. Built-in defaults.
 
 > **Home directory (`~`) across platforms:** `~` resolves from `$HOME` when set and non-empty, then falls back to `%USERPROFILE%` (standard on Windows in `cmd.exe` and PowerShell, e.g. `C:\Users\<user>`), and finally to the OS password database (`getpwuid`) on Unix. On Windows you can place your global configuration at `%USERPROFILE%\.marmel\marmel.toml` (or `%USERPROFILE%\.marmel\config.toml`, `%USERPROFILE%\.config\marmel\config.toml`, `%USERPROFILE%\.config\marmel\marmel.toml`). The same home-directory resolution applies to `~` expansion in `system_prompt_path` and to user-level `~/.marmel/AGENTS.md`, `~/.marmel/ARCHETYPES.md`, and `~/.marmel/skills/`.
@@ -178,8 +179,8 @@ Marmel reads exactly one configuration file — the first candidate below wins, 
 | `enable_xml_rescue` | `true` | Parse pseudo-XML tool calls into valid JSON tool calls. |
 | `ui_mode` | `"tui"` | Interface mode: `"tui"` (Ratatui) or `"raw"` (streaming stdout). Raw mode is selected automatically whenever stdout is not a terminal — a pipe or a redirect — even with `"tui"` set. |
 | `debug` | `false` | Not a `marmel.toml` key: it is absent from the deserializing mirror, so only the `--debug` flag sets it. Logs all LLM and tool traffic to `.marmel/debug.log`. |
-| `session_enabled` | `true` | Capture the session bundle at all. `MARMEL_SESSION_DISABLE` can only turn it **off**; a disabled capture makes `--resume` a usage error (`exit 2`). |
-| `session_resume` | `false` | Resume automatically on every launch. Overridden by `--resume` / `--fresh` and by `MARMEL_RESUME`. Independent of it, a run with **no** flag resumes by default when `.marmel/execution_plan.md` still carries unchecked tasks and capture is enabled; that default is never fatal — a missing or refused bundle simply starts fresh. |
+| `session_enabled` | `true` | Capture the session bundle at all. `MARMEL_SESSION_DISABLE` can only turn it **off**; a disabled capture makes `--resume` a usage error (`exit 2`), and no plan-driven resume is ever attempted — a launch then simply starts fresh, with no error. |
+| `session_resume` | `false` | Ask for a resume on every launch — the explicit request, the same one `--resume` spells. `MARMEL_RESUME` overrides it (the environment beats the file) and `--fresh` beats both. Independent of it, a launch with **no** flag resumes by default when `.marmel/execution_plan.md` still carries unchecked tasks and capture is enabled; `--fresh` beats that default too, and the default is never fatal — a missing or refused bundle simply starts fresh. See [Resuming a Previous Run](#resuming-a-previous-run). |
 | `session_commit_min_interval_ms` | `250` | Floor between throttled commits (UI and worker-edge triggers only). Never delays turn boundaries, tool results, or ending commits. |
 | `session_commit_on_tool_result` | `true` | Commit after each tool result. |
 | `session_worker_mirror_max_messages` | `4000` | Cap on the mirrored conversation history stored per specialist. |
@@ -394,12 +395,37 @@ the full procedure.
 | `--config <path>` | Path to an explicit configuration file. |
 | `--raw` | Force headless stdout streaming mode (no TUI). |
 | `--debug` | Log every LLM and tool exchange to `.marmel/debug.log`. The only way to set `debug` at all. |
-| `--resume` | Rehydrate the previous run from `.marmel/session/`. A bundle that exists but is refused exits with code `3`; combining it with `--fresh`, or resuming while capture is disabled, is a usage error with exit `2`. With no flag at all, a plan on disk that still has unchecked tasks resumes by default — that implicit resume is never fatal: a missing or refused bundle starts fresh and never exits `3`. |
-| `--fresh` | Force a fresh start even when `session_resume` or `MARMEL_RESUME` is set, or when the execution plan on disk is unfinished — the escape hatch, and always the winner. |
+| `--resume` | Rehydrate the previous run from `.marmel/session/`. An explicit request, also spelled `MARMEL_RESUME=1` or `session_resume = true`. A bundle that exists but is refused exits with code `3`; combining it with `--fresh`, or resuming while capture is disabled, is a usage error with exit `2`. With no flag at all the same restore happens by default when the plan on disk is unfinished — see [Resuming a Previous Run](#resuming-a-previous-run). |
+| `--fresh` | Force a fresh start: it wins over `--resume`, `MARMEL_RESUME`, `session_resume` and an unfinished plan on disk alike — the escape hatch, and always the winner. |
 | `-h`, `--help` | Show command-line help. |
 | `[PROMPT]` | Optional initial prompt to immediately start the session. |
 
 Model, backend URL, and auth token are configuration keys and environment variables, never flags. There is no `--model`, `--temperature`, `--no-tui`, `--version`, or short flag other than `-h`: the parser has a catch-all arm that turns the first unrecognized token into the session goal, so `marmel --model gpt-x "task"` silently runs with `--model` as the goal and `ignoring extra argument: gpt-x` on stderr.
+
+### Resuming a Previous Run
+
+**Resume is the default when yesterday's plan is unfinished.** Launch `marmel` with no resume flag in a workspace whose `.marmel/execution_plan.md` still carries unchecked `- [ ]` tasks, and Marmel picks the previous run back up — transcript, workers and plan progress — instead of starting over. There is no flag to remember and nothing to type.
+
+What wins, from strongest to weakest:
+
+1. **`--fresh`** — always wins, including over an unfinished plan.
+2. **An explicit resume request** — `--resume`, `MARMEL_RESUME=1`, or `session_resume = true` (the environment variable beats the config key).
+3. **The plan-driven default** — an execution plan on disk with at least one pending task.
+4. **A fresh start** — everything else.
+
+**Opting out.** Pass `--fresh`. Finishing the plan works too: once every task is checked off, the next launch starts fresh on its own. `MARMEL_RESUME=0` declines the *explicit* request only — it does not switch the plan-driven default off.
+
+**The default is never fatal.** Only a request you made yourself promises a restore:
+
+| Situation on launch | `--resume` (explicit) | Unfinished plan (default) |
+|---|---|---|
+| No bundle in `.marmel/session/` | normal fresh start | normal fresh start, no error |
+| Bundle present but refused or corrupt | exit code `3` | fresh start, warning in the log — never `3` |
+| Capture disabled (`session_enabled = false`) | usage error, exit `2` | no resume attempted, no error |
+
+Explicit resume behaves exactly as it always has: `--resume` together with `--fresh` is a usage error (`exit 2`), and a refused `--resume` still stops the run with `3`.
+
+**When nothing is continued.** A plan whose task lines are all checked off, a plan file with no recognised task lines at all, and a plan that is missing, empty or unreadable each count as "nothing to continue", so the run starts fresh; an unreadable or malformed plan is logged as a warning rather than guessed at.
 
 ### Interactive TUI
 
@@ -494,7 +520,7 @@ Output format:
 ```
 
 - **No input, no commands.** Raw mode never reads stdin: `marmel --raw` with no `[PROMPT]` exits `0` immediately, and slash commands, keyboard shortcuts, and mid-flight steering are unreachable.
-- **Full event vocabulary.** Besides the tags above there are `[steer]`, `[thinking]`, `[status]`, `<agent_tag>:content`, `<agent_tag>:thinking`, and `[delegation] STARTED → …` / `DONE    …` / `FAILED  …`. A `--resume` run additionally labels the replayed pane content and the repair report: `[restored]` echoes each restored transcript line, and `[restore]` / `[restore-warning]` / `[restore-lost]` / `[restore-skipped]` carry the restore summary, the warnings, the lost entries and the panels raw mode cannot redraw. Token counters and queue-state transitions are silent, so headless output is byte-stable.
+- **Full event vocabulary.** Besides the tags above there are `[steer]`, `[thinking]`, `[status]`, `<agent_tag>:content`, `<agent_tag>:thinking`, and `[delegation] STARTED → …` / `DONE    …` / `FAILED  …`. A resumed run — `--resume`, or the plan-driven default — additionally labels the replayed pane content and the repair report: `[restored]` echoes each restored transcript line, and `[restore]` / `[restore-warning]` / `[restore-lost]` / `[restore-skipped]` carry the restore summary, the warnings, the lost entries and the panels raw mode cannot redraw. Token counters and queue-state transitions are silent, so headless output is byte-stable.
 - **Logs go to stderr.** In raw mode `tracing` writes to stderr instead of the rotating `.marmel/marmel.log`.
 
 ### Terminal Commands (`run_command` & PTY)
@@ -522,7 +548,7 @@ Internal session files are stored in `.marmel/` within the workspace root:
 | `.marmel/marmel.log` | Rotating application log for TUI mode (5 MiB, 3 backups). Raw mode logs to stderr instead. |
 | `.marmel/debug.log` | LLM and tool traffic, written only under `--debug`. |
 | `.marmel/archive/` | Archived completed execution plans. |
-| `.marmel/session/` | The **session bundle**: the split-file snapshot that `--resume` reads back (implemented in `src/session/**`: `src/session/mod.rs`, `src/session/commit.rs`, `src/session/format/`, `src/session/restore.rs`). It is a directory, never a single file. |
+| `.marmel/session/` | The **session bundle**: the split-file snapshot that a resumed run reads back (implemented in `src/session/**`: `src/session/mod.rs`, `src/session/commit.rs`, `src/session/format/`, `src/session/restore.rs`). It is a directory, never a single file. |
 | `.marmel/session/manifest.json` | The bundle's root document and **commit point**: format/schema versions, session id, wall/monotonic anchors, how the previous process ended, the identity floors, and the member list with each member's byte length and fingerprint. It is written **LAST** — that rename *is* the commit — and it is the only file that names the member set. |
 | `.marmel/session/manager.json` | Manager member: the message history (pinned system prompt and goal preserved byte-for-byte), the pin witness, and the engine scalars. |
 | `.marmel/session/ui.json` | UI member: pane text (chat, subagents, plan panel), status line, composer text + caret + history, scroll / selection / focus, subagent panels, and the token witnesses. |
