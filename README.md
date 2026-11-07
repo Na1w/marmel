@@ -397,6 +397,7 @@ the full procedure.
 | `--debug` | Log every LLM and tool exchange to `.marmel/debug.log`. The only way to set `debug` at all. |
 | `--resume` | Rehydrate the previous run from `.marmel/session/`. An explicit request, also spelled `MARMEL_RESUME=1` or `session_resume = true`. A bundle that exists but is refused exits with code `3`; combining it with `--fresh`, or resuming while capture is disabled, is a usage error with exit `2`. With no flag at all the same restore happens by default when the plan on disk is unfinished — see [Resuming a Previous Run](#resuming-a-previous-run). |
 | `--fresh` | Force a fresh start: it wins over `--resume`, `MARMEL_RESUME`, `session_resume` and an unfinished plan on disk alike — the escape hatch, and always the winner. |
+| `--keep-session` | Preserve runtime and session files in `.marmel/` upon completion. By default, completed execution plans clean up Marmel's runtime files (`prompts/`, `session/`, `archive/`, `marmel.log*`, `execution_plan.md`) leaving user-authored files intact (or removing `.marmel/` entirely if empty). |
 | `-h`, `--help` | Show command-line help. |
 | `[PROMPT]` | Optional initial prompt to immediately start the session. |
 
@@ -536,7 +537,9 @@ On Windows a one-shot command is not a pseudo-terminal session at all: it runs a
 
 ### Runtime Directory (`.marmel/`)
 
-Internal session files are stored in `.marmel/` within the workspace root:
+Internal session files are stored in `.marmel/` within the workspace root.
+
+By default, when an execution plan reaches completion, Marmel cleans up its internal runtime files (`session/`, `prompts/`, `archive/`, logs, and completed plan files) upon session exit. If no user-created files remain in `.marmel/`, the directory itself is removed so the repository is left completely clean. User-authored files (such as `marmel.toml` or `research/`) are always preserved. To opt out of this cleanup and keep all session artifacts on disk, pass `--keep-session`.
 
 | File / Folder | Purpose |
 |---|---|

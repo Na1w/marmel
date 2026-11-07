@@ -21,6 +21,9 @@ struct CliArgs {
     /// Force a fresh start: overrides `session_resume = true` and
     /// `MARMEL_RESUME=1`. `--fresh` always wins; it is the escape hatch.
     fresh: bool,
+    /// Preserve session and runtime files in `.marmel/` upon completion
+    /// (by default, completed execution plans clean up Marmel's runtime files).
+    keep_session: bool,
     prompt: Option<String>,
 }
 
@@ -333,6 +336,7 @@ fn main() -> Result<()> {
     // `false`/`false`: the resume-by-default decision belongs to
     // `ui::session::resume_intent`, which also weighs the execution plan on disk.
     ui::session::set_resume_request(args.resume, args.fresh);
+    manager::phase::set_keep_session(args.keep_session);
 
     if cfg.debug {
         let ws = harness::workspace::Workspace::new();
@@ -515,6 +519,10 @@ fn main() -> Result<()> {
     {
         eprintln!("{err}");
         std::process::exit(marmennill::session::EXIT_RESTORE_REFUSED);
+    }
+    if res.is_ok() && !manager::phase::is_keep_session() {
+        let plan = manager::phase::Plan::default();
+        let _ = plan.cleanup_completed();
     }
     res
 }
@@ -714,13 +722,15 @@ fn parse_args() -> CliArgs {
             // forgotten arm would make `--resume` the session's goal text.
             "--resume" => args.resume = true,
             "--fresh" => args.fresh = true,
+            "--keep-session" => args.keep_session = true,
             "-h" | "--help" => {
                 println!(
                     "marmel — autonomous agentic coding assistant\n\n\
-                     USAGE:\n    marmel [--config <path>] [--raw] [--debug] [--resume | --fresh] [PROMPT]\n\n\
+                     USAGE:\n    marmel [--config <path>] [--raw] [--debug] [--keep-session] [--resume | --fresh] [PROMPT]\n\n\
                      FLAGS:\n    --raw            force headless stdout (pipe-friendly) mode\n\
                      --debug          log all incoming and outgoing LLM and tool traffic to debug.log\n\
                      --config <path>  override the config file path\n\
+                     --keep-session   preserve session and runtime files in .marmel/ after completion\n\
                      --resume         rehydrate the previous run from .marmel/session/\n\
                      --fresh          start fresh even if session_resume / MARMEL_RESUME is set or the plan is unfinished\n\
                      -h, --help       print this help\n\n\
@@ -1026,6 +1036,7 @@ mod tests {
         let args = CliArgs::default();
         assert!(!args.resume);
         assert!(!args.fresh);
+        assert!(!args.keep_session);
     }
 
     /// No flags at all must produce no error, whatever the config says — the run
@@ -1107,7 +1118,11 @@ mod tests {
             .find("fn parse_args()")
             .map(|at| src[at..].to_string())
             .expect("parse_args must exist");
-        for (flag, field) in [("\"--resume\"", "resume"), ("\"--fresh\"", "fresh")] {
+        for (flag, field) in [
+            ("\"--resume\"", "resume"),
+            ("\"--fresh\"", "fresh"),
+            ("\"--keep-session\"", "keep_session"),
+        ] {
             let arm = parser
                 .find(flag)
                 .unwrap_or_else(|| panic!("parse_args must have a {flag} arm"));
