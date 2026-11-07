@@ -2111,7 +2111,7 @@ mod tests {
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains(SANDBOX_OPTOUT_ENV) && stderr.contains("WITHOUT Landlock"),
+            stderr.contains(SANDBOX_OPTOUT_ENV) && stderr.contains("WITHOUT the sandbox backend"),
             "an honoured opt-out must be warned about, got {stderr:?}"
         );
     }
