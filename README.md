@@ -331,7 +331,7 @@ When worktree isolation is active, agents create ephemeral worktrees under `.wor
 | `--debug` | Log LLM and tool interactions to `.marmel/debug.log`. |
 | `--resume` | Resume the previous run from `.marmel/session/`. |
 | `--fresh` | Force a fresh start, ignoring any existing session or unfinished plan. |
-| `--keep-session` | Preserve runtime and session files in `.marmel/` upon completion. By default, completed execution plans clean up Marmel's runtime files (`prompts/`, `session/`, `archive/`, `marmel.log*`, `execution_plan.md`) leaving user-authored files intact (or removing `.marmel/` entirely if empty). |
+| `--keep-session` | Preserve runtime and session files in `.marmel/` upon completion. By default, completed execution plans clean up Marmel's runtime files (`prompts/`, `session/`, `archive/`, `research/`, `tmp/`, `marmel.log*`, `execution_plan.md`) leaving user-authored files intact (or removing `.marmel/` entirely if empty). |
 | `-h`, `--help` | Show command-line help. |
 | `[PROMPT]` | Optional initial prompt to immediately start the session. |
 
@@ -429,9 +429,10 @@ Marmel maintains session state and working files in `.marmel/`:
 - `.marmel/session/`: Snapshot bundle for session resumption (`manifest.json`, worker journals).
 - `.marmel/marmel.log`: Application log file (with automatic rotation).
 - `.marmel/archive/`: Historical copies of completed plans.
+- `.marmel/research/`: Internal intermediate research notes created during execution.
 
 > [!TIP]
-> **Automatic Workspace Cleanup:** When an execution plan finishes all tasks, Marmel automatically deletes its temporary runtime files upon exit. User-created files in `.marmel/` (such as `marmel.toml` or notes in `research/`) are always preserved. Pass `--keep-session` to keep runtime snapshots.
+> **Automatic Workspace Cleanup:** When an execution plan finishes all tasks, Marmel automatically deletes its temporary runtime files upon exit (`prompts/`, `session/`, `archive/`, `research/`, `tmp/`, logs, and execution plan). User-created files in `.marmel/` (such as `marmel.toml` or `skills/`) are always preserved. Pass `--keep-session` to keep runtime snapshots.
 
 ---
 

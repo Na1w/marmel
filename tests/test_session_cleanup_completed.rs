@@ -1,9 +1,9 @@
 //! Integration tests for cleaning up .marmel on plan completion.
 //!
 //! When an execution plan finishes (`is_complete()`), runtime files (plan, prompts,
-//! session bundle, archive, logs) are swept at session end unless `--keep-session`
-//! is set. User-authored files are preserved, and empty `.marmel` directories are
-//! removed completely.
+//! session bundle, archive, research notes, temporary files, logs) are swept at session end
+//! unless `--keep-session` is set. User-authored files are preserved, and empty `.marmel`
+//! directories are removed completely.
 
 use std::fs;
 use std::sync::Mutex;
@@ -43,6 +43,10 @@ fn integration_cleanup_on_completion_removes_marmel_dir_when_empty() {
     fs::write(marmel_dir.join("session/manifest.json"), "{}").expect("manifest");
     fs::create_dir_all(marmel_dir.join("archive")).expect("archive dir");
     fs::write(marmel_dir.join("archive/plan_1.md"), "archive").expect("archive");
+    fs::create_dir_all(marmel_dir.join("research")).expect("research dir");
+    fs::write(marmel_dir.join("research/topic.md"), "research notes").expect("research notes");
+    fs::create_dir_all(marmel_dir.join("tmp")).expect("tmp dir");
+    fs::write(marmel_dir.join("tmp/overflow.txt"), "overflow").expect("tmp overflow");
     fs::write(marmel_dir.join("marmel.log"), "log").expect("log");
     fs::write(marmel_dir.join("debug.log"), "debug").expect("debug log");
 
@@ -73,12 +77,14 @@ fn integration_cleanup_preserves_user_files_and_keeps_marmel_dir() {
     // Add runtime files
     fs::create_dir_all(marmel_dir.join("prompts")).expect("prompts dir");
     fs::write(marmel_dir.join("prompts/t-001.md"), "prompt").expect("prompt file");
+    fs::create_dir_all(marmel_dir.join("research")).expect("research dir");
+    fs::write(marmel_dir.join("research/notes.md"), "research notes").expect("notes");
     fs::write(marmel_dir.join("marmel.log"), "log").expect("log");
 
     // Add user files
     fs::write(marmel_dir.join("marmel.toml"), "model = \"test\"").expect("config file");
-    fs::create_dir_all(marmel_dir.join("research")).expect("research dir");
-    fs::write(marmel_dir.join("research/notes.md"), "my notes").expect("notes");
+    fs::create_dir_all(marmel_dir.join("skills")).expect("skills dir");
+    fs::write(marmel_dir.join("skills/custom.md"), "my skill").expect("skill");
 
     let cleaned = plan.cleanup_completed().expect("cleanup_completed");
     assert!(cleaned, "completed plan must trigger cleanup");
@@ -91,12 +97,16 @@ fn integration_cleanup_preserves_user_files_and_keeps_marmel_dir() {
         "marmel.toml must be preserved"
     );
     assert!(
-        marmel_dir.join("research/notes.md").exists(),
-        "research/notes.md must be preserved"
+        marmel_dir.join("skills/custom.md").exists(),
+        "skills/custom.md must be preserved"
     );
     assert!(
         !marmel_dir.join("prompts").exists(),
         "prompts directory must be deleted"
+    );
+    assert!(
+        !marmel_dir.join("research").exists(),
+        "research directory must be deleted"
     );
     assert!(
         !marmel_dir.join("marmel.log").exists(),

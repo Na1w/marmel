@@ -2163,6 +2163,10 @@ fn test_cleanup_completed_removes_runtime_and_deletes_empty_dir() {
     fs::write(dir.join("archive/plan_1.md"), "archive").unwrap();
     fs::create_dir_all(dir.join("session")).unwrap();
     fs::write(dir.join("session/manifest.json"), "{}").unwrap();
+    fs::create_dir_all(dir.join("research")).unwrap();
+    fs::write(dir.join("research/topic.md"), "internal research").unwrap();
+    fs::create_dir_all(dir.join("tmp")).unwrap();
+    fs::write(dir.join("tmp/data.txt"), "overflow").unwrap();
     fs::write(dir.join("marmel.log"), "log line").unwrap();
     fs::write(dir.join("marmel.log.1"), "rotated log").unwrap();
     fs::write(dir.join("debug.log"), "debug line").unwrap();
@@ -2184,12 +2188,14 @@ fn test_cleanup_completed_preserves_user_files() {
     // Populate runtime files
     fs::create_dir_all(dir.join("prompts")).unwrap();
     fs::write(dir.join("prompts/t-001.md"), "prompt").unwrap();
+    fs::create_dir_all(dir.join("research")).unwrap();
+    fs::write(dir.join("research/internal.md"), "internal research notes").unwrap();
     fs::write(dir.join("marmel.log"), "log").unwrap();
 
     // Populate user files
     fs::write(dir.join("marmel.toml"), "model = \"custom\"").unwrap();
-    fs::create_dir_all(dir.join("research")).unwrap();
-    fs::write(dir.join("research/notes.md"), "my research").unwrap();
+    fs::create_dir_all(dir.join("skills")).unwrap();
+    fs::write(dir.join("skills/custom.md"), "my skill").unwrap();
 
     let cleaned = plan.cleanup_completed().unwrap();
     assert!(cleaned, "completed plan must trigger cleanup");
@@ -2202,12 +2208,16 @@ fn test_cleanup_completed_preserves_user_files() {
         "user config file must be preserved"
     );
     assert!(
-        dir.join("research/notes.md").exists(),
-        "user research files must be preserved"
+        dir.join("skills/custom.md").exists(),
+        "user skills files must be preserved"
     );
     assert!(
         !dir.join("prompts").exists(),
         "runtime prompts must be removed"
+    );
+    assert!(
+        !dir.join("research").exists(),
+        "runtime research notes must be removed"
     );
     assert!(
         !dir.join("marmel.log").exists(),

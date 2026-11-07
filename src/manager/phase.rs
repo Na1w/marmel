@@ -509,10 +509,10 @@ impl Plan {
     }
 
     /// Clean up runtime session artifacts (execution plan, prompts, session bundle,
-    /// logs, and plan archives) when the execution plan has been completed.
+    /// research notes, temporary files, logs, and plan archives) when the execution plan has been completed.
     ///
-    /// Preserves user-authored files (such as `marmel.toml`, `config.toml`, or custom
-    /// subdirectories like `research/`). If no files remain in the runtime directory,
+    /// Preserves user-authored files (such as `skills/`, `marmel.toml`, `config.toml`, or
+    /// custom configuration/archetype files). If no files remain in the runtime directory,
     /// the directory itself is removed so the workspace is left completely clean.
     ///
     /// Respects the [`is_keep_session`] opt-out: when `--keep-session` is set,
@@ -578,6 +578,16 @@ impl Plan {
         let archive_dir = self.archive_dir();
         if archive_dir.exists() {
             let _ = std::fs::remove_dir_all(&archive_dir);
+        }
+
+        let research_dir = self.dir.join("research");
+        if research_dir.exists() {
+            let _ = std::fs::remove_dir_all(&research_dir);
+        }
+
+        let tmp_dir = self.dir.join("tmp");
+        if tmp_dir.exists() {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
         }
 
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
