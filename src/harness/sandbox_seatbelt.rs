@@ -13,8 +13,8 @@
 //! and no parameter list. We call **`sandbox_init_with_parameters`** with `flags = 0` and an
 //! empty, NULL-terminated parameter list, for two reasons.
 //!
-//! The first is that the profile the emitter builds embeds **literal** paths (SBPL filters match
-//! path text, not resolved descriptors — a well-known macOS gotcha, unlike Landlock), so
+//! The first is that the profile the emitter builds embeds **literal** paths, because SBPL
+//! filters match path text rather than the resolved file descriptors Landlock matches, so
 //! there is no `$()` substitution to do, and an empty list states that explicitly instead of
 //! relying on the parameter slot being optional.
 //!

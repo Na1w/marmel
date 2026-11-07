@@ -1,4 +1,5 @@
-//! Behavioural tests for the macOS Seatbelt backend (`.marmel/research/seatbelt-design.md` §6).
+//! Behavioural tests for the macOS Seatbelt backend: they drive the sandbox re-entry child
+//! and assert what Seatbelt actually enforces.
 //!
 //! The Seatbelt backend is invisible to a Linux host — `src/harness/sandbox_seatbelt.rs` is gated
 //! by `#[cfg(target_os = "macos")]` and there is no Landlock on a Mac — so the emitted SBPL text

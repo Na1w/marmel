@@ -18,14 +18,12 @@
 //!   **both** spellings: a rule on the link spelling alone misses the path the kernel opens.
 //! * **`$TMPDIR`.** The per-user temp folder on macOS is not `/tmp` but a folder under
 //!   `/private/var/folders`, and the Linux policy has no entry for it. Without it `rustc`,
-//!   `cc`, `mktemp` and `tempfile` cannot write (gotcha 2), so it is always granted
-//!   read-write.
+//!   `cc`, `mktemp` and `tempfile` cannot write, so it is always granted read-write.
 //! * **A non-file operation block.** Seatbelt mediates `sysctl`, Mach lookups, signals,
 //!   sockets, network and `execve`/`fork`, which Landlock never mediates, so `(deny default)`
-//!   breaks a plain shell unless those are granted explicitly (gotcha 3 and 5). They are
-//!   emitted from [`NON_FILE_ALLOW_BLOCK`] as data, and the vocabulary is Apple-private: the
-//!   block is marked `[verify-on-Mac]` because it was never observed on a Mac from this
-//!   repository (research note §3 and §8).
+//!   breaks a plain shell unless those are granted explicitly. They are emitted from
+//!   [`NON_FILE_ALLOW_BLOCK`] as data, and the vocabulary is Apple-private: the block is
+//!   marked `[verify-on-Mac]` because it was never observed on a Mac from this repository.
 //!
 //! * **The proven shell floor.** Beyond the shared policy list the emitter also grants the
 //!   clauses a known-working reference profile (the `profiles/default.pb` of the upstream
@@ -65,7 +63,7 @@ pub const TMPDIR_ENV: &str = "TMPDIR";
 const TMPDIR_FALLBACK: &str = "/private/var/folders";
 
 /// FHS prefixes macOS serves as symlinks into `/private`, as `(link, real)` pairs. A policy
-/// entry at or below one of them is emitted under both spellings (gotcha 1).
+/// entry at or below one of them is emitted under both spellings.
 const PRIVATE_PATH_PREFIXES: &[(&str, &str)] = &[
     ("/tmp", "/private/tmp"),
     ("/var", "/private/var"),
@@ -94,7 +92,7 @@ const SINGLE_FILE_BASENAMES: &[&str] = &[".gitconfig", ".CFUserTextEncoding"];
 /// Read-only roots a macOS shell and toolchain needs that the Linux allow-list has no
 /// counterpart for: the system volume, the plain `/Library` tree, the Command Line Tools
 /// `ld`/`libtool` that `rustc` execs in its link steps, the real root of the `/tmp`, `/var`
-/// and `/etc` symlink targets, and Xcode when it is installed (gotcha 6). A rule on a root
+/// and `/etc` symlink targets, and Xcode when it is installed. A rule on a root
 /// the host does not have grants nothing. `/private` is read-only here: writes stay scoped to
 /// the individual entries (`/private/tmp`, the `TMPDIR` folder), never to the whole tree.
 const MACOS_READONLY_ADDITIONS: &[&str] = &[
@@ -226,16 +224,16 @@ const NON_FILE_ALLOW_BLOCK: &[&str] = &[
     // unfiltered rather than per tree.
     "(allow file-read-metadata)",
     // Device ioctls: `stty`/`ulimit` in the wrapped payload, PTY size queries (TIOCGWINSZ)
-    // and the dtrace helper node (gotcha 8).
+    // and the dtrace helper node.
     "(allow file-ioctl (subpath \"/dev\") (literal \"/dev/dtracehelper\"))",
-    // Mapping an executable image is its own operation on macOS 11+ (gotcha 4): the read
-    // grants alone are not enough for the dyld shared cache.
+    // Mapping an executable image is its own operation on macOS 11+: the read grants alone
+    // are not enough for the dyld shared cache.
     "(allow file-map-executable)",
 ];
 
 /// The dynamic-linker block inlined from `/System/Library/Sandbox/Profiles/dyld-support.sb` —
 /// verbatim from Chromium's `sandbox/policy/mac/common.sb:276-282`, because a profile handed
-/// to `sandbox_init*` is one flat string that cannot `import` it (gotcha 4).
+/// to `sandbox_init*` is one flat string that cannot `import` a file living on disk.
 const DYLD_SUPPORT_BLOCK: &str = "(allow file-read* file-map-executable \
     (subpath \"/System/Cryptexes/App\") \
     (subpath \"/System/Cryptexes/OS\") \
