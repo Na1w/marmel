@@ -1746,7 +1746,8 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/src/harness/sandbox.rs"
         ))
-        .expect("sandbox.rs must be readable from the crate manifest dir");
+        .expect("sandbox.rs must be readable from the crate manifest dir")
+        .replace("\r\n", "\n");
 
         let quote = char::from(34);
         let linux = format!("#[cfg(target_os = {quote}linux{quote})]\nfn attempt_backend(");

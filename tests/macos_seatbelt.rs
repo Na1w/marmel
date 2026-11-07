@@ -57,6 +57,17 @@ fn run_child(
     opt_out: bool,
     bad_profile: bool,
 ) -> Output {
+    run_child_with_home(workspace, command, extras, None, opt_out, bad_profile)
+}
+
+fn run_child_with_home(
+    workspace: &Path,
+    command: &str,
+    extras: Option<&str>,
+    home: Option<&Path>,
+    opt_out: bool,
+    bad_profile: bool,
+) -> Output {
     let exe = reentry_child();
     let mut cmd = Command::new(&exe);
     cmd.arg(SANDBOX_EXEC_ARG)
@@ -67,6 +78,9 @@ fn run_child(
         .env_remove(SEATBELT_TEST_BAD_PROFILE_ENV);
     if let Some(extra) = extras {
         cmd.env(SANDBOX_EXTRA_RO_PATHS_ENV, extra);
+    }
+    if let Some(home) = home {
+        cmd.env("HOME", home);
     }
     if opt_out {
         cmd.env(SANDBOX_OPTOUT_ENV, "1");
@@ -269,10 +283,11 @@ fn test_seatbelt_denies_the_ssh_home_even_under_an_operator_grant() {
     let extras = fake_home.to_string_lossy().into_owned();
 
     // 1. The grant itself is live: a plain file in the published home is readable.
-    let granted_read = run_child(
+    let granted_read = run_child_with_home(
         workspace.path(),
         &format!("cat '{}'", granted_file.display()),
         Some(extras.as_str()),
+        Some(&fake_home),
         false,
         false,
     );
@@ -289,10 +304,11 @@ fn test_seatbelt_denies_the_ssh_home_even_under_an_operator_grant() {
 
     // 2. The `.ssh` home inside that same granted directory must still be denied, and its content
     //    must never appear: the explicit denial outranks the grant, it is not undone by it.
-    let ssh_read = run_child(
+    let ssh_read = run_child_with_home(
         workspace.path(),
         &format!("cat '{}'", ssh_config.display()),
         Some(extras.as_str()),
+        Some(&fake_home),
         false,
         false,
     );
@@ -315,10 +331,11 @@ fn test_seatbelt_denies_the_ssh_home_even_under_an_operator_grant() {
 
     // 3. A file next to the granted home rather than under it stays unreadable: the grant covers
     //    the path it names and nothing around it.
-    let ungranted_read = run_child(
+    let ungranted_read = run_child_with_home(
         workspace.path(),
         &format!("cat '{}'", ungranted.display()),
         Some(extras.as_str()),
+        Some(&fake_home),
         false,
         false,
     );
@@ -331,7 +348,7 @@ fn test_seatbelt_denies_the_ssh_home_even_under_an_operator_grant() {
 
     // 4. Opted out, all three reads succeed: the denials above are Seatbelt's doing.
     let both = format!("cat '{}' '{}'", ssh_config.display(), ungranted.display());
-    let opted = run_child(workspace.path(), &both, None, true, false);
+    let opted = run_child_with_home(workspace.path(), &both, None, Some(&fake_home), true, false);
     let opted_stdout = stdout_of(&opted);
     assert!(
         opted.status.success()

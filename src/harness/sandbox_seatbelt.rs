@@ -70,7 +70,7 @@
 //! * [`path_answer`] asks whether a read of each path the rendered profile denies explicitly —
 //!   the SSH and GnuPG homes, from [`crate::harness::sbpl::SENSITIVE_DENIED_BASENAMES`] joined
 //!   onto the same `$HOME` the profile was rendered with — by passing `SANDBOX_FILTER_PATH` and
-//!   the path itself. `1` means the read is allowed, `0` means it is denied.
+//!   the path itself. `0` means the read is allowed, `1` means it is denied.
 //! * [`verdict`] turns those two answers into the [`SandboxAttempt`]: confined **and** denied is
 //!   `FullyEnforced`; confined but the read comes back allowed means the policy enforcing this
 //!   run is not the policy we rendered, which is `EnforcementFailed` and therefore a refusal; an
@@ -221,6 +221,16 @@ fn break_profile_for_test_env(text: String, requested: bool) -> String {
 /// to libSystem **once**, then prove enforcement with `sandbox_check`.
 #[must_use = "the Seatbelt attempt decides whether the re-entry child may exec at all"]
 pub fn attempt_seatbelt(workspace_root: &Path, extra_readonly_paths: &[String]) -> SandboxAttempt {
+    // The workspace root is the only required policy entry (see `policy_paths`): if it does not
+    // exist or cannot be accessed, the policy cannot be granted. Fail closed before installing
+    // anything, exactly like Landlock's `PathFd::new` check.
+    if let Err(err) = std::fs::metadata(workspace_root) {
+        return SandboxAttempt::RuleFailed {
+            path: workspace_root.display().to_string(),
+            reason: format!("opening workspace root: {err}"),
+        };
+    }
+
     // 1. One flat profile. Seatbelt has no reliable `import` across a string boundary, and the
     //    call below cannot be repeated, so every grant and every denial has to be in the text
     //    already. [`break_profile_for_test_env`] may replace this text with a deliberately
@@ -317,9 +327,9 @@ struct Probe {
 /// The answer `sandbox_check` gave about one path and one operation.
 #[derive(Debug, PartialEq, Eq)]
 enum PathAnswer {
-    /// The call answered `1`: the profile in force **allows** the read of that path.
+    /// The call answered `0`: the profile in force **allows** the read of that path.
     Allowed,
-    /// The call answered `0`: the read is denied — the evidence the verdict wants to see.
+    /// The call answered `1`: the read is denied — the evidence the verdict wants to see.
     Denied,
     /// An answer that is neither `0` nor `1`, or a path that could not be handed to the callee.
     /// Never confused with a denial: this is the "no evidence" case.
@@ -408,12 +418,12 @@ fn path_answer(path: &Path) -> PathAnswer {
     };
 
     match rc {
-        1 => PathAnswer::Allowed,
-        0 => PathAnswer::Denied,
+        0 => PathAnswer::Allowed,
+        1 => PathAnswer::Denied,
         other => PathAnswer::Unavailable {
             reason: format!(
                 "sandbox_check({PROBE_OPERATION}, {}, {}) returned {other}, which is neither 0 \
-                 (denied) nor 1 (allowed)",
+                 (allowed) nor 1 (denied)",
                 SANDBOX_FILTER_PATH,
                 path.display(),
             ),
@@ -448,7 +458,7 @@ fn verdict(confined: Option<bool>, probes: &[Probe]) -> SandboxAttempt {
             reason: format!(
                 "Seatbelt installed a profile that does not deny a read of \
                  {allowed} (sandbox_check({PROBE_OPERATION}, filter {SANDBOX_FILTER_PATH} \
-                 answered 1): the policy enforcing this run is not the policy it rendered",
+                 answered 0): the policy enforcing this run is not the policy it rendered",
                 allowed = allowed.join(", "),
             ),
         };
@@ -594,7 +604,7 @@ mod tests {
         );
     }
 
-    /// `sandbox_check` answering `1` for a path the profile denies is a policy failure, not a
+    /// `sandbox_check` answering `0` for a path the profile denies is a policy failure, not a
     /// warning: the run must be refused, and the reason must say which path read as allowed and
     /// which call said so.
     #[test]

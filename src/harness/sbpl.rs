@@ -293,7 +293,15 @@ pub fn path_dirs() -> Vec<PathBuf> {
 fn path_dirs_from_os(raw: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
     let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
     if let Some(raw) = raw {
-        dirs.extend(std::env::split_paths(&raw.to_os_string()).filter(|dir| dir.is_absolute()));
+        // Seatbelt is a macOS facility, so PATH entries are ':'-separated POSIX paths
+        // and absolute paths start with '/', even when this profile emitter is unit-tested
+        // on non-Unix hosts.
+        for part in raw.to_string_lossy().split(':') {
+            let trimmed = part.trim();
+            if trimmed.starts_with('/') {
+                dirs.insert(PathBuf::from(trimmed));
+            }
+        }
     }
     dirs.into_iter().collect()
 }
@@ -380,14 +388,15 @@ fn macos_floor_rules(home: Option<&Path>, path_dirs: &[PathBuf]) -> Vec<String> 
     }
 
     if let Some(home) = home {
+        let home_str = home.to_string_lossy().replace('\\', "/");
+        let home_trimmed = home_str.trim_end_matches('/');
         for name in MACOS_HOME_LITERAL_READONLY {
-            rules.push(format!(
-                "(allow file-read* (literal {}))",
-                quote_path(&home.join(name)),
-            ));
+            let path = format!("{home_trimmed}/{name}");
+            rules.push(format!("(allow file-read* (literal {}))", quote(&path),));
         }
         for name in MACOS_HOME_READWRITE {
-            let granted = quote_path(&home.join(name));
+            let path = format!("{home_trimmed}/{name}");
+            let granted = quote(&path);
             rules.push(format!("(allow file-read* (subpath {granted}))"));
             rules.push(format!("(allow file-write* (subpath {granted}))"));
         }
@@ -410,13 +419,13 @@ fn sensitive_deny_rules(home: Option<&Path>) -> Vec<String> {
     let Some(home) = home else {
         return Vec::new();
     };
+    let home_str = home.to_string_lossy().replace('\\', "/");
+    let home_trimmed = home_str.trim_end_matches('/');
     SENSITIVE_DENIED_BASENAMES
         .iter()
         .map(|base| {
-            format!(
-                "(deny file-read* (subpath {}))",
-                quote_path(&home.join(base)),
-            )
+            let path = format!("{home_trimmed}/{base}");
+            format!("(deny file-read* (subpath {}))", quote(&path),)
         })
         .collect()
 }
@@ -1082,7 +1091,11 @@ mod tests {
             );
         }
         if let Some(home) = home_from_env() {
-            let caches = quote_path(&home.join("Library/Caches"));
+            let home_str = home.to_string_lossy().replace('\\', "/");
+            let caches = quote(&format!(
+                "{}/Library/Caches",
+                home_str.trim_end_matches('/')
+            ));
             assert!(
                 profile.contains(&format!("(allow file-read* (subpath {caches}))"))
                     && profile.contains(&format!("(allow file-write* (subpath {caches}))")),
