@@ -518,6 +518,7 @@ fn boot_bundle(bundle: &Path) -> Booted {
         ui_transcript: &mut transcript,
     };
     let report = marmennill::ui::session::boot(
+        marmennill::ui::session::ResumeIntent::Explicit,
         &plan,
         &cfg,
         &mut engine,

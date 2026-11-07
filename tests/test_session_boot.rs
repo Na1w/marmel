@@ -771,3 +771,109 @@ fn a_sound_resume_rehydrates_through_the_cli_and_announces_the_restore() {
         run.stderr
     );
 }
+
+// ------------------------------------------------- resume by default, end to end
+
+/// Write the execution plan the child will find: `main` boots its manager with
+/// `Plan::default()`, rooted at `MARMEL_DIR` **relative to the working
+/// directory**, so `<dir>/.marmel/execution_plan.md` is the file the
+/// resume-by-default decision reads.
+fn write_unfinished_plan(dir: &Path) {
+    let plan_dir = dir.join(marmennill::manager::phase::MARMEL_DIR);
+    std::fs::create_dir_all(&plan_dir).expect("plan dir");
+    std::fs::write(
+        plan_dir.join(marmennill::manager::phase::PLAN_FILE),
+        "- [ ] [t-022] the task the previous run left open\n",
+    )
+    .expect("write the plan file");
+}
+
+/// The default this feature adds, end to end: **no flag at all**, an execution
+/// plan on disk with an open task, and a sound bundle — the run rehydrates the
+/// previous session exactly as `--resume` would, and ends with neither the
+/// refusal code nor a usage error.
+#[test]
+fn an_unfinished_plan_alone_resumes_without_any_flag() {
+    if expect_no_trust_store() {
+        assert_store_really_is_absent();
+    }
+
+    let dir = workspace(PLAIN_CONFIG);
+    write_bundle_at(dir.path());
+    write_unfinished_plan(dir.path());
+
+    let run = run_marmel(dir.path(), &["--config", "marmel.toml"], &[]);
+    assert!(!run.timed_out, "the boot path returns promptly: {run:?}");
+    assert_booted_past_the_tls_setup(&run, "an implicit resume");
+    assert!(
+        run.code != Some(marmennill::session::EXIT_RESTORE_REFUSED)
+            && run.code != Some(2)
+            && run.code != Some(PANIC_EXIT_CODE),
+        "an implicit resume is neither a refusal, a usage error, nor a panic in TLS setup: {run:?}"
+    );
+    assert!(
+        run.stdout
+            .contains("Session restored (session id session-t022-e2e"),
+        "the plan on disk alone must restore the bundle, got {:?}",
+        run.stdout
+    );
+    assert!(
+        !run.stderr.contains("session restore refused"),
+        "and nothing was refused: {:?}",
+        run.stderr
+    );
+}
+
+/// The other half of the guarantee: the same fixture with the bundle damaged is
+/// **not** fatal, because nobody asked for the resume. The refusal is logged, the
+/// run continues fresh, and it must never end with `EXIT_RESTORE_REFUSED` (3) —
+/// the code an explicit `--resume` still ends on for this very bundle
+/// (`a_refused_resume_exits_with_the_named_refusal_code_and_says_so_three_times`).
+#[test]
+fn an_unfinished_plan_never_turns_a_refused_bundle_into_exit_three() {
+    if expect_no_trust_store() {
+        assert_store_really_is_absent();
+    }
+
+    let dir = workspace(PLAIN_CONFIG);
+    let bundle = write_bundle_at(dir.path());
+    tamper_format_version(&bundle);
+    write_unfinished_plan(dir.path());
+    let bundle_before = tree_bytes(&bundle);
+
+    let run = run_marmel(dir.path(), &["--config", "marmel.toml"], &[]);
+    assert!(
+        !run.timed_out,
+        "a degraded refusal returns promptly: {run:?}"
+    );
+    assert_booted_past_the_tls_setup(&run, "an implicit resume of a refused bundle");
+    assert_ne!(
+        run.code,
+        Some(marmennill::session::EXIT_RESTORE_REFUSED),
+        "an unrequested resume must never end on exit 3: {run:?}"
+    );
+    assert_ne!(run.code, Some(2), "and never on a usage error: {run:?}");
+    // In raw mode `tracing`'s sink **is** stderr, so the log line belongs there;
+    // what must never appear is the pane verdict a requested resume prints, and
+    // what must never happen is the exit code that verdict maps onto.
+    assert!(
+        run.stderr.contains("implicit resume refused"),
+        "the degradation is logged, got {:?}",
+        run.stderr
+    );
+    assert!(
+        !run.stdout.contains("session restore refused") && !run.stdout.contains("exit code 3"),
+        "the run-stopping verdict is never printed to a user who asked for nothing: {:?}",
+        run.stdout
+    );
+    assert!(
+        !run.stdout.contains("Session restored"),
+        "and nothing was restored: {:?}",
+        run.stdout
+    );
+    assert_eq!(
+        tree_bytes(&bundle),
+        bundle_before,
+        "a degraded refusal never repairs the bundle in place"
+    );
+}

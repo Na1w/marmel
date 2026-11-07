@@ -179,7 +179,7 @@ Marmel reads exactly one configuration file — the first candidate below wins, 
 | `ui_mode` | `"tui"` | Interface mode: `"tui"` (Ratatui) or `"raw"` (streaming stdout). Raw mode is selected automatically whenever stdout is not a terminal — a pipe or a redirect — even with `"tui"` set. |
 | `debug` | `false` | Not a `marmel.toml` key: it is absent from the deserializing mirror, so only the `--debug` flag sets it. Logs all LLM and tool traffic to `.marmel/debug.log`. |
 | `session_enabled` | `true` | Capture the session bundle at all. `MARMEL_SESSION_DISABLE` can only turn it **off**; a disabled capture makes `--resume` a usage error (`exit 2`). |
-| `session_resume` | `false` | Resume automatically on every launch. Overridden by `--resume` / `--fresh` and by `MARMEL_RESUME`. |
+| `session_resume` | `false` | Resume automatically on every launch. Overridden by `--resume` / `--fresh` and by `MARMEL_RESUME`. Independent of it, a run with **no** flag resumes by default when `.marmel/execution_plan.md` still carries unchecked tasks and capture is enabled; that default is never fatal — a missing or refused bundle simply starts fresh. |
 | `session_commit_min_interval_ms` | `250` | Floor between throttled commits (UI and worker-edge triggers only). Never delays turn boundaries, tool results, or ending commits. |
 | `session_commit_on_tool_result` | `true` | Commit after each tool result. |
 | `session_worker_mirror_max_messages` | `4000` | Cap on the mirrored conversation history stored per specialist. |
@@ -394,8 +394,8 @@ the full procedure.
 | `--config <path>` | Path to an explicit configuration file. |
 | `--raw` | Force headless stdout streaming mode (no TUI). |
 | `--debug` | Log every LLM and tool exchange to `.marmel/debug.log`. The only way to set `debug` at all. |
-| `--resume` | Rehydrate the previous run from `.marmel/session/`. A bundle that exists but is refused exits with code `3`; combining it with `--fresh`, or resuming while capture is disabled, is a usage error with exit `2`. |
-| `--fresh` | Force a fresh start even when `session_resume` or `MARMEL_RESUME` is set — the escape hatch, and always the winner. |
+| `--resume` | Rehydrate the previous run from `.marmel/session/`. A bundle that exists but is refused exits with code `3`; combining it with `--fresh`, or resuming while capture is disabled, is a usage error with exit `2`. With no flag at all, a plan on disk that still has unchecked tasks resumes by default — that implicit resume is never fatal: a missing or refused bundle starts fresh and never exits `3`. |
+| `--fresh` | Force a fresh start even when `session_resume` or `MARMEL_RESUME` is set, or when the execution plan on disk is unfinished — the escape hatch, and always the winner. |
 | `-h`, `--help` | Show command-line help. |
 | `[PROMPT]` | Optional initial prompt to immediately start the session. |
 

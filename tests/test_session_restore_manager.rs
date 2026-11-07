@@ -1163,6 +1163,7 @@ fn ac_m8_engine_scalars_survive_and_budget_drift_is_reported() {
         ui_transcript: &mut transcript,
     };
     let boot = marmennill::ui::session::boot(
+        marmennill::ui::session::ResumeIntent::Explicit,
         &plan,
         &cfg,
         &mut boot_engine,

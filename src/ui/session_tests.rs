@@ -1112,7 +1112,7 @@ async fn test_ui_run_session_executes_parallel_delegations() {
 }
 
 // ---------------------------------------------------------------------------
-// The boot wiring — `resume_requested`, `boot_if_requested`, `boot`.
+// The boot wiring — `resume_intent`, `boot_if_requested`, `boot`.
 //
 // These exercise the ONE restore pass the session loop runs before its manager
 // loop: `load_bundle` -> floors + `WORKERS` -> the engine -> the panes -> the
@@ -1121,8 +1121,8 @@ async fn test_ui_run_session_executes_parallel_delegations() {
 // ---------------------------------------------------------------------------
 
 use super::session::{
-    BootSink, boot_if_requested, build_manager_context, build_restored_context, resume_requested,
-    set_resume_request,
+    BootSink, ResumeIntent, boot_if_requested, build_manager_context, build_restored_context,
+    explicit_resume_requested, resume_intent, set_resume_request,
 };
 use crate::session::commit::{CapturePayload, CommitLock, CommitPolicy, write_bundle};
 use crate::session::format::TimePoint;
@@ -1407,40 +1407,198 @@ fn resume_trigger_precedence_is_fresh_then_resume_then_env_then_config() {
     cfg.session_resume = false;
 
     set_resume_request(false, false);
-    assert!(!resume_requested(&cfg), "nothing asked: fresh start");
+    assert!(
+        !explicit_resume_requested(&cfg),
+        "nothing asked: fresh start"
+    );
 
     cfg.session_resume = true;
     assert!(
-        resume_requested(&cfg),
+        explicit_resume_requested(&cfg),
         "session_resume = true (or MARMEL_RESUME folded into it) restores"
     );
 
     set_resume_request(true, false);
-    assert!(resume_requested(&cfg), "--resume restores");
+    assert!(explicit_resume_requested(&cfg), "--resume restores");
 
     cfg.session_resume = false;
-    assert!(resume_requested(&cfg), "--resume alone restores");
+    assert!(explicit_resume_requested(&cfg), "--resume alone restores");
 
     set_resume_request(true, true);
     assert!(
-        !resume_requested(&cfg),
+        !explicit_resume_requested(&cfg),
         "--fresh wins over --resume and over the config/env spelling"
     );
 
     set_resume_request(false, true);
     assert!(
-        !resume_requested(&cfg),
+        !explicit_resume_requested(&cfg),
         "--fresh alone also outranks session_resume = true"
     );
 
     // Leave the process-wide handoff exactly as the rest of the suite expects it.
     set_resume_request(false, false);
-    assert!(!resume_requested(&cfg));
+    assert!(!explicit_resume_requested(&cfg));
+}
+
+// ---------------------------------------------------------------------------
+// Resume by default: `resume_intent` against the execution plan on disk.
+//
+// The resolution rules are pinned here, on a real `Plan` over a temp directory —
+// never `Plan::default()`, which would point at this repository's own `.marmel/`.
+// What the intents then do inside the boot pass (silent degradation, no exit 3) is
+// pinned in the boot section below.
+// ---------------------------------------------------------------------------
+
+/// Write `content` as the plan file of `plan`, creating the directory if needed.
+fn write_plan_file(plan: &crate::manager::phase::Plan, content: &str) {
+    std::fs::create_dir_all(plan.dir()).expect("plan dir");
+    std::fs::write(plan.plan_path(), content).expect("write the plan file");
+}
+
+/// A plan with one unchecked task line: `PlanWorkState::Unfinished`.
+fn write_unfinished_plan(plan: &crate::manager::phase::Plan) {
+    write_plan_file(plan, "- [ ] [t-001] the task that is still open\n");
+}
+
+/// A plan whose only task line is checked: `PlanWorkState::Complete`.
+fn write_complete_plan(plan: &crate::manager::phase::Plan) {
+    write_plan_file(plan, "- [x] [t-001] the task that is done\n");
+}
+
+/// A non-empty plan file the grammar recognises no task line in:
+/// `PlanWorkState::Unknown`.
+fn write_unknown_plan(plan: &crate::manager::phase::Plan) {
+    write_plan_file(plan, "free prose, and not one checkbox line\n");
+}
+
+/// [`resume_intent`] with the process-wide flag handoff driven explicitly, left at
+/// rest afterwards so no other test inherits it.
+fn intent_with_flags(
+    plan: &crate::manager::phase::Plan,
+    cfg: &Config,
+    resume: bool,
+    fresh: bool,
+) -> ResumeIntent {
+    let _resume_guard = RESUME_FLAGS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    set_resume_request(resume, fresh);
+    let intent = resume_intent(plan, cfg);
+    set_resume_request(false, false);
+    intent
+}
+
+/// The default this feature adds: an execution plan on disk that still has open
+/// tasks, no flag, and capture enabled — continue the previous run.
+#[test]
+fn unfinished_plan_without_a_flag_is_an_implicit_resume() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan = crate::manager::phase::Plan::at(tmp.path());
+    write_unfinished_plan(&plan);
+    let cfg = boot_cfg();
+    assert!(!cfg.session_resume, "no explicit trigger in this Config");
+    assert!(cfg.session_enabled, "capture is on by default");
+    assert_eq!(
+        intent_with_flags(&plan, &cfg, false, false),
+        ResumeIntent::Implicit
+    );
+}
+
+/// The escape hatch still wins: `--fresh` never resumes, not even over an
+/// unfinished plan (and over `session_resume = true` at the same time).
+#[test]
+fn fresh_flag_beats_an_unfinished_plan() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan = crate::manager::phase::Plan::at(tmp.path());
+    write_unfinished_plan(&plan);
+    let mut cfg = boot_cfg();
+    cfg.session_resume = true;
+    assert_eq!(
+        intent_with_flags(&plan, &cfg, false, true),
+        ResumeIntent::Fresh,
+        "--fresh outranks the config and the plan on disk"
+    );
+}
+
+/// An explicit trigger is explicit whatever the plan says: a complete plan and a
+/// missing plan are both restored, because the operator asked.
+#[test]
+fn explicit_resume_is_explicit_with_a_complete_or_a_missing_plan() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan = crate::manager::phase::Plan::at(tmp.path());
+    let cfg = boot_cfg();
+
+    write_complete_plan(&plan);
+    assert_eq!(
+        intent_with_flags(&plan, &cfg, true, false),
+        ResumeIntent::Explicit,
+        "a complete plan changes nothing about an explicit --resume"
+    );
+
+    std::fs::remove_file(plan.plan_path()).expect("remove the plan");
+    assert_eq!(
+        intent_with_flags(&plan, &cfg, true, false),
+        ResumeIntent::Explicit,
+        "a missing plan changes nothing about an explicit --resume"
+    );
+}
+
+/// No flag and nothing to continue: `Complete`, `NoPlan` and `Unknown` all stay
+/// `Fresh` — the default fails closed instead of guessing.
+#[test]
+fn no_flag_with_a_complete_missing_or_unknown_plan_stays_fresh() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan = crate::manager::phase::Plan::at(tmp.path());
+    let cfg = boot_cfg();
+
+    assert_eq!(
+        intent_with_flags(&plan, &cfg, false, false),
+        ResumeIntent::Fresh,
+        "no plan file at all"
+    );
+
+    write_complete_plan(&plan);
+    assert_eq!(
+        intent_with_flags(&plan, &cfg, false, false),
+        ResumeIntent::Fresh,
+        "a plan with nothing left to do"
+    );
+
+    write_unknown_plan(&plan);
+    assert_eq!(
+        intent_with_flags(&plan, &cfg, false, false),
+        ResumeIntent::Fresh,
+        "a plan the grammar cannot read is never resumed on a guess"
+    );
+}
+
+/// Capture disabled can never reach the implicit default, so a user who never
+/// asked can never be handed the usage error that guards `--resume`.
+#[test]
+fn capture_disabled_without_a_flag_stays_fresh_even_with_an_unfinished_plan() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan = crate::manager::phase::Plan::at(tmp.path());
+    write_unfinished_plan(&plan);
+    let cfg = Config {
+        session_enabled: false,
+        ..boot_cfg()
+    };
+    assert_eq!(
+        intent_with_flags(&plan, &cfg, false, false),
+        ResumeIntent::Fresh,
+        "a run that writes no bundle is never resumed"
+    );
 }
 
 /// The fresh path is untouched by the restore pass: with a real bundle sitting
 /// on disk and nobody asking for a resume, the pass installs **nothing**, and the
 /// prompt this process composed stays at `[0]`.
+///
+/// A bundle alone is deliberately **not** a reason to resume: the default is keyed
+/// off the execution plan on disk ([`resume_intent`]), and this plan directory
+/// holds none, so the resolved intent is [`ResumeIntent::Fresh`] and the bundle
+/// below is live ammunition that must never be opened.
 #[test]
 fn fresh_boot_never_reads_a_bundle_and_keeps_the_live_prompt() {
     let _resume_guard = RESUME_FLAGS_LOCK
@@ -1462,8 +1620,14 @@ fn fresh_boot_never_reads_a_bundle_and_keeps_the_live_prompt() {
 
     let cfg = boot_cfg();
     assert!(
-        !resume_requested(&cfg),
-        "the default Config asks for a fresh run"
+        !cfg.session_resume,
+        "the default Config asks for no restore"
+    );
+    let intent = resume_intent(&plan, &cfg);
+    assert_eq!(
+        intent,
+        ResumeIntent::Fresh,
+        "no flag and no plan on disk: the default stays a fresh run"
     );
     let mut ctx = build_manager_context(&cfg, "the prompt this process composed".to_string());
     assert!(
@@ -1480,7 +1644,7 @@ fn fresh_boot_never_reads_a_bundle_and_keeps_the_live_prompt() {
             ui_transcript: &mut transcript,
         };
         boot_if_requested(
-            resume_requested(&cfg),
+            intent,
             &plan,
             &cfg,
             &mut ctx,
@@ -1561,7 +1725,7 @@ fn resume_boot_installs_manager_history_workers_and_panes_in_one_pass() {
             ui_transcript: &mut transcript,
         };
         boot_if_requested(
-            true,
+            ResumeIntent::Explicit,
             &plan,
             &cfg,
             &mut ctx,
@@ -1794,7 +1958,7 @@ fn refusal_installs_nothing_and_is_carried_as_exit_three() {
             ui_transcript: &mut transcript,
         };
         boot_if_requested(
-            true,
+            ResumeIntent::Explicit,
             &plan,
             &cfg,
             &mut ctx,
@@ -1894,7 +2058,7 @@ fn partial_restore_continues_and_surfaces_the_unrecoverable_worker() {
             ui_transcript: &mut transcript,
         };
         boot_if_requested(
-            true,
+            ResumeIntent::Explicit,
             &plan,
             &cfg,
             &mut ctx,
@@ -1978,7 +2142,7 @@ fn resume_without_a_bundle_is_a_loud_fresh_start() {
             ui_transcript: &mut transcript,
         };
         boot_if_requested(
-            true,
+            ResumeIntent::Explicit,
             &plan,
             &cfg,
             &mut ctx,
@@ -2032,6 +2196,164 @@ fn resume_without_a_bundle_is_a_loud_fresh_start() {
     assert_eq!(goal, "a goal with no bundle behind it");
 }
 
+/// An implicit resume with **no** bundle is silent: nobody asked, so nobody is
+/// told anything, nothing is installed, and nothing is an error.
+#[test]
+fn implicit_resume_with_no_bundle_is_silent_and_starts_fresh() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan = crate::manager::phase::Plan::at(tmp.path());
+    write_unfinished_plan(&plan);
+    let cfg = boot_cfg();
+    let intent = intent_with_flags(&plan, &cfg, false, false);
+    assert_eq!(
+        intent,
+        ResumeIntent::Implicit,
+        "the fixture must really resolve to an implicit resume"
+    );
+
+    let mut ctx = build_restored_context(&cfg);
+    let mut renderer = BootRenderer::default();
+    let mut transcript = UiTranscript::new();
+    let mut session_id = String::new();
+    let outcome = {
+        let mut sink = BootSink {
+            ui_transcript: &mut transcript,
+        };
+        boot_if_requested(
+            intent,
+            &plan,
+            &cfg,
+            &mut ctx,
+            &mut renderer,
+            &mut session_id,
+            &mut sink,
+        )
+    };
+    assert!(
+        outcome
+            .expect("an implicit resume is never an error")
+            .is_none(),
+        "nothing existed, so nothing was installed"
+    );
+    assert!(
+        renderer.events.is_empty(),
+        "an implicit resume says nothing on the terminal, got {:?}",
+        renderer.status_lines()
+    );
+    assert!(transcript.is_empty(), "and journals nothing");
+    assert!(ctx.messages().is_empty());
+    assert_eq!(ctx.pin_setter_calls(), 0);
+    assert!(renderer.restored_panes.is_empty());
+    assert!(renderer.announcements.is_empty());
+    assert!(session_id.is_empty());
+}
+
+/// A bundle that exists but is refused is **never** fatal on an implicit resume:
+/// the refusal is logged, nothing is installed, the run continues fresh, and the
+/// typed `RestoreRefused` that `main` maps onto exit `3` is never produced. The
+/// same fixture under an explicit `--resume` is the control: it still refuses, so
+/// the difference is the intent and not a broken bundle.
+#[test]
+fn implicit_resume_with_a_refused_bundle_degrades_to_a_fresh_start() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan = crate::manager::phase::Plan::at(tmp.path());
+    let key = "coder-t012-implicit-refused";
+    let bundle = write_boot_bundle(
+        &plan,
+        &boot_payload(vec![boot_worker(key)]),
+        ProcessEnding::UserAbort,
+    );
+    crate::orchestrator::workers::remove_worker_entry_for_test(key);
+    tamper_member(&bundle, MANAGER_FILE);
+    write_unfinished_plan(&plan);
+
+    let cfg = boot_cfg();
+    let intent = intent_with_flags(&plan, &cfg, false, false);
+    assert_eq!(
+        intent,
+        ResumeIntent::Implicit,
+        "the fixture must really resolve to an implicit resume"
+    );
+
+    let mut ctx = build_restored_context(&cfg);
+    let mut renderer = BootRenderer::default();
+    let mut transcript = UiTranscript::new();
+    let mut session_id = String::new();
+    let outcome = {
+        let mut sink = BootSink {
+            ui_transcript: &mut transcript,
+        };
+        boot_if_requested(
+            intent,
+            &plan,
+            &cfg,
+            &mut ctx,
+            &mut renderer,
+            &mut session_id,
+            &mut sink,
+        )
+    };
+    match outcome {
+        Ok(report) => assert!(
+            report.is_none(),
+            "a degraded refusal installs nothing, so there is no report: {report:?}"
+        ),
+        Err(refused) => {
+            panic!("an implicit resume must never turn a refusal into a hard stop, got {refused}")
+        }
+    }
+    assert!(
+        renderer.events.is_empty(),
+        "the refusal sentences are logged, never printed, got {:?}",
+        renderer.status_lines()
+    );
+    assert!(transcript.is_empty(), "and never journaled");
+    assert!(ctx.messages().is_empty(), "a refusal installs nothing");
+    assert_eq!(ctx.pin_setter_calls(), 0);
+    assert!(
+        crate::orchestrator::workers::worker_state_snapshot(key).is_none(),
+        "a degraded refusal installs no worker"
+    );
+    assert!(renderer.restored_panes.is_empty());
+    assert!(renderer.announcements.is_empty());
+    assert!(session_id.is_empty());
+
+    // Control: the very same bundle under `--resume` is still the hard stop.
+    let explicit = intent_with_flags(&plan, &cfg, true, false);
+    assert_eq!(explicit, ResumeIntent::Explicit);
+    let mut ctx = build_restored_context(&cfg);
+    let mut renderer = BootRenderer::default();
+    let mut transcript = UiTranscript::new();
+    let mut session_id = String::new();
+    let outcome = {
+        let mut sink = BootSink {
+            ui_transcript: &mut transcript,
+        };
+        boot_if_requested(
+            explicit,
+            &plan,
+            &cfg,
+            &mut ctx,
+            &mut renderer,
+            &mut session_id,
+            &mut sink,
+        )
+    };
+    assert!(
+        outcome.is_err(),
+        "an explicit resume still refuses the same bundle, so the degradation above is an \
+         intent decision and not a broken fixture"
+    );
+    assert!(
+        renderer
+            .status_lines()
+            .iter()
+            .any(|line| line.contains("exit code 3")),
+        "and it is still loud about the exit code it maps onto, got {:?}",
+        renderer.status_lines()
+    );
+}
+
 /// The resume branch builds the engine **without** a system prompt on purpose (a
 /// restore may never route through a pin setter), so a resume trigger with **no**
 /// bundle must re-install the composed prompt before the goal is pinned; otherwise
@@ -2039,7 +2361,7 @@ fn resume_without_a_bundle_is_a_loud_fresh_start() {
 /// with no system prompt, silently, exit `0`. Asserted on the request that is
 /// really sent, through a wiremock backend: `[0]` is byte-identical to a plain
 /// fresh start and is the composed prompt. The trigger here is
-/// `Config::session_resume`, but because `run_session` reads [`resume_requested`]
+/// `Config::session_resume`, but because `run_session` reads [`resume_intent`]
 /// (which consults the process-wide `FRESH_REQUESTED` and `RESUME_REQUESTED`
 /// statics), this test must hold [`RESUME_FLAGS_LOCK`] to avoid racing with
 /// tests that mutate those flags.
@@ -2283,7 +2605,7 @@ fn rewrite_manifest_format_version(bundle: &std::path::Path, version: u32) {
 
 /// One boot pass, exactly as the session loop calls it.
 fn run_boot(
-    resume: bool,
+    intent: ResumeIntent,
     plan: &crate::manager::phase::Plan,
     cfg: &Config,
     ctx: &mut ContextEngine,
@@ -2291,13 +2613,17 @@ fn run_boot(
     session_id: &mut String,
     sink: &mut BootSink<'_>,
 ) -> Result<Option<super::session::BootReport>, crate::session::restore::RestoreRefused> {
-    boot_if_requested(resume, plan, cfg, ctx, renderer, session_id, sink)
+    boot_if_requested(intent, plan, cfg, ctx, renderer, session_id, sink)
 }
 
 /// A fresh boot is untouched by the restore path. The bundle on disk is one the
 /// resume path would **refuse** (an unknown `format_version`), so a pass that so
 /// much as opened the directory would say so; a fresh boot says nothing, installs
 /// nothing, and leaves every byte under the plan directory alone.
+///
+/// The default is keyed off the **execution plan**, never off the bundle: this
+/// plan directory holds no plan file, so the resolved intent is
+/// [`ResumeIntent::Fresh`] even though a bundle sits there.
 #[test]
 fn fresh_boot_never_opens_the_bundle_dir_even_when_it_would_refuse() {
     let _resume_guard = RESUME_FLAGS_LOCK
@@ -2332,7 +2658,13 @@ fn fresh_boot_never_opens_the_bundle_dir_even_when_it_would_refuse() {
         !cfg.session_resume,
         "the default Config asks for a fresh run"
     );
-    assert!(!resume_requested(&cfg), "and no CLI flag was handed over");
+    let intent = resume_intent(&plan, &cfg);
+    assert_eq!(
+        intent,
+        ResumeIntent::Fresh,
+        "no flag was handed over and no plan file exists, so even a bundle the resume \
+         path would refuse is never opened"
+    );
 
     let mut ctx = build_manager_context(&cfg, "the prompt this process composed".to_string());
     let ctx_before = wire_bytes(ctx.messages());
@@ -2351,7 +2683,7 @@ fn fresh_boot_never_opens_the_bundle_dir_even_when_it_would_refuse() {
             ui_transcript: &mut transcript,
         };
         run_boot(
-            resume_requested(&cfg),
+            intent,
             &plan,
             &cfg,
             &mut ctx,
@@ -2558,7 +2890,7 @@ fn resume_boot_restores_the_manager_history_element_for_element() {
             ui_transcript: &mut transcript,
         };
         run_boot(
-            true,
+            ResumeIntent::Explicit,
             &plan,
             &cfg,
             &mut ctx,
@@ -2823,7 +3155,7 @@ fn resume_boot_assigns_every_pane_string_verbatim_including_the_plan_pane() {
             ui_transcript: &mut transcript,
         };
         run_boot(
-            true,
+            ResumeIntent::Explicit,
             &plan,
             &cfg,
             &mut ctx,
@@ -3015,7 +3347,7 @@ fn resume_boot_rebuilds_every_worker_key_and_never_lowers_the_identity_floors() 
             ui_transcript: &mut transcript,
         };
         run_boot(
-            true,
+            ResumeIntent::Explicit,
             &plan,
             &cfg,
             &mut ctx,
@@ -3213,7 +3545,7 @@ fn refusal_on_an_ununderstood_format_version_installs_nothing_and_is_exit_three(
             ui_transcript: &mut transcript,
         };
         run_boot(
-            true,
+            ResumeIntent::Explicit,
             &plan,
             &cfg,
             &mut ctx,
@@ -3391,7 +3723,7 @@ fn one_corrupt_worker_file_is_the_tolerated_partial_and_the_rest_installs() {
             ui_transcript: &mut transcript,
         };
         run_boot(
-            true,
+            ResumeIntent::Explicit,
             &plan,
             &cfg,
             &mut ctx,
@@ -3693,8 +4025,10 @@ fn the_fresh_flag_outranks_session_resume_inside_the_boot_pass() {
 
     // ---------------------------------------------------------------- `--fresh`
     set_resume_request(false, true);
-    assert!(
-        !resume_requested(&cfg),
+    let fresh_intent = resume_intent(&plan, &cfg);
+    assert_eq!(
+        fresh_intent,
+        ResumeIntent::Fresh,
         "--fresh must outrank session_resume = true before the pass is even called"
     );
 
@@ -3713,7 +4047,7 @@ fn the_fresh_flag_outranks_session_resume_inside_the_boot_pass() {
             ui_transcript: &mut transcript,
         };
         run_boot(
-            resume_requested(&cfg),
+            fresh_intent,
             &plan,
             &cfg,
             &mut ctx,
@@ -3764,8 +4098,10 @@ fn the_fresh_flag_outranks_session_resume_inside_the_boot_pass() {
     // ---------------------------------------------------------------- `--resume`
     // Same bundle, same Config, same engine: only the flag moved.
     set_resume_request(true, false);
-    assert!(
-        resume_requested(&cfg),
+    let explicit_intent = resume_intent(&plan, &cfg);
+    assert_eq!(
+        explicit_intent,
+        ResumeIntent::Explicit,
         "--resume on the same Config restores"
     );
     let entered = {
@@ -3773,7 +4109,7 @@ fn the_fresh_flag_outranks_session_resume_inside_the_boot_pass() {
             ui_transcript: &mut transcript,
         };
         run_boot(
-            resume_requested(&cfg),
+            explicit_intent,
             &plan,
             &cfg,
             &mut ctx,
@@ -3819,10 +4155,10 @@ fn the_fresh_flag_outranks_session_resume_inside_the_boot_pass() {
 /// command-line flag set. Three layers are pinned in one place: the env value
 /// folded into `Config` by `config::apply_session_env` (the recognized
 /// spellings, the cancelling spellings, and an unrecognized value keeping the
-/// file's answer), the trigger read `resume_requested` with the process-wide flag
-/// statics at rest, and — decisively — a real restore through `boot_if_requested`
-/// driven only by `resume_requested(&cfg)`, plus the same bundle installing
-/// nothing once the env cancels the file.
+/// file's answer), the trigger reads `explicit_resume_requested` / `resume_intent`
+/// with the process-wide flag statics at rest, and — decisively — a real restore
+/// through `boot_if_requested` driven only by `resume_intent(&plan, &cfg)`, plus
+/// the same bundle installing nothing once the env cancels the file.
 #[test]
 fn marmel_resume_env_reaches_the_boot_pass_and_restores() {
     use crate::config::SESSION_RESUME_ENV;
@@ -3893,20 +4229,20 @@ fn marmel_resume_env_reaches_the_boot_pass_and_restores() {
         crate::config::apply_session_env(on_by_file.clone(), Some("0".to_string()), None, None);
     set_resume_request(false, false);
     assert!(
-        resume_requested(&env_on),
+        explicit_resume_requested(&env_on),
         "{SESSION_RESUME_ENV}=yes alone asks for the restore pass"
     );
     assert!(
-        !resume_requested(&env_off),
+        !explicit_resume_requested(&env_off),
         "{SESSION_RESUME_ENV}=0 alone cancels it, flag statics included"
     );
     assert!(
-        !resume_requested(&off_by_file),
-        "the control: with nothing set anywhere, the pass is not entered"
+        !explicit_resume_requested(&off_by_file),
+        "the control: with nothing set anywhere, no explicit trigger is present"
     );
 
     // ---- and the env spelling really restores: the pass is driven by exactly
-    // `resume_requested(&cfg)`, which is what the session loop hands it.
+    // `resume_intent(&plan, &cfg)`, which is what the session loop hands it.
     let tmp = tempfile::tempdir().expect("tempdir");
     let plan = crate::manager::phase::Plan::at(tmp.path());
     let key = "t022-env-resume";
@@ -3935,7 +4271,7 @@ fn marmel_resume_env_reaches_the_boot_pass_and_restores() {
             ui_transcript: &mut transcript,
         };
         run_boot(
-            resume_requested(&env_on),
+            resume_intent(&plan, &env_on),
             &plan,
             &env_on,
             &mut ctx,
@@ -3968,7 +4304,7 @@ fn marmel_resume_env_reaches_the_boot_pass_and_restores() {
             ui_transcript: &mut second_transcript,
         };
         run_boot(
-            resume_requested(&env_off),
+            resume_intent(&plan, &env_off),
             &plan,
             &env_off,
             &mut ctx,

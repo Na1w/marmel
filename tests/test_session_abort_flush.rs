@@ -551,6 +551,7 @@ async fn a_run_left_in_progress_is_classified_hard_kill_and_said_out_loud() {
         ui_transcript: &mut transcript,
     };
     let report = marmennill::ui::session::boot(
+        marmennill::ui::session::ResumeIntent::Explicit,
         &plan,
         &cfg,
         &mut boot_ctx,
@@ -699,6 +700,7 @@ async fn reset_marks_the_bundle_and_the_plan_sweep_sweeps_it_away() {
         ui_transcript: &mut transcript,
     };
     let report = marmennill::ui::session::boot(
+        marmennill::ui::session::ResumeIntent::Explicit,
         &plan,
         &cfg,
         &mut boot_ctx,
