@@ -43,10 +43,12 @@
 //!   (`/lib64`, `/nix/store`, `~/.npm`, an absent Xcode) never matches and grants nothing —
 //!   which is also why [`PolicyPath::required`](crate::harness::sandbox::PolicyPath) has no
 //!   effect on the rendered text.
-//! * It emits no explicit `deny` clauses for sensitive directories (`~/.ssh`, `~/.gnupg`).
-//!   The deny-default baseline already denies them; making the denial log-visible needs the
-//!   home paths the platform-neutral list does not carry, and that `[verify-on-Mac]`
-//!   refinement belongs to the backend (research note §5).
+//! * The only explicit `deny` clauses are the ones for the sensitive per-user homes
+//!   (`~/.ssh` and `~/.gnupg`, [`SENSITIVE_DENIED_BASENAMES`]). `(deny default)` already
+//!   denies them, so the clauses are redundant on purpose: they make the denial log-visible,
+//!   they name the paths the enforcement probe of `harness::sandbox_seatbelt` asks libSystem
+//!   about, and they are emitted after every allow clause, so an operator grant of `$HOME`
+//!   cannot shadow them.
 
 use crate::harness::sandbox::{Grant, PolicyPath, policy_paths};
 use std::collections::BTreeSet;
@@ -136,6 +138,15 @@ const MACOS_DEVICE_EXTRA: &[(&str, &str, &str)] = &[
     ("file-read*", "literal", "/dev/stderr"),
 ];
 
+/// The `$HOME`-relative directories that must never be readable by the confined command: the
+/// SSH home and the GnuPG home. They are denied by name here rather than left to
+/// `(deny default)` alone for one reason: the Seatbelt backend asks libSystem whether a read
+/// of exactly these paths is denied, and that probe is only meaningful if the rendered profile
+/// states the denial explicitly. The list is shared with that backend
+/// (`harness::sandbox_seatbelt`), which joins the same basenames onto the same `$HOME`, so the
+/// probe can never ask about a path the profile does not deny.
+pub const SENSITIVE_DENIED_BASENAMES: &[&str] = &[".ssh", ".gnupg"];
+
 /// The environment key holding the executable search path.
 pub const PATH_ENV: &str = "PATH";
 
@@ -159,6 +170,15 @@ const SECTION_MACOS_COMMENT: &[&str] = &[
     ";     the root directory, `$HOME/.CFUserTextEncoding`, the private tree read-only, the",
     ";     per-user caches and keychain directory, the pty nodes behind `/dev/tty` and every",
     ";     directory of `$PATH`.",
+];
+
+/// Section-local comment for the explicit denials at the end of the file-grant section, so a
+/// profile on disk explains itself.
+const SECTION_DENY_COMMENT: &[&str] = &[
+    "; Explicit denial of the SSH and GnuPG homes. (deny default) already covers them, so these",
+    "; clauses are redundant by design: they make the denial log-visible and they outlast any",
+    "; grant of $HOME higher up in this profile. They are also the paths the enforcement probe",
+    "; of harness::sandbox_seatbelt asks libSystem about, which is why they are spelled here.",
 ];
 
 /// Section header comment for the non-file block.
@@ -324,6 +344,11 @@ pub fn render_policy_profile(
     // a *policy* entry from what the policy knows about it and can say nothing about a table
     // entry or about a directory the caller's `$HOME` names.
     lines.extend(macos_floor_rules(home, path_dirs));
+    // The denials are emitted last in this section, after every allow clause that could
+    // otherwise cover the same paths (an operator-granted `$HOME` lands in section 1).
+    lines.push(String::new());
+    lines.extend(SECTION_DENY_COMMENT.iter().map(|line| (*line).to_string()));
+    lines.extend(sensitive_deny_rules(home));
 
     // 3. The operations Landlock never mediates.
     lines.push(String::new());
@@ -378,6 +403,26 @@ fn macos_floor_rules(home: Option<&Path>, path_dirs: &[PathBuf]) -> Vec<String> 
 
     rules.extend(render_path_dirs(path_dirs));
     rules
+}
+
+/// The explicit denials of [`SENSITIVE_DENIED_BASENAMES`], joined onto `home` and filtered with
+/// `subpath` so the denial covers everything below each directory. Nothing is emitted when
+/// `home` is `None`: the emitter never invents a home path, and the shared policy list emits
+/// its `$HOME` entries under the same condition.
+#[must_use]
+fn sensitive_deny_rules(home: Option<&Path>) -> Vec<String> {
+    let Some(home) = home else {
+        return Vec::new();
+    };
+    SENSITIVE_DENIED_BASENAMES
+        .iter()
+        .map(|base| {
+            format!(
+                "(deny file-read* (subpath {}))",
+                quote_path(&home.join(base)),
+            )
+        })
+        .collect()
 }
 
 /// One read-only clause per `$PATH` directory: the confined process looks its executables up by
@@ -596,6 +641,13 @@ mod tests {
 (allow file-read* (subpath "/opt/homebrew/bin"))
 (allow file-read* (subpath "/usr/bin"))
 (allow file-read* (subpath "/usr/local/bin"))
+
+; Explicit denial of the SSH and GnuPG homes. (deny default) already covers them, so these
+; clauses are redundant by design: they make the denial log-visible and they outlast any
+; grant of $HOME higher up in this profile. They are also the paths the enforcement probe
+; of harness::sandbox_seatbelt asks libSystem about, which is why they are spelled here.
+(deny file-read* (subpath "/Users/goldentester/.ssh"))
+(deny file-read* (subpath "/Users/goldentester/.gnupg"))
 
 ; --- 3. Non-file operations Seatbelt mediates and Landlock never does. The vocabulary is
 ;     Apple-private, so every clause below is [verify-on-Mac] against the target host:
@@ -896,6 +948,57 @@ mod tests {
         assert!(
             !profile.contains("(allow file-write* (subpath \"/dev\"))"),
             "whole `/dev` must never become writable: {profile}"
+        );
+    }
+
+    /// The enforcement probe of the Seatbelt backend asks libSystem whether a read of the SSH
+    /// and GnuPG homes is denied, and that question is only meaningful if the rendered profile
+    /// states the denial. `(deny default)` alone is not enough: an operator extra of `$HOME`
+    /// (`sandbox_extra_readonly_paths`) would otherwise grant the very path the probe asks
+    /// about, and a working profile would read as a broken one.
+    #[test]
+    fn test_sensitive_homes_are_denied_by_name_and_come_last() {
+        let profile = render_policy_profile(
+            &golden_policy(),
+            Some(Path::new(GOLDEN_TMPDIR)),
+            Some(Path::new(GOLDEN_HOME)),
+            &golden_path_dirs(),
+        );
+
+        for name in SENSITIVE_DENIED_BASENAMES {
+            let granted = format!("{GOLDEN_HOME}/{name}");
+            let clause = format!("(deny file-read* (subpath \"{granted}\"))");
+            assert!(
+                profile.contains(&clause),
+                "{name} must be denied by its real path, joined onto the caller's home: {profile}"
+            );
+            assert!(
+                !profile.contains(&format!("(allow file-read* (subpath \"{granted}\")")),
+                "nothing may grant a sensitive home as an exact subpath: {profile}"
+            );
+        }
+
+        // Placement is part of the guarantee: the denial is the last file clause of the profile,
+        // so it outranks every allow that could cover the same path.
+        let first_allow = profile.find("(allow").expect("allow clauses exist");
+        let last_deny = profile
+            .rfind("(deny file-read*")
+            .expect("the sensitive denials exist");
+        assert!(
+            last_deny > first_allow,
+            "the explicit denials must be emitted after every grant: {profile}"
+        );
+        assert_eq!(
+            profile.matches("(deny file-read*").count(),
+            SENSITIVE_DENIED_BASENAMES.len(),
+            "one denial per sensitive directory, and no stray deny clause"
+        );
+
+        // An unset home emits nothing home-specific, rather than inventing a path.
+        let without_home = render_policy_profile(&golden_policy(), None, None, &[]);
+        assert!(
+            !without_home.contains("(deny file-read*"),
+            "no denial may be emitted for an unset HOME: {without_home}"
         );
     }
 
