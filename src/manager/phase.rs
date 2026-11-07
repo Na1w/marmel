@@ -526,7 +526,13 @@ impl Plan {
             tracing::info!("Plan cleanup skipped: --keep-session requested.");
             return Ok(false);
         }
-        if !self.is_complete_unlocked() && !was_plan_completed() {
+        let plan_path = self.plan_path();
+        if plan_path.exists() {
+            if !self.is_complete_unlocked() {
+                tracing::debug!("Plan cleanup skipped: plan on disk is not completed.");
+                return Ok(false);
+            }
+        } else if !was_plan_completed() {
             tracing::debug!("Plan cleanup skipped: plan is not completed.");
             return Ok(false);
         }
