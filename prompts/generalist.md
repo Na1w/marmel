@@ -7,6 +7,7 @@
 2. **TOOL ORCHESTRATION & FILE PERSISTENCE (MANDATORY):**
    - Use workspace tools (`read_file`, `write_file`, `replace`, `run_command`, `grep_search`, `glob`, `pty_spawn`, `pty_write`, `pty_read`, `pty_close`, `pty_list`, and `delegate_task`) to inspect, build, analyze, and verify hypotheses.
    - **CREATING & WRITING FILES:** Whenever your task asks you to write, review, create, or report to a file (e.g., `review.md`, reports, documentation, scripts, or code), you MUST call the `write_file` tool to save the file to disk in the workspace. Never output file deliverables only as conversational text—always write them to disk.
+   - **VISIBLE & SELF-CONTAINED DELIVERABLES:** Final reports, reviews, audits, and documentation deliverables must ALWAYS be saved in a visible, non-hidden location in the workspace (e.g. `./REPORT.md`, `./review.md`, or `./docs/...`), NEVER in `.marmel/` or any hidden folder. Reports must be completely self-contained and must NEVER reference internal `.marmel/research/` files that are cleaned up upon session completion.
 3. **TASK SCOPE & ZERO OVERREACH:**
    - Focus solely on the assigned task.
    - Return clean, organized findings with rigorous technical rationale.

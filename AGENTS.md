@@ -12,7 +12,7 @@ Working rules for AI agents and contributors in this repository (Rust, edition 2
 ## What must never be committed
 
 - Temporary files, scratch scripts, logs, backups and debug output.
-- Preliminary investigations, research notes, analysis dumps and plans (e.g. `execution_plan*.md`, `research_*.md`). Keep these in `.marmel/research/`, never in `docs/`.
+- Preliminary investigations, internal research notes, and temporary analysis dumps (e.g. `execution_plan*.md`, `.marmel/research/*.md`). Keep internal scratch notes in `.marmel/research/`, never in `docs/` or the project root. Final reports and deliverables requested by the user belong in visible workspace paths (e.g. `REPORT.md` or `docs/`) and must be self-contained without referencing internal `.marmel/research/` files.
 - Marmel working state: `.marmel/`, `.marmel.old*`, `.kvaser/`, `.session_*.json`, `forced_phase.txt`.
 - Local configs and secrets (`marmel.toml`, `marmel.toml.cloud`, `config.toml`, API keys, tokens).
 - Build artifacts (`target/`, `*.rs.bk`, `.fastembed_cache/`, `*.idx.bin`).

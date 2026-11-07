@@ -87,6 +87,8 @@ pub const LATEST_ARCHIVE_FILE: &str = "execution_plan_archive.md";
 /// disk by an older release is still deletable by [`Plan::clear`] (see [`Plan`]),
 /// and `harness::Workspace` re-exports it as the canonical path.
 pub const FORCED_PHASE_FILE: &str = "forced_phase.txt";
+/// Name of the tracking log for files created inside `.marmel` by tools (e.g. `write_file`).
+pub const CREATED_FILES_LOG: &str = ".created_files";
 /// Name of the **superseded** manager journal — a re-export of the session-owned
 /// [`crate::session::manager_capture::LEGACY_TRANSCRIPT_FILE`], not a second copy.
 ///
@@ -131,6 +133,105 @@ static PLAN_COMPLETED_AT: std::sync::LazyLock<std::sync::RwLock<Option<std::time
 static PLAN_WAS_COMPLETED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static KEEP_SESSION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+static TRACKED_MARMEL_FILES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// If `path` is located inside a `.marmel` directory, returns `Some((marmel_dir, relative_subpath))`.
+pub fn find_marmel_dir_and_subpath(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let comps: Vec<_> = path.components().collect();
+    if let Some(idx) = comps.iter().rposition(|c| c.as_os_str() == MARMEL_DIR) {
+        let dir: PathBuf = comps[..=idx].iter().collect();
+        let subpath: PathBuf = comps[idx + 1..].iter().collect();
+        if !subpath.as_os_str().is_empty() {
+            return Some((dir, subpath));
+        }
+    }
+    None
+}
+
+/// Track a file created within `.marmel` so it can be cleaned up on plan completion.
+pub fn track_created_marmel_file(marmel_dir: &Path, rel_subpath: &Path) {
+    if rel_subpath.as_os_str() == PLAN_FILE
+        || rel_subpath.as_os_str() == CREATED_FILES_LOG
+        || rel_subpath.as_os_str() == FORCED_PHASE_FILE
+        || rel_subpath.as_os_str() == LATEST_ARCHIVE_FILE
+    {
+        return;
+    }
+    let full_path = marmel_dir.join(rel_subpath);
+    if let Ok(mut set) = TRACKED_MARMEL_FILES.lock()
+        && set.insert(full_path)
+    {
+        let log_file = marmel_dir.join(CREATED_FILES_LOG);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_file)
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "{}", rel_subpath.display());
+        }
+    }
+}
+
+/// If `safe_path` is located inside a `.marmel` directory, track it for cleanup.
+pub fn track_created_file_if_marmel(safe_path: &Path) {
+    if let Some((marmel_dir, subpath)) = find_marmel_dir_and_subpath(safe_path) {
+        track_created_marmel_file(&marmel_dir, &subpath);
+    }
+}
+
+/// Clear in-memory tracked files.
+pub fn clear_tracked_marmel_files() {
+    if let Ok(mut set) = TRACKED_MARMEL_FILES.lock() {
+        set.clear();
+    }
+}
+
+/// Retrieve all tracked files for a given marmel directory (combines memory and on-disk log).
+pub fn get_tracked_marmel_files_for(marmel_dir: &Path) -> std::collections::HashSet<PathBuf> {
+    let mut result = std::collections::HashSet::new();
+    if let Ok(set) = TRACKED_MARMEL_FILES.lock() {
+        for path in set.iter() {
+            if path.starts_with(marmel_dir) {
+                result.insert(path.clone());
+            }
+        }
+    }
+    let log_file = marmel_dir.join(CREATED_FILES_LOG);
+    if let Ok(content) = std::fs::read_to_string(&log_file) {
+        for line in content.lines() {
+            let trimmed = line.trim().replace('\\', "/");
+            if !trimmed.is_empty() {
+                result.insert(marmel_dir.join(trimmed));
+            }
+        }
+    }
+    result
+}
+
+/// Prune empty subdirectories under `dir` bottom-up, keeping user directories like `skills` intact.
+pub fn prune_empty_subdirectories(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name() == Some(std::ffi::OsStr::new("skills")) {
+                continue;
+            }
+            prune_empty_subdirectories(&path);
+            if let Ok(mut sub) = std::fs::read_dir(&path)
+                && sub.next().is_none()
+            {
+                let _ = std::fs::remove_dir(&path);
+            }
+        }
+    }
+}
 
 pub fn record_plan_start() {
     record_plan_start_at(std::time::Instant::now());
@@ -185,6 +286,7 @@ pub fn clear_plan_start() {
         *g = None;
     }
     PLAN_WAS_COMPLETED.store(false, std::sync::atomic::Ordering::SeqCst);
+    clear_tracked_marmel_files();
 }
 
 /// Retrieve the start time of the active execution plan, falling back to disk metadata if needed.
@@ -425,6 +527,11 @@ impl Plan {
         let path = self.plan_path();
         std::fs::write(&path, &content).with_context(|| format!("writing {}", path.display()))?;
         record_plan_start();
+        clear_tracked_marmel_files();
+        let created_log = self.dir.join(CREATED_FILES_LOG);
+        if created_log.exists() {
+            let _ = std::fs::remove_file(&created_log);
+        }
         tracing::info!(
             "Execution plan created at {} ({} chars):\n{}",
             path.display(),
@@ -495,6 +602,11 @@ impl Plan {
             );
             let _ = std::fs::remove_file(&forced);
         }
+        let created_log = self.dir.join(CREATED_FILES_LOG);
+        if created_log.exists() {
+            let _ = std::fs::remove_file(&created_log);
+        }
+        clear_tracked_marmel_files();
         // Session state: the superseded manager journal and the superseded UI
         // journal (stale copies only), the session bundle that replaced both, plus
         // the in-memory manager capture.
@@ -509,10 +621,10 @@ impl Plan {
     }
 
     /// Clean up runtime session artifacts (execution plan, prompts, session bundle,
-    /// logs, and plan archives) when the execution plan has been completed.
+    /// research notes, temporary files, logs, and plan archives) when the execution plan has been completed.
     ///
-    /// Preserves user-authored files (such as `marmel.toml`, `config.toml`, or custom
-    /// subdirectories like `research/`). If no files remain in the runtime directory,
+    /// Preserves user-authored files (such as `skills/`, `marmel.toml`, `config.toml`, or
+    /// custom configuration/archetype files). If no files remain in the runtime directory,
     /// the directory itself is removed so the workspace is left completely clean.
     ///
     /// Respects the [`is_keep_session`] opt-out: when `--keep-session` is set,
@@ -580,6 +692,31 @@ impl Plan {
             let _ = std::fs::remove_dir_all(&archive_dir);
         }
 
+        let research_dir = self.dir.join("research");
+        if research_dir.exists() {
+            let _ = std::fs::remove_dir_all(&research_dir);
+        }
+
+        let tmp_dir = self.dir.join("tmp");
+        if tmp_dir.exists() {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        }
+
+        // Clean up all tracked files created by tools in .marmel
+        let tracked_files = get_tracked_marmel_files_for(&self.dir);
+        for file_path in tracked_files {
+            if file_path.exists() && file_path.is_file() {
+                let _ = std::fs::remove_file(&file_path);
+            }
+        }
+        let created_log = self.dir.join(CREATED_FILES_LOG);
+        if created_log.exists() {
+            let _ = std::fs::remove_file(&created_log);
+        }
+        if let Ok(mut set) = TRACKED_MARMEL_FILES.lock() {
+            set.retain(|p| !p.starts_with(&self.dir));
+        }
+
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -594,6 +731,8 @@ impl Plan {
                 }
             }
         }
+
+        prune_empty_subdirectories(&self.dir);
 
         crate::session::manager_capture::clear_capture();
         clear_plan_start();

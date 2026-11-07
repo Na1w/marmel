@@ -20,6 +20,10 @@ Every task in the plan is assigned to an archetype that best fits the scope of w
    - Group tasks into clear sequential phases (e.g. `### Phase 1: Discovery & Scaffolding`, `### Phase 2: Core Implementation`, `### Phase 3: Verification`).
    - Identify dependencies explicitly: dependent tasks must be placed in subsequent phases.
    - Independent tasks within a phase should be organized so they can be dispatched concurrently (aim for 2 to 4 parallel specialists per phase).
+   - **DELIVERABLE PLACEMENT (RESEARCH VS FINAL REPORTS):**
+     - Intermediate research tasks in Phase 1 (internal discovery / scratch notes) should record findings in `.marmel/research/<topic>.md`.
+     - Final reports, summaries, architecture reviews, audits, or user-requested documentation deliverables MUST be assigned a visible, non-hidden workspace path (e.g. `REPORT.md`, `<topic>_REPORT.md`, `docs/...`), NEVER inside `.marmel/` or any hidden folder.
+     - Final report task briefs MUST require that the report is completely self-contained and does NOT reference or link to internal temporary research notes in `.marmel/research/`, because `.marmel/` is cleaned up upon mission completion.
    - **GIT WORKFLOW IN PLANS:** When the target workspace is an existing git repo:
      - The plan MUST operate on a dedicated feature branch (`feature/<name>`), created in an initial setup task if not already on one.
      - Individual coding/implementation subtasks MUST each be assigned their own isolated per-task worktree (`.worktrees/<task_id>` on branch `task/<task_id>` branched from the feature branch) so parallel subagents never collide on uncommitted files, index locks, or build artefacts.

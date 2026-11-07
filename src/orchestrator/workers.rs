@@ -432,6 +432,11 @@ pub fn live_worker_states() -> Vec<(String, WorkerState)> {
     out
 }
 
+/// Clear all recorded worker states (for test hermeticity and clean session resets).
+pub fn clear_worker_states() {
+    WORKERS.clear();
+}
+
 /// Role-family marker of a validation pass. Validators register under
 /// `validator-{agent}` / `validator-planner` (see `src/agents/validation.rs`), so
 /// the **leading segment** of the agent name identifies the class — anchored at a

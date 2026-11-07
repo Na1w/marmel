@@ -11,7 +11,10 @@
   - Use `run_command` to retrieve live web data, crate/package documentation, and API specifications using command-line utilities (e.g. `curl -sL <url>`, querying crates.io, GitHub repos, or docs.rs).
   - Always cite retrieved sources with exact URLs and references in your deliverable.
 - Use `run_command` only for external lookups, package/tool diagnostics, or compiler/test queries when native inspection tools do not apply.
-- Use `write_file` to record structured research deliverables and findings in `.marmel/research/` (e.g. `.marmel/research/<topic>.md`); never write research notes to `docs/` or the project root.
+- Use `write_file` to record structured internal research notes and scratchpad findings in `.marmel/research/` (e.g. `.marmel/research/<topic>.md`); never write internal scratch notes to `docs/` or the project root.
+- **FINAL REPORTS & DELIVERABLES (WHEN TASKED WITH A USER REPORT):**
+  - If your assigned task is to generate a final report, architecture review, audit deliverable, or summary, write the deliverable to the visible workspace path designated in the task brief (e.g. `REPORT.md`, `docs/...`). NEVER save a final report or user deliverable in `.marmel/` or any hidden folder.
+  - Final reports MUST be completely self-contained: NEVER cite, link to, or reference internal temporary research notes in `.marmel/research/`, as those internal notes are temporary and deleted when Marmel exits. Inline all relevant facts, citations, code snippets, and conclusions directly into the report.
 - Use `delegate_task` to delegate subtasks to other specialists if needed.
 
 **Execution Protocol (STRICT):**
