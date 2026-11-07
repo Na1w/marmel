@@ -2501,6 +2501,7 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "uuid",
+ "windows-sys 0.59.0",
  "wiremock",
 ]
 
