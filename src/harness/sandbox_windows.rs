@@ -34,8 +34,16 @@
 //!    reasons the shared policy layer publishes.
 //! 4. [`AclGrantGuard`] — apply exactly one grant ACE for the AppContainer SID on one path,
 //!    and put the saved DACL back when the run ends.
-//! 5. [`attempt_windows_sandbox`] — the attempt surface wired to "profile created + required
-//!    grants applied", mapped onto the fail-closed `SandboxAttempt` contract.
+//! 5. [`attempt_windows_sandbox`] — the attempt surface wired to "profile created, required
+//!    grants applied, and one confined probe process really launched inside the profile", mapped
+//!    onto the fail-closed `SandboxAttempt` contract.
+//! 6. [`AttributeListGuard`] and [`ChildHandles`] — the `PROC_THREAD_ATTRIBUTE_LIST` that carries
+//!    the confinement declaration, and the process and thread handles of the child, released on
+//!    every exit path including a `?` return.
+//! 7. [`spawn_in_appcontainer`] — the launch itself: `<comspec> /C <command>` confined in the
+//!    prepared profile, waited for, with the child's exit code as the answer.
+//! 8. [`run_in_appcontainer`] — the composite entry point of the re-entry child: prepare, probe,
+//!    launch the command, return its exit code, and only then release the guards.
 //!
 //! One Windows-specific wrinkle shapes the read-only half of the policy. An unprivileged process
 //! cannot just add an ACE to `C:\Windows` or `C:\Program Files`: those objects need `WRITE_DAC`,
@@ -48,9 +56,12 @@
 //! non-required entry, and a rule failure only for a required one (the workspace root and the
 //! temporary directories).
 //!
-//! The task in two parts: this module is the **policy** layer. The launch layer that hands the
-//! profile to `CreateProcessW`, plus the probe that proves the confinement from inside the
-//! child, is added by the follow-up task at the seam marked below.
+//! The module comes in two layers, and they meet at one hand-off. The policy layer creates the
+//! profile and puts the ACEs on the objects; the launch layer hands that profile to
+//! `CreateProcessW`, runs one confined probe process, and keeps every guard alive until the child
+//! has exited. The hand-off is [`attempt_windows_sandbox_with_setup`], which returns the attempt
+//! *and* the [`WindowsPolicySetup`] it built, and [`take_windows_policy_setup`], which is how the
+//! composite entry point [`run_in_appcontainer`] picks that setup up again without preparing twice.
 //!
 //! [`AppContainerProfileGuard`]: self::AppContainerProfileGuard
 //! [`CapabilitySids`]: self::CapabilitySids
@@ -105,6 +116,21 @@ pub enum WindowsSandboxError {
     /// is not there: the rule exists, the object says otherwise.
     #[error("the DACL of {path} does not show the grant this policy applied: {reason}")]
     AclVerification { path: String, reason: String },
+    /// The `PROC_THREAD_ATTRIBUTE_LIST` for the launch could not be sized, allocated or filled:
+    /// the confinement is declared correctly, but it cannot be handed to `CreateProcessW`.
+    #[error("the launch attribute list could not be built: {reason}")]
+    AttributeList { reason: String },
+    /// The confined process could not be created, or the wait for it and the read of its exit code
+    /// failed. `code` is the Win32 error as `GetLastError` reported it (0 where no Win32 error is
+    /// involved), which is what renders the failure through
+    /// `io::Error::from_raw_os_error` rather than through a guess.
+    #[error("the confined process could not be launched: {reason}")]
+    Launch { reason: String, code: WIN32_ERROR },
+    /// The confined probe process was created, but what it reported says the confinement is not
+    /// real: a crash status instead of a command failure, or anything other than the exit code the
+    /// probe itself asks for.
+    #[error("the confined probe process did not confirm the confinement: {reason}")]
+    Probe { reason: String },
 }
 
 impl WindowsSandboxError {
@@ -129,11 +155,15 @@ impl WindowsSandboxError {
 // Win32 bindings actually used by this module
 // ---------------------------------------------------------------------------
 
+use std::cell::RefCell;
 use std::ffi::c_void;
+use std::io;
 use std::os::windows::ffi::OsStrExt;
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_PRIVILEGE_NOT_HELD, ERROR_SUCCESS, GetLastError, LocalFree,
-    WIN32_ERROR,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_PRIVILEGE_NOT_HELD, ERROR_SUCCESS, GetLastError,
+    HANDLE, INVALID_HANDLE_VALUE, LocalFree, STATUS_ACCESS_DENIED, STATUS_ACCESS_VIOLATION,
+    STATUS_DLL_NOT_FOUND, STATUS_ENTRYPOINT_NOT_FOUND, STATUS_IN_PAGE_ERROR, STILL_ACTIVE,
+    WAIT_OBJECT_0, WIN32_ERROR,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
@@ -151,6 +181,21 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+};
+// The launch half of the backend: the process-attribute list that carries the confinement
+// declaration, `CreateProcessW` and the wait for the child, and the std-handle inspection that
+// decides how the child is given its standard streams. `GetStdHandle` and `GetConsoleMode` need
+// `Win32_System_Console`, which is a required feature exactly because the std handles of this
+// process are how a confined child reaches the terminal it was started from.
+use windows_sys::Win32::System::Console::{
+    GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
+use windows_sys::Win32::System::Threading::{
+    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 // ---------------------------------------------------------------------------
@@ -1452,6 +1497,605 @@ fn apply_policy_entries(
     Ok(guards)
 }
 
+// ---------------------------------------------------------------------------
+// launch: the confined child process
+// ---------------------------------------------------------------------------
+//
+// Everything above this line is a promise about objects; this is the half that acts on it. The
+// confinement identity exists and the ACEs are on the objects, so the one thing left is to create
+// the process that carries the identity: `CreateProcessW` with
+// the real name of the attribute is `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`
+// (value 131081), whose value is the `SECURITY_CAPABILITIES` block
+// `AppContainerProfileGuard::security_capabilities` builds. The child created that way is a member
+// of the AppContainer whose SID the policy granted, and so is everything below it.
+//
+// Three details decide whether such a launch works at all, and all three are visible below:
+//
+// * the attribute list has to be sized by the API itself, in two passes, and deleted on every exit
+//   path — `AttributeListGuard`;
+// * the profile and the applied ACEs must still be alive when `CreateProcessW` runs, and must not
+//   be released before the child has exited — that is the `WindowsPolicySetup` hand-off, and
+//   `take_windows_policy_setup` is how the launch layer picks it up;
+// * the std handles of this process are console handles on the interactive (ConPTY) path and pipe
+//   or file handles on the one-shot path, and the two need different wiring — `stdio_state`.
+
+/// The command the enforcement probe runs: the shell's own `exit`, so the probe creates a real
+/// confined process, asks it for nothing, and knows exactly which status a healthy launch reports.
+const PROBE_COMMAND: &str = "exit 0";
+
+/// The crash statuses that say the confined process could not be created *inside* the container
+/// rather than ran a command that happened to fail: an AppContainer that cannot map its own image,
+/// reach its DLLs or enter its own directory dies with one of these before the shell runs anything.
+///
+/// Spelled as the `NTSTATUS` values `Win32::Foundation` gives them; `STATUS_IN_PAGE_ERROR` belongs
+/// on the list because a failed image page-in is an access failure wearing a different mask.
+const CONFINEMENT_FAILURE_STATUSES: &[u32] = &[
+    STATUS_ACCESS_VIOLATION as u32,
+    STATUS_ACCESS_DENIED as u32,
+    STATUS_IN_PAGE_ERROR as u32,
+    STATUS_DLL_NOT_FOUND as u32,
+    STATUS_ENTRYPOINT_NOT_FOUND as u32,
+];
+
+/// The shell program the confined launch resolves, from inputs a test can pin.
+///
+/// The first half mirrors `pty.rs::windows_cmd_program`: a trimmed `%COMSPEC%` when it names
+/// something, and an empty or blank value never wins. The difference is the fallback. There, the
+/// bare token `cmd.exe` is resolved through `search_path` by portable-pty; here the program token
+/// is the first token of `lpCommandLine` with `lpApplicationName` left null, and a confined child
+/// is exactly the case where a PATH search can fail, because the search itself needs
+/// read-and-execute on every directory it searches. The fallback therefore spells the absolute
+/// path (`%SystemRoot%\System32\cmd.exe`, falling back to `C:\Windows\System32\cmd.exe` when
+/// `SystemRoot` is unset), which needs no search at all.
+#[must_use]
+fn shell_program(comspec: Option<&str>, system_root: Option<&str>) -> String {
+    if let Some(value) = comspec.map(str::trim).filter(|value| !value.is_empty()) {
+        return value.to_owned();
+    }
+    let root = system_root
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("C:\\Windows");
+    let root = root.trim_end_matches(['\\', '/']);
+    format!("{root}\\System32\\cmd.exe")
+}
+
+/// Quote one program token for `lpCommandLine` with the Windows `QUOTE_AND_ESCAPE` rules: the token
+/// is wrapped in quotes when it needs them, a quote inside it is escaped with a backslash after
+/// doubling the backslash run that precedes it, and a trailing backslash run is doubled so that it
+/// does not eat the closing quote.
+///
+/// A path with a space in it — a `%COMSPEC%` stored under `C:\Program Files…`, say — reaches
+/// `CreateProcessW` as one token only when it is quoted this way. Unquoted it splits, and the
+/// launch either fails with `ERROR_FILE_NOT_FOUND` or starts a different program altogether.
+#[must_use]
+fn quote_command_token(value: &str) -> String {
+    let needs_quotes = value
+        .chars()
+        .any(|ch| matches!(ch, '"' | '\\') || ch.is_whitespace());
+    if !needs_quotes {
+        return value.to_owned();
+    }
+    let mut out = String::with_capacity(value.len() + 8);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for ch in value.chars() {
+        match ch {
+            '\\' => {
+                backslashes += 1;
+                out.push('\\');
+            }
+            // Escape the quote, and double the backslash run in front of it so that the escape is
+            // not mistaken for part of that run.
+            '"' => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                out.push('\\');
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                backslashes = 0;
+                out.push(ch);
+            }
+        }
+    }
+    for _ in 0..backslashes {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
+
+/// The complete `lpCommandLine` of one confined launch: `<program> /C <command>`.
+///
+/// The program token is quoted per [`quote_command_token`]; the payload is appended **verbatim**,
+/// which is what `windows_shell_argv` rule R5 promises: what follows `/C` is `cmd.exe`'s own
+/// command line, and `cmd.exe` re-parses it with its own metacharacters (`&`, `|`, `>`, `^`, `"`).
+/// Passing that payload through the MSVCRT escaping a real argv would need (what portable-pty's
+/// `append_quoted` does) would change what the confined shell reads — `echo "hi there"` included —
+/// so the command reaches it byte for byte.
+#[must_use]
+fn confined_command_line(program: &str, payload: &str) -> String {
+    let quoted = quote_command_token(program);
+    format!("{quoted} /C {payload}")
+}
+
+/// The `PROC_THREAD_ATTRIBUTE_LIST` of one launch, sized by the API and released on drop.
+///
+/// The two-pass size query is what the API requires: the first call, with a null list, is the
+/// documented way to ask how many bytes the list needs, and it reports that number while failing.
+/// The second call initialises a buffer allocated from that number. The guard is not decoration:
+/// everything between the second call and `CreateProcessW` is a `?`, and an attribute list that is
+/// never deleted is a leak the process carries until it exits.
+struct AttributeListGuard {
+    /// The backing bytes, spelled as `u64` so that the 8-byte alignment a list holding pointers
+    /// needs on x64 is guaranteed by the element type rather than by luck.
+    buffer: Vec<u64>,
+    /// The byte count the API reported; zero means the list was never initialised.
+    size: usize,
+    /// Non-`Sync` marker: the list is written and read on the launching thread only.
+    _single_thread: PhantomData<*mut ()>,
+}
+
+impl AttributeListGuard {
+    /// Query the size, then allocate and initialise a list with room for `count` attributes.
+    fn new(count: u32) -> Result<Self, WindowsSandboxError> {
+        let mut size = 0usize;
+        // SAFETY: the size-query pass hands a null list and a valid out-parameter; the documented
+        // shape of that call is a failure that writes the required size into `size`.
+        let queried =
+            unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), count, 0, &mut size) };
+        let _ = queried;
+        if size == 0 {
+            return Err(WindowsSandboxError::AttributeList {
+                reason: format!(
+                    "the size query for a {count}-attribute list reported 0 bytes (query pass: {}",
+                    last_win32_error()
+                ),
+            });
+        }
+        let mut buffer = vec![0u64; size.div_ceil(std::mem::size_of::<u64>())];
+        // SAFETY: `buffer` owns at least `size` bytes with the alignment the list needs, and the
+        // out-parameter is a valid pointer.
+        let initialised = unsafe {
+            InitializeProcThreadAttributeList(
+                buffer.as_mut_ptr().cast::<c_void>(),
+                count,
+                0,
+                &mut size,
+            )
+        };
+        if initialised == 0 {
+            return Err(WindowsSandboxError::AttributeList {
+                reason: format!(
+                    "InitializeProcThreadAttributeList({count} attributes, {size} bytes) failed: {}",
+                    last_win32_error()
+                ),
+            });
+        }
+        Ok(Self {
+            buffer,
+            size,
+            _single_thread: PhantomData,
+        })
+    }
+
+    /// Attach one attribute value, sized by the caller.
+    ///
+    /// The value is copied into the list, so the caller only has to keep it alive for this call,
+    /// while everything the value *points at* — the SIDs behind a `SECURITY_CAPABILITIES` block,
+    /// owned here by the profile guard — has to stay valid until `CreateProcessW` has returned.
+    fn set_raw(
+        &mut self,
+        attribute: u32,
+        value: *const c_void,
+        size: usize,
+    ) -> Result<(), WindowsSandboxError> {
+        let list = self.buffer.as_mut_ptr().cast::<c_void>();
+        // SAFETY: the list was initialised by `Self::new` into this buffer, and the value names a
+        // readable object of exactly `size` bytes.
+        let updated = unsafe {
+            UpdateProcThreadAttribute(
+                list,
+                0,
+                attribute as usize,
+                value,
+                size,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        if updated == 0 {
+            return Err(WindowsSandboxError::AttributeList {
+                reason: format!(
+                    "UpdateProcThreadAttribute({attribute}) failed: {}",
+                    last_win32_error()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Hand the confinement declaration to `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` (131081).
+    fn set_security_capabilities(
+        &mut self,
+        capabilities: &SECURITY_CAPABILITIES,
+    ) -> Result<(), WindowsSandboxError> {
+        self.set_raw(
+            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+            std::ptr::from_ref(capabilities).cast::<c_void>(),
+            std::mem::size_of::<SECURITY_CAPABILITIES>(),
+        )
+    }
+
+    /// Whitelist the handles the child may inherit, through `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`
+    /// (131074, the value verified in `.marmel/research/windows_appcontainer_api.md`).
+    fn set_handle_list(&mut self, handles: &[HANDLE]) -> Result<(), WindowsSandboxError> {
+        self.set_raw(
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            handles.as_ptr().cast::<c_void>(),
+            std::mem::size_of_val(handles),
+        )
+    }
+
+    /// The pointer `STARTUPINFOEXW::lpAttributeList` wants, valid while `self` lives.
+    fn as_list(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+        self.buffer.as_mut_ptr().cast::<c_void>()
+    }
+}
+
+impl Drop for AttributeListGuard {
+    fn drop(&mut self) {
+        if self.size == 0 {
+            return;
+        }
+        // SAFETY: the list was initialised into this buffer, and the heap block a `Vec` owns is
+        // never moved by moving the `Vec`, so this is the same pointer `Initialize` wrote.
+        unsafe { DeleteProcThreadAttributeList(self.buffer.as_mut_ptr().cast::<c_void>()) };
+    }
+}
+
+/// The process and thread handles of a confined child, closed as a unit on drop.
+///
+/// The two handles belong to one launch, and a launch that fails halfway is the path that leaks
+/// exactly one of them. Neither is ever closed twice, and a handle the launch never produced
+/// (`null`) is not closed at all.
+struct ChildHandles {
+    process: HANDLE,
+    thread: HANDLE,
+}
+
+impl ChildHandles {
+    /// Adopt the handles `CreateProcessW` reported.
+    const fn new(info: &PROCESS_INFORMATION) -> Self {
+        Self {
+            process: info.hProcess,
+            thread: info.hThread,
+        }
+    }
+
+    const fn process(&self) -> HANDLE {
+        self.process
+    }
+}
+
+impl Drop for ChildHandles {
+    fn drop(&mut self) {
+        for handle in [self.process, self.thread] {
+            if handle.is_null() {
+                continue;
+            }
+            // SAFETY: these are the two handles the launch produced and nothing else references.
+            let closed = unsafe { CloseHandle(handle) };
+            if closed == 0 {
+                tracing::warn!(
+                    "failed to close a handle of the confined child process: {}",
+                    last_win32_error()
+                );
+            }
+        }
+    }
+}
+
+/// The std handles of this process, and what kind they are.
+///
+/// The kind matters more than the values: the two spawn pipelines of `pty.rs` hand their child a
+/// different *kind* of standard stream, and the confined launch has to follow whichever one this
+/// process is actually in.
+struct StdioState {
+    /// The std handles of this process, in `stdin`, `stdout`, `stderr` order.
+    handles: [HANDLE; 3],
+    /// Whether every one of them is a **console** handle, which is the shape of the interactive
+    /// re-entry child: `portable-pty` hands the ConPTY child its standard streams as the
+    /// pseudo-console and spawns it with `bInheritHandles = FALSE`, so those handles are console
+    /// handles all the way down.
+    all_console: bool,
+}
+
+/// Whether `handle` names a console input or output buffer rather than a pipe or a file.
+fn is_console_handle(handle: HANDLE) -> bool {
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    let mut mode = 0u32;
+    // SAFETY: `GetConsoleMode` writes one mode value into a valid pointer, and reports failure for
+    // a handle that is not a console at all rather than answering wrongly about it.
+    unsafe { GetConsoleMode(handle, &mut mode) != 0 }
+}
+
+/// Read the three std handles once, and ask each one what it is.
+///
+/// This is the decision the interactive path lives or dies by, so it is worth stating plainly: the
+/// re-entry child of an interactive run is itself inside a ConPTY, so its standard streams are the
+/// console. The confined launch must then **not** set `STARTF_USESTDHANDLES` and must not inherit
+/// handles at all, because the confined grandchild is meant to inherit that same console the way
+/// its parent did — which is how its output reaches the PTY reader in the first place. Only when a
+/// std handle is *not* a console handle (the one-shot path, where standard streams are pipes or
+/// files, and a null or invalid handle counts as not-a-console here) does this module hand handles
+/// to the child.
+fn stdio_state() -> StdioState {
+    let mut handles = [std::ptr::null_mut(); 3];
+    for (slot, which) in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+        .into_iter()
+        .enumerate()
+    {
+        // SAFETY: `GetStdHandle` is given one of the documented sentinels and returns the handle of
+        // that stream, allocating nothing.
+        handles[slot] = unsafe { GetStdHandle(which) };
+    }
+    let all_console = handles.iter().all(|handle| is_console_handle(*handle));
+    StdioState {
+        handles,
+        all_console,
+    }
+}
+
+/// Create the confined process, wait for it, and report the exit code it left behind, as the raw
+/// `u32` `GetExitCodeProcess` wrote.
+///
+/// The two helpers of the PTY path are reused rather than reimplemented: `pty.rs::windows_shell_argv`
+/// yields `(COMSPEC-or-cmd.exe, ["/C", command-verbatim])`, and `pty.rs::windows_child_cwd` strips
+/// the `\\?\` / `\\?\UNC\` namespace prefix `canonicalize()` produces, because `cmd.exe` reads a
+/// leading `\\` as a UNC location and then quietly runs in a different directory. The confined
+/// launch uses that same cwd spelling for that same reason.
+fn launch_confined(
+    setup: &WindowsPolicySetup,
+    cwd: &Path,
+    command: &str,
+) -> Result<u32, WindowsSandboxError> {
+    if command.trim().is_empty() {
+        return Err(WindowsSandboxError::RuleSetup {
+            path: path_text(cwd),
+            reason: "the command to run inside the AppContainer is empty".to_string(),
+        });
+    }
+
+    // The child's cwd, spelled the way the PTY path spells it, for the reason just documented.
+    let child_cwd = crate::harness::pty::windows_child_cwd(cwd);
+    if !child_cwd.is_dir() {
+        return Err(WindowsSandboxError::RuleSetup {
+            path: path_text(&child_cwd),
+            reason: "the working directory of the confined command does not exist".to_string(),
+        });
+    }
+    let cwd_wide = WideString::from_path(&child_cwd);
+
+    let program = shell_program(
+        std::env::var("COMSPEC").ok().as_deref(),
+        std::env::var("SystemRoot").ok().as_deref(),
+    );
+    let line = confined_command_line(&program, command);
+    // A NUL anywhere in the line is a truncation waiting to happen: `lpCommandLine` is a UTF-16
+    // buffer, and the API stops reading at the first NUL it meets.
+    if line.contains('\0') {
+        return Err(WindowsSandboxError::RuleSetup {
+            path: path_text(&child_cwd),
+            reason: "the launch command line contains a null character".to_string(),
+        });
+    }
+    let mut line_wide = WideString::new(&line);
+
+    let stdio = stdio_state();
+    // The std wiring, decided once and applied consistently with that decision:
+    //
+    // * every std handle is a console handle (the ConPTY path): no `STARTF_USESTDHANDLES`, no handle
+    //   list, `bInheritHandles = FALSE`, and the confined child inherits the console itself;
+    // * the std handles are pipes or files (the one-shot path): `STARTF_USESTDHANDLES` with those
+    //   handles, `bInheritHandles = TRUE`, and `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` naming exactly
+    //   them, which also keeps every *other* inheritable handle of this process out of the sandbox.
+    //
+    // HANDLE-CAPABILITY CAVEAT (documented, not faked): making a handle visible to an AppContainer
+    // child is not the same as letting the child use the object behind it. The access check for an
+    // inherited kernel object is re-run in the child's token context, and the anonymous pipes this
+    // process creates carry the default DACL of this process's token, which names the user and not
+    // the AppContainer SID (nor the app-capability SID). A confined child in that shape can
+    // therefore be created and run while still failing to write to its own standard streams, and
+    // that shows up as a lost write and an exit status rather than as a hidden success. Granting the
+    // std objects an explicit ACE for the AppContainer identity is the fix, and is deliberately not
+    // attempted here: it would mean rewriting standard streams this module does not own.
+    let inherited: Option<[HANDLE; 3]> = if stdio.all_console {
+        None
+    } else {
+        Some(stdio.handles)
+    };
+
+    let capabilities = setup.profile.security_capabilities();
+    let mut attrlist = AttributeListGuard::new(1 + u32::from(inherited.is_some()))?;
+    attrlist.set_security_capabilities(&capabilities)?;
+    if let Some(handles) = &inherited {
+        attrlist.set_handle_list(handles)?;
+    }
+
+    let (std_input, std_output, std_error) = match inherited {
+        Some(handles) => (handles[0], handles[1], handles[2]),
+        None => (
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ),
+    };
+    let startup = STARTUPINFOEXW {
+        StartupInfo: STARTUPINFOW {
+            // `cb` has to name the extended block: with `EXTENDED_STARTUPINFO_PRESENT` set,
+            // `CreateProcessW` reads the attribute list only when this is its size.
+            cb: std::mem::size_of::<STARTUPINFOEXW>() as u32,
+            lpReserved: std::ptr::null_mut(),
+            lpDesktop: std::ptr::null_mut(),
+            lpTitle: std::ptr::null_mut(),
+            dwX: 0,
+            dwY: 0,
+            dwXSize: 0,
+            dwYSize: 0,
+            dwXCountChars: 0,
+            dwYCountChars: 0,
+            dwFillAttribute: 0,
+            dwFlags: if inherited.is_some() {
+                STARTF_USESTDHANDLES
+            } else {
+                0
+            },
+            wShowWindow: 0,
+            cbReserved2: 0,
+            lpReserved2: std::ptr::null_mut(),
+            hStdInput: std_input,
+            hStdOutput: std_output,
+            hStdError: std_error,
+        },
+        lpAttributeList: attrlist.as_list(),
+    };
+
+    let mut info = PROCESS_INFORMATION {
+        hProcess: std::ptr::null_mut(),
+        hThread: std::ptr::null_mut(),
+        dwProcessId: 0,
+        dwThreadId: 0,
+    };
+    // `lpApplicationName` stays null: the program is the first token of the command line, which is
+    // a mutable `PWSTR` the API is allowed to rewrite. `lpenvironment` stays null and
+    // `CREATE_UNICODE_ENVIRONMENT` stays unset: the child gets a copy of the environment of this
+    // process, which is what keeps `COMSPEC`, `PATH` and the rest usable by a confined `cmd.exe`.
+    let spawned = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            line_wide.buf.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            if inherited.is_some() { 1 } else { 0 },
+            EXTENDED_STARTUPINFO_PRESENT,
+            std::ptr::null(),
+            cwd_wide.pcwstr(),
+            &startup.StartupInfo,
+            &mut info,
+        )
+    };
+    // The two handles exist the moment the call returns, whether or not it succeeded; taking them
+    // over here is what stops every `?` below from leaking one of them.
+    let handles = ChildHandles::new(&info);
+    if spawned == 0 {
+        let code = unsafe { GetLastError() };
+        return Err(WindowsSandboxError::Launch {
+            reason: format!(
+                "CreateProcessW({line}) in {} failed: {}",
+                path_text(&child_cwd),
+                io::Error::from_raw_os_error(code as i32)
+            ),
+            code,
+        });
+    }
+
+    let waited = unsafe { WaitForSingleObject(handles.process(), INFINITE) };
+    if waited != WAIT_OBJECT_0 {
+        let code = unsafe { GetLastError() };
+        return Err(WindowsSandboxError::Launch {
+            reason: format!(
+                "waiting for the confined process returned {waited} instead of WAIT_OBJECT_0: {}",
+                io::Error::from_raw_os_error(code as i32)
+            ),
+            code,
+        });
+    }
+    let mut raw = 0u32;
+    let ok = unsafe { GetExitCodeProcess(handles.process(), &mut raw) };
+    if ok == 0 {
+        let code = unsafe { GetLastError() };
+        return Err(WindowsSandboxError::Launch {
+            reason: format!(
+                "GetExitCodeProcess of the confined child failed: {}",
+                io::Error::from_raw_os_error(code as i32)
+            ),
+            code,
+        });
+    }
+    // `STILL_ACTIVE` (259) is what `GetExitCodeProcess` reports for a process that is still
+    // running. After an infinite wait that is a contradiction about the child, not an exit code, so
+    // it is reported as a failure rather than handed back as 259.
+    if raw == STILL_ACTIVE as u32 {
+        return Err(WindowsSandboxError::Launch {
+            reason: "the confined process reported STILL_ACTIVE after the wait".to_string(),
+            code: 0,
+        });
+    }
+    Ok(raw)
+}
+
+/// The exit-code surface: the raw `u32` rendered as the `i32` an exit code is expected to be.
+/// NTSTATUS-shaped statuses (`0x8000_0000` and above) wrap to negative numbers, which is exactly how
+/// a shell reports them.
+#[must_use]
+const fn confined_exit_code(raw: u32) -> i32 {
+    raw as i32
+}
+
+/// Launch `command` confined in the AppContainer of `setup`, wait for it, and return its exit code.
+///
+/// The setup has to stay alive for the whole call: it owns the profile whose SID is being declared
+/// and the ACEs the child is running under.
+pub fn spawn_in_appcontainer(
+    setup: &WindowsPolicySetup,
+    cwd: &Path,
+    command: &str,
+) -> Result<i32, WindowsSandboxError> {
+    launch_confined(setup, cwd, command).map(confined_exit_code)
+}
+
+/// Run one confined probe process, and report whether the confinement is real enough to trust.
+///
+/// This is what keeps the attempt surface from claiming `FullyEnforced` on the strength of a profile
+/// and a set of ACEs that nothing has ever used: an AppContainer whose identity Win32 refuses to put
+/// on a process, or whose ACEs are on objects the child cannot actually open, either cannot be
+/// launched at all or dies with one of the statuses in `CONFINEMENT_FAILURE_STATUSES`. The probe is
+/// one process, created once, asking for nothing but `exit 0`.
+fn probe_confined_launch(
+    setup: &WindowsPolicySetup,
+    cwd: &Path,
+) -> Result<(), WindowsSandboxError> {
+    let raw = match launch_confined(setup, cwd, PROBE_COMMAND) {
+        Ok(raw) => raw,
+        Err(err) => {
+            return Err(WindowsSandboxError::Probe {
+                reason: format!("the confined probe process could not be launched: {err}"),
+            });
+        }
+    };
+    if CONFINEMENT_FAILURE_STATUSES.contains(&raw) {
+        return Err(WindowsSandboxError::Probe {
+            reason: format!(
+                "the confined probe process died with the status {raw:#010x}, which is a confinement failure rather than a command failure"
+            ),
+        });
+    }
+    if raw != 0 {
+        return Err(WindowsSandboxError::Probe {
+            reason: format!(
+                "the confined probe process ({PROBE_COMMAND}) exited with {raw}, not the 0 it asked for"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Map one backend failure onto the `SandboxAttempt` variant that describes it.
 #[must_use]
 fn attempt_from_windows_error(err: WindowsSandboxError) -> SandboxAttempt {
@@ -1469,6 +2113,13 @@ fn attempt_from_windows_error(err: WindowsSandboxError) -> SandboxAttempt {
             SandboxAttempt::EnforcementFailed {
                 reason: format!("{path}: {reason}"),
             }
+        }
+        // Launch-side failures say the same thing about the attempt: the policy was built, but
+        // confining something with it did not work, which is an enforcement failure.
+        WindowsSandboxError::AttributeList { reason }
+        | WindowsSandboxError::Probe { reason }
+        | WindowsSandboxError::Launch { reason, .. } => {
+            SandboxAttempt::EnforcementFailed { reason }
         }
     }
 }
@@ -1493,6 +2144,9 @@ impl From<WindowsSandboxError> for SandboxError {
             | WindowsSandboxError::AclVerification { path, reason } => {
                 SandboxError::RuleSetup { path, reason }
             }
+            WindowsSandboxError::AttributeList { reason }
+            | WindowsSandboxError::Probe { reason }
+            | WindowsSandboxError::Launch { reason, .. } => SandboxError::Enforcement { reason },
         }
     }
 }
@@ -1565,28 +2219,157 @@ pub fn prepare_windows_policy(
     Ok(WindowsPolicySetup { profile, grants })
 }
 
-/// What one Windows sandbox attempt achieved.
+thread_local! {
+    /// The setup prepared by the policy half of this layer, parked for the launch half.
+    ///
+    /// `thread_local!` rather than a `static`, because [`WindowsPolicySetup`] is neither `Send` nor
+    /// `Sync`: the profile guard and the ACL guards own objects created on the thread that applied
+    /// them, and a DACL restored from another thread would race the thread that changed it. That is
+    /// not a limitation but the shape of the hand-off — the re-entry child runs its sandbox
+    /// handshake on one thread, so exactly one setup is prepared there, parked once, and picked up
+    /// once by [`take_windows_policy_setup`].
+    static PREPARED_SETUP: RefCell<Option<WindowsPolicySetup>> = const { RefCell::new(None) };
+}
+
+/// Park a prepared setup for the launch half, releasing whatever was parked before.
 ///
-/// Wired up to the only stage this layer can claim: the profile exists, and the required grants
-/// were applied. On success this reports `FullyEnforced`, which is provisional *by construction*
-/// until the launch layer exists — confinement is a property of the child launched inside the
-/// profile, not of the process that created the profile — and every failure maps onto the
-/// backend-neutral variant that names it.
+/// A second preparation on the same thread means two AppContainer profiles over the same objects:
+/// the older profile has to be deleted, and its ACEs restored, before the newer one is used — which
+/// is what dropping the replaced setup does. The note is printed on the console, in the style of the
+/// `extra_path_skip_note` precedent, because the re-entry child has no log subscriber yet.
+fn put_prepared_setup(setup: WindowsPolicySetup) {
+    let replaced = PREPARED_SETUP.with(|cell| cell.replace(Some(setup)));
+    if replaced.is_some() {
+        tracing::warn!(
+            "an AppContainer setup was already parked for this run: releasing the older one first"
+        );
+        eprintln!(
+            "warning: an AppContainer setup was already parked for this run; releasing the older one first"
+        );
+        drop(replaced);
+    }
+}
+
+/// Pick up the setup prepared by the policy half, in the launch half.
+///
+/// Returns `None` when nothing was parked: the caller has either prepared a setup (via
+/// [`attempt_windows_sandbox_with_setup`]) or given up on confinement. Exactly one of the two per
+/// run, which is what makes the hand-off single-shot rather than a race between two profiles.
+#[must_use]
+pub fn take_windows_policy_setup() -> Option<WindowsPolicySetup> {
+    PREPARED_SETUP.with(|cell| cell.take())
+}
+
+/// Release a parked setup without running anything confined in it, and report whether one was
+/// parked at all.
+///
+/// The path that needs this is a caller which decided, after the attempt said `FullyEnforced`, not
+/// to run a confined command: leaving the setup parked would keep this process's AppContainer SID
+/// written into the DACLs of the workspace until exit, instead of restoring them now.
+pub fn discard_windows_policy_setup() -> bool {
+    let taken = PREPARED_SETUP.with(|cell| cell.take());
+    let released = taken.is_some();
+    drop(taken);
+    released
+}
+
+/// The policy judgement and the guard hand-off in one call.
+///
+/// Returns what the attempt achieved **and** the [`WindowsPolicySetup`] it built: the profile and
+/// the applied ACEs have to outlive the judgement, because [`CreateProcessW`] confines the child by
+/// the SID in that profile and the ACEs on those objects. Nothing is launched or reverted between
+/// the two, so the caller of this function owns the guards (and the drop that restores the
+/// DACLs and deletes the profile) from here on.
+///
+/// The setup is parked in the `PREPARED_SETUP` thread-local and handed straight back, which is
+/// what keeps preparation single-shot per run: whoever prepared it once is the only one who can
+/// pick it up. The returned attempt is `FullyEnforced` only when the enforcement probe accepted
+/// the confinement, and every failure comes back with `None` — no half-applied policy is parked.
+#[must_use]
+pub fn attempt_windows_sandbox_with_setup(
+    workspace_root: &Path,
+    extra_readonly_paths: &[String],
+) -> (SandboxAttempt, Option<WindowsPolicySetup>) {
+    let setup = match prepare_windows_policy(workspace_root, extra_readonly_paths) {
+        Ok(setup) => setup,
+        Err(err) => return (attempt_from_windows_error(err), None),
+    };
+    // The probe is what turns "the profile exists and the ACEs are set" into "confinement is
+    // enforceable": one confined process, launched under exactly the SECURITY_CAPABILITIES block
+    // the launch layer will use, asked for nothing but `exit 0`. Without it a backend could report
+    // FullyEnforced while CreateProcessW would fail, or while the confined child cannot even reach
+    // the workspace it was confined to.
+    if let Err(err) = probe_confined_launch(&setup, workspace_root) {
+        return (attempt_from_windows_error(err), None);
+    }
+    put_prepared_setup(setup);
+    (SandboxAttempt::FullyEnforced, take_windows_policy_setup())
+}
+
+/// What one Windows sandbox attempt achieved, guards released.
+///
+/// This is the judgement surface the dispatch (`sandbox::attempt_backend`) calls: it prepares the
+/// policy, checks it with the probe and reports. The setup it built is released here — which
+/// restores the DACLs and deletes the profile — because this surface owns no child to keep it alive
+/// for; the launch layer takes the same setup from [`attempt_windows_sandbox_with_setup`] instead.
 #[must_use]
 pub fn attempt_windows_sandbox(
     workspace_root: &Path,
     extra_readonly_paths: &[String],
 ) -> SandboxAttempt {
-    let setup = match prepare_windows_policy(workspace_root, extra_readonly_paths) {
-        Ok(setup) => setup,
-        Err(err) => return attempt_from_windows_error(err),
-    };
-    // t-008: launch layer adds CreateProcessW (with this profile's SECURITY_CAPABILITIES block)
-    // plus the probe from inside the child. Until that exists, the setup below is dropped here,
-    // which restores every DACL it changed and deletes the profile: the state the launch layer
-    // must not reach before the command has finished.
+    let (attempt, setup) = attempt_windows_sandbox_with_setup(workspace_root, extra_readonly_paths);
     drop(setup);
-    SandboxAttempt::FullyEnforced
+    attempt
+}
+
+/// Map one failed attempt onto the error the re-entry contract carries.
+///
+/// `Ok(())` from [`sandbox::sandbox_outcome`] means the attempt was not a failure at all, which in
+/// this module's flow means the setup went missing rather than the policy failing: spelled out as
+/// `Unavailable` rather than reported as a success.
+fn attempt_error(attempt: SandboxAttempt) -> SandboxError {
+    match sandbox::sandbox_outcome(&attempt) {
+        Ok(()) => SandboxError::Unavailable {
+            reason: "no prepared AppContainer setup is parked for this run".to_string(),
+        },
+        Err(err) => err,
+    }
+}
+
+/// Run `command` inside the AppContainer this run prepared, and return its exit code.
+///
+/// The composite of the two layers: it picks up the setup prepared by
+/// [`attempt_windows_sandbox_with_setup`] (preparing one only when nothing was parked — so a re-entry
+/// run that has already been through the attempt surface does not create a second profile over the
+/// same objects), launches the command confined in it, and releases the guards only once the child
+/// has exited. The confined child of a re-entry process is a grandchild: everything below the
+/// re-entry process inherits its AppContainer membership whether or not it was launched with the
+/// attribute list, so confining the command this way is what the re-entry's own confinement means.
+///
+/// Not yet called in this crate: the re-entry plumbing (`main.rs`) is what references it, in the
+/// follow-up task that wires the re-entry command line to this layer.
+pub fn run_in_appcontainer(
+    workspace_root: &Path,
+    extra_readonly_paths: &[String],
+    cwd: &Path,
+    command: &str,
+) -> Result<i32, SandboxError> {
+    let setup = match take_windows_policy_setup() {
+        Some(setup) => setup,
+        None => {
+            let (attempt, setup) =
+                attempt_windows_sandbox_with_setup(workspace_root, extra_readonly_paths);
+            match setup {
+                Some(setup) => setup,
+                None => return Err(attempt_error(attempt)),
+            }
+        }
+    };
+    let outcome = spawn_in_appcontainer(&setup, cwd, command).map_err(SandboxError::from);
+    // Release only now: the child has exited, so the ACEs and the profile are no longer in use, and
+    // dropping the guards here is what puts the workspace DACLs back.
+    drop(setup);
+    outcome
 }
 
 #[cfg(test)]
@@ -1933,5 +2716,314 @@ mod tests {
             source.contains(&format!("{gate}\n{module}")),
             "the Windows backend must be declared behind its own platform gate in mod.rs"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // launch layer: command line, attribute list, exit codes, hand-off
+    // -------------------------------------------------------------------
+
+    /// The command line the confined launch hands to `CreateProcessW`: the program token quoted so
+    /// that it stays one token, and the payload appended verbatim because `cmd.exe` re-parses what
+    /// follows `/C` with its own metacharacters.
+    #[test]
+    fn test_confined_command_line_quotes_the_program_token_and_keeps_the_payload_verbatim() {
+        assert_eq!(
+            confined_command_line("C:\\Windows\\System32\\cmd.exe", "exit 0"),
+            "\"C:\\Windows\\System32\\cmd.exe\" /C exit 0"
+        );
+        // A program path with a space in it is quoted, and only quoted: nothing else changes.
+        assert_eq!(
+            confined_command_line("C:\\Program Files\\spec.exe", "echo hi"),
+            "\"C:\\Program Files\\spec.exe\" /C echo hi"
+        );
+        // A token with no backslash, quote or space is passed through unquoted.
+        assert_eq!(
+            confined_command_line("cmd.exe", "echo hi"),
+            "cmd.exe /C echo hi"
+        );
+        // The MSVCRT escaping rules: a trailing backslash run is doubled so that it cannot eat the
+        // closing quote, and a quote inside the token is escaped with a backslash.
+        assert_eq!(
+            quote_command_token("C:\\dir test\\"),
+            "\"C:\\dir test\\\\\""
+        );
+        assert_eq!(
+            quote_command_token("C:\\a b\\c\" d"),
+            "\"C:\\a b\\c\\\" d\""
+        );
+        // The payload is not escaped at all: `cmd.exe` sees the command exactly as it was given,
+        // quoting and shell metacharacters included.
+        let payload = r#"echo "hi there" && dir"#;
+        assert_eq!(
+            confined_command_line("cmd.exe", payload),
+            format!("cmd.exe /C {payload}")
+        );
+        assert_eq!(
+            confined_command_line("C:\\sh\"ell.exe", "exit 0"),
+            "\"C:\\sh\\\"ell.exe\" /C exit 0"
+        );
+    }
+
+    /// `%COMSPEC%` wins when it names something; an empty or blank value never does, and the
+    /// fallback spells the absolute path because a confined shell cannot rely on a PATH search.
+    #[test]
+    fn test_shell_program_prefers_comspec_and_falls_back_to_the_absolute_path() {
+        assert_eq!(
+            shell_program(Some(r#"C:\Windows\System32\cmd.exe"#), None),
+            r"C:\Windows\System32\cmd.exe"
+        );
+        // A blank value is not a program: the fallback takes over.
+        assert_eq!(
+            shell_program(Some("   "), Some(r#"C:\toolchain"#)),
+            r"C:\toolchain\System32\cmd.exe"
+        );
+        // Whitespace around a real value is dropped, the value is not.
+        assert_eq!(
+            shell_program(Some(" C:\\tmp\\shell.exe "), Some(r#"Q:\Windows"#)),
+            r"C:\tmp\shell.exe"
+        );
+        // A trailing separator in the value is kept: it is part of what `%COMSPEC%` named.
+        assert_eq!(shell_program(Some("C:\\tool\\"), None), "C:\\tool\\");
+        // A `SystemRoot` with a trailing separator does not become `System32\\cmd.exe`.
+        assert_eq!(
+            shell_program(None, Some(r#"D:\win\"#)),
+            r"D:\win\System32\cmd.exe"
+        );
+        // Nothing usable set at all: the documented default, which needs no search.
+        assert_eq!(
+            shell_program(None, Some("   ")),
+            r"C:\Windows\System32\cmd.exe"
+        );
+        assert_eq!(shell_program(None, None), r"C:\Windows\System32\cmd.exe");
+    }
+
+    /// The attribute list is sized by the API, in two passes; the extended startup block is the
+    /// plain block plus the list pointer, which is what `STARTUPINFOEXW::cb` has to name.
+    #[test]
+    fn test_the_attribute_list_is_sized_by_the_api_and_holds_the_two_attributes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            std::mem::size_of::<STARTUPINFOEXW>(),
+            std::mem::size_of::<STARTUPINFOW>()
+                + std::mem::size_of::<LPPROC_THREAD_ATTRIBUTE_LIST>(),
+            "the extended block is the plain one plus the list pointer"
+        );
+
+        let mut guard = AttributeListGuard::new(2)?;
+        // The API reported a size, and the buffer is that many bytes rounded up to `u64` elements
+        // (which is also what guarantees the 8-byte alignment a list of pointers needs).
+        assert!(guard.size > 0, "the two-pass size query must report a size");
+        assert!(guard.buffer.len() * std::mem::size_of::<u64>() >= guard.size);
+        assert_eq!(
+            guard.buffer.as_ptr() as usize % std::mem::align_of::<u64>(),
+            0
+        );
+        assert!(!guard.as_list().is_null());
+
+        // A real `SECURITY_CAPABILITIES` block, built the way the profile guard builds it: the list
+        // accepts it, which is what proves the attribute constant and the size argument agree.
+        let sid = string_to_sid("S-1-15-3-1")?;
+        let capabilities = CapabilitySids::internet_client()?;
+        let block = SECURITY_CAPABILITIES {
+            AppContainerSid: sid,
+            Capabilities: capabilities.as_sid_attributes(),
+            CapabilityCount: capabilities.count(),
+            Reserved: 0,
+        };
+        guard.set_security_capabilities(&block)?;
+
+        // And the handle list, with the std handles of this process as the confined launch hands
+        // them over.
+        let handles = stdio_state().handles;
+        guard.set_handle_list(&handles)?;
+
+        // SAFETY: the SID was allocated by `ConvertStringSidToSidW`, whose documented release is
+        // `LocalFree`; the capability array belongs to `capabilities`, which outlives this call.
+        unsafe { LocalFree(sid) };
+        Ok(())
+    }
+
+    /// The exit-code surface and the probe constants: a status stays a status, and the probe asks
+    /// the shell for nothing but `exit 0`.
+    #[test]
+    fn test_raw_statuses_reach_the_caller_as_exit_codes() {
+        assert_eq!(confined_exit_code(0), 0);
+        assert_eq!(confined_exit_code(3), 3);
+        // NTSTATUS-shaped statuses wrap to the negative number a shell reports.
+        assert_eq!(
+            confined_exit_code(STATUS_ACCESS_VIOLATION as u32),
+            -1073741819
+        );
+        assert!(CONFINEMENT_FAILURE_STATUSES.contains(&(STATUS_ACCESS_VIOLATION as u32)));
+        assert!(CONFINEMENT_FAILURE_STATUSES.contains(&(STATUS_ACCESS_DENIED as u32)));
+        assert_ne!(
+            confined_exit_code(STILL_ACTIVE as u32),
+            confined_exit_code(0),
+            "the STILL_ACTIVE guard has something to guard against"
+        );
+        assert_eq!(PROBE_COMMAND, "exit 0");
+        assert!(!PROBE_COMMAND.contains('\0'));
+    }
+
+    /// Every launch-side failure says the same thing about the attempt: the policy was built, and
+    /// confining something with it did not work. That is enforcement, never a warning.
+    #[test]
+    fn test_launch_side_failures_map_onto_enforcement() {
+        for err in [
+            WindowsSandboxError::AttributeList {
+                reason: "the attribute list refused the capability block".to_string(),
+            },
+            WindowsSandboxError::Launch {
+                reason: "CreateProcessW failed".to_string(),
+                code: 2,
+            },
+            WindowsSandboxError::Probe {
+                reason: "the confined probe process could not be launched".to_string(),
+            },
+        ] {
+            let attempt = attempt_from_windows_error(err.clone());
+            match attempt {
+                SandboxAttempt::EnforcementFailed { reason } => {
+                    assert!(!reason.is_empty(), "the reason has to say what failed");
+                }
+                other => panic!("expected EnforcementFailed, got {other:?}"),
+            }
+            let mapped = SandboxError::from(err.clone());
+            assert_eq!(
+                mapped.kind(),
+                "enforcement",
+                "a launch-side failure must reach the caller as an enforcement failure"
+            );
+            assert!(!mapped.reason().is_empty());
+        }
+    }
+
+    /// The rest of the mapping stays the way the policy layer left it: no identity is an
+    /// availability failure, a refused rule is a rule failure, and each reaches the matching
+    /// `SandboxError` class.
+    #[test]
+    fn test_availability_and_rule_failures_keep_their_classes() {
+        let no_identity = WindowsSandboxError::Sid {
+            reason: "no SID could be allocated".to_string(),
+        };
+        assert!(
+            matches!(
+                attempt_from_windows_error(no_identity.clone()),
+                SandboxAttempt::Unavailable { .. }
+            ),
+            "no confinement identity is an availability failure"
+        );
+        assert_eq!(SandboxError::from(no_identity).kind(), "unavailable");
+
+        let refused = WindowsSandboxError::AclMutate {
+            path: r"C:\Windows\System32".to_string(),
+            reason: "no WRITE_DAC on that object".to_string(),
+            code: 5,
+        };
+        assert!(
+            matches!(
+                attempt_from_windows_error(refused.clone()),
+                SandboxAttempt::RuleFailed { .. }
+            ),
+            "a refused rule is a rule failure"
+        );
+        assert_eq!(SandboxError::from(refused).kind(), "rule-setup");
+
+        let broken_verification = WindowsSandboxError::AclVerification {
+            path: r"C:\workspace".to_string(),
+            reason: "the applied ACE is not visible in the DACL".to_string(),
+        };
+        assert!(
+            matches!(
+                attempt_from_windows_error(broken_verification.clone()),
+                SandboxAttempt::EnforcementFailed { .. }
+            ),
+            "a policy that does not match the object is an enforcement failure"
+        );
+        assert_eq!(
+            SandboxError::from(broken_verification).kind(),
+            "enforcement"
+        );
+    }
+
+    /// The hand-off is single-shot and per-thread: a thread that never prepared a policy has
+    /// nothing parked, and releasing what is not there says so rather than pretending.
+    #[test]
+    fn test_a_fresh_thread_holds_no_parked_setup() {
+        let handled = std::thread::spawn(|| {
+            assert!(
+                take_windows_policy_setup().is_none(),
+                "a thread that prepared nothing has no parked setup"
+            );
+            !discard_windows_policy_setup()
+        })
+        .join();
+        assert!(
+            matches!(handled, Ok(false)),
+            "the fresh-thread hand-off check must report that nothing was parked"
+        );
+    }
+
+    /// The preparation half of the hand-off returns no setup when it failed, and leaves nothing
+    /// parked behind: a failed attempt must not strand a half-applied policy.
+    #[test]
+    fn test_with_setup_returns_no_setup_when_preparation_fails() {
+        let missing = if cfg!(target_os = "windows") {
+            "Q:\\marmel-does-not-exist"
+        } else {
+            "/marmel-does-not-exist"
+        };
+        let (attempt, setup) = attempt_windows_sandbox_with_setup(Path::new(missing), &[]);
+        assert!(
+            setup.is_none(),
+            "a failed preparation cannot hand over a setup"
+        );
+        match attempt {
+            SandboxAttempt::RuleFailed { path, .. } => {
+                assert!(path.contains("marmel-does-not-exist"), "{path}");
+            }
+            other => panic!("expected RuleFailed, got {other:?}"),
+        }
+        assert!(
+            !discard_windows_policy_setup(),
+            "the failed attempt must have left nothing parked"
+        );
+    }
+
+    /// A confined command in a temporary workspace: what the composite entry point answers.
+    ///
+    /// The workspace is a `tempfile` directory, so nothing outside it is created, and the command is
+    /// the shell's own `exit 0` shape: either the confined child ran and left 0, or the run stopped
+    /// at a stage that names itself. What must not happen is a hang, a leaked profile or a parked
+    /// setup left behind.
+    #[test]
+    fn test_run_in_appcontainer_answers_for_a_confined_command_in_a_temp_workspace()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+
+        let outcome = run_in_appcontainer(&workspace, &[], &workspace, "echo hi");
+        match outcome {
+            Ok(code) => assert_eq!(code, 0, "the confined command left the wrong exit code"),
+            Err(err) => {
+                // Not a success: this host could not confine the command, either because the
+                // policy could not be applied to the real objects (unavailable, rule-setup) or
+                // because the confined launch itself was refused (enforcement). Both answer with a
+                // reason the operator can act on, and neither is a silent pass.
+                assert!(!err.reason().is_empty(), "the refusal must name a reason");
+                assert!(
+                    matches!(err.kind(), "unavailable" | "rule-setup" | "enforcement"),
+                    "unexpected error class: {}",
+                    err.kind()
+                );
+            }
+        }
+        assert!(
+            !discard_windows_policy_setup(),
+            "the run must not leave a setup parked"
+        );
+        assert!(workspace.is_dir(), "the confined run left the workspace");
+        Ok(())
     }
 }
