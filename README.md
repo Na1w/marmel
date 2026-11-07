@@ -123,6 +123,14 @@ The project was conceived as a lightweight, single-binary incarnation of `kvaser
 
 In a fitting showcase of the concept, **the first version of Marmel was synthesized by `kvaser-cli` itself**: it analyzed Kvaser's codebase, excised the core orchestration engine, tools, and UI, and distilled them into a self-contained Rust application with minimal configuration.
 
+### Sandboxing: Autonomy Without Confirmation Fatigue
+
+A defining design pillar underpinning both `kvaser-cli` and Marmel is robust sandboxing. Many existing AI coding tools require the user to babysit every file change and shell execution, inducing prompt fatigue as operators mindlessly press "yes" to dozens of confirmation dialogues.
+
+The goal of Marmel has always been **true autonomy**: enabling agents to plan, edit, run test suites, and execute commands across multi-step tasks without stalling for permission. To make that autonomy safe, security had to be enforced structurally at the system boundary rather than interactively by the user.
+
+By combining in-process workspace path confinement with kernel-enforced Linux Landlock LSM sandboxing and isolated per-task git worktrees, Marmel gives subagents full freedom to build and test code within the project directory, while guaranteeing that sensitive user data (such as `~/.ssh`, `~/.gnupg`, or system configurations) remains strictly protected.
+
 ### Autonomous Dogfooding Since v0.4
 
 Since Marmel `v0.4`, virtually no code in this repository has been written by hand. Marmel has developed, debugged, and refactored itself based on user requirements and architectural goals.
