@@ -416,8 +416,8 @@ Raw mode streams structured, parseable event lines:
 
 Specialists execute shell commands via `run_command` (bounded by `command_timeout_secs`) or interactive PTY sessions (`pty_spawn`, `pty_write`, `pty_read`):
 
-- **Linux & macOS:** Commands execute inside `/bin/sh` with path confinement and command sandboxing (Landlock on Linux, Seatbelt on macOS).
-- **Windows:** Commands execute via `%COMSPEC%` (`cmd.exe`) with workspace path confinement.
+- **Linux & macOS:** Commands execute inside `/bin/sh` with command sandboxing (Landlock on Linux, Seatbelt on macOS).
+- **Windows:** Commands execute via `%COMSPEC%` (`cmd.exe`).
 - Clean exit codes and command outputs are preserved even when timeouts or cancellations occur.
 
 ### Runtime Directory (`.marmel/`)
@@ -533,9 +533,9 @@ args = ["mcp", "--kiwix-dir", "/path/to/kiwix", "--index", "/path/to/index"]
 
 Marmel enforces layered security boundaries to protect your host system:
 
-1. **Path Confinement:** All file access tools (`read_file`, `write_file`, `replace`, etc.) strictly validate paths against the workspace boundary. Traversal attempts (`../../`) are blocked.
-2. **Process Sandboxing (Landlock on Linux, Seatbelt/SBPL applied by Marmel itself on macOS):** Terminal commands execute within an unprivileged sandbox. Read/write access is restricted to the workspace, temporary directories (`/tmp`), and language caches (`~/.cargo`, `~/.cache`). Sensitive directories (`~/.ssh`, `~/.gnupg`) are strictly inaccessible. A host with no sandbox backend, or an enforcement failure, refuses the command rather than running it unsandboxed.
-3. **Cross-Platform Boundaries:** On macOS and Windows, workspace boundary confinement is actively enforced in-process; on macOS the command sandbox adds the same directory protections at the OS level.
+1. **Path Confinement:** All file access tools (`read_file`, `write_file`, `replace`, etc.) strictly validate paths against the workspace boundary in-process on all platforms. Traversal attempts (`../../`) are blocked.
+2. **Process Sandboxing (Linux Landlock & macOS Seatbelt):** Terminal commands execute within an unprivileged kernel-enforced sandbox (Landlock LSM on Linux, Seatbelt/SBPL on macOS). Read/write access is restricted to the workspace, temporary directories (`/tmp`), and language caches (`~/.cargo`, `~/.cache`). Sensitive directories (`~/.ssh`, `~/.gnupg`) are strictly inaccessible. A host with no sandbox backend, or an enforcement failure, refuses the command rather than running it unsandboxed.
+3. **Windows:** Command-level process sandboxing is currently unsupported; file access tools remain strictly confined to the workspace via in-process path validation.
 
 ### Extra Sandbox Read-Only Paths (`sandbox_extra_readonly_paths`)
 
