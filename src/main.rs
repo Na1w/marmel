@@ -328,9 +328,10 @@ fn main() -> Result<()> {
     config::set_active(cfg.clone());
     // Hand the CLI's resume decision to the module that owns the session loop. The
     // precedence `--fresh` > `--resume` > `MARMEL_RESUME` / `session_resume` is
-    // documented at `ui::session::resume_requested`, and the contradictory
+    // documented at `ui::session::explicit_resume_requested`, and the contradictory
     // combinations are rejected above (`exit 2`). With neither flag this records
-    // `false`/`false`.
+    // `false`/`false`: the resume-by-default decision belongs to
+    // `ui::session::resume_intent`, which also weighs the execution plan on disk.
     ui::session::set_resume_request(args.resume, args.fresh);
 
     if cfg.debug {
@@ -721,7 +722,7 @@ fn parse_args() -> CliArgs {
                      --debug          log all incoming and outgoing LLM and tool traffic to debug.log\n\
                      --config <path>  override the config file path\n\
                      --resume         rehydrate the previous run from .marmel/session/\n\
-                     --fresh          start fresh even if session_resume / MARMEL_RESUME is set\n\
+                     --fresh          start fresh even if session_resume / MARMEL_RESUME is set or the plan is unfinished\n\
                      -h, --help       print this help\n\n\
                      ARGS:\n    PROMPT           optional initial prompt to start the session"
                 );

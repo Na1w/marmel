@@ -33,7 +33,7 @@ use marmennill::session::{
     MessageRecord, PinWitness, ProcessEnding, RefusalCode, RestoreOutcome, SubagentPanel,
     UiJournalRecord, UiSection, ViewState,
 };
-use marmennill::ui::session::{BootReport, BootSink, boot, build_restored_context};
+use marmennill::ui::session::{BootReport, BootSink, ResumeIntent, boot, build_restored_context};
 use marmennill::ui::tui::TuiRenderer;
 use marmennill::ui::{Event, InputState, Renderer, SubagentDetail, UiRecord, UiTranscript};
 
@@ -360,6 +360,7 @@ fn boot_with_panes(bundle: &Path) -> Booted {
         ui_transcript: &mut transcript,
     };
     let report = boot(
+        ResumeIntent::Explicit,
         &plan,
         &cfg,
         &mut engine,
@@ -1463,6 +1464,7 @@ fn ac_c4_out_of_range_caret_selection_or_unknown_panel_refuses_and_leaves_bytes_
             ui_transcript: &mut transcript,
         };
         let error = boot(
+            ResumeIntent::Explicit,
             &plan,
             &cfg,
             &mut engine,

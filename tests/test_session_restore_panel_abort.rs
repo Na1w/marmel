@@ -107,7 +107,7 @@ use marmennill::session::{
     ProcessEnding, RefusalCode, RestoreOutcome, RestoredSession, SubagentPanel, ToolCallRecord,
     ToolFunctionRecord, UiSection, ViewState, WorkerCounters, WorkerSection, WorkerStatus,
 };
-use marmennill::ui::session::{BootReport, BootSink, boot, build_restored_context};
+use marmennill::ui::session::{BootReport, BootSink, ResumeIntent, boot, build_restored_context};
 use marmennill::ui::tui::TuiRenderer;
 use marmennill::ui::{Event, InputState, Renderer, SubagentDetail, UiTranscript};
 use tokio_util::sync::CancellationToken;
@@ -912,6 +912,7 @@ fn boot_with_panes(bundle: &Path) -> Booted {
         ui_transcript: &mut transcript,
     };
     let report = boot(
+        ResumeIntent::Explicit,
         &plan,
         &cfg,
         &mut engine,

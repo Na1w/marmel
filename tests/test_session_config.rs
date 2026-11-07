@@ -17,7 +17,9 @@
 //! Not covered: `--resume` / `--fresh` flag parsing, the contradictory-flag usage
 //! error (exit 2) and the `std::process::exit(EXIT_RESTORE_REFUSED)` call — all in
 //! the `marmel` **binary** target. The seam resolving that precedence,
-//! `ui::session::set_resume_request` / `resume_requested`, is covered here.
+//! `ui::session::set_resume_request` / `explicit_resume_requested`, is covered here
+//! (the plan-aware default on top of it, `ui::session::resume_intent`, is covered
+//! in `src/ui/session_tests.rs`, where a real `Plan` can be built over a temp dir).
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -40,7 +42,7 @@ use marmennill::config::apply_session_env;
 use marmennill::config::env_flag;
 use marmennill::config::load;
 use marmennill::session::EXIT_RESTORE_REFUSED;
-use marmennill::ui::session::resume_requested;
+use marmennill::ui::session::explicit_resume_requested;
 use marmennill::ui::session::set_resume_request;
 
 /// Serializes every test that reads or writes the three session env keys.
@@ -1051,7 +1053,7 @@ fn exit_restore_refused_const_is_three() {
 #[test]
 fn resume_handoff_fresh_outranks_the_resume_flag_and_the_config_spelling() {
     // Precedence resolved by the public seam the binary hands its flags to
-    // (`ui::session::set_resume_request`, `resume_requested`). The flags
+    // (`ui::session::set_resume_request`, `explicit_resume_requested`). The flags
     // themselves are parsed in `main`, which is unreachable from here — see the
     // module header.
     let env_guard = SessionEnvGuard::cleared();
@@ -1062,7 +1064,7 @@ fn resume_handoff_fresh_outranks_the_resume_flag_and_the_config_spelling() {
     };
 
     assert!(
-        !resume_requested(&cfg),
+        !explicit_resume_requested(&cfg),
         "`--fresh` must win over `--resume` and over the MARMEL_RESUME/session_resume spelling"
     );
 }
@@ -1077,7 +1079,7 @@ fn resume_handoff_fresh_alone_outranks_the_config_spelling() {
     };
 
     assert!(
-        !resume_requested(&cfg),
+        !explicit_resume_requested(&cfg),
         "`--fresh` alone must still outrank `session_resume = true`"
     );
 }
@@ -1093,7 +1095,7 @@ fn resume_handoff_resume_flag_restores_without_a_config_spelling() {
     );
 
     assert!(
-        resume_requested(&cfg),
+        explicit_resume_requested(&cfg),
         "`--resume` must request a restore even with `session_resume = false`"
     );
 }
@@ -1108,11 +1110,11 @@ fn resume_handoff_with_no_flag_falls_back_to_the_config_spelling() {
         ..Default::default()
     };
     assert!(
-        resume_requested(&from_config),
+        explicit_resume_requested(&from_config),
         "with no CLI flag, `session_resume = true` requests the restore"
     );
     assert!(
-        !resume_requested(&Config::default()),
+        !explicit_resume_requested(&Config::default()),
         "nothing requested => fresh start, byte-for-byte the pre-session behaviour"
     );
 }
@@ -1132,7 +1134,7 @@ fn resume_env_beats_the_file_and_the_handoff_agrees() {
         "`MARMEL_RESUME=1` must outrank `session_resume = false`"
     );
     assert!(
-        resume_requested(&cfg),
+        explicit_resume_requested(&cfg),
         "with no CLI flag the resolved config alone decides the trigger"
     );
 }
@@ -1149,7 +1151,7 @@ fn resume_handoff_fresh_outranks_the_resume_env_end_to_end() {
     let cfg = load(Some(path.as_str())).expect("a valid marmel.toml must load");
     assert!(cfg.session_resume, "the env value still wins inside `load`");
     assert!(
-        !resume_requested(&cfg),
+        !explicit_resume_requested(&cfg),
         "`--fresh` must outrank `MARMEL_RESUME=1`"
     );
 }

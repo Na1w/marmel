@@ -48,6 +48,12 @@
 //! swallowing it, and [`Plan::is_complete`] returns `false` when the plan cannot
 //! be read, so no loop concludes an unreadable plan was finished.
 //!
+//! The **resume** decision has its own authority, [`Plan::work_state`] returning
+//! [`PlanWorkState`]: four values (no plan / unfinished / complete / unknown)
+//! taken from a **single** `PLAN_MUTEX` acquisition and a single read, so "there
+//! is a plan file but I cannot tell what is in it" is stated out loud instead of
+//! collapsing into "nothing to resume".
+//!
 //! `.marmel/forced_phase.txt` is a legacy name nothing writes:
 //! [`FORCED_PHASE_FILE`] survives so that [`Plan::clear`] can delete a stale
 //! copy left on disk.
@@ -190,6 +196,73 @@ pub fn get_plan_start_time() -> Option<(std::time::Instant, chrono::DateTime<chr
 /// owner, [`crate::markers`], and this module only re-exports the type so that
 /// every existing `crate::manager::phase::MissionMarker` path keeps resolving.
 pub use crate::markers::MissionMarker;
+
+/// Three-plus-one valued view of the on-disk execution plan's work state — the
+/// answer to "is there a plan on disk, and does it still carry unfinished work?".
+///
+/// Four values, because three are not enough: [`Self::NoPlan`] and
+/// [`Self::Complete`] both mean "nothing to continue", while [`Self::Unknown`]
+/// means "a plan file is there but its work state cannot be determined" — a case
+/// a `bool` predicate would silently report as "nothing to continue". A caller
+/// that sees [`Self::Unknown`] must **fail closed**: neither resume nor declare
+/// victory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanWorkState {
+    /// No plan file at all — nothing to continue.
+    NoPlan,
+    /// A plan file exists and still has `pending` unchecked task lines.
+    Unfinished {
+        /// Exact number of unchecked task lines (a checkbox line counts even
+        /// when it carries no task id — it is open work the grammar can see).
+        pending: usize,
+    },
+    /// A plan file exists and every recognised task line is checked.
+    Complete,
+    /// A plan file exists but could not be read, or holds no recognised task
+    /// line at all: the caller must fail closed rather than guess.
+    Unknown {
+        /// Human-readable reason, for logging and for a user-facing notice.
+        warning: String,
+    },
+}
+
+/// Classify plan **content** into a [`PlanWorkState`] — the pure half of
+/// [`Plan::work_state`], so the classification rules can be pinned without a
+/// real plan file.
+///
+/// Every "is this a task line" decision comes from the single grammar owner,
+/// [`crate::plan_parse::parse_tasks`]; this function only counts what that parser
+/// reports and declares no grammar of its own.
+///
+/// * no task line **and** nothing but whitespace on disk → [`PlanWorkState::NoPlan`]
+///   (the parser can tell "nothing was written" from "garbage": the document has
+///   no content to interpret, so there is nothing to continue);
+/// * no task line in a **non-empty** document → [`PlanWorkState::Unknown`]: a plan
+///   file that the grammar does not understand says neither "done" nor "empty",
+///   so both readings would be guesses;
+/// * task lines, none unchecked → [`PlanWorkState::Complete`];
+/// * task lines with at least one unchecked → [`PlanWorkState::Unfinished`].
+fn classify_plan_work(content: &str) -> PlanWorkState {
+    let tasks = crate::plan_parse::parse_tasks(content);
+    if tasks.is_empty() {
+        return if content.trim().is_empty() {
+            PlanWorkState::NoPlan
+        } else {
+            PlanWorkState::Unknown {
+                warning: format!(
+                    "execution plan exists ({} bytes) but contains no recognised task line",
+                    content.len()
+                ),
+            }
+        };
+    }
+    let pending = tasks.iter().filter(|task| task.is_pending()).count();
+    if pending == 0 {
+        PlanWorkState::Complete
+    } else {
+        PlanWorkState::Unfinished { pending }
+    }
+}
 
 /// Manages the on-disk execution plan and its state under a marmel directory.
 ///
@@ -514,6 +587,58 @@ impl Plan {
             }
         };
         Self::completion_of(&content)
+    }
+
+    /// Classify the on-disk plan into a [`PlanWorkState`], taking `PLAN_MUTEX`
+    /// exactly once and reading the file exactly once.
+    ///
+    /// This is the **resume predicate**: "does an execution plan exist on disk,
+    /// and does it still contain unfinished tasks — and if we cannot tell, say so
+    /// explicitly instead of guessing?". It is deliberately one lock acquisition
+    /// and one read: composing `exists()` with `!is_complete()` would take the
+    /// lock twice (two snapshots that can disagree about the same file) and could
+    /// not express "the file is there but I cannot tell", so an unreadable or
+    /// garbled plan would collapse into "nothing to resume".
+    ///
+    /// The classification itself lives in [`classify_plan_work`] and is decided
+    /// entirely by the shared task-line grammar in [`crate::plan_parse`] — this
+    /// module keeps no second parser:
+    ///
+    /// * no plan file → [`PlanWorkState::NoPlan`];
+    /// * empty / whitespace-only file → [`PlanWorkState::NoPlan`];
+    /// * non-empty file with **no** recognised task line → [`PlanWorkState::Unknown`];
+    /// * task lines, all checked → [`PlanWorkState::Complete`];
+    /// * task lines with at least one unchecked →
+    ///   [`PlanWorkState::Unfinished`] with the exact pending count;
+    /// * file exists but cannot be read (permissions, invalid UTF-8, a directory
+    ///   in its place) → [`PlanWorkState::Unknown`] carrying the warning.
+    ///
+    /// Every classification is `Ok`: an unreadable plan is a **state to report**,
+    /// not a failure to propagate, and it is reported as [`PlanWorkState::Unknown`]
+    /// rather than as an `Err` so no caller can drop it into a `?` and fall back to
+    /// a default. `Err` is kept in the signature for a future IO-level fault; no
+    /// current path produces one.
+    pub fn work_state(&self) -> Result<PlanWorkState> {
+        let _guard = PLAN_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        self.work_state_unlocked()
+    }
+
+    /// [`Plan::work_state`] for call sites that already hold `PLAN_MUTEX` — see
+    /// [`Plan::read_unlocked`].
+    fn work_state_unlocked(&self) -> Result<PlanWorkState> {
+        let content = match self.read_unlocked() {
+            Ok(Some(content)) => content,
+            Ok(None) => return Ok(PlanWorkState::NoPlan),
+            Err(e) => {
+                let warning = format!(
+                    "execution plan at {} could not be read: {e:#}",
+                    self.plan_path().display()
+                );
+                tracing::warn!("Plan::work_state: {warning} — plan work state is UNKNOWN");
+                return Ok(PlanWorkState::Unknown { warning });
+            }
+        };
+        Ok(classify_plan_work(&content))
     }
 
     /// Directory holding the completed-plan snapshots (`.marmel/archive/`).

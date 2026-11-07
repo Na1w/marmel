@@ -302,14 +302,46 @@ pub fn set_resume_request(resume: bool, fresh: bool) {
     FRESH_REQUESTED.store(fresh, Ordering::SeqCst);
 }
 
-/// The resume trigger, resolved with this precedence:
+/// How this run treats the session bundle on disk — the three-valued replacement
+/// for the old `resume_requested: bool`.
+///
+/// The values are not a `bool` in disguise: [`Self::Explicit`] is a promise the
+/// operator made ("restore, or fail"), while [`Self::Implicit`] is a default this
+/// program chose for them ("there is unfinished work on disk — continue it"). The
+/// two therefore carry deliberately different failure policies: a bundle that
+/// exists but is refused stops an explicit resume with
+/// [`crate::session::EXIT_RESTORE_REFUSED`] (`3`) and never stops an implicit one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeIntent {
+    /// Nobody asked for a restore and nothing on disk justifies one: today's
+    /// fresh start, byte for byte.
+    Fresh,
+    /// `--resume`, `MARMEL_RESUME=1` or `session_resume = true`: restore, and a
+    /// bundle that exists but is refused is the hard stop (exit `3`).
+    Explicit,
+    /// No flag and no config asked for it, but the execution plan on disk still
+    /// carries unfinished tasks and session capture is enabled: continue the
+    /// previous run. **Never fatal** — no bundle, or a refused one, degrades to a
+    /// fresh start with no usage error and no refusal verdict.
+    Implicit,
+}
+
+impl ResumeIntent {
+    /// `true` for both restore intents: the engine must then be built **without**
+    /// a system prompt, because a restore may never route through a pin setter.
+    pub fn restores(self) -> bool {
+        matches!(self, ResumeIntent::Explicit | ResumeIntent::Implicit)
+    }
+}
+
+/// The **explicit** trigger, resolved with this precedence:
 ///
 /// ```text
 ///   --fresh                    wins over everything else: never restore
 ///   --resume                   restore
 ///   MARMEL_RESUME=<bool>       restore (environment)
 ///   session_resume = true      restore (config file)
-///   none of the above          fresh start — byte-for-byte today's behaviour
+///   none of the above          no explicit request
 /// ```
 ///
 /// `MARMEL_RESUME` is already folded into `cfg.session_resume` by
@@ -317,9 +349,77 @@ pub fn set_resume_request(resume: bool, fresh: bool) {
 /// two spellings are a single read here and neither can outrank `--fresh`.
 /// `--resume --fresh` and `--resume` with capture disabled are usage errors that
 /// `main` exits `2` on (`main.rs:41`) long before this is consulted.
-pub fn resume_requested(cfg: &Config) -> bool {
+///
+/// This answers only "did somebody ask for a restore?", which is one half of
+/// [`resume_intent`]: the plan-aware default lives there.
+pub fn explicit_resume_requested(cfg: &Config) -> bool {
     (RESUME_REQUESTED.load(Ordering::SeqCst) || cfg.session_resume)
         && !FRESH_REQUESTED.load(Ordering::SeqCst)
+}
+
+/// Resolve this run's [`ResumeIntent`] — the single place the resume decision is
+/// made, and the only reader of the [`RESUME_REQUESTED`] / [`FRESH_REQUESTED`]
+/// statics.
+///
+/// Order, and nothing else is consulted:
+///
+/// 1. `--fresh` → [`ResumeIntent::Fresh`]: the escape hatch always wins;
+/// 2. `--resume` / `MARMEL_RESUME` / `session_resume = true` →
+///    [`ResumeIntent::Explicit`], exactly today's behaviour;
+/// 3. session capture enabled **and** [`Plan::work_state`] reports
+///    [`PlanWorkState::Unfinished`] → [`ResumeIntent::Implicit`];
+/// 4. otherwise → [`ResumeIntent::Fresh`].
+///
+/// Step 3 is a default, never a guess: [`PlanWorkState::NoPlan`],
+/// [`PlanWorkState::Complete`] and [`PlanWorkState::Unknown`] all resolve to
+/// [`ResumeIntent::Fresh`] (fail closed), and so does a `work_state` that returns
+/// an error. Those indeterminate cases are logged with `tracing::warn!` and never
+/// printed to the terminal — nobody asked for a restore, so nobody is owed a
+/// restore verdict.
+///
+/// [`Plan::work_state`]: crate::manager::phase::Plan::work_state
+/// [`PlanWorkState::NoPlan`]: crate::manager::phase::PlanWorkState::NoPlan
+/// [`PlanWorkState::Complete`]: crate::manager::phase::PlanWorkState::Complete
+/// [`PlanWorkState::Unknown`]: crate::manager::phase::PlanWorkState::Unknown
+/// [`PlanWorkState::Unfinished`]: crate::manager::phase::PlanWorkState::Unfinished
+pub fn resume_intent(plan: &crate::manager::phase::Plan, cfg: &Config) -> ResumeIntent {
+    use crate::manager::phase::PlanWorkState;
+
+    if FRESH_REQUESTED.load(Ordering::SeqCst) {
+        return ResumeIntent::Fresh;
+    }
+    if explicit_resume_requested(cfg) {
+        return ResumeIntent::Explicit;
+    }
+    // Nobody asked, so the default may only continue a run the user really left
+    // unfinished: capture enabled, and a plan on disk that still has open tasks.
+    if !cfg.session_enabled {
+        return ResumeIntent::Fresh;
+    }
+    match plan.work_state() {
+        Ok(PlanWorkState::Unfinished { pending }) => {
+            tracing::info!(
+                "resume-by-default: the execution plan at {} still has {pending} unchecked \
+                 task(s), so this run continues the previous one",
+                plan.plan_path().display()
+            );
+            ResumeIntent::Implicit
+        }
+        Ok(PlanWorkState::Unknown { warning }) => {
+            tracing::warn!(
+                "resume-by-default: {warning} — starting fresh instead of resuming on a guess"
+            );
+            ResumeIntent::Fresh
+        }
+        Ok(PlanWorkState::NoPlan | PlanWorkState::Complete) => ResumeIntent::Fresh,
+        Err(error) => {
+            tracing::warn!(
+                "resume-by-default: the execution plan state could not be read ({error:#}) — \
+                 starting fresh instead of resuming on a guess"
+            );
+            ResumeIntent::Fresh
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,7 +1220,16 @@ pub struct BootReport {
 ///   [`build_restored_context`] instead of [`build_manager_context`];
 /// * [`Renderer::restore_panes`] / [`Renderer::announce_restore`] — the pane bytes
 ///   are assigned verbatim, never regenerated.
+///
+/// `intent` decides how loud the two "nothing was restored" outcomes are and
+/// whether a refusal is fatal — see [`ResumeIntent`]. Only
+/// [`ResumeIntent::Implicit`] ever degrades: a missing bundle is then silent on
+/// the terminal, and a refused one logs a `tracing::warn!` and answers
+/// `Ok(BootReport::default())` (nothing restored, nothing installed), which is
+/// why an unrequested resume can never end a run with
+/// [`crate::session::EXIT_RESTORE_REFUSED`].
 pub fn boot(
+    intent: ResumeIntent,
     plan: &crate::manager::phase::Plan,
     cfg: &Config,
     ctx: &mut ContextEngine,
@@ -1137,14 +1246,46 @@ pub fn boot(
             orphan_members,
         } => {
             let report = no_bundle_report(&bundle, &legacy_journals, &orphan_members);
-            surface_restore_lines(renderer, sink, &report.no_bundle_lines);
+            // A resume that was asked for gets the loud fresh start; an implicit
+            // one (nobody asked) says nothing on the terminal — the same sentences
+            // still reach `tracing` inside `no_bundle_report`.
+            if intent != ResumeIntent::Implicit {
+                surface_restore_lines(renderer, sink, &report.no_bundle_lines);
+            }
             return Ok(report);
         }
         RestoreOutcome::Refused { refusal, report } => {
             // Fail-closed: the bundle was never read into live state, so
-            // there is nothing to un-install. The refusal is still printed through
-            // all three destinations before the typed error carries it out to
-            // `main`, which maps it to `session::EXIT_RESTORE_REFUSED` (3).
+            // there is nothing to un-install. For a resume that was **asked for**
+            // the refusal is printed through all three destinations before the
+            // typed error carries it out to `main`, which maps it to
+            // `session::EXIT_RESTORE_REFUSED` (3); for an implicit one it degrades
+            // to a fresh start instead (see below).
+            if intent == ResumeIntent::Implicit {
+                // Nobody asked for this restore, so a refusal must never become a
+                // hard stop: the bundle stays untouched and unread, the reason goes
+                // to the log, and this run starts fresh exactly as a run with no
+                // bundle at all would. Nothing is printed and nothing is journaled:
+                // the sentences built below say "this run stops with exit code 3",
+                // which would be a lie here.
+                tracing::warn!(
+                    "implicit resume refused ({}): continuing with a fresh session — {}",
+                    refusal.code.label(),
+                    refusal.display(&bundle)
+                );
+                for notice in &report.notices {
+                    tracing::warn!(
+                        "implicit resume lost [{:?}] {}: {}",
+                        notice.kind,
+                        notice.subject,
+                        notice.detail
+                    );
+                }
+                for warning in &report.warnings {
+                    tracing::warn!("implicit resume warning: {warning}");
+                }
+                return Ok(BootReport::default());
+            }
             let mut lines = vec![
                 refusal.display(&bundle),
                 format!(
@@ -1416,19 +1557,31 @@ pub fn boot(
     })
 }
 
-/// The `--resume` decision point. `Ok(None)` means the session continues as
+/// The resume decision point. `Ok(None)` means the session continues as
 /// a fresh run — either nothing asked for a restore, or `--resume` was asked and
 /// there is no bundle, which is answered with a **loud** fresh start (exit
 /// `0`). `Err(RestoreRefused)` is the hard stop (exit `EXIT_RESTORE_REFUSED`).
 ///
-/// **Caller contract:** `Ok(None)` while a resume was asked means the resume-branch
-/// engine ([`build_restored_context`], which deliberately carries no `[0]`) kept
-/// its empty transcript, so the caller MUST install the composed system prompt
-/// before pinning the goal — otherwise [`ContextEngine::set_goal`] pads
-/// `messages[0]` with an empty `System` and the Manager runs with no prompt at all.
-/// `src/ui/session.rs` does that immediately after this call.
+/// `intent` is resolved once, by [`resume_intent`], and only its two restore
+/// values enter the pass:
+///
+/// * [`ResumeIntent::Fresh`] — today's behaviour: the pass is never entered and
+///   the bundle directory is not opened;
+/// * [`ResumeIntent::Explicit`] — today's behaviour, byte for byte: the loud
+///   fresh start when there is no bundle, and `Err(RestoreRefused)` when the
+///   bundle exists but is refused;
+/// * [`ResumeIntent::Implicit`] — the same pass, **never fatal**: a missing
+///   bundle says nothing, a refused bundle is logged and answered with
+///   `Ok(None)`, so a default that nobody asked for can never fail a run.
+///
+/// **Caller contract:** `Ok(None)` while a resume was attempted means the
+/// resume-branch engine ([`build_restored_context`], which deliberately carries no
+/// `[0]`) kept its empty transcript, so the caller MUST install the composed
+/// system prompt before pinning the goal — otherwise [`ContextEngine::set_goal`]
+/// pads `messages[0]` with an empty `System` and the Manager runs with no prompt at
+/// all. `src/ui/session.rs` does that immediately after this call.
 pub fn boot_if_requested(
-    resume_requested: bool,
+    intent: ResumeIntent,
     plan: &crate::manager::phase::Plan,
     cfg: &Config,
     ctx: &mut ContextEngine,
@@ -1436,10 +1589,10 @@ pub fn boot_if_requested(
     session_id: &mut String,
     sink: &mut BootSink<'_>,
 ) -> Result<Option<BootReport>, RestoreRefused> {
-    if !resume_requested {
+    if !intent.restores() {
         return Ok(None);
     }
-    let report = boot(plan, cfg, ctx, renderer, session_id, sink)?;
+    let report = boot(intent, plan, cfg, ctx, renderer, session_id, sink)?;
     if report.restored {
         Ok(Some(report))
     } else {
@@ -1867,8 +2020,14 @@ pub async fn run_session_with_bounds_report(
     // the order a fresh boot installs it, so `--resume` / `MARMEL_RESUME=1` /
     // `session_resume = true` with no bundle is byte-for-byte the fresh request
     // (`session_tests.rs::resume_without_a_bundle_sends_the_same_request_as_a_fresh_start`).
-    let resume = resume_requested(cfg);
-    let mut ctx = if resume {
+    //
+    // The intent is resolved here, once, because it decides both **how** the
+    // engine is built and **how loud** the boot pass may be: `--fresh` wins over
+    // everything, an explicit trigger keeps every existing behaviour and exit
+    // code, and an implicit one (an unfinished execution plan on disk, nobody
+    // asked) is a default that may never fail this run — see [`resume_intent`].
+    let intent = resume_intent(&plan, cfg);
+    let mut ctx = if intent.restores() {
         build_restored_context(cfg)
     } else {
         build_manager_context(cfg, system.clone())
@@ -1926,7 +2085,7 @@ pub async fn run_session_with_bounds_report(
             ui_transcript: &mut ui_transcript,
         };
         boot_if_requested(
-            resume,
+            intent,
             &plan,
             cfg,
             &mut ctx,
@@ -1955,7 +2114,7 @@ pub async fn run_session_with_bounds_report(
     // `ctx.set_goal` below pad `messages[0]` with an empty `Message::System`
     // (`ContextEngine::set_goal`), so the composed prompt is installed here in
     // the fresh-boot order. With `boot.is_some()` bytes were restored: no-op.
-    if resume && boot.is_none() {
+    if intent.restores() && boot.is_none() {
         ctx.set_system_prompt(system.clone());
     }
 
