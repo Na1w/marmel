@@ -162,6 +162,52 @@ unsafe extern "C" {
     ) -> libc::c_int;
 }
 
+/// Test-only knob: when set to an unambiguous truthy value, the next [`attempt_seatbelt`] hands
+/// libSystem a deliberately unparsable profile instead of the rendered one.
+///
+/// It exists so a real macOS host can be driven into [`SandboxAttempt::EnforcementFailed`] by a
+/// profile libSystem refuses to compile, and the end-to-end spine "profile rejected -> refusal ->
+/// exit [`crate::harness::sandbox::SANDBOX_REFUSE_EXIT_CODE`]" can be exercised there rather than
+/// asserted only from the pure mapping in `sandbox::reentry_action`. Nothing in production sets
+/// it, and no other code reads it.
+pub const SEATBELT_TEST_BAD_PROFILE_ENV: &str = "MARMEL_SEATBELT_TEST_BAD_PROFILE";
+
+/// The clause that makes the knob's profile text unparsable: an unterminated `subpath` filter,
+/// i.e. SBPL text the parser must reject instead of compile.
+const BROKEN_PROFILE_TAIL: &str = "\n(deny file-read* (subpath \"unterminated\n";
+
+/// `true` when the test knob is switched on: the raw value it carries, run through the same
+/// fail-closed parsing as the sandbox opt-out ([`crate::harness::pty::is_optout_value`]), so
+/// `0`, `false`, an empty value or a typo keep the real profile in place.
+#[must_use]
+fn bad_profile_requested() -> bool {
+    bad_profile_from_value(std::env::var(SEATBELT_TEST_BAD_PROFILE_ENV).ok().as_deref())
+}
+
+/// Pure half of [`bad_profile_requested`], so the accepted values are testable without touching
+/// the environment of a running test process.
+#[must_use]
+fn bad_profile_from_value(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| crate::harness::pty::is_optout_value(value))
+}
+
+/// The text handed to libSystem, with the deliberate break applied when `requested` says the
+/// knob is on. The break is append-only, so the policy clauses the rendered profile carries stay
+/// untouched; only the tail makes the text fail to compile.
+#[must_use]
+fn break_profile_for_test_env(text: String, requested: bool) -> String {
+    if !requested {
+        return text;
+    }
+    // The re-entry child has no logging subscriber yet, so a knob that changes what libSystem
+    // sees must never be confused with a policy decision: name it out loud.
+    tracing::warn!(
+        "{SEATBELT_TEST_BAD_PROFILE_ENV} is set: handing libSystem a deliberately unparsable \
+         Seatbelt profile (test knob only, no production run sets it)"
+    );
+    format!("{text}{BROKEN_PROFILE_TAIL}")
+}
+
 /// Confine the current process with a Seatbelt profile built from the shared policy list.
 ///
 /// The macOS sibling of `crate::harness::sandbox::attempt_landlock`: the same inputs
@@ -177,8 +223,11 @@ unsafe extern "C" {
 pub fn attempt_seatbelt(workspace_root: &Path, extra_readonly_paths: &[String]) -> SandboxAttempt {
     // 1. One flat profile. Seatbelt has no reliable `import` across a string boundary, and the
     //    call below cannot be repeated, so every grant and every denial has to be in the text
-    //    already.
-    let profile = match CString::new(sbpl::render_profile(workspace_root, extra_readonly_paths)) {
+    //    already. [`break_profile_for_test_env`] may replace this text with a deliberately
+    //    unparsable variant, and only while its test-only knob is switched on.
+    let rendered = sbpl::render_profile(workspace_root, extra_readonly_paths);
+    let broken = bad_profile_requested();
+    let profile = match CString::new(break_profile_for_test_env(rendered, broken)) {
         Ok(profile) => profile,
         // A `NUL` anywhere in the rendered profile means the policy text is not a valid C
         // string, i.e. the requested policy cannot be handed to the kernel: the Seatbelt
@@ -787,7 +836,62 @@ mod tests {
         assert!(with.contains("rc -1"), "{with}");
     }
 
-    /// The diagnostic is read before it is freed, and an empty or absent message still leaves a
+    /// The knob that drives a real macOS run into a refusal must stay off for anything but an
+    /// unambiguous truthy value — the same fail-closed parsing the sandbox opt-out uses — so a
+    /// typo or a falsy value can never silently hand libSystem a broken profile.
+    #[test]
+    fn test_bad_profile_knob_parses_like_the_optout() {
+        for value in ["1", "true", "TRUE", "yes", "on", " 1 "] {
+            assert!(
+                bad_profile_from_value(Some(value)),
+                "{value:?} must switch the knob on"
+            );
+        }
+        for value in ["", "0", "false", "no", "off", "maybe", "1x", "test"] {
+            assert!(
+                !bad_profile_from_value(Some(value)),
+                "{value:?} must leave the knob off"
+            );
+        }
+        assert!(
+            !bad_profile_from_value(None),
+            "an unset knob must leave the rendered profile exactly as the emitter made it"
+        );
+    }
+
+    /// The break must be append-only: the policy text the emitter rendered stays in place (so a
+    /// refusal under the knob proves the *tail* is what libSystem rejected, never a missing
+    /// clause), and the tail must be text the SBPL parser cannot accept.
+    #[test]
+    fn test_bad_profile_break_is_an_unparsable_tail_and_only_a_tail() {
+        let rendered = "(version 1)\n(deny default)\n(allow file-read* (subpath \"/work\"))\n";
+        let broken = break_profile_for_test_env(rendered.to_string(), true);
+
+        assert_eq!(
+            rendered,
+            broken
+                .strip_suffix(BROKEN_PROFILE_TAIL)
+                .expect("the break must be an appended tail"),
+            "the break must not touch the rendered policy text"
+        );
+        assert!(
+            broken.matches('(').count() > broken.matches(')').count(),
+            "the tail must leave an unbalanced clause behind: {broken}"
+        );
+        assert_eq!(
+            broken.matches('"').count() % 2,
+            1,
+            "the tail must leave an unterminated string literal behind: {broken}"
+        );
+
+        assert_eq!(
+            break_profile_for_test_env(rendered.to_string(), false),
+            rendered,
+            "an off knob must not change the profile one way or the other"
+        );
+    }
+
+    /// The diagnostic for a failed init is read before it is freed, and an empty or absent message still leaves a
     /// usable reason rather than `None` pretending to be success. The buffer belongs to
     /// libSystem, so the test keeps its own allocation out of the way rather than freeing it
     /// twice.
