@@ -49,7 +49,7 @@ Marmel is built for autonomous, multi-step software development with continuous 
 - **Dynamic Subagents & JIT Prompt Architect:** Subagents are not static templates. A Just-In-Time (JIT) Agent Architect dynamically synthesizes tailored blueprints for each task, assembling role archetypes (Coder, Researcher, Debugger, etc.), relevant domain skills (`skills/`), and least-privilege tool allowlists before delegation.
 - **Automated Validation:** Deliverables from specialist agents are independently audited by a Validator subagent. If tests fail or requirements are missed, actionable feedback is returned in an automated fix loop. Individual tasks can optionally declare `(no-validate)` when formal testing is unnecessary.
 - **Real-Time Steering & Live Dialogue:** You can type into the prompt at any point. Active subagents pause to answer questions, explain reasoning, incorporate feedback, or adjust the plan on the fly.
-- **Git Worktree Isolation:** Subagents can work in isolated git worktrees (`.worktrees/`) on dedicated branches, committing changes cleanly to avoid file conflicts.
+- **Isolated Per-Task Git Worktrees:** Subagents work in isolated git worktrees (`.worktrees/<task_id>`) on dedicated task branches, commit their changes as `"Marmel Coder"`, and merge back cleanly to avoid file conflicts.
 - **Offline Reference Search (MCP):** Connect external tool servers via Model Context Protocol (stdio or SSE), including the bundled `zim-search` engine for lightning-fast offline querying of multi-gigabyte Kiwix/ZIM dumps (such as Wikipedia or Stack Overflow).
 - **Workspace Sandboxing:** File operations are strictly confined to the workspace. On Linux, terminal commands are isolated with Linux Landlock LSM to protect sensitive directories like `~/.ssh` and `~/.gnupg`.
 
@@ -316,7 +316,7 @@ Marmel integrates tightly with git to keep changes clean, auditable, and isolate
 - **`off`**: Disables git context injection.
 - **`enforce_worktree`**: Enforces strict git worktree isolation for subtasks.
 
-Git worktrees are created under the gitignored `.worktrees/` directory inside the workspace root, because the sandbox denies writes outside it. Agents commit small and often, staging explicit paths with conventional message prefixes, and `.marmel/` is never committed.
+When worktree isolation is active, agents create ephemeral worktrees under `.worktrees/<task_id>` inside the workspace. Each specialist operates on an isolated `task/<task_id>` branch, commits as **`"Marmel Coder"`**, and merges changes back into the active feature branch upon task completion.
 
 ---
 

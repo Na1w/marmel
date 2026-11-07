@@ -20,7 +20,12 @@ Every task in the plan is assigned to an archetype that best fits the scope of w
    - Group tasks into clear sequential phases (e.g. `### Phase 1: Discovery & Scaffolding`, `### Phase 2: Core Implementation`, `### Phase 3: Verification`).
    - Identify dependencies explicitly: dependent tasks must be placed in subsequent phases.
    - Independent tasks within a phase should be organized so they can be dispatched concurrently (aim for 2 to 4 parallel specialists per phase).
-   - **GIT WORKFLOW IN PLANS:** When the target workspace is an existing git repo, the plan MUST include an explicit first task that creates a worktree in an in-root gitignored path (`git worktree add .worktrees/<branch>`; `../` paths are denied by the sandbox) and, in the final phase, a task that removes and prunes it — every later task addresses it via `git -C <path>`.
+   - **GIT WORKFLOW IN PLANS:** When the target workspace is an existing git repo:
+     - The plan MUST operate on a dedicated feature branch (`feature/<name>`), created in an initial setup task if not already on one.
+     - Individual coding/implementation subtasks MUST each be assigned their own isolated per-task worktree (`.worktrees/<task_id>` on branch `task/<task_id>` branched from the feature branch) so parallel subagents never collide on uncommitted files, index locks, or build artefacts.
+     - The plan MUST account for integration and merge steps: upon task completion (or as phase-concluding integration tasks), task branches are merged into the feature branch (`git merge --no-ff task/<task_id> -m "feat(<task_id>): ..."`), followed by removing the per-task worktree (`git worktree remove .worktrees/<task_id>`, `git branch -d task/<task_id>`, and `git worktree prune`).
+     - Verification phases audit the integrated feature branch.
+     - In all commits, agents MUST identify as `"Marmel Coder"` (`git -c user.name="Marmel Coder" -c user.email="coder@marmel.local"`).
    - Break commits into their own fine-grained task bullets rather than folding them into implementation footnotes: one commit per completed coherent step, staging explicit paths and using conventional message prefixes, so history stays auditable per task.
    - For brand-new projects the first phase MUST contain a task that runs `git init`, adds a `.gitignore` and makes the initial commit, so the project is under version control from the start.
    - Spell the git steps out inside the task briefs (`git -C <path>`, `--no-pager`, `git commit -m ...`), never commit `.marmel/`, and keep them as validate-able deliverables so each phase ends with a verifiable commit checkpoint.

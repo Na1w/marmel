@@ -18,27 +18,26 @@ suggested_tools:
   - Reach for an isolated worktree when the mission rewrites build or configuration files (`Cargo.toml`, `Cargo.lock`, `.cargo/config.toml`), starts long builds that would race another specialist, or spans several specialists at once.
 - **WORKTREE ISOLATION (PREFERRED):**
   - The sandbox allows writes ONLY inside the workspace root, so the idiomatic sibling layout (`git worktree add ../<branch>`) is denied — anything outside the root fails with a permission error.
-  - Create the worktree inside the root, under a dedicated gitignored directory. Add `.worktrees/` to `.gitignore` first (edit `.gitignore` with `replace`/`write_file`), and commit that rule on its own before creating the worktree:
+  - Create isolated worktrees per-task inside the root under the gitignored `.worktrees/` directory. This ensures multiple subagents running in parallel never clash on uncommitted files, index locks, or build artefacts.
+  - Add `.worktrees/` to `.gitignore` first (edit `.gitignore` with `replace`/`write_file`), and commit that rule on its own before creating worktrees:
     - `git add .gitignore`
     - `git commit -m "chore: ignore .worktrees/ for isolated worktrees"`
-  - Then branch from the tip of the current integration branch and verify the worktree exists:
-    - `git worktree add .worktrees/<branch> -b feature/<name>`
+  - For each coding task (`<task_id>`, e.g. `t-001`), branch from the active feature branch into an isolated task worktree:
+    - `git worktree add .worktrees/<task_id> -b task/<task_id> <feature-branch>`
     - `git worktree list`
-    - `git -C .worktrees/<branch> branch --show-current`
-  - If `.worktrees/` already holds a worktree from an earlier run, list and prune stale entries before creating a new one (`git worktree prune`, then `git worktree list`).
-  - Address every git operation at the worktree explicitly — cwd is fixed to the workspace root:
-    - `git -C .worktrees/<branch> status --short`
-    - `git -C .worktrees/<branch> add crates/<crate>/src/<file>.rs`
-    - `git -C .worktrees/<branch> commit -m "feat: <concise summary>"`
+    - `git -C .worktrees/<task_id> branch --show-current`
+  - If `.worktrees/` already holds a stale worktree from an earlier task or aborted run, list and prune stale entries (`git worktree prune`, then `git worktree list`).
+  - Address every git operation at the per-task worktree explicitly — cwd is fixed to the workspace root:
+    - `git -C .worktrees/<task_id> status --short`
+    - `git -C .worktrees/<task_id> add <changed-files>`
+    - `git -C .worktrees/<task_id> commit -m "feat(<task_id>): <concise summary>"`
   - A gitignored subtree is pruned by the workspace walker, so `glob` may not list files under `.worktrees/`. Open them with `read_file` and search them with `grep_search` using explicit paths, or inspect them through `run_command`.
-  - Clean up when the branch is merged or abandoned:
-    - `git worktree remove .worktrees/<branch>`
+  - MERGE THE WORK BACK to the feature branch and clean up when the task is verified and green:
+    - `git -C <feature-branch-dir-or-root> merge --no-ff task/<task_id> -m "feat(<task_id>): merge completed <task_id> work"`
+    - `git worktree remove .worktrees/<task_id>`
+    - `git branch -d task/<task_id>`
     - `git worktree prune`
-  - FALL BACK to a plain branch (`git checkout -b feature/<name>`) when a worktree is impossible: shallow or restricted history, detached `HEAD`, or uncommitted local changes that must stay shared with the main checkout.
-  - MERGE THE WORK BACK from the main checkout once the branch is green:
-    - `git status --short` (main checkout must be clean)
-    - `git merge --no-ff feature/<name> -m "feat: merge <name> work"`
-    - `git worktree remove .worktrees/<branch>` then `git branch -d feature/<name>`
+  - FALL BACK to a plain branch (`git checkout -b task/<task_id>`) only when a worktree is genuinely impossible (shallow history, detached `HEAD`).
 - **NEW PROJECTS UNDER GIT:**
   - Run `git init`, then write `.gitignore` BEFORE any real work so artefacts never enter the index: `target/`, `.marmel/`, `marmel.toml`, `*.idx.bin`, `.fastembed_cache/`.
   - Make the initial commit immediately (`git add .gitignore Cargo.toml && git commit -m "chore: initial commit"`), then commit early and often from the first edit onwards.
@@ -55,7 +54,7 @@ suggested_tools:
   - Disable the pager on every read-only inspection: `git --no-pager log --oneline -20`, `git --no-pager diff`, `git --no-pager show --stat HEAD`.
   - `git` exit codes are NOT reported on Linux, so confirm each step out of band instead of trusting the exit code: `git status --short`, `git --no-pager log --oneline -1`, `git worktree list`.
   - Pass `timeout_seconds` on long-running git calls (`git fetch`, a whole-repo `git log`, a large `git diff`) so nothing blocks the mission.
-  - `git config --global` writes are denied by the sandbox. Supply the identity per call with `git -c user.name="<name>" -c user.email="<addr>" commit -m "..."`, or set it once repo-local: `git -C <path> config user.name "<name>"` and `git -C <path> config user.email "<addr>"`.
+  - Always commit with author identity "Marmel Coder": supply it per call with `git -c user.name="Marmel Coder" -c user.email="coder@marmel.local" commit -m "..."`, or set it once locally in the worktree/repository: `git -C <path> config user.name "Marmel Coder"` and `git -C <path> config user.email "coder@marmel.local"` (global config writes are denied by the sandbox).
 - **NEVER DO:**
   - Force-push a shared branch (`git push --force`); use `--force-with-lease` only for your own branch.
   - Skip hooks with `--no-verify`.
