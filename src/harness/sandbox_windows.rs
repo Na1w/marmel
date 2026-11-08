@@ -167,20 +167,31 @@ pub enum WindowsSandboxError {
 }
 
 impl WindowsSandboxError {
-    /// Whether the failure is the expected "an unprivileged process cannot rewrite this DACL"
-    /// case: `ERROR_ACCESS_DENIED` (no `WRITE_DAC` on the object) or
+    /// Whether the failure is the expected "this process may not read or rewrite this DACL" case:
+    /// `ERROR_ACCESS_DENIED` (no `READ_CONTROL`/`WRITE_DAC` on the object) or
     /// `ERROR_PRIVILEGE_NOT_HELD`.
     ///
-    /// This is what separates a skip note from a hard rule failure, so it stays an exact match
-    /// on those two codes rather than a heuristic over the reason text.
+    /// Both halves of a grant are covered, because both are refused by the same token limitation:
+    /// the DACL **read** asks for `READ_CONTROL`, and the DACL **write** for `WRITE_DAC` — through
+    /// the handle [`open_security_handle`] opens, which refuses the open itself before
+    /// `SetSecurityInfo` is ever reached, so the write half arrives as `AclMutate` from either
+    /// call.
+    ///
+    /// This is what separates a skip note from a hard rule failure, and what makes the hard rule
+    /// failure say *why* (t-034 wired it into `required_grant_refusal`, where a genuine refusal on
+    /// the required workspace-root grant is reported as an actionable `WRITE_DAC`/`icacls` verdict
+    /// instead of as the catch-all rule failure it used to be). It stays an exact match on those
+    /// two codes rather than a heuristic over the reason text.
+    ///
+    /// [`open_security_handle`]: self::open_security_handle
     #[must_use]
     pub fn is_access_refusal(&self) -> bool {
-        match self {
-            WindowsSandboxError::AclMutate { code, .. } => {
-                *code == ERROR_ACCESS_DENIED || *code == ERROR_PRIVILEGE_NOT_HELD
-            }
-            _ => false,
-        }
+        let code = match self {
+            WindowsSandboxError::AclMutate { code, .. }
+            | WindowsSandboxError::AclRead { code, .. } => *code,
+            _ => return false,
+        };
+        code == ERROR_ACCESS_DENIED || code == ERROR_PRIVILEGE_NOT_HELD
     }
 
     /// The machine-readable class of this failure, named after the stage it happened in.
@@ -286,8 +297,10 @@ use windows_sys::Win32::Security::{
     SUB_CONTAINERS_AND_OBJECTS_INHERIT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
-    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
+    CreateFileW, FILE_ALL_ACCESS, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE,
+    FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, OPEN_EXISTING, READ_CONTROL,
+    SYNCHRONIZE, WRITE_DAC,
 };
 // The launch half of the backend: the process-attribute list that carries the confinement
 // declaration, `CreateProcessW` and the wait for the child, and the std-handle inspection that
@@ -994,8 +1007,16 @@ fn paths_match(left: &Path, right: &Path) -> bool {
 /// root canonicalises to the UNC spelling).
 fn comparable_components(path: &Path) -> Vec<String> {
     let spelling = path.as_os_str().to_string_lossy().to_lowercase();
+    // Every separator spelling Windows accepts is flattened **before** the markers are stripped,
+    // and the order of those two steps is the whole point (t-034): a marker is itself spelled with
+    // separators, so `//?/C:/Users` — a verbatim path that reached this code through a channel
+    // which normalises `\` to `/` — was never recognised as a marker and left a leading `?`
+    // segment behind. The drive prefix of that spelling (`?`, then `c:`) could then never equal
+    // the drive prefix of the plain one (`c:`): the same `\\?\c:` versus `c:` mismatch the
+    // backslash spelling used to have, surviving in the one spelling the strip could not see.
+    let spelling = spelling.replace('/', "\\");
     strip_windows_path_markers(&spelling)
-        .split(['/', '\\'])
+        .split('\\')
         // An empty segment is what a separator pair leaves behind, and a `.` segment says "this
         // directory": neither names a part of the location.
         .filter(|segment| !segment.is_empty() && *segment != ".")
@@ -1027,6 +1048,10 @@ const UNC_SEPARATOR: &str = "\\";
 /// spellings of one location have to lose the marker before they can be compared:
 /// `\\?\C:\Users` becomes `C:\Users` and `\\?\UNC\server\share` becomes `\\server\share`. A
 /// spelling without a marker is returned as it stands.
+///
+/// The spelling arrives with every separator already flattened to `\` by the caller, because the
+/// markers themselves are spelled with separators: `//?/C:/Users` is the marker of one volume
+/// written with the other separator, not a `?` segment on a relative path.
 fn strip_windows_path_markers(spelling: &str) -> String {
     if let Some(rest) = spelling.strip_prefix(VERBATIM_UNC_MARKER) {
         // The marker ends with the separator that closes the `UNC` word, so `rest` starts at the
@@ -1528,12 +1553,18 @@ impl Drop for DaclSnapshot {
     }
 }
 
-/// One applied ACE, and the handle on the DACL it replaced.
+/// One applied ACE, the handle the write was issued through, and the handle on the DACL it
+/// replaced.
 ///
 /// Adding an ACE for the AppContainer SID changes an object the operator owns; putting the
 /// saved DACL back when the run ends is what stops a failed or interrupted run from leaking a
 /// grant that every later process would inherit. `Drop` performs that restore, so the guard is
 /// the whole contract: as long as it drops on every path, no ACE outlives the run.
+///
+/// The handle is part of that contract since t-034: the grant is written and restored through the
+/// **same** open on one object, so neither half of the pair ever resolves a path name — and the
+/// handle has to outlive the confined child exactly as the ACE does, which is what keeping it in
+/// the guard guarantees.
 pub struct AclGrantGuard {
     path: PathBuf,
     /// The security descriptor read before the ACE was added; its DACL is what the restore
@@ -1541,9 +1572,15 @@ pub struct AclGrantGuard {
     saved: DaclSnapshot,
     /// The ACL `SetEntriesInAclW` built for this grant, released on drop.
     applied_dacl: *mut ACL,
+    /// The handle [`open_security_handle`] opened for the write, closed by this guard once the
+    /// saved DACL is back where it was.
+    handle: HANDLE,
     /// Whether the saved DACL was a NULL DACL, which the restore has to put back as such rather
     /// than as an empty ACL.
     saved_null: bool,
+    /// `Some` when the grant is on the object but did not propagate to what already exists under
+    /// it; the clause is the operator note for that decline (see [`propagate_grant`]).
+    propagation: Option<String>,
     /// Non-`Sync` marker: the saved descriptor is only ever read and written on one thread.
     _single_thread: PhantomData<*mut ()>,
 }
@@ -1554,6 +1591,19 @@ impl AclGrantGuard {
     /// The guard is returned only when a mutation was really needed: an entry already covered
     /// by an existing ACE ([`AclCoverage::Covered`]) and an object with a NULL DACL
     /// ([`AclCoverage::NoDacl`]) need neither a change nor a restore.
+    ///
+    /// Read by name, written by handle — the deliberate asymmetry, and it is chosen rather than
+    /// incidental (t-034). The DACL **read** is issued by name exactly as it always was, because
+    /// it asks only for `READ_CONTROL`: an object this token may read but not rewrite
+    /// (`C:\Windows`, `C:\Program Files`) answers the read with the DACL that already carries the
+    /// application-package ACEs the coverage check exists to find, and `apply` then does nothing.
+    /// The DACL **write** is issued through a handle on the object, because that is the step that
+    /// must never touch anything else (see [`open_security_handle`]), and a handle asking for
+    /// `WRITE_DAC` is the right thing for *that* call alone. Moving the read to a handle too would
+    /// have asked `WRITE_DAC` of the objects above — turning "already covered, nothing to do" into
+    /// a refusal on every read-only toolchain entry — which is why the pair is not symmetric while
+    /// both halves still address one object. Verification reads by name as well
+    /// ([`grant_is_visible`]), so read and verify keep one spelling rule and only the write moved.
     #[must_use = "the guard restores the saved DACL when the run ends, so no applied ACE leaks"]
     pub fn apply(app_sid: PSID, entry: &PolicyPath) -> Result<Option<Self>, WindowsSandboxError> {
         let path = entry.path.as_path();
@@ -1563,7 +1613,6 @@ impl AclGrantGuard {
             return Ok(None);
         }
         let mask = mask_for_grant(entry.grant);
-        let wide_path = WideString::from_path(path);
         // The trustee names the SID rather than a name: an AppContainer SID is something the
         // account-name lookup would not resolve, so the SID form is the only honest spelling.
         let trustee = TRUSTEE_W {
@@ -1593,10 +1642,21 @@ impl AclGrantGuard {
                 code,
             });
         }
-        // SAFETY: the object name is owned by `wide_path`, and `applied` is a freshly built ACL.
+        // The authoritative write goes through a handle on the object itself (t-034). The
+        // name-based call this replaces resolves a *path*, and a call that resolves a path is free
+        // to touch everything that path contains: on a real repository root — `target\`, `.git\`,
+        // junctions, cloud placeholders, a descendant this token cannot open for the security
+        // rights — that was the one step whose refusal (`ERROR_ACCESS_DENIED`) reached
+        // `apply_policy_entries` as a rule failure on the **required** entry, i.e. an exit
+        // `SANDBOX_REFUSE_EXIT_CODE` on every command the host ran, while an empty fixture root
+        // stayed green. A handle has no name to resolve and nothing below it to walk: it writes
+        // exactly one object's security descriptor, which is the grant this entry asks for.
+        let handle = open_security_handle(path)?;
+        // SAFETY: `handle` is the handle just opened on this object, and `applied` is the ACL the
+        // guard takes ownership of from here on.
         let set = unsafe {
-            SetNamedSecurityInfoW(
-                wide_path.pcwstr(),
+            SetSecurityInfo(
+                handle,
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION,
                 std::ptr::null_mut(),
@@ -1607,19 +1667,28 @@ impl AclGrantGuard {
         };
         if set != ERROR_SUCCESS {
             // SAFETY: the ACL that was just built is freed here rather than kept, because the
-            // object was never changed.
-            unsafe { LocalFree(applied as *mut c_void) };
+            // object was never changed, and the handle made for the write is released with it.
+            unsafe {
+                LocalFree(applied as *mut c_void);
+                CloseHandle(handle);
+            };
             return Err(WindowsSandboxError::AclMutate {
                 path: path_text(path),
-                reason: format!("SetNamedSecurityInfoW failed: {}", last_win32_error()),
+                reason: format!("SetSecurityInfo failed: {}", last_win32_error()),
                 code: set,
             });
         }
+        // Pre-existing descendants are reached by propagation and by nothing else, and propagation
+        // is best effort: its refusal becomes a note on the guard, never an `Err` from here, so it
+        // can never reach the fatal arm of `apply_policy_entries`. See [`propagate_grant`].
+        let propagation = propagate_grant(path, applied);
         Ok(Some(Self {
             path: path.to_path_buf(),
             saved,
             applied_dacl: applied,
+            handle,
             saved_null,
+            propagation,
             _single_thread: PhantomData,
         }))
     }
@@ -1629,23 +1698,32 @@ impl AclGrantGuard {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// `Some` when this grant is written on the object but did not propagate to the objects that
+    /// already existed under it: the clause of the operator note about that decline, which
+    /// [`apply_policy_entries`] reports on the same channel as every other declined grant.
+    #[must_use]
+    fn propagation_note(&self) -> Option<&str> {
+        self.propagation.as_deref()
+    }
 }
 
 impl Drop for AclGrantGuard {
     fn drop(&mut self) {
         // Restore the saved DACL, exactly as it was read: a NULL DACL goes back as NULL, because
-        // an empty ACL would deny everything instead.
-        let wide_path = WideString::from_path(&self.path);
+        // an empty ACL would deny everything instead. The restore runs through the same handle the
+        // write ran through — one object, already opened, and no path name to resolve on the way
+        // out of a run whose command has long since started writing inside this directory.
         let dacl: *const ACL = if self.saved_null || self.saved.dacl().is_null() {
             std::ptr::null()
         } else {
             self.saved.dacl()
         };
-        // SAFETY: the name is owned by `wide_path`; the ACL is the saved one, still owned by
-        // `saved`, which drops after this call.
+        // SAFETY: `self.handle` is the handle `apply` opened for this guard and kept alive for the
+        // run; the ACL is the saved one, still owned by `saved`, which drops after this call.
         let code = unsafe {
-            SetNamedSecurityInfoW(
-                wide_path.pcwstr(),
+            SetSecurityInfo(
+                self.handle,
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION,
                 std::ptr::null_mut(),
@@ -1661,9 +1739,204 @@ impl Drop for AclGrantGuard {
                 "failed to restore the DACL this run changed: the AppContainer ACE may still be set"
             );
         }
-        // SAFETY: `SetEntriesInAclW` allocated the applied ACL, and nothing else references it.
-        unsafe { LocalFree(self.applied_dacl as *mut c_void) };
+        // SAFETY: the handle is the one `open_security_handle` made for this guard and nothing else
+        // references it, and `SetEntriesInAclW` allocated the applied ACL, which nothing else
+        // references either. The saved descriptor is released by `DaclSnapshot::drop`, which runs
+        // after this body.
+        unsafe {
+            CloseHandle(self.handle);
+            LocalFree(self.applied_dacl as *mut c_void);
+        };
     }
+}
+
+/// The right a DACL write needs on the object it is issued against, spelled the way the operator
+/// has to name it to `icacls` when the grant is refused.
+const REQUIRED_WRITE_RIGHT: &str = "WRITE_DAC";
+
+/// Open one object so that its DACL can be rewritten through a handle instead of through its name.
+///
+/// Every argument here is a decision, so each is justified:
+///
+/// * `READ_CONTROL | WRITE_DAC` — the two rights the DACL pair asks of the handle it works
+///   through: the read for `READ_CONTROL`, `SetSecurityInfo` for `WRITE_DAC`. Nothing else is
+///   requested, so opening the object never asks this token for a right the security calls
+///   themselves would not have asked for (a grant must not, for instance, want `SYNCHRONIZE` or
+///   the data rights of the object it is only publishing an ACE on).
+/// * `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` — this handle is held for the whole
+///   run, because the ACE has to outlive the confined child. Refusing to share would make the
+///   sandbox hold the workspace (or a temporary directory) closed against the very build, test run
+///   or `git` invocation it exists to run, and refusing `DELETE` would change what a rename of the
+///   root costs the run for no security gain: the ACE, not the handle, is the enforcement.
+/// * `OPEN_EXISTING` — a policy publishes a grant on an object that is already there; it never
+///   creates, replaces or truncates anything to do its job.
+/// * `FILE_FLAG_BACKUP_SEMANTICS` — the required entry is a **directory**, and `CreateFileW` opens
+///   a directory only with this flag; without it the open of a container answers
+///   `ERROR_ACCESS_DENIED`/`ERROR_SHARING_VIOLATION`, which would make the sandbox refuse the one
+///   entry it cannot lose. Backup/restore *privileges* are deliberately not requested, so the open
+///   is judged by the ordinary access check and reports the same refusal the DACL calls did.
+fn open_security_handle(path: &Path) -> Result<HANDLE, WindowsSandboxError> {
+    let wide_path = WideString::from_path(path);
+    // SAFETY: the name is owned by `wide_path` for the duration of the call; null security
+    // attributes mean "the default descriptor, not inherited", which an existing object ignores
+    // anyway; a null template handle is what the API documents.
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.pcwstr(),
+            READ_CONTROL | WRITE_DAC,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        let (code, text) = last_win32_error_detail();
+        return Err(WindowsSandboxError::AclMutate {
+            path: path_text(path),
+            reason: format!(
+                "CreateFileW({REQUIRED_WRITE_RIGHT} on the object, the handle the DACL write is issued \
+                 through) failed: {text}"
+            ),
+            code,
+        });
+    }
+    Ok(handle)
+}
+
+/// Ask the security runtime to push the applied ACE down to the objects that already existed under
+/// `path`, and report a refusal as a note rather than as a failure.
+///
+/// What genuinely needs propagation, precisely: the ACE this policy writes is inheritable
+/// (`SUB_CONTAINERS_AND_OBJECTS_INHERIT`), so every object created **after** the grant is given it
+/// at creation time and needs nothing from anyone. Two cases are not covered by that:
+///
+/// * an object that already existed when the grant was written. Its own DACL was materialised
+///   earlier, so the only way the new parent ACE reaches it is the security runtime propagating the
+///   change — which is exactly what this name-based call asks for, and exactly the step that can
+///   fail one descendant at a time on a large tree (an unrenameable `target\` entry, a junction, an
+///   offline cloud placeholder, a child this token cannot open).
+/// * a descendant whose DACL is **protected** — switched off with `icacls /inheritance:d`, or
+///   carried in by a copy from another location. Inheritance into that object is blocked *by the
+///   object itself*, so no parent-side mechanism reaches inside it: propagation declines for the
+///   tree, and the only thing that opens it again is resetting that descendant's own DACL
+///   (`icacls "<descendant>" /reset`), which this run does not presume to do to the operator's files.
+///
+/// A decline here is therefore a **degraded** run and never a fatal one. The required grant itself
+/// is on the object — that is the handle-based write in [`AclGrantGuard::apply`], which *is* fatal
+/// when it fails — so the confined command can write everything it creates and everything created
+/// from now on inherits. Failing the run over the rest is the difference between one warning on a
+/// host and that host exiting `SANDBOX_REFUSE_EXIT_CODE` on every command, which is the failure this
+/// module exists to stop.
+fn propagate_grant(path: &Path, applied: *const ACL) -> Option<String> {
+    let wide_path = WideString::from_path(path);
+    // SAFETY: the name is owned by `wide_path`, and `applied` is the ACL the caller has already
+    // written to the object itself and which the guard keeps owned until it drops.
+    let code = unsafe {
+        SetNamedSecurityInfoW(
+            wide_path.pcwstr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            applied,
+            std::ptr::null(),
+        )
+    };
+    if code == ERROR_SUCCESS {
+        return None;
+    }
+    Some(propagation_note(path, code))
+}
+
+/// The operator note for a propagation this policy asked for and did not get: what is missing, why
+/// it does not fail the run, and the two commands that show and open whatever blocks it.
+///
+/// The clause is stored **without** the `warning: ` prefix, because it is read three ways: logged
+/// as it stands, printed on the console as a note (prefixed, the `declined_grant_note` shape), and
+/// named inside the reason of a partially enforced attempt, where a second "warning" would read as
+/// a warning about a warning.
+fn propagation_note(path: &Path, code: WIN32_ERROR) -> String {
+    let object = path_text(path);
+    format!(
+        "the AppContainer grant on {object} was written on the object itself but could not be \
+         propagated to what already exists under it: SetNamedSecurityInfoW failed (win32 error \
+         {code}): {}. Everything created from now on inherits the grant; an object that already \
+         existed stays out of reach for the confined command while its own DACL keeps it there — \
+         most often a descendant whose inheritance is switched off, which no grant on its parent \
+         can cross. Show the DACL with `icacls \"{object}\"`, and open the affected descendant \
+         again with `icacls \"{object}\\<name>\" /reset /c /q`.",
+        status_text(code),
+    )
+}
+
+/// The deliberate handling of a failure on the **required** entry (t-034).
+///
+/// The decision, stated because it is the decision the whole backend hangs on: a genuine access
+/// refusal on the required workspace-root grant stays **fatal**, because the mission is fail-closed
+/// unless the operator opts out ([`crate::harness::pty::SANDBOX_OPTOUT_ENV`]) and the required
+/// entry is the one rule the mission rests on — the workspace is where the confined command has to
+/// be able to write. Reporting `PartiallyEnforced` instead would start the command inside a
+/// confinement that cannot write its own workspace: every command would then fail on its first
+/// write, with a shell error message instead of a diagnosis, which is a worse version of the
+/// refusal this is trying to avoid. What propagation degrades to a note (see
+/// [`propagate_grant`]), the required grant itself may not: that failure is on the object this run
+/// was asked to grant, so it is terminal *and* actionable.
+///
+/// Being actionable is the half `is_access_refusal()` pays for: it says "this token may not rewrite
+/// that DACL", which is a sentence the operator can do something about, so the reason is rewritten
+/// to name the right, the object, where the failure happened, and the commands that show and fix
+/// it. Every other code (a name that does not resolve, a path that is too long, an object with no
+/// security at all) is returned as it came: those are not this case, and dressing them up in
+/// `icacls` advice would send the operator to a lever that cannot move them.
+fn required_grant_refusal(entry: &PolicyPath, err: WindowsSandboxError) -> WindowsSandboxError {
+    if !err.is_access_refusal() {
+        return err;
+    }
+    let object = {
+        let named = err.path();
+        if named.is_empty() {
+            path_text(&entry.path)
+        } else {
+            named.to_string()
+        }
+    };
+    let guidance = required_write_guidance(&object);
+    match err {
+        WindowsSandboxError::AclMutate { path, reason, code } => WindowsSandboxError::AclMutate {
+            path,
+            reason: format!("{reason} — {guidance}"),
+            code,
+        },
+        WindowsSandboxError::AclRead { path, reason, code } => WindowsSandboxError::AclRead {
+            path,
+            reason: format!("{reason} — {guidance}"),
+            code,
+        },
+        // `is_access_refusal()` is exact about the variants that carry a code, so this arm is
+        // unreachable for a refusal; spelled out rather than `other => other` folded in, so a
+        // future variant that reports a refusal cannot lose the guidance silently.
+        other => other,
+    }
+}
+
+/// The operator-facing half of a refused required grant: the right this run needed, where the
+/// failure happened, the commands that show and fix it, and the opt-out that runs the command
+/// unsandboxed anyway.
+#[must_use]
+fn required_write_guidance(path: &str) -> String {
+    let opt_out = crate::harness::pty::SANDBOX_OPTOUT_ENV;
+    format!(
+        "this failure is on the required workspace-root grant itself: the propagation to objects \
+         that already existed under it is best effort and can only warn, so nothing here degraded \
+         quietly. The right this run needs on {path} is {REQUIRED_WRITE_RIGHT} (together with \
+         READ_CONTROL to read the DACL back), because the AppContainer identity of this run is \
+         written into that object's DACL. Show who holds it with `icacls \"{path}\"`, then give it \
+         to this account from an elevated prompt with `icacls \"{path}\" /grant \
+         \"%USERNAME%\":(OI)(CI)F`, or restore the inherited permissions with `icacls \"{path}\" \
+         /reset`, and run the command again. {opt_out}=1 runs it unsandboxed."
+    )
 }
 
 /// The one-line note for a grant this policy asked for and did not get: the entry, the polarity it
@@ -1682,7 +1955,8 @@ fn declined_grant_note(entry: &PolicyPath, reason: impl std::fmt::Display) -> St
 
 /// What one run of [`apply_policy_entries`] produced: the guards that restore what changed, plus
 /// the optional read-write entries (the temporary directories) whose grant was asked for and not
-/// got, named by path.
+/// got, named by path, plus the entries whose grant is on the object but did not reach what already
+/// existed under it.
 struct PolicyApplication {
     /// The guards for every ACE that really was added, in application order.
     guards: Vec<AclGrantGuard>,
@@ -1690,6 +1964,10 @@ struct PolicyApplication {
     /// Read-only entries that declined are not listed here: losing a toolchain directory does not
     /// narrow what the confinement can *write*, and the confinement itself is unaffected.
     declined_readwrite: Vec<String>,
+    /// One clause per entry whose grant was written on the object itself but could not be
+    /// propagated to the objects that already existed under it, in application order. Every entry
+    /// in this list is a **degraded** run, never a failed one: see [`propagate_grant`].
+    propagation_notes: Vec<String>,
 }
 
 /// Whether the grant `entry` asks for is visible on the object it names, using the same snapshot
@@ -1729,15 +2007,32 @@ fn decline_read_write_entry(
 /// extra path that cannot become a rule takes on a Landlock host — and the read-write decline is
 /// additionally recorded, because it is what turns the attempt from `FullyEnforced` into
 /// `PartiallyEnforced` rather than an exit for every command on that host.
+///
+/// The third outcome class is neither a decline nor a failure: a grant that was written on the
+/// object itself but could not be pushed down onto the objects that already existed under it. That
+/// is a degraded run, reported as a note, and never terminal — see [`propagate_grant`] for the one
+/// case that needs propagation at all.
 fn apply_policy_entries(
     app_sid: PSID,
     table: &WindowsPolicyTable,
 ) -> Result<PolicyApplication, WindowsSandboxError> {
     let mut guards: Vec<AclGrantGuard> = Vec::new();
     let mut declined_readwrite: Vec<String> = Vec::new();
+    let mut propagation_notes: Vec<String> = Vec::new();
     for entry in &table.entries {
         match AclGrantGuard::apply(app_sid, entry) {
-            Ok(Some(guard)) => guards.push(guard),
+            Ok(Some(guard)) => {
+                if let Some(note) = guard.propagation_note() {
+                    // The authoritative grant is on the object; only pre-existing descendants with
+                    // a protected DACL missed it. Warn the operator the same way a declined grant
+                    // is reported and keep going.
+                    let note = note.to_owned();
+                    tracing::warn!("{note}");
+                    eprintln!("warning: {note}");
+                    propagation_notes.push(note);
+                }
+                guards.push(guard);
+            }
             Ok(None) => {}
             Err(err) if !entry.required => {
                 // A non-required refusal: the confinement stands and one entry is simply not
@@ -1750,12 +2045,19 @@ fn apply_policy_entries(
                     declined_readwrite.push(path_text(&entry.path));
                 }
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                // The required entry (the workspace root) failed. Fail-closed is deliberate here —
+                // see [`required_grant_refusal`] for why a `PartiallyEnforced` answer would be the
+                // worse failure — but the refusal is rewritten so it names the right, the object and
+                // the commands that fix it.
+                return Err(required_grant_refusal(entry, err));
+            }
         }
     }
     Ok(PolicyApplication {
         guards,
         declined_readwrite,
+        propagation_notes,
     })
 }
 
@@ -2896,6 +3198,28 @@ fn partial_reason_for(declined_readwrite: &[String]) -> Option<String> {
     ))
 }
 
+/// The reason a run is degraded because a grant stopped at the object it was written on: the
+/// entries whose propagation onto pre-existing descendants was refused, each with the clause
+/// [`propagation_note`] built for it. `None` when every grant reached the whole tree.
+///
+/// This is a degraded verdict, never a refusal: the confined command runs, writes what it creates,
+/// and inherits from now on. What it cannot touch is only what already existed and keeps its own
+/// DACL, which is precisely the thing the operator — not this run — has to reset.
+#[must_use]
+fn propagation_reason_for(notes: &[String]) -> Option<String> {
+    if notes.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "the AppContainer policy wrote every grant it asked for, but {} of them did not reach the \
+         objects that already existed under the entry: {} — pre-existing files or directories \
+         there may stay out of reach for the confined command until their own DACL is reset \
+         (`icacls \"<path>\\<name>\" /reset /c /q`); everything created from now on inherits",
+        notes.len(),
+        notes.join(" | ")
+    ))
+}
+
 /// Everything the policy layer has established for one run.
 ///
 /// `t-008` hands [`WindowsPolicySetup::profile`] (and the capability list it owns) to
@@ -2916,6 +3240,15 @@ pub struct WindowsPolicySetup {
     /// partially enforced run rather than quietly calling full, or failing every command run on
     /// that host.
     pub declined_readwrite: Vec<String>,
+    /// The entries whose grant was written on the object itself but could not be propagated to the
+    /// objects that already existed under it, each carrying the clause [`propagation_note`] built
+    /// for it, in application order.
+    ///
+    /// Empty means every grant covers its whole subtree. Non-empty means the confinement is the
+    /// policy that was asked for **except** for pre-existing objects behind one of these entries,
+    /// which is a degraded run (`PartiallyEnforced`) and never a refused one: the entry itself is
+    /// granted, so everything the confined command creates is reachable.
+    pub propagation_notes: Vec<String>,
 }
 
 impl WindowsPolicySetup {
@@ -2926,14 +3259,23 @@ impl WindowsPolicySetup {
     }
 
     /// The reason of a partially enforced run: the optional read-write entries that are missing
-    /// from the confinement that was asked for. `None` when every entry landed, i.e. when the
-    /// confinement is the whole policy.
+    /// from the confinement that was asked for, and the grants that stopped at the object they were
+    /// written on. `None` when every entry landed and reached its tree, i.e. when the confinement is
+    /// the whole policy.
     ///
     /// Every entry it names is a path the operator can act on, which is the point of spelling the
     /// reason out rather than keeping the verdict quiet.
     #[must_use]
     pub fn partial_reason(&self) -> Option<String> {
-        partial_reason_for(&self.declined_readwrite)
+        // Both degradation classes belong in the one verdict, so an operator reading the attempt
+        // sees a declined write target and a stalled propagation as one honest sentence instead of
+        // the first masking the second.
+        let reasons = [
+            partial_reason_for(&self.declined_readwrite),
+            propagation_reason_for(&self.propagation_notes),
+        ];
+        let reasons: Vec<String> = reasons.into_iter().flatten().collect();
+        (!reasons.is_empty()).then(|| reasons.join("; "))
     }
 }
 
@@ -3007,6 +3349,7 @@ pub fn prepare_windows_policy(
         profile,
         grants: application.guards,
         declined_readwrite,
+        propagation_notes: application.propagation_notes,
     })
 }
 
@@ -5076,6 +5419,323 @@ mod tests {
             !paths_match(Path::new(r"repos\alpha"), Path::new(r"C:\repos\alpha")),
             "a relative spelling is not the absolute one"
         );
+    }
+
+    /// The verbatim marker is itself spelled with separators, so the *other* separator spelling of
+    /// one location is still that location — and used to be a different one, because the marker was
+    /// only recognised in its backslash form and `//?/C:\repos` left a `?` segment behind (t-034:
+    /// the same `\\?\c:` versus `c:` mismatch the task names, surviving in the spelling the strip
+    /// could not see).
+    #[test]
+    fn test_a_verbatim_marker_written_with_either_separator_names_one_location() {
+        let plain = Path::new(r"C:\Users\fredrik\source\marmel");
+        for spelling in [
+            r"\\?\C:\Users\fredrik\source\marmel",
+            r"//?/C:/Users/fredrik/source/marmel",
+            r"//?\C:\Users\fredrik\source\marmel",
+            r"\\?\c:\users\FREDRIK\Source\MARMEL",
+        ] {
+            assert!(
+                paths_match(plain, Path::new(spelling)),
+                "{spelling} is one directory on one volume: {:?}",
+                comparable_components(Path::new(spelling))
+            );
+            // The relation is symmetric, because it is one comparison used both ways.
+            assert!(paths_match(Path::new(spelling), plain), "{spelling}");
+        }
+
+        // The drive root in every spelling the policy meets: this is the comparison the required
+        // workspace-root entry turns on, and a bare `c:` is one location with `c:\` and with the
+        // verbatim spelling of either.
+        let drive_root = Path::new(r"c:\");
+        for spelling in [r"c:", r"C:", r"\\?\c:", r"\\?\C:\", r"//?/c:", r"//?/c:/"] {
+            assert!(
+                paths_match(drive_root, Path::new(spelling)),
+                "the drive root {spelling} has to compare as the drive root: {:?}",
+                comparable_components(Path::new(spelling))
+            );
+        }
+
+        // A verbatim **share** written with slashes is the same share as the plain spelling, and the
+        // device marker loses its marker whichever separator writes it.
+        let plain_share = Path::new(r"\\server\share\work");
+        for spelling in [r"\\?\UNC\server\share\work", r"//?/UNC/server/share/work"] {
+            assert!(
+                paths_match(plain_share, Path::new(spelling)),
+                "{spelling} is one share: {:?}",
+                comparable_components(Path::new(spelling))
+            );
+        }
+        assert_eq!(
+            comparable_components(Path::new(r"//./COM1")),
+            comparable_components(Path::new(r"\\.\COM1")),
+            "the device marker is a marker in either separator"
+        );
+
+        // What is not one location stays two: the flattening must not collapse different directories
+        // onto each other, however they are spelled.
+        for (left, right) in [
+            (r"//?/C:\Users\alpha", r"C:\Users\beta"),
+            (r"//?/C:\repos", r"\\.\repos"),
+            (r"//?/C:/repos/proj", r"\\?\UNC\server\share\repos\proj"),
+        ] {
+            assert!(
+                !paths_match(Path::new(left), Path::new(right)),
+                "{left} and {right} are different locations"
+            );
+        }
+    }
+
+    /// Every spelling of the workspace root resolves to the **one** required entry it names. Before
+    /// the fix a `//?/C:\…` extra became a second grant on the object the table already carries — and
+    /// on the required entry itself, the duplicate, profile-root and sensitive-directory checks all
+    /// silently missed it (t-034).
+    #[test]
+    fn test_every_spelling_of_the_workspace_root_resolves_to_one_entry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let host = FakeHost::new()?;
+        let root = host.workspace.clone();
+        // The spellings come from the paths themselves rather than from `path_text`, so the leg sees
+        // the verbatim marker whether or not the display helper keeps it.
+        let plain = root.to_string_lossy().into_owned();
+        let verbatim = verbatim_spelling(&root).to_string_lossy().into_owned();
+        let spellings = [
+            plain.clone(),
+            verbatim.clone(),
+            plain.replace('\\', "/"),
+            verbatim.replace('\\', "/"),
+        ];
+        let base = build_policy_table(&root, &[], &host.host)?;
+
+        for spelling in &spellings {
+            let table = build_policy_table(&root, std::slice::from_ref(spelling), &host.host)?;
+            let matching = table
+                .entries
+                .iter()
+                .filter(|entry| paths_match(&entry.path, &root))
+                .count();
+            assert_eq!(
+                matching,
+                1,
+                "{spelling} is the directory the table already grants read-write, and may not \
+                 become a second entry: {:?}",
+                table
+                    .entries
+                    .iter()
+                    .map(|entry| path_text(&entry.path))
+                    .collect::<Vec<String>>()
+            );
+            assert_eq!(
+                table.notes.len(),
+                base.notes.len() + 1,
+                "{spelling} has to be reported as the non-entry it is, not dropped: {:?}",
+                table.notes
+            );
+        }
+
+        // The backslash verbatim spelling is unambiguously absolute, so it earns the *duplicate*
+        // note: the skip vocabulary the shared layer publishes, not a bespoke Windows one.
+        let table = build_policy_table(&root, std::slice::from_ref(&verbatim), &host.host)?;
+        assert!(
+            table
+                .notes
+                .iter()
+                .any(|note| note.contains("already covered by the built-in allow-list")),
+            "the verbatim spelling of an entry is a duplicate of it: {:?}",
+            table.notes
+        );
+        Ok(())
+    }
+
+    /// Propagation is best effort. A grant that is written on the object but could not be pushed
+    /// onto what already existed under it becomes a warning, a named clause of the partially
+    /// enforced reason, and nothing else: it never reaches the fatal rule-setup arm that used to
+    /// make every command on such a host exit with the refusal code (t-034).
+    #[test]
+    fn test_a_stalled_propagation_degrades_to_a_note_and_never_to_a_rule_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let snapshot = DaclSnapshot::read(dir.path())?;
+        let missing = dir.path().join("no-such-descendant-here");
+
+        // A name that does not resolve cannot be propagated, and the refusal is a note.
+        let note = propagate_grant(&missing, snapshot.dacl())
+            .expect("propagating onto a name that does not resolve is refused");
+        for expected in [
+            path_text(&missing).as_str(),
+            "written on the object itself",
+            "SetNamedSecurityInfoW failed",
+            "icacls",
+            "/reset",
+        ] {
+            assert!(
+                note.contains(expected),
+                "the propagation note has to name {expected}: {note}"
+            );
+        }
+        assert_eq!(note.lines().count(), 1, "one line per entry: {note}");
+
+        // Propagating an object's own DACL back onto that object is a success, and a success is not
+        // a note: the degraded verdict is reserved for a real decline.
+        assert!(
+            propagate_grant(dir.path(), snapshot.dacl()).is_none(),
+            "propagating onto the object that was just granted cannot be refused"
+        );
+
+        // The verdict half: nothing stalled is nothing to report, and a stalled grant degrades the
+        // run without refusing it.
+        assert_eq!(
+            propagation_reason_for(&[]),
+            None,
+            "a policy whose grants all reached their tree is the whole policy"
+        );
+        let reason = propagation_reason_for(std::slice::from_ref(&note))
+            .expect("one stalled propagation degrades the verdict");
+        for expected in [
+            "1 of them",
+            "did not reach the objects that already existed",
+            path_text(&missing).as_str(),
+            "/reset",
+        ] {
+            assert!(
+                reason.contains(expected),
+                "the partial reason has to name {expected}: {reason}"
+            );
+        }
+        let attempt = SandboxAttempt::PartiallyEnforced { reason };
+        assert!(
+            sandbox::sandbox_outcome(&attempt).is_ok(),
+            "a degraded run still runs the confined command"
+        );
+        assert!(
+            !matches!(
+                sandbox::sandbox_outcome(&attempt),
+                Err(SandboxError::RuleSetup { .. })
+            ),
+            "a stalled propagation must never reach the fatal rule-setup arm"
+        );
+        Ok(())
+    }
+
+    /// A genuine access refusal on the **required** workspace-root grant stays fatal — the mission is
+    /// fail-closed unless the operator opts out — but it is fatal *and* actionable: the right that
+    /// was refused, the object it was refused on, where in the sequence it happened, and the
+    /// commands that show and fix it (t-034).
+    #[test]
+    fn test_a_refused_required_grant_stays_fatal_and_names_the_right_it_needed() {
+        let entry = PolicyPath {
+            path: PathBuf::from(r"C:\work\proj"),
+            grant: Grant::ReadWrite,
+            required: true,
+        };
+        let object = path_text(&entry.path);
+        let refused = WindowsSandboxError::AclMutate {
+            path: object.clone(),
+            reason: "SetSecurityInfo failed: Access is denied.".to_string(),
+            code: ERROR_ACCESS_DENIED,
+        };
+        assert!(
+            refused.is_access_refusal(),
+            "an access refusal on the DACL write is exactly the class the classification exists for"
+        );
+
+        let actionable = required_grant_refusal(&entry, refused);
+        let WindowsSandboxError::AclMutate { path, reason, code } = &actionable else {
+            panic!("a refused required grant stays the same class of failure, got {actionable:?}");
+        };
+        assert_eq!(
+            *path, object,
+            "and it stays attached to the object that refused"
+        );
+        assert_eq!(
+            *code, ERROR_ACCESS_DENIED,
+            "the win32 code survives the rewrite"
+        );
+        for expected in [
+            "WRITE_DAC",
+            "READ_CONTROL",
+            object.as_str(),
+            "workspace-root grant itself",
+            "best effort",
+            &format!("icacls \"{object}\""),
+            "/grant",
+            "/reset",
+            crate::harness::pty::SANDBOX_OPTOUT_ENV,
+        ] {
+            assert!(
+                reason.contains(expected),
+                "the refusal has to name {expected}: {reason}"
+            );
+        }
+        // The original diagnosis is kept, and the guidance appended to it, so the number the call
+        // reported is not edited out of the operator's line of sight.
+        assert!(
+            reason.starts_with("SetSecurityInfo failed:"),
+            "the refusal keeps the call that failed: {reason}"
+        );
+        assert!(reason.contains(" — "), "the guidance is appended: {reason}");
+
+        // The class survives the mapping into the public verdict: still terminal, still `rule-setup`
+        // (which is the exit code every command on that host carries), never a downgraded warning.
+        assert_eq!(
+            SandboxError::from(actionable.clone()).kind(),
+            "rule-setup",
+            "the required grant stays a rule failure"
+        );
+        assert!(
+            matches!(
+                attempt_from_windows_error(actionable),
+                SandboxAttempt::RuleFailed { .. }
+            ),
+            "and the attempt surface says the same thing"
+        );
+
+        // The read half is classified too: the same token limitation is reached one call earlier,
+        // and the operator has to be told the same thing about it.
+        let read_refused = WindowsSandboxError::AclRead {
+            path: object.clone(),
+            reason: "GetNamedSecurityInfoW failed (win32 error 5)".to_string(),
+            code: ERROR_ACCESS_DENIED,
+        };
+        assert!(
+            read_refused.is_access_refusal(),
+            "the DACL read is refused by the same missing right"
+        );
+        let actionable_read = required_grant_refusal(&entry, read_refused);
+        assert!(
+            matches!(&actionable_read, WindowsSandboxError::AclRead { code, .. } if *code == ERROR_ACCESS_DENIED),
+            "a refused read stays a refused read: {actionable_read:?}"
+        );
+        let rendered = actionable_read.to_string();
+        assert!(
+            rendered.contains("WRITE_DAC")
+                && rendered.contains(&object)
+                && rendered.contains("icacls")
+                && rendered.contains(crate::harness::pty::SANDBOX_OPTOUT_ENV),
+            "and it says what to do about it: {rendered}"
+        );
+
+        // Everything that is not an access refusal is handed back untouched: a name that does not
+        // resolve or an object with no security is not fixed by `icacls`, and dressing those up in
+        // WRITE_DAC advice would send the operator to a lever that cannot move them.
+        for code in [2u32, 1350] {
+            // `ERROR_FILE_NOT_FOUND` and `ERROR_CANT_ACCESS_FILE`: neither is a right this token lacks.
+            let other = WindowsSandboxError::AclMutate {
+                path: object.clone(),
+                reason: "SetSecurityInfo failed".to_string(),
+                code,
+            };
+            assert!(
+                !other.is_access_refusal(),
+                "win32 error {code} is not an access refusal"
+            );
+            let handed_back = required_grant_refusal(&entry, other);
+            assert!(
+                matches!(&handed_back, WindowsSandboxError::AclMutate { reason, code: reported, path: _ }
+                    if !reason.contains("icacls") && *reported == code),
+                "a non-refusal comes back exactly as it went in: {handed_back:?}"
+            );
+        }
     }
 
     /// The sensitive-directory invariant has to fire whichever way the paths are spelled, and keep

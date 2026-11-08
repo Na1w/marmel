@@ -46,7 +46,13 @@
 //! 12. the regression guard for the universal-73 shape: on a healthy fixture the attempt has to come
 //!     back **applied** (`sandbox_outcome` accepts it) and the command launched inside it has to run,
 //!     so the one failure mode that costs every command on a desktop is reported by this test, with
-//!     the refusal reason in its message.
+//!     the refusal reason in its message;
+//! 13. the pre-existing-content legs (t-034): a confined command reads a file that already existed in
+//!     the workspace **before** the sandbox was set up (at the root and inside a pre-existing
+//!     subdirectory) and writes a new file into a pre-existing subdirectory, and the workspace root
+//!     is verified to carry the grant for this run's own AppContainer SID — the shape the
+//!     handle-based root write of the backend depends on, because a descendant that existed before
+//!     the grant is covered by inheritance and propagation alone.
 //!
 //! Fixtures: the fixture a denial is proved **in** never sits under a temporary directory, because
 //! the Windows policy grants those read-write on its own and a denial there would prove nothing —
@@ -75,12 +81,12 @@
 
 use marmennill::harness::pty::{SANDBOX_EXEC_ARG, SANDBOX_OPTOUT_ENV};
 use marmennill::harness::sandbox::{
-    SANDBOX_EXTRA_RO_PATHS_ENV, SANDBOX_REFUSAL_MARKER, SANDBOX_REFUSE_EXIT_CODE, SandboxAttempt,
-    sandbox_outcome,
+    Grant, SANDBOX_EXTRA_RO_PATHS_ENV, SANDBOX_REFUSAL_MARKER, SANDBOX_REFUSE_EXIT_CODE,
+    SandboxAttempt, sandbox_outcome,
 };
 use marmennill::harness::sandbox_windows::{
-    CapabilitySids, attempt_windows_sandbox, prepare_windows_policy, run_in_appcontainer,
-    spawn_in_appcontainer,
+    AclCoverage, CapabilitySids, acl_coverage, attempt_windows_sandbox, prepare_windows_policy,
+    run_in_appcontainer, spawn_in_appcontainer,
 };
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -1118,6 +1124,198 @@ fn test_windows_runner_allows_a_nested_write_inside_the_workspace() {
     assert!(
         written.contains(WRITTEN_MARK),
         "{name}: the confined command must have written the marker it was asked to, got: {written}"
+    );
+}
+
+/// The content of a file that existed in the workspace **before** the sandbox was set up: the shape
+/// no leg used to ask about, and the one a root-only DACL write has to keep working (t-034).
+const PRE_EXISTING_MARK: &str = "PRE-EXISTING-WORKSPACE-CONTENT";
+
+/// A confined child has to read what was **already in the workspace** when the sandbox was set up,
+/// both at the root and inside a directory that already existed. This is the case the handle-based
+/// workspace-root write (t-034) could regress: the grant on the root is authoritative for the root
+/// and for everything created afterwards, while a descendant that already had a DACL of its own is
+/// reached by inheritance and propagation alone — and no other leg in this file ever asked a confined
+/// command to read a file the run did not create.
+#[test]
+fn test_windows_reads_a_file_that_already_existed_when_the_sandbox_was_set_up() {
+    let name = "test_windows_reads_a_file_that_already_existed_when_the_sandbox_was_set_up";
+    let Some(workspace) = workspace_outside_temp(name) else {
+        return;
+    };
+
+    // Every fixture below is created **before** any sandbox work happens, which is the whole point of
+    // the leg: the confinement never saw these objects being created.
+    let existing = workspace.path().join("pre-existing.txt");
+    let nested_dir = workspace.path().join("pre-existing-dir");
+    let nested = nested_dir.join("pre-existing-nested.txt");
+    std::fs::create_dir_all(&nested_dir)
+        .unwrap_or_else(|err| panic!("{name}: the pre-existing nested directory: {err}"));
+    for file in [&existing, &nested] {
+        std::fs::write(file, format!("{PRE_EXISTING_MARK}\n")).unwrap_or_else(|err| {
+            panic!("{name}: the pre-existing fixture {}: {err}", file.display())
+        });
+    }
+    let payload = read_payload(&[existing.as_path(), nested.as_path()]);
+
+    let out = run_child(workspace.path(), &payload, None, false);
+    let stdout = stdout_of(&out);
+    let stderr = stderr_of(&out);
+    assert_ne!(
+        out.status.code(),
+        Some(SANDBOX_REFUSE_EXIT_CODE),
+        "{name}: the sandbox has to be established for this leg to say anything about the rules — a \
+         workspace whose existing contents the confinement cannot reach is exactly the shape that \
+         exits {SANDBOX_REFUSE_EXIT_CODE} on every command; stderr: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{name}: reading a file that existed before the sandbox was set up must succeed confined; \
+         stdout: {stdout} stderr: {stderr}"
+    );
+    assert!(
+        stdout.matches(PRE_EXISTING_MARK).count() >= 2,
+        "{name}: both pre-existing files — the one in the workspace root and the one in the \
+         pre-existing subdirectory — have to be readable confined, got: {stdout}"
+    );
+
+    // Attribution: the same payload and the same fixtures with no AppContainer in the picture, so the
+    // leg above measures the confinement rather than a fixture the shell could not read anyway.
+    let plain = run_unconfined(workspace.path(), &payload);
+    assert_eq!(
+        plain.status.code(),
+        Some(0),
+        "{name}: the fixtures have to be readable unconfined too; stderr: {}",
+        stderr_of(&plain)
+    );
+    assert!(
+        stdout_of(&plain).contains(PRE_EXISTING_MARK),
+        "{name}: the unconfined run reads the same content, otherwise the confined leg above proves \
+         nothing: {}",
+        stdout_of(&plain)
+    );
+}
+
+/// A confined child has to create a **new** file inside a directory that already existed when the
+/// sandbox was set up — the everyday shape of a build writing into a source or test directory, and
+/// the shape that depends on the workspace-root grant covering objects this run did not create.
+#[test]
+fn test_windows_writes_a_new_file_into_a_pre_existing_nested_directory() {
+    let name = "test_windows_writes_a_new_file_into_a_pre_existing_nested_directory";
+    let Some(workspace) = workspace_outside_temp(name) else {
+        return;
+    };
+    let nested_dir = workspace.path().join("pre-existing-dir");
+    let sibling = nested_dir.join("pre-existing.txt");
+    std::fs::create_dir_all(&nested_dir)
+        .unwrap_or_else(|err| panic!("{name}: the pre-existing nested directory: {err}"));
+    std::fs::write(&sibling, format!("{PRE_EXISTING_MARK}\n"))
+        .unwrap_or_else(|err| panic!("{name}: the pre-existing sibling: {err}"));
+    let inside = nested_dir.join("written-by-the-confined-child.txt");
+
+    let out = run_child(workspace.path(), &write_payload(&inside), None, false);
+    let stdout = stdout_of(&out);
+    let stderr = stderr_of(&out);
+    assert_ne!(
+        out.status.code(),
+        Some(SANDBOX_REFUSE_EXIT_CODE),
+        "{name}: the sandbox has to be established for this leg to be about the rules at all; \
+         stderr: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{name}: creating a new file inside a directory that existed before the sandbox was set up \
+         must succeed confined; stdout: {stdout} stderr: {stderr}"
+    );
+    let written = std::fs::read_to_string(&inside).unwrap_or_else(|err| {
+        format!("cannot read the marker in the pre-existing directory: {err}")
+    });
+    assert!(
+        written.contains(WRITTEN_MARK),
+        "{name}: the confined child must have created the new file in the pre-existing directory, \
+         got: {written}"
+    );
+    // And the pre-existing content is still there afterwards: the grant added for this run does not
+    // rewrite or replace what the directory already held.
+    let still_there = std::fs::read_to_string(&sibling)
+        .unwrap_or_else(|err| format!("cannot read the pre-existing sibling: {err}"));
+    assert!(
+        still_there.contains(PRE_EXISTING_MARK),
+        "{name}: the pre-existing file in that directory has to survive the run untouched, got: \
+         {still_there}"
+    );
+}
+
+/// The runner-level leg of the same contract, and the leg that pins the ACE itself: after the policy
+/// pass the workspace root carries the grant for **this run's own** AppContainer SID, and a command
+/// launched inside that setup still reads the files that existed before it was prepared. The
+/// propagation this backend asks for after the authoritative root write is best effort, so a host
+/// that declines it is reported here as a note rather than silently passing (t-034).
+#[test]
+fn test_windows_runner_reads_a_pre_existing_workspace_file_and_carries_the_root_ace() {
+    let name = "test_windows_runner_reads_a_pre_existing_workspace_file_and_carries_the_root_ace";
+    let Some(workspace) = workspace_outside_temp(name) else {
+        return;
+    };
+    let existing = workspace.path().join("pre-existing.txt");
+    let nested_dir = workspace.path().join("pre-existing-dir");
+    let nested = nested_dir.join("pre-existing-nested.txt");
+    std::fs::create_dir_all(&nested_dir)
+        .unwrap_or_else(|err| panic!("{name}: the pre-existing nested directory: {err}"));
+    for file in [&existing, &nested] {
+        std::fs::write(file, format!("{PRE_EXISTING_MARK}\n")).unwrap_or_else(|err| {
+            panic!("{name}: the pre-existing fixture {}: {err}", file.display())
+        });
+    }
+
+    let setup = prepare_windows_policy(workspace.path(), &[])
+        .unwrap_or_else(|err| panic!("{name}: the policy pass must build a setup: {err}"));
+
+    // The grant this run applied is visible on the required entry, naming this run's own SID.
+    let coverage =
+        acl_coverage(workspace.path(), setup.sid(), Grant::ReadWrite).unwrap_or_else(|err| {
+            panic!("{name}: the DACL of the workspace root must be readable: {err}")
+        });
+    assert!(
+        matches!(coverage, AclCoverage::Covered),
+        "{name}: the workspace root must carry the AppContainer grant this run applied for its own \
+         SID, got {coverage:?}"
+    );
+    if !setup.propagation_notes.is_empty() {
+        eprintln!(
+            "NOTE {name}: this host wrote the root grant but declined to propagate it onto \
+             pre-existing descendants: {:?}",
+            setup.propagation_notes
+        );
+    }
+
+    // The payload's own streams belong to this process, so they are captured inside the granted
+    // workspace, where the leg can read them back.
+    let stdout_file = workspace.path().join("leg-stdout.txt");
+    let stderr_file = workspace.path().join("leg-stderr.txt");
+    let payload = runner_captured_payload(
+        &read_payload(&[existing.as_path(), nested.as_path()]),
+        &stdout_file,
+        &stderr_file,
+    );
+    let code = spawn_in_appcontainer(&setup, workspace.path(), &payload)
+        .unwrap_or_else(|err| panic!("{name}: the pre-existing read must launch confined: {err}"));
+    let stdout = captured(&stdout_file);
+    let stderr = captured(&stderr_file);
+    assert_eq!(
+        code, 0,
+        "{name}: a confined command that only reads pre-existing workspace files must exit 0, got \
+         {code}; stdout: {stdout} stderr: {stderr}"
+    );
+    assert!(
+        stdout.matches(PRE_EXISTING_MARK).count() >= 2,
+        "{name}: the confined command must have read both pre-existing files, got: {stdout}"
+    );
+    assert!(
+        !names_denial_in(&stderr),
+        "{name}: reading what already existed must not answer with a denial: {stderr}"
     );
 }
 
