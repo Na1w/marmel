@@ -5197,8 +5197,9 @@ mod tests {
     /// `ERROR_ACCESS_DENIED` on this call names a fixture whose mask forgot its own creator, not a
     /// Windows the grant path cannot work on.
     ///
-    /// `Err` carries the code so that the companion test can accept the denial it provokes on
-    /// purpose.
+    /// `Err` carries the code so that a test which needs the object can report the exact refusal: a
+    /// create the fixture's own DACL defeats is a mask that withheld a right the creator asked for,
+    /// which is a failure to surface and never a reason to skip the measurement that follows.
     fn create_fixture_pipe(
         attrs: &SECURITY_ATTRIBUTES,
         conceded: u32,
@@ -5606,21 +5607,24 @@ mod tests {
         let mut descriptor =
             TestDescriptor::for_caller(FIXTURE_DATA_ONLY_ACCESS, FIXTURE_SECURITY_ACCESS, &caller)?;
         let attrs = descriptor.attributes();
-        let (read, write) = match create_fixture_pipe(&attrs, FIXTURE_DATA_ONLY_ACCESS) {
-            Ok((read, write)) => (read, write),
-            Err((code, detail)) => {
-                // The access check behind the create is the same access check as the one behind the
-                // security calls, so a descriptor that refuses the security rights can also refuse
-                // the create outright. That is the fact this test pins, one call earlier than
-                // expected, and the denial is still accepted for exactly that reason.
-                assert_eq!(
-                    code, ERROR_ACCESS_DENIED,
-                    "the fixture pipe must either be created, so that its refused security read can \
-                     be measured, or refuse the access request itself, got: {detail}"
-                );
-                return Ok(());
-            }
-        };
+        // The contrast object has to exist, or the two assertions below are never executed and the
+        // test goes green having measured nothing. The DACL this test wrote concedes the generic
+        // data rights `CreatePipe` asks for at create time and refuses only the two security rights,
+        // so the create is expected to succeed; a refusal here is a broken fixture — a mask that
+        // forgot the rights its own creator asked for — and that is a regression to report, not a
+        // condition to skip past. The failure names the object, the conceded mask in hex and the
+        // Win32 code, all three of which `create_fixture_pipe` already puts into `detail`.
+        let (read, write) =
+            create_fixture_pipe(&attrs, FIXTURE_DATA_ONLY_ACCESS).map_err(|(code, detail)| {
+                WindowsSandboxError::Launch {
+                    reason: format!(
+                        "the foreign-handle test could not create the contrast pipe its own \
+                         descriptor is meant to make possible, so its refused security read was \
+                         never measured: {detail}"
+                    ),
+                    code,
+                }
+            })?;
         // The object is perfectly usable for data: what is out of reach is its descriptor, not the
         // stream. One byte proves the pipe works, so the refusals below cannot be blamed on an object
         // that never came into being.
