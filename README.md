@@ -87,7 +87,7 @@ Marmel is built for autonomous, multi-step software development with continuous 
                                                   ┌───────────────────────────────┐
                                                   │      Scoped Tool Harness      │
                                                   │  • Workspace Path Confinement │
-                                                  │  • Landlock/Seatbelt sandbox  │
+                                                  │  • Platform command sandbox   │
                                                   │  • Git Worktree Isolation     │
                                                   │  • MCP Servers (stdio / SSE)  │
                                                   └───────────────────────────────┘
@@ -129,7 +129,7 @@ A defining design pillar underpinning both `kvaser-cli` and Marmel is robust san
 
 The goal of Marmel has always been **true autonomy**: enabling agents to plan, edit, run test suites, and execute commands across multi-step tasks without stalling for permission. To make that autonomy safe, security had to be enforced structurally at the system boundary rather than interactively by the user.
 
-By combining in-process workspace path confinement with kernel-enforced sandboxing (Linux Landlock LSM, macOS Seatbelt) and isolated per-task git worktrees, Marmel gives subagents full freedom to build and test code within the project directory, while guaranteeing that sensitive user data (such as `~/.ssh`, `~/.gnupg`, or system configurations) remains strictly protected.
+By combining in-process workspace path confinement with platform-enforced command sandboxing (Linux Landlock LSM, macOS Seatbelt, Windows AppContainer) and isolated per-task git worktrees, Marmel gives subagents full freedom to build and test code within the project directory, while guaranteeing that sensitive user data (such as `~/.ssh`, `~/.gnupg`, or system configurations) remains strictly protected.
 
 ### Autonomous Dogfooding Since v0.4
 
@@ -225,8 +225,8 @@ Marmel loads the first configuration file found from this list (files are not me
 | `reasoning_effort` | _unset_ | Optional reasoning-effort hint forwarded to backend (`none`, `minimal`, `low`, `medium`, `high`). |
 | `preserve_thinking` | `true` | Retain thinking blocks in the session transcript. |
 | `command_timeout_secs` | `60` | Timeout in seconds for a single `run_command` invocation (clamped to `1..=300`). |
-| `sandbox_disabled` | `false` | Disable the command sandbox (`true` runs unsandboxed; Landlock on Linux, Seatbelt on macOS, AppContainer on Windows). |
-| `sandbox_extra_readonly_paths` | `[]` | Additional absolute paths granted read+execute access in the sandbox. |
+| `sandbox_disabled` | `false` | Disable the command sandbox (`true` runs unsandboxed on Linux, macOS and Windows). `MARMEL_DISABLE_SANDBOX=1` has the same effect. |
+| `sandbox_extra_readonly_paths` | `[]` | Additional absolute paths granted read+execute access in the sandbox (Linux, macOS and Windows). |
 | `enable_xml_rescue` | `true` | Attempt to parse pseudo-XML tool calls when a model emits malformed JSON. |
 | `ui_mode` | `"tui"` | Interface mode: `"tui"` (Ratatui) or `"raw"` (streaming stdout). Automatically degrades to raw if stdout is redirected. |
 | `session_enabled` | `true` | Enable persistent session bundling in `.marmel/session/`. |
@@ -418,6 +418,7 @@ Specialists execute shell commands via `run_command` (bounded by `command_timeou
 
 - **Linux & macOS:** Commands execute inside `/bin/sh` with command sandboxing (Landlock on Linux, Seatbelt on macOS).
 - **Windows:** Commands execute via `%COMSPEC%` (`cmd.exe`), sandboxed in a Windows AppContainer that the sandbox re-entry child launches the command inside.
+- **Fail-closed on every platform:** if the sandbox cannot be established, the command is not run at all and the run exits with code `73`. `sandbox_disabled = true` or `MARMEL_DISABLE_SANDBOX=1` opts out explicitly and runs the command unsandboxed.
 - Clean exit codes and command outputs are preserved even when timeouts or cancellations occur.
 
 ### Runtime Directory (`.marmel/`)
@@ -534,8 +535,9 @@ args = ["mcp", "--kiwix-dir", "/path/to/kiwix", "--index", "/path/to/index"]
 Marmel enforces layered security boundaries to protect your host system:
 
 1. **Path Confinement:** All file access tools (`read_file`, `write_file`, `replace`, etc.) strictly validate paths against the workspace boundary in-process on all platforms. Traversal attempts (`../../`) are blocked.
-2. **Process Sandboxing (Linux Landlock, macOS Seatbelt, Windows AppContainer):** Terminal commands execute within an unprivileged platform sandbox (Landlock LSM on Linux, Seatbelt/SBPL on macOS, a Windows AppContainer on Windows). Read/write access is restricted to the workspace, temporary directories (`/tmp`), and language caches (`~/.cargo`, `~/.cache`). Sensitive directories (`~/.ssh`, `~/.gnupg`) are strictly inaccessible. A host with no sandbox backend, or an enforcement failure, refuses the command rather than running it unsandboxed.
-3. **Windows:** The sandbox is a Windows AppContainer. An AppContainer identity is carried by a process only at creation, so the command sandbox is applied in a re-entry child: Marmel starts a second copy of itself, which prepares the AppContainer (its profile, and the grants on the workspace and toolchain directories) and launches the pending command **inside** it. The confined command therefore sees the workspace, the temporary directories and the configured toolchains, and no user profile directories. A refused attempt exits non-zero rather than running the command unsandboxed.
+2. **Command Sandboxing (Linux Landlock, macOS Seatbelt, Windows AppContainer):** Terminal commands run inside an unprivileged platform sandbox — the Landlock LSM on Linux, a Seatbelt (SBPL) profile on macOS, a Windows AppContainer on Windows. The workspace root is read-write, temporary directories (`/tmp` and `/var/tmp` on Unix, `%TEMP%` and `%TMP%` on Windows) are read-write, system and toolchain directories are read-only, and build caches (`~/.cargo`, `~/.cache`, `~/.npm`) are writable on Linux and macOS. Sensitive directories (`~/.ssh`, `~/.gnupg`) are strictly inaccessible on every platform, and a write outside the workspace is refused rather than allowed. The network is not part of the sandbox: sandboxed commands still reach it, so `cargo`, `npm`, `pip` and `git` keep working.
+3. **Windows:** The sandbox is a Windows AppContainer. An AppContainer identity is carried by a process only at creation, so the command sandbox is applied in a re-entry child: Marmel starts a second copy of itself, which prepares a throwaway AppContainer for the run (its profile, and the grants on the workspace, temporary and toolchain directories) and launches the pending command **inside** it. The confined command therefore sees the workspace read-write, the temporary directories read-write and the toolchain directories (`CARGO_HOME`, `RUSTUP_HOME`, the Windows directory and the program-files directories) read-only, and nothing else. The user profile itself is never granted, so `%USERPROFILE%\.ssh` and `%USERPROFILE%\.gnupg` are never reachable.
+4. **Fail-Closed:** If confinement cannot be established — a host with no sandbox backend, or an enforcement failure — the command is not run at all and the run exits with code `73` rather than running it unconfined. The only legitimate way to run unsandboxed is an explicit opt-out (`sandbox_disabled = true` in `marmel.toml`, or `MARMEL_DISABLE_SANDBOX=1` in the environment), which also runs the command unconfined on Windows and is always warned about.
 
 ### Extra Sandbox Read-Only Paths (`sandbox_extra_readonly_paths`)
 
@@ -544,6 +546,8 @@ If your build toolchain resides outside standard system paths (for example, cust
 ```toml
 sandbox_extra_readonly_paths = ["/mnt/nix/store"]
 ```
+
+The key is honoured by all three sandbox backends (Linux Landlock, macOS Seatbelt and Windows AppContainer) and can only ever add read-and-execute rights; it never widens write access. Entries that are relative, absent on this host or already covered by the built-in allow-list never become grants and are reported as a one-line note naming the key. On Windows the user-profile root itself is never granted — `%USERPROFILE%` stays out of the list, because granting it would make `%USERPROFILE%\.ssh` and `%USERPROFILE%\.gnupg` reachable again — so an entry that covers the profile root, or sits inside one of the denied directories, is skipped with a note instead. List the toolchain directory below it (`%USERPROFILE%\.cargo` and friends) rather than the profile root.
 
 ---
 
