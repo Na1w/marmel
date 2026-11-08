@@ -155,7 +155,15 @@ pub enum WindowsSandboxError {
     /// real: a crash status instead of a command failure, or anything other than the exit code the
     /// probe itself asks for.
     #[error("the confined probe process did not confirm the confinement: {reason}")]
-    Probe { reason: String },
+    Probe {
+        reason: String,
+        /// The status the confined probe answered with — an `NTSTATUS` crash status, or the exit
+        /// code it returned — or, for a probe that never started, the Win32 error the launch
+        /// reported. It is the number that tells "the confinement killed the child" from "a
+        /// command inside the confinement failed", so it is carried structurally and not only in
+        /// the prose, which already names it (and is why the verdict text does not repeat it).
+        code: WIN32_ERROR,
+    },
 }
 
 impl WindowsSandboxError {
@@ -203,9 +211,11 @@ impl WindowsSandboxError {
     /// (`log_windows_sandbox_failure`) and the prose always name the same one. `AclRead` and
     /// `Profile` used to answer `0` here while their prose carried `5` and an `HRESULT`
     /// respectively — the asymmetry that made two ranks of a desktop refusal (t-030 §5-§6)
-    /// indistinguishable in the log, and impossible to tell apart from the code field alone. The
-    /// variants that stay at `0` are the ones decided before or between calls, where reporting a
-    /// code would be a lie.
+    /// indistinguishable in the log, and impossible to tell apart from the code field alone. A
+    /// `Probe` failure used to answer `0` for the same reason: it reported the status the confined
+    /// child answered with, which is the whole diagnosis for a probe rank, and dropped it on the
+    /// way to the log record. The variants that stay at `0` are the ones decided before or between
+    /// calls, where reporting a code would be a lie.
     #[must_use]
     pub fn win32_code(&self) -> WIN32_ERROR {
         match self {
@@ -214,13 +224,14 @@ impl WindowsSandboxError {
             | WindowsSandboxError::Profile { code, .. }
             | WindowsSandboxError::Sid { code, .. }
             | WindowsSandboxError::AttributeList { code, .. }
+            | WindowsSandboxError::Probe { code, .. }
             | WindowsSandboxError::Launch { code, .. } => *code,
-            // No Win32 call failed behind these three: the rule failure is a policy judgement, the
-            // verification failure is a DACL that does not match the policy, and a probe failure
-            // reports the child's own exit status rather than a `GetLastError` value.
-            WindowsSandboxError::RuleSetup { .. }
-            | WindowsSandboxError::AclVerification { .. }
-            | WindowsSandboxError::Probe { .. } => 0,
+            // No Win32 call failed behind these two: the rule failure is a policy judgement, and
+            // the verification failure is a DACL that does not match the policy — the calls that
+            // read it both answered `ERROR_SUCCESS`, which is why the object says no.
+            WindowsSandboxError::RuleSetup { .. } | WindowsSandboxError::AclVerification { .. } => {
+                0
+            }
         }
     }
 
@@ -2678,26 +2689,46 @@ fn probe_confined_launch(
     let raw = match launch_confined(setup, cwd, PROBE_COMMAND) {
         Ok(raw) => raw,
         Err(err) => {
+            // The code of the failure *behind* the probe: a probe that never started says what
+            // the launch reported, so the log field of a rank-3 refusal names a number and not 0.
+            let code = err.win32_code();
             return Err(WindowsSandboxError::Probe {
                 reason: format!("the confined probe process could not be launched: {err}"),
+                code,
             });
         }
     };
     if CONFINEMENT_FAILURE_STATUSES.contains(&raw) {
         return Err(WindowsSandboxError::Probe {
             reason: format!(
-                "the confined probe process died with the status {raw:#010x}, which is a confinement failure rather than a command failure"
+                "the confined probe process died with the status {}, which is a confinement failure rather than a command failure",
+                exit_status_text(raw)
             ),
+            code: raw,
         });
     }
     if raw != 0 {
         return Err(WindowsSandboxError::Probe {
             reason: format!(
-                "the confined probe process ({PROBE_COMMAND}) exited with {raw}, not the 0 it asked for"
+                "the confined probe process ({PROBE_COMMAND}) exited with {}, not the 0 it asked for",
+                exit_status_text(raw)
             ),
+            code: raw,
         });
     }
     Ok(())
+}
+
+/// The exit status a confined child reported, spelled so an `NTSTATUS`-shaped one cannot be read
+/// as a small command exit code: from `0x8000_0000` up it is named in hex with its decimal beside
+/// it, and below that as the plain decimal number a shell hands back.
+#[must_use]
+fn exit_status_text(raw: u32) -> String {
+    if raw & 0x8000_0000 == 0 {
+        raw.to_string()
+    } else {
+        format!("{raw:#010x} (decimal {})", raw as i32)
+    }
 }
 
 /// The reason text of a failure that carries a Win32 error, with the code spelled the way the
@@ -2707,34 +2738,57 @@ fn probe_confined_launch(
 /// reason string is the one channel a refusal has to the operator: the re-entry child prints
 /// it to stderr, and the harness folds that stderr into the `run_command` result. `0` means no
 /// Win32 error is involved, and is deliberately not spelled as a code.
+///
+/// A status with the high bit set — an `HRESULT` from `CreateAppContainerProfile`, or an
+/// `NTSTATUS` a confined child died with — is **not** a small Win32 code, and its decimal
+/// rendering (`-2147024891`, `3221225781`) reads like one and is not recognisable in a log or a
+/// search. Those are spelled in hex first, with the decimal kept beside them so the two renderings
+/// of the same number still line up with the decimal `code` field of the log record.
 #[must_use]
 fn append_win32_code(reason: String, code: WIN32_ERROR) -> String {
     if code == 0 {
         reason
-    } else {
+    } else if code & 0x8000_0000 == 0 {
         format!("{reason} (win32 code = {code})")
+    } else {
+        format!(
+            "{reason} (win32 code = {code:#010x}, decimal {})",
+            code as i32
+        )
     }
+}
+
+/// The two spellings one machine status has to reach the log with: the decimal `code` field
+/// tracing records for a number, and the `code_hex` field that makes an `HRESULT` or `NTSTATUS`
+/// recognisable without arithmetic (`0x80070005`, never `2147942405` on its own).
+#[must_use]
+fn log_code_fields(err: &WindowsSandboxError) -> (WIN32_ERROR, String) {
+    let code = err.win32_code();
+    (code, format!("{code:#010x}"))
 }
 
 /// One log record per backend failure, with the fields a diagnosis needs: where in the chain it
 /// happened (`step`), what stage failed (`kind`), which object it is about (`path`) and the
-/// Win32 error the failing call reported (`code`).
+/// Win32 error the failing call reported (`code`, plus `code_hex` for the same number).
 ///
 /// The `code` field is the raw status the call reported: a `WIN32_ERROR` for a DACL, SID or launch
-/// call, and the `HRESULT` of `CreateAppContainerProfile` for a profile failure. The field is a
-/// decimal either way, which is why the prose of a profile failure spells the same status in hex
-/// and in decimal too — `0x80070005` and `-2147024891` are the same thing, and an operator reading
-/// `code=2147483653` needs to know which of the two to look up.
+/// call, the `HRESULT` of `CreateAppContainerProfile` for a profile failure, and the status the
+/// confined child answered with for a probe failure. A numeric field is recorded as decimal, which
+/// is why the same record carries `code_hex`: `0x80070005` and `-2147024891` are one status, and an
+/// operator reading `code=2147942405` needs to know which of the two to look up. The prose of the
+/// failure spells it the same way, so the two views cannot disagree.
 ///
 /// Every refusal class has to appear in the log with its causal chain, because the operator can
 /// only be told to look there; the prose of the failure is kept in the message so the two views
 /// cannot disagree.
 fn log_windows_sandbox_failure(step: &str, err: &WindowsSandboxError) {
+    let (code, code_hex) = log_code_fields(err);
     tracing::error!(
         step = step,
         kind = err.kind(),
         path = err.path(),
-        code = err.win32_code(),
+        code,
+        code_hex = code_hex.as_str(),
         "sandbox refusal: {err}"
     );
 }
@@ -2761,9 +2815,11 @@ fn attempt_from_windows_error(err: WindowsSandboxError) -> SandboxAttempt {
             }
         }
         // Launch-side failures say the same thing about the attempt: the policy was built, but
-        // confining something with it did not work, which is an enforcement failure.
+        // confining something with it did not work, which is an enforcement failure. A probe
+        // failure is not given a second copy of its code, because its prose already names the
+        // status the child (or the launch behind it) reported — the `AclRead` precedent.
         WindowsSandboxError::AttributeList { reason, .. }
-        | WindowsSandboxError::Probe { reason } => SandboxAttempt::EnforcementFailed { reason },
+        | WindowsSandboxError::Probe { reason, .. } => SandboxAttempt::EnforcementFailed { reason },
         WindowsSandboxError::Launch { reason, code } => SandboxAttempt::EnforcementFailed {
             reason: append_win32_code(reason, code),
         },
@@ -2807,7 +2863,7 @@ impl From<WindowsSandboxError> for SandboxError {
                 reason: format!("{path}: {reason}"),
             },
             WindowsSandboxError::AttributeList { reason, .. }
-            | WindowsSandboxError::Probe { reason } => SandboxError::Enforcement { reason },
+            | WindowsSandboxError::Probe { reason, .. } => SandboxError::Enforcement { reason },
             WindowsSandboxError::Launch { reason, code } => SandboxError::Enforcement {
                 reason: append_win32_code(reason, code),
             },
@@ -4099,6 +4155,7 @@ mod tests {
             },
             WindowsSandboxError::Probe {
                 reason: "the confined probe process could not be launched".to_string(),
+                code: 2,
             },
         ] {
             let attempt = attempt_from_windows_error(err.clone());
@@ -4201,15 +4258,17 @@ mod tests {
         };
         assert!(rendered.contains("win32 code = 2"), "{rendered}");
         let probe = WindowsSandboxError::Probe {
-            reason: "the confined probe died with status 0xc0000005".to_string(),
+            reason: "the confined probe died with status 0x80000003".to_string(),
+            code: 0x8000_0003,
         };
         let rendered = match attempt_from_windows_error(probe) {
             SandboxAttempt::EnforcementFailed { reason } => reason,
             other => panic!("expected EnforcementFailed, got {other:?}"),
         };
         assert_eq!(
-            rendered, "the confined probe died with status 0xc0000005",
-            "a probe failure involves no Win32 code: {rendered}"
+            rendered, "the confined probe died with status 0x80000003",
+            "a probe failure names the status in its prose, so the verdict text does not repeat \
+             it as a second code: {rendered}"
         );
     }
 
@@ -4228,9 +4287,14 @@ mod tests {
 
         let probe = WindowsSandboxError::Probe {
             reason: "the confined probe exited with 1".to_string(),
+            code: 1,
         };
         assert_eq!(probe.kind(), "probe");
-        assert_eq!(probe.win32_code(), 0, "no Win32 error is involved");
+        assert_eq!(
+            probe.win32_code(),
+            1,
+            "the status the confined child answered with is the code the log field names"
+        );
         assert_eq!(probe.path(), "", "the probe names no object");
 
         // The desktop case for a profile refusal: `E_ACCESSDENIED` from
@@ -4290,6 +4354,12 @@ mod tests {
                 reason: "CreateProcessW failed".to_string(),
                 code: 2,
             },
+            // `STATUS_DLL_NOT_FOUND`: what a confined child dies with when the container cannot
+            // map its own image, which is the probe rank of a desktop refusal.
+            WindowsSandboxError::Probe {
+                reason: "the confined probe process died with the status 0xc0000135".to_string(),
+                code: 0xC000_0135,
+            },
         ];
         // The class and the code belong to the variant: this is what the log record of a refusal
         // is built from, so a wrong pairing is a wrong diagnosis.
@@ -4300,6 +4370,7 @@ mod tests {
             ("attribute-list", 24),
             ("acl-mutate", 1314),
             ("launch", 2),
+            ("probe", 0xC000_0135),
         ];
         for (err, (expected_kind, expected_code)) in cases.into_iter().zip(expected.iter()) {
             assert_eq!(err.kind(), *expected_kind, "the class of {err}");
@@ -4310,10 +4381,12 @@ mod tests {
             );
         }
 
-        // The variants decided *before or between* calls still report no code, because reporting
-        // one would be a lie: the rule failure is a policy judgement, the verification failure is
-        // a DACL that does not match the policy, and a probe failure reports the child's own exit
-        // status rather than a `GetLastError` value.
+        // The two variants decided *before or between* calls still report no code, because
+        // reporting one would be a lie: the rule failure is a policy judgement, and the
+        // verification failure is a DACL that does not match the policy after every call that read
+        // it answered `ERROR_SUCCESS`. A `Probe` failure used to sit here and answer `0`, while its
+        // prose named the status the child reported — the same asymmetry as `AclRead` and
+        // `Profile`, and one log line away from the launch code it wraps.
         for (err, expected_kind) in [
             (
                 WindowsSandboxError::RuleSetup {
@@ -4328,12 +4401,6 @@ mod tests {
                     reason: "the grant this policy applied is not visible in the DACL".to_string(),
                 },
                 "acl-verification",
-            ),
-            (
-                WindowsSandboxError::Probe {
-                    reason: "the confined probe exited with 1".to_string(),
-                },
-                "probe",
             ),
         ] {
             assert_eq!(err.kind(), expected_kind, "the class of {err}");
@@ -4382,6 +4449,122 @@ mod tests {
             None,
             "an access-violation status does not wrap a Win32 code"
         );
+    }
+
+    /// A probe refusal has to carry the status that made it one — the crash status the confined
+    /// child died with, the exit code it returned, or, when it never started, the code of the
+    /// launch behind it. All three are real machine statuses, and a `code = 0` in the capture of a
+    /// probe-rank refusal reads as "nothing reported" (t-030 §5-§6).
+    #[test]
+    fn test_a_probe_failure_reports_the_status_behind_it() {
+        // `STATUS_ACCESS_DENIED`: the container refused the child its own image.
+        let crash = WindowsSandboxError::Probe {
+            reason: "the confined probe process died with the status 0xc0000022".to_string(),
+            code: 0xC000_0022,
+        };
+        assert_eq!(crash.kind(), "probe");
+        assert_eq!(
+            crash.win32_code(),
+            0xC000_0022,
+            "the crash status is the diagnosis"
+        );
+
+        // A plain non-zero exit is a status too, and is the one that says the confinement worked
+        // and the command inside it did not.
+        let exit = WindowsSandboxError::Probe {
+            reason: "the confined probe process (exit 0) exited with 73".to_string(),
+            code: 73,
+        };
+        assert_eq!(exit.win32_code(), 73, "a non-zero exit is a status");
+        assert_eq!(exit.path(), "", "the probe names no object");
+
+        // The exit arm spells an `NTSTATUS`-shaped status so it cannot be mistaken for a small
+        // command exit code, and leaves a plain one as the decimal a shell hands back.
+        assert_eq!(exit_status_text(0), "0");
+        assert_eq!(exit_status_text(73), "73");
+        assert_eq!(
+            exit_status_text(0xC000_0374),
+            "0xc0000374 (decimal -1073740940)",
+            "a heap-corruption status must not read as a command exit code"
+        );
+
+        // The launch-behind case is carried structurally, which is what keeps the code of a probe
+        // that never started from being lost in the reason text it is folded into.
+        let never_started = WindowsSandboxError::Probe {
+            reason: "the confined probe process could not be launched: CreateProcessW failed"
+                .to_string(),
+            code: 2,
+        };
+        assert_eq!(never_started.win32_code(), 2);
+        assert_eq!(never_started.kind(), "probe");
+    }
+
+    /// An `HRESULT`- or `NTSTATUS`-class status has to be recognisable as one wherever it is
+    /// read: in the operator's reason line, and as `code_hex` next to the decimal `code` field of
+    /// the log record. `2147942405` is not recognisable as `E_ACCESSDENIED`, and the decimal-only
+    /// field left the operator to work out which number to look up.
+    #[test]
+    fn test_the_machine_status_is_spelled_in_hex_for_the_operator_and_the_log() {
+        // A plain Win32 code keeps the single spelling the operator and the log grep for.
+        assert_eq!(
+            append_win32_code("no WRITE_DAC on that object".to_string(), 5),
+            "no WRITE_DAC on that object (win32 code = 5)"
+        );
+        // `0` is not a code, and is deliberately not spelled as one.
+        assert_eq!(append_win32_code("quiet".to_string(), 0), "quiet");
+
+        // `E_ACCESSDENIED` from `CreateAppContainerProfile`: hex first, with the decimal the log
+        // field carries kept beside it so the two spellings cannot be confused for two numbers.
+        let profile_line = append_win32_code(
+            "the AppContainer profile could not be created".to_string(),
+            0x8007_0005,
+        );
+        for spelling in ["0x80070005", "-2147024891"] {
+            assert!(
+                profile_line.contains(spelling),
+                "the reason line has to carry the {spelling} spelling: {profile_line}"
+            );
+        }
+        // The crash status of a confined child, the same class of number.
+        let probe_line = append_win32_code("the confined probe failed".to_string(), 0xC000_0135);
+        let probe_decimal = (0xC000_0135u32 as i32).to_string();
+        for spelling in ["0xc0000135", probe_decimal.as_str()] {
+            assert!(
+                probe_line.contains(spelling),
+                "the reason line has to carry the {spelling} spelling: {probe_line}"
+            );
+        }
+
+        // The record of a refusal names the same number twice, once per spelling, for whichever
+        // variant it describes — including the ones with no code, which say so in both.
+        let profile = WindowsSandboxError::Profile {
+            name: "marmel-sandbox-x".to_string(),
+            reason: "CreateAppContainerProfile failed".to_string(),
+            code: 0x8007_0005,
+        };
+        assert_eq!(
+            log_code_fields(&profile),
+            (0x8007_0005, "0x80070005".to_string())
+        );
+        let refused = WindowsSandboxError::AclRead {
+            path: r"C:\work\proj".to_string(),
+            reason: "GetNamedSecurityInfoW failed (win32 error 5)".to_string(),
+            code: 5,
+        };
+        assert_eq!(log_code_fields(&refused), (5, "0x00000005".to_string()));
+        let probe = WindowsSandboxError::Probe {
+            reason: "the confined probe process died with the status 0xc0000135".to_string(),
+            code: 0xC000_0135,
+        };
+        assert_eq!(
+            log_code_fields(&probe),
+            (0xC000_0135, "0xc0000135".to_string())
+        );
+        let judgement = WindowsSandboxError::RuleSetup {
+            path: r"C:\work\proj".to_string(),
+            reason: "the root is a denied directory".to_string(),
+        };
+        assert_eq!(log_code_fields(&judgement), (0, "0x00000000".to_string()));
     }
 
     /// The two spellings one location can be written in have to compare as one location: the

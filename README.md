@@ -558,8 +558,11 @@ set MARMEL_DISABLE_SANDBOX=1 to run it unsandboxed.
 Every line names the step that failed (`sandbox attempt`: the confinement itself; `confined launch`:
 launching the real command inside a confinement that had been accepted), the failure class, the
 object it is about and, for a Windows ACL or launch failure, the Win32 error the failing call
-reported. A `run_command` result ends with a matching notice, and when a refusal happens the same
-records are written to the log with `step`, `kind`, `path` and `code` as structured fields.
+reported. A status whose home is an `HRESULT` or `NTSTATUS` — such as `0x80070005` for a profile that
+could not be created, or `0xc0000374` for a probe process the heap terminated — is spelled in hex next
+to its decimal value, because the hex form is the one that can be looked up. A `run_command` result ends
+with a matching notice, and when a refusal happens the same records are written to the log with `step`,
+`kind`, `path`, `code` and `code_hex` (the same status in hex) as structured fields.
 
 To read the reason for yourself, drive one re-entry leg by hand (the same invocation the Windows
 behaviour tests drive) and redirect the streams so nothing is lost:
